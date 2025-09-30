@@ -11,13 +11,16 @@ pub fn main() !void {
     );
     defer json.deinit();
 
-    var stack = try std.ArrayList([]const u8).initCapacity(allocator, 0);
-    defer stack.deinit(allocator);
+    var ns_stack = try std.ArrayList(Namespace).initCapacity(allocator, 0);
+    try ns_stack.append(allocator, Namespace.init(allocator));
+    defer ns_stack.deinit(allocator);
 
     const buffer = try allocator.alloc(u8, 4096);
     defer allocator.free(buffer);
     var stdout_writer = std.fs.File.stdout().writer(buffer);
-    try codegenNamespace(allocator, json.value, &stack, &stdout_writer.interface);
+    try codegenNamespace(allocator, json.value, &ns_stack, &stdout_writer.interface);
+    ns_stack.items[0].deinit();
+
     try stdout_writer.interface.flush();
 }
 
@@ -36,10 +39,33 @@ fn readJson(
     );
 }
 
+const Namespace = struct {
+    types: std.StringHashMap(void),
+
+    pub fn init(allocator: std.mem.Allocator) Namespace {
+        return .{ .types = std.StringHashMap(void).init(allocator) };
+    }
+
+    pub fn deinit(self: *Namespace) void {
+        self.types.deinit();
+    }
+};
+
+pub fn namespaceContains(ns_stack: []Namespace, key: []const u8) bool {
+    var i: usize = ns_stack.len;
+    while (i > 0) {
+        i -= 1;
+        if (ns_stack[i].types.contains(key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn codegenNamespace(
     allocator: std.mem.Allocator,
     value: std.json.Value,
-    ns_stack: *std.ArrayList([]const u8),
+    ns_stack: *std.ArrayList(Namespace),
     writer: *std.io.Writer,
 ) !void {
     switch (value) {
@@ -50,17 +76,19 @@ fn codegenNamespace(
                     if (entry.value_ptr.* == .object) {
                         var t_it = entry.value_ptr.*.object.iterator();
                         while (t_it.next()) |type_entry| {
+                            try ns_stack.items[ns_stack.items.len - 1].types.put(type_entry.key_ptr.*, void{});
                             try codegenType(allocator, type_entry, ns_stack, writer);
                         }
                     }
                 } else {
-                    try indent(writer, ns_stack.items.len);
+                    try indent(writer, ns_stack.items.len - 1);
                     try writer.print("pub const @\"{s}\" = struct {{\n", .{entry.key_ptr.*});
-                    try ns_stack.append(allocator, entry.key_ptr.*);
+                    try ns_stack.append(allocator, Namespace.init(allocator));
                     try codegenNamespace(allocator, entry.value_ptr.*, ns_stack, writer);
-                    _ = ns_stack.pop();
-                    try indent(writer, ns_stack.items.len);
-                    try writer.print("}};\n", .{});
+                    var ns = ns_stack.pop().?;
+                    ns.deinit();
+                    try indent(writer, ns_stack.items.len - 1);
+                    try writer.print("}};\n\n", .{});
                 }
             }
         },
@@ -73,14 +101,20 @@ fn codegenNamespace(
 fn codegenType(
     allocator: std.mem.Allocator,
     type_entry: std.json.ObjectMap.Entry,
-    ns_stack: *std.ArrayList([]const u8),
+    ns_stack: *std.ArrayList(Namespace),
     writer: *std.io.Writer,
 ) !void {
     _ = allocator;
-    try indent(writer, ns_stack.items.len);
+    try indent(writer, ns_stack.items.len - 1);
     switch (type_entry.value_ptr.*) {
         .string => |str| {
-            try writer.print("pub const @\"{s}\" = \"{s}\";\n", .{ type_entry.key_ptr.*, str });
+            if (std.mem.eql(u8, str, "native")) {
+                try writer.print("pub const @\"{s}\" = \"native\";\n", .{type_entry.key_ptr.*});
+            } else if (namespaceContains(ns_stack.items, str)) {
+                try writer.print("pub const @\"{s}\" = \"good {s}\";\n", .{ type_entry.key_ptr.*, str });
+            } else {
+                try writer.print("pub const @\"{s}\" = \"bad {s}\";\n", .{ type_entry.key_ptr.*, str });
+            }
         },
         else => {
             try writer.print("pub const @\"{s}\" = \"<object>\";\n", .{type_entry.key_ptr.*});
