@@ -106,7 +106,7 @@ NATIVE_TYPES = {
 constructors = set()
 
 
-def recurse(x: Any, namespaces: list[str]):
+def recurse(x: Any, namespaces: list[tuple[str, set[str]]]):
     for k, v in x.items():
         if k == "type":
             do_type(k, namespaces, v)
