@@ -12,16 +12,20 @@ pub fn main() !void {
     defer json.deinit();
 
     var ns_stack = try std.ArrayList(Namespace).initCapacity(allocator, 0);
-    try ns_stack.append(allocator, Namespace.init(allocator));
+    try ns_stack.append(allocator, Namespace.init(allocator, "codegen"));
     defer ns_stack.deinit(allocator);
 
     const buffer = try allocator.alloc(u8, 4096);
     defer allocator.free(buffer);
-    var stdout_writer = std.fs.File.stdout().writer(buffer);
-    try codegenNamespace(allocator, json.value, &ns_stack, &stdout_writer.interface);
+    var writer = std.fs.File.stdout().writer(buffer);
+
+    try writer.interface.print("const codegen_support = @import(\"codegen_support\");\n", .{});
+    try writer.interface.print("const codegen = @This();\n", .{});
+
+    try codegenNamespace(allocator, json.value, &ns_stack, &writer.interface);
     ns_stack.items[0].deinit();
 
-    try stdout_writer.interface.flush();
+    try writer.interface.flush();
 }
 
 fn readJson(
@@ -40,10 +44,14 @@ fn readJson(
 }
 
 const Namespace = struct {
+    name: []const u8,
     types: std.StringHashMap(void),
 
-    pub fn init(allocator: std.mem.Allocator) Namespace {
-        return .{ .types = std.StringHashMap(void).init(allocator) };
+    pub fn init(allocator: std.mem.Allocator, name: []const u8) Namespace {
+        return .{
+            .name = name,
+            .types = std.StringHashMap(void).init(allocator),
+        };
     }
 
     pub fn deinit(self: *Namespace) void {
@@ -51,15 +59,15 @@ const Namespace = struct {
     }
 };
 
-pub fn namespaceContains(ns_stack: []Namespace, key: []const u8) bool {
-    var i: usize = ns_stack.len;
-    while (i > 0) {
-        i -= 1;
-        if (ns_stack[i].types.contains(key)) {
-            return true;
+pub fn namespaceLookup(ns_stack: []Namespace, key: []const u8) !usize {
+    var ns_index: usize = ns_stack.len;
+    while (ns_index > 0) {
+        ns_index -= 1;
+        if (ns_stack[ns_index].types.contains(key)) {
+            return ns_index;
         }
     }
-    return false;
+    return error.UndefinedType;
 }
 
 fn codegenNamespace(
@@ -77,23 +85,26 @@ fn codegenNamespace(
                         var t_it = entry.value_ptr.*.object.iterator();
                         while (t_it.next()) |type_entry| {
                             try ns_stack.items[ns_stack.items.len - 1].types.put(type_entry.key_ptr.*, void{});
+                            try indent(writer, ns_stack.items.len - 1);
+                            try writer.print("pub const @\"{s}\" = ", .{type_entry.key_ptr.*});
                             try codegenType(allocator, type_entry, ns_stack, writer);
+                            try writer.print(";\n", .{});
                         }
                     }
                 } else {
                     try indent(writer, ns_stack.items.len - 1);
                     try writer.print("pub const @\"{s}\" = struct {{\n", .{entry.key_ptr.*});
-                    try ns_stack.append(allocator, Namespace.init(allocator));
+                    try ns_stack.append(allocator, Namespace.init(allocator, entry.key_ptr.*));
                     try codegenNamespace(allocator, entry.value_ptr.*, ns_stack, writer);
                     var ns = ns_stack.pop().?;
                     ns.deinit();
                     try indent(writer, ns_stack.items.len - 1);
-                    try writer.print("}};\n\n", .{});
+                    try writer.print("}};\n", .{});
                 }
             }
         },
         else => {
-            return error.ExpectedObject;
+            return error.InvalidProtocol;
         },
     }
 }
@@ -105,19 +116,34 @@ fn codegenType(
     writer: *std.io.Writer,
 ) !void {
     _ = allocator;
-    try indent(writer, ns_stack.items.len - 1);
     switch (type_entry.value_ptr.*) {
         .string => |str| {
             if (std.mem.eql(u8, str, "native")) {
-                try writer.print("pub const @\"{s}\" = \"native\";\n", .{type_entry.key_ptr.*});
-            } else if (namespaceContains(ns_stack.items, str)) {
-                try writer.print("pub const @\"{s}\" = \"good {s}\";\n", .{ type_entry.key_ptr.*, str });
+                try writer.print("codegen_support.@\"{s}\"", .{type_entry.key_ptr.*});
             } else {
-                try writer.print("pub const @\"{s}\" = \"bad {s}\";\n", .{ type_entry.key_ptr.*, str });
+                const ns_index = try namespaceLookup(ns_stack.items, str);
+                std.debug.print("\n\nNS_INDEX = {}\n\n", .{ns_index});
+                for (0..ns_index + 1) |i| {
+                    try writer.print("@\"{s}\".", .{ns_stack.items[i].name});
+                }
+                try writer.print("@\"{s}\"", .{str});
+            }
+        },
+        .array => |array| {
+            if (array.items.len != 2) {
+                return error.InvalidProtocol;
+            }
+            switch (array.items[0]) {
+                .string => |constructor| {
+                    try writer.print("\"<{s}>\"", .{constructor});
+                },
+                else => {
+                    return error.InvalidProtocol;
+                },
             }
         },
         else => {
-            try writer.print("pub const @\"{s}\" = \"<object>\";\n", .{type_entry.key_ptr.*});
+            return error.InvalidProtocol;
         },
     }
 }
