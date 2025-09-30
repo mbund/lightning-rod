@@ -3,26 +3,31 @@ const std = @import("std");
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
 
-    const jason = try readJson(
+    const json = try readJson(
         allocator,
         "/var/home/josh/src/lightning-rod/minecraft-data/data/pc/1.21.8/protocol.json",
     );
-    defer jason.deinit();
+    defer json.deinit();
 
     var stack = try std.ArrayList([]const u8).initCapacity(allocator, 0);
     defer stack.deinit(allocator);
 
-    try walkNamespaces(allocator, jason.value, &stack);
+    const buffer = try allocator.alloc(u8, 4096);
+    defer allocator.free(buffer);
+    var stdout_writer = std.fs.File.stdout().writer(buffer);
+    try codegenNamespace(allocator, json.value, &stack, &stdout_writer.interface);
+    try stdout_writer.interface.flush();
 }
 
 fn readJson(
     allocator: std.mem.Allocator,
     path: []const u8,
 ) !std.json.Parsed(std.json.Value) {
-    const data =
-        try std.fs.cwd().readFileAlloc(allocator, path, 9999999999999);
+    const data = try std.fs.cwd().readFileAlloc(allocator, path, std.math.maxInt(u64));
     defer allocator.free(data);
+
     return std.json.parseFromSlice(
         std.json.Value,
         allocator,
@@ -31,12 +36,11 @@ fn readJson(
     );
 }
 
-/// Recurse under every key that is not "types".
-/// When hitting "types", print all its keys/values.
-fn walkNamespaces(
+fn codegenNamespace(
     allocator: std.mem.Allocator,
     value: std.json.Value,
-    stack: *std.ArrayList([]const u8),
+    ns_stack: *std.ArrayList([]const u8),
+    writer: *std.io.Writer,
 ) !void {
     switch (value) {
         .object => |obj| {
@@ -45,61 +49,48 @@ fn walkNamespaces(
                 if (std.mem.eql(u8, entry.key_ptr.*, "types")) {
                     if (entry.value_ptr.* == .object) {
                         var t_it = entry.value_ptr.*.object.iterator();
-                        while (t_it.next()) |t_entry| {
-                            const path = try joinPath(
-                                allocator,
-                                stack.items,
-                            );
-                            defer allocator.free(path);
-
-                            std.debug.print(
-                                "{s}{s}{s} = {f}\n",
-                                .{
-                                    path,
-                                    if (path.len > 0) "." else "",
-                                    t_entry.key_ptr.*,
-                                    std.json.fmt(
-                                        t_entry.value_ptr.*,
-                                        .{ .whitespace = .minified },
-                                    ),
-                                },
-                            );
+                        while (t_it.next()) |type_entry| {
+                            try codegenType(allocator, type_entry, ns_stack, writer);
                         }
                     }
                 } else {
-                    try stack.append(allocator, entry.key_ptr.*);
-                    try walkNamespaces(
-                        allocator,
-                        entry.value_ptr.*,
-                        stack,
-                    );
-                    _ = stack.pop();
+                    try indent(writer, ns_stack.items.len);
+                    try writer.print("pub const @\"{s}\" = struct {{\n", .{entry.key_ptr.*});
+                    try ns_stack.append(allocator, entry.key_ptr.*);
+                    try codegenNamespace(allocator, entry.value_ptr.*, ns_stack, writer);
+                    _ = ns_stack.pop();
+                    try indent(writer, ns_stack.items.len);
+                    try writer.print("}};\n", .{});
                 }
             }
         },
-        .array => |arr| {
-            var i: usize = 0;
-            for (arr.items) |item| {
-                const idx_str =
-                    try std.fmt.allocPrint(allocator, "{d}", .{i});
-                defer allocator.free(idx_str);
-
-                try stack.append(allocator, idx_str);
-                try walkNamespaces(allocator, item, stack);
-                _ = stack.pop();
-
-                i += 1;
-            }
+        else => {
+            return error.ExpectedObject;
         },
-        else => {},
     }
 }
 
-/// Join path with "." using the passed allocator.
-fn joinPath(
+fn codegenType(
     allocator: std.mem.Allocator,
-    parts: [][]const u8,
-) ![]const u8 {
-    if (parts.len == 0) return allocator.dupe(u8, "");
-    return try std.mem.join(allocator, ".", parts);
+    type_entry: std.json.ObjectMap.Entry,
+    ns_stack: *std.ArrayList([]const u8),
+    writer: *std.io.Writer,
+) !void {
+    _ = allocator;
+    try indent(writer, ns_stack.items.len);
+    switch (type_entry.value_ptr.*) {
+        .string => |str| {
+            try writer.print("pub const @\"{s}\" = \"{s}\";\n", .{ type_entry.key_ptr.*, str });
+        },
+        else => {
+            try writer.print("pub const @\"{s}\" = \"<object>\";\n", .{type_entry.key_ptr.*});
+        },
+    }
+}
+
+fn indent(writer: *std.io.Writer, level: usize) !void {
+    var i: usize = 0;
+    while (i < level) : (i += 1) {
+        try writer.print("    ", .{});
+    }
 }
