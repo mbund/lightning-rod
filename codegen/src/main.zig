@@ -86,14 +86,14 @@ fn codegenNamespace(
                         while (t_it.next()) |type_entry| {
                             try ns_stack.items[ns_stack.items.len - 1].types.put(type_entry.key_ptr.*, void{});
                             try indent(writer, ns_stack.items.len - 1);
-                            try writer.print("pub const @\"{s}\" = ", .{type_entry.key_ptr.*});
+                            try writer.print("pub const {f} = ", .{idfmt(type_entry.key_ptr.*)});
                             try codegenType(allocator, type_entry.key_ptr.*, type_entry.value_ptr.*, ns_stack, writer);
                             try writer.print(";\n", .{});
                         }
                     }
                 } else {
                     try indent(writer, ns_stack.items.len - 1);
-                    try writer.print("pub const @\"{s}\" = struct {{\n", .{entry.key_ptr.*});
+                    try writer.print("pub const {f} = struct {{\n", .{idfmt(entry.key_ptr.*)});
                     try ns_stack.append(allocator, Namespace.init(allocator, entry.key_ptr.*));
                     try codegenNamespace(allocator, entry.value_ptr.*, ns_stack, writer);
                     var ns = ns_stack.pop().?;
@@ -119,13 +119,13 @@ fn codegenType(
     switch (typ) {
         .string => |str| {
             if (std.mem.eql(u8, str, "native")) {
-                try writer.print("codegen_support.@\"{s}\"", .{name});
+                try writer.print("codegen_support.{f}", .{idfmt(name)});
             } else {
                 const ns_index = try namespaceLookup(ns_stack.items, str);
                 for (0..ns_index + 1) |i| {
-                    try writer.print("@\"{s}\".", .{ns_stack.items[i].name});
+                    try writer.print("{f}.", .{idfmt(ns_stack.items[i].name)});
                 }
-                try writer.print("@\"{s}\"", .{str});
+                try writer.print("{f}", .{idfmt(str)});
             }
         },
         .array => |array| {
@@ -178,9 +178,9 @@ fn codegenContainer(
                         const typ = container_entry.get("type") orelse {
                             return error.InvalidProtocol;
                         };
-                        try writer.print("{s}@\"{s}\": ", .{ sep, name });
+                        try writer.print("{s}{f}: ", .{ sep, idfmt(name) });
                         sep = @ptrCast(", ");
-                        try codegenType(allocator, "???", typ, ns_stack, writer);
+                        try codegenType(allocator, "", typ, ns_stack, writer);
                     },
                     else => {
                         return error.InvalidProtocol;
@@ -201,3 +201,79 @@ fn indent(writer: *std.io.Writer, level: usize) !void {
         try writer.print("    ", .{});
     }
 }
+
+pub fn idfmt(input: []const u8) IdFormatter {
+    return IdFormatter{ .input = input };
+}
+
+pub const IdFormatter = struct {
+    input: []const u8,
+
+    /// Checks if a given string slice matches any known Zig keyword.
+    /// In a real-world scenario, a hash map lookup would be used for efficiency.
+    fn isKeyword(s: []const u8) bool {
+        const keywords = [_][]const u8{
+            "const",
+            "var",
+            "fn",
+            "struct",
+            "union",
+            "enum",
+            "if",
+            "else",
+            "while",
+            "for",
+            "break",
+            "continue",
+            "return",
+            "try",
+            "catch",
+            "pub",
+            "extern",
+            "comptime",
+            "async",
+            "await",
+            "test",
+            "error",
+            "orelse",
+            "switch",
+            "usingnamespace",
+            "noalias",
+            "volatile",
+            "linksection",
+            "threadlocal",
+            "align",
+            "export",
+            "u8",
+            "u16",
+            "u32",
+            "u64",
+            "i8",
+            "i16",
+            "i32",
+            "i64",
+            "bool",
+            "f32",
+            "f64",
+            "void",
+        };
+
+        for (keywords) |keyword| {
+            if (std.mem.eql(u8, keyword, s)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn format(
+        self: @This(),
+        writer: anytype,
+    ) !void {
+        if (@This().isKeyword(self.input)) {
+            try writer.print("@\"{s}\"", .{self.input});
+        } else {
+            try writer.writeAll(self.input);
+        }
+    }
+};
