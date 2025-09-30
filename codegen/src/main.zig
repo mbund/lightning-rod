@@ -19,7 +19,7 @@ pub fn main() !void {
     defer allocator.free(buffer);
     var writer = std.fs.File.stdout().writer(buffer);
 
-    try writer.interface.print("const codegen_support = @import(\"codegen_support\");\n", .{});
+    try writer.interface.print("const codegen_support = @import(\"codegen_support.zig\");\n", .{});
     try writer.interface.print("const codegen = @This();\n", .{});
 
     try codegenNamespace(allocator, json.value, &ns_stack, &writer.interface);
@@ -85,20 +85,20 @@ fn codegenNamespace(
                         var t_it = entry.value_ptr.*.object.iterator();
                         while (t_it.next()) |type_entry| {
                             try ns_stack.items[ns_stack.items.len - 1].types.put(type_entry.key_ptr.*, void{});
-                            try indent(writer, ns_stack.items.len - 1);
+                            try printIndent(writer, ns_stack.items.len - 1);
                             try writer.print("pub const {f} = ", .{idfmt(type_entry.key_ptr.*)});
-                            try codegenType(allocator, type_entry.key_ptr.*, type_entry.value_ptr.*, ns_stack, writer);
+                            try codegenType(allocator, type_entry.key_ptr.*, type_entry.value_ptr.*, ns_stack, writer, ns_stack.items.len - 1);
                             try writer.print(";\n", .{});
                         }
                     }
                 } else {
-                    try indent(writer, ns_stack.items.len - 1);
+                    try printIndent(writer, ns_stack.items.len - 1);
                     try writer.print("pub const {f} = struct {{\n", .{idfmt(entry.key_ptr.*)});
                     try ns_stack.append(allocator, Namespace.init(allocator, entry.key_ptr.*));
                     try codegenNamespace(allocator, entry.value_ptr.*, ns_stack, writer);
                     var ns = ns_stack.pop().?;
                     ns.deinit();
-                    try indent(writer, ns_stack.items.len - 1);
+                    try printIndent(writer, ns_stack.items.len - 1);
                     try writer.print("}};\n", .{});
                 }
             }
@@ -115,6 +115,7 @@ fn codegenType(
     typ: std.json.Value,
     ns_stack: *std.ArrayList(Namespace),
     writer: *std.io.Writer,
+    indent: usize,
 ) anyerror!void {
     switch (typ) {
         .string => |str| {
@@ -135,7 +136,7 @@ fn codegenType(
             switch (array.items[0]) {
                 .string => |constructor| {
                     if (std.mem.eql(u8, constructor, "container")) {
-                        try codegenContainer(allocator, array.items[1], ns_stack, writer);
+                        try codegenContainer(allocator, array.items[1], ns_stack, writer, indent);
                     } else {
                         try writer.print("\"<{s}>\"", .{constructor});
                     }
@@ -156,11 +157,11 @@ fn codegenContainer(
     container: std.json.Value,
     ns_stack: *std.ArrayList(Namespace),
     writer: *std.io.Writer,
+    indent: usize,
 ) anyerror!void {
-    try writer.print("codegen_support.Container(struct{{ ", .{});
+    try writer.print("struct {{\n", .{});
     switch (container) {
         .array => |array| {
-            var sep: []const u8 = "";
             for (array.items) |container_item| {
                 switch (container_item) {
                     .object => |container_entry| {
@@ -178,9 +179,10 @@ fn codegenContainer(
                         const typ = container_entry.get("type") orelse {
                             return error.InvalidProtocol;
                         };
-                        try writer.print("{s}{f}: ", .{ sep, idfmt(name) });
-                        sep = @ptrCast(", ");
-                        try codegenType(allocator, "", typ, ns_stack, writer);
+                        try printIndent(writer, indent + 1);
+                        try writer.print("{f}: ", .{idfmt(name)});
+                        try codegenType(allocator, "", typ, ns_stack, writer, indent + 1);
+                        try writer.print(",\n", .{});
                     },
                     else => {
                         return error.InvalidProtocol;
@@ -192,10 +194,11 @@ fn codegenContainer(
             return error.InvalidProtocol;
         },
     }
-    try writer.print("}})", .{});
+    try printIndent(writer, indent);
+    try writer.print("}}", .{});
 }
 
-fn indent(writer: *std.io.Writer, level: usize) !void {
+fn printIndent(writer: *std.io.Writer, level: usize) !void {
     var i: usize = 0;
     while (i < level) : (i += 1) {
         try writer.print("    ", .{});
@@ -209,8 +212,6 @@ pub fn idfmt(input: []const u8) IdFormatter {
 pub const IdFormatter = struct {
     input: []const u8,
 
-    /// Checks if a given string slice matches any known Zig keyword.
-    /// In a real-world scenario, a hash map lookup would be used for efficiency.
     fn isKeyword(s: []const u8) bool {
         const keywords = [_][]const u8{
             "const",
