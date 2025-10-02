@@ -248,7 +248,7 @@ const Type = union(enum) {
     varint,
     todo,
     native: NativeType,
-    container: []Field,
+    container: struct { name: []const u8, fields: []Field },
 
     pub fn fromJson(allocator: std.mem.Allocator, key: []const u8, json: std.json.Value) !Type {
         if (equalsString(json, "native")) {
@@ -267,7 +267,7 @@ const Type = union(enum) {
                     const field_type = try Type.fromJson(allocator, field_name, try expectGet(field_object, "type"));
                     fields[i] = .{ .name = field_name, .type = field_type };
                 }
-                return .{ .container = fields };
+                return .{ .container = .{ .name = key, .fields = fields } };
             }
         }
 
@@ -278,7 +278,7 @@ const Type = union(enum) {
         switch (self.*) {
             .container, .todo => {
                 try printIndent(writer, indent);
-                try writer.print("const {f} = ", .{idfmt(name)});
+                try writer.print("pub const {f} = ", .{idfmt(name)});
                 try self.codegenType(allocator, writer, indent, scope);
                 try writer.print(";\n\n", .{});
             },
@@ -303,17 +303,73 @@ const Type = union(enum) {
             },
             .container => |container| {
                 try writer.print("struct {{\n", .{});
-                for (container) |field| {
+                for (container.fields) |field| {
                     try printIndent(writer, indent + 1);
                     try writer.print("{f}: ", .{idfmt(field.name)});
                     try field.type.codegenType(allocator, writer, indent + 1, scope);
                     try writer.print(",\n", .{});
                 }
+                try writer.print("\n", .{});
+                try printIndent(writer, indent + 1);
+                try writer.print("fn read(self: *@This(), r: *protocol_support.Reader) !void {{\n", .{});
+                try printIndent(writer, indent + 2);
+                try self.codegenRead(allocator, writer, indent + 2, scope, "self", null);
+                try writer.print("\n", .{});
+                try printIndent(writer, indent + 1);
+                try writer.print("}}\n", .{});
                 try printIndent(writer, indent);
                 try writer.print("}}", .{});
             },
             else => {
-                try writer.print("\"todo\"", .{});
+                try writer.print("protocol_support.Todo", .{});
+            },
+        }
+    }
+
+    pub fn codegenRead(
+        self: *const @This(),
+        allocator: std.mem.Allocator,
+        writer: *std.io.Writer,
+        indent: usize,
+        scope: Scope,
+        dest: []const u8,
+        parent_dest: ?[]const u8,
+    ) anyerror!void {
+        _ = parent_dest;
+        switch (self.*) {
+            .reference => |reference| {
+                if (scope.outer.types.get(reference)) |referenced| {
+                    switch (referenced) {
+                        .native => |native| {
+                            try writer.print("r.read_{s}(&{s});", .{ @tagName(native), dest });
+                        },
+                        .container => |_| {
+                            try writer.print("{f}.read({s}, r);", .{ idfmt(reference), dest });
+                        },
+                        else => |_| {
+                            try writer.print("protocol_support.todo(&{s}, r);", .{dest});
+                        },
+                    }
+                } else {
+                    return error.UndefinedReference;
+                }
+            },
+            .native => |_| {
+                return error.UnexpectedNative;
+            },
+            .container => |container| {
+                var dest_buf: [256]u8 = undefined;
+                for (0.., container.fields) |i, field| {
+                    if (i >= 1) {
+                        try writer.print("\n", .{});
+                        try printIndent(writer, indent);
+                    }
+                    const child_dest = try std.fmt.bufPrint(&dest_buf, "{s}.{s}", .{ dest, field.name });
+                    try field.type.codegenRead(allocator, writer, indent, scope, child_dest, dest);
+                }
+            },
+            else => {
+                try writer.print("protocol_support.todo(&{s}, r);", .{dest});
             },
         }
     }

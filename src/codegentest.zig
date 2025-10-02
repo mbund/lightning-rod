@@ -1,4 +1,4 @@
-const codegen = @import("codegen.zig");
+const protocol = @import("codegen.zig");
 const std = @import("std");
 
 fn bytes(comptime hex: []const u8) [hex.len / 2]u8 {
@@ -7,7 +7,7 @@ fn bytes(comptime hex: []const u8) [hex.len / 2]u8 {
     return result;
 }
 
-// test {
-//     const actual = @sizeOf(codegen.play.toClient.packet_difficulty);
-//     try std.testing.expectEqual(2, actual);
-// }
+test {
+    const actual = @sizeOf(protocol.vec3f);
+    try std.testing.expectEqual(12, actual);
+}
