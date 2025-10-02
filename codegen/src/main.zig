@@ -34,7 +34,8 @@ const Protocol = struct {
     }
 
     pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *std.io.Writer) !void {
-        try self.types.codegen(allocator, writer, 0);
+        try writer.print("const packet_lib = @import(\"packet_lib.zig\");\n", .{});
+        try self.types.codegen(allocator, writer, 0, .{ .outer = &self.types, .inner = null });
         try writer.print("\n", .{});
     }
 };
@@ -56,10 +57,10 @@ const Types = struct {
         };
     }
 
-    pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *std.io.Writer, indent: usize) !void {
+    pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *std.io.Writer, indent: usize, scope: Scope) !void {
         var it = self.types.iterator();
         while (it.next()) |entry| {
-            try entry.value_ptr.codegenDefinition(allocator, entry.key_ptr.*, writer, indent);
+            try entry.value_ptr.codegenDefinition(allocator, entry.key_ptr.*, writer, indent, scope);
         }
     }
 };
@@ -67,6 +68,11 @@ const Types = struct {
 const State = struct {
     ToServer: Types,
     ToClient: Types,
+};
+
+const Scope = struct {
+    outer: *const Types,
+    inner: ?*const Types,
 };
 
 const NativeType = enum {
@@ -98,7 +104,6 @@ const NativeType = enum {
     optionalNbt,
     registryEntryHolder,
     registryEntryHolderSet,
-
     fake,
 
     pub fn fromString(str: []const u8) !NativeType {
@@ -200,7 +205,37 @@ const NativeType = enum {
     }
 
     fn codegenType(self: NativeType) []const u8 {
-        return @tagName(self);
+        return switch (self) {
+            .varint => "i32",
+            .varlong => "i64",
+            .optvarint => "packet_lib.optvarint",
+            .pstring => "packet_lib.pstring",
+            .buffer => "packet_lib.buffer",
+            .u8 => "u8",
+            .u16 => "u16",
+            .u32 => "u32",
+            .u64 => "u64",
+            .i8 => "i8",
+            .i16 => "i16",
+            .i32 => "i32",
+            .i64 => "i64",
+            .bool => "bool",
+            .f32 => "f32",
+            .f64 => "f64",
+            .UUID => "packet_lib.UUID",
+            .option => "packet_lib.option",
+            .entityMetadataLoop => "packet_lib.entityMetadataLoop",
+            .topBitSetTerminatedArray => "packet_lib.topBitSetTerminatedArray",
+            .bitfield => "packet_lib.bitfield",
+            .bitflags => "packet_lib.bitflags",
+            .void => "packet_lib.void",
+            .restBuffer => "packet_lib.restBuffer",
+            .nbt => "packet_lib.nbt",
+            .optionalNbt => "packet_lib.optionalNbt",
+            .registryEntryHolder => "packet_lib.registryEntryHolder",
+            .registryEntryHolderSet => "packet_lib.registryEntryHolderSet",
+            .fake => "packet_lib.fake",
+        };
     }
 };
 
@@ -210,7 +245,7 @@ const Field = struct {
 };
 
 const Type = union(enum) {
-    reference: []u8,
+    reference: []const u8,
     varint,
     todo,
     native: NativeType,
@@ -219,6 +254,9 @@ const Type = union(enum) {
     pub fn fromJson(allocator: std.mem.Allocator, key: []const u8, json: std.json.Value) !Type {
         if (equalsString(json, "native")) {
             return .{ .native = try NativeType.fromString(key) };
+        }
+        if (isString(json)) |str| {
+            return .{ .reference = str };
         }
         if (isConstructor(json)) |constructor| {
             if (std.mem.eql(u8, constructor.name, "container")) {
@@ -237,29 +275,39 @@ const Type = union(enum) {
         return .todo;
     }
 
-    pub fn codegenDefinition(self: *const @This(), allocator: std.mem.Allocator, name: []const u8, writer: *std.io.Writer, indent: usize) !void {
+    pub fn codegenDefinition(self: *const @This(), allocator: std.mem.Allocator, name: []const u8, writer: *std.io.Writer, indent: usize, scope: Scope) !void {
         switch (self.*) {
             .container, .todo => {
                 try printIndent(writer, indent);
                 try writer.print("const {f} = ", .{idfmt(name)});
-                try self.codegenTypeInDefinition(allocator, writer, indent);
+                try self.codegenType(allocator, writer, indent, scope);
                 try writer.print(";\n\n", .{});
             },
             else => {},
         }
     }
 
-    pub fn codegenTypeInDefinition(self: *const @This(), allocator: std.mem.Allocator, writer: *std.io.Writer, indent: usize) !void {
+    pub fn codegenType(self: *const @This(), allocator: std.mem.Allocator, writer: *std.io.Writer, indent: usize, scope: Scope) !void {
         switch (self.*) {
-            .native => |native| {
-                try writer.print("{s}", .{native.codegenType()});
+            .reference => |reference| {
+                if (scope.outer.types.get(reference)) |referenced| {
+                    switch (referenced) {
+                        .native => |native| try writer.print("{s}", .{native.codegenType()}),
+                        else => try writer.print("{s}", .{reference}),
+                    }
+                } else {
+                    return error.UndefinedReference;
+                }
+            },
+            .native => |_| {
+                return error.UnexpectedNative;
             },
             .container => |container| {
                 try writer.print("struct {{\n", .{});
                 for (container) |field| {
                     try printIndent(writer, indent + 1);
                     try writer.print("{f}: ", .{idfmt(field.name)});
-                    try field.type.codegenTypeInDefinition(allocator, writer, indent + 1);
+                    try field.type.codegenType(allocator, writer, indent + 1, scope);
                     try writer.print(",\n", .{});
                 }
                 try printIndent(writer, indent);
@@ -330,6 +378,13 @@ fn equalsString(json: std.json.Value, str: []const u8) bool {
     return switch (json) {
         .string => |s| std.mem.eql(u8, s, str),
         else => false,
+    };
+}
+
+fn isString(json: std.json.Value) ?[]const u8 {
+    return switch (json) {
+        .string => |str| str,
+        else => null,
     };
 }
 

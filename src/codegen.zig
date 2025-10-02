@@ -1,10 +1,11 @@
+const packet_lib = @import("packet_lib.zig");
 const previousMessages = "todo";
 
 const chunkBlockEntity = struct {
     anon: "todo",
-    y: "todo",
-    type: "todo",
-    nbtData: "todo",
+    y: i16,
+    type: i32,
+    nbtData: packet_lib.optionalNbt,
 };
 
 const entityMetadataItem = "todo";
@@ -12,18 +13,16 @@ const entityMetadataItem = "todo";
 const entityMetadata = "todo";
 
 const vec3f = struct {
-    x: "todo",
-    y: "todo",
-    z: "todo",
+    x: f32,
+    y: f32,
+    z: f32,
 };
 
 const ItemSoundHolder = "todo";
 
-const optvarint = "todo";
-
 const packedChunkPos = struct {
-    z: "todo",
-    x: "todo",
+    z: i32,
+    x: i32,
 };
 
 const tags = "todo";
@@ -31,27 +30,27 @@ const tags = "todo";
 const soundSource = "todo";
 
 const vec4f = struct {
-    x: "todo",
-    y: "todo",
-    z: "todo",
-    w: "todo",
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32,
 };
 
 const particleData = "todo";
 
 const minecraft_simple_recipe_format = struct {
-    category: "todo",
+    category: i32,
 };
 
 const position = "todo";
 
 const minecraft_smelting_format = struct {
-    group: "todo",
-    category: "todo",
-    ingredient: "todo",
-    result: "todo",
-    experience: "todo",
-    cookTime: "todo",
+    group: string,
+    category: i32,
+    ingredient: ingredient,
+    result: slot,
+    experience: f32,
+    cookTime: i32,
 };
 
 const chat_session = "todo";
@@ -59,14 +58,14 @@ const chat_session = "todo";
 const ingredient = "todo";
 
 const slot = struct {
-    present: "todo",
+    present: bool,
     anon: "todo",
 };
 
 const string = "todo";
 
 const particle = struct {
-    particleId: "todo",
+    particleId: i32,
     data: "todo",
 };
 
@@ -80,19 +79,19 @@ const command_node = struct {
 };
 
 const ItemSoundEvent = struct {
-    soundName: "todo",
+    soundName: string,
     fixedRange: "todo",
 };
 
 const game_profile = struct {
-    name: "todo",
+    name: string,
     properties: "todo",
 };
 
 const vec3f64 = struct {
-    x: "todo",
-    y: "todo",
-    z: "todo",
+    x: f64,
+    y: f64,
+    z: f64,
 };
 
 
