@@ -34,7 +34,8 @@ const Protocol = struct {
     }
 
     pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *std.io.Writer) !void {
-        try writer.print("const protocol_support = @import(\"protocol_support.zig\");\n", .{});
+        try writer.print("const std = @import(\"std\");\n", .{});
+        try writer.print("const protocol_support = @import(\"protocol_support.zig\");\n\n", .{});
         try self.types.codegen(allocator, writer, 0, .{ .outer = &self.types, .inner = null });
         try writer.print("\n", .{});
     }
@@ -311,7 +312,9 @@ const Type = union(enum) {
                 }
                 try writer.print("\n", .{});
                 try printIndent(writer, indent + 1);
-                try writer.print("fn read(self: *@This(), r: *protocol_support.Reader) !void {{\n", .{});
+                try writer.print("pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {{\n", .{});
+                try printIndent(writer, indent + 2);
+                try writer.print("protocol_support.maybe_unused(allocator);\n", .{});
                 try printIndent(writer, indent + 2);
                 try self.codegenRead(allocator, writer, indent + 2, scope, "self", null);
                 try writer.print("\n", .{});
@@ -341,13 +344,13 @@ const Type = union(enum) {
                 if (scope.outer.types.get(reference)) |referenced| {
                     switch (referenced) {
                         .native => |native| {
-                            try writer.print("r.read_{s}(&{s});", .{ @tagName(native), dest });
+                            try writer.print("try r.read_{s}(&{s});", .{ @tagName(native), dest });
                         },
                         .container => |_| {
-                            try writer.print("{f}.read({s}, r);", .{ idfmt(reference), dest });
+                            try writer.print("try {s}.read(r, allocator);", .{dest});
                         },
                         else => |_| {
-                            try writer.print("protocol_support.todo(&{s}, r);", .{dest});
+                            try writer.print("try protocol_support.todo(r, &{s});", .{dest});
                         },
                     }
                 } else {
@@ -369,7 +372,7 @@ const Type = union(enum) {
                 }
             },
             else => {
-                try writer.print("protocol_support.todo(&{s}, r);", .{dest});
+                try writer.print("try protocol_support.todo(r, &{s});", .{dest});
             },
         }
     }

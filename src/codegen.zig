@@ -1,4 +1,6 @@
+const std = @import("std");
 const protocol_support = @import("protocol_support.zig");
+
 pub const previousMessages = protocol_support.Todo;
 
 pub const chunkBlockEntity = struct {
@@ -7,11 +9,12 @@ pub const chunkBlockEntity = struct {
     type: i32,
     nbtData: protocol_support.optionalNbt,
 
-    fn read(self: *@This(), r: *protocol_support.Reader) !void {
-        protocol_support.todo(&self.anon, r);
-        r.read_i16(&self.y);
-        r.read_varint(&self.type);
-        r.read_optionalNbt(&self.nbtData);
+    pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {
+        protocol_support.maybe_unused(allocator);
+        try protocol_support.todo(r, &self.anon);
+        try r.read_i16(&self.y);
+        try r.read_varint(&self.type);
+        try r.read_optionalNbt(&self.nbtData);
     }
 };
 
@@ -24,10 +27,11 @@ pub const vec3f = struct {
     y: f32,
     z: f32,
 
-    fn read(self: *@This(), r: *protocol_support.Reader) !void {
-        r.read_f32(&self.x);
-        r.read_f32(&self.y);
-        r.read_f32(&self.z);
+    pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {
+        protocol_support.maybe_unused(allocator);
+        try r.read_f32(&self.x);
+        try r.read_f32(&self.y);
+        try r.read_f32(&self.z);
     }
 };
 
@@ -37,9 +41,10 @@ pub const packedChunkPos = struct {
     z: i32,
     x: i32,
 
-    fn read(self: *@This(), r: *protocol_support.Reader) !void {
-        r.read_i32(&self.z);
-        r.read_i32(&self.x);
+    pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {
+        protocol_support.maybe_unused(allocator);
+        try r.read_i32(&self.z);
+        try r.read_i32(&self.x);
     }
 };
 
@@ -53,11 +58,12 @@ pub const vec4f = struct {
     z: f32,
     w: f32,
 
-    fn read(self: *@This(), r: *protocol_support.Reader) !void {
-        r.read_f32(&self.x);
-        r.read_f32(&self.y);
-        r.read_f32(&self.z);
-        r.read_f32(&self.w);
+    pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {
+        protocol_support.maybe_unused(allocator);
+        try r.read_f32(&self.x);
+        try r.read_f32(&self.y);
+        try r.read_f32(&self.z);
+        try r.read_f32(&self.w);
     }
 };
 
@@ -66,8 +72,9 @@ pub const particleData = protocol_support.Todo;
 pub const minecraft_simple_recipe_format = struct {
     category: i32,
 
-    fn read(self: *@This(), r: *protocol_support.Reader) !void {
-        r.read_varint(&self.category);
+    pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {
+        protocol_support.maybe_unused(allocator);
+        try r.read_varint(&self.category);
     }
 };
 
@@ -81,13 +88,14 @@ pub const minecraft_smelting_format = struct {
     experience: f32,
     cookTime: i32,
 
-    fn read(self: *@This(), r: *protocol_support.Reader) !void {
-        protocol_support.todo(&self.group, r);
-        r.read_varint(&self.category);
-        protocol_support.todo(&self.ingredient, r);
-        slot.read(self.result, r);
-        r.read_f32(&self.experience);
-        r.read_varint(&self.cookTime);
+    pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {
+        protocol_support.maybe_unused(allocator);
+        try protocol_support.todo(r, &self.group);
+        try r.read_varint(&self.category);
+        try protocol_support.todo(r, &self.ingredient);
+        try self.result.read(r, allocator);
+        try r.read_f32(&self.experience);
+        try r.read_varint(&self.cookTime);
     }
 };
 
@@ -99,9 +107,10 @@ pub const slot = struct {
     present: bool,
     anon: protocol_support.Todo,
 
-    fn read(self: *@This(), r: *protocol_support.Reader) !void {
-        r.read_bool(&self.present);
-        protocol_support.todo(&self.anon, r);
+    pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {
+        protocol_support.maybe_unused(allocator);
+        try r.read_bool(&self.present);
+        try protocol_support.todo(r, &self.anon);
     }
 };
 
@@ -111,9 +120,10 @@ pub const particle = struct {
     particleId: i32,
     data: protocol_support.Todo,
 
-    fn read(self: *@This(), r: *protocol_support.Reader) !void {
-        r.read_varint(&self.particleId);
-        protocol_support.todo(&self.data, r);
+    pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {
+        protocol_support.maybe_unused(allocator);
+        try r.read_varint(&self.particleId);
+        try protocol_support.todo(r, &self.data);
     }
 };
 
@@ -125,11 +135,12 @@ pub const command_node = struct {
     redirectNode: protocol_support.Todo,
     extraNodeData: protocol_support.Todo,
 
-    fn read(self: *@This(), r: *protocol_support.Reader) !void {
-        protocol_support.todo(&self.flags, r);
-        protocol_support.todo(&self.children, r);
-        protocol_support.todo(&self.redirectNode, r);
-        protocol_support.todo(&self.extraNodeData, r);
+    pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {
+        protocol_support.maybe_unused(allocator);
+        try protocol_support.todo(r, &self.flags);
+        try protocol_support.todo(r, &self.children);
+        try protocol_support.todo(r, &self.redirectNode);
+        try protocol_support.todo(r, &self.extraNodeData);
     }
 };
 
@@ -137,9 +148,10 @@ pub const ItemSoundEvent = struct {
     soundName: string,
     fixedRange: protocol_support.Todo,
 
-    fn read(self: *@This(), r: *protocol_support.Reader) !void {
-        protocol_support.todo(&self.soundName, r);
-        protocol_support.todo(&self.fixedRange, r);
+    pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {
+        protocol_support.maybe_unused(allocator);
+        try protocol_support.todo(r, &self.soundName);
+        try protocol_support.todo(r, &self.fixedRange);
     }
 };
 
@@ -147,9 +159,10 @@ pub const game_profile = struct {
     name: string,
     properties: protocol_support.Todo,
 
-    fn read(self: *@This(), r: *protocol_support.Reader) !void {
-        protocol_support.todo(&self.name, r);
-        protocol_support.todo(&self.properties, r);
+    pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {
+        protocol_support.maybe_unused(allocator);
+        try protocol_support.todo(r, &self.name);
+        try protocol_support.todo(r, &self.properties);
     }
 };
 
@@ -158,10 +171,11 @@ pub const vec3f64 = struct {
     y: f64,
     z: f64,
 
-    fn read(self: *@This(), r: *protocol_support.Reader) !void {
-        r.read_f64(&self.x);
-        r.read_f64(&self.y);
-        r.read_f64(&self.z);
+    pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {
+        protocol_support.maybe_unused(allocator);
+        try r.read_f64(&self.x);
+        try r.read_f64(&self.y);
+        try r.read_f64(&self.z);
     }
 };
 
