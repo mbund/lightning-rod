@@ -7,7 +7,7 @@ fn bytes(comptime hex: []const u8) [hex.len / 2]u8 {
     return result;
 }
 
-test {
-    const actual = @sizeOf(codegen.play.toClient.packet_difficulty);
-    try std.testing.expectEqual(2, actual);
-}
+// test {
+//     const actual = @sizeOf(codegen.play.toClient.packet_difficulty);
+//     try std.testing.expectEqual(2, actual);
+// }

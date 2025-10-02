@@ -3,7 +3,6 @@ const std = @import("std");
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
-    defer _ = gpa.deinit();
 
     const json = try readJson(
         allocator,
@@ -11,22 +10,85 @@ pub fn main() !void {
     );
     defer json.deinit();
 
-    var ns_stack = try std.ArrayList(Namespace).initCapacity(allocator, 0);
-    try ns_stack.append(allocator, Namespace.init(allocator, "codegen"));
-    defer ns_stack.deinit(allocator);
-
+    const protocol = try Protocol.fromJson(allocator, json.value);
     const buffer = try allocator.alloc(u8, 4096);
-    defer allocator.free(buffer);
-    var writer = std.fs.File.stdout().writer(buffer);
-
-    try writer.interface.print("const codegen_support = @import(\"codegen_support.zig\");\n", .{});
-    try writer.interface.print("const codegen = @This();\n", .{});
-
-    try codegenNamespace(allocator, json.value, &ns_stack, &writer.interface);
-    ns_stack.items[0].deinit();
-
-    try writer.interface.flush();
+    var stdout = std.fs.File.stdout().writer(buffer);
+    try protocol.codegen(allocator, &stdout.interface);
+    try stdout.interface.flush();
 }
+
+const Protocol = struct {
+    types: Types,
+    // handshaking: State,
+    // status: State,
+    // login: State,
+    // play: State,
+
+    pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) !Protocol {
+        const object = try expectObject(json);
+        const types = try Types.fromJson(allocator, try expectGet(object, "types"));
+
+        return Protocol{
+            .types = types,
+        };
+    }
+
+    pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *std.io.Writer) !void {
+        try self.types.codegen(allocator, writer, 0);
+        try writer.print("\n", .{});
+    }
+};
+
+const Types = struct {
+    types: std.StringHashMap(Type),
+
+    pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) !Types {
+        const object = try expectObject(json);
+        var types = std.StringHashMap(Type).init(allocator);
+
+        var it = object.iterator();
+        while (it.next()) |entry| {
+            try types.put(entry.key_ptr.*, try Type.fromJson(allocator, entry.value_ptr.*));
+        }
+
+        return Types{
+            .types = types,
+        };
+    }
+
+    pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *std.io.Writer, indent: usize) !void {
+        _ = allocator;
+        var it = self.types.iterator();
+        while (it.next()) |entry| {
+            try printIndent(writer, indent);
+            try writer.print("const {f} = struct {{}};\n", .{idfmt(entry.key_ptr.*)});
+        }
+    }
+};
+
+const State = struct {
+    ToServer: Types,
+    ToClient: Types,
+};
+
+const Type = union(enum) {
+    reference: []u8,
+    varint,
+    todo,
+
+    pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) !Type {
+        _ = allocator;
+        _ = json;
+        return .todo;
+    }
+
+    pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *std.io.Writer, indent: usize) !void {
+        _ = self;
+        _ = allocator;
+        _ = writer;
+        _ = indent;
+    }
+};
 
 fn readJson(
     allocator: std.mem.Allocator,
@@ -43,159 +105,21 @@ fn readJson(
     );
 }
 
-const Namespace = struct {
-    name: []const u8,
-    types: std.StringHashMap(void),
-
-    pub fn init(allocator: std.mem.Allocator, name: []const u8) Namespace {
-        return .{
-            .name = name,
-            .types = std.StringHashMap(void).init(allocator),
-        };
-    }
-
-    pub fn deinit(self: *Namespace) void {
-        self.types.deinit();
-    }
-};
-
-pub fn namespaceLookup(ns_stack: []Namespace, key: []const u8) !usize {
-    var ns_index: usize = ns_stack.len;
-    while (ns_index > 0) {
-        ns_index -= 1;
-        if (ns_stack[ns_index].types.contains(key)) {
-            return ns_index;
-        }
-    }
-    return error.UndefinedType;
-}
-
-fn codegenNamespace(
-    allocator: std.mem.Allocator,
-    value: std.json.Value,
-    ns_stack: *std.ArrayList(Namespace),
-    writer: *std.io.Writer,
-) !void {
-    switch (value) {
+fn expectObject(json: std.json.Value) !std.json.ObjectMap {
+    switch (json) {
         .object => |obj| {
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "types")) {
-                    if (entry.value_ptr.* == .object) {
-                        var t_it = entry.value_ptr.*.object.iterator();
-                        while (t_it.next()) |type_entry| {
-                            try ns_stack.items[ns_stack.items.len - 1].types.put(type_entry.key_ptr.*, void{});
-                            try printIndent(writer, ns_stack.items.len - 1);
-                            try writer.print("pub const {f} = ", .{idfmt(type_entry.key_ptr.*)});
-                            try codegenType(allocator, type_entry.key_ptr.*, type_entry.value_ptr.*, ns_stack, writer, ns_stack.items.len - 1);
-                            try writer.print(";\n", .{});
-                        }
-                    }
-                } else {
-                    try printIndent(writer, ns_stack.items.len - 1);
-                    try writer.print("pub const {f} = struct {{\n", .{idfmt(entry.key_ptr.*)});
-                    try ns_stack.append(allocator, Namespace.init(allocator, entry.key_ptr.*));
-                    try codegenNamespace(allocator, entry.value_ptr.*, ns_stack, writer);
-                    var ns = ns_stack.pop().?;
-                    ns.deinit();
-                    try printIndent(writer, ns_stack.items.len - 1);
-                    try writer.print("}};\n", .{});
-                }
-            }
+            return obj;
         },
         else => {
-            return error.InvalidProtocol;
+            return error.ExpectedObject;
         },
     }
 }
 
-fn codegenType(
-    allocator: std.mem.Allocator,
-    name: []const u8,
-    typ: std.json.Value,
-    ns_stack: *std.ArrayList(Namespace),
-    writer: *std.io.Writer,
-    indent: usize,
-) anyerror!void {
-    switch (typ) {
-        .string => |str| {
-            if (std.mem.eql(u8, str, "native")) {
-                try writer.print("codegen_support.{f}", .{idfmt(name)});
-            } else {
-                const ns_index = try namespaceLookup(ns_stack.items, str);
-                for (0..ns_index + 1) |i| {
-                    try writer.print("{f}.", .{idfmt(ns_stack.items[i].name)});
-                }
-                try writer.print("{f}", .{idfmt(str)});
-            }
-        },
-        .array => |array| {
-            if (array.items.len != 2) {
-                return error.InvalidProtocol;
-            }
-            switch (array.items[0]) {
-                .string => |constructor| {
-                    if (std.mem.eql(u8, constructor, "container")) {
-                        try codegenContainer(allocator, array.items[1], ns_stack, writer, indent);
-                    } else {
-                        try writer.print("\"<{s}>\"", .{constructor});
-                    }
-                },
-                else => {
-                    return error.InvalidProtocol;
-                },
-            }
-        },
-        else => {
-            return error.InvalidProtocol;
-        },
-    }
-}
-
-fn codegenContainer(
-    allocator: std.mem.Allocator,
-    container: std.json.Value,
-    ns_stack: *std.ArrayList(Namespace),
-    writer: *std.io.Writer,
-    indent: usize,
-) anyerror!void {
-    try writer.print("struct {{\n", .{});
-    switch (container) {
-        .array => |array| {
-            for (array.items) |container_item| {
-                switch (container_item) {
-                    .object => |container_entry| {
-                        const name = if (container_entry.contains("anon")) "anon" else blk: {
-                            const name_entry = container_entry.get("name") orelse {
-                                return error.InvalidProtocol;
-                            };
-                            switch (name_entry) {
-                                .string => |name| break :blk name,
-                                else => {
-                                    return error.InvalidProtocol;
-                                },
-                            }
-                        };
-                        const typ = container_entry.get("type") orelse {
-                            return error.InvalidProtocol;
-                        };
-                        try printIndent(writer, indent + 1);
-                        try writer.print("{f}: ", .{idfmt(name)});
-                        try codegenType(allocator, "", typ, ns_stack, writer, indent + 1);
-                        try writer.print(",\n", .{});
-                    },
-                    else => {
-                        return error.InvalidProtocol;
-                    },
-                }
-            }
-        },
-        else => {
-            return error.InvalidProtocol;
-        },
-    }
-    try printIndent(writer, indent);
-    try writer.print("}}", .{});
+fn expectGet(object: std.json.ObjectMap, key: []const u8) !std.json.Value {
+    return object.get(key) orelse {
+        return error.MissingKey;
+    };
 }
 
 fn printIndent(writer: *std.io.Writer, level: usize) !void {
