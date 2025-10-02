@@ -34,7 +34,7 @@ const Protocol = struct {
     }
 
     pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *std.io.Writer) !void {
-        try writer.print("const packet_lib = @import(\"packet_lib.zig\");\n", .{});
+        try writer.print("const protocol_support = @import(\"protocol_support.zig\");\n", .{});
         try self.types.codegen(allocator, writer, 0, .{ .outer = &self.types, .inner = null });
         try writer.print("\n", .{});
     }
@@ -200,17 +200,16 @@ const NativeType = enum {
         if (std.mem.eql(u8, str, "array")) {
             return .fake;
         }
-        std.debug.print("{s}\n", .{str});
         return error.UnknownNativeType;
     }
 
-    fn codegenType(self: NativeType) []const u8 {
+    fn codegenType(self: NativeType) ![]const u8 {
         return switch (self) {
             .varint => "i32",
             .varlong => "i64",
-            .optvarint => "packet_lib.optvarint",
-            .pstring => "packet_lib.pstring",
-            .buffer => "packet_lib.buffer",
+            .optvarint => "protocol_support.optvarint",
+            .pstring => "protocol_support.pstring",
+            .buffer => "protocol_support.buffer",
             .u8 => "u8",
             .u16 => "u16",
             .u32 => "u32",
@@ -222,19 +221,19 @@ const NativeType = enum {
             .bool => "bool",
             .f32 => "f32",
             .f64 => "f64",
-            .UUID => "packet_lib.UUID",
-            .option => "packet_lib.option",
-            .entityMetadataLoop => "packet_lib.entityMetadataLoop",
-            .topBitSetTerminatedArray => "packet_lib.topBitSetTerminatedArray",
-            .bitfield => "packet_lib.bitfield",
-            .bitflags => "packet_lib.bitflags",
-            .void => "packet_lib.void",
-            .restBuffer => "packet_lib.restBuffer",
-            .nbt => "packet_lib.nbt",
-            .optionalNbt => "packet_lib.optionalNbt",
-            .registryEntryHolder => "packet_lib.registryEntryHolder",
-            .registryEntryHolderSet => "packet_lib.registryEntryHolderSet",
-            .fake => "packet_lib.fake",
+            .UUID => "protocol_support.UUID",
+            .option => "protocol_support.option",
+            .entityMetadataLoop => "protocol_support.entityMetadataLoop",
+            .topBitSetTerminatedArray => "protocol_support.topBitSetTerminatedArray",
+            .bitfield => "protocol_support.bitfield",
+            .bitflags => "protocol_support.bitflags",
+            .void => "protocol_support.void",
+            .restBuffer => "protocol_support.restBuffer",
+            .nbt => "protocol_support.nbt",
+            .optionalNbt => "protocol_support.optionalNbt",
+            .registryEntryHolder => "protocol_support.registryEntryHolder",
+            .registryEntryHolderSet => "protocol_support.registryEntryHolderSet",
+            .fake => error.ReferencedFakeNativeType,
         };
     }
 };
@@ -292,7 +291,7 @@ const Type = union(enum) {
             .reference => |reference| {
                 if (scope.outer.types.get(reference)) |referenced| {
                     switch (referenced) {
-                        .native => |native| try writer.print("{s}", .{native.codegenType()}),
+                        .native => |native| try writer.print("{s}", .{try native.codegenType()}),
                         else => try writer.print("{s}", .{reference}),
                     }
                 } else {

@@ -1,11 +1,11 @@
-const packet_lib = @import("packet_lib.zig");
+const protocol_support = @import("protocol_support.zig");
 const previousMessages = "todo";
 
 const chunkBlockEntity = struct {
     anon: "todo",
     y: i16,
     type: i32,
-    nbtData: packet_lib.optionalNbt,
+    nbtData: protocol_support.optionalNbt,
 };
 
 const entityMetadataItem = "todo";
