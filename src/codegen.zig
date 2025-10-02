@@ -1,7 +1,16 @@
 const std = @import("std");
 const protocol_support = @import("protocol_support.zig");
 
-pub const previousMessages = protocol_support.Todo;
+pub const previousMessages = []struct {
+    id: i32,
+    signature: protocol_support.Todo,
+
+    pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {
+        protocol_support.maybe_unused(allocator);
+        try r.read_varint(&self.id);
+        try protocol_support.todo(r, &self.signature);
+    }
+};
 
 pub const chunkBlockEntity = struct {
     anon: protocol_support.Todo,
@@ -48,7 +57,21 @@ pub const packedChunkPos = struct {
     }
 };
 
-pub const tags = protocol_support.Todo;
+pub const tags = []struct {
+    tagName: string,
+    entries: []i32,
+
+    pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {
+        protocol_support.maybe_unused(allocator);
+        try protocol_support.todo(r, &self.tagName);
+        var length_i: i32 = undefined;
+        try r.read_varint(&length_i);
+        self.entries = allocator.alloc(@TypeOf(self.entries[0]), length_i);
+        for (0..length_i) |i| {
+            try r.read_varint(&self.entries[i]);
+        }
+    }
+};
 
 pub const soundSource = protocol_support.Todo;
 
@@ -92,7 +115,12 @@ pub const minecraft_smelting_format = struct {
         protocol_support.maybe_unused(allocator);
         try protocol_support.todo(r, &self.group);
         try r.read_varint(&self.category);
-        try protocol_support.todo(r, &self.ingredient);
+        var length_i: i32 = undefined;
+        try r.read_varint(&length_i);
+        self.ingredient = allocator.alloc(@TypeOf(self.ingredient[0]), length_i);
+        for (0..length_i) |i| {
+            try self.ingredient[i].read(r, allocator);
+        }
         try self.result.read(r, allocator);
         try r.read_f32(&self.experience);
         try r.read_varint(&self.cookTime);
@@ -101,7 +129,7 @@ pub const minecraft_smelting_format = struct {
 
 pub const chat_session = protocol_support.Todo;
 
-pub const ingredient = protocol_support.Todo;
+pub const ingredient = []slot;
 
 pub const slot = struct {
     present: bool,
@@ -131,14 +159,19 @@ pub const ByteArray = protocol_support.Todo;
 
 pub const command_node = struct {
     flags: protocol_support.Todo,
-    children: protocol_support.Todo,
+    children: []i32,
     redirectNode: protocol_support.Todo,
     extraNodeData: protocol_support.Todo,
 
     pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {
         protocol_support.maybe_unused(allocator);
         try protocol_support.todo(r, &self.flags);
-        try protocol_support.todo(r, &self.children);
+        var length_i: i32 = undefined;
+        try r.read_varint(&length_i);
+        self.children = allocator.alloc(@TypeOf(self.children[0]), length_i);
+        for (0..length_i) |i| {
+            try r.read_varint(&self.children[i]);
+        }
         try protocol_support.todo(r, &self.redirectNode);
         try protocol_support.todo(r, &self.extraNodeData);
     }
@@ -157,12 +190,30 @@ pub const ItemSoundEvent = struct {
 
 pub const game_profile = struct {
     name: string,
-    properties: protocol_support.Todo,
+    properties: []struct {
+        name: string,
+        value: string,
+        signature: protocol_support.Todo,
+
+        pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {
+            protocol_support.maybe_unused(allocator);
+            try protocol_support.todo(r, &self.name);
+            try protocol_support.todo(r, &self.value);
+            try protocol_support.todo(r, &self.signature);
+        }
+    },
 
     pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {
         protocol_support.maybe_unused(allocator);
         try protocol_support.todo(r, &self.name);
-        try protocol_support.todo(r, &self.properties);
+        var length_i: i32 = undefined;
+        try r.read_varint(&length_i);
+        self.properties = allocator.alloc(@TypeOf(self.properties[0]), length_i);
+        for (0..length_i) |i| {
+            try protocol_support.todo(r, &self.properties[i].name);
+            try protocol_support.todo(r, &self.properties[i].value);
+            try protocol_support.todo(r, &self.properties[i].signature);
+        }
     }
 };
 
