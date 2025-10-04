@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn maybe_unused(x: anytype) void {
     _ = x;
@@ -41,10 +42,13 @@ pub const Reader = struct {
     //     try self.read(bool, out);
     // }
     pub fn read_f32(self: *Reader, out: *f32) !void {
-        //todo: endianness
-        try self.read_u32(@ptrCast(out));
+        const size = 4;
+        out.* = @bitCast(std.mem.readInt(u32, self.buffer[0..size], builtin.cpu.arch.endian()));
+        self.buffer = self.buffer[size..];
     }
     pub fn read_f64(self: *Reader, out: *f64) !void {
-        try self.read_u64(@ptrCast(out));
+        const size = 8;
+        out.* = @bitCast(std.mem.readInt(u64, self.buffer[0..size], builtin.cpu.arch.endian()));
+        self.buffer = self.buffer[size..];
     }
 };
