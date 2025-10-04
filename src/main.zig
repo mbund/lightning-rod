@@ -9,6 +9,8 @@ const String = @import("string.zig").String;
 
 const log = std.log.scoped(.tcp_epoll_server);
 
+const nbt = @import("nbt.zig");
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
