@@ -289,6 +289,7 @@ const Type = union(enum) {
     native: NativeType,
     container: struct { name: []const u8, fields: []Field },
     array: struct { countType: NativeType, elementType: *Type },
+    switch_: struct { compareTo: []const u8, fields: []Field, default: *Type },
 
     pub fn fromJson(allocator: std.mem.Allocator, key: []const u8, json: std.json.Value) !Type {
         if (equalsString(json, "native")) {
@@ -315,6 +316,26 @@ const Type = union(enum) {
                 const elementType = try allocator.create(Type);
                 elementType.* = try Type.fromJson(allocator, "elementType", try expectGet(object, "type"));
                 return .{ .array = .{ .countType = countType, .elementType = elementType } };
+            }
+            if (std.mem.eql(u8, constructor.name, "switch")) {
+                const object = try expectObject(constructor.arg);
+                std.debug.print("===========\n{f}\n===============\n", .{std.json.fmt(constructor.arg, .{})});
+                const compareTo = try expectString(try expectGet(object, "compareTo"));
+                const default = try allocator.create(Type);
+                default.* = if (object.get("default")) |d|
+                    try Type.fromJson(allocator, "default", d)
+                else
+                    .{ .native = .void };
+                const fieldsObject = try expectObject(try expectGet(object, "fields"));
+                var fields = try allocator.alloc(Field, fieldsObject.count());
+                var it = fieldsObject.iterator();
+                var i: usize = 0;
+                while (it.next()) |entry| : (i += 1) {
+                    const field_name = entry.key_ptr.*;
+                    const field_type = try Type.fromJson(allocator, entry.key_ptr.*, entry.value_ptr.*);
+                    fields[i] = .{ .name = field_name, .type = field_type };
+                }
+                return .{ .switch_ = .{ .compareTo = compareTo, .fields = fields, .default = default } };
             }
         }
 
