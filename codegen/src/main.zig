@@ -19,7 +19,7 @@ pub fn main() !void {
 
 const Protocol = struct {
     types: Types,
-    // handshaking: State,
+    handshaking: State,
     // status: State,
     // login: State,
     // play: State,
@@ -27,9 +27,11 @@ const Protocol = struct {
     pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) !Protocol {
         const object = try expectObject(json);
         const types = try Types.fromJson(allocator, try expectGet(object, "types"));
+        const handshaking = try State.fromJson(allocator, try expectGet(object, "handshaking"));
 
         return Protocol{
             .types = types,
+            .handshaking = handshaking,
         };
     }
 
@@ -37,6 +39,8 @@ const Protocol = struct {
         try writer.print("const std = @import(\"std\");\n", .{});
         try writer.print("const protocol_support = @import(\"protocol_support.zig\");\n\n", .{});
         try self.types.codegen(allocator, writer, 0, .{ .outer = &self.types, .inner = null });
+        try writer.print("\n", .{});
+        try self.handshaking.codegen(allocator, writer, "handshaking", &self.types, 0);
         try writer.print("\n", .{});
     }
 };
@@ -67,8 +71,33 @@ const Types = struct {
 };
 
 const State = struct {
-    ToServer: Types,
-    ToClient: Types,
+    toServer: Types,
+    toClient: Types,
+
+    pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) !State {
+        return .{
+            .toServer = try Types.fromJson(allocator, try expectGet(try expectObject(try expectGet(try expectObject(json), "toServer")), "types")),
+            .toClient = try Types.fromJson(allocator, try expectGet(try expectObject(try expectGet(try expectObject(json), "toClient")), "types")),
+        };
+    }
+
+    pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *std.io.Writer, name: []const u8, outer: *const Types, indent: usize) !void {
+        try writer.print("pub const {s} = struct {{\n", .{name});
+        try printIndent(writer, indent + 1);
+        try writer.print("pub const toClient = struct {{\n", .{});
+        try self.toClient.codegen(allocator, writer, indent + 2, .{ .outer = outer, .inner = &self.toClient });
+        try writer.print("\n", .{});
+        try printIndent(writer, indent + 1);
+        try writer.print("}};\n", .{});
+        try printIndent(writer, indent + 1);
+        try writer.print("pub const toServer = struct {{\n", .{});
+        try self.toServer.codegen(allocator, writer, indent + 2, .{ .outer = outer, .inner = &self.toServer });
+        try writer.print("\n", .{});
+        try printIndent(writer, indent + 1);
+        try writer.print("}};\n", .{});
+        try printIndent(writer, indent);
+        try writer.print("}};", .{});
+    }
 };
 
 const Scope = struct {
@@ -286,7 +315,7 @@ const Type = union(enum) {
     pub fn codegenDefinition(self: *const @This(), allocator: std.mem.Allocator, name: []const u8, writer: *std.io.Writer, indent: usize, scope: Scope) !void {
         switch (self.*) {
             .container, .array, .todo => {
-                try printIndent(writer, indent);
+                try printIndent(writer, indenttoServer;
                 try writer.print("pub const {f} = ", .{idfmt(name)});
                 try self.codegenType(allocator, writer, indent, scope);
                 try writer.print(";\n\n", .{});
