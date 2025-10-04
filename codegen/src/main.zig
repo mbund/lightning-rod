@@ -20,18 +20,24 @@ pub fn main() !void {
 const Protocol = struct {
     types: Types,
     handshaking: State,
-    // status: State,
-    // login: State,
-    // play: State,
+    status: State,
+    login: State,
+    play: State,
 
     pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) !Protocol {
         const object = try expectObject(json);
         const types = try Types.fromJson(allocator, try expectGet(object, "types"));
         const handshaking = try State.fromJson(allocator, try expectGet(object, "handshaking"));
+        const status = try State.fromJson(allocator, try expectGet(object, "status"));
+        const login = try State.fromJson(allocator, try expectGet(object, "login"));
+        const play = try State.fromJson(allocator, try expectGet(object, "play"));
 
         return Protocol{
             .types = types,
             .handshaking = handshaking,
+            .status = status,
+            .login = login,
+            .play = play,
         };
     }
 
@@ -41,6 +47,9 @@ const Protocol = struct {
         try self.types.codegen(allocator, writer, 0, .{ .outer = &self.types, .inner = null });
         try writer.print("\n", .{});
         try self.handshaking.codegen(allocator, writer, "handshaking", &self.types, 0);
+        try self.status.codegen(allocator, writer, "status", &self.types, 0);
+        try self.login.codegen(allocator, writer, "login", &self.types, 0);
+        try self.play.codegen(allocator, writer, "play", &self.types, 0);
         try writer.print("\n", .{});
     }
 };
@@ -315,7 +324,7 @@ const Type = union(enum) {
     pub fn codegenDefinition(self: *const @This(), allocator: std.mem.Allocator, name: []const u8, writer: *std.io.Writer, indent: usize, scope: Scope) !void {
         switch (self.*) {
             .container, .array, .todo => {
-                try printIndent(writer, indenttoServer;
+                try printIndent(writer, indent);
                 try writer.print("pub const {f} = ", .{idfmt(name)});
                 try self.codegenType(allocator, writer, indent, scope);
                 try writer.print(";\n\n", .{});
@@ -353,7 +362,12 @@ const Type = union(enum) {
                 try printIndent(writer, indent + 2);
                 try writer.print("protocol_support.maybe_unused(allocator);\n", .{});
                 try printIndent(writer, indent + 2);
-                try self.codegenRead(allocator, writer, indent + 2, scope, "self", null, 'i');
+                try writer.print("protocol_support.maybe_unused(r);\n", .{});
+                try printIndent(writer, indent + 2);
+                try writer.print("protocol_support.maybe_unused(self);\n", .{});
+                try printIndent(writer, indent + 2);
+                var loop_index: usize = 0;
+                try self.codegenRead(allocator, writer, indent + 2, scope, "self", null, &loop_index);
                 try writer.print("\n", .{});
                 try printIndent(writer, indent + 1);
                 try writer.print("}}\n", .{});
@@ -378,7 +392,7 @@ const Type = union(enum) {
         scope: Scope,
         dest: []const u8,
         parent_dest: ?[]const u8,
-        loop_index: u8,
+        loop_index: *usize,
     ) anyerror!void {
         switch (self.*) {
             .reference => |reference| {
@@ -417,16 +431,17 @@ const Type = union(enum) {
             },
             .array => |array| {
                 var dest_buf: [256]u8 = undefined;
-                const child_dest = try std.fmt.bufPrint(&dest_buf, "{s}[{c}]", .{ dest, loop_index });
-                try writer.print("var length_{c}: {s} = undefined;\n", .{ loop_index, try array.countType.codegenType() });
+                const child_dest = try std.fmt.bufPrint(&dest_buf, "{s}[i_{d}]", .{ dest, loop_index.* });
+                try writer.print("var length_{d}: {s} = undefined;\n", .{ loop_index.*, try array.countType.codegenType() });
                 try printIndent(writer, indent);
-                try writer.print("try r.read_{s}(&length_{c});\n", .{ @tagName(array.countType), loop_index });
+                try writer.print("try r.read_{s}(&length_{d});\n", .{ @tagName(array.countType), loop_index.* });
                 try printIndent(writer, indent);
-                try writer.print("{s} = allocator.alloc(@TypeOf({s}[0]), length_{c});\n", .{ dest, dest, loop_index });
+                try writer.print("{s} = allocator.alloc(@TypeOf({s}[0]), length_{d});\n", .{ dest, dest, loop_index.* });
                 try printIndent(writer, indent);
-                try writer.print("for (0..length_{c}) |{c}| {{\n", .{ loop_index, loop_index });
+                try writer.print("for (0..length_{d}) |i_{d}| {{\n", .{ loop_index.*, loop_index.* });
                 try printIndent(writer, indent + 1);
-                try array.elementType.codegenRead(allocator, writer, indent + 1, scope, child_dest, dest, loop_index + 1);
+                loop_index.* += 1;
+                try array.elementType.codegenRead(allocator, writer, indent + 1, scope, child_dest, dest, loop_index);
                 try writer.print("\n", .{});
                 try printIndent(writer, indent);
                 try writer.print("}}", .{});
