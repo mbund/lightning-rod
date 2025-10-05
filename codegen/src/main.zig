@@ -74,30 +74,35 @@ const Types = struct {
     pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *std.io.Writer, indent: usize, scope: Scope) !void {
         var it = self.types.iterator();
         while (it.next()) |entry| {
-            try entry.value_ptr.codegenDefinition(allocator, entry.key_ptr.*, writer, indent, scope);
+            try printIndent(writer, indent);
+            try writer.print("// {s}\n", .{entry.key_ptr.*});
+            try printIndent(writer, indent);
+            const resolved = entry.value_ptr.resolve(allocator, scope);
+            try writer.print("{any}", .{resolved});
+            try writer.print("\n\n", .{});
         }
     }
 };
 
 const State = struct {
     toServer: Types,
-    toClient: Types,
+    // toClient: Types,
 
     pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) !State {
         return .{
             .toServer = try Types.fromJson(allocator, try expectGet(try expectObject(try expectGet(try expectObject(json), "toServer")), "types")),
-            .toClient = try Types.fromJson(allocator, try expectGet(try expectObject(try expectGet(try expectObject(json), "toClient")), "types")),
+            // .toClient = try Types.fromJson(allocator, try expectGet(try expectObject(try expectGet(try expectObject(json), "toClient")), "types")),
         };
     }
 
     pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *std.io.Writer, name: []const u8, outer: *const Types, indent: usize) !void {
         try writer.print("pub const {s} = struct {{\n", .{name});
-        try printIndent(writer, indent + 1);
-        try writer.print("pub const toClient = struct {{\n", .{});
-        try self.toClient.codegen(allocator, writer, indent + 2, .{ .outer = outer, .inner = &self.toClient });
-        try writer.print("\n", .{});
-        try printIndent(writer, indent + 1);
-        try writer.print("}};\n", .{});
+        // try printIndent(writer, indent + 1);
+        // try writer.print("pub const toClient = struct {{\n", .{});
+        // try self.toClient.codegen(allocator, writer, indent + 2, .{ .outer = outer, .inner = &self.toClient });
+        // try writer.print("\n", .{});
+        // try printIndent(writer, indent + 1);
+        // try writer.print("}};\n", .{});
         try printIndent(writer, indent + 1);
         try writer.print("pub const toServer = struct {{\n", .{});
         try self.toServer.codegen(allocator, writer, indent + 2, .{ .outer = outer, .inner = &self.toServer });
@@ -105,7 +110,7 @@ const State = struct {
         try printIndent(writer, indent + 1);
         try writer.print("}};\n", .{});
         try printIndent(writer, indent);
-        try writer.print("}};", .{});
+        try writer.print("}};\n\n", .{});
     }
 };
 
@@ -305,12 +310,12 @@ const ArrayCount = union(enum) {
 
 const Type = union(enum) {
     reference: []const u8,
-    varint,
     todo,
     native: NativeType,
     container: struct { fields: []Field },
     bitfield: struct { fields: []BitfieldField },
     array: struct { count: ArrayCount, elementType: *Type },
+    pstring: struct { countType: NativeType },
     switch_: struct { compareTo: []const u8, fields: []Field, default: *Type },
 
     pub fn fromJson(allocator: std.mem.Allocator, key: []const u8, json: std.json.Value) !Type {
@@ -360,6 +365,12 @@ const Type = union(enum) {
                 elementType.* = try Type.fromJson(allocator, "elementType", try expectGet(object, "type"));
                 return .{ .array = .{ .count = count, .elementType = elementType } };
             }
+            if (std.mem.eql(u8, constructor.name, "pstring")) {
+                const object = try expectObject(constructor.arg);
+                const countType = try NativeType.fromString(try expectString(try expectGet(object, "countType")));
+
+                return .{ .pstring = .{ .countType = countType } };
+            }
             if (std.mem.eql(u8, constructor.name, "switch")) {
                 const object = try expectObject(constructor.arg);
                 const compareTo = try expectString(try expectGet(object, "compareTo"));
@@ -384,208 +395,68 @@ const Type = union(enum) {
         return .todo;
     }
 
-    pub fn codegenDefinition(self: *const @This(), allocator: std.mem.Allocator, name: []const u8, writer: *std.io.Writer, indent: usize, scope: Scope) !void {
-        switch (self.*) {
-            .container, .array, .todo => {
-                try printIndent(writer, indent);
-                try writer.print("pub const {f} = ", .{idfmt(name)});
-                try self.codegenType(allocator, writer, indent, scope);
-                try writer.print(";\n\n", .{});
-            },
-            else => {},
-        }
-    }
-
-    pub fn codegenType(self: *const @This(), allocator: std.mem.Allocator, writer: *std.io.Writer, indent: usize, scope: Scope) !void {
+    pub fn resolve(self: *const Type, allocator: std.mem.Allocator, scope: Scope) !*ResolvedType {
         switch (self.*) {
             .reference => |reference| {
                 if (scope.outer.types.get(reference)) |referenced| {
-                    switch (referenced) {
-                        .native => |native| try writer.print("{s}", .{try native.codegenType()}),
-                        else => try writer.print("{s}", .{reference}),
-                    }
-                } else {
-                    return error.UndefinedReference;
+                    return referenced.resolve(allocator, Scope{ .outer = scope.outer, .inner = null });
                 }
-            },
-            .native => |_| {
-                return error.UnexpectedNative;
+                if (scope.inner) |inner| {
+                    if (inner.types.get(reference)) |referenced| {
+                        return referenced.resolve(allocator, scope);
+                    }
+                }
+                return error.UndefinedReference;
             },
             .container => |container| {
-                try writer.print("struct {{\n", .{});
-                for (container.fields) |field| {
-                    try printIndent(writer, indent + 1);
-                    try writer.print("{f}: ", .{idfmt(field.name)});
-                    try field.type.codegenType(allocator, writer, indent + 1, scope);
-                    try writer.print(",\n", .{});
-                }
-                try writer.print("\n", .{});
-                try printIndent(writer, indent + 1);
-                try writer.print("pub fn read(self: *@This(), r: *protocol_support.Reader, allocator: std.mem.Allocator) !void {{\n", .{});
-                try printIndent(writer, indent + 2);
-                try writer.print("protocol_support.maybe_unused(allocator);\n", .{});
-                try printIndent(writer, indent + 2);
-                try writer.print("protocol_support.maybe_unused(r);\n", .{});
-                try printIndent(writer, indent + 2);
-                try writer.print("protocol_support.maybe_unused(self);\n", .{});
-                try printIndent(writer, indent + 2);
-                var loop_index: usize = 0;
-                try self.codegenRead(allocator, writer, indent + 2, scope, "self", null, null, null, &loop_index);
-                try writer.print("\n", .{});
-                try printIndent(writer, indent + 1);
-                try writer.print("}}\n", .{});
-                try printIndent(writer, indent);
-                try writer.print("}}", .{});
-            },
-            .array => |array| {
-                try writer.print("[]", .{});
-                try array.elementType.codegenType(allocator, writer, indent, scope);
-            },
-            else => {
-                try writer.print("protocol_support.Todo", .{});
-            },
-        }
-    }
-
-    pub fn codegenRead(
-        self: *const @This(),
-        allocator: std.mem.Allocator,
-        writer: *std.io.Writer,
-        indent: usize,
-        scope: Scope,
-        dest: []const u8,
-        parent_dest: ?[]const u8,
-        parent_type: ?*const Type,
-        grandparent_type: ?*const Type,
-        loop_index: *usize,
-    ) anyerror!void {
-        try writer.print("// parent_type {any} grandparent_type {any}\n", .{ parent_type, grandparent_type });
-        try printIndent(writer, indent);
-        switch (self.*) {
-            .reference => |reference| {
-                if (scope.outer.types.get(reference)) |referenced| {
-                    switch (referenced) {
-                        .native => |native| {
-                            try writer.print("try r.read_{s}(&{s});", .{ @tagName(native), dest });
-                        },
-                        .container => |_| {
-                            try writer.print("try {s}.read(r, allocator);", .{dest});
-                        },
-                        .array => |_| {
-                            try referenced.codegenRead(allocator, writer, indent, scope, dest, parent_dest, parent_type, grandparent_type, loop_index);
-                        },
-                        else => |_| {
-                            try writer.print("try protocol_support.todo(r, &{s});", .{dest});
-                        },
-                    }
-                } else {
-                    return error.UndefinedReference;
-                }
-            },
-            .native => |_| {
-                return error.UnexpectedNative;
-            },
-            .container => |container| {
-                var dest_buf: [256]u8 = undefined;
+                const result = try allocator.create(ResolvedType);
+                var fields = try allocator.alloc(ResolvedField, container.fields.len);
+                result.* = .{ .container = .{ .fields = fields[0..0] } };
                 for (0.., container.fields) |i, field| {
-                    if (i >= 1) {
-                        try writer.print("\n", .{});
-                        try printIndent(writer, indent);
-                    }
-                    const child_dest = try std.fmt.bufPrint(&dest_buf, "{s}.{s}", .{ dest, field.name });
-                    try field.type.codegenRead(allocator, writer, indent, scope, child_dest, dest, self, parent_type, loop_index);
+                    fields[i] = .{ .name = field.name, .type = try field.type.resolve(allocator, scope) };
+                    result.container.fields = fields[0 .. i + 1];
                 }
+                return result;
             },
-            .array => |array| {
-                var dest_buf: [256]u8 = undefined;
-                const child_dest = try std.fmt.bufPrint(&dest_buf, "{s}[i_{d}]", .{ dest, loop_index.* });
-                switch (array.count) {
-                    .type => |countType| {
-                        try writer.print("var length_{d}: {s} = undefined;\n", .{ loop_index.*, try countType.codegenType() });
-                        try printIndent(writer, indent);
-                        try writer.print("try r.read_{s}(&length_{d});\n", .{ @tagName(countType), loop_index.* });
-                    },
-                    .field => {
-                        try writer.print("protocol_support.todo(&length_{d});\n", .{loop_index.*});
-                    },
-                    .constant => |constant| {
-                        try writer.print("const length_{d} = {}\n", .{ loop_index.*, constant });
-                    },
-                }
-                try printIndent(writer, indent);
-                try writer.print("{s} = allocator.alloc(@TypeOf({s}[0]), length_{d});\n", .{ dest, dest, loop_index.* });
-                try printIndent(writer, indent);
-                try writer.print("for (0..length_{d}) |i_{d}| {{\n", .{ loop_index.*, loop_index.* });
-                try printIndent(writer, indent + 1);
-                loop_index.* += 1;
-                try array.elementType.codegenRead(allocator, writer, indent + 1, scope, child_dest, dest, parent_type, grandparent_type, loop_index);
-                try writer.print("\n", .{});
-                try printIndent(writer, indent);
-                try writer.print("}}", .{});
+            .native => |native| {
+                const result = try allocator.create(ResolvedType);
+                result.* = .{ .native = native };
+                return result;
             },
-            else => {
-                try writer.print("try protocol_support.todo(r, &{s});", .{dest});
+            .pstring => |pstring| {
+                const result = try allocator.create(ResolvedType);
+                result.* = .{ .pstring = .{ .countType = pstring.countType } };
+                return result;
             },
-            .switch_ => |switch_| {
-                try writer.flush();
-                try resolveReference(allocator, switch_.compareTo, parent_type, dest, grandparent_type, parent_dest);
-            },
+            else => return error.Todo,
         }
     }
 };
 
-fn resolveReference(allocator: std.mem.Allocator, reference: []const u8, typ: ?*const Type, dest: []const u8, parent_type: ?*const Type, parent_dest: ?[]const u8) !void {
-    std.debug.print("<<<<<<<<<<<<<<<<\nType {any}\nParent {any}\n>>>>>>>>>>>>>\n", .{ typ, parent_type });
-    var resolved_dest = dest;
-    var resolved_container_type = if (typ) |t| t else return error.InvalidReference;
-    var ref = reference;
-    std.debug.print("=================\nRESOLVE REFERENCE\n{s}\n======================\n", .{reference});
+const ResolvedField = struct {
+    name: []const u8,
+    type: *ResolvedType,
+};
 
-    if (ref.len >= 3 and std.mem.eql(u8, ref[0..3], "../")) {
-        ref = ref[3..];
-        if (parent_type) |pt| {
-            if (parent_dest) |pd| {
-                resolved_container_type = pt;
-                resolved_dest = pd;
-            } else {
-                std.debug.print("AAAAAAAAAAA\n", .{});
-                return error.InvalidReference;
-            }
-        } else {
-            std.debug.print("BBBBBBBBBBB\n", .{});
-            return error.InvalidReference;
-        }
-    }
+const ResolvedType = union(enum) {
+    todo,
+    native: NativeType,
+    container: struct { fields: []ResolvedField },
+    pstring: struct { countType: NativeType },
+    // array: struct { count: ArrayCount, elementType: *Type },
+    // switch_: struct { compareTo: []const u8, fields: []Field, default: *Type },
+};
 
-    var resolved_type = TypeOrBitfieldType{ .type = resolved_container_type.* };
-    if (std.mem.indexOf(u8, ref, "/")) |i| {
-        resolved_dest = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ resolved_dest, ref[0..i] });
-        resolved_type = switch (resolved_container_type.*) {
-            .container => |container| blk: {
-                std.debug.print("LOOKING FOR {s}\n", .{ref[0..i]});
-                for (container.fields) |field| {
-                    if (std.mem.eql(u8, field.name, ref[0..i])) {
-                        break :blk .{ .type = field.type };
-                    }
-                }
-                return error.InvalidReference;
-            },
-            .bitfield => |bitfield| blk: {
-                std.debug.print("LOOKING FOR (BITFILED) {s}\n", .{ref[0..i]});
-                for (bitfield.fields) |field| {
-                    if (std.mem.eql(u8, field.name, ref[0..i])) {
-                        break :blk .{ .bitfield_type = field.type };
-                    }
-                }
-                return error.InvalidReference;
-            },
-            else => {
-                std.debug.print("CCCCCCCCCCCCCCCCCCC {s}\n", .{@tagName(resolved_container_type.*)});
-                return error.InvalidReference;
-            },
-        };
-    }
-}
+const Cursor = struct {
+    justRead: ?struct {
+        name: []const u8,
+        typ: NativeType,
+    },
+    toRead: union(enum) {
+        simple: *Cursor, // type is defined in next cursor's justRead
+        done,
+    },
+};
 
 fn readJson(
     allocator: std.mem.Allocator,
