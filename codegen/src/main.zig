@@ -206,9 +206,6 @@ const NativeType = enum {
         if (std.mem.eql(u8, str, "topBitSetTerminatedArray")) {
             return .topBitSetTerminatedArray;
         }
-        if (std.mem.eql(u8, str, "bitfield")) {
-            return .bitfield;
-        }
         if (std.mem.eql(u8, str, "bitflags")) {
             return .bitflags;
         }
@@ -229,6 +226,9 @@ const NativeType = enum {
         }
         if (std.mem.eql(u8, str, "registryEntryHolderSet")) {
             return .registryEntryHolderSet;
+        }
+        if (std.mem.eql(u8, str, "bitfield")) {
+            return .fake;
         }
         if (std.mem.eql(u8, str, "switch")) {
             return .fake;
@@ -282,13 +282,35 @@ const Field = struct {
     type: Type,
 };
 
+const BitfieldType = struct {
+    size: u8,
+    signed: bool,
+};
+
+const TypeOrBitfieldType = union(enum) {
+    type: Type,
+    bitfield_type: BitfieldType,
+};
+
+const BitfieldField = struct {
+    name: []const u8,
+    type: BitfieldType,
+};
+
+const ArrayCount = union(enum) {
+    type: NativeType,
+    field: []const u8,
+    constant: usize,
+};
+
 const Type = union(enum) {
     reference: []const u8,
     varint,
     todo,
     native: NativeType,
-    container: struct { name: []const u8, fields: []Field },
-    array: struct { countType: NativeType, elementType: *Type },
+    container: struct { fields: []Field },
+    bitfield: struct { fields: []BitfieldField },
+    array: struct { count: ArrayCount, elementType: *Type },
     switch_: struct { compareTo: []const u8, fields: []Field, default: *Type },
 
     pub fn fromJson(allocator: std.mem.Allocator, key: []const u8, json: std.json.Value) !Type {
@@ -308,18 +330,38 @@ const Type = union(enum) {
                     const field_type = try Type.fromJson(allocator, field_name, try expectGet(field_object, "type"));
                     fields[i] = .{ .name = field_name, .type = field_type };
                 }
-                return .{ .container = .{ .name = key, .fields = fields } };
+                return .{ .container = .{ .fields = fields } };
+            }
+            if (std.mem.eql(u8, constructor.name, "bitfield")) {
+                const array = try expectArray(constructor.arg);
+                var fields = try allocator.alloc(BitfieldField, array.items.len);
+                for (0.., array.items) |i, field_json| {
+                    const field_object = try expectObject(field_json);
+                    const field_name = try expectString(try expectGet(field_object, "name"));
+                    const field_size = try expectInteger(try expectGet(field_object, "size"));
+                    const field_signed = try expectBoolean(try expectGet(field_object, "signed"));
+                    fields[i] = .{ .name = field_name, .type = .{ .size = @intCast(field_size), .signed = field_signed } };
+                }
+                return .{ .bitfield = .{ .fields = fields } };
             }
             if (std.mem.eql(u8, constructor.name, "array")) {
                 const object = try expectObject(constructor.arg);
-                const countType = try NativeType.fromString(try expectString(try expectGet(object, "countType")));
+                const count: ArrayCount = if (object.get("countType")) |count_type|
+                    .{ .type = try NativeType.fromString(try expectString(count_type)) }
+                else switch (try expectGet(object, "count")) {
+                    .string => |str| .{ .field = str },
+                    .integer => |integer| .{ .constant = @intCast(integer) },
+                    else => {
+                        return error.UnexpectedTypeForCount;
+                    },
+                };
+
                 const elementType = try allocator.create(Type);
                 elementType.* = try Type.fromJson(allocator, "elementType", try expectGet(object, "type"));
-                return .{ .array = .{ .countType = countType, .elementType = elementType } };
+                return .{ .array = .{ .count = count, .elementType = elementType } };
             }
             if (std.mem.eql(u8, constructor.name, "switch")) {
                 const object = try expectObject(constructor.arg);
-                std.debug.print("===========\n{f}\n===============\n", .{std.json.fmt(constructor.arg, .{})});
                 const compareTo = try expectString(try expectGet(object, "compareTo"));
                 const default = try allocator.create(Type);
                 default.* = if (object.get("default")) |d|
@@ -388,7 +430,7 @@ const Type = union(enum) {
                 try writer.print("protocol_support.maybe_unused(self);\n", .{});
                 try printIndent(writer, indent + 2);
                 var loop_index: usize = 0;
-                try self.codegenRead(allocator, writer, indent + 2, scope, "self", null, &loop_index);
+                try self.codegenRead(allocator, writer, indent + 2, scope, "self", null, null, null, &loop_index);
                 try writer.print("\n", .{});
                 try printIndent(writer, indent + 1);
                 try writer.print("}}\n", .{});
@@ -413,8 +455,12 @@ const Type = union(enum) {
         scope: Scope,
         dest: []const u8,
         parent_dest: ?[]const u8,
+        parent_type: ?*const Type,
+        grandparent_type: ?*const Type,
         loop_index: *usize,
     ) anyerror!void {
+        try writer.print("// parent_type {any} grandparent_type {any}\n", .{ parent_type, grandparent_type });
+        try printIndent(writer, indent);
         switch (self.*) {
             .reference => |reference| {
                 if (scope.outer.types.get(reference)) |referenced| {
@@ -426,7 +472,7 @@ const Type = union(enum) {
                             try writer.print("try {s}.read(r, allocator);", .{dest});
                         },
                         .array => |_| {
-                            try referenced.codegenRead(allocator, writer, indent, scope, dest, parent_dest, loop_index);
+                            try referenced.codegenRead(allocator, writer, indent, scope, dest, parent_dest, parent_type, grandparent_type, loop_index);
                         },
                         else => |_| {
                             try writer.print("try protocol_support.todo(r, &{s});", .{dest});
@@ -447,22 +493,32 @@ const Type = union(enum) {
                         try printIndent(writer, indent);
                     }
                     const child_dest = try std.fmt.bufPrint(&dest_buf, "{s}.{s}", .{ dest, field.name });
-                    try field.type.codegenRead(allocator, writer, indent, scope, child_dest, dest, loop_index);
+                    try field.type.codegenRead(allocator, writer, indent, scope, child_dest, dest, self, parent_type, loop_index);
                 }
             },
             .array => |array| {
                 var dest_buf: [256]u8 = undefined;
                 const child_dest = try std.fmt.bufPrint(&dest_buf, "{s}[i_{d}]", .{ dest, loop_index.* });
-                try writer.print("var length_{d}: {s} = undefined;\n", .{ loop_index.*, try array.countType.codegenType() });
-                try printIndent(writer, indent);
-                try writer.print("try r.read_{s}(&length_{d});\n", .{ @tagName(array.countType), loop_index.* });
+                switch (array.count) {
+                    .type => |countType| {
+                        try writer.print("var length_{d}: {s} = undefined;\n", .{ loop_index.*, try countType.codegenType() });
+                        try printIndent(writer, indent);
+                        try writer.print("try r.read_{s}(&length_{d});\n", .{ @tagName(countType), loop_index.* });
+                    },
+                    .field => {
+                        try writer.print("protocol_support.todo(&length_{d});\n", .{loop_index.*});
+                    },
+                    .constant => |constant| {
+                        try writer.print("const length_{d} = {}\n", .{ loop_index.*, constant });
+                    },
+                }
                 try printIndent(writer, indent);
                 try writer.print("{s} = allocator.alloc(@TypeOf({s}[0]), length_{d});\n", .{ dest, dest, loop_index.* });
                 try printIndent(writer, indent);
                 try writer.print("for (0..length_{d}) |i_{d}| {{\n", .{ loop_index.*, loop_index.* });
                 try printIndent(writer, indent + 1);
                 loop_index.* += 1;
-                try array.elementType.codegenRead(allocator, writer, indent + 1, scope, child_dest, dest, loop_index);
+                try array.elementType.codegenRead(allocator, writer, indent + 1, scope, child_dest, dest, parent_type, grandparent_type, loop_index);
                 try writer.print("\n", .{});
                 try printIndent(writer, indent);
                 try writer.print("}}", .{});
@@ -470,9 +526,66 @@ const Type = union(enum) {
             else => {
                 try writer.print("try protocol_support.todo(r, &{s});", .{dest});
             },
+            .switch_ => |switch_| {
+                try writer.flush();
+                try resolveReference(allocator, switch_.compareTo, parent_type, dest, grandparent_type, parent_dest);
+            },
         }
     }
 };
+
+fn resolveReference(allocator: std.mem.Allocator, reference: []const u8, typ: ?*const Type, dest: []const u8, parent_type: ?*const Type, parent_dest: ?[]const u8) !void {
+    std.debug.print("<<<<<<<<<<<<<<<<\nType {any}\nParent {any}\n>>>>>>>>>>>>>\n", .{ typ, parent_type });
+    var resolved_dest = dest;
+    var resolved_container_type = if (typ) |t| t else return error.InvalidReference;
+    var ref = reference;
+    std.debug.print("=================\nRESOLVE REFERENCE\n{s}\n======================\n", .{reference});
+
+    if (ref.len >= 3 and std.mem.eql(u8, ref[0..3], "../")) {
+        ref = ref[3..];
+        if (parent_type) |pt| {
+            if (parent_dest) |pd| {
+                resolved_container_type = pt;
+                resolved_dest = pd;
+            } else {
+                std.debug.print("AAAAAAAAAAA\n", .{});
+                return error.InvalidReference;
+            }
+        } else {
+            std.debug.print("BBBBBBBBBBB\n", .{});
+            return error.InvalidReference;
+        }
+    }
+
+    var resolved_type = TypeOrBitfieldType{ .type = resolved_container_type.* };
+    if (std.mem.indexOf(u8, ref, "/")) |i| {
+        resolved_dest = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ resolved_dest, ref[0..i] });
+        resolved_type = switch (resolved_container_type.*) {
+            .container => |container| blk: {
+                std.debug.print("LOOKING FOR {s}\n", .{ref[0..i]});
+                for (container.fields) |field| {
+                    if (std.mem.eql(u8, field.name, ref[0..i])) {
+                        break :blk .{ .type = field.type };
+                    }
+                }
+                return error.InvalidReference;
+            },
+            .bitfield => |bitfield| blk: {
+                std.debug.print("LOOKING FOR (BITFILED) {s}\n", .{ref[0..i]});
+                for (bitfield.fields) |field| {
+                    if (std.mem.eql(u8, field.name, ref[0..i])) {
+                        break :blk .{ .bitfield_type = field.type };
+                    }
+                }
+                return error.InvalidReference;
+            },
+            else => {
+                std.debug.print("CCCCCCCCCCCCCCCCCCC {s}\n", .{@tagName(resolved_container_type.*)});
+                return error.InvalidReference;
+            },
+        };
+    }
+}
 
 fn readJson(
     allocator: std.mem.Allocator,
@@ -518,6 +631,28 @@ fn expectString(json: std.json.Value) ![]const u8 {
         },
         else => {
             return error.ExpectedString;
+        },
+    }
+}
+
+fn expectInteger(json: std.json.Value) !i64 {
+    switch (json) {
+        .integer => |integer| {
+            return integer;
+        },
+        else => {
+            return error.ExpectedInteger;
+        },
+    }
+}
+
+fn expectBoolean(json: std.json.Value) !bool {
+    switch (json) {
+        .bool => |boolean| {
+            return boolean;
+        },
+        else => {
+            return error.ExpectedBoolean;
         },
     }
 }
