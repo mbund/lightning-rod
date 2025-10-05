@@ -77,7 +77,7 @@ const Types = struct {
             try printIndent(writer, indent);
             try writer.print("// {s}\n", .{entry.key_ptr.*});
             try printIndent(writer, indent);
-            const resolved = entry.value_ptr.resolve(allocator, scope);
+            const resolved = entry.value_ptr.resolve(allocator, scope, null);
             try writer.print("{any}", .{resolved});
             try writer.print("\n\n", .{});
         }
@@ -292,6 +292,11 @@ const BitfieldType = struct {
     signed: bool,
 };
 
+const Mapping = struct {
+    name: []const u8,
+    value: i64,
+};
+
 const TypeOrBitfieldType = union(enum) {
     type: Type,
     bitfield_type: BitfieldType,
@@ -317,6 +322,7 @@ const Type = union(enum) {
     array: struct { count: ArrayCount, elementType: *Type },
     pstring: struct { countType: NativeType },
     switch_: struct { compareTo: []const u8, fields: []Field, default: *Type },
+    mapper: struct { type: NativeType, mappings: []Mapping },
 
     pub fn fromJson(allocator: std.mem.Allocator, key: []const u8, json: std.json.Value) !Type {
         if (equalsString(json, "native")) {
@@ -336,6 +342,19 @@ const Type = union(enum) {
                     fields[i] = .{ .name = field_name, .type = field_type };
                 }
                 return .{ .container = .{ .fields = fields } };
+            }
+            if (std.mem.eql(u8, constructor.name, "mapper")) {
+                const object = try expectObject(constructor.arg);
+                const typ = try NativeType.fromString(try expectString(try expectGet(object, "type")));
+                const mappings_object = try expectObject(try expectGet(object, "mappings"));
+                var mappings = try allocator.alloc(Mapping, mappings_object.count());
+                var i: usize = 0;
+                var it = mappings_object.iterator();
+                while (it.next()) |entry| : (i += 1) {
+                    const value = try std.fmt.parseInt(i64, entry.key_ptr.*, 0);
+                    mappings[i] = .{ .value = value, .name = try expectString(entry.value_ptr.*) };
+                }
+                return .{ .mapper = .{ .mappings = mappings, .type = typ } };
             }
             if (std.mem.eql(u8, constructor.name, "bitfield")) {
                 const array = try expectArray(constructor.arg);
@@ -395,15 +414,15 @@ const Type = union(enum) {
         return .todo;
     }
 
-    pub fn resolve(self: *const Type, allocator: std.mem.Allocator, scope: Scope) !*ResolvedType {
+    pub fn resolve(self: *const Type, allocator: std.mem.Allocator, scope: Scope, parentContainer: ?*ResolvedContainer) !*ResolvedType {
         switch (self.*) {
             .reference => |reference| {
                 if (scope.outer.types.get(reference)) |referenced| {
-                    return referenced.resolve(allocator, Scope{ .outer = scope.outer, .inner = null });
+                    return referenced.resolve(allocator, Scope{ .outer = scope.outer, .inner = null }, null);
                 }
                 if (scope.inner) |inner| {
                     if (inner.types.get(reference)) |referenced| {
-                        return referenced.resolve(allocator, scope);
+                        return referenced.resolve(allocator, scope, parentContainer);
                     }
                 }
                 return error.UndefinedReference;
@@ -413,7 +432,7 @@ const Type = union(enum) {
                 var fields = try allocator.alloc(ResolvedField, container.fields.len);
                 result.* = .{ .container = .{ .fields = fields[0..0] } };
                 for (0.., container.fields) |i, field| {
-                    fields[i] = .{ .name = field.name, .type = try field.type.resolve(allocator, scope) };
+                    fields[i] = .{ .name = field.name, .type = try field.type.resolve(allocator, scope, &result.container) };
                     result.container.fields = fields[0 .. i + 1];
                 }
                 return result;
@@ -428,23 +447,74 @@ const Type = union(enum) {
                 result.* = .{ .pstring = .{ .countType = pstring.countType } };
                 return result;
             },
+            .switch_ => |switch_| {
+                const compareTo = try resolveReference(switch_.compareTo, parentContainer);
+                const result = try allocator.create(ResolvedType);
+                var fields = try allocator.alloc(ResolvedVariant, switch_.fields.len);
+                for (0.., switch_.fields) |i, field| {
+                    fields[i] = .{
+                        .value = field.name,
+                        .type = try field.type.resolve(allocator, scope, parentContainer),
+                    };
+                }
+                result.* = .{
+                    .switch_ = .{
+                        .compareTo = compareTo,
+                        .variants = fields,
+                        .default = try switch_.default.resolve(allocator, scope, parentContainer),
+                    },
+                };
+                return result;
+            },
+            .mapper => |mapper| {
+                const result = try allocator.create(ResolvedType);
+                result.* = .{ .mapper = .{ .mappings = mapper.mappings, .type = mapper.type } };
+                return result;
+            },
             else => return error.Todo,
         }
     }
 };
 
+fn resolveReference(reference: []const u8, parentContainer: ?*ResolvedContainer) !*ResolvedField {
+    if (parentContainer) |pc| {
+        for (0.., pc.fields) |i, field| {
+            if (std.mem.eql(u8, field.name, reference)) {
+                pc.fields[i].referenced = true;
+                return &pc.fields[i];
+            }
+        }
+    }
+    return error.InvalidCompareTo;
+}
+
 const ResolvedField = struct {
     name: []const u8,
+    type: *ResolvedType,
+    referenced: bool = false,
+    currentValue: i64 = 0,
+};
+
+const ResolvedContainer = struct {
+    fields: []ResolvedField,
+};
+
+const ResolvedVariant = struct {
+    value: []const u8,
     type: *ResolvedType,
 };
 
 const ResolvedType = union(enum) {
     todo,
     native: NativeType,
-    container: struct { fields: []ResolvedField },
+    container: ResolvedContainer,
     pstring: struct { countType: NativeType },
-    // array: struct { count: ArrayCount, elementType: *Type },
-    // switch_: struct { compareTo: []const u8, fields: []Field, default: *Type },
+    switch_: struct {
+        compareTo: *ResolvedField,
+        variants: []ResolvedVariant,
+        default: *ResolvedType,
+    },
+    mapper: struct { type: NativeType, mappings: []Mapping },
 };
 
 const Cursor = struct {

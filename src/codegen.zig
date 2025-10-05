@@ -11,7 +11,7 @@ error.Todo
 error.Todo
 
 // entityMetadataItem
-error.Todo
+error.InvalidCompareTo
 
 // entityMetadata
 error.Todo
@@ -74,7 +74,7 @@ error.Todo
 .{ .native = .option }
 
 // soundSource
-error.Todo
+.{ .mapper = .{ .type = .varint, .mappings = { .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... } } } }
 
 // vec4f
 .{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... }, .{ ... } } } }
@@ -83,7 +83,7 @@ error.Todo
 .{ .native = .u64 }
 
 // particleData
-error.Todo
+error.InvalidCompareTo
 
 // minecraft_simple_recipe_format
 .{ .container = .{ .fields = { .{ ... } } } }
@@ -116,7 +116,7 @@ error.Todo
 .{ .native = .restBuffer }
 
 // slot
-error.Todo
+.{ .container = .{ .fields = { .{ ... }, .{ ... } } } }
 
 // string
 .{ .pstring = .{ .countType = .varint } }
@@ -173,7 +173,7 @@ pub const handshaking = struct {
         .{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... }, .{ ... } } } }
 
         // packet
-        error.Todo
+        .{ .container = .{ .fields = { .{ ... }, .{ ... } } } }
 
         // packet_legacy_server_list_ping
         .{ .container = .{ .fields = { .{ ... } } } }
@@ -191,7 +191,7 @@ pub const status = struct {
         .{ .container = .{ .fields = {  } } }
 
         // packet
-        error.Todo
+        .{ .container = .{ .fields = { .{ ... }, .{ ... } } } }
 
 
     };
@@ -227,7 +227,7 @@ pub const play = struct {
         .{ .container = .{ .fields = { .{ ... } } } }
 
         // packet_set_creative_slot
-        error.Todo
+        .{ .container = .{ .fields = { .{ ... }, .{ ... } } } }
 
         // packet_chat_command
         error.Todo
@@ -245,7 +245,7 @@ pub const play = struct {
         .{ .container = .{ .fields = { .{ ... } } } }
 
         // packet_use_entity
-        error.Todo
+        .{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... } } } }
 
         // packet_position
         .{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... }, .{ ... } } } }
@@ -293,7 +293,7 @@ pub const play = struct {
         error.Todo
 
         // packet_advancement_tab
-        error.Todo
+        .{ .container = .{ .fields = { .{ ... }, .{ ... } } } }
 
         // packet_entity_action
         .{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... } } } }
