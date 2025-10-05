@@ -8,15 +8,28 @@ const String = @import("string.zig").String;
 
 const nbt = @import("nbt.zig");
 
-pub fn main() !void {
-    const path = "/var/home/admin/.var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/instances/1.21.5/minecraft/saves/Super Flat Test 2/playerdata/dfd7dc6d-cffd-4f60-90b9-a4a5002f1111.dat";
-    const file = try std.fs.openFileAbsolute(path, .{});
+pub fn openNbtFile(name: []const u8, allocator: *std.mem.Allocator) !nbt.NbtData {
+    const file = try std.fs.cwd().openFile(name, .{});
     defer file.close();
-    var buf = std.mem.zeroes([100_000]u8);
-    var buf2 = std.mem.zeroes([100_000]u8);
-    var file_reader = file.reader(&buf2);
-    var d = std.compress.flate.Decompress.init(&file_reader.interface, .gzip, &buf);
+    var buf = std.mem.zeroes([16384]u8);
+    var file_reader = file.reader(&buf);
+    const data = try nbt.NbtData.read(&file_reader.interface, allocator);
+    return data;
+}
+
+pub fn writeNbtFile(name: []const u8, data: nbt.NbtData) !void {
+    const file = try std.fs.cwd().createFile(name, .{});
+    defer file.close();
+    var buf = std.mem.zeroes([16384]u8);
+    var file_writer = file.writer(&buf);
+    try data.write(&file_writer.interface);
+}
+
+pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     var allocator = gpa.allocator();
-    _ = try nbt.NbtData.read(&d.reader, &allocator);
+    const data = try openNbtFile("nbt", &allocator);
+    data.print(0);
+
+    try writeNbtFile("nbt-out", data);
 }
