@@ -241,6 +241,7 @@ pub const NbtData = struct {
         try writer.writeAll(self.name);
         try self.data.write(writer);
         std.debug.print("writing: {s} ", .{self.name});
+        try writer.flush();
     }
 
     pub fn print(self: NbtData, indent: u32) void {
