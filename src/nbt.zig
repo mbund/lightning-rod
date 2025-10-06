@@ -240,7 +240,6 @@ pub const NbtData = struct {
         try writer.writeInt(u16, len, std.builtin.Endian.big);
         try writer.writeAll(self.name);
         try self.data.write(writer);
-        std.debug.print("writing: {s} ", .{self.name});
         try writer.flush();
     }
 
@@ -253,3 +252,50 @@ pub const NbtData = struct {
         std.debug.print("\n", .{});
     }
 };
+
+test "basic_read" {
+    const buf = [10]u8{ 0x03, 0x00, 0x03, 0x69, 0x6e, 0x74, 0x00, 0x00, 0x00, 0x2f };
+    var reader = std.io.Reader.fixed(&buf);
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var allocator = gpa.allocator();
+    const data = try NbtData.read(&reader, &allocator);
+    std.debug.assert(std.mem.eql(u8, data.name, "int"));
+    std.debug.assert(data.data.int == 47);
+}
+
+test "basic_write" {
+    const data = NbtData{ .name = @constCast("int"), .data = NbtPayload{ .int = 47 } };
+    var buf = std.mem.zeroes([10]u8);
+    var writer = std.io.Writer.fixed(&buf);
+    try data.write(&writer);
+    std.debug.assert(std.mem.eql(u8, &buf, &[10]u8{ 0x03, 0x00, 0x03, 0x69, 0x6e, 0x74, 0x00, 0x00, 0x00, 0x2f }));
+}
+
+test "pair_read" {
+    const buf = [33]u8{ 0x0a, 0x00, 0x00, 0x04, 0x00, 0x05, 0x66, 0x69, 0x72, 0x73, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xe2, 0x40, 0x05, 0x00, 0x06, 0x73, 0x65, 0x63, 0x6f, 0x6e, 0x64, 0x3f, 0x00, 0x00, 0x00, 0x00 };
+    var reader = std.io.Reader.fixed(&buf);
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var allocator = gpa.allocator();
+    const data = try NbtData.read(&reader, &allocator);
+    std.debug.assert(data.name.len == 0);
+    std.debug.assert(data.data.compound.items.len == 2);
+    std.debug.assert(std.mem.eql(u8, data.data.compound.items[0].name, "first"));
+    std.debug.assert(data.data.compound.items[0].data.long == 123456);
+    std.debug.assert(std.mem.eql(u8, data.data.compound.items[1].name, "second"));
+    std.debug.assert(data.data.compound.items[1].data.float == 0.5);
+}
+
+test "pair_write" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+
+    var list = std.ArrayList(NbtData){};
+    try list.append(allocator, NbtData{ .name = @constCast("first"), .data = NbtPayload{ .long = 123456 } });
+    try list.append(allocator, NbtData{ .name = @constCast("second"), .data = NbtPayload{ .float = 0.5 } });
+
+    const data = NbtData{ .name = @constCast(""), .data = NbtPayload{ .compound = list } };
+    var buf = std.mem.zeroes([33]u8);
+    var writer = std.io.Writer.fixed(&buf);
+    try data.write(&writer);
+    std.debug.assert(std.mem.eql(u8, &buf, &[33]u8{ 0x0a, 0x00, 0x00, 0x04, 0x00, 0x05, 0x66, 0x69, 0x72, 0x73, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xe2, 0x40, 0x05, 0x00, 0x06, 0x73, 0x65, 0x63, 0x6f, 0x6e, 0x64, 0x3f, 0x00, 0x00, 0x00, 0x00 }));
+}

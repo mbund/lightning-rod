@@ -11,9 +11,24 @@ const log = std.log.scoped(.tcp_epoll_server);
 
 const nbt = @import("nbt.zig");
 
+pub fn writeNbtFile(name: []const u8, data: nbt.NbtData) !void {
+    const file = try std.fs.cwd().createFile(name, .{});
+    defer file.close();
+    var buf = std.mem.zeroes([16384]u8);
+    var file_writer = file.writer(&buf);
+    try data.write(&file_writer.interface);
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
+
+    var list = std.ArrayList(nbt.NbtData){};
+    try list.append(allocator, nbt.NbtData{ .name = @constCast("first"), .data = nbt.NbtPayload{ .long = 123456 } });
+    try list.append(allocator, nbt.NbtData{ .name = @constCast("second"), .data = nbt.NbtPayload{ .float = 0.5 } });
+
+    const data = nbt.NbtData{ .name = @constCast(""), .data = nbt.NbtPayload{ .compound = list } };
+    try writeNbtFile("out", data);
 
     var server = try Server.init(allocator, 4096);
     defer server.deinit();
