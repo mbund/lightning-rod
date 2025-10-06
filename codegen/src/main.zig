@@ -77,8 +77,14 @@ const Types = struct {
             try printIndent(writer, indent);
             try writer.print("// {s}\n", .{entry.key_ptr.*});
             try printIndent(writer, indent);
-            const resolved = entry.value_ptr.resolve(allocator, scope, null);
-            try writer.print("{any}", .{resolved});
+            const resolved = entry.value_ptr.resolve(allocator, scope, null) catch |err| {
+                try writer.print("{any}", .{err});
+                try writer.print("\n\n", .{});
+                continue;
+            };
+            var cursors = try Cursors.init(allocator);
+            const cursor = resolved.cursor(&cursors);
+            try writer.print("{any}", .{cursor});
             try writer.print("\n\n", .{});
         }
     }
@@ -497,6 +503,28 @@ const ResolvedField = struct {
 
 const ResolvedContainer = struct {
     fields: []ResolvedField,
+
+    pub fn cursor(self: *const ResolvedContainer, cursors: *Cursors, i: usize) anyerror!CursorTree {
+        if (self.fields[i].referenced) {
+            switch (self.fields[i].type.*) {
+                .mapper => |mapper| {
+                    var result = try cursors.allocateCursor();
+                    result.readType = .{ .native = mapper.type };
+                    result.next = .{ .switch_ =  }
+                },
+                else => {
+                    return error.Todo;
+                },
+            }
+        } else {
+            var result = try self.fields[i].type.cursor(cursors);
+            if (i + 1 < self.fields.len) {
+                const next = try self.cursor(cursors, i + 1);
+                result.updateNext(next.head);
+            }
+            return result;
+        }
+    }
 };
 
 const ResolvedVariant = struct {
@@ -515,17 +543,93 @@ const ResolvedType = union(enum) {
         default: *ResolvedType,
     },
     mapper: struct { type: NativeType, mappings: []Mapping },
+
+    pub fn cursor(self: *const ResolvedType, cursors: *Cursors) anyerror!CursorTree {
+        switch (self.*) {
+            .native => |native| {
+                const result = try cursors.allocateCursor();
+                result.readType = .{ .native = native };
+                result.next = .none;
+                return .{ .head = result, .tails = .{ .one = result } };
+            },
+            .container => |container| {
+                if (container.fields.len == 0) {
+                    return error.Todo;
+                }
+                return container.cursor(cursors, 0);
+            },
+            .pstring => |pstring| {
+                const result = try cursors.allocateCursor();
+                result.readType = .{ .pstring = pstring.countType };
+                result.next = .none;
+                return .{ .head = result, .tails = .{ .one = result } };
+            },
+            else => {
+                return error.Todo;
+            },
+        }
+    }
+};
+
+const CursorTree = struct {
+    head: *Cursor,
+    tails: union(enum) {
+        one: *Cursor,
+        many: []*Cursor,
+    },
+
+    pub fn updateNext(self: *CursorTree, next: *Cursor) void {
+        switch (self.tails) {
+            .many => |many| {
+                for (many) |f| {
+                    f.next = .{ .always = next };
+                }
+            },
+            .one => |o| {
+                o.next = .{ .always = o };
+            },
+        }
+    }
+};
+
+const CursorVariant = struct {
+    value: i64,
+    cursor: *Cursor,
 };
 
 const Cursor = struct {
-    justRead: ?struct {
-        name: []const u8,
-        typ: NativeType,
+    name: []const u8,
+    readType: union(enum) {
+        native: NativeType,
+        pstring: NativeType,
     },
-    toRead: union(enum) {
-        simple: *Cursor, // type is defined in next cursor's justRead
-        done,
+    next: union(enum) {
+        always: *Cursor,
+        switch_: struct {
+            variants: []CursorVariant,
+            default: *Cursor,
+        },
+        none,
     },
+};
+
+const Cursors = struct {
+    cursors: std.ArrayList(*Cursor),
+    allocator: std.mem.Allocator,
+
+    pub fn allocateCursor(self: *Cursors) !*Cursor {
+        const cursor = try self.allocator.create(Cursor);
+        cursor.name = "Cursor";
+        try self.cursors.append(self.allocator, cursor);
+        return cursor;
+    }
+
+    pub fn init(allocator: std.mem.Allocator) !Cursors {
+        return .{
+            .cursors = try std.ArrayList(*Cursor).initCapacity(allocator, 0),
+            .allocator = allocator,
+        };
+    }
 };
 
 fn readJson(

@@ -2,7 +2,7 @@ const std = @import("std");
 const protocol_support = @import("protocol_support.zig");
 
 // optionalNbt
-.{ .native = .optionalNbt }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .optionalNbt }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // previousMessages
 error.Todo
@@ -17,85 +17,85 @@ error.InvalidCompareTo
 error.Todo
 
 // switch
-.{ .native = .fake }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .fake }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // i16
-.{ .native = .i16 }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .i16 }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // vec3f
-.{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... } } } }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .f32 }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // void
-.{ .native = .void }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .void }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // array
-.{ .native = .fake }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .fake }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // ItemSoundHolder
 error.Todo
 
 // u16
-.{ .native = .u16 }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .u16 }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // nbt
-.{ .native = .nbt }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .nbt }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // registryEntryHolder
-.{ .native = .registryEntryHolder }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .registryEntryHolder }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // optvarint
-.{ .native = .varint }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .varint }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // bitflags
-.{ .native = .bitflags }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .bitflags }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // bitfield
-.{ .native = .fake }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .fake }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // packedChunkPos
-.{ .container = .{ .fields = { .{ ... }, .{ ... } } } }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .i32 }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // u8
-.{ .native = .u8 }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .u8 }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // i32
-.{ .native = .i32 }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .i32 }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // buffer
-.{ .native = .buffer }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .buffer }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // tags
 error.Todo
 
 // varlong
-.{ .native = .varlong }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .varlong }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // option
-.{ .native = .option }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .option }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // soundSource
-.{ .mapper = .{ .type = .varint, .mappings = { .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... } } } }
+error.Todo
 
 // vec4f
-.{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... }, .{ ... } } } }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .f32 }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // u64
-.{ .native = .u64 }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .u64 }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // particleData
 error.InvalidCompareTo
 
 // minecraft_simple_recipe_format
-.{ .container = .{ .fields = { .{ ... } } } }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .varint }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // f32
-.{ .native = .f32 }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .f32 }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // u32
-.{ .native = .u32 }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .u32 }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // registryEntryHolderSet
-.{ .native = .registryEntryHolderSet }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .registryEntryHolderSet }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // position
 error.Todo
@@ -110,40 +110,40 @@ error.Todo
 error.Todo
 
 // bool
-.{ .native = .bool }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .bool }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // restBuffer
-.{ .native = .restBuffer }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .restBuffer }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // slot
-.{ .container = .{ .fields = { .{ ... }, .{ ... } } } }
+error.Todo
 
 // string
-.{ .pstring = .{ .countType = .varint } }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .pstring = .varint }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // particle
 error.Todo
 
 // f64
-.{ .native = .f64 }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .f64 }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // varint
-.{ .native = .varint }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .varint }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // i64
-.{ .native = .i64 }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .i64 }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // ByteArray
 error.Todo
 
 // entityMetadataLoop
-.{ .native = .entityMetadataLoop }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .entityMetadataLoop }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // UUID
-.{ .native = .UUID }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .UUID }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // i8
-.{ .native = .i8 }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .i8 }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // command_node
 error.Todo
@@ -155,28 +155,28 @@ error.Todo
 error.Todo
 
 // container
-.{ .native = .fake }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .fake }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // pstring
-.{ .native = .pstring }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .pstring }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // vec3f64
-.{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... } } } }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .f64 }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 // topBitSetTerminatedArray
-.{ .native = .topBitSetTerminatedArray }
+.{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .topBitSetTerminatedArray }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 
 pub const handshaking = struct {
     pub const toServer = struct {
         // packet_set_protocol
-        .{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... }, .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .varint }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet
-        .{ .container = .{ .fields = { .{ ... }, .{ ... } } } }
+        error.Todo
 
         // packet_legacy_server_list_ping
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .u8 }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
 
     };
@@ -185,13 +185,13 @@ pub const handshaking = struct {
 pub const status = struct {
     pub const toServer = struct {
         // packet_ping
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .i64 }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_ping_start
-        .{ .container = .{ .fields = {  } } }
+        error.Todo
 
         // packet
-        .{ .container = .{ .fields = { .{ ... }, .{ ... } } } }
+        error.Todo
 
 
     };
@@ -218,85 +218,85 @@ pub const login = struct {
 pub const play = struct {
     pub const toServer = struct {
         // packet_displayed_recipe
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .pstring = .varint }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_keep_alive
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .i64 }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_close_window
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .u8 }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_set_creative_slot
-        .{ .container = .{ .fields = { .{ ... }, .{ ... } } } }
+        error.Todo
 
         // packet_chat_command
         error.Todo
 
         // packet_look
-        .{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .f32 }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_update_structure_block
         error.Todo
 
         // packet_client_command
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .varint }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_pong
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .i32 }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_use_entity
-        .{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... } } } }
+        error.Todo
 
         // packet_position
-        .{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... }, .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .f64 }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_recipe_book
-        .{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .varint }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_set_beacon_effect
         error.Todo
 
         // packet_name_item
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .pstring = .varint }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_custom_payload
-        .{ .container = .{ .fields = { .{ ... }, .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .pstring = .varint }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_lock_difficulty
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .bool }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_vehicle_move
-        .{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .f64 }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_flying
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .bool }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_settings
-        .{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .pstring = .varint }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_select_trade
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .varint }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_update_command_block
         error.Todo
 
         // packet_update_command_block_minecart
-        .{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .varint }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_set_difficulty
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .u8 }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_resource_pack_receive
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .varint }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_query_block_nbt
         error.Todo
 
         // packet_advancement_tab
-        .{ .container = .{ .fields = { .{ ... }, .{ ... } } } }
+        error.Todo
 
         // packet_entity_action
-        .{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .varint }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_block_place
         error.Todo
@@ -305,13 +305,13 @@ pub const play = struct {
         error.Todo
 
         // packet_teleport_confirm
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .varint }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_enchant_item
-        .{ .container = .{ .fields = { .{ ... }, .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .i8 }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_steer_vehicle
-        .{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .f32 }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_edit_book
         error.Todo
@@ -323,28 +323,28 @@ pub const play = struct {
         error.Todo
 
         // packet_arm_animation
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .varint }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_tab_complete
-        .{ .container = .{ .fields = { .{ ... }, .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .varint }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_use_item
-        .{ .container = .{ .fields = { .{ ... }, .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .varint }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_craft_recipe_request
-        .{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .i8 }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_position_look
-        .{ .container = .{ .fields = { .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... }, .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .f64 }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_abilities
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .i8 }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_query_entity_nbt
-        .{ .container = .{ .fields = { .{ ... }, .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .varint }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_steer_boat
-        .{ .container = .{ .fields = { .{ ... }, .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .bool }, .next = .{ .always = .{ ... } } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_chat_message
         error.Todo
@@ -353,10 +353,10 @@ pub const play = struct {
         error.Todo
 
         // packet_spectate
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .UUID }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_pick_item
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .varint }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet
         error.Todo
@@ -365,10 +365,10 @@ pub const play = struct {
         error.Todo
 
         // packet_held_item_slot
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .i16 }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_message_acknowledgement
-        .{ .container = .{ .fields = { .{ ... } } } }
+        .{ .head = .{ .name = { 67, 117, 114, 115, 111, 114 }, .readType = .{ .native = .varint }, .next = .{ .none = void } }, .tails = .{ .one = .{ .name = { ... }, .readType = .{ ... }, .next = .{ ... } } } }
 
         // packet_update_sign
         error.Todo
