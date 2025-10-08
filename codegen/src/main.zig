@@ -47,9 +47,9 @@ const Protocol = struct {
         try self.types.codegen(allocator, writer, 0, .{ .outer = &self.types, .inner = null });
         try writer.print("\n", .{});
         try self.handshaking.codegen(allocator, writer, "handshaking", &self.types, 0);
-        try self.status.codegen(allocator, writer, "status", &self.types, 0);
-        try self.login.codegen(allocator, writer, "login", &self.types, 0);
-        try self.play.codegen(allocator, writer, "play", &self.types, 0);
+        // try self.status.codegen(allocator, writer, "status", &self.types, 0);
+        // try self.login.codegen(allocator, writer, "login", &self.types, 0);
+        // try self.play.codegen(allocator, writer, "play", &self.types, 0);
         try writer.print("\n", .{});
     }
 };
@@ -477,7 +477,7 @@ const Type = union(enum) {
                 result.* = .{ .mapper = .{ .mappings = mapper.mappings, .type = mapper.type } };
                 return result;
             },
-            else => return error.Todo,
+            else => return error.Todo1,
         }
     }
 };
@@ -498,7 +498,7 @@ const ResolvedField = struct {
     name: []const u8,
     type: *ResolvedType,
     referenced: bool = false,
-    currentValue: i64 = 0,
+    currentValue: ?i64 = null,
 };
 
 const ResolvedContainer = struct {
@@ -508,21 +508,51 @@ const ResolvedContainer = struct {
         if (self.fields[i].referenced) {
             switch (self.fields[i].type.*) {
                 .mapper => |mapper| {
-                    var result = try cursors.allocateCursor();
-                    result.readType = .{ .native = mapper.type };
-                    result.next = .{ .switch_ =  }
+                    var c = try cursors.allocateCursor();
+                    c.readType = .{ .native = mapper.type };
+                    const variants = try cursors.allocator.alloc(CursorVariant, mapper.mappings.len);
+                    var tails = try std.ArrayList(*Cursor).initCapacity(cursors.allocator, 0);
+                    for (0.., mapper.mappings) |j, mapping| {
+                        self.fields[i].currentValue = mapping.value;
+                        const nextTree = try self.cursor(cursors, i + 1);
+                        switch (nextTree.tails) {
+                            .one => |one| try tails.append(cursors.allocator, one),
+                            .many => |many| try tails.appendSlice(cursors.allocator, many.items),
+                        }
+                        variants[j] = .{
+                            .value = mapping.value,
+                            .cursor = nextTree.head,
+                        };
+                    }
+                    self.fields[i].currentValue = null;
+                    const defaultNextTree = try self.cursor(cursors, i + 1);
+                    switch (defaultNextTree.tails) {
+                        .one => |one| try tails.append(cursors.allocator, one),
+                        .many => |many| try tails.appendSlice(cursors.allocator, many.items),
+                    }
+                    c.next = .{
+                        .switch_ = .{
+                            .variants = variants,
+                            .default = defaultNextTree.head,
+                        },
+                    };
+                    return .{
+                        .head = c,
+                        .tails = .{ .many = tails },
+                    };
                 },
                 else => {
-                    return error.Todo;
+                    return error.Todo2;
                 },
             }
         } else {
-            var result = try self.fields[i].type.cursor(cursors);
+            var cursorTree = try self.fields[i].type.cursor(cursors);
             if (i + 1 < self.fields.len) {
                 const next = try self.cursor(cursors, i + 1);
-                result.updateNext(next.head);
+                try cursorTree.updateNext(next.head);
+                cursorTree.tails = next.tails;
             }
-            return result;
+            return cursorTree;
         }
     }
 };
@@ -554,7 +584,7 @@ const ResolvedType = union(enum) {
             },
             .container => |container| {
                 if (container.fields.len == 0) {
-                    return error.Todo;
+                    return error.Todo3;
                 }
                 return container.cursor(cursors, 0);
             },
@@ -564,29 +594,57 @@ const ResolvedType = union(enum) {
                 result.next = .none;
                 return .{ .head = result, .tails = .{ .one = result } };
             },
+            .switch_ => |switch_| {
+                switch (switch_.compareTo.type.*) {
+                    .mapper => |mapper| {
+                        if (switch_.compareTo.currentValue) |currentValue| {
+                            const currentValueName = blk: {
+                                for (mapper.mappings) |mapping| {
+                                    if (mapping.value == currentValue) {
+                                        break :blk mapping.name;
+                                    }
+                                }
+                                @panic("unreachable");
+                            };
+                            for (switch_.variants) |variant| {
+                                if (std.mem.eql(u8, variant.value, currentValueName)) {
+                                    return variant.type.cursor(cursors);
+                                }
+                            }
+                        }
+                        return switch_.default.cursor(cursors);
+                    },
+                    else => {
+                        return error.Todo5;
+                    },
+                }
+            },
             else => {
-                return error.Todo;
+                return error.Todo4;
             },
         }
     }
 };
 
+const CursorTreeTails = union(enum) {
+    one: *Cursor,
+    many: std.ArrayList(*Cursor),
+};
+
 const CursorTree = struct {
     head: *Cursor,
-    tails: union(enum) {
-        one: *Cursor,
-        many: []*Cursor,
-    },
+    tails: CursorTreeTails,
 
-    pub fn updateNext(self: *CursorTree, next: *Cursor) void {
+    pub fn updateNext(self: *CursorTree, next: *Cursor) !void {
         switch (self.tails) {
             .many => |many| {
-                for (many) |f| {
+                for (many.items) |f| {
                     f.next = .{ .always = next };
                 }
             },
             .one => |o| {
                 o.next = .{ .always = o };
+                self.tails = .{ .one = o };
             },
         }
     }
