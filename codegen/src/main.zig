@@ -83,6 +83,7 @@ const Types = struct {
                 continue;
             };
             var cursors = try Cursors.init(allocator);
+            try cursors.pushName("packet");
             const cursorTree = try resolved.cursor(&cursors);
             try cursorTree.head.codegen(null, writer);
         }
@@ -503,11 +504,15 @@ const ResolvedContainer = struct {
             switch (self.fields[i].type.*) {
                 .mapper => |mapper| {
                     var c = try cursors.allocateCursor();
+                    try cursors.pushName(self.fields[i].name);
                     const variants = try cursors.allocator.alloc(CursorVariant, mapper.mappings.len);
+                    cursors.popName();
                     var tails = try std.ArrayList(*Cursor).initCapacity(cursors.allocator, 0);
                     for (0.., mapper.mappings) |j, mapping| {
                         self.fields[i].currentValue = mapping.value;
+                        try cursors.pushName(mapping.name);
                         const nextTree = try self.cursor(cursors, i + 1);
+                        cursors.popName();
                         switch (nextTree.tails) {
                             .one => |one| try tails.append(cursors.allocator, one),
                             .many => |many| try tails.appendSlice(cursors.allocator, many.items),
@@ -540,7 +545,9 @@ const ResolvedContainer = struct {
                 },
             }
         } else {
+            try cursors.pushName(self.fields[i].name);
             var cursorTree = try self.fields[i].type.cursor(cursors);
+            cursors.popName();
             if (i + 1 < self.fields.len) {
                 const next = try self.cursor(cursors, i + 1);
                 try cursorTree.updateNext(next.head);
@@ -711,23 +718,37 @@ const Cursor = struct {
 };
 
 const Cursors = struct {
-    cursors: std.ArrayList(*Cursor),
     allocator: std.mem.Allocator,
-    i: usize,
+    namestack: std.ArrayList([]const u8),
 
     pub fn allocateCursor(self: *Cursors) !*Cursor {
         const cursor = try self.allocator.create(Cursor);
-        cursor.name = try std.fmt.allocPrint(self.allocator, "Cursor{}", .{self.i});
-        self.i += 1;
-        try self.cursors.append(self.allocator, cursor);
+        var name = try std.ArrayList(u8).initCapacity(self.allocator, 0);
+        defer name.deinit(self.allocator);
+        for (0.., self.namestack.items) |i, part| {
+            if (i > 0) try name.appendSlice(self.allocator, "__");
+            try name.appendSlice(self.allocator, part);
+        }
+        cursor.name = try std.fmt.allocPrint(self.allocator, "{s}", .{name.items});
         return cursor;
+    }
+
+    pub fn pushName(self: *Cursors, name: []const u8) !void {
+        try self.namestack.append(self.allocator, name);
+    }
+
+    pub fn popName(self: *Cursors) void {
+        _ = self.namestack.pop();
+    }
+
+    pub fn peekName(self: *Cursors) ![]const u8 {
+        return self.namestack.getLastOrNull() orelse error.Empty;
     }
 
     pub fn init(allocator: std.mem.Allocator) !Cursors {
         return .{
-            .cursors = try std.ArrayList(*Cursor).initCapacity(allocator, 0),
             .allocator = allocator,
-            .i = 0,
+            .namestack = try std.ArrayList([]const u8).initCapacity(allocator, 0),
         };
     }
 };
