@@ -503,7 +503,6 @@ const ResolvedContainer = struct {
             switch (self.fields[i].type.*) {
                 .mapper => |mapper| {
                     var c = try cursors.allocateCursor();
-                    c.readType = .{ .native = mapper.type };
                     const variants = try cursors.allocator.alloc(CursorVariant, mapper.mappings.len);
                     var tails = try std.ArrayList(*Cursor).initCapacity(cursors.allocator, 0);
                     for (0.., mapper.mappings) |j, mapping| {
@@ -524,8 +523,9 @@ const ResolvedContainer = struct {
                         .one => |one| try tails.append(cursors.allocator, one),
                         .many => |many| try tails.appendSlice(cursors.allocator, many.items),
                     }
-                    c.next = .{
-                        .switch_ = .{
+                    c.kind = .{
+                        .variants = .{
+                            .readType = mapper.type,
                             .variants = variants,
                             .default = defaultNextTree.head,
                         },
@@ -572,8 +572,7 @@ const ResolvedType = union(enum) {
         switch (self.*) {
             .native => |native| {
                 const result = try cursors.allocateCursor();
-                result.readType = .{ .native = native };
-                result.next = .none;
+                result.kind = .{ .simple = .{ .readType = .{ .native = native }, .next = null } };
                 return .{ .head = result, .tails = .{ .one = result } };
             },
             .container => |container| {
@@ -584,8 +583,7 @@ const ResolvedType = union(enum) {
             },
             .pstring => |pstring| {
                 const result = try cursors.allocateCursor();
-                result.readType = .{ .pstring = pstring.countType };
-                result.next = .none;
+                result.kind = .{ .simple = .{ .readType = .{ .pstring = pstring.countType }, .next = null } };
                 return .{ .head = result, .tails = .{ .one = result } };
             },
             .switch_ => |switch_| {
@@ -633,11 +631,11 @@ const CursorTree = struct {
         switch (self.tails) {
             .many => |many| {
                 for (many.items) |f| {
-                    f.next = .{ .always = next };
+                    try f.updateNext(next);
                 }
             },
             .one => |o| {
-                o.next = .{ .always = o };
+                try o.updateNext(next);
                 self.tails = .{ .one = o };
             },
         }
@@ -651,48 +649,63 @@ const CursorVariant = struct {
 
 const Cursor = struct {
     name: []const u8,
-    readType: union(enum) {
-        native: NativeType,
-        pstring: NativeType,
-    },
-    next: union(enum) {
-        always: *Cursor,
-        switch_: struct {
+    kind: union(enum) {
+        simple: struct {
+            readType: union(enum) {
+                native: NativeType,
+                pstring: NativeType,
+            },
+            next: ?*Cursor,
+        },
+        variants: struct {
+            readType: NativeType,
             variants: []CursorVariant,
             default: *Cursor,
         },
-        none,
     },
     visited: bool = false,
 
     pub fn codegen(self: *Cursor, prev: ?*Cursor, writer: *IndentedWriter) !void {
+        _ = prev;
         if (self.visited) {
             return;
         }
         self.visited = true;
 
-        try writer.println("const {s} = struct {{", .{self.name});
+        try writer.println("pub const {s} = struct {{", .{self.name});
         writer.indent();
         try writer.println("buffer: []const u8;", .{});
-        if (prev) |p| {
-            // p.
-            try writer.println("// previous {s}", .{p.name});
-        }
-        writer.unindent();
-        try writer.println("}}", .{});
-        try writer.println("", .{});
 
-        switch (self.next) {
-            .always => |always| {
-                try always.codegen(self, writer);
+        switch (self.kind) {
+            .simple => |simple| {
+                try writer.println("// simple", .{});
+                try writer.println("// {any}", .{simple});
+                writer.unindent();
+                try writer.println("}}", .{});
+                try writer.println("", .{});
+                if (simple.next) |next| {
+                    try next.codegen(self, writer);
+                }
             },
-            .switch_ => |switch_| {
-                for (switch_.variants) |variant| {
+            .variants => |variants| {
+                try writer.println("// variants", .{});
+                writer.unindent();
+                try writer.println("}}", .{});
+                try writer.println("", .{});
+                for (variants.variants) |variant| {
                     try variant.cursor.codegen(self, writer);
                 }
-                try switch_.default.codegen(self, writer);
+                try variants.default.codegen(self, writer);
             },
-            .none => {},
+        }
+    }
+
+    pub fn updateNext(self: *Cursor, next: *Cursor) !void {
+        switch (self.kind) {
+            .simple => |_| {
+                self.kind.simple.next = next;
+            },
+            else => return error.UpdateNextOnNonSimple,
         }
     }
 };
