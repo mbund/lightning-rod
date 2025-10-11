@@ -85,7 +85,7 @@ const Types = struct {
             var cursors = try Cursors.init(allocator);
             try cursors.pushName("packet");
             const cursorTree = try resolved.cursor(&cursors);
-            try cursorTree.head.codegen(null, writer);
+            try cursorTree.head.codegen(writer);
         }
     }
 };
@@ -661,6 +661,13 @@ const Cursor = struct {
             readType: union(enum) {
                 native: NativeType,
                 pstring: NativeType,
+
+                pub fn codegenType(self: @This()) ![]const u8 {
+                    return switch (self) {
+                        .native => |native| try native.codegenType(),
+                        .pstring => |_| "[]const u8",
+                    };
+                }
             },
             next: ?*Cursor,
         },
@@ -670,10 +677,10 @@ const Cursor = struct {
             default: *Cursor,
         },
     },
+    fieldName: []const u8,
     visited: bool = false,
 
-    pub fn codegen(self: *Cursor, prev: ?*Cursor, writer: *IndentedWriter) !void {
-        _ = prev;
+    pub fn codegen(self: *Cursor, writer: *IndentedWriter) !void {
         if (self.visited) {
             return;
         }
@@ -685,13 +692,14 @@ const Cursor = struct {
 
         switch (self.kind) {
             .simple => |simple| {
-                try writer.println("// simple", .{});
-                try writer.println("// {any}", .{simple});
+                try writer.println("pub fn next() !struct {{ {s}: {s}, cursor: {s} }} {{", .{ self.fieldName, try simple.readType.codegenType(), cursorName(simple.next) });
+                writer.indent();
+                try writer.println("}}", .{});
                 writer.unindent();
                 try writer.println("}}", .{});
                 try writer.println("", .{});
                 if (simple.next) |next| {
-                    try next.codegen(self, writer);
+                    try next.codegen(writer);
                 }
             },
             .variants => |variants| {
@@ -700,9 +708,9 @@ const Cursor = struct {
                 try writer.println("}}", .{});
                 try writer.println("", .{});
                 for (variants.variants) |variant| {
-                    try variant.cursor.codegen(self, writer);
+                    try variant.cursor.codegen(writer);
                 }
-                try variants.default.codegen(self, writer);
+                try variants.default.codegen(writer);
             },
         }
     }
@@ -717,6 +725,10 @@ const Cursor = struct {
     }
 };
 
+fn cursorName(cursor: ?*Cursor) []const u8 {
+    return if (cursor) |c| c.name else "FinalCursor";
+}
+
 const Cursors = struct {
     allocator: std.mem.Allocator,
     namestack: std.ArrayList([]const u8),
@@ -730,6 +742,7 @@ const Cursors = struct {
             try name.appendSlice(self.allocator, part);
         }
         cursor.name = try std.fmt.allocPrint(self.allocator, "{s}", .{name.items});
+        cursor.fieldName = self.namestack.getLast();
         return cursor;
     }
 
@@ -739,10 +752,6 @@ const Cursors = struct {
 
     pub fn popName(self: *Cursors) void {
         _ = self.namestack.pop();
-    }
-
-    pub fn peekName(self: *Cursors) ![]const u8 {
-        return self.namestack.getLastOrNull() orelse error.Empty;
     }
 
     pub fn init(allocator: std.mem.Allocator) !Cursors {

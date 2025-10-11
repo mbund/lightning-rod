@@ -11,41 +11,41 @@ pub const handshaking = struct {
         
         pub const packet__set_protocol__params__protocolVersion = struct {
             buffer: []const u8;
-            // simple
-            // .{ .readType = .{ .native = .varint }, .next = .{ .name = { 112, 97, 99, 107, 101, 116, 95, 95, 115, 101, 116, 95, 112, 114, 111, 116, 111, 99, 111, 108, 95, 95, 112, 97, 114, 97, 109, 115, 95, 95, 115, 101, 114, 118, 101, 114, 72, 111, 115, 116 }, .kind = .{ .simple = .{ ... } }, .visited = false } }
-        }
-        
-        pub const packet__set_protocol__params__serverHost = struct {
-            buffer: []const u8;
-            // simple
-            // .{ .readType = .{ .pstring = .varint }, .next = .{ .name = { 112, 97, 99, 107, 101, 116, 95, 95, 115, 101, 116, 95, 112, 114, 111, 116, 111, 99, 111, 108, 95, 95, 112, 97, 114, 97, 109, 115, 95, 95, 115, 101, 114, 118, 101, 114, 80, 111, 114, 116 }, .kind = .{ .simple = .{ ... } }, .visited = false } }
-        }
-        
-        pub const packet__set_protocol__params__serverPort = struct {
-            buffer: []const u8;
-            // simple
-            // .{ .readType = .{ .native = .u16 }, .next = .{ .name = { 112, 97, 99, 107, 101, 116, 95, 95, 115, 101, 116, 95, 112, 114, 111, 116, 111, 99, 111, 108, 95, 95, 112, 97, 114, 97, 109, 115, 95, 95, 110, 101, 120, 116, 83, 116, 97, 116, 101 }, .kind = .{ .simple = .{ ... } }, .visited = false } }
-        }
-        
-        pub const packet__set_protocol__params__nextState = struct {
-            buffer: []const u8;
-            // simple
-            // .{ .readType = .{ .native = .varint }, .next = null }
-        }
-        
-        pub const packet__legacy_server_list_ping__params__payload = struct {
-            buffer: []const u8;
-            // simple
-            // .{ .readType = .{ .native = .u8 }, .next = null }
-        }
-        
-        pub const packet__params = struct {
-            buffer: []const u8;
-            // simple
-            // .{ .readType = .{ .native = .void }, .next = null }
-        }
-        
-    };
-};
+            pub fn next() !struct { protocolVersion: i32, cursor: packet__set_protocol__params__serverHost } {
+                }
+            }
+            
+            pub const packet__set_protocol__params__serverHost = struct {
+                buffer: []const u8;
+                pub fn next() !struct { serverHost: []const u8, cursor: packet__set_protocol__params__serverPort } {
+                    }
+                }
+                
+                pub const packet__set_protocol__params__serverPort = struct {
+                    buffer: []const u8;
+                    pub fn next() !struct { serverPort: u16, cursor: packet__set_protocol__params__nextState } {
+                        }
+                    }
+                    
+                    pub const packet__set_protocol__params__nextState = struct {
+                        buffer: []const u8;
+                        pub fn next() !struct { nextState: i32, cursor: FinalCursor } {
+                            }
+                        }
+                        
+                        pub const packet__legacy_server_list_ping__params__payload = struct {
+                            buffer: []const u8;
+                            pub fn next() !struct { payload: u8, cursor: FinalCursor } {
+                                }
+                            }
+                            
+                            pub const packet__params = struct {
+                                buffer: []const u8;
+                                pub fn next() !struct { params: protocol_support.void, cursor: FinalCursor } {
+                                    }
+                                }
+                                
+                            };
+                        };
 
-
+                        
