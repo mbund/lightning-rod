@@ -73,19 +73,25 @@ const Types = struct {
 
     pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *std.io.Writer, indent: usize, scope: Scope) !void {
         var it = self.types.iterator();
+        _ = indent;
         while (it.next()) |entry| {
-            try printIndent(writer, indent);
-            try writer.print("// {s}\n", .{entry.key_ptr.*});
-            try printIndent(writer, indent);
+            if (!std.mem.eql(u8, entry.key_ptr.*, "packet")) {
+                continue;
+            }
+            // try printIndent(writer, indent);
+            // try writer.print("// {s}\n", .{entry.key_ptr.*});
+            // try printIndent(writer, indent);
             const resolved = entry.value_ptr.resolve(allocator, scope, null) catch |err| {
                 try writer.print("{any}", .{err});
                 try writer.print("\n\n", .{});
                 continue;
             };
             var cursors = try Cursors.init(allocator);
-            const cursor = resolved.cursor(&cursors);
-            try writer.print("{any}", .{cursor});
-            try writer.print("\n\n", .{});
+            _ = try resolved.cursor(&cursors);
+            try cursors.codegen(writer);
+
+            // try writer.print("{any}", .{cursor});
+            // try writer.print("\n\n", .{});
         }
     }
 };
@@ -669,15 +675,21 @@ const Cursor = struct {
         },
         none,
     },
+
+    pub fn codegen(self: *Cursor, writer: *std.io.Writer) !void {
+        try writer.print("const {s} = struct {{}};\n", .{self.name});
+    }
 };
 
 const Cursors = struct {
     cursors: std.ArrayList(*Cursor),
     allocator: std.mem.Allocator,
+    i: usize,
 
     pub fn allocateCursor(self: *Cursors) !*Cursor {
         const cursor = try self.allocator.create(Cursor);
-        cursor.name = "Cursor";
+        cursor.name = try std.fmt.allocPrint(self.allocator, "Cursor{}", .{self.i});
+        self.i += 1;
         try self.cursors.append(self.allocator, cursor);
         return cursor;
     }
@@ -686,7 +698,14 @@ const Cursors = struct {
         return .{
             .cursors = try std.ArrayList(*Cursor).initCapacity(allocator, 0),
             .allocator = allocator,
+            .i = 0,
         };
+    }
+
+    pub fn codegen(self: *Cursors, writer: *std.io.Writer) !void {
+        for (self.cursors.items) |cursor| {
+            try cursor.codegen(writer);
+        }
     }
 };
 
