@@ -94,17 +94,17 @@ const Server = struct {
                                         if (intent == 1) {
                                             client.state = .status;
 
-                                            var output = std.io.Writer.fixed(client.write_buf[3..]);
+                                            var output = std.io.Writer.fixed(client.write_buf[2..]);
                                             _ = try VarInt.write(&output, 0);
                                             _ = try String.write(&output,
                                                 \\{"version":{"name":"1.21.8","protocol":772},"players":{"max":20,"online":1,"sample":[{"name":"cakeless","id":"0341ed27-7393-4e6a-9101-6c07f879b7b3"}]},"description":{"text":"Hello, world!"}}
                                             );
 
+                                            // packet length is a maximum of 3 byte varint
+                                            @memset(client.write_buf[1..3], 0);
                                             var final_output = std.io.Writer.fixed(client.write_buf[0..3]);
                                             _ = try VarInt.write(&final_output, @intCast(output.end));
-                                            const packet_length_length = final_output.end;
-                                            @memmove(client.write_buf[3 - packet_length_length .. 3], client.write_buf[0..packet_length_length]);
-                                            client.to_write = client.write_buf[3 - packet_length_length .. 3 + output.end];
+                                            client.to_write = client.write_buf[0 .. 2 + output.end];
                                             try client.write();
                                         } else if (intent == 2) {
                                             client.state = .login;
@@ -132,6 +132,14 @@ const Server = struct {
                                         _ = try VarInt.write(&final_output, @intCast(output.end));
                                         client.to_write = client.write_buf[0 .. 1 + output.end];
                                         try client.write();
+                                    }
+                                } else if (client.state == .login) {
+                                    // login start
+                                    if (packet_id == 0) {
+                                        const player_name = try String.read(&input);
+                                        const uuid = try input.takeInt(u128, std.builtin.Endian.big);
+                                        log.info("login start name={s} uuid={}", .{ player_name, uuid });
+                                        continue;
                                     }
                                 }
                             }
