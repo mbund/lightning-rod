@@ -13,7 +13,8 @@ pub fn main() !void {
     const protocol = try Protocol.fromJson(allocator, json.value);
     const buffer = try allocator.alloc(u8, 4096);
     var stdout = std.fs.File.stdout().writer(buffer);
-    try protocol.codegen(allocator, &stdout.interface);
+    var writer = IndentedWriter{ .writer = &stdout.interface };
+    try protocol.codegen(allocator, &writer);
     try stdout.interface.flush();
 }
 
@@ -41,16 +42,16 @@ const Protocol = struct {
         };
     }
 
-    pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *std.io.Writer) !void {
-        try writer.print("const std = @import(\"std\");\n", .{});
-        try writer.print("const protocol_support = @import(\"protocol_support.zig\");\n\n", .{});
-        try self.types.codegen(allocator, writer, 0, .{ .outer = &self.types, .inner = null });
-        try writer.print("\n", .{});
-        try self.handshaking.codegen(allocator, writer, "handshaking", &self.types, 0);
+    pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *IndentedWriter) !void {
+        try writer.println("const std = @import(\"std\");", .{});
+        try writer.println("const protocol_support = @import(\"protocol_support.zig\");\n", .{});
+        try self.types.codegen(allocator, writer, .{ .outer = &self.types, .inner = null });
+        try writer.println("", .{});
+        try self.handshaking.codegen(allocator, writer, "handshaking", &self.types);
         // try self.status.codegen(allocator, writer, "status", &self.types, 0);
         // try self.login.codegen(allocator, writer, "login", &self.types, 0);
         // try self.play.codegen(allocator, writer, "play", &self.types, 0);
-        try writer.print("\n", .{});
+        try writer.println("", .{});
     }
 };
 
@@ -71,27 +72,19 @@ const Types = struct {
         };
     }
 
-    pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *std.io.Writer, indent: usize, scope: Scope) !void {
+    pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *IndentedWriter, scope: Scope) !void {
         var it = self.types.iterator();
-        _ = indent;
         while (it.next()) |entry| {
             if (!std.mem.eql(u8, entry.key_ptr.*, "packet")) {
                 continue;
             }
-            // try printIndent(writer, indent);
-            // try writer.print("// {s}\n", .{entry.key_ptr.*});
-            // try printIndent(writer, indent);
             const resolved = entry.value_ptr.resolve(allocator, scope, null) catch |err| {
-                try writer.print("{any}", .{err});
-                try writer.print("\n\n", .{});
+                try writer.println("{any}", .{err});
                 continue;
             };
             var cursors = try Cursors.init(allocator);
-            _ = try resolved.cursor(&cursors);
-            try cursors.codegen(writer);
-
-            // try writer.print("{any}", .{cursor});
-            // try writer.print("\n\n", .{});
+            const cursorTree = try resolved.cursor(&cursors);
+            try cursorTree.head.codegen(null, writer);
         }
     }
 };
@@ -107,22 +100,17 @@ const State = struct {
         };
     }
 
-    pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *std.io.Writer, name: []const u8, outer: *const Types, indent: usize) !void {
-        try writer.print("pub const {s} = struct {{\n", .{name});
-        // try printIndent(writer, indent + 1);
-        // try writer.print("pub const toClient = struct {{\n", .{});
-        // try self.toClient.codegen(allocator, writer, indent + 2, .{ .outer = outer, .inner = &self.toClient });
-        // try writer.print("\n", .{});
-        // try printIndent(writer, indent + 1);
-        // try writer.print("}};\n", .{});
-        try printIndent(writer, indent + 1);
-        try writer.print("pub const toServer = struct {{\n", .{});
-        try self.toServer.codegen(allocator, writer, indent + 2, .{ .outer = outer, .inner = &self.toServer });
-        try writer.print("\n", .{});
-        try printIndent(writer, indent + 1);
-        try writer.print("}};\n", .{});
-        try printIndent(writer, indent);
-        try writer.print("}};\n\n", .{});
+    pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *IndentedWriter, name: []const u8, outer: *const Types) !void {
+        try writer.println("pub const {s} = struct {{", .{name});
+        writer.indent();
+
+        try writer.println("pub const toServer = struct {{", .{});
+        writer.indent();
+        try self.toServer.codegen(allocator, writer, .{ .outer = outer, .inner = &self.toServer });
+        writer.unindent();
+        try writer.println("}};", .{});
+        writer.unindent();
+        try writer.println("}};\n", .{});
     }
 };
 
@@ -675,9 +663,37 @@ const Cursor = struct {
         },
         none,
     },
+    visited: bool = false,
 
-    pub fn codegen(self: *Cursor, writer: *std.io.Writer) !void {
-        try writer.print("const {s} = struct {{}};\n", .{self.name});
+    pub fn codegen(self: *Cursor, prev: ?*Cursor, writer: *IndentedWriter) !void {
+        if (self.visited) {
+            return;
+        }
+        self.visited = true;
+
+        try writer.println("const {s} = struct {{", .{self.name});
+        writer.indent();
+        try writer.println("buffer: []const u8;", .{});
+        if (prev) |p| {
+            // p.
+            try writer.println("// previous {s}", .{p.name});
+        }
+        writer.unindent();
+        try writer.println("}}", .{});
+        try writer.println("", .{});
+
+        switch (self.next) {
+            .always => |always| {
+                try always.codegen(self, writer);
+            },
+            .switch_ => |switch_| {
+                for (switch_.variants) |variant| {
+                    try variant.cursor.codegen(self, writer);
+                }
+                try switch_.default.codegen(self, writer);
+            },
+            .none => {},
+        }
     }
 };
 
@@ -700,12 +716,6 @@ const Cursors = struct {
             .allocator = allocator,
             .i = 0,
         };
-    }
-
-    pub fn codegen(self: *Cursors, writer: *std.io.Writer) !void {
-        for (self.cursors.items) |cursor| {
-            try cursor.codegen(writer);
-        }
     }
 };
 
@@ -819,13 +829,6 @@ fn isConstructor(json: std.json.Value) ?struct { name: []const u8, arg: std.json
     }
 }
 
-fn printIndent(writer: *std.io.Writer, level: usize) !void {
-    var i: usize = 0;
-    while (i < level) : (i += 1) {
-        try writer.print("    ", .{});
-    }
-}
-
 pub fn idfmt(input: []const u8) IdFormatter {
     return IdFormatter{ .input = input };
 }
@@ -897,5 +900,31 @@ pub const IdFormatter = struct {
         } else {
             try writer.writeAll(self.input);
         }
+    }
+};
+
+fn printIndent(writer: *std.io.Writer, level: usize) !void {
+    var i: usize = 0;
+    while (i < level) : (i += 1) {
+        try writer.print("    ", .{});
+    }
+}
+
+const IndentedWriter = struct {
+    writer: *std.io.Writer,
+    level: usize = 0,
+
+    pub fn println(self: *IndentedWriter, comptime fmt: []const u8, args: anytype) !void {
+        try printIndent(self.writer, self.level);
+        try self.writer.print(fmt, args);
+        _ = try self.writer.write("\n");
+    }
+
+    pub fn indent(self: *IndentedWriter) void {
+        self.level += 1;
+    }
+
+    pub fn unindent(self: *IndentedWriter) void {
+        self.level -= 1;
     }
 };
