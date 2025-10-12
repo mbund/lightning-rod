@@ -16,11 +16,11 @@ pub const handshaking = struct {
                 legacy_server_list_ping: packet__legacy_server_list_ping__params__payload,
                 default: packet__params,
             } {
-                const value, const rest = read_varint(self.buffer);
+                const value, const rest = try protocol_support.read_varint(self.buffer);
                 return switch (value) {
-                    0 => .{ .set_protocol = .{ .buffer = rest } };
-                    254 => .{ .legacy_server_list_ping = .{ .buffer = rest } };
-                    else => .{ .default = .{ .buffer = rest } };
+                    0 => .{ .set_protocol = .{ .buffer = rest } },
+                    254 => .{ .legacy_server_list_ping = .{ .buffer = rest } },
+                    else => .{ .default = .{ .buffer = rest } },
                 };
             }
         };
@@ -39,7 +39,8 @@ pub const handshaking = struct {
             
             pub fn serverHost(self: @This()) !struct { []const u8, packet__set_protocol__params__serverPort } {
                 const length, const rest = try protocol_support.read_varint(self.buffer);
-                return .{ rest[0..length], .{.buffer = rest[length..] } };
+                const size: usize = @intCast(length);
+                return .{ rest[0..size], .{.buffer = rest[size..] } };
             }
         };
         

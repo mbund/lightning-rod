@@ -4,7 +4,7 @@ const builtin = @import("builtin");
 
 pub fn read_int(buffer: []const u8, comptime T: type) !struct { T, []const u8 } {
     const size = @divExact(@typeInfo(T).int.bits, 8);
-    const value = std.mem.readInt(T, buffer[0..size], .little);
+    const value = std.mem.readInt(T, buffer[0..size], .big);
     const rest = buffer[size..];
     return .{ value, rest };
 }
@@ -17,7 +17,7 @@ pub fn read_varint(buffer: []const u8) !struct { i32, []const u8 } {
         const b = @as(i32, rest[0]);
         rest = rest[1..];
         value |= (b & varint.SEGMENT_BITS) << (@as(u5, @intCast(i)) * 7);
-        if (b & varint.CONTINUE_BIT == 0) return value;
+        if (b & varint.CONTINUE_BIT == 0) return .{ value, rest };
     }
 
     return .{ value, rest };
@@ -54,6 +54,16 @@ pub fn read_i32(buffer: []const u8) !struct { i32, []const u8 } {
 pub fn read_i64(buffer: []const u8) !struct { i64, []const u8 } {
     return read_int(buffer, i64);
 }
+
+pub const FinalCursor = struct {
+    buffer: []const u8,
+
+    pub fn finish(self: FinalCursor) !void {
+        if (self.buffer.len != 0) {
+            return error.TooLong;
+        }
+    }
+};
 //
 // pub fn read_f32(self: *Reader, out: *f32) !void {
 //     const size = 4;

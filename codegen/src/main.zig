@@ -698,7 +698,8 @@ const Cursor = struct {
                     },
                     .pstring => |pstring| {
                         try writer.println("const length, const rest = try protocol_support.read_{s}(self.buffer);", .{@tagName(pstring)});
-                        try writer.println("return .{{ rest[0..length], .{{.buffer = rest[length..] }} }};", .{});
+                        try writer.println("const size: usize = @intCast(length);", .{});
+                        try writer.println("return .{{ rest[0..size], .{{.buffer = rest[size..] }} }};", .{});
                     },
                 }
                 writer.unindent();
@@ -720,13 +721,13 @@ const Cursor = struct {
                 writer.unindent();
                 try writer.println("}} {{", .{});
                 writer.indent();
-                try writer.println("const value, const rest = read_{s}(self.buffer);", .{@tagName(variants.readType)});
+                try writer.println("const value, const rest = try protocol_support.read_{s}(self.buffer);", .{@tagName(variants.readType)});
                 try writer.println("return switch (value) {{", .{});
                 writer.indent();
                 for (variants.variants) |variant| {
-                    try writer.println("{} => .{{ .{s} = .{{ .buffer = rest }} }};", .{ variant.value, variant.name });
+                    try writer.println("{} => .{{ .{s} = .{{ .buffer = rest }} }},", .{ variant.value, variant.name });
                 }
-                try writer.println("else => .{{ .default = .{{ .buffer = rest }} }};", .{});
+                try writer.println("else => .{{ .default = .{{ .buffer = rest }} }},", .{});
                 writer.unindent();
                 try writer.println("}};", .{});
                 writer.unindent();
