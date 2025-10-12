@@ -78,13 +78,16 @@ const Types = struct {
             if (!std.mem.eql(u8, entry.key_ptr.*, "packet")) {
                 continue;
             }
-            const resolved = entry.value_ptr.resolve(allocator, scope, null) catch |err| {
-                try writer.println("{any}", .{err});
-                continue;
-            };
+            const resolved = try entry.value_ptr.resolve(allocator, scope, null);
             var cursors = try Cursors.init(allocator);
             try cursors.pushName("packet");
             const cursorTree = try resolved.cursor(&cursors);
+            try writer.println("pub fn read(buffer: []const u8) {s} {{", .{cursorTree.head.name});
+            writer.indent();
+            try writer.println("return .{{ .buffer = buffer }};", .{});
+            writer.unindent();
+            try writer.println("}}", .{});
+            try writer.println("", .{});
             try cursorTree.head.codegen(writer);
         }
     }
@@ -123,9 +126,6 @@ const Scope = struct {
 const NativeType = enum {
     varint,
     varlong,
-    optvarint,
-    pstring,
-    buffer,
     u8,
     u16,
     u32,
@@ -158,14 +158,11 @@ const NativeType = enum {
         if (std.mem.eql(u8, str, "varlong")) {
             return .varlong;
         }
-        if (std.mem.eql(u8, str, "optvarint")) {
-            return .optvarint;
-        }
         if (std.mem.eql(u8, str, "pstring")) {
-            return .pstring;
+            return .fake;
         }
         if (std.mem.eql(u8, str, "buffer")) {
-            return .buffer;
+            return .fake;
         }
         if (std.mem.eql(u8, str, "u8")) {
             return .u8;
@@ -252,9 +249,6 @@ const NativeType = enum {
         return switch (self) {
             .varint => "i32",
             .varlong => "i64",
-            .optvarint => "protocol_support.optvarint",
-            .pstring => "protocol_support.pstring",
-            .buffer => "protocol_support.buffer",
             .u8 => "u8",
             .u16 => "u16",
             .u32 => "u32",
@@ -503,10 +497,10 @@ const ResolvedContainer = struct {
         if (self.fields[i].referenced) {
             switch (self.fields[i].type.*) {
                 .mapper => |mapper| {
-                    var c = try cursors.allocateCursor();
                     try cursors.pushName(self.fields[i].name);
-                    const variants = try cursors.allocator.alloc(CursorVariant, mapper.mappings.len);
+                    var c = try cursors.allocateCursor();
                     cursors.popName();
+                    const variants = try cursors.allocator.alloc(CursorVariant, mapper.mappings.len);
                     var tails = try std.ArrayList(*Cursor).initCapacity(cursors.allocator, 0);
                     for (0.., mapper.mappings) |j, mapping| {
                         self.fields[i].currentValue = mapping.value;
@@ -519,6 +513,7 @@ const ResolvedContainer = struct {
                         }
                         variants[j] = .{
                             .value = mapping.value,
+                            .name = mapping.name,
                             .cursor = nextTree.head,
                         };
                     }
@@ -650,6 +645,7 @@ const CursorTree = struct {
 };
 
 const CursorVariant = struct {
+    name: []const u8,
     value: i64,
     cursor: *Cursor,
 };
@@ -688,24 +684,55 @@ const Cursor = struct {
 
         try writer.println("pub const {s} = struct {{", .{self.name});
         writer.indent();
-        try writer.println("buffer: []const u8;", .{});
+        try writer.println("buffer: []const u8,", .{});
+        try writer.println("", .{});
 
         switch (self.kind) {
             .simple => |simple| {
-                try writer.println("pub fn next() !struct {{ {s}: {s}, cursor: {s} }} {{", .{ self.fieldName, try simple.readType.codegenType(), cursorName(simple.next) });
+                try writer.println("pub fn {s}(self: @This()) !struct {{ {s}, {s} }} {{", .{ self.fieldName, try simple.readType.codegenType(), cursorName(simple.next) });
                 writer.indent();
-                try writer.println("}}", .{});
+                switch (simple.readType) {
+                    .native => |native| {
+                        try writer.println("const value, const rest = try protocol_support.read_{s}(self.buffer);", .{@tagName(native)});
+                        try writer.println("return .{{ value, .{{ .buffer = rest }} }};", .{});
+                    },
+                    .pstring => |pstring| {
+                        try writer.println("const length, const rest = try protocol_support.read_{s}(self.buffer);", .{@tagName(pstring)});
+                        try writer.println("return .{{ rest[0..length], .{{.buffer = rest[length..] }} }};", .{});
+                    },
+                }
                 writer.unindent();
                 try writer.println("}}", .{});
+                writer.unindent();
+                try writer.println("}};", .{});
                 try writer.println("", .{});
                 if (simple.next) |next| {
                     try next.codegen(writer);
                 }
             },
             .variants => |variants| {
-                try writer.println("// variants", .{});
+                try writer.println("pub fn {s}(self: @This()) !union(enum) {{", .{self.fieldName});
+                writer.indent();
+                for (variants.variants) |variant| {
+                    try writer.println("{s}: {s},", .{ variant.name, variant.cursor.name });
+                }
+                try writer.println("default: {s},", .{variants.default.name});
+                writer.unindent();
+                try writer.println("}} {{", .{});
+                writer.indent();
+                try writer.println("const value, const rest = read_{s}(self.buffer);", .{@tagName(variants.readType)});
+                try writer.println("return switch (value) {{", .{});
+                writer.indent();
+                for (variants.variants) |variant| {
+                    try writer.println("{} => .{{ .{s} = .{{ .buffer = rest }} }};", .{ variant.value, variant.name });
+                }
+                try writer.println("else => .{{ .default = .{{ .buffer = rest }} }};", .{});
+                writer.unindent();
+                try writer.println("}};", .{});
                 writer.unindent();
                 try writer.println("}}", .{});
+                writer.unindent();
+                try writer.println("}};", .{});
                 try writer.println("", .{});
                 for (variants.variants) |variant| {
                     try variant.cursor.codegen(writer);
@@ -726,7 +753,7 @@ const Cursor = struct {
 };
 
 fn cursorName(cursor: ?*Cursor) []const u8 {
-    return if (cursor) |c| c.name else "FinalCursor";
+    return if (cursor) |c| c.name else "protocol_support.FinalCursor";
 }
 
 const Cursors = struct {

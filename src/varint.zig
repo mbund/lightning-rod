@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const SEGMENT_BITS = 0x7F;
-const CONTINUE_BIT = 0x80;
+pub const SEGMENT_BITS = 0x7F;
+pub const CONTINUE_BIT = 0x80;
 
 pub const VarInt = struct {
     pub fn read(reader: *std.Io.Reader) !i32 {
