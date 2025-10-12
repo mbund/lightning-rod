@@ -72,5 +72,5 @@ test {
     const buf = &[_]u8{ 132, 6 };
     var stream = std.io.Reader.fixed(buf);
     const actual = try VarInt.read(&stream);
-    try std.testing.expectEqual(10, actual);
+    try std.testing.expectEqual(772, actual);
 }
