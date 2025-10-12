@@ -48,9 +48,9 @@ const Protocol = struct {
         try self.types.codegen(allocator, writer, .{ .outer = &self.types, .inner = null });
         try writer.println("", .{});
         try self.handshaking.codegen(allocator, writer, "handshaking", &self.types);
-        // try self.status.codegen(allocator, writer, "status", &self.types, 0);
-        // try self.login.codegen(allocator, writer, "login", &self.types, 0);
-        // try self.play.codegen(allocator, writer, "play", &self.types, 0);
+        try self.status.codegen(allocator, writer, "status", &self.types);
+        try self.login.codegen(allocator, writer, "login", &self.types);
+        try self.play.codegen(allocator, writer, "play", &self.types);
         try writer.println("", .{});
     }
 };
@@ -466,7 +466,11 @@ const Type = union(enum) {
                 result.* = .{ .mapper = .{ .mappings = mapper.mappings, .type = mapper.type } };
                 return result;
             },
-            else => return error.Todo1,
+            else => {
+                const result = try allocator.create(ResolvedType);
+                result.* = .todo;
+                return result;
+            },
         }
     }
 };
@@ -536,7 +540,9 @@ const ResolvedContainer = struct {
                     };
                 },
                 else => {
-                    return error.Todo2;
+                    const result = try cursors.allocateCursor();
+                    result.kind = .todo;
+                    return .{ .head = result, .tails = .{ .one = result } };
                 },
             }
         } else {
@@ -579,7 +585,9 @@ const ResolvedType = union(enum) {
             },
             .container => |container| {
                 if (container.fields.len == 0) {
-                    return error.Todo3;
+                    const result = try cursors.allocateCursor();
+                    result.kind = .todo;
+                    return .{ .head = result, .tails = .{ .one = result } };
                 }
                 return container.cursor(cursors, 0);
             },
@@ -609,12 +617,16 @@ const ResolvedType = union(enum) {
                         return switch_.default.cursor(cursors);
                     },
                     else => {
-                        return error.Todo5;
+                        const result = try cursors.allocateCursor();
+                        result.kind = .todo;
+                        return .{ .head = result, .tails = .{ .one = result } };
                     },
                 }
             },
             else => {
-                return error.Todo4;
+                const result = try cursors.allocateCursor();
+                result.kind = .todo;
+                return .{ .head = result, .tails = .{ .one = result } };
             },
         }
     }
@@ -672,6 +684,7 @@ const Cursor = struct {
             variants: []CursorVariant,
             default: *Cursor,
         },
+        todo,
     },
     fieldName: []const u8,
     visited: bool = false,
@@ -740,6 +753,16 @@ const Cursor = struct {
                 }
                 try variants.default.codegen(writer);
             },
+            .todo => |_| {
+                try writer.println("pub fn {s}(self: @This()) noreturn {{", .{self.fieldName});
+                writer.indent();
+                try writer.println("_ = self;", .{});
+                try writer.println("@panic(\"todo\");", .{});
+                writer.unindent();
+                try writer.println("}}", .{});
+                writer.unindent();
+                try writer.println("}};", .{});
+            },
         }
     }
 
@@ -748,6 +771,7 @@ const Cursor = struct {
             .simple => |_| {
                 self.kind.simple.next = next;
             },
+            .todo => {},
             else => return error.UpdateNextOnNonSimple,
         }
     }
