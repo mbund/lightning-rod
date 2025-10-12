@@ -1,4 +1,5 @@
 const protocol_support = @import("protocol_support.zig");
+const protocol = @import("codegen.zig.zig");
 const std = @import("std");
 const builtin = @import("builtin");
 
