@@ -2,7 +2,11 @@ const std = @import("std");
 const net = std.net;
 const posix = std.posix;
 
-const _ = @import("varint.zig");
+test {
+    _ = @import("varint.zig");
+    _ = @import("protocol_test.zig");
+}
+
 const VarInt = @import("varint.zig").VarInt;
 const String = @import("string.zig").String;
 

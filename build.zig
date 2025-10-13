@@ -4,6 +4,28 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const codegen_exe = b.addExecutable(.{
+        .name = "codegen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("codegen/codegen.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const codegen_cmd = b.addRunArtifact(codegen_exe);
+
+    codegen_cmd.addFileArg(b.path("minecraft-data/data/pc/1.21.8/protocol.json"));
+    const protocol_zig_file = codegen_cmd.addOutputFileArg("protocol.zig");
+
+    const protocol_module = b.createModule(.{
+        .root_source_file = protocol_zig_file,
+    });
+
+    protocol_module.addAnonymousImport("protocol_support", .{
+        .root_source_file = b.path("codegen/protocol_support.zig"),
+    });
+
     const mod = b.addModule("lightning_rod", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -20,6 +42,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
+    exe.root_module.addImport("protocol", protocol_module);
 
     b.installArtifact(exe);
 
@@ -49,18 +73,4 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
-}
-
-fn makeCodegen(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
-    const prog_node = options.progress_node;
-    const b = step.owner;
-
-    const c_source_path = translate_c.source.getPath2(b, step);
-    try argv_list.append(c_source_path);
-
-    const output_dir = try step.evalZigProcess(argv_list.items, prog_node, false, options.web_server, options.gpa);
-
-    const basename = std.fs.path.stem(std.fs.path.basename(c_source_path));
-    translate_c.out_basename = b.fmt("{s}.zig", .{basename});
-    translate_c.output_file.path = output_dir.?.joinString(b.allocator, translate_c.out_basename) catch @panic("OOM");
 }

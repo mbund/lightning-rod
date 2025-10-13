@@ -4,18 +4,24 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
+    var args = std.process.args();
+    _ = args.skip();
+    const input_path = args.next() orelse return error.NotEnoughArgs;
+    const output_path = args.next() orelse return error.NotEnoughArgs;
+    const output_file = try std.fs.cwd().createFile(output_path, .{});
+
     const json = try readJson(
         allocator,
-        "/var/home/josh/src/lightning-rod/minecraft-data/data/pc/1.20/protocol.json",
+        input_path,
     );
     defer json.deinit();
 
     const protocol = try Protocol.fromJson(allocator, json.value);
     const buffer = try allocator.alloc(u8, 4096);
-    var stdout = std.fs.File.stdout().writer(buffer);
-    var writer = IndentedWriter{ .writer = &stdout.interface };
+    var output_writer = output_file.writer(buffer);
+    var writer = IndentedWriter{ .writer = &output_writer.interface };
     try protocol.codegen(allocator, &writer);
-    try stdout.interface.flush();
+    try output_writer.interface.flush();
 }
 
 const Protocol = struct {
@@ -44,7 +50,7 @@ const Protocol = struct {
 
     pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *IndentedWriter) !void {
         try writer.println("const std = @import(\"std\");", .{});
-        try writer.println("const protocol_support = @import(\"protocol_support.zig\");\n", .{});
+        try writer.println("pub const protocol_support = @import(\"protocol_support\");\n", .{});
         try self.types.codegen(allocator, writer, .{ .outer = &self.types, .inner = null });
         try writer.println("", .{});
         try self.handshaking.codegen(allocator, writer, "handshaking", &self.types);
@@ -147,6 +153,8 @@ const NativeType = enum {
     restBuffer,
     nbt,
     optionalNbt,
+    anonymousNbt,
+    anonOptionalNbt,
     registryEntryHolder,
     registryEntryHolderSet,
     fake,
@@ -224,6 +232,12 @@ const NativeType = enum {
         if (std.mem.eql(u8, str, "optionalNbt")) {
             return .optionalNbt;
         }
+        if (std.mem.eql(u8, str, "anonymousNbt")) {
+            return .anonymousNbt;
+        }
+        if (std.mem.eql(u8, str, "anonOptionalNbt")) {
+            return .anonOptionalNbt;
+        }
         if (std.mem.eql(u8, str, "registryEntryHolder")) {
             return .registryEntryHolder;
         }
@@ -242,6 +256,7 @@ const NativeType = enum {
         if (std.mem.eql(u8, str, "array")) {
             return .fake;
         }
+        std.debug.print("Unknown native type: {s}\n", .{str});
         return error.UnknownNativeType;
     }
 
@@ -270,6 +285,8 @@ const NativeType = enum {
             .restBuffer => "protocol_support.restBuffer",
             .nbt => "protocol_support.nbt",
             .optionalNbt => "protocol_support.optionalNbt",
+            .anonymousNbt => "protocol_support.anonymousNbt",
+            .anonOptionalNbt => "protocol_support.anonOptionalNbt",
             .registryEntryHolder => "protocol_support.registryEntryHolder",
             .registryEntryHolderSet => "protocol_support.registryEntryHolderSet",
             .fake => error.ReferencedFakeNativeType,
@@ -702,7 +719,7 @@ const Cursor = struct {
 
         switch (self.kind) {
             .simple => |simple| {
-                try writer.println("pub fn {s}(self: @This()) !struct {{ {s}, {s} }} {{", .{ self.fieldName, try simple.readType.codegenType(), cursorName(simple.next) });
+                try writer.println("pub fn {f}(self: @This()) !struct {{ {s}, {s} }} {{", .{ idfmt(self.fieldName), try simple.readType.codegenType(), cursorName(simple.next) });
                 writer.indent();
                 switch (simple.readType) {
                     .native => |native| {
@@ -725,7 +742,7 @@ const Cursor = struct {
                 }
             },
             .variants => |variants| {
-                try writer.println("pub fn {s}(self: @This()) !union(enum) {{", .{self.fieldName});
+                try writer.println("pub fn {f}(self: @This()) !union(enum) {{", .{idfmt(self.fieldName)});
                 writer.indent();
                 for (variants.variants) |variant| {
                     try writer.println("{s}: {s},", .{ variant.name, variant.cursor.name });
@@ -754,7 +771,7 @@ const Cursor = struct {
                 try variants.default.codegen(writer);
             },
             .todo => |_| {
-                try writer.println("pub fn {s}(self: @This()) noreturn {{", .{self.fieldName});
+                try writer.println("pub fn {f}(self: @This()) noreturn {{", .{idfmt(self.fieldName)});
                 writer.indent();
                 try writer.println("_ = self;", .{});
                 try writer.println("@panic(\"todo\");", .{});
@@ -976,6 +993,7 @@ pub const IdFormatter = struct {
             "f32",
             "f64",
             "void",
+            "type",
         };
 
         for (keywords) |keyword| {

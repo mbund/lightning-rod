@@ -1,6 +1,8 @@
 const std = @import("std");
-const varint = @import("varint.zig");
 const builtin = @import("builtin");
+
+pub const SEGMENT_BITS = 0x7F;
+pub const CONTINUE_BIT = 0x80;
 
 pub fn read_int(buffer: []const u8, comptime T: type) !struct { T, []const u8 } {
     const size = @divExact(@typeInfo(T).int.bits, 8);
@@ -16,8 +18,8 @@ pub fn read_varint(buffer: []const u8) !struct { i32, []const u8 } {
     for (0..5) |i| {
         const b = @as(i32, rest[0]);
         rest = rest[1..];
-        value |= (b & varint.SEGMENT_BITS) << (@as(u5, @intCast(i)) * 7);
-        if (b & varint.CONTINUE_BIT == 0) return .{ value, rest };
+        value |= (b & SEGMENT_BITS) << (@as(u5, @intCast(i)) * 7);
+        if (b & CONTINUE_BIT == 0) return .{ value, rest };
     }
 
     return .{ value, rest };

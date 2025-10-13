@@ -1,5 +1,4 @@
-const protocol_support = @import("protocol_support.zig");
-const protocol = @import("codegen.zig");
+const protocol = @import("protocol");
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -11,7 +10,7 @@ fn bytes(comptime hex: []const u8) [hex.len / 2]u8 {
 
 test {
     const buffer = &bytes("00409a44b81e634200409a44");
-    const int, const rest = try protocol_support.read_int(buffer, u32);
+    const int, const rest = try protocol.protocol_support.read_int(buffer, u32);
 
     try std.testing.expectEqual(0x00409a44, int);
     try std.testing.expectEqualSlices(u8, rest, &bytes("b81e634200409a44"));
