@@ -51,7 +51,7 @@ const Protocol = struct {
     pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *IndentedWriter) !void {
         try writer.println("const std = @import(\"std\");", .{});
         try writer.println("pub const protocol_support = @import(\"protocol_support\");\n", .{});
-        try self.types.codegen(allocator, writer, .{ .outer = &self.types, .inner = null });
+        try self.types.codegenRead(allocator, writer, .{ .outer = &self.types, .inner = null });
         try writer.println("", .{});
         try self.handshaking.codegen(allocator, writer, "handshaking", &self.types);
         try self.status.codegen(allocator, writer, "status", &self.types);
@@ -78,7 +78,7 @@ const Types = struct {
         };
     }
 
-    pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *IndentedWriter, scope: Scope) !void {
+    pub fn codegenRead(self: *const @This(), allocator: std.mem.Allocator, writer: *IndentedWriter, scope: Scope) !void {
         var it = self.types.iterator();
         while (it.next()) |entry| {
             if (!std.mem.eql(u8, entry.key_ptr.*, "packet")) {
@@ -94,7 +94,27 @@ const Types = struct {
             writer.unindent();
             try writer.println("}}", .{});
             try writer.println("", .{});
-            try cursorTree.head.codegen(writer);
+            try cursorTree.head.codegenRead(writer);
+        }
+    }
+
+    pub fn codegenWrite(self: *const @This(), allocator: std.mem.Allocator, writer: *IndentedWriter, scope: Scope) !void {
+        var it = self.types.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.eql(u8, entry.key_ptr.*, "packet")) {
+                continue;
+            }
+            const resolved = try entry.value_ptr.resolve(allocator, scope, null);
+            var cursors = try Cursors.init(allocator);
+            try cursors.pushName("packet");
+            const cursorTree = try resolved.cursor(&cursors);
+            try writer.println("pub fn write(buffer: []const u8) {s} {{", .{cursorTree.head.name});
+            writer.indent();
+            try writer.println("return .{{ .buffer = buffer }};", .{});
+            writer.unindent();
+            try writer.println("}}", .{});
+            try writer.println("", .{});
+            try cursorTree.head.codegenWrite(writer);
         }
     }
 };
@@ -116,9 +136,16 @@ const State = struct {
 
         try writer.println("pub const toServer = struct {{", .{});
         writer.indent();
-        try self.toServer.codegen(allocator, writer, .{ .outer = outer, .inner = &self.toServer });
+        try self.toServer.codegenRead(allocator, writer, .{ .outer = outer, .inner = &self.toServer });
         writer.unindent();
         try writer.println("}};", .{});
+
+        try writer.println("pub const toClient = struct {{", .{});
+        writer.indent();
+        try self.toClient.codegenWrite(allocator, writer, .{ .outer = outer, .inner = &self.toClient });
+        writer.unindent();
+        try writer.println("}};", .{});
+
         writer.unindent();
         try writer.println("}};\n", .{});
     }
@@ -325,23 +352,26 @@ const ArrayCount = union(enum) {
     constant: usize,
 };
 
-const Type = union(enum) {
-    reference: []const u8,
-    todo,
-    native: NativeType,
-    container: struct { fields: []Field },
-    bitfield: struct { fields: []BitfieldField },
-    array: struct { count: ArrayCount, elementType: *Type },
-    pstring: struct { countType: NativeType },
-    switch_: struct { compareTo: []const u8, fields: []Field, default: *Type },
-    mapper: struct { type: NativeType, mappings: []Mapping },
+const Type = struct {
+    kind: union(enum) {
+        reference: []const u8,
+        todo,
+        native: NativeType,
+        container: struct { fields: []Field },
+        bitfield: struct { fields: []BitfieldField },
+        array: struct { count: ArrayCount, elementType: *Type },
+        pstring: struct { countType: NativeType },
+        switch_: struct { compareTo: []const u8, fields: []Field, default: *Type },
+        mapper: struct { type: NativeType, mappings: []Mapping },
+    },
+    resolved: ?*ResolvedType = null,
 
     pub fn fromJson(allocator: std.mem.Allocator, key: []const u8, json: std.json.Value) !Type {
         if (equalsString(json, "native")) {
-            return .{ .native = try NativeType.fromString(key) };
+            return .{ .kind = .{ .native = try NativeType.fromString(key) } };
         }
         if (isString(json)) |str| {
-            return .{ .reference = str };
+            return .{ .kind = .{ .reference = str } };
         }
         if (isConstructor(json)) |constructor| {
             if (std.mem.eql(u8, constructor.name, "container")) {
@@ -353,7 +383,7 @@ const Type = union(enum) {
                     const field_type = try Type.fromJson(allocator, field_name, try expectGet(field_object, "type"));
                     fields[i] = .{ .name = field_name, .type = field_type };
                 }
-                return .{ .container = .{ .fields = fields } };
+                return .{ .kind = .{ .container = .{ .fields = fields } } };
             }
             if (std.mem.eql(u8, constructor.name, "mapper")) {
                 const object = try expectObject(constructor.arg);
@@ -366,7 +396,7 @@ const Type = union(enum) {
                     const value = try std.fmt.parseInt(i64, entry.key_ptr.*, 0);
                     mappings[i] = .{ .value = value, .name = try expectString(entry.value_ptr.*) };
                 }
-                return .{ .mapper = .{ .mappings = mappings, .type = typ } };
+                return .{ .kind = .{ .mapper = .{ .mappings = mappings, .type = typ } } };
             }
             if (std.mem.eql(u8, constructor.name, "bitfield")) {
                 const array = try expectArray(constructor.arg);
@@ -378,7 +408,7 @@ const Type = union(enum) {
                     const field_signed = try expectBoolean(try expectGet(field_object, "signed"));
                     fields[i] = .{ .name = field_name, .type = .{ .size = @intCast(field_size), .signed = field_signed } };
                 }
-                return .{ .bitfield = .{ .fields = fields } };
+                return .{ .kind = .{ .bitfield = .{ .fields = fields } } };
             }
             if (std.mem.eql(u8, constructor.name, "array")) {
                 const object = try expectObject(constructor.arg);
@@ -394,13 +424,13 @@ const Type = union(enum) {
 
                 const elementType = try allocator.create(Type);
                 elementType.* = try Type.fromJson(allocator, "elementType", try expectGet(object, "type"));
-                return .{ .array = .{ .count = count, .elementType = elementType } };
+                return .{ .kind = .{ .array = .{ .count = count, .elementType = elementType } } };
             }
             if (std.mem.eql(u8, constructor.name, "pstring")) {
                 const object = try expectObject(constructor.arg);
                 const countType = try NativeType.fromString(try expectString(try expectGet(object, "countType")));
 
-                return .{ .pstring = .{ .countType = countType } };
+                return .{ .kind = .{ .pstring = .{ .countType = countType } } };
             }
             if (std.mem.eql(u8, constructor.name, "switch")) {
                 const object = try expectObject(constructor.arg);
@@ -409,7 +439,7 @@ const Type = union(enum) {
                 default.* = if (object.get("default")) |d|
                     try Type.fromJson(allocator, "default", d)
                 else
-                    .{ .native = .void };
+                    .{ .kind = .{ .native = .void } };
                 const fieldsObject = try expectObject(try expectGet(object, "fields"));
                 var fields = try allocator.alloc(Field, fieldsObject.count());
                 var it = fieldsObject.iterator();
@@ -419,15 +449,19 @@ const Type = union(enum) {
                     const field_type = try Type.fromJson(allocator, entry.key_ptr.*, entry.value_ptr.*);
                     fields[i] = .{ .name = field_name, .type = field_type };
                 }
-                return .{ .switch_ = .{ .compareTo = compareTo, .fields = fields, .default = default } };
+                return .{ .kind = .{ .switch_ = .{ .compareTo = compareTo, .fields = fields, .default = default } } };
             }
         }
 
-        return .todo;
+        return .{ .kind = .todo };
     }
 
-    pub fn resolve(self: *const Type, allocator: std.mem.Allocator, scope: Scope, parentContainer: ?*ResolvedContainer) !*ResolvedType {
-        switch (self.*) {
+    pub fn resolve(self: *Type, allocator: std.mem.Allocator, scope: Scope, parentContainer: ?*ResolvedContainer) !*ResolvedType {
+        std.debug.print("=== {any} ===\n", .{self.*});
+        if (self.resolved) |resolved| {
+            return resolved;
+        }
+        switch (self.kind) {
             .reference => |reference| {
                 if (scope.outer.types.get(reference)) |referenced| {
                     return referenced.resolve(allocator, Scope{ .outer = scope.outer, .inner = null }, null);
@@ -437,31 +471,32 @@ const Type = union(enum) {
                         return referenced.resolve(allocator, scope, parentContainer);
                     }
                 }
+                std.debug.print("Undefined reference: {s}\n", .{reference});
                 return error.UndefinedReference;
             },
             .container => |container| {
-                const result = try allocator.create(ResolvedType);
+                self.resolved = try allocator.create(ResolvedType);
                 var fields = try allocator.alloc(ResolvedField, container.fields.len);
-                result.* = .{ .container = .{ .fields = fields[0..0] } };
+                self.resolved.?.* = .{ .container = .{ .fields = fields[0..0] } };
                 for (0.., container.fields) |i, field| {
-                    fields[i] = .{ .name = field.name, .type = try field.type.resolve(allocator, scope, &result.container) };
-                    result.container.fields = fields[0 .. i + 1];
+                    fields[i] = .{ .name = field.name, .type = try field.type.resolve(allocator, scope, &self.resolved.?.container) };
+                    self.resolved.?.container.fields = fields[0 .. i + 1];
                 }
-                return result;
+                return self.resolved.?;
             },
             .native => |native| {
-                const result = try allocator.create(ResolvedType);
-                result.* = .{ .native = native };
-                return result;
+                self.resolved = try allocator.create(ResolvedType);
+                self.resolved.?.* = .{ .native = native };
+                return self.resolved.?;
             },
             .pstring => |pstring| {
-                const result = try allocator.create(ResolvedType);
-                result.* = .{ .pstring = .{ .countType = pstring.countType } };
-                return result;
+                self.resolved = try allocator.create(ResolvedType);
+                self.resolved.?.* = .{ .pstring = .{ .countType = pstring.countType } };
+                return self.resolved.?;
             },
             .switch_ => |switch_| {
                 const compareTo = try resolveReference(switch_.compareTo, parentContainer);
-                const result = try allocator.create(ResolvedType);
+                self.resolved = try allocator.create(ResolvedType);
                 var fields = try allocator.alloc(ResolvedVariant, switch_.fields.len);
                 for (0.., switch_.fields) |i, field| {
                     fields[i] = .{
@@ -469,24 +504,24 @@ const Type = union(enum) {
                         .type = try field.type.resolve(allocator, scope, parentContainer),
                     };
                 }
-                result.* = .{
+                self.resolved.?.* = .{
                     .switch_ = .{
                         .compareTo = compareTo,
                         .variants = fields,
                         .default = try switch_.default.resolve(allocator, scope, parentContainer),
                     },
                 };
-                return result;
+                return self.resolved.?;
             },
             .mapper => |mapper| {
-                const result = try allocator.create(ResolvedType);
-                result.* = .{ .mapper = .{ .mappings = mapper.mappings, .type = mapper.type } };
-                return result;
+                self.resolved = try allocator.create(ResolvedType);
+                self.resolved.?.* = .{ .mapper = .{ .mappings = mapper.mappings, .type = mapper.type } };
+                return self.resolved.?;
             },
             else => {
-                const result = try allocator.create(ResolvedType);
-                result.* = .todo;
-                return result;
+                self.resolved = try allocator.create(ResolvedType);
+                self.resolved.?.* = .todo;
+                return self.resolved.?;
             },
         }
     }
@@ -705,8 +740,9 @@ const Cursor = struct {
     },
     fieldName: []const u8,
     visited: bool = false,
+    visited_write: bool = false,
 
-    pub fn codegen(self: *Cursor, writer: *IndentedWriter) !void {
+    pub fn codegenRead(self: *Cursor, writer: *IndentedWriter) !void {
         if (self.visited) {
             return;
         }
@@ -738,7 +774,7 @@ const Cursor = struct {
                 try writer.println("}};", .{});
                 try writer.println("", .{});
                 if (simple.next) |next| {
-                    try next.codegen(writer);
+                    try next.codegenRead(writer);
                 }
             },
             .variants => |variants| {
@@ -766,9 +802,75 @@ const Cursor = struct {
                 try writer.println("}};", .{});
                 try writer.println("", .{});
                 for (variants.variants) |variant| {
-                    try variant.cursor.codegen(writer);
+                    try variant.cursor.codegenRead(writer);
                 }
-                try variants.default.codegen(writer);
+                try variants.default.codegenRead(writer);
+            },
+            .todo => |_| {
+                try writer.println("pub fn {f}(self: @This()) noreturn {{", .{idfmt(self.fieldName)});
+                writer.indent();
+                try writer.println("_ = self;", .{});
+                try writer.println("@panic(\"todo\");", .{});
+                writer.unindent();
+                try writer.println("}}", .{});
+                writer.unindent();
+                try writer.println("}};", .{});
+            },
+        }
+    }
+
+    pub fn codegenWrite(self: *Cursor, writer: *IndentedWriter) !void {
+        if (self.visited_write) {
+            return;
+        }
+        self.visited_write = true;
+
+        try writer.println("pub const write__{s} = struct {{", .{self.name});
+        writer.indent();
+        try writer.println("buffer: []u8,", .{});
+        try writer.println("", .{});
+
+        switch (self.kind) {
+            .simple => |simple| {
+                switch (simple.readType) {
+                    .native => |native| {
+                        try writer.println("pub fn {f}(self: @This(), value: {s}) protocol_support.WriteError!{s} {{", .{ idfmt(self.fieldName), try native.codegenType(), cursorName(simple.next) });
+                        writer.indent();
+                        try writer.println("const rest = try protocol_support.write_{s}(self.buffer, value);", .{@tagName(native)});
+                        try writer.println("return .{{ .buffer = rest }};", .{});
+                    },
+                    .pstring => |pstring| {
+                        try writer.println("pub fn {f}(self: @This(), size: usize) protocol_support.WriteError!struct {{ []u8, {s} }} {{", .{ idfmt(self.fieldName), cursorName(simple.next) });
+                        writer.indent();
+                        try writer.println("const rest = try protocol_support.write_{s}(self.buffer, @intCast(size));", .{@tagName(pstring)});
+                        try writer.println("return .{{ rest[0..size], .{{.buffer = rest[size..] }} }};", .{});
+                    },
+                }
+                writer.unindent();
+                try writer.println("}}", .{});
+                writer.unindent();
+                try writer.println("}};", .{});
+                try writer.println("", .{});
+                if (simple.next) |next| {
+                    try next.codegenWrite(writer);
+                }
+            },
+            .variants => |variants| {
+                for (variants.variants) |variant| {
+                    try writer.println("pub fn {f}(self: @This()) protocol_support.WriteError!{s} {{", .{ idfmt(variant.name), variant.cursor.name });
+                    writer.indent();
+                    try writer.println("const rest = try protocol_support.write_{s}(self.buffer, {});", .{ @tagName(variants.readType), variant.value });
+                    try writer.println("return .{{ .buffer = rest }};", .{});
+                    writer.unindent();
+                    try writer.println("}}", .{});
+                }
+                writer.unindent();
+                try writer.println("}};", .{});
+                try writer.println("", .{});
+                for (variants.variants) |variant| {
+                    try variant.cursor.codegenWrite(writer);
+                }
+                try variants.default.codegenWrite(writer);
             },
             .todo => |_| {
                 try writer.println("pub fn {f}(self: @This()) noreturn {{", .{idfmt(self.fieldName)});
