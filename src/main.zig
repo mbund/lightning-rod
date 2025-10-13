@@ -15,16 +15,6 @@ const String = @import("string.zig").String;
 
 const log = std.log.scoped(.tcp_epoll_server);
 
-const nbt = @import("nbt.zig");
-
-pub fn writeNbtFile(name: []const u8, data: nbt.NbtData) !void {
-    const file = try std.fs.cwd().createFile(name, .{});
-    defer file.close();
-    var buf = std.mem.zeroes([16384]u8);
-    var file_writer = file.writer(&buf);
-    try data.write(&file_writer.interface);
-}
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
