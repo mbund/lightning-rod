@@ -623,7 +623,7 @@ const ResolvedType = union(enum) {
                                         break :blk mapping.name;
                                     }
                                 }
-                                @panic("unreachable");
+                                unreachable;
                             };
                             for (switch_.variants) |variant| {
                                 if (std.mem.eql(u8, variant.value, currentValueName)) {
