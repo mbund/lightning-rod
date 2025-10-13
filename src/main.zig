@@ -82,8 +82,6 @@ const Server = struct {
                                     break;
                                 } orelse break; // no more messages
 
-                                std.debug.print("GOT MESSAGE: {any}\n", .{msg});
-
                                 var input = std.io.Reader.fixed(msg);
 
                                 const packet_id = try VarInt.read(&input);
