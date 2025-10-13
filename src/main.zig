@@ -1,8 +1,14 @@
 const std = @import("std");
+const protocol = @import("protocol");
 const net = std.net;
 const posix = std.posix;
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
+
+test {
+    _ = @import("varint.zig");
+    _ = @import("protocol_test.zig");
+}
 
 const VarInt = @import("varint.zig").VarInt;
 const String = @import("string.zig").String;
@@ -94,61 +100,73 @@ const Server = struct {
                                     break;
                                 } orelse break; // no more messages
 
-                                var input = std.io.Reader.fixed(msg);
-
-                                const packet_id = try VarInt.read(&input);
-
                                 if (client.state == .handshaking) {
+                                    const c1 = protocol.handshaking.toServer.read(msg);
                                     // handshake
-                                    if (packet_id == 0) {
-                                        const protocol_version = try VarInt.read(&input);
-                                        const server_address = try String.read(&input);
-                                        const server_port = try input.takeInt(u16, std.builtin.Endian.big);
-                                        const intent = try VarInt.read(&input);
+                                    switch (try c1.name()) {
+                                        .set_protocol => |c2| {
+                                            const protocol_version, const c3 = try c2.protocolVersion();
+                                            const server_address, const c4 = try c3.serverHost();
+                                            const server_port, const c5 = try c4.serverPort();
+                                            const intent, const c6 = try c5.nextState();
+                                            try c6.finish();
 
-                                        log.info("handshake protocol_version={} server_address={s} server_port={} intent={}", .{ protocol_version, server_address, server_port, intent });
+                                            log.info("handshake protocol_version={} server_address={s} server_port={} intent={}", .{ protocol_version, server_address, server_port, intent });
 
-                                        if (intent == 1) {
-                                            client.state = .status;
+                                            if (intent == 1) {
+                                                client.state = .status;
 
-                                            var output = std.io.Writer.fixed(client.write_buf[3..]);
-                                            _ = try VarInt.write(&output, 0);
-                                            _ = try String.write(&output,
-                                                \\{"version":{"name":"1.21.8","protocol":772},"players":{"max":20,"online":1,"sample":[{"name":"cakeless","id":"0341ed27-7393-4e6a-9101-6c07f879b7b3"}]},"description":{"text":"Hello, world!"}}
-                                            );
+                                                var output = std.io.Writer.fixed(client.write_buf[2..]);
+                                                _ = try VarInt.write(&output, 0);
+                                                _ = try String.write(&output,
+                                                    \\{"version":{"name":"1.21.8","protocol":772},"players":{"max":20,"online":1,"sample":[{"name":"cakeless","id":"0341ed27-7393-4e6a-9101-6c07f879b7b3"}]},"description":{"text":"Hello, world!"}}
+                                                );
 
-                                            var final_output = std.io.Writer.fixed(client.write_buf[0..3]);
-                                            _ = try VarInt.write(&final_output, @intCast(output.end));
-                                            const packet_length_length = final_output.end;
-                                            @memmove(client.write_buf[3 - packet_length_length .. 3], client.write_buf[0..packet_length_length]);
-                                            client.to_write = client.write_buf[3 - packet_length_length .. 3 + output.end];
-                                            try client.write();
-                                        } else if (intent == 2) {
-                                            client.state = .login;
-                                        }
+                                                // packet length is a maximum of 3 byte varint
+                                                @memset(client.write_buf[1..3], 0);
+                                                var final_output = std.io.Writer.fixed(client.write_buf[0..3]);
+                                                _ = try VarInt.write(&final_output, @intCast(output.end));
+                                                client.to_write = client.write_buf[0 .. 2 + output.end];
+                                                try client.write();
+                                            } else if (intent == 2) {
+                                                client.state = .login;
+                                            }
+                                        },
+                                        else => {},
                                     }
                                 } else if (client.state == .status) {
-                                    // status request
-                                    if (packet_id == 0) {
-                                        log.info("status request", .{});
-                                        continue;
+                                    const c1 = protocol.status.toServer.read(msg);
+                                    switch (try c1.name()) {
+                                        .ping => |c2| {
+                                            const timestamp, const c3 = try c2.time();
+                                            try c3.finish();
+                                            log.info("ping request timestamp={}", .{timestamp});
+
+                                            var output = std.io.Writer.fixed(client.write_buf[1..]);
+                                            _ = try VarInt.write(&output, 1);
+                                            try output.writeInt(i64, timestamp, std.builtin.Endian.big);
+
+                                            // std.posix.nanosleep(0, 20 * 1000 * 1000);
+
+                                            var final_output = std.io.Writer.fixed(client.write_buf[0..1]);
+                                            _ = try VarInt.write(&final_output, @intCast(output.end));
+                                            client.to_write = client.write_buf[0 .. 1 + output.end];
+                                            try client.write();
+                                        },
+                                        else => {
+                                            log.info("status request", .{});
+                                        },
                                     }
-
-                                    // ping request
-                                    if (packet_id == 1) {
-                                        const timestamp = try input.takeInt(i64, std.builtin.Endian.big);
-                                        log.info("ping request timestamp={}", .{timestamp});
-
-                                        var output = std.io.Writer.fixed(client.write_buf[1..]);
-                                        _ = try VarInt.write(&output, 1);
-                                        try output.writeInt(i64, timestamp, std.builtin.Endian.big);
-
-                                        // std.posix.nanosleep(0, 20 * 1000 * 1000);
-
-                                        var final_output = std.io.Writer.fixed(client.write_buf[0..1]);
-                                        _ = try VarInt.write(&final_output, @intCast(output.end));
-                                        client.to_write = client.write_buf[0 .. 1 + output.end];
-                                        try client.write();
+                                } else if (client.state == .login) {
+                                    const c1 = protocol.login.toServer.read(msg);
+                                    switch (try c1.name()) {
+                                        .login_start => |c2| {
+                                            const player_name, const c3 = try c2.username();
+                                            const uuid, const c4 = try c3.playerUUID();
+                                            try c4.finish();
+                                            log.info("login start name={s} uuid={}", .{ player_name, uuid });
+                                        },
+                                        else => {},
                                     }
                                 }
                             }
