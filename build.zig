@@ -4,6 +4,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const minecraft_data = b.dependency("minecraft_data", .{});
+
     const codegen_exe = b.addExecutable(.{
         .name = "codegen",
         .root_module = b.createModule(.{
@@ -14,8 +16,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const codegen_cmd = b.addRunArtifact(codegen_exe);
-
-    codegen_cmd.addFileArg(b.path("minecraft-data/data/pc/1.21.8/protocol.json"));
+    codegen_cmd.addFileArg(minecraft_data.path("data/pc/1.21.8/protocol.json"));
     const protocol_zig_file = codegen_cmd.addOutputFileArg("protocol.zig");
 
     const protocol_module = b.createModule(.{
