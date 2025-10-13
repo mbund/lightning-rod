@@ -50,3 +50,17 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 }
+
+fn makeCodegen(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
+    const prog_node = options.progress_node;
+    const b = step.owner;
+
+    const c_source_path = translate_c.source.getPath2(b, step);
+    try argv_list.append(c_source_path);
+
+    const output_dir = try step.evalZigProcess(argv_list.items, prog_node, false, options.web_server, options.gpa);
+
+    const basename = std.fs.path.stem(std.fs.path.basename(c_source_path));
+    translate_c.out_basename = b.fmt("{s}.zig", .{basename});
+    translate_c.output_file.path = output_dir.?.joinString(b.allocator, translate_c.out_basename) catch @panic("OOM");
+}
