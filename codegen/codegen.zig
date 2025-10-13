@@ -101,12 +101,12 @@ const Types = struct {
 
 const State = struct {
     toServer: Types,
-    // toClient: Types,
+    toClient: Types,
 
     pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) !State {
         return .{
             .toServer = try Types.fromJson(allocator, try expectGet(try expectObject(try expectGet(try expectObject(json), "toServer")), "types")),
-            // .toClient = try Types.fromJson(allocator, try expectGet(try expectObject(try expectGet(try expectObject(json), "toClient")), "types")),
+            .toClient = try Types.fromJson(allocator, try expectGet(try expectObject(try expectGet(try expectObject(json), "toClient")), "types")),
         };
     }
 
