@@ -7,7 +7,7 @@ fn bytes(comptime hex: []const u8) [hex.len / 2]u8 {
     return result;
 }
 
-test {
+test "reading integer from random bytes" {
     const buffer = &bytes("00409a44b81e634200409a44");
     const int, const rest = try protocol.protocol_support.read_int(buffer, u32);
 
@@ -15,7 +15,7 @@ test {
     try std.testing.expectEqualSlices(u8, rest, &bytes("b81e634200409a44"));
 }
 
-test {
+test "handshaking set_protocol" {
     const buffer = &bytes("008406093132372e302e302e3163dd01");
     const c1 = protocol.handshaking.toServer.read(buffer);
     switch (try c1.name()) {
@@ -40,7 +40,7 @@ test {
     }
 }
 
-test {
+test "status ping" {
     const buffer = &bytes("01000000000000158b");
     const c1 = protocol.status.toServer.read(buffer);
     switch (try c1.name()) {
@@ -59,7 +59,7 @@ test {
     }
 }
 
-test {
+test "login login_start" {
     const buffer = &bytes("000a77617270636f726530351a13faa879e54c248997b6dd9b14e23d");
     const c1 = protocol.login.toServer.read(buffer);
     switch (try c1.name()) {
