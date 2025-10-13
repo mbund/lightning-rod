@@ -1017,8 +1017,7 @@ pub const IdFormatter = struct {
 };
 
 fn printIndent(writer: *std.io.Writer, level: usize) !void {
-    var i: usize = 0;
-    while (i < level) : (i += 1) {
+    for (0..level) |_| {
         try writer.print("    ", .{});
     }
 }
