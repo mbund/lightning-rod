@@ -719,7 +719,7 @@ const Cursor = struct {
 
         switch (self.kind) {
             .simple => |simple| {
-                try writer.println("pub fn {f}(self: @This()) !struct {{ {s}, {s} }} {{", .{ idfmt(self.fieldName), try simple.readType.codegenType(), cursorName(simple.next) });
+                try writer.println("pub fn {f}(self: @This()) protocol_support.ReadError!struct {{ {s}, {s} }} {{", .{ idfmt(self.fieldName), try simple.readType.codegenType(), cursorName(simple.next) });
                 writer.indent();
                 switch (simple.readType) {
                     .native => |native| {
@@ -742,7 +742,7 @@ const Cursor = struct {
                 }
             },
             .variants => |variants| {
-                try writer.println("pub fn {f}(self: @This()) !union(enum) {{", .{idfmt(self.fieldName)});
+                try writer.println("pub fn {f}(self: @This()) protocol_support.ReadError!union(enum) {{", .{idfmt(self.fieldName)});
                 writer.indent();
                 for (variants.variants) |variant| {
                     try writer.println("{s}: {s},", .{ variant.name, variant.cursor.name });

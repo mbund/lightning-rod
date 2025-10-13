@@ -1,6 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+pub const ReadError = error{
+    ExtraDataAfterEndOfPacket,
+};
+
 const SEGMENT_BITS = 0x7F;
 const CONTINUE_BIT = 0x80;
 
@@ -66,9 +70,9 @@ pub fn read_UUID(buffer: []const u8) !struct { u128, []const u8 } {
 pub const FinalCursor = struct {
     buffer: []const u8,
 
-    pub fn finish(self: FinalCursor) !void {
+    pub fn finish(self: FinalCursor) ReadError!void {
         if (self.buffer.len != 0) {
-            return error.TooLong;
+            return error.ExtraDataAfterEndOfPacket;
         }
     }
 };
