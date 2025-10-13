@@ -40,3 +40,38 @@ test {
         },
     }
 }
+
+test {
+    const buffer = &bytes("01000000000000158b");
+    const c1 = protocol.status.toServer.read(buffer);
+    switch (try c1.name()) {
+        .ping => |c2| {
+            const timestamp, const c3 = try c2.time();
+            try c3.finish();
+
+            try std.testing.expectEqual(5515, timestamp);
+        },
+        .ping_start => {
+            return error.No;
+        },
+        .default => {
+            return error.No;
+        },
+    }
+}
+
+test {
+    const buffer = &bytes("000a77617270636f726530351a13faa879e54c248997b6dd9b14e23d");
+    const c1 = protocol.login.toServer.read(buffer);
+    switch (try c1.name()) {
+        .login_start => |c2| {
+            const username, const c3 = try c2.username();
+            const uuid, const c4 = try c3.playerUUID();
+            try c4.finish();
+
+            try std.testing.expectEqualStrings("warpcore05", username);
+            try std.testing.expectEqual(34663665481177079509380347836620923453, uuid);
+        },
+        else => return error.No,
+    }
+}

@@ -1,8 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const SEGMENT_BITS = 0x7F;
-pub const CONTINUE_BIT = 0x80;
+const SEGMENT_BITS = 0x7F;
+const CONTINUE_BIT = 0x80;
+
+pub const UUID = u128;
 
 pub fn read_int(buffer: []const u8, comptime T: type) !struct { T, []const u8 } {
     const size = @divExact(@typeInfo(T).int.bits, 8);
@@ -55,6 +57,10 @@ pub fn read_i32(buffer: []const u8) !struct { i32, []const u8 } {
 
 pub fn read_i64(buffer: []const u8) !struct { i64, []const u8 } {
     return read_int(buffer, i64);
+}
+
+pub fn read_UUID(buffer: []const u8) !struct { u128, []const u8 } {
+    return read_int(buffer, u128);
 }
 
 pub const FinalCursor = struct {
