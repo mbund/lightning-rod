@@ -1,6 +1,5 @@
 const protocol = @import("protocol");
 const std = @import("std");
-const builtin = @import("builtin");
 
 fn bytes(comptime hex: []const u8) [hex.len / 2]u8 {
     comptime var result = std.mem.zeroes([hex.len / 2]u8);
