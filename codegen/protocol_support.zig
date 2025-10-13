@@ -72,14 +72,3 @@ pub const FinalCursor = struct {
         }
     }
 };
-//
-// pub fn read_f32(self: *Reader, out: *f32) !void {
-//     const size = 4;
-//     out.* = @bitCast(std.mem.readInt(u32, self.buffer[0..size], builtin.cpu.arch.endian()));
-//     self.buffer = self.buffer[size..];
-// }
-// pub fn read_f64(self: *Reader, out: *f64) !void {
-//     const size = 8;
-//     out.* = @bitCast(std.mem.readInt(u64, self.buffer[0..size], builtin.cpu.arch.endian()));
-//     self.buffer = self.buffer[size..];
-// }
