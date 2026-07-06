@@ -31,10 +31,10 @@ test "handshaking set_protocol" {
             try std.testing.expectEqual(25565, port);
             try std.testing.expectEqual(1, nextState);
         },
-        .legacy_server_list_ping => |_| {
+        .legacy_server_list_ping => {
             return error.No;
         },
-        .default => |_| {
+        .default => {
             return error.No;
         },
     }

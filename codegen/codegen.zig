@@ -1,16 +1,18 @@
 const std = @import("std");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    var args = std.process.args();
+    var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.skip();
     const input_path = args.next() orelse return error.NotEnoughArgs;
     const output_path = args.next() orelse return error.NotEnoughArgs;
-    const output_file = try std.fs.cwd().createFile(output_path, .{});
+    const output_file = try std.Io.Dir.createFile(.cwd(), init.io, output_path, .{});
+    defer output_file.close(init.io);
 
     const json = try readJson(
+        init.io,
         allocator,
         input_path,
     );
@@ -18,7 +20,7 @@ pub fn main() !void {
 
     const protocol = try Protocol.fromJson(allocator, json.value);
     const buffer = try allocator.alloc(u8, 4096);
-    var output_writer = output_file.writer(buffer);
+    var output_writer = output_file.writer(init.io, buffer);
     var writer = IndentedWriter{ .writer = &output_writer.interface };
     try protocol.codegen(allocator, &writer);
     try output_writer.interface.flush();
@@ -690,7 +692,7 @@ const Cursor = struct {
                 pub fn codegenType(self: @This()) ![]const u8 {
                     return switch (self) {
                         .native => |native| try native.codegenType(),
-                        .pstring => |_| "[]const u8",
+                        .pstring => "[]const u8",
                     };
                 }
             },
@@ -770,7 +772,7 @@ const Cursor = struct {
                 }
                 try variants.default.codegen(writer);
             },
-            .todo => |_| {
+            .todo => {
                 try writer.println("pub fn {f}(self: @This()) noreturn {{", .{idfmt(self.fieldName)});
                 writer.indent();
                 try writer.println("_ = self;", .{});
@@ -785,7 +787,7 @@ const Cursor = struct {
 
     pub fn updateNext(self: *Cursor, next: *Cursor) !void {
         switch (self.kind) {
-            .simple => |_| {
+            .simple => {
                 self.kind.simple.next = next;
             },
             .todo => {},
@@ -832,10 +834,11 @@ const Cursors = struct {
 };
 
 fn readJson(
+    io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
 ) !std.json.Parsed(std.json.Value) {
-    const data = try std.fs.cwd().readFileAlloc(allocator, path, std.math.maxInt(u64));
+    const data = try std.Io.Dir.readFileAlloc(.cwd(), io, path, allocator, .unlimited);
     defer allocator.free(data);
 
     return std.json.parseFromSlice(
@@ -1016,14 +1019,14 @@ pub const IdFormatter = struct {
     }
 };
 
-fn printIndent(writer: *std.io.Writer, level: usize) !void {
+fn printIndent(writer: *std.Io.Writer, level: usize) !void {
     for (0..level) |_| {
         try writer.print("    ", .{});
     }
 }
 
 const IndentedWriter = struct {
-    writer: *std.io.Writer,
+    writer: *std.Io.Writer,
     level: usize = 0,
 
     pub fn println(self: *IndentedWriter, comptime fmt: []const u8, args: anytype) !void {

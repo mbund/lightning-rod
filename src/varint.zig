@@ -35,42 +35,42 @@ pub const VarInt = struct {
 
 test {
     const buf = &[_]u8{16};
-    var stream = std.io.Reader.fixed(buf);
+    var stream = std.Io.Reader.fixed(buf);
     const actual = try VarInt.read(&stream);
     try std.testing.expectEqual(16, actual);
 }
 
 test {
     const buf = &[_]u8{ 254, 1 };
-    var stream = std.io.Reader.fixed(buf);
+    var stream = std.Io.Reader.fixed(buf);
     const actual = try VarInt.read(&stream);
     try std.testing.expectEqual(254, actual);
 }
 
 test {
     const buf = &[_]u8{ 254, 2 };
-    var stream = std.io.Reader.fixed(buf);
+    var stream = std.Io.Reader.fixed(buf);
     const actual = try VarInt.read(&stream);
     try std.testing.expectEqual(382, actual);
 }
 
 test {
     const buf = &[_]u8{ 128, 128, 128, 128, 8 };
-    var stream = std.io.Reader.fixed(buf);
+    var stream = std.Io.Reader.fixed(buf);
     const actual = try VarInt.read(&stream);
     try std.testing.expectEqual(-2147483648, actual);
 }
 
 test {
     const buf = &[_]u8{ 128, 128, 128, 128, 128, 8 };
-    var stream = std.io.Reader.fixed(buf);
+    var stream = std.Io.Reader.fixed(buf);
     const actual = VarInt.read(&stream);
     try std.testing.expectError(error.TooManyBytes, actual);
 }
 
 test {
     const buf = &[_]u8{ 132, 6 };
-    var stream = std.io.Reader.fixed(buf);
+    var stream = std.Io.Reader.fixed(buf);
     const actual = try VarInt.read(&stream);
     try std.testing.expectEqual(772, actual);
 }

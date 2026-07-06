@@ -2,7 +2,7 @@
     .fingerprint = 0x96542973218a6f7d,
     .name = .lightning_rod,
     .version = "0.0.0",
-    .minimum_zig_version = "0.15.1",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .minecraft_data = .{
             .url = "git+https://github.com/PrismarineJS/minecraft-data#3.99.1",

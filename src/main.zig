@@ -1,6 +1,6 @@
 const std = @import("std");
 const protocol = @import("protocol");
-const net = std.net;
+const net = std.Io.net;
 const posix = std.posix;
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
@@ -16,13 +16,13 @@ const String = @import("string.zig").String;
 const log = std.log.scoped(.tcp_epoll_server);
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     const allocator = gpa.allocator();
 
     var server = try Server.init(allocator, 4096);
     defer server.deinit();
 
-    const address = try std.net.Address.parseIp("127.0.0.1", 25565);
+    const address = try net.IpAddress.parse("127.0.0.1", 25565);
     try server.run(address);
 }
 
@@ -47,27 +47,29 @@ const Server = struct {
             .connected = 0,
             .loop = loop,
             .allocator = allocator,
-            .client_pool = std.heap.MemoryPool(Client).init(allocator),
+            .client_pool = .empty,
         };
     }
 
     fn deinit(self: *Server) void {
         self.loop.deinit();
-        self.client_pool.deinit();
+        self.client_pool.deinit(self.allocator);
     }
 
-    fn run(self: *Server, address: std.net.Address) !void {
-        const listener = try posix.socket(address.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP);
-        defer posix.close(listener);
+    fn run(self: *Server, address: net.IpAddress) !void {
+        const listener = try linuxSocket(posixAddressFamily(&address), linux.SOCK.STREAM | linux.SOCK.NONBLOCK, linux.IPPROTO.TCP);
+        defer linuxClose(listener);
 
         try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-        try posix.bind(listener, &address.any, address.getOsSockLen());
-        try posix.listen(listener, 128);
+        var storage: PosixAddress = undefined;
+        const address_len = addressToPosix(&address, &storage);
+        try linuxBind(listener, &storage.any, address_len);
+        try linuxListen(listener, 128);
 
         try self.loop.addListener(listener);
 
         while (true) {
-            const ready_events = self.loop.wait(-1);
+            const ready_events = try self.loop.wait(-1);
             for (ready_events) |ready| {
                 switch (ready.data.ptr) {
                     0 => self.accept(listener) catch |err| log.err("failed to accept: {}", .{err}),
@@ -99,7 +101,7 @@ const Server = struct {
                                             if (intent == 1) {
                                                 client.state = .status;
 
-                                                var output = std.io.Writer.fixed(client.write_buf[2..]);
+                                                var output = std.Io.Writer.fixed(client.write_buf[2..]);
                                                 _ = try VarInt.write(&output, 0);
                                                 _ = try String.write(&output,
                                                     \\{"version":{"name":"1.21.8","protocol":772},"players":{"max":20,"online":1,"sample":[{"name":"cakeless","id":"0341ed27-7393-4e6a-9101-6c07f879b7b3"}]},"description":{"text":"Hello, world!"}}
@@ -107,7 +109,7 @@ const Server = struct {
 
                                                 // packet length is a maximum of 3 byte varint
                                                 @memset(client.write_buf[1..3], 0);
-                                                var final_output = std.io.Writer.fixed(client.write_buf[0..3]);
+                                                var final_output = std.Io.Writer.fixed(client.write_buf[0..3]);
                                                 _ = try VarInt.write(&final_output, @intCast(output.end));
                                                 client.to_write = client.write_buf[0 .. 2 + output.end];
                                                 try client.write();
@@ -125,13 +127,13 @@ const Server = struct {
                                             try c3.finish();
                                             log.info("ping request timestamp={}", .{timestamp});
 
-                                            var output = std.io.Writer.fixed(client.write_buf[1..]);
+                                            var output = std.Io.Writer.fixed(client.write_buf[1..]);
                                             _ = try VarInt.write(&output, 1);
                                             try output.writeInt(i64, timestamp, std.builtin.Endian.big);
 
                                             // std.posix.nanosleep(0, 20 * 1000 * 1000);
 
-                                            var final_output = std.io.Writer.fixed(client.write_buf[0..1]);
+                                            var final_output = std.Io.Writer.fixed(client.write_buf[0..1]);
                                             _ = try VarInt.write(&final_output, @intCast(output.end));
                                             client.to_write = client.write_buf[0 .. 1 + output.end];
                                             try client.write();
@@ -165,19 +167,20 @@ const Server = struct {
     fn accept(self: *Server, listener: posix.socket_t) !void {
         const space = self.max - self.connected;
         for (0..space) |_| {
-            var address: net.Address = undefined;
-            var address_len: posix.socklen_t = @sizeOf(net.Address);
-            const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.NONBLOCK) catch |err| switch (err) {
+            var posix_address: PosixAddress = undefined;
+            var address_len: posix.socklen_t = @sizeOf(PosixAddress);
+            const socket = linuxAccept(listener, &posix_address.any, &address_len, linux.SOCK.NONBLOCK) catch |err| switch (err) {
                 error.WouldBlock => return,
                 else => return err,
             };
+            const address = addressFromPosix(&posix_address);
 
             log.info("ACCEPT {f}", .{address});
 
-            const client = try self.client_pool.create();
+            const client = try self.client_pool.create(self.allocator);
             errdefer self.client_pool.destroy(client);
             client.* = Client.init(self.allocator, socket, address, &self.loop) catch |err| {
-                posix.close(socket);
+                linuxClose(socket);
                 log.err("failed to initialize client: {}", .{err});
                 return;
             };
@@ -193,7 +196,7 @@ const Server = struct {
 
     fn closeClient(self: *Server, client: *Client) void {
         log.info("CLOSE {f}", .{client.address});
-        posix.close(client.socket);
+        linuxClose(client.socket);
         client.deinit(self.allocator);
         self.client_pool.destroy(client);
     }
@@ -210,7 +213,7 @@ const Client = struct {
     mode: Epoll.IOMode = .read,
 
     socket: posix.socket_t,
-    address: std.net.Address,
+    address: net.IpAddress,
 
     reader: Reader,
 
@@ -224,7 +227,7 @@ const Client = struct {
 
     state: ConnectionState = .handshaking,
 
-    fn init(allocator: Allocator, socket: posix.socket_t, address: std.net.Address, loop: *Epoll) !Client {
+    fn init(allocator: Allocator, socket: posix.socket_t, address: net.IpAddress, loop: *Epoll) !Client {
         const reader = try Reader.init(allocator, 4096);
         errdefer reader.deinit(allocator);
 
@@ -259,7 +262,7 @@ const Client = struct {
         var buf = self.to_write;
         defer self.to_write = buf;
         while (buf.len > 0) {
-            const n = posix.write(self.socket, buf) catch |err| switch (err) {
+            const n = linuxWrite(self.socket, buf) catch |err| switch (err) {
                 error.WouldBlock => return self.setEpollMode(.write),
                 else => return err,
             };
@@ -332,7 +335,7 @@ const Reader = struct {
             return null;
         }
 
-        var input = std.io.Reader.fixed(unprocessed);
+        var input = std.Io.Reader.fixed(unprocessed);
         const len = try VarInt.read(&input);
         if (len < 0) {
             @panic("negative message length");
@@ -368,6 +371,105 @@ const Reader = struct {
     }
 };
 
+const PosixAddress = extern union {
+    any: posix.sockaddr,
+    in: posix.sockaddr.in,
+    in6: posix.sockaddr.in6,
+};
+
+fn posixAddressFamily(address: *const net.IpAddress) u32 {
+    return switch (address.*) {
+        .ip4 => linux.AF.INET,
+        .ip6 => linux.AF.INET6,
+    };
+}
+
+fn addressToPosix(address: *const net.IpAddress, storage: *PosixAddress) posix.socklen_t {
+    return switch (address.*) {
+        .ip4 => |ip4| {
+            storage.in = .{
+                .port = std.mem.nativeToBig(u16, ip4.port),
+                .addr = @bitCast(ip4.bytes),
+            };
+            return @sizeOf(posix.sockaddr.in);
+        },
+        .ip6 => |ip6| {
+            storage.in6 = .{
+                .port = std.mem.nativeToBig(u16, ip6.port),
+                .flowinfo = ip6.flow,
+                .addr = ip6.bytes,
+                .scope_id = ip6.interface.index,
+            };
+            return @sizeOf(posix.sockaddr.in6);
+        },
+    };
+}
+
+fn addressFromPosix(address: *const PosixAddress) net.IpAddress {
+    return switch (address.any.family) {
+        linux.AF.INET => .{ .ip4 = .{
+            .port = std.mem.bigToNative(u16, address.in.port),
+            .bytes = @bitCast(address.in.addr),
+        } },
+        linux.AF.INET6 => .{ .ip6 = .{
+            .port = std.mem.bigToNative(u16, address.in6.port),
+            .bytes = address.in6.addr,
+            .flow = address.in6.flowinfo,
+            .interface = .{ .index = address.in6.scope_id },
+        } },
+        else => .{ .ip4 = .loopback(0) },
+    };
+}
+
+fn linuxSocket(domain: u32, socket_type: u32, protocol_id: u32) !posix.socket_t {
+    const rc = linux.socket(domain, socket_type, protocol_id);
+    return switch (linux.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        else => |err| posix.unexpectedErrno(err),
+    };
+}
+
+fn linuxBind(fd: posix.socket_t, address: *const posix.sockaddr, address_len: posix.socklen_t) !void {
+    const rc = linux.bind(fd, address, address_len);
+    return switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        else => |err| posix.unexpectedErrno(err),
+    };
+}
+
+fn linuxListen(fd: posix.socket_t, backlog: u32) !void {
+    const rc = linux.listen(fd, backlog);
+    return switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        else => |err| posix.unexpectedErrno(err),
+    };
+}
+
+fn linuxAccept(fd: posix.socket_t, address: *posix.sockaddr, address_len: *posix.socklen_t, flags: u32) !posix.socket_t {
+    const rc = linux.accept4(fd, address, address_len, flags);
+    return switch (linux.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        .AGAIN => error.WouldBlock,
+        else => |err| posix.unexpectedErrno(err),
+    };
+}
+
+fn linuxWrite(fd: posix.socket_t, buffer: []const u8) !usize {
+    const rc = linux.write(fd, buffer.ptr, buffer.len);
+    return switch (linux.errno(rc)) {
+        .SUCCESS => rc,
+        .AGAIN => error.WouldBlock,
+        else => |err| posix.unexpectedErrno(err),
+    };
+}
+
+fn linuxClose(fd: posix.fd_t) void {
+    switch (linux.errno(linux.close(fd))) {
+        .SUCCESS => {},
+        else => {},
+    }
+}
+
 const Epoll = struct {
     efd: posix.fd_t,
     ready_list: [128]linux.epoll_event = undefined,
@@ -378,16 +480,16 @@ const Epoll = struct {
     };
 
     fn init() !Epoll {
-        const efd = try posix.epoll_create1(0);
+        const efd = try linuxEpollCreate1(0);
         return .{ .efd = efd };
     }
 
     fn deinit(self: Epoll) void {
-        posix.close(self.efd);
+        linuxClose(self.efd);
     }
 
-    fn wait(self: *Epoll, timeout: i32) []linux.epoll_event {
-        const count = posix.epoll_wait(self.efd, &self.ready_list, timeout);
+    fn wait(self: *Epoll, timeout: i32) ![]linux.epoll_event {
+        const count = try linuxEpollWait(self.efd, &self.ready_list, timeout);
         return self.ready_list[0..count];
     }
 
@@ -396,11 +498,11 @@ const Epoll = struct {
             .events = linux.EPOLL.IN,
             .data = .{ .ptr = 0 },
         };
-        try posix.epoll_ctl(self.efd, linux.EPOLL.CTL_ADD, listener, &event);
+        try linuxEpollCtl(self.efd, linux.EPOLL.CTL_ADD, listener, &event);
     }
 
     fn removeListener(self: Epoll, listener: posix.socket_t) !void {
-        try posix.epoll_ctl(self.efd, linux.EPOLL.CTL_DEL, listener, null);
+        try linuxEpollCtl(self.efd, linux.EPOLL.CTL_DEL, listener, null);
     }
 
     fn newClient(self: Epoll, client: *Client) !void {
@@ -408,7 +510,7 @@ const Epoll = struct {
             .events = linux.EPOLL.IN,
             .data = .{ .ptr = @intFromPtr(client) },
         };
-        try posix.epoll_ctl(self.efd, linux.EPOLL.CTL_ADD, client.socket, &event);
+        try linuxEpollCtl(self.efd, linux.EPOLL.CTL_ADD, client.socket, &event);
     }
 
     fn readMode(self: Epoll, client: *Client) !void {
@@ -417,7 +519,7 @@ const Epoll = struct {
             .events = linux.EPOLL.IN,
             .data = .{ .ptr = @intFromPtr(client) },
         };
-        try posix.epoll_ctl(self.efd, linux.EPOLL.CTL_MOD, client.socket, &event);
+        try linuxEpollCtl(self.efd, linux.EPOLL.CTL_MOD, client.socket, &event);
     }
 
     fn writeMode(self: Epoll, client: *Client) !void {
@@ -426,6 +528,30 @@ const Epoll = struct {
             .events = linux.EPOLL.OUT,
             .data = .{ .ptr = @intFromPtr(client) },
         };
-        try posix.epoll_ctl(self.efd, linux.EPOLL.CTL_MOD, client.socket, &event);
+        try linuxEpollCtl(self.efd, linux.EPOLL.CTL_MOD, client.socket, &event);
+    }
+
+    fn linuxEpollCreate1(flags: usize) !posix.fd_t {
+        const rc = linux.epoll_create1(flags);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            else => |err| posix.unexpectedErrno(err),
+        };
+    }
+
+    fn linuxEpollWait(efd: posix.fd_t, events: []linux.epoll_event, timeout: i32) !usize {
+        const rc = linux.epoll_wait(efd, events.ptr, @intCast(events.len), timeout);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => rc,
+            else => |err| posix.unexpectedErrno(err),
+        };
+    }
+
+    fn linuxEpollCtl(efd: posix.fd_t, op: u32, fd: posix.fd_t, event: ?*linux.epoll_event) !void {
+        const rc = linux.epoll_ctl(efd, op, fd, event);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            else => |err| posix.unexpectedErrno(err),
+        };
     }
 };

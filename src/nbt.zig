@@ -255,8 +255,8 @@ pub const NbtData = struct {
 
 test "basic_read" {
     const buf = [10]u8{ 0x03, 0x00, 0x03, 0x69, 0x6e, 0x74, 0x00, 0x00, 0x00, 0x2f };
-    var reader = std.io.Reader.fixed(&buf);
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var reader = std.Io.Reader.fixed(&buf);
+    var gpa = std.heap.DebugAllocator(.{}){};
     var allocator = gpa.allocator();
     const data = try NbtData.read(&reader, &allocator);
     std.debug.assert(std.mem.eql(u8, data.name, "int"));
@@ -266,15 +266,15 @@ test "basic_read" {
 test "basic_write" {
     const data = NbtData{ .name = @constCast("int"), .data = NbtPayload{ .int = 47 } };
     var buf = std.mem.zeroes([10]u8);
-    var writer = std.io.Writer.fixed(&buf);
+    var writer = std.Io.Writer.fixed(&buf);
     try data.write(&writer);
     std.debug.assert(std.mem.eql(u8, &buf, &[10]u8{ 0x03, 0x00, 0x03, 0x69, 0x6e, 0x74, 0x00, 0x00, 0x00, 0x2f }));
 }
 
 test "pair_read" {
     const buf = [33]u8{ 0x0a, 0x00, 0x00, 0x04, 0x00, 0x05, 0x66, 0x69, 0x72, 0x73, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xe2, 0x40, 0x05, 0x00, 0x06, 0x73, 0x65, 0x63, 0x6f, 0x6e, 0x64, 0x3f, 0x00, 0x00, 0x00, 0x00 };
-    var reader = std.io.Reader.fixed(&buf);
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var reader = std.Io.Reader.fixed(&buf);
+    var gpa = std.heap.DebugAllocator(.{}){};
     var allocator = gpa.allocator();
     const data = try NbtData.read(&reader, &allocator);
     std.debug.assert(data.name.len == 0);
@@ -286,7 +286,7 @@ test "pair_read" {
 }
 
 test "pair_write" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     const allocator = gpa.allocator();
 
     var list = std.ArrayList(NbtData){};
@@ -295,7 +295,7 @@ test "pair_write" {
 
     const data = NbtData{ .name = @constCast(""), .data = NbtPayload{ .compound = list } };
     var buf = std.mem.zeroes([33]u8);
-    var writer = std.io.Writer.fixed(&buf);
+    var writer = std.Io.Writer.fixed(&buf);
     try data.write(&writer);
     std.debug.assert(std.mem.eql(u8, &buf, &[33]u8{ 0x0a, 0x00, 0x00, 0x04, 0x00, 0x05, 0x66, 0x69, 0x72, 0x73, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xe2, 0x40, 0x05, 0x00, 0x06, 0x73, 0x65, 0x63, 0x6f, 0x6e, 0x64, 0x3f, 0x00, 0x00, 0x00, 0x00 }));
 }
