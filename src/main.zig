@@ -1,19 +1,21 @@
 const std = @import("std");
 const protocol = @import("protocol");
+const protocol_support = @import("protocol_support");
 const net = std.Io.net;
 const posix = std.posix;
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 
 test {
-    _ = @import("varint.zig");
     _ = @import("protocol_test.zig");
 }
 
-const VarInt = @import("varint.zig").VarInt;
-const String = @import("string.zig").String;
-
 const log = std.log.scoped(.tcp_epoll_server);
+
+const max_packet_prefix_len = 5;
+const status_response_json =
+    \\{"version":{"name":"1.21.8","protocol":772},"players":{"max":20,"online":0},"description":{"text":"lightning-rod"}}
+;
 
 pub fn main() !void {
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -78,81 +80,23 @@ const Server = struct {
                         const client: *Client = @ptrFromInt(nptr);
 
                         if (events & linux.EPOLL.IN == linux.EPOLL.IN) {
-                            // this socket is ready to be read
                             while (true) {
                                 const msg = client.readMessage() catch {
                                     self.closeClient(client);
                                     break;
                                 } orelse break; // no more messages
 
-                                if (client.state == .handshaking) {
-                                    const c1 = protocol.handshaking.toServer.read(msg);
-                                    // handshake
-                                    switch (try c1.name()) {
-                                        .set_protocol => |c2| {
-                                            const protocol_version, const c3 = try c2.protocolVersion();
-                                            const server_address, const c4 = try c3.serverHost();
-                                            const server_port, const c5 = try c4.serverPort();
-                                            const intent, const c6 = try c5.nextState();
-                                            try c6.finish();
-
-                                            log.info("handshake protocol_version={} server_address={s} server_port={} intent={}", .{ protocol_version, server_address, server_port, intent });
-
-                                            if (intent == 1) {
-                                                client.state = .status;
-
-                                                var output = std.Io.Writer.fixed(client.write_buf[2..]);
-                                                _ = try VarInt.write(&output, 0);
-                                                _ = try String.write(&output,
-                                                    \\{"version":{"name":"1.21.8","protocol":772},"players":{"max":20,"online":1,"sample":[{"name":"cakeless","id":"0341ed27-7393-4e6a-9101-6c07f879b7b3"}]},"description":{"text":"Hello, world!"}}
-                                                );
-
-                                                // packet length is a maximum of 3 byte varint
-                                                @memset(client.write_buf[1..3], 0);
-                                                var final_output = std.Io.Writer.fixed(client.write_buf[0..3]);
-                                                _ = try VarInt.write(&final_output, @intCast(output.end));
-                                                client.to_write = client.write_buf[0 .. 2 + output.end];
-                                                try client.write();
-                                            } else if (intent == 2) {
-                                                client.state = .login;
-                                            }
-                                        },
-                                        else => {},
-                                    }
-                                } else if (client.state == .status) {
-                                    const c1 = protocol.status.toServer.read(msg);
-                                    switch (try c1.name()) {
-                                        .ping => |c2| {
-                                            const timestamp, const c3 = try c2.time();
-                                            try c3.finish();
-                                            log.info("ping request timestamp={}", .{timestamp});
-
-                                            var output = std.Io.Writer.fixed(client.write_buf[1..]);
-                                            _ = try VarInt.write(&output, 1);
-                                            try output.writeInt(i64, timestamp, std.builtin.Endian.big);
-
-                                            // std.posix.nanosleep(0, 20 * 1000 * 1000);
-
-                                            var final_output = std.Io.Writer.fixed(client.write_buf[0..1]);
-                                            _ = try VarInt.write(&final_output, @intCast(output.end));
-                                            client.to_write = client.write_buf[0 .. 1 + output.end];
-                                            try client.write();
-                                        },
-                                        else => {
-                                            log.info("status request", .{});
-                                        },
-                                    }
-                                } else if (client.state == .login) {
-                                    const c1 = protocol.login.toServer.read(msg);
-                                    switch (try c1.name()) {
-                                        .login_start => |c2| {
-                                            const player_name, const c3 = try c2.username();
-                                            const uuid, const c4 = try c3.playerUUID();
-                                            try c4.finish();
-                                            log.info("login start name={s} uuid={}", .{ player_name, uuid });
-                                        },
-                                        else => {},
-                                    }
+                                client.handlePacket(msg) catch |err| {
+                                    log.err("protocol error from {f}: {}", .{ client.address, err });
+                                    self.closeClient(client);
+                                    break;
+                                };
+                                if (client.to_write.len != 0) {
+                                    client.write() catch {
+                                        self.closeClient(client);
+                                        break;
+                                    };
+                                    if (client.to_write.len != 0) break;
                                 }
                             }
                         } else if (events & linux.EPOLL.OUT == linux.EPOLL.OUT) {
@@ -188,9 +132,6 @@ const Server = struct {
 
             try self.loop.newClient(client);
             self.connected += 1;
-        } else {
-            // we've run out of space, stop monitoring the listening socket
-            try self.loop.removeListener(listener);
         }
     }
 
@@ -199,13 +140,14 @@ const Server = struct {
         linuxClose(client.socket);
         client.deinit(self.allocator);
         self.client_pool.destroy(client);
+        std.debug.assert(self.connected > 0);
+        self.connected -= 1;
     }
 };
 
 const ConnectionState = enum {
     handshaking,
     status,
-    login,
 };
 
 const Client = struct {
@@ -217,12 +159,10 @@ const Client = struct {
 
     reader: Reader,
 
-    // Bytes we still need to send. This is a slice of `write_buf`. When
-    // empty, then we're in "read-mode" and are waiting for a message from the
-    // client.
+    // Bytes still pending from write_buf. Empty means the client is in read mode.
     to_write: []u8,
 
-    // Buffer for storing our length-prefixed messaged
+    // Scratch space for encoded length-prefixed packets.
     write_buf: []u8,
 
     state: ConnectionState = .handshaking,
@@ -256,8 +196,75 @@ const Client = struct {
         };
     }
 
-    // Returns `false` if we didn't manage to write the whole mssage
-    // Returns `true` if the message is fully written
+    fn handlePacket(self: *Client, msg: []const u8) !void {
+        switch (self.state) {
+            .handshaking => try self.handleHandshake(msg),
+            .status => try self.handleStatus(msg),
+        }
+    }
+
+    fn handleHandshake(self: *Client, msg: []const u8) !void {
+        const packet = protocol.handshaking.toServer.read(msg);
+        switch (try packet.name()) {
+            .set_protocol => |body| {
+                const protocol_version, const c2 = try body.protocolVersion();
+                const server_address, const c3 = try c2.serverHost();
+                const server_port, const c4 = try c3.serverPort();
+                const intent, const done = try c4.nextState();
+                try done.finish();
+
+                log.info("handshake protocol={} host={s} port={} intent={}", .{ protocol_version, server_address, server_port, intent });
+                if (intent != 1) return error.UnsupportedIntent;
+                self.state = .status;
+            },
+            else => return error.UnexpectedPacket,
+        }
+    }
+
+    fn handleStatus(self: *Client, msg: []const u8) !void {
+        const packet = protocol.status.toServer.read(msg);
+        switch (try packet.name()) {
+            .ping_start => |body| {
+                try body.finish();
+                try self.queueStatusResponse();
+            },
+            .ping => |body| {
+                const timestamp, const done = try body.time();
+                try done.finish();
+                try self.queuePong(timestamp);
+            },
+            else => return error.UnexpectedPacket,
+        }
+    }
+
+    fn queueStatusResponse(self: *Client) !void {
+        const body_buffer = self.write_buf[max_packet_prefix_len..];
+        const c1 = protocol.status.toClient.write(body_buffer);
+        const c2 = try c1.server_info();
+        const done = try c2.response(status_response_json);
+        try self.queueFramed(done.finish());
+    }
+
+    fn queuePong(self: *Client, timestamp: i64) !void {
+        const body_buffer = self.write_buf[max_packet_prefix_len..];
+        const c1 = protocol.status.toClient.write(body_buffer);
+        const c2 = try c1.ping();
+        const done = try c2.time(timestamp);
+        try self.queueFramed(done.finish());
+    }
+
+    fn queueFramed(self: *Client, body: []u8) !void {
+        std.debug.assert(body.ptr == self.write_buf[max_packet_prefix_len..].ptr);
+        if (body.len > @as(usize, @intCast(std.math.maxInt(i32)))) return error.PacketTooLarge;
+
+        var prefix: [max_packet_prefix_len]u8 = undefined;
+        const prefix_rest = try protocol_support.write_varint(&prefix, @intCast(body.len));
+        const prefix_len = prefix.len - prefix_rest.len;
+        const packet_start = max_packet_prefix_len - prefix_len;
+        @memcpy(self.write_buf[packet_start..max_packet_prefix_len], prefix[0..prefix_len]);
+        self.to_write = self.write_buf[packet_start .. max_packet_prefix_len + body.len];
+    }
+
     fn write(self: *Client) !void {
         var buf = self.to_write;
         defer self.to_write = buf;
@@ -328,20 +335,25 @@ const Reader = struct {
 
         std.debug.assert(pos >= start);
         const unprocessed = buf[start..pos];
-        // The length field cannot be longer than 3 bytes. We assume (wrongly) that a message has
-        // at least 3 bytes including its message length varint
-        if (unprocessed.len < 3) {
-            self.ensureSpace(3 - unprocessed.len) catch unreachable;
+        if (unprocessed.len == 0) {
+            self.ensureSpace(1) catch unreachable;
             return null;
         }
 
-        var input = std.Io.Reader.fixed(unprocessed);
-        const len = try VarInt.read(&input);
+        const len, const payload = protocol_support.read_varint(unprocessed) catch |err| switch (err) {
+            error.EndOfStream => {
+                if (unprocessed.len >= max_packet_prefix_len) return error.MalformedPacketLength;
+                self.ensureSpace(unprocessed.len + 1) catch unreachable;
+                return null;
+            },
+            else => return err,
+        };
         if (len < 0) {
-            @panic("negative message length");
+            return error.MalformedPacketLength;
         }
         const message_len: usize = @intCast(len);
-        const total_len = message_len + input.seek;
+        const prefix_len = unprocessed.len - payload.len;
+        const total_len = prefix_len + message_len;
 
         if (unprocessed.len < total_len) {
             try self.ensureSpace(total_len);
@@ -349,7 +361,7 @@ const Reader = struct {
         }
 
         self.start += total_len;
-        return unprocessed[input.seek..total_len];
+        return unprocessed[prefix_len..total_len];
     }
 
     fn ensureSpace(self: *Reader, space: usize) error{BufferTooSmall}!void {
@@ -499,10 +511,6 @@ const Epoll = struct {
             .data = .{ .ptr = 0 },
         };
         try linuxEpollCtl(self.efd, linux.EPOLL.CTL_ADD, listener, &event);
-    }
-
-    fn removeListener(self: Epoll, listener: posix.socket_t) !void {
-        try linuxEpollCtl(self.efd, linux.EPOLL.CTL_DEL, listener, null);
     }
 
     fn newClient(self: Epoll, client: *Client) !void {
