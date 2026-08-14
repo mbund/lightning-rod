@@ -1,0 +1,10 @@
+.{
+    .fingerprint = 0x5d61e09f7bb7e595,
+    .name = .lightning_rod_worldguard,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .lightning_rod = .{ .path = "../../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

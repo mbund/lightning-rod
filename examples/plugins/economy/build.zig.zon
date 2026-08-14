@@ -1,0 +1,10 @@
+.{
+    .fingerprint = 0x75f3621bb01f5776,
+    .name = .lightning_rod_economy,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .lightning_rod = .{ .path = "../../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

@@ -1,0 +1,12 @@
+.{
+    .fingerprint = 0xc1364550b35a1b66,
+    .name = .lightning_rod_vanilla_plus,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .lightning_rod = .{ .path = "../.." },
+        .economy = .{ .path = "../plugins/economy" },
+        .shop = .{ .path = "../plugins/shop" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

@@ -722,9 +722,7 @@ fn scan(buffer: []const u8, named: bool, nodes: []Node, stack: []Frame) Error!Do
                 if (tag.is_container()) {
                     try push_container(buffer, &offset, tag, child, nodes, stack, &stack_len);
                 } else {
-                    const value = try read_value(buffer, &offset, tag);
-                    nodes[child].payload = buffer[payload_start..offset];
-                    nodes[child].value = value;
+                    try finish_value_node(buffer, &offset, tag, payload_start, child, nodes);
                 }
             },
             .list => {
@@ -741,15 +739,18 @@ fn scan(buffer: []const u8, named: bool, nodes: []Node, stack: []Frame) Error!Do
                 if (tag.is_container()) {
                     try push_container(buffer, &offset, tag, child, nodes, stack, &stack_len);
                 } else {
-                    const value = try read_value(buffer, &offset, tag);
-                    nodes[child].payload = buffer[payload_start..offset];
-                    nodes[child].value = value;
+                    try finish_value_node(buffer, &offset, tag, payload_start, child, nodes);
                 }
             },
         }
     }
 
     return .{ .buffer = buffer, .nodes = nodes[0..node_count], .root = root, .rest = buffer[offset..] };
+}
+
+fn finish_value_node(buffer: []const u8, offset: *usize, tag: Tag, payload_start: usize, child: u32, nodes: []Node) Error!void {
+    nodes[child].value = try read_value(buffer, offset, tag);
+    nodes[child].payload = buffer[payload_start..offset.*];
 }
 
 fn skip(buffer: []const u8, named: bool, stack: []Frame) Error![]const u8 {

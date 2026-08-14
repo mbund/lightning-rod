@@ -8,6 +8,15 @@ pub fn main(init: std.process.Init) !void {
     _ = args.skip();
     const input_path = args.next() orelse return error.NotEnoughArgs;
     const output_path = args.next() orelse return error.NotEnoughArgs;
+    const equivalent_path = args.next();
+
+    if (equivalent_path) |path| {
+        if (!try filesEqual(init.io, allocator, input_path, path)) {
+            std.debug.print("protocol schemas are not identical: {s} and {s}\n", .{ input_path, path });
+            return error.ProtocolSchemasDiffer;
+        }
+    }
+
     const output_file = try std.Io.Dir.createFile(.cwd(), init.io, output_path, .{});
     defer output_file.close(init.io);
 
@@ -26,11 +35,20 @@ pub fn main(init: std.process.Init) !void {
     try output_writer.interface.flush();
 }
 
+fn filesEqual(io: std.Io, allocator: std.mem.Allocator, lhs_path: []const u8, rhs_path: []const u8) !bool {
+    const lhs = try std.Io.Dir.readFileAlloc(.cwd(), io, lhs_path, allocator, .unlimited);
+    defer allocator.free(lhs);
+    const rhs = try std.Io.Dir.readFileAlloc(.cwd(), io, rhs_path, allocator, .unlimited);
+    defer allocator.free(rhs);
+    return std.mem.eql(u8, lhs, rhs);
+}
+
 const Protocol = struct {
     types: Types,
     handshaking: State,
     status: State,
     login: State,
+    configuration: State,
     play: State,
 
     pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) !Protocol {
@@ -39,6 +57,7 @@ const Protocol = struct {
         const handshaking = try State.fromJson(allocator, try expectGet(object, "handshaking"));
         const status = try State.fromJson(allocator, try expectGet(object, "status"));
         const login = try State.fromJson(allocator, try expectGet(object, "login"));
+        const configuration = try State.fromJson(allocator, try expectGet(object, "configuration"));
         const play = try State.fromJson(allocator, try expectGet(object, "play"));
 
         return Protocol{
@@ -46,6 +65,7 @@ const Protocol = struct {
             .handshaking = handshaking,
             .status = status,
             .login = login,
+            .configuration = configuration,
             .play = play,
         };
     }
@@ -53,11 +73,18 @@ const Protocol = struct {
     pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *IndentedWriter) !void {
         try writer.println("const std = @import(\"std\");", .{});
         try writer.println("const protocol_support = @import(\"protocol_support\");\n", .{});
+        // Global minecraft-data types are visible from every nested protocol
+        // state. Emit them once here instead of copying the entire global
+        // type universe into all ten state/direction namespaces.
+        const global_scope = Scope{ .outer = &self.types, .inner = null };
+        try Types.codegenNamedViewTypesFromMap(allocator, writer, global_scope, &self.types);
+        try Types.codegenNamedWriteTypesFromMap(allocator, writer, global_scope, &self.types);
         try self.types.codegen(allocator, writer, .{ .outer = &self.types, .inner = null });
         try writer.println("", .{});
         try self.handshaking.codegen(allocator, writer, "handshaking", &self.types);
         try self.status.codegen(allocator, writer, "status", &self.types);
         try self.login.codegen(allocator, writer, "login", &self.types);
+        try self.configuration.codegen(allocator, writer, "configuration", &self.types);
         try self.play.codegen(allocator, writer, "play", &self.types);
         try writer.println("", .{});
     }
@@ -163,13 +190,154 @@ const Types = struct {
         try writer.println("}};", .{});
         try writer.println("", .{});
 
+        try writer.println("pub const PacketName = enum {{", .{});
+        writer.indent();
+        for (mapper.mappings) |mapping| try writer.println("{f},", .{idfmt(mapping.name)});
+        writer.unindent();
+        try writer.println("}};", .{});
+        try writer.println("", .{});
+
+        try writer.println("pub const Header = struct {{ id: {s}, body: []const u8 }};", .{try mapper.type.codegenType()});
+        try writer.println("", .{});
+        try writer.println("pub fn readHeader(buffer: []const u8) protocol_support.ReadError!Header {{", .{});
+        writer.indent();
+        try writer.println("const id, const body = try protocol_support.read_{s}(buffer);", .{@tagName(mapper.type)});
+        try writer.println("return .{{ .id = id, .body = body }};", .{});
+        writer.unindent();
+        try writer.println("}}", .{});
+        try writer.println("", .{});
+
+        try writer.println("pub fn packetId(comptime name: PacketName) {s} {{", .{try mapper.type.codegenType()});
+        writer.indent();
+        try writer.println("return switch (name) {{", .{});
+        writer.indent();
+        for (mapper.mappings) |mapping| try writer.println(".{f} => {},", .{ idfmt(mapping.name), mapping.value });
+        writer.unindent();
+        try writer.println("}};", .{});
+        writer.unindent();
+        try writer.println("}}", .{});
+        try writer.println("", .{});
+
+        try writer.println("pub fn PacketBody(comptime name: PacketName) type {{", .{});
+        writer.indent();
+        try writer.println("return switch (name) {{", .{});
+        writer.indent();
+        for (mapper.mappings) |mapping| {
+            try writer.println(".{f} => body__{f},", .{ idfmt(mapping.name), idfmt(packetBodyTypeName(packet_switch, mapping.name)) });
+        }
+        writer.unindent();
+        try writer.println("}};", .{});
+        writer.unindent();
+        try writer.println("}}", .{});
+        try writer.println("", .{});
+
+        try writer.println("pub fn readBody(comptime name: PacketName, header: Header) protocol_support.ReadError!PacketBody(name) {{", .{});
+        writer.indent();
+        try writer.println("if (header.id != packetId(name)) return error.UnexpectedPacketId;", .{});
+        try writer.println("return .{{ .buffer = header.body }};", .{});
+        writer.unindent();
+        try writer.println("}}", .{});
+        try writer.println("", .{});
+
         if (packet_switch) |switch_| {
             for (switch_.fields) |field| {
                 try self.codegenPacketBodyCursor(allocator, writer, scope, field);
             }
         }
 
+        try self.codegenCanonicalEnvelope(writer, scope, mapper, packet_switch);
+
         try self.codegenEnvelopeWriter(allocator, writer, scope, mapper, packet_switch);
+    }
+
+    /// Generate a lossless structural canonicalizer from the same protocol AST
+    /// that generates the packet reader. No packet list or field list is
+    /// maintained by the conformance layer: adding a packet to minecraft-data
+    /// automatically adds a case here.
+    fn codegenCanonicalEnvelope(self: *const @This(), writer: *IndentedWriter, scope: Scope, mapper: anytype, packet_switch: ?SwitchType) !void {
+        try writer.println("pub const CanonicalPacket = struct {{ name: []const u8 }};", .{});
+        try writer.println("pub const packet_names = [_][]const u8{{", .{});
+        writer.indent();
+        for (mapper.mappings) |mapping| try writer.println("\"{s}\",", .{mapping.name});
+        writer.unindent();
+        try writer.println("}};", .{});
+        try writer.println("", .{});
+        try writer.println("pub fn canonicalize(buffer: []const u8, output: *std.Io.Writer) anyerror!CanonicalPacket {{", .{});
+        writer.indent();
+        try writer.println("const decoded = try read(buffer).name();", .{});
+        try writer.println("return switch (decoded) {{", .{});
+        writer.indent();
+        for (mapper.mappings) |mapping| {
+            if (findPacketField(packet_switch, mapping.name) != null) {
+                try writer.println(".{s} => |body| canonicalize__{f}(body, output),", .{ mapping.name, idfmt(mapping.name) });
+            } else {
+                try writer.println(".{s} => |body| canonicalizeRaw(body, output, \"{s}\"),", .{ mapping.name, mapping.name });
+            }
+        }
+        try writer.println(".default => |body| blk: {{", .{});
+        writer.indent();
+        try writer.println("try output.writeAll(\"{{payload=\");", .{});
+        try writer.println("try protocol_support.writeCanonicalValue(output, body.payload());", .{});
+        try writer.println("try output.writeByte('}}');", .{});
+        try writer.println("break :blk .{{ .name = \"unknown\" }};", .{});
+        writer.unindent();
+        try writer.println("}},", .{});
+        writer.unindent();
+        try writer.println("}};", .{});
+        writer.unindent();
+        try writer.println("}}", .{});
+        try writer.println("", .{});
+
+        if (packet_switch) |switch_| {
+            for (switch_.fields) |packet_field| {
+                try self.codegenCanonicalPacketFunction(writer, scope, packet_field);
+            }
+        }
+        try writer.println("fn canonicalizeRaw(body: protocol_support.RawPayload, output: *std.Io.Writer, name: []const u8) anyerror!CanonicalPacket {{", .{});
+        writer.indent();
+        try writer.println("try output.writeAll(\"{{payload=\");", .{});
+        try writer.println("try protocol_support.writeCanonicalValue(output, body.payload());", .{});
+        try writer.println("try output.writeByte('}}');", .{});
+        try writer.println("return .{{ .name = name }};", .{});
+        writer.unindent();
+        try writer.println("}}", .{});
+        try writer.println("", .{});
+    }
+
+    fn codegenCanonicalPacketFunction(self: *const @This(), writer: *IndentedWriter, scope: Scope, packet_field: Field) !void {
+        try writer.println("fn canonicalize__{f}(body: body__{f}, output: *std.Io.Writer) anyerror!CanonicalPacket {{", .{ idfmt(packet_field.name), idfmt(packet_field.name) });
+        writer.indent();
+        try writer.println("try output.writeByte('{{');", .{});
+        const resolved = packet_field.type.resolveAstWriteAlias(self, scope);
+        switch (resolved.*) {
+            .container => |container| {
+                if (container.fields.len == 0) {
+                    try writer.println("try body.finish();", .{});
+                } else {
+                    for (container.fields, 0..) |field, index| {
+                        if (index == 0) {
+                            try writer.println("const value_{d}, const cursor_{d} = try body.{f}();", .{ index, index + 1, idfmt(field.name) });
+                        } else {
+                            try writer.println("const value_{d}, const cursor_{d} = try cursor_{d}.{f}();", .{ index, index + 1, index, idfmt(field.name) });
+                        }
+                        try writer.println("try output.writeAll(\"{s}{s}=\");", .{ if (index == 0) "" else ";", field.name });
+                        try writer.println("try protocol_support.writeCanonicalValue(output, value_{d});", .{index});
+                    }
+                    try writer.println("try cursor_{d}.finish();", .{container.fields.len});
+                }
+            },
+            else => {
+                try writer.println("const value, const done = try body.{f}();", .{idfmt(packet_field.name)});
+                try writer.println("try output.writeAll(\"value=\");", .{});
+                try writer.println("try protocol_support.writeCanonicalValue(output, value);", .{});
+                try writer.println("try done.finish();", .{});
+            },
+        }
+        try writer.println("try output.writeByte('}}');", .{});
+        try writer.println("return .{{ .name = \"{s}\" }};", .{packet_field.name});
+        writer.unindent();
+        try writer.println("}}", .{});
+        try writer.println("", .{});
     }
 
     fn codegenPacketBodyCursor(self: *const @This(), allocator: std.mem.Allocator, writer: *IndentedWriter, scope: Scope, packet_field: Field) !void {
@@ -234,7 +402,6 @@ const Types = struct {
         if (scope.inner) |inner| {
             try codegenNamedWriteTypesFromMap(allocator, writer, scope, inner);
         }
-        try codegenNamedWriteTypesFromMap(allocator, writer, scope, scope.outer);
     }
 
     fn codegenNamedViewTypes(self: *const @This(), allocator: std.mem.Allocator, writer: *IndentedWriter, scope: Scope) !void {
@@ -242,7 +409,6 @@ const Types = struct {
         if (scope.inner) |inner| {
             try codegenNamedViewTypesFromMap(allocator, writer, scope, inner);
         }
-        try codegenNamedViewTypesFromMap(allocator, writer, scope, scope.outer);
     }
 
     fn codegenNamedViewTypesFromMap(allocator: std.mem.Allocator, writer: *IndentedWriter, scope: Scope, types: *const Types) !void {
@@ -295,6 +461,15 @@ fn packetBodyTypeName(packet_switch: ?SwitchType, packet_name: []const u8) []con
         }
     }
     return "protocol_support.RawPayload";
+}
+
+fn findPacketField(packet_switch: ?SwitchType, packet_name: []const u8) ?Field {
+    if (packet_switch) |switch_| {
+        for (switch_.fields) |field| {
+            if (std.mem.eql(u8, field.name, packet_name)) return field;
+        }
+    }
+    return null;
 }
 
 fn astReadCursorTypeName(allocator: std.mem.Allocator, body_name: []const u8, fields: []const Field, index: usize) ![]const u8 {
@@ -490,7 +665,11 @@ fn codegenAstReadCursorMethod(
     if (field.type.codegenAstIsScalar(types, scope)) {
         try codegenAstReadScalarInto(types, writer, scope, &field.type, "rest", "field_value");
         if (carries_current) {
-            try writer.println("const {s} = field_value;", .{current_compare_name});
+            switch (actual.*) {
+                .bitflags => |bitflags| try writer.println("const {s}, _ = try protocol_support.read_{s}(self.buffer);", .{ current_compare_name, @tagName(bitflags.type) }),
+                .bitfield => |bitfield| try writer.println("const {s}, _ = try protocol_support.read_packed_bits(self.buffer, {});", .{ current_compare_name, bitfieldBits(bitfield.fields) }),
+                else => try writer.println("const {s} = field_value;", .{current_compare_name}),
+            }
         }
     } else {
         try writer.println("const field_start = rest;", .{});
@@ -729,7 +908,7 @@ const NativeType = enum {
             .topBitSetTerminatedArray => "protocol_support.topBitSetTerminatedArray",
             .bitfield => "protocol_support.bitfield",
             .bitflags => "protocol_support.bitflags",
-            .void => "protocol_support.void",
+            .void => "void",
             .restBuffer => "protocol_support.restBuffer",
             .nbt => "protocol_support.nbt",
             .optionalNbt => "protocol_support.optionalNbt",
@@ -818,7 +997,6 @@ const SwitchType = struct {
 
 const Type = union(enum) {
     reference: []const u8,
-    todo,
     native: NativeType,
     container: struct { fields: []Field },
     bitfield: struct { fields: []BitfieldField },
@@ -994,7 +1172,8 @@ const Type = union(enum) {
             }
         }
 
-        return .todo;
+        std.log.err("unsupported protocol type '{s}'", .{key});
+        return error.UnsupportedProtocolType;
     }
 
     pub fn resolve(self: *const Type, allocator: std.mem.Allocator, scope: Scope, parentContainer: ?*ResolvedContainer) !*ResolvedType {
@@ -1097,11 +1276,7 @@ const Type = union(enum) {
                 return result;
             },
             .switch_ => |switch_| {
-                const compareTo = resolveReference(switch_.compareTo, parentContainer) catch {
-                    const result = try allocator.create(ResolvedType);
-                    result.* = .todo;
-                    return result;
-                };
+                const compareTo = try resolveReference(switch_.compareTo, parentContainer);
                 const result = try allocator.create(ResolvedType);
                 var fields = try allocator.alloc(ResolvedVariant, switch_.fields.len);
                 for (0.., switch_.fields) |i, field| {
@@ -1122,11 +1297,6 @@ const Type = union(enum) {
             .mapper => |mapper| {
                 const result = try allocator.create(ResolvedType);
                 result.* = .{ .mapper = .{ .mappings = mapper.mappings, .type = mapper.type } };
-                return result;
-            },
-            else => {
-                const result = try allocator.create(ResolvedType);
-                result.* = .todo;
                 return result;
             },
         }
@@ -1209,7 +1379,7 @@ const Type = union(enum) {
                     if (array.count == .field) {
                         if (findPreviousField(previous, i, array.count.field)) |count_index| {
                             if (compare_names[count_index]) |count_name| {
-                                try writer.println("for (0..@intCast({s})) |_| {{", .{count_name});
+                                try writer.println("for (0..try protocol_support.count_to_usize({s})) |_| {{", .{count_name});
                                 writer.indent();
                                 try array.elementType.codegenAstSkipDepthWithCompares(types, writer, scope, "rest", bindings.items, 12);
                                 writer.unindent();
@@ -1316,12 +1486,12 @@ const Type = union(enum) {
                     .field => |count_field| {
                         if (findPreviousField(previous, previous.len, count_field)) |count_index| {
                             if (compare_names[count_index]) |count_name| {
-                                try writer.println("for (0..@intCast({s})) |_| {{", .{count_name});
+                                try writer.println("for (0..try protocol_support.count_to_usize({s})) |_| {{", .{count_name});
                                 writer.indent();
                                 try array.elementType.codegenAstSkipDepthWithCompares(types, writer, scope, "rest", bindings.items, 12);
                                 writer.unindent();
                                 try writer.println("}}", .{});
-                                try printViewInitializer(writer, try std.fmt.allocPrint(writer.allocator, "protocol_support.slice_to_rest(field_start_{}, rest)", .{id}), try std.fmt.allocPrint(writer.allocator, "@intCast({s})", .{count_name}), child_bindings);
+                                try printViewInitializer(writer, try std.fmt.allocPrint(writer.allocator, "protocol_support.slice_to_rest(field_start_{}, rest)", .{id}), try std.fmt.allocPrint(writer.allocator, "try protocol_support.count_to_usize({s})", .{count_name}), child_bindings);
                             } else {
                                 try self.codegenAstSkipDepthWithCompares(types, writer, scope, "rest", bindings.items, 12);
                                 try printViewInitializer(writer, try std.fmt.allocPrint(writer.allocator, "protocol_support.slice_to_rest(field_start_{}, rest)", .{id}), "0", child_bindings);
@@ -1668,7 +1838,7 @@ const Type = union(enum) {
             else => {
                 try writer.println("var rest = self.buffer;", .{});
                 const count_id = try codegenArrayCountRead(array.count, writer, "rest");
-                try printIteratorInitializer(writer, "rest", try std.fmt.allocPrint(writer.allocator, "@intCast(count_{})", .{count_id}), carried_bindings);
+                try printIteratorInitializer(writer, "rest", try std.fmt.allocPrint(writer.allocator, "count_{}", .{count_id}), carried_bindings);
             },
         }
         writer.unindent();
@@ -1682,8 +1852,8 @@ const Type = union(enum) {
                 try writer.println("return {};", .{constant});
             },
             .type => |countType| {
-                try writer.println("const count, _ = try protocol_support.read_{s}(self.buffer);", .{@tagName(countType)});
-                try writer.println("return @intCast(count);", .{});
+                try writer.println("const count, _ = try protocol_support.read_count(self.buffer, {s});", .{try countType.codegenType()});
+                try writer.println("return count;", .{});
             },
             .field => {
                 try writer.println("return self.remaining;", .{});
@@ -1957,7 +2127,7 @@ const Type = union(enum) {
                             if (array.count == .field) {
                                 if (findPreviousField(container.fields, i, array.count.field)) |count_index| {
                                     if (compare_names[count_index]) |count_name| {
-                                        try writer.println("for (0..@intCast({s})) |_| {{", .{count_name});
+                                        try writer.println("for (0..try protocol_support.count_to_usize({s})) |_| {{", .{count_name});
                                         writer.indent();
                                         try array.elementType.codegenAstSkipDepthWithCompares(types, writer, scope, restName, bindings.items, budget - 1);
                                         writer.unindent();
@@ -2008,7 +2178,7 @@ const Type = union(enum) {
                 writer.unindent();
                 try writer.println("}} else {{", .{});
                 writer.indent();
-                try writer.println("for (0..@intCast(holder_set_count_{} - 1)) |_| {{", .{id});
+                try writer.println("for (0..try protocol_support.count_minus_one_to_usize(holder_set_count_{})) |_| {{", .{id});
                 writer.indent();
                 try set.otherwise.type.codegenAstSkipDepthWithCompares(types, writer, scope, restName, parent_bindings, budget - 1);
                 writer.unindent();
@@ -2017,7 +2187,7 @@ const Type = union(enum) {
                 try writer.println("}}", .{});
             },
             .topBitSetTerminatedArray => |array| {
-                try writer.println("while (true) {{", .{});
+                try writer.println("for (0..protocol_support.maximum_sequence_elements) |_| {{", .{});
                 writer.indent();
                 const id = writer.nextId();
                 try writer.println("const marker_{}, const rest_{} = try protocol_support.read_i8({s});", .{ id, id, restName });
@@ -2030,10 +2200,10 @@ const Type = union(enum) {
                 }
                 try writer.println("if (marker_{} >= 0) break;", .{id});
                 writer.unindent();
-                try writer.println("}}", .{});
+                try writer.println("}} else return error.CollectionTooLarge;", .{});
             },
             .entityMetadataLoop => |loop| {
-                try writer.println("while (true) {{", .{});
+                try writer.println("for (0..protocol_support.maximum_sequence_elements) |_| {{", .{});
                 writer.indent();
                 const id = writer.nextId();
                 try writer.println("const marker_{}, const rest_{} = try protocol_support.read_u8({s});", .{ id, id, restName });
@@ -2046,7 +2216,7 @@ const Type = union(enum) {
                     try loop.type.codegenAstSkipDepthWithCompares(types, writer, scope, restName, parent_bindings, budget - 1);
                 }
                 writer.unindent();
-                try writer.println("}}", .{});
+                try writer.println("}} else return error.CollectionTooLarge;", .{});
             },
             .array => |array| {
                 const count_expr = switch (array.count) {
@@ -2058,10 +2228,10 @@ const Type = union(enum) {
                 };
                 defer if (count_expr) |expr| writer.allocator.free(expr);
                 if (count_expr) |expr| {
-                    try writer.println("for (0..@intCast({s})) |_| {{", .{expr});
+                    try writer.println("for (0..try protocol_support.count_to_usize({s})) |_| {{", .{expr});
                 } else {
                     const count_id = try codegenArrayCountRead(array.count, writer, restName);
-                    try writer.println("for (0..@intCast(count_{})) |_| {{", .{count_id});
+                    try writer.println("for (0..count_{}) |_| {{", .{count_id});
                 }
                 writer.indent();
                 try array.elementType.codegenAstSkipDepthWithCompares(types, writer, scope, restName, parent_bindings, budget - 1);
@@ -2086,7 +2256,6 @@ const Type = union(enum) {
                 }
             },
             .mapper => |mapper| try writer.println("{s} = (try protocol_support.read_{s}({s}))[1];", .{ restName, @tagName(mapper.type), restName }),
-            else => try writer.println("{s} = try protocol_support.skip_rest({s});", .{ restName, restName }),
         }
     }
 
@@ -2222,6 +2391,17 @@ const Type = union(enum) {
         };
     }
 
+    fn astWriteEntryHasNestedCursor(self: *const Type, types: *const Types, scope: Scope) bool {
+        switch (self.*) {
+            .reference => |reference| if (isNamedWriteTarget(reference)) return true,
+            else => {},
+        }
+        return switch (self.resolveAstWriteAlias(types, scope).*) {
+            .container, .option, .array, .registryEntryHolder, .switch_ => true,
+            else => false,
+        };
+    }
+
     fn codegenAstWriteContainerType(self: *const Type, types: *const Types, writer: *IndentedWriter, scope: Scope, type_name: []const u8, next_name: []const u8, next_init: WriteNextInit, fields: []Field, depth: usize) anyerror!void {
         _ = self;
         if (fields.len == 0) {
@@ -2264,7 +2444,9 @@ const Type = union(enum) {
             try writer.println("}};", .{});
             try writer.println("", .{});
 
-            try field.type.codegenAstWriteType(types, writer, scope, nested_name, after_name, field_init, depth + 1);
+            if (field.type.astWriteEntryHasNestedCursor(types, scope)) {
+                try field.type.codegenAstWriteType(types, writer, scope, nested_name, after_name, field_init, depth + 1);
+            }
 
             if (!is_last) {
                 writer.allocator.free(current_name);
@@ -2297,6 +2479,8 @@ const Type = union(enum) {
                 try writer.println("}}", .{});
             },
             .array => |array| {
+                const empty_method_name = try emptyArrayMethodName(writer.allocator, field_name);
+                defer writer.allocator.free(empty_method_name);
                 switch (array.count) {
                     .type => |countType| {
                         try writer.println("pub fn {f}(self: @This(), count: usize) protocol_support.WriteError!{s} {{", .{ idfmt(field_name), nested_name });
@@ -2304,6 +2488,14 @@ const Type = union(enum) {
                         try writer.println("var rest = self.rest;", .{});
                         try writer.println("rest = try protocol_support.write_count(rest, {s}, count);", .{try countType.codegenType()});
                         try codegenWriteReturnNewArray(writer, next_init, "rest", "count");
+                        writer.unindent();
+                        try writer.println("}}", .{});
+                        try writer.println("", .{});
+                        try writer.println("pub fn {s}(self: @This()) protocol_support.WriteError!{s} {{", .{ empty_method_name, next_name });
+                        writer.indent();
+                        try writer.println("var rest = self.rest;", .{});
+                        try writer.println("rest = try protocol_support.write_count(rest, {s}, 0);", .{try countType.codegenType()});
+                        try codegenWriteNextReturn(writer, next_init);
                         writer.unindent();
                         try writer.println("}}", .{});
                     },
@@ -2315,6 +2507,15 @@ const Type = union(enum) {
                         try codegenWriteReturnNewArray(writer, next_init, "self.rest", count_expr);
                         writer.unindent();
                         try writer.println("}}", .{});
+                        if (constant == 0) {
+                            try writer.println("", .{});
+                            try writer.println("pub fn {s}(self: @This()) protocol_support.WriteError!{s} {{", .{ empty_method_name, next_name });
+                            writer.indent();
+                            try writer.println("const rest = self.rest;", .{});
+                            try codegenWriteNextReturn(writer, next_init);
+                            writer.unindent();
+                            try writer.println("}}", .{});
+                        }
                     },
                     .field => {
                         try writer.println("pub fn {f}(self: @This(), count: usize) protocol_support.WriteError!{s} {{", .{ idfmt(field_name), nested_name });
@@ -2431,6 +2632,7 @@ const Type = union(enum) {
         const element = array.elementType.resolveAstWriteAlias(types, scope);
         if (element.isAstWriteScalar(types, scope)) {
             try element.codegenAstArrayElementMethod(types, writer, scope, type_name, next_init.elementForArray());
+            try element.codegenAstArraySingleMethod(types, writer, scope, next_name, next_init);
         } else if (array.elementType.isNamedWriteReference()) {
             const element_name = try std.fmt.allocPrint(writer.allocator, "{s}__element", .{type_name});
             defer writer.allocator.free(element_name);
@@ -2475,6 +2677,53 @@ const Type = union(enum) {
         const actual = self.resolveAstWriteAlias(types, scope);
         try actual.codegenAstWriteLeafEntry(types, writer, scope, "element", array_name, next_init);
         try writer.println("", .{});
+    }
+
+    fn codegenAstArraySingleMethod(self: *const Type, types: *const Types, writer: *IndentedWriter, scope: Scope, next_name: []const u8, next_init: WriteNextInit) anyerror!void {
+        const actual = self.resolveAstWriteAlias(types, scope);
+        switch (actual.*) {
+            .native => |native| {
+                if (native == .void) {
+                    try writer.println("pub fn single(self: @This()) protocol_support.WriteError!{s} {{", .{next_name});
+                } else if (native.hasDirectWrite()) {
+                    try writer.println("pub fn single(self: @This(), field_value: {s}) protocol_support.WriteError!{s} {{", .{ try native.codegenType(), next_name });
+                } else {
+                    try writer.println("pub fn single(self: @This(), field_value: []const u8) protocol_support.WriteError!{s} {{", .{next_name});
+                }
+            },
+            .pstring => try writer.println("pub fn single(self: @This(), field_value: []const u8) protocol_support.WriteError!{s} {{", .{next_name}),
+            .mapper => |mapper| try writer.println("pub fn single(self: @This(), field_value: {s}) protocol_support.WriteError!{s} {{", .{ try mapper.type.codegenType(), next_name }),
+            .bitfield => |bitfield| try writer.println("pub fn single(self: @This(), field_value: {s}) protocol_support.WriteError!{s} {{", .{ try codegenBitfieldValueType(writer.allocator, bitfield.fields), next_name }),
+            .bitflags => |bitflags| try writer.println("pub fn single(self: @This(), field_value: {s}) protocol_support.WriteError!{s} {{", .{ try codegenBitflagsValueType(writer.allocator, bitflags.flags), next_name }),
+            else => return,
+        }
+        writer.indent();
+        try writer.println("if (self.remaining != 1) return error.MissingItems;", .{});
+        try writer.println("var rest = self.rest;", .{});
+        try actual.codegenAstWriteScalarValue(types, writer, scope, "rest");
+        try codegenWriteNextReturn(writer, next_init);
+        writer.unindent();
+        try writer.println("}}", .{});
+        try writer.println("", .{});
+    }
+
+    fn codegenAstWriteScalarValue(self: *const Type, types: *const Types, writer: *IndentedWriter, scope: Scope, rest_name: []const u8) anyerror!void {
+        _ = types;
+        _ = scope;
+        switch (self.*) {
+            .native => |native| {
+                if (native.hasDirectWrite()) {
+                    try codegenNativeWrite(native, writer, rest_name);
+                } else {
+                    try writer.println("{s} = try protocol_support.write_bytes({s}, field_value);", .{ rest_name, rest_name });
+                }
+            },
+            .pstring => |pstring| try writer.println("{s} = try protocol_support.write_pstring({s}, field_value, {s});", .{ rest_name, rest_name, try pstring.countType.codegenType() }),
+            .mapper => |mapper| try writer.println("{s} = try protocol_support.write_{s}({s}, field_value);", .{ rest_name, @tagName(mapper.type), rest_name }),
+            .bitfield => |bitfield| try codegenBitfieldWrite(bitfield.fields, writer, rest_name),
+            .bitflags => |bitflags| try codegenBitflagsWrite(bitflags, writer, rest_name),
+            else => try writer.println("{s} = try protocol_support.write_bytes({s}, field_value);", .{ rest_name, rest_name }),
+        }
     }
 
     fn codegenAstWriteOptionType(self: *const Type, types: *const Types, writer: *IndentedWriter, scope: Scope, type_name: []const u8, next_name: []const u8, next_init: WriteNextInit, depth: usize) anyerror!void {
@@ -2931,7 +3180,7 @@ fn codegenAstSkipFields(types: *const Types, writer: *IndentedWriter, scope: Sco
                 if (array.count == .field) {
                     if (findPreviousField(fields, i, array.count.field)) |count_index| {
                         if (compare_names[count_index]) |count_name| {
-                            try writer.println("for (0..@intCast({s})) |_| {{", .{count_name});
+                            try writer.println("for (0..try protocol_support.count_to_usize({s})) |_| {{", .{count_name});
                             writer.indent();
                             try array.elementType.codegenAstSkipDepthWithCompares(types, writer, scope, restName, bindings.items, budget - 1);
                             writer.unindent();
@@ -3511,7 +3760,6 @@ const ResolvedVariant = struct {
 };
 
 const ResolvedType = union(enum) {
-    todo,
     native: NativeType,
     container: ResolvedContainer,
     bitfield: struct { fields: []BitfieldField },
@@ -3627,7 +3875,7 @@ const ResolvedType = union(enum) {
             .bitflags => |bitflags| try codegenNativeSkip(bitflags.type, writer, restName),
             .array => |array| {
                 const count_id = try codegenArrayCountRead(array.count, writer, restName);
-                try writer.println("for (0..@intCast(count_{})) |_| {{", .{count_id});
+                try writer.println("for (0..count_{}) |_| {{", .{count_id});
                 writer.indent();
                 try array.elementType.codegenSkip(writer, restName);
                 writer.unindent();
@@ -3644,7 +3892,7 @@ const ResolvedType = union(enum) {
                 try writer.println("}}", .{});
             },
             .topBitSetTerminatedArray => |array| {
-                try writer.println("while (true) {{", .{});
+                try writer.println("for (0..protocol_support.maximum_sequence_elements) |_| {{", .{});
                 writer.indent();
                 const id = writer.nextId();
                 try writer.println("const marker_{}, const rest_{} = try protocol_support.read_i8({s});", .{ id, id, restName });
@@ -3652,10 +3900,10 @@ const ResolvedType = union(enum) {
                 try writer.println("if (marker_{} < 0) break;", .{id});
                 try array.codegenSkip(writer, restName);
                 writer.unindent();
-                try writer.println("}}", .{});
+                try writer.println("}} else return error.CollectionTooLarge;", .{});
             },
             .entityMetadataLoop => |loop| {
-                try writer.println("while (true) {{", .{});
+                try writer.println("for (0..protocol_support.maximum_sequence_elements) |_| {{", .{});
                 writer.indent();
                 const id = writer.nextId();
                 try writer.println("const marker_{}, const rest_{} = try protocol_support.read_u8({s});", .{ id, id, restName });
@@ -3663,7 +3911,7 @@ const ResolvedType = union(enum) {
                 try writer.println("if (marker_{} == {}) break;", .{ id, loop.endVal });
                 try loop.type.codegenSkip(writer, restName);
                 writer.unindent();
-                try writer.println("}}", .{});
+                try writer.println("}} else return error.CollectionTooLarge;", .{});
             },
             .registryEntryHolder => |holder| {
                 const id = writer.nextId();
@@ -3685,7 +3933,7 @@ const ResolvedType = union(enum) {
                 writer.unindent();
                 try writer.println("}} else {{", .{});
                 writer.indent();
-                try writer.println("for (0..@intCast(registry_entry_holder_set_count_{} - 1)) |_| {{", .{id});
+                try writer.println("for (0..try protocol_support.count_minus_one_to_usize(registry_entry_holder_set_count_{})) |_| {{", .{id});
                 writer.indent();
                 try set.otherwise.type.codegenSkip(writer, restName);
                 writer.unindent();
@@ -3698,7 +3946,6 @@ const ResolvedType = union(enum) {
                 try writer.println("{s} = try protocol_support.skip_rest({s});", .{ restName, restName });
             },
             .mapper => |mapper| try codegenNativeSkip(mapper.type, writer, restName),
-            .todo => try writer.println("{s} = try protocol_support.skip_rest({s});", .{ restName, restName }),
         }
     }
 
@@ -3712,6 +3959,8 @@ const ResolvedType = union(enum) {
                 try writer.println("}}", .{});
             },
             .array => |array| {
+                const empty_method_name = try emptyArrayMethodName(writer.allocator, field_name);
+                defer writer.allocator.free(empty_method_name);
                 switch (array.count) {
                     .type => |countType| {
                         try writer.println("pub fn {f}(self: @This(), count: usize) protocol_support.WriteError!{s} {{", .{ idfmt(field_name), nested_name });
@@ -3719,6 +3968,14 @@ const ResolvedType = union(enum) {
                         try writer.println("var rest = self.rest;", .{});
                         try writer.println("rest = try protocol_support.write_count(rest, {s}, count);", .{try countType.codegenType()});
                         try codegenWriteReturnNewArray(writer, next_init, "rest", "count");
+                        writer.unindent();
+                        try writer.println("}}", .{});
+                        try writer.println("", .{});
+                        try writer.println("pub fn {s}(self: @This()) protocol_support.WriteError!{s} {{", .{ empty_method_name, next_name });
+                        writer.indent();
+                        try writer.println("var rest = self.rest;", .{});
+                        try writer.println("rest = try protocol_support.write_count(rest, {s}, 0);", .{try countType.codegenType()});
+                        try codegenWriteNextReturn(writer, next_init);
                         writer.unindent();
                         try writer.println("}}", .{});
                     },
@@ -3730,6 +3987,15 @@ const ResolvedType = union(enum) {
                         try codegenWriteReturnNewArray(writer, next_init, "self.rest", count_expr);
                         writer.unindent();
                         try writer.println("}}", .{});
+                        if (constant == 0) {
+                            try writer.println("", .{});
+                            try writer.println("pub fn {s}(self: @This()) protocol_support.WriteError!{s} {{", .{ empty_method_name, next_name });
+                            writer.indent();
+                            try writer.println("const rest = self.rest;", .{});
+                            try codegenWriteNextReturn(writer, next_init);
+                            writer.unindent();
+                            try writer.println("}}", .{});
+                        }
                     },
                     .field => {
                         try writer.println("pub fn {f}(self: @This(), count: usize) protocol_support.WriteError!{s} {{", .{ idfmt(field_name), nested_name });
@@ -4274,7 +4540,7 @@ const ResolvedType = union(enum) {
         writer.indent();
         try writer.println("var rest = self.buffer;", .{});
         const count_id = try codegenArrayCountRead(array.count, writer, "rest");
-        try writer.println("return .{{ .rest = rest, .remaining = @intCast(count_{}) }};", .{count_id});
+        try writer.println("return .{{ .rest = rest, .remaining = count_{} }};", .{count_id});
         writer.unindent();
         try writer.println("}}", .{});
         try writer.println("", .{});
@@ -4286,8 +4552,8 @@ const ResolvedType = union(enum) {
                 try writer.println("return {};", .{constant});
             },
             .type => |countType| {
-                try writer.println("const count, _ = try protocol_support.read_{s}(self.buffer);", .{@tagName(countType)});
-                try writer.println("return @intCast(count);", .{});
+                try writer.println("const count, _ = try protocol_support.read_count(self.buffer, {s});", .{try countType.codegenType()});
+                try writer.println("return count;", .{});
             },
             .field => {
                 try writer.println("_ = self;", .{});
@@ -4816,7 +5082,7 @@ fn codegenArrayCountRead(count: ArrayCount, writer: *IndentedWriter, restName: [
     switch (count) {
         .constant => |constant| try writer.println("const count_{}: usize = {};", .{ id, constant }),
         .type => |countType| {
-            try writer.println("const count_{}, const rest_{} = try protocol_support.read_{s}({s});", .{ id, id, @tagName(countType), restName });
+            try writer.println("const count_{}, const rest_{} = try protocol_support.read_count({s}, {s});", .{ id, id, restName, try countType.codegenType() });
             try writer.println("{s} = rest_{};", .{ restName, id });
         },
         .field => {
@@ -4893,7 +5159,6 @@ const Cursor = struct {
             variants: []CursorVariant,
             default: *Cursor,
         },
-        todo,
     },
     fieldName: []const u8,
     visited: bool = false,
@@ -5012,7 +5277,6 @@ const Cursor = struct {
                 }
                 try variants.default.codegen(writer);
             },
-            .todo => unreachable,
         }
     }
 
@@ -5101,7 +5365,6 @@ const Cursor = struct {
                 }
                 try variants.default.codegenWrite(writer);
             },
-            .todo => unreachable,
         }
     }
 
@@ -5113,7 +5376,6 @@ const Cursor = struct {
             .complex => {
                 self.kind.complex.next = next;
             },
-            .todo => {},
             else => return error.UpdateNextOnNonSimple,
         }
     }
@@ -5343,6 +5605,12 @@ fn namedSkipFunctionName(allocator: std.mem.Allocator, type_name: []const u8) ![
     const sanitized = try sanitizeTypeNamePart(allocator, type_name);
     defer allocator.free(sanitized);
     return std.fmt.allocPrint(allocator, "skip_type__{s}", .{sanitized});
+}
+
+fn emptyArrayMethodName(allocator: std.mem.Allocator, field_name: []const u8) ![]const u8 {
+    const sanitized = try sanitizeTypeNamePart(allocator, field_name);
+    defer allocator.free(sanitized);
+    return std.fmt.allocPrint(allocator, "{s}Empty", .{sanitized});
 }
 
 fn isNamedWriteTarget(type_name: []const u8) bool {

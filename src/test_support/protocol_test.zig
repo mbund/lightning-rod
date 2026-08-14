@@ -648,3 +648,86 @@ test "play toClient recipe_book_add encodes typed requirements holder set" {
 
     try std.testing.expectEqualSlices(u8, &bytes("430105000000000000010102090000"), written);
 }
+
+test "play toServer position_look decodes type-safe cursor chain" {
+    var buffer: [64]u8 = undefined;
+    const c1 = protocol.play.toServer.write(&buffer);
+    const c2 = try c1.position_look();
+    const c3 = try c2.x(1.5);
+    const c4 = try c3.y(64.0);
+    const c5 = try c4.z(-2.25);
+    const c6 = try c5.yaw(90.0);
+    const c7 = try c6.pitch(15.0);
+    const written = (try c7.flags(.{ .onGround = true })).finish();
+
+    const packet = protocol.play.toServer.read(written);
+    switch (try packet.name()) {
+        .position_look => |body| {
+            const x, const r2 = try body.x();
+            const y, const r3 = try r2.y();
+            const z, const r4 = try r3.z();
+            const yaw, const r5 = try r4.yaw();
+            const pitch, const r6 = try r5.pitch();
+            const flags, const done = try r6.flags();
+
+            try std.testing.expectEqual(@as(f64, 1.5), x);
+            try std.testing.expectEqual(@as(f64, 64.0), y);
+            try std.testing.expectEqual(@as(f64, -2.25), z);
+            try std.testing.expectEqual(@as(f32, 90.0), yaw);
+            try std.testing.expectEqual(@as(f32, 15.0), pitch);
+            try std.testing.expectEqual(true, flags.onGround);
+            try std.testing.expectEqual(false, flags.hasHorizontalCollision);
+            try done.finish();
+        },
+        else => return error.UnexpectedPacket,
+    }
+}
+
+test "configuration toClient boot packets encode with cursor style" {
+    var flags_buffer: [64]u8 = undefined;
+    const flags_c1 = protocol.configuration.toClient.write(&flags_buffer);
+    const flags_c2 = try flags_c1.feature_flags();
+    const flags_written = (try (try flags_c2.features(1)).single("minecraft:vanilla")).finish();
+    try std.testing.expectEqualSlices(u8, &bytes("0c01116d696e6563726166743a76616e696c6c61"), flags_written);
+
+    var tags_buffer: [8]u8 = undefined;
+    const tags_c1 = protocol.configuration.toClient.write(&tags_buffer);
+    const tags_c2 = try tags_c1.tags();
+    const tags_written = (try tags_c2.tagsEmpty()).finish();
+    try std.testing.expectEqualSlices(u8, &bytes("0d00"), tags_written);
+
+    var known_packs_buffer: [64]u8 = undefined;
+    const known_packs_c1 = protocol.configuration.toClient.write(&known_packs_buffer);
+    const known_packs_c2 = try known_packs_c1.select_known_packs();
+    var packs = try known_packs_c2.packs(1);
+    const pack = try packs.element();
+    const pack_id = try (try pack.namespace("minecraft")).id("core");
+    packs = try pack_id.version("1.21.8");
+    const known_packs_written = (try packs.finish()).finish();
+    try std.testing.expectEqualSlices(u8, &bytes("0e01096d696e65637261667404636f726506312e32312e38"), known_packs_written);
+
+    var registry_buffer: [128]u8 = undefined;
+    const registry_c1 = protocol.configuration.toClient.write(&registry_buffer);
+    const registry_c2 = try registry_c1.registry_data();
+    const registry_c3 = try registry_c2.id("minecraft:dimension_type");
+    var entries = try registry_c3.entries(1);
+    const entry = try entries.element();
+    const value = try (try entry.key("minecraft:overworld")).value();
+    entries = try value.none();
+    const registry_written = (try entries.finish()).finish();
+    try std.testing.expectEqualSlices(u8, &bytes("07186d696e6563726166743a64696d656e73696f6e5f7479706501136d696e6563726166743a6f766572776f726c6400"), registry_written);
+
+    var finish_buffer: [4]u8 = undefined;
+    const finish_c1 = protocol.configuration.toClient.write(&finish_buffer);
+    const finish_c2 = try finish_c1.finish_configuration();
+    const finish_written = (try finish_c2.finish()).finish();
+    try std.testing.expectEqualSlices(u8, &bytes("03"), finish_written);
+}
+
+test "configuration toServer finish gates play transition packet" {
+    const packet = protocol.configuration.toServer.read(&bytes("03"));
+    switch (try packet.name()) {
+        .finish_configuration => |body| try body.finish(),
+        else => return error.UnexpectedPacket,
+    }
+}

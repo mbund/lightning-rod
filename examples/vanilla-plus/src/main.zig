@@ -1,0 +1,10 @@
+const std = @import("std");
+const lightning_rod = @import("lightning_rod");
+const profile = @import("vanilla_plus_profile");
+
+pub const panic = lightning_rod.server_app.panic;
+pub const std_options: std.Options = lightning_rod.server_app.std_options;
+
+pub fn main(init: std.process.Init) !void {
+    try lightning_rod.server_app.run(profile, init);
+}

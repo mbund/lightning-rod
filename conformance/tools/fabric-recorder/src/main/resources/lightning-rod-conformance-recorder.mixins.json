@@ -1,0 +1,7 @@
+{
+  "required": true,
+  "package": "dev.mbund.lightningrod.conformance.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": ["DecoderHandlerMixin", "EncoderHandlerMixin"],
+  "injectors": { "defaultRequire": 1 }
+}

@@ -1,0 +1,12 @@
+.{
+    .fingerprint = 0xba2a96c42f22450f,
+    .name = .lightning_rod_skyblock,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .lightning_rod = .{ .path = "../.." },
+        .economy = .{ .path = "../plugins/economy" },
+        .worldguard = .{ .path = "../plugins/worldguard" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

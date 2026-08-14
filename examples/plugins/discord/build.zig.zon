@@ -1,0 +1,10 @@
+.{
+    .fingerprint = 0x8b398ad038aa419d,
+    .name = .lightning_rod_discord,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .lightning_rod = .{ .path = "../../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

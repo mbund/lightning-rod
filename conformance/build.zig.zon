@@ -1,0 +1,25 @@
+.{
+    .fingerprint = 0x11dd58c96560d5d5,
+    .name = .lightning_rod_conformance,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .lightning_rod = .{ .path = ".." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "codegen",
+        "src",
+        "tests",
+        "tools/fabric-recorder/build.gradle",
+        "tools/fabric-recorder/gradle.properties",
+        "tools/fabric-recorder/run-headless",
+        "tools/fabric-recorder/settings.gradle",
+        "tools/fabric-recorder/src",
+        "tools/vanilla-harness/build.gradle",
+        "tools/vanilla-harness/gradle.properties",
+        "tools/vanilla-harness/settings.gradle",
+        "tools/vanilla-harness/src",
+    },
+}

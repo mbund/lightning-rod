@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const nbt_module = @import("nbt");
 
 pub const ReadError = error{
+    UnexpectedPacketId,
     ExtraDataAfterEndOfPacket,
     EndOfStream,
     NegativeLength,
@@ -12,6 +13,7 @@ pub const ReadError = error{
     LengthOverflow,
     VarIntTooLong,
     VarLongTooLong,
+    CollectionTooLarge,
 };
 
 pub const WriteError = error{
@@ -24,6 +26,7 @@ pub const WriteError = error{
 
 const SEGMENT_BITS = 0x7F;
 const CONTINUE_BIT = 0x80;
+pub const maximum_sequence_elements: usize = 65_536;
 const nbt_max_depth = 128;
 
 pub const UUID = u128;
@@ -157,6 +160,31 @@ pub fn read_buffer_counted(buffer: []const u8, comptime Count: type) !struct { [
     return read_buffer_exact(rest, @intCast(length));
 }
 
+pub fn count_to_usize(value: anytype) ReadError!usize {
+    const T = @TypeOf(value);
+    const info = @typeInfo(T);
+    if (info != .int) @compileError("count must be an integer");
+    if (info.int.signedness == .signed and value < 0) return error.NegativeLength;
+    return std.math.cast(usize, value) orelse error.LengthOverflow;
+}
+
+pub fn count_minus_one_to_usize(value: anytype) ReadError!usize {
+    if (value <= 0) return error.NegativeLength;
+    return count_to_usize(value - 1);
+}
+
+pub fn read_count(buffer: []const u8, comptime Count: type) ReadError!struct { usize, []const u8 } {
+    const value, const rest = try switch (Count) {
+        i32 => read_varint(buffer),
+        i64 => read_varlong(buffer),
+        u8 => read_u8(buffer),
+        u16 => read_u16(buffer),
+        u32 => read_u32(buffer),
+        else => @compileError("unsupported count type"),
+    };
+    return .{ try count_to_usize(value), rest };
+}
+
 pub fn slice_to_rest(start: []const u8, rest: []const u8) []const u8 {
     return start[0 .. start.len - rest.len];
 }
@@ -223,7 +251,7 @@ pub fn write_varint(buffer: []u8, value: i32) WriteError![]u8 {
     var rest = buffer;
     var bits: u32 = @bitCast(value);
 
-    while (true) {
+    for (0..5) |_| {
         if (rest.len == 0) return error.EndOfStream;
         if ((bits & ~@as(u32, SEGMENT_BITS)) == 0) {
             rest[0] = @intCast(bits);
@@ -233,13 +261,14 @@ pub fn write_varint(buffer: []u8, value: i32) WriteError![]u8 {
         rest = rest[1..];
         bits >>= 7;
     }
+    unreachable;
 }
 
 pub fn write_varlong(buffer: []u8, value: i64) WriteError![]u8 {
     var rest = buffer;
     var bits: u64 = @bitCast(value);
 
-    while (true) {
+    for (0..10) |_| {
         if (rest.len == 0) return error.EndOfStream;
         if ((bits & ~@as(u64, SEGMENT_BITS)) == 0) {
             rest[0] = @intCast(bits);
@@ -249,6 +278,7 @@ pub fn write_varlong(buffer: []u8, value: i64) WriteError![]u8 {
         rest = rest[1..];
         bits >>= 7;
     }
+    unreachable;
 }
 
 pub fn write_u8(buffer: []u8, value: u8) WriteError![]u8 {
@@ -468,3 +498,70 @@ pub const RawPayload = struct {
         _ = self;
     }
 };
+
+/// Deterministic, whitespace-free representation used by generated protocol
+/// canonicalizers. Cursor/view structs deliberately collapse to their decoded
+/// byte span: this is lossless for every AST type, including newly introduced
+/// NBT and protocol-specific structures, while ordinary scalar and bit-field
+/// values are independent of their wire integer encoding.
+pub fn writeCanonicalValue(writer: *std.Io.Writer, value: anytype) anyerror!void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .void => try writer.writeAll("null"),
+        .bool => try writer.writeAll(if (value) "true" else "false"),
+        .int, .comptime_int => try writer.print("{d}", .{value}),
+        .float => |float_info| switch (float_info.bits) {
+            32 => try writer.print("f32:{x}", .{@as(u32, @bitCast(value))}),
+            64 => try writer.print("f64:{x}", .{@as(u64, @bitCast(value))}),
+            else => @compileError("unsupported canonical float width"),
+        },
+        .pointer => |pointer| {
+            if (pointer.size != .slice or pointer.child != u8)
+                @compileError("canonical packet values only support byte slices");
+            try writeCanonicalBytes(writer, value);
+        },
+        .array => |array| {
+            if (array.child == u8) {
+                try writeCanonicalBytes(writer, &value);
+            } else {
+                try writer.writeByte('[');
+                for (value, 0..) |element, index| {
+                    if (index != 0) try writer.writeByte(',');
+                    try writeCanonicalValue(writer, element);
+                }
+                try writer.writeByte(']');
+            }
+        },
+        .optional => {
+            if (value) |present| try writeCanonicalValue(writer, present) else try writer.writeAll("null");
+        },
+        .@"enum" => try writer.writeAll(@tagName(value)),
+        .@"struct" => |struct_info| {
+            if (@hasField(T, "buffer")) {
+                try writeCanonicalBytes(writer, value.buffer);
+            } else {
+                try writer.writeByte('{');
+                inline for (struct_info.fields, 0..) |field, index| {
+                    if (index != 0) try writer.writeByte(';');
+                    try writer.print("{s}=", .{field.name});
+                    try writeCanonicalValue(writer, @field(value, field.name));
+                }
+                try writer.writeByte('}');
+            }
+        },
+        else => @compileError("unsupported generated canonical packet value: " ++ @typeName(T)),
+    }
+}
+
+fn writeCanonicalBytes(writer: *std.Io.Writer, bytes: []const u8) anyerror!void {
+    const hex = "0123456789abcdef";
+    try writer.writeByte('h');
+    for (bytes) |byte| try writer.writeAll(&.{ hex[byte >> 4], hex[byte & 0x0f] });
+}
+
+test "canonical byte values preserve their complete payload" {
+    var storage: [32]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&storage);
+    try writeCanonicalBytes(&writer, &.{ 0x01, 0xab });
+    try std.testing.expectEqualStrings("h01ab", writer.buffered());
+}
