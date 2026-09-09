@@ -120,6 +120,7 @@ const entity_symbols = [_]Symbol{
     .{ .name = "turtle", .registry_name = "turtle" },
     .{ .name = "cow", .registry_name = "cow" },
     .{ .name = "pig", .registry_name = "pig" },
+    .{ .name = "chicken", .registry_name = "chicken" },
 };
 
 const sound_symbols = [_]Symbol{
@@ -146,6 +147,7 @@ pub fn main(init: std.process.Init) !void {
     const collision_shapes_path = args.next() orelse return error.MissingCollisionShapesPath;
     const enchantments_path = args.next() orelse return error.MissingEnchantmentsPath;
     const protocol_path = args.next() orelse return error.MissingProtocolPath;
+    const biomes_path = args.next() orelse return error.MissingBiomesPath;
     const canonical_blocks_path = args.next() orelse return error.MissingCanonicalBlocksPath;
     const canonical_items_path = args.next() orelse return error.MissingCanonicalItemsPath;
     const canonical_entities_path = args.next() orelse return error.MissingCanonicalEntitiesPath;
@@ -161,6 +163,7 @@ pub fn main(init: std.process.Init) !void {
     const collision_shapes = try parseFile(init.io, cwd, allocator, collision_shapes_path);
     const enchantments = try parseFile(init.io, cwd, allocator, enchantments_path);
     const protocol = try parseFile(init.io, cwd, allocator, protocol_path);
+    const biomes = try parseFile(init.io, cwd, allocator, biomes_path);
     const canonical_blocks = try parseFile(init.io, cwd, allocator, canonical_blocks_path);
     const canonical_items = try parseFile(init.io, cwd, allocator, canonical_items_path);
     const canonical_entities = try parseFile(init.io, cwd, allocator, canonical_entities_path);
@@ -269,6 +272,20 @@ pub fn main(init: std.process.Init) !void {
             "}\n\n",
     );
     try writeCanonicalTranslations(&output, allocator, blocks, items, entities, canonical_blocks, canonical_items, canonical_entities);
+
+    try output.appendSlice("\npub const biome_names = &[_][]const u8{\n");
+    for (biomes.array.items, 0..) |entry, biome_index| {
+        const biome = entry.object;
+        if (try intField(biome, "id") != biome_index) return error.NonDenseBiomeRegistry;
+        try output.print("    \"minecraft:{s}\",\n", .{biome.get("name").?.string});
+    }
+    try output.appendSlice(
+        "};\n\n" ++
+            "pub fn biomeId(name: []const u8) ?u8 {\n" ++
+            "    for (biome_names, 0..) |candidate, biome_id| if (std.mem.eql(u8, candidate, name)) return @intCast(biome_id);\n" ++
+            "    return null;\n" ++
+            "}\n\n",
+    );
 
     try output.appendSlice("\npub const items = &[_]ItemInfo{\n");
     for (items.array.items, 0..) |entry, item_index| {

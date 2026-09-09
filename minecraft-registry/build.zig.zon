@@ -1,0 +1,14 @@
+.{
+    .fingerprint = 0xd213ed662c713920,
+    .name = .minecraft_registry,
+    .version = "1.21.8",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .lightning_rod_test_runner = .{ .path = "../test-runner" },
+        .minecraft_data = .{
+            .url = "git+https://github.com/PrismarineJS/minecraft-data#3.99.1",
+            .hash = "N-V-__8AAMLHwRStW6njOmmly5KMd1jTqR4TxZt78Y3XFKjS",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "tools" },
+}

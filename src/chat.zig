@@ -1,10 +1,7 @@
 const std = @import("std");
-const config = @import("config.zig").value;
 
 pub const max_prefixes = 8;
 
-/// Compile-time capability owned by the single plugin which turns a chat
-/// batch into packets. Any number of modifier plugins may run before it.
 pub const OutputCapability = struct {};
 
 pub const Audience = union(enum) {
@@ -12,8 +9,6 @@ pub const Audience = union(enum) {
     player: u16,
 };
 
-/// All slices borrow either the tick input arena or longer-lived plugin/world
-/// storage. They are never retained after the tick finishes.
 pub const Draft = struct {
     sender: u16,
     text: []const u8,
@@ -38,8 +33,6 @@ pub const Draft = struct {
     }
 };
 
-/// Formats a fully modified draft without first materializing the line. This
-/// can be passed through normal Zig formatting into a final packet buffer.
 pub const Line = struct {
     draft: *const Draft,
 
@@ -51,8 +44,13 @@ pub const Line = struct {
 };
 
 pub const Batch = struct {
-    drafts: [config.max_tick_player_messages]Draft = undefined,
+    drafts: []Draft = &.{},
     len: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator, capacity: usize) !Batch {
+        if (capacity == 0) return error.InvalidChatCapacity;
+        return .{ .drafts = try allocator.alloc(Draft, capacity) };
+    }
 
     pub fn append(self: *Batch, sender: u16, text: []const u8) error{ChatBatchFull}!*Draft {
         if (self.len == self.drafts.len) return error.ChatBatchFull;
@@ -72,7 +70,8 @@ pub const Batch = struct {
 };
 
 test "chat modifiers compose over one borrowed draft" {
-    var batch: Batch = .{};
+    var storage: [2]Draft = undefined;
+    var batch = Batch{ .drafts = &storage };
     const borrowed = "hello";
     const draft = try batch.append(3, borrowed);
     try draft.addPrefix("[Admin] ");
@@ -83,4 +82,8 @@ test "chat modifiers compose over one borrowed draft" {
     try std.testing.expectEqualStrings(borrowed, batch.items()[0].text);
     try std.testing.expectEqualStrings("[Admin] ", batch.items()[0].prefixes[0]);
     try std.testing.expectEqualStrings("[Blue] ", batch.items()[0].prefixes[1]);
+
+    var rendered: [64]u8 = undefined;
+    const line = try std.fmt.bufPrint(&rendered, "{f}", .{Line{ .draft = draft }});
+    try std.testing.expectEqualStrings("[Admin] [Blue] <Alex> hello", line);
 }

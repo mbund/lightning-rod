@@ -4,14 +4,11 @@ const api = @import("dimension_api.zig");
 const identity = @import("identity.zig");
 const world_store = @import("worlds.zig");
 
-pub const Definition = api.Definition;
-pub const MonsterSettings = api.MonsterSettings;
-pub const SpawnLight = api.SpawnLight;
 pub const max_protocol_nbt_bytes = 1_024;
 pub const max_dimensions = 32;
 
 pub const Overworld = struct {
-    pub const definition = Definition{
+    pub const definition = api.Definition{
         .id = "minecraft:overworld",
         .known_pack = true,
         .fixed_time = null,
@@ -39,7 +36,7 @@ pub const Overworld = struct {
 };
 
 pub const Nether = struct {
-    pub const definition = Definition{
+    pub const definition = api.Definition{
         .id = "minecraft:the_nether",
         .known_pack = true,
         .fixed_time = 18_000,
@@ -67,7 +64,7 @@ pub const Nether = struct {
 };
 
 pub const End = struct {
-    pub const definition = Definition{
+    pub const definition = api.Definition{
         .id = "minecraft:the_end",
         .known_pack = true,
         .fixed_time = 6_000,
@@ -99,11 +96,15 @@ pub fn Registry(comptime configured: anytype) type {
     const definitions = configuredDefinitions(configured);
     return struct {
         pub const id = "lightning_rod:dimensions";
+        pub const Configuration = struct {};
+        pub const Dependencies = struct { worlds: *world_store.Worlds };
 
-        pub fn create(allocator: std.mem.Allocator, worlds: *world_store.Worlds) !*@This() {
+        deps: Dependencies,
+
+        pub fn init(allocator: std.mem.Allocator, deps: Dependencies, _: Configuration) !*@This() {
             const self = try allocator.create(@This());
-            self.* = .{};
-            try worlds.bindDimensions(.{ .definitions = &definitions });
+            self.* = .{ .deps = deps };
+            try deps.worlds.bindDimensions(.{ .definitions = &definitions });
             return self;
         }
 
@@ -119,7 +120,7 @@ pub fn Registry(comptime configured: anytype) type {
 
 pub const Vanilla = Registry(.{ Overworld{}, Nether{}, End{} });
 
-pub fn writeProtocolNbt(buffer: []u8, definition: Definition) ![]const u8 {
+pub fn writeProtocolNbt(buffer: []u8, definition: api.Definition) ![]const u8 {
     var frames: [4]nbt.WriteFrame = undefined;
     var writer = nbt.Writer.init(buffer, &frames);
     try writer.beginAnonymousCompound();
@@ -146,7 +147,7 @@ pub fn writeProtocolNbt(buffer: []u8, definition: Definition) ![]const u8 {
     return writer.finish();
 }
 
-fn writeSpawnLight(writer: *nbt.Writer, value: SpawnLight) !void {
+fn writeSpawnLight(writer: *nbt.Writer, value: api.SpawnLight) !void {
     switch (value) {
         .constant => |level| try writer.putInt("monster_spawn_light_level", @intCast(level)),
         .uniform => |range| {
@@ -165,8 +166,8 @@ fn putBoolean(writer: *nbt.Writer, name: []const u8, value: bool) !void {
     try writer.putByte(name, @intFromBool(value));
 }
 
-fn configuredDefinitions(comptime configured: anytype) [configured.len]Definition {
-    var result: [configured.len]Definition = undefined;
+fn configuredDefinitions(comptime configured: anytype) [configured.len]api.Definition {
+    var result: [configured.len]api.Definition = undefined;
     inline for (configured, 0..) |dimension, index|
         result[index] = @TypeOf(dimension).definition;
     return result;
@@ -194,7 +195,7 @@ fn validate(comptime configured: anytype) void {
     }
 }
 
-fn validateDefinition(comptime definition: Definition) void {
+fn validateDefinition(comptime definition: api.Definition) void {
     if (definition.id.len == 0) @compileError("dimension id must not be empty");
     if (definition.height < 16 or @mod(definition.height, 16) != 0)
         @compileError("dimension height must be a positive multiple of 16");

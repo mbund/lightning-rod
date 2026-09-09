@@ -2,13 +2,14 @@ const block_store = @import("blocks.zig");
 const std = @import("std");
 const registry = @import("registry_data");
 const game_data = @import("../game_data.zig");
-const config = @import("../config.zig").value;
 const collision = @import("../collision.zig");
 const player_lifecycle = @import("../player_lifecycle.zig");
 const preallocated = @import("preallocated");
 const geometry = @import("geometry.zig");
+const limits = @import("limits.zig");
 const world_random = @import("random.zig");
 const world_identity = @import("identity.zig");
+const world_store = @import("worlds.zig");
 
 const cache_line_size = 64;
 
@@ -30,6 +31,15 @@ pub const GameMode = enum(u8) {
 };
 
 pub const LoginDisposition = enum { new_player, restored_player };
+
+pub const Session = extern struct {
+    slot: u16,
+    generation: u64,
+
+    pub fn eql(a: Session, b: Session) bool {
+        return a.slot == b.slot and a.generation == b.generation;
+    }
+};
 
 pub const HotbarStack = extern struct {
     block_state: i32 = registry.block_air_default_state,
@@ -89,19 +99,14 @@ pub const CorePlayer = struct {
     food_tick_timer: i32 = 0,
     last_attacked_ticks: u32 = 0,
     last_attack_item_id: i32 = 0,
-    last_arm_swing_tick: u64 = std.math.maxInt(u64),
-    play_bootstrap_complete: bool = false,
-    play_join_terrain_ready: bool = false,
-    play_join_stage: u8 = 0,
-    announce_join: bool = false,
-    needs_spawn_position: bool = false,
     teleport_epoch: u64 = 0,
+    next_teleport_id: i32 = 1,
+    pending_teleport_id: i32 = 0,
+    client_loaded: bool = false,
     selected_hotbar_slot: u4 = 0,
     on_ground: bool = false,
     sneaking: bool = false,
     sprinting: bool = false,
-    // Survival players do not receive a development kit. Tests and plugins
-    // that need inventory state must declare it explicitly.
     hotbar: [9]HotbarStack = [_]HotbarStack{.{}} ** 9,
     main_inventory: [27]HotbarStack = [_]HotbarStack{.{}} ** 27,
     armor: [4]HotbarStack = [_]HotbarStack{.{}} ** 4,
@@ -109,7 +114,7 @@ pub const CorePlayer = struct {
     crafting_grid: [4]HotbarStack = [_]HotbarStack{.{}} ** 4,
     crafting_result: HotbarStack = .{},
     cursor_stack: HotbarStack = .{},
-    name: [config.max_username_bytes]u8 = undefined,
+    name: [maximum_name_bytes]u8 = undefined,
     name_len: usize = 0,
 
     pub fn name_slice(self: *const CorePlayer) []const u8 {
@@ -120,8 +125,28 @@ pub const CorePlayer = struct {
 
 pub const Players = struct {
     pub const id = "lightning_rod:players";
+    pub const Dependencies = struct {
+        events: *player_lifecycle.Events,
+        worlds: *world_store.Worlds,
+    };
+    pub const Configuration = struct {
+        initial_world: world_identity.Key,
+        maximum_connections: usize = 80,
+        maximum_players: usize = 64,
+        maximum_saved_players: usize = 256,
 
-    lifecycle: *player_lifecycle.Events,
+        pub fn validate(self: Configuration) !void {
+            if (self.maximum_connections == 0 or self.maximum_connections > std.math.maxInt(u16))
+                return error.InvalidConnectionCapacity;
+            if (self.maximum_players == 0 or self.maximum_players > self.maximum_connections)
+                return error.InvalidPlayerCapacity;
+            if (self.maximum_saved_players == 0 or self.maximum_saved_players > std.math.maxInt(u16))
+                return error.InvalidSavedPlayerCapacity;
+        }
+    };
+
+    deps: Dependencies,
+    initial_world: world_identity.Key,
     records: []align(cache_line_size) CorePlayer = &.{},
     session_generations: []u64 = &.{},
     active_slots: []u16 = &.{},
@@ -130,14 +155,16 @@ pub const Players = struct {
     saved: []CorePlayer = &.{},
     saved_count: usize = 0,
 
-    pub fn create(allocator: std.mem.Allocator, lifecycle: *player_lifecycle.Events) !*Players {
+    pub fn init(allocator: std.mem.Allocator, deps: Dependencies, configuration: Configuration) !*Players {
+        try configuration.validate();
+        if (deps.worlds.find(configuration.initial_world) == null) return error.UnknownInitialWorld;
         const self = try preallocated.create(Players, allocator);
-        self.* = .{ .lifecycle = lifecycle };
-        self.records = try preallocated.alignedAlloc(CorePlayer, allocator, .@"64", config.connectionCapacity());
-        self.session_generations = try preallocated.alloc(u64, allocator, config.connectionCapacity());
-        self.active_slots = try preallocated.alloc(u16, allocator, config.max_players);
-        self.active_positions = try preallocated.alloc(u16, allocator, config.connectionCapacity());
-        self.saved = try preallocated.alloc(CorePlayer, allocator, config.max_saved_players);
+        self.* = .{ .deps = deps, .initial_world = configuration.initial_world };
+        self.records = try preallocated.alignedAlloc(CorePlayer, allocator, .@"64", configuration.maximum_connections);
+        self.session_generations = try preallocated.alloc(u64, allocator, configuration.maximum_connections);
+        self.active_slots = try preallocated.alloc(u16, allocator, configuration.maximum_players);
+        self.active_positions = try preallocated.alloc(u16, allocator, configuration.maximum_connections);
+        self.saved = try preallocated.alloc(CorePlayer, allocator, configuration.maximum_saved_players);
         @memset(self.records, .{});
         @memset(self.session_generations, 0);
         @memset(self.saved, .{});
@@ -146,6 +173,16 @@ pub const Players = struct {
 
     pub inline fn activeSlots(self: *const Players) []const u16 {
         return self.active_slots[0..self.active_count];
+    }
+
+    pub fn session(self: *const Players, slot: u16) ?Session {
+        if (slot >= self.records.len or self.records[slot].state == .free) return null;
+        return .{ .slot = slot, .generation = self.session_generations[slot] };
+    }
+
+    pub fn validSession(self: *const Players, value: Session) bool {
+        const current = self.session(value.slot) orelse return false;
+        return current.eql(value);
     }
 
     pub fn assertSlot(self: *const Players, slot: u16) void {
@@ -303,6 +340,16 @@ pub const Players = struct {
         };
     }
 
+    pub fn discardConnection(self: *Players, slot: u16) void {
+        self.assertSlot(slot);
+        if (self.records[slot].state == .play) self.removeActive(slot);
+        self.records[slot] = .{};
+    }
+
+    pub fn hasSaved(self: *const Players, uuid: u128, username: []const u8) bool {
+        return self.findSaved(uuid, username) != null;
+    }
+
     pub fn transition(self: *Players, slot: u16, state: PlayerState) void {
         std.debug.assert(slot < self.records.len);
         const previous = self.records[slot].state;
@@ -320,7 +367,7 @@ pub const Players = struct {
     ) !LoginDisposition {
         std.debug.assert(slot < self.records.len);
         std.debug.assert(self.records[slot].state != .free);
-        if (username.len > config.max_username_bytes) return error.UsernameTooLong;
+        if (username.len > maximum_name_bytes) return error.UsernameTooLong;
         const player = &self.records[slot];
         const entity_id = player.entity_id;
         const uuid = if (client_uuid != 0) client_uuid else random.random.uuid_for(slot);
@@ -328,12 +375,27 @@ pub const Players = struct {
             player.* = self.saved[saved_index];
             break :restored true;
         } else false;
+        if (restored) {
+            if (self.deps.worlds.getConst(player.world) == null) return error.StaleWorldHandle;
+        } else {
+            const world = self.deps.worlds.find(self.initial_world) orelse return error.UnknownInitialWorld;
+            const description = self.deps.worlds.getConst(world).?;
+            player.world = world;
+            player.position = .{
+                .x = @floatFromInt(description.spawn_x),
+                .y = @floatFromInt(description.spawn_y),
+                .z = @floatFromInt(description.spawn_z),
+            };
+        }
         player.uuid = uuid;
         player.entity_id = entity_id;
         player.last_attacked_ticks = 0;
         player.last_attack_item_id = 0;
         player.sneaking = false;
         player.sprinting = false;
+        player.client_loaded = false;
+        player.pending_teleport_id = 0;
+        if (player.next_teleport_id <= 0) player.next_teleport_id = 1;
         @memcpy(player.name[0..username.len], username);
         player.name_len = username.len;
         player.state = .login;
@@ -374,10 +436,12 @@ pub const Players = struct {
         self.saved[index].sprinting = false;
     }
 
-    pub fn left(
-        self: *Players,
-    ) void {
-        for (self.lifecycle.left.values) |event| {
+    pub fn tick(self: *Players, _: std.mem.Allocator) void {
+        self.processLeft();
+    }
+
+    fn processLeft(self: *Players) void {
+        for (self.deps.events.left.values) |event| {
             const slot: usize = event.slot;
             std.debug.assert(slot < self.records.len);
             self.savePlayer(@intCast(slot)) catch
@@ -413,20 +477,28 @@ pub const Players = struct {
     }
 };
 
+pub const maximum_name_bytes = limits.username_bytes;
+
 pub const Containers = struct {
     pub const id = "lightning_rod:containers";
+    pub const Configuration = struct {};
+    pub const Dependencies = struct {
+        events: *player_lifecycle.Events,
+        players: *Players,
+    };
 
-    lifecycle: *player_lifecycle.Events,
+    deps: Dependencies,
     drags: []InventoryDrag = &.{},
     open: []OpenContainer = &.{},
     counters: []u8 = &.{},
 
-    pub fn create(allocator: std.mem.Allocator, lifecycle: *player_lifecycle.Events) !*Containers {
+    pub fn init(allocator: std.mem.Allocator, deps: Dependencies, _: Configuration) !*Containers {
         const self = try preallocated.create(Containers, allocator);
-        self.* = .{ .lifecycle = lifecycle };
-        self.drags = try preallocated.alloc(InventoryDrag, allocator, config.connectionCapacity());
-        self.open = try preallocated.alloc(OpenContainer, allocator, config.connectionCapacity());
-        self.counters = try preallocated.alloc(u8, allocator, config.connectionCapacity());
+        self.* = .{ .deps = deps };
+        const connections = deps.players.records.len;
+        self.drags = try preallocated.alloc(InventoryDrag, allocator, connections);
+        self.open = try preallocated.alloc(OpenContainer, allocator, connections);
+        self.counters = try preallocated.alloc(u8, allocator, connections);
         @memset(self.drags, .{});
         @memset(self.open, .{});
         @memset(self.counters, 0);
@@ -446,10 +518,12 @@ pub const Containers = struct {
         return open.state_id;
     }
 
-    pub fn left(
-        self: *Containers,
-    ) void {
-        for (self.lifecycle.left.values) |event| {
+    pub fn tick(self: *Containers, _: std.mem.Allocator) void {
+        self.processLeft();
+    }
+
+    fn processLeft(self: *Containers) void {
+        for (self.deps.events.left.values) |event| {
             self.drags[event.slot] = .{};
             self.open[event.slot] = .{};
             self.counters[event.slot] = 0;
@@ -564,8 +638,6 @@ pub fn blockStateForItem(item_id: i32) i32 {
     return game_data.blockStateForItem(item_id);
 }
 
-/// Vanilla's LeavesBlock placement state sets `persistent=true`; the registry
-/// default is the natural, decayable state used by world generation.
 pub fn playerPlacedBlockState(block_state: i32) i32 {
     if (block_state < 0 or block_state >= registry.block_state_to_block.len) return block_state;
     if (registry.block_state_to_block[@intCast(block_state)] != registry.block_oak_leaves_id) return block_state;
@@ -588,13 +660,10 @@ pub fn dropStackForBlockState(block_state: i32, count: u8) ?HotbarStack {
 }
 
 pub fn validBuildY(y: i16) bool {
-    return y >= config.world_min_y and y <= block_store.world_top_y;
+    return y >= limits.min_y and y <= block_store.world_top_y;
 }
 
 pub fn playerCanReachBlock(player: *const CorePlayer, pos: geometry.BlockPos) bool {
-    // ServerPlayerEntity.canInteractWithBlockAt(pos, 1.0): the default
-    // BLOCK_INTERACTION_RANGE is 4.5 and distance is measured from the eye to
-    // the nearest point of the block's unit box, not to its center.
     const min_x: f64 = @floatFromInt(pos.x);
     const min_y: f64 = @floatFromInt(pos.y);
     const min_z: f64 = @floatFromInt(pos.z);
@@ -639,32 +708,72 @@ fn validStateTransition(previous: PlayerState, next: PlayerState) bool {
     };
 }
 
+const test_world_key = world_identity.Key{ .value = 1 };
+const test_world_description = world_store.Description{
+    .key = test_world_key,
+    .name = "test:overworld",
+    .dimension = .{ .index = 0 },
+    .generator = @enumFromInt(0),
+    .seed = 1,
+    .spawn_x = 8,
+    .spawn_y = 64,
+    .spawn_z = 8,
+};
+
+fn createTestPlayers(allocator: std.mem.Allocator, lifecycle: *player_lifecycle.Events) !*Players {
+    const worlds = try world_store.Worlds.init(allocator, .{ .initial = &.{test_world_description} });
+    return Players.init(allocator, .{ .events = lifecycle, .worlds = worlds }, .{ .initial_world = test_world_key });
+}
+
+test "new player admission resolves the current initial world generation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lifecycle: player_lifecycle.Events = .{};
+    const worlds = try world_store.Worlds.init(arena.allocator(), .{ .initial = &.{test_world_description} });
+    const first = worlds.find(test_world_key).?;
+    try worlds.destroy(first);
+    const current = try worlds.add(test_world_description);
+    try std.testing.expect(current.generation != first.generation);
+    const players = try Players.init(
+        arena.allocator(),
+        .{ .events = &lifecycle, .worlds = worlds },
+        .{ .initial_world = test_world_key },
+    );
+    var random: world_random.Random = .{};
+    random.random = world_random.DeterministicRng.init(11);
+    players.beginConnection(&random, 0);
+    try std.testing.expectEqual(LoginDisposition.new_player, try players.login(&random, 0, "new-player", 44));
+    try std.testing.expect(players.records[0].world.eql(current));
+    try std.testing.expectEqual(@as(f64, test_world_description.spawn_y), players.records[0].position.y);
+}
+
 test "player session generation changes when a connection slot is reused" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lifecycle: player_lifecycle.Events = .{};
-    const players = try Players.create(arena.allocator(), &lifecycle);
+    const players = try createTestPlayers(arena.allocator(), &lifecycle);
     var random: world_random.Random = .{};
     random.random = world_random.DeterministicRng.init(17);
     players.beginConnection(&random, 0);
-    const first = players.session_generations[0];
-    try std.testing.expect(first != 0);
+    const first = players.session(0).?;
+    try std.testing.expect(first.generation != 0);
     const event = player_lifecycle.PlayerLeft{
         .slot = 0,
         .connection = .{ .index = 0, .generation = 1 },
         .reason = .peer_closed,
     };
     lifecycle.left = .{ .values = &.{event} };
-    players.left();
+    players.tick(std.testing.allocator);
     players.beginConnection(&random, 0);
-    try std.testing.expect(players.session_generations[0] != first);
+    try std.testing.expect(!players.validSession(first));
+    try std.testing.expect(!players.session(0).?.eql(first));
 }
 
 test "player disconnect saves normalized state before releasing the slot" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lifecycle: player_lifecycle.Events = .{};
-    const players = try Players.create(arena.allocator(), &lifecycle);
+    const players = try createTestPlayers(arena.allocator(), &lifecycle);
     var random: world_random.Random = .{};
     random.random = world_random.DeterministicRng.init(23);
     players.beginConnection(&random, 0);
@@ -679,8 +788,29 @@ test "player disconnect saves normalized state before releasing the slot" {
         .reason = .peer_closed,
     };
     lifecycle.left = .{ .values = &.{event} };
-    players.left();
+    players.tick(std.testing.allocator);
     try std.testing.expectEqual(PlayerState.free, players.records[0].state);
     try std.testing.expectEqual(@as(usize, 1), players.saved_count);
     try std.testing.expectEqual(@as(u8, 7), players.saved[0].hotbar[4].count);
+}
+
+test "replacement connection restores the persisted player by UUID and name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lifecycle: player_lifecycle.Events = .{};
+    const players = try createTestPlayers(arena.allocator(), &lifecycle);
+    var random: world_random.Random = .{};
+    random.random = world_random.DeterministicRng.init(29);
+    players.beginConnection(&random, 0);
+    _ = try players.login(&random, 0, "restore", 77);
+    players.transition(0, .configuration);
+    players.transition(0, .play);
+    players.records[0].world = .{ .index = 0, .generation = 1 };
+    players.records[0].position = .{ .x = 9, .y = 72, .z = -4 };
+    try players.savePlayer(0);
+    players.discardConnection(0);
+    try std.testing.expect(players.hasSaved(77, "restore"));
+    players.beginConnection(&random, 1);
+    try std.testing.expectEqual(LoginDisposition.restored_player, try players.login(&random, 1, "restore", 77));
+    try std.testing.expectEqual(@as(f64, 9), players.records[1].position.x);
 }

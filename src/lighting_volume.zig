@@ -1,9 +1,9 @@
 const std = @import("std");
-const config = @import("config.zig").value;
+const limits = @import("world/limits.zig");
 const light_projection = @import("light_projection.zig");
 
 pub const side = 16;
-pub const height = config.overworld_section_count * side;
+pub const height = limits.section_count * side;
 pub const cell_count = side * side * height;
 pub const word_count = cell_count / 64;
 pub const direction_count = 6;
@@ -39,9 +39,6 @@ pub const Topology = struct {
         );
     }
 
-    /// Build topology while skipping sections which are known to be uniform.
-    /// A prepared section must either have empty occlusion faces or attenuate
-    /// light completely. Both cases have no per-cell edges to classify.
     pub fn buildPrepared(
         attenuation: *const [cell_count]u8,
         block_states: *const [cell_count]i32,
@@ -55,7 +52,7 @@ pub const Topology = struct {
 
         const cells_per_section = side * side * side;
         const words_per_section = cells_per_section / 64;
-        for (0..config.overworld_section_count) |section| {
+        for (0..limits.section_count) |section| {
             const first_cell = section * cells_per_section;
             if (uniform_sections &
                 (@as(u32, 1) << @intCast(section)) != 0)

@@ -1,5 +1,4 @@
 const std = @import("std");
-const config = @import("../config.zig").value;
 const dimension_api = @import("dimension_api.zig");
 const identity = @import("identity.zig");
 const preallocated = @import("preallocated");
@@ -9,6 +8,8 @@ pub const Border = struct {
     center_z: f64 = 0,
     diameter: f64 = 59_999_968,
 };
+
+pub const maximum_name_bytes = 128;
 
 pub const Description = struct {
     key: identity.Key,
@@ -24,7 +25,7 @@ pub const Description = struct {
 
 pub const World = struct {
     key: identity.Key,
-    name: [config.max_world_name_bytes]u8,
+    name: [maximum_name_bytes]u8,
     name_len: u8,
     dimension: identity.DimensionId,
     generator: identity.GeneratorId,
@@ -47,12 +48,21 @@ pub const Context = struct {
 
 pub const Configuration = struct {
     initial: []const Description,
+    maximum_worlds: usize = 4096,
+
+    pub fn validate(self: Configuration) !void {
+        if (self.maximum_worlds < 3 or self.maximum_worlds > std.math.maxInt(u16) or
+            !std.math.isPowerOfTwo(self.maximum_worlds))
+            return error.InvalidWorldCapacity;
+    }
 };
+const WorldConfiguration = Configuration;
 
 pub const Worlds = struct {
     pub const id = "lightning_rod:worlds";
+    pub const Configuration = WorldConfiguration;
 
-    configuration: Configuration,
+    config: WorldConfiguration,
     records: []World = &.{},
     generations: []u16 = &.{},
     occupied: []bool = &.{},
@@ -64,28 +74,29 @@ pub const Worlds = struct {
     active_count: usize = 0,
     free_count: usize = 0,
 
-    pub fn create(allocator: std.mem.Allocator, configuration: Configuration) !*Worlds {
-        try validateRuntimeConfiguration(configuration);
+    pub fn init(allocator: std.mem.Allocator, settings: WorldConfiguration) !*Worlds {
+        try settings.validate();
+        try validateRuntimeConfiguration(settings);
         const self = try preallocated.create(Worlds, allocator);
-        self.* = .{ .configuration = configuration };
-        self.records = try preallocated.alloc(World, allocator, config.max_worlds);
-        self.generations = try preallocated.alloc(u16, allocator, config.max_worlds);
-        self.occupied = try preallocated.alloc(bool, allocator, config.max_worlds);
-        self.active_handles = try preallocated.alloc(identity.Handle, allocator, config.max_worlds);
-        self.active_positions = try preallocated.alloc(u16, allocator, config.max_worlds);
-        self.free_indices = try preallocated.alloc(u16, allocator, config.max_worlds);
-        self.key_lookup = try preallocated.alloc(identity.Handle, allocator, config.max_worlds * 2);
+        self.* = .{ .config = settings };
+        self.records = try preallocated.alloc(World, allocator, settings.maximum_worlds);
+        self.generations = try preallocated.alloc(u16, allocator, settings.maximum_worlds);
+        self.occupied = try preallocated.alloc(bool, allocator, settings.maximum_worlds);
+        self.active_handles = try preallocated.alloc(identity.Handle, allocator, settings.maximum_worlds);
+        self.active_positions = try preallocated.alloc(u16, allocator, settings.maximum_worlds);
+        self.free_indices = try preallocated.alloc(u16, allocator, settings.maximum_worlds);
+        self.key_lookup = try preallocated.alloc(identity.Handle, allocator, settings.maximum_worlds * 2);
         @memset(self.generations, 1);
         @memset(self.occupied, false);
         @memset(self.key_lookup, identity.invalid);
         self.initializeFreeList();
-        for (configuration.initial) |description| _ = try self.add(description);
+        for (settings.initial) |description| _ = try self.add(description);
         return self;
     }
 
     pub fn add(self: *Worlds, description: Description) !identity.Handle {
         if (self.find(description.key) != null) return error.DuplicateWorldKey;
-        if (description.name.len == 0 or description.name.len > config.max_world_name_bytes)
+        if (description.name.len == 0 or description.name.len > maximum_name_bytes)
             return error.InvalidWorldName;
         for (self.active()) |handle|
             if (std.mem.eql(u8, self.getConst(handle).?.nameSlice(), description.name))
@@ -230,9 +241,9 @@ pub const Worlds = struct {
 };
 
 fn validateRuntimeConfiguration(configuration: Configuration) !void {
-    if (configuration.initial.len > config.max_worlds) return error.WorldCapacity;
+    if (configuration.initial.len > configuration.maximum_worlds) return error.WorldCapacity;
     for (configuration.initial, 0..) |world, index| {
-        if (world.name.len == 0 or world.name.len > config.max_world_name_bytes)
+        if (world.name.len == 0 or world.name.len > maximum_name_bytes)
             return error.InvalidWorldName;
         for (configuration.initial[0..index]) |previous| {
             if (previous.key.value == world.key.value) return error.DuplicateWorldKey;

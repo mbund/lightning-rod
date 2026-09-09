@@ -2,7 +2,7 @@ const player_store = @import("players.zig");
 const block_store = @import("blocks.zig");
 const std = @import("std");
 const registry = @import("registry_data");
-const config = @import("../config.zig").value;
+const limits = @import("limits.zig");
 const living_entities = @import("../living_entities.zig");
 const navigation = @import("../navigation.zig");
 const diagnostics = @import("../diagnostics.zig");
@@ -19,6 +19,7 @@ pub fn livingEntityCanonicalTypeId(entity_type: living_entities.EntityType) i32 
         .turtle => registry.entity_turtle_type_id,
         .cow => registry.entity_cow_type_id,
         .pig => registry.entity_pig_type_id,
+        .chicken => registry.entity_chicken_type_id,
     };
 }
 
@@ -30,9 +31,6 @@ const item_air_friction: f64 = 0.98;
 const item_ground_friction: f64 = 0.6;
 pub const block_drop_pickup_delay_ticks: u16 = 10;
 pub const player_drop_pickup_delay_ticks: u16 = 40;
-/// Vanilla removes an ordinary item entity after five minutes at 20 TPS.
-/// Keeping this bounded is also essential for recovering slots in the fixed
-/// item-entity pool on long-running servers.
 pub const item_despawn_age_ticks: u32 = 5 * 60 * 20;
 
 pub const ItemEntity = extern struct {
@@ -50,17 +48,31 @@ pub const ItemEntity = extern struct {
 
 pub const LivingEntities = struct {
     pub const id = "lightning_rod:living_entities";
+    pub const Configuration = struct {
+        maximum_entities: usize = 4_096,
+        maximum_search_nodes: usize = 4_096,
+        maximum_path_nodes: usize = 128,
+        first_entity_id: i32 = 1_105,
+    };
 
     entities: living_entities.Pool = .{},
     paths: navigation.Paths = .{},
     search: navigation.Search = .{},
 
-    pub fn create(allocator: std.mem.Allocator) !*LivingEntities {
+    pub fn init(allocator: std.mem.Allocator, configuration: Configuration) !*LivingEntities {
         const self = try allocator.create(LivingEntities);
         self.* = .{};
-        try self.entities.allocate(allocator);
-        try self.paths.allocate(allocator);
-        try self.search.allocate(allocator);
+        try self.entities.allocate(allocator, .{
+            .maximum_entities = configuration.maximum_entities,
+            .first_entity_id = configuration.first_entity_id,
+        });
+        const navigation_configuration = navigation.Configuration{
+            .maximum_entities = configuration.maximum_entities,
+            .maximum_search_nodes = configuration.maximum_search_nodes,
+            .maximum_path_nodes = configuration.maximum_path_nodes,
+        };
+        try self.paths.allocate(allocator, navigation_configuration);
+        try self.search.allocate(allocator, navigation_configuration);
         return self;
     }
 
@@ -77,7 +89,7 @@ pub const LivingEntities = struct {
         if (self.entities.free_count == 0) return error.LivingEntityCapacity;
         const block_position = geometry.BlockPos{
             .x = geometry.blockCoord(position.x),
-            .y = @intCast(@max(@as(i32, config.world_min_y), @min(geometry.blockCoord(position.y), @as(i32, block_store.world_top_y)))),
+            .y = @intCast(@max(@as(i32, limits.min_y), @min(geometry.blockCoord(position.y), @as(i32, block_store.world_top_y)))),
             .z = geometry.blockCoord(position.z),
         };
         if (block_world.residentChunk(world, geometry.chunkForBlock(block_position)) == null)
@@ -113,6 +125,16 @@ pub const LivingEntities = struct {
 
 pub const ItemEntities = struct {
     pub const id = "lightning_rod:item_entities";
+    pub const Configuration = struct {
+        maximum_entities: usize = 1_024,
+        spatial_bucket_count: usize = 256,
+        first_entity_id: i32 = 81,
+
+        pub fn validate(self: Configuration) !void {
+            if (self.maximum_entities == 0 or self.maximum_entities >= std.math.maxInt(u16)) return error.InvalidItemEntityCapacity;
+            if (!std.math.isPowerOfTwo(self.spatial_bucket_count)) return error.InvalidItemSpatialBuckets;
+        }
+    };
 
     worlds: []align(cache_line_size) world_identity.Handle = &.{},
     position_x: []align(cache_line_size) f64 = &.{},
@@ -139,32 +161,35 @@ pub const ItemEntities = struct {
     free_indices: []align(cache_line_size) u16 = &.{},
     free_count: usize = 0,
     free_list_initialized: bool = false,
+    first_entity_id: i32 = 0,
 
-    pub fn create(allocator: std.mem.Allocator) !*ItemEntities {
+    pub fn init(allocator: std.mem.Allocator, configuration: Configuration) !*ItemEntities {
+        try configuration.validate();
         const self = try allocator.create(ItemEntities);
         self.* = .{};
-        self.position_x = try allocator.alignedAlloc(f64, .@"64", config.max_item_entities);
-        self.worlds = try allocator.alignedAlloc(world_identity.Handle, .@"64", config.max_item_entities);
-        self.position_y = try allocator.alignedAlloc(f64, .@"64", config.max_item_entities);
-        self.position_z = try allocator.alignedAlloc(f64, .@"64", config.max_item_entities);
-        self.velocity_x = try allocator.alignedAlloc(f64, .@"64", config.max_item_entities);
-        self.velocity_y = try allocator.alignedAlloc(f64, .@"64", config.max_item_entities);
-        self.velocity_z = try allocator.alignedAlloc(f64, .@"64", config.max_item_entities);
-        self.age_ticks = try allocator.alignedAlloc(u32, .@"64", config.max_item_entities);
-        self.pickup_delay_ticks = try allocator.alignedAlloc(u16, .@"64", config.max_item_entities);
-        self.entity_ids = try allocator.alignedAlloc(i32, .@"64", config.max_item_entities);
-        self.active = try allocator.alignedAlloc(bool, .@"64", config.max_item_entities);
-        self.on_ground = try allocator.alignedAlloc(bool, .@"64", config.max_item_entities);
-        self.stacks = try allocator.alignedAlloc(player_store.HotbarStack, .@"64", config.max_item_entities);
-        self.uuids = try allocator.alignedAlloc(u128, .@"64", config.max_item_entities);
-        self.active_indices = try allocator.alignedAlloc(u16, .@"64", config.max_item_entities);
-        self.active_positions = try allocator.alignedAlloc(u16, .@"64", config.max_item_entities);
-        self.next_in_bucket = try allocator.alignedAlloc(u16, .@"64", config.max_item_entities);
-        self.bucket_indices = try allocator.alignedAlloc(u16, .@"64", config.max_item_entities);
-        self.cell_x = try allocator.alignedAlloc(i32, .@"64", config.max_item_entities);
-        self.cell_z = try allocator.alignedAlloc(i32, .@"64", config.max_item_entities);
-        self.bucket_heads = try allocator.alignedAlloc(u16, .@"64", config.item_spatial_bucket_count);
-        self.free_indices = try allocator.alignedAlloc(u16, .@"64", config.max_item_entities);
+        self.position_x = try allocator.alignedAlloc(f64, .@"64", configuration.maximum_entities);
+        self.worlds = try allocator.alignedAlloc(world_identity.Handle, .@"64", configuration.maximum_entities);
+        self.position_y = try allocator.alignedAlloc(f64, .@"64", configuration.maximum_entities);
+        self.position_z = try allocator.alignedAlloc(f64, .@"64", configuration.maximum_entities);
+        self.velocity_x = try allocator.alignedAlloc(f64, .@"64", configuration.maximum_entities);
+        self.velocity_y = try allocator.alignedAlloc(f64, .@"64", configuration.maximum_entities);
+        self.velocity_z = try allocator.alignedAlloc(f64, .@"64", configuration.maximum_entities);
+        self.age_ticks = try allocator.alignedAlloc(u32, .@"64", configuration.maximum_entities);
+        self.pickup_delay_ticks = try allocator.alignedAlloc(u16, .@"64", configuration.maximum_entities);
+        self.entity_ids = try allocator.alignedAlloc(i32, .@"64", configuration.maximum_entities);
+        self.active = try allocator.alignedAlloc(bool, .@"64", configuration.maximum_entities);
+        self.on_ground = try allocator.alignedAlloc(bool, .@"64", configuration.maximum_entities);
+        self.stacks = try allocator.alignedAlloc(player_store.HotbarStack, .@"64", configuration.maximum_entities);
+        self.uuids = try allocator.alignedAlloc(u128, .@"64", configuration.maximum_entities);
+        self.active_indices = try allocator.alignedAlloc(u16, .@"64", configuration.maximum_entities);
+        self.active_positions = try allocator.alignedAlloc(u16, .@"64", configuration.maximum_entities);
+        self.next_in_bucket = try allocator.alignedAlloc(u16, .@"64", configuration.maximum_entities);
+        self.bucket_indices = try allocator.alignedAlloc(u16, .@"64", configuration.maximum_entities);
+        self.cell_x = try allocator.alignedAlloc(i32, .@"64", configuration.maximum_entities);
+        self.cell_z = try allocator.alignedAlloc(i32, .@"64", configuration.maximum_entities);
+        self.bucket_heads = try allocator.alignedAlloc(u16, .@"64", configuration.spatial_bucket_count);
+        self.free_indices = try allocator.alignedAlloc(u16, .@"64", configuration.maximum_entities);
+        self.first_entity_id = configuration.first_entity_id;
         @memset(self.position_x, 0);
         @memset(self.worlds, world_identity.invalid);
         @memset(self.position_y, 0);
@@ -185,20 +210,6 @@ pub const ItemEntities = struct {
         return self;
     }
 
-    pub fn resetInPlace(self: *ItemEntities) void {
-        for (self.active_indices[0..self.active_count]) |index| {
-            self.active[index] = false;
-            self.next_in_bucket[index] = item_entity_sentinel;
-            self.bucket_indices[index] = item_entity_sentinel;
-        }
-        self.active_count = 0;
-        self.free_count = config.max_item_entities;
-        for (0..config.max_item_entities) |index|
-            self.free_indices[index] = @intCast(config.max_item_entities - 1 - index);
-        self.free_list_initialized = true;
-        @memset(self.bucket_heads, item_entity_sentinel);
-    }
-
     pub fn spawn(
         self: *ItemEntities,
         random: *world_random.Random,
@@ -215,7 +226,7 @@ pub const ItemEntities = struct {
             .x = geometry.blockCoord(spawn_position.x),
             .y = @intCast(std.math.clamp(
                 geometry.blockCoord(spawn_position.y),
-                @as(i32, config.world_min_y),
+                @as(i32, limits.min_y),
                 @as(i32, block_store.world_top_y),
             )),
             .z = geometry.blockCoord(spawn_position.z),
@@ -228,7 +239,7 @@ pub const ItemEntities = struct {
         self.set(index, .{
             .world = world,
             .active = true,
-            .entity_id = itemEntityIdForIndex(index),
+            .entity_id = self.itemEntityId(index),
             .uuid = random.random.uuid_for_item(index),
             .position = sanitizePosition(spawn_position),
             .velocity = sanitizeVelocity(velocity),
@@ -243,7 +254,7 @@ pub const ItemEntities = struct {
     }
 
     pub fn set(self: *ItemEntities, index: usize, entity: ItemEntity) void {
-        std.debug.assert(index < config.max_item_entities);
+        std.debug.assert(index < self.active.len);
         self.worlds[index] = entity.world;
         self.position_x[index] = entity.position.x;
         self.position_y[index] = entity.position.y;
@@ -269,7 +280,7 @@ pub const ItemEntities = struct {
     }
 
     pub fn value(self: *const ItemEntities, index: usize) ItemEntity {
-        std.debug.assert(index < config.max_item_entities);
+        std.debug.assert(index < self.active.len);
         return .{
             .world = self.worlds[index],
             .position = self.position(index),
@@ -314,7 +325,7 @@ pub const ItemEntities = struct {
     }
 
     pub fn remove(self: *ItemEntities, index: usize) void {
-        std.debug.assert(index < config.max_item_entities);
+        std.debug.assert(index < self.active.len);
         if (!self.active[index]) return;
         self.removeBucket(index);
         const active_position: usize = self.active_positions[index];
@@ -328,9 +339,9 @@ pub const ItemEntities = struct {
     }
 
     pub fn updateBucket(self: *ItemEntities, index: usize) void {
-        std.debug.assert(index < config.max_item_entities and self.active[index]);
+        std.debug.assert(index < self.active.len and self.active[index]);
         const cell = itemSpatialCell(self.position(index));
-        const bucket = itemSpatialBucketForCell(self.worlds[index], cell.x, cell.z);
+        const bucket = self.spatialBucketForCell(self.worlds[index], cell.x, cell.z);
         if (self.bucket_indices[index] == bucket and
             self.cell_x[index] == cell.x and
             self.cell_z[index] == cell.z) return;
@@ -368,9 +379,9 @@ pub const ItemEntities = struct {
 
     fn ensureFreeList(self: *ItemEntities) void {
         if (self.free_list_initialized) return;
-        for (0..config.max_item_entities) |index|
-            self.free_indices[index] = @intCast(config.max_item_entities - 1 - index);
-        self.free_count = config.max_item_entities;
+        for (0..self.active.len) |index|
+            self.free_indices[index] = @intCast(self.active.len - 1 - index);
+        self.free_count = self.active.len;
         self.free_list_initialized = true;
     }
 
@@ -381,7 +392,7 @@ pub const ItemEntities = struct {
             .z = self.position_z[index],
         };
         const cell = itemSpatialCell(item_position);
-        const bucket = itemSpatialBucketForCell(self.worlds[index], cell.x, cell.z);
+        const bucket = self.spatialBucketForCell(self.worlds[index], cell.x, cell.z);
         self.cell_x[index] = cell.x;
         self.cell_z[index] = cell.z;
         self.bucket_indices[index] = bucket;
@@ -394,7 +405,7 @@ pub const ItemEntities = struct {
         if (bucket == item_entity_sentinel) return;
         var current = self.bucket_heads[bucket];
         var previous: u16 = item_entity_sentinel;
-        for (0..config.max_item_entities) |_| {
+        for (0..self.active.len) |_| {
             if (current == item_entity_sentinel) break;
             if (current == index) {
                 if (previous == item_entity_sentinel)
@@ -410,26 +421,34 @@ pub const ItemEntities = struct {
         } else diagnostics.panic("item spatial bucket contains a cycle", &.{});
         diagnostics.panic("item spatial bucket is missing its indexed entity", &.{});
     }
+
+    pub fn itemSpatialBucket(
+        self: *const ItemEntities,
+        world: world_identity.Handle,
+        item_position: geometry.Vec3,
+    ) u16 {
+        const cell = itemSpatialCell(item_position);
+        return self.spatialBucketForCell(world, cell.x, cell.z);
+    }
+
+    pub fn spatialBucketForCell(self: *const ItemEntities, world: world_identity.Handle, cell_x: i32, cell_z: i32) u16 {
+        var hash: u64 = 0x243f_6a88_85a3_08d3;
+        hash ^= @as(u32, @bitCast(world));
+        hash *%= 0x94d0_49bb_1331_11eb;
+        hash ^= @as(u32, @bitCast(cell_x));
+        hash *%= 0x9e37_79b9_7f4a7c15;
+        hash ^= @as(u32, @bitCast(cell_z));
+        hash *%= 0xbf58476d1ce4e5b9;
+        return @intCast(hash & (self.bucket_heads.len - 1));
+    }
+
+    fn itemEntityId(self: *const ItemEntities, index: usize) i32 {
+        return self.first_entity_id + @as(i32, @intCast(index));
+    }
 };
 
 pub fn itemSpatialCell(position: geometry.Vec3) struct { x: i32, z: i32 } {
     return .{ .x = @divFloor(geometry.blockCoord(position.x), item_spatial_cell_size), .z = @divFloor(geometry.blockCoord(position.z), item_spatial_cell_size) };
-}
-
-pub fn itemSpatialBucket(world: world_identity.Handle, position: geometry.Vec3) u16 {
-    const cell = itemSpatialCell(position);
-    return itemSpatialBucketForCell(world, cell.x, cell.z);
-}
-
-pub fn itemSpatialBucketForCell(world: world_identity.Handle, cell_x: i32, cell_z: i32) u16 {
-    var value: u64 = 0x243f_6a88_85a3_08d3;
-    value ^= @as(u32, @bitCast(world));
-    value *%= 0x94d0_49bb_1331_11eb;
-    value ^= @as(u32, @bitCast(cell_x));
-    value *%= 0x9e37_79b9_7f4a_7c15;
-    value ^= @as(u32, @bitCast(cell_z));
-    value *%= 0xbf58_476d_1ce4_e5b9;
-    return @intCast(value & (config.item_spatial_bucket_count - 1));
 }
 
 pub fn blockDropPosition(pos: geometry.BlockPos) geometry.Vec3 {
@@ -438,10 +457,6 @@ pub fn blockDropPosition(pos: geometry.BlockPos) geometry.Vec3 {
         .y = @as(f64, @floatFromInt(pos.y)) + 0.5,
         .z = @as(f64, @floatFromInt(pos.z)) + 0.5,
     };
-}
-
-fn itemEntityIdForIndex(index: usize) i32 {
-    return @intCast(config.connectionCapacity() + index + 1);
 }
 
 fn sanitizePosition(value: geometry.Vec3) geometry.Vec3 {
@@ -467,12 +482,12 @@ pub fn itemGroundY(blocks: *block_store.Blocks, world: world_identity.Handle, po
 }
 
 fn highestSolidBlockAtOrBelow(blocks: *const block_store.Blocks, world: world_identity.Handle, x: i32, z: i32, max_y: i16) ?i16 {
-    if (max_y < config.world_min_y) return null;
+    if (max_y < limits.min_y) return null;
     const chunk = geometry.ChunkPos{ .x = @divFloor(x, 16), .z = @divFloor(z, 16) };
     var highest: ?i16 = null;
 
     var base_y = @min(max_y, blocks.highestGeneratedY(world, x, z));
-    while (base_y >= config.world_min_y) : (base_y -= 1) {
+    while (base_y >= limits.min_y) : (base_y -= 1) {
         if (blocks.blockAt(world, .{ .x = x, .y = base_y, .z = z }) != registry.block_air_default_state) {
             highest = base_y;
             break;

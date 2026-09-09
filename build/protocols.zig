@@ -33,6 +33,29 @@ pub const versions = [_]Version{
 pub const canonical = 1;
 pub const default = 1;
 
+pub fn fromMinimumMinecraftVersion(minimum: []const u8) ?[]const Version {
+    for (versions, 0..) |version, index| {
+        if (matchesMinecraftVersion(version, minimum))
+            return versions[index..];
+    }
+    return null;
+}
+
+pub fn releaseIndex(minimum: []const u8) ?usize {
+    for (versions, 0..) |version, index| {
+        if (matchesMinecraftVersion(version, minimum)) return index;
+    }
+    return null;
+}
+
+fn matchesMinecraftVersion(version: Version, name: []const u8) bool {
+    if (std.mem.eql(u8, version.minecraft_version, name)) return true;
+    for (version.accepted_names) |accepted| {
+        if (std.mem.eql(u8, accepted, name)) return true;
+    }
+    return false;
+}
+
 comptime {
     if (versions.len == 0) @compileError("at least one protocol version is required");
     if (schemas.len == 0) @compileError("at least one protocol schema is required");

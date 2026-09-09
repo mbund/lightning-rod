@@ -1,0 +1,11 @@
+.{
+    .fingerprint = 0xe4bfc57e75007690,
+    .name = .lightning_rod_linux,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .lightning_rod = .{ .path = ".." },
+        .lightning_rod_tui = .{ .path = "../tui" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

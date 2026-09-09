@@ -73,9 +73,6 @@ const Protocol = struct {
     pub fn codegen(self: *const @This(), allocator: std.mem.Allocator, writer: *IndentedWriter) !void {
         try writer.println("const std = @import(\"std\");", .{});
         try writer.println("const protocol_support = @import(\"protocol_support\");\n", .{});
-        // Global minecraft-data types are visible from every nested protocol
-        // state. Emit them once here instead of copying the entire global
-        // type universe into all ten state/direction namespaces.
         const global_scope = Scope{ .outer = &self.types, .inner = null };
         try Types.codegenNamedViewTypesFromMap(allocator, writer, global_scope, &self.types);
         try Types.codegenNamedWriteTypesFromMap(allocator, writer, global_scope, &self.types);
@@ -250,10 +247,6 @@ const Types = struct {
         try self.codegenEnvelopeWriter(allocator, writer, scope, mapper, packet_switch);
     }
 
-    /// Generate a lossless structural canonicalizer from the same protocol AST
-    /// that generates the packet reader. No packet list or field list is
-    /// maintained by the conformance layer: adding a packet to minecraft-data
-    /// automatically adds a case here.
     fn codegenCanonicalEnvelope(self: *const @This(), writer: *IndentedWriter, scope: Scope, mapper: anytype, packet_switch: ?SwitchType) !void {
         try writer.println("pub const CanonicalPacket = struct {{ name: []const u8 }};", .{});
         try writer.println("pub const packet_names = [_][]const u8{{", .{});

@@ -1,43 +1,13 @@
-plugins {
-    id 'fabric-loom' version "${loom_version}"
-    id 'maven-publish'
-}
-
+plugins { id 'fabric-loom' version "${loom_version}" }
 version = project.mod_version
 group = project.maven_group
-
-loom {
-    splitEnvironmentSourceSets()
-    mods {
-        "lightning-rod-conformance-recorder" {
-            sourceSet sourceSets.main
-            sourceSet sourceSets.client
-        }
-    }
-}
-
+loom { splitEnvironmentSourceSets(); mods { recorder { sourceSet sourceSets.main; sourceSet sourceSets.client } } }
 dependencies {
     minecraft "com.mojang:minecraft:${minecraft_version}"
     mappings "net.fabricmc:yarn:${yarn_mappings}:v2"
     modImplementation "net.fabricmc:fabric-loader:${loader_version}"
     modImplementation "net.fabricmc.fabric-api:fabric-api:${fabric_api_version}"
 }
-
-processResources {
-    inputs.property "version", project.version
-    filesMatching("fabric.mod.json") { expand "version": project.version }
-}
-
+processResources { inputs.property "version", project.version; filesMatching("fabric.mod.json") { expand "version": project.version } }
 tasks.withType(JavaCompile).configureEach { options.release = 21 }
-tasks.withType(JavaExec).configureEach {
-    ["mcc.scenario", "mcc.output", "mcc.client", "mcc.server"].each { key ->
-        def value = System.getProperty(key)
-        if (value != null) systemProperty key, value
-    }
-}
-
-java {
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
-    withSourcesJar()
-}
+tasks.withType(JavaExec).configureEach { ["mcc.output", "mcc.server"].each { key -> if (System.getProperty(key) != null) systemProperty key, System.getProperty(key) } }

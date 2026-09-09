@@ -66,6 +66,54 @@ pub const Identity = struct {
     }
 };
 
+pub fn serverHash(secret: [16]u8, public_key: []const u8, output: []u8) ?[]const u8 {
+    var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    var hasher = std.crypto.hash.Sha1.init(.{});
+    hasher.update("");
+    hasher.update(&secret);
+    hasher.update(public_key);
+    hasher.final(&digest);
+    const negative = digest[0] & 0x80 != 0;
+    if (negative) {
+        var carry: u8 = 1;
+        var index = digest.len;
+        while (index != 0) {
+            index -= 1;
+            const value = (~digest[index]) +% carry;
+            carry = @intFromBool(carry == 1 and value == 0);
+            digest[index] = value;
+        }
+    }
+    var first: usize = 0;
+    while (first < digest.len and digest[first] == 0) : (first += 1) {}
+    if (first == digest.len) {
+        if (output.len == 0) return null;
+        output[0] = '0';
+        return output[0..1];
+    }
+    const digits = (digest.len - first) * 2;
+    const prefix: usize = @intFromBool(negative);
+    if (output.len < digits + prefix) return null;
+    var cursor: usize = 0;
+    if (negative) {
+        output[0] = '-';
+        cursor = 1;
+    }
+    for (digest[first..], 0..) |byte, index| {
+        const high: u8 = byte >> 4;
+        const low: u8 = byte & 15;
+        output[cursor + index * 2] = hexDigit(high);
+        output[cursor + index * 2 + 1] = hexDigit(low);
+    }
+    const start: usize = if (output[prefix] == '0') 1 else 0;
+    if (start != 0) std.mem.copyForwards(u8, output[prefix .. digits + prefix - 1], output[prefix + 1 .. digits + prefix]);
+    return output[0 .. digits + prefix - start];
+}
+
+fn hexDigit(value: u8) u8 {
+    return if (value < 10) '0' + value else 'a' + value - 10;
+}
+
 fn powModPrime(base_value: PrimeInt, exponent_value: PrimeInt, modulus: PrimeInt) !PrimeInt {
     const Field = std.crypto.ff.Modulus(prime_bits);
     var modulus_bytes: [prime_bits / 8]u8 = undefined;
@@ -137,10 +185,32 @@ fn encodePublicKey(modulus: RsaInt) [162]u8 {
 
 pub const Cfb8 = struct {
     aes: std.crypto.core.aes.AesEncryptCtx(std.crypto.core.aes.Aes128),
+    secret: [16]u8,
     feedback: [16]u8,
 
+    pub const Snapshot = extern struct {
+        secret: [16]u8,
+        feedback: [16]u8,
+    };
+
     pub fn init(secret: [16]u8) Cfb8 {
-        return .{ .aes = std.crypto.core.aes.Aes128.initEnc(secret), .feedback = secret };
+        return .{
+            .aes = std.crypto.core.aes.Aes128.initEnc(secret),
+            .secret = secret,
+            .feedback = secret,
+        };
+    }
+
+    pub fn snapshot(self: *const Cfb8) Snapshot {
+        return .{ .secret = self.secret, .feedback = self.feedback };
+    }
+
+    pub fn restore(saved: Snapshot) Cfb8 {
+        return .{
+            .aes = std.crypto.core.aes.Aes128.initEnc(saved.secret),
+            .secret = saved.secret,
+            .feedback = saved.feedback,
+        };
     }
 
     pub fn encrypt(self: *Cfb8, bytes: []u8) void {
@@ -181,6 +251,20 @@ test "CFB8 streams round trip across arbitrary boundaries" {
     decryptor.decrypt(bytes[0..11]);
     decryptor.decrypt(bytes[11..]);
     try std.testing.expectEqualSlices(u8, &expected, &bytes);
+}
+
+test "CFB8 continuation reconstructs the exact stream state" {
+    const secret = [_]u8{0x19} ** 16;
+    var original = Cfb8.init(secret);
+    var prefix = [_]u8{ 1, 2, 3, 4 };
+    original.encrypt(&prefix);
+    const snapshot = original.snapshot();
+    var restored = Cfb8.restore(snapshot);
+    var expected = [_]u8{ 5, 6, 7, 8 };
+    var actual = expected;
+    original.encrypt(&expected);
+    restored.encrypt(&actual);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
 }
 
 test "RSA public key uses the Minecraft 1024-bit DER shape" {

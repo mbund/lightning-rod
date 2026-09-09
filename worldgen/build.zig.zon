@@ -1,0 +1,20 @@
+.{
+    .fingerprint = 0x3bee3d6cffca9364,
+    .name = .vanilla_worldgen,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .lightning_rod_test_runner = .{ .path = "../test-runner" },
+        .minecraft_registry = .{ .path = "../minecraft-registry" },
+        .nbt = .{ .path = "../nbt" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "codegen",
+        "data",
+        "examples",
+        "src",
+        "verify",
+    },
+}

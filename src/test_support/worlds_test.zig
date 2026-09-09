@@ -3,11 +3,16 @@ const dimensions = @import("../world/dimensions.zig");
 const generation = @import("../world/generation.zig");
 const worlds = @import("../world/worlds.zig");
 
+const TestGeneration = generation.Registry(.{
+    generation.Flat{},
+    generation.Void{},
+});
+
 const initial = [_]worlds.Description{.{
     .key = .{ .value = 1 },
     .name = "test:initial",
     .dimension = dimensions.Vanilla.dimensionId(dimensions.Overworld),
-    .generator = generation.Default.generatorId(generation.Overworld),
+    .generator = TestGeneration.generatorId(generation.Flat),
     .seed = 1,
     .spawn_x = 0,
     .spawn_y = 64,
@@ -17,13 +22,13 @@ const initial = [_]worlds.Description{.{
 test "dynamic world slots reject stale handles" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const state = try worlds.Worlds.create(arena.allocator(), .{ .initial = &initial });
-    _ = try dimensions.Vanilla.create(arena.allocator(), state);
+    const state = try worlds.Worlds.init(arena.allocator(), .{ .initial = &initial });
+    _ = try dimensions.Vanilla.init(arena.allocator(), .{ .worlds = state }, .{});
     const island = try state.add(.{
         .key = .{ .value = 2 },
         .name = "test:island",
         .dimension = dimensions.Vanilla.dimensionId(dimensions.Overworld),
-        .generator = generation.Default.generatorId(generation.Void),
+        .generator = TestGeneration.generatorId(generation.Void),
         .seed = 2,
         .spawn_x = 0,
         .spawn_y = 64,
@@ -34,7 +39,7 @@ test "dynamic world slots reject stale handles" {
         .key = .{ .value = 4 },
         .name = "test:island",
         .dimension = dimensions.Vanilla.dimensionId(dimensions.Nether),
-        .generator = generation.Default.generatorId(generation.Void),
+        .generator = TestGeneration.generatorId(generation.Void),
         .seed = 4,
         .spawn_x = 0,
         .spawn_y = 64,
@@ -46,7 +51,7 @@ test "dynamic world slots reject stale handles" {
         .key = .{ .value = 3 },
         .name = "test:replacement",
         .dimension = dimensions.Vanilla.dimensionId(dimensions.Overworld),
-        .generator = generation.Default.generatorId(generation.Void),
+        .generator = TestGeneration.generatorId(generation.Void),
         .seed = 3,
         .spawn_x = 0,
         .spawn_y = 64,

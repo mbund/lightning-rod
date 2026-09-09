@@ -8,42 +8,29 @@ const preallocated = @import("preallocated");
 const terrain = @import("../terrain.zig");
 const world_store = @import("worlds.zig");
 
-pub const Overworld = struct {
-    pub const id = "minecraft:overworld";
-
-    base_chunk_cache_capacity: usize = 128,
-    generator: terrain.Generator = undefined,
-
-    fn initialize(self: *Overworld, allocator: std.mem.Allocator) !void {
-        self.generator = try terrain.Generator.init(allocator, 0, self.base_chunk_cache_capacity);
-    }
-
-    pub fn generate(
-        self: *Overworld,
-        seed: u64,
-        chunk: geometry.ChunkPos,
-    ) !terrain.ChunkShape {
-        try self.generator.reseed(seed);
-        return self.generator.generate(chunk.x, chunk.z);
-    }
-
-    pub fn advance(
-        self: *Overworld,
-        seed: u64,
-        chunk: geometry.ChunkPos,
-    ) !?terrain.ChunkShape {
-        try self.generator.reseed(seed);
-        return self.generator.advance(chunk.x, chunk.z);
-    }
-};
-
 pub const Flat = struct {
     pub const id = "minecraft:flat";
+    pub const Configuration = struct {
+        surface_y: i16 = 64,
+        surface_state: i32 = registry.block_grass_block_default_state,
+        underground_state: i32 = registry.block_stone_default_state,
+    };
+    pub const default_configuration: Configuration = .{};
 
     surface_y: i16 = 64,
     surface_state: i32 = registry.block_grass_block_default_state,
     underground_state: i32 = registry.block_stone_default_state,
     storage: [terrain.chunk_storage_capacity]u8 = undefined,
+
+    pub fn configured(configuration: Configuration) Flat {
+        return .{
+            .surface_y = configuration.surface_y,
+            .surface_state = configuration.surface_state,
+            .underground_state = configuration.underground_state,
+        };
+    }
+
+    pub fn initialize(_: *Flat, _: std.mem.Allocator) !void {}
 
     pub fn generate(
         self: *Flat,
@@ -64,8 +51,16 @@ pub const Flat = struct {
 
 pub const Void = struct {
     pub const id = "minecraft:void";
+    pub const Configuration = struct {};
+    pub const default_configuration: Configuration = .{};
 
     storage: [terrain.chunk_storage_capacity]u8 = undefined,
+
+    pub fn configured(_: Configuration) Void {
+        return .{};
+    }
+
+    pub fn initialize(_: *Void, _: std.mem.Allocator) !void {}
 
     pub fn generate(
         self: *Void,
@@ -80,30 +75,29 @@ pub const Void = struct {
 pub fn Registry(comptime configured: anytype) type {
     comptime validate(configured);
     const Algorithms = algorithmStorage(@TypeOf(configured));
-    const defaults = algorithmDefaults(Algorithms, configured);
+    const ConfigurationTuple = configurationStorage(Algorithms);
+    const defaults = configurationDefaults(ConfigurationTuple, configured);
     return struct {
         const Self = @This();
         pub const id = "lightning_rod:world_generation";
-        pub const Configuration = Algorithms;
-        pub const default_configuration = defaults;
-
-        algorithms: Algorithms = defaults,
-        worlds: *world_store.Worlds = undefined,
-
-        pub fn create(
-            allocator: std.mem.Allocator,
+        pub const Dependencies = struct {
             worlds: *world_store.Worlds,
             blocks: *block_store.Blocks,
-            configuration: Configuration,
-        ) !*Self {
+        };
+        pub const Configuration = ConfigurationTuple;
+        pub const default_configuration = defaults;
+
+        deps: Dependencies,
+        algorithms: Algorithms,
+
+        pub fn init(allocator: std.mem.Allocator, deps: Dependencies, configuration: Configuration) !*Self {
             const self = try preallocated.create(Self, allocator);
-            self.algorithms = configuration;
-            self.worlds = worlds;
-            inline for (&self.algorithms) |*algorithm| {
-                const Algorithm = @TypeOf(algorithm.*);
-                if (@hasDecl(Algorithm, "initialize")) try algorithm.initialize(allocator);
-            }
-            blocks.bindGenerator(.{
+            self.* = .{
+                .deps = deps,
+                .algorithms = configureAlgorithms(Algorithms, configuration),
+            };
+            inline for (&self.algorithms) |*algorithm| try algorithm.initialize(allocator);
+            deps.blocks.bindGenerator(.{
                 .context = self,
                 .generate_fn = dispatch,
                 .advance_fn = dispatchAdvance,
@@ -127,7 +121,7 @@ pub fn Registry(comptime configured: anytype) type {
             chunk: geometry.ChunkPos,
         ) anyerror!terrain.ChunkShape {
             const self: *Self = @ptrCast(@alignCast(context));
-            const description = self.worlds.get(world) orelse
+            const description = self.deps.worlds.get(world) orelse
                 return error.StaleWorldHandle;
             inline for (&self.algorithms, 0..) |*algorithm, index| {
                 if (@intFromEnum(description.generator) == index)
@@ -140,16 +134,18 @@ pub fn Registry(comptime configured: anytype) type {
             context: *anyopaque,
             world: identity.Handle,
             chunk: geometry.ChunkPos,
-        ) anyerror!?terrain.ChunkShape {
+            sink: generator_api.Sink,
+        ) anyerror!generator_api.Advance {
             const self: *Self = @ptrCast(@alignCast(context));
-            const description = self.worlds.get(world) orelse
+            const description = self.deps.worlds.get(world) orelse
                 return error.StaleWorldHandle;
             inline for (&self.algorithms, 0..) |*algorithm, index| {
                 if (@intFromEnum(description.generator) == index) {
                     const Algorithm = @TypeOf(algorithm.*);
                     if (@hasDecl(Algorithm, "advance"))
-                        return algorithm.advance(description.seed, chunk);
-                    return try algorithm.generate(description.seed, chunk);
+                        return algorithm.advance(description.seed, chunk, sink);
+                    try sink.emit(try algorithm.generate(description.seed, chunk));
+                    return .complete;
                 }
             }
             return error.UnknownWorldGenerator;
@@ -164,14 +160,35 @@ fn algorithmStorage(comptime Configured: type) type {
     return std.meta.Tuple(&types);
 }
 
-fn algorithmDefaults(comptime Algorithms: type, comptime configured: anytype) Algorithms {
-    var result: Algorithms = undefined;
-    inline for (@typeInfo(Algorithms).@"struct".fields, 0..) |field, index|
-        @field(result, field.name) = configured[index];
+fn configurationStorage(comptime Algorithms: type) type {
+    const fields = @typeInfo(Algorithms).@"struct".fields;
+    var types: [fields.len]type = undefined;
+    inline for (fields, 0..) |field, index|
+        types[index] = if (@hasDecl(field.type, "Configuration")) field.type.Configuration else struct {};
+    return std.meta.Tuple(&types);
+}
+
+fn configurationDefaults(comptime Configuration: type, comptime configured: anytype) Configuration {
+    var result: Configuration = undefined;
+    inline for (@typeInfo(Configuration).@"struct".fields, 0..) |field, index| {
+        const Algorithm = @TypeOf(configured[index]);
+        @field(result, field.name) = if (@hasDecl(Algorithm, "default_configuration"))
+            Algorithm.default_configuration
+        else
+            .{};
+    }
     return result;
 }
 
-pub const Default = Registry(.{ Overworld{}, Void{}, Flat{} });
+fn configureAlgorithms(comptime Algorithms: type, configuration: anytype) Algorithms {
+    var result: Algorithms = undefined;
+    inline for (@typeInfo(Algorithms).@"struct".fields, 0..) |field, index|
+        @field(result, field.name) = if (@hasDecl(field.type, "configured"))
+            field.type.configured(configuration[index])
+        else
+            .{};
+    return result;
+}
 
 fn algorithmIndex(comptime Algorithms: type, comptime Algorithm: type) usize {
     inline for (@typeInfo(Algorithms).@"struct".fields, 0..) |field, index|
@@ -188,14 +205,10 @@ fn validate(comptime configured: anytype) void {
             @compileError("world generator must declare a stable non-empty id");
         if (!@hasDecl(Algorithm, "generate"))
             @compileError(Algorithm.id ++ " must implement generate");
+        if (!@hasDecl(Algorithm, "initialize"))
+            @compileError(Algorithm.id ++ " must implement initialize");
         inline for (0..index) |previous_index|
             if (std.mem.eql(u8, Algorithm.id, @TypeOf(configured[previous_index]).id))
                 @compileError("duplicate world generator id: " ++ Algorithm.id);
     }
-}
-
-test "generator ids follow the configured tuple" {
-    try std.testing.expectEqual(@as(u16, 0), @intFromEnum(Default.generatorId(Overworld)));
-    try std.testing.expectEqual(@as(u16, 1), @intFromEnum(Default.generatorId(Void)));
-    try std.testing.expectEqualStrings("minecraft:flat", Default.stableId(Default.generatorId(Flat)).?);
 }

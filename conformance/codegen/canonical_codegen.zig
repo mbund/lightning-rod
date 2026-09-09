@@ -1,9 +1,5 @@
 const std = @import("std");
 
-// Optional semantic projections only. Universal `wire/<packet-name>` packet
-// shapes and field serializers are generated from protocol.json by
-// codegen/codegen.zig; adding protocol coverage never requires editing here.
-
 const Codec = enum {
     float,
     integer,

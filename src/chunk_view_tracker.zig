@@ -1,14 +1,29 @@
 const geometry = @import("world/geometry.zig");
 const std = @import("std");
 const preallocated = @import("preallocated");
-const config = @import("config.zig").value;
+pub const Order = struct {
+    indices: []u16 = &.{},
+    radius: i32 = 0,
+    grid_radius: i32 = 0,
+    diameter: usize = 0,
 
-pub const visible_radius: i32 = config.view_distance_chunks;
-pub const radius: i32 = visible_radius;
-pub const diameter: usize = @intCast(radius * 2 + 1);
-pub const chunk_count: usize = diameter * diameter;
-const bit_word_count = std.math.divCeil(usize, chunk_count, 64) catch unreachable;
-const radial_indices = buildRadialIndices();
+    pub fn create(allocator: std.mem.Allocator, radius: i32) !Order {
+        if (radius < 0) return error.InvalidViewDistance;
+        const grid_radius = radius + @intFromBool(radius >= 2);
+        const diameter: usize = @intCast(grid_radius * 2 + 1);
+        const grid_count = diameter * diameter;
+        if (grid_count > std.math.maxInt(u16)) return error.ViewDistanceTooLarge;
+        const chunk_count = viewChunkCount(radius, grid_radius);
+        const result = Order{
+            .indices = try preallocated.alloc(u16, allocator, chunk_count),
+            .radius = radius,
+            .grid_radius = grid_radius,
+            .diameter = diameter,
+        };
+        initializeRadialIndices(result.indices, radius, grid_radius);
+        return result;
+    }
+};
 
 pub const Tracker = struct {
     pub const MissingIterator = struct {
@@ -16,12 +31,12 @@ pub const Tracker = struct {
         cursor: usize,
 
         pub fn next(self: *MissingIterator) ?geometry.ChunkPos {
-            while (self.cursor < radial_indices.len) {
-                const index = radial_indices[self.cursor];
+            while (self.cursor < self.tracker.order.len) {
+                const index = self.tracker.order[self.cursor];
                 self.cursor += 1;
-                if (!self.tracker.bit(index) or
-                    self.tracker.dirtyBit(index))
-                    return positionForIndex(self.tracker.center, index);
+                const position = self.tracker.positionForIndex(self.tracker.center, index);
+                if (!inView(self.tracker.stream_radius, position, self.tracker.center)) continue;
+                if (!self.tracker.bit(index) or self.tracker.dirtyBit(index)) return position;
             }
             return null;
         }
@@ -29,62 +44,72 @@ pub const Tracker = struct {
 
     center: geometry.ChunkPos = .{ .x = 0, .z = 0 },
     sent_count: usize = 0,
-    radial_cursor: usize = 0,
-    stream_radius: i32 = radius,
+    stream_cursor: usize = 0,
+    stream_radius: i32 = 0,
+    maximum_radius: i32 = 0,
+    grid_radius: i32 = 0,
+    diameter: usize = 0,
+    translated_bits: []u64 = &.{},
+    order: []const u16 = &.{},
     sent_bits: []u64 = &.{},
     dirty_bits: []u64 = &.{},
 
-    pub fn allocate(self: *Tracker, allocator: std.mem.Allocator) !void {
+    pub fn allocate(self: *Tracker, allocator: std.mem.Allocator, order: *const Order) !void {
         self.* = .{};
-        self.sent_bits = try preallocated.alloc(u64, allocator, bit_word_count);
-        self.dirty_bits = try preallocated.alloc(u64, allocator, bit_word_count);
+        self.order = order.indices;
+        self.maximum_radius = order.radius;
+        self.grid_radius = order.grid_radius;
+        self.stream_radius = order.radius;
+        self.diameter = order.diameter;
+        const words = std.math.divCeil(usize, order.diameter * order.diameter, 64) catch unreachable;
+        self.sent_bits = try preallocated.alloc(u64, allocator, words);
+        self.dirty_bits = try preallocated.alloc(u64, allocator, words);
+        self.translated_bits = try preallocated.alloc(u64, allocator, words);
     }
 
     pub fn reset(self: *Tracker, center: geometry.ChunkPos) void {
         self.center = center;
         self.sent_count = 0;
-        self.radial_cursor = 0;
+        self.stream_cursor = 0;
         @memset(self.sent_bits, 0);
         @memset(self.dirty_bits, 0);
         self.maskOutsideStream();
     }
 
     pub fn setRadius(self: *Tracker, center: geometry.ChunkPos, requested_radius: i32) void {
-        std.debug.assert(requested_radius >= 0 and requested_radius <= visible_radius);
+        std.debug.assert(requested_radius >= 0 and requested_radius <= self.maximum_radius);
         self.stream_radius = requested_radius;
         self.reset(center);
     }
 
     fn maskOutsideStream(self: *Tracker) void {
-        if (self.stream_radius == radius) {
-            self.advanceCursor();
-            return;
-        }
-        for (radial_indices) |index| {
-            const position = positionForIndex(self.center, index);
-            const dx = position.x - self.center.x;
-            const dz = position.z - self.center.z;
-            const inside =
-                @abs(dx) <= self.stream_radius and @abs(dz) <= self.stream_radius;
-            if (inside) continue;
-            if (!self.bit(index)) {
-                self.setBit(index);
-                self.sent_count += 1;
-            }
+        for (0..self.diameter * self.diameter) |index| {
+            const position = self.positionForIndex(self.center, index);
+            if (inView(self.stream_radius, position, self.center)) continue;
+            self.clearBit(index);
             self.clearDirtyBit(index);
         }
+        const grid_bits = self.diameter * self.diameter;
+        const tail_bits = grid_bits & 63;
+        if (tail_bits != 0) {
+            const mask = lowMask(tail_bits);
+            self.sent_bits[self.sent_bits.len - 1] &= mask;
+            self.dirty_bits[self.dirty_bits.len - 1] &= mask;
+        }
+        self.sent_count = 0;
+        for (self.order) |index|
+            self.sent_count += @intFromBool(self.bit(index));
         self.advanceCursor();
     }
 
     pub fn has(self: *const Tracker, pos: geometry.ChunkPos) bool {
-        const index = viewIndex(pos, self.center) orelse return false;
+        if (!inView(self.stream_radius, pos, self.center)) return false;
+        const index = self.viewIndex(pos, self.center) orelse return false;
         return self.bit(index);
     }
 
     pub fn delivered(self: *const Tracker, pos: geometry.ChunkPos) bool {
-        if (@abs(pos.x - self.center.x) > self.stream_radius or
-            @abs(pos.z - self.center.z) > self.stream_radius)
-            return false;
+        if (!inView(self.stream_radius, pos, self.center)) return false;
         return self.has(pos);
     }
 
@@ -92,46 +117,43 @@ pub const Tracker = struct {
         if (@abs(pos.x - self.center.x) > self.stream_radius or
             @abs(pos.z - self.center.z) > self.stream_radius)
             return false;
-        const index = viewIndex(pos, self.center) orelse return false;
+        const index = self.viewIndex(pos, self.center) orelse return false;
         return self.bit(index) and !self.dirtyBit(index);
     }
 
     pub fn mark(self: *Tracker, pos: geometry.ChunkPos) void {
-        const index = viewIndex(pos, self.center) orelse return;
+        if (!inView(self.stream_radius, pos, self.center)) return;
+        const index = self.viewIndex(pos, self.center) orelse return;
         if (self.bit(index)) {
             self.clearDirtyBit(index);
             self.advanceCursor();
             return;
         }
-        if (self.sent_count >= chunk_count)
-            std.debug.panic("chunk view tracker invariant failed: marking ({d}, {d}) around center ({d}, {d}) with sent count {d} at capacity {d}", .{ pos.x, pos.z, self.center.x, self.center.z, self.sent_count, chunk_count });
+        if (self.sent_count >= self.order.len)
+            std.debug.panic("chunk view tracker invariant failed: marking ({d}, {d}) around center ({d}, {d}) with sent count {d} at capacity {d}", .{ pos.x, pos.z, self.center.x, self.center.z, self.sent_count, self.order.len });
         self.setBit(index);
         self.sent_count += 1;
         self.advanceCursor();
     }
 
     pub fn unmark(self: *Tracker, pos: geometry.ChunkPos) bool {
-        if (@abs(pos.x - self.center.x) > self.stream_radius or
-            @abs(pos.z - self.center.z) > self.stream_radius)
-            return false;
-        const index = viewIndex(pos, self.center) orelse return false;
+        if (!inView(self.stream_radius, pos, self.center)) return false;
+        const index = self.viewIndex(pos, self.center) orelse return false;
         if (!self.bit(index)) return false;
         self.clearBit(index);
         self.clearDirtyBit(index);
         self.sent_count -= 1;
-        self.radial_cursor = 0;
+        self.stream_cursor = 0;
         self.advanceCursor();
         return true;
     }
 
     pub fn markDirty(self: *Tracker, pos: geometry.ChunkPos) bool {
-        if (@abs(pos.x - self.center.x) > self.stream_radius or
-            @abs(pos.z - self.center.z) > self.stream_radius)
-            return false;
-        const index = viewIndex(pos, self.center) orelse return false;
+        if (!inView(self.stream_radius, pos, self.center)) return false;
+        const index = self.viewIndex(pos, self.center) orelse return false;
         if (!self.bit(index) or self.dirtyBit(index)) return false;
         self.setDirtyBit(index);
-        self.radial_cursor = 0;
+        self.stream_cursor = 0;
         self.advanceCursor();
         return true;
     }
@@ -142,55 +164,49 @@ pub const Tracker = struct {
         self.center = center;
         const delta_x = center.x - old_center.x;
         const delta_z = center.z - old_center.z;
+        const diameter: i32 = @intCast(self.diameter);
         if (@abs(delta_x) >= diameter or @abs(delta_z) >= diameter) {
             @memset(self.sent_bits, 0);
             @memset(self.dirty_bits, 0);
             self.sent_count = 0;
-            self.radial_cursor = 0;
+            self.stream_cursor = 0;
             return;
         }
-        const shift = delta_z * @as(i32, @intCast(diameter)) + delta_x;
-        translateBits(self.sent_bits, shift);
-        translateBits(self.dirty_bits, shift);
+        const shift = delta_z * @as(i32, @intCast(self.diameter)) + delta_x;
+        self.translateBits(self.sent_bits, shift);
+        self.translateBits(self.dirty_bits, shift);
         const first_x: usize = @intCast(@max(0, -delta_x));
-        const last_x: usize = @intCast(@min(@as(i32, @intCast(diameter)), @as(i32, @intCast(diameter)) - delta_x));
+        const last_x: usize = @intCast(@min(@as(i32, @intCast(self.diameter)), @as(i32, @intCast(self.diameter)) - delta_x));
         const first_z: usize = @intCast(@max(0, -delta_z));
-        const last_z: usize = @intCast(@min(@as(i32, @intCast(diameter)), @as(i32, @intCast(diameter)) - delta_z));
-        for (0..diameter) |z| {
+        const last_z: usize = @intCast(@min(@as(i32, @intCast(self.diameter)), @as(i32, @intCast(self.diameter)) - delta_z));
+        for (0..self.diameter) |z| {
             if (z < first_z or z >= last_z) {
-                self.clearRange(z * diameter, diameter);
-                clearBitsRange(self.dirty_bits, z * diameter, diameter);
+                self.clearRange(z * self.diameter, self.diameter);
+                clearBitsRange(self.dirty_bits, z * self.diameter, self.diameter);
                 continue;
             }
             if (first_x != 0) {
-                self.clearRange(z * diameter, first_x);
-                clearBitsRange(self.dirty_bits, z * diameter, first_x);
+                self.clearRange(z * self.diameter, first_x);
+                clearBitsRange(self.dirty_bits, z * self.diameter, first_x);
             }
-            if (last_x != diameter) {
-                self.clearRange(z * diameter + last_x, diameter - last_x);
-                clearBitsRange(self.dirty_bits, z * diameter + last_x, diameter - last_x);
+            if (last_x != self.diameter) {
+                self.clearRange(z * self.diameter + last_x, self.diameter - last_x);
+                clearBitsRange(self.dirty_bits, z * self.diameter + last_x, self.diameter - last_x);
             }
         }
-        const tail_bits = chunk_count & 63;
-        if (tail_bits != 0)
-            self.sent_bits[self.sent_bits.len - 1] &= (@as(u64, 1) << @intCast(tail_bits)) - 1;
-        if (tail_bits != 0)
-            self.dirty_bits[self.dirty_bits.len - 1] &= (@as(u64, 1) << @intCast(tail_bits)) - 1;
-        self.sent_count = 0;
-        for (self.sent_bits) |word| self.sent_count += @popCount(word);
         self.maskOutsideStream();
-        self.radial_cursor = 0;
+        self.stream_cursor = 0;
         self.advanceCursor();
     }
 
-    fn translateBits(bits_slice: []u64, shift: i32) void {
+    fn translateBits(self: *Tracker, bits_slice: []u64, shift: i32) void {
         const source = bits_slice;
-        var translated = [_]u64{0} ** bit_word_count;
+        @memset(self.translated_bits, 0);
         if (shift > 0) {
             const amount: usize = @intCast(shift);
             const words = amount / 64;
             const bits: u6 = @intCast(amount & 63);
-            for (&translated, 0..) |*destination, index| {
+            for (self.translated_bits, 0..) |*destination, index| {
                 const source_index = index + words;
                 if (source_index >= source.len) break;
                 destination.* = source[source_index] >> bits;
@@ -201,7 +217,7 @@ pub const Tracker = struct {
             const amount: usize = @intCast(-shift);
             const words = amount / 64;
             const bits: u6 = @intCast(amount & 63);
-            for (&translated, 0..) |*destination, index| {
+            for (self.translated_bits, 0..) |*destination, index| {
                 if (index < words) continue;
                 const source_index = index - words;
                 destination.* = source[source_index] << bits;
@@ -209,7 +225,7 @@ pub const Tracker = struct {
                     destination.* |= source[source_index - 1] >> @intCast(64 - @as(u7, bits));
             }
         }
-        @memcpy(bits_slice, &translated);
+        @memcpy(bits_slice, self.translated_bits);
     }
 
     fn clearRange(self: *Tracker, first: usize, len: usize) void {
@@ -234,31 +250,29 @@ pub const Tracker = struct {
     }
 
     pub fn nextMissing(self: *const Tracker) ?geometry.ChunkPos {
-        if (self.radial_cursor == radial_indices.len) return null;
-        return positionForIndex(self.center, radial_indices[self.radial_cursor]);
+        if (self.stream_cursor == self.order.len) return null;
+        return self.positionForIndex(self.center, self.order[self.stream_cursor]);
     }
 
     pub fn nextMissingFrom(self: *const Tracker, cursor: *usize) ?geometry.ChunkPos {
         var iterator = MissingIterator{
             .tracker = self,
-            .cursor = @max(cursor.*, self.radial_cursor),
+            .cursor = @max(cursor.*, self.stream_cursor),
         };
         const position = iterator.next();
         cursor.* = iterator.cursor;
         return position;
     }
 
-    /// Iterates unsent chunks ahead of the radial cursor without changing the
-    /// visible send order. A single cursor keeps prefetch linear in lookahead.
     pub fn missingIterator(self: *const Tracker) MissingIterator {
-        return .{ .tracker = self, .cursor = self.radial_cursor };
+        return .{ .tracker = self, .cursor = self.stream_cursor };
     }
 
     fn advanceCursor(self: *Tracker) void {
-        while (self.radial_cursor < radial_indices.len and
-            (self.bit(radial_indices[self.radial_cursor]) and
-                !self.dirtyBit(radial_indices[self.radial_cursor])))
-            self.radial_cursor += 1;
+        while (self.stream_cursor < self.order.len and
+            (self.bit(self.order[self.stream_cursor]) and
+                !self.dirtyBit(self.order[self.stream_cursor])))
+            self.stream_cursor += 1;
     }
 
     fn bit(self: *const Tracker, index: usize) bool {
@@ -290,13 +304,27 @@ pub const Tracker = struct {
         const bit_index: u6 = @intCast(index & 63);
         self.dirty_bits[index / 64] &= ~(@as(u64, 1) << bit_index);
     }
+
+    fn viewIndex(self: *const Tracker, pos: geometry.ChunkPos, center: geometry.ChunkPos) ?usize {
+        const relative_x = pos.x - center.x + self.grid_radius;
+        const relative_z = pos.z - center.z + self.grid_radius;
+        if (relative_x < 0 or relative_z < 0 or relative_x >= @as(i32, @intCast(self.diameter)) or relative_z >= @as(i32, @intCast(self.diameter))) return null;
+        return @as(usize, @intCast(relative_z)) * self.diameter + @as(usize, @intCast(relative_x));
+    }
+
+    fn positionForIndex(self: *const Tracker, center: geometry.ChunkPos, index: usize) geometry.ChunkPos {
+        return .{
+            .x = center.x + @as(i32, @intCast(index % self.diameter)) - self.grid_radius,
+            .z = center.z + @as(i32, @intCast(index / self.diameter)) - self.grid_radius,
+        };
+    }
 };
 
 test "bounded streaming cursor skips a pending nearest chunk" {
     var tracker: Tracker = .{};
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try tracker.allocate(arena.allocator());
+    try allocateTestTracker(&tracker, arena.allocator());
     tracker.reset(.{ .x = 0, .z = 0 });
 
     var cursor: usize = 0;
@@ -310,63 +338,63 @@ inline fn lowMask(bits: usize) u64 {
     return if (bits == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(bits)) - 1;
 }
 
-pub inline fn inView(pos: geometry.ChunkPos, center: geometry.ChunkPos) bool {
-    return @abs(pos.x - center.x) <= visible_radius and
-        @abs(pos.z - center.z) <= visible_radius;
+pub inline fn inView(radius: i32, pos: geometry.ChunkPos, center: geometry.ChunkPos) bool {
+    if (radius < 2)
+        return @abs(pos.x - center.x) <= radius and
+            @abs(pos.z - center.z) <= radius;
+    const dx = @abs(@as(i64, pos.x) - center.x) -| 2;
+    const dz = @abs(@as(i64, pos.z) - center.z) -| 2;
+    return dx * dx + dz * dz < @as(u64, @intCast(radius)) * @as(u64, @intCast(radius));
 }
 
-pub inline fn inStream(pos: geometry.ChunkPos, center: geometry.ChunkPos) bool {
-    return @abs(pos.x - center.x) <= radius and
-        @abs(pos.z - center.z) <= radius;
+fn viewChunkCount(radius: i32, grid_radius: i32) usize {
+    const diameter: usize = @intCast(grid_radius * 2 + 1);
+    var result: usize = 0;
+    for (0..diameter * diameter) |index| {
+        const position = relativePosition(@intCast(index), grid_radius);
+        result += @intFromBool(inView(radius, position, .{ .x = 0, .z = 0 }));
+    }
+    return result;
 }
 
-fn viewIndex(pos: geometry.ChunkPos, center: geometry.ChunkPos) ?usize {
-    const relative_x = pos.x - center.x + radius;
-    const relative_z = pos.z - center.z + radius;
-    if (relative_x < 0 or relative_z < 0 or relative_x >= @as(i32, @intCast(diameter)) or relative_z >= @as(i32, @intCast(diameter))) return null;
-    return @as(usize, @intCast(relative_z)) * diameter + @as(usize, @intCast(relative_x));
-}
-
-fn positionForIndex(center: geometry.ChunkPos, index: usize) geometry.ChunkPos {
-    return .{
-        .x = center.x + @as(i32, @intCast(index % diameter)) - radius,
-        .z = center.z + @as(i32, @intCast(index / diameter)) - radius,
-    };
-}
-
-fn buildRadialIndices() [chunk_count]u16 {
-    @setEvalBranchQuota(chunk_count * 128);
-    var indices: [chunk_count]u16 = undefined;
-    for (&indices, 0..) |*index, value| index.* = @intCast(value);
+fn initializeRadialIndices(indices: []u16, radius: i32, grid_radius: i32) void {
+    const diameter: usize = @intCast(grid_radius * 2 + 1);
+    var count: usize = 0;
+    for (0..diameter * diameter) |index| {
+        const position = relativePosition(@intCast(index), grid_radius);
+        if (!inView(radius, position, .{ .x = 0, .z = 0 })) continue;
+        indices[count] = @intCast(index);
+        count += 1;
+    }
+    std.debug.assert(count == indices.len);
 
     var root = indices.len / 2;
     while (root != 0) {
         root -= 1;
-        siftDown(&indices, root, indices.len);
+        siftDown(indices, root, indices.len, grid_radius);
     }
     var end = indices.len;
     while (end > 1) {
         end -= 1;
         std.mem.swap(u16, &indices[0], &indices[end]);
-        siftDown(&indices, 0, end);
+        siftDown(indices, 0, end, grid_radius);
     }
-    return indices;
 }
 
-fn siftDown(indices: *[chunk_count]u16, start: usize, end: usize) void {
+fn siftDown(indices: []u16, start: usize, end: usize, radius: i32) void {
     var root = start;
     while (root * 2 + 1 < end) {
         var child = root * 2 + 1;
-        if (child + 1 < end and radialLess(indices[child], indices[child + 1])) child += 1;
-        if (!radialLess(indices[root], indices[child])) return;
+        if (child + 1 < end and radialLess(indices[child], indices[child + 1], radius)) child += 1;
+        if (!radialLess(indices[root], indices[child], radius)) return;
         std.mem.swap(u16, &indices[root], &indices[child]);
         root = child;
     }
 }
 
-fn radialLess(left_index: u16, right_index: u16) bool {
-    const left = relativePosition(left_index);
-    const right = relativePosition(right_index);
+fn radialLess(left_index: u16, right_index: u16, radius: i32) bool {
+    const left = relativePosition(left_index, radius);
+    const right = relativePosition(right_index, radius);
     const left_distance = left.x * left.x + left.z * left.z;
     const right_distance = right.x * right.x + right.z * right.z;
     if (left_distance != right_distance) return left_distance < right_distance;
@@ -374,31 +402,37 @@ fn radialLess(left_index: u16, right_index: u16) bool {
     return left.x < right.x;
 }
 
-fn relativePosition(index: u16) struct { x: i32, z: i32 } {
+fn relativePosition(index: u16, radius: i32) geometry.ChunkPos {
     const wide: usize = index;
+    const diameter: usize = @intCast(radius * 2 + 1);
     return .{
         .x = @as(i32, @intCast(wide % diameter)) - radius,
         .z = @as(i32, @intCast(wide / diameter)) - radius,
     };
 }
 
-test "tracker streams radially and retains membership" {
+fn allocateTestTracker(tracker: *Tracker, allocator: std.mem.Allocator) !void {
+    const order = try Order.create(allocator, 4);
+    try tracker.allocate(allocator, &order);
+}
+
+test "tracker streams in radial order and retains membership" {
     var tracker: Tracker = .{};
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try tracker.allocate(arena.allocator());
+    try allocateTestTracker(&tracker, arena.allocator());
     tracker.reset(.{ .x = 0, .z = 0 });
     tracker.mark(.{ .x = 0, .z = 0 });
     const next = tracker.nextMissing().?;
-    try std.testing.expect(inView(next, tracker.center));
+    try std.testing.expect(inView(tracker.maximum_radius, next, tracker.center));
     try std.testing.expect(!tracker.has(next));
 }
 
-test "unmark schedules an already sent chunk for radial retransmission" {
+test "unmark schedules an already sent chunk for retransmission" {
     var tracker: Tracker = .{};
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try tracker.allocate(arena.allocator());
+    try allocateTestTracker(&tracker, arena.allocator());
     tracker.reset(.{ .x = 0, .z = 0 });
     const center = geometry.ChunkPos{ .x = 0, .z = 0 };
     tracker.mark(center);
@@ -411,7 +445,7 @@ test "dirty retransmission preserves client chunk possession" {
     var tracker: Tracker = .{};
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try tracker.allocate(arena.allocator());
+    try allocateTestTracker(&tracker, arena.allocator());
     const center = geometry.ChunkPos{ .x = 0, .z = 0 };
     tracker.reset(center);
     tracker.mark(center);
@@ -424,14 +458,14 @@ test "dirty retransmission preserves client chunk possession" {
     try std.testing.expect(!geometry.sameChunk(center, tracker.nextMissing().?));
 }
 
-test "radius sentinels cannot be scheduled for retransmission" {
+test "chunks outside the configured radius are never scheduled" {
     var tracker: Tracker = .{};
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try tracker.allocate(arena.allocator());
+    try allocateTestTracker(&tracker, arena.allocator());
     tracker.setRadius(.{ .x = 0, .z = 0 }, 1);
     try std.testing.expect(!tracker.unmark(.{ .x = 2, .z = 0 }));
-    try std.testing.expect(tracker.has(.{ .x = 2, .z = 0 }));
+    try std.testing.expect(!tracker.has(.{ .x = 2, .z = 0 }));
     try std.testing.expect(!tracker.delivered(.{ .x = 2, .z = 0 }));
 }
 
@@ -439,28 +473,18 @@ test "reset preserves the configured stream radius" {
     var tracker: Tracker = .{};
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try tracker.allocate(arena.allocator());
+    try allocateTestTracker(&tracker, arena.allocator());
     tracker.setRadius(.{ .x = 0, .z = 0 }, 1);
     tracker.reset(.{ .x = 7, .z = -4 });
-    try std.testing.expect(tracker.has(.{ .x = 9, .z = -4 }));
+    try std.testing.expect(!tracker.has(.{ .x = 9, .z = -4 }));
     try std.testing.expect(!tracker.has(.{ .x = 8, .z = -4 }));
-}
-
-test "stream order is nondecreasing by Euclidean radius" {
-    var previous_distance: i32 = -1;
-    for (radial_indices) |index| {
-        const position = relativePosition(index);
-        const distance = position.x * position.x + position.z * position.z;
-        try std.testing.expect(distance >= previous_distance);
-        previous_distance = distance;
-    }
 }
 
 test "missing iterator looks ahead without advancing stream order" {
     var tracker: Tracker = .{};
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try tracker.allocate(arena.allocator());
+    try allocateTestTracker(&tracker, arena.allocator());
     tracker.reset(.{ .x = 4, .z = -3 });
     const first = tracker.nextMissing().?;
     var iterator = tracker.missingIterator();
@@ -474,53 +498,69 @@ test "missing iterator looks ahead without advancing stream order" {
 }
 
 test "stream order covers the radial view exactly once" {
-    var seen = [_]bool{false} ** chunk_count;
-    for (radial_indices) |index| {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const order = try Order.create(arena.allocator(), 4);
+    const seen = try arena.allocator().alloc(bool, order.diameter * order.diameter);
+    @memset(seen, false);
+    for (order.indices) |index| {
         try std.testing.expect(!seen[index]);
         seen[index] = true;
     }
-    for (seen) |present| try std.testing.expect(present);
+    var count: usize = 0;
+    for (seen, 0..) |present, index| {
+        const position = relativePosition(@intCast(index), order.grid_radius);
+        try std.testing.expectEqual(inView(order.radius, position, .{ .x = 0, .z = 0 }), present);
+        count += @intFromBool(present);
+    }
+    try std.testing.expectEqual(order.indices.len, count);
+}
+
+test "distance 32 matches the Java client tracking shape" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const order = try Order.create(arena.allocator(), 32);
+    try std.testing.expectEqual(@as(usize, 3725), order.indices.len);
 }
 
 test "recenter retains overlap without growing beyond the view" {
     var tracker: Tracker = .{};
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try tracker.allocate(arena.allocator());
+    try allocateTestTracker(&tracker, arena.allocator());
     tracker.reset(.{ .x = 0, .z = 0 });
-    for (radial_indices) |index| tracker.mark(positionForIndex(tracker.center, index));
-    try std.testing.expectEqual(chunk_count, tracker.sent_count);
+    for (tracker.order) |index| tracker.mark(tracker.positionForIndex(tracker.center, index));
+    try std.testing.expectEqual(tracker.order.len, tracker.sent_count);
     tracker.recenter(.{ .x = 1, .z = 0 });
-    try std.testing.expectEqual(chunk_count - diameter, tracker.sent_count);
     try std.testing.expect(tracker.delivered(.{
-        .x = tracker.center.x + visible_radius - 1,
+        .x = tracker.center.x + tracker.maximum_radius - 1,
         .z = tracker.center.z,
     }));
     try std.testing.expect(!tracker.delivered(.{
-        .x = tracker.center.x + visible_radius,
+        .x = tracker.center.x + tracker.maximum_radius + 1,
         .z = tracker.center.z,
     }));
     while (tracker.nextMissing()) |pos| tracker.mark(pos);
-    try std.testing.expectEqual(chunk_count, tracker.sent_count);
+    try std.testing.expectEqual(tracker.order.len, tracker.sent_count);
 }
 
 test "stream radius equals the advertised view distance" {
     var tracker: Tracker = .{};
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try tracker.allocate(arena.allocator());
+    try allocateTestTracker(&tracker, arena.allocator());
     const center = geometry.ChunkPos{ .x = 7, .z = -3 };
     tracker.reset(center);
     const visible_edge = geometry.ChunkPos{
-        .x = center.x + visible_radius,
+        .x = center.x + tracker.maximum_radius + 1,
         .z = center.z,
     };
     const outside = geometry.ChunkPos{
-        .x = center.x + radius + 1,
+        .x = center.x + tracker.maximum_radius + 2,
         .z = center.z,
     };
-    try std.testing.expect(inView(visible_edge, center));
-    try std.testing.expect(!inStream(outside, center));
+    try std.testing.expect(inView(tracker.maximum_radius, visible_edge, center));
+    try std.testing.expect(!inView(tracker.maximum_radius, outside, center));
     tracker.mark(visible_edge);
     try std.testing.expect(tracker.delivered(visible_edge));
     try std.testing.expect(!tracker.delivered(outside));
@@ -530,11 +570,11 @@ test "packed recenter matches coordinate remapping" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var original: Tracker = .{};
-    try original.allocate(arena.allocator());
+    try allocateTestTracker(&original, arena.allocator());
     original.reset(.{ .x = 11, .z = -7 });
-    for (radial_indices, 0..) |index, sample| {
+    for (original.order, 0..) |index, sample| {
         if (sample % 7 == 0 or sample % 19 == 0)
-            original.mark(positionForIndex(original.center, index));
+            original.mark(original.positionForIndex(original.center, index));
     }
     const deltas = [_]geometry.ChunkPos{
         .{ .x = -66, .z = 0 },
@@ -549,27 +589,27 @@ test "packed recenter matches coordinate remapping" {
     for (deltas) |delta| {
         const center = geometry.ChunkPos{ .x = original.center.x + delta.x, .z = original.center.z + delta.z };
         var actual: Tracker = .{};
-        try actual.allocate(arena.allocator());
+        try allocateTestTracker(&actual, arena.allocator());
         actual.center = original.center;
         actual.sent_count = original.sent_count;
-        actual.radial_cursor = original.radial_cursor;
+        actual.stream_cursor = original.stream_cursor;
         @memcpy(actual.sent_bits, original.sent_bits);
         actual.recenter(center);
 
         var expected: Tracker = .{};
-        try expected.allocate(arena.allocator());
+        try allocateTestTracker(&expected, arena.allocator());
         expected.reset(center);
-        for (0..chunk_count) |old_index| {
+        for (original.order) |old_index| {
             if (!original.bit(old_index)) continue;
-            const pos = positionForIndex(original.center, old_index);
-            if (viewIndex(pos, center)) |new_index| {
-                expected.setBit(new_index);
-                expected.sent_count += 1;
-            }
+            const pos = original.positionForIndex(original.center, old_index);
+            if (!inView(expected.stream_radius, pos, center)) continue;
+            const new_index = expected.viewIndex(pos, center) orelse continue;
+            expected.setBit(new_index);
+            expected.sent_count += 1;
         }
         expected.advanceCursor();
         try std.testing.expectEqual(expected.sent_count, actual.sent_count);
-        try std.testing.expectEqual(expected.radial_cursor, actual.radial_cursor);
+        try std.testing.expectEqual(expected.stream_cursor, actual.stream_cursor);
         try std.testing.expectEqualSlices(u64, expected.sent_bits, actual.sent_bits);
     }
 }

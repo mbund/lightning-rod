@@ -1,12 +1,19 @@
 const std = @import("std");
 const preallocated = @import("preallocated");
-const config = @import("config.zig").value;
-
-pub const search_capacity = config.max_path_search_nodes;
-pub const lookup_capacity = search_capacity * 2;
-pub const path_capacity = config.max_path_nodes;
-pub const entity_capacity = config.max_living_entities;
 const none: u16 = std.math.maxInt(u16);
+
+pub const Configuration = struct {
+    maximum_entities: usize = 512,
+    maximum_search_nodes: usize = 2_048,
+    maximum_path_nodes: usize = 128,
+
+    pub fn validate(self: Configuration) !void {
+        if (self.maximum_entities == 0 or self.maximum_entities >= std.math.maxInt(u16)) return error.InvalidEntityCapacity;
+        if (self.maximum_search_nodes == 0 or self.maximum_search_nodes >= std.math.maxInt(u16)) return error.InvalidSearchCapacity;
+        if (!std.math.isPowerOfTwo(self.maximum_search_nodes * 2)) return error.SearchLookupMustBePowerOfTwo;
+        if (self.maximum_path_nodes == 0 or self.maximum_path_nodes > std.math.maxInt(u8)) return error.InvalidPathCapacity;
+    }
+};
 
 pub const NodeType = enum(u8) {
     blocked,
@@ -41,22 +48,25 @@ pub const Paths = struct {
     target_z: []align(64) i32 = &.{},
     reaches_target: []align(64) bool = &.{},
     speed: []align(64) f64 = &.{},
+    path_capacity: usize = 0,
 
-    pub fn allocate(self: *Paths, allocator: std.mem.Allocator) !void {
+    pub fn allocate(self: *Paths, allocator: std.mem.Allocator, configuration: Configuration) !void {
+        try configuration.validate();
         self.* = .{};
-        const node_capacity = entity_capacity * path_capacity;
+        const node_capacity = configuration.maximum_entities * configuration.maximum_path_nodes;
         self.x = try preallocated.alignedAlloc(i32, allocator, .@"64", node_capacity);
         self.y = try preallocated.alignedAlloc(i16, allocator, .@"64", node_capacity);
         self.z = try preallocated.alignedAlloc(i32, allocator, .@"64", node_capacity);
         self.node_type = try preallocated.alignedAlloc(NodeType, allocator, .@"64", node_capacity);
         self.penalty = try preallocated.alignedAlloc(f32, allocator, .@"64", node_capacity);
-        self.length = try preallocated.alignedAlloc(u8, allocator, .@"64", entity_capacity);
-        self.current = try preallocated.alignedAlloc(u8, allocator, .@"64", entity_capacity);
-        self.target_x = try preallocated.alignedAlloc(i32, allocator, .@"64", entity_capacity);
-        self.target_y = try preallocated.alignedAlloc(i16, allocator, .@"64", entity_capacity);
-        self.target_z = try preallocated.alignedAlloc(i32, allocator, .@"64", entity_capacity);
-        self.reaches_target = try preallocated.alignedAlloc(bool, allocator, .@"64", entity_capacity);
-        self.speed = try preallocated.alignedAlloc(f64, allocator, .@"64", entity_capacity);
+        self.length = try preallocated.alignedAlloc(u8, allocator, .@"64", configuration.maximum_entities);
+        self.current = try preallocated.alignedAlloc(u8, allocator, .@"64", configuration.maximum_entities);
+        self.target_x = try preallocated.alignedAlloc(i32, allocator, .@"64", configuration.maximum_entities);
+        self.target_y = try preallocated.alignedAlloc(i16, allocator, .@"64", configuration.maximum_entities);
+        self.target_z = try preallocated.alignedAlloc(i32, allocator, .@"64", configuration.maximum_entities);
+        self.reaches_target = try preallocated.alignedAlloc(bool, allocator, .@"64", configuration.maximum_entities);
+        self.speed = try preallocated.alignedAlloc(f64, allocator, .@"64", configuration.maximum_entities);
+        self.path_capacity = configuration.maximum_path_nodes;
         @memset(self.length, 0);
         @memset(self.current, 0);
         @memset(self.reaches_target, false);
@@ -87,23 +97,23 @@ pub const Paths = struct {
     }
 
     pub inline fn xFor(self: anytype, entity: usize) []i32 {
-        return self.x[entity * path_capacity ..][0..path_capacity];
+        return self.x[entity * self.path_capacity ..][0..self.path_capacity];
     }
 
     pub inline fn yFor(self: anytype, entity: usize) []i16 {
-        return self.y[entity * path_capacity ..][0..path_capacity];
+        return self.y[entity * self.path_capacity ..][0..self.path_capacity];
     }
 
     pub inline fn zFor(self: anytype, entity: usize) []i32 {
-        return self.z[entity * path_capacity ..][0..path_capacity];
+        return self.z[entity * self.path_capacity ..][0..self.path_capacity];
     }
 
     pub inline fn nodeTypesFor(self: anytype, entity: usize) []NodeType {
-        return self.node_type[entity * path_capacity ..][0..path_capacity];
+        return self.node_type[entity * self.path_capacity ..][0..self.path_capacity];
     }
 
     pub inline fn penaltiesFor(self: anytype, entity: usize) []f32 {
-        return self.penalty[entity * path_capacity ..][0..path_capacity];
+        return self.penalty[entity * self.path_capacity ..][0..self.path_capacity];
     }
 };
 
@@ -129,9 +139,14 @@ pub const Search = struct {
     count: u16 = 0,
     heap_count: u16 = 0,
     last_iterations: u16 = 0,
+    search_capacity: usize = 0,
+    lookup_capacity: usize = 0,
 
-    pub fn allocate(self: *Search, allocator: std.mem.Allocator) !void {
+    pub fn allocate(self: *Search, allocator: std.mem.Allocator, configuration: Configuration) !void {
+        try configuration.validate();
         self.* = .{};
+        const search_capacity = configuration.maximum_search_nodes;
+        const lookup_capacity = search_capacity * 2;
         self.x = try preallocated.alignedAlloc(i32, allocator, .@"64", search_capacity);
         self.y = try preallocated.alignedAlloc(i16, allocator, .@"64", search_capacity);
         self.z = try preallocated.alignedAlloc(i32, allocator, .@"64", search_capacity);
@@ -149,6 +164,8 @@ pub const Search = struct {
         self.heap = try preallocated.alignedAlloc(u16, allocator, .@"64", search_capacity);
         self.lookup_node = try preallocated.alignedAlloc(u16, allocator, .@"64", lookup_capacity);
         self.lookup_epoch = try preallocated.alignedAlloc(u32, allocator, .@"64", lookup_capacity);
+        self.search_capacity = search_capacity;
+        self.lookup_capacity = lookup_capacity;
         @memset(self.lookup_epoch, 0);
     }
 
@@ -163,7 +180,7 @@ pub const Search = struct {
         max_distance: f32,
         max_iterations: usize,
     ) bool {
-        std.debug.assert(entity < entity_capacity);
+        std.debug.assert(entity < paths.length.len);
         std.debug.assert(max_iterations > 0);
         self.reset();
         paths.clear(entity);
@@ -236,9 +253,6 @@ pub const Search = struct {
         }
     }
 
-    /// Vanilla's NodeMaker memoizes the classification of a coordinate for
-    /// the duration of one search. Without this, an eight-neighbor A* grid
-    /// performs the same collision query once per incoming edge.
     pub fn classifyCached(self: *Search, context: anytype, value: Node) Candidate {
         const index = self.getOrCreate(value) orelse return context.classifyPathNode(value);
         if (self.classification_known[index]) return .{
@@ -268,15 +282,15 @@ pub const Search = struct {
     }
 
     fn getOrCreate(self: *Search, value: Node) ?u16 {
-        var slot = nodeHash(value) & (lookup_capacity - 1);
-        for (0..lookup_capacity) |_| {
+        var slot = nodeHash(value) & (self.lookup_capacity - 1);
+        for (0..self.lookup_capacity) |_| {
             if (self.lookup_epoch[slot] != self.epoch) break;
             const index = self.lookup_node[slot];
             if (self.x[index] == value.x and self.y[index] == value.y and self.z[index] == value.z) return index;
-            slot = (slot + 1) & (lookup_capacity - 1);
+            slot = (slot + 1) & (self.lookup_capacity - 1);
         } else unreachable;
         std.debug.assert(self.lookup_epoch[slot] != self.epoch);
-        if (self.count == search_capacity) return null;
+        if (self.count == self.search_capacity) return null;
         const index = self.count;
         self.count += 1;
         self.x[index] = value.x;
@@ -304,7 +318,7 @@ pub const Search = struct {
 
     fn push(self: *Search, node_index: u16) void {
         std.debug.assert(self.heap_index[node_index] < 0);
-        std.debug.assert(self.heap_count < search_capacity);
+        std.debug.assert(self.heap_count < self.search_capacity);
         const position = self.heap_count;
         self.heap_count += 1;
         self.heap[position] = node_index;
@@ -352,7 +366,7 @@ pub const Search = struct {
         var at = initial;
         const node_index = self.heap[at];
         const weight = self.heap_weight[node_index];
-        for (0..std.math.log2_int_ceil(usize, search_capacity + 1)) |_| {
+        for (0..self.heap_count) |_| {
             const left = 1 + (at << 1);
             if (left >= self.heap_count) break;
             const right = left + 1;
@@ -372,11 +386,9 @@ pub const Search = struct {
     }
 
     fn writePath(self: *const Search, paths: *Paths, entity: usize, end: u16, reached: bool) void {
-        var reverse: [path_capacity]u16 = undefined;
         var count: usize = 0;
         var cursor = end;
-        while (count < reverse.len) {
-            reverse[count] = cursor;
+        while (count < paths.path_capacity) {
             count += 1;
             if (self.previous[cursor] == none) break;
             cursor = self.previous[cursor];
@@ -384,13 +396,18 @@ pub const Search = struct {
         paths.length[entity] = @intCast(count);
         paths.current[entity] = 0;
         paths.reaches_target[entity] = reached;
-        for (0..count) |path_index| {
-            const source = reverse[count - 1 - path_index];
+        cursor = end;
+        var path_index = count;
+        while (path_index != 0) {
+            path_index -= 1;
+            const source = cursor;
             paths.xFor(entity)[path_index] = self.x[source];
             paths.yFor(entity)[path_index] = self.y[source];
             paths.zFor(entity)[path_index] = self.z[source];
             paths.nodeTypesFor(entity)[path_index] = self.node_type[source];
             paths.penaltiesFor(entity)[path_index] = self.penalty[source];
+            if (self.previous[cursor] == none) break;
+            cursor = self.previous[cursor];
         }
     }
 };
@@ -464,8 +481,8 @@ test "Vanilla successor order and heap ties produce a straight westward path" {
     defer arena.deinit();
     var search: Search = .{};
     var paths: Paths = .{};
-    try search.allocate(arena.allocator());
-    try paths.allocate(arena.allocator());
+    try search.allocate(arena.allocator(), .{});
+    try paths.allocate(arena.allocator(), .{});
     const grid = FlatGrid{ .min = -16, .max = 16 };
     try std.testing.expect(search.findPath(&grid, &paths, 0, .{ .x = 10, .y = 64, .z = 0 }, .{ .x = 0, .y = 64, .z = 0 }, 0, 35, 560));
     try std.testing.expect(paths.reaches_target[0]);
@@ -481,12 +498,12 @@ test "path search capacity failure remains bounded and allocation free" {
     defer arena.deinit();
     var search: Search = .{};
     var paths: Paths = .{};
-    try search.allocate(arena.allocator());
-    try paths.allocate(arena.allocator());
+    try search.allocate(arena.allocator(), .{});
+    try paths.allocate(arena.allocator(), .{});
     const grid = FlatGrid{ .min = -10000, .max = 10000 };
     try std.testing.expect(search.findPath(&grid, &paths, 0, .{ .x = 0, .y = 64, .z = 0 }, .{ .x = 10000, .y = 64, .z = 10000 }, 0, 35, 560));
     try std.testing.expect(!paths.reaches_target[0]);
-    try std.testing.expect(search.count <= search_capacity);
+    try std.testing.expect(search.count <= search.search_capacity);
 }
 
 test "path node classification is memoized for one search" {
@@ -502,7 +519,7 @@ test "path node classification is memoized for one search" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var search: Search = .{};
-    try search.allocate(arena.allocator());
+    try search.allocate(arena.allocator(), .{});
     var calls: usize = 0;
     var classifier = Classifier{ .calls = &calls };
     const node = Node{ .x = 7, .y = 64, .z = -3 };

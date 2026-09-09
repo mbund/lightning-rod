@@ -2,6 +2,17 @@ const geometry = @import("geometry.zig");
 const identity = @import("identity.zig");
 const terrain = @import("../terrain.zig");
 
+pub const Advance = enum { pending, complete };
+
+pub const Sink = struct {
+    context: *anyopaque,
+    emit_fn: *const fn (*anyopaque, terrain.ChunkShape) anyerror!void,
+
+    pub fn emit(self: Sink, shape: terrain.ChunkShape) !void {
+        try self.emit_fn(self.context, shape);
+    }
+};
+
 pub const Service = struct {
     context: *anyopaque,
     generate_fn: *const fn (
@@ -13,7 +24,8 @@ pub const Service = struct {
         context: *anyopaque,
         world: identity.Handle,
         chunk: geometry.ChunkPos,
-    ) anyerror!?terrain.ChunkShape,
+        sink: Sink,
+    ) anyerror!Advance,
 
     pub fn generate(
         self: Service,
@@ -27,7 +39,8 @@ pub const Service = struct {
         self: Service,
         world: identity.Handle,
         chunk: geometry.ChunkPos,
-    ) !?terrain.ChunkShape {
-        return self.advance_fn(self.context, world, chunk);
+        sink: Sink,
+    ) !Advance {
+        return self.advance_fn(self.context, world, chunk, sink);
     }
 };

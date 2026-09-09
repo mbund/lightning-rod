@@ -3,10 +3,18 @@ const geometry = @import("world/geometry.zig");
 const std = @import("std");
 const registry = @import("registry_data");
 const preallocated = @import("preallocated");
-const config = @import("config.zig").value;
+const limits = @import("world/limits.zig");
 const world_identity = @import("world/identity.zig");
 
 pub const ChunkProjection = enum(u8) { canonical, personalized };
+
+pub const Configuration = struct {
+    maximum_overlays: usize = 256,
+
+    pub fn validate(self: Configuration) !void {
+        if (self.maximum_overlays == 0 or !std.math.isPowerOfTwo(self.maximum_overlays)) return error.InvalidOverlayCapacity;
+    }
+};
 
 pub const ProjectionIdentity = extern struct {
     source: u64 = 0,
@@ -34,17 +42,18 @@ pub const PlayerView = struct {
     overlay_chunks: []OverlayChunk = &.{},
     overlay_count: usize = 0,
 
-    pub fn allocate(self: *PlayerView, allocator: std.mem.Allocator) !void {
+    pub fn allocate(self: *PlayerView, allocator: std.mem.Allocator, configuration: Configuration) !void {
+        try configuration.validate();
         self.* = .{};
         self.overlays = try preallocated.alloc(
             Overlay,
             allocator,
-            config.max_player_block_overlays,
+            configuration.maximum_overlays,
         );
         self.overlay_chunks = try preallocated.alloc(
             OverlayChunk,
             allocator,
-            config.max_player_block_overlays,
+            configuration.maximum_overlays,
         );
     }
 
@@ -155,7 +164,7 @@ pub const PlayerView = struct {
             if (overlay_section != section) continue;
             const x: usize = @intCast(overlay.pos.x & 15);
             const y: usize = @intCast(
-                (@as(i32, overlay.pos.y) - config.world_min_y) & 15,
+                (@as(i32, overlay.pos.y) - limits.min_y) & 15,
             );
             const z: usize = @intCast(overlay.pos.z & 15);
             states[x | (z << 4) | (y << 8)] = overlay.state;

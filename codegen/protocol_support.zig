@@ -499,11 +499,6 @@ pub const RawPayload = struct {
     }
 };
 
-/// Deterministic, whitespace-free representation used by generated protocol
-/// canonicalizers. Cursor/view structs deliberately collapse to their decoded
-/// byte span: this is lossless for every AST type, including newly introduced
-/// NBT and protocol-specific structures, while ordinary scalar and bit-field
-/// values are independent of their wire integer encoding.
 pub fn writeCanonicalValue(writer: *std.Io.Writer, value: anytype) anyerror!void {
     const T = @TypeOf(value);
     switch (@typeInfo(T)) {

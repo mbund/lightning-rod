@@ -1,7 +1,1 @@
-{
-  "required": true,
-  "package": "dev.mbund.lightningrod.vanillaharness.mixin",
-  "compatibilityLevel": "JAVA_21",
-  "mixins": ["ItemEntityAccessor", "MinecraftServerMixin", "PlayerManagerMixin", "ServerPlayNetworkHandlerAccessor"],
-  "injectors": { "defaultRequire": 1 }
-}
+{ "required": true, "package": "dev.mbund.lightningrod.vanillaharness.mixin", "compatibilityLevel": "JAVA_21", "mixins": ["DecoderHandlerMixin", "EncoderHandlerMixin"] }

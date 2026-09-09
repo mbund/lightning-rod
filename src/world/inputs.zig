@@ -2,7 +2,6 @@ const player_store = @import("players.zig");
 const block_store = @import("blocks.zig");
 const std = @import("std");
 const registry = @import("registry_data");
-const config = @import("../config.zig").value;
 const diagnostics = @import("../diagnostics.zig");
 const player_lifecycle = @import("../player_lifecycle.zig");
 const preallocated = @import("preallocated");
@@ -94,6 +93,17 @@ const PendingPlayerAttack = struct {
     target_entity_id: i32 = 0,
 };
 
+pub const PlayerAttackIntent = struct {
+    slot: u16,
+    target_slot: u16,
+    target_entity_id: i32,
+};
+
+pub const LivingAttackIntent = struct {
+    slot: u16,
+    target_entity_id: i32,
+};
+
 pub const PendingLivingInteraction = struct {
     active: bool = false,
     entity_id: i32 = 0,
@@ -107,6 +117,13 @@ const PendingArmSwing = struct {
 
 pub const PendingItemDrop = struct {
     count: u8 = 0,
+};
+
+pub const PendingUseItem = struct {
+    active: bool = false,
+    hand: i32 = 0,
+    sequence: i32 = 0,
+    rotation: geometry.Rotation = .{},
 };
 
 const PendingDigAction = union(enum) {
@@ -125,8 +142,22 @@ pub const BlockDigIntent = struct {
 
 pub const Inputs = struct {
     pub const id = "lightning_rod:tick_inputs";
+    pub const Dependencies = struct {
+        events: *player_lifecycle.Events,
+        players: *player_store.Players,
+    };
+    pub const Configuration = struct {
+        maximum_block_requests: usize = 1024,
+        maximum_inventory_clicks: usize = 1024,
+        maximum_creative_slot_changes: usize = 1024,
 
-    lifecycle: *player_lifecycle.Events,
+        pub fn validate(self: Configuration) !void {
+            if (self.maximum_block_requests == 0 or self.maximum_inventory_clicks == 0 or self.maximum_creative_slot_changes == 0)
+                return error.InvalidBatchCapacity;
+        }
+    };
+
+    deps: Dependencies,
     block_requests: []BlockRequest = &.{},
     block_request_count: usize = 0,
     inventory_clicks: []InventoryClick = &.{},
@@ -143,25 +174,35 @@ pub const Inputs = struct {
     living_interactions: []PendingLivingInteraction = &.{},
     arm_swings: []PendingArmSwing = &.{},
     item_drops: []PendingItemDrop = &.{},
+    use_items: []PendingUseItem = &.{},
     respawns: []bool = &.{},
+    keep_alive_responses: []i64 = &.{},
+    chunk_batch_received: []?f32 = &.{},
+    disconnected: []bool = &.{},
 
-    pub fn create(allocator: std.mem.Allocator, lifecycle: *player_lifecycle.Events) !*Inputs {
+    pub fn init(allocator: std.mem.Allocator, deps: Dependencies, configuration: Configuration) !*Inputs {
+        try configuration.validate();
         const self = try preallocated.create(Inputs, allocator);
-        self.* = .{ .lifecycle = lifecycle };
-        self.block_requests = try preallocated.alloc(BlockRequest, allocator, config.tick_block_request_capacity);
-        self.inventory_clicks = try preallocated.alloc(InventoryClick, allocator, config.tick_inventory_click_capacity);
-        self.creative_slot_changes = try preallocated.alloc(CreativeSlotChange, allocator, config.tick_creative_slot_capacity);
-        self.container_closes = try preallocated.alloc(i32, allocator, config.connectionCapacity());
-        self.dig_actions = try preallocated.alloc(PendingDigAction, allocator, config.connectionCapacity());
-        self.movements = try preallocated.alloc(PendingMovement, allocator, config.connectionCapacity());
-        self.player_inputs = try preallocated.alloc(PendingPlayerInput, allocator, config.connectionCapacity());
-        self.sprint_actions = try preallocated.alloc(PendingSprintAction, allocator, config.connectionCapacity());
-        self.living_attacks = try preallocated.alloc(PendingLivingAttack, allocator, config.connectionCapacity());
-        self.player_attacks = try preallocated.alloc(PendingPlayerAttack, allocator, config.connectionCapacity());
-        self.living_interactions = try preallocated.alloc(PendingLivingInteraction, allocator, config.connectionCapacity());
-        self.arm_swings = try preallocated.alloc(PendingArmSwing, allocator, config.connectionCapacity());
-        self.item_drops = try preallocated.alloc(PendingItemDrop, allocator, config.connectionCapacity());
-        self.respawns = try preallocated.alloc(bool, allocator, config.connectionCapacity());
+        self.* = .{ .deps = deps };
+        const connections = deps.players.records.len;
+        self.block_requests = try preallocated.alloc(BlockRequest, allocator, configuration.maximum_block_requests);
+        self.inventory_clicks = try preallocated.alloc(InventoryClick, allocator, configuration.maximum_inventory_clicks);
+        self.creative_slot_changes = try preallocated.alloc(CreativeSlotChange, allocator, configuration.maximum_creative_slot_changes);
+        self.container_closes = try preallocated.alloc(i32, allocator, connections);
+        self.dig_actions = try preallocated.alloc(PendingDigAction, allocator, connections);
+        self.movements = try preallocated.alloc(PendingMovement, allocator, connections);
+        self.player_inputs = try preallocated.alloc(PendingPlayerInput, allocator, connections);
+        self.sprint_actions = try preallocated.alloc(PendingSprintAction, allocator, connections);
+        self.living_attacks = try preallocated.alloc(PendingLivingAttack, allocator, connections);
+        self.player_attacks = try preallocated.alloc(PendingPlayerAttack, allocator, connections);
+        self.living_interactions = try preallocated.alloc(PendingLivingInteraction, allocator, connections);
+        self.arm_swings = try preallocated.alloc(PendingArmSwing, allocator, connections);
+        self.item_drops = try preallocated.alloc(PendingItemDrop, allocator, connections);
+        self.use_items = try preallocated.alloc(PendingUseItem, allocator, connections);
+        self.respawns = try preallocated.alloc(bool, allocator, connections);
+        self.keep_alive_responses = try preallocated.alloc(i64, allocator, connections);
+        self.chunk_batch_received = try preallocated.alloc(?f32, allocator, connections);
+        self.disconnected = try preallocated.alloc(bool, allocator, connections);
         @memset(self.container_closes, -1);
         @memset(self.dig_actions, .none);
         @memset(self.movements, .{});
@@ -172,7 +213,11 @@ pub const Inputs = struct {
         @memset(self.living_interactions, .{});
         @memset(self.arm_swings, .{});
         @memset(self.item_drops, .{});
+        @memset(self.use_items, .{});
         @memset(self.respawns, false);
+        @memset(self.keep_alive_responses, std.math.minInt(i64));
+        @memset(self.chunk_batch_received, null);
+        @memset(self.disconnected, false);
         return self;
     }
 
@@ -190,7 +235,11 @@ pub const Inputs = struct {
         @memset(self.living_interactions, .{});
         @memset(self.arm_swings, .{});
         @memset(self.item_drops, .{});
+        @memset(self.use_items, .{});
         @memset(self.respawns, false);
+        @memset(self.keep_alive_responses, std.math.minInt(i64));
+        @memset(self.chunk_batch_received, null);
+        @memset(self.disconnected, false);
     }
 
     pub fn resetPlayerTransfer(self: *Inputs, slot: u16) void {
@@ -205,7 +254,21 @@ pub const Inputs = struct {
         self.living_interactions[slot] = .{};
         self.arm_swings[slot] = .{};
         self.item_drops[slot] = .{};
+        self.use_items[slot] = .{};
         self.respawns[slot] = false;
+        self.chunk_batch_received[slot] = null;
+    }
+
+    pub fn queueChunkBatchReceived(self: *Inputs, slot: u16, chunks_per_tick: f32) void {
+        std.debug.assert(slot < self.chunk_batch_received.len);
+        self.chunk_batch_received[slot] = chunks_per_tick;
+    }
+
+    pub fn takeChunkBatchReceived(self: *Inputs, slot: u16) ?f32 {
+        std.debug.assert(slot < self.chunk_batch_received.len);
+        const value = self.chunk_batch_received[slot];
+        self.chunk_batch_received[slot] = null;
+        return value;
     }
 
     pub fn stageBlockRequest(
@@ -270,6 +333,11 @@ pub const Inputs = struct {
         players.assertSlot(slot);
         if (players.records[slot].state != .play) return error.PlayerNotInPlay;
         self.respawns[slot] = true;
+    }
+
+    pub fn requestUseItem(self: *Inputs, players: *const player_store.Players, slot: u16, hand: i32, sequence: i32, rotation: geometry.Rotation) !void {
+        try players.assertPlayingAndAlive(slot);
+        self.use_items[slot] = .{ .active = true, .hand = hand, .sequence = sequence, .rotation = rotation };
     }
 
     pub fn stageDigStart(self: *Inputs, slot: u16, pos: geometry.BlockPos, face: i32, sequence: i32) void {
@@ -347,6 +415,34 @@ pub const Inputs = struct {
         self.dig_actions[slot] = .none;
     }
 
+    pub fn playerAttackIntent(self: *const Inputs, slot: u16) ?PlayerAttackIntent {
+        std.debug.assert(slot < self.player_attacks.len);
+        const pending = self.player_attacks[slot];
+        if (!pending.active) return null;
+        return .{
+            .slot = slot,
+            .target_slot = pending.target_slot,
+            .target_entity_id = pending.target_entity_id,
+        };
+    }
+
+    pub fn rejectPlayerAttack(self: *Inputs, slot: u16) void {
+        std.debug.assert(self.playerAttackIntent(slot) != null);
+        self.player_attacks[slot] = .{};
+    }
+
+    pub fn livingAttackIntent(self: *const Inputs, slot: u16) ?LivingAttackIntent {
+        std.debug.assert(slot < self.living_attacks.len);
+        const pending = self.living_attacks[slot];
+        if (!pending.active) return null;
+        return .{ .slot = slot, .target_entity_id = pending.entity_id };
+    }
+
+    pub fn rejectLivingAttack(self: *Inputs, slot: u16) void {
+        std.debug.assert(self.livingAttackIntent(slot) != null);
+        self.living_attacks[slot] = .{};
+    }
+
     pub fn enqueueInventoryClick(self: *Inputs, players: *const player_store.Players, click: InventoryClick) !void {
         try players.assertPlayingAndAlive(click.slot);
         if (self.inventory_click_count == self.inventory_clicks.len) return error.InventoryClickBatchFull;
@@ -372,61 +468,65 @@ pub const Inputs = struct {
         self.creative_slot_change_count += 1;
     }
 
-    pub fn assertConsumed(self: *const Inputs, tick: u64) void {
+    pub fn assertConsumed(self: *const Inputs, tick_number: u64) void {
         if (self.block_request_count != 0)
-            diagnostics.panic("tick completed with unconsumed block requests (tick, count)", &.{ diagnostics.integer(tick), diagnostics.integer(self.block_request_count) });
+            diagnostics.panic("tick completed with unconsumed block requests (tick, count)", &.{ diagnostics.integer(tick_number), diagnostics.integer(self.block_request_count) });
         if (self.inventory_click_count != 0)
-            diagnostics.panic("tick completed with unconsumed inventory clicks (tick, count)", &.{ diagnostics.integer(tick), diagnostics.integer(self.inventory_click_count) });
+            diagnostics.panic("tick completed with unconsumed inventory clicks (tick, count)", &.{ diagnostics.integer(tick_number), diagnostics.integer(self.inventory_click_count) });
         if (self.creative_slot_change_count != 0)
-            diagnostics.panic("tick completed with unconsumed creative slot changes (tick, count)", &.{ diagnostics.integer(tick), diagnostics.integer(self.creative_slot_change_count) });
+            diagnostics.panic("tick completed with unconsumed creative slot changes (tick, count)", &.{ diagnostics.integer(tick_number), diagnostics.integer(self.creative_slot_change_count) });
     }
 
-    pub fn left(
-        self: *Inputs,
-    ) void {
-        var slots = [_]u64{0} ** ((config.connectionCapacity() + 63) / 64);
-        for (self.lifecycle.left.values) |event| {
+    pub fn tick(self: *Inputs, _: std.mem.Allocator) void {
+        self.processLeft();
+    }
+
+    fn processLeft(self: *Inputs) void {
+        for (self.deps.events.left.values) |event| {
             const slot: usize = event.slot;
-            std.debug.assert(slot < config.connectionCapacity());
-            slots[slot / 64] |= @as(u64, 1) << @intCast(slot % 64);
+            std.debug.assert(slot < self.disconnected.len);
+            self.disconnected[slot] = true;
             self.container_closes[slot] = -1;
             self.dig_actions[slot] = .none;
             self.movements[slot] = .{};
             self.player_inputs[slot] = .{};
             self.sprint_actions[slot] = .{};
             self.item_drops[slot] = .{};
+            self.use_items[slot] = .{};
             self.living_attacks[slot] = .{};
             self.player_attacks[slot] = .{};
             self.living_interactions[slot] = .{};
             self.arm_swings[slot] = .{};
             self.respawns[slot] = false;
+            self.chunk_batch_received[slot] = null;
         }
         self.block_request_count = retainConnected(
             BlockRequest,
             self.block_requests[0..self.block_request_count],
-            &slots,
+            self.disconnected,
         );
         self.inventory_click_count = retainConnected(
             InventoryClick,
             self.inventory_clicks[0..self.inventory_click_count],
-            &slots,
+            self.disconnected,
         );
         self.creative_slot_change_count = retainConnected(
             CreativeSlotChange,
             self.creative_slot_changes[0..self.creative_slot_change_count],
-            &slots,
+            self.disconnected,
         );
+        for (self.deps.events.left.values) |event| self.disconnected[event.slot] = false;
     }
 
     fn retainConnected(
         comptime T: type,
         values: []T,
-        disconnected: []const u64,
+        disconnected: []const bool,
     ) usize {
         var retained: usize = 0;
         for (values) |value| {
             const slot: usize = value.slot;
-            if (disconnected[slot / 64] & (@as(u64, 1) << @intCast(slot % 64)) != 0)
+            if (disconnected[slot])
                 continue;
             values[retained] = value;
             retained += 1;
@@ -434,3 +534,29 @@ pub const Inputs = struct {
         return retained;
     }
 };
+
+test "attack intents can be rejected before combat" {
+    var player_attacks = [_]PendingPlayerAttack{.{
+        .active = true,
+        .target_slot = 1,
+        .target_entity_id = 2,
+    }};
+    var living_attacks = [_]PendingLivingAttack{.{
+        .active = true,
+        .entity_id = 3,
+    }};
+    var inputs = Inputs{
+        .deps = undefined,
+        .player_attacks = &player_attacks,
+        .living_attacks = &living_attacks,
+    };
+    const player_intent = inputs.playerAttackIntent(0).?;
+    const living_intent = inputs.livingAttackIntent(0).?;
+    try std.testing.expectEqual(@as(u16, 1), player_intent.target_slot);
+    try std.testing.expectEqual(@as(i32, 2), player_intent.target_entity_id);
+    try std.testing.expectEqual(@as(i32, 3), living_intent.target_entity_id);
+    inputs.rejectPlayerAttack(0);
+    inputs.rejectLivingAttack(0);
+    try std.testing.expect(inputs.playerAttackIntent(0) == null);
+    try std.testing.expect(inputs.livingAttackIntent(0) == null);
+}

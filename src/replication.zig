@@ -1,83 +1,48 @@
 const std = @import("std");
 const preallocated = @import("preallocated");
-const config = @import("config.zig");
-const chunk_stream = @import("chunk_view_tracker.zig");
 const view = @import("view.zig");
 
-const living_visibility_words = (config.value.max_living_entities + 63) / 64;
-const item_visibility_words = (config.value.max_item_entities + 63) / 64;
-const player_visibility_words = (config.connection_capacity + 63) / 64;
+pub const Configuration = struct {
+    maximum_clients: usize,
+    maximum_players: usize,
+    maximum_living: usize,
+    maximum_items: usize,
+    view: view.Configuration = .{},
 
-/// Per-recipient projection state owned by packet replication, not transport.
-/// It records what a client has already been told so tick plugins can produce
-/// the next exact packet delta.
+    pub fn validate(self: Configuration) !void {
+        if (self.maximum_clients == 0 or self.maximum_players == 0 or self.maximum_living == 0 or self.maximum_items == 0) return error.InvalidReplicationCapacity;
+        try self.view.validate();
+    }
+};
+
 pub const ClientProjection = struct {
-    chunks: chunk_stream.Tracker = .{},
     view: view.PlayerView = .{},
     visible_players: []u64 = &.{},
     visible_living: []u64 = &.{},
     visible_items: []u64 = &.{},
     pending_item_metadata: []u64 = &.{},
     item_sync_pending: bool = false,
-    chunks_per_tick: f32 = 9.0,
-    chunk_batch_quota: f32 = 0.0,
-    unacknowledged_chunk_batches: u8 = 0,
-    maximum_unacknowledged_chunk_batches: u8 = 1,
 
-    pub fn allocate(self: *ClientProjection, allocator: std.mem.Allocator) !void {
+    pub fn allocate(
+        self: *ClientProjection,
+        allocator: std.mem.Allocator,
+        configuration: Configuration,
+    ) !void {
         self.* = .{};
-        try self.chunks.allocate(allocator);
-        try self.view.allocate(allocator);
-        self.visible_players = try preallocated.alloc(u64, allocator, player_visibility_words);
-        self.visible_living = try preallocated.alloc(u64, allocator, living_visibility_words);
-        self.visible_items = try preallocated.alloc(u64, allocator, item_visibility_words);
-        self.pending_item_metadata = try preallocated.alloc(u64, allocator, item_visibility_words);
+        try self.view.allocate(allocator, configuration.view);
+        self.visible_players = try preallocated.alloc(u64, allocator, wordsFor(configuration.maximum_players));
+        self.visible_living = try preallocated.alloc(u64, allocator, wordsFor(configuration.maximum_living));
+        self.visible_items = try preallocated.alloc(u64, allocator, wordsFor(configuration.maximum_items));
+        self.pending_item_metadata = try preallocated.alloc(u64, allocator, wordsFor(configuration.maximum_items));
     }
 
     pub fn reset(self: *ClientProjection) void {
-        self.chunks.reset(.{ .x = 0, .z = 0 });
         self.view.reset();
         @memset(self.visible_players, 0);
         @memset(self.visible_living, 0);
         @memset(self.visible_items, 0);
         @memset(self.pending_item_metadata, 0);
         self.item_sync_pending = false;
-        self.chunks_per_tick = 9.0;
-        self.chunk_batch_quota = 0.0;
-        self.unacknowledged_chunk_batches = 0;
-        self.maximum_unacknowledged_chunk_batches = 1;
-    }
-
-    pub fn beginChunkBatch(self: *ClientProjection) u16 {
-        if (self.unacknowledged_chunk_batches >=
-            self.maximum_unacknowledged_chunk_batches) return 0;
-        self.chunk_batch_quota = @min(
-            self.chunk_batch_quota + self.chunks_per_tick,
-            @max(1.0, self.chunks_per_tick),
-        );
-        if (self.chunk_batch_quota < 1.0) return 0;
-        return @min(64, @as(u16, @intFromFloat(self.chunk_batch_quota)));
-    }
-
-    pub fn finishChunkBatch(self: *ClientProjection, chunk_count: u16) void {
-        std.debug.assert(self.unacknowledged_chunk_batches <
-            self.maximum_unacknowledged_chunk_batches);
-        std.debug.assert(@as(f32, @floatFromInt(chunk_count)) <= self.chunk_batch_quota);
-        self.chunk_batch_quota -= @floatFromInt(chunk_count);
-        self.unacknowledged_chunk_batches += 1;
-    }
-
-    pub fn acknowledgeChunkBatch(self: *ClientProjection, chunks_per_tick: f32) void {
-        if (self.unacknowledged_chunk_batches != 0)
-            self.unacknowledged_chunk_batches -= 1;
-        if (self.unacknowledged_chunk_batches == 0) {
-            self.chunk_batch_quota = 1.0;
-            self.maximum_unacknowledged_chunk_batches = 10;
-        }
-        self.chunks_per_tick = if (std.math.isNan(chunks_per_tick))
-            1.0
-        else
-            std.math.clamp(chunks_per_tick, 0.01, 64.0);
     }
 
     pub inline fn playerVisible(self: *const ClientProjection, slot: u16) bool {
@@ -112,6 +77,10 @@ inline fn bitIsSet(words: []const u64, index: u16) bool {
     return words[word] & mask != 0;
 }
 
+inline fn wordsFor(capacity: usize) usize {
+    return std.math.divCeil(usize, capacity, 64) catch unreachable;
+}
+
 inline fn setBit(words: []u64, index: u16, value: bool) void {
     const word = index >> 6;
     const mask = @as(u64, 1) << @intCast(index & 63);
@@ -124,13 +93,12 @@ inline fn setBit(words: []u64, index: u16, value: bool) void {
 pub const State = struct {
     clients: []ClientProjection = &.{},
 
-    /// Avoid materializing a complete multi-megabyte default State in every
-    /// executable that owns replication. Only one projection-sized default is
-    /// needed and it is applied directly to already allocated storage.
-    pub fn allocate(self: *State, allocator: std.mem.Allocator) !void {
+    pub fn allocate(self: *State, allocator: std.mem.Allocator, configuration: Configuration) !void {
+        try configuration.validate();
         self.* = .{};
-        self.clients = try preallocated.alloc(ClientProjection, allocator, config.connection_capacity);
-        for (self.clients) |*client| try client.allocate(allocator);
+        self.clients = try preallocated.alloc(ClientProjection, allocator, configuration.maximum_clients);
+        for (self.clients) |*client|
+            try client.allocate(allocator, configuration);
     }
 
     pub fn reset(self: *State, slot: u16) void {
@@ -142,7 +110,12 @@ test "item projection distinguishes spawn visibility from pending metadata" {
     var projection: ClientProjection = .{};
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try projection.allocate(arena.allocator());
+    try projection.allocate(arena.allocator(), .{
+        .maximum_clients = 1,
+        .maximum_players = 64,
+        .maximum_living = 64,
+        .maximum_items = 64,
+    });
     projection.reset();
     projection.setItemVisible(47, true);
     projection.setItemMetadataPending(47, true);
@@ -152,17 +125,4 @@ test "item projection distinguishes spawn visibility from pending metadata" {
     projection.setItemVisible(47, false);
     try std.testing.expect(!projection.itemVisible(47));
     try std.testing.expect(!projection.itemMetadataPending(47));
-}
-
-test "chunk batch pacing is client driven and bounded" {
-    var projection: ClientProjection = .{};
-    try std.testing.expectEqual(@as(u16, 9), projection.beginChunkBatch());
-    projection.finishChunkBatch(9);
-    try std.testing.expectEqual(@as(u16, 0), projection.beginChunkBatch());
-
-    projection.acknowledgeChunkBatch(1000.0);
-    try std.testing.expectEqual(@as(u16, 64), projection.beginChunkBatch());
-    projection.finishChunkBatch(64);
-    projection.acknowledgeChunkBatch(0.01);
-    try std.testing.expectEqual(@as(u16, 1), projection.beginChunkBatch());
 }

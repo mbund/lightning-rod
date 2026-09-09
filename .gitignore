@@ -2,8 +2,11 @@
 zig-out/
 zig-pkg/
 *.so
+*.wal
 /world/
 /examples/*/world/
+/examples/*/*.root
+/examples/*/*.root.pack.*
 logs/
 perf.data*
 tests/conformance/.cache/
@@ -25,3 +28,4 @@ conformance/tools/vanilla-harness/.gradle/
 conformance/tools/vanilla-harness/build/
 conformance/tools/vanilla-harness/home/
 conformance/tools/vanilla-harness/run/
+/tools/worldgen/vanilla-*/

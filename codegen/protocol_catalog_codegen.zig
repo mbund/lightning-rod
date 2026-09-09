@@ -19,6 +19,7 @@ pub fn main(init: std.process.Init) !void {
     const version_count = try std.fmt.parseInt(usize, args.next() orelse return error.MissingVersionCount, 10);
     const default_index = try std.fmt.parseInt(usize, args.next() orelse return error.MissingDefaultVersion, 10);
     const canonical_index = try std.fmt.parseInt(usize, args.next() orelse return error.MissingCanonicalVersion, 10);
+    const minimum_release = try std.fmt.parseInt(u8, args.next() orelse return error.MissingMinimumRelease, 10);
     if (default_index >= version_count or canonical_index >= version_count) return error.InvalidSelectedVersion;
 
     const versions = try allocator.alloc(Version, version_count);
@@ -32,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
         version.accepted_names = accepted_names;
     }
     if (args.next() != null) return error.TooManyArguments;
-    try writeCatalog(init.io, output_path, schema_count, versions, default_index, canonical_index);
+    try writeCatalog(init.io, output_path, schema_count, versions, default_index, canonical_index, minimum_release);
 }
 
 fn writeCatalog(
@@ -42,6 +43,7 @@ fn writeCatalog(
     versions: []const Version,
     default_index: usize,
     canonical_index: usize,
+    minimum_release: u8,
 ) !void {
     const file = try std.Io.Dir.createFile(.cwd(), io, output_path, .{});
     defer file.close(io);
@@ -62,11 +64,16 @@ fn writeCatalog(
     for (versions, 0..) |version, index| try writeVersion(out, version, index);
     try out.writeAll("pub const entries = .{\n");
     for (versions, 0..) |_, index| try out.print("    version_{},\n", .{index});
+    try out.writeAll("};\n\npub const minecraft_names = [_][]const u8{\n");
+    for (versions) |version| {
+        for (version.accepted_names) |name| try out.print("    \"{s}\",\n", .{name});
+    }
     try out.writeAll("};\n\npub const Support = struct {\n    id: []const u8,\n    version: Version,\n    protocol_number: i32,\n};\n\npub const support = [_]Support{\n");
     for (versions, 0..) |_, index|
         try out.print("    .{{ .id = version_{}.id, .version = version_{}.version, .protocol_number = version_{}.protocol_number }},\n", .{ index, index, index });
     try out.print("}};\n\npub const default = Version.version_{};\n", .{default_index});
     try out.print("pub const canonical = Version.version_{};\n", .{canonical_index});
+    try out.print("pub const minimum_release: u8 = {};\n", .{minimum_release});
     try out.writeAll("\npub fn fromMinecraftName(name: []const u8) ?Version {\n");
     for (versions, 0..) |version, index| {
         for (version.accepted_names) |name|

@@ -1,6 +1,4 @@
 const protocol = @import("protocol");
-const play_decode = @import("play_decode.zig");
-const registry_data = @import("registry_data");
 
 pub const State = enum {
     handshaking,
@@ -10,8 +8,6 @@ pub const State = enum {
     play,
 };
 
-/// Exercises the generated, zero-copy packet readers without any connection or
-/// reactor state. Callers decide whether a decode error is expected.
 pub fn validatePayload(state: State, payload: []const u8) !void {
     switch (state) {
         .handshaking => try validateHandshake(payload),
@@ -77,28 +73,5 @@ fn validateConfiguration(payload: []const u8) !void {
 }
 
 fn validatePlay(payload: []const u8) !void {
-    const Validator = struct {
-        pub fn teleport_confirm(_: *@This(), _: u16, _: i32) void {}
-        pub fn keep_alive_response(_: *@This(), _: u16, _: i64) void {}
-        pub fn movement(_: *@This(), _: u16, _: ?play_decode.Position, _: ?play_decode.Rotation, _: bool) !void {}
-        pub fn player_input(_: *@This(), _: u16, _: bool, _: bool) !void {}
-        pub fn player_sprint(_: *@This(), _: u16, _: bool) !void {}
-        pub fn player_loaded(_: *@This(), _: u16) void {}
-        pub fn chat(_: *@This(), _: u16, _: []const u8) !void {}
-        pub fn command(_: *@This(), _: u16, _: []const u8) !void {}
-        pub fn block_dig(_: *@This(), _: u16, _: i32, _: play_decode.BlockPosition, _: i32, _: i32) !void {}
-        pub fn block_place(_: *@This(), _: u16, _: play_decode.BlockPosition, _: i32, _: f32, _: f32, _: f32, _: i32) !void {}
-        pub fn held_item_slot(_: *@This(), _: u16, _: i16) !void {}
-        pub fn arm_animation(_: *@This(), _: u16, _: i32) !void {}
-        pub fn attack_entity(_: *@This(), _: u16, _: i32) !void {}
-        pub fn interact_entity(_: *@This(), _: u16, _: i32, _: i32) !void {}
-        pub fn respawn(_: *@This(), _: u16) !void {}
-        pub fn use_item(_: *@This(), _: u16, _: i32) !void {}
-        pub fn window_click(_: *@This(), _: u16, _: i32, _: i32, _: i16, _: i8, _: i32) !void {}
-        pub fn creative_slot(_: *@This(), _: u16, _: i16, _: i32, _: u8) !void {}
-        pub fn close_window(_: *@This(), _: u16, _: i32) !void {}
-        pub fn ignored(_: *@This(), _: u16) void {}
-    };
-    var validator: Validator = .{};
-    try play_decode.dispatchWith(protocol, registry_data, payload, 0, &validator);
+    _ = try protocol.play.toServer.read(payload).name();
 }

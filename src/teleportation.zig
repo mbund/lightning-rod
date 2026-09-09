@@ -8,7 +8,6 @@ const player_store = @import("world/players.zig");
 const Packets = @import("packet_writer.zig").Packets;
 const world_identity = @import("world/identity.zig");
 const world_dimensions = @import("world/dimensions.zig");
-const world_generation = @import("world/generation.zig");
 const world_store = @import("world/worlds.zig");
 
 pub const Rotation = union(enum) {
@@ -31,32 +30,21 @@ pub const Destination = struct {
 
 pub const Teleportation = struct {
     pub const id = "lightning_rod:teleportation";
-
-    worlds: *world_store.Worlds,
-    players: *player_store.Players,
-    living: *entity_store.LivingEntities,
-    items: *entity_store.ItemEntities,
-    containers: *player_store.Containers,
-    inputs: *input_store.Inputs,
-
-    pub fn create(
-        allocator: std.mem.Allocator,
+    pub const Configuration = struct {};
+    pub const Dependencies = struct {
         worlds: *world_store.Worlds,
         players: *player_store.Players,
         living: *entity_store.LivingEntities,
         items: *entity_store.ItemEntities,
         containers: *player_store.Containers,
         inputs: *input_store.Inputs,
-    ) !*Teleportation {
+    };
+
+    deps: Dependencies,
+
+    pub fn init(allocator: std.mem.Allocator, deps: Dependencies, _: Configuration) !*Teleportation {
         const self = try allocator.create(Teleportation);
-        self.* = .{
-            .worlds = worlds,
-            .players = players,
-            .living = living,
-            .items = items,
-            .containers = containers,
-            .inputs = inputs,
-        };
+        self.* = .{ .deps = deps };
         return self;
     }
 
@@ -70,7 +58,7 @@ pub const Teleportation = struct {
         if (result.closed_window) |window_id|
             outputs.container_closed(.{ .slot = slot, .window_id = window_id });
         if (result.world_changed) {
-            outputs.player_world_changed(slot);
+            outputs.playerWorldChanged(slot, result.previous_world);
         } else {
             outputs.player_teleported(slot);
         }
@@ -78,6 +66,7 @@ pub const Teleportation = struct {
 
     const PlayerTransfer = struct {
         world_changed: bool,
+        previous_world: world_identity.Handle,
         closed_window: ?i32,
     };
 
@@ -87,20 +76,20 @@ pub const Teleportation = struct {
         destination: Destination,
     ) !PlayerTransfer {
         try self.validate(destination);
-        self.players.assertSlot(slot);
-        const player_record = &self.players.records[slot];
+        self.deps.players.assertSlot(slot);
+        const player_record = &self.deps.players.records[slot];
         if (player_record.state != .play) return error.PlayerNotInPlay;
-        const world_changed = !player_record.world.eql(destination.world);
+        const previous_world = player_record.world;
+        const world_changed = !previous_world.eql(destination.world);
         const rotation = resolveRotation(player_record.rotation, destination.rotation);
-        const closed_window = if (self.containers.open[slot].kind == .none)
+        const closed_window = if (self.deps.containers.open[slot].kind == .none)
             null
         else
-            self.containers.open[slot].id;
-        container_menu.close(self.players, self.containers, slot);
-        self.players.teleport(slot, destination.world, destination.position, rotation);
-        self.inputs.resetPlayerTransfer(slot);
-        if (world_changed) player_record.play_join_terrain_ready = false;
-        return .{ .world_changed = world_changed, .closed_window = closed_window };
+            self.deps.containers.open[slot].id;
+        container_menu.close(self.deps.players, self.deps.containers, slot);
+        self.deps.players.teleport(slot, destination.world, destination.position, rotation);
+        self.deps.inputs.resetPlayerTransfer(slot);
+        return .{ .world_changed = world_changed, .previous_world = previous_world, .closed_window = closed_window };
     }
 
     pub fn livingEntity(
@@ -109,20 +98,27 @@ pub const Teleportation = struct {
         handle: living_entities.Handle,
         destination: Destination,
     ) !void {
-        const index = try self.applyLivingEntity(handle, destination);
-        outputs.living_moved(index);
+        const transfer = try self.applyLivingEntity(handle, destination);
+        if (transfer.world_changed)
+            outputs.livingTransferred(transfer.index, transfer.previous_world)
+        else
+            outputs.living_moved(transfer.index);
     }
+
+    const EntityTransfer = struct { index: u16, previous_world: world_identity.Handle, world_changed: bool };
 
     fn applyLivingEntity(
         self: *Teleportation,
         handle: living_entities.Handle,
         destination: Destination,
-    ) !u16 {
+    ) !EntityTransfer {
         try self.validate(destination);
-        if (!self.living.transfer(handle, destination.world, destination.position))
+        if (!self.deps.living.entities.isAlive(handle)) return error.InvalidLivingEntity;
+        const previous_world = self.deps.living.entities.worlds[handle.index];
+        if (!self.deps.living.transfer(handle, destination.world, destination.position))
             return error.InvalidLivingEntity;
         const index = handle.index;
-        const entities = &self.living.entities;
+        const entities = &self.deps.living.entities;
         const rotation = resolveRotation(.{
             .yaw = entities.yaw[index],
             .pitch = entities.pitch[index],
@@ -132,7 +128,7 @@ pub const Teleportation = struct {
         entities.body_yaw[index] = rotation.yaw;
         entities.head_yaw[index] = rotation.yaw;
         applyLivingVelocity(entities, index, destination.velocity);
-        return index;
+        return .{ .index = index, .previous_world = previous_world, .world_changed = !previous_world.eql(destination.world) };
     }
 
     pub fn itemEntity(
@@ -141,27 +137,32 @@ pub const Teleportation = struct {
         index: u16,
         destination: Destination,
     ) !void {
-        _ = try self.applyItemEntity(index, destination);
-        outputs.item_moved(index);
+        const transfer = try self.applyItemEntity(index, destination);
+        if (transfer.world_changed)
+            outputs.itemTransferred(transfer.index, transfer.previous_world)
+        else
+            outputs.item_moved(transfer.index);
     }
 
     fn applyItemEntity(
         self: *Teleportation,
         index: u16,
         destination: Destination,
-    ) !u16 {
+    ) !EntityTransfer {
         try self.validate(destination);
-        if (!self.items.transfer(
+        if (index >= self.deps.items.active.len or !self.deps.items.active[index]) return error.InvalidItemEntity;
+        const previous_world = self.deps.items.worlds[index];
+        if (!self.deps.items.transfer(
             index,
             destination.world,
             destination.position,
             resolvedVelocity(destination.velocity),
         )) return error.InvalidItemEntity;
-        return index;
+        return .{ .index = index, .previous_world = previous_world, .world_changed = !previous_world.eql(destination.world) };
     }
 
     fn validate(self: *const Teleportation, destination: Destination) !void {
-        if (self.worlds.getConst(destination.world) == null) return error.InvalidWorld;
+        if (self.deps.worlds.getConst(destination.world) == null) return error.InvalidWorld;
         if (!finite(destination.position)) return error.InvalidPosition;
         switch (destination.rotation) {
             .preserve => {},
@@ -209,7 +210,7 @@ const test_world_descriptions = [_]world_store.Description{
         .key = .{ .value = 1 },
         .name = "test:source",
         .dimension = world_dimensions.Vanilla.dimensionId(world_dimensions.Overworld),
-        .generator = world_generation.Default.generatorId(world_generation.Overworld),
+        .generator = @enumFromInt(0),
         .seed = 1,
         .spawn_x = 0,
         .spawn_y = 64,
@@ -219,7 +220,7 @@ const test_world_descriptions = [_]world_store.Description{
         .key = .{ .value = 2 },
         .name = "test:target",
         .dimension = world_dimensions.Vanilla.dimensionId(world_dimensions.Overworld),
-        .generator = world_generation.Default.generatorId(world_generation.Overworld),
+        .generator = @enumFromInt(0),
         .seed = 2,
         .spawn_x = 0,
         .spawn_y = 80,
@@ -232,20 +233,20 @@ test "player transfer atomically resets session-local state" {
     defer arena.deinit();
     const allocator = arena.allocator();
     var lifecycle: @import("player_lifecycle.zig").Events = .{};
-    const worlds = try world_store.Worlds.create(allocator, .{ .initial = &test_world_descriptions });
-    _ = try world_dimensions.Vanilla.create(allocator, worlds);
-    const players = try player_store.Players.create(allocator, &lifecycle);
-    const living = try entity_store.LivingEntities.create(allocator);
-    const items = try entity_store.ItemEntities.create(allocator);
-    const containers = try player_store.Containers.create(allocator, &lifecycle);
-    const inputs = try input_store.Inputs.create(allocator, &lifecycle);
+    const worlds = try world_store.Worlds.init(allocator, .{ .initial = &test_world_descriptions });
+    _ = try world_dimensions.Vanilla.init(allocator, .{ .worlds = worlds }, .{});
+    const players = try player_store.Players.init(allocator, .{ .events = &lifecycle, .worlds = worlds }, .{ .initial_world = .{ .value = 1 } });
+    const items = try entity_store.ItemEntities.init(allocator, .{ .first_entity_id = @intCast(players.records.len + 1) });
+    const living = try entity_store.LivingEntities.init(allocator, .{ .first_entity_id = @intCast(players.records.len + items.active.len + 1) });
+    const containers = try player_store.Containers.init(allocator, .{ .events = &lifecycle, .players = players }, .{});
+    const inputs = try input_store.Inputs.init(allocator, .{ .events = &lifecycle, .players = players }, .{});
 
     const source = worlds.find(.{ .value = 1 }).?;
     const target = worlds.find(.{ .value = 2 }).?;
-    players.records[0] = .{ .state = .play, .world = source, .play_join_terrain_ready = true };
+    players.records[0] = .{ .state = .play, .world = source };
     containers.open[0] = .{ .kind = .chest, .id = 7 };
     inputs.movements[0].dirty = true;
-    const teleports = try Teleportation.create(allocator, worlds, players, living, items, containers, inputs);
+    const teleports = try Teleportation.init(allocator, .{ .worlds = worlds, .players = players, .living = living, .items = items, .containers = containers, .inputs = inputs }, .{});
     const destination = Destination{ .world = target, .position = .{ .x = 1, .y = 80, .z = 2 } };
     const result = try teleports.applyPlayer(0, destination);
 
@@ -254,7 +255,6 @@ test "player transfer atomically resets session-local state" {
     try std.testing.expect(players.records[0].world.eql(target));
     try std.testing.expectEqual(destination.position, players.records[0].position);
     try std.testing.expectEqual(@as(u64, 1), players.records[0].teleport_epoch);
-    try std.testing.expect(!players.records[0].play_join_terrain_ready);
     try std.testing.expect(!inputs.movements[0].dirty);
     try std.testing.expectEqual(player_store.ContainerKind.none, containers.open[0].kind);
 }
@@ -264,13 +264,13 @@ test "living and item transfers update world-local state" {
     defer arena.deinit();
     const allocator = arena.allocator();
     var lifecycle: @import("player_lifecycle.zig").Events = .{};
-    const worlds = try world_store.Worlds.create(allocator, .{ .initial = &test_world_descriptions });
-    _ = try world_dimensions.Vanilla.create(allocator, worlds);
-    const players = try player_store.Players.create(allocator, &lifecycle);
-    const living = try entity_store.LivingEntities.create(allocator);
-    const items = try entity_store.ItemEntities.create(allocator);
-    const containers = try player_store.Containers.create(allocator, &lifecycle);
-    const inputs = try input_store.Inputs.create(allocator, &lifecycle);
+    const worlds = try world_store.Worlds.init(allocator, .{ .initial = &test_world_descriptions });
+    _ = try world_dimensions.Vanilla.init(allocator, .{ .worlds = worlds }, .{});
+    const players = try player_store.Players.init(allocator, .{ .events = &lifecycle, .worlds = worlds }, .{ .initial_world = .{ .value = 1 } });
+    const items = try entity_store.ItemEntities.init(allocator, .{ .first_entity_id = @intCast(players.records.len + 1) });
+    const living = try entity_store.LivingEntities.init(allocator, .{ .first_entity_id = @intCast(players.records.len + items.active.len + 1) });
+    const containers = try player_store.Containers.init(allocator, .{ .events = &lifecycle, .players = players }, .{});
+    const inputs = try input_store.Inputs.init(allocator, .{ .events = &lifecycle, .players = players }, .{});
     const source = worlds.find(.{ .value = 1 }).?;
     const target = worlds.find(.{ .value = 2 }).?;
     const handle = try living.entities.spawn(.{
@@ -282,7 +282,7 @@ test "living and item transfers update world-local state" {
     });
     items.active[0] = true;
     items.worlds[0] = source;
-    const teleports = try Teleportation.create(allocator, worlds, players, living, items, containers, inputs);
+    const teleports = try Teleportation.init(allocator, .{ .worlds = worlds, .players = players, .living = living, .items = items, .containers = containers, .inputs = inputs }, .{});
     const destination = Destination{
         .world = target,
         .position = .{ .x = 4, .y = 80, .z = 5 },
@@ -298,7 +298,7 @@ test "living and item transfers update world-local state" {
     try std.testing.expect(items.worlds[0].eql(target));
     try std.testing.expectEqual(destination.position, items.position(0));
     try std.testing.expectEqual(@as(f64, 3), items.velocity_z[0]);
-    try std.testing.expectEqual(entity_store.itemSpatialBucket(target, destination.position), items.bucket_indices[0]);
+    try std.testing.expectEqual(items.itemSpatialBucket(target, destination.position), items.bucket_indices[0]);
 }
 
 test "destination policies preserve or replace rotation" {

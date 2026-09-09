@@ -1,7 +1,7 @@
 const std = @import("std");
 const registry = @import("registry_data");
 const game_data = @import("../game_data.zig");
-const config = @import("../config.zig").value;
+const limits = @import("limits.zig");
 const collision = @import("../collision.zig");
 const navigation = @import("../navigation.zig");
 const diagnostics = @import("../diagnostics.zig");
@@ -49,11 +49,9 @@ pub fn adjustLivingMovement(blocks: *block_store.Blocks, world: world_identity.H
 }
 
 pub fn livingBoxCollides(blocks: *block_store.Blocks, world: world_identity.Handle, box: collision.Box) bool {
-    // Collision shapes never leave their owning block, so only unit cubes
-    // overlapping the half-open entity box can collide.
     const min_x = geometry.blockCoord(box.min_x);
     const max_x = blockCoordBelow(box.max_x);
-    const min_y = @max(geometry.blockCoord(box.min_y), @as(i32, config.world_min_y));
+    const min_y = @max(geometry.blockCoord(box.min_y), @as(i32, limits.min_y));
     const max_y = @min(blockCoordBelow(box.max_y), @as(i32, block_store.world_top_y));
     const min_z = geometry.blockCoord(box.min_z);
     const max_z = blockCoordBelow(box.max_z);
@@ -103,7 +101,7 @@ pub fn hasLineOfSight(blocks: *block_store.Blocks, world: world_identity.Handle,
 
     var traversed: usize = 0;
     while (traversed < 256) : (traversed += 1) {
-        if (y >= config.world_min_y and y <= block_store.world_top_y) {
+        if (y >= limits.min_y and y <= block_store.world_top_y) {
             const current_chunk = geometry.chunkForBlock(.{ .x = x, .y = 0, .z = z });
             if (!geometry.sameChunk(current_chunk, resident_chunk)) {
                 resident_chunk = current_chunk;
@@ -172,7 +170,7 @@ pub fn hasVisualLineOfSight(
 
     var traversed: usize = 0;
     while (traversed < 512) : (traversed += 1) {
-        if (y >= config.world_min_y and y <= block_store.world_top_y) {
+        if (y >= limits.min_y and y <= block_store.world_top_y) {
             const current_chunk =
                 geometry.chunkForBlock(.{ .x = x, .y = 0, .z = z });
             if (!geometry.sameChunk(current_chunk, resident_chunk)) {
@@ -203,7 +201,7 @@ pub fn hasVisualLineOfSight(
 }
 
 pub fn pathNode(blocks: *block_store.Blocks, world: world_identity.Handle, x: i32, y: i16, z: i32, baby: bool) navigation.Candidate {
-    if (y <= config.world_min_y or y > block_store.world_top_y) return .{ .node = .{ .x = x, .y = y, .z = z, .node_type = .blocked, .penalty = -1 }, .passable = false };
+    if (y <= limits.min_y or y > block_store.world_top_y) return .{ .node = .{ .x = x, .y = y, .z = z, .node_type = .blocked, .penalty = -1 }, .passable = false };
     const resident = blocks.residentChunk(world, .{ .x = @divFloor(x, 16), .z = @divFloor(z, 16) }) orelse
         return .{ .node = .{ .x = x, .y = y, .z = z, .node_type = .blocked, .penalty = -1 }, .passable = false };
     return pathNodeInResident(blocks, resident, x, y, z, baby);
@@ -230,13 +228,10 @@ pub fn pathNodeForDimensionsInResident(
     width: f32,
     height: f32,
 ) navigation.Candidate {
-    if (y <= config.world_min_y or y > block_store.world_top_y) return .{ .node = .{ .x = x, .y = y, .z = z, .node_type = .blocked, .penalty = -1 }, .passable = false };
+    if (y <= limits.min_y or y > block_store.world_top_y) return .{ .node = .{ .x = x, .y = y, .z = z, .node_type = .blocked, .penalty = -1 }, .passable = false };
     std.debug.assert(geometry.sameChunk(resident.chunk, .{ .x = @divFloor(x, 16), .z = @divFloor(z, 16) }));
     const below_y: i32 = @as(i32, y) - 1;
     const below_state = blocks.blockAtResident(resident, .{ .x = x, .y = @intCast(below_y), .z = z });
-    // Vanilla's land node maker treats an open trapdoor as a walkable
-    // floor even though its physical collision is vertical. This is the
-    // intentional pathfinding/physics disagreement used by mob farms.
     var support_height: f64 = if (isOpenTrapdoor(below_state)) 1 else 0;
     if (support_height == 0) for (collision.shapeBoxes(below_state)) |local_box| {
         support_height = @max(support_height, @as(f64, @floatFromInt(local_box.max_y)) / collision.coordinate_scale);
@@ -251,7 +246,7 @@ pub fn pathNodeForDimensionsInResident(
         width,
         height - 0.002,
     );
-    const min_y = @max(geometry.blockCoord(body.min_y), @as(i32, config.world_min_y));
+    const min_y = @max(geometry.blockCoord(body.min_y), @as(i32, limits.min_y));
     const max_y = @min(blockCoordBelow(body.max_y), @as(i32, block_store.world_top_y));
     var body_y = min_y;
     while (body_y <= max_y) : (body_y += 1) {
@@ -269,7 +264,7 @@ fn clipLivingAxis(blocks: *const block_store.Blocks, world: world_identity.Handl
     var result = requested;
     const min_x = geometry.blockCoord(swept.min_x);
     const max_x = blockCoordBelow(swept.max_x);
-    const min_y = @max(geometry.blockCoord(swept.min_y), @as(i32, config.world_min_y));
+    const min_y = @max(geometry.blockCoord(swept.min_y), @as(i32, limits.min_y));
     const max_y = @min(blockCoordBelow(swept.max_y), @as(i32, block_store.world_top_y));
     const min_z = geometry.blockCoord(swept.min_z);
     const max_z = blockCoordBelow(swept.max_z);

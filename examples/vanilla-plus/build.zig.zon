@@ -5,6 +5,9 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .lightning_rod = .{ .path = "../.." },
+        .lightning_rod_linux = .{ .path = "../../linux" },
+        .lightning_rod_tui = .{ .path = "../../tui" },
+        .lightning_rod_vanilla_1_21_6 = .{ .path = "../../vanilla" },
         .economy = .{ .path = "../plugins/economy" },
         .shop = .{ .path = "../plugins/shop" },
     },

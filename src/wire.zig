@@ -6,8 +6,6 @@ pub const FramedPacket = struct {
     total_len: usize,
 };
 
-/// Returns a zero-copy view of one complete Minecraft frame. Incomplete input
-/// is not an error and remains owned by the caller.
 pub fn nextPacket(buffer: []const u8) !?FramedPacket {
     if (buffer.len == 0) return null;
     const len, const payload = protocol_support.read_varint(buffer) catch |err| switch (err) {

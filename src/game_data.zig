@@ -81,8 +81,6 @@ pub fn blockStateForItem(item_id: i32) i32 {
     return itemInfo(item_id).block_state;
 }
 
-/// Total unenchanted player attack damage for the generated 1.21.8 item ids.
-/// The empty hand contributes the player's intrinsic one point of damage.
 pub fn playerAttackDamage(item_id: i32) f32 {
     return itemInfo(item_id).attack_damage;
 }
@@ -143,15 +141,12 @@ pub fn canHarvest(block_state: i32, item_id: i32) bool {
     return false;
 }
 
-/// Vanilla's base destruction-time calculation. Status effects,
-/// enchantments, water, and airborne penalties can be layered onto speed.
 pub fn blockBreakTicks(block_state: i32, item_id: i32) u16 {
     const damage = blockDamagePerTick(block_state, item_id);
     if (damage == 0) return std.math.maxInt(u16);
     return @intFromFloat(@max(1, @min(@as(f32, std.math.maxInt(u16)), @ceil(1.0 / damage))));
 }
 
-/// Vanilla's destroy-progress increment for one server game-mode tick.
 pub fn blockDamagePerTick(block_state: i32, item_id: i32) f32 {
     const block = blockInfo(block_state);
     if (!block.diggable or block.hardness < 0) return 0;
@@ -177,7 +172,6 @@ pub fn blockDamageQ32(block_state: i32, item_id: i32) u64 {
     return @intFromFloat(@ceil(@as(f64, damage) * @as(f64, @floatFromInt(one))));
 }
 
-/// Matches a normalized 2x2 or 3x3 crafting grid. Item id zero is empty.
 pub fn craft(grid: []const i32, width: u8, height: u8) ?CraftResult {
     if ((width != 2 and width != 3) or (height != 2 and height != 3) or grid.len != @as(usize, width) * height) return null;
     var min_x: usize = width;
@@ -290,7 +284,6 @@ test "generated item and block metadata covers ordinary and durable items" {
 }
 
 test "generated recipes match shaped and shapeless layouts" {
-    // Four stone blocks craft stone bricks in this data version.
     const shaped = [_]i32{ data.item_stone_id, data.item_stone_id, data.item_stone_id, data.item_stone_id };
     try std.testing.expect(craft(&shaped, 2, 2) != null);
 }

@@ -8,7 +8,7 @@ test "player overlays affect only their block and chunk" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var player_view: view.PlayerView = .{};
-    try player_view.allocate(arena.allocator());
+    try player_view.allocate(arena.allocator(), .{});
 
     const pos = geometry.BlockPos{ .x = 17, .y = 64, .z = -1 };
     const chunk = geometry.chunkForBlock(pos);

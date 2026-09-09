@@ -58,7 +58,7 @@ test "collision queries never generate missing terrain" {
     defer arena.deinit();
     var generator: test_generator.Generator = .{};
     const blocks = try test_generator.createBlocks(&generator, arena.allocator(), 0x7265_7369_6465_6e74);
-    blocks.requestChunkGeneration(test_world, .{ .x = 0, .z = 0 });
+    try std.testing.expect(blocks.requestChunkGeneration(test_world, .{ .x = 0, .z = 0 }));
 
     const body = collision.entityBox(8, 90, 8, 0.6, 1.8);
     try std.testing.expectEqual(collision.Movement{}, adjustLivingMovement(blocks, test_world, body, .{ .y = -0.08 }));

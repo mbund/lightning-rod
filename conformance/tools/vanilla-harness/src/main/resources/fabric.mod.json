@@ -2,17 +2,8 @@
   "schemaVersion": 1,
   "id": "lightning-rod-vanilla-conformance-harness",
   "version": "${version}",
-  "name": "Lightning Rod Vanilla Conformance Harness",
-  "description": "A behavior-free tick and packet boundary around the Vanilla server.",
   "environment": "server",
-  "entrypoints": {
-    "main": ["dev.mbund.lightningrod.vanillaharness.VanillaHarnessMod"]
-  },
+  "entrypoints": { "main": ["dev.mbund.lightningrod.vanillaharness.VanillaHarnessMod"] },
   "mixins": ["lightning-rod-vanilla-harness.mixins.json"],
-  "depends": {
-    "fabricloader": ">=0.19.3",
-    "minecraft": "1.21.8",
-    "fabric-api": "*",
-    "java": ">=21"
-  }
+  "depends": { "fabricloader": ">=0.19.3", "minecraft": "1.21.8", "fabric-api": "*", "java": ">=21" }
 }

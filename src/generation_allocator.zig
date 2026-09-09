@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
 pub const Allocator = struct {
     storage: std.heap.FixedBufferAllocator,
@@ -25,9 +24,38 @@ pub const Allocator = struct {
         return self.storage.end_index;
     }
 
+    pub fn owns(self: *const Allocator, pointer: anytype) bool {
+        const address = @intFromPtr(pointer);
+        const begin = @intFromPtr(self.storage.buffer.ptr);
+        return address >= begin and address - begin < self.storage.buffer.len;
+    }
+
+    pub fn ownsCurrentPluginAllocation(self: *const Allocator, pointer: anytype) bool {
+        const Pointer = @typeInfo(@TypeOf(pointer)).pointer;
+        if (@sizeOf(Pointer.child) == 0) {
+            const expected = std.mem.Alignment.of(Pointer.child).backward(std.math.maxInt(usize));
+            return @intFromPtr(pointer) == expected;
+        }
+        const start = self.owner_start;
+        const end = self.storage.end_index;
+        std.debug.assert(self.owner != null);
+        if (start == end) return false;
+        const address = @intFromPtr(pointer);
+        const begin = @intFromPtr(self.storage.buffer.ptr);
+        if (address < begin) return false;
+        const offset = address - begin;
+        return offset >= start and offset < end;
+    }
+
+    pub fn currentPluginBytes(self: *const Allocator) usize {
+        std.debug.assert(self.owner != null);
+        return self.storage.end_index - self.owner_start;
+    }
+
     pub fn trackPlugins(self: *Allocator, plugin_bytes: []u64) void {
         self.requireOpen();
         std.debug.assert(self.owner == null);
+        std.debug.assert(self.plugin_bytes.len == 0);
         self.plugin_bytes = plugin_bytes;
         @memset(plugin_bytes, 0);
     }
@@ -85,40 +113,6 @@ pub const Allocator = struct {
     };
 };
 
-test "generation allocator rejects retained use after initialization" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    var bytes: [64]u8 = undefined;
-    var generation = Allocator.init(&bytes);
-    const allocator = generation.allocator();
-    _ = try allocator.alloc(u8, 1);
-    generation.seal();
-
-    const fork_result = std.posix.system.fork();
-    switch (std.posix.errno(fork_result)) {
-        .SUCCESS => {},
-        else => |err| return std.posix.unexpectedErrno(err),
-    }
-    if (fork_result == 0) {
-        _ = allocator.alloc(u8, 1) catch std.posix.system.exit(1);
-        std.posix.system.exit(0);
-    }
-
-    var status: c_int = undefined;
-    var waited = false;
-    for (0..1024) |_| switch (std.posix.errno(
-        std.posix.system.waitpid(@intCast(fork_result), &status, 0),
-    )) {
-        .SUCCESS => {
-            waited = true;
-            break;
-        },
-        .INTR => continue,
-        else => |err| return std.posix.unexpectedErrno(err),
-    };
-    try std.testing.expect(waited);
-    try std.testing.expect(std.posix.W.IFSIGNALED(@bitCast(status)));
-}
-
 test "generation allocator attributes aligned reservations to their plugin" {
     var bytes: [256]u8 = undefined;
     var plugin_bytes = [_]u64{ 0, 0 };
@@ -129,4 +123,19 @@ test "generation allocator attributes aligned reservations to their plugin" {
     generation.endPlugin();
     try std.testing.expectEqual(@as(u64, generation.used()), plugin_bytes[1]);
     try std.testing.expectEqual(@as(u64, 0), plugin_bytes[0]);
+}
+
+test "generation allocator distinguishes the current plugin allocation interval" {
+    var bytes: [256]u8 = undefined;
+    var plugin_bytes = [_]u64{ 0, 0 };
+    var generation = Allocator.init(&bytes);
+    generation.trackPlugins(&plugin_bytes);
+    generation.beginPlugin(0);
+    const first = try generation.allocator().create(u8);
+    generation.endPlugin();
+    generation.beginPlugin(1);
+    const second = try generation.allocator().create(u8);
+    try std.testing.expect(generation.ownsCurrentPluginAllocation(second));
+    try std.testing.expect(!generation.ownsCurrentPluginAllocation(first));
+    generation.endPlugin();
 }

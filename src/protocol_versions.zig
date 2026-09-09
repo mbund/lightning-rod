@@ -2,14 +2,11 @@ const std = @import("std");
 const protocol_catalog = @import("protocol_catalog");
 const protocol_support = @import("protocol_support");
 const command_spec = @import("commands.zig");
-const play_decode = @import("play_decode.zig");
 const protocol_values = @import("protocol_values.zig");
 const light_projection = @import("light_projection.zig");
 const world_dimensions = @import("world/dimensions.zig");
 const dimension_api = @import("world/dimension_api.zig");
 
-/// Protocol selection is performed once when the handshake is decoded. A
-/// connection retains this compact value for its entire lifetime.
 pub const Version = protocol_catalog.Version;
 
 pub const Support = protocol_catalog.Support;
@@ -19,10 +16,40 @@ pub fn support(comptime selected: Version) Support {
 }
 
 pub const all = protocol_catalog.support;
+pub const minecraft_names = protocol_catalog.minecraft_names;
 
-pub fn selectVersions(comptime minecraft_names: anytype) [minecraft_names.len]Support {
-    var result: [minecraft_names.len]Support = undefined;
-    inline for (minecraft_names, 0..) |name, index| {
+pub const Release = enum { v1_21_6, v1_21_7, v1_21_8 };
+pub const minimum_release: Release = @enumFromInt(protocol_catalog.minimum_release);
+
+pub fn from(comptime minimum: Release) [all.len - releaseStart(minimum)]Support {
+    const start = comptime releaseStart(minimum);
+    var result: [all.len - start]Support = undefined;
+    inline for (&result, start..) |*entry, index| entry.* = all[index];
+    return result;
+}
+
+fn releaseStart(comptime release: Release) usize {
+    const name = switch (release) {
+        .v1_21_6 => "1.21.6",
+        .v1_21_7 => "1.21.7",
+        .v1_21_8 => "1.21.8",
+    };
+    const version = comptime protocol_catalog.fromMinecraftName(name);
+    if (version == null) @compileError("the requested Minecraft baseline was not compiled into this binary");
+    return @intFromEnum(version.?);
+}
+
+pub fn supportsRelease(comptime selected: anytype, comptime release: Release) bool {
+    if (@intFromEnum(release) < protocol_catalog.minimum_release) return false;
+    const index: usize = if (release == .v1_21_6) 0 else all.len - 1;
+    const required = all[index].version;
+    inline for (selected) |entry| if (entry.version == required) return true;
+    return false;
+}
+
+pub fn selectVersions(comptime requested_names: anytype) [requested_names.len]Support {
+    var result: [requested_names.len]Support = undefined;
+    inline for (requested_names, 0..) |name, index| {
         const selected = protocol_catalog.fromMinecraftName(name) orelse
             @compileError("unknown Minecraft protocol version '" ++ name ++ "'");
         result[index] = support(selected);
@@ -97,6 +124,23 @@ pub fn descriptor(version: Version) *const Descriptor {
     return &supported[@intFromEnum(version)];
 }
 
+test "compiled protocol range contains exactly its configured releases" {
+    try std.testing.expectEqual(
+        @as(usize, 2) - @as(usize, protocol_catalog.minimum_release),
+        all.len,
+    );
+    try std.testing.expectEqual(
+        protocol_catalog.minimum_release != 0,
+        protocol_catalog.fromMinecraftName("1.21.6") == null,
+    );
+    try std.testing.expect(protocol_catalog.fromMinecraftName("1.21.7") != null);
+    try std.testing.expect(protocol_catalog.fromMinecraftName("1.21.8") != null);
+    try std.testing.expect(supportsRelease(all, @enumFromInt(protocol_catalog.minimum_release)));
+    try std.testing.expect(supportsRelease(all, .v1_21_8));
+    try std.testing.expectEqual(@as(usize, 1), from(.v1_21_7).len);
+    try std.testing.expectEqual(@as(usize, 1), from(.v1_21_8).len);
+}
+
 pub const default = protocol_catalog.default;
 
 pub const Handshake = struct {
@@ -137,12 +181,8 @@ fn writeTextComponent(buffer: []u8, text: []const u8) ![]const u8 {
     return buffer[0 .. buffer.len - rest.len];
 }
 
-pub fn PlayCodec(comptime ProtocolModule: type, comptime RegistryData: type) type {
+pub fn PlayCodec(comptime ProtocolModule: type, comptime _: type) type {
     return struct {
-        pub fn dispatchPlay(payload: []const u8, slot: u16, handler: *const play_decode.Handler) !void {
-            return play_decode.dispatchWith(ProtocolModule, RegistryData, payload, slot, handler);
-        }
-
         pub fn decodeStatus(payload: []const u8) !protocol_values.StatusCommand {
             const Packets = ProtocolModule.status.toServer;
             const header = try Packets.readHeader(payload);
@@ -394,6 +434,15 @@ pub fn PlayCodec(comptime ProtocolModule: type, comptime RegistryData: type) typ
             return (try (try destroy.entityIds(1)).single(entity_id)).finish();
         }
 
+        pub fn encodeSetPassengers(buffer: []u8, vehicle_id: i32, passenger_id: ?i32) ![]u8 {
+            const packet = ProtocolModule.play.toClient.write(buffer);
+            const passengers = try packet.set_passengers();
+            const vehicle = try passengers.entityId(vehicle_id);
+            if (passenger_id) |passenger|
+                return (try (try vehicle.passengers(1)).single(passenger)).finish();
+            return (try (try vehicle.passengers(0)).finish()).finish();
+        }
+
         pub fn encodeCollectItem(buffer: []u8, collected_entity_id: i32, collector_entity_id: i32, count: i32) ![]u8 {
             const packet = ProtocolModule.play.toClient.write(buffer);
             const collect = try packet.collect();
@@ -492,6 +541,15 @@ pub fn PlayCodec(comptime ProtocolModule: type, comptime RegistryData: type) typ
             const packet = ProtocolModule.play.toClient.write(buffer);
             const held = try packet.held_item_slot();
             return (try held.slot(slot)).finish();
+        }
+
+        pub fn encodeBrand(buffer: []u8, brand: []const u8) ![]u8 {
+            var payload: [256]u8 = undefined;
+            const rest = try protocol_support.write_pstring(&payload, brand, i32);
+            const used = payload.len - rest.len;
+            const packet = ProtocolModule.play.toClient.write(buffer);
+            const custom = try packet.custom_payload();
+            return (try (try custom.channel("minecraft:brand")).data(payload[0..used])).finish();
         }
 
         pub fn encodeUpdateTime(buffer: []u8, age: i64, time: i64, tick_day_time: bool) ![]u8 {
@@ -849,9 +907,15 @@ pub fn PlayCodec(comptime ProtocolModule: type, comptime RegistryData: type) typ
         }
 
         pub fn encodeFeatureFlags(buffer: []u8) ![]u8 {
+            return encodeFeatureFlagList(buffer, &.{"minecraft:vanilla"});
+        }
+
+        pub fn encodeFeatureFlagList(buffer: []u8, values: []const []const u8) ![]u8 {
             const packet = ProtocolModule.configuration.toClient.write(buffer);
             const flags = try packet.feature_flags();
-            return (try (try flags.features(1)).single("minecraft:vanilla")).finish();
+            var list = try flags.features(values.len);
+            for (values) |value| list = try list.element(value);
+            return (try list.finish()).finish();
         }
 
         pub fn encodeConfigurationTags(buffer: []u8, payload: []const u8) ![]u8 {
@@ -861,12 +925,18 @@ pub fn PlayCodec(comptime ProtocolModule: type, comptime RegistryData: type) typ
         }
 
         pub fn encodeKnownPacks(buffer: []u8, minecraft_name: []const u8) ![]u8 {
+            return encodeKnownPackList(buffer, &.{.{ .namespace = "minecraft", .id = "core", .version = minecraft_name }});
+        }
+
+        pub fn encodeKnownPackList(buffer: []u8, packs_data: []const @import("configuration_plan.zig").KnownPack) ![]u8 {
             const packet = ProtocolModule.configuration.toClient.write(buffer);
             const select = try packet.select_known_packs();
-            var packs = try select.packs(1);
-            const pack = try packs.element();
-            const pack_id = try (try pack.namespace("minecraft")).id("core");
-            packs = try pack_id.version(minecraft_name);
+            var packs = try select.packs(packs_data.len);
+            for (packs_data) |data| {
+                const pack = try packs.element();
+                const pack_id = try (try pack.namespace(data.namespace)).id(data.id);
+                packs = try pack_id.version(data.version);
+            }
             return (try packs.finish()).finish();
         }
 
@@ -881,6 +951,28 @@ pub fn PlayCodec(comptime ProtocolModule: type, comptime RegistryData: type) typ
                 entries = try value.none();
             }
             return (try entries.finish()).finish();
+        }
+
+        pub fn encodeRegistryEntries(buffer: []u8, data: @import("configuration_plan.zig").Registry) ![]u8 {
+            const packet = ProtocolModule.configuration.toClient.write(buffer);
+            const registry = try packet.registry_data();
+            const id = try registry.id(data.id);
+            var entries = try id.entries(data.entries.len);
+            for (data.entries) |data_entry| {
+                const entry = try entries.element();
+                const value = try (try entry.key(data_entry.id)).value();
+                entries = if (data_entry.nbt) |nbt| try value.some(nbt) else try value.none();
+            }
+            return (try entries.finish()).finish();
+        }
+
+        pub fn encodeResourcePack(buffer: []u8, data: @import("configuration_plan.zig").ResourcePack) ![]u8 {
+            const packet = ProtocolModule.configuration.toClient.write(buffer);
+            const add = try packet.add_resource_pack();
+            const url = try (try add.uuid(data.uuid)).url(data.url);
+            const hash = try url.hash(data.hash);
+            const prompt = try (try hash.forced(data.required)).promptMessage();
+            return if (data.prompt_nbt) |nbt| (try prompt.some(nbt)).finish() else (try prompt.none()).finish();
         }
 
         pub fn encodeDimensionRegistry(buffer: []u8, definitions: []const dimension_api.Definition) ![]u8 {
@@ -1039,11 +1131,12 @@ pub fn fromProtocolNumber(value: i32) ?Version {
     return null;
 }
 
-/// Resolves a generated protocol module at compile time. Runtime code should
-/// select a connection's operation table once instead of switching for every
-/// field or packet member.
 pub fn Protocol(comptime version: Version) type {
     return EntryFor(version).Protocol;
+}
+
+pub fn Registry(comptime version: Version) type {
+    return EntryFor(version).Registry;
 }
 
 test "supported protocol versions have unique wire numbers" {
@@ -1082,14 +1175,34 @@ test "generated registry translations preserve names" {
 
 fn testOutputCodec(comptime ProtocolModule: type, comptime WireCodec: type) !void {
     var bytes: [2048]u8 = undefined;
+    try testEntityOutputCodec(ProtocolModule, WireCodec, &bytes);
+    try testPlayerInfoOutputCodec(ProtocolModule, WireCodec, &bytes);
+    try testPlayOutputCodec(ProtocolModule, WireCodec, &bytes);
+    try testNonPlayOutputCodec(ProtocolModule, WireCodec, &bytes);
+}
 
-    const health = try WireCodec.encodeUpdateHealth(&bytes, 18.5, 19, 4.0);
+fn testEntityOutputCodec(comptime ProtocolModule: type, comptime WireCodec: type, bytes: []u8) !void {
+    const health = try WireCodec.encodeUpdateHealth(bytes, 18.5, 19, 4.0);
     _ = try ProtocolModule.play.toClient.read(health).name();
 
-    const damage = try WireCodec.encodeDamageEvent(&bytes, 7, 1, 3, 3);
+    const damage = try WireCodec.encodeDamageEvent(bytes, 7, 1, 3, 3);
     _ = try ProtocolModule.play.toClient.read(damage).name();
 
-    const position = try WireCodec.encodeSyncEntityPosition(&bytes, 7, -31.5, 96.56, 82.5, 0, 0.06, 0, 90, 10, true);
+    const position = try WireCodec.encodeSyncEntityPosition(bytes, 7, -31.5, 96.56, 82.5, 0, 0.06, 0, 90, 10, true);
+    try expectSyncEntityPosition(ProtocolModule, position);
+
+    var rest = try WireCodec.startEntityMetadata(bytes, 7);
+    rest = try protocol_support.write_u8(rest, 0xff);
+    _ = try ProtocolModule.play.toClient.read(bytes[0 .. bytes.len - rest.len]).name();
+
+    const destroyed = try WireCodec.encodeEntityDestroy(bytes, 7);
+    _ = try ProtocolModule.play.toClient.read(destroyed).name();
+
+    try expectPassengersPacket(ProtocolModule, try WireCodec.encodeSetPassengers(bytes, 7, 8));
+    try expectPassengersPacket(ProtocolModule, try WireCodec.encodeSetPassengers(bytes, 7, null));
+}
+
+fn expectSyncEntityPosition(comptime ProtocolModule: type, position: []const u8) !void {
     switch (try ProtocolModule.play.toClient.read(position).name()) {
         .sync_entity_position => |body| {
             const entity_id, const c1 = try body.entityId();
@@ -1116,17 +1229,31 @@ fn testOutputCodec(comptime ProtocolModule: type, comptime WireCodec: type) !voi
         },
         else => return error.UnexpectedPacket,
     }
+}
 
-    var rest = try WireCodec.startEntityMetadata(&bytes, 7);
-    rest = try protocol_support.write_u8(rest, 0xff);
-    const metadata = bytes[0 .. bytes.len - rest.len];
-    _ = try ProtocolModule.play.toClient.read(metadata).name();
+fn expectPassengersPacket(comptime ProtocolModule: type, packet: []const u8) !void {
+    switch (try ProtocolModule.play.toClient.read(packet).name()) {
+        .set_passengers => {},
+        else => return error.UnexpectedPacket,
+    }
+}
 
-    const destroyed = try WireCodec.encodeEntityDestroy(&bytes, 7);
-    _ = try ProtocolModule.play.toClient.read(destroyed).name();
+fn testPlayerInfoOutputCodec(comptime ProtocolModule: type, comptime WireCodec: type, bytes: []u8) !void {
+    const player_info = try WireCodec.encodePlayerInfoAdd(bytes, 9, "player", 1);
+    try expectPlayerInfoAdd(ProtocolModule, player_info);
 
-    const player_info = try WireCodec.encodePlayerInfoAdd(&bytes, 9, "player", 1);
-    switch (try ProtocolModule.play.toClient.read(player_info).name()) {
+    const player_info_batch = try WireCodec.encodePlayerInfoAddBatch(bytes, &.{
+        .{ .uuid = 9, .name = "alice", .gamemode = 0 },
+        .{ .uuid = 10, .name = "bob", .gamemode = 1 },
+    });
+    try expectPlayerInfoEntries(ProtocolModule, player_info_batch, 2);
+
+    const player_latency = try WireCodec.encodePlayerInfoLatency(bytes, 9, 150);
+    try expectPlayerInfoLatency(ProtocolModule, player_latency);
+}
+
+fn expectPlayerInfoAdd(comptime ProtocolModule: type, packet: []const u8) !void {
+    switch (try ProtocolModule.play.toClient.read(packet).name()) {
         .player_info => |body| {
             try std.testing.expectEqual(@as(usize, 33), body.buffer.len);
             try std.testing.expectEqualSlices(
@@ -1149,23 +1276,22 @@ fn testOutputCodec(comptime ProtocolModule: type, comptime WireCodec: type) !voi
         },
         else => return error.UnexpectedPacket,
     }
+}
 
-    const player_info_batch = try WireCodec.encodePlayerInfoAddBatch(&bytes, &.{
-        .{ .uuid = 9, .name = "alice", .gamemode = 0 },
-        .{ .uuid = 10, .name = "bob", .gamemode = 1 },
-    });
-    switch (try ProtocolModule.play.toClient.read(player_info_batch).name()) {
+fn expectPlayerInfoEntries(comptime ProtocolModule: type, packet: []const u8, expected: usize) !void {
+    switch (try ProtocolModule.play.toClient.read(packet).name()) {
         .player_info => |body| {
             _, const data_cursor = try body.action();
             const entries, const done = try data_cursor.data();
-            try std.testing.expectEqual(@as(usize, 2), try entries.len());
+            try std.testing.expectEqual(expected, try entries.len());
             try done.finish();
         },
         else => return error.UnexpectedPacket,
     }
+}
 
-    const player_latency = try WireCodec.encodePlayerInfoLatency(&bytes, 9, 150);
-    switch (try ProtocolModule.play.toClient.read(player_latency).name()) {
+fn expectPlayerInfoLatency(comptime ProtocolModule: type, packet: []const u8) !void {
+    switch (try ProtocolModule.play.toClient.read(packet).name()) {
         .player_info => |body| {
             const actions, const data_cursor = try body.action();
             try std.testing.expect(actions.update_latency);
@@ -1176,17 +1302,19 @@ fn testOutputCodec(comptime ProtocolModule: type, comptime WireCodec: type) !voi
         },
         else => return error.UnexpectedPacket,
     }
+}
 
-    const collected = try WireCodec.encodeCollectItem(&bytes, 7, 8, 1);
+fn testPlayOutputCodec(comptime ProtocolModule: type, comptime WireCodec: type, bytes: []u8) !void {
+    const collected = try WireCodec.encodeCollectItem(bytes, 7, 8, 1);
     _ = try ProtocolModule.play.toClient.read(collected).name();
 
-    rest = try WireCodec.startSystemChat(&bytes);
+    var rest = try WireCodec.startSystemChat(bytes);
     rest = try protocol_support.write_u8(rest, 0);
     rest = try protocol_support.write_bool(rest, false);
     const chat = bytes[0 .. bytes.len - rest.len];
     _ = try ProtocolModule.play.toClient.read(chat).name();
 
-    const spawned = try WireCodec.encodeSpawnEntity(&bytes, .{
+    const spawned = try WireCodec.encodeSpawnEntity(bytes, .{
         .entity_id = 7,
         .uuid = 9,
         .entity_type = 1,
@@ -1203,8 +1331,24 @@ fn testOutputCodec(comptime ProtocolModule: type, comptime WireCodec: type) !voi
     });
     _ = try ProtocolModule.play.toClient.read(spawned).name();
 
-    const time_packet = try WireCodec.encodeUpdateTime(&bytes, 77, 13_000, true);
-    switch (try ProtocolModule.play.toClient.read(time_packet).name()) {
+    const time_packet = try WireCodec.encodeUpdateTime(bytes, 77, 13_000, true);
+    try expectUpdateTime(ProtocolModule, time_packet);
+
+    rest = try WireCodec.startWindowItems(bytes, 0, 1);
+    rest = try protocol_support.write_u8(rest, 0);
+    rest = try protocol_support.write_u8(rest, 0);
+    _ = try ProtocolModule.play.toClient.read(bytes[0 .. bytes.len - rest.len]).name();
+
+    const commands = try WireCodec.encodeDeclareCommands(bytes, &.{
+        .{ .name = "gamemode", .alternatives = &.{ "survival", "creative", "adventure", "spectator" } },
+        .{ .name = "summon", .alternatives = &.{"zombie"} },
+        .{ .name = "time", .greedy_argument = "operation" },
+    });
+    _ = try ProtocolModule.play.toClient.read(commands).name();
+}
+
+fn expectUpdateTime(comptime ProtocolModule: type, packet: []const u8) !void {
+    switch (try ProtocolModule.play.toClient.read(packet).name()) {
         .update_time => |body| {
             const age, const time_cursor = try body.age();
             const time, const ticking_cursor = try time_cursor.time();
@@ -1216,30 +1360,22 @@ fn testOutputCodec(comptime ProtocolModule: type, comptime WireCodec: type) !voi
         },
         else => return error.UnexpectedPacket,
     }
+}
 
-    rest = try WireCodec.startWindowItems(&bytes, 0, 1);
-    rest = try protocol_support.write_u8(rest, 0);
-    rest = try protocol_support.write_u8(rest, 0);
-    const inventory = bytes[0 .. bytes.len - rest.len];
-    _ = try ProtocolModule.play.toClient.read(inventory).name();
-
-    const commands = try WireCodec.encodeDeclareCommands(&bytes, &.{
-        .{ .name = "gamemode", .alternatives = &.{ "survival", "creative", "adventure", "spectator" } },
-        .{ .name = "summon", .alternatives = &.{"zombie"} },
-        .{ .name = "time", .greedy_argument = "operation" },
-    });
-    _ = try ProtocolModule.play.toClient.read(commands).name();
-
-    const status = try WireCodec.encodeStatusResponse(&bytes, "{}");
+fn testNonPlayOutputCodec(comptime ProtocolModule: type, comptime WireCodec: type, bytes: []u8) !void {
+    const status = try WireCodec.encodeStatusResponse(bytes, "{}");
     _ = try ProtocolModule.status.toClient.read(status).name();
 
-    const login = try WireCodec.encodeLoginSuccess(&bytes, 9, "player");
+    const login = try WireCodec.encodeLoginSuccess(bytes, 9, "player");
     _ = try ProtocolModule.login.toClient.read(login).name();
 
-    const flags = try WireCodec.encodeFeatureFlags(&bytes);
+    const compression = try WireCodec.encodeSetCompression(bytes, 256);
+    _ = try ProtocolModule.login.toClient.read(compression).name();
+
+    const flags = try WireCodec.encodeFeatureFlags(bytes);
     _ = try ProtocolModule.configuration.toClient.read(flags).name();
 
-    const tags = try WireCodec.encodeConfigurationTags(&bytes, &.{0});
+    const tags = try WireCodec.encodeConfigurationTags(bytes, &.{0});
     _ = try ProtocolModule.configuration.toClient.read(tags).name();
 }
 

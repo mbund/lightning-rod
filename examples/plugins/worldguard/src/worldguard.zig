@@ -13,11 +13,15 @@ pub const Flags = struct {
     break_blocks: Rule = .inherit,
     place_blocks: Rule = .inherit,
     interact_blocks: Rule = .inherit,
+    attack_players: Rule = .inherit,
+    attack_living: Rule = .inherit,
 
     pub const protect = Flags{
         .break_blocks = .deny,
         .place_blocks = .deny,
         .interact_blocks = .deny,
+        .attack_players = .deny,
+        .attack_living = .deny,
     };
 };
 
@@ -51,14 +55,12 @@ pub const Region = struct {
     flags: Flags,
 };
 
-pub const Config = struct {
-    maximum_regions: u16 = 1_024,
-};
-
 const Action = enum {
     break_blocks,
     place_blocks,
     interact_blocks,
+    attack_players,
+    attack_living,
 };
 
 const StoredRegion = struct {
@@ -86,33 +88,36 @@ const StoredRegion = struct {
             .break_blocks => self.flags.break_blocks,
             .place_blocks => self.flags.place_blocks,
             .interact_blocks => self.flags.interact_blocks,
+            .attack_players => self.flags.attack_players,
+            .attack_living => self.flags.attack_living,
         };
     }
 };
 
 pub const WorldGuard = struct {
     pub const id = "worldguard:regions";
+    pub const Configuration = struct {
+        maximum_regions: u16 = 1_024,
+    };
+    pub const Dependencies = struct {
+        players: *lightning_rod.players.Players,
+        living: *lightning_rod.entities.LivingEntities,
+        inputs: *lightning_rod.inputs.Inputs,
+        outputs: *lightning_rod.Packets,
+    };
 
     regions: []StoredRegion,
     region_count: usize = 0,
-    players: *lightning_rod.players.Players,
-    inputs: *lightning_rod.inputs.Inputs,
-    outputs: *lightning_rod.Packets,
+    deps: Dependencies,
+    config: Configuration,
 
-    pub fn create(
-        allocator: std.mem.Allocator,
-        players: *lightning_rod.players.Players,
-        inputs: *lightning_rod.inputs.Inputs,
-        outputs: *lightning_rod.Packets,
-        config: Config,
-    ) !*WorldGuard {
+    pub fn init(allocator: std.mem.Allocator, deps: Dependencies, config: Configuration) !*WorldGuard {
         if (config.maximum_regions == 0) return error.InvalidRegionCapacity;
         const self = try allocator.create(WorldGuard);
         self.* = .{
             .regions = try allocator.alloc(StoredRegion, config.maximum_regions),
-            .players = players,
-            .inputs = inputs,
-            .outputs = outputs,
+            .deps = deps,
+            .config = config,
         };
         return self;
     }
@@ -159,15 +164,24 @@ pub const WorldGuard = struct {
         return self.allows(.interact_blocks, world, pos);
     }
 
+    pub fn allowsPlayerAttack(self: *const WorldGuard, world: lightning_rod.world_identity.Handle, pos: lightning_rod.geometry.BlockPos) bool {
+        return self.allows(.attack_players, world, pos);
+    }
+
+    pub fn allowsLivingAttack(self: *const WorldGuard, world: lightning_rod.world_identity.Handle, pos: lightning_rod.geometry.BlockPos) bool {
+        return self.allows(.attack_living, world, pos);
+    }
+
     pub fn tick(self: *WorldGuard, _: std.mem.Allocator) void {
-        for (self.players.activeSlots()) |slot| {
-            const intent = self.inputs.blockDigIntent(slot) orelse continue;
-            const player = &self.players.records[slot];
+        self.rejectAttacks();
+        for (self.deps.players.activeSlots()) |slot| {
+            const intent = self.deps.inputs.blockDigIntent(slot) orelse continue;
+            const player = &self.deps.players.records[slot];
             if (self.allowsBreaking(player.world, intent.pos)) continue;
-            self.inputs.rejectBlockDig(slot);
-            self.outputs.block_correction(.{ .slot = slot, .pos = intent.pos });
+            self.deps.inputs.rejectBlockDig(slot);
+            self.deps.outputs.block_correction(.{ .slot = slot, .pos = intent.pos });
         }
-        for (self.inputs.block_requests[0..self.inputs.block_request_count]) |*request| {
+        for (self.deps.inputs.block_requests[0..self.deps.inputs.block_request_count]) |*request| {
             if (request.handled) continue;
             const allowed = switch (request.kind) {
                 .break_block => self.allowsBreaking(request.world, request.pos),
@@ -178,13 +192,42 @@ pub const WorldGuard = struct {
             };
             if (allowed) continue;
             request.handled = true;
-            self.outputs.block_correction(.{ .slot = request.slot, .pos = request.pos });
+            self.deps.outputs.block_correction(.{ .slot = request.slot, .pos = request.pos });
             if (request.kind == .use_item_on) {
-                self.outputs.block_correction(.{ .slot = request.slot, .pos = request.against_pos });
-                const player = &self.players.records[request.slot];
-                self.outputs.hotbar_changed(.{ .slot = request.slot, .hotbar_slot = player.selected_hotbar_slot });
+                self.deps.outputs.block_correction(.{ .slot = request.slot, .pos = request.against_pos });
+                const player = &self.deps.players.records[request.slot];
+                self.deps.outputs.hotbar_changed(.{ .slot = request.slot, .hotbar_slot = player.selected_hotbar_slot });
             }
         }
+    }
+
+    fn rejectAttacks(self: *WorldGuard) void {
+        for (self.deps.players.activeSlots()) |slot| {
+            self.rejectPlayerAttack(slot);
+            self.rejectLivingAttack(slot);
+        }
+    }
+
+    fn rejectPlayerAttack(self: *WorldGuard, slot: u16) void {
+        const intent = self.deps.inputs.playerAttackIntent(slot) orelse return;
+        const target_slot: usize = intent.target_slot;
+        if (target_slot >= self.deps.players.records.len) return;
+        const target = &self.deps.players.records[target_slot];
+        if (target.state != .play or target.entity_id != intent.target_entity_id) return;
+        if (self.allowsPlayerAttack(target.world, blockPosition(target.position))) return;
+        self.deps.inputs.rejectPlayerAttack(slot);
+    }
+
+    fn rejectLivingAttack(self: *WorldGuard, slot: u16) void {
+        const intent = self.deps.inputs.livingAttackIntent(slot) orelse return;
+        const entities = &self.deps.living.entities;
+        const index = entities.indexForEntityId(intent.target_entity_id) orelse return;
+        if (self.allowsLivingAttack(entities.worlds[index], .{
+            .x = lightning_rod.geometry.blockCoord(entities.position_x[index]),
+            .y = @intCast(lightning_rod.geometry.blockCoord(entities.position_y[index])),
+            .z = lightning_rod.geometry.blockCoord(entities.position_z[index]),
+        })) return;
+        self.deps.inputs.rejectLivingAttack(slot);
     }
 
     fn allows(self: *const WorldGuard, action: Action, world: lightning_rod.world_identity.Handle, pos: lightning_rod.geometry.BlockPos) bool {
@@ -211,14 +254,21 @@ pub const WorldGuard = struct {
     }
 };
 
+fn blockPosition(position: lightning_rod.geometry.Vec3) lightning_rod.geometry.BlockPos {
+    return .{
+        .x = lightning_rod.geometry.blockCoord(position.x),
+        .y = @intCast(lightning_rod.geometry.blockCoord(position.y)),
+        .z = lightning_rod.geometry.blockCoord(position.z),
+    };
+}
+
 test "higher-priority regions override lower-priority protection" {
     const world = lightning_rod.world_identity.Handle{ .index = 1, .generation = 1 };
     var regions: [2]StoredRegion = undefined;
     var guard = WorldGuard{
         .regions = &regions,
-        .players = undefined,
-        .inputs = undefined,
-        .outputs = undefined,
+        .deps = undefined,
+        .config = .{},
     };
     try guard.add(.{ .name = "spawn", .world = world, .flags = .protect });
     try guard.add(.{
@@ -234,6 +284,8 @@ test "higher-priority regions override lower-priority protection" {
     try std.testing.expect(guard.allowsBreaking(world, .{ .x = 0, .y = 1, .z = 0 }));
     try std.testing.expect(!guard.allowsBreaking(world, .{ .x = 10, .y = 1, .z = 0 }));
     try std.testing.expect(!guard.allowsInteraction(world, .{ .x = 0, .y = 1, .z = 0 }));
+    try std.testing.expect(!guard.allowsPlayerAttack(world, .{ .x = 0, .y = 1, .z = 0 }));
+    try std.testing.expect(!guard.allowsLivingAttack(world, .{ .x = 0, .y = 1, .z = 0 }));
 }
 
 test "regions are isolated by world handle" {
@@ -242,9 +294,8 @@ test "regions are isolated by world handle" {
     var regions: [1]StoredRegion = undefined;
     var guard = WorldGuard{
         .regions = &regions,
-        .players = undefined,
-        .inputs = undefined,
-        .outputs = undefined,
+        .deps = undefined,
+        .config = .{},
     };
     try guard.protectWorld("lobby", protected);
     try std.testing.expect(!guard.allowsPlacement(protected, .{ .x = 0, .y = 0, .z = 0 }));

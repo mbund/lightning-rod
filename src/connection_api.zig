@@ -1,24 +1,40 @@
-pub const StatusDraft = struct {
-    slot: u16,
-    version_name: []const u8,
-    protocol_number: i32,
-    motd: []const u8,
-    maximum_players: usize,
-    online_players: usize,
-    cancelled: bool = false,
-};
+pub const Handle = extern struct {
+    index: u32,
+    generation: u32,
 
-pub const LoginDraft = struct {
-    slot: u16,
-    username: []const u8,
-    uuid: u128,
-    current_players: usize,
-    maximum_players: usize,
-    accepted: bool = true,
-    rejection_reason: []const u8 = "",
-
-    pub fn reject(self: *LoginDraft, reason: []const u8) void {
-        self.accepted = false;
-        self.rejection_reason = reason;
+    pub fn eql(a: Handle, b: Handle) bool {
+        return a.index == b.index and a.generation == b.generation;
     }
 };
+
+pub const Page = enum(u32) { _ };
+
+pub const DisconnectReason = enum(u8) {
+    peer_closed,
+    timeout,
+    transport_error,
+    malformed_packet,
+    overloaded,
+    authentication_failed,
+    server_shutdown,
+    kicked,
+};
+
+pub const Limits = struct {
+    connections: u16,
+    pages: u16,
+    page_bytes: u16,
+    completions_per_advance: u16,
+    packets_per_advance: u16,
+
+    pub fn valid(self: Limits) bool {
+        return self.connections != 0 and self.pages != 0 and self.page_bytes != 0 and
+            self.completions_per_advance != 0 and self.packets_per_advance != 0;
+    }
+};
+
+test "connection identity has no process-local state" {
+    const a = Handle{ .index = 3, .generation = 7 };
+    try @import("std").testing.expect(a.eql(.{ .index = 3, .generation = 7 }));
+    try @import("std").testing.expect(!a.eql(.{ .index = 3, .generation = 8 }));
+}

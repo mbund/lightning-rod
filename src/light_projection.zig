@@ -1,7 +1,7 @@
-const config = @import("config.zig").value;
+const limits = @import("world/limits.zig");
 
 pub const bytes_per_section = 16 * 16 * 16 / 2;
-pub const world_section_count = config.overworld_section_count;
+pub const world_section_count = limits.section_count;
 pub const protocol_section_count = world_section_count + 2;
 
 pub const Section = extern struct {

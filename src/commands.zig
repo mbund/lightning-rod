@@ -1,8 +1,5 @@
-const config = @import("config.zig").value;
+const std = @import("std");
 
-/// Command-tree contribution supplied by a compile-time plugin. Alternatives
-/// are executable literal children. A greedy argument accepts the remaining
-/// command text and leaves semantic validation to the owning plugin.
 pub const Declaration = struct {
     name: []const u8,
     alternatives: []const []const u8 = &.{},
@@ -10,8 +7,6 @@ pub const Declaration = struct {
     executable_without_arguments: bool = false,
 };
 
-/// A decoded command borrows its text from the tick packet arena. Command
-/// plugins claim entries in deterministic profile order.
 pub const Entry = struct {
     sender: u16,
     text: []const u8,
@@ -19,8 +14,13 @@ pub const Entry = struct {
 };
 
 pub const Batch = struct {
-    entries: [config.max_tick_player_messages]Entry = undefined,
+    entries: []Entry = &.{},
     len: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator, capacity: usize) !Batch {
+        if (capacity == 0) return error.InvalidCommandCapacity;
+        return .{ .entries = try allocator.alloc(Entry, capacity) };
+    }
 
     pub fn append(self: *Batch, sender: u16, text: []const u8) error{CommandBatchFull}!*Entry {
         if (self.len == self.entries.len) return error.CommandBatchFull;

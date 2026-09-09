@@ -84,6 +84,65 @@ pub fn encodeUniform(buffer: []u8, state: i32) ![]u8 {
     return protocol_support.write_varint(rest, state);
 }
 
+pub fn encodePacked(
+    buffer: []u8,
+    palette: []const i32,
+    source: []const u8,
+    source_bits: u8,
+    air_index: ?u16,
+) ![]u8 {
+    if (palette.len == 0 or palette.len > maximum_indirect_palette_entries)
+        return error.InvalidPalette;
+    if (source_bits > 8 or (palette.len == 1) != (source_bits == 0))
+        return error.InvalidPalette;
+    if (palette.len == 1) return encodeUniform(buffer, palette[0]);
+    const bits: u8 = @max(4, std.math.log2_int_ceil(usize, palette.len));
+    var rest = try protocol_support.write_i16(buffer, countNonAir(source, source_bits, air_index));
+    rest = try protocol_support.write_u8(rest, bits);
+    rest = try protocol_support.write_count(rest, i32, palette.len);
+    for (palette) |state| {
+        if (state < 0 or state > registry.maximum_block_state)
+            return error.InvalidBlockState;
+        rest = try protocol_support.write_varint(rest, state);
+    }
+    return writePackedIndices(rest, source, source_bits, bits);
+}
+
+fn countNonAir(source: []const u8, bits: u8, air_index: ?u16) i16 {
+    const air = air_index orelse return block_count;
+    var count: i16 = 0;
+    for (0..block_count) |index|
+        if (packedIndex(source, bits, index) != air) {
+            count += 1;
+        };
+    return count;
+}
+
+fn writePackedIndices(buffer: []u8, source: []const u8, source_bits: u8, output_bits: u8) ![]u8 {
+    var rest = buffer;
+    const values_per_long = 64 / @as(usize, output_bits);
+    const long_count = std.math.divCeil(usize, block_count, values_per_long) catch unreachable;
+    for (0..long_count) |long_index| {
+        var word: u64 = 0;
+        for (0..values_per_long) |entry_index| {
+            const index = long_index * values_per_long + entry_index;
+            if (index == block_count) break;
+            word |= @as(u64, packedIndex(source, source_bits, index)) << @intCast(entry_index * output_bits);
+        }
+        rest = try protocol_support.write_i64(rest, @bitCast(word));
+    }
+    return rest;
+}
+
+fn packedIndex(source: []const u8, bits: u8, index: usize) u16 {
+    const bit_offset = index * bits;
+    const byte_offset = bit_offset / 8;
+    const shift: u4 = @intCast(bit_offset & 7);
+    var encoded: u16 = source[byte_offset];
+    if (shift + bits > 8) encoded |= @as(u16, source[byte_offset + 1]) << 8;
+    return (encoded >> shift) & ((@as(u16, 1) << @intCast(bits)) - 1);
+}
+
 fn findState(lookup: *const [lookup_size]LookupEntry, state: i32) ?u16 {
     var probe = stateHash(state);
     for (0..lookup.len) |_| {
@@ -139,4 +198,36 @@ test "global palette handles more than 256 distinct states" {
     const rest = try encode(&buffer, &states);
     try std.testing.expect(buffer.len - rest.len > 0);
     try std.testing.expectEqual(registry.block_state_bits, buffer[2]);
+}
+
+test "resident packed palettes encode identically without expanding states" {
+    const palette = [_]i32{
+        registry.block_air_default_state,
+        registry.block_stone_default_state,
+        registry.block_dirt_default_state,
+        registry.block_grass_block_default_state,
+        registry.block_sand_default_state,
+    };
+    const source_bits = 3;
+    var states: [block_count]i32 = undefined;
+    var packed_indices: [(block_count * source_bits + 7) / 8]u8 = @splat(0);
+    for (&states, 0..) |*state, index| {
+        const palette_index: u8 = @intCast(index % palette.len);
+        state.* = palette[palette_index];
+        const bit_offset = index * source_bits;
+        const byte_offset = bit_offset / 8;
+        const shift: u3 = @intCast(bit_offset & 7);
+        packed_indices[byte_offset] |= palette_index << shift;
+        if (@as(u4, shift) + source_bits > 8)
+            packed_indices[byte_offset + 1] |= palette_index >> @intCast(8 - @as(u4, shift));
+    }
+    var expanded: [maximum_encoded_len]u8 = undefined;
+    var direct: [maximum_encoded_len]u8 = undefined;
+    const expanded_rest = try encode(&expanded, &states);
+    const direct_rest = try encodePacked(&direct, &palette, &packed_indices, source_bits, 0);
+    try std.testing.expectEqualSlices(
+        u8,
+        expanded[0 .. expanded.len - expanded_rest.len],
+        direct[0 .. direct.len - direct_rest.len],
+    );
 }

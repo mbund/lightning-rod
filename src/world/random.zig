@@ -1,5 +1,4 @@
 const std = @import("std");
-const config = @import("../config.zig").value;
 
 pub const DeterministicRng = struct {
     const multiplier: u64 = 0x5deece66d;
@@ -107,11 +106,13 @@ pub const DeterministicRng = struct {
 
 pub const Random = struct {
     pub const id = "minecraft:random";
-    random: DeterministicRng = DeterministicRng.init(config.seed),
+    pub const Configuration = struct { seed: u64 = 0x6d_62_75_6e_64_00_00_01 };
 
-    pub fn create(allocator: std.mem.Allocator) !*Random {
+    random: DeterministicRng = DeterministicRng.init(0x6d_62_75_6e_64_00_00_01),
+
+    pub fn init(allocator: std.mem.Allocator, configuration: Configuration) !*Random {
         const self = try allocator.create(Random);
-        self.* = .{ .random = DeterministicRng.init(config.seed) };
+        self.* = .{ .random = DeterministicRng.init(configuration.seed) };
         return self;
     }
 };

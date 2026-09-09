@@ -7,9 +7,6 @@ const packet_model = @import("packet.zig");
 
 pub const Version = protocol_catalog.Version;
 
-/// Protocol-specific decoding lives here, once, rather than in either the
-/// Fabric recorder or a server adapter. It consumes the same generated
-/// PrismarineJS protocol views as the production server.
 pub const Canonicalizer = struct {
     identities: []const raw_packet.Identity,
     version: Version = protocol_catalog.default,
@@ -59,9 +56,6 @@ pub const Canonicalizer = struct {
         return .{ .identities = identities, .version = version, .allocator = allocator };
     }
 
-    /// Semantic overrides are used where identities or registries need stable
-    /// names. Every other valid protocol packet falls through to its generated
-    /// `wire/<name>` structural form; malformed packets remain hard errors.
     pub fn canonicalize(self: *Canonicalizer, raw: raw_packet.Clientbound) !?Output {
         inline for (protocol_catalog.entries) |Entry| if (self.version == Entry.version)
             return self.canonicalizeWith(Entry.Protocol, Entry.Registry, raw);
@@ -78,9 +72,6 @@ pub const Canonicalizer = struct {
         const decoded = try Protocol.play.toClient.read(raw.payload).name();
         const Tag = std.meta.Tag(@TypeOf(decoded));
         const active = std.meta.activeTag(decoded);
-        // A client can render an item only after the item-typed entity spawn
-        // and its tracked Slot metadata have both arrived. Retain that
-        // relationship while preserving the generated spawn canonical form.
         if (active == @field(Tag, "spawn_entity")) {
             const body = @field(decoded, "spawn_entity");
             try self.observeItemSpawn(Registry, raw.recipient, body);
@@ -381,61 +372,66 @@ pub const Canonicalizer = struct {
         const metadata, const done = try c1.metadata();
         try metadata.finish();
         try done.finish();
-        var rest = metadata.payload();
-        if (rest.len >= 7 and rest[0] == 9) {
-            const serializer, const after_serializer = try readVarInt(rest[1..]);
-            if (serializer == 3 and after_serializer.len >= 4) {
-                const bits = std.mem.readInt(u32, after_serializer[0..4], .big);
-                self.fields[0] = .{ .name = "subject", .value = .{ .literal = try self.resolveSubject(entity_id) } };
-                self.fields[1] = .{ .name = "health", .value = .{ .literal = try std.fmt.bufPrint(&self.field_tokens[1], "{d}", .{@as(f32, @bitCast(bits))}) } };
-                return .{ .recipient = recipient, .packet = .{ .name = "entity_state", .fields = self.fields[0..2] } };
-            }
-        }
-        if (rest.len >= 3 and rest[0] == 0) {
-            const serializer, const after_serializer = try readVarInt(rest[1..]);
-            if (serializer == 0 and after_serializer.len != 0) {
-                self.fields[0] = .{ .name = "subject", .value = .{ .literal = try self.resolveSubject(entity_id) } };
-                self.fields[1] = .{ .name = "on_fire", .value = .{ .literal = if (after_serializer[0] & 0x01 != 0) "1" else "0" } };
-                self.fields[2] = .{ .name = "sneaking", .value = .{ .literal = if (after_serializer[0] & 0x02 != 0) "1" else "0" } };
-                self.fields[3] = .{ .name = "sprinting", .value = .{ .literal = if (after_serializer[0] & 0x08 != 0) "1" else "0" } };
-                if (after_serializer.len >= 8 and after_serializer[1] == 9) {
-                    const health_serializer, const health_value = try readVarInt(after_serializer[2..]);
-                    if (health_serializer == 3 and health_value.len >= 4) {
-                        const bits = std.mem.readInt(u32, health_value[0..4], .big);
-                        self.fields[4] = .{ .name = "health", .value = .{ .literal = try std.fmt.bufPrint(&self.field_tokens[4], "{d}", .{@as(f32, @bitCast(bits))}) } };
-                        return .{ .recipient = recipient, .packet = .{ .name = "entity_state", .fields = self.fields[0..5] } };
-                    }
-                }
-                return .{ .recipient = recipient, .packet = .{ .name = "entity_state", .fields = self.fields[0..4] } };
-            }
-        }
-        // Player pose is tracked at metadata index 6 with the Pose serializer
-        // (21). Expose the semantic value while arbitrary metadata continues
-        // through the generated wire canonicalizer.
-        if (rest.len >= 3 and rest[0] == 6) {
-            const serializer, const after_serializer = try readVarInt(rest[1..]);
-            if (serializer == 21) {
-                const pose, const after_pose = try readVarInt(after_serializer);
-                if (after_pose.len == 1 and after_pose[0] == 0xff) {
-                    const pose_name: []const u8 = switch (pose) {
-                        0 => "standing",
-                        5 => "crouching",
-                        else => return null,
-                    };
-                    self.fields[0] = .{ .name = "subject", .value = .{ .literal = try self.resolveSubject(entity_id) } };
-                    self.fields[1] = .{ .name = "pose", .value = .{ .literal = pose_name } };
-                    return .{ .recipient = recipient, .packet = .{ .name = "entity_pose", .fields = self.fields[0..2] } };
-                }
-            }
-        }
-        // ItemEntity's tracked stack is metadata index 8 using the Slot
-        // serializer (7). Other entity metadata remains in its generated wire
-        // form and is intentionally not mistaken for a loot observation.
+        const rest = metadata.payload();
+        if (try self.metadataHealth(recipient, entity_id, rest)) |output| return output;
+        if (try self.metadataFlags(recipient, entity_id, rest)) |output| return output;
+        if (try self.metadataPose(recipient, entity_id, rest)) |output| return output;
+        return self.metadataStack(Registry, recipient, entity_id, rest);
+    }
+
+    fn metadataHealth(self: *Canonicalizer, recipient: []const u8, entity_id: i32, rest: []const u8) !?Output {
+        if (rest.len < 7 or rest[0] != 9) return null;
+        const serializer, const after_serializer = try readVarInt(rest[1..]);
+        if (serializer != 3 or after_serializer.len < 4) return null;
+        const bits = std.mem.readInt(u32, after_serializer[0..4], .big);
+        self.fields[0] = .{ .name = "subject", .value = .{ .literal = try self.resolveSubject(entity_id) } };
+        self.fields[1] = .{ .name = "health", .value = .{ .literal = try std.fmt.bufPrint(&self.field_tokens[1], "{d}", .{@as(f32, @bitCast(bits))}) } };
+        return .{ .recipient = recipient, .packet = .{ .name = "entity_state", .fields = self.fields[0..2] } };
+    }
+
+    fn metadataFlags(self: *Canonicalizer, recipient: []const u8, entity_id: i32, rest: []const u8) !?Output {
+        if (rest.len < 3 or rest[0] != 0) return null;
+        const serializer, const after_serializer = try readVarInt(rest[1..]);
+        if (serializer != 0 or after_serializer.len == 0) return null;
+        self.fields[0] = .{ .name = "subject", .value = .{ .literal = try self.resolveSubject(entity_id) } };
+        self.fields[1] = .{ .name = "on_fire", .value = .{ .literal = if (after_serializer[0] & 0x01 != 0) "1" else "0" } };
+        self.fields[2] = .{ .name = "sneaking", .value = .{ .literal = if (after_serializer[0] & 0x02 != 0) "1" else "0" } };
+        self.fields[3] = .{ .name = "sprinting", .value = .{ .literal = if (after_serializer[0] & 0x08 != 0) "1" else "0" } };
+        const count: usize = if (try self.metadataFlagHealth(after_serializer)) 5 else 4;
+        return .{ .recipient = recipient, .packet = .{ .name = "entity_state", .fields = self.fields[0..count] } };
+    }
+
+    fn metadataFlagHealth(self: *Canonicalizer, rest: []const u8) !bool {
+        if (rest.len < 8 or rest[1] != 9) return false;
+        const serializer, const value = try readVarInt(rest[2..]);
+        if (serializer != 3 or value.len < 4) return false;
+        const bits = std.mem.readInt(u32, value[0..4], .big);
+        self.fields[4] = .{ .name = "health", .value = .{ .literal = try std.fmt.bufPrint(&self.field_tokens[4], "{d}", .{@as(f32, @bitCast(bits))}) } };
+        return true;
+    }
+
+    fn metadataPose(self: *Canonicalizer, recipient: []const u8, entity_id: i32, rest: []const u8) !?Output {
+        if (rest.len < 3 or rest[0] != 6) return null;
+        const serializer, const after_serializer = try readVarInt(rest[1..]);
+        if (serializer != 21) return null;
+        const pose, const after_pose = try readVarInt(after_serializer);
+        if (after_pose.len != 1 or after_pose[0] != 0xff) return null;
+        const pose_name: []const u8 = switch (pose) {
+            0 => "standing",
+            5 => "crouching",
+            else => return null,
+        };
+        self.fields[0] = .{ .name = "subject", .value = .{ .literal = try self.resolveSubject(entity_id) } };
+        self.fields[1] = .{ .name = "pose", .value = .{ .literal = pose_name } };
+        return .{ .recipient = recipient, .packet = .{ .name = "entity_pose", .fields = self.fields[0..2] } };
+    }
+
+    fn metadataStack(self: *Canonicalizer, comptime Registry: type, recipient: []const u8, entity_id: i32, rest: []const u8) !?Output {
         if (rest.len < 3 or rest[0] != 8) return null;
-        const serializer, rest = try readVarInt(rest[1..]);
+        const serializer, const after_serializer = try readVarInt(rest[1..]);
         if (serializer != 7) return null;
-        const stack, rest = try decodeRawSlot(Registry, rest);
-        if (rest.len != 1 or rest[0] != 0xff or stack.count == 0) return null;
+        const stack, const remaining = try decodeRawSlot(Registry, after_serializer);
+        if (remaining.len != 1 or remaining[0] != 0xff or stack.count == 0) return null;
         const stream = self.itemStream(recipient, entity_id) orelse return null;
         if (!stream.active) return null;
         const first_metadata = !stream.metadata_seen;
@@ -1140,7 +1136,9 @@ fn writePercentEncodedSnbt(writer: *std.Io.Writer, raw: []const u8) !void {
     }
 }
 
-fn writeSnbtNode(writer: *std.Io.Writer, node: nbt.Node, nodes: []const nbt.Node) !void {
+const SnbtWriteError = nbt.Error || std.Io.Writer.Error || error{InvalidCanonicalNbt};
+
+fn writeSnbtNode(writer: *std.Io.Writer, node: nbt.Node, nodes: []const nbt.Node) SnbtWriteError!void {
     switch (node.tag) {
         .end => return error.InvalidCanonicalNbt,
         .byte => try writer.print("{}b", .{node.value.byte}),
@@ -1150,66 +1148,65 @@ fn writeSnbtNode(writer: *std.Io.Writer, node: nbt.Node, nodes: []const nbt.Node
         .float => try writer.print("{d}f", .{node.value.float}),
         .double => try writer.print("{d}d", .{node.value.double}),
         .string => try writeSnbtString(writer, node.value.string),
-        .byte_array => {
-            try writer.writeAll("[B;");
-            for (node.value.bytes, 0..) |value, index| {
-                if (index != 0) try writer.writeByte(',');
-                try writer.print("{}b", .{@as(i8, @bitCast(value))});
-            }
-            try writer.writeByte(']');
-        },
-        .int_array => {
-            try writer.writeAll("[I;");
-            var iterator = (try node.intArray()).iterator();
-            var index: usize = 0;
-            while (iterator.next()) |value| : (index += 1) {
-                if (index != 0) try writer.writeByte(',');
-                try writer.print("{}", .{value});
-            }
-            try writer.writeByte(']');
-        },
-        .long_array => {
-            try writer.writeAll("[L;");
-            var iterator = (try node.longArray()).iterator();
-            var index: usize = 0;
-            while (iterator.next()) |value| : (index += 1) {
-                if (index != 0) try writer.writeByte(',');
-                try writer.print("{}L", .{value});
-            }
-            try writer.writeByte(']');
-        },
-        .list => {
-            try writer.writeByte('[');
-            var child = node.first_child;
-            for (0..node.child_count) |index| {
-                if (index != 0) try writer.writeByte(',');
-                try writeSnbtNode(writer, nodes[child], nodes);
-                child = nodes[child].next_sibling;
-            }
-            try writer.writeByte(']');
-        },
-        .compound => {
-            var children: [256]u32 = undefined;
-            var child = node.first_child;
-            for (0..node.child_count) |index| {
-                children[index] = child;
-                child = nodes[child].next_sibling;
-            }
-            std.mem.sort(u32, children[0..node.child_count], nodes, struct {
-                fn lessThan(all_nodes: []const nbt.Node, left: u32, right: u32) bool {
-                    return std.mem.order(u8, all_nodes[left].name, all_nodes[right].name) == .lt;
-                }
-            }.lessThan);
-            try writer.writeByte('{');
-            for (children[0..node.child_count], 0..) |child_index, index| {
-                if (index != 0) try writer.writeByte(',');
-                try writeSnbtString(writer, nodes[child_index].name);
-                try writer.writeByte(':');
-                try writeSnbtNode(writer, nodes[child_index], nodes);
-            }
-            try writer.writeByte('}');
-        },
+        .byte_array => try writeSnbtBytes(writer, node.value.bytes),
+        .int_array => try writeSnbtIntegers(writer, try node.intArray(), "[I;", ""),
+        .long_array => try writeSnbtIntegers(writer, try node.longArray(), "[L;", "L"),
+        .list => try writeSnbtList(writer, node, nodes),
+        .compound => try writeSnbtCompound(writer, node, nodes),
     }
+}
+
+fn writeSnbtBytes(writer: *std.Io.Writer, bytes: []const u8) !void {
+    try writer.writeAll("[B;");
+    for (bytes, 0..) |value, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.print("{}b", .{@as(i8, @bitCast(value))});
+    }
+    try writer.writeByte(']');
+}
+
+fn writeSnbtIntegers(writer: *std.Io.Writer, array: anytype, prefix: []const u8, suffix: []const u8) !void {
+    try writer.writeAll(prefix);
+    var iterator = array.iterator();
+    var index: usize = 0;
+    while (iterator.next()) |value| : (index += 1) {
+        if (index != 0) try writer.writeByte(',');
+        try writer.print("{}{s}", .{ value, suffix });
+    }
+    try writer.writeByte(']');
+}
+
+fn writeSnbtList(writer: *std.Io.Writer, node: nbt.Node, nodes: []const nbt.Node) !void {
+    try writer.writeByte('[');
+    var child = node.first_child;
+    for (0..node.child_count) |index| {
+        if (index != 0) try writer.writeByte(',');
+        try writeSnbtNode(writer, nodes[child], nodes);
+        child = nodes[child].next_sibling;
+    }
+    try writer.writeByte(']');
+}
+
+fn writeSnbtCompound(writer: *std.Io.Writer, node: nbt.Node, nodes: []const nbt.Node) !void {
+    var children: [256]u32 = undefined;
+    var child = node.first_child;
+    for (0..node.child_count) |index| {
+        children[index] = child;
+        child = nodes[child].next_sibling;
+    }
+    std.mem.sort(u32, children[0..node.child_count], nodes, struct {
+        fn lessThan(all_nodes: []const nbt.Node, left: u32, right: u32) bool {
+            return std.mem.order(u8, all_nodes[left].name, all_nodes[right].name) == .lt;
+        }
+    }.lessThan);
+    try writer.writeByte('{');
+    for (children[0..node.child_count], 0..) |child_index, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writeSnbtString(writer, nodes[child_index].name);
+        try writer.writeByte(':');
+        try writeSnbtNode(writer, nodes[child_index], nodes);
+    }
+    try writer.writeByte('}');
 }
 
 fn writeSnbtString(writer: *std.Io.Writer, value: []const u8) !void {

@@ -1,6 +1,5 @@
 const std = @import("std");
 const registry = @import("registry_data");
-const config = @import("../config.zig").value;
 const terrain = @import("../terrain.zig");
 const geometry = @import("../world/geometry.zig");
 const world_identity = @import("../world/identity.zig");
@@ -16,7 +15,7 @@ const air_block_state = registry.block_air_default_state;
 const stone_block_default_state = registry.block_stone_default_state;
 const dirt_block_default_state = registry.block_dirt_default_state;
 const sparse_section_change_capacity = 32;
-const resident_chunk_lookup_slots = config.max_resident_chunks * 2;
+const resident_chunk_lookup_slots = test_generator.block_configuration.maximum_resident_chunks * 2;
 
 fn isRandomTickableBlock(block_state: i32) bool {
     return registry.randomTickState(block_state).kind != .none;
@@ -135,7 +134,10 @@ test "modified section promotes only after sparse capacity is exceeded" {
     table_index = value.findModifiedSection(test_world, chunk, section).?;
     try std.testing.expect(value.modified_sections[table_index].dense);
     try std.testing.expectEqual(@as(u16, sparse_section_change_capacity + 1), value.modified_sections[table_index].modified_count);
-    try std.testing.expectEqual(config.max_modified_sections - 1, value.availableSectionPages());
+    try std.testing.expectEqual(
+        test_generator.block_configuration.maximum_modified_sections - 1,
+        value.availableSectionPages(),
+    );
     try std.testing.expectEqual(stone_block_default_state, value.blockAt(test_world, promoted));
 }
 
@@ -148,9 +150,9 @@ test "terrain generation batch discards stale view requests" {
 
     const stale = geometry.ChunkPos{ .x = -32, .z = 0 };
     const current = geometry.ChunkPos{ .x = 33, .z = 0 };
-    value.requestChunkGeneration(test_world, stale);
+    try std.testing.expect(value.requestChunkGeneration(test_world, stale));
     value.beginChunkGenerationBatch();
-    value.requestChunkGeneration(test_world, current);
+    try std.testing.expect(value.requestChunkGeneration(test_world, current));
 
     try std.testing.expectEqual(@as(usize, 1), value.pendingChunkGenerationCount());
     try std.testing.expectEqual(block_store.ChunkGenerationResult.complete, value.generateRequestedChunk(1));
@@ -172,18 +174,19 @@ test "terrain generation batch preserves its active request" {
         arena.allocator(),
         0x6163_7469_7665_5f67,
     );
+    generator.mode = .staged_flat;
 
     const active = geometry.ChunkPos{ .x = -2, .z = 3 };
     const later = geometry.ChunkPos{ .x = 9, .z = -7 };
     value.beginChunkGenerationBatch();
-    value.requestChunkGeneration(test_world, active);
+    try std.testing.expect(value.requestChunkGeneration(test_world, active));
     try std.testing.expectEqual(
         block_store.ChunkGenerationResult.pending,
         value.generateRequestedChunk(1),
     );
 
     value.beginChunkGenerationBatch();
-    value.requestChunkGeneration(test_world, later);
+    try std.testing.expect(value.requestChunkGeneration(test_world, later));
     try std.testing.expectEqual(@as(usize, 2), value.pendingChunkGenerationCount());
     for (0..4096) |_| {
         if (value.residentChunk(test_world, active) != null) break;
@@ -195,11 +198,86 @@ test "terrain generation batch preserves its active request" {
     try std.testing.expect(value.residentChunk(test_world, later) == null);
 }
 
+test "terrain generation preserves request order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var generator: test_generator.Generator = .{};
+    const value = try test_generator.createBlocks(
+        &generator,
+        arena.allocator(),
+        0x7265_7175_6573_745f,
+    );
+    generator.mode = .staged_flat;
+
+    const first = geometry.ChunkPos{ .x = 5, .z = 5 };
+    value.beginChunkGenerationBatch();
+    try std.testing.expect(value.requestChunkGeneration(test_world, first));
+    try std.testing.expect(value.requestChunkGeneration(test_world, .{ .x = -5, .z = -5 }));
+    try std.testing.expectEqual(
+        block_store.ChunkGenerationResult.pending,
+        value.generateRequestedChunk(1),
+    );
+    try std.testing.expectEqualDeep(first, generator.staged_chunk.?);
+}
+
+test "terrain generation queue reuses consumed capacity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var generator: test_generator.Generator = .{};
+    const value = try Blocks.init(arena.allocator(), .{
+        .maximum_resident_chunks = 4,
+        .maximum_modified_sections = 4,
+    });
+    try generator.init(arena.allocator(), 0x7175_6575_655f_7265);
+    generator.mode = .flat;
+    generator.bind(value);
+
+    for (0..4) |x|
+        try std.testing.expect(value.requestChunkGeneration(test_world, .{ .x = @intCast(x), .z = 0 }));
+    for (0..8) |x| {
+        const chunk = geometry.ChunkPos{ .x = @intCast(x), .z = 0 };
+        try std.testing.expectEqual(block_store.ChunkGenerationResult.complete, value.generateRequestedChunk(1));
+        try std.testing.expect(value.markGeneratedChunkNew(test_world, chunk));
+        value.markChunkCleanThrough(test_world, chunk, value.chunkDirtyRevision(test_world, chunk));
+        try std.testing.expect(value.evictChunk(test_world, chunk));
+        if (x + 4 < 8)
+            try std.testing.expect(value.requestChunkGeneration(test_world, .{ .x = @intCast(x + 4), .z = 0 }));
+    }
+    try std.testing.expectEqual(@as(usize, 0), value.pendingChunkGenerationCount());
+}
+
+test "terrain completion survives eviction after early output" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var generator: test_generator.Generator = .{};
+    const value = try test_generator.createBlocks(
+        &generator,
+        arena.allocator(),
+        0x6561_726c_795f_6f75,
+    );
+    generator.mode = .early_flat;
+
+    const chunk = geometry.ChunkPos{ .x = 1, .z = -9 };
+    try std.testing.expect(value.requestChunkGeneration(test_world, chunk));
+    try std.testing.expectEqual(
+        block_store.ChunkGenerationResult.pending,
+        value.generateRequestedChunk(1),
+    );
+    try std.testing.expect(value.markGeneratedChunkNew(test_world, chunk));
+    value.markChunkCleanThrough(test_world, chunk, value.chunkDirtyRevision(test_world, chunk));
+    try std.testing.expect(value.evictChunk(test_world, chunk));
+    try std.testing.expectEqual(
+        block_store.ChunkGenerationResult.complete,
+        value.generateRequestedChunk(2),
+    );
+    try std.testing.expectEqual(@as(usize, 0), value.pendingChunkGenerationCount());
+}
+
 test "resident capacity applies backpressure and resumes after paging" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var generator: test_generator.Generator = .{};
-    const value = try Blocks.create(arena.allocator(), .{
+    const value = try Blocks.init(arena.allocator(), .{
         .maximum_resident_chunks = 4,
         .maximum_modified_sections = 4,
     });
@@ -209,18 +287,18 @@ test "resident capacity applies backpressure and resumes after paging" {
 
     for (0..4) |x| {
         value.beginChunkGenerationBatch();
-        value.requestChunkGeneration(test_world, .{ .x = @intCast(x), .z = 0 });
+        try std.testing.expect(value.requestChunkGeneration(test_world, .{ .x = @intCast(x), .z = 0 }));
         try std.testing.expectEqual(block_store.ChunkGenerationResult.complete, value.generateRequestedChunk(1));
     }
     value.beginChunkGenerationBatch();
-    value.requestChunkGeneration(test_world, .{ .x = 4, .z = 0 });
+    try std.testing.expect(value.requestChunkGeneration(test_world, .{ .x = 4, .z = 0 }));
     try std.testing.expectEqual(block_store.ChunkGenerationResult.backpressured, value.generateRequestedChunk(1));
     try std.testing.expect(value.residentPressure());
 
     try std.testing.expect(value.evictChunk(test_world, .{ .x = 0, .z = 0 }));
     value.clearResidentPressure();
     value.beginChunkGenerationBatch();
-    value.requestChunkGeneration(test_world, .{ .x = 4, .z = 0 });
+    try std.testing.expect(value.requestChunkGeneration(test_world, .{ .x = 4, .z = 0 }));
     try std.testing.expectEqual(block_store.ChunkGenerationResult.complete, value.generateRequestedChunk(2));
     try std.testing.expect(value.residentChunk(test_world, .{ .x = 4, .z = 0 }) != null);
 }
@@ -229,7 +307,7 @@ test "resident ticket cycle evicts only clean unticketed chunks" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var generator: test_generator.Generator = .{};
-    const value = try Blocks.create(arena.allocator(), .{
+    const value = try Blocks.init(arena.allocator(), .{
         .maximum_resident_chunks = 4,
         .maximum_modified_sections = 4,
     });
@@ -259,7 +337,7 @@ test "streaming releases only persisted unticketed chunks" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var generator: test_generator.Generator = .{};
-    const value = try Blocks.create(arena.allocator(), .{
+    const value = try Blocks.init(arena.allocator(), .{
         .maximum_resident_chunks = 4,
         .maximum_modified_sections = 4,
     });
@@ -281,11 +359,54 @@ test "streaming releases only persisted unticketed chunks" {
     try std.testing.expect(value.releaseStreamedChunk(test_world, generated.entry.chunk) != null);
 }
 
+test "newly generated chunks remain resident until their terrain is durable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var generator: test_generator.Generator = .{};
+    const value = try test_generator.createBlocks(&generator, arena.allocator(), 0x7061_6765_6162_6c65);
+    generator.mode = .flat;
+
+    const chunk = geometry.ChunkPos{ .x = 0, .z = 0 };
+    _ = value.generatedHeightChunkRef(test_world, chunk, 1);
+    try std.testing.expect(value.markGeneratedChunkNew(test_world, chunk));
+    const resident = value.residentChunk(test_world, chunk).?;
+    try std.testing.expect(resident.persistence_known);
+    try std.testing.expect(resident.dirty);
+    try std.testing.expect(value.chunkDirtyRevision(test_world, chunk) != 0);
+    try std.testing.expect(!value.evictChunk(test_world, chunk));
+    value.markChunkCleanThrough(test_world, chunk, value.chunkDirtyRevision(test_world, chunk));
+    try std.testing.expect(value.evictChunk(test_world, chunk));
+}
+
+test "bounded resident storage cycles through pristine terrain indefinitely" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var generator: test_generator.Generator = .{};
+    const value = try Blocks.init(arena.allocator(), .{
+        .maximum_resident_chunks = 4,
+        .maximum_modified_sections = 4,
+    });
+    try generator.init(arena.allocator(), 0x6379_636c_655f_7465);
+    generator.mode = .flat;
+    generator.bind(value);
+
+    for (0..64) |x| {
+        const chunk = geometry.ChunkPos{ .x = @intCast(x), .z = 0 };
+        value.beginChunkGenerationBatch();
+        try std.testing.expect(value.requestChunkGeneration(test_world, chunk));
+        try std.testing.expectEqual(block_store.ChunkGenerationResult.complete, value.generateRequestedChunk(@intCast(x + 1)));
+        try std.testing.expect(value.markGeneratedChunkNew(test_world, chunk));
+        value.markChunkCleanThrough(test_world, chunk, value.chunkDirtyRevision(test_world, chunk));
+        try std.testing.expectEqual(@as(usize, 1), value.residentChunkCount());
+        try std.testing.expectEqual(@as(usize, 1), value.evictUnticketedChunks());
+    }
+}
+
 test "dirty resident slots become pageable only after write acknowledgement" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var generator: test_generator.Generator = .{};
-    const value = try Blocks.create(arena.allocator(), .{
+    const value = try Blocks.init(arena.allocator(), .{
         .maximum_resident_chunks = 4,
         .maximum_modified_sections = 4,
     });
@@ -296,7 +417,7 @@ test "dirty resident slots become pageable only after write acknowledgement" {
     for (0..4) |x| {
         const chunk = geometry.ChunkPos{ .x = @intCast(x), .z = 0 };
         value.beginChunkGenerationBatch();
-        value.requestChunkGeneration(test_world, chunk);
+        try std.testing.expect(value.requestChunkGeneration(test_world, chunk));
         try std.testing.expectEqual(block_store.ChunkGenerationResult.complete, value.generateRequestedChunk(1));
         const position = geometry.BlockPos{ .x = @as(i32, @intCast(x)) * 16, .y = 80, .z = 0 };
         try std.testing.expect(try value.setBlock(test_world, position, stone_block_default_state));
@@ -304,7 +425,7 @@ test "dirty resident slots become pageable only after write acknowledgement" {
     }
 
     value.beginChunkGenerationBatch();
-    value.requestChunkGeneration(test_world, .{ .x = 4, .z = 0 });
+    try std.testing.expect(value.requestChunkGeneration(test_world, .{ .x = 4, .z = 0 }));
     try std.testing.expectEqual(block_store.ChunkGenerationResult.backpressured, value.generateRequestedChunk(1));
     const revision = value.chunkDirtyRevision(test_world, .{ .x = 0, .z = 0 });
     value.markChunkCleanThrough(test_world, .{ .x = 0, .z = 0 }, revision);
@@ -312,7 +433,7 @@ test "dirty resident slots become pageable only after write acknowledgement" {
 
     value.clearResidentPressure();
     value.beginChunkGenerationBatch();
-    value.requestChunkGeneration(test_world, .{ .x = 4, .z = 0 });
+    try std.testing.expect(value.requestChunkGeneration(test_world, .{ .x = 4, .z = 0 }));
     try std.testing.expectEqual(block_store.ChunkGenerationResult.complete, value.generateRequestedChunk(2));
 }
 

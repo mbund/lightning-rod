@@ -11,47 +11,45 @@ pub const Offer = struct {
     sell: u128,
 };
 
-pub const Config = struct {
-    offers: []const Offer = &.{
-        .{ .item = "minecraft:oak_log", .buy = 250, .sell = 100 },
-        .{ .item = "minecraft:bread", .buy = 500, .sell = 200 },
-    },
-
-    pub fn validate(self: Config) !void {
-        if (self.offers.len > 256) return error.TooManyShopOffers;
-        for (self.offers) |offer| {
-            if (offer.item.len == 0 or offer.buy == 0 or offer.sell > offer.buy)
-                return error.InvalidShopOffer;
-            if (registry.itemId(offer.item) == null) return error.UnknownShopItem;
-        }
-    }
-};
-
 pub const Shop = struct {
     pub const id = "example:shop";
+    pub const Configuration = struct {
+        offers: []const Offer = &.{
+            .{ .item = "minecraft:oak_log", .buy = 250, .sell = 100 },
+            .{ .item = "minecraft:bread", .buy = 500, .sell = 200 },
+        },
+
+        pub fn validate(self: Configuration) !void {
+            if (self.offers.len > 256) return error.TooManyShopOffers;
+            for (self.offers) |offer| {
+                if (offer.item.len == 0 or offer.buy == 0 or offer.sell > offer.buy)
+                    return error.InvalidShopOffer;
+                if (registry.itemId(offer.item) == null) return error.UnknownShopItem;
+            }
+        }
+    };
+    pub const Dependencies = struct { players: *player_store.Players, economy: *economy.Economy, outputs: *Packets };
     pub const command_declarations = [_]commands.Declaration{
         .{ .name = "buy" },
         .{ .name = "sell" },
     };
 
-    config: Config,
-    players: *player_store.Players,
-    economy: *economy.Economy,
-    outputs: *Packets,
+    config: Configuration,
+    deps: Dependencies,
 
-    pub fn create(allocator: std.mem.Allocator, players: *player_store.Players, economy_plugin: *economy.Economy, outputs: *Packets, shop_config: Config) !*Shop {
-        try shop_config.validate();
+    pub fn init(allocator: std.mem.Allocator, deps: Dependencies, config: Configuration) !*Shop {
+        try config.validate();
         const self = try allocator.create(Shop);
-        self.* = .{ .config = shop_config, .players = players, .economy = economy_plugin, .outputs = outputs };
+        self.* = .{ .config = config, .deps = deps };
         return self;
     }
 
     pub fn tick(self: *Shop, _: std.mem.Allocator) void {
         Runner.run(
-            self.players,
-            self.economy,
-            self.outputs,
-            &self.outputs.commands,
+            self.deps.players,
+            self.deps.economy,
+            self.deps.outputs,
+            &self.deps.outputs.commands,
             &self.config,
         );
     }
@@ -60,7 +58,7 @@ pub const Shop = struct {
 const Work = struct {
     players: *player_store.Players,
     outputs: *Packets,
-    config: *const Config,
+    config: *const Shop.Configuration,
     economy: *economy.Economy,
 };
 
@@ -98,9 +96,8 @@ const Trade = struct {
 };
 
 const Runner = struct {
-    fn run(players: *player_store.Players, economy_service: *economy.Economy, outputs: *Packets, command_batch: *commands.Batch, plugin_config: *const Config) void {
+    fn run(players: *player_store.Players, economy_service: *economy.Economy, outputs: *Packets, command_batch: *commands.Batch, plugin_config: *const Shop.Configuration) void {
         var work = Work{ .players = players, .outputs = outputs, .config = plugin_config, .economy = economy_service };
-        if (!work.economy.ready()) return;
         for (command_batch.items()) |*entry| {
             if (entry.handled) continue;
             var words = std.mem.tokenizeScalar(u8, entry.text, ' ');
@@ -168,7 +165,7 @@ fn removeItem(slots: []player_store.HotbarStack, item_id: i32, remaining: *usize
     }
 }
 
-fn findOffer(plugin_config: *const Config, input: []const u8) ?Offer {
+fn findOffer(plugin_config: *const Shop.Configuration, input: []const u8) ?Offer {
     for (plugin_config.offers) |offer| {
         if (std.mem.eql(u8, offer.item, input)) return offer;
         if (std.mem.startsWith(u8, offer.item, "minecraft:") and std.mem.eql(u8, offer.item["minecraft:".len..], input)) return offer;
@@ -177,7 +174,7 @@ fn findOffer(plugin_config: *const Config, input: []const u8) ?Offer {
 }
 
 test "shop configuration uses namespaced registry items" {
-    const plugin_config = Config{};
+    const plugin_config = Shop.Configuration{};
     try plugin_config.validate();
     try std.testing.expectEqualStrings("minecraft:oak_log", findOffer(&plugin_config, "oak_log").?.item);
     try std.testing.expect(findOffer(&plugin_config, "diamond") == null);

@@ -2,26 +2,14 @@ const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const player_store = lightning_rod.players;
 const commands = lightning_rod.commands;
-const config = lightning_rod.config.value;
 const Packets = lightning_rod.Packets;
-const tick_io = lightning_rod.tick_io;
 
-const storage_magic = "LRECON01";
-
-pub const Config = struct {
-    unit: []const u8 = "coin",
-    precision: u8 = 2,
-
-    pub fn validate(self: Config) !void {
-        if (self.unit.len == 0 or self.unit.len > 32) return error.InvalidCurrencyUnit;
-        if (self.precision > 18) return error.InvalidCurrencyPrecision;
-    }
-};
+const storage_header = "LRECON01";
 
 pub const Account = struct {
     uuid: u128 = 0,
     balance: u128 = 0,
-    name: [config.max_username_bytes]u8 = undefined,
+    name: [lightning_rod.players.maximum_name_bytes]u8 = undefined,
     name_len: u8 = 0,
 
     pub fn nameSlice(self: *const Account) []const u8 {
@@ -31,6 +19,22 @@ pub const Account = struct {
 
 pub const Economy = struct {
     pub const id = "example:economy";
+    pub const Configuration = struct {
+        unit: []const u8 = "coin",
+        precision: u8 = 2,
+        maximum_accounts: usize,
+        pub fn validate(self: Configuration) !void {
+            if (self.unit.len == 0 or self.unit.len > 32) return error.InvalidCurrencyUnit;
+            if (self.precision > 18) return error.InvalidCurrencyPrecision;
+            if (self.maximum_accounts == 0 or self.maximum_accounts > std.math.maxInt(u16))
+                return error.InvalidAccountCapacity;
+        }
+    };
+    pub const Dependencies = struct {
+        persistence: lightning_rod.persistence.PluginAccess,
+        players: *player_store.Players,
+        outputs: *Packets,
+    };
     pub const command_declarations = [_]commands.Declaration{
         .{ .name = "balance" },
         .{ .name = "bal" },
@@ -38,53 +42,41 @@ pub const Economy = struct {
         .{ .name = "pay" },
     };
 
-    config: Config,
+    config: Configuration,
     accounts: []Account = &.{},
     ranking: []u16 = &.{},
     persistence_buffer: []u8 = &.{},
     account_count: usize = 0,
-    loaded: bool = false,
     dirty: bool = false,
-    players: *player_store.Players,
-    outputs: *Packets,
-    io: *tick_io.TickIo,
+    deps: Dependencies,
 
-    pub fn create(allocator: std.mem.Allocator, players: *player_store.Players, outputs: *Packets, io: *tick_io.TickIo, economy_config: Config) !*Economy {
-        try economy_config.validate();
+    pub fn init(allocator: std.mem.Allocator, deps: Dependencies, settings: Configuration) !*Economy {
+        try settings.validate();
+        if (settings.maximum_accounts > deps.players.records.len) return error.InvalidAccountCapacity;
         const self = try allocator.create(Economy);
-        self.* = .{ .config = economy_config, .players = players, .outputs = outputs, .io = io };
-        self.accounts = try allocator.alloc(Account, config.max_saved_players);
-        self.ranking = try allocator.alloc(u16, config.max_saved_players);
-        self.persistence_buffer = try allocator.alloc(u8, encodedCapacity());
+        self.* = .{ .config = settings, .deps = deps };
+        self.accounts = try allocator.alloc(Account, settings.maximum_accounts);
+        self.ranking = try allocator.alloc(u16, settings.maximum_accounts);
+        self.persistence_buffer = try allocator.alloc(u8, encodedCapacity(settings.maximum_accounts));
         @memset(self.accounts, .{});
+        try self.restore();
         return self;
     }
 
-    pub fn load(self: *Economy) !void {
-        if (self.loaded) return;
-        if (try self.io.readPluginSync(Economy.id)) |bytes| try decode(self, bytes);
-        self.loaded = true;
-    }
-
     pub fn tick(self: *Economy, _: std.mem.Allocator) void {
-        std.debug.assert(self.loaded);
         var work = Work{
-            .players = self.players,
-            .outputs = self.outputs,
+            .players = self.deps.players,
+            .outputs = self.deps.outputs,
             .economy = self,
         };
-        CommandRunner.run(&work, &self.outputs.commands);
+        CommandRunner.run(&work, &self.deps.outputs.commands);
     }
 
-    pub fn save(self: *Economy) !void {
+    pub fn checkpoint(self: *Economy, writer: *lightning_rod.plugin_lifecycle.Checkpoint.NamespaceWriter) !void {
         if (!self.dirty) return;
         const bytes = try encode(self, self.persistence_buffer);
-        try self.io.writePluginSync(Economy.id, bytes);
+        try writer.put("state", bytes);
         self.dirty = false;
-    }
-
-    pub fn ready(self: *const Economy) bool {
-        return self.loaded;
     }
 
     pub fn balance(self: *Economy, uuid: u128) u128 {
@@ -149,6 +141,17 @@ pub const Economy = struct {
 
     fn markDirty(self: *Economy) void {
         self.dirty = true;
+    }
+
+    fn restore(self: *Economy) !void {
+        const loaded = self.deps.persistence.load("state", self.persistence_buffer) catch |err| switch (err) {
+            error.ReadFailed => return,
+            else => return err,
+        };
+        switch (loaded) {
+            .missing => {},
+            .value => |length| try decode(self, self.persistence_buffer[0..length]),
+        }
     }
 };
 
@@ -257,7 +260,7 @@ pub fn parseAmount(text: []const u8, precision: u8) !u128 {
     return value;
 }
 
-pub fn formatAmount(buffer: []u8, amount: u128, plugin_config: Config) ![]const u8 {
+pub fn formatAmount(buffer: []u8, amount: u128, plugin_config: Economy.Configuration) ![]const u8 {
     const scale = try powerOfTen(plugin_config.precision);
     var writer = std.Io.Writer.fixed(buffer);
     try writer.print("{d}", .{amount / scale});
@@ -280,7 +283,7 @@ pub fn formatAmount(buffer: []u8, amount: u128, plugin_config: Config) ![]const 
 
 pub fn encode(state: *const Economy, buffer: []u8) ![]const u8 {
     var writer = std.Io.Writer.fixed(buffer);
-    try writer.writeAll(storage_magic);
+    try writer.writeAll(storage_header);
     try writer.writeInt(u16, @intCast(state.account_count), .little);
     for (state.accounts[0..state.account_count]) |account| {
         try writer.writeInt(u128, account.uuid, .little);
@@ -293,9 +296,9 @@ pub fn encode(state: *const Economy, buffer: []u8) ![]const u8 {
 
 pub fn decode(state: *Economy, bytes: []const u8) !void {
     var reader = std.Io.Reader.fixed(bytes);
-    var magic: [storage_magic.len]u8 = undefined;
-    try reader.readSliceAll(&magic);
-    if (!std.mem.eql(u8, &magic, storage_magic)) return error.InvalidEconomyData;
+    var header: [storage_header.len]u8 = undefined;
+    try reader.readSliceAll(&header);
+    if (!std.mem.eql(u8, &header, storage_header)) return error.InvalidEconomyData;
     const count = try reader.takeInt(u16, .little);
     if (count > state.accounts.len) return error.InvalidEconomyData;
     state.account_count = count;
@@ -311,8 +314,8 @@ pub fn decode(state: *Economy, bytes: []const u8) !void {
     state.dirty = false;
 }
 
-fn encodedCapacity() usize {
-    return storage_magic.len + @sizeOf(u16) + config.max_saved_players * (@sizeOf(u128) * 2 + 1 + config.max_username_bytes);
+fn encodedCapacity(maximum_accounts: usize) usize {
+    return storage_header.len + @sizeOf(u16) + maximum_accounts * (@sizeOf(u128) * 2 + 1 + lightning_rod.players.maximum_name_bytes);
 }
 
 fn setName(account: *Account, name: []const u8) void {
@@ -332,31 +335,27 @@ test "amounts preserve configured precision" {
     try std.testing.expectEqual(@as(u128, 12_300), try parseAmount("123", 2));
     try std.testing.expectError(error.InvalidAmount, parseAmount("0", 2));
     var buffer: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("123.45 coins", try formatAmount(&buffer, 12_345, .{ .unit = "coins" }));
+    try std.testing.expectEqualStrings("123.45 coins", try formatAmount(&buffer, 12_345, .{ .unit = "coins", .maximum_accounts = 1 }));
 }
 
 test "account data round trips without allocator state" {
-    var source_accounts: [config.max_saved_players]Account = undefined;
-    var restored_accounts: [config.max_saved_players]Account = undefined;
+    var source_accounts: [2]Account = undefined;
+    var restored_accounts: [2]Account = undefined;
     @memset(&source_accounts, .{});
     @memset(&restored_accounts, .{});
     var source = Economy{
-        .config = .{},
+        .config = .{ .maximum_accounts = source_accounts.len },
         .accounts = &source_accounts,
-        .players = undefined,
-        .outputs = undefined,
-        .io = undefined,
+        .deps = undefined,
     };
     try source.deposit(11, "alice", 500);
     try source.deposit(22, "bob", 725);
-    var bytes: [encodedCapacity()]u8 = undefined;
+    var bytes: [encodedCapacity(source_accounts.len)]u8 = undefined;
     const encoded = try encode(&source, &bytes);
     var restored = Economy{
-        .config = .{},
+        .config = .{ .maximum_accounts = restored_accounts.len },
         .accounts = &restored_accounts,
-        .players = undefined,
-        .outputs = undefined,
-        .io = undefined,
+        .deps = undefined,
     };
     try decode(&restored, encoded);
     try std.testing.expectEqual(@as(u128, 500), restored.balance(11));
@@ -364,14 +363,12 @@ test "account data round trips without allocator state" {
 }
 
 test "an account cannot pay itself" {
-    var accounts: [config.max_saved_players]Account = undefined;
+    var accounts: [1]Account = undefined;
     @memset(&accounts, .{});
     var economy = Economy{
-        .config = .{},
+        .config = .{ .maximum_accounts = accounts.len },
         .accounts = &accounts,
-        .players = undefined,
-        .outputs = undefined,
-        .io = undefined,
+        .deps = undefined,
     };
     try economy.deposit(11, "alice", 500);
     const alice = economy.findByUuid(11).?;

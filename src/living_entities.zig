@@ -1,11 +1,9 @@
 const std = @import("std");
 const preallocated = @import("preallocated");
-const config = @import("config.zig").value;
-const vanilla_random = @import("vanilla/random.zig");
+const vanilla_random = @import("java_random.zig");
 const diagnostics = @import("diagnostics.zig");
 const world_identity = @import("world/identity.zig");
 
-pub const capacity = config.max_living_entities;
 pub const cache_line_size = 64;
 const test_world = world_identity.Handle{ .index = 0, .generation = 1 };
 
@@ -14,12 +12,15 @@ pub const Handle = packed struct(u32) {
     generation: u16,
 };
 
+pub const no_vehicle = Handle{ .index = std.math.maxInt(u16), .generation = 0 };
+
 pub const EntityType = enum(u8) {
     zombie,
     zombified_piglin,
     turtle,
     cow,
     pig,
+    chicken,
 };
 
 pub const Target = union(enum) {
@@ -75,6 +76,7 @@ pub const Entity = struct {
     fire_ticks: i32,
     despawn_counter: u32,
     target: Target,
+    vehicle: ?Handle,
     baby: bool,
     breeding_age: i32,
     love_ticks: u16,
@@ -87,6 +89,15 @@ pub const Entity = struct {
 };
 
 pub const Pool = struct {
+    pub const Configuration = struct {
+        maximum_entities: usize = 512,
+        first_entity_id: i32,
+
+        pub fn validate(self: Configuration) !void {
+            if (self.maximum_entities == 0 or self.maximum_entities >= std.math.maxInt(u16)) return error.InvalidLivingEntityCapacity;
+        }
+    };
+
     worlds: []align(cache_line_size) world_identity.Handle = &.{},
     position_x: []align(cache_line_size) f64 = &.{},
     position_y: []align(cache_line_size) f64 = &.{},
@@ -113,8 +124,11 @@ pub const Pool = struct {
     entity_types: []align(cache_line_size) EntityType = &.{},
     uuids: []align(cache_line_size) u128 = &.{},
     targets: []align(cache_line_size) Target = &.{},
+    vehicles: []align(cache_line_size) Handle = &.{},
+    restored_vehicle_uuids: []align(cache_line_size) u128 = &.{},
     active: []align(cache_line_size) bool = &.{},
     baby: []align(cache_line_size) bool = &.{},
+    jockey_candidate: []align(cache_line_size) bool = &.{},
     breeding_age: []align(cache_line_size) i32 = &.{},
     love_ticks: []align(cache_line_size) u16 = &.{},
     loving_player: []align(cache_line_size) u16 = &.{},
@@ -159,41 +173,31 @@ pub const Pool = struct {
     active_count: usize = 0,
     free_count: usize = 0,
     initialized: bool = false,
+    first_entity_id: i32 = 0,
 
-    pub fn allocate(self: *Pool, allocator: std.mem.Allocator) !void {
+    pub fn allocate(self: *Pool, allocator: std.mem.Allocator, configuration: Configuration) !void {
+        try configuration.validate();
         self.* = .{};
         inline for (@typeInfo(Pool).@"struct".fields) |field| {
             if (@typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
                 const Child = @typeInfo(field.type).pointer.child;
-                @field(self, field.name) = try preallocated.alignedAlloc(Child, allocator, .@"64", capacity);
+                @field(self, field.name) = try preallocated.alignedAlloc(Child, allocator, .@"64", configuration.maximum_entities);
             }
         }
+        self.first_entity_id = configuration.first_entity_id;
         self.initInPlace();
     }
 
     pub fn initInPlace(self: *Pool) void {
         @memset(self.active, false);
         @memset(self.generations, 1);
-        self.free_count = capacity;
-        for (0..capacity) |position| {
-            self.free_indices[position] = @intCast(capacity - 1 - position);
+        @memset(self.vehicles, no_vehicle);
+        @memset(self.restored_vehicle_uuids, 0);
+        self.free_count = self.active.len;
+        for (0..self.active.len) |position| {
+            self.free_indices[position] = @intCast(self.active.len - 1 - position);
         }
         self.initialized = true;
-        self.assertInvariants();
-    }
-
-    pub fn resetInPlace(self: *Pool) void {
-        if (!self.initialized) return self.initInPlace();
-        for (self.active_indices[0..self.active_count]) |index| {
-            self.active[index] = false;
-            self.targets[index] = .none;
-            self.generations[index] +%= 1;
-            if (self.generations[index] == 0) self.generations[index] = 1;
-        }
-        self.active_count = 0;
-        self.free_count = capacity;
-        for (0..capacity) |position|
-            self.free_indices[position] = @intCast(capacity - 1 - position);
         self.assertInvariants();
     }
 
@@ -224,7 +228,7 @@ pub const Pool = struct {
         std.debug.assert(world_identity.valid(value.world));
         self.worlds[index] = value.world;
         self.entity_types[index] = value.entity_type;
-        self.entity_ids[index] = entityId(index);
+        self.entity_ids[index] = self.entityId(index);
         self.uuids[index] = value.uuid;
         self.position_x[index] = value.position.x;
         self.position_y[index] = value.position.y;
@@ -239,7 +243,10 @@ pub const Pool = struct {
         self.fire_ticks[index] = 0;
         self.despawn_counter[index] = 0;
         self.targets[index] = .none;
+        self.vehicles[index] = no_vehicle;
+        self.restored_vehicle_uuids[index] = 0;
         self.baby[index] = value.baby;
+        self.jockey_candidate[index] = false;
         self.breeding_age[index] = if (value.baby) -24_000 else 0;
         self.love_ticks[index] = 0;
         self.loving_player[index] = std.math.maxInt(u16);
@@ -294,6 +301,8 @@ pub const Pool = struct {
         self.can_pick_up_loot[index] = spawn_random.nextFloat() < 0.55;
         self.can_break_doors[index] = spawn_random.nextFloat() < 0.1;
         self.leader[index] = spawn_random.nextFloat() < 0.05;
+        var jockey_random = vanilla_random.Random.init(value.random_seed ^ 0x6c6176615f636869);
+        self.jockey_candidate[index] = value.baby and jockey_random.nextFloat() < 0.05;
         if (!self.leader[index]) return;
         self.reinforcement_chance[index] += 0.5 + spawn_random.nextDouble() * 0.25;
         self.max_health[index] *= @floatCast(2 + spawn_random.nextDouble() * 3);
@@ -324,6 +333,9 @@ pub const Pool = struct {
         self.active_count -= 1;
         self.active[index] = false;
         self.targets[index] = .none;
+        self.vehicles[index] = no_vehicle;
+        self.restored_vehicle_uuids[index] = 0;
+        self.jockey_candidate[index] = false;
         self.generations[index] +%= 1;
         if (self.generations[index] == 0) self.generations[index] = 1;
         self.free_indices[self.free_count] = index;
@@ -337,13 +349,37 @@ pub const Pool = struct {
     }
 
     pub fn isAlive(self: *const Pool, handle: Handle) bool {
-        return handle.index < capacity and self.active[handle.index] and self.generations[handle.index] == handle.generation;
+        return handle.index < self.active.len and self.active[handle.index] and self.generations[handle.index] == handle.generation;
+    }
+
+    pub fn vehicleFor(self: *const Pool, rider: Handle) ?Handle {
+        if (!self.isAlive(rider)) return null;
+        const vehicle = self.vehicles[rider.index];
+        return if (vehicle.index == no_vehicle.index) null else vehicle;
+    }
+
+    pub fn setVehicle(self: *Pool, rider: Handle, vehicle: Handle) bool {
+        if (!self.isAlive(rider) or !self.isAlive(vehicle)) return false;
+        if (rider.index == vehicle.index) return false;
+        for (self.active_indices[0..self.active_count]) |candidate| {
+            if (candidate == rider.index) continue;
+            if (self.vehicles[candidate].index != vehicle.index) continue;
+            if (self.vehicles[candidate].generation != vehicle.generation) continue;
+            return false;
+        }
+        self.vehicles[rider.index] = vehicle;
+        return true;
+    }
+
+    pub fn clearVehicle(self: *Pool, rider: Handle) void {
+        if (!self.isAlive(rider)) return;
+        self.vehicles[rider.index] = no_vehicle;
+        self.restored_vehicle_uuids[rider.index] = 0;
     }
 
     pub fn indexForEntityId(self: *const Pool, entity_id: i32) ?u16 {
-        const first_id: i32 = @intCast(config.connectionCapacity() + config.max_item_entities + 1);
-        const offset = entity_id - first_id;
-        if (offset < 0 or offset >= capacity) return null;
+        const offset = entity_id - self.first_entity_id;
+        if (offset < 0 or offset >= self.active.len) return null;
         const index: u16 = @intCast(offset);
         return if (self.active[index] and self.entity_ids[index] == entity_id) index else null;
     }
@@ -367,6 +403,7 @@ pub const Pool = struct {
             .fire_ticks = self.fire_ticks[index],
             .despawn_counter = self.despawn_counter[index],
             .target = self.targets[index],
+            .vehicle = self.vehicleFor(handle),
             .baby = self.baby[index],
             .breeding_age = self.breeding_age[index],
             .love_ticks = self.love_ticks[index],
@@ -387,6 +424,8 @@ pub const Pool = struct {
         self.position_y[index] = position.y;
         self.position_z[index] = position.z;
         self.targets[index] = .none;
+        self.vehicles[index] = no_vehicle;
+        self.restored_vehicle_uuids[index] = 0;
         self.target_goal_running[index] = false;
         self.melee_goal_running[index] = false;
         self.melee_update_countdown[index] = 0;
@@ -394,16 +433,16 @@ pub const Pool = struct {
     }
 
     pub fn assertInvariants(self: *const Pool) void {
-        if (self.initialized and self.active_count + self.free_count != capacity)
-            diagnostics.panic("living pool invariant failed (active count, free count, capacity)", &.{ diagnostics.integer(self.active_count), diagnostics.integer(self.free_count), diagnostics.integer(capacity) });
-        if (self.active_count > capacity)
-            diagnostics.panic("living pool invariant failed (active count, capacity)", &.{ diagnostics.integer(self.active_count), diagnostics.integer(capacity) });
-        if (self.free_count > capacity)
-            diagnostics.panic("living pool invariant failed (free count, capacity)", &.{ diagnostics.integer(self.free_count), diagnostics.integer(capacity) });
+        if (self.initialized and self.active_count + self.free_count != self.active.len)
+            diagnostics.panic("living pool invariant failed (active count, free count, capacity)", &.{ diagnostics.integer(self.active_count), diagnostics.integer(self.free_count), diagnostics.integer(self.active.len) });
+        if (self.active_count > self.active.len)
+            diagnostics.panic("living pool invariant failed (active count, capacity)", &.{ diagnostics.integer(self.active_count), diagnostics.integer(self.active.len) });
+        if (self.free_count > self.active.len)
+            diagnostics.panic("living pool invariant failed (free count, capacity)", &.{ diagnostics.integer(self.free_count), diagnostics.integer(self.active.len) });
         if (!self.initialized) return;
         for (self.active_indices[0..self.active_count], 0..) |index, position| {
-            if (index >= capacity)
-                diagnostics.panic("living pool invariant failed (active index, list position, capacity)", &.{ diagnostics.integer(index), diagnostics.integer(position), diagnostics.integer(capacity) });
+            if (index >= self.active.len)
+                diagnostics.panic("living pool invariant failed (active index, list position, capacity)", &.{ diagnostics.integer(index), diagnostics.integer(position), diagnostics.integer(self.active.len) });
             if (!self.active[index])
                 diagnostics.panic("living pool invariant failed: active-list entry is marked inactive (index, list position)", &.{ diagnostics.integer(index), diagnostics.integer(position) });
             if (self.active_positions[index] != position)
@@ -467,11 +506,19 @@ pub const Pool = struct {
                 self.attack_damage[index] = 0;
                 self.armor[index] = 0;
             },
+            .chicken => {
+                self.health[index] = 4;
+                self.max_health[index] = 4;
+                self.follow_range[index] = 10;
+                self.movement_speed[index] = 0.25;
+                self.attack_damage[index] = 0;
+                self.armor[index] = 0;
+            },
         }
     }
 
-    fn entityId(index: usize) i32 {
-        return @intCast(config.connectionCapacity() + config.max_item_entities + index + 1);
+    fn entityId(self: *const Pool, index: usize) i32 {
+        return self.first_entity_id + @as(i32, @intCast(index));
     }
 };
 
@@ -480,6 +527,7 @@ pub fn width(entity_type: EntityType, baby: bool) f32 {
         .zombie, .zombified_piglin => 0.6,
         .turtle => 1.2,
         .cow, .pig => 0.9,
+        .chicken => 0.4,
     };
     return if (baby) adult * 0.5 else adult;
 }
@@ -490,6 +538,7 @@ pub fn height(entity_type: EntityType, baby: bool) f32 {
         .turtle => 0.4,
         .cow => 1.4,
         .pig => 0.9,
+        .chicken => 0.7,
     };
     return if (baby) adult * 0.5 else adult;
 }
@@ -497,7 +546,7 @@ pub fn height(entity_type: EntityType, baby: bool) f32 {
 pub fn canDespawn(entity_type: EntityType) bool {
     return switch (entity_type) {
         .zombie, .zombified_piglin => true,
-        .turtle, .cow, .pig => false,
+        .turtle, .cow, .pig, .chicken => false,
     };
 }
 
@@ -505,7 +554,7 @@ test "generational handles reject stale living entity references" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var pool: Pool = undefined;
-    try pool.allocate(arena.allocator());
+    try pool.allocate(arena.allocator(), .{ .first_entity_id = 1 });
     const first = try pool.spawn(.{ .world = test_world, .entity_type = .zombie, .position = .{ .x = 1, .y = 64, .z = 2 }, .uuid = 1, .random_seed = 1 });
     try std.testing.expect(pool.remove(first));
     const second = try pool.spawn(.{ .world = test_world, .entity_type = .zombie, .position = .{ .x = 3, .y = 64, .z = 4 }, .uuid = 2, .random_seed = 2 });
@@ -523,11 +572,24 @@ test "passive animals do not use hostile mob despawning" {
     try std.testing.expect(!canDespawn(.pig));
 }
 
+test "a bounded vehicle relation accepts one live passenger" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var pool: Pool = undefined;
+    try pool.allocate(arena.allocator(), .{ .first_entity_id = 1 });
+    const chicken = try pool.spawn(.{ .world = test_world, .entity_type = .chicken, .position = .{ .x = 0, .y = 64, .z = 0 }, .uuid = 1, .random_seed = 1 });
+    const first = try pool.spawn(.{ .world = test_world, .entity_type = .zombie, .position = .{ .x = 0, .y = 64, .z = 0 }, .uuid = 2, .random_seed = 2, .baby = true });
+    const second = try pool.spawn(.{ .world = test_world, .entity_type = .zombie, .position = .{ .x = 0, .y = 64, .z = 0 }, .uuid = 3, .random_seed = 3, .baby = true });
+    try std.testing.expect(pool.setVehicle(first, chicken));
+    try std.testing.expect(!pool.setVehicle(second, chicken));
+    try std.testing.expectEqual(chicken, pool.vehicleFor(first).?);
+}
+
 test "world transfer preserves intrinsic state and clears world-relative goals" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var pool: Pool = undefined;
-    try pool.allocate(arena.allocator());
+    try pool.allocate(arena.allocator(), .{ .first_entity_id = 1 });
     const entity = try pool.spawn(.{
         .world = test_world,
         .entity_type = .zombie,
@@ -554,7 +616,7 @@ test "removal preserves stable living entity tick order" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var pool: Pool = undefined;
-    try pool.allocate(arena.allocator());
+    try pool.allocate(arena.allocator(), .{ .first_entity_id = 1 });
     const a = try pool.spawn(.{ .world = test_world, .entity_type = .zombie, .position = .{ .x = 0, .y = 64, .z = 0 }, .uuid = 1, .random_seed = 1 });
     const b = try pool.spawn(.{ .world = test_world, .entity_type = .zombie, .position = .{ .x = 1, .y = 64, .z = 0 }, .uuid = 2, .random_seed = 2 });
     const c = try pool.spawn(.{ .world = test_world, .entity_type = .zombie, .position = .{ .x = 2, .y = 64, .z = 0 }, .uuid = 3, .random_seed = 3 });
@@ -566,7 +628,7 @@ test "cow and pig defaults are vanilla-sized passive animals" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var pool: Pool = undefined;
-    try pool.allocate(arena.allocator());
+    try pool.allocate(arena.allocator(), .{ .first_entity_id = 1 });
     const cow = try pool.spawn(.{ .world = test_world, .entity_type = .cow, .position = .{ .x = 0, .y = 64, .z = 0 }, .uuid = 1, .random_seed = 1 });
     const pig = try pool.spawn(.{ .world = test_world, .entity_type = .pig, .position = .{ .x = 1, .y = 64, .z = 0 }, .uuid = 2, .random_seed = 2 });
     try std.testing.expectEqual(@as(f32, 10), pool.health[cow.index]);
@@ -583,7 +645,7 @@ test "zombie defaults match the 1.21.8 attribute contract" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var pool: Pool = undefined;
-    try pool.allocate(arena.allocator());
+    try pool.allocate(arena.allocator(), .{ .first_entity_id = 1 });
     const adult = try pool.spawn(.{ .world = test_world, .entity_type = .zombie, .position = .{ .x = 0, .y = 64, .z = 0 }, .uuid = 1, .random_seed = 1 });
     const baby = try pool.spawn(.{ .world = test_world, .entity_type = .zombie, .position = .{ .x = 0, .y = 64, .z = 0 }, .uuid = 2, .baby = true, .random_seed = 2 });
     try std.testing.expectEqual(@as(f32, 20), pool.health[adult.index]);
@@ -597,7 +659,7 @@ test "zombie leader initialization applies the reinforcement and health contract
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var pool: Pool = undefined;
-    try pool.allocate(arena.allocator());
+    try pool.allocate(arena.allocator(), .{ .first_entity_id = 1 });
     var found_leader = false;
     for (0..256) |seed| {
         const zombie = try pool.spawn(.{ .world = test_world, .entity_type = .zombie, .position = .{ .x = 0, .y = 64, .z = 0 }, .uuid = seed + 1, .random_seed = seed });

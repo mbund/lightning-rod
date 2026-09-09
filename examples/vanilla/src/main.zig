@@ -1,10 +1,12 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
-const vanilla = @import("vanilla");
+const linux = @import("lightning_rod_linux");
+const vanilla = @import("lightning_rod_vanilla_1_21_6");
 
-pub const panic = lightning_rod.server_app.panic;
-pub const std_options: std.Options = lightning_rod.server_app.std_options;
+pub const std_options: std.Options = .{ .logFn = lightning_rod.logging.logFn };
 
 pub fn main(init: std.process.Init) !void {
-    try lightning_rod.server_app.run(vanilla, init);
+    const plugins = vanilla.plugins();
+    const Server = linux.Profile(vanilla.protocols, @TypeOf(plugins), .{});
+    try Server.run(init, .{ .plugins = plugins });
 }

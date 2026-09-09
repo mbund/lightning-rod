@@ -3,8 +3,6 @@ const generated = @import("canonical_spec");
 const protocol_catalog = @import("protocol_catalog");
 const packet_model = @import("packet.zig");
 
-/// Converts the version-independent canonical input into an opaque Minecraft
-/// packet body before it crosses a target harness boundary.
 pub fn encode(buffer: []u8, packet: packet_model.Packet) ![]const u8 {
     const Default = protocol_catalog.entries[@intFromEnum(protocol_catalog.default)];
     return encodeWith(Default.Protocol, Default.Registry, buffer, packet, &.{});

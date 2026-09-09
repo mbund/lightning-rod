@@ -6,7 +6,6 @@ const test_state = @import("test_support/state.zig");
 const diagnostics = @import("diagnostics.zig");
 const world_identity = @import("world/identity.zig");
 const Packets = @import("packet_writer.zig").Packets;
-const tick_host = @import("tick_host.zig");
 
 pub const max_batch_changes = 64;
 
@@ -33,9 +32,13 @@ pub const Writer = struct {
     }
 
     inline fn emit(self: Self, world: world_identity.Handle, pos: geometry.BlockPos, block_state: i32) void {
-        self.outputs.block_changed(.{ .world = world, .pos = pos, .block_state = block_state });
+        self.outputs.blockChanged(.{ .world = world, .pos = pos, .block_state = block_state });
     }
 };
+
+inline fn samePosition(a: geometry.BlockPos, b: geometry.BlockPos) bool {
+    return a.x == b.x and a.y == b.y and a.z == b.z;
+}
 
 pub const Batch = struct {
     writer: Writer,
@@ -103,59 +106,3 @@ pub const Batch = struct {
         self.len = 0;
     }
 };
-
-inline fn samePosition(a: geometry.BlockPos, b: geometry.BlockPos) bool {
-    return a.x == b.x and a.y == b.y and a.z == b.z;
-}
-
-test "writer couples authoritative state and block output" {
-    const simulation = try std.testing.allocator.create(test_state.State);
-    defer std.testing.allocator.destroy(simulation);
-    try simulation.init(std.testing.allocator, 11);
-    defer simulation.deinit();
-
-    var host: tick_host.Host = undefined;
-    var output = Packets.init(&host);
-    const blocks = Writer.init(simulation.blocks, &output);
-    const pos = geometry.BlockPos{ .x = 1, .y = 100, .z = 2 };
-    simulation.blocks.ensureChunkAt(simulation.world, pos.x, pos.z, simulation.clock.tick);
-    const previous = simulation.blocks.blockAt(simulation.world, pos);
-    const replacement = if (previous == registry.block_air_default_state) registry.block_stone_default_state else registry.block_air_default_state;
-
-    try std.testing.expect(try blocks.set(simulation.world, pos, replacement));
-    try std.testing.expectEqual(replacement, simulation.blocks.blockAt(simulation.world, pos));
-    try std.testing.expectEqual(@as(usize, 1), output.pending_block_change_count);
-    try std.testing.expect(samePosition(pos, output.pending_block_changes[0].pos));
-    try std.testing.expectEqual(replacement, output.pending_block_changes[0].block_state);
-    try std.testing.expect(!(try blocks.set(simulation.world, pos, replacement)));
-    try std.testing.expectEqual(@as(usize, 1), output.pending_block_change_count);
-}
-
-test "batch coalesces positions and emits committed changes in order" {
-    const simulation = try std.testing.allocator.create(test_state.State);
-    defer std.testing.allocator.destroy(simulation);
-    try simulation.init(std.testing.allocator, 12);
-    defer simulation.deinit();
-
-    var host: tick_host.Host = undefined;
-    var output = Packets.init(&host);
-    const blocks = Writer.init(simulation.blocks, &output);
-    var batch = blocks.beginBatch();
-    const first = geometry.BlockPos{ .x = 3, .y = 101, .z = 4 };
-    const second = geometry.BlockPos{ .x = 4, .y = 101, .z = 4 };
-    simulation.blocks.ensureChunkAt(simulation.world, first.x, first.z, simulation.clock.tick);
-    const first_previous = simulation.blocks.blockAt(simulation.world, first);
-    const second_previous = simulation.blocks.blockAt(simulation.world, second);
-    const first_state = if (first_previous == registry.block_air_default_state) registry.block_stone_default_state else registry.block_air_default_state;
-    const second_state = if (second_previous == registry.block_air_default_state) registry.block_dirt_default_state else registry.block_air_default_state;
-
-    try batch.set(simulation.world, first, registry.block_dirt_default_state);
-    try batch.set(simulation.world, second, second_state);
-    try batch.set(simulation.world, first, first_state);
-    try std.testing.expectEqual(@as(usize, 2), try batch.finish());
-    try std.testing.expectEqual(@as(usize, 2), output.pending_block_change_count);
-    try std.testing.expect(samePosition(first, output.pending_block_changes[0].pos));
-    try std.testing.expect(samePosition(second, output.pending_block_changes[1].pos));
-    try std.testing.expectEqual(first_state, simulation.blocks.blockAt(simulation.world, first));
-    try std.testing.expectEqual(second_state, simulation.blocks.blockAt(simulation.world, second));
-}
