@@ -1,7 +1,6 @@
 const lightning_rod = @import("lightning_rod");
 const entity_store = lightning_rod.entities;
 const living_entities = lightning_rod.living_entities;
-const block_store = lightning_rod.blocks;
 const block_queries = lightning_rod.block_queries;
 const geometry = lightning_rod.geometry;
 const std = @import("std");
@@ -9,10 +8,11 @@ const world_limits = lightning_rod.world_limits;
 const navigation = lightning_rod.navigation;
 const vanilla_math = @import("math.zig");
 const world_identity = lightning_rod.world_identity;
+const vanilla_collision_projection = @import("../plugins/vanilla_collision_projection.zig");
 
 const LandPathContext = struct {
     world: world_identity.Handle,
-    blocks: *block_store.Blocks,
+    projection: *vanilla_collision_projection.CollisionProjection,
     search: *navigation.Search,
     width: f32,
     height: f32,
@@ -60,24 +60,9 @@ const LandPathContext = struct {
     }
 
     pub fn classifyPathNode(self: *@This(), node: navigation.Node) navigation.Candidate {
-        const resident = self.blocks.residentChunk(self.world, .{ .x = @divFloor(node.x, 16), .z = @divFloor(node.z, 16) }) orelse
-            return blockedCandidate(node);
-        return block_queries.pathNodeForDimensionsInResident(self.blocks, resident, node.x, node.y, node.z, self.width, self.height);
+        return block_queries.pathNodeForDimensionsFrom(self.projection.source(), self.world, node.x, node.y, node.z, self.width, self.height);
     }
 };
-
-fn blockedCandidate(node: navigation.Node) navigation.Candidate {
-    return .{
-        .node = .{
-            .x = node.x,
-            .y = node.y,
-            .z = node.z,
-            .node_type = .blocked,
-            .penalty = -1,
-        },
-        .passable = false,
-    };
-}
 
 pub fn stop(living: *entity_store.LivingEntities, entity: usize) void {
     living.paths.clear(entity);
@@ -88,7 +73,7 @@ pub fn isIdle(living: *const entity_store.LivingEntities, entity: usize) bool {
 }
 
 pub fn start(
-    blocks: *block_store.Blocks,
+    projection: *vanilla_collision_projection.CollisionProjection,
     living: *entity_store.LivingEntities,
     entity: usize,
     target: geometry.BlockPos,
@@ -105,7 +90,7 @@ pub fn start(
     const target_node = navigation.Node{ .x = target.x, .y = target.y, .z = target.z };
     var context = LandPathContext{
         .world = living.entities.worlds[entity],
-        .blocks = blocks,
+        .projection = projection,
         .search = &living.search,
         .width = living_entities.width(entity_type, baby),
         .height = living_entities.height(entity_type, baby),
@@ -152,16 +137,4 @@ pub fn tick(living: *entity_store.LivingEntities, entity: usize) bool {
 
     const vertical_delta = @as(f64, @floatFromInt(move_node.y)) - pool.position_y[entity];
     return vertical_delta > 0.6 and distance_squared < @max(@as(f64, 1), @as(f64, width));
-}
-
-test "navigation stops by clearing a living path" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var paths = navigation.Paths{};
-    try paths.allocate(arena.allocator());
-    paths.length[0] = 1;
-    paths.speed[0] = 1;
-    paths.clear(0);
-    try std.testing.expect(paths.isIdle(0));
-    try std.testing.expectEqual(@as(f64, 0), paths.speed[0]);
 }

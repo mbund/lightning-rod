@@ -61,6 +61,8 @@ pub fn openCraftingTable(players: *player_store.Players, containers: *player_sto
         .kind = .crafting_table,
         .id = window_id,
         .position = position,
+        .menu_type = 13,
+        .top_slot_count = 10,
     };
 }
 

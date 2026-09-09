@@ -26,34 +26,34 @@ pub fn main(_: std.process.Init) !void {
     defer arena.deinit();
     const allocator = arena.allocator();
     const source_blocks = try createBlocks(allocator);
-    var generator = try terrain.Generator.init(allocator, seed, 3);
+    var generator = try terrain.Generator.init(allocator, seed);
     var positions: [chunk_count]Position = undefined;
     var shape_bytes: u64 = 0;
     for (&positions, 0..) |*position, index| {
         position.* = samplePosition(index);
         const shape = try generator.generate(position.x, position.z);
         shape_bytes += shape.storage_len;
-        _ = try source_blocks.installResidentChunk(world, shape, 1, .persisted);
+        _ = try source_blocks.installMaterialization(world, shape, 1, .persisted);
     }
 
-    var legacy_order = positions;
+    var radial_order = positions;
     var spatial_orders: [tile_sizes.len][chunk_count]Position = undefined;
-    sortPositions(&legacy_order, radialLess);
+    sortPositions(&radial_order, radialLess);
     for (tile_sizes, &spatial_orders) |tile_size, *order| {
         order.* = positions;
         sortSpatial(order, tile_size);
     }
-    var legacy = try measure(source_blocks, &legacy_order, .interleaved);
+    var radial = try measure(source_blocks, &radial_order, .interleaved);
     var spatial_interleaved: [tile_sizes.len]Result = @splat(.{});
     for (&spatial_orders, &spatial_interleaved) |*order, *result|
         result.* = try measure(source_blocks, order, .interleaved);
     var spatial = try measure(source_blocks, &spatial_orders[2], .prelit);
     var cached = try measure(source_blocks, &spatial_orders[1], .cached);
-    legacy.shape_bytes = shape_bytes * trials;
+    radial.shape_bytes = shape_bytes * trials;
     for (&spatial_interleaved) |*result| result.shape_bytes = shape_bytes * trials;
     spatial.shape_bytes = shape_bytes * trials;
     cached.shape_bytes = shape_bytes * trials;
-    printResults(legacy, spatial_interleaved, spatial, cached);
+    printResults(radial, spatial_interleaved, spatial, cached);
 }
 
 fn measure(source: *lightning_rod.blocks.Blocks, order: *const [chunk_count]Position, pipeline: Pipeline) !Result {
@@ -63,19 +63,19 @@ fn measure(source: *lightning_rod.blocks.Blocks, order: *const [chunk_count]Posi
         defer arena.deinit();
         const blocks = try createBlocks(arena.allocator());
         for (order) |position| {
-            const resident = source.residentChunk(world, position).?;
-            _ = try blocks.installResidentChunk(world, resident.shape, 1, .persisted);
+            const resident = source.materializedChunk(world, position).?;
+            _ = try blocks.installMaterialization(world, resident.shape, 1, .persisted);
         }
         const lighting = try createLighting(arena.allocator(), blocks);
         var scratch: [lightning_rod.chunk_packet.maximum_payload_bytes]u8 = undefined;
         var framed: [lightning_rod.chunk_packet.maximum_payload_bytes + 64 * 1024]u8 = undefined;
         var window: [std.compress.flate.max_window_len]u8 = undefined;
         switch (pipeline) {
-            .interleaved => add(&total, try runLegacy(blocks, lighting, order, &scratch, &framed, &window)),
+            .interleaved => add(&total, try runInterleaved(blocks, lighting, order, &scratch, &framed, &window)),
             .prelit => add(&total, try runPrelit(blocks, lighting, order, &scratch, &framed, &window)),
             .cached => {
                 for (order) |position| _ = lighting.chunk(world, position);
-                add(&total, try runLegacy(blocks, lighting, order, &scratch, &framed, &window));
+                add(&total, try runInterleaved(blocks, lighting, order, &scratch, &framed, &window));
             },
         }
     }
@@ -93,7 +93,7 @@ fn add(total: *Result, value: Result) void {
 
 fn createBlocks(allocator: std.mem.Allocator) !*lightning_rod.blocks.Blocks {
     return lightning_rod.blocks.Blocks.init(allocator, .{
-        .maximum_resident_chunks = 128,
+        .maximum_transient_chunks = 128,
         .maximum_modified_sections = 128,
     });
 }
@@ -104,21 +104,23 @@ fn createLighting(allocator: std.mem.Allocator, blocks: *lightning_rod.blocks.Bl
         var players: lightning_rod.players.Players = undefined;
         var sessions: lightning_rod.sessions.Sessions = undefined;
     };
-    return vanilla_lighting.Lighting.init(allocator, .{
+    const lighting = try vanilla_lighting.Lighting.init(allocator, .{
         .clock = &State.clock,
         .blocks = blocks,
         .players = &State.players,
         .sessions = &State.sessions,
-        .paging = null,
-    }, .{});
+        .materialization = null,
+    }, .{ .maximum_projected_chunks = 128, .source_mutations = 1 });
+    try lighting.tick(allocator);
+    return lighting;
 }
 
-fn runLegacy(blocks: *lightning_rod.blocks.Blocks, lighting: *vanilla_lighting.Lighting, positions: *const [chunk_count]Position, payload: []u8, framed: []u8, window: *[std.compress.flate.max_window_len]u8) !Result {
+fn runInterleaved(blocks: *lightning_rod.blocks.Blocks, lighting: *vanilla_lighting.Lighting, positions: *const [chunk_count]Position, payload: []u8, framed: []u8, window: *[std.compress.flate.max_window_len]u8) !Result {
     var result = Result{};
     var player_view: lightning_rod.view.PlayerView = .{};
     const started = now();
     for (positions) |position| {
-        const resident = blocks.residentChunk(world, position).?;
+        const resident = blocks.materializedChunk(world, position).?;
         var stage = now();
         const light = lighting.chunk(world, position);
         result.lighting_ns += now() - stage;
@@ -142,7 +144,7 @@ fn runPrelit(blocks: *lightning_rod.blocks.Blocks, lighting: *vanilla_lighting.L
     var stage = now();
     for (positions) |position| _ = lighting.chunk(world, position);
     for (positions) |position| {
-        const resident = blocks.residentChunk(world, position).?;
+        const resident = blocks.materializedChunk(world, position).?;
         const light = lighting.chunk(world, position);
         result.lighting_ns += now() - stage;
         stage = now();
@@ -231,13 +233,13 @@ fn varIntLen(value: i32) usize {
     return length;
 }
 
-fn printResults(legacy: Result, interleaved: [tile_sizes.len]Result, spatial: Result, cached: Result) void {
+fn printResults(radial: Result, interleaved: [tile_sizes.len]Result, spatial: Result, cached: Result) void {
     std.debug.print(
         "streaming benchmark chunks={} trials={} protocol=772\n" ++
             "  resident shape                  {d:.1} KiB/chunk\n" ++
             "  packet payload                  {d:.1} KiB/chunk\n" ++
             "  compressed frame                {d:.1} KiB/chunk\n" ++
-            "  legacy radial/interleaved       {d:.3} ms/chunk\n" ++
+            "  radial/interleaved              {d:.3} ms/chunk\n" ++
             "    lighting {d:.3}  encode {d:.3}  zlib {d:.3}\n" ++
             "  spatial tile sweep (interleaved)\n" ++
             "  spatial 3x3/prelit              {d:.3} ms/chunk\n" ++
@@ -249,10 +251,10 @@ fn printResults(legacy: Result, interleaved: [tile_sizes.len]Result, spatial: Re
             kibPerChunk(spatial.shape_bytes),
             kibPerChunk(spatial.payload_bytes),
             kibPerChunk(spatial.framed_bytes),
-            msPerChunk(legacy.total_ns),
-            msPerChunk(legacy.lighting_ns),
-            msPerChunk(legacy.encoding_ns),
-            msPerChunk(legacy.compression_ns),
+            msPerChunk(radial.total_ns),
+            msPerChunk(radial.lighting_ns),
+            msPerChunk(radial.encoding_ns),
+            msPerChunk(radial.compression_ns),
             msPerChunk(spatial.total_ns),
             msPerChunk(spatial.lighting_ns),
             msPerChunk(spatial.encoding_ns),
@@ -279,7 +281,7 @@ fn printResults(legacy: Result, interleaved: [tile_sizes.len]Result, spatial: Re
             msPerChunk(result.lighting_ns),
             msPerChunk(result.encoding_ns),
             msPerChunk(result.compression_ns),
-            @as(f64, @floatFromInt(legacy.total_ns)) / @as(f64, @floatFromInt(result.total_ns)),
+            @as(f64, @floatFromInt(radial.total_ns)) / @as(f64, @floatFromInt(result.total_ns)),
         },
     );
 }

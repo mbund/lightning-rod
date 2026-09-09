@@ -322,9 +322,9 @@ pub const Sampler = struct {
         var output_index: usize = 0;
         for (0..8) |local_y| {
             const y = first.y + @as(i32, @intCast(local_y));
-            for (0..4) |local_x| {
-                const x = first.x + @as(i32, @intCast(local_x));
-                for (0..4) |local_z| {
+            for (0..4) |local_z| {
+                for (0..4) |local_x| {
+                    const x = first.x + @as(i32, @intCast(local_x));
                     const z = first.z + @as(i32, @intCast(local_z));
                     const default = defaultFluidLevel(y).materialAt(y);
                     if (default == .lava) {

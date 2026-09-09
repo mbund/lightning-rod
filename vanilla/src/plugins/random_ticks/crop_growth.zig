@@ -13,7 +13,7 @@ pub const CropGrowth = struct {
         return .{ .context = self, .apply = apply };
     }
 
-    fn apply(_: *anyopaque, tick: *engine.Invocation) void {
-        engine.applyCropGrowth(tick);
+    fn apply(_: *anyopaque, tick: *engine.Invocation) engine.FatalError!void {
+        try engine.applyCropGrowth(tick);
     }
 };

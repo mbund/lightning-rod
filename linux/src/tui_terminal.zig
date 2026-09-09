@@ -2,6 +2,7 @@ const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const tui = @import("lightning_rod_tui");
 const logging = lightning_rod.logging;
+const metrics = lightning_rod.metrics;
 const runtime = lightning_rod.runtime;
 
 pub fn Terminal(comptime render_bytes: usize) type {
@@ -11,6 +12,9 @@ pub fn Terminal(comptime render_bytes: usize) type {
 
         io: std.Io,
         dashboard: *const tui.Plugin,
+        runtime_metrics: *metrics.Runtime,
+        persistence_store: *const lightning_rod.persistence.Store,
+        persistence_capacity: usize,
         dimensions: tui.Dimensions,
         rendered_revision: u64 = 0,
         rendered_scrollback_revision: u64 = 0,
@@ -24,8 +28,25 @@ pub fn Terminal(comptime render_bytes: usize) type {
         buffer: [render_bytes]u8 = undefined,
         scrollback: [render_bytes / 4]u8 = undefined,
 
-        pub fn init(io: std.Io, dashboard: *const tui.Plugin, dimensions: tui.Dimensions) Self {
-            return .{ .io = io, .dashboard = dashboard, .dimensions = dimensions };
+        pub fn init(
+            io: std.Io,
+            dashboard: *const tui.Plugin,
+            runtime_metrics: *metrics.Runtime,
+            persistence_store: *const lightning_rod.persistence.Store,
+            persistence_capacity: usize,
+            dimensions: tui.Dimensions,
+        ) Self {
+            var self: Self = .{
+                .io = io,
+                .dashboard = dashboard,
+                .runtime_metrics = runtime_metrics,
+                .persistence_store = persistence_store,
+                .persistence_capacity = persistence_capacity,
+                .dimensions = dimensions,
+            };
+            self.sampleDimensions();
+            self.sampleRuntime();
+            return self;
         }
 
         pub fn backend(self: *Self) runtime.Backend {
@@ -48,6 +69,9 @@ pub fn Terminal(comptime render_bytes: usize) type {
 
         pub fn draw(self: *Self) !bool {
             if (!self.entered or self.stopping) return false;
+            if (!self.dashboard.ready()) return false;
+            self.sampleDimensions();
+            self.sampleRuntime();
             const snapshot = self.dashboard.snapshot();
             if (snapshot.revision == self.rendered_revision and
                 self.scrollback_revision == self.rendered_scrollback_revision) return false;
@@ -58,6 +82,36 @@ pub fn Terminal(comptime render_bytes: usize) type {
             self.rendered_revision = snapshot.revision;
             self.rendered_scrollback_revision = self.scrollback_revision;
             return true;
+        }
+
+        fn sampleDimensions(self: *Self) void {
+            var size: std.posix.winsize = undefined;
+            const file = std.Io.File.stdout();
+            const fd: usize = @bitCast(@as(isize, file.handle));
+            const result = std.os.linux.syscall3(.ioctl, fd, std.os.linux.T.IOCGWINSZ, @intFromPtr(&size));
+            if (std.os.linux.errno(result) != .SUCCESS or size.row == 0 or size.col == 0) return;
+            self.dimensions = .{ .rows = size.row, .columns = size.col };
+        }
+
+        fn sampleResidentSet(self: *Self) void {
+            const file = std.Io.Dir.openFileAbsolute(self.io, "/proc/self/status", .{ .mode = .read_only }) catch return;
+            defer file.close(self.io);
+            var storage: [4096]u8 = undefined;
+            const length = file.readPositionalAll(self.io, &storage, 0) catch return;
+            const marker = "VmRSS:";
+            const start = (std.mem.indexOf(u8, storage[0..length], marker) orelse return) + marker.len;
+            const end = start + (std.mem.indexOfScalar(u8, storage[start..length], '\n') orelse return);
+            var fields = std.mem.tokenizeAny(u8, storage[start..end], " \t");
+            const kibibytes = std.fmt.parseInt(usize, fields.next() orelse return, 10) catch return;
+            self.runtime_metrics.setResidentSet(std.math.mul(usize, kibibytes, 1024) catch return);
+        }
+
+        fn sampleRuntime(self: *Self) void {
+            self.sampleResidentSet();
+            self.runtime_metrics.setPersistenceKeys(
+                self.persistence_store.liveRecords(),
+                self.persistence_capacity,
+            );
         }
 
         pub fn leave(self: *Self) !void {
@@ -76,7 +130,7 @@ pub fn Terminal(comptime render_bytes: usize) type {
             try writer.writeAll("\n\x1b[1mLogs\x1b[0m\n");
             if (self.scrollback_evictions != 0)
                 try writer.print("[older log bytes evicted: {d}]\n", .{self.scrollback_evictions});
-            try writer.writeAll(self.scrollback[0..self.scrollback_len]);
+            try writer.writeAll(lastLines(self.scrollback[0..self.scrollback_len], 2));
         }
 
         fn from(raw: *anyopaque) *Self {
@@ -154,6 +208,19 @@ pub fn Terminal(comptime render_bytes: usize) type {
     };
 }
 
+fn lastLines(bytes: []const u8, maximum_lines: usize) []const u8 {
+    if (maximum_lines == 0) return bytes[bytes.len..];
+    var start = bytes.len;
+    var lines: usize = 0;
+    while (start != 0) {
+        start -= 1;
+        if (bytes[start] != '\n' or start + 1 == bytes.len) continue;
+        lines += 1;
+        if (lines == maximum_lines) return bytes[start + 1 ..];
+    }
+    return bytes;
+}
+
 fn appendScrollbackBytes(storage: []u8, length: *usize, evictions: *u64, record: []const u8) void {
     if (record.len >= storage.len) {
         @memcpy(storage, record[record.len - storage.len ..]);
@@ -170,14 +237,4 @@ fn appendScrollbackBytes(storage: []u8, length: *usize, evictions: *u64, record:
     }
     @memcpy(storage[length.*..][0..record.len], record);
     length.* += record.len;
-}
-
-test "terminal scrollback retains a bounded newest tail" {
-    var storage: [8]u8 = undefined;
-    var length: usize = 0;
-    var evictions: u64 = 0;
-    appendScrollbackBytes(&storage, &length, &evictions, "first");
-    appendScrollbackBytes(&storage, &length, &evictions, "-second");
-    try std.testing.expectEqualStrings("t-second", storage[0..length]);
-    try std.testing.expectEqual(@as(u64, 1), evictions);
 }

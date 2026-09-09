@@ -15,6 +15,43 @@ const living_entities = @import("../living_entities.zig");
 const std = @import("std");
 const test_generator = @import("world_generator.zig");
 
+pub const SavedPlayers = struct {
+    records: [16]player_store.CorePlayer = undefined,
+    count: usize = 0,
+
+    pub fn interface(self: *SavedPlayers) player_store.SavedPlayerStorage {
+        return .{ .context = self, .load_fn = load, .save_fn = save };
+    }
+
+    fn load(raw: *anyopaque, uuid: u128, name: []const u8, output: *player_store.CorePlayer) player_store.SavedPlayerLoadError!bool {
+        const self: *SavedPlayers = @ptrCast(@alignCast(raw));
+        for (self.records[0..self.count]) |record| {
+            if (record.uuid != uuid) continue;
+            output.* = record;
+            return true;
+        }
+        if (uuid != 0) return false;
+        for (self.records[0..self.count]) |record| {
+            if (!std.mem.eql(u8, record.name_slice(), name)) continue;
+            output.* = record;
+            return true;
+        }
+        return false;
+    }
+
+    fn save(raw: *anyopaque, _: std.Io, player: *const player_store.CorePlayer) player_store.SavedPlayerSaveError!void {
+        const self: *SavedPlayers = @ptrCast(@alignCast(raw));
+        for (self.records[0..self.count]) |*record| {
+            if (record.uuid != player.uuid) continue;
+            record.* = player.*;
+            return;
+        }
+        if (self.count == self.records.len) return error.StorageUnavailable;
+        self.records[self.count] = player.*;
+        self.count += 1;
+    }
+};
+
 const test_world_descriptions = [_]world_store.Description{
     .{ .key = .{ .value = 1 }, .name = "test:overworld", .dimension = world_dimensions.Vanilla.dimensionId(world_dimensions.Overworld), .generator = @enumFromInt(0), .seed = 1, .spawn_x = 0, .spawn_y = 64, .spawn_z = 0 },
     .{ .key = .{ .value = 2 }, .name = "test:nether", .dimension = world_dimensions.Vanilla.dimensionId(world_dimensions.Nether), .generator = @enumFromInt(0), .seed = 1, .spawn_x = 0, .spawn_y = 64, .spawn_z = 0 },
@@ -27,6 +64,7 @@ pub const State = struct {
     storage_owner: std.mem.Allocator = undefined,
     storage_memory: []align(64) u8 = &.{},
     storage: std.heap.FixedBufferAllocator = undefined,
+    saved_players: SavedPlayers = .{},
     worlds: *world_store.Worlds = undefined,
     dimensions: *world_dimensions.Vanilla = undefined,
     world: world_identity.Handle = world_identity.invalid,
@@ -52,7 +90,7 @@ pub const State = struct {
         self.storage = std.heap.FixedBufferAllocator.init(self.storage_memory);
         errdefer allocator.rawFree(self.storage_memory, .@"64", @returnAddress());
         const storage = self.storage.allocator();
-        self.worlds = try world_store.Worlds.init(storage, .{ .initial = &test_world_descriptions });
+        self.worlds = try world_store.Worlds.init(storage, .{ .initial = &test_world_descriptions, .maximum_worlds = 4 });
         self.dimensions = try world_dimensions.Vanilla.init(storage, .{ .worlds = self.worlds }, .{});
         self.world = self.worlds.find(.{ .value = 1 }).?;
         self.random.random = world_random.DeterministicRng.init(seed);
@@ -61,8 +99,8 @@ pub const State = struct {
             .initial_world = .{ .value = 1 },
             .maximum_connections = 8,
             .maximum_players = 4,
-            .maximum_saved_players = 16,
         })).*;
+        try self.players.bindSavedPlayerStorage(self.saved_players.interface());
         self.inputs = (try input_store.Inputs.init(storage, .{ .events = self.events, .players = &self.players }, .{
             .maximum_block_requests = 32,
             .maximum_inventory_clicks = 32,
@@ -101,7 +139,7 @@ pub const State = struct {
             .y = @intCast(geometry.blockCoord(position.y)),
             .z = geometry.blockCoord(position.z),
         };
-        _ = self.blocks.generatedHeightChunkRef(self.world, geometry.chunkForBlock(block), self.clock.tick);
+        _ = self.blocks.materializeGeneratedChunk(self.world, geometry.chunkForBlock(block), self.clock.tick);
         return self.living.spawn(&self.random, &self.blocks, self.world, entity_type, position, baby, persistent);
     }
 };

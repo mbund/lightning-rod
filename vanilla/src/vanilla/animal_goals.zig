@@ -10,7 +10,8 @@ const world_limits = lightning_rod.world_limits;
 const preallocated = lightning_rod.preallocated;
 const registry = lightning_rod.registry_data;
 const land_navigation = @import("land_navigation.zig");
-const active_chunks = @import("active_chunks.zig");
+const simulation_admission = @import("simulation_admission.zig");
+const vanilla_collision_projection = @import("../plugins/vanilla_collision_projection.zig");
 
 pub const no_index: u16 = std.math.maxInt(u16);
 
@@ -66,8 +67,9 @@ pub const State = struct {
 
 pub const Context = struct {
     blocks: *block_store.Blocks,
+    collision_projection: *vanilla_collision_projection.CollisionProjection,
     players: *player_store.Players,
-    active: *active_chunks.ActiveChunks,
+    active: *simulation_admission.SimulationAdmission,
     living: *entity_store.LivingEntities,
     state: *State,
 };
@@ -145,7 +147,7 @@ pub fn closestWater(context: *Context, index: usize) ?geometry.BlockPos {
         while (z <= origin.z + 5) : (z += 1) {
             var x = origin.x - 5;
             while (x <= origin.x + 5) : (x += 1) {
-                const state = context.blocks.blockAtIfResident(context.living.entities.worlds[index], .{ .x = x, .y = @intCast(y), .z = z }) orelse continue;
+                const state = context.collision_projection.blockState(context.living.entities.worlds[index], .{ .x = x, .y = @intCast(y), .z = z }) orelse continue;
                 if (!block_store.isWaterBlockState(state)) continue;
                 const dx = x - origin.x;
                 const dy = y - origin.y;
@@ -212,8 +214,15 @@ pub fn randomLandTarget(context: *Context, index: usize, horizontal: i32, vertic
             const up = y + @divTrunc(scan, 2);
             for ([_]i32{ down, up }) |candidate_y| {
                 if (candidate_y <= world_limits.min_y or candidate_y > block_store.world_top_y) continue;
-                const resident = context.blocks.residentChunk(entities.worlds[index], .{ .x = @divFloor(x, 16), .z = @divFloor(z, 16) }) orelse continue;
-                const node = block_queries.pathNodeInResident(context.blocks, resident, x, @intCast(candidate_y), z, entities.baby[index]);
+                const node = block_queries.pathNodeForDimensionsFrom(
+                    context.collision_projection.source(),
+                    entities.worlds[index],
+                    x,
+                    @intCast(candidate_y),
+                    z,
+                    if (entities.baby[index]) 0.45 else 0.9,
+                    if (entities.baby[index]) 0.7 else 1.4,
+                );
                 if (node.passable) {
                     candidate = .{ .x = x, .y = @intCast(candidate_y), .z = z };
                     break;
@@ -222,7 +231,7 @@ pub fn randomLandTarget(context: *Context, index: usize, horizontal: i32, vertic
             if (candidate != null) break;
         }
         const value = candidate orelse continue;
-        const below = context.blocks.blockAtIfResident(entities.worlds[index], .{ .x = value.x, .y = value.y - 1, .z = value.z }) orelse continue;
+        const below = context.collision_projection.blockState(entities.worlds[index], .{ .x = value.x, .y = value.y - 1, .z = value.z }) orelse continue;
         const score: f64 = if (below == registry.block_grass_block_default_state) 10 else 0;
         if (score > best_score) {
             best_score = score;
@@ -233,7 +242,7 @@ pub fn randomLandTarget(context: *Context, index: usize, horizontal: i32, vertic
 }
 
 pub fn beginPath(context: *Context, index: usize, target: geometry.BlockPos, speed: f64, target_distance: i32) bool {
-    return land_navigation.start(context.blocks, context.living, index, target, target_distance, speed);
+    return land_navigation.start(context.collision_projection, context.living, index, target, target_distance, speed);
 }
 
 pub fn stopGoal(context: *Context, index: usize) void {
@@ -341,8 +350,8 @@ pub fn tickLifecycle(entities: *living_entities.Pool, index: usize) void {
     if (entities.breeding_age[index] != 0) entities.love_ticks[index] = 0 else if (entities.love_ticks[index] > 0) entities.love_ticks[index] -= 1;
 }
 
-pub fn isWater(blocks: *const block_store.Blocks, entities: *const living_entities.Pool, index: usize) bool {
-    const state = blocks.blockAtIfResident(entities.worlds[index], .{
+pub fn isWater(context: *Context, entities: *const living_entities.Pool, index: usize) bool {
+    const state = context.collision_projection.blockState(entities.worlds[index], .{
         .x = geometry.blockCoord(entities.position_x[index]),
         .y = @intFromFloat(@floor(entities.position_y[index] + 0.2)),
         .z = geometry.blockCoord(entities.position_z[index]),
@@ -355,18 +364,18 @@ pub fn isEntityTicking(context: *Context, entities: *const living_entities.Pool,
         .x = @divFloor(geometry.blockCoord(entities.position_x[index]), 16),
         .z = @divFloor(geometry.blockCoord(entities.position_z[index]), 16),
     };
-    return context.blocks.residentChunk(entities.worlds[index], chunk) != null and
-        context.active.entityTicking(entities.worlds[index], chunk);
+    return context.active.entityTicking(entities.worlds[index], chunk);
 }
 
 pub fn initContext(
     state: *State,
     blocks: *block_store.Blocks,
+    collision_projection: *vanilla_collision_projection.CollisionProjection,
     players: *player_store.Players,
-    active: *active_chunks.ActiveChunks,
+    active: *simulation_admission.SimulationAdmission,
     living: *entity_store.LivingEntities,
 ) Context {
-    return .{ .blocks = blocks, .players = players, .active = active, .living = living, .state = state };
+    return .{ .blocks = blocks, .collision_projection = collision_projection, .players = players, .active = active, .living = living, .state = state };
 }
 
 pub fn stopNavigation(living: *entity_store.LivingEntities, index: usize) void {

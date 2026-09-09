@@ -53,7 +53,6 @@ pub const GeneratedState = enum(u16) {
         const value = @intFromEnum(self);
         if (value < surface_offset) return .base;
         if (value < feature_offset) return .surface;
-        std.debug.assert(value - feature_offset < feature_data.state_names.len);
         return .feature;
     }
 
@@ -68,13 +67,16 @@ pub const GeneratedState = enum(u16) {
     }
 
     pub fn surfaceIndex(self: GeneratedState) ?u16 {
-        if (self.kind() != .surface) return null;
-        return @intCast(@intFromEnum(self) - surface_offset);
+        const value = @intFromEnum(self);
+        if (value < surface_offset or value >= feature_offset) return null;
+        return @intCast(value - surface_offset);
     }
 
     pub fn featureIndex(self: GeneratedState) ?u16 {
-        if (self.kind() != .feature) return null;
-        return @intCast(@intFromEnum(self) - feature_offset);
+        @setRuntimeSafety(false);
+        const value = @intFromEnum(self);
+        if (value < feature_offset) return null;
+        return @intCast(value - feature_offset);
     }
 
     pub fn canonicalName(self: GeneratedState) []const u8 {
@@ -95,11 +97,12 @@ pub const GeneratedState = enum(u16) {
     }
 
     pub inline fn canonicalState(self: GeneratedState) minecraft.State {
-        return .{ .id = switch (self.kind()) {
-            .base => base_state_ids[@intFromEnum(self)],
-            .surface => surface.canonicalStateId(self.surfaceIndex().?),
-            .feature => feature_data.canonical_state_ids[self.featureIndex().?],
-        } };
+        @setRuntimeSafety(false);
+        const value = @intFromEnum(self);
+        if (value < surface_offset) return .{ .id = base_state_ids[value] };
+        if (value < feature_offset)
+            return .{ .id = surface.canonicalStateId(@intCast(value - surface_offset)) };
+        return .{ .id = feature_data.canonical_state_ids[value - feature_offset] };
     }
 
     pub inline fn nameEquals(self: GeneratedState, comptime name: []const u8) bool {

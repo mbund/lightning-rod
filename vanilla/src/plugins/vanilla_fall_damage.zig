@@ -9,8 +9,9 @@ const world_identity = lightning_rod.world_identity;
 const world_limits = lightning_rod.world_limits;
 const std = @import("std");
 const registry = lightning_rod.registry_data;
-const active_chunks = @import("../vanilla/active_chunks.zig");
+const simulation_admission = @import("../vanilla/simulation_admission.zig");
 const vanilla_living_death = @import("vanilla_living_death.zig");
+const vanilla_collision_projection = @import("vanilla_collision_projection.zig");
 const Packets = lightning_rod.Packets;
 
 const safe_fall_distance: f64 = 3;
@@ -44,7 +45,7 @@ pub const FallTracking = struct {
         return self;
     }
 
-    fn applyPlayer(self: *FallTracking, blocks: *block_store.Blocks, players: *player_store.Players, outputs: *Packets) void {
+    fn applyPlayer(self: *FallTracking, projection: *vanilla_collision_projection.CollisionProjection, players: *player_store.Players, outputs: *Packets) void {
         for (players.activeSlots()) |slot| {
             const player = &players.records[slot];
             const track = &self.players[slot];
@@ -52,8 +53,8 @@ pub const FallTracking = struct {
                 track.* = .{};
                 continue;
             }
-            const grounded = block_queries.playerGroundSupported(blocks, player.world, player.position);
-            if (isInFluid(blocks, player.world, player.position)) {
+            const grounded = block_queries.playerGroundSupportedFrom(projection.source(), player.world, player.position);
+            if (isInFluid(projection, player.world, player.position)) {
                 track.* = .{ .world = player.world, .last_y = player.position.y, .generation = players.session_generations[slot], .teleport_epoch = player.teleport_epoch, .initialized = true, .grounded = grounded };
                 continue;
             }
@@ -65,7 +66,7 @@ pub const FallTracking = struct {
         }
     }
 
-    fn applyLiving(self: *FallTracking, deaths: *vanilla_living_death.LivingDeaths, blocks: *block_store.Blocks, active: *active_chunks.ActiveChunks, living: *entity_store.LivingEntities, outputs: *Packets) void {
+    fn applyLiving(self: *FallTracking, deaths: *vanilla_living_death.LivingDeaths, projection: *vanilla_collision_projection.CollisionProjection, active: *simulation_admission.SimulationAdmission, living: *entity_store.LivingEntities, outputs: *Packets) void {
         const entities = &living.entities;
         for (entities.active_indices[0..entities.active_count]) |index| {
             const track = &self.living[index];
@@ -74,9 +75,9 @@ pub const FallTracking = struct {
                 track.* = .{};
                 continue;
             }
-            if (!livingFallTicks(blocks, active, entities, index)) continue;
+            if (!livingFallTicks(active, entities, index)) continue;
             const position = geometry.Vec3{ .x = entities.position_x[index], .y = entities.position_y[index], .z = entities.position_z[index] };
-            if (isInFluid(blocks, entities.worlds[index], position)) {
+            if (isInFluid(projection, entities.worlds[index], position)) {
                 track.* = .{ .world = entities.worlds[index], .last_y = position.y, .generation = generation, .initialized = true, .grounded = entities.on_ground[index] };
                 continue;
             }
@@ -149,9 +150,9 @@ fn acceptedDamage(raw_damage: f32, last_damage: *f32, time_until_regen: *i32) f3
     return damage;
 }
 
-fn isInFluid(blocks: *block_store.Blocks, world: world_identity.Handle, position: geometry.Vec3) bool {
+fn isInFluid(projection: *vanilla_collision_projection.CollisionProjection, world: world_identity.Handle, position: geometry.Vec3) bool {
     const y = std.math.clamp(geometry.blockCoord(position.y), @as(i32, world_limits.min_y), @as(i32, block_store.world_top_y));
-    const state = blocks.blockAtIfResident(world, .{
+    const state = projection.blockState(world, .{
         .x = geometry.blockCoord(position.x),
         .y = @intCast(y),
         .z = geometry.blockCoord(position.z),
@@ -160,19 +161,18 @@ fn isInFluid(blocks: *block_store.Blocks, world: world_identity.Handle, position
         (state >= registry.state_lava_level_0 and state <= registry.state_lava_level_15);
 }
 
-fn livingFallTicks(blocks: *const block_store.Blocks, active: *const active_chunks.ActiveChunks, entities: *const living_entities.Pool, index: u16) bool {
+fn livingFallTicks(active: *const simulation_admission.SimulationAdmission, entities: *const living_entities.Pool, index: u16) bool {
     const chunk = geometry.ChunkPos{
         .x = @divFloor(geometry.blockCoord(entities.position_x[index]), 16),
         .z = @divFloor(geometry.blockCoord(entities.position_z[index]), 16),
     };
-    return blocks.residentChunk(entities.worlds[index], chunk) != null and
-        active.entityTicking(entities.worlds[index], chunk);
+    return active.entityTicking(entities.worlds[index], chunk);
 }
 
 pub const PlayerFallDamage = struct {
     pub const id = "minecraft:player_fall_damage";
     pub const Configuration = struct {};
-    pub const Dependencies = struct { tracking: *FallTracking, blocks: *block_store.Blocks, players: *player_store.Players, outputs: *Packets };
+    pub const Dependencies = struct { tracking: *FallTracking, collision_projection: *vanilla_collision_projection.CollisionProjection, players: *player_store.Players, outputs: *Packets };
 
     deps: Dependencies,
 
@@ -183,7 +183,7 @@ pub const PlayerFallDamage = struct {
     }
 
     pub fn tick(self: *PlayerFallDamage, _: std.mem.Allocator) void {
-        self.deps.tracking.applyPlayer(self.deps.blocks, self.deps.players, self.deps.outputs);
+        self.deps.tracking.applyPlayer(self.deps.collision_projection, self.deps.players, self.deps.outputs);
     }
 };
 
@@ -211,8 +211,8 @@ pub const LivingFallDamage = struct {
     pub const Dependencies = struct {
         tracking: *FallTracking,
         deaths: *vanilla_living_death.LivingDeaths,
-        blocks: *block_store.Blocks,
-        active: *active_chunks.ActiveChunks,
+        collision_projection: *vanilla_collision_projection.CollisionProjection,
+        active: *simulation_admission.SimulationAdmission,
         living: *entity_store.LivingEntities,
         outputs: *Packets,
     };
@@ -226,7 +226,7 @@ pub const LivingFallDamage = struct {
     }
 
     pub fn tick(self: *LivingFallDamage, _: std.mem.Allocator) void {
-        self.deps.tracking.applyLiving(self.deps.deaths, self.deps.blocks, self.deps.active, self.deps.living, self.deps.outputs);
+        self.deps.tracking.applyLiving(self.deps.deaths, self.deps.collision_projection, self.deps.active, self.deps.living, self.deps.outputs);
     }
 };
 

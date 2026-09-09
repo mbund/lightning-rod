@@ -227,13 +227,13 @@ test "generated terrain projects as one complete map-chunk packet" {
     defer arena.deinit();
     var generator: test_generator.Generator = .{};
     const blocks = try block_store.Blocks.init(arena.allocator(), .{
-        .maximum_resident_chunks = 4,
+        .maximum_transient_chunks = 4,
         .maximum_modified_sections = 4,
     });
     try generator.init(arena.allocator(), 0x5eed_0001);
     generator.bind(blocks);
     const position = geometry.ChunkPos{ .x = 3, .z = -2 };
-    const resident = blocks.generatedHeightChunkRef(test_world, position, 1).entry;
+    const resident = blocks.materializeGeneratedChunk(test_world, position, 1).entry;
     var sky: [light_projection.bytes_per_section]u8 = @splat(0xff);
     var block: [light_projection.bytes_per_section]u8 = @splat(0);
     var light = light_projection.Chunk{
@@ -252,10 +252,10 @@ test "generated terrain projects as one complete map-chunk packet" {
     var player_view = view.PlayerView{};
     var bytes: [maximum_payload_bytes]u8 = undefined;
     const payload = try writeChunkPayload(&bytes, blocks, test_world, &player_view, position, &resident.shape, &light, 772);
-    const resident_count = blocks.residentChunkCount();
+    const resident_count = blocks.materializedChunkCount();
     var retry_bytes: [maximum_payload_bytes]u8 = undefined;
     const retry = try writeChunkPayload(&retry_bytes, blocks, test_world, &player_view, position, &resident.shape, &light, 772);
-    try std.testing.expectEqual(resident_count, blocks.residentChunkCount());
+    try std.testing.expectEqual(resident_count, blocks.materializedChunkCount());
     try std.testing.expectEqualSlices(u8, payload, retry);
     const Protocol = protocol_versions.Protocol(.version_1);
     const packet = try Protocol.play.toClient.read(payload).name();

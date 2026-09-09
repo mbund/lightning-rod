@@ -15,143 +15,133 @@ const world_identity = lightning_rod.world_identity;
 const world_random = lightning_rod.random;
 const world_store = lightning_rod.worlds;
 
-const metadata_magic = "LRMETA05";
-const metadata_header_len = metadata_magic.len + @sizeOf(u64) + @sizeOf(u32);
+const metadata_magic = "LRMETA08";
+const legacy_metadata_magic = "LRMETA07";
+const record_header_len = metadata_magic.len + @sizeOf(u8) + @sizeOf(u32) + @sizeOf(u32);
 const living_encoded_size = 242;
-const player_fixed_encoded_size = 16 + 16 + 1 + 3 * 8 + 2 * 4 + 1 + 1 + 1 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 42 * (4 + 4 + 2 + 1);
-const item_encoded_size = 16 + 3 * 8 + 3 * 8 + 16 + 4 + 2 + 4 + 4 + 2 + 1;
+const player_fixed_encoded_size = 16 + 16 + 1 + 3 * 8 + 2 * 4 + 1 + 1 + 1 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 46 * (4 + 4 + 2 + 1);
+
+const RecordKind = enum(u8) { root = 1, player = 2, item = 3, living = 4 };
+
+pub const Root = struct {
+    tick: u64,
+    day_time: u64,
+    entropy: u64,
+    items: u32,
+    living: u32,
+};
+
+pub const maximum_root_encoded_size = record_header_len + 3 * @sizeOf(u64) + 2 * @sizeOf(u32);
+pub const maximum_record_encoded_size = record_header_len + player_fixed_encoded_size + player_store.maximum_name_bytes;
 
 pub const PersistedState = struct {
     worlds: *world_store.Worlds,
     clock: *world_clock.Clock,
     time: *vanilla_time.Time,
     random: *world_random.Random,
-    blocks: *block_store.Blocks,
     living: *entity_store.LivingEntities,
     players: *player_store.Players,
     items: *entity_store.ItemEntities,
 };
 
-pub fn metadataStateEncodedSize(state: *const PersistedState) usize {
-    var size: usize = metadata_header_len + 8 + 8 + 8 + 8 + 8;
-    for (state.players.saved[0..state.players.saved_count]) |player| {
-        size += player_fixed_encoded_size + player.name_len;
-    }
-    size += state.items.active_count * item_encoded_size;
-    size += 8 + state.living.entities.active_count * living_encoded_size;
-    std.debug.assert(size <= maximumMetadataStateEncodedSize(state));
-    return size;
+pub fn root(state: *const PersistedState) !Root {
+    return .{
+        .tick = state.clock.tick,
+        .day_time = state.time.day_time,
+        .entropy = state.random.random.entropy,
+        .items = std.math.cast(u32, state.items.active_count) orelse return error.LengthOverflow,
+        .living = std.math.cast(u32, state.living.entities.active_count) orelse return error.LengthOverflow,
+    };
 }
 
-pub fn maximumMetadataStateEncodedSize(state: *const PersistedState) usize {
-    return metadata_header_len + 8 * 5 +
-        state.players.saved.len * (player_fixed_encoded_size + state.players.saved[0].name.len) +
-        state.items.active.len * item_encoded_size +
-        8 + state.living.entities.active.len * living_encoded_size;
+pub fn encodeRoot(buffer: []u8, value: Root) ![]u8 {
+    var writer = try beginRecord(buffer, .root);
+    try writer.int(u64, value.tick);
+    try writer.int(u64, value.day_time);
+    try writer.int(u64, value.entropy);
+    try writer.int(u32, value.items);
+    try writer.int(u32, value.living);
+    return finishRecord(&writer);
 }
 
-pub fn encodeMetadataState(buffer: []u8, state: *const PersistedState) ![]u8 {
-    const required = metadataStateEncodedSize(state);
-    if (buffer.len < required) return error.EndOfStream;
-    var writer = Writer{ .buffer = buffer[0..required] };
-    try writer.bytes(metadata_magic);
-    const payload_len_offset = writer.index;
-    try writer.int(u64, 0);
-    const checksum_offset = writer.index;
-    try writer.int(u32, 0);
-    const payload_start = writer.index;
-
-    try writer.int(u64, state.clock.tick);
-    try writer.int(u64, state.time.day_time);
-    try writer.int(u64, state.random.random.entropy);
-    try writer.int(u64, state.players.saved_count);
-    for (state.players.saved[0..state.players.saved_count]) |player| try writePlayer(&writer, state.worlds, player);
-
-    try writer.int(u64, state.items.active_count);
-    for (state.items.active_indices[0..state.items.active_count]) |index|
-        try writeItem(&writer, state.worlds, state.items.value(index));
-
-    try writer.int(u64, state.living.entities.active_count);
-    for (state.living.entities.active_indices[0..state.living.entities.active_count]) |index|
-        try writeLiving(&writer, state.worlds, state.living, index);
-
-    std.debug.assert(writer.index == required);
-    const payload = buffer[payload_start..writer.index];
-    std.mem.writeInt(u64, buffer[payload_len_offset..][0..8], @intCast(payload.len), .little);
-    std.mem.writeInt(u32, buffer[checksum_offset..][0..4], std.hash.crc.Crc32.hash(payload), .little);
-    return buffer[0..writer.index];
+pub fn decodeRoot(bytes: []const u8) !Root {
+    var reader = try recordReader(bytes, .root);
+    const value = Root{
+        .tick = try reader.int(u64),
+        .day_time = try reader.int(u64),
+        .entropy = try reader.int(u64),
+        .items = try reader.int(u32),
+        .living = try reader.int(u32),
+    };
+    if (reader.index != reader.buffer.len) return error.ExtraWorldData;
+    return value;
 }
 
-pub fn decodeMetadataState(state: *PersistedState, bytes: []const u8) !void {
-    if (bytes.len < metadata_header_len) return error.TruncatedWorldFile;
-    if (!std.mem.eql(u8, bytes[0..metadata_magic.len], metadata_magic)) return error.InvalidWorldMagic;
-    var reader = Reader{ .buffer = bytes, .index = metadata_magic.len };
-    const payload_len = try reader.int(u64);
-    const expected_checksum = try reader.int(u32);
-    if (payload_len != bytes.len - metadata_header_len) return error.InvalidWorldLength;
-    const payload = bytes[metadata_header_len..];
-    if (std.hash.crc.Crc32.hash(payload) != expected_checksum) return error.WorldChecksumMismatch;
+pub fn encodePlayerRecord(buffer: []u8, state: *const PersistedState, player: player_store.CorePlayer) ![]u8 {
+    var writer = try beginRecord(buffer, .player);
+    try writePlayer(&writer, state.worlds, player);
+    return finishRecord(&writer);
+}
 
-    const tick = try reader.int(u64);
-    const day_time = try reader.int(u64);
-    const entropy = try reader.int(u64);
+pub fn encodeItemRecord(buffer: []u8, state: *const PersistedState, item: entity_store.ItemEntity) ![]u8 {
+    var writer = try beginRecord(buffer, .item);
+    try writeItem(&writer, state.worlds, item);
+    return finishRecord(&writer);
+}
+
+pub fn encodeLivingRecord(buffer: []u8, state: *const PersistedState, index: u16) ![]u8 {
+    var writer = try beginRecord(buffer, .living);
+    try writeLiving(&writer, state.worlds, state.living, index);
+    return finishRecord(&writer);
+}
+
+pub fn beginRestore(state: *PersistedState, value: Root) !void {
     assertEmptyPersistedState(state);
-    state.clock.tick = tick;
-    state.time.day_time = day_time;
+    const items: usize = @intCast(value.items);
+    const living: usize = @intCast(value.living);
+    if (items > state.items.active.len) return error.ItemEntityCapacity;
+    if (living > state.living.entities.active.len) return error.LivingEntityCapacity;
+    state.clock.tick = value.tick;
+    state.time.day_time = value.day_time;
+}
 
-    const player_count = try reader.int(u64);
-    const player_count_usize = try countToUsize(player_count);
-    if (player_count_usize > state.players.saved.len) return error.SavedPlayerCapacity;
-    for (0..player_count_usize) |index| {
-        state.players.saved[index] = try readPlayer(&reader, state.worlds);
-        const player = &state.players.saved[index];
-        player_store.returnCraftingGridToInventory(player);
-        for (&player.crafting_grid) |*stack| {
-            if (stack.isEmpty()) continue;
-            if (state.items.active_count == state.items.active.len) return error.ItemEntityCapacity;
-            state.blocks.ensureChunkAt(player.world, geometry.blockCoord(player.position.x), geometry.blockCoord(player.position.z), tick);
-            _ = try state.items.spawn(state.random, state.blocks, player.world, player.position, .{}, stack.*, entity_store.block_drop_pickup_delay_ticks);
-            stack.* = .{};
-        }
-    }
-    state.players.saved_count = player_count_usize;
+pub fn decodePlayerRecord(state: *PersistedState, bytes: []const u8) !player_store.CorePlayer {
+    var reader = try recordReader(bytes, .player);
+    const player = try readPlayer(&reader, state.worlds);
+    if (reader.index != reader.buffer.len) return error.ExtraWorldData;
+    return player;
+}
 
-    const item_count = try reader.int(u64);
-    const item_count_usize = try countToUsize(item_count);
-    if (item_count_usize > state.items.active.len - state.items.active_count) return error.ItemEntityCapacity;
-    for (0..item_count_usize) |_| {
-        const item = try readItem(&reader, state.worlds);
-        state.blocks.ensureChunkAt(item.world, geometry.blockCoord(item.position.x), geometry.blockCoord(item.position.z), tick);
-        _ = try state.items.restoreEntity(state.random, state.blocks, item);
-    }
-    const living_count = try countToUsize(try reader.int(u64));
-    if (living_count > state.living.entities.active.len) return error.LivingEntityCapacity;
-    for (0..living_count) |_| try readLiving(&reader, state.worlds, state.living);
+pub fn restoreItemRecord(state: *PersistedState, bytes: []const u8) !void {
+    var reader = try recordReader(bytes, .item);
+    const item = try readItem(&reader, state.worlds);
+    if (reader.index != reader.buffer.len) return error.ExtraWorldData;
+    _ = try state.items.restoreEntity(item);
+}
+
+pub fn restoreLivingRecord(state: *PersistedState, bytes: []const u8) !void {
+    var reader = try recordReader(bytes, .living);
+    try readLiving(&reader, state.worlds, state.living);
+    if (reader.index != reader.buffer.len) return error.ExtraWorldData;
+}
+
+pub fn finishRestore(state: *PersistedState, value: Root) void {
     resolveVehicleRelations(&state.living.entities);
-    if (reader.index != bytes.len) return error.ExtraWorldData;
-    state.random.random.entropy = entropy & ((@as(u64, 1) << 48) - 1);
+    state.random.random.entropy = value.entropy & ((@as(u64, 1) << 48) - 1);
     assertPersistedState(state);
 }
 
 fn assertEmptyPersistedState(state: *const PersistedState) void {
-    std.debug.assert(state.blocks.resident_chunk_count == 0);
     std.debug.assert(state.living.entities.active_count == 0);
     std.debug.assert(state.items.active_count == 0);
     std.debug.assert(state.players.active_count == 0);
-    std.debug.assert(state.players.saved_count == 0);
 }
 
 fn assertPersistedState(state: *const PersistedState) void {
     std.debug.assert(state.items.active_count <= state.items.active.len);
     std.debug.assert(state.items.free_count <= state.items.active.len);
-    std.debug.assert(state.players.saved_count <= state.players.saved.len);
     std.debug.assert(state.players.active_count <= state.players.records.len);
-    std.debug.assert(state.blocks.modified_section_count <= state.blocks.modified_sections.len);
     state.living.entities.assertInvariants();
-}
-
-fn countToUsize(value: u64) !usize {
-    return std.math.cast(usize, value) orelse error.LengthOverflow;
 }
 
 fn writeWorld(writer: *Writer, worlds: *const world_store.Worlds, handle: world_identity.Handle) !void {
@@ -188,6 +178,7 @@ fn writePlayer(writer: *Writer, worlds: *const world_store.Worlds, player: playe
     for (player.armor) |stack| try writeStack(writer, stack);
     try writeStack(writer, player.offhand);
     try writeStack(writer, player.cursor_stack);
+    for (player.crafting_grid) |stack| try writeStack(writer, stack);
 }
 
 fn readPlayer(reader: *Reader, worlds: *const world_store.Worlds) !player_store.CorePlayer {
@@ -225,6 +216,7 @@ fn readPlayer(reader: *Reader, worlds: *const world_store.Worlds) !player_store.
     for (&player.armor) |*stack| stack.* = try readStack(reader);
     player.offhand = try readStack(reader);
     player.cursor_stack = try readStack(reader);
+    for (&player.crafting_grid) |*stack| stack.* = try readStack(reader);
     return player;
 }
 
@@ -549,17 +541,110 @@ const Reader = struct {
     }
 };
 
+fn beginRecord(buffer: []u8, kind: RecordKind) !Writer {
+    if (buffer.len < record_header_len) return error.EndOfStream;
+    var writer = Writer{ .buffer = buffer };
+    try writer.bytes(metadata_magic);
+    try writer.int(u8, @intFromEnum(kind));
+    try writer.int(u32, 0);
+    try writer.int(u32, 0);
+    return writer;
+}
+
+fn finishRecord(writer: *Writer) ![]u8 {
+    const payload = writer.buffer[record_header_len..writer.index];
+    const payload_len = std.math.cast(u32, payload.len) orelse return error.LengthOverflow;
+    std.mem.writeInt(u32, writer.buffer[metadata_magic.len + 1 ..][0..@sizeOf(u32)], payload_len, .little);
+    std.mem.writeInt(u32, writer.buffer[metadata_magic.len + 1 + @sizeOf(u32) ..][0..@sizeOf(u32)], std.hash.crc.Crc32.hash(payload), .little);
+    return writer.buffer[0..writer.index];
+}
+
+fn recordReader(bytes: []const u8, expected: RecordKind) !Reader {
+    if (bytes.len < record_header_len) return error.TruncatedWorldFile;
+    if (!std.mem.eql(u8, bytes[0..metadata_magic.len], metadata_magic)) {
+        if (std.mem.eql(u8, bytes[0..legacy_metadata_magic.len], legacy_metadata_magic))
+            return error.StoredPlayerFormatUnsupported;
+        return error.InvalidWorldMagic;
+    }
+    if (bytes[metadata_magic.len] != @intFromEnum(expected)) return error.InvalidWorldRecordKind;
+    const payload_len = std.mem.readInt(u32, bytes[metadata_magic.len + 1 ..][0..@sizeOf(u32)], .little);
+    const checksum = std.mem.readInt(u32, bytes[metadata_magic.len + 1 + @sizeOf(u32) ..][0..@sizeOf(u32)], .little);
+    const payload_bytes: usize = @intCast(payload_len);
+    if (payload_bytes != bytes.len - record_header_len) return error.InvalidWorldLength;
+    const payload = bytes[record_header_len..];
+    if (std.hash.crc.Crc32.hash(payload) != checksum) return error.WorldChecksumMismatch;
+    return .{ .buffer = payload };
+}
+
 fn persistedTestState(state: *test_state.State) PersistedState {
     return .{
-        .worlds = &state.worlds,
+        .worlds = state.worlds,
         .clock = &state.clock,
         .time = &state.time,
         .random = &state.random,
-        .blocks = &state.blocks,
         .living = &state.living,
         .players = &state.players,
         .items = &state.items,
     };
+}
+
+fn restoreTestMetadata(source: *test_state.State, restored: *test_state.State) !void {
+    var source_state = persistedTestState(source);
+    var restored_state = persistedTestState(restored);
+    var root_bytes: [maximum_root_encoded_size]u8 = undefined;
+    const encoded_root = try encodeRoot(&root_bytes, try root(&source_state));
+    const decoded_root = try decodeRoot(encoded_root);
+    try beginRestore(&restored_state, decoded_root);
+
+    var record_bytes: [maximum_record_encoded_size]u8 = undefined;
+    for (source_state.items.active_indices[0..source_state.items.active_count]) |index| {
+        const encoded = try encodeItemRecord(&record_bytes, &source_state, source_state.items.value(index));
+        try restoreItemRecord(&restored_state, encoded);
+    }
+    for (source_state.living.entities.active_indices[0..source_state.living.entities.active_count]) |index| {
+        const encoded = try encodeLivingRecord(&record_bytes, &source_state, index);
+        try restoreLivingRecord(&restored_state, encoded);
+    }
+    finishRestore(&restored_state, decoded_root);
+}
+
+test "restoring remote item records does not materialize chunks" {
+    const source = try std.testing.allocator.create(test_state.State);
+    defer std.testing.allocator.destroy(source);
+    try source.init(std.testing.allocator, 1);
+    defer source.deinit();
+    const restored = try std.testing.allocator.create(test_state.State);
+    defer std.testing.allocator.destroy(restored);
+    try restored.init(std.testing.allocator, 2);
+    defer restored.deinit();
+
+    const count = restored.blocks.materializationCapacity() + 1;
+    try std.testing.expect(count <= restored.items.active.len);
+    var source_state = persistedTestState(source);
+    var restored_state = persistedTestState(restored);
+    const value = Root{
+        .tick = 123,
+        .day_time = 456,
+        .entropy = 789,
+        .items = @intCast(count),
+        .living = 0,
+    };
+    try beginRestore(&restored_state, value);
+    var record_bytes: [maximum_record_encoded_size]u8 = undefined;
+    for (0..count) |index| {
+        const item = entity_store.ItemEntity{
+            .world = source.world,
+            .position = .{ .x = @floatFromInt(index * 32), .y = 80, .z = -@as(f64, @floatFromInt(index * 32)) },
+            .stack = player_store.stackForItem(1, 1),
+            .uuid = @intCast(index + 1),
+            .active = true,
+        };
+        const encoded = try encodeItemRecord(&record_bytes, &source_state, item);
+        try restoreItemRecord(&restored_state, encoded);
+    }
+    finishRestore(&restored_state, value);
+    try std.testing.expectEqual(@as(usize, 0), restored.blocks.materialization_count);
+    try std.testing.expectEqual(count, restored.items.active_count);
 }
 
 test "world state round trips with blocks players and item entities" {
@@ -571,30 +656,12 @@ test "world state round trips with blocks players and item entities" {
     source.time.day_time = 6_789;
     _ = source.random.random.next();
 
-    _ = source.blocks.generatedHeightChunkRef(source.world, .{ .x = -2, .z = 2 }, source.clock.tick);
+    _ = source.blocks.materializeGeneratedChunk(source.world, .{ .x = -2, .z = 2 }, source.clock.tick);
     const removed = geometry.BlockPos{ .x = -17, .y = source.blocks.surfaceHeightAt(source.world, -17, 33), .z = 33 };
     try std.testing.expect(try source.blocks.setBlock(source.world, removed, registry.block_air_default_state));
     const placed = geometry.BlockPos{ .x = 42, .y = 120, .z = -9 };
+    _ = source.blocks.materializeGeneratedChunk(source.world, .{ .x = 2, .z = -1 }, source.clock.tick);
     try std.testing.expect(try source.blocks.setBlock(source.world, placed, registry.block_dirt_default_state));
-
-    source.players.beginConnection(&source.random, 0);
-    _ = try source.players.login(&source.random, 0, "persistent-player", 0x1234);
-    source.players.records[0].position = .{ .x = 123.5, .y = 91, .z = -44.25 };
-    source.players.records[0].world = source.world;
-    source.players.records[0].rotation = .{ .yaw = 37, .pitch = -12 };
-    source.players.records[0].gamemode = .creative;
-    source.players.records[0].hotbar[0] = player_store.stackForItem(registry.item_diamond_shovel_id, 1);
-    source.players.records[0].hotbar[1] = player_store.stackForItem(registry.item_diamond_pickaxe_id, 1);
-    source.players.records[0].hotbar[2] = player_store.stackForItem(registry.item_diamond_axe_id, 1);
-    source.players.records[0].hotbar[4] = .{ .block_state = registry.block_dirt_default_state, .item_id = 99, .damage = 7, .count = 17 };
-    source.players.records[0].main_inventory[8] = player_store.stackForItem(1, 12);
-    source.players.records[0].armor[1] = player_store.stackForItem(1, 1);
-    source.players.records[0].offhand = player_store.stackForItem(1, 2);
-    source.players.records[0].crafting_grid[2] = player_store.stackForItem(1, 3);
-    source.players.records[0].cursor_stack = player_store.stackForItem(1, 2);
-    player_store.returnCraftingGridToInventory(&source.players.records[0]);
-    try source.players.saveAll();
-    source.players.records[0].state = .free;
 
     source.blocks.ensureChunkAt(source.world, 2, 3, source.clock.tick);
     const item_index = try source.items.spawn(&source.random, &source.blocks, source.world, .{ .x = 2, .y = 100, .z = 3 }, .{ .x = 0.1, .y = -0.2, .z = 0.3 }, .{ .block_state = registry.block_stone_default_state, .item_id = 1, .count = 5 }, entity_store.block_drop_pickup_delay_ticks);
@@ -616,10 +683,6 @@ test "world state round trips with blocks players and item entities" {
     const chicken = try source.living.spawn(&source.random, &source.blocks, source.world, .chicken, .{ .x = -8.5, .y = 64, .z = 12.25 }, false, true);
     try std.testing.expect(source.living.entities.setVehicle(zombie, chicken));
 
-    var source_state = persistedTestState(source);
-    const buffer = try std.testing.allocator.alloc(u8, metadataStateEncodedSize(&source_state));
-    defer std.testing.allocator.free(buffer);
-    const encoded = try encodeMetadataState(buffer, &source_state);
     const removed_chunk_buffer = try std.testing.allocator.alloc(u8, chunk_storage.encoded_size);
     defer std.testing.allocator.free(removed_chunk_buffer);
     const removed_chunk = geometry.chunkForBlock(removed);
@@ -635,8 +698,7 @@ test "world state round trips with blocks players and item entities" {
     defer std.testing.allocator.destroy(restored);
     try restored.init(std.testing.allocator, 0);
     defer restored.deinit();
-    var restored_state = persistedTestState(restored);
-    try decodeMetadataState(&restored_state, encoded);
+    try restoreTestMetadata(source, restored);
     try chunk_storage.decode(&restored.blocks, restored.world, removed_chunk, encoded_removed_chunk);
     try chunk_storage.decode(&restored.blocks, restored.world, placed_chunk, encoded_placed_chunk);
     try std.testing.expectEqual(source.clock.tick, restored.clock.tick);
@@ -644,18 +706,6 @@ test "world state round trips with blocks players and item entities" {
     try std.testing.expectEqual(source.random.random.entropy, restored.random.random.entropy);
     try std.testing.expectEqual(registry.block_air_default_state, restored.blocks.blockAt(restored.world, removed));
     try std.testing.expectEqual(registry.block_dirt_default_state, restored.blocks.blockAt(restored.world, placed));
-    try std.testing.expectEqual(@as(usize, 1), restored.players.saved_count);
-    try std.testing.expectEqualStrings("persistent-player", restored.players.saved[0].name_slice());
-    try std.testing.expectEqual(@as(f64, 123.5), restored.players.saved[0].position.x);
-    try std.testing.expectEqual(player_store.GameMode.creative, restored.players.saved[0].gamemode);
-    try std.testing.expectEqual(@as(u8, 3), restored.players.saved[0].hotbar[3].count);
-    try std.testing.expectEqual(@as(u8, 17), restored.players.saved[0].hotbar[4].count);
-    try std.testing.expectEqual(@as(u16, 7), restored.players.saved[0].hotbar[4].damage);
-    try std.testing.expectEqual(@as(u8, 12), restored.players.saved[0].main_inventory[8].count);
-    try std.testing.expectEqual(@as(u8, 1), restored.players.saved[0].armor[1].count);
-    try std.testing.expectEqual(@as(u8, 2), restored.players.saved[0].offhand.count);
-    try std.testing.expect(restored.players.saved[0].crafting_grid[2].isEmpty());
-    try std.testing.expectEqual(@as(u8, 2), restored.players.saved[0].cursor_stack.count);
     try std.testing.expectEqual(@as(usize, 1), restored.items.active_count);
     const restored_item = restored.items.value(restored.items.active_indices[0]);
     try std.testing.expect(restored_item.entity_id != 0);
@@ -682,11 +732,6 @@ test "world state round trips with blocks players and item entities" {
     try std.testing.expect(restored_vehicle != null);
     try std.testing.expectEqual(restored_chicken, restored_vehicle.?.index);
     try std.testing.expectEqual(living_entities.EntityType.chicken, restored.living.entities.entity_types[restored_chicken]);
-
-    const second_buffer = try std.testing.allocator.alloc(u8, metadataStateEncodedSize(&restored_state));
-    defer std.testing.allocator.free(second_buffer);
-    const second = try encodeMetadataState(second_buffer, &restored_state);
-    try std.testing.expectEqualSlices(u8, encoded, second);
 }
 
 test "world state rejects truncation and corruption" {
@@ -695,15 +740,11 @@ test "world state rejects truncation and corruption" {
     try source.init(std.testing.allocator, 9);
     defer source.deinit();
     var source_state = persistedTestState(source);
-    const buffer = try std.testing.allocator.alloc(u8, metadataStateEncodedSize(&source_state));
-    defer std.testing.allocator.free(buffer);
-    const encoded = try encodeMetadataState(buffer, &source_state);
-    const restored = try std.testing.allocator.create(test_state.State);
-    defer std.testing.allocator.destroy(restored);
-    try restored.init(std.testing.allocator, 0);
-    defer restored.deinit();
-    var restored_state = persistedTestState(restored);
-    try std.testing.expectError(error.InvalidWorldLength, decodeMetadataState(&restored_state, encoded[0 .. encoded.len - 1]));
-    encoded[encoded.len - 1] ^= 0x80;
-    try std.testing.expectError(error.WorldChecksumMismatch, decodeMetadataState(&restored_state, encoded));
+    var root_bytes: [maximum_root_encoded_size]u8 = undefined;
+    const encoded = try encodeRoot(&root_bytes, try root(&source_state));
+    try std.testing.expectError(error.InvalidWorldLength, decodeRoot(encoded[0 .. encoded.len - 1]));
+    root_bytes[encoded.len - 1] ^= 0x80;
+    try std.testing.expectError(error.WorldChecksumMismatch, decodeRoot(encoded));
+    @memcpy(root_bytes[0..legacy_metadata_magic.len], legacy_metadata_magic);
+    try std.testing.expectError(error.StoredPlayerFormatUnsupported, decodeRoot(encoded));
 }

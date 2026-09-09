@@ -4,3 +4,7 @@ pub const q: u512 = 0xdacd5be4eb7fb6cfbb71a7edfa22c0b2d2e9c7d238138f43a7a709701a
 pub const dp: u512 = 0xd94b4eed8693640c3a261dde37bfb21c24e7dd872e5e582b2312c3d82c91b1f2a086ae8773098d1fdd3e03ef7ca928d905f5696263ad85f58c64b4af37c9936d;
 pub const dq: u512 = 0xcce7504d9b756900352c04f5ca304d81aa1f20f06f6f71d50be653e2564ed364f41a3e34f9ea2c5dfde5706571e5d72da2238ee3e8d4aa2d42448af767858c11;
 pub const q_inverse: u512 = 0x31fd475a2b4fff783091b95f4bfe67962bc144d7dd74808788df2efa9c56da0f0decc313ce355f5626dd2eadbaa65e822949a826b123042121534efcf2f697dc;
+
+pub fn privateKey(comptime Key: type) Key {
+    return .{ .modulus = modulus, .p = p, .q = q, .dp = dp, .dq = dq, .q_inverse = q_inverse };
+}

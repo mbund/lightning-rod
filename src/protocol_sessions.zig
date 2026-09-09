@@ -79,6 +79,7 @@ pub fn Catalog(comptime selected: anytype) type {
                         .encryption_request = encryptionRequest,
                         .set_compression = setCompression,
                         .login_success = loginSuccess,
+                        .disconnect = disconnect,
                         .encoded_capacity = encodedCapacity,
                         .encode = encode,
                         .status = status,
@@ -164,8 +165,8 @@ pub fn Catalog(comptime selected: anytype) type {
                     return framePayloadSession(item, body, output);
                 }
 
-                fn encryptionRequest(_: *anyopaque, item: *minecraft.Session, public_key: []const u8, verify_token: []const u8, output: []u8) ?usize {
-                    const body = Generated.encodeEncryptionRequest(item.decoded_state[0..], public_key, verify_token) catch return null;
+                fn encryptionRequest(_: *anyopaque, item: *minecraft.Session, request: session_api.Authentication.EncryptionRequest, output: []u8) ?usize {
+                    const body = Generated.encodeEncryptionRequest(item.decoded_state[0..], request) catch return null;
                     return framePayloadSession(item, body, output);
                 }
 
@@ -176,6 +177,11 @@ pub fn Catalog(comptime selected: anytype) type {
 
                 fn loginSuccess(_: *anyopaque, item: *minecraft.Session, uuid: u128, username: []const u8, output: []u8) ?usize {
                     const body = Generated.encodeLoginSuccess(item.decoded_state[0..], uuid, username) catch return null;
+                    return framePayloadSession(item, body, output);
+                }
+
+                fn disconnect(_: *anyopaque, item: *minecraft.Session, output: []u8) ?usize {
+                    const body = Generated.encodeShutdownDisconnect(item.decoded_state[0..], item.phase) catch return null;
                     return framePayloadSession(item, body, output);
                 }
 
@@ -359,7 +365,8 @@ fn decodePayload(value: *minecraft.Session, framed: []const u8, storage: minecra
     if (data_len < threshold or data_len > max_packet_bytes) return null;
     const output_len: usize = @intCast(data_len);
     var source: std.Io.Reader = .fixed(compressed);
-    var decompressor = std.compress.flate.Decompress.init(&source, .zlib, &value.decompression_window);
+    const workspace = value.workspace orelse return null;
+    var decompressor = std.compress.flate.Decompress.init(&source, .zlib, &workspace.decompression_window);
     decompressor.reader.readSliceAll(value.decoded_state[0..output_len]) catch return null;
     return .{ .bytes = value.decoded_state[0..output_len], .storage = .session };
 }
@@ -378,12 +385,14 @@ fn frame(id: i32, bytes: []const u8, output: []u8) ?usize {
 }
 
 fn frameSession(value: *minecraft.Session, id: i32, bytes: []const u8, output: []u8) ?usize {
-    var rest: []u8 = value.compression_scratch[0..];
+    if (value.compression_threshold == null) return frame(id, bytes, output);
+    const workspace = value.workspace orelse return null;
+    var rest: []u8 = workspace.compression_scratch[0..];
     rest = protocol_support.write_varint(rest, id) catch return null;
     if (rest.len < bytes.len) return null;
-    const body_len = value.compression_scratch.len - rest.len + bytes.len;
+    const body_len = workspace.compression_scratch.len - rest.len + bytes.len;
     @memcpy(rest[0..bytes.len], bytes);
-    return framePayloadSession(value, value.compression_scratch[0..body_len], output);
+    return framePayloadSession(value, workspace.compression_scratch[0..body_len], output);
 }
 
 fn framePayloadSession(value: *minecraft.Session, body: []const u8, output: []u8) ?usize {
@@ -419,7 +428,8 @@ fn frameCompressed(value: *minecraft.Session, body: []const u8, output: []u8) ?u
     const reserve = 10;
     if (output.len <= reserve) return null;
     var writer: std.Io.Writer = .fixed(output[reserve..]);
-    var compressor = std.compress.flate.Compress.init(&writer, &value.compression_window, .zlib, .level_1) catch return null;
+    const workspace = value.workspace orelse return null;
+    var compressor = std.compress.flate.Compress.init(&writer, &workspace.compression_window, .zlib, .level_1) catch return null;
     compressor.writer.writeAll(body) catch return null;
     compressor.finish() catch return null;
     const compressed_len = writer.buffered().len;
@@ -458,9 +468,11 @@ test "selected catalog has one protocol entry per selected wire protocol" {
 }
 
 test "large server packets fit the bounded session output buffer" {
+    var workspace: minecraft.Workspace = .{};
     var session = minecraft.Session{
         .connection = .{ .index = 0, .generation = 1 },
         .compression_threshold = 256,
+        .workspace = &workspace,
     };
     var body: [128 * 1024]u8 = @splat(0x4a);
     var framed: [minecraft.Codec.max_state_bytes]u8 = undefined;
@@ -661,7 +673,8 @@ test "encrypted fragmented stream decrypts in place before framing" {
 test "compression action state round trips framed packets" {
     const catalog = Catalog([_]protocol_versions.Support{protocol_versions.support(protocol_versions.default)});
     const codec = catalog.protocols[0].codec;
-    var value = minecraft.Session{ .connection = .{ .index = 0, .generation = 1 }, .compression_threshold = 0 };
+    var workspace: minecraft.Workspace = .{};
+    var value = minecraft.Session{ .connection = .{ .index = 0, .generation = 1 }, .compression_threshold = 0, .workspace = &workspace };
     var encoded: [256]u8 = undefined;
     const len = codec.vtable.encode(codec.context, &value, 9, "compress me compress me", &encoded).?;
     var packets: [1]minecraft.Packet = undefined;

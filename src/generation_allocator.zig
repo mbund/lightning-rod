@@ -44,7 +44,7 @@ pub const Allocator = struct {
         const begin = @intFromPtr(self.storage.buffer.ptr);
         if (address < begin) return false;
         const offset = address - begin;
-        return offset >= start and offset < end;
+        return offset >= start and offset < end and @sizeOf(Pointer.child) <= end - offset;
     }
 
     pub fn currentPluginBytes(self: *const Allocator) usize {
@@ -136,6 +136,8 @@ test "generation allocator distinguishes the current plugin allocation interval"
     generation.beginPlugin(1);
     const second = try generation.allocator().create(u8);
     try std.testing.expect(generation.ownsCurrentPluginAllocation(second));
+    const incomplete: *[2]u8 = @ptrCast(second);
+    try std.testing.expect(!generation.ownsCurrentPluginAllocation(incomplete));
     try std.testing.expect(!generation.ownsCurrentPluginAllocation(first));
     generation.endPlugin();
 }

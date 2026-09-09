@@ -13,7 +13,7 @@ pub const RandomBlockEvents = struct {
         return .{ .context = self, .apply = apply };
     }
 
-    fn apply(_: *anyopaque, tick: *engine.Invocation) void {
-        engine.applyRandomBlockEvents(tick);
+    fn apply(_: *anyopaque, tick: *engine.Invocation) engine.FatalError!void {
+        try engine.applyRandomBlockEvents(tick);
     }
 };

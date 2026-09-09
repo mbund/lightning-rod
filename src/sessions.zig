@@ -76,6 +76,11 @@ pub const Sessions = struct {
         self.runtime = value;
     }
 
+    pub fn flush(self: *Sessions) void {
+        const runtime = self.runtime orelse return;
+        runtime.flush();
+    }
+
     pub fn playerSession(self: *const Sessions, slot: u16) ?players.Session {
         const runtime = self.runtime orelse return null;
         return runtime.vtable.player_session(runtime.context, slot);
@@ -212,6 +217,26 @@ pub const Sessions = struct {
         )).values;
     }
 
+    pub fn batch(
+        self: *Sessions,
+        temporary: std.mem.Allocator,
+        items: []const PacketBatchItem,
+        class: DeliveryClass,
+    ) std.mem.Allocator.Error![]const PacketAdmission {
+        const runtime = self.runtime orelse {
+            const admissions = try temporary.alloc(PacketAdmission, items.len);
+            @memset(admissions, .closed);
+            return admissions;
+        };
+        return (try runtime.vtable.batch(
+            runtime.context,
+            temporary,
+            items,
+            class,
+            .reliable,
+        )).values;
+    }
+
     pub fn fanoutOne(self: *Sessions, temporary: std.mem.Allocator, recipient: players.Session, class: DeliveryClass, encoder: PacketEncoder, policy: DeliveryPolicy) std.mem.Allocator.Error!PacketAdmission {
         _ = temporary;
         const runtime = self.runtime orelse return .closed;
@@ -279,6 +304,7 @@ pub const Driver = driver.Driver;
 pub const Clock = driver.Clock;
 pub const Status = driver.Status;
 pub const CoreBoundary = driver.CoreBoundary;
+pub const PacketBridge = @import("sessions/packet_bridge.zig").Bridge;
 
 test {
     _ = driver;
@@ -339,6 +365,8 @@ test "typed fanout delegates to the session runtime" {
             std.debug.assert(encoded.payload.len == 1);
             return fanoutResult(temporary, recipients, &.{.backpressured});
         }
+
+        fn flush(_: *anyopaque) void {}
     };
     const Descriptor = struct {
         pub const Arguments = State;
@@ -362,6 +390,7 @@ test "typed fanout delegates to the session runtime" {
         .send_one = State.sendOne,
         .batch = State.batch,
         .fanout = State.fanout,
+        .flush = State.flush,
     } });
     var storage: [4096]u8 = undefined;
     var fixed = std.heap.FixedBufferAllocator.init(&storage);

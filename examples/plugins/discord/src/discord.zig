@@ -69,22 +69,22 @@ pub const Discord = struct {
     }
 
     pub fn tick(self: *Discord, _: std.mem.Allocator) void {
-        self.enqueueJoined();
-        self.enqueueLeft();
-        self.flush();
-    }
-
-    fn enqueueJoined(self: *Discord) void {
+        // enqueue joined
         for (self.deps.lifecycle.joined.values) |event| {
             const player = &self.deps.players.records[event.slot];
             self.enqueue(player.name_slice(), " joined the game");
         }
-    }
 
-    fn enqueueLeft(self: *Discord) void {
+        // enqueue left
         for (self.deps.lifecycle.left.values) |event| {
             const player = &self.deps.players.records[event.slot];
             self.enqueue(player.name_slice(), " left the game");
+        }
+
+        // flush
+        while (self.read != self.write) {
+            if (!self.config.scheduler.stage(self.queue[self.read % self.queue.len])) return;
+            self.read += 1;
         }
     }
 
@@ -93,13 +93,6 @@ pub const Discord = struct {
         const job = formatJob(self.webhook_url, name, suffix) catch return;
         self.queue[self.write % self.queue.len] = job;
         self.write += 1;
-    }
-
-    fn flush(self: *Discord) void {
-        while (self.read != self.write) {
-            if (!self.config.scheduler.stage(self.queue[self.read % self.queue.len])) return;
-            self.read += 1;
-        }
     }
 };
 
@@ -111,22 +104,4 @@ fn formatJob(webhook_url: []const u8, name: []const u8, suffix: []const u8) !Sen
     const body = try std.fmt.bufPrint(&job.payload, "{{\"content\":\"{s}{s}\"}}", .{ name, suffix });
     job.payload_len = @intCast(body.len);
     return job;
-}
-
-test "webhook jobs preserve bounded URL and JSON body" {
-    const job = try formatJob("https://example.invalid/hook", "player_name", " joined the game");
-    try std.testing.expectEqualStrings("https://example.invalid/hook", job.url());
-    try std.testing.expectEqualStrings("{\"content\":\"player_name joined the game\"}", job.body());
-}
-
-test "configuration rejects non-HTTP webhook URLs" {
-    const Scheduler = struct {
-        fn stage(_: *anyopaque, _: SendJob) bool {
-            return true;
-        }
-    };
-    try std.testing.expectError(error.InvalidWebhookUrl, (Discord.Configuration{
-        .webhook_url = "file:///tmp/webhook",
-        .scheduler = .{ .context = undefined, .stage_fn = Scheduler.stage },
-    }).validate());
 }

@@ -13,7 +13,7 @@ pub const FarmlandHydration = struct {
         return .{ .context = self, .apply = apply };
     }
 
-    fn apply(_: *anyopaque, tick: *engine.Invocation) void {
-        engine.applyFarmlandHydration(tick);
+    fn apply(_: *anyopaque, tick: *engine.Invocation) engine.FatalError!void {
+        try engine.applyFarmlandHydration(tick);
     }
 };

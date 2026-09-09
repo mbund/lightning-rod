@@ -20,9 +20,10 @@ pub const Codec = struct {
         start_configuration: *const fn (*anyopaque, *Session, []u8) ?usize,
         configuration_entry: ?*const fn (*anyopaque, *Session, configuration.Entry, []u8) ?usize = null,
         finish_configuration: ?*const fn (*anyopaque, *Session, []u8) ?usize = null,
-        encryption_request: ?*const fn (*anyopaque, *Session, []const u8, []const u8, []u8) ?usize = null,
+        encryption_request: ?*const fn (*anyopaque, *Session, session.Authentication.EncryptionRequest, []u8) ?usize = null,
         set_compression: ?*const fn (*anyopaque, *Session, i32, []u8) ?usize = null,
         login_success: ?*const fn (*anyopaque, *Session, u128, []const u8, []u8) ?usize = null,
+        disconnect: ?*const fn (*anyopaque, *Session, []u8) ?usize = null,
         encoded_capacity: *const fn (*anyopaque, *const Session, i32, []const u8) ?usize,
         encode: *const fn (*anyopaque, *Session, i32, []const u8, []u8) ?usize,
         status: *const fn (*anyopaque, i32, []const u8, []u8) ?usize,
@@ -70,6 +71,12 @@ pub const Name = struct {
     }
 };
 
+pub const Workspace = struct {
+    decompression_window: [std.compress.flate.max_window_len]u8 = undefined,
+    compression_window: [std.compress.flate.max_window_len]u8 = undefined,
+    compression_scratch: [Codec.max_state_bytes]u8 = undefined,
+};
+
 pub const Session = struct {
     connection: connection.Handle,
     phase: session.Phase = .handshake,
@@ -87,10 +94,9 @@ pub const Session = struct {
     codec_state_len: u16 = 0,
     codec_state_exposed: bool = false,
     decoded_state: [Codec.max_state_bytes]u8 = undefined,
-    decompression_window: [std.compress.flate.max_window_len]u8 = undefined,
-    compression_window: [std.compress.flate.max_window_len]u8 = undefined,
-    compression_scratch: [Codec.max_state_bytes]u8 = undefined,
+    workspace: ?*Workspace = null,
     auth_deadline_ns: u64 = 0,
+    authentication_challenged: bool = false,
     closing: ?connection.DisconnectReason = null,
     retained_page: ?connection.Page = null,
     retained_offset: u32 = 0,

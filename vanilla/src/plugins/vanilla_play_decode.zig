@@ -98,11 +98,14 @@ const Sink = struct {
 
     pub fn block_dig(self: *Sink, player: u16, status: i32, position: BlockPosition, face: i32, sequence: i32) !void {
         try self.append(.{ .dig = .{ .player = player, .status = status, .position = position, .face = face, .sequence = sequence } });
+        try self.packets.deferAcknowledgement(player, sequence);
     }
 
     pub fn block_place(self: *Sink, player: u16, position: BlockPosition, face: i32, x: f32, y: f32, z: f32, sequence: i32) !void {
         const world = self.packets.deps.players.records[player].world;
-        try self.append(.{ .place = .{ .world = world, .player = player, .kind = .use_item_on, .position = position, .against_position = position, .face = face, .cursor = .{ .x = x, .y = y, .z = z }, .sequence = sequence } });
+        const placed = placementPosition(position, face) orelse return error.InvalidBlockFace;
+        try self.append(.{ .place = .{ .world = world, .player = player, .kind = .use_item_on, .position = placed, .against_position = position, .face = face, .cursor = .{ .x = x, .y = y, .z = z }, .sequence = sequence } });
+        try self.packets.deferAcknowledgement(player, sequence);
     }
 
     pub fn held_item_slot(self: *Sink, player: u16, selected: i16) !void {
@@ -143,6 +146,19 @@ const Sink = struct {
 
     pub fn ignored(_: *Sink, _: u16) void {}
 };
+
+fn placementPosition(clicked: BlockPosition, face: i32) ?BlockPosition {
+    const offset = switch (face) {
+        0 => BlockPosition{ .x = 0, .y = -1, .z = 0 },
+        1 => BlockPosition{ .x = 0, .y = 1, .z = 0 },
+        2 => BlockPosition{ .x = 0, .y = 0, .z = -1 },
+        3 => BlockPosition{ .x = 0, .y = 0, .z = 1 },
+        4 => BlockPosition{ .x = -1, .y = 0, .z = 0 },
+        5 => BlockPosition{ .x = 1, .y = 0, .z = 0 },
+        else => return null,
+    };
+    return .{ .x = clicked.x + offset.x, .y = clicked.y + offset.y, .z = clicked.z + offset.z };
+}
 
 pub fn dispatchWith(comptime Protocol: type, comptime Registry: type, id: i32, body: []const u8, slot: u16, handler: anytype) !bool {
     const Packets = Protocol.play.toServer;

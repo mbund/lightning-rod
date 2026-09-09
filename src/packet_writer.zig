@@ -32,6 +32,7 @@ pub const Packets = struct {
     const EntityClass = enum(u8) { player, living, item };
     const EntityUpdate = enum { spawn, move, metadata, equipment };
     const Failure = enum { input_full, temporary_full };
+    const Acknowledgement = struct { slot: u16, sequence: i32 };
     pub const Configuration = struct {
         maximum_input_packets: usize = 4096,
         input_byte_capacity: usize = 256 * 1024,
@@ -67,6 +68,8 @@ pub const Packets = struct {
     packet_views: []const core_exchange.PacketView = &.{},
     packet_claimed: []bool = &.{},
     player_protocols: []i32 = &.{},
+    acknowledgements: []Acknowledgement = &.{},
+    acknowledgement_count: usize = 0,
     sound_count: u16 = 0,
     overflow: ?Failure = null,
     reload_request: ?u16 = null,
@@ -86,6 +89,8 @@ pub const Packets = struct {
         errdefer input.deinit(allocator);
         const player_protocols = try allocator.alloc(i32, deps.players.records.len);
         errdefer allocator.free(player_protocols);
+        const acknowledgements = try allocator.alloc(Acknowledgement, configuration.maximum_input_packets);
+        errdefer allocator.free(acknowledgements);
         const chats = try chat_batch.Batch.init(allocator, configuration.maximum_player_messages);
         const commands = try command_batch.Batch.init(allocator, configuration.maximum_player_messages);
         self.* = .{
@@ -95,6 +100,7 @@ pub const Packets = struct {
             .chats = chats,
             .commands = commands,
             .player_protocols = player_protocols,
+            .acknowledgements = acknowledgements,
         };
         @memset(self.player_protocols, 0);
         return self;
@@ -102,6 +108,10 @@ pub const Packets = struct {
 
     pub fn bindRuntime(self: *Packets, runtime: session_settings.Runtime) void {
         self.deps.sessions.bindRuntime(runtime);
+    }
+
+    pub fn flush(self: *Packets) void {
+        self.deps.sessions.flush();
     }
 
     pub fn beginTick(self: *Packets) void {
@@ -258,7 +268,7 @@ pub const Packets = struct {
     pub fn blockDig(self: *Packets, slot: u16, status: i32, position: geometry.BlockPos, face: i32, sequence: i32) !void {
         if (self.input.append(.{ .dig = .{ .player = slot, .status = status, .position = position, .face = face, .sequence = sequence } }) == .full)
             return error.InputBatchFull;
-        _ = self.acknowledgeDig(slot, sequence);
+        try self.deferAcknowledgement(slot, sequence);
     }
 
     pub fn blockPlace(self: *Packets, request: input_state.BlockRequest) !void {
@@ -273,12 +283,12 @@ pub const Packets = struct {
             .sequence = request.sequence,
         };
         if (self.input.append(.{ .place = input }) == .full) return error.InputBatchFull;
-        _ = self.acknowledgeDig(request.slot, request.sequence);
+        try self.deferAcknowledgement(request.slot, request.sequence);
     }
 
     pub fn heldItemSlot(self: *Packets, slot: u16, selected: i16) void {
         if (self.input.append(.{ .held_item = .{ .player = slot, .selected = selected } }) == .full) self.fail(.input_full);
-        self.emitPlayerInventory(slot);
+        _ = self.emitPlayerInventory(slot);
     }
 
     pub fn chat(self: *Packets, slot: u16, text: []const u8) !void {
@@ -293,6 +303,27 @@ pub const Packets = struct {
 
     pub fn blockChanged(self: *Packets, change: packet_args.BlockChanged) void {
         self.sendBlock(.{ .world = change.world, .position = change.pos, .state = change.block_state }, .other);
+    }
+
+    pub fn blocksChanged(self: *Packets, changes: []const packet_args.BlockChanged) void {
+        var first: usize = 0;
+        while (first < changes.len) {
+            const origin = changes[first];
+            const chunk_x = @divFloor(origin.pos.x, 16);
+            const section_y = @divFloor(@as(i32, origin.pos.y), 16);
+            const chunk_z = @divFloor(origin.pos.z, 16);
+            var end = first + 1;
+            while (end < changes.len) : (end += 1) {
+                const change = changes[end];
+                if (!change.world.eql(origin.world) or @divFloor(change.pos.x, 16) != chunk_x or
+                    @divFloor(@as(i32, change.pos.y), 16) != section_y or @divFloor(change.pos.z, 16) != chunk_z) break;
+            }
+            if (end - first == 1)
+                self.blockChanged(origin)
+            else
+                self.sendSectionBlocks(origin.world, chunk_x, section_y, chunk_z, changes[first..end]);
+            first = end;
+        }
     }
 
     pub fn block_changed(self: *Packets, change: packet_args.BlockChanged) void {
@@ -312,6 +343,29 @@ pub const Packets = struct {
         return self.sendPlayer(slot, .control, .{ .phase = .play, .maximum_payload_bytes = 16, .context = &arguments, .encode = Encoder.encode });
     }
 
+    pub fn deferAcknowledgement(self: *Packets, slot: u16, sequence: i32) !void {
+        if (self.acknowledgement_count == self.acknowledgements.len) return error.InputBatchFull;
+        self.acknowledgements[self.acknowledgement_count] = .{ .slot = slot, .sequence = sequence };
+        self.acknowledgement_count += 1;
+    }
+
+    pub fn flushAcknowledgements(self: *Packets) void {
+        var sent: usize = 0;
+        while (sent < self.acknowledgement_count) : (sent += 1) {
+            const acknowledgement = self.acknowledgements[sent];
+            if (self.playerSession(acknowledgement.slot) == null) continue;
+            if (!self.acknowledgeDig(acknowledgement.slot, acknowledgement.sequence)) break;
+        }
+        if (sent != 0) {
+            std.mem.copyForwards(
+                Acknowledgement,
+                self.acknowledgements[0 .. self.acknowledgement_count - sent],
+                self.acknowledgements[sent..self.acknowledgement_count],
+            );
+            self.acknowledgement_count -= sent;
+        }
+    }
+
     pub fn keepAlive(self: *Packets, slot: u16, value: i64) bool {
         const Arguments = struct { value: i64 };
         const Encoder = struct {
@@ -326,7 +380,7 @@ pub const Packets = struct {
     }
 
     pub fn hotbarChanged(self: *Packets, change: packet_args.HotbarChanged) void {
-        self.emitPlayerInventory(change.slot);
+        _ = self.emitPlayerInventory(change.slot);
     }
 
     pub fn hotbar_changed(self: *Packets, change: packet_args.HotbarChanged) void {
@@ -369,31 +423,32 @@ pub const Packets = struct {
         _ = self.deps.sessions.tryFanout(temporary, recipients, .entities, .{ .phase = .play, .maximum_payload_bytes = 16, .context = &arguments, .encode = Encoder.encode }) catch self.fail(.temporary_full);
     }
 
-    pub fn emitPlayerInventory(self: *Packets, slot: u16) void {
-        if (slot >= self.deps.players.records.len) return;
-        const player = self.deps.players.records[slot];
-        const Arguments = struct { player: players.CorePlayer };
+    pub fn emitPlayerInventory(self: *Packets, slot: u16) bool {
+        if (slot >= self.deps.players.records.len) return false;
+        const player = &self.deps.players.records[slot];
+        const state_id = player.inventory_state_id +% 1;
+        const Arguments = struct { player: players.CorePlayer, state_id: i32 };
         const Encoder = struct {
             fn encode(raw: *const anyopaque, protocol: session_settings.Protocol, output: []u8) ?session_settings.EncodedPacket {
                 const arguments: *const Arguments = @ptrCast(@alignCast(raw));
-                var rest = protocol_versions.staticCall("startWindowItems", protocol.value, .{ output, @as(i32, 0), @as(i32, 0) }) catch return null;
+                var rest = protocol_versions.staticCall("startWindowItems", protocol.value, .{ output, @as(i32, 0), arguments.state_id }) catch return null;
                 const snapshot = arguments.player;
-                const count = snapshot.hotbar.len + snapshot.main_inventory.len + snapshot.armor.len + 1;
+                const count = 1 + snapshot.crafting_grid.len + snapshot.armor.len + snapshot.main_inventory.len + snapshot.hotbar.len + 1;
                 rest = protocol_support.write_count(rest, i32, count) catch return null;
-                for (snapshot.hotbar) |stack| rest = writeWireStack(protocol.value, rest, stack) orelse return null;
-                for (snapshot.main_inventory) |stack| rest = writeWireStack(protocol.value, rest, stack) orelse return null;
-                for (snapshot.armor) |stack| rest = writeWireStack(protocol.value, rest, stack) orelse return null;
-                rest = writeWireStack(protocol.value, rest, snapshot.offhand) orelse return null;
-                rest = writeWireStack(protocol.value, rest, .{}) orelse return null;
+                for (0..46) |protocol_slot|
+                    rest = writeWireStack(protocol.value, rest, playerWindowStack(&snapshot, protocol_slot)) orelse return null;
+                rest = writeWireStack(protocol.value, rest, snapshot.cursor_stack) orelse return null;
                 return generatedPacket(output[0 .. output.len - rest.len]);
             }
         };
-        const arguments = Arguments{ .player = player };
-        _ = self.sendPlayer(slot, .control, .{ .phase = .play, .maximum_payload_bytes = 16 * 1024, .context = &arguments, .encode = Encoder.encode });
+        const arguments = Arguments{ .player = player.*, .state_id = state_id };
+        if (!self.sendPlayer(slot, .control, .{ .phase = .play, .maximum_payload_bytes = 16 * 1024, .context = &arguments, .encode = Encoder.encode })) return false;
+        player.inventory_state_id = state_id;
+        return true;
     }
 
-    pub fn emitPlayerHealth(self: *Packets, slot: u16) void {
-        if (slot >= self.deps.players.records.len) return;
+    pub fn emitPlayerHealth(self: *Packets, slot: u16) bool {
+        if (slot >= self.deps.players.records.len) return false;
         const player = self.deps.players.records[slot];
         const Arguments = struct { health: f32, food: i32, saturation: f32 };
         const Encoder = struct {
@@ -403,7 +458,7 @@ pub const Packets = struct {
             }
         };
         const arguments = Arguments{ .health = player.health, .food = player.food, .saturation = player.saturation };
-        _ = self.sendPlayer(slot, .control, .{ .phase = .play, .maximum_payload_bytes = 24, .context = &arguments, .encode = Encoder.encode });
+        return self.sendPlayer(slot, .control, .{ .phase = .play, .maximum_payload_bytes = 24, .context = &arguments, .encode = Encoder.encode });
     }
 
     pub fn emitPlayerGamemode(self: *Packets, slot: u16) void {
@@ -419,12 +474,39 @@ pub const Packets = struct {
         _ = self.sendPlayer(slot, .control, .{ .phase = .play, .maximum_payload_bytes = 16, .context = &arguments, .encode = Encoder.encode });
     }
 
-    pub fn emitPlayerCorrection(self: *Packets, slot: u16) void {
+    pub fn emitPlayerAbilities(self: *Packets, slot: u16) void {
+        if (slot >= self.deps.players.records.len) return;
+        const Arguments = struct { flags: i8 };
+        const Encoder = struct {
+            fn encode(raw: *const anyopaque, protocol: session_settings.Protocol, output: []u8) ?session_settings.EncodedPacket {
+                const arguments: *const Arguments = @ptrCast(@alignCast(raw));
+                return generatedPacket(protocol_versions.staticCall("encodeAbilities", protocol.value, .{ output, arguments.flags, @as(f32, 0.05), @as(f32, 0.1) }) catch return null);
+            }
+        };
+        const arguments = Arguments{ .flags = abilityFlags(self.deps.players.records[slot].gamemode) };
+        _ = self.sendPlayer(slot, .control, .{ .phase = .play, .maximum_payload_bytes = 16, .context = &arguments, .encode = Encoder.encode });
+    }
+
+    pub fn emitPlayerInfoGamemode(self: *Packets, slot: u16) void {
+        if (slot >= self.deps.players.records.len) return;
+        const player = self.deps.players.records[slot];
+        const temporary = self.temporary orelse return;
+        const recipients = self.allRecipients(temporary) orelse return;
+        const Arguments = struct { uuid: u128, gamemode: i32 };
+        const Encoder = struct {
+            fn encode(raw: *const anyopaque, protocol: session_settings.Protocol, output: []u8) ?session_settings.EncodedPacket {
+                const arguments: *const Arguments = @ptrCast(@alignCast(raw));
+                return generatedPacket(protocol_versions.staticCall("encodePlayerInfoGamemode", protocol.value, .{ output, arguments.uuid, arguments.gamemode }) catch return null);
+            }
+        };
+        const arguments = Arguments{ .uuid = player.uuid, .gamemode = @intFromEnum(player.gamemode) };
+        _ = self.deps.sessions.fanout(temporary, recipients, .control, .{ .phase = .play, .maximum_payload_bytes = 64, .context = &arguments, .encode = Encoder.encode }) catch self.fail(.temporary_full);
+    }
+
+    pub fn emitPlayerCorrection(self: *Packets, slot: u16) bool {
+        if (slot >= self.deps.players.records.len) return false;
         const player = &self.deps.players.records[slot];
         const teleport_id = player.next_teleport_id;
-        player.next_teleport_id +%= 1;
-        if (player.next_teleport_id <= 0) player.next_teleport_id = 1;
-        player.pending_teleport_id = teleport_id;
         const Arguments = struct {
             teleport_id: i32,
             position: geometry.Vec3,
@@ -447,7 +529,11 @@ pub const Packets = struct {
             }
         };
         const arguments = Arguments{ .teleport_id = teleport_id, .position = player.position, .rotation = player.rotation };
-        _ = self.sendPlayer(slot, .control, .{ .phase = .play, .maximum_payload_bytes = 64, .context = &arguments, .encode = Encoder.encode });
+        if (!self.sendPlayer(slot, .control, .{ .phase = .play, .maximum_payload_bytes = 64, .context = &arguments, .encode = Encoder.encode })) return false;
+        player.next_teleport_id +%= 1;
+        if (player.next_teleport_id <= 0) player.next_teleport_id = 1;
+        player.pending_teleport_id = teleport_id;
+        return true;
     }
 
     pub fn emitArmSwing(self: *Packets, slot: u16, hand: i32) void {
@@ -459,10 +545,10 @@ pub const Packets = struct {
     }
 
     pub fn emitRespawn(self: *Packets, slot: u16) void {
-        self.bootstrap(slot, .respawn);
+        _ = self.bootstrap(slot, .respawn);
         _ = self.emitPlayerCorrection(slot);
-        self.emitPlayerHealth(slot);
-        self.emitPlayerInventory(slot);
+        _ = self.emitPlayerHealth(slot);
+        _ = self.emitPlayerInventory(slot);
     }
 
     pub fn emitTime(self: *Packets, game_time: u64, day_time: u64) void {
@@ -470,6 +556,7 @@ pub const Packets = struct {
         const recipients = temporary.alloc(players.Session, self.deps.players.activeSlots().len) catch return self.fail(.temporary_full);
         var count: usize = 0;
         for (self.deps.players.activeSlots()) |slot| {
+            if (!self.deps.players.records[slot].presentation_ready) continue;
             recipients[count] = self.deps.players.session(slot) orelse continue;
             count += 1;
         }
@@ -503,7 +590,7 @@ pub const Packets = struct {
         var buffer: [512]u8 = undefined;
         const text = std.fmt.bufPrint(&buffer, "{f}", .{chat_batch.Line{ .draft = draft }}) catch
             return self.fail(.temporary_full);
-        self.sendSystemText(slot, text);
+        _ = self.sendSystemText(slot, text);
     }
 
     pub fn input_failed(self: *Packets, _: anyerror) void {
@@ -513,43 +600,65 @@ pub const Packets = struct {
         self.emitTime(0, 0);
     }
     pub fn gamemode_changed(self: *Packets, change: packet_args.GamemodeChanged) void {
+        if (change.slot >= self.deps.players.records.len) return;
+        std.debug.assert(self.deps.players.records[change.slot].gamemode == change.value);
         self.emitPlayerGamemode(change.slot);
+        self.emitPlayerAbilities(change.slot);
+        self.emitPlayerInfoGamemode(change.slot);
     }
     pub fn inventory_changed(self: *Packets, slot: u16) void {
-        self.emitPlayerInventory(slot);
+        _ = self.emitPlayerInventory(slot);
     }
     pub fn inventory_slot_changed(self: *Packets, change: packet_args.InventorySlotChanged) void {
-        self.emitPlayerInventory(change.slot);
+        _ = self.emitPlayerInventory(change.slot);
     }
     pub fn player_screen_slot_changed(self: *Packets, change: packet_args.PlayerScreenSlotChanged) void {
-        self.emitPlayerInventory(change.slot);
+        _ = self.emitPlayerInventory(change.slot);
     }
     pub fn container_opened(self: *Packets, slot: u16) void {
+        self.sendOpenContainer(slot, "Crafting");
         self.sendContainer(slot);
     }
     pub fn container_closed(self: *Packets, closed: packet_args.ContainerClosed) void {
-        self.sendContainer(closed.slot);
+        self.sendCloseContainer(closed.slot, closed.window_id);
+        _ = self.emitPlayerInventory(closed.slot);
     }
     pub fn menu_opened(self: *Packets, opened: packet_args.ContainerOpened) void {
+        self.sendOpenContainer(opened.slot, opened.title);
         self.sendContainer(opened.slot);
+        self.sendContainerProperties(opened.slot, opened.properties);
     }
-    pub fn menu_changed(self: *Packets, slot: u16, _: []const packet_args.ContainerProperty) void {
+    pub fn menu_changed(self: *Packets, slot: u16, properties: []const packet_args.ContainerProperty) void {
         self.sendContainer(slot);
+        self.sendContainerProperties(slot, properties);
     }
-    pub fn menu_player_inventory_changed(self: *Packets, slot: u16, _: []const packet_args.ContainerProperty) void {
-        self.emitPlayerInventory(slot);
-    }
-    pub fn menu_properties_changed(self: *Packets, slot: u16, _: []const packet_args.ContainerProperty) void {
+    pub fn menu_player_inventory_changed(self: *Packets, slot: u16, properties: []const packet_args.ContainerProperty) void {
         self.sendContainer(slot);
+        self.sendContainerProperties(slot, properties);
+    }
+    pub fn menu_properties_changed(self: *Packets, slot: u16, properties: []const packet_args.ContainerProperty) void {
+        self.sendContainerProperties(slot, properties);
     }
     pub fn block_correction(self: *Packets, correction: packet_args.BlockCorrection) void {
         const world = self.deps.players.records[correction.slot].world;
-        const state = self.deps.blocks.blockAtIfResident(world, correction.pos) orelse return;
+        const state = self.deps.blocks.blockAtIfMaterialized(world, correction.pos) orelse return;
         self.sendBlockToPlayer(correction.slot, .{ .position = correction.pos, .state = state }, .control);
     }
     pub fn block_break_animation(self: *Packets, animation: packet_args.BlockBreakAnimation) void {
         const temporary = self.temporary orelse return;
-        const recipients = self.worldRecipients(temporary, animation.world) orelse return;
+        const recipients = temporary.alloc(players.Session, self.deps.players.activeSlots().len) catch return self.fail(.temporary_full);
+        var recipient_count: usize = 0;
+        for (self.deps.players.activeSlots()) |slot| {
+            const player = &self.deps.players.records[slot];
+            if (slot == animation.slot or !player.world.eql(animation.world)) continue;
+            if (!player.presentation_ready) continue;
+            const dx = @as(f64, @floatFromInt(animation.pos.x)) - player.position.x;
+            const dy = @as(f64, @floatFromInt(animation.pos.y)) - player.position.y;
+            const dz = @as(f64, @floatFromInt(animation.pos.z)) - player.position.z;
+            if (dx * dx + dy * dy + dz * dz >= 32.0 * 32.0) continue;
+            recipients[recipient_count] = self.deps.players.session(slot) orelse continue;
+            recipient_count += 1;
+        }
         const entity_id = self.deps.players.records[animation.slot].entity_id;
         const Arguments = struct { entity_id: i32, position: geometry.BlockPos, stage: i8 };
         const Encoder = struct {
@@ -559,7 +668,7 @@ pub const Packets = struct {
             }
         };
         const arguments = Arguments{ .entity_id = entity_id, .position = animation.pos, .stage = animation.stage };
-        _ = self.deps.sessions.tryFanout(temporary, recipients, .entities, .{ .phase = .play, .maximum_payload_bytes = 32, .context = &arguments, .encode = Encoder.encode }) catch self.fail(.temporary_full);
+        _ = self.deps.sessions.fanout(temporary, recipients[0..recipient_count], .entities, .{ .phase = .play, .maximum_payload_bytes = 32, .context = &arguments, .encode = Encoder.encode }) catch self.fail(.temporary_full);
     }
     pub fn item_spawned(self: *Packets, index: u16) void {
         self.stageEntity(.spawn, .item, index);
@@ -576,6 +685,16 @@ pub const Packets = struct {
     }
     pub fn living_moved(self: *Packets, index: u16) void {
         self.stageEntity(.move, .living, index);
+    }
+    pub fn living_stepped(self: *Packets, value: packet_args.LivingMoved) void {
+        const world = if (value.index < self.deps.living.entities.active.len and self.deps.living.entities.active[value.index])
+            self.deps.living.entities.worlds[value.index]
+        else
+            return;
+        for (self.deps.players.activeSlots()) |slot| {
+            if (!self.deps.players.records[slot].world.eql(world)) continue;
+            self.sendLivingStep(slot, value);
+        }
     }
     pub fn living_metadata_changed(self: *Packets, index: u16) void {
         self.stageEntity(.metadata, .living, index);
@@ -645,13 +764,13 @@ pub const Packets = struct {
         _ = self.deps.sessions.tryFanout(temporary, recipients, .entities, .{ .phase = .play, .maximum_payload_bytes = 24, .context = &arguments, .encode = Encoder.encode }) catch self.fail(.temporary_full);
     }
     pub fn player_health_changed(self: *Packets, slot: u16) void {
-        self.emitPlayerHealth(slot);
+        _ = self.emitPlayerHealth(slot);
     }
     pub fn player_damaged(self: *Packets, value: packet_args.PlayerDamaged) void {
-        self.emitPlayerHealth(value.slot);
+        _ = self.emitPlayerHealth(value.slot);
     }
     pub fn player_fell(self: *Packets, value: packet_args.PlayerFell) void {
-        self.emitPlayerHealth(value.slot);
+        _ = self.emitPlayerHealth(value.slot);
     }
     pub fn player_respawned(self: *Packets, slot: u16) void {
         self.emitRespawn(slot);
@@ -665,7 +784,7 @@ pub const Packets = struct {
         self.emitRespawn(slot);
     }
     pub fn player_teleported(self: *Packets, slot: u16) void {
-        self.emitPlayerCorrection(slot);
+        _ = self.emitPlayerCorrection(slot);
     }
 
     pub fn livingTransferred(self: *Packets, index: u16, previous_world: world_identity.Handle) void {
@@ -683,10 +802,10 @@ pub const Packets = struct {
         self.stageEntity(.metadata, .item, index);
     }
     pub fn hotbar_selected(self: *Packets, slot: u16) void {
-        self.emitPlayerInventory(slot);
+        _ = self.emitPlayerInventory(slot);
     }
     pub fn chest_viewers_changed(self: *Packets, value: packet_args.ChestViewersChanged) void {
-        const state = self.deps.blocks.blockAtIfResident(value.world, value.position) orelse return;
+        const state = self.deps.blocks.blockAtIfMaterialized(value.world, value.position) orelse return;
         self.sendBlock(.{ .world = value.world, .position = value.position, .state = state }, .other);
     }
     pub fn living_sound(self: *Packets, value: packet_args.LivingSound) void {
@@ -771,9 +890,9 @@ pub const Packets = struct {
 
     fn applyDig(self: *Packets, value: core_exchange.DigInput) void {
         switch (value.status) {
-            0 => self.deps.inputs.stageDigStart(value.player, value.position, value.face, value.sequence),
-            1 => self.deps.inputs.stageDigCancel(value.player),
-            2 => self.deps.inputs.stageDigFinish(value.player, value.position, value.sequence),
+            0 => self.deps.inputs.stageDigStart(value.player, value.position, value.face, value.sequence) catch self.fail(.input_full),
+            1 => self.deps.inputs.stageDigCancel(value.player, value.position, value.sequence) catch self.fail(.input_full),
+            2 => self.deps.inputs.stageDigFinish(value.player, value.position, value.sequence) catch self.fail(.input_full),
             3, 4 => self.deps.inputs.requestItemDrop(value.player, if (value.status == 3) 64 else 1),
             else => {},
         }
@@ -810,22 +929,25 @@ pub const Packets = struct {
     pub fn system(self: *Packets, slot: u16, comptime format: []const u8, args: anytype) void {
         var scratch: [512]u8 = undefined;
         const rendered = std.fmt.bufPrint(&scratch, format, args) catch return;
-        self.sendSystemText(slot, rendered);
+        _ = self.sendSystemText(slot, rendered);
     }
 
     pub fn activePlaySlots(self: *const Packets) []const u16 {
         return self.deps.players.activeSlots();
     }
 
-    pub fn bootstrap(self: *Packets, slot: u16, action: BootstrapAction) void {
-        if (slot >= self.deps.players.records.len) return;
-        const temporary = self.temporary orelse return;
+    pub fn bootstrap(self: *Packets, slot: u16, action: BootstrapAction) bool {
+        if (slot >= self.deps.players.records.len) return false;
+        const temporary = self.temporary orelse return false;
         var world_names: []const []const u8 = &.{};
         if (action == .play_login) {
             const active = self.deps.worlds.active();
-            if (active.len == 0) return;
-            const names = temporary.alloc([]const u8, active.len) catch return self.fail(.temporary_full);
-            for (active, names) |handle, *name| name.* = (self.deps.worlds.getConst(handle) orelse return).nameSlice();
+            if (active.len == 0) return false;
+            const names = temporary.alloc([]const u8, active.len) catch {
+                self.fail(.temporary_full);
+                return false;
+            };
+            for (active, names) |handle, *name| name.* = (self.deps.worlds.getConst(handle) orelse return false).nameSlice();
             world_names = names;
         }
         const Arguments = struct { packets: *const Packets, slot: u16, action: BootstrapAction, world_names: []const []const u8 };
@@ -851,7 +973,7 @@ pub const Packets = struct {
                         .sea_level = 63,
                     } }) catch return null,
                     .respawn => protocol_versions.staticCall("encodeRespawn", protocol.value, .{ output, protocol_values.Respawn{ .dimension_type = dimension_type, .world_name = world.nameSlice(), .hashed_seed = @as(i64, @bitCast(world.seed)), .gamemode = @as(i8, @bitCast(@intFromEnum(player.gamemode))), .sea_level = 63 } }) catch return null,
-                    .abilities => protocol_versions.staticCall("encodeAbilities", protocol.value, .{ output, @as(i8, @bitCast(if (player.gamemode == .creative or player.gamemode == .spectator) @as(u8, 6) else 0)), @as(f32, 0.05), @as(f32, 0.1) }) catch return null,
+                    .abilities => protocol_versions.staticCall("encodeAbilities", protocol.value, .{ output, abilityFlags(player.gamemode), @as(f32, 0.05), @as(f32, 0.1) }) catch return null,
                     .held_item => protocol_versions.staticCall("encodeHeldItemSlot", protocol.value, .{ output, player.selected_hotbar_slot }) catch return null,
                     .combat_attributes => protocol_versions.staticCall("encodeCombatAttributes", protocol.value, .{ output, player.entity_id, @as(f64, 1.0), @as(f64, 4.0) }) catch return null,
                     .view_center => protocol_versions.staticCall("encodeUpdateViewPosition", protocol.value, .{ output, geometry.chunkCoord(geometry.blockCoord(player.position.x)), geometry.chunkCoord(geometry.blockCoord(player.position.z)) }) catch return null,
@@ -862,10 +984,16 @@ pub const Packets = struct {
             }
         };
         const arguments = Arguments{ .packets = self, .slot = slot, .action = action, .world_names = world_names };
-        _ = self.sendPlayer(slot, .control, .{ .phase = .play, .maximum_payload_bytes = 64 * 1024, .context = &arguments, .encode = Encoder.encode });
+        const encoder: session_settings.PacketEncoder = .{ .phase = .play, .maximum_payload_bytes = 4096, .context = &arguments, .encode = Encoder.encode };
+        const sent = if (action == .play_login)
+            self.sendPlayerBeforeLogin(slot, .control, encoder)
+        else
+            self.sendPlayer(slot, .control, encoder);
+        if (sent and action == .play_login) self.deps.players.records[slot].presentation_ready = true;
+        return sent;
     }
 
-    pub fn brand(self: *Packets, slot: u16) void {
+    pub fn brand(self: *Packets, slot: u16) bool {
         const Arguments = struct { value: []const u8 };
         const Encoder = struct {
             fn encode(raw: *const anyopaque, protocol: session_settings.Protocol, output: []u8) ?session_settings.EncodedPacket {
@@ -875,24 +1003,20 @@ pub const Packets = struct {
             }
         };
         const arguments = Arguments{ .value = self.config.brand };
-        _ = self.sendPlayer(slot, .control, .{ .phase = .play, .maximum_payload_bytes = self.config.brand.len + 16, .context = &arguments, .encode = Encoder.encode });
+        return self.sendPlayer(slot, .control, .{ .phase = .play, .maximum_payload_bytes = self.config.brand.len + 16, .context = &arguments, .encode = Encoder.encode });
     }
 
-    pub fn tabAdd(self: *Packets, target: u16, subject: u16) void {
-        if (subject >= self.deps.players.records.len) return;
-        const player = &self.deps.players.records[subject];
-        const Arguments = struct { uuid: u128, name: []const u8, gamemode: i32 };
+    pub fn tabAdd(self: *Packets, target: u16, player: protocol_values.PlayerInfo) bool {
         const Encoder = struct {
             fn encode(raw: *const anyopaque, protocol: session_settings.Protocol, output: []u8) ?session_settings.EncodedPacket {
-                const arguments: *const Arguments = @ptrCast(@alignCast(raw));
+                const arguments: *const protocol_values.PlayerInfo = @ptrCast(@alignCast(raw));
                 return generatedPacket(protocol_versions.staticCall("encodePlayerInfoAdd", protocol.value, .{ output, arguments.uuid, arguments.name, arguments.gamemode }) catch return null);
             }
         };
-        const arguments = Arguments{ .uuid = player.uuid, .name = player.name_slice(), .gamemode = @intFromEnum(player.gamemode) };
-        _ = self.sendPlayer(target, .control, .{ .phase = .play, .maximum_payload_bytes = arguments.name.len + 64, .context = &arguments, .encode = Encoder.encode });
+        return self.sendPlayer(target, .control, .{ .phase = .play, .maximum_payload_bytes = player.name.len + 64, .context = &player, .encode = Encoder.encode });
     }
 
-    pub fn tabRemove(self: *Packets, target: u16, uuid: u128) void {
+    pub fn tabRemove(self: *Packets, target: u16, uuid: u128) bool {
         const Arguments = struct { uuid: u128 };
         const Encoder = struct {
             fn encode(raw: *const anyopaque, protocol: session_settings.Protocol, output: []u8) ?session_settings.EncodedPacket {
@@ -901,7 +1025,7 @@ pub const Packets = struct {
             }
         };
         const arguments = Arguments{ .uuid = uuid };
-        _ = self.sendPlayer(target, .control, .{ .phase = .play, .maximum_payload_bytes = 32, .context = &arguments, .encode = Encoder.encode });
+        return self.sendPlayer(target, .control, .{ .phase = .play, .maximum_payload_bytes = 32, .context = &arguments, .encode = Encoder.encode });
     }
 
     pub fn playerLatency(self: *Packets, subject: u16, latency_ms: i32) void {
@@ -945,15 +1069,27 @@ pub const Packets = struct {
     }
 
     fn sendPlayer(self: *Packets, slot: u16, class: session_settings.DeliveryClass, encoder: session_settings.PacketEncoder) bool {
+        if (slot >= self.deps.players.records.len or !self.deps.players.records[slot].presentation_ready) return false;
+        return self.sendPlayerBeforeLogin(slot, class, encoder);
+    }
+
+    fn sendPlayerBeforeLogin(self: *Packets, slot: u16, class: session_settings.DeliveryClass, encoder: session_settings.PacketEncoder) bool {
         const temporary = self.temporary orelse return false;
         const player = self.deps.players.session(slot) orelse return false;
-        return (self.deps.sessions.fanoutOne(temporary, player, class, encoder, .reliable) catch return false) == .accepted;
+        const admission = self.deps.sessions.fanoutOne(temporary, player, class, encoder, .reliable) catch |err| {
+            std.log.err("event=packet_admission_failed slot={d} error={s}", .{ slot, @errorName(err) });
+            return false;
+        };
+        if (admission == .wrong_protocol or admission == .wrong_phase)
+            std.log.err("event=packet_admission_rejected slot={d} reason={s} phase={s}", .{ slot, @tagName(admission), @tagName(encoder.phase) });
+        return admission == .accepted;
     }
 
     fn allRecipients(self: *const Packets, temporary: std.mem.Allocator) ?[]players.Session {
         const recipients = temporary.alloc(players.Session, self.deps.players.activeSlots().len) catch return null;
         var count: usize = 0;
         for (self.deps.players.activeSlots()) |slot| {
+            if (!self.deps.players.records[slot].presentation_ready) continue;
             recipients[count] = self.deps.players.session(slot) orelse continue;
             count += 1;
         }
@@ -965,6 +1101,7 @@ pub const Packets = struct {
         var count: usize = 0;
         for (self.deps.players.activeSlots()) |slot| {
             if (!self.deps.players.records[slot].world.eql(world)) continue;
+            if (!self.deps.players.records[slot].presentation_ready) continue;
             recipients[count] = self.deps.players.session(slot) orelse continue;
             count += 1;
         }
@@ -976,6 +1113,7 @@ pub const Packets = struct {
         var count: usize = 0;
         for (self.deps.players.activeSlots()) |slot| {
             if (slot == excluded or !self.deps.players.records[slot].world.eql(world)) continue;
+            if (!self.deps.players.records[slot].presentation_ready) continue;
             recipients[count] = self.deps.players.session(slot) orelse continue;
             count += 1;
         }
@@ -1084,6 +1222,24 @@ pub const Packets = struct {
         if (entity.yaw != previous.rotation.yaw) self.sendEntityHeadRotation(target, entity.id, entity.yaw);
     }
 
+    fn sendLivingStep(self: *Packets, target: u16, value: packet_args.LivingMoved) void {
+        const entity = self.entitySnapshot(.living, value.index) orelse return;
+        const dx = relativeMoveDelta(value.previous.x, entity.position.x);
+        const dy = relativeMoveDelta(value.previous.y, entity.position.y);
+        const dz = relativeMoveDelta(value.previous.z, entity.position.z);
+        if (dx == null or dy == null or dz == null) return self.sendEntityMove(target, .living, value.index);
+        const Arguments = struct { id: i32, dx: i16, dy: i16, dz: i16, yaw: i8, pitch: i8, on_ground: bool };
+        const Encoder = struct {
+            fn encode(raw: *const anyopaque, protocol: session_settings.Protocol, output: []u8) ?session_settings.EncodedPacket {
+                const arguments: *const Arguments = @ptrCast(@alignCast(raw));
+                return generatedPacket(protocol_versions.staticCall("encodeEntityMoveLook", protocol.value, .{ output, arguments.id, arguments.dx, arguments.dy, arguments.dz, arguments.yaw, arguments.pitch, arguments.on_ground }) catch return null);
+            }
+        };
+        const arguments = Arguments{ .id = entity.id, .dx = dx.?, .dy = dy.?, .dz = dz.?, .yaw = angle(entity.yaw), .pitch = angle(entity.pitch), .on_ground = entity.on_ground };
+        _ = self.sendPlayer(target, .entities, .{ .phase = .play, .maximum_payload_bytes = 32, .context = &arguments, .encode = Encoder.encode });
+        self.sendEntityHeadRotation(target, entity.id, entity.yaw);
+    }
+
     fn sendEntityHeadRotation(self: *Packets, target: u16, entity_id: i32, yaw: f32) void {
         const Arguments = struct { id: i32, yaw: i8 };
         const Encoder = struct {
@@ -1173,7 +1329,7 @@ pub const Packets = struct {
         }
     }
 
-    fn sendSystemText(self: *Packets, slot: u16, text: []const u8) void {
+    pub fn sendSystemText(self: *Packets, slot: u16, text: []const u8) bool {
         const Arguments = struct { text: []const u8 };
         const Encoder = struct {
             fn encode(raw: *const anyopaque, protocol: session_settings.Protocol, output: []u8) ?session_settings.EncodedPacket {
@@ -1190,9 +1346,9 @@ pub const Packets = struct {
                 return generatedPacket(output[0 .. output.len - rest.len]);
             }
         };
-        if (text.len > std.math.maxInt(u16)) return;
+        if (text.len > std.math.maxInt(u16)) return false;
         const arguments = Arguments{ .text = text };
-        _ = self.sendPlayer(slot, .other, .{
+        return self.sendPlayer(slot, .other, .{
             .phase = .play,
             .maximum_payload_bytes = text.len + 16,
             .context = &arguments,
@@ -1202,26 +1358,75 @@ pub const Packets = struct {
 
     fn sendContainer(self: *Packets, slot: u16) void {
         if (slot >= self.deps.players.records.len or slot >= self.deps.containers.open.len) return;
-        const Arguments = struct { player: *const players.CorePlayer, open: *const players.OpenContainer };
+        if (self.deps.containers.open[slot].kind == .none) return;
+        const state_id = self.deps.containers.nextStateId(self.deps.players, slot);
+        const Arguments = struct { player: *const players.CorePlayer, open: *const players.OpenContainer, state_id: i32 };
         const Encoder = struct {
             fn encode(raw: *const anyopaque, protocol: session_settings.Protocol, output: []u8) ?session_settings.EncodedPacket {
                 const arguments: *const Arguments = @ptrCast(@alignCast(raw));
                 const container = arguments.open.*;
-                var rest = protocol_versions.staticCall("startWindowItems", protocol.value, .{ output, container.id, container.state_id }) catch return null;
+                var rest = protocol_versions.staticCall("startWindowItems", protocol.value, .{ output, container.id, arguments.state_id }) catch return null;
                 const snapshot = arguments.player.*;
-                const count = @as(usize, container.top_slot_count) + snapshot.hotbar.len + snapshot.main_inventory.len + snapshot.armor.len + 1;
+                const top_count: usize = if (container.kind == .crafting_table) 10 else container.top_slot_count;
+                const count = top_count + snapshot.main_inventory.len + snapshot.hotbar.len;
                 rest = protocol_support.write_count(rest, i32, count) catch return null;
-                for (container.top_slots[0..container.top_slot_count]) |stack| rest = writeWireStack(protocol.value, rest, stack) orelse return null;
-                for (snapshot.hotbar) |stack| rest = writeWireStack(protocol.value, rest, stack) orelse return null;
+                if (container.kind == .crafting_table) {
+                    rest = writeWireStack(protocol.value, rest, container.crafting_result) orelse return null;
+                    for (container.crafting_grid) |stack| rest = writeWireStack(protocol.value, rest, stack) orelse return null;
+                } else {
+                    for (container.top_slots[0..container.top_slot_count]) |stack| rest = writeWireStack(protocol.value, rest, stack) orelse return null;
+                }
                 for (snapshot.main_inventory) |stack| rest = writeWireStack(protocol.value, rest, stack) orelse return null;
-                for (snapshot.armor) |stack| rest = writeWireStack(protocol.value, rest, stack) orelse return null;
-                rest = writeWireStack(protocol.value, rest, snapshot.offhand) orelse return null;
-                rest = writeWireStack(protocol.value, rest, .{}) orelse return null;
+                for (snapshot.hotbar) |stack| rest = writeWireStack(protocol.value, rest, stack) orelse return null;
+                rest = writeWireStack(protocol.value, rest, snapshot.cursor_stack) orelse return null;
                 return generatedPacket(output[0 .. output.len - rest.len]);
             }
         };
-        const arguments = Arguments{ .player = &self.deps.players.records[slot], .open = &self.deps.containers.open[slot] };
+        const arguments = Arguments{ .player = &self.deps.players.records[slot], .open = &self.deps.containers.open[slot], .state_id = state_id };
         _ = self.sendPlayer(slot, .control, .{ .phase = .play, .maximum_payload_bytes = 32 * 1024, .context = &arguments, .encode = Encoder.encode });
+    }
+
+    fn sendOpenContainer(self: *Packets, slot: u16, title: []const u8) void {
+        if (slot >= self.deps.containers.open.len) return;
+        const container = self.deps.containers.open[slot];
+        if (container.kind == .none) return;
+        const Arguments = struct { id: i32, menu_type: i32, title: []const u8 };
+        const Encoder = struct {
+            fn encode(raw: *const anyopaque, protocol: session_settings.Protocol, output: []u8) ?session_settings.EncodedPacket {
+                const arguments: *const Arguments = @ptrCast(@alignCast(raw));
+                return generatedPacket(protocol_versions.staticCall("encodeOpenWindow", protocol.value, .{ output, arguments.id, arguments.menu_type, arguments.title }) catch return null);
+            }
+        };
+        const arguments = Arguments{ .id = container.id, .menu_type = container.menu_type, .title = title };
+        _ = self.sendPlayer(slot, .control, .{ .phase = .play, .maximum_payload_bytes = title.len + 64, .context = &arguments, .encode = Encoder.encode });
+    }
+
+    fn sendCloseContainer(self: *Packets, slot: u16, window_id: i32) void {
+        const Arguments = struct { id: i32 };
+        const Encoder = struct {
+            fn encode(raw: *const anyopaque, protocol: session_settings.Protocol, output: []u8) ?session_settings.EncodedPacket {
+                const arguments: *const Arguments = @ptrCast(@alignCast(raw));
+                return generatedPacket(protocol_versions.staticCall("encodeCloseWindow", protocol.value, .{ output, arguments.id }) catch return null);
+            }
+        };
+        const arguments = Arguments{ .id = window_id };
+        _ = self.sendPlayer(slot, .control, .{ .phase = .play, .maximum_payload_bytes = 16, .context = &arguments, .encode = Encoder.encode });
+    }
+
+    fn sendContainerProperties(self: *Packets, slot: u16, properties: []const packet_args.ContainerProperty) void {
+        if (slot >= self.deps.containers.open.len) return;
+        const window_id = self.deps.containers.open[slot].id;
+        for (properties) |property| {
+            const Arguments = struct { window_id: i32, property: packet_args.ContainerProperty };
+            const Encoder = struct {
+                fn encode(raw: *const anyopaque, protocol: session_settings.Protocol, output: []u8) ?session_settings.EncodedPacket {
+                    const arguments: *const Arguments = @ptrCast(@alignCast(raw));
+                    return generatedPacket(protocol_versions.staticCall("encodeContainerProperty", protocol.value, .{ output, arguments.window_id, arguments.property.id, arguments.property.value }) catch return null);
+                }
+            };
+            const arguments = Arguments{ .window_id = window_id, .property = property };
+            _ = self.sendPlayer(slot, .control, .{ .phase = .play, .maximum_payload_bytes = 16, .context = &arguments, .encode = Encoder.encode });
+        }
     }
 
     const BlockPacket = struct {
@@ -1253,6 +1458,43 @@ pub const Packets = struct {
         _ = self.deps.sessions.fanout(temporary, recipients, class, .{ .phase = .play, .maximum_payload_bytes = 32, .context = &value, .encode = Encoder.encode }) catch self.fail(.temporary_full);
     }
 
+    fn sendSectionBlocks(self: *Packets, world: world_identity.Handle, chunk_x: i32, section_y: i32, chunk_z: i32, changes: []const packet_args.BlockChanged) void {
+        const temporary = self.temporary orelse return;
+        const recipients = self.worldRecipients(temporary, world) orelse return self.fail(.temporary_full);
+        const Arguments = struct {
+            chunk_x: i32,
+            section_y: i32,
+            chunk_z: i32,
+            changes: []const packet_args.BlockChanged,
+        };
+        const Encoder = struct {
+            fn encode(raw: *const anyopaque, protocol: session_settings.Protocol, output: []u8) ?session_settings.EncodedPacket {
+                const arguments: *const Arguments = @ptrCast(@alignCast(raw));
+                var records: [@import("world/mutations.zig").maximum_writes]i32 = undefined;
+                if (arguments.changes.len > records.len) return null;
+                for (arguments.changes, records[0..arguments.changes.len]) |change, *record| {
+                    const state = protocol_versions.staticWireBlockState(protocol.value, change.block_state) catch return null;
+                    const local = (@as(i32, change.pos.x & 15) << 8) |
+                        (@as(i32, change.pos.z & 15) << 4) |
+                        @as(i32, change.pos.y & 15);
+                    record.* = (state << 12) | local;
+                }
+                return generatedPacket(protocol_versions.staticCall(
+                    "encodeSectionBlockChanges",
+                    protocol.value,
+                    .{ output, arguments.chunk_x, arguments.section_y, arguments.chunk_z, records[0..arguments.changes.len] },
+                ) catch return null);
+            }
+        };
+        const arguments = Arguments{ .chunk_x = chunk_x, .section_y = section_y, .chunk_z = chunk_z, .changes = changes };
+        _ = self.deps.sessions.fanout(temporary, recipients, .other, .{
+            .phase = .play,
+            .maximum_payload_bytes = 24 + changes.len * 5,
+            .context = &arguments,
+            .encode = Encoder.encode,
+        }) catch self.fail(.temporary_full);
+    }
+
     fn fail(self: *Packets, value: Failure) void {
         if (self.overflow == null) self.overflow = value;
     }
@@ -1262,6 +1504,30 @@ fn playerEntityFlags(sneaking: bool, sprinting: bool) i8 {
     const value = (@as(u8, @intFromBool(sneaking)) << 1) |
         (@as(u8, @intFromBool(sprinting)) << 3);
     return @bitCast(value);
+}
+
+fn abilityFlags(gamemode: players.GameMode) i8 {
+    return @bitCast(@as(u8, switch (gamemode) {
+        .survival, .adventure => 0,
+        .creative => 0x0d,
+        .spectator => 0x07,
+    }));
+}
+
+fn playerWindowStack(player: *const players.CorePlayer, protocol_slot: usize) players.HotbarStack {
+    std.debug.assert(protocol_slot < 46);
+    return if (protocol_slot == 0)
+        player.crafting_result
+    else if (protocol_slot <= 4)
+        player.crafting_grid[protocol_slot - 1]
+    else if (protocol_slot <= 8)
+        player.armor[protocol_slot - 5]
+    else if (protocol_slot <= 35)
+        player.main_inventory[protocol_slot - 9]
+    else if (protocol_slot <= 44)
+        player.hotbar[protocol_slot - 36]
+    else
+        player.offhand;
 }
 
 fn generatedPacket(payload: []const u8) ?session_settings.EncodedPacket {
@@ -1298,16 +1564,4 @@ fn writeWireStack(protocol: i32, buffer: []u8, stack: players.HotbarStack) ?[]u8
         rest = protocol_support.write_varint(rest, stack.damage) catch return null;
     }
     return rest;
-}
-
-test "sound capacity is bounded by the client limit" {
-    try Packets.Configuration.validate(.{});
-    try std.testing.expectError(error.InvalidPacketCapacity, Packets.Configuration.validate(.{ .maximum_sounds = 256 }));
-}
-
-test "player movement metadata uses the Vanilla entity flag bits" {
-    try std.testing.expectEqual(@as(i8, 0x02), playerEntityFlags(true, false));
-    try std.testing.expectEqual(@as(i8, 0x08), playerEntityFlags(false, true));
-    try std.testing.expectEqual(@as(i8, 0x0a), playerEntityFlags(true, true));
-    try std.testing.expectEqual(@as(i8, 0), playerEntityFlags(false, false));
 }

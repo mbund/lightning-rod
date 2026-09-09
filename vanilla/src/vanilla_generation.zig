@@ -1,33 +1,25 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
-const terrain = @import("vanilla_terrain.zig");
+const terrain = @import("vanilla_terrain");
 
 pub const Overworld = struct {
     pub const id = "minecraft:overworld";
-    pub const Configuration = struct {
-        batch_side: usize = 3,
-        base_chunks_per_slice: usize = 1,
-        feature_steps_per_slice: usize = 128,
-    };
+    pub const transient_workspace_bytes = 24 * 1024 * 1024;
+    pub const Configuration = struct {};
     pub const default_configuration: Configuration = .{};
 
-    batch_side: usize = 3,
-    base_chunks_per_slice: usize = 1,
-    feature_steps_per_slice: usize = 128,
     generator: terrain.Generator = undefined,
 
-    pub fn configured(configuration: Configuration) Overworld {
-        return .{
-            .batch_side = configuration.batch_side,
-            .base_chunks_per_slice = configuration.base_chunks_per_slice,
-            .feature_steps_per_slice = configuration.feature_steps_per_slice,
-        };
+    pub fn configured(_: Configuration) Overworld {
+        return .{};
     }
 
     pub fn initialize(self: *Overworld, allocator: std.mem.Allocator) !void {
-        if (self.base_chunks_per_slice == 0 or self.feature_steps_per_slice == 0)
-            return error.InvalidTerrainSlice;
-        try self.generator.initInto(allocator, 0, self.batch_side);
+        try self.generator.initInto(allocator, 0, 5);
+    }
+
+    pub fn deinitialize(self: *Overworld) void {
+        self.generator.deinit();
     }
 
     pub fn generate(self: *Overworld, seed: u64, chunk: lightning_rod.geometry.ChunkPos) !lightning_rod.terrain.ChunkShape {
@@ -35,21 +27,19 @@ pub const Overworld = struct {
         return try self.generator.generate(chunk.x, chunk.z);
     }
 
-    pub fn advance(
-        self: *Overworld,
-        seed: u64,
-        chunk: lightning_rod.geometry.ChunkPos,
-        sink: lightning_rod.generator_api.Sink,
-    ) !lightning_rod.generator_api.Advance {
+    pub fn prepare(self: *Overworld, seed: u64) !void {
         try self.generator.reseed(seed);
-        return if (try self.generator.advanceSlice(
-            chunk.x,
-            chunk.z,
-            self.base_chunks_per_slice,
-            self.feature_steps_per_slice,
-            sink,
-        )) .complete else .pending;
     }
+
+    pub fn stageName(self: *const Overworld) []const u8 {
+        return @tagName(self.generator.generationStage());
+    }
+
+    pub fn step(self: *Overworld, seed: u64, chunk: lightning_rod.geometry.ChunkPos) !?lightning_rod.terrain.ChunkShape {
+        try self.generator.reseed(seed);
+        return self.generator.advance(chunk.x, chunk.z);
+    }
+
 };
 
 fn VanillaDimension(comptime Dimension: type, comptime stable_id: []const u8) type {
@@ -57,6 +47,7 @@ fn VanillaDimension(comptime Dimension: type, comptime stable_id: []const u8) ty
     const biome_count = @typeInfo(Biome).@"enum".fields.len;
     return struct {
         pub const id = stable_id;
+        pub const transient_workspace_bytes = 16 * 1024 * 1024;
         pub const Configuration = struct { enabled: bool = true };
         pub const default_configuration: Configuration = .{};
 
@@ -82,6 +73,12 @@ fn VanillaDimension(comptime Dimension: type, comptime stable_id: []const u8) ty
                 const biome: Biome = @enumFromInt(field.value);
                 self.biome_ids[field.value] = terrain.biomeId(biome.canonicalName()) orelse return error.UnknownGeneratedBiome;
             }
+        }
+
+        pub fn deinitialize(self: *@This()) void {
+            if (self.enabled) self.area.deinit();
+            self.states = &.{};
+            self.state_ids = &.{};
         }
 
         pub fn generate(self: *@This(), seed: u64, chunk: lightning_rod.geometry.ChunkPos) !lightning_rod.terrain.ChunkShape {
@@ -118,16 +115,34 @@ pub const Default = lightning_rod.world_generation.Registry(.{
     lightning_rod.world_generation.Flat{},
 });
 
-test "Overworld adapter initializes and incrementally completes its first chunk" {
+test "Overworld adapter fits its production workspace with startup and local batches" {
+    var storage: [Overworld.transient_workspace_bytes]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
     var overworld = Overworld{};
-    try overworld.initialize(std.testing.allocator);
+    try overworld.initialize(fixed.allocator());
     defer overworld.generator.deinit();
-    try overworld.generator.reseed(0x6d_62_75_6e_64_00_00_01);
-    for (0..2_048) |_| {
-        const shape = (try overworld.generator.advance(0, 0)) orelse continue;
+    try overworld.prepare(0x6d_62_75_6e_64_00_00_01);
+    var startup_emitted: usize = 0;
+    for (0..32_768) |_| {
+        const shape = (try overworld.step(0x6d_62_75_6e_64_00_00_01, .{ .x = 0, .z = 0 })) orelse continue;
         try std.testing.expectEqual(@as(i32, 0), shape.chunk_x);
         try std.testing.expectEqual(@as(i32, 0), shape.chunk_z);
-        return;
+        startup_emitted += 1;
+        if (startup_emitted == 1) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), startup_emitted);
+
+    var emitted: usize = 0;
+    for (0..32_768) |_| {
+        const shape = (try overworld.step(0x6d_62_75_6e_64_00_00_01, .{ .x = 1, .z = 0 })) orelse continue;
+        try std.testing.expect(@abs(shape.chunk_x) <= 2);
+        try std.testing.expect(@abs(shape.chunk_z) <= 2);
+        emitted += 1;
+        if (shape.chunk_x == 1 and shape.chunk_z == 0) {
+            try std.testing.expectEqual(@as(usize, 25), emitted);
+            try std.testing.expect(fixed.end_index <= storage.len);
+            return;
+        }
     }
     return error.TerrainGenerationDidNotComplete;
 }

@@ -27,6 +27,8 @@ pub const Transport = struct {
         output_credit: *const fn (*anyopaque, Connection) usize,
         output_metrics: *const fn (*anyopaque, Connection) ?OutputMetrics,
         write: *const fn (*anyopaque, Connection, []const u8) bool,
+        reserve_output: *const fn (*anyopaque, Connection, usize) ?[]u8 = reserveOutputUnavailable,
+        commit_output: *const fn (*anyopaque, Connection, usize) bool = commitOutputUnavailable,
         release_input: *const fn (*anyopaque, Page) void,
         close: *const fn (*anyopaque, Connection, DisconnectReason) void,
         submit: *const fn (*anyopaque) void,
@@ -37,18 +39,14 @@ pub const Transport = struct {
     }
 };
 
-pub const AttachPlayer = struct {
-    connection: Connection,
-    uuid: u128,
-    protocol: i32,
-    name: [16]u8,
-    name_len: u8,
-    reconfiguring: bool,
-};
-pub const DetachPlayer = struct { connection: Connection, reason: DisconnectReason };
-pub const CoreInput = struct {
-    attachments: []const AttachPlayer,
-    detachments: []const DetachPlayer,
-    packet_views: []const core_exchange.PacketView,
-    packet_claimed: []bool,
-};
+fn reserveOutputUnavailable(_: *anyopaque, _: Connection, _: usize) ?[]u8 {
+    return null;
+}
+
+fn commitOutputUnavailable(_: *anyopaque, _: Connection, _: usize) bool {
+    return false;
+}
+
+pub const AttachPlayer = core_exchange.AttachPlayer;
+pub const DetachPlayer = core_exchange.DetachPlayer;
+pub const CoreInput = core_exchange.CoreInput;

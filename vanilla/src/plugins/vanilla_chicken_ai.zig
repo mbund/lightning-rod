@@ -123,18 +123,24 @@ pub const LavaChickenLoot = struct {
     }
 
     pub fn tick(self: *LavaChickenLoot, _: std.mem.Allocator) void {
-        for (self.deps.deaths.pendingDeaths()) |death| self.dropLavaChickenDisc(death);
+        for (self.deps.deaths.pendingDeaths()) |death| {
+            if (death.extension_complete) continue;
+            if (self.dropLavaChickenDisc(death))
+                self.deps.deaths.completeExtension(death.index, death.generation)
+            else
+                self.deps.deaths.deferDeath(death.index, death.generation);
+        }
         self.deps.deaths.process(self.deps.random, self.deps.blocks, self.deps.living, self.deps.items, self.deps.outputs);
     }
 
-    fn dropLavaChickenDisc(self: *LavaChickenLoot, death: deaths.PendingDeath) void {
+    fn dropLavaChickenDisc(self: *LavaChickenLoot, death: deaths.PendingDeath) bool {
         const entities = &self.deps.living.entities;
-        if (death.index >= entities.active.len or !entities.active[death.index]) return;
-        if (entities.generations[death.index] != death.generation or !entities.dead[death.index]) return;
-        if (!isLavaChickenJockey(entities, death.index)) return;
+        if (death.index >= entities.active.len or !entities.active[death.index]) return true;
+        if (entities.generations[death.index] != death.generation or !entities.dead[death.index]) return true;
+        if (!isLavaChickenJockey(entities, death.index)) return true;
         const index: usize = death.index;
         const position = geometry.Vec3{ .x = entities.position_x[index], .y = entities.position_y[index], .z = entities.position_z[index] };
-        deaths.LivingDeaths.spawnStack(self.deps.random, self.deps.blocks, self.deps.living, self.deps.items, self.deps.outputs, death.index, position, player_store.stackForItem(lava_chicken_disc_id, 1));
+        return deaths.LivingDeaths.spawnStack(self.deps.random, self.deps.blocks, self.deps.living, self.deps.items, self.deps.outputs, death.index, position, player_store.stackForItem(lava_chicken_disc_id, 1));
     }
 };
 

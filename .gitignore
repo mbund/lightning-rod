@@ -5,8 +5,8 @@ zig-pkg/
 *.wal
 /world/
 /examples/*/world/
-/examples/*/*.root
-/examples/*/*.root.pack.*
+/examples/*/lightning-rod-data/
+lightning-rod-data/
 logs/
 perf.data*
 tests/conformance/.cache/
@@ -24,8 +24,10 @@ conformance/tests/vanilla-server/whitelist.json
 conformance/tools/fabric-recorder/.gradle/
 conformance/tools/fabric-recorder/build/
 conformance/tools/fabric-recorder/run/
+conformance/tools/fabric-recorder/.e2e/
 conformance/tools/vanilla-harness/.gradle/
 conformance/tools/vanilla-harness/build/
 conformance/tools/vanilla-harness/home/
 conformance/tools/vanilla-harness/run/
+/e2e/artifacts/
 /tools/worldgen/vanilla-*/

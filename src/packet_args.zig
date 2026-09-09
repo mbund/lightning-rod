@@ -42,6 +42,7 @@ pub const LivingVelocityChanged = struct { index: u16, x: f64, y: f64, z: f64 };
 pub const LivingDied = struct { index: u16, attacker_slot: u16 };
 pub const LivingEquipmentChanged = struct { index: u16, equipment_slot: u8 };
 pub const LivingStatus = struct { index: u16, status: i8 };
+pub const LivingMoved = struct { index: u16, previous: geometry.Vec3 };
 pub const LivingSound = struct {
     index: u16,
     sound: protocol_values.Sound,

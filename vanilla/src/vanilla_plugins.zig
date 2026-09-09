@@ -1,9 +1,11 @@
 pub const block_loot = @import("plugins/vanilla_block_loot.zig");
+pub const block_destruction = @import("plugins/vanilla_block_destruction.zig");
 pub const chat = @import("plugins/vanilla_chat.zig");
 pub const chicken_ai = @import("plugins/vanilla_chicken_ai.zig");
 pub const chests = @import("plugins/vanilla_chests.zig");
 pub const chunk_streaming = @import("plugins/vanilla_chunk_streaming.zig");
-pub const chunk_residency = @import("plugins/vanilla_chunk_residency.zig");
+pub const chunk_cache = @import("plugins/vanilla_chunk_cache.zig");
+pub const collision_projection = @import("plugins/vanilla_collision_projection.zig");
 pub const commands = @import("plugins/vanilla_commands.zig");
 pub const connection = @import("plugins/vanilla_connection.zig");
 pub const end_tick = @import("plugins/vanilla_end_tick.zig");
@@ -15,6 +17,7 @@ pub const status = @import("plugins/vanilla_status.zig");
 pub const inventory = @import("plugins/vanilla_inventory.zig");
 pub const item_entities = @import("plugins/vanilla_item_entities.zig");
 pub const join = @import("plugins/vanilla_join.zig");
+pub const tab_list = @import("plugins/vanilla_tab_list.zig");
 pub const keep_alive = @import("plugins/vanilla_keep_alive.zig");
 pub const leaf_distance = @import("plugins/vanilla_leaf_distance.zig");
 pub const lighting = @import("plugins/vanilla_lighting.zig");
@@ -34,15 +37,18 @@ pub const player_survival = @import("plugins/vanilla_player_survival.zig");
 pub const random_ticks = @import("plugins/vanilla_random_ticks.zig");
 pub const recipes = @import("plugins/vanilla_recipes.zig");
 pub const zombie_ai = @import("plugins/vanilla_zombie_ai.zig");
-pub const active_chunks = @import("vanilla/active_chunks.zig");
+pub const chunk_tickets = @import("vanilla/chunk_tickets.zig");
+pub const simulation_admission = @import("vanilla/simulation_admission.zig");
 
 test {
     _ = block_loot;
+    _ = block_destruction;
     _ = chat;
     _ = chicken_ai;
     _ = chests;
     _ = chunk_streaming;
-    _ = chunk_residency;
+    _ = chunk_cache;
+    _ = collision_projection;
     _ = commands;
     _ = connection;
     _ = end_tick;
@@ -54,6 +60,7 @@ test {
     _ = inventory;
     _ = item_entities;
     _ = join;
+    _ = tab_list;
     _ = keep_alive;
     _ = leaf_distance;
     _ = lighting;
@@ -71,7 +78,9 @@ test {
     _ = player_input;
     _ = player_survival;
     _ = random_ticks;
+    _ = @import("plugins/random_ticks/engine.zig");
     _ = recipes;
     _ = zombie_ai;
-    _ = active_chunks;
+    _ = chunk_tickets;
+    _ = simulation_admission;
 }

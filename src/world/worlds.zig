@@ -48,10 +48,10 @@ pub const Context = struct {
 
 pub const Configuration = struct {
     initial: []const Description,
-    maximum_worlds: usize = 4096,
+    maximum_worlds: usize,
 
     pub fn validate(self: Configuration) !void {
-        if (self.maximum_worlds < 3 or self.maximum_worlds > std.math.maxInt(u16) or
+        if (self.maximum_worlds == 0 or self.maximum_worlds > std.math.maxInt(u16) or
             !std.math.isPowerOfTwo(self.maximum_worlds))
             return error.InvalidWorldCapacity;
     }
@@ -261,4 +261,28 @@ fn keyHash(key: identity.Key) usize {
 
 fn probeDistance(ideal: usize, actual: usize, mask: usize) usize {
     return (actual -% ideal) & mask;
+}
+
+test "small Core world registries fit a bounded KiB and preserve handle retirement" {
+    const descriptions = [_]Description{
+        .{ .key = .{ .value = 1 }, .name = "island:overworld", .dimension = .{ .index = 0 }, .generator = @enumFromInt(0), .seed = 1, .spawn_x = 0, .spawn_y = 80, .spawn_z = 0 },
+        .{ .key = .{ .value = 2 }, .name = "island:nether", .dimension = .{ .index = 1 }, .generator = @enumFromInt(0), .seed = 1, .spawn_x = 0, .spawn_y = 80, .spawn_z = 0 },
+    };
+    for ([_]usize{ 1, 2 }) |capacity| {
+        var memory: [1024]u8 = undefined;
+        var allocator = std.heap.FixedBufferAllocator.init(&memory);
+        const worlds = try Worlds.init(allocator.allocator(), .{ .initial = descriptions[0..capacity], .maximum_worlds = capacity });
+        try std.testing.expectEqual(capacity, worlds.active_count);
+        var extra = descriptions[0];
+        extra.key.value = 3;
+        extra.name = "island:extra";
+        try std.testing.expectError(error.WorldCapacity, worlds.add(extra));
+        const old = worlds.find(descriptions[0].key).?;
+        try worlds.destroy(old);
+        const replacement = try worlds.add(extra);
+        try std.testing.expect(!old.eql(replacement));
+        try std.testing.expect(worlds.get(old) == null);
+        try std.testing.expect(worlds.find(descriptions[0].key) == null);
+        try std.testing.expect(worlds.find(extra.key).?.eql(replacement));
+    }
 }

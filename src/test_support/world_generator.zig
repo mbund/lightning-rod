@@ -6,10 +6,10 @@ const generator_api = @import("../world/generator_api.zig");
 const geometry = @import("../world/geometry.zig");
 const identity = @import("../world/identity.zig");
 
-pub const Mode = enum { overworld, flat, staged_flat, early_flat, void };
+pub const Mode = enum { overworld, flat, void };
 
 pub const block_configuration = blocks.Blocks.Configuration{
-    .maximum_resident_chunks = 16,
+    .maximum_transient_chunks = 16,
     .maximum_modified_sections = 64,
     .maximum_block_mutations = 256,
 };
@@ -17,7 +17,6 @@ pub const block_configuration = blocks.Blocks.Configuration{
 pub const Generator = struct {
     storage: [terrain.chunk_storage_capacity]u8 = undefined,
     mode: Mode = .overworld,
-    staged_chunk: ?geometry.ChunkPos = null,
 
     pub fn init(self: *Generator, allocator: std.mem.Allocator, seed: u64) !void {
         _ = allocator;
@@ -33,8 +32,23 @@ pub const Generator = struct {
         return .{
             .context = self,
             .generate_fn = generate,
-            .advance_fn = advance,
+            .request_fn = request,
+            .pending_fn = pending,
+            .capacity_fn = pending,
+            .metrics_fn = metrics,
         };
+    }
+
+    fn request(_: *anyopaque, _: identity.Handle, _: geometry.ChunkPos, _: generator_api.Priority) bool {
+        return false;
+    }
+
+    fn pending(_: *const anyopaque) usize {
+        return 0;
+    }
+
+    fn metrics(_: *const anyopaque) generator_api.Metrics {
+        return .{ .calls = 0, .nanoseconds = 0, .maximum_nanoseconds = 0, .emitted = 0, .installed = 0, .materialization_nanoseconds = 0 };
     }
 
     fn generate(
@@ -45,7 +59,7 @@ pub const Generator = struct {
         _ = world;
         const self: *Generator = @ptrCast(@alignCast(context));
         return switch (self.mode) {
-            .overworld, .flat, .staged_flat, .early_flat => terrain.buildFlatChunkShape(
+            .overworld, .flat => terrain.buildFlatChunkShape(
                 &self.storage,
                 chunk.x,
                 chunk.z,
@@ -55,41 +69,6 @@ pub const Generator = struct {
             ),
             .void => terrain.buildVoidChunkShape(&self.storage, chunk.x, chunk.z),
         };
-    }
-
-    fn advance(
-        context: *anyopaque,
-        world: identity.Handle,
-        chunk: geometry.ChunkPos,
-        sink: generator_api.Sink,
-    ) anyerror!generator_api.Advance {
-        const self: *Generator = @ptrCast(@alignCast(context));
-        switch (self.mode) {
-            .overworld, .flat, .void => {
-                try sink.emit(try generate(context, world, chunk));
-                return .complete;
-            },
-            .staged_flat => {
-                if (self.staged_chunk == null) {
-                    self.staged_chunk = chunk;
-                    return .pending;
-                }
-                std.debug.assert(std.meta.eql(self.staged_chunk.?, chunk));
-                self.staged_chunk = null;
-                try sink.emit(try generate(context, world, chunk));
-                return .complete;
-            },
-            .early_flat => {
-                if (self.staged_chunk == null) {
-                    self.staged_chunk = chunk;
-                    try sink.emit(try generate(context, world, chunk));
-                    return .pending;
-                }
-                std.debug.assert(std.meta.eql(self.staged_chunk.?, chunk));
-                self.staged_chunk = null;
-                return .complete;
-            },
-        }
     }
 };
 

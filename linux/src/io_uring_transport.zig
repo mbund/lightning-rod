@@ -36,7 +36,6 @@ pub fn Transport(comptime limits: Limits) type {
         const ConnectionState = enum { free, open, closing };
         const InputState = enum { free, receiving, ready };
         const output_capacity = limits.output_pages_per_connection * limits.output_page_bytes;
-        const ReadinessTask = std.Io.Future(std.Io.Cancelable!void);
         const Connection = struct {
             state: ConnectionState = .free,
             fd: posix.socket_t = invalid_fd,
@@ -53,6 +52,7 @@ pub fn Transport(comptime limits: Limits) type {
             output_tail: ?u16 = null,
             output_pages: u16 = 0,
             output_len: usize = 0,
+            output_reserved: usize = 0,
         };
         const InputPage = struct { state: InputState = .free, owner: u16 = 0, len: u16 = 0 };
         const OutputPage = struct { next: ?u16 = null, start: usize = 0, end: usize = 0 };
@@ -81,13 +81,7 @@ pub fn Transport(comptime limits: Limits) type {
         reload_quiesced: bool,
         reload_unread: [limits.page_bytes]u8,
         reload_output: [output_capacity]u8,
-        readiness_eventfd: posix.fd_t,
-        readiness_registered: bool,
-        readiness_io: ?std.Io,
-        readiness_wake: ?runtime.Wake,
-        readiness_task: ?ReadinessTask,
-        readiness_stopping: std.atomic.Value(bool),
-        readiness_failed: std.atomic.Value(bool),
+        completion_event_registered: bool,
         stopping: bool,
         faulted: bool,
 
@@ -133,7 +127,6 @@ pub fn Transport(comptime limits: Limits) type {
         }
 
         pub fn deinit(self: *Self) void {
-            self.stopReadiness();
             if (self.ring_initialized) self.ring.deinit();
             sockets.close(self.listener);
             for (&self.connections) |*item| sockets.close(item.fd);
@@ -144,12 +137,28 @@ pub fn Transport(comptime limits: Limits) type {
             return .{ .context = self, .vtable = &transport_vtable };
         }
 
+        pub fn connectionAt(self: *const Self, index: u16) ?exchange.Connection {
+            if (index >= limits.connections) return null;
+            const connection = self.connections[index];
+            if (connection.state != .open) return null;
+            return .{ .index = index, .generation = connection.generation };
+        }
+
         pub fn backend(self: *Self) runtime.Backend {
-            return .{
-                .context = self,
-                .vtable = &backend_vtable,
-                .readiness = .{ .context = self, .bind_fn = bindReadiness },
-            };
+            return .{ .context = self, .vtable = &backend_vtable };
+        }
+
+        pub fn registerCompletionEvent(self: *Self, fd: posix.fd_t) !void {
+            if (fd == invalid_fd or self.completion_event_registered or !self.ring_initialized)
+                return error.InvalidReadinessState;
+            try self.ring.register_eventfd(fd);
+            self.completion_event_registered = true;
+        }
+
+        pub fn unregisterCompletionEvent(self: *Self) void {
+            if (!self.completion_event_registered) return;
+            self.ring.unregister_eventfd() catch @panic("failed to unregister io_uring completion eventfd");
+            self.completion_event_registered = false;
         }
 
         pub fn reloaderTransport(self: *Self) reload.Transport {
@@ -175,13 +184,7 @@ pub fn Transport(comptime limits: Limits) type {
             self.reloading = false;
             self.reload_cancel_count = 0;
             self.reload_quiesced = false;
-            self.readiness_eventfd = invalid_fd;
-            self.readiness_registered = false;
-            self.readiness_io = null;
-            self.readiness_wake = null;
-            self.readiness_task = null;
-            self.readiness_stopping = .init(false);
-            self.readiness_failed = .init(false);
+            self.completion_event_registered = false;
             self.stopping = false;
             self.faulted = false;
         }
@@ -226,9 +229,40 @@ pub fn Transport(comptime limits: Limits) type {
             const self = raw(raw_context);
             if (bytes.len == 0 or bytes.len > output_capacity) return false;
             const connection = self.openConnection(identity) orelse return false;
-            if (connection.writable_pending) return false;
+            if (connection.writable_pending or connection.output_reserved != 0) return false;
             if (bytes.len > self.outputCreditFor(connection)) return false;
             self.writeOutput(connection, bytes);
+            return true;
+        }
+
+        fn reserveOutput(raw_context: *anyopaque, identity: exchange.Connection, len: usize) ?[]u8 {
+            const self = raw(raw_context);
+            if (len == 0 or len > limits.output_page_bytes) return null;
+            const connection = self.openConnection(identity) orelse return null;
+            if (connection.writable_pending or connection.output_reserved != 0 or len > self.outputCreditFor(connection)) return null;
+            var page = connection.output_tail;
+            if (page == null or limits.output_page_bytes - self.output[page.?].end < len) {
+                const fresh = self.takeOutputPage() orelse return null;
+                if (connection.output_tail) |tail| self.output[tail].next = fresh else connection.output_head = fresh;
+                connection.output_tail = fresh;
+                connection.output_pages += 1;
+                page = fresh;
+            }
+            const item = &self.output[page.?];
+            connection.output_reserved = len;
+            return self.output_bytes[page.?][item.end..][0..len];
+        }
+
+        fn commitOutput(raw_context: *anyopaque, identity: exchange.Connection, len: usize) bool {
+            const self = raw(raw_context);
+            const connection = self.openConnection(identity) orelse return false;
+            if (len == 0 or connection.output_reserved != len) return false;
+            const page = connection.output_tail orelse return false;
+            const item = &self.output[page];
+            if (len > limits.output_page_bytes - item.end) return false;
+            item.end += len;
+            connection.output_len += len;
+            connection.output_reserved = 0;
             return true;
         }
 
@@ -260,7 +294,7 @@ pub fn Transport(comptime limits: Limits) type {
 
         fn backendComplete(raw_context: *anyopaque, _: std.Io, budget: usize) runtime.Completion {
             const self = raw(raw_context);
-            if (self.faulted or self.readiness_failed.load(.acquire)) return .{ .count = 0, .outcome = .failed };
+            if (self.faulted) return .{ .count = 0, .outcome = .failed };
             var cqes: [limits.completion_batch]linux.io_uring_cqe = undefined;
             const maximum = @min(budget, limits.completion_batch);
             if (maximum == 0) return .{ .count = 0 };
@@ -269,7 +303,7 @@ pub fn Transport(comptime limits: Limits) type {
                 return .{ .count = 0, .outcome = .failed };
             };
             for (cqes[0..count]) |cqe| self.handleCompletion(cqe);
-            return .{ .count = count, .outcome = if (self.faulted or self.readiness_failed.load(.acquire)) .failed else .ok };
+            return .{ .count = count, .outcome = if (self.faulted) .failed else .ok };
         }
 
         fn backendSubmit(raw_context: *anyopaque, _: std.Io) runtime.Outcome {
@@ -278,7 +312,7 @@ pub fn Transport(comptime limits: Limits) type {
 
         fn submitNow(raw_context: *anyopaque) runtime.Outcome {
             const self = raw(raw_context);
-            if (self.faulted or self.readiness_failed.load(.acquire)) return .failed;
+            if (self.faulted) return .failed;
             self.stageWork();
             if (self.faulted) return .failed;
             _ = self.ring.submit() catch {
@@ -301,93 +335,11 @@ pub fn Transport(comptime limits: Limits) type {
 
         fn shutdownProgress(raw_context: *anyopaque) runtime.Progress {
             const self = raw(raw_context);
-            if (self.faulted or self.readiness_failed.load(.acquire)) return .failed;
+            if (self.faulted) return .failed;
             if (!self.stopping or self.accept_pending or self.accept_cancel_pending) return .pending;
             if (self.listener != invalid_fd or self.event_count != 0) return .pending;
             for (self.connections) |item| if (item.state != .free) return .pending;
             return .complete;
-        }
-
-        fn bindReadiness(raw_context: *anyopaque, wake: runtime.Wake) runtime.Outcome {
-            const self = raw(raw_context);
-            if (self.readiness_wake != null or self.readiness_registered or !self.ring_initialized) return .failed;
-            const fd = createReadinessEventfd() catch return .failed;
-            self.ring.register_eventfd(fd) catch {
-                sockets.close(fd);
-                return .failed;
-            };
-            self.readiness_eventfd = fd;
-            self.readiness_registered = true;
-            self.readiness_io = wake.io;
-            self.readiness_wake = wake;
-            self.readiness_task = std.Io.concurrent(wake.io, waitReadiness, .{self}) catch {
-                self.unregisterReadiness();
-                return .failed;
-            };
-            return .ok;
-        }
-
-        fn waitReadiness(self: *Self) std.Io.Cancelable!void {
-            const io = self.readiness_io orelse {
-                self.failReadiness();
-                return;
-            };
-            var counter: [@sizeOf(u64)]u8 = undefined;
-            while (!self.readiness_stopping.load(.acquire)) {
-                const count = readinessFile(self).readStreaming(io, &.{counter[0..]}) catch |err| {
-                    if (err == error.Canceled) return error.Canceled;
-                    self.failReadiness();
-                    return;
-                };
-                if (count != counter.len) {
-                    self.failReadiness();
-                    return;
-                }
-                if (self.readiness_stopping.load(.acquire)) return;
-                const wake = self.readiness_wake orelse {
-                    self.failReadiness();
-                    return;
-                };
-                wake.signal();
-            }
-        }
-
-        fn failReadiness(self: *Self) void {
-            self.readiness_failed.store(true, .release);
-            if (self.readiness_wake) |wake| wake.signal();
-        }
-
-        fn stopReadiness(self: *Self) void {
-            self.readiness_stopping.store(true, .release);
-            if (self.readiness_task) |*task| {
-                const io = self.readiness_io orelse @panic("io_uring readiness task has no std.Io");
-                _ = task.cancel(io) catch {};
-                self.readiness_task = null;
-            }
-            self.unregisterReadiness();
-        }
-
-        fn unregisterReadiness(self: *Self) void {
-            if (!self.readiness_registered) return;
-            self.ring.unregister_eventfd() catch @panic("failed to unregister io_uring readiness eventfd");
-            self.readiness_registered = false;
-            sockets.close(self.readiness_eventfd);
-            self.readiness_eventfd = invalid_fd;
-            self.readiness_io = null;
-            self.readiness_wake = null;
-        }
-
-        fn readinessFile(self: *const Self) std.Io.File {
-            std.debug.assert(self.readiness_eventfd != invalid_fd);
-            return .{ .handle = self.readiness_eventfd, .flags = .{ .nonblocking = false } };
-        }
-
-        fn createReadinessEventfd() !posix.fd_t {
-            const result = linux.eventfd(0, linux.EFD.CLOEXEC);
-            return switch (linux.errno(result)) {
-                .SUCCESS => @intCast(result),
-                else => |err| posix.unexpectedErrno(err),
-            };
         }
 
         const transport_vtable: exchange.Transport.VTable = .{
@@ -396,6 +348,8 @@ pub fn Transport(comptime limits: Limits) type {
             .output_credit = outputCredit,
             .output_metrics = outputMetrics,
             .write = write,
+            .reserve_output = reserveOutput,
+            .commit_output = commitOutput,
             .release_input = releaseInput,
             .close = close,
             .submit = transportSubmit,
@@ -662,6 +616,18 @@ pub fn Transport(comptime limits: Limits) type {
         fn stageClose(self: *Self, index: u16) void {
             const connection = &self.connections[index];
             if (connection.state != .closing or connection.close_pending or connection.fd == invalid_fd) return;
+            if (connection.recv_pending and !connection.recv_cancel_pending) {
+                _ = self.ring.cancel(pack(.cancel_recv, index, connection.generation), pack(.recv, index, connection.generation), 0) catch |err| return self.stageError(err);
+                connection.recv_cancel_pending = true;
+            }
+            if (connection.send_pending and !connection.send_cancel_pending) {
+                _ = self.ring.cancel(pack(.cancel_send, index, connection.generation), pack(.send, index, connection.generation), 0) catch |err| return self.stageError(err);
+                connection.send_cancel_pending = true;
+            }
+            if (connection.writable_pending and !connection.writable_cancel_pending) {
+                _ = self.ring.poll_remove(pack(.cancel_writable, index, connection.generation), pack(.writable, index, connection.generation)) catch |err| return self.stageError(err);
+                connection.writable_cancel_pending = true;
+            }
             _ = self.ring.close(pack(.close, index, connection.generation), connection.fd) catch |err| return self.stageError(err);
             connection.close_pending = true;
         }
@@ -682,8 +648,7 @@ pub fn Transport(comptime limits: Limits) type {
                 .writable => self.completeWritable(tag, cqe),
                 .close => self.completeClose(tag, cqe),
                 .cancel_accept => self.completeAcceptCancel(),
-                .cancel_recv => self.completeReloadCancel(tag, true),
-                .cancel_send => self.completeReloadCancel(tag, false),
+                .cancel_recv, .cancel_send => self.completeCancel(tag),
                 .cancel_writable => {},
             }
         }
@@ -758,7 +723,7 @@ pub fn Transport(comptime limits: Limits) type {
             connection.writable_pending = false;
             if (connection.writable_cancel_pending) {
                 connection.writable_cancel_pending = false;
-                if (self.reloading and self.reload_cancel_count != 0) self.reload_cancel_count -= 1;
+                if (self.reloading and connection.state == .open and self.reload_cancel_count != 0) self.reload_cancel_count -= 1;
             }
             if (self.reloading) return;
             if (connection.state != .open) return self.finalize(tag.index);
@@ -779,10 +744,9 @@ pub fn Transport(comptime limits: Limits) type {
             self.closeListenerWhenIdle();
         }
 
-        fn completeReloadCancel(self: *Self, tag: Tag, recv: bool) void {
-            if (self.reload_cancel_count != 0) self.reload_cancel_count -= 1;
-            _ = tag;
-            _ = recv;
+        fn completeCancel(self: *Self, tag: Tag) void {
+            const connection = self.taggedConnection(tag) orelse return;
+            if (self.reloading and connection.state == .open and self.reload_cancel_count != 0) self.reload_cancel_count -= 1;
         }
 
         fn requestClose(self: *Self, index: u16, reason: exchange.DisconnectReason) void {

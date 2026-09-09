@@ -23,8 +23,9 @@ test "open trapdoors are pathfinding support but not collision support" {
     const blocks = try test_generator.createBlocks(&generator, arena.allocator(), 7);
     generator.mode = .flat;
     const pos = geometry.BlockPos{ .x = 0, .y = 64, .z = 0 };
+    blocks.ensureChunkAt(test_world, pos.x, pos.z, 1);
     _ = try blocks.setBlock(test_world, pos, open);
-    const resident = blocks.residentChunk(test_world, .{ .x = 0, .z = 0 }).?;
+    const resident = blocks.materializedChunk(test_world, .{ .x = 0, .z = 0 }).?;
     const node = pathNodeInResident(blocks, resident, 0, 65, 0, false);
     try std.testing.expect(node.passable);
     try std.testing.expectEqual(navigation.NodeType.walkable, node.node.node_type);
@@ -44,6 +45,7 @@ test "collision bounds are half open" {
     var generator: test_generator.Generator = .{};
     const blocks = try test_generator.createBlocks(&generator, arena.allocator(), 0x636f_6c6c_6973_696f);
     generator.mode = .flat;
+    blocks.ensureChunkAt(test_world, 0, 0, 1);
     try std.testing.expect(try blocks.setBlock(test_world, .{ .x = 0, .y = 100, .z = 0 }, registry.block_stone_default_state));
     blocks.ensureChunkAt(test_world, -1, 0, 0);
 
@@ -58,11 +60,8 @@ test "collision queries never generate missing terrain" {
     defer arena.deinit();
     var generator: test_generator.Generator = .{};
     const blocks = try test_generator.createBlocks(&generator, arena.allocator(), 0x7265_7369_6465_6e74);
-    try std.testing.expect(blocks.requestChunkGeneration(test_world, .{ .x = 0, .z = 0 }));
-
     const body = collision.entityBox(8, 90, 8, 0.6, 1.8);
     try std.testing.expectEqual(collision.Movement{}, adjustLivingMovement(blocks, test_world, body, .{ .y = -0.08 }));
     try std.testing.expect(livingBoxCollides(blocks, test_world, body));
-    try std.testing.expectEqual(@as(usize, 1), blocks.pendingChunkGenerationCount());
-    try std.testing.expect(blocks.residentChunk(test_world, .{ .x = 0, .z = 0 }) == null);
+    try std.testing.expect(blocks.materializedChunk(test_world, .{ .x = 0, .z = 0 }) == null);
 }

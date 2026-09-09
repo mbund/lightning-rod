@@ -1,7 +1,10 @@
 const engine = @import("random_ticks/engine.zig");
 const lightning_rod = @import("lightning_rod");
 const std = @import("std");
-const active_chunks = @import("../vanilla/active_chunks.zig");
+const chunk_tickets = @import("../vanilla/chunk_tickets.zig");
+const simulation_admission = @import("../vanilla/simulation_admission.zig");
+const vanilla_persistence = @import("vanilla_persistence.zig");
+const vanilla_collision_projection = @import("vanilla_collision_projection.zig");
 
 pub const ScheduledBlockTicks = engine.ScheduledBlockTicks;
 pub const CropGrowth = @import("random_ticks/crop_growth.zig").CropGrowth;
@@ -36,10 +39,14 @@ pub const RandomTicks = struct {
         random: *lightning_rod.random.Random,
         blocks: *lightning_rod.blocks.Blocks,
         players: *lightning_rod.players.Players,
-        active: *active_chunks.ActiveChunks,
+        active: *chunk_tickets.ChunkTickets,
+        admission: *simulation_admission.SimulationAdmission,
+        materialization: *vanilla_persistence.Materializer,
+        collision_projection: *vanilla_collision_projection.CollisionProjection,
         living: *lightning_rod.entities.LivingEntities,
         items: *lightning_rod.entities.ItemEntities,
         outputs: *lightning_rod.Packets,
+        runtime_metrics: ?*lightning_rod.metrics.Runtime = null,
     };
 
     state: *engine.RandomTicks,
@@ -66,14 +73,18 @@ pub const RandomTicks = struct {
             .blocks = deps.blocks,
             .players = deps.players,
             .active = deps.active,
+            .admission = deps.admission,
+            .materialization = deps.materialization,
+            .collision_projection = deps.collision_projection,
             .living = deps.living,
             .items = deps.items,
             .outputs = deps.outputs,
+            .runtime_metrics = deps.runtime_metrics,
         }, settings) };
         return self;
     }
 
-    pub fn tick(self: *RandomTicks, allocator: std.mem.Allocator) void {
-        self.state.tick(allocator);
+    pub fn tick(self: *RandomTicks, io: std.Io, allocator: std.mem.Allocator) lightning_rod.plugin_lifecycle.FatalError!void {
+        try self.state.tick(io, allocator);
     }
 };

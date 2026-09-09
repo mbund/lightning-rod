@@ -1,7 +1,11 @@
 test {
+    _ = @import("session_worker.zig");
+    _ = @import("persistence_gateway.zig");
+    _ = @import("tick_pool.zig");
     _ = @import("authentication.zig");
     _ = @import("io_uring_transport.zig");
     _ = @import("local_packs.zig");
+    _ = @import("local_index.zig");
     _ = @import("logging_stdout.zig");
     _ = @import("reexec.zig");
     _ = @import("shutdown.zig");

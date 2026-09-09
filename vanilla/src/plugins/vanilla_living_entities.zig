@@ -10,8 +10,9 @@ const std = @import("std");
 const registry = lightning_rod.registry_data;
 const collision = lightning_rod.collision;
 const vanilla_zombie_ai = @import("vanilla_zombie_ai.zig");
+const vanilla_collision_projection = @import("vanilla_collision_projection.zig");
 const diagnostics = lightning_rod.diagnostics;
-const active_chunks = @import("../vanilla/active_chunks.zig");
+const simulation_admission = @import("../vanilla/simulation_admission.zig");
 const vanilla_living_death = @import("vanilla_living_death.zig");
 const Packets = lightning_rod.Packets;
 
@@ -21,9 +22,9 @@ pub const LivingEntityTick = struct {
     pub const Dependencies = struct {
         deaths: *vanilla_living_death.LivingDeaths,
         clock: *world_clock.Clock,
-        blocks: *block_store.Blocks,
+        collision_projection: *vanilla_collision_projection.CollisionProjection,
         players: *player_store.Players,
-        active: *active_chunks.ActiveChunks,
+        active: *simulation_admission.SimulationAdmission,
         living: *entity_store.LivingEntities,
         outputs: *Packets,
     };
@@ -46,7 +47,6 @@ pub const LivingEntityTick = struct {
     fn runLivingEntities(
         self: *LivingEntityTick,
         clock: *world_clock.Clock,
-        blocks: *block_store.Blocks,
         players: *player_store.Players,
         entities: *entity_store.LivingEntities,
         deaths: *vanilla_living_death.LivingDeaths,
@@ -59,7 +59,7 @@ pub const LivingEntityTick = struct {
             if (active_position >= living.active_count) break;
             const living_index = living.active_indices[active_position];
             const index: usize = living_index;
-            if (!isEntityTicking(blocks, self.deps.active, entities, index)) {
+            if (!isEntityTicking(self.deps.active, entities, index)) {
                 paths.clear(index);
                 living.jump_requested[index] = false;
                 active_position += 1;
@@ -69,7 +69,7 @@ pub const LivingEntityTick = struct {
             if (reapDead(clock, entities, outputs, living_index) or despawn(clock, players, entities, outputs, living_index)) {
                 continue;
             }
-            const previous = moveLiving(blocks, living, index);
+            const previous = moveLiving(self.deps.collision_projection, living, index);
             emitLiving(entities, outputs, living_index, previous);
             active_position += 1;
         }
@@ -77,14 +77,13 @@ pub const LivingEntityTick = struct {
             diagnostics.panic("living entity tick exceeded the entity capacity", &.{});
     }
 
-    fn isEntityTicking(blocks: *const block_store.Blocks, active: *const active_chunks.ActiveChunks, entities: *const entity_store.LivingEntities, index: usize) bool {
+    fn isEntityTicking(active: *const simulation_admission.SimulationAdmission, entities: *const entity_store.LivingEntities, index: usize) bool {
         const living = &entities.entities;
         const chunk = geometry.ChunkPos{
             .x = @divFloor(geometry.blockCoord(living.position_x[index]), 16),
             .z = @divFloor(geometry.blockCoord(living.position_z[index]), 16),
         };
-        return blocks.residentChunk(living.worlds[index], chunk) != null and
-            active.entityTicking(living.worlds[index], chunk);
+        return active.entityTicking(living.worlds[index], chunk);
     }
 
     fn tickBurning(entities: *entity_store.LivingEntities, deaths: *vanilla_living_death.LivingDeaths, outputs: *Packets, living_index: u16) void {
@@ -152,11 +151,11 @@ pub const LivingEntityTick = struct {
 
     const PreviousPosition = struct { x: f64, y: f64, z: f64 };
 
-    fn moveLiving(block_world: *block_store.Blocks, living: *living_entities.Pool, index: usize) PreviousPosition {
+    fn moveLiving(collision_projection: *vanilla_collision_projection.CollisionProjection, living: *living_entities.Pool, index: usize) PreviousPosition {
         const previous = PreviousPosition{ .x = living.position_x[index], .y = living.position_y[index], .z = living.position_z[index] };
         tickHandSwing(living, index);
         clampVelocity(living, index);
-        const in_water = block_store.isWaterBlockState(block_world.blockAtIfResident(living.worlds[index], .{
+        const in_water = block_store.isWaterBlockState(collision_projection.blockState(living.worlds[index], .{
             .x = geometry.blockCoord(living.position_x[index]),
             .y = @intFromFloat(@floor(living.position_y[index] + 0.2)),
             .z = geometry.blockCoord(living.position_z[index]),
@@ -170,7 +169,7 @@ pub const LivingEntityTick = struct {
             living_entities.height(living.entity_types[index], living.baby[index]),
         );
         const requested = collision.Movement{ .x = living.velocity_x[index], .y = living.velocity_y[index], .z = living.velocity_z[index] };
-        applyMovement(living, index, requested, block_queries.adjustLivingMovement(block_world, living.worlds[index], box, requested), in_water);
+        applyMovement(living, index, requested, block_queries.adjustLivingMovementFrom(collision_projection.source(), living.worlds[index], box, requested), in_water);
         return previous;
     }
 
@@ -220,13 +219,13 @@ pub const LivingEntityTick = struct {
         living.age[index] +%= 1;
         if (living.position_x[index] != previous.x or living.position_y[index] != previous.y or
             living.position_z[index] != previous.z or living.pose_dirty[index])
-            outputs.living_moved(living_index);
+            outputs.living_stepped(.{ .index = living_index, .previous = .{ .x = previous.x, .y = previous.y, .z = previous.z } });
         if (living.metadata_dirty[index]) outputs.living_metadata_changed(living_index);
         living.pose_dirty[index] = false;
         living.metadata_dirty[index] = false;
     }
 
     pub fn tick(self: *LivingEntityTick, _: std.mem.Allocator) void {
-        self.runLivingEntities(self.deps.clock, self.deps.blocks, self.deps.players, self.deps.living, self.deps.deaths, self.deps.outputs);
+        self.runLivingEntities(self.deps.clock, self.deps.players, self.deps.living, self.deps.deaths, self.deps.outputs);
     }
 };

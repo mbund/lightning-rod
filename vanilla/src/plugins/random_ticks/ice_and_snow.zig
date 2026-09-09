@@ -13,7 +13,7 @@ pub const IceAndSnow = struct {
         return .{ .context = self, .apply = apply };
     }
 
-    fn apply(_: *anyopaque, tick: *engine.Invocation) void {
-        engine.applyIceAndSnow(tick);
+    fn apply(_: *anyopaque, tick: *engine.Invocation) engine.FatalError!void {
+        try engine.applyIceAndSnow(tick);
     }
 };

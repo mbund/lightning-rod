@@ -24,6 +24,17 @@ pub fn selectedCount(comptime Selections: type) usize {
     return (comptime tupleFields(Selections)).len;
 }
 
+pub fn minimumTickScratchBytes(comptime Selections: type) usize {
+    return comptime total: {
+        var bytes: usize = 0;
+        for (tupleFields(Selections)) |field| {
+            const Plugin = selectedPlugin(field.type);
+            if (@hasDecl(Plugin, "tick_scratch_bytes")) bytes += Plugin.tick_scratch_bytes;
+        }
+        break :total bytes;
+    };
+}
+
 pub fn traceCount(comptime Selections: type) usize {
     var count: usize = 0;
     inline for (comptime tupleFields(Selections)) |field|
@@ -131,16 +142,6 @@ pub fn compose(parts: anytype) Compose(@TypeOf(parts)) {
     return result;
 }
 
-pub fn configure(selections: anytype, comptime Plugin: type, configuration: Plugin.Configuration) void {
-    const Pointer = @TypeOf(selections);
-    if (@typeInfo(Pointer) != .pointer or @typeInfo(Pointer).pointer.size != .one)
-        @compileError("plugin.configure expects a pointer to a plugin selection tuple");
-    const Selections = @typeInfo(Pointer).pointer.child;
-    const index = comptime indexOfPlugin(Selections, Plugin) orelse
-        @compileError("cannot configure a plugin that is not selected: " ++ Plugin.id);
-    selections.*[index].configuration = configuration;
-}
-
 pub fn remove(selections: anytype, comptime Plugin: type) Remove(@TypeOf(selections), Plugin) {
     const removed = comptime indexOfPlugin(@TypeOf(selections), Plugin) orelse
         @compileError("cannot remove a plugin that is not selected: " ++ Plugin.id);
@@ -150,13 +151,16 @@ pub fn remove(selections: anytype, comptime Plugin: type) Remove(@TypeOf(selecti
     return result;
 }
 
-pub fn replace(selections: anytype, comptime Old: type, replacement: anytype) Replace(@TypeOf(selections), Old, @TypeOf(replacement)) {
-    const index = comptime indexOfPlugin(@TypeOf(selections), Old) orelse
-        @compileError("cannot replace a plugin that is not selected: " ++ Old.id);
-    if (comptime !std.mem.eql(u8, selectedPlugin(@TypeOf(replacement)).id, Old.id))
-        @compileError("replacement plugin id must equal the replaced plugin id");
-    var result: Replace(@TypeOf(selections), Old, @TypeOf(replacement)) = undefined;
-    inline for (0..selections.len) |source| result[source] = if (source == index) replacement else selections[source];
+pub fn replace(selections: anytype, replacements: anytype) Replace(@TypeOf(selections), @TypeOf(replacements)) {
+    comptime validateReplacements(@TypeOf(selections), @TypeOf(replacements));
+    var result: Replace(@TypeOf(selections), @TypeOf(replacements)) = undefined;
+    inline for (comptime tupleFields(@TypeOf(selections)), 0..) |field, index| {
+        const id = selectedPlugin(field.type).id;
+        if (comptime replacementIndex(@TypeOf(replacements), id)) |replacement|
+            result[index] = replacements[replacement]
+        else
+            result[index] = selections[index];
+    }
     return result;
 }
 
@@ -200,13 +204,39 @@ pub fn Remove(comptime Selections: type, comptime Plugin: type) type {
     return std.meta.Tuple(&result);
 }
 
-pub fn Replace(comptime Selections: type, comptime Old: type, comptime Replacement: type) type {
+pub fn Replace(comptime Selections: type, comptime Replacements: type) type {
     const fields = comptime tupleFields(Selections);
-    const index = comptime indexOfPlugin(Selections, Old) orelse @compileError("plugin is not selected: " ++ Old.id);
+    comptime validateReplacements(Selections, Replacements);
     comptime var result: [fields.len]type = undefined;
-    inline for (fields, 0..) |field, field_index|
-        result[field_index] = if (field_index == index) Replacement else field.type;
+    inline for (fields, 0..) |field, index| {
+        const id = selectedPlugin(field.type).id;
+        result[index] = if (replacementIndex(Replacements, id)) |replacement|
+            tupleFields(Replacements)[replacement].type
+        else
+            field.type;
+    }
     return std.meta.Tuple(&result);
+}
+
+fn validateReplacements(comptime Selections: type, comptime Replacements: type) void {
+    const fields = tupleFields(Replacements);
+    if (fields.len == 0) @compileError("plugin.replace requires at least one replacement");
+    inline for (fields, 0..) |field, index| {
+        if (!isSelection(field.type)) @compileError("plugin.replace accepts plugin selections");
+        const Replacement = selectedPlugin(field.type);
+        if (indexOfId(Selections, Replacement.id) == null)
+            @compileError("cannot replace a plugin that is not selected: " ++ Replacement.id);
+        inline for (fields[0..index]) |previous| {
+            if (std.mem.eql(u8, Replacement.id, selectedPlugin(previous.type).id))
+                @compileError("duplicate plugin replacement: " ++ Replacement.id);
+        }
+    }
+}
+
+fn replacementIndex(comptime Replacements: type, comptime id: []const u8) ?usize {
+    inline for (tupleFields(Replacements), 0..) |field, index|
+        if (std.mem.eql(u8, id, selectedPlugin(field.type).id)) return index;
+    return null;
 }
 
 pub fn InsertAfter(comptime Selections: type, comptime Anchor: type, comptime Inserted: type) type {
@@ -268,17 +298,16 @@ fn validateDependenciesType(comptime Plugin: type) void {
 
 fn validateInit(comptime Plugin: type) void {
     const info = @typeInfo(@TypeOf(Plugin.init)).@"fn";
-    const expected_parameters: usize = 1 + @as(usize, @intFromBool(@hasDecl(Plugin, "Dependencies"))) +
-        1 +
-        @as(usize, @intFromBool(@hasDecl(Plugin, "Meta")));
-    if (info.params.len != expected_parameters or info.params[0].type != std.mem.Allocator)
-        @compileError(Plugin.id ++ ".init must be fn (Allocator, [Dependencies,] Configuration, [Meta,]) !*Self");
-    if (@hasDecl(Plugin, "Dependencies") and info.params[1].type != Plugin.Dependencies)
-        @compileError(Plugin.id ++ ".init Dependencies parameter must be its Dependencies type");
-    if (info.params[1 + @as(usize, @intFromBool(@hasDecl(Plugin, "Dependencies")))].type != Plugin.Configuration)
-        @compileError(Plugin.id ++ ".init Configuration parameter must be its Configuration type");
-    if (@hasDecl(Plugin, "Meta") and info.params[info.params.len - 1].type != Plugin.Meta)
-        @compileError(Plugin.id ++ ".init Meta parameter must be its Meta type");
+    var seen: u8 = 0;
+    for (info.params) |parameter| {
+        const T = parameter.type orelse @compileError(Plugin.id ++ ".init requires typed parameters");
+        const bit: u8 = if (T == std.mem.Allocator) 1 else if (T == std.Io) 2 else if (T == Plugin.Configuration) 4 else if (@hasDecl(Plugin, "Dependencies") and T == Plugin.Dependencies) 8 else if (@hasDecl(Plugin, "Meta") and T == Plugin.Meta) 16 else @compileError(Plugin.id ++ ".init has an unsupported parameter");
+        if (seen & bit != 0) @compileError(Plugin.id ++ ".init has a duplicate injected parameter");
+        seen |= bit;
+    }
+    const expected: u8 = 1 | 4 | @as(u8, if (@hasDecl(Plugin, "Dependencies")) 8 else 0) | @as(u8, if (@hasDecl(Plugin, "Meta")) 16 else 0);
+    if (seen & ~@as(u8, 2) != expected)
+        @compileError(Plugin.id ++ ".init requires Allocator, Configuration, and its declared Dependencies/Meta; std.Io is optional");
     const result = info.return_type orelse @compileError(Plugin.id ++ ".init must return !*Self");
     if (@typeInfo(result) != .error_union or @typeInfo(result).error_union.payload != *Plugin)
         @compileError(Plugin.id ++ ".init must return !*Self");
@@ -292,10 +321,21 @@ fn validateLifecycle(comptime Plugin: type) void {
 
 fn validateTick(comptime Plugin: type) void {
     const info = @typeInfo(@TypeOf(Plugin.tick)).@"fn";
-    if (info.return_type != void or info.params.len < 1 or info.params.len > 2 or info.params[0].type != *Plugin)
-        @compileError(Plugin.id ++ ".tick must be fn (*Self) void or fn (*Self, Allocator) void");
-    if (info.params.len == 2 and info.params[1].type != std.mem.Allocator)
-        @compileError(Plugin.id ++ ".tick's optional second parameter must be Allocator");
+    const result = info.return_type orelse @compileError(Plugin.id ++ ".tick requires an explicit return type");
+    if (result != void) {
+        const fatal = @import("plugin_lifecycle.zig").FatalError;
+        if (@typeInfo(result) != .error_union or @typeInfo(result).error_union.payload != void or
+            (@typeInfo(result).error_union.error_set || fatal) != fatal)
+            @compileError(Plugin.id ++ ".tick must return void or a subset of plugin_lifecycle.FatalError!void");
+    }
+    if (info.params.len < 1 or info.params.len > 3 or info.params[0].type != *Plugin)
+        @compileError(Plugin.id ++ ".tick must take *Self and optionally Allocator and std.Io");
+    var seen: u8 = 0;
+    for (info.params[1..]) |parameter| {
+        const bit: u8 = if (parameter.type == std.mem.Allocator) 1 else if (parameter.type == std.Io) 2 else @compileError(Plugin.id ++ ".tick accepts only Allocator and std.Io after *Self");
+        if (seen & bit != 0) @compileError(Plugin.id ++ ".tick has a duplicate injected parameter");
+        seen |= bit;
+    }
 }
 
 fn validateCheckpoint(comptime Plugin: type) void {
@@ -303,19 +343,31 @@ fn validateCheckpoint(comptime Plugin: type) void {
     const lifecycle = @import("plugin_lifecycle.zig");
     const result = info.return_type orelse
         @compileError(Plugin.id ++ ".checkpoint must return !void");
-    if (info.params.len != 2 or info.params[0].type != *Plugin or
-        info.params[1].type != *lifecycle.Checkpoint.NamespaceWriter or
+    if (info.params.len < 2 or info.params.len > 3 or info.params[0].type != *Plugin or
         @typeInfo(result) != .error_union or
         @typeInfo(result).error_union.payload != void)
-        @compileError(Plugin.id ++ ".checkpoint must be fn (*Self, *Checkpoint.NamespaceWriter) !void");
+        @compileError(Plugin.id ++ ".checkpoint requires *Self, *Checkpoint.NamespaceWriter, optional std.Io and an error union void result");
+    var seen: u8 = 0;
+    for (info.params[1..]) |parameter| {
+        const bit: u8 = if (parameter.type == *lifecycle.Checkpoint.NamespaceWriter) 1 else if (parameter.type == std.Io) 2 else @compileError(Plugin.id ++ ".checkpoint accepts only *Checkpoint.NamespaceWriter and std.Io after *Self");
+        if (seen & bit != 0) @compileError(Plugin.id ++ ".checkpoint has a duplicate injected parameter");
+        seen |= bit;
+    }
+    if (seen & 1 == 0) @compileError(Plugin.id ++ ".checkpoint requires *Checkpoint.NamespaceWriter");
 }
 
 fn validateClose(comptime Plugin: type) void {
     const info = @typeInfo(@TypeOf(Plugin.close)).@"fn";
     const lifecycle = @import("plugin_lifecycle.zig");
-    if (info.params.len != 2 or info.params[0].type != *Plugin or
-        info.params[1].type != *lifecycle.Closing or info.return_type != void)
-        @compileError(Plugin.id ++ ".close must be fn (*Self, *Closing) void");
+    if (info.params.len < 2 or info.params.len > 3 or info.params[0].type != *Plugin or info.return_type != void)
+        @compileError(Plugin.id ++ ".close requires *Self, *Closing, optional std.Io and a void result");
+    var seen: u8 = 0;
+    for (info.params[1..]) |parameter| {
+        const bit: u8 = if (parameter.type == *lifecycle.Closing) 1 else if (parameter.type == std.Io) 2 else @compileError(Plugin.id ++ ".close accepts only *Closing and std.Io after *Self");
+        if (seen & bit != 0) @compileError(Plugin.id ++ ".close has a duplicate injected parameter");
+        seen |= bit;
+    }
+    if (seen & 1 == 0) @compileError(Plugin.id ++ ".close requires *Closing");
 }
 
 fn validateDependencies(comptime Selections: type, comptime Plugin: type, comptime plugin_index: usize) void {
@@ -384,14 +436,12 @@ test "composition is explicit and keyed by stable id" {
             return a.create(@This());
         }
     };
-    var selected = .{ configured(First, .{}), configured(Second, .{ .value = 3 }) };
+    const selected = .{ configured(First, .{}), configured(Second, .{ .value = 3 }) };
     try std.testing.expectEqual(@as(?usize, 0), indexOfId(@TypeOf(selected), "test:first"));
     try std.testing.expectEqual(@as(?usize, 0), indexOfPlugin(@TypeOf(selected), First));
-    configure(&selected, Second, .{ .value = 7 });
-    try std.testing.expectEqual(@as(u8, 7), selected[1].configuration.value);
     const Trimmed = Remove(@TypeOf(selected), First);
     try std.testing.expectEqual(@as(usize, 1), @typeInfo(Trimmed).@"struct".fields.len);
-    const changed = replace(selected, Second, configured(Second, .{ .value = 9 }));
+    const changed = replace(selected, .{configured(Second, .{ .value = 9 })});
     try std.testing.expectEqual(@as(u8, 9), changed[1].configuration.value);
     try std.testing.expectEqual(@as(usize, 1), remove(changed, First).len);
 }

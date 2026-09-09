@@ -1,18 +1,17 @@
 const lightning_rod = @import("lightning_rod");
 const input_store = lightning_rod.inputs;
 const player_store = lightning_rod.players;
-const block_store = lightning_rod.blocks;
 const block_queries = lightning_rod.block_queries;
 const geometry = lightning_rod.geometry;
-const world_clock = lightning_rod.clock;
 const world_store = lightning_rod.worlds;
 const std = @import("std");
 const Packets = lightning_rod.Packets;
-const world_limits = lightning_rod.world_limits;
 const registry = lightning_rod.registry_data;
 const collision = lightning_rod.collision;
 const diagnostics = lightning_rod.diagnostics;
 const test_state = lightning_rod.test_support.state;
+const vanilla_collision_projection = @import("vanilla_collision_projection.zig");
+const vanilla_persistence = @import("vanilla_persistence.zig");
 
 fn sameVec3(a: geometry.Vec3, b: geometry.Vec3) bool {
     return a.x == b.x and a.y == b.y and a.z == b.z;
@@ -44,7 +43,7 @@ pub const MovementValidation = struct {
     pub const id = "lightning_rod:survival_movement_validation";
     pub const Configuration = struct {};
     pub const Dependencies = struct {
-        blocks: *block_store.Blocks,
+        collision_projection: *vanilla_collision_projection.CollisionProjection,
         players: *player_store.Players,
         inputs: *input_store.Inputs,
         outputs: *Packets,
@@ -75,7 +74,7 @@ pub const MovementValidation = struct {
     }
 
     pub fn tick(self: *MovementValidation, _: std.mem.Allocator) void {
-        const blocks = self.deps.blocks;
+        const projection = self.deps.collision_projection;
         const players = self.deps.players;
         const inputs = self.deps.inputs;
         const outputs = self.deps.outputs;
@@ -84,12 +83,12 @@ pub const MovementValidation = struct {
             const pending = &inputs.movements[slot];
             const player = &players.records[slot];
             if (!pending.dirty or !pending.has_position or player.gamemode == .creative or player.gamemode == .spectator) continue;
-            if (movementIsValid(blocks, players, inputs, self, slot)) continue;
+            if (movementIsValid(projection, players, inputs, self, slot)) continue;
             pending.* = .{};
             self.airborne_ticks[slot] = 0;
             self.floating_ticks[slot] = 0;
             self.initialized[slot] = false;
-            outputs.emitPlayerCorrection(slot);
+            _ = outputs.emitPlayerCorrection(slot);
         }
     }
 };
@@ -118,7 +117,7 @@ fn beginPlayerSession(state: *MovementValidation, players: *player_store.Players
     state.floating_ticks[slot] = 0;
 }
 
-fn movementIsValid(blocks: *block_store.Blocks, players: *player_store.Players, inputs: *input_store.Inputs, state: *MovementValidation, slot: usize) bool {
+fn movementIsValid(projection: *vanilla_collision_projection.CollisionProjection, players: *player_store.Players, inputs: *input_store.Inputs, state: *MovementValidation, slot: usize) bool {
     const pending = &inputs.movements[slot];
     const player = &players.records[slot];
     const candidate = pending.position;
@@ -127,15 +126,10 @@ fn movementIsValid(blocks: *block_store.Blocks, players: *player_store.Players, 
     const dz = candidate.z - player.position.z;
     if (!std.math.isFinite(candidate.x) or !std.math.isFinite(candidate.y) or
         !std.math.isFinite(candidate.z) or dx * dx + dy * dy + dz * dz > 100 * 100) return false;
-    const candidate_chunk = geometry.chunkForBlock(.{
-        .x = geometry.blockCoord(candidate.x),
-        .y = @intCast(std.math.clamp(geometry.blockCoord(candidate.y), @as(i32, world_limits.min_y), @as(i32, block_store.world_top_y))),
-        .z = geometry.blockCoord(candidate.z),
-    });
-    if (blocks.residentChunk(player.world, candidate_chunk) == null or
-        block_queries.livingBoxCollides(blocks, player.world, playerCollisionBox(candidate))) return false;
-    const previous_supported = block_queries.playerGroundSupported(blocks, player.world, player.position);
-    const candidate_supported = block_queries.playerGroundSupported(blocks, player.world, candidate);
+    const source = projection.source();
+    if (block_queries.livingBoxCollidesFrom(source, player.world, playerCollisionBox(candidate))) return false;
+    const previous_supported = block_queries.playerGroundSupportedFrom(source, player.world, player.position);
+    const candidate_supported = block_queries.playerGroundSupportedFrom(source, player.world, candidate);
     if (!state.initialized[slot] or previous_supported) {
         state.initialized[slot] = true;
         state.airborne_ticks[slot] = 0;
@@ -215,11 +209,10 @@ fn applyArmSwings(players: *player_store.Players, inputs: *input_store.Inputs, o
     }
 }
 
-fn resetPlayerAfterRespawn(clock: *world_clock.Clock, worlds: *world_store.Worlds, blocks: *block_store.Blocks, players: *player_store.Players, inputs: *input_store.Inputs, slot: usize) void {
+fn resetPlayerAfterRespawn(worlds: *world_store.Worlds, players: *player_store.Players, inputs: *input_store.Inputs, slot: usize) void {
     const player = &players.records[slot];
     const world = worlds.get(player.world) orelse
         diagnostics.panic("player respawn requested in an unknown world (player slot)", &.{diagnostics.integer(slot)});
-    blocks.ensureChunkAt(player.world, world.spawn_x, world.spawn_z, clock.tick);
     players.teleport(@intCast(slot), player.world, .{
         .x = @as(f64, @floatFromInt(world.spawn_x)) + 0.5,
         .y = @floatFromInt(world.spawn_y),
@@ -239,7 +232,7 @@ fn resetPlayerAfterRespawn(clock: *world_clock.Clock, worlds: *world_store.World
     inputs.movements[slot] = .{};
     inputs.player_inputs[slot] = .{};
     inputs.sprint_actions[slot] = .{};
-    inputs.dig_actions[slot] = .none;
+    inputs.clearDigActions(@intCast(slot));
     inputs.item_drops[slot] = .{};
     inputs.living_attacks[slot] = .{};
     inputs.player_attacks[slot] = .{};
@@ -247,7 +240,7 @@ fn resetPlayerAfterRespawn(clock: *world_clock.Clock, worlds: *world_store.World
     inputs.arm_swings[slot] = .{};
 }
 
-fn applyRespawns(clock: *world_clock.Clock, worlds: *world_store.Worlds, blocks: *block_store.Blocks, players: *player_store.Players, inputs: *input_store.Inputs, outputs: *Packets) void {
+fn applyRespawns(worlds: *world_store.Worlds, materialization: *vanilla_persistence.Materializer, players: *player_store.Players, inputs: *input_store.Inputs, outputs: *Packets) void {
     for (players.activeSlots()) |active_slot| {
         const slot: usize = active_slot;
         const pending = &inputs.respawns[slot];
@@ -255,10 +248,15 @@ fn applyRespawns(clock: *world_clock.Clock, worlds: *world_store.Worlds, blocks:
             @branchHint(.likely);
             continue;
         }
-        pending.* = false;
         const player = &players.records[slot];
-        if (player.state != .play or player.health > 0) continue;
-        resetPlayerAfterRespawn(clock, worlds, blocks, players, inputs, slot);
+        if (player.state != .play or player.health > 0) {
+            pending.* = false;
+            continue;
+        }
+        const world = worlds.get(player.world) orelse continue;
+        if (materialization.requestProjection(player.world, geometry.chunkForBlock(.{ .x = world.spawn_x, .y = world.spawn_y, .z = world.spawn_z })) != .resident) continue;
+        pending.* = false;
+        resetPlayerAfterRespawn(worlds, players, inputs, slot);
         outputs.emitRespawn(@as(u16, @intCast(slot)));
     }
 }
@@ -267,9 +265,8 @@ pub const PlayerInput = struct {
     pub const id = "minecraft:player_input";
     pub const Configuration = struct {};
     pub const Dependencies = struct {
-        clock: *world_clock.Clock,
         worlds: *world_store.Worlds,
-        blocks: *block_store.Blocks,
+        materialization: *vanilla_persistence.Materializer,
         players: *player_store.Players,
         inputs: *input_store.Inputs,
         outputs: *Packets,
@@ -287,7 +284,7 @@ pub const PlayerInput = struct {
         applyPlayerFlags(self.deps.players, self.deps.inputs, self.deps.outputs);
         applyMovements(self.deps.players, self.deps.inputs, self.deps.outputs);
         applyArmSwings(self.deps.players, self.deps.inputs, self.deps.outputs);
-        applyRespawns(self.deps.clock, self.deps.worlds, self.deps.blocks, self.deps.players, self.deps.inputs, self.deps.outputs);
+        applyRespawns(self.deps.worlds, self.deps.materialization, self.deps.players, self.deps.inputs, self.deps.outputs);
     }
 };
 
@@ -305,11 +302,10 @@ test "respawn uses the current world's configured spawn" {
     const player = &simulation.players.records[0];
     player.world = destination;
     player.health = 0;
+    simulation.blocks.ensureChunkAt(destination, world.spawn_x, world.spawn_z, simulation.clock.tick);
 
     resetPlayerAfterRespawn(
-        &simulation.clock,
         simulation.worlds,
-        &simulation.blocks,
         &simulation.players,
         &simulation.inputs,
         0,

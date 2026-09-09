@@ -33,7 +33,7 @@ pub const ModifiedSection = struct {
     chunk: geometry.ChunkPos = .{ .x = 0, .z = 0 },
     world: world_identity.Handle = world_identity.invalid,
     section: u8 = 0,
-    page_index: u16 = 0,
+    dense_index: u16 = 0,
     sparse_count: u8 = 0,
     modified_count: u16 = 0,
     random_tickable_count: u16 = 0,
@@ -43,23 +43,102 @@ pub const ModifiedSection = struct {
     sparse_states: [sparse_section_change_capacity]i32 = undefined,
 };
 
-const resident_chunk_empty = std.math.maxInt(u16);
+const materialization_empty = std.math.maxInt(u16);
 pub const no_modified_section_index = std.math.maxInt(u16);
 
-pub const GeneratedHeightChunk = struct {
+test "materialization owns fixed buffers and replaces a full cache without extra pages" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const blocks = try Blocks.init(arena.allocator(), .{
+        .maximum_transient_chunks = 4,
+        .maximum_modified_sections = 1,
+        .maximum_block_mutations = 16,
+    });
+    var storage: [terrain.chunk_storage_capacity]u8 = undefined;
+    var shape = terrain.ChunkShape{
+        .chunk_x = 0,
+        .chunk_z = 0,
+        .heights = @splat(0),
+        .biomes = @splat(0),
+        .storage = &storage,
+    };
+    for (0..limits.section_count) |section| try shape.encodeUniformSection(section, registry.block_stone_default_state);
+    const world = world_identity.Handle{ .index = 0, .generation = 1 };
+    var slots: [4]usize = undefined;
+    for (&slots, 0..) |*slot, x| {
+        shape.chunk_x = @intCast(x);
+        slot.* = try blocks.installMaterialization(world, shape, 0, .persisted);
+        try std.testing.expectEqual(@intFromPtr(&blocks.shape_storage[slot.*]), @intFromPtr(blocks.materialized_chunks[slot.*].shape.storage.ptr));
+    }
+    shape.chunk_x = 4;
+    try std.testing.expectError(error.MaterializationCapacity, blocks.installMaterialization(world, shape, 0, .persisted));
+    const own = blocks.materialized_chunks[slots[2]].shape;
+    try std.testing.expectEqual(slots[2], try blocks.installMaterialization(world, own, 1, .persisted));
+    try std.testing.expectEqual(registry.block_stone_default_state, blocks.materialized_chunks[slots[2]].shape.sectionPaletteState(0, 0));
+    shape.storage_len = 0;
+    for (0..limits.section_count) |section| try shape.encodeUniformSection(section, registry.block_air_default_state);
+    shape.chunk_x = 1;
+    _ = try blocks.installMaterialization(world, shape, 1, .persisted);
+    var copied = blocks.materialized_chunks[slots[1]].shape;
+    copied.chunk_x = 2;
+    _ = try blocks.installMaterialization(world, copied, 1, .persisted);
+    try std.testing.expectEqual(registry.block_air_default_state, blocks.materialized_chunks[slots[2]].shape.sectionPaletteState(0, 0));
+    try std.testing.expectEqual(registry.block_stone_default_state, blocks.materialized_chunks[slots[0]].shape.sectionPaletteState(0, 0));
+    try std.testing.expect(blocks.evictChunk(world, .{ .x = 2, .z = 0 }));
+    shape.chunk_x = 4;
+    try std.testing.expectEqual(slots[2], try blocks.installMaterialization(world, shape, 2, .persisted));
+    try std.testing.expect(blocks.materializedChunk(world, .{ .x = 2, .z = 0 }) == null);
+    try std.testing.expect(blocks.materializedChunk(world, .{ .x = 4, .z = 0 }) != null);
+}
+
+test "render materialization defers random tick derivation until a mutation needs it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const blocks = try Blocks.init(arena.allocator(), .{
+        .maximum_transient_chunks = 4,
+        .maximum_modified_sections = 4,
+        .maximum_block_mutations = 16,
+    });
+    var storage: [terrain.chunk_storage_capacity]u8 = undefined;
+    var shape = try terrain.buildFlatChunkShape(
+        &storage,
+        0,
+        0,
+        64,
+        registry.block_grass_block_default_state,
+        registry.block_stone_default_state,
+    );
+    // This is conservative metadata: retaining `true` does not require eager mask work.
+    shape.grass_spread_possible = true;
+    const world = world_identity.Handle{ .index = 0, .generation = 1 };
+    const index = try blocks.installMaterialization(world, shape, 0, .persisted);
+    const resident = &blocks.materialized_chunks[index];
+    try std.testing.expect(!resident.random_tick_derived);
+    try std.testing.expectEqual(shape.heights, resident.heights);
+    try std.testing.expectEqual(shape.grass_spread_possible, resident.base_grass_spread_possible);
+    try std.testing.expectEqual(blocks.free_random_tick_masks.len, blocks.free_random_tick_mask_count);
+
+    try std.testing.expect(try blocks.setBlock(world, .{ .x = 0, .y = 64, .z = 0 }, registry.block_air_default_state));
+    try std.testing.expect(resident.random_tick_derived);
+    const section = sectionIndexForY(64).?;
+    try std.testing.expect(resident.random_tick_sections & (@as(u32, 1) << @intCast(section)) != 0);
+    try std.testing.expectEqual(@as(?i32, null), blocks.sectionRandomTickBlockState(resident, section, localBlockIndex(.{ .x = 0, .y = 64, .z = 0 }), blocks.modifiedSectionIndex(resident, section)));
+}
+
+pub const MaterializedChunk = struct {
     valid: bool = false,
     dirty: bool = false,
-    persistence_known: bool = false,
     chunk: geometry.ChunkPos = .{ .x = 0, .z = 0 },
     world: world_identity.Handle = world_identity.invalid,
     last_used_tick: u64 = 0,
-    ticket_generation: u64 = 0,
     revision: u64 = 0,
     content_revision: u64 = 0,
+    binding_revision: u64 = 0,
     modified_section_mask: u32 = 0,
     dirty_section_mask: u32 = 0,
     modified_section_indices: [limits.section_count]u16 = [_]u16{no_modified_section_index} ** limits.section_count,
     shape: terrain.ChunkShape = undefined,
+    random_tick_derived: bool = false,
     random_tick_sections: u32 = 0,
     heights: [16 * 16]i16 = undefined,
     grass_above_blocked: [4]u64 = undefined,
@@ -69,26 +148,73 @@ pub const GeneratedHeightChunk = struct {
     random_tick_uniform_states: [limits.section_count]i32 = [_]i32{random_tick_mixed_state} ** limits.section_count,
 };
 
-pub const GeneratedHeightRef = struct {
+pub const MaterializedChunkRef = struct {
     index: u16,
-    entry: *const GeneratedHeightChunk,
+    entry: *const MaterializedChunk,
 };
 
-pub const ResidentChunkSource = enum { generated_unknown, generated_new, persisted };
-pub const ChunkGenerationResult = enum { idle, pending, complete, backpressured };
+pub const MaterializationSource = enum { generated, persisted };
+
+pub const MutationCursor = struct {
+    sequence: u64,
+
+    pub fn next(self: *MutationCursor, blocks: *const Blocks) error{HistoryLost}!?geometry.BlockMutation {
+        const pending = blocks.block_mutation_sequence -% self.sequence;
+        if (pending == 0) return null;
+        if (pending > blocks.block_mutations.len) return error.HistoryLost;
+        self.sequence +%= 1;
+        if (self.sequence == 0) self.sequence = 1;
+        return blocks.blockMutation(self.sequence);
+    }
+};
+
+pub const Materialization = struct {
+    world: world_identity.Handle,
+    chunk: geometry.ChunkPos,
+    content_revision: u64,
+    binding_revision: u64,
+    source: MaterializationSource,
+};
+
+pub const MaterializationCursor = struct {
+    sequence: u64,
+
+    pub fn next(self: *MaterializationCursor, blocks: *const Blocks) error{HistoryLost}!?Materialization {
+        const pending = blocks.chunk_change_sequence -% self.sequence;
+        if (pending == 0) return null;
+        if (pending > blocks.materializations.len) return error.HistoryLost;
+        self.sequence +%= 1;
+        if (self.sequence == 0) self.sequence = 1;
+        return blocks.materializations[(self.sequence -% 1) % blocks.materializations.len];
+    }
+};
+pub const GenerationMetrics = generator_api.Metrics;
+pub const MutationWrite = struct {
+    world: world_identity.Handle,
+    pos: geometry.BlockPos,
+    block_state: i32,
+};
 
 pub const Blocks = struct {
     pub const id = "lightning_rod:blocks";
 
+    /// A persisted revision must leave room for a worst-case canonical reload.
+    /// `loadSectionFromShape` can advance the shared revision allocator once for
+    /// every section before `finishPersistedMaterialization` restores this
+    /// logical value.  Keeping that headroom makes a valid checksummed record
+    /// incapable of exhausting the allocator midway through installation.
+    pub const maximum_persisted_content_revision: u64 =
+        std.math.maxInt(u64) - @as(u64, limits.section_count) - 2;
+
     pub const Configuration = struct {
-        maximum_resident_chunks: usize = 1024,
-        maximum_modified_sections: usize = 1024,
+        maximum_transient_chunks: usize = 32,
+        maximum_modified_sections: usize = 64,
         maximum_block_mutations: usize = 4096,
 
         pub fn validate(self: Configuration) !void {
-            if (self.maximum_resident_chunks < 4 or self.maximum_resident_chunks >= std.math.maxInt(u16) or
-                !std.math.isPowerOfTwo(self.maximum_resident_chunks))
-                return error.InvalidResidentChunkCapacity;
+            if (self.maximum_transient_chunks < 4 or self.maximum_transient_chunks >= std.math.maxInt(u16) or
+                !std.math.isPowerOfTwo(self.maximum_transient_chunks))
+                return error.InvalidMaterializationCapacity;
             if (self.maximum_modified_sections == 0 or
                 self.maximum_modified_sections >= std.math.maxInt(u16) or
                 !std.math.isPowerOfTwo(self.maximum_modified_sections))
@@ -97,109 +223,59 @@ pub const Blocks = struct {
                 return error.InvalidMutationCapacity;
         }
     };
-
-    const no_generation_request = std.math.maxInt(u16);
-
-    const GenerationSink = struct {
-        blocks: *Blocks,
-        world: world_identity.Handle,
-        requested: geometry.ChunkPos,
-        tick: u64,
-        requested_emitted: *bool,
-
-        fn emit(context: *anyopaque, shape: terrain.ChunkShape) anyerror!void {
-            const self: *GenerationSink = @ptrCast(@alignCast(context));
-            const chunk = geometry.ChunkPos{ .x = shape.chunk_x, .z = shape.chunk_z };
-            if (!self.blocks.chunkGenerationPending(self.world, chunk)) return;
-            const is_requested = geometry.sameChunk(chunk, self.requested);
-            if (self.blocks.residentChunk(self.world, chunk) != null) {
-                if (is_requested) self.requested_emitted.* = true;
-                return;
-            }
-            if (!is_requested and
-                self.blocks.resident_chunk_count + 1 >= self.blocks.resident_chunks.len)
-                return;
-            _ = try self.blocks.installResidentChunk(
-                self.world,
-                shape,
-                self.tick,
-                .generated_unknown,
-            );
-            if (is_requested) self.requested_emitted.* = true;
-        }
-    };
-
     generator: ?generator_api.Service = null,
     modified_sections: []ModifiedSection = &.{},
     free_modified_sections: []u16 = &.{},
     free_modified_section_count: usize = 0,
-    modified_section_pool_initialized: bool = false,
-    section_pages: []align(cache_line_size) [blocks_per_section]i32 = &.{},
-    free_section_pages: []u16 = &.{},
+    dense_sections: []align(cache_line_size) [blocks_per_section]i32 = &.{},
+    free_dense_sections: []u16 = &.{},
     modified_block_count: usize = 0,
     modified_section_count: usize = 0,
-    free_section_page_count: usize = 0,
-    page_pool_initialized: bool = false,
+    free_dense_section_count: usize = 0,
     next_section_revision: u64 = 1,
     block_mutation_sequence: u64 = 0,
     block_mutations: []geometry.BlockMutation = &.{},
-    resident_chunks: []GeneratedHeightChunk = &.{},
-    resident_shape_storage: []align(cache_line_size) u8 = &.{},
-    resident_chunk_lookup: []u16 = &.{},
-    free_resident_chunks: []u16 = &.{},
-    active_resident_indices: []u16 = &.{},
-    resident_active_positions: []u16 = &.{},
-    free_resident_chunk_count: usize = 0,
-    resident_chunk_count: usize = 0,
-    resident_pool_initialized: bool = false,
-    resident_pressure: bool = false,
-    resident_binding_revision: u64 = 1,
-    resident_ticket_generation: u64 = 1,
-    resident_ticket_previous_generation: u64 = 0,
+    chunk_change_sequence: u64 = 0,
+    materializations: []Materialization = &.{},
+    materialized_chunks: []MaterializedChunk = &.{},
+    shape_storage: []align(64) [terrain.chunk_storage_capacity]u8 = &.{},
+    materialization_lookup: []u16 = &.{},
+    free_materializations: []u16 = &.{},
+    active_materialization_indices: []u16 = &.{},
+    materialization_active_positions: []u16 = &.{},
+    free_materialization_count: usize = 0,
+    materialization_count: usize = 0,
+    materialization_pressure: bool = false,
+    materialization_binding_revision: u64 = 1,
     random_tick_masks: []align(cache_line_size) [blocks_per_section / 64]u64 = &.{},
     free_random_tick_masks: []u16 = &.{},
     free_random_tick_mask_count: usize = 0,
-    random_tick_mask_pool_initialized: bool = false,
-    chunk_generation_requests: []geometry.WorldChunk = &.{},
-    chunk_generation_request_lookup: []u16 = &.{},
-    chunk_generation_request_count: usize = 0,
-    chunk_generation_request_cursor: usize = 0,
-    chunk_generation_active: bool = false,
-    chunk_generation_requested_emitted: bool = false,
-
-    fn allocateStorage(self: *Blocks, allocator: std.mem.Allocator, configuration: Configuration) !void {
-        try configuration.validate();
-        self.* = .{};
-        self.modified_sections = try preallocated.alloc(ModifiedSection, allocator, configuration.maximum_modified_sections);
-        self.free_modified_sections = try preallocated.alloc(u16, allocator, configuration.maximum_modified_sections);
-        self.section_pages = try preallocated.alignedAlloc([blocks_per_section]i32, allocator, .@"64", configuration.maximum_modified_sections);
-        self.free_section_pages = try preallocated.alloc(u16, allocator, configuration.maximum_modified_sections);
-        self.block_mutations = try preallocated.alloc(geometry.BlockMutation, allocator, configuration.maximum_block_mutations);
-        self.resident_chunks = try preallocated.alloc(GeneratedHeightChunk, allocator, configuration.maximum_resident_chunks);
-        self.resident_shape_storage = try preallocated.alignedAlloc(
-            u8,
-            allocator,
-            .@"64",
-            configuration.maximum_resident_chunks * terrain.chunk_storage_capacity,
-        );
-        self.resident_chunk_lookup = try preallocated.alloc(u16, allocator, configuration.maximum_resident_chunks * 2);
-        self.free_resident_chunks = try preallocated.alloc(u16, allocator, configuration.maximum_resident_chunks);
-        self.active_resident_indices = try preallocated.alloc(u16, allocator, configuration.maximum_resident_chunks);
-        self.resident_active_positions = try preallocated.alloc(u16, allocator, configuration.maximum_resident_chunks);
-        const random_tick_masks = @min(configuration.maximum_resident_chunks * 2, @as(usize, random_tick_mask_columns - 1));
-        self.random_tick_masks = try preallocated.alignedAlloc([blocks_per_section / 64]u64, allocator, .@"64", random_tick_masks);
-        self.free_random_tick_masks = try preallocated.alloc(u16, allocator, random_tick_masks);
-        self.chunk_generation_requests =
-            try preallocated.alloc(geometry.WorldChunk, allocator, configuration.maximum_resident_chunks);
-        self.chunk_generation_request_lookup =
-            try preallocated.alloc(u16, allocator, configuration.maximum_resident_chunks * 2);
-        @memset(self.resident_chunk_lookup, resident_chunk_empty);
-        self.resetStorageState();
-    }
 
     pub fn init(allocator: std.mem.Allocator, configuration: Configuration) !*Blocks {
         const self = try allocator.create(Blocks);
-        try self.allocateStorage(allocator, configuration);
+        try configuration.validate();
+        self.* = .{};
+        self.shape_storage = try preallocated.alignedAlloc(
+            [terrain.chunk_storage_capacity]u8,
+            allocator,
+            .@"64",
+            configuration.maximum_transient_chunks,
+        );
+        self.modified_sections = try preallocated.alloc(ModifiedSection, allocator, configuration.maximum_modified_sections);
+        self.free_modified_sections = try preallocated.alloc(u16, allocator, configuration.maximum_modified_sections);
+        self.dense_sections = try preallocated.alignedAlloc([blocks_per_section]i32, allocator, .@"64", configuration.maximum_modified_sections);
+        self.free_dense_sections = try preallocated.alloc(u16, allocator, configuration.maximum_modified_sections);
+        self.block_mutations = try preallocated.alloc(geometry.BlockMutation, allocator, configuration.maximum_block_mutations);
+        self.materializations = try preallocated.alloc(Materialization, allocator, configuration.maximum_block_mutations);
+        self.materialized_chunks = try preallocated.alloc(MaterializedChunk, allocator, configuration.maximum_transient_chunks);
+        self.materialization_lookup = try preallocated.alloc(u16, allocator, configuration.maximum_transient_chunks * 2);
+        self.free_materializations = try preallocated.alloc(u16, allocator, configuration.maximum_transient_chunks);
+        self.active_materialization_indices = try preallocated.alloc(u16, allocator, configuration.maximum_transient_chunks);
+        self.materialization_active_positions = try preallocated.alloc(u16, allocator, configuration.maximum_transient_chunks);
+        const random_tick_masks = @min(configuration.maximum_transient_chunks * 2, @as(usize, random_tick_mask_columns - 1));
+        self.random_tick_masks = try preallocated.alignedAlloc([blocks_per_section / 64]u64, allocator, .@"64", random_tick_masks);
+        self.free_random_tick_masks = try preallocated.alloc(u16, allocator, random_tick_masks);
+        self.resetStorageState();
         return self;
     }
 
@@ -208,43 +284,39 @@ pub const Blocks = struct {
     }
 
     fn resetStorageState(self: *Blocks) void {
-        self.free_modified_section_count = 0;
-        self.modified_section_pool_initialized = false;
+        for (self.free_modified_sections, 0..) |*entry, index|
+            entry.* = @intCast(self.free_modified_sections.len - 1 - index);
+        self.free_modified_section_count = self.free_modified_sections.len;
         self.modified_block_count = 0;
         self.modified_section_count = 0;
-        self.free_section_page_count = 0;
-        self.page_pool_initialized = false;
+        for (self.free_dense_sections, 0..) |*entry, index|
+            entry.* = @intCast(self.free_dense_sections.len - 1 - index);
+        self.free_dense_section_count = self.free_dense_sections.len;
         self.next_section_revision = 1;
         self.block_mutation_sequence = 0;
-        self.free_resident_chunk_count = 0;
-        self.resident_chunk_count = 0;
-        self.resident_pool_initialized = false;
-        self.resident_pressure = false;
-        self.resident_binding_revision = 1;
-        self.resident_ticket_generation = 1;
-        self.resident_ticket_previous_generation = 0;
-        self.free_random_tick_mask_count = 0;
-        self.random_tick_mask_pool_initialized = false;
-        self.chunk_generation_request_count = 0;
-        self.chunk_generation_request_cursor = 0;
-        self.chunk_generation_active = false;
-        self.chunk_generation_requested_emitted = false;
-        @memset(
-            self.chunk_generation_request_lookup,
-            no_generation_request,
-        );
+        self.chunk_change_sequence = 0;
+        for (self.free_materializations, 0..) |*entry, index|
+            entry.* = @intCast(self.free_materializations.len - 1 - index);
+        self.free_materialization_count = self.free_materializations.len;
+        self.materialization_count = 0;
+        self.materialization_pressure = false;
+        self.materialization_binding_revision = 1;
+        for (self.free_random_tick_masks, 0..) |*entry, index|
+            entry.* = @intCast(self.free_random_tick_masks.len - 1 - index);
+        self.free_random_tick_mask_count = self.free_random_tick_masks.len;
+        @memset(self.materialization_lookup, materialization_empty);
     }
 
     pub fn blockAt(self: *const Blocks, world: world_identity.Handle, pos: geometry.BlockPos) i32 {
         const chunk: geometry.ChunkPos = geometry.chunkForBlock(pos);
-        const resident = self.residentChunk(world, chunk) orelse
-            diagnostics.panic("world query touched non-resident chunk; load or generate it explicitly (chunk x, chunk z, block x, block y, block z)", &.{ diagnostics.integer(chunk.x), diagnostics.integer(chunk.z), diagnostics.integer(pos.x), diagnostics.integer(pos.y), diagnostics.integer(pos.z) });
-        return self.blockAtResident(resident, pos);
+        const resident = self.materializedChunk(world, chunk) orelse
+            diagnostics.panic("world query touched non-materialized chunk; load or generate it explicitly (chunk x, chunk z, block x, block y, block z)", &.{ diagnostics.integer(chunk.x), diagnostics.integer(chunk.z), diagnostics.integer(pos.x), diagnostics.integer(pos.y), diagnostics.integer(pos.z) });
+        return self.blockAtMaterialized(resident, pos);
     }
 
-    pub fn blockAtIfResident(self: *const Blocks, world: world_identity.Handle, pos: geometry.BlockPos) ?i32 {
-        const resident = self.residentChunk(world, geometry.chunkForBlock(pos)) orelse return null;
-        return self.blockAtResident(resident, pos);
+    pub fn blockAtIfMaterialized(self: *const Blocks, world: world_identity.Handle, pos: geometry.BlockPos) ?i32 {
+        const resident = self.materializedChunk(world, geometry.chunkForBlock(pos)) orelse return null;
+        return self.blockAtMaterialized(resident, pos);
     }
 
     pub fn blockMutation(self: *const Blocks, sequence: u64) geometry.BlockMutation {
@@ -252,11 +324,46 @@ pub const Blocks = struct {
         return self.block_mutations[(sequence -% 1) % self.block_mutations.len];
     }
 
+    /// Call only after storage owns the complete replacement record.
+    pub fn acceptStoredMutations(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, mutations: []const geometry.BlockMutation) void {
+        if (self.materializedChunk(world, chunk) != null) {
+            self.markChunkClean(world, chunk);
+            std.debug.assert(self.evictChunk(world, chunk));
+        }
+        for (mutations) |mutation| {
+            std.debug.assert(mutation.world.eql(world) and geometry.sameChunk(geometry.chunkForBlock(mutation.pos), chunk));
+            if (mutation.previous_state != mutation.block_state)
+                self.recordBlockMutation(world, mutation.pos, mutation.previous_state, mutation.block_state);
+        }
+    }
+
     pub fn blockMutationSequence(self: *const Blocks) u64 {
         return self.block_mutation_sequence;
     }
 
-    pub fn modifiedSection(self: *const Blocks, resident: *const GeneratedHeightChunk, section: usize) ?*const ModifiedSection {
+    pub fn mutationCursor(self: *const Blocks) MutationCursor {
+        return .{ .sequence = self.block_mutation_sequence };
+    }
+
+    pub fn mutationCursorFrom(_: *const Blocks, sequence: u64) MutationCursor {
+        return .{ .sequence = sequence };
+    }
+
+    pub fn materializationCursor(self: *const Blocks) MaterializationCursor {
+        return .{ .sequence = self.chunk_change_sequence };
+    }
+
+    pub fn materializationCursorFrom(_: *const Blocks, sequence: u64) MaterializationCursor {
+        return .{ .sequence = sequence };
+    }
+
+    pub fn materialized(self: *const Blocks, event: Materialization) ?*const MaterializedChunk {
+        const resident = self.materializedChunk(event.world, event.chunk) orelse return null;
+        if (resident.content_revision != event.content_revision or resident.binding_revision != event.binding_revision) return null;
+        return resident;
+    }
+
+    pub fn modifiedSection(self: *const Blocks, resident: *const MaterializedChunk, section: usize) ?*const ModifiedSection {
         const index = self.modifiedSectionIndex(resident, section) orelse return null;
         return &self.modified_sections[index];
     }
@@ -265,19 +372,19 @@ pub const Blocks = struct {
         return self.modifiedBlockState(entry, local_index);
     }
 
-    pub fn blockAtResident(self: *const Blocks, resident: *const GeneratedHeightChunk, pos: geometry.BlockPos) i32 {
+    pub fn blockAtMaterialized(self: *const Blocks, resident: *const MaterializedChunk, pos: geometry.BlockPos) i32 {
         std.debug.assert(geometry.sameChunk(resident.chunk, geometry.chunkForBlock(pos)));
         if (sectionIndexForY(pos.y)) |section| {
             if (resident.modified_section_mask & (@as(u32, 1) << @intCast(section)) != 0) {
                 const table_index = self.modifiedSectionIndex(resident, section) orelse
-                    diagnostics.panic("resident modified-section mask is stale (chunk x, chunk z, section)", &.{ diagnostics.integer(resident.chunk.x), diagnostics.integer(resident.chunk.z), diagnostics.integer(section) });
+                    diagnostics.panic("materialized modified-section mask is stale (chunk x, chunk z, section)", &.{ diagnostics.integer(resident.chunk.x), diagnostics.integer(resident.chunk.z), diagnostics.integer(section) });
                 return self.sectionBlockState(resident, section, localBlockIndex(pos), table_index);
             }
         }
         return terrain.blockAtFromShape(&resident.shape, pos.x, pos.y, pos.z);
     }
 
-    pub fn grassAboveIsBlocked(self: *const Blocks, resident: *const GeneratedHeightChunk, grass: geometry.BlockPos) bool {
+    pub fn grassAboveIsBlocked(self: *const Blocks, resident: *const MaterializedChunk, grass: geometry.BlockPos) bool {
         const above = geometry.BlockPos{ .x = grass.x, .y = grass.y + 1, .z = grass.z };
         if (sectionIndexForY(above.y)) |section| {
             if (resident.modified_section_mask & (@as(u32, 1) << @intCast(section)) != 0) {
@@ -295,7 +402,7 @@ pub const Blocks = struct {
         ));
     }
 
-    pub fn grassCanSpreadAt(self: *const Blocks, resident: *const GeneratedHeightChunk, candidate: geometry.BlockPos) bool {
+    pub fn grassCanSpreadAt(self: *const Blocks, resident: *const MaterializedChunk, candidate: geometry.BlockPos) bool {
         const candidate_section = sectionIndexForY(candidate.y) orelse return false;
         const above = geometry.BlockPos{ .x = candidate.x, .y = candidate.y + 1, .z = candidate.z };
         const above_section = sectionIndexForY(above.y) orelse return false;
@@ -324,7 +431,7 @@ pub const Blocks = struct {
 
     pub fn sectionBlockState(
         self: *const Blocks,
-        resident: *const GeneratedHeightChunk,
+        resident: *const MaterializedChunk,
         section: usize,
         local_index: u16,
         modified_index: ?usize,
@@ -352,7 +459,7 @@ pub const Blocks = struct {
 
     pub fn sectionBlockHasRandomTicks(
         self: *const Blocks,
-        resident: *const GeneratedHeightChunk,
+        resident: *const MaterializedChunk,
         section: usize,
         local_index: u16,
         modified_index: ?usize,
@@ -376,7 +483,7 @@ pub const Blocks = struct {
 
     pub fn sectionRandomTickBlockState(
         self: *const Blocks,
-        resident: *const GeneratedHeightChunk,
+        resident: *const MaterializedChunk,
         section: usize,
         local_index: u16,
         modified_index: ?usize,
@@ -412,13 +519,13 @@ pub const Blocks = struct {
             self.sectionBlockState(resident, section, local_index, null);
     }
 
-    pub fn sectionUsesRandomTickColumns(resident: *const GeneratedHeightChunk, section: usize) bool {
+    pub fn sectionUsesRandomTickColumns(resident: *const MaterializedChunk, section: usize) bool {
         return resident.random_tick_mask_handles[section] == random_tick_mask_columns;
     }
 
     pub fn columnRandomTickBlockState(
         self: *const Blocks,
-        resident: *const GeneratedHeightChunk,
+        resident: *const MaterializedChunk,
         section: usize,
         local_index: u16,
     ) ?i32 {
@@ -433,7 +540,7 @@ pub const Blocks = struct {
     }
 
     fn modifiedBlockState(self: *const Blocks, entry: *const ModifiedSection, local_index: u16) i32 {
-        if (entry.dense) return self.section_pages[entry.page_index][local_index];
+        if (entry.dense) return self.denseSection(entry.dense_index)[local_index];
         for (entry.sparse_indices[0..entry.sparse_count], 0..) |index, sparse_index| {
             if (index == local_index) return entry.sparse_states[sparse_index];
         }
@@ -444,9 +551,9 @@ pub const Blocks = struct {
         return self.modifiedBlockState(&self.modified_sections[table_index], local_index);
     }
 
-    pub fn generatedHeightChunkRef(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, tick: u64) GeneratedHeightRef {
-        if (self.residentChunkIndex(world, chunk)) |index| {
-            const entry = &self.resident_chunks[index];
+    pub fn materializeGeneratedChunk(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, tick: u64) MaterializedChunkRef {
+        if (self.materializedChunkIndex(world, chunk)) |index| {
+            const entry = &self.materialized_chunks[index];
             entry.last_used_tick = tick;
             return .{ .index = @intCast(index), .entry = entry };
         }
@@ -461,267 +568,151 @@ pub const Blocks = struct {
                     diagnostics.text(@errorName(err)),
                 },
             );
-        const index = self.installResidentChunk(world, shape, tick, .generated_unknown) catch |err|
-            diagnostics.panic("failed to generate resident chunk (chunk x, chunk z, error)", &.{ diagnostics.integer(chunk.x), diagnostics.integer(chunk.z), diagnostics.text(@errorName(err)) });
-        return .{ .index = @intCast(index), .entry = &self.resident_chunks[index] };
+        const index = self.installMaterialization(world, shape, tick, .generated) catch |err|
+            diagnostics.panic("failed to materialize generated chunk (chunk x, chunk z, error)", &.{ diagnostics.integer(chunk.x), diagnostics.integer(chunk.z), diagnostics.text(@errorName(err)) });
+        return .{ .index = @intCast(index), .entry = &self.materialized_chunks[index] };
     }
 
     pub fn requestChunkGeneration(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos) bool {
-        if (self.residentChunk(world, chunk) != null) return true;
-        self.compactGenerationRequests();
-        var probe = generatedHeightHash(world, chunk);
-        var searched: usize = 0;
-        while (searched < self.chunk_generation_request_lookup.len) : ({
-            searched += 1;
-            probe += 1;
-        }) {
-            const lookup_index =
-                probe & (self.chunk_generation_request_lookup.len - 1);
-            const encoded = self.chunk_generation_request_lookup[lookup_index];
-            if (encoded == no_generation_request) {
-                if (self.chunk_generation_request_count ==
-                    self.chunk_generation_requests.len)
-                    return false;
-                const index = self.chunk_generation_request_count;
-                self.chunk_generation_request_count += 1;
-                self.chunk_generation_requests[index] = .{ .world = world, .pos = chunk };
-                self.chunk_generation_request_lookup[lookup_index] =
-                    @intCast(index);
-                return true;
-            }
-            const pending = self.chunk_generation_requests[encoded];
-            if (pending.world.eql(world) and geometry.sameChunk(pending.pos, chunk)) return true;
-        }
-        return false;
+        if (self.materializedChunk(world, chunk) != null) return true;
+        const generator = self.generator orelse return false;
+        return generator.request(world, chunk, .simulation);
+    }
+
+    pub fn requestStreamingChunkGeneration(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos) bool {
+        if (self.materializedChunk(world, chunk) != null) return true;
+        const generator = self.generator orelse return false;
+        return generator.request(world, chunk, .streaming);
     }
 
     pub fn generationRequestCapacity(self: *const Blocks) usize {
-        return self.chunk_generation_requests.len;
+        return if (self.generator) |generator| generator.capacity() else 0;
     }
 
-    fn compactGenerationRequests(self: *Blocks) void {
-        if (self.chunk_generation_request_cursor == 0) return;
-        const remaining = self.chunk_generation_request_count -
-            self.chunk_generation_request_cursor;
-        std.mem.copyForwards(
-            geometry.WorldChunk,
-            self.chunk_generation_requests[0..remaining],
-            self.chunk_generation_requests[self.chunk_generation_request_cursor..self.chunk_generation_request_count],
-        );
-        self.chunk_generation_request_count = remaining;
-        self.chunk_generation_request_cursor = 0;
-        @memset(self.chunk_generation_request_lookup, no_generation_request);
-        for (0..remaining) |index|
-            self.insertGenerationRequestLookup(@intCast(index));
-    }
-
-    pub fn generateRequestedChunk(self: *Blocks, tick: u64) ChunkGenerationResult {
-        if (self.chunk_generation_request_cursor ==
-            self.chunk_generation_request_count)
-            return .idle;
-        const request = self.chunk_generation_requests[
-            self.chunk_generation_request_cursor
-        ];
-        const world = request.world;
-        const chunk = request.pos;
-        if (!self.chunk_generation_active and self.residentChunk(world, chunk) != null) {
-            self.chunk_generation_active = false;
-            self.chunk_generation_requested_emitted = false;
-            self.chunk_generation_request_cursor += 1;
-            self.finishGenerationBatchIfDrained();
-            return .complete;
-        }
-        if (self.resident_chunk_count == self.resident_chunks.len) {
-            self.resident_pressure = true;
-            return .backpressured;
-        }
-        if (!self.chunk_generation_active)
-            self.chunk_generation_requested_emitted = false;
-        var generation_sink = GenerationSink{
-            .blocks = self,
-            .world = world,
-            .requested = chunk,
-            .tick = tick,
-            .requested_emitted = &self.chunk_generation_requested_emitted,
+    pub fn generationMetrics(self: *const Blocks) GenerationMetrics {
+        return if (self.generator) |generator| generator.metrics() else .{
+            .calls = 0,
+            .nanoseconds = 0,
+            .maximum_nanoseconds = 0,
+            .emitted = 0,
+            .installed = 0,
+            .materialization_nanoseconds = 0,
         };
-        const sink = generator_api.Sink{
-            .context = &generation_sink,
-            .emit_fn = GenerationSink.emit,
-        };
-        const result = (self.generator orelse
-            diagnostics.panic("world generator is not bound", &.{}))
-            .advance(world, chunk, sink) catch |err| switch (err) {
-            error.ResidentChunkCapacity => {
-                self.resident_pressure = true;
-                return .backpressured;
-            },
-            else => diagnostics.panic(
-                "failed to generate terrain chunk (chunk x, chunk z, error)",
-                &.{
-                    diagnostics.integer(chunk.x),
-                    diagnostics.integer(chunk.z),
-                    diagnostics.text(@errorName(err)),
-                },
-            ),
-        };
-        if (result == .pending) {
-            self.chunk_generation_active = true;
-            return .pending;
-        }
-        self.chunk_generation_active = false;
-        if (!self.chunk_generation_requested_emitted)
-            diagnostics.panic(
-                "world generator completed without requested chunk (chunk x, chunk z)",
-                &.{ diagnostics.integer(chunk.x), diagnostics.integer(chunk.z) },
-            );
-        self.chunk_generation_requested_emitted = false;
-        self.chunk_generation_request_cursor += 1;
-        self.finishGenerationBatchIfDrained();
-        return .complete;
-    }
-
-    pub fn beginChunkGenerationBatch(self: *Blocks) void {
-        if (self.chunk_generation_active) {
-            std.debug.assert(
-                self.chunk_generation_request_cursor <
-                    self.chunk_generation_request_count,
-            );
-            self.chunk_generation_requests[0] =
-                self.chunk_generation_requests[
-                    self.chunk_generation_request_cursor
-                ];
-            self.chunk_generation_request_count = 1;
-        } else {
-            self.chunk_generation_request_count = 0;
-        }
-        self.chunk_generation_request_cursor = 0;
-        @memset(
-            self.chunk_generation_request_lookup,
-            no_generation_request,
-        );
-        if (self.chunk_generation_active)
-            self.insertGenerationRequestLookup(0);
     }
 
     pub fn pendingChunkGenerationCount(self: *const Blocks) usize {
-        return self.chunk_generation_request_count -
-            self.chunk_generation_request_cursor;
+        return if (self.generator) |generator| generator.pending() else 0;
     }
 
-    fn finishGenerationBatchIfDrained(self: *Blocks) void {
-        if (self.chunk_generation_request_cursor !=
-            self.chunk_generation_request_count)
-            return;
-        self.chunk_generation_request_count = 0;
-        self.chunk_generation_request_cursor = 0;
-        self.chunk_generation_active = false;
-        self.chunk_generation_requested_emitted = false;
-        @memset(
-            self.chunk_generation_request_lookup,
-            no_generation_request,
-        );
-    }
-
-    fn insertGenerationRequestLookup(self: *Blocks, request_index: u16) void {
-        const request = self.chunk_generation_requests[request_index];
-        var probe = generatedHeightHash(request.world, request.pos);
-        for (0..self.chunk_generation_request_lookup.len) |_| {
-            const lookup_index =
-                probe & (self.chunk_generation_request_lookup.len - 1);
-            if (self.chunk_generation_request_lookup[lookup_index] ==
-                no_generation_request)
-            {
-                self.chunk_generation_request_lookup[lookup_index] =
-                    request_index;
-                return;
-            }
-            probe += 1;
-        }
-        unreachable;
-    }
-
-    pub fn chunkGenerationPending(self: *const Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos) bool {
-        var probe = generatedHeightHash(world, chunk);
-        for (0..self.chunk_generation_request_lookup.len) |_| {
-            const encoded = self.chunk_generation_request_lookup[
-                probe & (self.chunk_generation_request_lookup.len - 1)
-            ];
-            if (encoded == no_generation_request) return false;
-            const request = self.chunk_generation_requests[encoded];
-            if (request.world.eql(world) and geometry.sameChunk(request.pos, chunk))
-                return encoded >= self.chunk_generation_request_cursor;
-            probe += 1;
-        }
+    pub fn hasMaterializationCapacity(self: *Blocks) bool {
+        if (self.free_materialization_count != 0 and self.materialization_count != self.materialized_chunks.len) return true;
+        self.materialization_pressure = true;
         return false;
     }
 
-    pub fn installResidentChunk(self: *Blocks, world: world_identity.Handle, shape: terrain.ChunkShape, tick: u64, source: ResidentChunkSource) !usize {
+    pub fn installMaterialization(self: *Blocks, world: world_identity.Handle, shape: terrain.ChunkShape, tick: u64, source: MaterializationSource) !usize {
+        return self.installMaterializationWithRevision(world, shape, tick, source, self.takeSectionRevision(), true);
+    }
+
+    /// Installs validated canonical bytes without exposing a materialization
+    /// event until every persisted modified section has been restored.
+    pub fn installPersistedMaterialization(self: *Blocks, world: world_identity.Handle, shape: terrain.ChunkShape, tick: u64, content_revision: u64) !usize {
+        try self.observeContentRevision(content_revision);
+        if (self.next_section_revision > maximum_persisted_content_revision + 1)
+            return error.ContentRevisionExhausted;
+        return self.installMaterializationWithRevision(world, shape, tick, .persisted, content_revision, false);
+    }
+
+    pub fn finishPersistedMaterialization(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, content_revision: u64) void {
+        const entry = self.materializedChunkMut(world, chunk) orelse unreachable;
+        std.debug.assert(entry.content_revision != 0 and content_revision != 0);
+        entry.content_revision = content_revision;
+        entry.revision = 0;
+        entry.dirty = false;
+        var mask = entry.modified_section_mask;
+        while (mask != 0) {
+            const section: usize = @intCast(@ctz(mask));
+            mask &= mask - 1;
+            const table_index = self.modifiedSectionIndex(entry, section) orelse unreachable;
+            self.modified_sections[table_index].dirty = false;
+            self.modified_sections[table_index].revision = 0;
+        }
+        entry.dirty_section_mask = 0;
+        self.recordMaterialization(world, chunk, entry.content_revision, entry.binding_revision, .persisted);
+    }
+
+    pub fn nextContentRevision(self: *Blocks, previous: u64) !u64 {
+        try self.observeContentRevision(previous);
+        if (self.next_section_revision > maximum_persisted_content_revision)
+            return error.ContentRevisionExhausted;
+        return self.takeSectionRevision();
+    }
+
+    fn installMaterializationWithRevision(self: *Blocks, world: world_identity.Handle, shape: terrain.ChunkShape, tick: u64, source: MaterializationSource, content_revision: u64, publish: bool) !usize {
+        std.debug.assert(content_revision != 0);
         const chunk = geometry.ChunkPos{ .x = shape.chunk_x, .z = shape.chunk_z };
-        const dirty = source == .generated_new;
-        const persistence_known = source != .generated_unknown;
-        if (self.residentChunkIndex(world, chunk)) |index| {
-            const entry = &self.resident_chunks[index];
-            const content_revision = self.takeSectionRevision();
-            self.resident_binding_revision +%= 1;
-            self.releaseResidentRandomTickMasks(entry);
-            self.storeResidentShape(index, entry, shape, shape.storage);
+        const dirty = source == .generated;
+        if (self.materializedChunkIndex(world, chunk)) |index| {
+            const entry = &self.materialized_chunks[index];
+            self.releaseMaterializedRandomTickMasks(entry);
+            self.storeMaterializedShape(index, shape);
             entry.last_used_tick = tick;
-            entry.persistence_known = persistence_known;
             entry.dirty = dirty;
             entry.revision = if (dirty) content_revision else 0;
             entry.content_revision = content_revision;
-            self.refreshResidentDerived(entry);
+            entry.binding_revision = self.takeMaterializationBindingRevision();
+            if (publish) self.recordMaterialization(world, chunk, content_revision, entry.binding_revision, source);
             return index;
         }
-        self.ensureResidentPool();
-        if (self.free_resident_chunk_count == 0) {
-            self.resident_pressure = true;
-            return error.ResidentChunkCapacity;
+        if (self.free_materialization_count == 0) {
+            self.materialization_pressure = true;
+            return error.MaterializationCapacity;
         }
-        self.free_resident_chunk_count -= 1;
-        const index: usize = self.free_resident_chunks[self.free_resident_chunk_count];
-        const content_revision = self.takeSectionRevision();
-        const entry = &self.resident_chunks[index];
+        self.free_materialization_count -= 1;
+        const index: usize = self.free_materializations[self.free_materialization_count];
+        const entry = &self.materialized_chunks[index];
         entry.* = .{
             .valid = true,
             .dirty = dirty,
-            .persistence_known = persistence_known,
             .chunk = chunk,
             .world = world,
             .last_used_tick = tick,
             .revision = if (dirty) content_revision else 0,
             .content_revision = content_revision,
+            .binding_revision = self.takeMaterializationBindingRevision(),
         };
-        self.storeResidentShape(index, entry, shape, shape.storage);
-        self.refreshResidentDerived(entry);
-        try self.insertResidentLookup(world, chunk, index);
-        self.active_resident_indices[self.resident_chunk_count] = @intCast(index);
-        self.resident_active_positions[index] = @intCast(self.resident_chunk_count);
-        self.resident_chunk_count += 1;
+        self.storeMaterializedShape(index, shape);
+        try self.insertMaterializationLookup(world, chunk, index);
+        self.active_materialization_indices[self.materialization_count] = @intCast(index);
+        self.materialization_active_positions[index] = @intCast(self.materialization_count);
+        self.materialization_count += 1;
+        if (publish) self.recordMaterialization(world, chunk, content_revision, entry.binding_revision, source);
         return index;
     }
 
-    fn storeResidentShape(
+    fn storeMaterializedShape(
         self: *Blocks,
         index: usize,
-        entry: *GeneratedHeightChunk,
         shape: terrain.ChunkShape,
-        source: []const u8,
     ) void {
         std.debug.assert(shape.storage_len <= terrain.chunk_storage_capacity);
-        const offset = index * terrain.chunk_storage_capacity;
-        const storage = self.resident_shape_storage[offset..][0..terrain.chunk_storage_capacity];
-        @memcpy(storage[0..shape.storage_len], source[0..shape.storage_len]);
+        const entry = &self.materialized_chunks[index];
+        const storage = &self.shape_storage[index];
+        const destination = storage[0..shape.storage_len];
+        const source = shape.storage[0..shape.storage_len];
+        if (@intFromPtr(destination.ptr) < @intFromPtr(source.ptr)) {
+            std.mem.copyForwards(u8, destination, source);
+        } else if (@intFromPtr(destination.ptr) > @intFromPtr(source.ptr)) {
+            std.mem.copyBackwards(u8, destination, source);
+        }
         entry.shape = shape;
         entry.shape.storage = storage;
+        entry.heights = shape.heights;
+        entry.base_grass_spread_possible = shape.grass_spread_possible;
     }
 
-    fn releaseResidentShape(_: *Blocks, entry: *GeneratedHeightChunk) void {
-        entry.shape.storage = &.{};
-    }
-
-    fn refreshResidentDerived(self: *Blocks, entry: *GeneratedHeightChunk) void {
-        entry.base_grass_spread_possible = entry.shape.grass_spread_possible;
+    fn buildRandomTickDerived(self: *Blocks, entry: *MaterializedChunk) void {
+        std.debug.assert(entry.valid and !entry.random_tick_derived);
         var masks: [limits.section_count][terrain.random_tick_mask_words]u64 = undefined;
         entry.random_tick_sections = terrain.fillChunkRandomTickMasksFromShape(
             &entry.shape,
@@ -783,16 +774,27 @@ pub const Blocks = struct {
             entry.random_tick_mask_handles[section] = handle + 1;
             @memcpy(&self.random_tick_masks[handle], &masks[section]);
         }
+        entry.random_tick_derived = true;
+    }
+
+    fn ensureRandomTickDerived(self: *Blocks, entry: *MaterializedChunk) void {
+        if (!entry.random_tick_derived) self.buildRandomTickDerived(entry);
+    }
+
+    pub fn ensureMaterializedRandomTickDerived(self: *Blocks, index: u16) *const MaterializedChunk {
+        const entry = &self.materialized_chunks[index];
+        std.debug.assert(entry.valid);
+        self.ensureRandomTickDerived(entry);
+        return entry;
     }
 
     fn allocateRandomTickMask(self: *Blocks) ?u16 {
-        self.ensureRandomTickMaskPool();
         if (self.free_random_tick_mask_count == 0) return null;
         self.free_random_tick_mask_count -= 1;
         return self.free_random_tick_masks[self.free_random_tick_mask_count];
     }
 
-    fn releaseResidentRandomTickMasks(self: *Blocks, entry: *GeneratedHeightChunk) void {
+    fn releaseMaterializedRandomTickMasks(self: *Blocks, entry: *MaterializedChunk) void {
         for (&entry.random_tick_mask_handles) |*encoded| {
             if (encoded.* != 0 and encoded.* != random_tick_mask_unindexed and encoded.* != random_tick_mask_columns) {
                 self.free_random_tick_masks[self.free_random_tick_mask_count] = encoded.* - 1;
@@ -800,222 +802,216 @@ pub const Blocks = struct {
             }
             encoded.* = 0;
         }
+        entry.random_tick_derived = false;
     }
 
-    fn ensureRandomTickMaskPool(self: *Blocks) void {
-        if (self.random_tick_mask_pool_initialized) return;
-        for (self.free_random_tick_masks, 0..) |*entry, index|
-            entry.* = @intCast(self.free_random_tick_masks.len - 1 - index);
-        self.free_random_tick_mask_count = self.free_random_tick_masks.len;
-        self.random_tick_mask_pool_initialized = true;
+    pub fn materializedChunk(self: *const Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos) ?*const MaterializedChunk {
+        const index = self.materializedChunkIndex(world, chunk) orelse return null;
+        return &self.materialized_chunks[index];
     }
 
-    pub fn residentChunk(self: *const Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos) ?*const GeneratedHeightChunk {
-        const index = self.residentChunkIndex(world, chunk) orelse return null;
-        return &self.resident_chunks[index];
+    pub fn materializedChunkSlot(self: *const Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos) ?u16 {
+        return @intCast(self.materializedChunkIndex(world, chunk) orelse return null);
     }
 
-    pub fn residentChunkSlot(self: *const Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos) ?u16 {
-        return @intCast(self.residentChunkIndex(world, chunk) orelse return null);
+    pub fn materializationBindingRevision(self: *const Blocks) u64 {
+        return self.materialization_binding_revision;
     }
 
-    pub fn residentBindingRevision(self: *const Blocks) u64 {
-        return self.resident_binding_revision;
-    }
-
-    pub fn residentChunkRef(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, tick: u64) ?GeneratedHeightRef {
-        const index = self.residentChunkIndex(world, chunk) orelse return null;
-        const entry = &self.resident_chunks[index];
+    pub fn materializedChunkRef(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, tick: u64) ?MaterializedChunkRef {
+        const index = self.materializedChunkIndex(world, chunk) orelse return null;
+        const entry = &self.materialized_chunks[index];
         entry.last_used_tick = tick;
         return .{ .index = @intCast(index), .entry = entry };
     }
 
-    pub fn residentChunkMut(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos) ?*GeneratedHeightChunk {
-        const index = self.residentChunkIndex(world, chunk) orelse return null;
-        return &self.resident_chunks[index];
+    pub fn materializedChunkMut(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos) ?*MaterializedChunk {
+        const index = self.materializedChunkIndex(world, chunk) orelse return null;
+        return &self.materialized_chunks[index];
     }
 
-    pub fn residentChunkCount(self: *const Blocks) usize {
-        return self.resident_chunk_count;
+    pub fn materializedChunkCount(self: *const Blocks) usize {
+        return self.materialization_count;
     }
 
-    pub fn beginResidentTickets(self: *Blocks) void {
-        self.resident_ticket_previous_generation = self.resident_ticket_generation;
-        self.resident_ticket_generation +%= 1;
-        if (self.resident_ticket_generation == 0) {
-            for (self.active_resident_indices[0..self.resident_chunk_count]) |index|
-                self.resident_chunks[index].ticket_generation = 0;
-            self.resident_ticket_generation = 1;
-            self.resident_ticket_previous_generation = 0;
-        }
+    pub fn materializationCapacity(self: *const Blocks) usize {
+        return self.materialized_chunks.len;
     }
 
-    pub fn ticketResidentChunk(
+    pub fn modifiedSectionCount(self: *const Blocks) usize {
+        return self.modified_section_count;
+    }
+
+    pub fn modifiedSectionCapacity(self: *const Blocks) usize {
+        return self.modified_sections.len;
+    }
+
+    pub fn modifiedBlockCount(self: *const Blocks) usize {
+        return self.modified_block_count;
+    }
+
+    pub fn releaseUnusedMaterializations(self: *Blocks) usize {
+        return self.releaseMaterializationsRetaining(null, null);
+    }
+
+    pub fn releaseMaterializationsRetaining(
         self: *Blocks,
-        world: world_identity.Handle,
-        chunk: geometry.ChunkPos,
-    ) bool {
-        const resident = self.residentChunkMut(world, chunk) orelse return false;
-        resident.ticket_generation = self.resident_ticket_generation;
-        return true;
-    }
-
-    pub fn ticketResidentIndex(self: *Blocks, index: usize) bool {
-        if (index >= self.resident_chunks.len or !self.resident_chunks[index].valid)
-            return false;
-        self.resident_chunks[index].ticket_generation = self.resident_ticket_generation;
-        return true;
-    }
-
-    pub fn residentChunkTicketed(
-        self: *const Blocks,
-        world: world_identity.Handle,
-        chunk: geometry.ChunkPos,
-    ) bool {
-        const resident = self.residentChunk(world, chunk) orelse return false;
-        return self.ticketActive(resident);
-    }
-
-    pub fn evictUnticketedChunks(self: *Blocks) usize {
+        context: ?*const anyopaque,
+        retain: ?*const fn (*const anyopaque, world_identity.Handle, geometry.ChunkPos) bool,
+    ) usize {
         var evicted: usize = 0;
-        var position = self.resident_chunk_count;
+        var position = self.materialization_count;
         while (position != 0) {
             position -= 1;
-            const index = self.active_resident_indices[position];
-            const resident = self.resident_chunks[index];
-            if (self.ticketActive(&resident) or !resident.persistence_known or
-                self.chunkDirty(resident.world, resident.chunk)) continue;
+            const index = self.active_materialization_indices[position];
+            const resident = self.materialized_chunks[index];
+            if (self.chunkDirty(resident.world, resident.chunk)) continue;
+            if (retain) |function| if (function(context.?, resident.world, resident.chunk)) continue;
             std.debug.assert(self.evictChunk(resident.world, resident.chunk));
             evicted += 1;
         }
-        self.resident_pressure = false;
+        self.materialization_pressure = false;
         return evicted;
     }
 
-    pub fn releaseStreamedChunk(
-        self: *Blocks,
-        world: world_identity.Handle,
-        chunk: geometry.ChunkPos,
-    ) ?u16 {
-        const resident = self.residentChunk(world, chunk) orelse return null;
-        if (self.ticketActive(resident) or
-            !resident.persistence_known or self.chunkDirty(world, chunk)) return null;
-        const index = self.residentChunkIndex(world, chunk) orelse unreachable;
-        std.debug.assert(self.evictChunk(world, chunk));
-        return @intCast(index);
+    pub fn materializationPressure(self: *const Blocks) bool {
+        return self.materialization_pressure;
     }
 
-    fn ticketActive(self: *const Blocks, resident: *const GeneratedHeightChunk) bool {
-        return resident.ticket_generation == self.resident_ticket_generation or
-            (self.resident_ticket_previous_generation != 0 and
-                resident.ticket_generation == self.resident_ticket_previous_generation);
+    pub fn requestMaterializationRelease(self: *Blocks) void {
+        self.materialization_pressure = true;
     }
 
-    pub fn residentPressure(self: *const Blocks) bool {
-        return self.resident_pressure;
+    pub fn clearMaterializationPressure(self: *Blocks) void {
+        self.materialization_pressure = false;
     }
 
-    pub fn requestResidentEviction(self: *Blocks) void {
-        self.resident_pressure = true;
-    }
-
-    pub fn clearResidentPressure(self: *Blocks) void {
-        self.resident_pressure = false;
-    }
-
-    fn residentChunkIndex(self: *const Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos) ?usize {
-        if (!self.resident_pool_initialized) return null;
+    fn materializedChunkIndex(self: *const Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos) ?usize {
+        if (self.materialization_lookup.len == 0) return null;
         var probe = generatedHeightHash(world, chunk);
         var searched: usize = 0;
-        while (searched < self.resident_chunk_lookup.len) : ({
+        while (searched < self.materialization_lookup.len) : ({
             searched += 1;
             probe += 1;
         }) {
-            const slot = self.resident_chunk_lookup[probe & (self.resident_chunk_lookup.len - 1)];
-            if (slot == resident_chunk_empty) return null;
-            const entry = &self.resident_chunks[slot];
+            const slot = self.materialization_lookup[probe & (self.materialization_lookup.len - 1)];
+            if (slot == materialization_empty) return null;
+            const entry = &self.materialized_chunks[slot];
             if (entry.valid and entry.world.eql(world) and geometry.sameChunk(entry.chunk, chunk)) return slot;
         }
         return null;
     }
 
-    fn ensureResidentPool(self: *Blocks) void {
-        if (self.resident_pool_initialized) return;
-        @memset(self.resident_chunk_lookup, resident_chunk_empty);
-        for (0..self.free_resident_chunks.len) |index|
-            self.free_resident_chunks[index] = @intCast(self.free_resident_chunks.len - 1 - index);
-        self.free_resident_chunk_count = self.free_resident_chunks.len;
-        self.resident_pool_initialized = true;
-    }
-
-    fn insertResidentLookup(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, resident_index: usize) !void {
+    fn insertMaterializationLookup(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, resident_index: usize) !void {
         var probe = generatedHeightHash(world, chunk);
-        for (0..self.resident_chunk_lookup.len) |_| {
-            const index = probe & (self.resident_chunk_lookup.len - 1);
-            if (self.resident_chunk_lookup[index] == resident_chunk_empty) {
-                self.resident_chunk_lookup[index] = @intCast(resident_index);
+        for (0..self.materialization_lookup.len) |_| {
+            const index = probe & (self.materialization_lookup.len - 1);
+            if (self.materialization_lookup[index] == materialization_empty) {
+                self.materialization_lookup[index] = @intCast(resident_index);
                 return;
             }
             probe += 1;
         }
-        return error.ResidentChunkLookupFull;
-    }
-
-    pub fn generatedHeightChunk(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, tick: u64) *const GeneratedHeightChunk {
-        return self.generatedHeightChunkRef(world, chunk, tick).entry;
+        return error.MaterializationLookupFull;
     }
 
     pub fn ensureChunkAt(self: *Blocks, world: world_identity.Handle, x: i32, z: i32, tick: u64) void {
-        _ = self.generatedHeightChunkRef(world, .{ .x = @divFloor(x, 16), .z = @divFloor(z, 16) }, tick);
+        _ = self.materializeGeneratedChunk(world, .{ .x = @divFloor(x, 16), .z = @divFloor(z, 16) }, tick);
     }
 
-    pub fn blockRectangleResident(self: *const Blocks, world: world_identity.Handle, min_x: i32, max_x: i32, min_z: i32, max_z: i32) bool {
+    pub fn blockRectangleMaterialized(self: *const Blocks, world: world_identity.Handle, min_x: i32, max_x: i32, min_z: i32, max_z: i32) bool {
         var chunk_z = @divFloor(min_z, 16);
         const last_z = @divFloor(max_z, 16);
         while (chunk_z <= last_z) : (chunk_z += 1) {
             var chunk_x = @divFloor(min_x, 16);
             const last_x = @divFloor(max_x, 16);
             while (chunk_x <= last_x) : (chunk_x += 1) {
-                if (self.residentChunk(world, .{ .x = chunk_x, .z = chunk_z }) == null) return false;
+                if (self.materializedChunk(world, .{ .x = chunk_x, .z = chunk_z }) == null) return false;
             }
         }
         return true;
     }
 
-    pub fn generatedHeightChunkHint(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, tick: u64, hint: *u16) *const GeneratedHeightChunk {
-        const index: usize = hint.*;
-        if (index < self.resident_chunks.len) {
-            const entry = &self.resident_chunks[index];
-            if (entry.valid and entry.world.eql(world) and geometry.sameChunk(entry.chunk, chunk)) {
-                entry.last_used_tick = tick;
-                return entry;
-            }
-        }
-        const resolved = self.generatedHeightChunkRef(world, chunk, tick);
-        hint.* = resolved.index;
-        return resolved.entry;
+    fn sameMutationSection(a: MutationWrite, world: world_identity.Handle, chunk: geometry.ChunkPos, section: usize) bool {
+        return a.world.eql(world) and geometry.sameChunk(geometry.chunkForBlock(a.pos), chunk) and sectionIndexForY(a.pos.y) == section;
     }
 
-    pub fn generatedHeightChunkHintNoTouch(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, tick: u64, hint: *u16) *const GeneratedHeightChunk {
-        const index: usize = hint.*;
-        if (index < self.resident_chunks.len) {
-            const entry = &self.resident_chunks[index];
-            if (entry.valid and entry.world.eql(world) and geometry.sameChunk(entry.chunk, chunk)) return entry;
+    fn sameMutationPosition(a: geometry.BlockPos, b: geometry.BlockPos) bool {
+        return a.x == b.x and a.y == b.y and a.z == b.z;
+    }
+
+    fn isFirstSectionWrite(writes: []const MutationWrite, index: usize, world: world_identity.Handle, chunk: geometry.ChunkPos, section: usize) bool {
+        for (writes[0..index]) |candidate| if (sameMutationSection(candidate, world, chunk, section)) return false;
+        return true;
+    }
+
+    fn isFinalSectionWrite(writes: []const MutationWrite, index: usize, world: world_identity.Handle, chunk: geometry.ChunkPos, section: usize) bool {
+        const candidate = writes[index];
+        if (!sameMutationSection(candidate, world, chunk, section)) return false;
+        return isFinalMutationWrite(writes, index);
+    }
+
+    fn isFinalMutationWrite(writes: []const MutationWrite, index: usize) bool {
+        const candidate = writes[index];
+        for (writes[index + 1 ..]) |later|
+            if (later.world.eql(candidate.world) and sameMutationPosition(later.pos, candidate.pos)) return false;
+        return true;
+    }
+
+    pub fn prepareBlockWrites(self: *const Blocks, writes: []const MutationWrite) !void {
+        var required_sections: usize = 0;
+        for (writes, 0..) |write, first_index| {
+            const section = sectionIndexForY(write.pos.y) orelse continue;
+            const chunk = geometry.chunkForBlock(write.pos);
+            if (!isFirstSectionWrite(writes, first_index, write.world, chunk, section)) continue;
+            const resident = self.materializedChunk(write.world, chunk) orelse return error.ChunkNotMaterialized;
+            const existing = self.modifiedSectionIndex(resident, section);
+            var final_count: i32 = if (existing) |index| self.modified_sections[index].modified_count else 0;
+            for (writes, 0..) |candidate, candidate_index| {
+                if (!isFinalSectionWrite(writes, candidate_index, write.world, chunk, section)) continue;
+                const local_index = localBlockIndex(candidate.pos);
+                const generated = terrain.blockAtFromShape(&resident.shape, candidate.pos.x, candidate.pos.y, candidate.pos.z);
+                const current = self.sectionBlockState(resident, section, local_index, existing);
+                if (current == generated and candidate.block_state != generated) final_count += 1;
+                if (current != generated and candidate.block_state == generated) final_count -= 1;
+            }
+            std.debug.assert(final_count >= 0 and final_count <= blocks_per_section);
+            if (existing == null and final_count != 0) required_sections += 1;
         }
-        const resolved = self.generatedHeightChunkRef(world, chunk, tick);
-        hint.* = resolved.index;
-        return resolved.entry;
+        if (required_sections > self.modified_sections.len - self.modified_section_count) return error.WorldSectionCapacity;
+    }
+
+    pub fn commitPreparedBlockWrites(self: *Blocks, writes: []const MutationWrite, changed: []bool) usize {
+        std.debug.assert(writes.len == changed.len);
+        var count: usize = 0;
+        for (writes, changed, 0..) |write, *was_changed, index| {
+            if (!isFinalMutationWrite(writes, index)) {
+                was_changed.* = false;
+                continue;
+            }
+            was_changed.* = self.setBlockPrepared(write.world, write.pos, write.block_state) catch |err|
+                diagnostics.panic("prepared block write failed (x, y, z, error)", &.{ diagnostics.integer(write.pos.x), diagnostics.integer(write.pos.y), diagnostics.integer(write.pos.z), diagnostics.text(@errorName(err)) });
+            count += @intFromBool(was_changed.*);
+        }
+        return count;
     }
 
     pub fn setBlock(self: *Blocks, world: world_identity.Handle, pos: geometry.BlockPos, block_state: i32) !bool {
+        const writes = [_]MutationWrite{.{ .world = world, .pos = pos, .block_state = block_state }};
+        try self.prepareBlockWrites(&writes);
+        var changed: [1]bool = undefined;
+        _ = self.commitPreparedBlockWrites(&writes, &changed);
+        return changed[0];
+    }
+
+    fn setBlockPrepared(self: *Blocks, world: world_identity.Handle, pos: geometry.BlockPos, block_state: i32) !bool {
         std.debug.assert(world_identity.valid(world));
         std.debug.assert(self.modified_block_count <= self.modified_sections.len * blocks_per_section);
         std.debug.assert(self.modified_section_count <= self.modified_sections.len);
         const section = sectionIndexForY(pos.y) orelse return false;
         const chunk = geometry.chunkForBlock(pos);
-        const generated_ref = self.generatedHeightChunkRef(world, chunk, 0);
+        const resident = self.materializedChunkMut(world, chunk) orelse return error.ChunkNotMaterialized;
         const local_index = localBlockIndex(pos);
-        const resident = &self.resident_chunks[generated_ref.index];
         const generated = terrain.blockAtFromShape(&resident.shape, pos.x, pos.y, pos.z);
         if (self.modifiedSectionIndex(resident, section)) |table_index|
             return self.setModifiedBlock(world, resident, table_index, section, local_index, generated, pos, block_state);
@@ -1026,13 +1022,13 @@ pub const Blocks = struct {
         return true;
     }
 
-    fn setModifiedBlock(self: *Blocks, world: world_identity.Handle, resident: *GeneratedHeightChunk, table_index: usize, section: usize, local_index: u16, generated: i32, pos: geometry.BlockPos, block_state: i32) !bool {
+    fn setModifiedBlock(self: *Blocks, world: world_identity.Handle, resident: *MaterializedChunk, table_index: usize, section: usize, local_index: u16, generated: i32, pos: geometry.BlockPos, block_state: i32) !bool {
         const entry = &self.modified_sections[table_index];
         const previous = self.sectionBlockState(resident, section, local_index, table_index);
         if (previous == block_state) return false;
         const sparse_index = findSparseIndex(entry, local_index);
         if (!entry.dense and block_state != generated and sparse_index == null and
-            entry.sparse_count == sparse_section_change_capacity) try self.promoteModifiedSection(entry);
+            entry.sparse_count == sparse_section_change_capacity) self.promoteModifiedSection(entry);
         self.storeModifiedBlock(entry, local_index, sparse_index, generated, block_state);
         const revision = self.markSectionChanged(resident, entry, section);
         updateRandomTickCount(entry, previous, block_state);
@@ -1049,13 +1045,13 @@ pub const Blocks = struct {
         return true;
     }
 
-    fn createBlockModification(self: *Blocks, resident: *GeneratedHeightChunk, section: usize, local_index: u16, generated: i32, block_state: i32) !void {
+    fn createBlockModification(self: *Blocks, resident: *MaterializedChunk, section: usize, local_index: u16, generated: i32, block_state: i32) !void {
+        const table_index = try self.createModifiedSection(resident, section);
         const revision = self.takeSectionRevision();
         resident.dirty = true;
         resident.revision = revision;
         resident.content_revision = revision;
         resident.dirty_section_mask |= @as(u32, 1) << @intCast(section);
-        const table_index = try self.createModifiedSection(resident, section);
         const entry = &self.modified_sections[table_index];
         entry.sparse_indices[0] = local_index;
         entry.sparse_states[0] = block_state;
@@ -1078,7 +1074,7 @@ pub const Blocks = struct {
 
     fn storeModifiedBlock(self: *Blocks, entry: *ModifiedSection, local_index: u16, sparse_index: ?usize, generated: i32, block_state: i32) void {
         if (entry.dense) {
-            self.section_pages[entry.page_index][local_index] = block_state;
+            self.denseSection(entry.dense_index)[local_index] = block_state;
             return;
         }
         if (block_state == generated) {
@@ -1095,7 +1091,7 @@ pub const Blocks = struct {
         }
     }
 
-    fn markSectionChanged(self: *Blocks, resident: *GeneratedHeightChunk, entry: *ModifiedSection, section: usize) u64 {
+    fn markSectionChanged(self: *Blocks, resident: *MaterializedChunk, entry: *ModifiedSection, section: usize) u64 {
         const revision = self.takeSectionRevision();
         resident.dirty = true;
         resident.revision = revision;
@@ -1124,7 +1120,7 @@ pub const Blocks = struct {
 
     pub fn findModifiedSection(self: *const Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, section: usize) ?usize {
         std.debug.assert(section < limits.section_count);
-        const resident = self.residentChunk(world, chunk) orelse return null;
+        const resident = self.materializedChunk(world, chunk) orelse return null;
         return self.modifiedSectionIndex(resident, section);
     }
 
@@ -1134,13 +1130,13 @@ pub const Blocks = struct {
         chunk: geometry.ChunkPos,
         section: usize,
     ) ?u64 {
-        const resident = self.residentChunk(world, chunk) orelse return null;
+        const resident = self.materializedChunk(world, chunk) orelse return null;
         const index = self.modifiedSectionIndex(resident, section) orelse return 0;
         const revision = self.modified_sections[index].revision;
         return if (revision == 0) resident.content_revision else revision;
     }
 
-    pub fn modifiedSectionIndex(self: *const Blocks, resident: *const GeneratedHeightChunk, section: usize) ?usize {
+    pub fn modifiedSectionIndex(self: *const Blocks, resident: *const MaterializedChunk, section: usize) ?usize {
         std.debug.assert(section < limits.section_count);
         const encoded = resident.modified_section_indices[section];
         if (encoded == no_modified_section_index) return null;
@@ -1156,17 +1152,27 @@ pub const Blocks = struct {
         std.debug.assert(table_index < self.modified_sections.len);
         const entry = &self.modified_sections[table_index];
         std.debug.assert(entry.active and entry.dense);
-        return &self.section_pages[entry.page_index];
+        return self.denseSection(entry.dense_index);
+    }
+
+    pub fn modifiedSectionIsDense(self: *const Blocks, table_index: usize) bool {
+        std.debug.assert(table_index < self.modified_sections.len);
+        return self.modified_sections[table_index].active and self.modified_sections[table_index].dense;
+    }
+
+    fn denseSection(self: *const Blocks, index: u16) *[blocks_per_section]i32 {
+        std.debug.assert(index < self.dense_sections.len);
+        return &self.dense_sections[index];
     }
 
     pub fn copySectionBlocks(self: *const Blocks, table_index: usize, output: *[blocks_per_section]i32) void {
         const entry = &self.modified_sections[table_index];
         std.debug.assert(entry.active);
         if (entry.dense) {
-            @memcpy(output, &self.section_pages[entry.page_index]);
+            @memcpy(output, self.denseSection(entry.dense_index));
             return;
         }
-        const resident = self.residentChunk(entry.world, entry.chunk) orelse unreachable;
+        const resident = self.materializedChunk(entry.world, entry.chunk) orelse unreachable;
         terrain.fillSectionFromShape(&resident.shape, entry.section, output);
         for (entry.sparse_indices[0..entry.sparse_count], entry.sparse_states[0..entry.sparse_count]) |local_index, state|
             output[local_index] = state;
@@ -1178,54 +1184,59 @@ pub const Blocks = struct {
     }
 
     pub fn loadSection(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, section: usize, blocks: *const [blocks_per_section]i32) !void {
-        const resident = self.residentChunk(world, chunk) orelse return error.ChunkNotResident;
+        const resident = self.materializedChunk(world, chunk) orelse return error.ChunkNotMaterialized;
         try self.loadSectionFromShape(world, chunk, section, blocks, &resident.shape);
     }
 
-    pub fn availableSectionPages(self: *const Blocks) usize {
-        return if (self.page_pool_initialized) self.free_section_page_count else self.section_pages.len;
+    pub fn availableDenseSections(self: *const Blocks) usize {
+        return self.free_dense_section_count;
     }
 
-    pub fn sectionStorageNeedsPage(section: usize, blocks: *const [blocks_per_section]i32, shape: *const terrain.ChunkShape) bool {
-        return countModifiedBlocks(section, blocks, shape) > sparse_section_change_capacity;
+    pub fn sectionDiffersFromShape(section: usize, blocks: *const [blocks_per_section]i32, shape: *const terrain.ChunkShape) bool {
+        return countModifiedBlocks(section, blocks, shape) != 0;
+    }
+
+    pub fn sectionRequiresDenseStorage(section: usize, section_blocks: *const [blocks_per_section]i32, shape: *const terrain.ChunkShape) bool {
+        return countModifiedBlocks(section, section_blocks, shape) > sparse_section_change_capacity;
     }
 
     pub fn loadSectionFromShape(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, section: usize, blocks: *const [blocks_per_section]i32, shape: *const terrain.ChunkShape) !void {
-        const resident = self.residentChunkMut(world, chunk) orelse return error.ChunkNotResident;
+        const resident = self.materializedChunkMut(world, chunk) orelse return error.ChunkNotMaterialized;
         if (self.modifiedSectionIndex(resident, section)) |table_index| {
             const entry = &self.modified_sections[table_index];
-            self.modified_block_count -= entry.modified_count;
             const modified_count = countModifiedBlocks(section, blocks, shape);
+            if (modified_count > sparse_section_change_capacity and !entry.dense and self.free_dense_section_count == 0)
+                return error.WorldSectionCapacity;
+            self.modified_block_count -= entry.modified_count;
             if (modified_count == 0) {
                 self.releaseModifiedSection(resident, table_index);
                 resident.content_revision = self.takeSectionRevision();
-                self.invalidateResidentProjections();
+                self.invalidateMaterializedProjections();
                 return;
             }
-            try self.assignModifiedSection(entry, section, blocks, shape, modified_count);
+            self.assignModifiedSection(entry, section, blocks, shape, modified_count);
             resident.dirty_section_mask &= ~(@as(u32, 1) << @intCast(section));
             resident.content_revision = self.takeSectionRevision();
             self.modified_block_count += modified_count;
-            self.invalidateResidentProjections();
+            self.invalidateMaterializedProjections();
             return;
         }
         const modified_count = countModifiedBlocks(section, blocks, shape);
         if (modified_count == 0) return;
+        if (modified_count > sparse_section_change_capacity and self.free_dense_section_count == 0)
+            return error.WorldSectionCapacity;
         const table_index = try self.createModifiedSection(resident, section);
         const entry = &self.modified_sections[table_index];
-        self.assignModifiedSection(entry, section, blocks, shape, modified_count) catch |err| {
-            self.releaseModifiedSection(resident, table_index);
-            return err;
-        };
+        self.assignModifiedSection(entry, section, blocks, shape, modified_count);
         resident.content_revision = self.takeSectionRevision();
         self.modified_block_count += modified_count;
-        self.invalidateResidentProjections();
+        self.invalidateMaterializedProjections();
     }
 
-    fn assignModifiedSection(self: *Blocks, entry: *ModifiedSection, section: usize, blocks: *const [blocks_per_section]i32, shape: *const terrain.ChunkShape, modified_count: u16) !void {
+    fn assignModifiedSection(self: *Blocks, entry: *ModifiedSection, section: usize, blocks: *const [blocks_per_section]i32, shape: *const terrain.ChunkShape, modified_count: u16) void {
         if (entry.dense) {
-            self.free_section_pages[self.free_section_page_count] = entry.page_index;
-            self.free_section_page_count += 1;
+            self.free_dense_sections[self.free_dense_section_count] = entry.dense_index;
+            self.free_dense_section_count += 1;
         }
         entry.dense = false;
         entry.sparse_count = 0;
@@ -1246,16 +1257,15 @@ pub const Blocks = struct {
             }
             return;
         }
-        self.ensurePagePool();
-        if (self.free_section_page_count == 0) return error.WorldSectionCapacity;
-        self.free_section_page_count -= 1;
-        entry.page_index = self.free_section_pages[self.free_section_page_count];
-        @memcpy(&self.section_pages[entry.page_index], blocks);
+        std.debug.assert(self.free_dense_section_count != 0);
+        self.free_dense_section_count -= 1;
+        entry.dense_index = self.free_dense_sections[self.free_dense_section_count];
+        @memcpy(self.denseSection(entry.dense_index), blocks);
         entry.dense = true;
     }
 
     pub fn markChunkClean(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos) void {
-        const resident = self.residentChunkMut(world, chunk) orelse return;
+        const resident = self.materializedChunkMut(world, chunk) orelse return;
         resident.dirty = false;
         var mask = resident.dirty_section_mask;
         while (mask != 0) {
@@ -1267,19 +1277,24 @@ pub const Blocks = struct {
         resident.dirty_section_mask = 0;
     }
 
+    pub fn markChunkForPersistence(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos) bool {
+        const resident = self.materializedChunkMut(world, chunk) orelse return false;
+        resident.dirty = true;
+        resident.revision = @max(resident.revision, resident.content_revision);
+        return true;
+    }
+
     pub fn markGeneratedChunkNew(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos) bool {
-        const resident = self.residentChunkMut(world, chunk) orelse return false;
-        if (resident.persistence_known and resident.dirty) return true;
+        const resident = self.materializedChunkMut(world, chunk) orelse return false;
+        if (resident.dirty) return true;
         const revision = self.takeSectionRevision();
-        resident.persistence_known = true;
         resident.dirty = true;
         resident.revision = revision;
         return true;
     }
 
     pub fn markChunkCleanThrough(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, revision: u64) void {
-        const resident = self.residentChunkMut(world, chunk) orelse return;
-        resident.persistence_known = true;
+        const resident = self.materializedChunkMut(world, chunk) orelse return;
         if (resident.dirty and resident.revision <= revision) resident.dirty = false;
         var mask = resident.dirty_section_mask;
         while (mask != 0) {
@@ -1299,7 +1314,7 @@ pub const Blocks = struct {
     }
 
     pub fn chunkDirtyRevision(self: *const Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos) u64 {
-        const resident = self.residentChunk(world, chunk) orelse return 0;
+        const resident = self.materializedChunk(world, chunk) orelse return 0;
         var revision: u64 = 0;
         if (resident.dirty) revision = resident.revision;
         var mask = resident.dirty_section_mask;
@@ -1314,14 +1329,14 @@ pub const Blocks = struct {
     }
 
     pub fn chunkDirty(self: *const Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos) bool {
-        const resident = self.residentChunk(world, chunk) orelse return false;
+        const resident = self.materializedChunk(world, chunk) orelse return false;
         return resident.dirty or resident.dirty_section_mask != 0;
     }
 
     pub fn evictChunk(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos) bool {
         if (self.chunkDirty(world, chunk)) return false;
         var removed = false;
-        const resident = self.residentChunkMut(world, chunk) orelse return false;
+        const resident = self.materializedChunkMut(world, chunk) orelse return false;
         var section_mask = resident.modified_section_mask;
         while (section_mask != 0) {
             const section: usize = @intCast(@ctz(section_mask));
@@ -1332,35 +1347,34 @@ pub const Blocks = struct {
             self.releaseModifiedSection(resident, table_index);
             removed = true;
         }
-        if (self.residentChunkIndex(world, chunk)) |resident_index| {
-            self.resident_binding_revision +%= 1;
-            self.removeResidentLookup(world, chunk, resident_index);
-            self.releaseResidentRandomTickMasks(&self.resident_chunks[resident_index]);
-            self.releaseResidentShape(&self.resident_chunks[resident_index]);
-            const active_position: usize = self.resident_active_positions[resident_index];
-            std.debug.assert(self.active_resident_indices[active_position] == resident_index);
-            self.resident_chunk_count -= 1;
-            if (active_position != self.resident_chunk_count) {
-                const moved_index = self.active_resident_indices[self.resident_chunk_count];
-                self.active_resident_indices[active_position] = moved_index;
-                self.resident_active_positions[moved_index] = @intCast(active_position);
+        if (self.materializedChunkIndex(world, chunk)) |resident_index| {
+            _ = self.takeMaterializationBindingRevision();
+            self.removeMaterializationLookup(world, chunk, resident_index);
+            self.releaseMaterializedRandomTickMasks(&self.materialized_chunks[resident_index]);
+            const active_position: usize = self.materialization_active_positions[resident_index];
+            std.debug.assert(self.active_materialization_indices[active_position] == resident_index);
+            self.materialization_count -= 1;
+            if (active_position != self.materialization_count) {
+                const moved_index = self.active_materialization_indices[self.materialization_count];
+                self.active_materialization_indices[active_position] = moved_index;
+                self.materialization_active_positions[moved_index] = @intCast(active_position);
             }
-            self.resident_chunks[resident_index] = .{};
-            self.free_resident_chunks[self.free_resident_chunk_count] = @intCast(resident_index);
-            self.free_resident_chunk_count += 1;
+            self.materialized_chunks[resident_index] = .{};
+            self.free_materializations[self.free_materialization_count] = @intCast(resident_index);
+            self.free_materialization_count += 1;
             removed = true;
         }
         return removed;
     }
 
-    fn removeResidentLookup(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, resident_index: usize) void {
-        const mask = self.resident_chunk_lookup.len - 1;
+    fn removeMaterializationLookup(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, resident_index: usize) void {
+        const mask = self.materialization_lookup.len - 1;
         var probe = generatedHeightHash(world, chunk);
         var found: ?usize = null;
-        for (0..self.resident_chunk_lookup.len) |_| {
+        for (0..self.materialization_lookup.len) |_| {
             const index = probe & mask;
-            const slot = self.resident_chunk_lookup[index];
-            if (slot == resident_chunk_empty) return;
+            const slot = self.materialization_lookup[index];
+            if (slot == materialization_empty) return;
             if (slot == resident_index) {
                 found = index;
                 break;
@@ -1368,16 +1382,16 @@ pub const Blocks = struct {
             probe += 1;
         }
         var hole = found orelse return;
-        self.resident_chunk_lookup[hole] = resident_chunk_empty;
+        self.materialization_lookup[hole] = materialization_empty;
         var scan = (hole + 1) & mask;
-        for (0..self.resident_chunk_lookup.len) |_| {
-            if (self.resident_chunk_lookup[scan] == resident_chunk_empty) return;
-            const slot = self.resident_chunk_lookup[scan];
-            const entry = self.resident_chunks[slot];
+        for (0..self.materialization_lookup.len) |_| {
+            if (self.materialization_lookup[scan] == materialization_empty) return;
+            const slot = self.materialization_lookup[scan];
+            const entry = self.materialized_chunks[slot];
             const ideal = generatedHeightHash(entry.world, entry.chunk) & mask;
             if (probeDistance(ideal, hole, mask) < probeDistance(ideal, scan, mask)) {
-                self.resident_chunk_lookup[hole] = slot;
-                self.resident_chunk_lookup[scan] = resident_chunk_empty;
+                self.materialization_lookup[hole] = slot;
+                self.materialization_lookup[scan] = materialization_empty;
                 hole = scan;
             }
             scan = (scan + 1) & mask;
@@ -1414,15 +1428,29 @@ pub const Blocks = struct {
     }
 
     fn takeSectionRevision(self: *Blocks) u64 {
+        if (self.next_section_revision == 0 or self.next_section_revision == std.math.maxInt(u64))
+            diagnostics.panic("content revision exhausted", &.{});
         const revision = self.next_section_revision;
-        self.next_section_revision +%= 1;
-        if (self.next_section_revision == 0) self.next_section_revision = 1;
+        self.next_section_revision = revision + 1;
         return revision;
     }
 
-    fn invalidateResidentProjections(self: *Blocks) void {
-        self.resident_binding_revision +%= 1;
-        if (self.resident_binding_revision == 0) self.resident_binding_revision = 1;
+    fn observeContentRevision(self: *Blocks, revision: u64) !void {
+        if (revision == 0 or revision > maximum_persisted_content_revision) return error.InvalidContentRevision;
+        if (self.next_section_revision == 0) return error.ContentRevisionExhausted;
+        if (self.next_section_revision <= revision) self.next_section_revision = revision + 1;
+    }
+
+    fn takeMaterializationBindingRevision(self: *Blocks) u64 {
+        if (self.materialization_binding_revision == 0)
+            diagnostics.panic("materialization binding revision exhausted", &.{});
+        const revision = self.materialization_binding_revision;
+        self.materialization_binding_revision = if (revision == std.math.maxInt(u64)) 0 else revision + 1;
+        return revision;
+    }
+
+    fn invalidateMaterializedProjections(self: *Blocks) void {
+        _ = self.takeMaterializationBindingRevision();
     }
 
     fn recordBlockMutation(self: *Blocks, world: world_identity.Handle, pos: geometry.BlockPos, previous_state: i32, block_state: i32) void {
@@ -1436,9 +1464,21 @@ pub const Blocks = struct {
         };
     }
 
-    fn createModifiedSection(self: *Blocks, resident: *GeneratedHeightChunk, section: usize) !usize {
+    fn recordMaterialization(self: *Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, content_revision: u64, binding_revision: u64, source: MaterializationSource) void {
+        self.chunk_change_sequence +%= 1;
+        if (self.chunk_change_sequence == 0) self.chunk_change_sequence = 1;
+        self.materializations[(self.chunk_change_sequence -% 1) % self.materializations.len] = .{
+            .world = world,
+            .chunk = chunk,
+            .content_revision = content_revision,
+            .binding_revision = binding_revision,
+            .source = source,
+        };
+    }
+
+    fn createModifiedSection(self: *Blocks, resident: *MaterializedChunk, section: usize) !usize {
         if (self.modified_section_count == self.modified_sections.len) return error.WorldSectionCapacity;
-        self.ensureModifiedSectionPool();
+        self.ensureRandomTickDerived(resident);
         const chunk = resident.chunk;
         std.debug.assert(resident.modified_section_indices[section] == no_modified_section_index);
         std.debug.assert(self.free_modified_section_count != 0);
@@ -1458,22 +1498,22 @@ pub const Blocks = struct {
         return index;
     }
 
-    fn promoteModifiedSection(self: *Blocks, entry: *ModifiedSection) !void {
+    fn promoteModifiedSection(self: *Blocks, entry: *ModifiedSection) void {
         std.debug.assert(entry.active and !entry.dense);
-        self.ensurePagePool();
-        if (self.free_section_page_count == 0) return error.WorldSectionCapacity;
-        self.free_section_page_count -= 1;
-        const page_index = self.free_section_pages[self.free_section_page_count];
-        const resident = self.residentChunk(entry.world, entry.chunk) orelse unreachable;
-        terrain.fillSectionFromShape(&resident.shape, entry.section, &self.section_pages[page_index]);
+        std.debug.assert(self.free_dense_section_count != 0);
+        self.free_dense_section_count -= 1;
+        const dense_index = self.free_dense_sections[self.free_dense_section_count];
+        const resident = self.materializedChunk(entry.world, entry.chunk) orelse unreachable;
+        const dense = self.denseSection(dense_index);
+        terrain.fillSectionFromShape(&resident.shape, entry.section, dense);
         for (entry.sparse_indices[0..entry.sparse_count], entry.sparse_states[0..entry.sparse_count]) |local_index, state|
-            self.section_pages[page_index][local_index] = state;
-        entry.page_index = page_index;
+            dense[local_index] = state;
+        entry.dense_index = dense_index;
         entry.dense = true;
         entry.sparse_count = 0;
     }
 
-    fn releaseModifiedSection(self: *Blocks, resident: *GeneratedHeightChunk, table_index: usize) void {
+    fn releaseModifiedSection(self: *Blocks, resident: *MaterializedChunk, table_index: usize) void {
         std.debug.assert(table_index < self.modified_sections.len);
         std.debug.assert(self.modified_sections[table_index].active);
         const released = self.modified_sections[table_index];
@@ -1487,32 +1527,16 @@ pub const Blocks = struct {
         self.free_modified_sections[self.free_modified_section_count] = @intCast(table_index);
         self.free_modified_section_count += 1;
         if (released.dense) {
-            self.free_section_pages[self.free_section_page_count] = released.page_index;
-            self.free_section_page_count += 1;
+            self.free_dense_sections[self.free_dense_section_count] = released.dense_index;
+            self.free_dense_section_count += 1;
         }
         self.modified_section_count -= 1;
-        std.debug.assert(self.free_section_page_count <= self.section_pages.len);
-    }
-
-    fn ensureModifiedSectionPool(self: *Blocks) void {
-        if (self.modified_section_pool_initialized) return;
-        for (self.free_modified_sections, 0..) |*entry, index|
-            entry.* = @intCast(self.free_modified_sections.len - 1 - index);
-        self.free_modified_section_count = self.free_modified_sections.len;
-        self.modified_section_pool_initialized = true;
-    }
-
-    fn ensurePagePool(self: *Blocks) void {
-        if (self.page_pool_initialized) return;
-        for (self.free_section_pages, 0..) |*entry, index|
-            entry.* = @intCast(self.free_section_pages.len - 1 - index);
-        self.free_section_page_count = self.free_section_pages.len;
-        self.page_pool_initialized = true;
+        std.debug.assert(self.free_dense_section_count <= self.dense_sections.len);
     }
 
     pub fn fillGeneratedSection(self: *const Blocks, world: world_identity.Handle, chunk: geometry.ChunkPos, section: usize, output: *[blocks_per_section]i32) void {
-        const resident = self.residentChunk(world, chunk) orelse
-            diagnostics.panic("section materialization requested for non-resident chunk (chunk x, chunk z)", &.{ diagnostics.integer(chunk.x), diagnostics.integer(chunk.z) });
+        const resident = self.materializedChunk(world, chunk) orelse
+            diagnostics.panic("section materialization requested for non-materialized chunk (chunk x, chunk z)", &.{ diagnostics.integer(chunk.x), diagnostics.integer(chunk.z) });
         terrain.fillSectionFromShape(&resident.shape, section, output);
     }
 
@@ -1522,7 +1546,7 @@ pub const Blocks = struct {
         chunk: geometry.ChunkPos,
         section: usize,
     ) ?i32 {
-        const resident = self.residentChunk(world, chunk) orelse return null;
+        const resident = self.materializedChunk(world, chunk) orelse return null;
         if (resident.modified_section_mask &
             (@as(u32, 1) << @intCast(section)) != 0)
             return null;
@@ -1535,7 +1559,7 @@ pub const Blocks = struct {
         chunk: geometry.ChunkPos,
         section: usize,
     ) ?terrain.SectionVisibility {
-        const resident = self.residentChunk(world, chunk) orelse return null;
+        const resident = self.materializedChunk(world, chunk) orelse return null;
         if (resident.modified_section_mask &
             (@as(u32, 1) << @intCast(section)) != 0)
             return null;
@@ -1544,22 +1568,22 @@ pub const Blocks = struct {
 
     pub fn surfaceHeightAt(self: *const Blocks, world: world_identity.Handle, x: i32, z: i32) i16 {
         const chunk = geometry.ChunkPos{ .x = @divFloor(x, 16), .z = @divFloor(z, 16) };
-        const resident = self.residentChunk(world, chunk) orelse
-            diagnostics.panic("surface query requested for non-resident chunk (chunk x, chunk z)", &.{ diagnostics.integer(chunk.x), diagnostics.integer(chunk.z) });
+        const resident = self.materializedChunk(world, chunk) orelse
+            diagnostics.panic("surface query requested for non-materialized chunk (chunk x, chunk z)", &.{ diagnostics.integer(chunk.x), diagnostics.integer(chunk.z) });
         return resident.shape.heights[@as(usize, @intCast(z & 15)) * 16 + @as(usize, @intCast(x & 15))];
     }
 
     pub fn highestGeneratedY(self: *const Blocks, world: world_identity.Handle, x: i32, z: i32) i16 {
         const chunk = geometry.ChunkPos{ .x = @divFloor(x, 16), .z = @divFloor(z, 16) };
-        const resident = self.residentChunk(world, chunk) orelse
-            diagnostics.panic("height query requested for non-resident chunk (chunk x, chunk z)", &.{ diagnostics.integer(chunk.x), diagnostics.integer(chunk.z) });
+        const resident = self.materializedChunk(world, chunk) orelse
+            diagnostics.panic("height query requested for non-materialized chunk (chunk x, chunk z)", &.{ diagnostics.integer(chunk.x), diagnostics.integer(chunk.z) });
         return terrain.highestYFromShape(&resident.shape, @intCast(x & 15), @intCast(z & 15));
     }
 
     pub fn highestBlockYAt(self: *const Blocks, world: world_identity.Handle, x: i32, z: i32) i16 {
         const chunk = geometry.ChunkPos{ .x = @divFloor(x, 16), .z = @divFloor(z, 16) };
-        const resident = self.residentChunk(world, chunk) orelse
-            diagnostics.panic("height query requested for non-resident chunk (chunk x, chunk z)", &.{ diagnostics.integer(chunk.x), diagnostics.integer(chunk.z) });
+        const resident = self.materializedChunk(world, chunk) orelse
+            diagnostics.panic("height query requested for non-materialized chunk (chunk x, chunk z)", &.{ diagnostics.integer(chunk.x), diagnostics.integer(chunk.z) });
         if (resident.modified_section_mask == 0)
             return terrain.highestYFromShape(
                 &resident.shape,
@@ -1577,7 +1601,7 @@ pub const Blocks = struct {
             @as(i32, sectionWorldY(highest_modified_section, 15)),
         );
         while (y >= limits.min_y) : (y -= 1) {
-            if (self.blockAtResident(
+            if (self.blockAtMaterialized(
                 resident,
                 .{ .x = x, .y = @intCast(y), .z = z },
             ) != air_block_state) return @intCast(y);

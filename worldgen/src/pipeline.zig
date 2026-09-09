@@ -64,6 +64,11 @@ pub fn Pipeline(comptime stages: Stages) type {
         pub fn generate(self: *Self, chunk_x: i32, chunk_z: i32, output: []generated_state.GeneratedState) !void {
             std.debug.assert(output.len == chunk.block_count);
             if (!stages.density) return;
+            if (stages.features) {
+                try self.generator.copyCachedTerrain(chunk_x, chunk_z, output);
+                try self.generator.applyFeatures(chunk_x, chunk_z, output);
+                return;
+            }
             try self.generator.fillBaseMaterials(chunk_x, chunk_z, self.materials);
             if (stages.surface) {
                 try self.generator.applySurface(chunk_x, chunk_z, self.materials, output);
@@ -72,7 +77,6 @@ pub fn Pipeline(comptime stages: Stages) type {
                     state.* = generated_state.GeneratedState.fromBase(material);
             }
             if (stages.carvers) try self.generator.applyCarvers(chunk_x, chunk_z, output);
-            if (stages.features) try self.generator.applyFeatures(chunk_x, chunk_z, output);
         }
     };
 }
@@ -167,6 +171,32 @@ pub fn Area(comptime stages: Stages, comptime side: usize) type {
             return self.states[first..][0..chunk.block_count];
         }
     };
+}
+
+test "complete chunk is independent of preceding requests" {
+    const allocator = std.testing.allocator;
+    const output = try allocator.alloc(generated_state.GeneratedState, chunk.block_count);
+    defer allocator.free(output);
+    var direct = try Pipeline(.{}).init(allocator, 0x6d62_756e_6400_0001);
+    try direct.generate(0, 0, output);
+    var expected = std.hash.Wyhash.init(0);
+    expected.update(std.mem.sliceAsBytes(output));
+    direct.deinit();
+
+    var warmed = try Pipeline(.{}).init(allocator, 0x6d62_756e_6400_0001);
+    defer warmed.deinit();
+    var z: i32 = -4;
+    while (z <= 4) : (z += 1) {
+        var x: i32 = -4;
+        while (x <= 4) : (x += 1) {
+            if (x == 0 and z == 0) continue;
+            try warmed.generate(x, z, output);
+        }
+    }
+    try warmed.generate(0, 0, output);
+    var actual = std.hash.Wyhash.init(0);
+    actual.update(std.mem.sliceAsBytes(output));
+    try std.testing.expectEqual(expected.final(), actual.final());
 }
 
 test "compile-time pipelines omit unused generator state" {

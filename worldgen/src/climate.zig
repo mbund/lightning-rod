@@ -9,6 +9,7 @@ pub const Sample = struct {
     continentalness: f64,
     erosion: f64,
     ridges: f64,
+    terrain_offset: f64,
 
     pub fn quantized(self: Sample, block_y: i32) QuantizedSample {
         return .{
@@ -16,20 +17,18 @@ pub const Sample = struct {
             .humidity = quantize(self.humidity),
             .continentalness = quantize(self.continentalness),
             .erosion = quantize(self.erosion),
-            .depth = quantize(self.depth(block_y)),
+            .depth = self.quantizedDepth(block_y),
             .ridges = quantize(self.ridges),
         };
     }
 
+    pub fn quantizedDepth(self: Sample, block_y: i32) i64 {
+        return quantize(self.depth(block_y));
+    }
+
     pub fn depth(self: Sample, block_y: i32) f64 {
-        const folded_ridges = -3 * (-1.0 / 3.0 + @abs(-2.0 / 3.0 + @abs(self.ridges)));
-        const terrain_offset = spline.overworldOffset(.{
-            .continents = @floatCast(self.continentalness),
-            .erosion = @floatCast(self.erosion),
-            .ridges_folded = @floatCast(folded_ridges),
-        });
         return clampedMap(@floatFromInt(block_y), -64, 320, 1.5, -1.5) -
-            0.5037500262260437 + @as(f64, terrain_offset);
+            0.5037500262260437 + self.terrain_offset;
     }
 };
 
@@ -70,12 +69,21 @@ pub const Sampler = struct {
         const shift_z = self.offset.sample(z * 0.25, x * 0.25, 0) * 4;
         const shifted_x = x * 0.25 + shift_x;
         const shifted_z = z * 0.25 + shift_z;
+        const continentalness = self.continentalness.sample(shifted_x, 0, shifted_z);
+        const erosion = self.erosion.sample(shifted_x, 0, shifted_z);
+        const ridges = self.ridge.sample(shifted_x, 0, shifted_z);
+        const folded_ridges = -3 * (-1.0 / 3.0 + @abs(-2.0 / 3.0 + @abs(ridges)));
         return .{
             .temperature = self.temperature.sample(shifted_x, 0, shifted_z),
             .humidity = self.vegetation.sample(shifted_x, 0, shifted_z),
-            .continentalness = self.continentalness.sample(shifted_x, 0, shifted_z),
-            .erosion = self.erosion.sample(shifted_x, 0, shifted_z),
-            .ridges = self.ridge.sample(shifted_x, 0, shifted_z),
+            .continentalness = continentalness,
+            .erosion = erosion,
+            .ridges = ridges,
+            .terrain_offset = spline.overworldOffset(.{
+                .continents = @floatCast(continentalness),
+                .erosion = @floatCast(erosion),
+                .ridges_folded = @floatCast(folded_ridges),
+            }),
         };
     }
 };

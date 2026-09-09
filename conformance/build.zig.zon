@@ -5,6 +5,7 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .lightning_rod = .{ .path = ".." },
+        .vanilla = .{ .path = "../vanilla" },
         .nbt = .{ .path = "../nbt" },
         .minecraft_registry = .{ .path = "../minecraft-registry" },
     },

@@ -13,27 +13,29 @@ const packet_args = lightning_rod.packet_args;
 const container_menu = lightning_rod.container_menu;
 const container_clicks = lightning_rod.container_clicks;
 const recipes_plugin = @import("vanilla_recipes.zig");
-const active_chunks = @import("../vanilla/active_chunks.zig");
+const simulation_admission = @import("../vanilla/simulation_admission.zig");
+const persistence_plugin = @import("vanilla_persistence.zig");
 const Packets = lightning_rod.Packets;
 const world_identity = lightning_rod.world_identity;
 const world_store = lightning_rod.worlds;
 
 const persistence_id = "minecraft:furnaces";
-const persistence_magic = "LRFURN02";
 const persistence_key = "state";
+const persistence_root_key = "\x00";
+const persistence_record_tag: u8 = 1;
+const root_magic = "LRFURN04";
 const test_world = world_identity.Handle{ .index = 0, .generation = 1 };
 const menu_type = 14;
 const stack_encoded_bytes = @sizeOf(i32) + @sizeOf(i32) + @sizeOf(u16) + @sizeOf(u8);
-const entry_encoded_bytes = @sizeOf(u128) + @sizeOf(i32) + @sizeOf(i16) + @sizeOf(i32) + 3 * stack_encoded_bytes + 4 * @sizeOf(u16);
-
-fn encodedCapacity(maximum_entries: usize) !usize {
-    return std.math.add(usize, persistence_magic.len + @sizeOf(u16), try std.math.mul(usize, maximum_entries, entry_encoded_bytes));
-}
+const entry_encoded_bytes = @sizeOf(u128) + 2 * @sizeOf(i32) + @sizeOf(i16) + @sizeOf(i32) + 3 * stack_encoded_bytes + 4 * @sizeOf(u16);
+const root_bytes = root_magic.len + @sizeOf(u16) + @sizeOf(u32);
+const record_bytes = entry_encoded_bytes + @sizeOf(u32);
 
 pub const Entry = struct {
     occupied: bool = false,
     world: world_identity.Handle = world_identity.invalid,
     position: geometry.BlockPos = .{ .x = 0, .y = 0, .z = 0 },
+    block_state: i32 = registry.block_furnace_default_state,
     items: [3]player_store.HotbarStack = [_]player_store.HotbarStack{.{}} ** 3,
     burn_time: u16 = 0,
     fuel_time: u16 = 0,
@@ -57,20 +59,35 @@ pub const Furnaces = struct {
         random: *world_random.Random,
         blocks: *block_store.Blocks,
         players: *player_store.Players,
-        active: *active_chunks.ActiveChunks,
+        active: *simulation_admission.SimulationAdmission,
         items: *entity_store.ItemEntities,
         inputs: *input_store.Inputs,
         containers: *player_store.Containers,
         recipes: *recipes_plugin.Recipes,
         outputs: *Packets,
+        chunk_io: *persistence_plugin.Materializer,
     };
 
     entries: []Entry = &.{},
     deps: Dependencies,
     dirty: bool = false,
-    observed_mutation_sequence: u64 = 0,
     drags: []container_clicks.Drag = &.{},
-    persistence_buffer: []u8 = &.{},
+    persistence_root: [root_bytes]u8 = undefined,
+    persistence_record: [record_bytes]u8 = undefined,
+
+    pub const Removal = struct {
+        world: world_identity.Handle,
+        position: geometry.BlockPos,
+        entry: ?u16 = null,
+        items: [3]player_store.HotbarStack = [_]player_store.HotbarStack{.{}} ** 3,
+    };
+
+    pub const Placement = struct {
+        entry: u16,
+        world: world_identity.Handle,
+        position: geometry.BlockPos,
+        block_state: i32,
+    };
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies, configuration: Configuration) !*Furnaces {
         try configuration.validate();
@@ -78,11 +95,9 @@ pub const Furnaces = struct {
         self.* = .{ .deps = deps };
         self.entries = try allocator.alloc(Entry, configuration.maximum_entries);
         self.drags = try allocator.alloc(container_clicks.Drag, deps.players.records.len);
-        self.persistence_buffer = try allocator.alloc(u8, try encodedCapacity(configuration.maximum_entries));
         @memset(self.entries, .{});
         @memset(self.drags, .{});
         try self.restore();
-        self.observed_mutation_sequence = self.deps.blocks.block_mutation_sequence;
         return self;
     }
 
@@ -98,15 +113,67 @@ pub const Furnaces = struct {
         var work = self.runtime(random, blocks, players, items, inputs, containers, recipes, outputs);
         handleBlockInteractions(&work);
         applyClicks(&work);
-        reconcileMutations(&work);
         tickFurnaces(&work);
     }
 
     pub fn checkpoint(self: *Furnaces, writer: *lightning_rod.plugin_lifecycle.Checkpoint.NamespaceWriter) !void {
         if (!self.dirty) return;
-        const bytes = try encodeState(self, self.persistence_buffer);
-        try writer.put(persistence_key, bytes);
+        var count: u16 = 0;
+        for (self.entries) |entry| {
+            if (!entry.occupied) continue;
+            const key = recordKey(count) orelse return error.FurnaceCapacity;
+            try writer.put(&key, try encodeEntry(self, &self.persistence_record, entry));
+            count += 1;
+        }
+        try writer.put(persistence_root_key, try encodeRoot(&self.persistence_root, count));
         self.dirty = false;
+    }
+
+    pub fn prepareRemoval(self: *const Furnaces, world: world_identity.Handle, position: geometry.BlockPos) Removal {
+        var removal = Removal{ .world = world, .position = position };
+        for (self.entries, 0..) |entry, index| {
+            if (!entry.occupied or !entry.world.eql(world) or !geometry.sameBlock(entry.position, position)) continue;
+            removal.entry = @intCast(index);
+            removal.items = entry.items;
+            break;
+        }
+        return removal;
+    }
+
+    pub fn commitRemoval(self: *Furnaces, removal: Removal) void {
+        if (removal.entry) |raw_index| {
+            const index: usize = raw_index;
+            const entry = &self.entries[index];
+            std.debug.assert(entry.occupied);
+            std.debug.assert(entry.world.eql(removal.world));
+            std.debug.assert(geometry.sameBlock(entry.position, removal.position));
+            entry.* = .{};
+            self.markDirty(true);
+        }
+        for (self.deps.players.activeSlots()) |slot| {
+            const container = &self.deps.containers.open[slot];
+            if (container.kind != .furnace or !geometry.sameBlock(container.position, removal.position)) continue;
+            const window_id = container.id;
+            container_menu.close(self.deps.players, self.deps.containers, slot);
+            self.deps.outputs.container_closed(.{ .slot = slot, .window_id = window_id });
+        }
+    }
+
+    pub fn reservePlacement(self: *const Furnaces, world: world_identity.Handle, position: geometry.BlockPos, block_state: i32) !Placement {
+        if (!isFurnace(block_state)) return error.InvalidFurnaceState;
+        if (entryIndex(self, world, position) != null) return error.FurnaceAlreadyExists;
+        for (self.entries, 0..) |entry, index| {
+            if (entry.occupied) continue;
+            return .{ .entry = @intCast(index), .world = world, .position = position, .block_state = block_state };
+        }
+        return error.FurnaceCapacity;
+    }
+
+    pub fn commitPlacement(self: *Furnaces, placement: Placement) void {
+        const entry = &self.entries[placement.entry];
+        std.debug.assert(!entry.occupied);
+        entry.* = .{ .occupied = true, .world = placement.world, .position = placement.position, .block_state = placement.block_state };
+        self.markDirty(true);
     }
 
     fn runtime(self: *Furnaces, random: *world_random.Random, blocks: *block_store.Blocks, players: *player_store.Players, items: *entity_store.ItemEntities, inputs: *input_store.Inputs, containers: *player_store.Containers, recipes: *recipes_plugin.Recipes, outputs: *Packets) FurnaceRuntime {
@@ -123,14 +190,32 @@ pub const Furnaces = struct {
     }
 
     fn restore(self: *Furnaces) !void {
-        const loaded = self.deps.persistence.load(persistence_key, self.persistence_buffer) catch |err| switch (err) {
-            error.ReadFailed => return,
+        self.rejectLegacy() catch |err| switch (err) {
+            error.DestinationTooSmall => return error.StorageSchemaUnsupported,
             else => return err,
         };
+        const loaded = try self.deps.persistence.load(persistence_root_key, &self.persistence_root);
         switch (loaded) {
             .missing => {},
-            .value => |length| try decodeState(self, self.persistence_buffer[0..length]),
+            .value => |length| {
+                const count = try decodeRoot(self.persistence_root[0..length]);
+                if (count > self.entries.len) return error.InvalidFurnaceData;
+                for (0..count) |index| {
+                    const key = recordKey(index) orelse return error.InvalidFurnaceData;
+                    const record = try self.deps.persistence.load(&key, &self.persistence_record);
+                    const bytes = switch (record) {
+                        .missing => return error.InvalidFurnaceData,
+                        .value => |value_length| self.persistence_record[0..value_length],
+                    };
+                    try decodeEntry(self, &self.entries[index], bytes);
+                }
+            },
         }
+    }
+
+    fn rejectLegacy(self: *Furnaces) !void {
+        const loaded = try self.deps.persistence.load(persistence_key, &.{});
+        if (loaded != .missing) return error.StorageSchemaUnsupported;
     }
 };
 
@@ -138,7 +223,7 @@ const FurnaceWork = struct {
     random: *world_random.Random,
     world: *block_store.Blocks,
     players: *player_store.Players,
-    active: *active_chunks.ActiveChunks,
+    active: *simulation_admission.SimulationAdmission,
     items: *entity_store.ItemEntities,
     inputs: *input_store.Inputs,
     containers: *player_store.Containers,
@@ -148,23 +233,34 @@ const FurnaceWork = struct {
         return self.players.active_slots[0..self.players.active_count];
     }
 
-    fn spawnItem(self: *FurnaceWork, world: world_identity.Handle, position: geometry.Vec3, velocity: geometry.Vec3, stack: player_store.HotbarStack) !usize {
-        return self.items.spawn(self.random, self.world, world, position, velocity, stack, entity_store.block_drop_pickup_delay_ticks);
-    }
+    const PreparedDrop = struct {
+        reservation: entity_store.ItemEntities.Reservation,
+        specification: entity_store.ItemEntities.Spawn,
+    };
 
-    fn spawnPlayerDrop(self: *FurnaceWork, player: *const player_store.CorePlayer, stack: player_store.HotbarStack) !usize {
+    fn preparePlayerDrop(self: *FurnaceWork, player: *const player_store.CorePlayer, stack: player_store.HotbarStack) !PreparedDrop {
         const yaw = std.math.degreesToRadians(@as(f64, player.rotation.yaw));
         const pitch = std.math.degreesToRadians(@as(f64, player.rotation.pitch));
         const horizontal = std.math.cos(pitch) * 0.3;
-        return self.items.spawn(self.random, self.world, player.world, .{
-            .x = player.position.x,
-            .y = player.position.y + 1.3,
-            .z = player.position.z,
-        }, .{
-            .x = -std.math.sin(yaw) * horizontal,
-            .y = -std.math.sin(pitch) * 0.3 + 0.1,
-            .z = std.math.cos(yaw) * horizontal,
-        }, stack, entity_store.player_drop_pickup_delay_ticks);
+        const specification = entity_store.ItemEntities.Spawn{
+            .world = player.world,
+            .position = .{ .x = player.position.x, .y = player.position.y + 1.3, .z = player.position.z },
+            .velocity = .{
+                .x = -std.math.sin(yaw) * horizontal,
+                .y = -std.math.sin(pitch) * 0.3 + 0.1,
+                .z = std.math.cos(yaw) * horizontal,
+            },
+            .stack = stack,
+            .pickup_delay_ticks = entity_store.player_drop_pickup_delay_ticks,
+        };
+        try self.items.validateSpawn(self.world, specification);
+        return .{ .reservation = try self.items.reserve(1), .specification = specification };
+    }
+
+    fn commitPlayerDrop(self: *FurnaceWork, prepared: *PreparedDrop) usize {
+        var output: [1]usize = undefined;
+        self.items.commitReserved(&prepared.reservation, self.random, &.{prepared.specification}, &output);
+        return output[0];
     }
 };
 
@@ -193,7 +289,7 @@ fn handleBlockInteractions(context: *FurnaceRuntime) void {
 
 fn openFurnace(context: *FurnaceRuntime, world: world_identity.Handle, slot: u16, position: geometry.BlockPos) void {
     if (!player_store.playerCanReachBlock(&context.deps.players.records[slot], position)) return;
-    const entry = getOrCreateEntry(context.state, world, position) catch return;
+    const entry = findEntry(context.state, world, position) orelse return;
     container_menu.open(
         context.deps.players,
         context.deps.containers,
@@ -240,17 +336,32 @@ fn applyClicks(context: *FurnaceRuntime) void {
         click.handled = true;
         const entry = findEntry(context.state, container.world, container.position) orelse continue;
         const rules: FurnaceRules = .{ .recipes = simulation.recipes };
+        var staged_player = simulation.players.records[click.slot];
+        var staged_entry = entry.*;
+        var staged_drag = context.state.drags[click.slot];
         const result = container_clicks.applyWithDrag(
             FurnaceRules,
             &rules,
-            &simulation.players.records[click.slot],
-            &entry.items,
+            &staged_player,
+            &staged_entry.items,
             click.*,
-            &context.state.drags[click.slot],
+            &staged_drag,
         );
+        context.state.drags[click.slot] = staged_drag;
         if (result.changed) {
+            var prepared_drop: ?FurnaceWork.PreparedDrop = null;
+            if (result.dropped) |stack|
+                prepared_drop = simulation.preparePlayerDrop(&staged_player, stack) catch {
+                    synchronizeViewer(context, click.slot, entry, true, false);
+                    continue;
+                };
+            simulation.players.records[click.slot] = staged_player;
+            entry.* = staged_entry;
             context.state.markDirty(true);
-            if (result.dropped) |stack| spawnPlayerDrop(context, click.slot, stack);
+            if (prepared_drop) |*prepared| {
+                const index = simulation.commitPlayerDrop(prepared);
+                context.outputs.item_spawned(@intCast(index));
+            }
         }
         synchronizeViewer(context, click.slot, entry, true, result.changed);
     }
@@ -261,33 +372,41 @@ fn tickFurnaces(context: *FurnaceRuntime) void {
         if (!entry.occupied) continue;
         const chunk = geometry.chunkForBlock(entry.position);
         if (!context.deps.active.blockTicking(entry.world, chunk)) continue;
-        const resident = context.deps.world.residentChunk(entry.world, chunk) orelse continue;
-        const current_state = context.deps.world.blockAtResident(resident, entry.position);
-        if (!isFurnace(current_state)) continue;
+        const current_state = entry.block_state;
         const was_lit = entry.burn_time != 0;
         const before_items = entry.items;
         const before_burn = entry.burn_time;
         const before_fuel = entry.fuel_time;
         const before_cook = entry.cook_time;
         const before_cook_total = entry.cook_total;
-        if (entry.burn_time != 0) entry.burn_time -= 1;
-        const recipe = smeltableResult(context.deps.recipes, entry);
-        if (entry.burn_time == 0 and recipe != null) ignite(context.deps.recipes, entry);
-        if (entry.burn_time != 0 and recipe != null) {
-            entry.cook_total = recipe.?.cooking_ticks;
-            entry.cook_time += 1;
-            if (entry.cook_time >= entry.cook_total) {
-                completeSmelt(entry, recipe.?);
-                entry.cook_time = 0;
+        var staged = entry.*;
+        if (staged.burn_time != 0) staged.burn_time -= 1;
+        const recipe = smeltableResult(context.deps.recipes, &staged);
+        if (staged.burn_time == 0 and recipe != null) ignite(context.deps.recipes, &staged);
+        if (staged.burn_time != 0 and recipe != null) {
+            staged.cook_total = recipe.?.cooking_ticks;
+            staged.cook_time += 1;
+            if (staged.cook_time >= staged.cook_total) {
+                completeSmelt(&staged, recipe.?);
+                staged.cook_time = 0;
             }
-        } else if (entry.cook_time != 0) {
-            entry.cook_time -|= @min(entry.cook_time, 2);
+        } else if (staged.cook_time != 0) {
+            staged.cook_time -|= @min(staged.cook_time, 2);
         }
-        const is_lit = entry.burn_time != 0;
-        if (was_lit != is_lit or furnaceLit(current_state) != is_lit)
-            _ = context.blocks.set(entry.world, entry.position, furnaceState(furnaceFacing(current_state), is_lit)) catch {};
-        const items_changed = !std.meta.eql(before_items, entry.items);
-        const progress_changed = before_burn != entry.burn_time or before_cook != entry.cook_time;
+        const is_lit = staged.burn_time != 0;
+        if (was_lit != is_lit or furnaceLit(current_state) != is_lit) {
+            const desired_state = furnaceState(furnaceFacing(current_state), is_lit);
+            if (context.blocks.set(staged.world, staged.position, desired_state)) |changed| {
+                _ = changed;
+                staged.block_state = desired_state;
+            } else |err| switch (err) {
+                error.ChunkNotMaterialized => _ = context.state.deps.chunk_io.requestCold(staged.world, chunk),
+                else => {},
+            }
+        }
+        entry.* = staged;
+        const items_changed = !std.meta.eql(before_items, staged.items);
+        const progress_changed = before_burn != staged.burn_time or before_cook != staged.cook_time;
         if (!items_changed and !progress_changed) continue;
         context.state.markDirty(items_changed);
         var properties: [4]packet_args.ContainerProperty = undefined;
@@ -398,72 +517,16 @@ fn furnaceProperties(entry: *const Entry) [4]packet_args.ContainerProperty {
     };
 }
 
-fn reconcileMutations(context: *FurnaceRuntime) void {
-    const latest = context.deps.world.block_mutation_sequence;
-    const pending = latest -% context.state.observed_mutation_sequence;
-    if (pending > context.deps.world.block_mutations.len) {
-        context.state.observed_mutation_sequence = latest;
-        return;
-    }
-    var sequence = context.state.observed_mutation_sequence;
-    for (0..@as(usize, @intCast(pending))) |_| {
-        sequence +%= 1;
-        if (sequence == 0) sequence = 1;
-        const mutation = context.deps.world.blockMutation(sequence);
-        if (isFurnace(mutation.previous_state) and !isFurnace(mutation.block_state))
-            removeFurnace(context, mutation.world, mutation.pos);
-        if (!isFurnace(mutation.previous_state) and isFurnace(mutation.block_state)) {
-            _ = getOrCreateEntry(context.state, mutation.world, mutation.pos) catch {};
-        }
-    }
-    context.state.observed_mutation_sequence = context.deps.world.block_mutation_sequence;
-}
-
-fn removeFurnace(context: *FurnaceRuntime, world: world_identity.Handle, position: geometry.BlockPos) void {
-    if (findEntry(context.state, world, position)) |entry| {
-        for (&entry.items) |*stack| {
-            if (stack.isEmpty()) continue;
-            const item_index = context.deps.spawnItem(
-                world,
-                entity_store.blockDropPosition(position),
-                .{ .x = 0, .y = 0.1, .z = 0 },
-                stack.*,
-            ) catch break;
-            stack.* = .{};
-            context.outputs.item_spawned(@intCast(item_index));
-        }
-        entry.* = .{};
-        context.state.markDirty(true);
-    }
-    for (context.deps.activePlayerSlots()) |slot| {
-        const container = &context.deps.containers.open[slot];
-        if (container.kind != .furnace or !geometry.sameBlock(container.position, position)) continue;
-        const window_id = container.id;
-        container_menu.close(context.deps.players, context.deps.containers, slot);
-        context.outputs.container_closed(.{ .slot = slot, .window_id = window_id });
-    }
-}
-
-fn spawnPlayerDrop(context: *FurnaceRuntime, slot: u16, stack: player_store.HotbarStack) void {
-    const item_index = context.deps.spawnPlayerDrop(&context.deps.players.records[slot], stack) catch return;
-    context.outputs.item_spawned(@intCast(item_index));
-}
-
 fn findEntry(state: *Furnaces, world: world_identity.Handle, position: geometry.BlockPos) ?*Entry {
     for (state.entries) |*entry|
         if (entry.occupied and entry.world.eql(world) and geometry.sameBlock(entry.position, position)) return entry;
     return null;
 }
 
-fn getOrCreateEntry(state: *Furnaces, world: world_identity.Handle, position: geometry.BlockPos) !*Entry {
-    if (findEntry(state, world, position)) |entry| return entry;
-    for (state.entries) |*entry| {
-        if (entry.occupied) continue;
-        entry.* = .{ .occupied = true, .world = world, .position = position };
-        state.markDirty(true);
-        return entry;
-    }
-    return error.FurnaceCapacity;
+fn entryIndex(state: *const Furnaces, world: world_identity.Handle, position: geometry.BlockPos) ?usize {
+    for (state.entries, 0..) |entry, index|
+        if (entry.occupied and entry.world.eql(world) and geometry.sameBlock(entry.position, position)) return index;
+    return null;
 }
 
 const Facing = enum(u2) { north, south, west, east };
@@ -499,48 +562,60 @@ fn facingForYaw(yaw: f32) Facing {
     };
 }
 
-fn encodeState(state: *const Furnaces, buffer: []u8) ![]const u8 {
-    var writer = std.Io.Writer.fixed(buffer);
-    try writer.writeAll(persistence_magic);
-    var count: u16 = 0;
-    for (state.entries) |entry| count += @intFromBool(entry.occupied);
-    try writer.writeInt(u16, count, .little);
-    for (state.entries) |entry| {
-        if (!entry.occupied) continue;
-        const world = state.deps.worlds.getConst(entry.world) orelse return error.StaleWorldHandle;
-        try writer.writeInt(u128, world.key.value, .little);
-        try writer.writeInt(i32, entry.position.x, .little);
-        try writer.writeInt(i16, entry.position.y, .little);
-        try writer.writeInt(i32, entry.position.z, .little);
-        for (entry.items) |stack| try writeStack(&writer, stack);
-        try writer.writeInt(u16, entry.burn_time, .little);
-        try writer.writeInt(u16, entry.fuel_time, .little);
-        try writer.writeInt(u16, entry.cook_time, .little);
-        try writer.writeInt(u16, entry.cook_total, .little);
-    }
-    return writer.buffered();
+fn recordKey(index: usize) ?[3]u8 {
+    const value = std.math.cast(u16, index) orelse return null;
+    var key: [3]u8 = undefined;
+    key[0] = persistence_record_tag;
+    std.mem.writeInt(u16, key[1..], value, .little);
+    return key;
 }
 
-fn decodeState(state: *Furnaces, bytes: []const u8) !void {
-    var reader = std.Io.Reader.fixed(bytes);
-    var magic: [persistence_magic.len]u8 = undefined;
-    try reader.readSliceAll(&magic);
-    if (!std.mem.eql(u8, &magic, persistence_magic)) return error.InvalidFurnaceData;
-    const count = try reader.takeInt(u16, .little);
-    if (count > state.entries.len) return error.InvalidFurnaceData;
-    for (state.entries[0..count]) |*entry| {
-        entry.* = .{ .occupied = true };
-        entry.world = state.deps.worlds.find(.{ .value = try reader.takeInt(u128, .little) }) orelse return error.UnknownWorldKey;
-        entry.position.x = try reader.takeInt(i32, .little);
-        entry.position.y = try reader.takeInt(i16, .little);
-        entry.position.z = try reader.takeInt(i32, .little);
-        for (&entry.items) |*stack| stack.* = try readStack(&reader);
-        entry.burn_time = try reader.takeInt(u16, .little);
-        entry.fuel_time = try reader.takeInt(u16, .little);
-        entry.cook_time = try reader.takeInt(u16, .little);
-        entry.cook_total = try reader.takeInt(u16, .little);
-    }
-    if (reader.seek != bytes.len) return error.InvalidFurnaceData;
+fn encodeRoot(buffer: []u8, count: u16) ![]const u8 {
+    if (buffer.len < root_bytes) return error.EndOfStream;
+    @memcpy(buffer[0..root_magic.len], root_magic);
+    std.mem.writeInt(u16, buffer[root_magic.len..][0..2], count, .little);
+    std.mem.writeInt(u32, buffer[root_magic.len + 2 ..][0..4], std.hash.crc.Crc32.hash(buffer[0 .. root_magic.len + 2]), .little);
+    return buffer[0..root_bytes];
+}
+
+fn decodeRoot(bytes: []const u8) !usize {
+    if (bytes.len != root_bytes or !std.mem.eql(u8, bytes[0..root_magic.len], root_magic)) return error.InvalidFurnaceData;
+    if (std.mem.readInt(u32, bytes[root_magic.len + 2 ..][0..4], .little) != std.hash.crc.Crc32.hash(bytes[0 .. root_magic.len + 2])) return error.InvalidFurnaceData;
+    return std.mem.readInt(u16, bytes[root_magic.len..][0..2], .little);
+}
+
+fn encodeEntry(state: *const Furnaces, buffer: []u8, entry: Entry) ![]const u8 {
+    var writer = std.Io.Writer.fixed(buffer[0..entry_encoded_bytes]);
+    const world = state.deps.worlds.getConst(entry.world) orelse return error.StaleWorldHandle;
+    try writer.writeInt(u128, world.key.value, .little);
+    try writer.writeInt(i32, entry.position.x, .little);
+    try writer.writeInt(i16, entry.position.y, .little);
+    try writer.writeInt(i32, entry.position.z, .little);
+    try writer.writeInt(i32, entry.block_state, .little);
+    for (entry.items) |stack| try writeStack(&writer, stack);
+    try writer.writeInt(u16, entry.burn_time, .little);
+    try writer.writeInt(u16, entry.fuel_time, .little);
+    try writer.writeInt(u16, entry.cook_time, .little);
+    try writer.writeInt(u16, entry.cook_total, .little);
+    std.mem.writeInt(u32, buffer[entry_encoded_bytes..][0..4], std.hash.crc.Crc32.hash(buffer[0..entry_encoded_bytes]), .little);
+    return buffer[0..record_bytes];
+}
+
+fn decodeEntry(state: *Furnaces, entry: *Entry, bytes: []const u8) !void {
+    if (bytes.len != record_bytes or std.mem.readInt(u32, bytes[entry_encoded_bytes..][0..4], .little) != std.hash.crc.Crc32.hash(bytes[0..entry_encoded_bytes])) return error.InvalidFurnaceData;
+    var reader = std.Io.Reader.fixed(bytes[0..entry_encoded_bytes]);
+    entry.* = .{ .occupied = true };
+    entry.world = state.deps.worlds.find(.{ .value = try reader.takeInt(u128, .little) }) orelse return error.UnknownWorldKey;
+    entry.position.x = try reader.takeInt(i32, .little);
+    entry.position.y = try reader.takeInt(i16, .little);
+    entry.position.z = try reader.takeInt(i32, .little);
+    entry.block_state = try reader.takeInt(i32, .little);
+    if (!isFurnace(entry.block_state)) return error.InvalidFurnaceData;
+    for (&entry.items) |*stack| stack.* = try readStack(&reader);
+    entry.burn_time = try reader.takeInt(u16, .little);
+    entry.fuel_time = try reader.takeInt(u16, .little);
+    entry.cook_time = try reader.takeInt(u16, .little);
+    entry.cook_total = try reader.takeInt(u16, .little);
 }
 
 fn writeStack(writer: *std.Io.Writer, stack: player_store.HotbarStack) !void {
@@ -582,7 +657,7 @@ test "furnace block states preserve facing and lit state" {
     }
 }
 
-test "furnace persistence retains inventory and progress" {
+test "furnace persistence records retain two inventories and timers in ordinal order" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const descriptions = [_]world_store.Description{.{
@@ -595,27 +670,41 @@ test "furnace persistence retains inventory and progress" {
         .spawn_y = 64,
         .spawn_z = 0,
     }};
-    const worlds = try world_store.Worlds.init(arena.allocator(), .{ .initial = &descriptions });
+    const worlds = try world_store.Worlds.init(arena.allocator(), .{ .initial = &descriptions, .maximum_worlds = 1 });
     const world = worlds.find(.{ .value = 1 }).?;
     var furnaces: Furnaces = .{ .deps = undefined };
     furnaces.deps.worlds = worlds;
     furnaces.entries = try arena.allocator().alloc(Entry, 8);
     @memset(furnaces.entries, .{});
-    const entry = try getOrCreateEntry(&furnaces, world, .{ .x = -4, .y = 70, .z = 9 });
-    entry.items[0] = player_store.stackForItem(registry.item_raw_gold_id, 3);
-    entry.burn_time = 1200;
-    entry.fuel_time = 1600;
-    entry.cook_time = 41;
-    var buffer: [encodedCapacity(8) catch unreachable]u8 = undefined;
-    const bytes = try encodeState(&furnaces, &buffer);
+    furnaces.entries[3] = .{ .occupied = true, .world = world, .position = .{ .x = -4, .y = 70, .z = 9 } };
+    furnaces.entries[3].items[0] = player_store.stackForItem(registry.item_raw_gold_id, 3);
+    furnaces.entries[3].burn_time = 1200;
+    furnaces.entries[3].fuel_time = 1600;
+    furnaces.entries[3].cook_time = 41;
+    furnaces.entries[7] = .{ .occupied = true, .world = world, .position = .{ .x = 3, .y = 63, .z = -2 } };
+    furnaces.entries[7].items[1] = player_store.stackForItem(registry.item_coal_id, 7);
+    furnaces.entries[7].burn_time = 800;
+    furnaces.entries[7].fuel_time = 1600;
+    furnaces.entries[7].cook_time = 99;
+    furnaces.entries[7].cook_total = 200;
     var restored: Furnaces = .{ .deps = undefined };
     restored.deps.worlds = worlds;
     restored.entries = try arena.allocator().alloc(Entry, 8);
     @memset(restored.entries, .{});
-    try decodeState(&restored, bytes);
-    const actual = findEntry(&restored, world, entry.position).?;
-    try std.testing.expectEqual(registry.item_raw_gold_id, actual.items[0].item_id);
-    try std.testing.expectEqual(@as(u8, 3), actual.items[0].count);
-    try std.testing.expectEqual(@as(u16, 1200), actual.burn_time);
-    try std.testing.expectEqual(@as(u16, 41), actual.cook_time);
+    var root: [root_bytes]u8 = undefined;
+    const root_data = try encodeRoot(&root, 2);
+    const count = try decodeRoot(root_data);
+    for ([_]Entry{ furnaces.entries[3], furnaces.entries[7] }, 0..) |source, ordinal| {
+        var record: [record_bytes]u8 = undefined;
+        const bytes = try encodeEntry(&furnaces, &record, source);
+        try decodeEntry(&restored, &restored.entries[ordinal], bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(registry.item_raw_gold_id, restored.entries[0].items[0].item_id);
+    try std.testing.expectEqual(@as(u8, 3), restored.entries[0].items[0].count);
+    try std.testing.expectEqual(@as(u16, 1200), restored.entries[0].burn_time);
+    try std.testing.expectEqual(@as(u16, 41), restored.entries[0].cook_time);
+    try std.testing.expectEqual(registry.item_coal_id, restored.entries[1].items[1].item_id);
+    try std.testing.expectEqual(@as(u16, 800), restored.entries[1].burn_time);
+    try std.testing.expectEqual(@as(u16, 99), restored.entries[1].cook_time);
 }

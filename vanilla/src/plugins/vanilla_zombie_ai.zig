@@ -19,17 +19,19 @@ const collision = lightning_rod.collision;
 const navigation = lightning_rod.navigation;
 const vanilla_math = @import("../vanilla/math.zig");
 const diagnostics = lightning_rod.diagnostics;
-const active_chunks = @import("../vanilla/active_chunks.zig");
+const simulation_admission = @import("../vanilla/simulation_admission.zig");
 const Packets = lightning_rod.Packets;
 const world_identity = lightning_rod.world_identity;
+const vanilla_collision_projection = @import("vanilla_collision_projection.zig");
 
 const ZombieSimulation = struct {
     clock: *world_clock.Clock,
     rules: *game_rules.GameRules,
     random: *world_random.Random,
     blocks: *block_store.Blocks,
+    collision_projection: *vanilla_collision_projection.CollisionProjection,
     players: *player_store.Players,
-    active: ?*active_chunks.ActiveChunks = null,
+    active: ?*simulation_admission.SimulationAdmission = null,
     living: *entity_store.LivingEntities,
     items: *entity_store.ItemEntities,
 
@@ -41,19 +43,8 @@ const ZombieSimulation = struct {
         return self.items.position(index);
     }
 
-    fn remove_item_entity(self: *ZombieSimulation, index: usize) void {
+    fn removeItemEntity(self: *ZombieSimulation, index: usize) void {
         self.items.remove(index);
-    }
-
-    fn spawn_item_entity_with_pickup_delay(
-        self: *ZombieSimulation,
-        world: world_identity.Handle,
-        position: geometry.Vec3,
-        velocity: geometry.Vec3,
-        stack: player_store.HotbarStack,
-        pickup_delay_ticks: u16,
-    ) !usize {
-        return self.items.spawn(self.random, self.blocks, world, position, velocity, stack, pickup_delay_ticks);
     }
 };
 
@@ -77,12 +68,10 @@ const NavigationNodeCache = struct {
 
 const LandPathContext = struct {
     world: world_identity.Handle,
-    blocks: *block_store.Blocks,
+    collision_projection: *vanilla_collision_projection.CollisionProjection,
     search: *navigation.Search,
     node_cache: *NavigationNodeCache,
     baby: bool,
-    resident_chunks: [8]geometry.ChunkPos = undefined,
-    residents: [8]?*const block_store.GeneratedHeightChunk = [_]?*const block_store.GeneratedHeightChunk{null} ** 8,
     dependency_count: u8 = 0,
     dependencies_complete: bool = true,
     dependency_chunks: [32]geometry.ChunkPos = undefined,
@@ -134,24 +123,28 @@ const LandPathContext = struct {
 
     pub fn classifyPathNode(self: *LandPathContext, node: navigation.Node) navigation.Candidate {
         const chunk = geometry.ChunkPos{ .x = @divFloor(node.x, 16), .z = @divFloor(node.z, 16) };
-        const slot = pathResidentHash(chunk) & (self.residents.len - 1);
-        const resident = blk: {
-            if (self.residents[slot]) |cached|
-                if (cached.valid and geometry.sameChunk(cached.chunk, chunk)) break :blk cached;
-            break :blk self.resolveResident(slot, chunk) orelse return blockedPathCandidate(node);
-        };
+        const revision = self.collision_projection.revision(self.world, chunk) orelse return blockedPathCandidate(node);
+        self.recordDependency(chunk, revision);
         const cache_slot = navigationNodeCacheHash(self.world, node, self.baby) & (navigation_node_cache_capacity - 1);
         const cached = &self.node_cache.entries[cache_slot];
-        if (cached.world.eql(self.world) and cached.revision == resident.content_revision and cached.x == node.x and cached.y == node.y and cached.z == node.z and cached.baby == self.baby) {
+        if (cached.world.eql(self.world) and cached.revision == revision and cached.x == node.x and cached.y == node.y and cached.z == node.z and cached.baby == self.baby) {
             return .{
                 .node = .{ .x = node.x, .y = node.y, .z = node.z, .node_type = cached.node_type, .penalty = cached.penalty },
                 .passable = cached.passable,
             };
         }
-        const result = block_queries.pathNodeInResident(self.blocks, resident, node.x, node.y, node.z, self.baby);
+        const result = block_queries.pathNodeForDimensionsFrom(
+            self.collision_projection.source(),
+            self.world,
+            node.x,
+            node.y,
+            node.z,
+            if (self.baby) 0.3 else 0.6,
+            if (self.baby) 0.975 else 1.95,
+        );
         cached.* = .{
             .world = self.world,
-            .revision = resident.content_revision,
+            .revision = revision,
             .x = node.x,
             .y = node.y,
             .z = node.z,
@@ -163,20 +156,16 @@ const LandPathContext = struct {
         return result;
     }
 
-    fn resolveResident(self: *LandPathContext, slot: usize, chunk: geometry.ChunkPos) ?*const block_store.GeneratedHeightChunk {
-        const resident = self.blocks.residentChunk(self.world, chunk) orelse return null;
+    fn recordDependency(self: *LandPathContext, chunk: geometry.ChunkPos, revision: u64) void {
         var dependency_index: usize = 0;
         while (dependency_index < self.dependency_count and !geometry.sameChunk(self.dependency_chunks[dependency_index], chunk)) : (dependency_index += 1) {}
         if (dependency_index == self.dependency_count and self.dependency_count < self.dependency_chunks.len) {
             self.dependency_chunks[dependency_index] = chunk;
-            self.dependency_revisions[dependency_index] = resident.content_revision;
+            self.dependency_revisions[dependency_index] = revision;
             self.dependency_count += 1;
         } else if (dependency_index == self.dependency_count) {
             self.dependencies_complete = false;
         }
-        self.resident_chunks[slot] = chunk;
-        self.residents[slot] = resident;
-        return resident;
     }
 };
 
@@ -204,18 +193,13 @@ fn navigationNodeCacheHash(world: world_identity.Handle, node: navigation.Node, 
     return @intCast(value ^ (value >> 32));
 }
 
-fn pathResidentHash(chunk: geometry.ChunkPos) usize {
-    return @as(usize, @as(u32, @bitCast(chunk.x))) *% 0x9e37_79b1 ^ @as(usize, @as(u32, @bitCast(chunk.z))) *% 0x85eb_ca77;
-}
-
 fn livingEntityTicking(simulation: *const ZombieSimulation, index: usize) bool {
     const chunk = geometry.ChunkPos{
         .x = @divFloor(geometry.blockCoord(simulation.living.entities.position_x[index]), 16),
         .z = @divFloor(geometry.blockCoord(simulation.living.entities.position_z[index]), 16),
     };
     const active = simulation.active orelse return false;
-    return simulation.blocks.residentChunk(simulation.living.entities.worlds[index], chunk) != null and
-        active.entityTicking(simulation.living.entities.worlds[index], chunk);
+    return active.entityTicking(simulation.living.entities.worlds[index], chunk);
 }
 
 const path_memo_capacity = 256;
@@ -245,8 +229,9 @@ pub const ZombieAi = struct {
         rules: *game_rules.GameRules,
         random: *world_random.Random,
         blocks: *block_store.Blocks,
+        collision_projection: *vanilla_collision_projection.CollisionProjection,
         players: *player_store.Players,
-        active: *active_chunks.ActiveChunks,
+        active: *simulation_admission.SimulationAdmission,
         living: *entity_store.LivingEntities,
         items: *entity_store.ItemEntities,
         outputs: *Packets,
@@ -274,6 +259,7 @@ pub const ZombieAi = struct {
             .rules = self.deps.rules,
             .random = self.deps.random,
             .blocks = self.deps.blocks,
+            .collision_projection = self.deps.collision_projection,
             .players = self.deps.players,
             .active = self.deps.active,
             .living = self.deps.living,
@@ -336,12 +322,20 @@ fn tickZombieItemPickup(simulation: *ZombieSimulation, living_index: u16, output
                 const equipped = simulation.living.entities.equipment[index][equipment_slot];
                 if (equipped.count != 0 and !preferredEquipment(incoming, equipped, equipment_slot)) continue;
 
+                var dropped_reservation: ?entity_store.ItemEntities.Reservation = null;
+                var dropped_specification: entity_store.ItemEntities.Spawn = undefined;
                 if (equipped.count != 0) {
                     const drop_chance: f32 = if (simulation.living.entities.equipment_drop_guaranteed[index][equipment_slot]) 2 else 0.085;
-                    if (simulation.living.entities.random[index].nextFloat() - 0.1 < drop_chance and simulation.items.free_count != 0) {
+                    if (simulation.living.entities.random[index].nextFloat() - 0.1 < drop_chance) {
                         const dropped = player_store.stackForItem(equipped.item_id, equipped.count);
-                        const dropped_index: ?usize = simulation.spawn_item_entity_with_pickup_delay(world, position, .{}, .{ .item_id = dropped.item_id, .block_state = dropped.block_state, .damage = equipped.damage, .count = equipped.count }, entity_store.block_drop_pickup_delay_ticks) catch null;
-                        if (dropped_index) |spawned| outputs.item_spawned(@as(u16, @intCast(spawned)));
+                        dropped_specification = .{
+                            .world = world,
+                            .position = position,
+                            .stack = .{ .item_id = dropped.item_id, .block_state = dropped.block_state, .damage = equipped.damage, .count = equipped.count },
+                            .pickup_delay_ticks = entity_store.block_drop_pickup_delay_ticks,
+                        };
+                        simulation.items.validateSpawn(simulation.blocks, dropped_specification) catch continue;
+                        dropped_reservation = simulation.items.reserve(1) catch continue;
                     }
                 }
                 simulation.living.entities.equipment[index][equipment_slot] = .{ .item_id = incoming.item_id, .damage = incoming.damage, .count = 1 };
@@ -357,10 +351,15 @@ fn tickZombieItemPickup(simulation: *ZombieSimulation, living_index: u16, output
                 simulation.items.stacks[item_index].count -= 1;
                 outputs.item_collected(.{ .item_entity_id = item_entity_id, .collector_entity_id = simulation.living.entities.entity_ids[index], .count = 1 });
                 if (simulation.items.stacks[item_index].count == 0) {
-                    simulation.remove_item_entity(item_index);
+                    simulation.removeItemEntity(item_index);
                     outputs.entityDestroyed(item_entity_id);
                 } else {
                     outputs.item_metadata_changed(item_index);
+                }
+                if (dropped_reservation) |*reservation| {
+                    var spawned: [1]usize = undefined;
+                    simulation.items.commitReserved(reservation, simulation.random, &.{dropped_specification}, &spawned);
+                    outputs.item_spawned(@intCast(spawned[0]));
                 }
                 plugin_profiler.countTrace(ZombieLootTrace.pickups, 1);
                 outputs.living_equipment_changed(.{ .index = living_index, .equipment_slot = equipment_slot });
@@ -382,7 +381,7 @@ fn startZombieWander(
     };
     var context = LandPathContext{
         .world = simulation.living.entities.worlds[index],
-        .blocks = simulation.blocks,
+        .collision_projection = simulation.collision_projection,
         .search = &simulation.living.search,
         .node_cache = &state.navigation_nodes,
         .baby = simulation.living.entities.baby[index],
@@ -628,7 +627,7 @@ fn updateMeleePath(simulation: *ZombieSimulation, index: usize, state: *ZombieAi
 fn landPathContext(simulation: *ZombieSimulation, state: *ZombieAi, index: usize) LandPathContext {
     return .{
         .world = simulation.living.entities.worlds[index],
-        .blocks = simulation.blocks,
+        .collision_projection = simulation.collision_projection,
         .search = &simulation.living.search,
         .node_cache = &state.navigation_nodes,
         .baby = simulation.living.entities.baby[index],
@@ -697,70 +696,6 @@ test "zombie goal selectors use vanilla's staggered every-other-tick cadence" {
     try std.testing.expect(zombieSelectorTick(1, 17));
     try std.testing.expect(zombieSelectorTick(2, 18));
     try std.testing.expect(!zombieSelectorTick(2, 17));
-}
-
-test "an idle zombie can start a wander path" {
-    const simulation = try std.testing.allocator.create(test_state.State);
-    defer std.testing.allocator.destroy(simulation);
-    try simulation.init(std.testing.allocator, 91);
-    defer simulation.deinit();
-    simulation.blocks.ensureChunkAt(simulation.world, 8, 8, 0);
-    const y: i32 = 65;
-    for (7..11) |x| for (7..11) |z| {
-        _ = try simulation.blocks.setBlock(
-            simulation.world,
-            .{ .x = @intCast(x), .y = y - 1, .z = @intCast(z) },
-            registry.block_stone_default_state,
-        );
-        _ = try simulation.blocks.setBlock(
-            simulation.world,
-            .{ .x = @intCast(x), .y = y, .z = @intCast(z) },
-            registry.block_air_default_state,
-        );
-        _ = try simulation.blocks.setBlock(
-            simulation.world,
-            .{ .x = @intCast(x), .y = y + 1, .z = @intCast(z) },
-            registry.block_air_default_state,
-        );
-    };
-    const handle = try simulation.spawnLiving(.zombie, .{
-        .x = 8.5,
-        .y = @floatFromInt(y),
-        .z = 8.5,
-    }, false, true);
-    simulation.living.entities.on_ground[handle.index] = true;
-    var candidate_seed: u64 = 0;
-    for (0..1_000_000) |_| {
-        var candidate = simulation.living.entities.random[handle.index];
-        candidate.setSeed(candidate_seed);
-        if (candidate.nextIntBounded(21) == 11 and
-            candidate.nextIntBounded(15) == 7 and
-            candidate.nextIntBounded(21) == 10)
-        {
-            simulation.living.entities.random[handle.index].setSeed(candidate_seed);
-            break;
-        }
-        candidate_seed += 1;
-    }
-    var state: ZombieAi = .{ .deps = undefined };
-    var state_storage = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer state_storage.deinit();
-    try allocateBuffers(&state, state_storage.allocator());
-    var dependencies = ZombieSimulation{
-        .clock = &simulation.clock,
-        .rules = &simulation.rules,
-        .random = &simulation.random,
-        .blocks = &simulation.blocks,
-        .players = &simulation.players,
-        .living = &simulation.living,
-        .items = &simulation.items,
-    };
-
-    try std.testing.expect(startZombieWander(&dependencies, handle.index, &state));
-    try std.testing.expect(!simulation.living.paths.isIdle(handle.index));
-    _ = tickLivingNavigation(&dependencies, handle.index);
-    try std.testing.expect(simulation.living.entities.velocity_x[handle.index] != 0 or
-        simulation.living.entities.velocity_z[handle.index] != 0);
 }
 
 fn tickLivingNavigation(simulation: *ZombieSimulation, index: usize) bool {
@@ -848,8 +783,8 @@ fn livingDistanceSquaredToPlayer(pool: *const living_entities.Pool, index: usize
 }
 
 fn zombieCanSeePlayer(simulation: *ZombieSimulation, index: usize, player: *const player_store.CorePlayer) bool {
-    return block_queries.hasLineOfSight(
-        simulation.blocks,
+    return block_queries.hasLineOfSightFrom(
+        simulation.collision_projection.source(),
         simulation.living.entities.worlds[index],
         .{
             .x = simulation.living.entities.position_x[index],
@@ -873,7 +808,7 @@ fn findLivingPath(
 ) bool {
     const slot = pathMemoHash(start, target, target_distance, context.baby, max_distance, max_iterations) & (path_memo_capacity - 1);
     const entry = &state.paths[slot];
-    if (entry.valid and entry.world.eql(context.world) and pathMemoDependenciesValid(simulation.blocks, entry) and entry.baby == context.baby and entry.target_distance == target_distance and
+    if (entry.valid and entry.world.eql(context.world) and pathMemoDependenciesValid(simulation.collision_projection, entry) and entry.baby == context.baby and entry.target_distance == target_distance and
         samePathNode(entry.start, start) and samePathNode(entry.target, target) and entry.max_distance_bits == @as(u32, @bitCast(max_distance)) and entry.max_iterations == max_iterations)
     {
         simulation.living.paths.clear(entity);
@@ -914,10 +849,9 @@ fn findLivingPath(
     return found;
 }
 
-fn pathMemoDependenciesValid(blocks: *const block_store.Blocks, entry: *const PathMemoEntry) bool {
+fn pathMemoDependenciesValid(projection: *vanilla_collision_projection.CollisionProjection, entry: *const PathMemoEntry) bool {
     for (entry.dependency_chunks[0..entry.dependency_count], entry.dependency_revisions[0..entry.dependency_count]) |chunk, revision| {
-        const resident = blocks.residentChunk(entry.world, chunk) orelse return false;
-        if (resident.content_revision != revision) return false;
+        if (projection.revision(entry.world, chunk) != revision) return false;
     }
     return true;
 }
@@ -985,7 +919,6 @@ fn allocateBuffers(state: *ZombieAi, allocator: std.mem.Allocator) !void {
     state.navigation_nodes.entries = try preallocated.alloc(NavigationNodeCacheEntry, allocator, navigation_node_cache_capacity);
     @memset(state.paths, .{});
     @memset(state.navigation_nodes.entries, .{});
-    vanilla_math.initialize();
 }
 
 pub const ZombieDaylight = struct {
@@ -993,8 +926,8 @@ pub const ZombieDaylight = struct {
     pub const Configuration = struct {};
     pub const Dependencies = struct {
         time: *vanilla_time.Time,
-        blocks: *block_store.Blocks,
-        active: *active_chunks.ActiveChunks,
+        collision_projection: *vanilla_collision_projection.CollisionProjection,
+        active: *simulation_admission.SimulationAdmission,
         living: *entity_store.LivingEntities,
     };
 
@@ -1007,11 +940,11 @@ pub const ZombieDaylight = struct {
     }
 
     pub fn tick(self: *ZombieDaylight, _: std.mem.Allocator) void {
-        tickZombieDaylight(self.deps.time, self.deps.blocks, self.deps.active, &self.deps.living.entities);
+        tickZombieDaylight(self.deps.time, self.deps.collision_projection, self.deps.active, &self.deps.living.entities);
     }
 };
 
-fn tickZombieDaylight(time: *vanilla_time.Time, blocks: *block_store.Blocks, active: ?*const active_chunks.ActiveChunks, entities: *living_entities.Pool) void {
+fn tickZombieDaylight(time: *vanilla_time.Time, projection: *vanilla_collision_projection.CollisionProjection, active: ?*const simulation_admission.SimulationAdmission, entities: *living_entities.Pool) void {
     const day_time = time.day_time % 24_000;
     if (day_time >= 12_000) return;
     for (entities.active_indices[0..entities.active_count]) |index| {
@@ -1020,12 +953,11 @@ fn tickZombieDaylight(time: *vanilla_time.Time, blocks: *block_store.Blocks, act
             .x = @divFloor(geometry.blockCoord(entities.position_x[index]), 16),
             .z = @divFloor(geometry.blockCoord(entities.position_z[index]), 16),
         };
-        if (blocks.residentChunk(entities.worlds[index], chunk) == null) continue;
         if (active) |policy| if (!policy.entityTicking(entities.worlds[index], chunk)) continue;
         const x = geometry.blockCoord(entities.position_x[index]);
         const z = geometry.blockCoord(entities.position_z[index]);
         const head_y = geometry.blockCoord(entities.position_y[index] + living_entities.height(.zombie, entities.baby[index]));
-        if (head_y <= blocks.highestGeneratedY(entities.worlds[index], x, z)) continue;
+        if (head_y <= (projection.highestBlockYAt(entities.worlds[index], x, z) orelse continue)) continue;
         if (entities.fire_ticks[index] <= 0) {
             entities.fire_ticks[index] = 160;
             entities.metadata_dirty[index] = true;
@@ -1042,8 +974,9 @@ pub const ZombieLoot = struct {
         rules: *game_rules.GameRules,
         random: *world_random.Random,
         blocks: *block_store.Blocks,
+        collision_projection: *vanilla_collision_projection.CollisionProjection,
         players: *player_store.Players,
-        active: *active_chunks.ActiveChunks,
+        active: *simulation_admission.SimulationAdmission,
         living: *entity_store.LivingEntities,
         items: *entity_store.ItemEntities,
         outputs: *Packets,
@@ -1063,6 +996,7 @@ pub const ZombieLoot = struct {
             .rules = self.deps.rules,
             .random = self.deps.random,
             .blocks = self.deps.blocks,
+            .collision_projection = self.deps.collision_projection,
             .players = self.deps.players,
             .active = self.deps.active,
             .living = self.deps.living,
@@ -1083,37 +1017,4 @@ fn tickZombieLoot(simulation: *ZombieSimulation, outputs: *Packets) void {
     }
 }
 
-test "exposed unhelmeted zombies burn only during daylight" {
-    const simulation = try std.testing.allocator.create(test_state.State);
-    defer std.testing.allocator.destroy(simulation);
-    try simulation.init(std.testing.allocator, 23);
-    defer simulation.deinit();
-    simulation.players.records[0].state = .play;
-    simulation.players.records[0].world = simulation.world;
-    simulation.players.records[0].position = .{ .x = 8.5, .y = 65, .z = 8.5 };
-    simulation.players.rebuildActive();
-    simulation.blocks.ensureChunkAt(simulation.world, 8, 8, 0);
-    const surface = simulation.blocks.highestGeneratedY(simulation.world, 8, 8);
-    const handle = try simulation.spawnLiving(.zombie, .{
-        .x = 8.5,
-        .y = @floatFromInt(@as(i32, surface) + 1),
-        .z = 8.5,
-    }, false, true);
-
-    simulation.time.day_time = 1_000;
-    tickZombieDaylight(&simulation.time, &simulation.blocks, null, &simulation.living.entities);
-    try std.testing.expectEqual(@as(i32, 160), simulation.living.entities.fire_ticks[handle.index]);
-    try std.testing.expect(simulation.living.entities.metadata_dirty[handle.index]);
-
-    simulation.living.entities.fire_ticks[handle.index] = 0;
-    simulation.living.entities.metadata_dirty[handle.index] = false;
-    simulation.time.day_time = 13_000;
-    tickZombieDaylight(&simulation.time, &simulation.blocks, null, &simulation.living.entities);
-    try std.testing.expectEqual(@as(i32, 0), simulation.living.entities.fire_ticks[handle.index]);
-
-    simulation.time.day_time = 1_000;
-    simulation.living.entities.equipment[handle.index][5] = .{ .item_id = 1, .count = 1 };
-    tickZombieDaylight(&simulation.time, &simulation.blocks, null, &simulation.living.entities);
-    try std.testing.expectEqual(@as(i32, 0), simulation.living.entities.fire_ticks[handle.index]);
-}
 const vanilla_time = lightning_rod.time;

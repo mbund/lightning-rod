@@ -40,6 +40,15 @@ pub const View = struct {
 };
 
 pub const Generator = struct {
+    const terrain_cache_count = 256;
+    const TerrainCacheEntry = struct {
+        valid: bool = false,
+        x: i32 = 0,
+        z: i32 = 0,
+        ocean_floor: [width * width]i16 = undefined,
+        world_surface: [width * width]i16 = undefined,
+    };
+
     allocator: std.mem.Allocator,
     world_seed: u64,
     router: *density.Router,
@@ -56,6 +65,9 @@ pub const Generator = struct {
     carver_scratch: carver.Scratch,
     feature_material_scratch: []aquifer.Material,
     feature_region_scratch: []GeneratedState,
+    terrain_cache_entries: [terrain_cache_count]TerrainCacheEntry = [_]TerrainCacheEntry{.{}} ** terrain_cache_count,
+    terrain_cache_states: []GeneratedState,
+    terrain_cache_next: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, world_seed: u64) !Generator {
         var result: Generator = undefined;
@@ -95,7 +107,7 @@ pub const Generator = struct {
         var ore_interpolation = try density.ChunkInterpolator.initVeins(
             allocator,
             router,
-            1024,
+            2048,
         );
         errdefer ore_interpolation.deinit();
         var carver_scratch = try carver.Scratch.init(allocator, router, world_seed);
@@ -112,6 +124,12 @@ pub const Generator = struct {
             @constCast(&[_]GeneratedState{});
         errdefer if (feature_region_scratch.len != 0)
             allocator.free(feature_region_scratch);
+        const terrain_cache_states = if (allocate_feature_scratch)
+            try preallocated.alloc(GeneratedState, allocator, block_count * terrain_cache_count)
+        else
+            @constCast(&[_]GeneratedState{});
+        errdefer if (terrain_cache_states.len != 0)
+            allocator.free(terrain_cache_states);
         var base_random = random.Xoroshiro.init(world_seed);
         const base_splitter = base_random.splitter();
         var ore_random = base_splitter.splitString("minecraft:ore");
@@ -131,10 +149,13 @@ pub const Generator = struct {
             .carver_scratch = carver_scratch,
             .feature_material_scratch = feature_material_scratch,
             .feature_region_scratch = feature_region_scratch,
+            .terrain_cache_states = terrain_cache_states,
         };
     }
 
     pub fn deinit(self: *Generator) void {
+        if (self.terrain_cache_states.len != 0)
+            self.allocator.free(self.terrain_cache_states);
         if (self.feature_region_scratch.len != 0)
             self.allocator.free(self.feature_region_scratch);
         if (self.feature_material_scratch.len != 0)
@@ -165,6 +186,8 @@ pub const Generator = struct {
         self.biome_cache = .{};
         self.stronghold_locator.invalidate();
         self.feature_biomes.clear();
+        self.terrain_cache_entries = [_]TerrainCacheEntry{.{}} ** terrain_cache_count;
+        self.terrain_cache_next = 0;
         self.world_seed = world_seed;
     }
 
@@ -232,25 +255,25 @@ pub const Generator = struct {
                 y - minimum_y,
                 density.ChunkInterpolator.vertical_cell_size,
             ));
-            for (0..width) |local_x| {
-                const x = first_x + @as(i32, @intCast(local_x));
+            var local_x: usize = 0;
+            while (local_x < width) : (local_x += density.sample_lanes / density.ChunkInterpolator.horizontal_cell_size) {
                 var local_z: usize = 0;
-                while (local_z < width) : (local_z += density.sample_lanes) {
+                while (local_z < width) : (local_z += density.ChunkInterpolator.horizontal_cell_size) {
                     const cell_x = local_x / density.ChunkInterpolator.horizontal_cell_size;
                     const cell_z = local_z / density.ChunkInterpolator.horizontal_cell_size;
                     if (!eligible[cell_y - first_cell_y][cell_x][cell_z]) continue;
-                    self.applyOreVeinBatch(x, y, local_x, local_z, first_z, output);
+                    self.applyOreVeinBatch(y, local_x, local_z, first_x, first_z, output);
                 }
             }
         }
     }
 
-    fn applyOreVeinBatch(self: *Generator, x: i32, y: i32, local_x: usize, first_local_z: usize, first_z: i32, output: []GeneratedState) void {
+    fn applyOreVeinBatch(self: *Generator, y: i32, first_local_x: usize, first_local_z: usize, first_x: i32, first_z: i32, output: []GeneratedState) void {
         var positions: [density.sample_lanes]density.Position = undefined;
         inline for (0..density.sample_lanes) |lane| positions[lane] = .{
-            .x = x,
+            .x = first_x + @as(i32, @intCast(first_local_x + lane / density.ChunkInterpolator.horizontal_cell_size)),
             .y = y,
-            .z = first_z + @as(i32, @intCast(first_local_z + lane)),
+            .z = first_z + @as(i32, @intCast(first_local_z + lane % density.ChunkInterpolator.horizontal_cell_size)),
         };
         const toggles: [density.sample_lanes]f64 = self.ore_interpolation.sampleVeinToggle4(positions);
         var sources: [density.sample_lanes]random.Xoroshiro = undefined;
@@ -266,7 +289,7 @@ pub const Generator = struct {
             const edge_reduction = clampedMap(@floatFromInt(distance_to_edge), 0, 20, -0.2, 0);
             const magnitude = @abs(toggle);
             if (magnitude + edge_reduction < @as(f32, 0.4)) continue;
-            sources[lane] = self.ore_splitter.splitPosition(x, y, positions[lane].z);
+            sources[lane] = self.ore_splitter.splitPosition(positions[lane].x, y, positions[lane].z);
             if (sources[lane].nextF32() > 0.7) continue;
             candidates[lane] = true;
             any_candidate = true;
@@ -291,7 +314,8 @@ pub const Generator = struct {
             @splat(0);
         for (0..density.sample_lanes) |lane| {
             if (!candidates[lane]) continue;
-            const local_z = first_local_z + lane;
+            const local_x = first_local_x + lane / density.ChunkInterpolator.horizontal_cell_size;
+            const local_z = first_local_z + lane % density.ChunkInterpolator.horizontal_cell_size;
             const index = blockIndex(@intCast(local_x), y, @intCast(local_z));
             const copper = toggles[lane] > 0;
             const state = oreVeinState(copper, rich[lane] and gaps[lane] > -0.3, &sources[lane]);
@@ -307,21 +331,32 @@ pub const Generator = struct {
         output: []GeneratedState,
     ) !void {
         var top_heights: [width * width]i32 = undefined;
-        var biome_halo: BiomeHalo = undefined;
         const preliminary_corners = density.preliminarySurfaceCorners(
             self.router,
             chunk_x,
             chunk_z,
         );
         try initializeSurface(base, output, &top_heights);
+        try self.applySurfaceToStates(chunk_x, chunk_z, output, &top_heights, &preliminary_corners);
+    }
+
+    fn applySurfaceToStates(
+        self: *Generator,
+        chunk_x: i32,
+        chunk_z: i32,
+        output: []GeneratedState,
+        top_heights: *[width * width]i32,
+        preliminary_corners: *const [4]i32,
+    ) !void {
+        var biome_halo: BiomeHalo = undefined;
         self.prepareSurfaceBiomeHalo(chunk_x, chunk_z, &biome_halo);
         try self.applySurfaceColumns(
             chunk_x,
             chunk_z,
             output,
-            &top_heights,
+            top_heights,
             &biome_halo,
-            &preliminary_corners,
+            preliminary_corners,
             0,
             width,
         );
@@ -354,7 +389,7 @@ pub const Generator = struct {
         chunk_z: i32,
         output: []GeneratedState,
         top_heights: *[width * width]i32,
-        biome_halo: *const BiomeHalo,
+        biome_halo: *BiomeHalo,
         preliminary_corners: *const [4]i32,
         first_local_x: usize,
         local_x_count: usize,
@@ -374,8 +409,10 @@ pub const Generator = struct {
                     first_x + @as(i32, @intCast(local_x)),
                     first_z + @as(i32, @intCast(local_z)),
                 );
+                var columns: [density.sample_lanes]SurfaceColumn = undefined;
                 inline for (0..density.sample_lanes) |lane| {
-                    var column = self.prepareSurfaceColumn(
+                    columns[lane] = SurfaceColumn.init(
+                        self,
                         first_x,
                         first_z,
                         local_x,
@@ -383,59 +420,74 @@ pub const Generator = struct {
                         depths.run[lane],
                         depths.surface_noise[lane],
                         depths.secondary[lane],
-                        output,
                         top_heights,
                         biome_halo,
                         preliminary_corners,
                     );
-                    self.applySurfaceColumn(&column, output, biome_halo, top_heights);
+                    const column = &columns[lane];
+                    if (std.mem.eql(u8, biome.name(column.surface_biome_index), "minecraft:eroded_badlands")) {
+                        if (self.surface_sampler.badlandsPillarHeight(column.x, column.z, column.initial_top)) |target| {
+                            if (placeBadlandsPillar(output, column.local_x, column.local_z, target))
+                                top_heights[column.height_index] = target + 1;
+                        }
+                    }
+                    column.steep = columnIsSteep(top_heights, column.local_x, column.local_z);
+                }
+                var consecutive = [_]u16{0} ** density.sample_lanes;
+                var top_count: usize = 0;
+                inline for (&columns) |*column|
+                    top_count = @max(top_count, @as(usize, @intCast(top_heights[column.height_index] - minimum_y)));
+                for (0..top_count) |local_y| {
+                    const first = local_y * width * width + local_z * width + local_x;
+                    inline for (0..density.sample_lanes) |lane| {
+                        if (local_y < @as(usize, @intCast(top_heights[columns[lane].height_index] - minimum_y))) {
+                            consecutive[lane] = if (generatedMaterial(output[first + lane * width]) == .stone)
+                                consecutive[lane] + 1
+                            else
+                                0;
+                            columns[lane].below[local_y] = consecutive[lane];
+                        }
+                    }
+                }
+                var stone_depth_above = [_]i32{0} ** density.sample_lanes;
+                var fluid_height = [_]i32{std.math.minInt(i32)} ** density.sample_lanes;
+                var y: i32 = minimum_y + height;
+                while (y > minimum_y) {
+                    y -= 1;
+                    inline for (0..density.sample_lanes) |lane| {
+                        lane_block: {
+                            const column = &columns[lane];
+                            if (y >= top_heights[column.height_index]) break :lane_block;
+                            if (y < column.preliminary_surface and y > 7) break :lane_block;
+                            const index = blockIndex(@intCast(column.local_x), y, @intCast(column.local_z));
+                            const material = generatedMaterial(output[index]);
+                            if (material == .air) {
+                                stone_depth_above[lane] = 0;
+                                fluid_height[lane] = std.math.minInt(i32);
+                                break :lane_block;
+                            }
+                            if (material == .water or material == .lava) {
+                                if (fluid_height[lane] == std.math.minInt(i32)) fluid_height[lane] = y + 1;
+                                break :lane_block;
+                            }
+                            stone_depth_above[lane] += 1;
+                            const context = self.surfaceContext(column, biome_halo, y, fluid_height[lane], stone_depth_above[lane]);
+                            if (self.surface_sampler.apply(&context)) |replacement| switch (replacement) {
+                                .state => |state| output[index] = GeneratedState.fromSurface(state),
+                                .badlands => output[index] = GeneratedState.fromSurface(self.surface_sampler.terracottaBlock(column.x, y, column.z)),
+                            };
+                        }
+                    }
+                }
+                inline for (&columns) |*column| {
                     if (frozenOceanBiome(column.surface_biome_index))
-                        self.applyFrozenOceanColumn(&column, output);
+                        self.applyFrozenOceanColumn(column, output);
                 }
             }
         }
     }
 
-    fn prepareSurfaceColumn(self: *Generator, first_x: i32, first_z: i32, local_x: usize, local_z: usize, run_depth: i32, surface_noise: f64, secondary_depth: f64, output: []GeneratedState, top_heights: *[width * width]i32, biome_halo: *const BiomeHalo, preliminary_corners: *const [4]i32) SurfaceColumn {
-        var column = SurfaceColumn.init(self, first_x, first_z, local_x, local_z, run_depth, surface_noise, secondary_depth, top_heights, biome_halo, preliminary_corners);
-        if (std.mem.eql(u8, biome.name(column.surface_biome_index), "minecraft:eroded_badlands")) {
-            if (self.surface_sampler.badlandsPillarHeight(column.x, column.z, column.initial_top)) |target| {
-                if (placeBadlandsPillar(output, local_x, local_z, target))
-                    top_heights[column.height_index] = target + 1;
-            }
-        }
-        column.steep = columnIsSteep(top_heights, local_x, local_z);
-        column.fillStoneDepth(output);
-        return column;
-    }
-
-    fn applySurfaceColumn(self: *Generator, column: *const SurfaceColumn, output: []GeneratedState, biome_halo: *const BiomeHalo, top_heights: *const [width * width]i32) void {
-        var stone_depth_above: i32 = 0;
-        var fluid_height: i32 = std.math.minInt(i32);
-        var y = top_heights[column.height_index];
-        while (y > minimum_y) {
-            y -= 1;
-            const index = blockIndex(@intCast(column.local_x), y, @intCast(column.local_z));
-            const material = generatedMaterial(output[index]);
-            if (material == .air) {
-                stone_depth_above = 0;
-                fluid_height = std.math.minInt(i32);
-                continue;
-            }
-            if (material == .water or material == .lava) {
-                if (fluid_height == std.math.minInt(i32)) fluid_height = y + 1;
-                continue;
-            }
-            stone_depth_above += 1;
-            const context = self.surfaceContext(column, biome_halo, y, fluid_height, stone_depth_above);
-            if (self.surface_sampler.apply(&context)) |replacement| switch (replacement) {
-                .state => |state| output[index] = GeneratedState.fromSurface(state),
-                .badlands => output[index] = GeneratedState.fromSurface(self.surface_sampler.terracottaBlock(column.x, y, column.z)),
-            };
-        }
-    }
-
-    fn surfaceContext(self: *Generator, column: *const SurfaceColumn, biome_halo: *const BiomeHalo, y: i32, fluid_height: i32, stone_depth_above: i32) surface.Context {
+    fn surfaceContext(self: *Generator, column: *const SurfaceColumn, biome_halo: *BiomeHalo, y: i32, fluid_height: i32, stone_depth_above: i32) surface.Context {
         const position = density.Position{ .x = column.x, .y = y, .z = column.z };
         var biome_mask: u32 = undefined;
         var temperature: f32 = undefined;
@@ -534,22 +586,28 @@ pub const Generator = struct {
             return error.FeatureScratchUnavailable;
         var chunks: [9][]GeneratedState = undefined;
         var neighbor_index: usize = 0;
+        var work: FeatureWork = undefined;
         for (0..3) |halo_z| {
             for (0..3) |halo_x| {
                 const neighbor_x = chunk_x + @as(i32, @intCast(halo_x)) - 1;
                 const neighbor_z = chunk_z + @as(i32, @intCast(halo_z)) - 1;
+                const cached = try self.cachedTerrainEntry(neighbor_x, neighbor_z);
                 const states = if (neighbor_x == chunk_x and neighbor_z == chunk_z)
                     output
                 else blk: {
                     const first = neighbor_index * block_count;
                     const scratch = self.feature_region_scratch[first .. first + block_count];
                     neighbor_index += 1;
-                    try self.fillBaseMaterials(neighbor_x, neighbor_z, self.feature_material_scratch);
-                    try self.applySurface(neighbor_x, neighbor_z, self.feature_material_scratch, scratch);
-                    try self.applyCarvers(neighbor_x, neighbor_z, scratch);
+                    @memcpy(scratch, self.terrainCacheStates(cached.index));
                     break :blk scratch;
                 };
                 chunks[halo_z * 3 + halo_x] = states;
+                for (0..width) |local_z| {
+                    const source_first = local_z * width;
+                    const target_first = (halo_z * width + local_z) * feature.height_halo_side + halo_x * width;
+                    @memcpy(work.ocean_floor[target_first..][0..width], cached.entry.ocean_floor[source_first..][0..width]);
+                    @memcpy(work.world_surface[target_first..][0..width], cached.entry.world_surface[source_first..][0..width]);
+                }
             }
         }
         var region: feature.Region = .{
@@ -558,7 +616,52 @@ pub const Generator = struct {
             .chunks = chunks,
             .biome_cache = &self.biome_cache,
         };
-        try self.applyFeaturesToRegion(chunk_x, chunk_z, &region);
+        self.beginFeatureWork(chunk_x, chunk_z, &region, &work);
+        while (!try self.advanceFeatureWork(chunk_x, chunk_z, &region, &work)) {}
+    }
+
+    pub fn copyCachedTerrain(
+        self: *Generator,
+        chunk_x: i32,
+        chunk_z: i32,
+        output: []GeneratedState,
+    ) !void {
+        if (output.len != block_count) return error.InvalidChunkOutputSize;
+        @memcpy(output, try self.cachedTerrain(chunk_x, chunk_z));
+    }
+
+    fn cachedTerrain(self: *Generator, chunk_x: i32, chunk_z: i32) ![]GeneratedState {
+        const cached = try self.cachedTerrainEntry(chunk_x, chunk_z);
+        return self.terrainCacheStates(cached.index);
+    }
+
+    fn terrainCacheStates(self: *Generator, index: usize) []GeneratedState {
+        const first = index * block_count;
+        return self.terrain_cache_states[first..][0..block_count];
+    }
+
+    fn cachedTerrainEntry(self: *Generator, chunk_x: i32, chunk_z: i32) !struct {
+        index: usize,
+        entry: *TerrainCacheEntry,
+    } {
+        if (self.terrain_cache_states.len == 0) return error.FeatureScratchUnavailable;
+        for (&self.terrain_cache_entries, 0..) |*entry, index| {
+            if (entry.valid and entry.x == chunk_x and entry.z == chunk_z)
+                return .{ .index = index, .entry = entry };
+        }
+        const index = self.terrain_cache_next;
+        self.terrain_cache_next = (self.terrain_cache_next + 1) % terrain_cache_count;
+        const states = self.terrainCacheStates(index);
+        var top_heights: [width * width]i32 = [_]i32{minimum_y} ** (width * width);
+        self.prepareBaseMaterials(chunk_x, chunk_z);
+        while (!self.advanceBaseStates(states, &top_heights)) {}
+        const preliminary_corners = density.preliminarySurfaceCorners(self.router, chunk_x, chunk_z);
+        try self.applySurfaceToStates(chunk_x, chunk_z, states, &top_heights, &preliminary_corners);
+        try self.applyCarvers(chunk_x, chunk_z, states);
+        self.terrain_cache_entries[index] = .{ .valid = true, .x = chunk_x, .z = chunk_z };
+        const entry = &self.terrain_cache_entries[index];
+        fillChunkHeights(states, &entry.ocean_floor, &entry.world_surface);
+        return .{ .index = index, .entry = entry };
     }
 
     pub fn applyFeaturesToRegion(
@@ -612,7 +715,7 @@ pub const Generator = struct {
             chunk_x,
             chunk_z,
         );
-        @memset(&work.touched_y, minimum_y - 1);
+        region.height_upper_bounds = &work.world_surface;
         work.stage = .lava_lakes;
         work.vegetation_index = 0;
     }
@@ -677,7 +780,7 @@ pub const BaseWork = struct {
         var interpolation = try density.ChunkInterpolator.initFinal(
             allocator,
             router,
-            1024,
+            2048,
         );
         errdefer interpolation.deinit();
         const fluids = try aquifer.Sampler.init(
@@ -803,7 +906,7 @@ pub const BaseWork = struct {
         comptime std.debug.assert(
             density.sample_lanes % density.ChunkInterpolator.horizontal_cell_size == 0,
         );
-        const x_lanes = density.sample_lanes /
+        const z_lanes = density.sample_lanes /
             density.ChunkInterpolator.horizontal_cell_size;
         var local_y: usize = density.ChunkInterpolator.vertical_cell_size;
         while (local_y > 0) {
@@ -811,18 +914,18 @@ pub const BaseWork = struct {
             const y = minimum_y + @as(i32, @intCast(
                 cell_y * density.ChunkInterpolator.vertical_cell_size + local_y,
             ));
-            var local_x: usize = 0;
-            while (local_x < density.ChunkInterpolator.horizontal_cell_size) : (local_x += x_lanes) {
+            var local_z: usize = 0;
+            while (local_z < density.ChunkInterpolator.horizontal_cell_size) : (local_z += z_lanes) {
                 var positions: [density.sample_lanes]density.Position = undefined;
                 inline for (0..density.sample_lanes) |lane| positions[lane] = .{
                     .x = self.first_x + @as(i32, @intCast(
                         cell_x * density.ChunkInterpolator.horizontal_cell_size +
-                            local_x + lane / density.ChunkInterpolator.horizontal_cell_size,
+                            lane % density.ChunkInterpolator.horizontal_cell_size,
                     )),
                     .y = y,
                     .z = self.first_z + @as(i32, @intCast(
                         cell_z * density.ChunkInterpolator.horizontal_cell_size +
-                            lane % density.ChunkInterpolator.horizontal_cell_size,
+                            local_z + lane / density.ChunkInterpolator.horizontal_cell_size,
                     )),
                 };
                 const densities = self.interpolation.sampleFinal4(positions);
@@ -892,8 +995,8 @@ pub const BaseWork = struct {
         var material_index: usize = 0;
         for (0..density.ChunkInterpolator.vertical_cell_size) |local_y| {
             const y = minimum_y + @as(i32, @intCast(first_y + local_y));
-            for (0..density.ChunkInterpolator.horizontal_cell_size) |local_x| {
-                for (0..density.ChunkInterpolator.horizontal_cell_size) |local_z| {
+            for (0..density.ChunkInterpolator.horizontal_cell_size) |local_z| {
+                for (0..density.ChunkInterpolator.horizontal_cell_size) |local_x| {
                     const material = materials[material_index];
                     output[blockIndex(@intCast(first_x + local_x), y, @intCast(first_z + local_z))] =
                         if (Output == GeneratedState)
@@ -929,7 +1032,6 @@ pub const FeatureStage = enum(u8) {
 pub const FeatureWork = struct {
     ocean_floor: feature.HeightHalo,
     world_surface: feature.HeightHalo,
-    touched_y: feature.HeightHalo,
     decorator_random: feature.DecoratorRandom,
     biomes: feature.BiomePlan,
     stage: FeatureStage,
@@ -1037,12 +1139,9 @@ const FeaturePass = struct {
 };
 
 pub const BiomeHalo = struct {
-    const side = 3;
-    const chunk_count = side * side;
-
     center_x: i32,
     center_z: i32,
-    chunks: [chunk_count][biome.overworld_cell_count]u8,
+    chunks: [9][biome.overworld_cell_count]u8,
 
     fn fill(
         self: *BiomeHalo,
@@ -1053,34 +1152,33 @@ pub const BiomeHalo = struct {
     ) void {
         self.center_x = center_x;
         self.center_z = center_z;
-        for (0..side) |local_z| {
-            for (0..side) |local_x| {
-                const chunk_x = center_x + @as(i32, @intCast(local_x)) - 1;
-                const chunk_z = center_z + @as(i32, @intCast(local_z)) - 1;
+        for (0..3) |z| {
+            for (0..3) |x| {
                 @memcpy(
-                    &self.chunks[local_z * side + local_x],
-                    cache.chunk(sampler, chunk_x, chunk_z),
+                    &self.chunks[z * 3 + x],
+                    cache.chunk(
+                        sampler,
+                        center_x + @as(i32, @intCast(x)) - 1,
+                        center_z + @as(i32, @intCast(z)) - 1,
+                    ),
                 );
             }
         }
     }
 
-    fn at(self: *const BiomeHalo, quart: density.Position) u8 {
-        const chunk_x = @divFloor(quart.x, 4);
-        const chunk_z = @divFloor(quart.z, 4);
-        const halo_x = chunk_x - self.center_x + 1;
-        const halo_z = chunk_z - self.center_z + 1;
-        std.debug.assert(halo_x >= 0 and halo_x < side);
-        std.debug.assert(halo_z >= 0 and halo_z < side);
-        const local_x: usize = @intCast(@mod(quart.x, 4));
-        const local_z: usize = @intCast(@mod(quart.z, 4));
-        const local_y: usize = @intCast(quart.y - @divFloor(minimum_y, 4));
-        const section = local_y / 4;
-        const section_y = local_y % 4;
-        const index = section * biome.quart_cells_per_section +
-            local_x + local_z * 4 + section_y * 16;
-        const halo_index: usize = @intCast(halo_z * side + halo_x);
-        return self.chunks[halo_index][index];
+    fn at(self: *BiomeHalo, quart: density.Position) u8 {
+        const halo_x = quart.x - (self.center_x - 1) * 4;
+        const halo_z = quart.z - (self.center_z - 1) * 4;
+        std.debug.assert(halo_x >= 0 and halo_x < 12);
+        std.debug.assert(halo_z >= 0 and halo_z < 12);
+        std.debug.assert(quart.y >= -16 and quart.y < 80);
+        const local_x: usize = @intCast(halo_x);
+        const local_z: usize = @intCast(halo_z);
+        const vertical: usize = @intCast(quart.y + 16);
+        return self.chunks[(local_z >> 2) * 3 + (local_x >> 2)][
+            (vertical >> 2) * biome.quart_cells_per_section +
+                (local_x & 3) + (local_z & 3) * 4 + (vertical & 3) * 16
+        ];
     }
 };
 
@@ -1099,7 +1197,7 @@ const SurfaceColumn = struct {
     steep: bool = false,
     below: [height]u16 = undefined,
 
-    fn init(generator: *Generator, first_x: i32, first_z: i32, local_x: usize, local_z: usize, run_depth: i32, surface_noise: f64, secondary_depth: f64, top_heights: *const [width * width]i32, biome_halo: *const BiomeHalo, preliminary_corners: *const [4]i32) SurfaceColumn {
+    fn init(generator: *Generator, first_x: i32, first_z: i32, local_x: usize, local_z: usize, run_depth: i32, surface_noise: f64, secondary_depth: f64, top_heights: *const [width * width]i32, biome_halo: *BiomeHalo, preliminary_corners: *const [4]i32) SurfaceColumn {
         const x = first_x + @as(i32, @intCast(local_x));
         const z = first_z + @as(i32, @intCast(local_z));
         const height_index = local_z * width + local_x;
@@ -1118,19 +1216,6 @@ const SurfaceColumn = struct {
             .preliminary_surface = density.preliminarySurfaceHeightFromCorners(preliminary_corners, x, z, run_depth),
             .surface_biome_index = biome_halo.at(quart),
         };
-    }
-
-    fn fillStoneDepth(self: *SurfaceColumn, output: []const GeneratedState) void {
-        var consecutive: u16 = 0;
-        for (0..height) |local_y| {
-            const index = local_y * width * width +
-                self.local_z * width + self.local_x;
-            consecutive = if (generatedMaterial(output[index]) == .stone)
-                consecutive + 1
-            else
-                0;
-            self.below[local_y] = consecutive;
-        }
     }
 };
 

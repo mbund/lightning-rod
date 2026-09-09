@@ -3,6 +3,8 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const options = b.addOptions();
+    options.addOption(u16, "port", b.option(u16, "port", "Listening port") orelse 25565);
     const lightning_rod = b.dependency("lightning_rod", .{ .target = target, .optimize = optimize });
     const linux = b.dependency("lightning_rod_linux", .{ .target = target, .optimize = optimize });
     const tui = b.dependency("lightning_rod_tui", .{ .target = target, .optimize = optimize });
@@ -34,10 +36,18 @@ pub fn build(b: *std.Build) void {
         },
     });
     const executable = b.addExecutable(.{ .name = "lightning_rod_skyblock", .root_module = application });
+    application.addOptions("options", options);
     b.installArtifact(executable);
     const run = b.addRunArtifact(executable);
     run.setCwd(b.path("."));
     run.step.dependOn(b.getInstallStep());
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run the Skyblock server").dependOn(&run.step);
+    const tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "lightning_rod", .module = library }},
+    }) });
+    b.step("test", "Test bounded cross-Core services").dependOn(&b.addRunArtifact(tests).step);
 }

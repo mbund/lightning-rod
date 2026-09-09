@@ -33,15 +33,91 @@ pub const Cache = struct {
     const way_count = 4;
     const set_count = 64;
 
+    const Horizontal = struct {
+        temperature: i64,
+        humidity: i64,
+        continentalness: i64,
+        erosion: i64,
+        ridges: i64,
+        sample: climate.Sample,
+
+        fn init(sample: climate.Sample) Horizontal {
+            const values = sample.quantized(0);
+            return .{
+                .temperature = values.temperature,
+                .humidity = values.humidity,
+                .continentalness = values.continentalness,
+                .erosion = values.erosion,
+                .ridges = values.ridges,
+                .sample = sample,
+            };
+        }
+
+        fn quantized(self: Horizontal, block_y: i32) climate.QuantizedSample {
+            return .{
+                .temperature = self.temperature,
+                .humidity = self.humidity,
+                .continentalness = self.continentalness,
+                .erosion = self.erosion,
+                .depth = self.sample.quantizedDepth(block_y),
+                .ridges = self.ridges,
+            };
+        }
+    };
+
     const Entry = struct {
         valid: bool = false,
         chunk_x: i32 = 0,
         chunk_z: i32 = 0,
+        horizontal: [4 * 4]Horizontal = undefined,
         cells: [overworld_cell_count]u8 = undefined,
+        resolved: [overworld_cell_count / 64]u64 = [_]u64{0} ** (overworld_cell_count / 64),
+
+        fn prepare(
+            self: *Entry,
+            sampler: *const climate.Sampler,
+            chunk_x: i32,
+            chunk_z: i32,
+        ) void {
+            const first_quart_x = chunk_x << 2;
+            const first_quart_z = chunk_z << 2;
+            for (0..4) |local_x| {
+                for (0..4) |local_z| {
+                    const quart_x = first_quart_x + @as(i32, @intCast(local_x));
+                    const quart_z = first_quart_z + @as(i32, @intCast(local_z));
+                    self.horizontal[local_x * 4 + local_z] = Horizontal.init(sampler.sample(quart_x << 2, quart_z << 2));
+                }
+            }
+            self.valid = true;
+            self.chunk_x = chunk_x;
+            self.chunk_z = chunk_z;
+            @memset(&self.resolved, 0);
+        }
+
+        fn resolveAll(self: *Entry, lookup: *VolumeLookup) void {
+            lookup.reset();
+            for (0..overworld_section_count) |section| {
+                for (0..4) |local_x| {
+                    for (0..4) |local_y| {
+                        const block_y = (-16 + @as(i32, @intCast(section * 4 + local_y))) << 2;
+                        for (0..4) |local_z| {
+                            const index = section * quart_cells_per_section +
+                                local_x + local_z * 4 + local_y * 16;
+                            self.cells[index] = lookup.biomeIndex(
+                                self.horizontal[local_x * 4 + local_z].quantized(block_y),
+                                local_x * 4 + local_z,
+                            );
+                        }
+                    }
+                }
+            }
+            @memset(&self.resolved, std.math.maxInt(u64));
+        }
     };
 
     entries: [set_count * way_count]Entry = [_]Entry{.{}} ** (set_count * way_count),
     replacement: [set_count]u2 = [_]u2{0} ** set_count,
+    volume_lookup: VolumeLookup = .{},
 
     pub fn chunk(
         self: *Cache,
@@ -49,22 +125,30 @@ pub const Cache = struct {
         chunk_x: i32,
         chunk_z: i32,
     ) *const [overworld_cell_count]u8 {
+        const entry = self.getEntry(sampler, chunk_x, chunk_z);
+        if (!std.mem.allEqual(u64, &entry.resolved, std.math.maxInt(u64)))
+            entry.resolveAll(&self.volume_lookup);
+        return &entry.cells;
+    }
+
+    fn getEntry(
+        self: *Cache,
+        sampler: *const climate.Sampler,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) *Entry {
         const set = cacheSet(chunk_x, chunk_z);
         const first = set * way_count;
         var target = first + self.replacement[set];
         for (self.entries[first..][0..way_count], first..) |*entry, index| {
             if (entry.valid and entry.chunk_x == chunk_x and entry.chunk_z == chunk_z)
-                return &entry.cells;
+                return entry;
             if (!entry.valid) target = index;
         }
         const entry = &self.entries[target];
-        var lookup: Lookup = .{};
-        fillOverworldChunk(sampler, &lookup, chunk_x, chunk_z, &entry.cells);
-        entry.valid = true;
-        entry.chunk_x = chunk_x;
-        entry.chunk_z = chunk_z;
+        entry.prepare(sampler, chunk_x, chunk_z);
         self.replacement[set] +%= 1;
-        return &entry.cells;
+        return entry;
     }
 
     pub fn atQuart(
@@ -92,10 +176,7 @@ pub const Cache = struct {
         const section = vertical / 4;
         const local_y = vertical & 3;
         return self.chunk(sampler, chunk_x, chunk_z)[
-            section * quart_cells_per_section +
-                local_x +
-                local_z * 4 +
-                local_y * 16
+            section * quart_cells_per_section + local_x + local_z * 4 + local_y * 16
         ];
     }
 
@@ -104,6 +185,88 @@ pub const Cache = struct {
         const z: u32 = @bitCast(chunk_z);
         const mixed = x *% 0x9e3779b1 ^ z *% 0x85ebca77;
         return @intCast(mixed & (set_count - 1));
+    }
+};
+
+const VolumeLookup = struct {
+    const capacity = 8192;
+
+    previous_leaf: ?u16 = null,
+    tags: [capacity]u32 = [_]u32{std.math.maxInt(u32)} ** capacity,
+    distances: [capacity]i64 = undefined,
+
+    fn reset(self: *VolumeLookup) void {
+        self.previous_leaf = null;
+        @memset(&self.tags, std.math.maxInt(u32));
+    }
+
+    fn biomeIndex(self: *VolumeLookup, sample: climate.QuantizedSample, column: usize) u8 {
+        const point = [7]i64{
+            sample.temperature,
+            sample.humidity,
+            sample.continentalness,
+            sample.erosion,
+            sample.depth,
+            sample.ridges,
+            0,
+        };
+        const leaf = self.resultingNode(data.overworld_biome_root, &point, column);
+        self.previous_leaf = leaf;
+        return data.biome_nodes[leaf].biome;
+    }
+
+    fn resultingNode(self: *VolumeLookup, root: u16, point: *const [7]i64, column: usize) u16 {
+        var best = self.previous_leaf;
+        var best_distance = if (best) |previous| self.distance(previous, point, column) else std.math.maxInt(i64);
+        if (best_distance == 0) return best.?;
+        var stack: [64]u16 = undefined;
+        var stack_len: usize = 1;
+        stack[0] = root;
+        while (stack_len != 0) {
+            stack_len -= 1;
+            const candidate = stack[stack_len];
+            const node = data.biome_nodes[candidate];
+            const candidate_distance = self.distance(candidate, point, column);
+            if (best_distance <= candidate_distance) continue;
+            if (node.child_len == 0) {
+                best = candidate;
+                best_distance = candidate_distance;
+                if (best_distance == 0) return candidate;
+                continue;
+            }
+            std.debug.assert(stack_len + node.child_len <= stack.len);
+            var child_index: usize = node.child_len;
+            while (child_index != 0) {
+                child_index -= 1;
+                stack[stack_len] = data.biome_children[node.child_start + child_index];
+                stack_len += 1;
+            }
+        }
+        return best orelse unreachable;
+    }
+
+    inline fn distance(self: *VolumeLookup, node_index: u16, point: *const [7]i64, column: usize) i64 {
+        const tag = @as(u32, @intCast(column)) << 16 | node_index;
+        const slot = (@as(usize, node_index) *% 40503 +% column *% 7919) & (capacity - 1);
+        const horizontal = if (self.tags[slot] == tag)
+            self.distances[slot]
+        else blk: {
+            const parameters = data.biome_nodes[node_index].parameters;
+            var value: i64 = 0;
+            inline for (.{ 0, 1, 2, 3, 5, 6 }) |index| {
+                const minimum: i64 = parameters[index][0];
+                const maximum: i64 = parameters[index][1];
+                const coordinate = point[index];
+                const delta = if (coordinate > maximum) coordinate - maximum else if (coordinate < minimum) minimum - coordinate else 0;
+                value += delta * delta;
+            }
+            self.tags[slot] = tag;
+            self.distances[slot] = value;
+            break :blk value;
+        };
+        const range = data.biome_nodes[node_index].parameters[4];
+        const depth = if (point[4] > range[1]) point[4] - range[1] else if (point[4] < range[0]) range[0] - point[4] else 0;
+        return horizontal + depth * depth;
     }
 };
 
@@ -164,28 +327,34 @@ pub fn climateFor(index: u8) Climate {
 }
 
 fn resultingNode(node_index: u16, point: *const [7]i64, previous_leaf: ?u16) u16 {
-    const node = data.biome_nodes[node_index];
-    if (node.child_len == 0) return node_index;
-
     var best = previous_leaf;
     var best_distance = if (previous_leaf) |previous|
         distanceSquared(data.biome_nodes[previous].parameters, point)
     else
         std.math.maxInt(i64);
     if (best_distance == 0) return previous_leaf.?;
-    const children = data.biome_children[node.child_start..][0..node.child_len];
-    for (children) |child| {
-        const child_distance = distanceSquared(data.biome_nodes[child].parameters, point);
-        if (best_distance <= child_distance) continue;
-        const candidate = resultingNode(child, point, best);
-        const candidate_distance = if (candidate == child)
-            child_distance
-        else
-            distanceSquared(data.biome_nodes[candidate].parameters, point);
-        if (best_distance > candidate_distance) {
-            best_distance = candidate_distance;
+
+    var stack: [64]u16 = undefined;
+    var stack_len: usize = 1;
+    stack[0] = node_index;
+    while (stack_len != 0) {
+        stack_len -= 1;
+        const candidate = stack[stack_len];
+        const node = data.biome_nodes[candidate];
+        const candidate_distance = distanceSquared(node.parameters, point);
+        if (best_distance <= candidate_distance) continue;
+        if (node.child_len == 0) {
             best = candidate;
+            best_distance = candidate_distance;
             if (best_distance == 0) return candidate;
+            continue;
+        }
+        std.debug.assert(stack_len + node.child_len <= stack.len);
+        var child_index: usize = node.child_len;
+        while (child_index != 0) {
+            child_index -= 1;
+            stack[stack_len] = data.biome_children[node.child_start + child_index];
+            stack_len += 1;
         }
     }
     return best orelse unreachable;
@@ -193,7 +362,9 @@ fn resultingNode(node_index: u16, point: *const [7]i64, previous_leaf: ?u16) u16
 
 inline fn distanceSquared(parameters: [7][2]i16, point: *const [7]i64) i64 {
     var result: i64 = 0;
-    for (parameters, point) |range, value| {
+    inline for (0..7) |index| {
+        const range = parameters[index];
+        const value = point[index];
         const minimum: i64 = range[0];
         const maximum: i64 = range[1];
         const distance = if (value > maximum)

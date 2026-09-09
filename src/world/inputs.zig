@@ -69,18 +69,23 @@ pub const PendingSprintAction = struct {
 };
 
 pub const BlockDigProgress = struct {
-    active: bool = false,
+    mining: bool = false,
     world: world_identity.Handle = world_identity.invalid,
     failed_to_mine: bool = false,
+    failed_world: world_identity.Handle = world_identity.invalid,
     pos: geometry.BlockPos = .{ .x = 0, .y = 0, .z = 0 },
+    failed_pos: geometry.BlockPos = .{ .x = 0, .y = 0, .z = 0 },
     face: i32 = 1,
+    failed_face: i32 = 1,
     sequence: i32 = 0,
+    failed_sequence: i32 = 0,
     start_tick: u64 = 0,
-    damage_q32: u64 = 0,
+    failed_start_tick: u64 = 0,
+    damage: f32 = 0,
     last_stage: i8 = -1,
 };
 
-const PendingDigStart = struct { pos: geometry.BlockPos, face: i32, sequence: i32 };
+pub const DigStart = struct { pos: geometry.BlockPos, face: i32, sequence: i32 };
 
 const PendingLivingAttack = struct {
     active: bool = false,
@@ -126,13 +131,11 @@ pub const PendingUseItem = struct {
     rotation: geometry.Rotation = .{},
 };
 
-const PendingDigAction = union(enum) {
+pub const DigAction = union(enum) {
     none,
-    start: PendingDigStart,
-    start_and_cancel: PendingDigStart,
-    start_and_finish: PendingDigStart,
+    start: DigStart,
     finish: struct { pos: geometry.BlockPos, sequence: i32 },
-    cancel,
+    cancel: struct { pos: geometry.BlockPos, sequence: i32 },
 };
 
 pub const BlockDigIntent = struct {
@@ -150,9 +153,11 @@ pub const Inputs = struct {
         maximum_block_requests: usize = 1024,
         maximum_inventory_clicks: usize = 1024,
         maximum_creative_slot_changes: usize = 1024,
+        maximum_dig_actions_per_player: usize = 8,
 
         pub fn validate(self: Configuration) !void {
-            if (self.maximum_block_requests == 0 or self.maximum_inventory_clicks == 0 or self.maximum_creative_slot_changes == 0)
+            if (self.maximum_block_requests == 0 or self.maximum_inventory_clicks == 0 or self.maximum_creative_slot_changes == 0 or
+                self.maximum_dig_actions_per_player == 0 or self.maximum_dig_actions_per_player > std.math.maxInt(u8))
                 return error.InvalidBatchCapacity;
         }
     };
@@ -165,7 +170,9 @@ pub const Inputs = struct {
     creative_slot_changes: []CreativeSlotChange = &.{},
     creative_slot_change_count: usize = 0,
     container_closes: []i32 = &.{},
-    dig_actions: []PendingDigAction = &.{},
+    dig_actions: []DigAction = &.{},
+    dig_action_counts: []u8 = &.{},
+    maximum_dig_actions_per_player: usize = 0,
     movements: []PendingMovement = &.{},
     player_inputs: []PendingPlayerInput = &.{},
     sprint_actions: []PendingSprintAction = &.{},
@@ -189,7 +196,9 @@ pub const Inputs = struct {
         self.inventory_clicks = try preallocated.alloc(InventoryClick, allocator, configuration.maximum_inventory_clicks);
         self.creative_slot_changes = try preallocated.alloc(CreativeSlotChange, allocator, configuration.maximum_creative_slot_changes);
         self.container_closes = try preallocated.alloc(i32, allocator, connections);
-        self.dig_actions = try preallocated.alloc(PendingDigAction, allocator, connections);
+        self.dig_actions = try preallocated.alloc(DigAction, allocator, try std.math.mul(usize, connections, configuration.maximum_dig_actions_per_player));
+        self.dig_action_counts = try preallocated.alloc(u8, allocator, connections);
+        self.maximum_dig_actions_per_player = configuration.maximum_dig_actions_per_player;
         self.movements = try preallocated.alloc(PendingMovement, allocator, connections);
         self.player_inputs = try preallocated.alloc(PendingPlayerInput, allocator, connections);
         self.sprint_actions = try preallocated.alloc(PendingSprintAction, allocator, connections);
@@ -204,7 +213,7 @@ pub const Inputs = struct {
         self.chunk_batch_received = try preallocated.alloc(?f32, allocator, connections);
         self.disconnected = try preallocated.alloc(bool, allocator, connections);
         @memset(self.container_closes, -1);
-        @memset(self.dig_actions, .none);
+        @memset(self.dig_action_counts, 0);
         @memset(self.movements, .{});
         @memset(self.player_inputs, .{});
         @memset(self.sprint_actions, .{});
@@ -226,7 +235,7 @@ pub const Inputs = struct {
         self.inventory_click_count = 0;
         self.creative_slot_change_count = 0;
         @memset(self.container_closes, -1);
-        @memset(self.dig_actions, .none);
+        @memset(self.dig_action_counts, 0);
         @memset(self.movements, .{});
         @memset(self.player_inputs, .{});
         @memset(self.sprint_actions, .{});
@@ -245,7 +254,7 @@ pub const Inputs = struct {
     pub fn resetPlayerTransfer(self: *Inputs, slot: u16) void {
         std.debug.assert(slot < self.movements.len);
         self.container_closes[slot] = -1;
-        self.dig_actions[slot] = .none;
+        self.dig_action_counts[slot] = 0;
         self.movements[slot] = .{};
         self.player_inputs[slot] = .{};
         self.sprint_actions[slot] = .{};
@@ -340,25 +349,35 @@ pub const Inputs = struct {
         self.use_items[slot] = .{ .active = true, .hand = hand, .sequence = sequence, .rotation = rotation };
     }
 
-    pub fn stageDigStart(self: *Inputs, slot: u16, pos: geometry.BlockPos, face: i32, sequence: i32) void {
-        self.dig_actions[slot] = switch (self.dig_actions[slot]) {
-            .none, .cancel, .finish => .{ .start = .{ .pos = pos, .face = face, .sequence = sequence } },
-            .start, .start_and_cancel, .start_and_finish => .{ .start = .{ .pos = pos, .face = face, .sequence = sequence } },
-        };
+    pub fn stageDigStart(self: *Inputs, slot: u16, pos: geometry.BlockPos, face: i32, sequence: i32) !void {
+        try self.appendDigAction(slot, .{ .start = .{ .pos = pos, .face = face, .sequence = sequence } });
     }
 
-    pub fn stageDigFinish(self: *Inputs, slot: u16, pos: geometry.BlockPos, sequence: i32) void {
-        self.dig_actions[slot] = switch (self.dig_actions[slot]) {
-            .start => |start| .{ .start_and_finish = start },
-            else => .{ .finish = .{ .pos = pos, .sequence = sequence } },
-        };
+    pub fn stageDigFinish(self: *Inputs, slot: u16, pos: geometry.BlockPos, sequence: i32) !void {
+        try self.appendDigAction(slot, .{ .finish = .{ .pos = pos, .sequence = sequence } });
     }
 
-    pub fn stageDigCancel(self: *Inputs, slot: u16) void {
-        self.dig_actions[slot] = switch (self.dig_actions[slot]) {
-            .start => |start| .{ .start_and_cancel = start },
-            else => .cancel,
-        };
+    pub fn stageDigCancel(self: *Inputs, slot: u16, pos: geometry.BlockPos, sequence: i32) !void {
+        try self.appendDigAction(slot, .{ .cancel = .{ .pos = pos, .sequence = sequence } });
+    }
+
+    fn appendDigAction(self: *Inputs, slot: u16, action: DigAction) !void {
+        std.debug.assert(slot < self.dig_action_counts.len);
+        const count = self.dig_action_counts[slot];
+        if (count == self.maximum_dig_actions_per_player) return error.DigActionBatchFull;
+        self.dig_actions[@as(usize, slot) * self.maximum_dig_actions_per_player + count] = action;
+        self.dig_action_counts[slot] = count + 1;
+    }
+
+    pub fn digActions(self: *const Inputs, slot: u16) []const DigAction {
+        std.debug.assert(slot < self.dig_action_counts.len);
+        const start = @as(usize, slot) * self.maximum_dig_actions_per_player;
+        return self.dig_actions[start..][0..self.dig_action_counts[slot]];
+    }
+
+    pub fn clearDigActions(self: *Inputs, slot: u16) void {
+        std.debug.assert(slot < self.dig_action_counts.len);
+        self.dig_action_counts[slot] = 0;
     }
 
     pub fn requestContainerClose(self: *Inputs, slot: u16, window_id: i32) void {
@@ -397,22 +416,42 @@ pub const Inputs = struct {
         self.block_request_count += 1;
     }
 
+    pub fn prependBlockRequest(self: *Inputs, request: BlockRequest) !void {
+        if (self.block_request_count == self.block_requests.len) return error.BlockRequestBatchFull;
+        std.mem.copyBackwards(
+            BlockRequest,
+            self.block_requests[1 .. self.block_request_count + 1],
+            self.block_requests[0..self.block_request_count],
+        );
+        self.block_requests[0] = request;
+        self.block_request_count += 1;
+    }
+
+    pub fn prependDigActions(self: *Inputs, slot: u16, actions: []const DigAction) !void {
+        const current = self.digActions(slot);
+        if (current.len + actions.len > self.maximum_dig_actions_per_player) return error.DigActionBatchFull;
+        const base = @as(usize, slot) * self.maximum_dig_actions_per_player;
+        std.mem.copyBackwards(
+            DigAction,
+            self.dig_actions[base + actions.len ..][0..current.len],
+            current,
+        );
+        @memcpy(self.dig_actions[base..][0..actions.len], actions);
+        self.dig_action_counts[slot] = @intCast(current.len + actions.len);
+    }
+
     pub fn blockDigIntent(self: *const Inputs, slot: u16) ?BlockDigIntent {
-        std.debug.assert(slot < self.dig_actions.len);
-        const pos = switch (self.dig_actions[slot]) {
-            .none, .cancel => return null,
-            .start => |intent| intent.pos,
-            .start_and_cancel => |intent| intent.pos,
-            .start_and_finish => |intent| intent.pos,
-            .finish => |intent| intent.pos,
+        for (self.digActions(slot)) |action| switch (action) {
+            .none, .cancel => {},
+            .start => |intent| return .{ .slot = slot, .pos = intent.pos },
+            .finish => |intent| return .{ .slot = slot, .pos = intent.pos },
         };
-        return .{ .slot = slot, .pos = pos };
+        return null;
     }
 
     pub fn rejectBlockDig(self: *Inputs, slot: u16) void {
-        std.debug.assert(slot < self.dig_actions.len);
         std.debug.assert(self.blockDigIntent(slot) != null);
-        self.dig_actions[slot] = .none;
+        self.clearDigActions(slot);
     }
 
     pub fn playerAttackIntent(self: *const Inputs, slot: u16) ?PlayerAttackIntent {
@@ -487,7 +526,7 @@ pub const Inputs = struct {
             std.debug.assert(slot < self.disconnected.len);
             self.disconnected[slot] = true;
             self.container_closes[slot] = -1;
-            self.dig_actions[slot] = .none;
+            self.dig_action_counts[slot] = 0;
             self.movements[slot] = .{};
             self.player_inputs[slot] = .{};
             self.sprint_actions[slot] = .{};

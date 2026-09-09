@@ -63,7 +63,6 @@ pub const HingedBlocks = struct {
         outputs: *Packets,
     };
 
-    observed_mutation_sequence: u64 = 0,
     deps: Dependencies,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies, _: Configuration) !*HingedBlocks {
@@ -79,7 +78,14 @@ pub const HingedBlocks = struct {
         const outputs = self.deps.outputs;
         const writer = Writer.init(blocks, outputs);
         processRequests(blocks, players, inputs, outputs, writer);
-        self.reconcileDoorRemoval(blocks, writer);
+    }
+
+    pub fn removalPartner(self: *const HingedBlocks, world: world_identity.Handle, position: geometry.BlockPos, block_state: i32) ?geometry.BlockPos {
+        const door = decodeDoor(block_state) orelse return null;
+        const partner = if (door.half == .lower) above(position) else below(position);
+        const other = decodeDoor(self.deps.blocks.blockAt(world, partner)) orelse return null;
+        if (other.block_id != door.block_id or other.half == door.half) return null;
+        return partner;
     }
 
     const Writer = block_writer.Writer;
@@ -382,28 +388,6 @@ pub const HingedBlocks = struct {
                 placeDoor(blocks, players, outputs, writer, request.*, door);
             }
         }
-    }
-
-    fn reconcileDoorRemoval(self: *HingedBlocks, blocks: *block_store.Blocks, writer: Writer) void {
-        const latest = blocks.blockMutationSequence();
-        const pending = latest -% self.observed_mutation_sequence;
-        if (pending > blocks.block_mutations.len) {
-            self.observed_mutation_sequence = latest;
-            return;
-        }
-        var sequence = self.observed_mutation_sequence;
-        for (0..@as(usize, @intCast(pending))) |_| {
-            sequence +%= 1;
-            if (sequence == 0) sequence = 1;
-            const mutation = blocks.blockMutation(sequence);
-            const previous = decodeDoor(mutation.previous_state) orelse continue;
-            if (decodeDoor(mutation.block_state) != null) continue;
-            const counterpart_position = if (previous.half == .lower) above(mutation.pos) else below(mutation.pos);
-            const counterpart = decodeDoor(blocks.blockAt(mutation.world, counterpart_position)) orelse continue;
-            if (counterpart.block_id == previous.block_id and counterpart.half != previous.half)
-                _ = writer.set(mutation.world, counterpart_position, registry.block_air_default_state) catch {};
-        }
-        self.observed_mutation_sequence = blocks.blockMutationSequence();
     }
 };
 

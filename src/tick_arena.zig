@@ -6,6 +6,7 @@ pub const Arena = struct {
     bytes: []u8,
     fixed: std.heap.FixedBufferAllocator,
     accounted_end: usize = 0,
+    active: bool = false,
 
     pub fn create(allocator: std.mem.Allocator, capacity: usize) !*Arena {
         if (capacity == 0) return error.InvalidCapacity;
@@ -21,12 +22,16 @@ pub const Arena = struct {
     }
 
     pub fn begin(self: *Arena) std.mem.Allocator {
+        std.debug.assert(!self.active);
+        self.active = true;
         self.fixed.reset();
         self.accounted_end = 0;
         return .{ .ptr = self, .vtable = &vtable };
     }
 
     pub fn finish(self: *Arena) void {
+        std.debug.assert(self.active);
+        self.active = false;
         self.fixed.reset();
         self.accounted_end = 0;
     }
@@ -86,6 +91,7 @@ test "temporary arena is bounded, resettable, and records reservations" {
     _ = try arena.begin().alloc(u8, 32);
     arena.finish();
     _ = try arena.begin().alloc(u8, 64);
+    arena.finish();
     plugin_profiler.endPlugin(0, started);
     profiler.finishTick();
     try std.testing.expectEqual(@as(usize, 128), arena.bytes.len);

@@ -49,8 +49,8 @@ pub const ItemEntity = extern struct {
 pub const LivingEntities = struct {
     pub const id = "lightning_rod:living_entities";
     pub const Configuration = struct {
-        maximum_entities: usize = 4_096,
-        maximum_search_nodes: usize = 4_096,
+        maximum_entities: usize = 1_024,
+        maximum_search_nodes: usize = 1_024,
         maximum_path_nodes: usize = 128,
         first_entity_id: i32 = 1_105,
     };
@@ -92,8 +92,8 @@ pub const LivingEntities = struct {
             .y = @intCast(@max(@as(i32, limits.min_y), @min(geometry.blockCoord(position.y), @as(i32, block_store.world_top_y)))),
             .z = geometry.blockCoord(position.z),
         };
-        if (block_world.residentChunk(world, geometry.chunkForBlock(block_position)) == null)
-            return error.SpawnChunkNotResident;
+        if (block_world.materializedChunk(world, geometry.chunkForBlock(block_position)) == null)
+            return error.SpawnChunkNotMaterialized;
         const handle = try self.entities.spawn(.{
             .world = world,
             .entity_type = entity_type,
@@ -120,6 +120,10 @@ pub const LivingEntities = struct {
         })) return false;
         self.paths.clear(handle.index);
         return true;
+    }
+
+    pub fn activeCount(self: *const LivingEntities) usize {
+        return self.entities.active_count;
     }
 };
 
@@ -162,6 +166,20 @@ pub const ItemEntities = struct {
     free_count: usize = 0,
     free_list_initialized: bool = false,
     first_entity_id: i32 = 0,
+
+    pub const Spawn = struct {
+        world: world_identity.Handle,
+        position: geometry.Vec3,
+        velocity: geometry.Vec3 = .{},
+        stack: player_store.HotbarStack,
+        pickup_delay_ticks: u16,
+    };
+
+    pub const Reservation = struct {
+        first: usize,
+        count: usize,
+        active: bool = true,
+    };
 
     pub fn init(allocator: std.mem.Allocator, configuration: Configuration) !*ItemEntities {
         try configuration.validate();
@@ -210,6 +228,10 @@ pub const ItemEntities = struct {
         return self;
     }
 
+    pub fn activeCount(self: *const ItemEntities) usize {
+        return self.active_count;
+    }
+
     pub fn spawn(
         self: *ItemEntities,
         random: *world_random.Random,
@@ -220,37 +242,82 @@ pub const ItemEntities = struct {
         stack: player_store.HotbarStack,
         pickup_delay_ticks: u16,
     ) !usize {
-        if (!world_identity.valid(world)) return error.InvalidWorld;
-        if (stack.isEmpty()) return error.EmptyItemEntity;
-        if (block_world.residentChunk(world, geometry.chunkForBlock(.{
-            .x = geometry.blockCoord(spawn_position.x),
+        const specification = Spawn{
+            .world = world,
+            .position = spawn_position,
+            .velocity = velocity,
+            .stack = stack,
+            .pickup_delay_ticks = pickup_delay_ticks,
+        };
+        try self.validateSpawn(block_world, specification);
+        var reservation = try self.reserve(1);
+        var result: [1]usize = undefined;
+        self.commitReserved(&reservation, random, &.{specification}, &result);
+        return result[0];
+    }
+
+    pub fn reserve(self: *ItemEntities, count: usize) !Reservation {
+        self.ensureFreeList();
+        if (count > self.free_count) return error.ItemEntityCapacity;
+        self.free_count -= count;
+        return .{ .first = self.free_count, .count = count };
+    }
+
+    pub fn cancelReservation(self: *ItemEntities, reservation: *Reservation) void {
+        std.debug.assert(reservation.active);
+        std.debug.assert(reservation.first == self.free_count);
+        self.free_count += reservation.count;
+        reservation.active = false;
+    }
+
+    pub fn validateSpawn(self: *const ItemEntities, block_world: *const block_store.Blocks, specification: Spawn) !void {
+        _ = self;
+        if (!world_identity.valid(specification.world)) return error.InvalidWorld;
+        if (specification.stack.isEmpty()) return error.EmptyItemEntity;
+        if (block_world.materializedChunk(specification.world, geometry.chunkForBlock(.{
+            .x = geometry.blockCoord(specification.position.x),
             .y = @intCast(std.math.clamp(
-                geometry.blockCoord(spawn_position.y),
+                geometry.blockCoord(specification.position.y),
                 @as(i32, limits.min_y),
                 @as(i32, block_store.world_top_y),
             )),
-            .z = geometry.blockCoord(spawn_position.z),
-        })) == null) return error.SpawnChunkNotResident;
-        self.ensureFreeList();
-        if (self.free_count == 0) return error.ItemEntityCapacity;
-        const before_count = self.active_count;
-        self.free_count -= 1;
-        const index = self.free_indices[self.free_count];
-        self.set(index, .{
-            .world = world,
-            .active = true,
-            .entity_id = self.itemEntityId(index),
-            .uuid = random.random.uuid_for_item(index),
-            .position = sanitizePosition(spawn_position),
-            .velocity = sanitizeVelocity(velocity),
-            .stack = stack,
-            .pickup_delay_ticks = pickup_delay_ticks,
-        });
-        self.active_indices[before_count] = index;
-        self.active_positions[index] = @intCast(before_count);
-        self.active_count += 1;
-        self.insertBucket(index);
-        return index;
+            .z = geometry.blockCoord(specification.position.z),
+        })) == null) return error.SpawnChunkNotMaterialized;
+    }
+
+    pub fn commitReserved(
+        self: *ItemEntities,
+        reservation: *Reservation,
+        random: *world_random.Random,
+        values: []const Spawn,
+        output: []usize,
+    ) void {
+        std.debug.assert(reservation.active);
+        std.debug.assert(values.len == reservation.count);
+        std.debug.assert(output.len == values.len);
+        std.debug.assert(self.active_count + values.len <= self.active.len);
+        for (values, output, 0..) |specification, *result, offset| {
+            std.debug.assert(world_identity.valid(specification.world));
+            std.debug.assert(!specification.stack.isEmpty());
+            const index = self.free_indices[reservation.first + offset];
+            const active_position = self.active_count;
+            self.set(index, .{
+                .world = specification.world,
+                .active = true,
+                .entity_id = self.itemEntityId(index),
+                .uuid = random.random.uuid_for_item(index),
+                .position = sanitizePosition(specification.position),
+                .velocity = sanitizeVelocity(specification.velocity),
+                .stack = specification.stack,
+                .pickup_delay_ticks = specification.pickup_delay_ticks,
+            });
+            self.active_indices[active_position] = index;
+            self.active_positions[index] = @intCast(active_position);
+            self.active_count += 1;
+            self.insertBucket(index);
+            result.* = index;
+        }
+        reservation.active = false;
     }
 
     pub fn set(self: *ItemEntities, index: usize, entity: ItemEntity) void {
@@ -299,28 +366,21 @@ pub const ItemEntities = struct {
         };
     }
 
-    pub fn restoreEntity(
-        self: *ItemEntities,
-        random: *world_random.Random,
-        block_world: *block_store.Blocks,
-        saved: ItemEntity,
-    ) !usize {
-        const index = try self.spawn(
-            random,
-            block_world,
-            saved.world,
-            saved.position,
-            saved.velocity,
-            saved.stack,
-            saved.pickup_delay_ticks,
-        );
-        const entity_id = self.entity_ids[index];
-        self.removeBucket(index);
+    pub fn restoreEntity(self: *ItemEntities, saved: ItemEntity) !usize {
+        if (!world_identity.valid(saved.world)) return error.InvalidWorld;
+        if (saved.stack.isEmpty()) return error.EmptyItemEntity;
+        var reservation = try self.reserve(1);
+        const index = self.free_indices[reservation.first];
+        const active_position = self.active_count;
         var restored = saved;
         restored.active = true;
-        restored.entity_id = entity_id;
+        restored.entity_id = self.itemEntityId(index);
         self.set(index, restored);
+        self.active_indices[active_position] = @intCast(index);
+        self.active_positions[index] = @intCast(active_position);
+        self.active_count += 1;
         self.insertBucket(@intCast(index));
+        reservation.active = false;
         return index;
     }
 
@@ -474,7 +534,7 @@ fn finiteOrZero(value: f64) f64 {
 pub fn itemGroundY(blocks: *block_store.Blocks, world: world_identity.Handle, position: geometry.Vec3) ?f64 {
     const x = geometry.blockCoord(position.x);
     const z = geometry.blockCoord(position.z);
-    if (blocks.residentChunk(world, .{ .x = @divFloor(x, 16), .z = @divFloor(z, 16) }) == null)
+    if (blocks.materializedChunk(world, .{ .x = @divFloor(x, 16), .z = @divFloor(z, 16) }) == null)
         return null;
     const max_y: i16 = @intCast(@min(geometry.blockCoord(position.y - 0.01), block_store.world_top_y));
     const solid_y = highestSolidBlockAtOrBelow(blocks, world, x, z, max_y) orelse return null;

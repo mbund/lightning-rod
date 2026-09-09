@@ -16,6 +16,7 @@ const packet_args = lightning_rod.packet_args;
 const vanilla_living_death = @import("vanilla_living_death.zig");
 const Packets = lightning_rod.Packets;
 const world_identity = lightning_rod.world_identity;
+const vanilla_collision_projection = @import("vanilla_collision_projection.zig");
 
 pub const LivingCombat = struct {
     pub const id = "minecraft:living_combat";
@@ -25,6 +26,7 @@ pub const LivingCombat = struct {
         random: *world_random.Random,
         rules: *game_rules.GameRules,
         blocks: *block_store.Blocks,
+        collision_projection: *vanilla_collision_projection.CollisionProjection,
         players: *player_store.Players,
         living: *entity_store.LivingEntities,
         inputs: *input_store.Inputs,
@@ -46,10 +48,10 @@ pub const LivingCombat = struct {
     }
 
     pub fn tick(self: *LivingCombat, _: std.mem.Allocator) void {
-        self.run(self.deps.deaths, self.deps.random, self.deps.rules, self.deps.blocks, self.deps.players, self.deps.living, self.deps.inputs, self.deps.outputs);
+        self.run(self.deps.deaths, self.deps.random, self.deps.rules, self.deps.blocks, self.deps.collision_projection, self.deps.players, self.deps.living, self.deps.inputs, self.deps.outputs);
     }
 
-    fn run(self: *LivingCombat, deaths: *vanilla_living_death.LivingDeaths, random: *world_random.Random, rules: *game_rules.GameRules, blocks: *block_store.Blocks, players: *player_store.Players, living: *entity_store.LivingEntities, inputs: *input_store.Inputs, outputs: *Packets) void {
+    fn run(self: *LivingCombat, deaths: *vanilla_living_death.LivingDeaths, random: *world_random.Random, rules: *game_rules.GameRules, blocks: *block_store.Blocks, projection: *vanilla_collision_projection.CollisionProjection, players: *player_store.Players, living: *entity_store.LivingEntities, inputs: *input_store.Inputs, outputs: *Packets) void {
         self.velocity_count = 0;
         self.hotbar_change_count = 0;
         for (players.activeSlots()) |active_slot| {
@@ -76,7 +78,7 @@ pub const LivingCombat = struct {
             self.recordVelocity(&living.entities, living_index);
             outputs.living_metadata_changed(living_index);
             if (living.entities.entity_types[index] == .zombie)
-                trySpawnZombieReinforcement(random, rules, blocks, players, living, outputs, living_index, @intCast(slot));
+                trySpawnZombieReinforcement(random, rules, blocks, projection, players, living, outputs, living_index, @intCast(slot));
             self.damageHeldItem(players, @intCast(slot));
             if (living.entities.health[index] == 0)
                 _ = deaths.kill(living, living_index, .player_attack, @intCast(slot));
@@ -206,6 +208,7 @@ pub const LivingCombat = struct {
         random: *world_random.Random,
         rules: *const game_rules.GameRules,
         blocks: *block_store.Blocks,
+        projection: *vanilla_collision_projection.CollisionProjection,
         players: *const player_store.Players,
         living_store: *entity_store.LivingEntities,
         outputs: *Packets,
@@ -240,8 +243,8 @@ pub const LivingCombat = struct {
             }
             if (player_too_close) continue;
             const box = collision.entityBox(position.x, position.y, position.z, 0.6, 1.95);
-            if (block_queries.livingBoxCollides(blocks, world, box)) continue;
-            const below = blocks.blockAt(world, .{ .x = x, .y = @intCast(y - 1), .z = z });
+            if (block_queries.livingBoxCollidesFrom(projection.source(), world, box)) continue;
+            const below = projection.blockState(world, .{ .x = x, .y = @intCast(y - 1), .z = z }) orelse continue;
             if (collision.shapeBoxes(below).len == 0) continue;
             var entity_intersection = false;
             for (living.active_indices[0..living.active_count]) |other_index| {

@@ -12,6 +12,52 @@ pub const Entry = extern struct {
     checksum: u64,
 };
 
+pub fn Publication(comptime maximum_packs: usize) type {
+    return struct {
+        const Self = @This();
+        const Tree = Root(maximum_packs);
+        const prefix_bytes = 24;
+        pub const maximum_bytes = prefix_bytes + 2 * Tree.maximum_bytes;
+        working: Tree,
+        committed: Tree,
+
+        pub fn encode(self: *const Self, destination: []u8) ![]const u8 {
+            if (destination.len < prefix_bytes) return error.DestinationTooSmall;
+            const working = try self.working.encode(destination[prefix_bytes..]);
+            const committed = try self.committed.encode(destination[prefix_bytes + working.len ..]);
+            var cursor: usize = 0;
+            write(destination, &cursor, u32, 0x4c525043);
+            write(destination, &cursor, u32, 1);
+            write(destination, &cursor, u32, @intCast(working.len));
+            write(destination, &cursor, u32, @intCast(committed.len));
+            write(destination, &cursor, u64, 0);
+            const bytes = destination[0 .. prefix_bytes + working.len + committed.len];
+            std.mem.writeInt(u64, destination[16..24], checksum(bytes), .little);
+            return bytes;
+        }
+
+        pub fn decode(source: []const u8) !Self {
+            if (source.len < prefix_bytes) return error.Truncated;
+            if (source.len > maximum_bytes) return error.InvalidLength;
+            if (std.mem.readInt(u32, source[0..4], .little) != 0x4c525043) return error.InvalidMagic;
+            if (std.mem.readInt(u32, source[4..8], .little) != 1) return error.InvalidVersion;
+            const working: usize = std.mem.readInt(u32, source[8..12], .little);
+            const committed: usize = std.mem.readInt(u32, source[12..16], .little);
+            if (working > source.len - prefix_bytes or committed != source.len - prefix_bytes - working)
+                return error.InvalidLength;
+            var copied: [maximum_bytes]u8 = undefined;
+            @memcpy(copied[0..source.len], source);
+            @memset(copied[16..24], 0);
+            if (checksum(copied[0..source.len]) != std.mem.readInt(u64, source[16..24], .little))
+                return error.InvalidChecksum;
+            return .{
+                .working = try Tree.decode(source[prefix_bytes..][0..working]),
+                .committed = try Tree.decode(source[prefix_bytes + working ..]),
+            };
+        }
+    };
+}
+
 pub fn Root(comptime maximum_packs: usize) type {
     if (maximum_packs == 0 or maximum_packs >= std.math.maxInt(u16))
         @compileError("local pack root needs a bounded u16 pack count");
@@ -31,6 +77,18 @@ pub fn Root(comptime maximum_packs: usize) type {
 
         pub fn slice(self: *const Self) []const Entry {
             return self.entries[0..self.count];
+        }
+
+        pub fn contains(self: *const Self, id: u64) bool {
+            var low: usize = 0;
+            var high: usize = self.count;
+            while (low < high) {
+                const middle = low + (high - low) / 2;
+                const found = self.entries[middle].id;
+                if (found == id) return true;
+                if (found < id) low = middle + 1 else high = middle;
+            }
+            return false;
         }
 
         pub fn append(self: *Self, entry: Entry) !void {

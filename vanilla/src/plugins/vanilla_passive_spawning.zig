@@ -1,6 +1,7 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
-const active_chunks = @import("../vanilla/active_chunks.zig");
+const chunk_tickets = @import("../vanilla/chunk_tickets.zig");
+const simulation_admission = @import("../vanilla/simulation_admission.zig");
 const entity_store = lightning_rod.entities;
 const living_entities = lightning_rod.living_entities;
 const player_store = lightning_rod.players;
@@ -11,19 +12,21 @@ const game_rules = lightning_rod.game_rules;
 const world_random = lightning_rod.random;
 const world_clock = lightning_rod.clock;
 const collision = lightning_rod.collision;
-const registry = lightning_rod.registry_data;
 const Packets = lightning_rod.Packets;
 const world_store = lightning_rod.worlds;
 const world_identity = lightning_rod.world_identity;
 const world_limits = lightning_rod.world_limits;
+const vanilla_collision_projection = @import("vanilla_collision_projection.zig");
 
 const SpawnContext = struct {
     clock: *world_clock.Clock,
     rules: *game_rules.GameRules,
     random: *world_random.Random,
     blocks: *block_store.Blocks,
+    collision_projection: *vanilla_collision_projection.CollisionProjection,
     players: *player_store.Players,
-    active: *active_chunks.ActiveChunks,
+    active: *chunk_tickets.ChunkTickets,
+    admission: *simulation_admission.SimulationAdmission,
     living: *entity_store.LivingEntities,
     eligible_players: []u16,
     eligible_count: usize = 0,
@@ -38,8 +41,10 @@ pub const PassiveSpawning = struct {
         rules: *game_rules.GameRules,
         random: *world_random.Random,
         blocks: *block_store.Blocks,
+        collision_projection: *vanilla_collision_projection.CollisionProjection,
         players: *player_store.Players,
-        active: *active_chunks.ActiveChunks,
+        active: *chunk_tickets.ChunkTickets,
+        admission: *simulation_admission.SimulationAdmission,
         living: *entity_store.LivingEntities,
         packets: *Packets,
     };
@@ -67,8 +72,10 @@ pub const PassiveSpawning = struct {
             .rules = rules,
             .random = random,
             .blocks = blocks,
+            .collision_projection = self.deps.collision_projection,
             .players = players,
             .active = self.deps.active,
+            .admission = self.deps.admission,
             .living = living,
             .eligible_players = self.eligible_players,
         };
@@ -88,8 +95,8 @@ fn spawnWorld(context: *SpawnContext, packets: *Packets, world: world_identity.H
     }
     if (context.eligible_count == 0) return;
     const radius = @min(@as(i32, 8), context.active.simulationDistance());
-    const bounds = context.active.rowBounds(world, radius) orelse return;
-    const spawning_chunks = context.active.countUnion(world, bounds, radius);
+    const bounds = context.active.playerRowBounds(world, radius) orelse return;
+    const spawning_chunks = context.active.countPlayerUnion(world, bounds, radius);
     const cap = 10 * spawning_chunks / 289;
     const count = passiveCount(&context.living.entities, world);
     if (count >= cap) return;
@@ -124,6 +131,7 @@ fn spawnPacks(
         const center_z = @divFloor(geometry.blockCoord(player.position.z), 16);
         const chunk_x = center_x + @as(i32, @intCast(context.random.random.nextIntBounded(diameter))) - radius;
         const chunk_z = center_z + @as(i32, @intCast(context.random.random.nextIntBounded(diameter))) - radius;
+        if (!context.admission.entityTicking(world, .{ .x = chunk_x, .z = chunk_z })) continue;
         spawned += spawnPack(context, packets, world, chunk_x, chunk_z, remaining - spawned);
     }
     return spawned;
@@ -143,8 +151,8 @@ fn spawnPack(
     var z = chunk_z * 16 + @as(i32, @intCast(context.random.random.nextIntBounded(16)));
     var spawned: usize = 0;
     for (0..12) |_| {
-        if (context.blocks.residentChunk(world, .{ .x = @divFloor(x, 16), .z = @divFloor(z, 16) }) != null) {
-            const y = @as(i32, context.blocks.highestBlockYAt(world, x, z)) + 1;
+        if (context.collision_projection.highestBlockYAt(world, x, z)) |height| {
+            const y = @as(i32, height) + 1;
             const position = geometry.BlockPos{ .x = x, .y = @intCast(y), .z = z };
             if (validSpawn(context, world, entity_type, position)) {
                 spawn(context, packets, world, entity_type, position) catch return spawned;
@@ -188,11 +196,10 @@ fn validSpawn(
     position: geometry.BlockPos,
 ) bool {
     if (position.y <= world_limits.min_y or position.y >= block_store.world_top_y) return false;
-    const below = geometry.BlockPos{ .x = position.x, .y = position.y - 1, .z = position.z };
     const above = geometry.BlockPos{ .x = position.x, .y = position.y + 1, .z = position.z };
-    if (context.blocks.blockAt(world, below) != registry.block_grass_block_default_state or
-        collision.shapeBoxes(context.blocks.blockAt(world, position)).len != 0 or
-        collision.shapeBoxes(context.blocks.blockAt(world, above)).len != 0) return false;
+    if (!context.collision_projection.surfaceIsGrass(world, position.x, position.z) or
+        collision.shapeBoxes(context.collision_projection.blockState(world, position) orelse return false).len != 0 or
+        collision.shapeBoxes(context.collision_projection.blockState(world, above) orelse return false).len != 0) return false;
     const point = geometry.Vec3{
         .x = @as(f64, @floatFromInt(position.x)) + 0.5,
         .y = @floatFromInt(position.y),
@@ -200,7 +207,7 @@ fn validSpawn(
     };
     if (!validPlayerDistance(context, world, point)) return false;
     const box = collision.entityBox(point.x, point.y, point.z, living_entities.width(entity_type, false), living_entities.height(entity_type, false));
-    if (block_queries.livingBoxCollides(context.blocks, world, box)) return false;
+    if (block_queries.livingBoxCollidesFrom(context.collision_projection.source(), world, box)) return false;
     for (context.living.entities.active_indices[0..context.living.entities.active_count]) |index| {
         if (!context.living.entities.worlds[index].eql(world)) continue;
         const other = collision.entityBox(

@@ -1,5 +1,7 @@
 const std = @import("std");
 
+pub const maximum_tick_ns: u64 = 50 * std.time.ns_per_ms;
+
 pub const Outcome = enum { ok, failed };
 pub const Progress = enum { pending, complete, failed };
 pub const CheckpointCapture = enum { captured, busy, failed };
@@ -39,6 +41,7 @@ pub const Backend = struct {
         submit: *const fn (*anyopaque, std.Io) Outcome,
         begin_shutdown: *const fn (*anyopaque, std.Io) Outcome,
         shutdown_progress: *const fn (*anyopaque) Progress,
+        poll_interval_ns: ?*const fn (*anyopaque) ?u64 = null,
     };
 
     pub inline fn complete(self: Backend, io: std.Io, limit: usize) Completion {
@@ -53,6 +56,10 @@ pub const Backend = struct {
     pub inline fn shutdownProgress(self: Backend) Progress {
         return self.vtable.shutdown_progress(self.context);
     }
+    pub inline fn pollIntervalNs(self: Backend) ?u64 {
+        const callback = self.vtable.poll_interval_ns orelse return null;
+        return callback(self.context);
+    }
 };
 
 pub const Sessions = struct {
@@ -66,6 +73,7 @@ pub const Sessions = struct {
         finish_input: *const fn (*anyopaque) Outcome,
         stop_accepting: *const fn (*anyopaque) Outcome,
         stage_final_detachments: *const fn (*anyopaque) Outcome,
+        fatal_disconnect: *const fn (*anyopaque) Progress,
         shutdown_progress: *const fn (*anyopaque) Progress,
     };
 
@@ -83,6 +91,9 @@ pub const Sessions = struct {
     }
     pub inline fn stageFinalDetachments(self: Sessions) Outcome {
         return self.vtable.stage_final_detachments(self.context);
+    }
+    pub inline fn fatalDisconnect(self: Sessions) Progress {
+        return self.vtable.fatal_disconnect(self.context);
     }
     pub inline fn shutdownProgress(self: Sessions) Progress {
         return self.vtable.shutdown_progress(self.context);

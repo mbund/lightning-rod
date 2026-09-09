@@ -233,7 +233,7 @@ test "player transfer atomically resets session-local state" {
     defer arena.deinit();
     const allocator = arena.allocator();
     var lifecycle: @import("player_lifecycle.zig").Events = .{};
-    const worlds = try world_store.Worlds.init(allocator, .{ .initial = &test_world_descriptions });
+    const worlds = try world_store.Worlds.init(allocator, .{ .initial = &test_world_descriptions, .maximum_worlds = 4 });
     _ = try world_dimensions.Vanilla.init(allocator, .{ .worlds = worlds }, .{});
     const players = try player_store.Players.init(allocator, .{ .events = &lifecycle, .worlds = worlds }, .{ .initial_world = .{ .value = 1 } });
     const items = try entity_store.ItemEntities.init(allocator, .{ .first_entity_id = @intCast(players.records.len + 1) });
@@ -264,7 +264,7 @@ test "living and item transfers update world-local state" {
     defer arena.deinit();
     const allocator = arena.allocator();
     var lifecycle: @import("player_lifecycle.zig").Events = .{};
-    const worlds = try world_store.Worlds.init(allocator, .{ .initial = &test_world_descriptions });
+    const worlds = try world_store.Worlds.init(allocator, .{ .initial = &test_world_descriptions, .maximum_worlds = 4 });
     _ = try world_dimensions.Vanilla.init(allocator, .{ .worlds = worlds }, .{});
     const players = try player_store.Players.init(allocator, .{ .events = &lifecycle, .worlds = worlds }, .{ .initial_world = .{ .value = 1 } });
     const items = try entity_store.ItemEntities.init(allocator, .{ .first_entity_id = @intCast(players.records.len + 1) });

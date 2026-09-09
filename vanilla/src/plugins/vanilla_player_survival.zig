@@ -55,7 +55,7 @@ pub const Survival = struct {
                 else if (player.food > 0)
                     player.food -= 1;
             } else @panic("player exhaustion exceeded its per-tick bound");
-            outputs.emitPlayerHealth(@intCast(slot));
+            _ = outputs.emitPlayerHealth(@intCast(slot));
         }
     }
 };

@@ -14,7 +14,7 @@ pub const maximum_generated_y = lightning_rod.terrain.maximum_generated_y;
 pub const chunk_storage_capacity = lightning_rod.terrain.chunk_storage_capacity;
 pub const biome_registry_count = lightning_rod.terrain.biome_registry_count;
 const base_cache_chunk_capacity = 16 * 1024;
-const base_cache_workspace_count = 8;
+const base_cache_workspace_count = 3;
 
 pub const random_tick_mask_words = lightning_rod.terrain.random_tick_mask_words;
 pub const biome_cells_per_section = lightning_rod.terrain.biome_cells_per_section;
@@ -44,6 +44,8 @@ pub const Generator = struct {
     state_ids: []i32,
     batch_side: usize,
     workspace_side: usize,
+    configured_batch_side: usize,
+    configured_workspace_side: usize,
     feature_workspace_storage: []GeneratedState,
     feature_heights: []ChunkHeights,
     base_cache: []CachedBaseChunk,
@@ -51,8 +53,6 @@ pub const Generator = struct {
     base_cache_stamp: u64 = 0,
     workspace_z: [workspace_rows]i32 = @splat(std.math.minInt(i32)),
     top_heights: [16 * 16]i32 = undefined,
-    dirty_columns: [9][4]u64 = @splat(@splat(0)),
-    dirty_origin: FeatureOrigin = .{ .x = 0, .z = 0 },
     feature_work: vanilla_worldgen.chunk.FeatureWork = undefined,
     shape_storage: [chunk_storage_capacity]u8 = undefined,
     requested_shape_storage: [chunk_storage_capacity]u8 = undefined,
@@ -86,9 +86,9 @@ pub const Generator = struct {
         requested_shape_emitted: bool = false,
     };
 
-    pub fn init(allocator: std.mem.Allocator, seed: u64, batch_side: usize) !Generator {
+    pub fn init(allocator: std.mem.Allocator, seed: u64) !Generator {
         var result: Generator = undefined;
-        try result.initInto(allocator, seed, batch_side);
+        try result.initInto(allocator, seed, 5);
         return result;
     }
 
@@ -136,16 +136,16 @@ pub const Generator = struct {
                 return error.UnknownGeneratedBlockState;
         }
         self.state_ids = state_ids;
-        self.batch_side = batch_side;
-        self.workspace_side = workspace_side;
+        self.batch_side = 1;
+        self.workspace_side = 5;
+        self.configured_batch_side = batch_side;
+        self.configured_workspace_side = workspace_side;
         self.feature_workspace_storage = feature_workspace_storage;
         self.feature_heights = feature_heights;
         self.base_cache = base_cache;
         self.base_cache_storage = base_cache_storage;
         self.base_cache_stamp = 0;
         self.workspace_z = @splat(std.math.minInt(i32));
-        self.dirty_columns = @splat(@splat(0));
-        self.dirty_origin = .{ .x = 0, .z = 0 };
         self.generation = .{};
     }
 
@@ -155,6 +155,8 @@ pub const Generator = struct {
         try self.vanilla.reseed(seed);
         @memset(self.base_cache, .{});
         self.base_cache_stamp = 0;
+        self.batch_side = 1;
+        self.workspace_side = 5;
     }
 
     pub fn deinit(self: *Generator) void {
@@ -226,47 +228,11 @@ pub const Generator = struct {
         };
     }
 
-    pub fn advanceSlice(
-        self: *Generator,
-        chunk_x: i32,
-        chunk_z: i32,
-        base_chunks: usize,
-        feature_steps: usize,
-        sink: lightning_rod.generator_api.Sink,
-    ) !bool {
-        std.debug.assert(base_chunks > 0 and feature_steps > 0);
-        var completed_bases: usize = 0;
-        var completed_features: usize = 0;
-        while (true) {
-            const stage = self.generation.stage;
-            const requested_shape_emitted = self.generation.requested_shape_emitted;
-            if (try self.advance(chunk_x, chunk_z)) |shape| {
-                const requested = shape.chunk_x == chunk_x and shape.chunk_z == chunk_z;
-                if (!requested or !requested_shape_emitted) try sink.emit(shape);
-            }
-            if (self.generation.stage == .idle) return true;
-            if (self.generation.requested_shape_ready and
-                !self.generation.requested_shape_emitted)
-            {
-                try sink.emit(self.requested_shape);
-                self.generation.requested_shape_emitted = true;
-            }
-            if (stage == .carvers) {
-                completed_bases += 1;
-                if (completed_bases == base_chunks) return false;
-            }
-            if (stage == .features) {
-                completed_features += 1;
-                if (completed_features == feature_steps) return false;
-            }
-        }
-    }
-
     fn beginBatch(self: *Generator, chunk_x: i32, chunk_z: i32) void {
         const side: i32 = @intCast(self.batch_side);
-        const batch_min_x = @divFloor(chunk_x, side) * side;
-        const batch_min_z = @divFloor(chunk_z, side) * side;
-        @memset(&self.dirty_columns, @splat(0));
+        const half = @divFloor(side, 2);
+        const batch_min_x = @divFloor(chunk_x + half, side) * side - half;
+        const batch_min_z = @divFloor(chunk_z + half, side) * side - half;
         @memset(&self.workspace_z, std.math.minInt(i32));
         self.generation = .{
             .stage = .base_prepare,
@@ -422,7 +388,6 @@ pub const Generator = struct {
             try self.initializeFeatureOrigin();
             return null;
         }
-        self.refreshDirtyHeights();
         if (self.generation.feature_z >= 1) {
             self.generation.output_z = @intCast(self.generation.feature_z - 1);
             self.generation.output_x = 0;
@@ -435,7 +400,6 @@ pub const Generator = struct {
 
     fn initializeFeatureOrigin(self: *Generator) !void {
         const origin = self.featureOrigin();
-        self.refreshDirtyHeights();
         self.loadFeatureHeights(origin, &self.feature_work);
         var region = self.featureRegion(origin.x, origin.z);
         self.vanilla.beginFeatureWork(
@@ -488,6 +452,8 @@ pub const Generator = struct {
         std.debug.assert(self.generation.requested_shape_ready);
         const requested = self.requested_shape;
         self.generation = .{};
+        self.batch_side = self.configured_batch_side;
+        self.workspace_side = self.configured_workspace_side;
         return requested;
     }
 
@@ -530,7 +496,6 @@ pub const Generator = struct {
         origin_x: i32,
         origin_z: i32,
     ) vanilla_worldgen.feature.Region {
-        self.dirty_origin = .{ .x = origin_x, .z = origin_z };
         var chunks: [9][]GeneratedState = undefined;
         for (&chunks, 0..) |*chunk, index| {
             const chunk_x = origin_x + @as(i32, @intCast(index % 3)) - 1;
@@ -542,9 +507,7 @@ pub const Generator = struct {
             .center_chunk_z = origin_z,
             .chunks = chunks,
             .biome_cache = &self.vanilla.biome_cache,
-            .dirty_columns = &self.dirty_columns,
             .height_upper_bounds = &self.feature_work.world_surface,
-            .touched_y = &self.feature_work.touched_y,
         };
     }
 
@@ -566,27 +529,6 @@ pub const Generator = struct {
                 @memcpy(work.world_surface[destination..][0..16], heights.world_surface[source..][0..16]);
             }
         };
-    }
-
-    fn refreshDirtyHeights(self: *Generator) void {
-        for (&self.dirty_columns, 0..) |*words, region_index| {
-            if (words[0] | words[1] | words[2] | words[3] == 0) continue;
-            const chunk_x = self.dirty_origin.x + @as(i32, @intCast(region_index % 3)) - 1;
-            const chunk_z = self.dirty_origin.z + @as(i32, @intCast(region_index / 3)) - 1;
-            const workspace = self.workspaceIndex(chunk_x, chunk_z);
-            for (words, 0..) |*word, word_index| while (word.* != 0) {
-                const bit: usize = @intCast(@ctz(word.*));
-                word.* &= word.* - 1;
-                const column = word_index * 64 + bit;
-                const heights = vanilla_worldgen.chunk.columnHeights(
-                    self.workspaceStates(workspace),
-                    column & 15,
-                    column >> 4,
-                );
-                self.feature_heights[workspace].ocean_floor[column] = heights.ocean_floor;
-                self.feature_heights[workspace].world_surface[column] = heights.world_surface;
-            };
-        }
     }
 
     fn workspaceIndex(self: *const Generator, chunk_x: i32, chunk_z: i32) usize {

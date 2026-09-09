@@ -58,41 +58,30 @@ pub const Region = struct {
     center_chunk_z: i32,
     chunks: [9][]GeneratedState,
     biome_cache: *biome.Cache,
-    dirty_columns: ?*[9][4]u64 = null,
     height_upper_bounds: ?*const HeightHalo = null,
-    touched_y: ?*HeightHalo = null,
 
     pub fn state(self: *Region, x: i32, y: i32, z: i32) ?*GeneratedState {
+        @setRuntimeSafety(false);
         if (y < minimum_y or y >= minimum_y + height) return null;
-        const chunk_x = @divFloor(x, width);
-        const chunk_z = @divFloor(z, width);
-        const region_x = chunk_x - self.center_chunk_x + 1;
-        const region_z = chunk_z - self.center_chunk_z + 1;
-        if (region_x < 0 or region_x >= 3 or region_z < 0 or region_z >= 3) return null;
-        const chunk_index: usize = @intCast(region_z * 3 + region_x);
-        const halo_x: usize = @intCast(region_x * width + @mod(x, width));
-        const halo_z: usize = @intCast(region_z * width + @mod(z, width));
-        if (self.touched_y) |touched|
-            touched[halo_z * height_halo_side + halo_x] = @max(
-                touched[halo_z * height_halo_side + halo_x],
-                @as(i16, @intCast(y)),
-            );
-        if (self.dirty_columns) |dirty| {
-            const column: usize = @intCast(@mod(z, width) * width + @mod(x, width));
-            dirty[chunk_index][column / 64] |= @as(u64, 1) << @intCast(column & 63);
-        }
-        return &self.chunks[chunk_index][blockIndex(@mod(x, width), y, @mod(z, width))];
+        const halo_x = x - (self.center_chunk_x - 1) * width;
+        const halo_z = z - (self.center_chunk_z - 1) * width;
+        if (halo_x < 0 or halo_x >= 3 * width or halo_z < 0 or halo_z >= 3 * width) return null;
+        const local_x: usize = @intCast(halo_x);
+        const local_z: usize = @intCast(halo_z);
+        const chunk_index = (local_z >> 4) * 3 + (local_x >> 4);
+        return &self.chunks[chunk_index][blockIndex(@intCast(local_x & 15), y, @intCast(local_z & 15))];
     }
 
     pub fn stateConst(self: *const Region, x: i32, y: i32, z: i32) ?GeneratedState {
+        @setRuntimeSafety(false);
         if (y < minimum_y or y >= minimum_y + height) return null;
-        const chunk_x = @divFloor(x, width);
-        const chunk_z = @divFloor(z, width);
-        const region_x = chunk_x - self.center_chunk_x + 1;
-        const region_z = chunk_z - self.center_chunk_z + 1;
-        if (region_x < 0 or region_x >= 3 or region_z < 0 or region_z >= 3) return null;
-        const chunk_index: usize = @intCast(region_z * 3 + region_x);
-        return self.chunks[chunk_index][blockIndex(@mod(x, width), y, @mod(z, width))];
+        const halo_x = x - (self.center_chunk_x - 1) * width;
+        const halo_z = z - (self.center_chunk_z - 1) * width;
+        if (halo_x < 0 or halo_x >= 3 * width or halo_z < 0 or halo_z >= 3 * width) return null;
+        const local_x: usize = @intCast(halo_x);
+        const local_z: usize = @intCast(halo_z);
+        const chunk_index = (local_z >> 4) * 3 + (local_x >> 4);
+        return self.chunks[chunk_index][blockIndex(@intCast(local_x & 15), y, @intCast(local_z & 15))];
     }
 };
 
@@ -6663,8 +6652,11 @@ fn isAir(state: GeneratedState) bool {
 }
 
 fn isWater(state: GeneratedState) bool {
-    return state == .water or
-        state.block() == .water;
+    return switch (state) {
+        .water => true,
+        .stone, .air, .lava => false,
+        _ => state.block() == .water,
+    };
 }
 
 fn springValidBlock(state: GeneratedState, valid_blocks: []const []const u8) bool {
@@ -6677,7 +6669,7 @@ fn springValidBlock(state: GeneratedState, valid_blocks: []const []const u8) boo
 }
 
 fn worldSurfaceHeight(region: *Region, x: i32, z: i32) i32 {
-    var y: i32 = minimum_y + height;
+    var y = heightScanUpperBound(region, x, z);
     while (y > minimum_y) {
         y -= 1;
         const state = region.state(x, y, z) orelse continue;
@@ -6687,7 +6679,7 @@ fn worldSurfaceHeight(region: *Region, x: i32, z: i32) i32 {
 }
 
 fn oceanFloorHeight(region: *Region, x: i32, z: i32) i32 {
-    var y: i32 = minimum_y + height;
+    var y = heightScanUpperBound(region, x, z);
     while (y > minimum_y) {
         y -= 1;
         const state = region.state(x, y, z) orelse continue;
@@ -6697,7 +6689,7 @@ fn oceanFloorHeight(region: *Region, x: i32, z: i32) i32 {
 }
 
 fn motionBlockingNoLeavesHeight(region: *Region, x: i32, z: i32) i32 {
-    var y: i32 = minimum_y + height;
+    var y = heightScanUpperBound(region, x, z);
     while (y > minimum_y) {
         y -= 1;
         const state = region.state(x, y, z) orelse continue;
@@ -6721,10 +6713,7 @@ fn heightScanUpperBound(region: *const Region, x: i32, z: i32) i32 {
     const bounds = region.height_upper_bounds orelse return minimum_y + height;
     const first_x = region.center_chunk_x * width;
     const first_z = region.center_chunk_z * width;
-    var upper = heightHaloAt(bounds, first_x, first_z, x, z);
-    if (region.touched_y) |touched|
-        upper = @max(upper, heightHaloAt(touched, first_x, first_z, x, z) + 1);
-    return @min(upper, minimum_y + height);
+    return @min(heightHaloAt(bounds, first_x, first_z, x, z) + 48, minimum_y + height);
 }
 
 fn saplingWouldSurvive(region: *Region, origin: Position) bool {
@@ -6868,6 +6857,11 @@ fn treeLeafStateBase(state: GeneratedState) ?u16 {
 }
 
 fn isOpaqueFullCube(state: GeneratedState) bool {
+    switch (state) {
+        .stone, .lava => return true,
+        .air, .water => return false,
+        _ => {},
+    }
     if (isAir(state) or isWater(state) or treeLeafDistance(state) != 0 or
         lichenStateBits(state) != null or isForestFlower(state) or
         isForestGrass(state) or isNonSolidSurfacePatch(state) or
@@ -6876,6 +6870,11 @@ fn isOpaqueFullCube(state: GeneratedState) bool {
 }
 
 fn blocksMovement(state: GeneratedState) bool {
+    switch (state) {
+        .stone => return true,
+        .air, .water, .lava => return false,
+        _ => {},
+    }
     if (isAir(state) or isWater(state) or lichenStateBits(state) != null or
         isForestFlower(state) or isForestGrass(state) or isNonSolidSurfacePatch(state) or
         isLeafLitter(state) or isNearWaterPlant(state) or isAquaticPlant(state) or

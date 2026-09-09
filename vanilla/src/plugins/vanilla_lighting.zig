@@ -23,7 +23,9 @@ const world_sections = light_projection.world_section_count;
 const all_protocol_sections: u32 =
     (@as(u32, 1) << protocol_sections) - 1;
 const top_protocol_section = protocol_sections - 1;
+const minimum_light_cache_bytes = protocol_sections * 2 * light_projection.bytes_per_section;
 const no_page: u16 = 0;
+const no_chunk: u16 = std.math.maxInt(u16);
 const source_work_empty_generation: u32 = 0;
 const persisted_magic = "LRLT";
 const persisted_version: u8 = 1;
@@ -67,8 +69,23 @@ const SourceWorkLookup = struct {
     index: u16 = 0,
 };
 
+const SolverScratch = struct {
+    block_states: [lighting_volume.cell_count]i32,
+    attenuation: [lighting_volume.cell_count]u8,
+    sky_sources: [lighting_volume.cell_count]u8,
+    sky_frontier: [lighting_volume.cell_count]u8,
+    block_emission: [lighting_volume.cell_count]u8,
+    block_sources: [lighting_volume.cell_count]u8,
+    topology: lighting_volume.Topology,
+    solver: lighting_volume.Scratch,
+    sky_result: lighting_volume.Result,
+    block_result: lighting_volume.Result,
+    section: [light_projection.bytes_per_section]u8,
+};
+
 const ChunkState = struct {
     valid: bool = false,
+    presented: bool = false,
     world: world_identity.Handle = world_identity.invalid,
     position: geometry.ChunkPos = .{ .x = 0, .z = 0 },
     source_revision: u64 = 0,
@@ -86,6 +103,7 @@ const ChunkState = struct {
 };
 
 pub const Lighting = struct {
+    pub const tick_scratch_bytes = @sizeOf(SolverScratch) + @alignOf(SolverScratch) - 1;
     pub const id = "minecraft:lighting";
     pub const Trace = enum { propagation, output };
     pub const Dependencies = struct {
@@ -93,34 +111,41 @@ pub const Lighting = struct {
         blocks: *block_store.Blocks,
         players: *players.Players,
         sessions: *sessions.Sessions,
-        paging: ?*vanilla_persistence.Persistence,
+        materialization: ?*vanilla_persistence.Materializer,
+        runtime_metrics: ?*lightning_rod.metrics.Runtime = null,
     };
 
-    pub const maximum_fully_projected_chunks =
-        (std.math.maxInt(u16) - 1) / (protocol_sections * 2);
-
     pub const Configuration = struct {
-        source_mutations: usize = 512,
+        source_mutations: usize = 64,
+        maximum_projected_chunks: usize = 512,
+        light_cache_bytes: usize = 1024 * 1024,
 
         pub fn validate(self: Configuration) !void {
-            if (self.source_mutations == 0 or !std.math.isPowerOfTwo(self.source_mutations))
+            if (self.source_mutations == 0 or !std.math.isPowerOfTwo(self.source_mutations) or
+                self.source_mutations > (@as(usize, std.math.maxInt(u16)) + 1) / 32)
+                return error.InvalidLightingCapacity;
+            if (self.maximum_projected_chunks == 0 or
+                self.maximum_projected_chunks > std.math.maxInt(u16) or
+                !std.math.isPowerOfTwo(self.maximum_projected_chunks))
+                return error.InvalidLightingCapacity;
+            if (self.light_cache_bytes < minimum_light_cache_bytes or
+                self.light_cache_bytes % light_projection.bytes_per_section != 0 or
+                self.light_cache_bytes / light_projection.bytes_per_section > std.math.maxInt(u16))
                 return error.InvalidLightingCapacity;
         }
     };
-
-    pub fn requiredLightPages(maximum_cached_chunks: usize) usize {
-        return maximum_cached_chunks * protocol_sections * 2;
-    }
 
     started: bool = false,
     mutation_sequence: u64 = 0,
     next_revision: u64 = 1,
     chunks: []ChunkState = &.{},
     chunk_occupancy: []u64 = &.{},
-    pages: []align(64) [light_projection.bytes_per_section]u8 = &.{},
-    free_pages: []u16 = &.{},
-    free_page_count: usize = 0,
-    page_pool_initialized: bool = false,
+    chunk_lookup: []u16 = &.{},
+    free_chunks: []u16 = &.{},
+    free_chunk_count: usize = 0,
+    light_cache_sections: []align(64) [light_projection.bytes_per_section]u8 = &.{},
+    free_light_cache_sections: []u16 = &.{},
+    free_light_cache_section_count: usize = 0,
     dirty_chunks: []u16 = &.{},
     dirty_chunk_count: usize = 0,
     rebuild_chunks: []u16 = &.{},
@@ -138,7 +163,7 @@ pub const Lighting = struct {
     block_result: *lighting_volume.Result = undefined,
     section_scratch: *[light_projection.bytes_per_section]u8 = undefined,
     source_mutations: []SourceMutation = &.{},
-    source_work_sections: []SourceWorkSection = &.{},
+    source_work: []SourceWorkSection = &.{},
     source_work_lookup: []SourceWorkLookup = &.{},
     source_work_count: usize = 0,
     source_work_generation: u32 = 0,
@@ -147,13 +172,11 @@ pub const Lighting = struct {
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies, settings: Configuration) !*Lighting {
         try settings.validate();
-        const maximum_cached_chunks = deps.blocks.resident_chunks.len;
-        if (maximum_cached_chunks == 0 or maximum_cached_chunks > maximum_fully_projected_chunks)
-            return error.InvalidLightingCapacity;
+        const maximum_cached_chunks = settings.maximum_projected_chunks;
         const self = try allocator.create(Lighting);
         self.* = .{ .deps = deps };
-        try allocateBuffers(self, allocator, maximum_cached_chunks, settings.source_mutations);
-        if (deps.paging) |paging| paging.setDerivedChunkCodec(.{
+        try allocateBuffers(self, allocator, maximum_cached_chunks, settings);
+        if (deps.materialization) |materialization| materialization.setDerivedChunkCodec(.{
             .context = self,
             .encode = encodePersistedAdapter,
             .decode = decodePersistedAdapter,
@@ -161,7 +184,19 @@ pub const Lighting = struct {
         return self;
     }
 
-    pub fn tick(self: *Lighting, temporary: std.mem.Allocator) void {
+    pub fn tick(self: *Lighting, temporary: std.mem.Allocator) lightning_rod.plugin_lifecycle.FatalError!void {
+        const scratch = preallocated.create(SolverScratch, temporary) catch return error.WorkingMemoryExceeded;
+        self.block_states = &scratch.block_states;
+        self.attenuation = &scratch.attenuation;
+        self.sky_sources = &scratch.sky_sources;
+        self.sky_frontier = &scratch.sky_frontier;
+        self.block_emission = &scratch.block_emission;
+        self.block_sources = &scratch.block_sources;
+        self.topology = &scratch.topology;
+        self.solver = &scratch.solver;
+        self.sky_result = &scratch.sky_result;
+        self.block_result = &scratch.block_result;
+        self.section_scratch = &scratch.section;
         const lighting = self.context();
         var propagation = plugin_profiler.beginTrace(Trace.propagation);
         consumeMutations(lighting);
@@ -169,6 +204,12 @@ pub const Lighting = struct {
         var output = plugin_profiler.beginTrace(Trace.output);
         self.flushChanges(temporary);
         output.end();
+        if (self.deps.runtime_metrics) |runtime| runtime.setLightingProjections(
+            self.chunks.len - self.free_chunk_count,
+            self.chunks.len,
+            self.light_cache_sections.len - self.free_light_cache_section_count,
+            self.light_cache_sections.len,
+        );
     }
 
     pub fn flushChanges(self: *Lighting, temporary: std.mem.Allocator) void {
@@ -179,12 +220,29 @@ pub const Lighting = struct {
         return self.context().skyLightAt(world, position);
     }
 
+    pub fn cachedSkyLightAt(self: *Lighting, world: world_identity.Handle, position: geometry.BlockPos) ?u8 {
+        return self.context().cachedSkyLightAt(world, position);
+    }
+
     pub fn blockLightAt(self: *Lighting, world: world_identity.Handle, position: geometry.BlockPos) u8 {
         return self.context().blockLightAt(world, position);
     }
 
+    pub fn cachedBlockLightAt(self: *Lighting, world: world_identity.Handle, position: geometry.BlockPos) ?u8 {
+        return self.context().cachedBlockLightAt(world, position);
+    }
+
     pub fn chunk(self: *Lighting, world: world_identity.Handle, position: geometry.ChunkPos) *const light_projection.Chunk {
         return self.context().chunk(world, position);
+    }
+
+    pub fn presentedChunk(self: *Lighting, world: world_identity.Handle, position: geometry.ChunkPos) *const light_projection.Chunk {
+        const index = self.context().ensureChunk(world, position);
+        const chunk_state = &self.chunks[index];
+        chunk_state.presented = true;
+        chunk_state.sky_changed_mask = 0;
+        chunk_state.block_changed_mask = 0;
+        return chunkView(self, index);
     }
 
     pub fn cachedChunk(self: *Lighting, world: world_identity.Handle, position: geometry.ChunkPos) ?*const light_projection.Chunk {
@@ -192,7 +250,8 @@ pub const Lighting = struct {
     }
 
     pub fn encodePersisted(self: *Lighting, world: world_identity.Handle, position: geometry.ChunkPos, output: []u8) ?[]u8 {
-        const projection = self.chunk(world, position);
+        if (self.mutation_sequence != self.deps.blocks.blockMutationSequence()) return null;
+        const projection = self.cachedChunk(world, position) orelse return null;
         if (output.len < persisted_magic.len + 1 + protocol_sections * 2) return null;
         @memcpy(output[0..persisted_magic.len], persisted_magic);
         output[persisted_magic.len] = persisted_version;
@@ -206,32 +265,19 @@ pub const Lighting = struct {
 
     pub fn decodePersisted(self: *Lighting, world: world_identity.Handle, position: geometry.ChunkPos, bytes: []const u8) bool {
         if (!validatePersisted(bytes)) return false;
-        const resident = self.deps.blocks.residentChunkRef(world, position, self.deps.clock.tick) orelse return false;
-        const projection = &self.chunks[resident.index];
-        if (occupied(self.chunk_occupancy, resident.index)) {
+        const resident = self.deps.blocks.materializedChunkRef(world, position, self.deps.clock.tick) orelse return false;
+        const chunk_index = resolveChunkSlot(self, world, position) orelse return false;
+        const projection = &self.chunks[chunk_index];
+        const presented = projection.presented;
+        if (occupied(self.chunk_occupancy, chunk_index)) {
             if (projection.dirty) return false;
             releaseChunkPages(self, projection);
         }
-        projection.* = .{ .valid = true, .world = world, .position = position, .source_revision = resident.entry.content_revision };
-        setOccupied(self.chunk_occupancy, resident.index);
-        decodePersistedSections(self, projection, bytes, resident.index);
+        projection.* = .{ .valid = true, .presented = presented, .world = world, .position = position, .source_revision = resident.entry.content_revision };
+        setOccupied(self.chunk_occupancy, chunk_index);
+        decodePersistedSections(self, projection, bytes, chunk_index);
         projection.revision = takeRevision(self);
         return true;
-    }
-
-    pub fn releaseResidentChunk(
-        self: *Lighting,
-        resident_index: u16,
-        world: world_identity.Handle,
-        position: geometry.ChunkPos,
-    ) void {
-        std.debug.assert(resident_index < self.chunks.len);
-        const projection = &self.chunks[resident_index];
-        if (!occupied(self.chunk_occupancy, resident_index) or
-            !projection.valid or projection.dirty or
-            !projection.world.eql(world) or
-            !geometry.sameChunk(projection.position, position)) return;
-        discardChunkProjection(self, resident_index);
     }
 
     fn context(self: *Lighting) Context {
@@ -313,8 +359,81 @@ fn decodePersistedSection(state: *Lighting, projection: *ChunkState, bytes: []co
     const handle = allocatePage(state, chunk_index);
     const pages = if (sky) &projection.sky_pages else &projection.block_pages;
     pages[section] = handle;
-    @memcpy(&state.pages[handle - 1], bytes[start + 1 ..][0..light_projection.bytes_per_section]);
+    @memcpy(lightPageForWrite(state, handle), bytes[start + 1 ..][0..light_projection.bytes_per_section]);
     return start + 1 + light_projection.bytes_per_section;
+}
+
+fn chunkHash(world: world_identity.Handle, position: geometry.ChunkPos) usize {
+    var value: u64 = @as(u32, @bitCast(world));
+    value = (value ^ @as(u32, @bitCast(position.x))) *% 0xa076_1d64_78bd_642f;
+    value = (value ^ @as(u32, @bitCast(position.z))) *% 0xe703_7ed1_a0b4_28db;
+    return @intCast(value ^ (value >> 32));
+}
+
+fn findChunkSlot(state: *const Lighting, world: world_identity.Handle, position: geometry.ChunkPos) ?u16 {
+    const mask = state.chunk_lookup.len - 1;
+    var probe = chunkHash(world, position) & mask;
+    for (0..state.chunk_lookup.len) |_| {
+        const encoded = state.chunk_lookup[probe];
+        if (encoded == no_chunk) return null;
+        const chunk = &state.chunks[encoded];
+        if (chunk.valid and chunk.world.eql(world) and geometry.sameChunk(chunk.position, position)) return encoded;
+        probe = (probe + 1) & mask;
+    }
+    return null;
+}
+
+fn insertChunkSlot(state: *Lighting, index: u16) void {
+    const chunk = state.chunks[index];
+    const mask = state.chunk_lookup.len - 1;
+    var probe = chunkHash(chunk.world, chunk.position) & mask;
+    for (0..state.chunk_lookup.len) |_| {
+        if (state.chunk_lookup[probe] == no_chunk) {
+            state.chunk_lookup[probe] = index;
+            return;
+        }
+        probe = (probe + 1) & mask;
+    }
+    diagnostics.panic("lighting chunk lookup capacity exhausted", &.{});
+}
+
+fn removeChunkSlot(state: *Lighting, index: u16) void {
+    const chunk = state.chunks[index];
+    const mask = state.chunk_lookup.len - 1;
+    var probe = chunkHash(chunk.world, chunk.position) & mask;
+    for (0..state.chunk_lookup.len) |_| {
+        if (state.chunk_lookup[probe] == index) break;
+        if (state.chunk_lookup[probe] == no_chunk) unreachable;
+        probe = (probe + 1) & mask;
+    } else unreachable;
+    state.chunk_lookup[probe] = no_chunk;
+    var scan = (probe + 1) & mask;
+    for (0..state.chunk_lookup.len) |_| {
+        const displaced = state.chunk_lookup[scan];
+        if (displaced == no_chunk) return;
+        state.chunk_lookup[scan] = no_chunk;
+        insertChunkSlot(state, displaced);
+        scan = (scan + 1) & mask;
+    }
+    unreachable;
+}
+
+fn resolveChunkSlot(state: *Lighting, world: world_identity.Handle, position: geometry.ChunkPos) ?u16 {
+    if (findChunkSlot(state, world, position)) |index| return index;
+    if (state.free_chunk_count == 0) {
+        for (state.chunks, 0..) |chunk, index| {
+            if (!chunk.valid or chunk.dirty) continue;
+            discardChunkProjection(state, @intCast(index));
+            break;
+        }
+    }
+    if (state.free_chunk_count == 0) return null;
+    state.free_chunk_count -= 1;
+    const index = state.free_chunks[state.free_chunk_count];
+    state.chunks[index] = .{ .valid = true, .world = world, .position = position };
+    setOccupied(state.chunk_occupancy, index);
+    insertChunkSlot(state, index);
+    return index;
 }
 
 const Context = struct {
@@ -324,17 +443,24 @@ const Context = struct {
 
     pub fn skyLightAt(self: Context, world: world_identity.Handle, pos: geometry.BlockPos) u8 {
         const section = block_store.sectionIndexForY(pos.y) orelse return 0;
-        const resident = self.blocks.residentChunk(
-            world,
-            geometry.chunkForBlock(pos),
-        ) orelse return 0;
-        const chunk_index = self.ensureChunk(world, resident.chunk);
+        const chunk_index = self.ensureChunk(world, geometry.chunkForBlock(pos));
+        return self.skyLightAtIndex(chunk_index, section, pos);
+    }
+
+    pub fn cachedSkyLightAt(self: Context, world: world_identity.Handle, pos: geometry.BlockPos) ?u8 {
+        const section = block_store.sectionIndexForY(pos.y) orelse return 0;
+        const chunk_index = findChunkSlot(self.state, world, geometry.chunkForBlock(pos)) orelse return null;
+        if (!self.state.chunks[chunk_index].valid) return null;
+        return self.skyLightAtIndex(chunk_index, section, pos);
+    }
+
+    fn skyLightAtIndex(self: Context, chunk_index: u16, section: usize, pos: geometry.BlockPos) u8 {
         const projection = &self.state.chunks[chunk_index];
         const protocol_section = section + 1;
         const handle = projection.sky_pages[protocol_section];
         if (handle != no_page)
             return getNibble(
-                &self.state.pages[handle - 1],
+                lightPage(self.state, handle),
                 block_store.localBlockIndexForPosition(pos),
             );
         return if (projection.sky_full_mask &
@@ -343,16 +469,23 @@ const Context = struct {
 
     pub fn blockLightAt(self: Context, world: world_identity.Handle, pos: geometry.BlockPos) u8 {
         const section = block_store.sectionIndexForY(pos.y) orelse return 0;
-        const resident = self.blocks.residentChunk(
-            world,
-            geometry.chunkForBlock(pos),
-        ) orelse return 0;
-        const chunk_index = self.ensureChunk(world, resident.chunk);
+        const chunk_index = self.ensureChunk(world, geometry.chunkForBlock(pos));
+        return self.blockLightAtIndex(chunk_index, section, pos);
+    }
+
+    pub fn cachedBlockLightAt(self: Context, world: world_identity.Handle, pos: geometry.BlockPos) ?u8 {
+        const section = block_store.sectionIndexForY(pos.y) orelse return 0;
+        const chunk_index = findChunkSlot(self.state, world, geometry.chunkForBlock(pos)) orelse return null;
+        if (!self.state.chunks[chunk_index].valid) return null;
+        return self.blockLightAtIndex(chunk_index, section, pos);
+    }
+
+    fn blockLightAtIndex(self: Context, chunk_index: u16, section: usize, pos: geometry.BlockPos) u8 {
         const handle = self.state.chunks[chunk_index]
             .block_pages[section + 1];
         if (handle == no_page) return 0;
         return getNibble(
-            &self.state.pages[handle - 1],
+            lightPage(self.state, handle),
             block_store.localBlockIndexForPosition(pos),
         );
     }
@@ -370,64 +503,50 @@ const Context = struct {
         world: world_identity.Handle,
         position: geometry.ChunkPos,
     ) ?*const light_projection.Chunk {
-        const resident = self.blocks.residentChunkRef(
-            world,
-            position,
-            self.clock.tick,
-        ) orelse return null;
-        const projection = &self.state.chunks[resident.index];
-        if (!occupied(self.state.chunk_occupancy, resident.index) or
-            !projection.valid or
-            !projection.world.eql(world) or
-            !geometry.sameChunk(projection.position, position) or
-            projection.source_revision != resident.entry.content_revision)
-            return null;
-        return chunkView(self.state, resident.index);
+        const index = findChunkSlot(self.state, world, position) orelse return null;
+        const projection = &self.state.chunks[index];
+        if (!projection.valid) return null;
+        if (self.blocks.materializedChunk(world, position)) |resident|
+            if (projection.source_revision != resident.content_revision) return null;
+        return chunkView(self.state, index);
     }
 
     fn ensureChunk(self: Context, world: world_identity.Handle, position: geometry.ChunkPos) u16 {
-        const resident = self.blocks.generatedHeightChunkRef(
-            world,
-            position,
-            self.clock.tick,
-        );
-        const projection = &self.state.chunks[resident.index];
-        if (occupied(self.state.chunk_occupancy, resident.index) and
-            projection.valid and projection.world.eql(world) and
-            geometry.sameChunk(projection.position, position) and
-            projection.source_revision == resident.entry.content_revision)
-            return resident.index;
-
-        const was_same = occupied(
-            self.state.chunk_occupancy,
-            resident.index,
-        ) and projection.valid and projection.world.eql(world) and
-            geometry.sameChunk(projection.position, position);
-        if (!was_same) {
-            releaseChunkPages(self.state, projection);
-            projection.* = .{
-                .valid = true,
-                .world = world,
-                .position = position,
-            };
-            setOccupied(self.state.chunk_occupancy, resident.index);
+        if (findChunkSlot(self.state, world, position)) |chunk_index| {
+            const projection = &self.state.chunks[chunk_index];
+            if (projection.valid) {
+                const resident = self.blocks.materializedChunk(world, position) orelse return chunk_index;
+                if (projection.source_revision == resident.content_revision) return chunk_index;
+            }
         }
-        rebuildChunk(self, resident.index, resident.entry, was_same);
-        if (!was_same)
+        const resident = self.blocks.materializedChunkRef(world, position, self.clock.tick) orelse
+            diagnostics.panic("lighting requested a chunk before materialization (chunk x, chunk z)", &.{ diagnostics.integer(position.x), diagnostics.integer(position.z) });
+        const chunk_index = resolveChunkSlot(self.state, world, position) orelse
+            diagnostics.panic("lighting chunk projection capacity exhausted", &.{});
+        const projection = &self.state.chunks[chunk_index];
+        if (projection.valid and
+            projection.source_revision == resident.entry.content_revision)
+            return chunk_index;
+
+        const was_initialized = projection.source_revision != 0 or chunkOwnsPage(projection);
+        const presented = projection.presented;
+        if (was_initialized) releaseChunkPages(self.state, projection);
+        projection.* = .{ .valid = true, .presented = presented, .world = world, .position = position };
+        rebuildChunk(self, chunk_index, resident.entry, was_initialized);
+        if (!was_initialized)
             refreshProjectedNeighbors(self, world, resident.entry.chunk);
-        return resident.index;
+        return chunk_index;
     }
 };
 
 fn flushContext(service: Context, temporary: std.mem.Allocator) void {
     emitDirtyChunks(service.state, temporary);
-    reclaimDetachedChunks(service);
 }
 
 fn emitDirtyChunks(state: *Lighting, temporary: std.mem.Allocator) void {
     for (state.dirty_chunks[0..state.dirty_chunk_count]) |index| {
         const chunk = &state.chunks[index];
-        if (chunk.sky_changed_mask != 0 or chunk.block_changed_mask != 0) {
+        if (chunk.presented and (chunk.sky_changed_mask != 0 or chunk.block_changed_mask != 0)) {
             sendLight(state, temporary, chunk.world, .{
                 .chunk = chunkView(state, index),
                 .sky_changed_mask = chunk.sky_changed_mask,
@@ -451,6 +570,7 @@ fn sendLight(
     var count: usize = 0;
     for (state.deps.players.activeSlots()) |slot| {
         if (!state.deps.players.records[slot].world.eql(world)) continue;
+        if (!state.deps.players.records[slot].presentation_ready) continue;
         recipients[count] = state.deps.players.session(slot) orelse continue;
         count += 1;
     }
@@ -476,26 +596,8 @@ fn sendLight(
     }) catch {};
 }
 
-fn reclaimDetachedChunks(service: Context) void {
-    for (service.state.chunks, 0..) |*projection, index| {
-        if (!occupied(service.state.chunk_occupancy, index) or
-            !projection.valid or projection.dirty) continue;
-        const resident = service.blocks.residentChunkRef(
-            projection.world,
-            projection.position,
-            service.clock.tick,
-        ) orelse {
-            discardChunkProjection(service.state, @intCast(index));
-            continue;
-        };
-        if (resident.index != index)
-            discardChunkProjection(service.state, @intCast(index));
-    }
-}
-
-fn allocateBuffers(state: *Lighting, allocator: std.mem.Allocator, maximum_cached_chunks: usize, source_mutations: usize) !void {
-    const light_pages = Lighting.requiredLightPages(maximum_cached_chunks);
-    if (light_pages >= std.math.maxInt(u16)) return error.InvalidLightingCapacity;
+fn allocateBuffers(state: *Lighting, allocator: std.mem.Allocator, maximum_cached_chunks: usize, settings: Lighting.Configuration) !void {
+    const light_cache_section_count = settings.light_cache_bytes / light_projection.bytes_per_section;
     state.chunks = try preallocated.alloc(
         ChunkState,
         allocator,
@@ -508,13 +610,16 @@ fn allocateBuffers(state: *Lighting, allocator: std.mem.Allocator, maximum_cache
         (maximum_cached_chunks + 63) / 64,
     );
     @memset(state.chunk_occupancy, 0);
-    state.pages = try preallocated.alignedAlloc(
-        [light_projection.bytes_per_section]u8,
-        allocator,
-        .@"64",
-        light_pages,
-    );
-    state.free_pages = try preallocated.alloc(u16, allocator, light_pages);
+    state.chunk_lookup = try preallocated.alloc(u16, allocator, maximum_cached_chunks * 2);
+    @memset(state.chunk_lookup, no_chunk);
+    state.free_chunks = try preallocated.alloc(u16, allocator, maximum_cached_chunks);
+    for (state.free_chunks, 0..) |*slot, index| slot.* = @intCast(maximum_cached_chunks - index - 1);
+    state.free_chunk_count = maximum_cached_chunks;
+    state.light_cache_sections = try preallocated.alignedAlloc([light_projection.bytes_per_section]u8, allocator, .@"64", light_cache_section_count);
+    state.free_light_cache_sections = try preallocated.alloc(u16, allocator, light_cache_section_count);
+    for (state.free_light_cache_sections, 0..) |*slot, index|
+        slot.* = @intCast(light_cache_section_count - index - 1);
+    state.free_light_cache_section_count = light_cache_section_count;
     state.dirty_chunks = try preallocated.alloc(
         u16,
         allocator,
@@ -531,63 +636,9 @@ fn allocateBuffers(state: *Lighting, allocator: std.mem.Allocator, maximum_cache
         (maximum_cached_chunks + 63) / 64,
     );
     @memset(state.rebuild_occupancy, 0);
-    try allocateSolverBuffers(state, allocator, source_mutations);
-}
-
-fn allocateSolverBuffers(state: *Lighting, allocator: std.mem.Allocator, source_mutations: usize) !void {
-    state.block_states = try preallocated.alloc(
-        i32,
-        allocator,
-        lighting_volume.cell_count,
-    );
-    state.attenuation = try preallocated.alloc(
-        u8,
-        allocator,
-        lighting_volume.cell_count,
-    );
-    state.sky_sources = try preallocated.alloc(
-        u8,
-        allocator,
-        lighting_volume.cell_count,
-    );
-    state.sky_frontier = try preallocated.alloc(
-        u8,
-        allocator,
-        lighting_volume.cell_count,
-    );
-    state.block_sources = try preallocated.alloc(
-        u8,
-        allocator,
-        lighting_volume.cell_count,
-    );
-    state.block_emission = try preallocated.alloc(
-        u8,
-        allocator,
-        lighting_volume.cell_count,
-    );
-    state.topology = try preallocated.create(lighting_volume.Topology, allocator);
-    state.solver = try preallocated.create(lighting_volume.Scratch, allocator);
-    state.sky_result = try preallocated.create(lighting_volume.Result, allocator);
-    state.block_result = try preallocated.create(lighting_volume.Result, allocator);
-    state.section_scratch = try preallocated.create(
-        [light_projection.bytes_per_section]u8,
-        allocator,
-    );
-    state.source_mutations = try preallocated.alloc(
-        SourceMutation,
-        allocator,
-        source_mutations,
-    );
-    state.source_work_sections = try preallocated.alloc(
-        SourceWorkSection,
-        allocator,
-        source_mutations * 32,
-    );
-    state.source_work_lookup = try preallocated.alloc(
-        SourceWorkLookup,
-        allocator,
-        source_mutations * 64,
-    );
+    state.source_mutations = try preallocated.alloc(SourceMutation, allocator, settings.source_mutations);
+    state.source_work = try preallocated.alloc(SourceWorkSection, allocator, settings.source_mutations * 32);
+    state.source_work_lookup = try preallocated.alloc(SourceWorkLookup, allocator, settings.source_mutations * 64);
     @memset(state.source_work_lookup, .{});
 }
 
@@ -674,7 +725,7 @@ fn rebuildMutations(service: Context, first: u64, latest: u64, history_lost: boo
         for (state.rebuild_chunks[0..state.rebuild_chunk_count]) |index| {
             const projection = &state.chunks[index];
             if (!occupied(state.chunk_occupancy, index) or !projection.valid) continue;
-            const resident = service.blocks.residentChunk(projection.world, projection.position) orelse continue;
+            const resident = service.blocks.materializedChunk(projection.world, projection.position) orelse continue;
             rebuildChunk(service, index, resident, true);
         }
     }
@@ -720,7 +771,7 @@ fn scheduleDenseMutationRebuilds(
         while (dz <= 1) : (dz += 1) {
             var dx: i32 = -1;
             while (dx <= 1) : (dx += 1)
-                scheduleResidentChunk(service, mutation.world, .{
+                scheduleMaterializedChunk(service, mutation.world, .{
                     .x = center.x + dx,
                     .z = center.z + dz,
                 });
@@ -738,13 +789,12 @@ fn synchronizeProjectionRevisions(
     for (0..mutation_count) |offset| {
         const sequence = first_sequence + offset;
         const mutation = service.blocks.blockMutation(sequence);
-        const resident = service.blocks.residentChunkRef(
+        const resident = service.blocks.materializedChunkRef(
             mutation.world,
             geometry.chunkForBlock(mutation.pos),
             service.clock.tick,
         ) orelse continue;
-        const index = resident.index;
-        if (!occupied(service.state.chunk_occupancy, index)) continue;
+        const index = findChunkSlot(service.state, mutation.world, resident.entry.chunk) orelse continue;
         const projection = &service.state.chunks[index];
         if (!projection.valid or !projection.world.eql(mutation.world) or
             !geometry.sameChunk(projection.position, resident.entry.chunk))
@@ -775,6 +825,7 @@ fn updateBlockSourcesIncrementally(
     mutations: []const SourceMutation,
 ) void {
     beginSourceWork(service.state);
+    defer service.state.source_work_count = 0;
 
     for (mutations) |mutation| {
         if (mutation.previous_emission <= mutation.current_emission)
@@ -790,7 +841,7 @@ fn updateBlockSourcesIncrementally(
     clearSourceFrontier(service.state);
     for (mutations) |mutation| {
         const block_state =
-            service.blocks.blockAtIfResident(mutation.world, mutation.pos) orelse continue;
+            service.blocks.blockAtIfMaterialized(mutation.world, mutation.pos) orelse continue;
         const emitted = game_data.blockInfo(block_state).emitted_light;
         if (emitted == 0) continue;
         const cell = sourceCell(service, mutation.world, mutation.pos, true) orelse continue;
@@ -848,38 +899,38 @@ fn findSourceWorkSection(
         const lookup = &state.source_work_lookup[lookup_index];
         if (lookup.generation != state.source_work_generation) {
             if (!create) return null;
-            if (state.source_work_count == state.source_work_sections.len)
+            if (state.source_work_count == state.source_work.len)
                 diagnostics.panic(
                     "incremental lighting section capacity exhausted",
                     &.{diagnostics.integer(state.source_work_count)},
                 );
-            const resident = service.blocks.residentChunkRef(
+            const resident = service.blocks.materializedChunkRef(
                 key.world,
                 .{ .x = key.chunk_x, .z = key.chunk_z },
                 service.clock.tick,
             ) orelse return null;
-            if (!occupied(state.chunk_occupancy, resident.index))
-                return null;
-            const projection = &state.chunks[resident.index];
+            const chunk_index = findChunkSlot(state, key.world, resident.entry.chunk) orelse return null;
+            const projection = &state.chunks[chunk_index];
             if (!projection.valid or !projection.world.eql(key.world) or
                 !geometry.sameChunk(projection.position, resident.entry.chunk))
                 return null;
 
             const index = state.source_work_count;
             state.source_work_count += 1;
-            state.source_work_sections[index] = .{
+            const work = &state.source_work[index];
+            work.* = .{
                 .key = key,
-                .chunk_index = resident.index,
+                .chunk_index = chunk_index,
             };
             lookup.* = .{
                 .generation = state.source_work_generation,
                 .key = key,
                 .index = @intCast(index),
             };
-            return &state.source_work_sections[index];
+            return work;
         }
         if (sameSourceSection(lookup.key, key))
-            return &state.source_work_sections[lookup.index];
+            return sourceWork(state, lookup.index);
         lookup_index = (lookup_index + 1) & mask;
     }
     diagnostics.panic("incremental lighting lookup capacity exhausted", &.{});
@@ -970,7 +1021,8 @@ fn takePendingWord(
 }
 
 fn clearSourceFrontier(state: *Lighting) void {
-    for (state.source_work_sections[0..state.source_work_count]) |*section| {
+    for (0..state.source_work_count) |index| {
+        const section = sourceWork(state, index);
         @memset(&section.settled, 0);
         @memset(&section.pending_planes, @splat(0));
         @memset(&section.pending_words, 0);
@@ -983,7 +1035,7 @@ fn invalidateRemovedSources(service: Context) void {
     while (level != 0) : (level -= 1) {
         var section_index: usize = 0;
         while (section_index < state.source_work_count) : (section_index += 1) {
-            const section = &state.source_work_sections[section_index];
+            const section = sourceWork(state, section_index);
             while (section.pending_words[level] != 0) {
                 const word_index: usize =
                     @intCast(@ctz(section.pending_words[level]));
@@ -1022,7 +1074,7 @@ fn invalidateSourceCell(
         if (bitSet(&target.section.invalid, target.local_index)) continue;
         const target_level = blockLightAtCell(service.state, target);
         if (target_level == 0) continue;
-        const target_state = service.blocks.blockAtIfResident(section.key.world, target_pos) orelse
+        const target_state = service.blocks.blockAtIfMaterialized(section.key.world, target_pos) orelse
             continue;
         if (game_data.blockInfo(target_state).emitted_light >= target_level) continue;
         if (propagatedLevel(
@@ -1042,7 +1094,7 @@ fn relightInvalidatedCells(service: Context) void {
     clearSourceFrontier(state);
     var section_index: usize = 0;
     while (section_index < state.source_work_count) : (section_index += 1) {
-        const section = &state.source_work_sections[section_index];
+        const section = sourceWork(state, section_index);
         for (section.invalid, 0..) |word_bits, word_index| {
             var cells = word_bits;
             while (cells != 0) {
@@ -1052,7 +1104,7 @@ fn relightInvalidatedCells(service: Context) void {
                     @intCast(word_index * 64 + bit_index);
                 const pos = sourcePosition(section.key, local_index);
                 const block_state =
-                    service.blocks.blockAtIfResident(section.key.world, pos) orelse continue;
+                    service.blocks.blockAtIfMaterialized(section.key.world, pos) orelse continue;
                 var desired: u8 =
                     game_data.blockInfo(block_state).emitted_light;
                 for (neighbor_steps) |step| {
@@ -1101,7 +1153,7 @@ fn propagateFrontier(service: Context, invalid_only: bool) void {
     while (level != 0) : (level -= 1) {
         var section_index: usize = 0;
         while (section_index < state.source_work_count) : (section_index += 1) {
-            const section = &state.source_work_sections[section_index];
+            const section = sourceWork(state, section_index);
             while (section.pending_words[level] != 0) {
                 const word_index: usize =
                     @intCast(@ctz(section.pending_words[level]));
@@ -1147,9 +1199,9 @@ fn propagatedLevel(
 ) u8 {
     if (source_level <= 1) return 0;
     const source_state =
-        service.blocks.blockAtIfResident(world, source_pos) orelse return 0;
+        service.blocks.blockAtIfMaterialized(world, source_pos) orelse return 0;
     const target_state =
-        service.blocks.blockAtIfResident(world, target_pos) orelse return 0;
+        service.blocks.blockAtIfMaterialized(world, target_pos) orelse return 0;
     if (game_data.blockInfo(source_state).emitted_light == 0) {
         const source_faces = game_data.lightFaceOcclusion(source_state);
         const target_faces = game_data.lightFaceOcclusion(target_state);
@@ -1202,7 +1254,7 @@ fn blockLightAtCell(state: *const Lighting, cell: SourceCell) u8 {
         .block_pages[@as(usize, cell.section.key.section) + 1];
     if (handle == no_page) return 0;
     return getNibble(
-        &state.pages[handle - 1],
+        lightPage(state, handle),
         cell.local_index,
     );
 }
@@ -1223,7 +1275,7 @@ fn setBlockLightAtCell(
         chunk.block_mask |=
             @as(u32, 1) << @intCast(protocol_section);
     }
-    const page = &state.pages[handle - 1];
+    const page = lightPageForWrite(state, handle);
     if (getNibble(page, local_index) == level) return;
     setNibble(page, local_index, level);
     const bit = @as(u32, 1) << @intCast(protocol_section);
@@ -1235,12 +1287,13 @@ fn setBlockLightAtCell(
 }
 
 fn compactSourceWorkPages(state: *Lighting) void {
-    for (state.source_work_sections[0..state.source_work_count]) |*section| {
+    for (0..state.source_work_count) |index| {
+        const section = sourceWork(state, index);
         const chunk = &state.chunks[section.chunk_index];
         const protocol_section = @as(usize, section.key.section) + 1;
         const handle = chunk.block_pages[protocol_section];
         if (handle == no_page) continue;
-        if (!allBytes(&state.pages[handle - 1], 0)) continue;
+        if (!allBytes(lightPage(state, handle), 0)) continue;
         releasePage(state, handle);
         chunk.block_pages[protocol_section] = no_page;
         chunk.block_mask &=
@@ -1289,7 +1342,7 @@ fn refreshProjectedNeighbors(
             .target_face = 4,
         },
     };
-    const source_ref = service.blocks.residentChunkRef(
+    const source_ref = service.blocks.materializedChunkRef(
         world,
         center,
         service.clock.tick,
@@ -1299,15 +1352,14 @@ fn refreshProjectedNeighbors(
             .x = center.x + boundary.dx,
             .z = center.z + boundary.dz,
         };
-        const resident = service.blocks.residentChunkRef(
+        const resident = service.blocks.materializedChunkRef(
             world,
             position,
             service.clock.tick,
         ) orelse continue;
-        const index = resident.index;
+        const index = findChunkSlot(service.state, world, position) orelse continue;
         const projection = &service.state.chunks[index];
-        if (!occupied(service.state.chunk_occupancy, index) or
-            !projection.valid or !projection.world.eql(world) or
+        if (!projection.valid or !projection.world.eql(world) or
             !geometry.sameChunk(projection.position, position) or
             !boundaryCanIncreaseLight(
                 service,
@@ -1336,12 +1388,14 @@ const BoundaryCoordinates = struct {
 
 fn boundaryCanIncreaseLight(
     service: Context,
-    source: block_store.GeneratedHeightRef,
-    target: block_store.GeneratedHeightRef,
+    source: block_store.MaterializedChunkRef,
+    target: block_store.MaterializedChunkRef,
     boundary: HorizontalBoundary,
 ) bool {
-    const source_light = &service.state.chunks[source.index];
-    const target_light = &service.state.chunks[target.index];
+    const source_index = findChunkSlot(service.state, source.entry.world, source.entry.chunk) orelse return false;
+    const target_index = findChunkSlot(service.state, target.entry.world, target.entry.chunk) orelse return false;
+    const source_light = &service.state.chunks[source_index];
+    const target_light = &service.state.chunks[target_index];
     for (0..world_sections) |section| {
         if (uniformBoundaryCanIncrease(
             service,
@@ -1362,8 +1416,8 @@ fn boundaryCanIncreaseLight(
 
 fn boundarySectionCanIncrease(
     service: Context,
-    source: block_store.GeneratedHeightRef,
-    target: block_store.GeneratedHeightRef,
+    source: block_store.MaterializedChunkRef,
+    target: block_store.MaterializedChunkRef,
     source_light: *const ChunkState,
     target_light: *const ChunkState,
     boundary: HorizontalBoundary,
@@ -1375,8 +1429,8 @@ fn boundarySectionCanIncrease(
             const coordinates = boundaryCoordinates(boundary, @intCast(axis));
             const source_pos = boundaryBlockPosition(source.entry.chunk, coordinates.source_x, coordinates.source_z, y);
             const target_pos = boundaryBlockPosition(target.entry.chunk, coordinates.target_x, coordinates.target_z, y);
-            const source_state = service.blocks.blockAtResident(source.entry, source_pos);
-            const target_state = service.blocks.blockAtResident(target.entry, target_pos);
+            const source_state = service.blocks.blockAtMaterialized(source.entry, source_pos);
+            const target_state = service.blocks.blockAtMaterialized(target.entry, target_pos);
             if (game_data.blockInfo(source_state).emitted_light == 0 and
                 lighting_volume.facesSeal(
                     game_data.lightFaceOcclusion(source_state)[boundary.source_face],
@@ -1417,8 +1471,8 @@ fn boundaryLocalIndex(x: i32, z: i32, y: usize) u16 {
 
 fn uniformBoundaryCanIncrease(
     service: Context,
-    source: block_store.GeneratedHeightRef,
-    target: block_store.GeneratedHeightRef,
+    source: block_store.MaterializedChunkRef,
+    target: block_store.MaterializedChunkRef,
     source_light: *const ChunkState,
     target_light: *const ChunkState,
     boundary: HorizontalBoundary,
@@ -1481,7 +1535,7 @@ fn projectedLevel(
     else
         chunk.block_pages[protocol_section];
     if (handle != no_page)
-        return getNibble(&state.pages[handle - 1], local_index);
+        return getNibble(lightPage(state, handle), local_index);
     if (sky and chunk.sky_full_mask &
         (@as(u32, 1) << @intCast(protocol_section)) != 0)
         return 15;
@@ -1507,27 +1561,28 @@ fn invalidateChunkLight(state: *Lighting, index: u16) void {
     markDirty(state, index);
 }
 
-fn scheduleResidentChunk(service: Context, world: world_identity.Handle, position: geometry.ChunkPos) void {
-    const resident = service.blocks.residentChunkRef(
+fn scheduleMaterializedChunk(service: Context, world: world_identity.Handle, position: geometry.ChunkPos) void {
+    _ = service.blocks.materializedChunkRef(
         world,
         position,
         service.clock.tick,
     ) orelse return;
-    if (!occupied(service.state.chunk_occupancy, resident.index)) return;
-    if (occupied(service.state.rebuild_occupancy, resident.index)) return;
-    setOccupied(service.state.rebuild_occupancy, resident.index);
+    const chunk_index = findChunkSlot(service.state, world, position) orelse return;
+    if (occupied(service.state.rebuild_occupancy, chunk_index)) return;
+    setOccupied(service.state.rebuild_occupancy, chunk_index);
     service.state.rebuild_chunks[service.state.rebuild_chunk_count] =
-        resident.index;
+        chunk_index;
     service.state.rebuild_chunk_count += 1;
 }
 
 fn rebuildChunk(
     service: Context,
     chunk_index: u16,
-    resident: *const block_store.GeneratedHeightChunk,
+    resident: *const block_store.MaterializedChunk,
     report_changes: bool,
 ) void {
     const state = service.state;
+    std.debug.assert(state.block_states.len == lighting_volume.cell_count);
     if (buildColumnarLight(service, resident)) {
         const chunk = &state.chunks[chunk_index];
         chunk.valid = true;
@@ -1568,7 +1623,7 @@ fn volumeData(state: *Lighting) VolumeData {
     };
 }
 
-fn populateVolume(service: Context, resident: *const block_store.GeneratedHeightChunk, volume: VolumeData) u32 {
+fn populateVolume(service: Context, resident: *const block_store.MaterializedChunk, volume: VolumeData) u32 {
     var uniform_topology_sections: u32 = 0;
     for (0..world_sections) |section| {
         const modified = service.blocks.modifiedSectionIndex(resident, section);
@@ -1626,7 +1681,7 @@ fn populateGeneratedSection(shape: *const terrain.ChunkShape, section: usize, vo
     }
 }
 
-fn solveVolume(service: Context, resident: *const block_store.GeneratedHeightChunk, volume: VolumeData, uniform_sections: u32) void {
+fn solveVolume(service: Context, resident: *const block_store.MaterializedChunk, volume: VolumeData, uniform_sections: u32) void {
     const state = service.state;
     if (containsLight(volume.block_emission)) {
         @memcpy(volume.block_sources, volume.block_emission);
@@ -1664,7 +1719,7 @@ fn solveVolume(service: Context, resident: *const block_store.GeneratedHeightChu
         state.block_result.* = .{};
 }
 
-fn skyWorkHeight(resident: *const block_store.GeneratedHeightChunk) usize {
+fn skyWorkHeight(resident: *const block_store.MaterializedChunk) usize {
     var highest = @as(i32, world_limits.min_y) - 1;
     for (resident.heights) |height| highest = @max(highest, height);
     if (resident.modified_section_mask != 0) {
@@ -1680,7 +1735,7 @@ fn skyWorkHeight(resident: *const block_store.GeneratedHeightChunk) usize {
 
 fn buildColumnarLight(
     service: Context,
-    resident: *const block_store.GeneratedHeightChunk,
+    resident: *const block_store.MaterializedChunk,
 ) bool {
     if (!isColumnarOpaque(service, resident) or neighborHasBlockLight(service, resident.world, resident.chunk)) return false;
     service.state.sky_result.* = .{};
@@ -1704,7 +1759,7 @@ fn buildColumnarLight(
     return true;
 }
 
-fn isColumnarOpaque(service: Context, resident: *const block_store.GeneratedHeightChunk) bool {
+fn isColumnarOpaque(service: Context, resident: *const block_store.MaterializedChunk) bool {
     var minimum_height = resident.heights[0];
     var maximum_height = resident.heights[0];
     for (resident.heights[1..]) |height| {
@@ -1779,14 +1834,8 @@ fn neighborHasBlockLight(
             .x = chunk.x + offset.x,
             .z = chunk.z + offset.z,
         };
-        const resident = service.blocks.residentChunkRef(
-            world,
-            position,
-            service.clock.tick,
-        ) orelse continue;
-        if (!occupied(service.state.chunk_occupancy, resident.index))
-            continue;
-        const projection = &service.state.chunks[resident.index];
+        const chunk_index = findChunkSlot(service.state, world, position) orelse continue;
+        const projection = &service.state.chunks[chunk_index];
         if (projection.valid and projection.world.eql(world) and
             geometry.sameChunk(projection.position, position) and
             projection.block_mask != 0)
@@ -1948,7 +1997,7 @@ fn seedDirectSky(
 
 fn seedNeighborBoundaries(
     service: Context,
-    resident: *const block_store.GeneratedHeightChunk,
+    resident: *const block_store.MaterializedChunk,
     states: *const [lighting_volume.cell_count]i32,
     attenuation: *const [lighting_volume.cell_count]u8,
     sky_sources: *[lighting_volume.cell_count]u8,
@@ -1973,7 +2022,7 @@ const NeighborEdge = struct {
 
 fn seedNeighborEdge(
     service: Context,
-    resident: *const block_store.GeneratedHeightChunk,
+    resident: *const block_store.MaterializedChunk,
     states: *const [lighting_volume.cell_count]i32,
     attenuation: *const [lighting_volume.cell_count]u8,
     sky_sources: *[lighting_volume.cell_count]u8,
@@ -1981,9 +2030,9 @@ fn seedNeighborEdge(
     edge: NeighborEdge,
 ) void {
     const position = geometry.ChunkPos{ .x = resident.chunk.x + edge.dx, .z = resident.chunk.z + edge.dz };
-    const neighbor_ref = service.blocks.residentChunkRef(resident.world, position, service.clock.tick) orelse return;
-    if (!occupied(service.state.chunk_occupancy, neighbor_ref.index)) return;
-    const projection = &service.state.chunks[neighbor_ref.index];
+    const neighbor_ref = service.blocks.materializedChunkRef(resident.world, position, service.clock.tick) orelse return;
+    const chunk_index = findChunkSlot(service.state, resident.world, position) orelse return;
+    const projection = &service.state.chunks[chunk_index];
     if (!projection.valid or !projection.world.eql(resident.world) or !geometry.sameChunk(projection.position, position)) return;
     for (0..world_sections) |section| {
         if (uniformNeighborBoundaryCannotSeed(
@@ -2011,7 +2060,7 @@ fn seedNeighborEdge(
 
 fn seedNeighborSection(
     service: Context,
-    neighbor: *const block_store.GeneratedHeightChunk,
+    neighbor: *const block_store.MaterializedChunk,
     projection: *const ChunkState,
     states: *const [lighting_volume.cell_count]i32,
     attenuation: *const [lighting_volume.cell_count]u8,
@@ -2036,14 +2085,14 @@ fn seedNeighborSection(
         const loss = @max(@as(u8, 1), attenuation[cell]);
         const sky = projection.sky_pages[section + 1];
         const sky_level = if (sky != no_page)
-            getNibble(&service.state.pages[sky - 1], local_index)
+            getNibble(lightPage(service.state, sky), local_index)
         else if (projection.sky_full_mask & (@as(u32, 1) << @intCast(section + 1)) != 0)
             @as(u8, 15)
         else
             @as(u8, 0);
         const block = projection.block_pages[section + 1];
         const block_level = if (block != no_page)
-            getNibble(&service.state.pages[block - 1], local_index)
+            getNibble(lightPage(service.state, block), local_index)
         else
             @as(u8, 0);
         sky_sources[cell] = @max(sky_sources[cell], sky_level -| loss);
@@ -2066,8 +2115,8 @@ fn neighborCoordinates(edge: NeighborEdge, axis: usize) NeighborCoordinates {
 
 fn uniformNeighborBoundaryCannotSeed(
     service: Context,
-    resident: *const block_store.GeneratedHeightChunk,
-    neighbor: *const block_store.GeneratedHeightChunk,
+    resident: *const block_store.MaterializedChunk,
+    neighbor: *const block_store.MaterializedChunk,
     projection: *const ChunkState,
     direction: usize,
     opposite: usize,
@@ -2247,7 +2296,7 @@ fn applySection(
             pages[protocol_section] = handle;
             changed = true;
         }
-        const page = &state.pages[handle - 1];
+        const page = lightPageForWrite(state, handle);
         if (!std.mem.eql(u8, page, bytes)) {
             @memcpy(page, bytes);
             changed = true;
@@ -2296,10 +2345,10 @@ fn chunkView(
     var block = [_]light_projection.Section{.{}} ** protocol_sections;
     for (0..protocol_sections) |section| {
         if (chunk.sky_pages[section] != no_page)
-            sky[section].ptr = &state.pages[chunk.sky_pages[section] - 1];
+            sky[section].ptr = lightPage(state, chunk.sky_pages[section]);
         if (chunk.block_pages[section] != no_page)
             block[section].ptr =
-                &state.pages[chunk.block_pages[section] - 1];
+                lightPage(state, chunk.block_pages[section]);
     }
     state.projection_scratch = .{
         .chunk_x = chunk.position.x,
@@ -2316,36 +2365,30 @@ fn chunkView(
 }
 
 fn allocatePage(state: *Lighting, protected_chunk: u16) u16 {
-    if (!state.page_pool_initialized) {
-        for (0..state.free_pages.len) |index|
-            state.free_pages[index] =
-                @intCast(state.free_pages.len - 1 - index);
-        state.free_page_count = state.free_pages.len;
-        state.page_pool_initialized = true;
-    }
-    if (state.free_page_count == 0)
-        reclaimLightingPages(state, protected_chunk);
-    if (state.free_page_count == 0)
+    if (state.free_light_cache_section_count == 0)
+        _ = reclaimLightingPages(state, protected_chunk);
+    if (state.free_light_cache_section_count == 0)
         diagnostics.panic(
-            "lighting page capacity exhausted while building resident chunk",
+            "lighting cache capacity exhausted while building resident chunk",
             &.{diagnostics.integer(protected_chunk)},
         );
-    state.free_page_count -= 1;
-    const index = state.free_pages[state.free_page_count];
-    @memset(&state.pages[index], 0);
+    state.free_light_cache_section_count -= 1;
+    const index = state.free_light_cache_sections[state.free_light_cache_section_count];
+    @memset(&state.light_cache_sections[index], 0);
     return index + 1;
 }
 
-fn reclaimLightingPages(state: *Lighting, protected_chunk: u16) void {
+fn reclaimLightingPages(state: *Lighting, protected_chunk: u16) bool {
     for (state.chunks, 0..) |*chunk, index| {
         if (index == protected_chunk or chunk.dirty or
             !occupied(state.chunk_occupancy, index) or !chunk.valid)
             continue;
         if (!chunkOwnsPage(chunk)) continue;
         discardChunkProjection(state, @intCast(index));
-        std.debug.assert(state.free_page_count != 0);
-        return;
+        std.debug.assert(state.free_light_cache_section_count != 0);
+        return true;
     }
+    return false;
 }
 
 fn chunkOwnsPage(chunk: *const ChunkState) bool {
@@ -2359,8 +2402,11 @@ fn discardChunkProjection(state: *Lighting, index: u16) void {
     const chunk = &state.chunks[index];
     std.debug.assert(!chunk.dirty);
     releaseChunkPages(state, chunk);
+    removeChunkSlot(state, index);
     chunk.* = .{};
     clearOccupied(state.chunk_occupancy, index);
+    state.free_chunks[state.free_chunk_count] = index;
+    state.free_chunk_count += 1;
 }
 
 fn releaseChunkPages(state: *Lighting, chunk: *ChunkState) void {
@@ -2371,10 +2417,25 @@ fn releaseChunkPages(state: *Lighting, chunk: *ChunkState) void {
 
 fn releasePage(state: *Lighting, handle: u16) void {
     if (handle == no_page) return;
-    std.debug.assert(handle <= state.pages.len);
-    std.debug.assert(state.free_page_count < state.free_pages.len);
-    state.free_pages[state.free_page_count] = handle - 1;
-    state.free_page_count += 1;
+    std.debug.assert(handle <= state.light_cache_sections.len);
+    std.debug.assert(state.free_light_cache_section_count < state.free_light_cache_sections.len);
+    state.free_light_cache_sections[state.free_light_cache_section_count] = handle - 1;
+    state.free_light_cache_section_count += 1;
+}
+
+fn lightPage(state: *const Lighting, handle: u16) *const [light_projection.bytes_per_section]u8 {
+    std.debug.assert(handle != no_page and handle <= state.light_cache_sections.len);
+    return &state.light_cache_sections[handle - 1];
+}
+
+fn lightPageForWrite(state: *Lighting, handle: u16) *[light_projection.bytes_per_section]u8 {
+    std.debug.assert(handle != no_page and handle <= state.light_cache_sections.len);
+    return &state.light_cache_sections[handle - 1];
+}
+
+fn sourceWork(state: *Lighting, index: usize) *SourceWorkSection {
+    std.debug.assert(index < state.source_work_count);
+    return &state.source_work[index];
 }
 
 fn occupied(words: []const u64, index: usize) bool {
@@ -2467,97 +2528,141 @@ test "skylight seeds vertically and spreads beneath a roof" {
     );
 }
 
-test "released resident chunks return their lighting pages" {
-    const world = world_identity.Handle{ .index = 0, .generation = 1 };
-    const position = geometry.ChunkPos{ .x = 7, .z = -3 };
-    var chunks = [_]ChunkState{ .{}, .{} };
-    var occupancy = [_]u64{0};
-    var pages: [4][light_projection.bytes_per_section]u8 align(64) = undefined;
-    var free_pages: [4]u16 = undefined;
-    var state = Lighting{
-        .chunks = &chunks,
-        .chunk_occupancy = &occupancy,
-        .pages = &pages,
-        .free_pages = &free_pages,
-        .deps = undefined,
-    };
-
-    for (0..1_024) |_| {
-        state.chunks[1] = .{ .valid = true, .world = world, .position = position };
-        setOccupied(state.chunk_occupancy, 1);
-        state.chunks[1].sky_pages[1] = allocatePage(&state, 1);
-        state.chunks[1].block_pages[1] = allocatePage(&state, 1);
-        state.releaseResidentChunk(1, world, position);
-        try std.testing.expectEqual(@as(usize, 4), state.free_page_count);
-        try std.testing.expect(!occupied(state.chunk_occupancy, 1));
-        try std.testing.expect(!state.chunks[1].valid);
-    }
-}
-
-test "page reclamation skips projections without allocated pages" {
-    const world = world_identity.Handle{ .index = 0, .generation = 1 };
-    var chunks = [_]ChunkState{
-        .{ .valid = true, .world = world, .position = .{ .x = 0, .z = 0 } },
-        .{ .valid = true, .world = world, .position = .{ .x = 1, .z = 0 } },
-        .{
-            .valid = true,
-            .world = world,
-            .position = .{ .x = 2, .z = 0 },
-            .sky_pages = init: {
-                var handles = [_]u16{no_page} ** protocol_sections;
-                handles[1] = 1;
-                handles[2] = 2;
-                break :init handles;
-            },
-        },
-        .{ .valid = true, .world = world, .position = .{ .x = 3, .z = 0 } },
-    };
-    var occupancy = [_]u64{0b1111};
-    var pages: [2][light_projection.bytes_per_section]u8 align(64) = undefined;
-    var free_pages: [2]u16 = undefined;
-    var state = Lighting{
-        .chunks = &chunks,
-        .chunk_occupancy = &occupancy,
-        .pages = &pages,
-        .free_pages = &free_pages,
-        .page_pool_initialized = true,
-        .deps = undefined,
-    };
-
-    const handle = allocatePage(&state, 3);
-
-    try std.testing.expect(handle == 1 or handle == 2);
-    try std.testing.expect(state.chunks[0].valid);
-    try std.testing.expect(state.chunks[1].valid);
-    try std.testing.expect(!state.chunks[2].valid);
-    try std.testing.expect(state.chunks[3].valid);
-    try std.testing.expectEqual(@as(usize, 1), state.free_page_count);
-}
-
-test "materialized lighting round trips without solving again" {
+test "minimum lighting cache evicts and rebuilds clean persisted projections" {
     const test_generator = lightning_rod.test_support.world_generator;
     const test_world = world_identity.Handle{ .index = 0, .generation = 1 };
-    const position = geometry.ChunkPos{ .x = 3, .z = 4 };
+    const first = geometry.ChunkPos{ .x = 0, .z = 0 };
+    const second = geometry.ChunkPos{ .x = 1, .z = 0 };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const source_blocks = try block_store.Blocks.init(arena.allocator(), .{ .maximum_resident_chunks = 4, .maximum_modified_sections = 4 });
-    const destination_blocks = try block_store.Blocks.init(arena.allocator(), .{ .maximum_resident_chunks = 4, .maximum_modified_sections = 4 });
+    const blocks = try block_store.Blocks.init(arena.allocator(), .{
+        .maximum_transient_chunks = 4,
+        .maximum_modified_sections = 4,
+    });
     var generator: test_generator.Generator = .{};
-    try generator.init(arena.allocator(), 91);
-    generator.bind(source_blocks);
-    const generated = source_blocks.generatedHeightChunkRef(test_world, position, 1).entry;
-    _ = try destination_blocks.installResidentChunk(test_world, generated.shape, 1, .persisted);
+    try generator.init(arena.allocator(), 0x6c69_6768_7469_6e67);
+    generator.bind(blocks);
+    _ = blocks.materializeGeneratedChunk(test_world, first, 1);
+    _ = blocks.materializeGeneratedChunk(test_world, second, 1);
     const State = struct {
         var clock: world_clock.Clock = .{};
         var players_state: players.Players = undefined;
         var sessions_state: sessions.Sessions = undefined;
     };
-    const source = try Lighting.init(arena.allocator(), .{ .clock = &State.clock, .blocks = source_blocks, .players = &State.players_state, .sessions = &State.sessions_state, .paging = null }, .{});
-    const destination = try Lighting.init(arena.allocator(), .{ .clock = &State.clock, .blocks = destination_blocks, .players = &State.players_state, .sessions = &State.sessions_state, .paging = null }, .{});
+    const lighting = try Lighting.init(arena.allocator(), .{
+        .clock = &State.clock,
+        .blocks = blocks,
+        .players = &State.players_state,
+        .sessions = &State.sessions_state,
+        .materialization = null,
+    }, .{
+        .source_mutations = 1,
+        .maximum_projected_chunks = 2,
+        .light_cache_bytes = minimum_light_cache_bytes,
+    });
+    var persisted: [persisted_magic.len + 1 + protocol_sections * 2 * (light_projection.bytes_per_section + 1)]u8 = undefined;
+    @memcpy(persisted[0..persisted_magic.len], persisted_magic);
+    persisted[persisted_magic.len] = persisted_version;
+    var offset = persisted_magic.len + 1;
+    for (0..protocol_sections * 2) |_| {
+        persisted[offset] = 2;
+        @memset(persisted[offset + 1 ..][0..light_projection.bytes_per_section], 0x34);
+        offset += light_projection.bytes_per_section + 1;
+    }
+    std.debug.assert(offset == persisted.len);
+
+    try std.testing.expect(lighting.decodePersisted(test_world, first, &persisted));
+    try std.testing.expectEqual(@as(usize, 0), lighting.free_light_cache_section_count);
+    try std.testing.expectEqual(@as(?u8, 4), lighting.cachedBlockLightAt(test_world, .{ .x = 0, .y = 0, .z = 0 }));
+    try std.testing.expect(lighting.decodePersisted(test_world, second, &persisted));
+    try std.testing.expect(lighting.cachedChunk(test_world, first) == null);
+    try std.testing.expect(lighting.cachedChunk(test_world, second) != null);
+    try std.testing.expect(lighting.decodePersisted(test_world, first, &persisted));
+    try std.testing.expect(lighting.cachedChunk(test_world, second) == null);
+    try std.testing.expectEqual(@as(?u8, 4), lighting.cachedBlockLightAt(test_world, .{ .x = 0, .y = 0, .z = 0 }));
+}
+
+test "materialized lighting round trips without solving again" {
+    try std.testing.expectError(error.InvalidLightingCapacity, (Lighting.Configuration{ .source_mutations = 4096 }).validate());
+    try std.testing.expectError(error.InvalidLightingCapacity, (Lighting.Configuration{ .light_cache_bytes = 1 }).validate());
+    const test_generator = lightning_rod.test_support.world_generator;
+    const test_world = world_identity.Handle{ .index = 0, .generation = 1 };
+    const position = geometry.ChunkPos{ .x = 3, .z = 4 };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source_blocks = try block_store.Blocks.init(arena.allocator(), .{ .maximum_transient_chunks = 4, .maximum_modified_sections = 4 });
+    const destination_blocks = try block_store.Blocks.init(arena.allocator(), .{ .maximum_transient_chunks = 4, .maximum_modified_sections = 4 });
+    var generator: test_generator.Generator = .{};
+    try generator.init(arena.allocator(), 91);
+    generator.bind(source_blocks);
+    const generated = source_blocks.materializeGeneratedChunk(test_world, position, 1).entry;
+    _ = try destination_blocks.installMaterialization(test_world, generated.shape, 1, .persisted);
+    const State = struct {
+        var clock: world_clock.Clock = .{};
+        var players_state: players.Players = undefined;
+        var sessions_state: sessions.Sessions = undefined;
+    };
+    const source = try Lighting.init(arena.allocator(), .{ .clock = &State.clock, .blocks = source_blocks, .players = &State.players_state, .sessions = &State.sessions_state, .materialization = null }, .{ .source_mutations = 4 });
+    const destination = try Lighting.init(arena.allocator(), .{ .clock = &State.clock, .blocks = destination_blocks, .players = &State.players_state, .sessions = &State.sessions_state, .materialization = null }, .{ .source_mutations = 4 });
+    try std.testing.expectEqual(@as(usize, 512), source.light_cache_sections.len);
+    try std.testing.expectEqual(source.light_cache_sections.len, source.free_light_cache_section_count);
+    try std.testing.expectEqual(@as(usize, 0), source.block_states.len);
+    var insufficient: [1]u8 = undefined;
+    var small = std.heap.FixedBufferAllocator.init(&insufficient);
+    try std.testing.expectError(error.WorkingMemoryExceeded, source.tick(small.allocator()));
+    try std.testing.expect(!source.started);
+    const workspace = try arena.allocator().alloc(u8, 2 * 1024 * 1024);
+    var scratch = std.heap.FixedBufferAllocator.init(workspace);
+    try source.tick(scratch.allocator());
+    const scratch_bytes = scratch.end_index;
+    try std.testing.expect(scratch_bytes > 1024 * 1024);
     var first: [protocol_sections * (light_projection.bytes_per_section * 2 + 2) + 5]u8 = undefined;
     var second: [first.len]u8 = undefined;
+    try std.testing.expect(source.encodePersisted(test_world, position, &first) == null);
+    _ = source.chunk(test_world, position);
     const encoded = source.encodePersisted(test_world, position, &first).?;
+    scratch.reset();
+    @memset(workspace, 0xa5);
+    try destination.tick(scratch.allocator());
+    try std.testing.expectEqual(scratch_bytes, scratch.end_index);
     try std.testing.expect(destination.decodePersisted(test_world, position, encoded));
     const restored = destination.encodePersisted(test_world, position, &second).?;
     try std.testing.expectEqualSlices(u8, encoded, restored);
+    const sample = geometry.BlockPos{ .x = position.x * 16 + 8, .y = 80, .z = position.z * 16 + 8 };
+    const expected = destination.skyLightAt(test_world, sample);
+    try std.testing.expect(expected != 0);
+    try std.testing.expectEqual(@as(usize, 1), destination_blocks.releaseUnusedMaterializations());
+    try std.testing.expectEqual(expected, destination.skyLightAt(test_world, sample));
+    const previous = source_blocks.blockAt(test_world, sample);
+    const replacement = if (previous == registry.block_stone_default_state) registry.block_air_default_state else registry.block_stone_default_state;
+    try std.testing.expect(try source_blocks.setBlock(test_world, sample, replacement));
+    try std.testing.expect(source.encodePersisted(test_world, position, &first) == null);
+
+    const neighbor = geometry.ChunkPos{ .x = position.x + 1, .z = position.z };
+    _ = source_blocks.materializeGeneratedChunk(test_world, neighbor, 1);
+    const torch = geometry.BlockPos{ .x = position.x * 16 + 15, .y = 80, .z = position.z * 16 + 8 };
+    const across = geometry.BlockPos{ .x = torch.x + 1, .y = torch.y, .z = torch.z };
+    const below = geometry.BlockPos{ .x = torch.x, .y = torch.y - 1, .z = torch.z };
+    _ = try source_blocks.setBlock(test_world, torch, registry.block_air_default_state);
+    _ = source.chunk(test_world, position);
+    _ = source.chunk(test_world, neighbor);
+    source.mutation_sequence = source_blocks.blockMutationSequence();
+    const generation_before = source.source_work_generation;
+    for (0..2) |_| {
+        @memset(std.mem.sliceAsBytes(source.source_work), 0xa5);
+        try std.testing.expect(try source_blocks.setBlock(test_world, torch, registry.blockStateId("minecraft:torch").?));
+        consumeMutations(source.context());
+        try std.testing.expectEqual(@as(?u8, 14), source.cachedBlockLightAt(test_world, torch));
+        try std.testing.expectEqual(@as(?u8, 13), source.cachedBlockLightAt(test_world, across));
+        try std.testing.expectEqual(@as(?u8, 13), source.cachedBlockLightAt(test_world, below));
+        try std.testing.expectEqual(@as(usize, 0), source.source_work_count);
+        @memset(std.mem.sliceAsBytes(source.source_work), 0xa5);
+        try std.testing.expect(try source_blocks.setBlock(test_world, torch, registry.block_air_default_state));
+        consumeMutations(source.context());
+        try std.testing.expectEqual(@as(?u8, 0), source.cachedBlockLightAt(test_world, torch));
+        try std.testing.expectEqual(@as(?u8, 0), source.cachedBlockLightAt(test_world, across));
+        try std.testing.expectEqual(@as(?u8, 0), source.cachedBlockLightAt(test_world, below));
+        try std.testing.expectEqual(@as(usize, 0), source.source_work_count);
+    }
+    try std.testing.expectEqual(generation_before + 4, source.source_work_generation);
 }

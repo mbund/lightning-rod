@@ -143,22 +143,128 @@ const Builder = struct {
             layer.appendAssumeCapacity(index);
         }
         if (layer.items.len == 0) return error.EmptyBiomeReport;
-        while (layer.items.len > 1) {
-            var next: std.ArrayListUnmanaged(u16) = .empty;
-            errdefer next.deinit(self.allocator);
-            try next.ensureTotalCapacity(
-                self.allocator,
-                (layer.items.len + biome_branching - 1) / biome_branching,
-            );
-            var first: usize = 0;
-            while (first < layer.items.len) : (first += biome_branching) {
-                const end = @min(first + biome_branching, layer.items.len);
-                next.appendAssumeCapacity(try self.appendBiomeBranch(layer.items[first..end]));
-            }
-            layer.deinit(self.allocator);
-            layer = next;
+        return self.buildBiomeTree(layer.items);
+    }
+
+    fn buildBiomeTree(self: *Builder, nodes: []u16) !u16 {
+        if (nodes.len == 1) return nodes[0];
+        const scratch = try self.allocator.alloc(u16, nodes.len);
+        defer self.allocator.free(scratch);
+        if (nodes.len <= biome_branching) {
+            self.sortBiomeNodesByCost(nodes, scratch);
+            return self.appendBiomeBranch(nodes);
         }
-        return layer.items[0];
+        var best_dimension: usize = 0;
+        var best_cost: i64 = std.math.maxInt(i64);
+        for (0..7) |dimension| {
+            @memcpy(scratch, nodes);
+            const candidate_scratch = try self.allocator.alloc(u16, nodes.len);
+            defer self.allocator.free(candidate_scratch);
+            self.sortBiomeNodes(scratch, candidate_scratch, dimension, false);
+            const size = biomeBucketSize(nodes.len);
+            var cost: i64 = 0;
+            var first: usize = 0;
+            while (first < nodes.len) : (first += size) {
+                const end = @min(first + size, nodes.len);
+                cost += biomeRangeCost(self.biomeNodeBounds(scratch[first..end]));
+            }
+            if (cost < best_cost) {
+                best_cost = cost;
+                best_dimension = dimension;
+            }
+        }
+        self.sortBiomeNodes(nodes, scratch, best_dimension, false);
+        const size = biomeBucketSize(nodes.len);
+        var groups: [biome_branching]BiomeGroup = undefined;
+        var group_count: usize = 0;
+        var first: usize = 0;
+        while (first < nodes.len) : (first += size) {
+            const len = @min(size, nodes.len - first);
+            groups[group_count] = .{
+                .first = first,
+                .len = len,
+                .parameters = self.biomeNodeBounds(nodes[first..][0..len]),
+            };
+            group_count += 1;
+        }
+        var index: usize = 1;
+        while (index < group_count) : (index += 1) {
+            const value = groups[index];
+            var destination = index;
+            while (destination != 0 and biomeParametersLessThan(
+                value.parameters,
+                groups[destination - 1].parameters,
+                best_dimension,
+                true,
+            )) : (destination -= 1) groups[destination] = groups[destination - 1];
+            groups[destination] = value;
+        }
+        var children: [biome_branching]u16 = undefined;
+        for (groups[0..group_count], 0..) |group, child|
+            children[child] = try self.buildBiomeTree(nodes[group.first..][0..group.len]);
+        return self.appendBiomeBranch(children[0..group_count]);
+    }
+
+    fn biomeNodeBounds(self: *Builder, nodes: []const u16) [7][2]i16 {
+        var result = self.biome_nodes.items[nodes[0]].parameters;
+        for (nodes[1..]) |node| for (&result, self.biome_nodes.items[node].parameters) |*range, child_range| {
+            range[0] = @min(range[0], child_range[0]);
+            range[1] = @max(range[1], child_range[1]);
+        };
+        return result;
+    }
+
+    fn sortBiomeNodes(self: *Builder, nodes: []u16, scratch: []u16, dimension: usize, absolute: bool) void {
+        var width: usize = 1;
+        while (width < nodes.len) : (width *= 2) {
+            var first: usize = 0;
+            while (first < nodes.len) : (first += width * 2) {
+                const middle = @min(first + width, nodes.len);
+                const end = @min(first + width * 2, nodes.len);
+                var left = first;
+                var right = middle;
+                for (first..end) |output| {
+                    if (right == end or (left != middle and !biomeParametersLessThan(
+                        self.biome_nodes.items[nodes[right]].parameters,
+                        self.biome_nodes.items[nodes[left]].parameters,
+                        dimension,
+                        absolute,
+                    ))) {
+                        scratch[output] = nodes[left];
+                        left += 1;
+                    } else {
+                        scratch[output] = nodes[right];
+                        right += 1;
+                    }
+                }
+            }
+            @memcpy(nodes, scratch[0..nodes.len]);
+        }
+    }
+
+    fn sortBiomeNodesByCost(self: *Builder, nodes: []u16, scratch: []u16) void {
+        var width: usize = 1;
+        while (width < nodes.len) : (width *= 2) {
+            var first: usize = 0;
+            while (first < nodes.len) : (first += width * 2) {
+                const middle = @min(first + width, nodes.len);
+                const end = @min(first + width * 2, nodes.len);
+                var left = first;
+                var right = middle;
+                for (first..end) |output| {
+                    if (right == end or (left != middle and biomeRangeCenterCost(self.biome_nodes.items[nodes[left]].parameters) <=
+                        biomeRangeCenterCost(self.biome_nodes.items[nodes[right]].parameters)))
+                    {
+                        scratch[output] = nodes[left];
+                        left += 1;
+                    } else {
+                        scratch[output] = nodes[right];
+                        right += 1;
+                    }
+                }
+            }
+            @memcpy(nodes, scratch[0..nodes.len]);
+        }
     }
 
     fn appendBiomeBranch(self: *Builder, children: []const u16) !u16 {
@@ -194,7 +300,48 @@ const Builder = struct {
     }
 };
 
-const biome_branching = 10;
+const BiomeGroup = struct {
+    first: usize,
+    len: usize,
+    parameters: [7][2]i16,
+};
+
+fn biomeBucketSize(count: usize) usize {
+    var result: usize = 1;
+    while (result * biome_branching < count) result *= biome_branching;
+    return result;
+}
+
+fn biomeRangeCost(parameters: [7][2]i16) i64 {
+    var result: i64 = 0;
+    for (parameters) |range| result += @as(i64, range[1]) - range[0];
+    return result;
+}
+
+fn biomeRangeCenterCost(parameters: [7][2]i16) i64 {
+    var result: i64 = 0;
+    for (parameters) |range| {
+        const center = @divTrunc(@as(i64, range[0]) + range[1], 2);
+        result += if (center < 0) -center else center;
+    }
+    return result;
+}
+
+fn biomeParametersLessThan(left: [7][2]i16, right: [7][2]i16, first_dimension: usize, absolute: bool) bool {
+    for (0..7) |offset| {
+        const dimension = (first_dimension + offset) % 7;
+        var left_center = @divTrunc(@as(i64, left[dimension][0]) + left[dimension][1], 2);
+        var right_center = @divTrunc(@as(i64, right[dimension][0]) + right[dimension][1], 2);
+        if (absolute) {
+            left_center = if (left_center < 0) -left_center else left_center;
+            right_center = if (right_center < 0) -right_center else right_center;
+        }
+        if (left_center != right_center) return left_center < right_center;
+    }
+    return false;
+}
+
+const biome_branching = 6;
 
 pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);

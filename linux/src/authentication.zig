@@ -87,10 +87,11 @@ pub fn Online(comptime maximum_pending: usize) type {
         io: *std.Io,
         identity: crypto.Identity,
         verifier: Verifier,
+        authenticate_client: bool = true,
         slots: [maximum_pending]Slot = @splat(.{}),
 
-        pub fn init(io: *std.Io, verifier: Verifier) Self {
-            return .{ .io = io, .identity = crypto.Identity.init(), .verifier = verifier };
+        pub fn init(io: *std.Io, verifier: Verifier, identity: crypto.Identity) Self {
+            return .{ .io = io, .identity = identity, .verifier = verifier };
         }
 
         pub fn deinit(self: *Self) void {
@@ -119,7 +120,7 @@ pub fn Online(comptime maximum_pending: usize) type {
             slot.* = .{ .connection = request.connection, .username_len = @intCast(request.username.len), .active = true };
             @memcpy(slot.username[0..request.username.len], request.username);
             self.io.randomSecure(&slot.token) catch return self.reject(slot);
-            return .{ .encryption_request = .{ .public_key = self.identity.publicKey(), .verify_token = &slot.token } };
+            return .{ .encryption_request = .{ .public_key = self.identity.publicKey(), .verify_token = &slot.token, .authenticate = self.authenticate_client } };
         }
 
         fn respond(raw: *anyopaque, request: session.Authentication.EncryptionResponse) session.Authentication.Result {
@@ -384,7 +385,7 @@ test "online authentication issues a bounded challenge and rejects invalid RSA r
     };
     var io = std.Io.Threaded.global_single_threaded.io();
     var context: u8 = 0;
-    var online = Online(1).init(&io, .{ .context = &context, .vtable = &.{ .start = Stub.start, .poll = Stub.poll, .cancel = Stub.cancel } });
+    var online = Online(1).init(&io, .{ .context = &context, .vtable = &.{ .start = Stub.start, .poll = Stub.poll, .cancel = Stub.cancel } }, crypto.testing.identity());
     defer online.deinit();
     const auth = online.interface();
     const handle: exchange.Connection = .{ .index = 1, .generation = 2 };
@@ -394,6 +395,7 @@ test "online authentication issues a bounded challenge and rejects invalid RSA r
     };
     try std.testing.expectEqual(@as(usize, 162), challenge.public_key.len);
     try std.testing.expectEqual(@as(usize, 4), challenge.verify_token.len);
+    try std.testing.expect(challenge.authenticate);
     const rejected = auth.vtable.respond(auth.context, .{
         .connection = handle,
         .username = "Alex",

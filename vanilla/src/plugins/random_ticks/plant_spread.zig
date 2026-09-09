@@ -13,7 +13,7 @@ pub const PlantSpread = struct {
         return .{ .context = self, .apply = apply };
     }
 
-    fn apply(_: *anyopaque, tick: *engine.Invocation) void {
-        engine.applyPlantSpread(tick);
+    fn apply(_: *anyopaque, tick: *engine.Invocation) engine.FatalError!void {
+        try engine.applyPlantSpread(tick);
     }
 };

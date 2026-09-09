@@ -8,6 +8,10 @@ pub const Clock = struct {
     tick: u64 = 0,
     ticks_per_second: u64 = 20,
 
+    pub fn currentTick(self: *const Clock) u64 {
+        return self.tick;
+    }
+
     pub fn init(allocator: std.mem.Allocator, configuration: Configuration) !*Clock {
         if (configuration.ticks_per_second == 0) return error.InvalidTicksPerSecond;
         const self = try allocator.create(Clock);

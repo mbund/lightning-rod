@@ -8,10 +8,15 @@ const PacketKind = enum {
     handshake,
     status_ping,
     position_look,
+    player_input,
+    block_dig,
     block_place,
+    held_item,
+    arm_animation,
+    close_window,
 };
 
-test "generated structurally valid client packets" {
+test "randomly generated valid gameplay packet bytes" {
     try std.testing.fuzz({}, fuzzOne, .{});
 }
 
@@ -42,6 +47,23 @@ fn fuzzOne(_: void, smith: *std.testing.Smith) !void {
             const c7 = try c6.pitch(smith.value(f32));
             break :body .{ .play, (try c7.flags(.{ .onGround = smith.value(bool), .hasHorizontalCollision = smith.value(bool) })).finish() };
         },
+        .player_input => body: {
+            const packet = protocol.play.toServer.write(&body_storage);
+            const input = try packet.player_input();
+            break :body .{ .play, (try input.inputs(.{ .shift = smith.value(bool), .sprint = smith.value(bool) })).finish() };
+        },
+        .block_dig => body: {
+            const packet = protocol.play.toServer.write(&body_storage);
+            const action = try packet.block_dig();
+            const location = try action.status(smith.valueRangeAtMost(i32, 0, 2));
+            const face = try location.location(.{
+                .x = smith.valueRangeAtMost(i32, -30_000_000, 30_000_000),
+                .z = smith.valueRangeAtMost(i32, -30_000_000, 30_000_000),
+                .y = smith.valueRangeAtMost(i16, -64, 319),
+            });
+            const sequence = try face.face(smith.valueRangeAtMost(i8, 0, 5));
+            break :body .{ .play, (try sequence.sequence(smith.value(i32))).finish() };
+        },
         .block_place => body: {
             const c1 = protocol.play.toServer.write(&body_storage);
             const c2 = try c1.block_place();
@@ -58,6 +80,21 @@ fn fuzzOne(_: void, smith: *std.testing.Smith) !void {
             const c9 = try c8.insideBlock(smith.value(bool));
             const c10 = try c9.worldBorderHit(smith.value(bool));
             break :body .{ .play, (try c10.sequence(smith.value(i32))).finish() };
+        },
+        .held_item => body: {
+            const packet = protocol.play.toServer.write(&body_storage);
+            const held = try packet.held_item_slot();
+            break :body .{ .play, (try held.slotId(smith.valueRangeAtMost(i16, 0, 8))).finish() };
+        },
+        .arm_animation => body: {
+            const packet = protocol.play.toServer.write(&body_storage);
+            const arm = try packet.arm_animation();
+            break :body .{ .play, (try arm.hand(smith.valueRangeAtMost(i32, 0, 1))).finish() };
+        },
+        .close_window => body: {
+            const packet = protocol.play.toServer.write(&body_storage);
+            const close = try packet.close_window();
+            break :body .{ .play, (try close.windowId(smith.valueRangeAtMost(i32, 0, 127))).finish() };
         },
     };
 

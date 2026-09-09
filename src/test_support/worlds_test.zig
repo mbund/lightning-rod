@@ -22,7 +22,7 @@ const initial = [_]worlds.Description{.{
 test "dynamic world slots reject stale handles" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const state = try worlds.Worlds.init(arena.allocator(), .{ .initial = &initial });
+    const state = try worlds.Worlds.init(arena.allocator(), .{ .initial = &initial, .maximum_worlds = 2 });
     _ = try dimensions.Vanilla.init(arena.allocator(), .{ .worlds = state }, .{});
     const island = try state.add(.{
         .key = .{ .value = 2 },

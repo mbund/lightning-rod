@@ -168,6 +168,7 @@ pub const Profiler = struct {
     }
 
     pub fn beginTick(self: *Profiler) void {
+        std.debug.assert(active_profiler == null);
         if (!self.enabled) return;
         @memset(self.current_plugins[0..self.registered_plugin_count], 0);
         @memset(self.current_plugin_memory[0..self.registered_plugin_count], 0);
@@ -179,6 +180,7 @@ pub const Profiler = struct {
 
     pub fn finishTick(self: *Profiler) void {
         if (!self.enabled) return;
+        std.debug.assert(active_profiler == self);
         const tick_duration = self.duration(self.tick_started_ns);
         active_profiler = null;
         const cursor = self.window_cursor;
@@ -224,6 +226,12 @@ pub const Profiler = struct {
         @memset(self.current_plugin_memory, 0);
     }
 
+    pub fn setMemory(self: *Profiler, capacity: usize, generation: usize, temporary: usize) void {
+        self.published.memory_capacity_bytes = @intCast(capacity);
+        self.published.generation_memory_bytes = @intCast(generation);
+        self.published.tick_memory_capacity_bytes = @intCast(temporary);
+    }
+
     pub fn setPluginName(self: *Profiler, index: usize, name: []const u8) void {
         std.debug.assert(index < self.plugin_names.len);
         self.plugin_names[index] = .{ .ptr = name.ptr, .len = name.len };
@@ -243,6 +251,9 @@ pub const Profiler = struct {
         destination.tick_count = self.tick_count;
         destination.tick_total_ns = self.tick_total_ns;
         destination.tick_window_ns = self.tick_window_ns;
+        destination.tick_window_max_ns = 0;
+        for (self.tick_samples[0..self.window_count]) |sample|
+            destination.tick_window_max_ns = @max(destination.tick_window_max_ns, sample);
         destination.tick_last_ns = self.tick_last_ns;
         destination.tick_max_ns = self.tick_max_ns;
         destination.window_count = self.window_count;
@@ -258,11 +269,15 @@ pub const Profiler = struct {
         for (destination.plugins[0..destination.plugin_count], 0..) |*item, index| {
             const timing = self.plugins[index];
             const name = self.plugin_names[index];
+            var window_max_ns: u64 = 0;
+            for (self.plugin_samples[index][0..self.window_count]) |sample|
+                window_max_ns = @max(window_max_ns, sample);
             item.* = .{
                 .id_ptr = name.ptr,
                 .id_len = name.len,
                 .total_ns = timing.total_ns,
                 .window_ns = timing.window_ns,
+                .window_max_ns = window_max_ns,
                 .last_ns = timing.last_ns,
                 .max_ns = timing.max_ns,
                 .generation_bytes = timing.generation_bytes,
@@ -353,10 +368,10 @@ pub const Profiler = struct {
     }
 };
 
-var active_profiler: ?*Profiler = null;
-var active_trace_base: usize = 0;
-var active_trace_count: usize = 0;
-var active_plugin_index: ?usize = null;
+threadlocal var active_profiler: ?*Profiler = null;
+threadlocal var active_trace_base: usize = 0;
+threadlocal var active_trace_count: usize = 0;
+threadlocal var active_plugin_index: ?usize = null;
 
 pub fn snapshotActive() ?*const metrics.Snapshot {
     const profiler = active_profiler orelse return null;
@@ -561,4 +576,54 @@ test "active tick elapsed time uses the configured monotonic counter" {
     try std.testing.expectEqual(@as(?u64, 1), tickElapsedNanoseconds());
     profiler.finishTick();
     try std.testing.expectEqual(@as(?u64, null), tickElapsedNanoseconds());
+}
+
+test "concurrent Core profiling remains isolated across worker threads" {
+    const Worker = struct {
+        profiler: *Profiler,
+        started: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+
+        fn run(self: *@This()) void {
+            self.profiler.beginTick();
+            const started = beginPlugin(0, 0, 0);
+            self.started.set(std.testing.io);
+            self.release.wait(std.testing.io) catch unreachable;
+            recordTickMemory(22);
+            endPlugin(0, started);
+            self.profiler.finishTick();
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var first: Profiler = .{};
+    var second: Profiler = .{};
+    for ([_]*Profiler{ &first, &second }) |profiler| {
+        try profiler.allocate(arena.allocator(), 1, 0);
+        profiler.setCounter(testCounter());
+        try profiler.setEnabled(true);
+    }
+    var worker: Worker = .{ .profiler = &second };
+    {
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        defer {
+            worker.release.set(std.testing.io);
+            thread.join();
+        }
+        try worker.started.wait(std.testing.io);
+        first.beginTick();
+        const started = beginPlugin(0, 0, 0);
+        recordTickMemory(11);
+        endPlugin(0, started);
+        first.finishTick();
+        try std.testing.expectEqual(@as(u64, 11), first.plugins[0].tick_memory_last_bytes);
+        try std.testing.expectEqual(@as(?u64, null), tickElapsedNanoseconds());
+    }
+    try std.testing.expectEqual(@as(u64, 22), second.plugins[0].tick_memory_last_bytes);
+    second.beginTick();
+    const started = beginPlugin(0, 0, 0);
+    recordTickMemory(33);
+    endPlugin(0, started);
+    second.finishTick();
+    try std.testing.expectEqual(@as(u64, 55), second.plugins[0].tick_memory_window_bytes);
 }

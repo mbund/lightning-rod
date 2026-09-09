@@ -30,12 +30,11 @@ pub const DeterministicRng = struct {
             const product = @as(i64, signed_bound) * @as(i64, self.nextBits(31));
             return @intCast(product >> 31);
         }
-        for (0..128) |_| {
+        while (true) {
             const bits: i32 = @intCast(self.nextBits(31));
             const value = @mod(bits, signed_bound);
             if (bits -% value +% (signed_bound -% 1) >= 0) return @intCast(value);
         }
-        unreachable;
     }
 
     pub fn nextIntBoundedComptime(self: *DeterministicRng, comptime bound: u32) u32 {
@@ -45,13 +44,12 @@ pub const DeterministicRng = struct {
             const product = @as(i64, signed_bound) * @as(i64, self.nextBits(31));
             return @intCast(product >> 31);
         }
-        for (0..128) |_| {
+        while (true) {
             const bits = self.nextBits(31);
             const value = constantRemainder(bits, bound);
             const acceptance: i32 = @bitCast(bits -% value +% (bound - 1));
             if (acceptance >= 0) return value;
         }
-        unreachable;
     }
 
     pub fn discardIntBoundedComptime(self: *DeterministicRng, comptime bound: u32) void {

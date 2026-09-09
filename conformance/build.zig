@@ -8,6 +8,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const lightning_rod = lightning_rod_dependency.module("lightning_rod");
+    const vanilla = b.dependency("vanilla", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("lightning_rod_vanilla_1_21_6");
     const registry = b.dependency("minecraft_registry", .{
         .target = target,
         .optimize = optimize,
@@ -36,6 +40,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "lightning_rod", .module = lightning_rod },
+                .{ .name = "vanilla", .module = vanilla },
                 .{ .name = "minecraft_conformance", .module = mcc },
             },
         }),
@@ -44,8 +49,22 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const test_step = b.step("test", "Run in-memory public Lightning Rod conformance tests");
+    const test_step = b.step("test", "Run Minecraft conformance suites through the Lightning Rod adapter");
     test_step.dependOn(&b.addRunArtifact(tests).step);
+
+    const gameplay_fuzz = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz_gameplay.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lightning_rod", .module = lightning_rod },
+                .{ .name = "vanilla", .module = vanilla },
+            },
+        }),
+    });
+    b.step("fuzz-gameplay", "Fuzz raw and generated-valid Vanilla Play input")
+        .dependOn(&b.addRunArtifact(gameplay_fuzz).step);
 
     const compare = b.addExecutable(.{
         .name = "lightning-rod-conformance",

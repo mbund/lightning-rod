@@ -6,6 +6,7 @@ pub fn build(b: *std.Build) void {
     const lightning_rod = b.dependency("lightning_rod", .{ .target = target, .optimize = optimize });
     const linux = b.dependency("lightning_rod_linux", .{ .target = target, .optimize = optimize });
     const vanilla = b.dependency("lightning_rod_vanilla_1_21_6", .{ .target = target, .optimize = optimize });
+    const tui = b.dependency("lightning_rod_tui", .{ .target = target, .optimize = optimize });
     const executable = b.addExecutable(.{
         .name = "lightning_rod",
         .root_module = b.createModule(.{
@@ -16,6 +17,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "lightning_rod", .module = lightning_rod.module("lightning_rod") },
                 .{ .name = "lightning_rod_linux", .module = linux.module("lightning_rod_linux") },
                 .{ .name = "lightning_rod_vanilla_1_21_6", .module = vanilla.module("lightning_rod_vanilla_1_21_6") },
+                .{ .name = "lightning_rod_tui", .module = tui.module("lightning_rod_tui") },
             },
         }),
     });

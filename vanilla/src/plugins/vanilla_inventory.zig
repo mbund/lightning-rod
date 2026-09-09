@@ -7,9 +7,21 @@ const world_random = lightning_rod.random;
 const std = @import("std");
 const registry = lightning_rod.registry_data;
 const vanilla_recipes = @import("vanilla_recipes.zig");
+const vanilla_collision_projection = @import("vanilla_collision_projection.zig");
 const Packets = lightning_rod.Packets;
 const player_lifecycle = lightning_rod.player_lifecycle;
 const container_menu = lightning_rod.container_menu;
+
+const PreparedDrop = struct {
+    reservation: entity_store.ItemEntities.Reservation,
+    specification: entity_store.ItemEntities.Spawn,
+};
+
+const InventoryDrop = struct {
+    source: *player_store.HotbarStack,
+    stack: player_store.HotbarStack,
+    single: bool,
+};
 
 const InventoryWork = struct {
     random: *world_random.Random,
@@ -19,12 +31,13 @@ const InventoryWork = struct {
     inputs: *input_store.Inputs,
     containers: *player_store.Containers,
     recipes: *vanilla_recipes.Recipes,
+    collision_projection: *vanilla_collision_projection.CollisionProjection,
 
     fn activePlayerSlots(self: *const InventoryWork) []const u16 {
         return self.players.active_slots[0..self.players.active_count];
     }
 
-    fn take_selected_item(self: *InventoryWork, slot: u16, count: u8) ?player_store.HotbarStack {
+    fn takeSelectedItem(self: *InventoryWork, slot: u16, count: u8) ?player_store.HotbarStack {
         const player = &self.players.records[slot];
         const stack = &player.hotbar[player.selected_hotbar_slot];
         if (stack.isEmpty()) return null;
@@ -36,19 +49,38 @@ const InventoryWork = struct {
         return result;
     }
 
-    fn spawn_player_dropped_item(self: *InventoryWork, player: *const player_store.CorePlayer, stack: player_store.HotbarStack) !usize {
+    fn spawnPlayerDroppedItem(self: *InventoryWork, player: *const player_store.CorePlayer, stack: player_store.HotbarStack) !usize {
+        var prepared = try self.preparePlayerDroppedItem(player, stack);
+        return self.commitPlayerDroppedItem(&prepared);
+    }
+
+    fn preparePlayerDroppedItem(self: *InventoryWork, player: *const player_store.CorePlayer, stack: player_store.HotbarStack) !PreparedDrop {
         const yaw = std.math.degreesToRadians(@as(f64, player.rotation.yaw));
         const pitch = std.math.degreesToRadians(@as(f64, player.rotation.pitch));
         const horizontal = std.math.cos(pitch) * 0.3;
-        return self.items.spawn(self.random, self.world, player.world, .{
-            .x = player.position.x,
-            .y = player.position.y + 1.3,
-            .z = player.position.z,
-        }, .{
-            .x = -std.math.sin(yaw) * horizontal,
-            .y = -std.math.sin(pitch) * 0.3 + 0.1,
-            .z = std.math.cos(yaw) * horizontal,
-        }, stack, entity_store.player_drop_pickup_delay_ticks);
+        const specification = entity_store.ItemEntities.Spawn{
+            .world = player.world,
+            .position = .{
+                .x = player.position.x,
+                .y = player.position.y + 1.3,
+                .z = player.position.z,
+            },
+            .velocity = .{
+                .x = -std.math.sin(yaw) * horizontal,
+                .y = -std.math.sin(pitch) * 0.3 + 0.1,
+                .z = std.math.cos(yaw) * horizontal,
+            },
+            .stack = stack,
+            .pickup_delay_ticks = entity_store.player_drop_pickup_delay_ticks,
+        };
+        try self.items.validateSpawn(self.world, specification);
+        return .{ .reservation = try self.items.reserve(1), .specification = specification };
+    }
+
+    fn commitPlayerDroppedItem(self: *InventoryWork, prepared: *PreparedDrop) usize {
+        var output: [1]usize = undefined;
+        self.items.commitReserved(&prepared.reservation, self.random, &.{prepared.specification}, &output);
+        return output[0];
     }
 };
 
@@ -65,6 +97,7 @@ fn makeWork(
     inputs: *input_store.Inputs,
     containers: *player_store.Containers,
     recipes: *vanilla_recipes.Recipes,
+    collision_projection: *vanilla_collision_projection.CollisionProjection,
     outputs: *Packets,
 ) InventoryRuntime {
     return .{
@@ -76,6 +109,7 @@ fn makeWork(
             .inputs = inputs,
             .containers = containers,
             .recipes = recipes,
+            .collision_projection = collision_projection,
         },
         .outputs = outputs,
     };
@@ -388,7 +422,7 @@ fn finishInventoryDrag(simulation: *InventoryWork, slot: u16, window_id: i32, se
     }
 }
 
-fn takeInventoryDrop(simulation: *InventoryWork, slot: u16, window_id: i32, protocol_slot: i16, mouse_button: i8, mode: i32) ?player_store.HotbarStack {
+fn inventoryDrop(simulation: *InventoryWork, slot: u16, window_id: i32, protocol_slot: i16, mouse_button: i8, mode: i32) ?InventoryDrop {
     const player = &simulation.players.records[slot];
     const source = if (mode == 4)
         windowStack(simulation, slot, window_id, protocol_slot) orelse return null
@@ -398,14 +432,21 @@ fn takeInventoryDrop(simulation: *InventoryWork, slot: u16, window_id: i32, prot
         return null;
     if (source.isEmpty() or (mouse_button != 0 and mouse_button != 1)) return null;
     var dropped = source.*;
-    if ((mouse_button == 0 and mode == 4) or (mouse_button == 1 and mode == 0)) {
+    const single = (mouse_button == 0 and mode == 4) or (mouse_button == 1 and mode == 0);
+    if (single) {
         dropped.count = 1;
-        source.count -= 1;
-        if (source.count == 0) source.* = .{};
-    } else {
-        source.* = .{};
     }
-    return dropped;
+    return .{ .source = source, .stack = dropped, .single = single };
+}
+
+fn commitInventoryDrop(drop: InventoryDrop) void {
+    if (drop.single) {
+        std.debug.assert(drop.source.count >= drop.stack.count);
+        drop.source.count -= drop.stack.count;
+        if (drop.source.count == 0) drop.source.* = .{};
+        return;
+    }
+    drop.source.* = .{};
 }
 
 fn returnPlayerCraftingGrid(simulation: *InventoryWork, slot: u16, outputs: *Packets) void {
@@ -422,7 +463,7 @@ fn returnPlayerCraftingGrid(simulation: *InventoryWork, slot: u16, outputs: *Pac
     for (&player.crafting_grid) |*stack| {
         if (stack.isEmpty()) continue;
         const dropped = stack.*;
-        const index = simulation.spawn_player_dropped_item(player, dropped) catch continue;
+        const index = simulation.spawnPlayerDroppedItem(player, dropped) catch continue;
         stack.* = .{};
         outputs.item_spawned(@as(u16, @intCast(index)));
     }
@@ -446,11 +487,17 @@ fn dropRequestedItems(simulation: *InventoryWork, outputs: *Packets) void {
         if (count == 0 or simulation.players.records[slot].state != .play) continue;
         const player = &simulation.players.records[slot];
         const hotbar_slot = player.selected_hotbar_slot;
-        const stack = simulation.take_selected_item(@intCast(slot), count) orelse continue;
-        const item_index = simulation.spawn_player_dropped_item(player, stack) catch {
+        const selected = player.hotbar[hotbar_slot];
+        if (selected.isEmpty()) continue;
+        var stack = selected;
+        stack.count = @min(count, stack.count);
+        var prepared = simulation.preparePlayerDroppedItem(player, stack) catch {
             outputs.input_failed(error.ItemEntityCapacity);
             continue;
         };
+        const removed = simulation.takeSelectedItem(@intCast(slot), count) orelse unreachable;
+        std.debug.assert(std.meta.eql(removed, stack));
+        const item_index = simulation.commitPlayerDroppedItem(&prepared);
         outputs.hotbar_changed(.{ .slot = active_slot, .hotbar_slot = hotbar_slot });
         outputs.item_spawned(@intCast(item_index));
     }
@@ -467,7 +514,7 @@ fn closeInvalidContainers(simulation: *InventoryWork, outputs: *Packets) void {
             .furnace => registry.block_furnace_id,
             .none => unreachable,
         };
-        const block_state = simulation.world.blockAtIfResident(container.world, container.position) orelse continue;
+        const block_state = simulation.collision_projection.blockState(container.world, container.position) orelse continue;
         const present = block_state >= 0 and block_state < registry.block_state_to_block.len and
             registry.block_state_to_block[@intCast(block_state)] == expected;
         if (present and player_store.playerCanReachBlock(&simulation.players.records[slot], container.position)) continue;
@@ -496,13 +543,14 @@ fn applyInventoryClicks(simulation: *InventoryWork, outputs: *Packets, changed: 
         if (click.handled or simulation.players.records[click.slot].state != .play) continue;
         const open = &simulation.containers.open[click.slot];
         if (click.window_id != 0 and (open.kind == .none or click.window_id != open.id)) continue;
-        const dropped = if (simulation.items.active_count < simulation.items.active.len)
-            takeInventoryDrop(simulation, click.slot, click.window_id, click.protocol_slot, click.mouse_button, click.mode)
-        else
-            null;
-        if (dropped) |stack| {
+        if (inventoryDrop(simulation, click.slot, click.window_id, click.protocol_slot, click.mouse_button, click.mode)) |drop| {
             const player = &simulation.players.records[click.slot];
-            const index = simulation.spawn_player_dropped_item(player, stack) catch unreachable;
+            var prepared = simulation.preparePlayerDroppedItem(player, drop.stack) catch {
+                changed[click.slot / 64] |= @as(u64, 1) << @intCast(click.slot % 64);
+                continue;
+            };
+            commitInventoryDrop(drop);
+            const index = simulation.commitPlayerDroppedItem(&prepared);
             outputs.item_spawned(@intCast(index));
         } else if (click.window_id == 0) {
             clickPlayerInventory(simulation, click.slot, click.protocol_slot, click.mouse_button, click.mode, outputs);
@@ -549,6 +597,7 @@ pub const Inventory = struct {
         inputs: *input_store.Inputs,
         containers: *player_store.Containers,
         recipes: *vanilla_recipes.Recipes,
+        collision_projection: *vanilla_collision_projection.CollisionProjection,
         outputs: *Packets,
         events: *player_lifecycle.Events,
     };
@@ -562,8 +611,7 @@ pub const Inventory = struct {
         return self;
     }
 
-    pub fn tick(self: *Inventory, _: std.mem.Allocator) void {
-        self.processLeft();
+    pub fn tick(self: *Inventory, _: std.mem.Allocator) lightning_rod.plugin_lifecycle.FatalError!void {
         const random = self.deps.random;
         const blocks = self.deps.blocks;
         const players = self.deps.players;
@@ -572,7 +620,8 @@ pub const Inventory = struct {
         const containers = self.deps.containers;
         const recipes = self.deps.recipes;
         const outputs = self.deps.outputs;
-        var runtime = makeWork(random, blocks, players, items, inputs, containers, recipes, outputs);
+        var runtime = makeWork(random, blocks, players, items, inputs, containers, recipes, self.deps.collision_projection, outputs);
+        for (self.deps.events.left.values) |event| try disconnectPlayer(&runtime, event);
         @memset(self.changed, 0);
         dropRequestedItems(&runtime.deps, outputs);
         closeInvalidContainers(&runtime.deps, outputs);
@@ -582,34 +631,24 @@ pub const Inventory = struct {
         emitInventoryChanges(&runtime.deps, outputs, self.changed);
     }
 
-    fn processLeft(self: *Inventory) void {
-        const random = self.deps.random;
-        const blocks = self.deps.blocks;
-        const players = self.deps.players;
-        const items = self.deps.items;
-        const inputs = self.deps.inputs;
-        const containers = self.deps.containers;
-        const recipes = self.deps.recipes;
-        const outputs = self.deps.outputs;
-        var storage = makeWork(random, blocks, players, items, inputs, containers, recipes, outputs);
-        for (self.deps.events.left.values) |event| disconnectPlayer(&storage, event);
-    }
 };
 
 fn disconnectPlayer(
     work: *InventoryRuntime,
     event: player_lifecycle.PlayerLeft,
-) void {
+) lightning_rod.plugin_lifecycle.FatalError!void {
     const slot = event.slot;
     const player = &work.deps.players.records[slot];
     const container = &work.deps.containers.open[slot];
     if (container.kind != .none) {
-        for (&container.crafting_grid) |*stack| moveOrDrop(work, player, stack);
+        for (&container.crafting_grid) |*stack|
+            if (!moveOrDrop(work, player, stack)) return error.WorkingMemoryExceeded;
         container.* = .{};
         work.deps.containers.drags[slot] = .{};
     }
-    moveOrDrop(work, player, &player.cursor_stack);
-    for (&player.crafting_grid) |*stack| moveOrDrop(work, player, stack);
+    if (!moveOrDrop(work, player, &player.cursor_stack)) return error.WorkingMemoryExceeded;
+    for (&player.crafting_grid) |*stack|
+        if (!moveOrDrop(work, player, stack)) return error.WorkingMemoryExceeded;
     player.crafting_result = .{};
 }
 
@@ -617,13 +656,137 @@ fn moveOrDrop(
     work: *InventoryRuntime,
     player: *player_store.CorePlayer,
     stack: *player_store.HotbarStack,
-) void {
-    if (stack.isEmpty()) return;
-    player_store.moveStackInto(&player.main_inventory, stack);
-    player_store.moveStackInto(&player.hotbar, stack);
-    if (stack.isEmpty()) return;
-    const dropped = stack.*;
-    const index = work.deps.spawn_player_dropped_item(player, dropped) catch return;
+) bool {
+    if (stack.isEmpty()) return true;
+    var staged_main_inventory = player.main_inventory;
+    var staged_hotbar = player.hotbar;
+    var staged_stack = stack.*;
+    player_store.moveStackInto(&staged_main_inventory, &staged_stack);
+    player_store.moveStackInto(&staged_hotbar, &staged_stack);
+    var prepared: ?PreparedDrop = null;
+    if (!staged_stack.isEmpty())
+        prepared = work.deps.preparePlayerDroppedItem(player, staged_stack) catch return false;
+    player.main_inventory = staged_main_inventory;
+    player.hotbar = staged_hotbar;
     stack.* = .{};
-    work.outputs.item_spawned(@intCast(index));
+    if (prepared) |*drop| {
+        const index = work.deps.commitPlayerDroppedItem(drop);
+        work.outputs.item_spawned(@intCast(index));
+    }
+    return true;
+}
+
+test "disconnect preserves unresolved cursor and container crafting stacks" {
+    var state: lightning_rod.test_support.state.State = undefined;
+    try state.init(std.testing.allocator, 0x51a7);
+    defer state.deinit();
+
+    state.players.beginConnection(&state.random, 0);
+    _ = try state.players.login(&state.random, 0, "full-inventory", 91);
+    const player = &state.players.records[0];
+    const full = player_store.stackForItem(registry.item_oak_planks_id, 64);
+    for (&player.hotbar) |*stack| stack.* = full;
+    for (&player.main_inventory) |*stack| stack.* = full;
+    player.cursor_stack = player_store.stackForItem(registry.item_diamond_shovel_id, 1);
+
+    const container = &state.containers.open[0];
+    container.kind = .crafting_table;
+    container.crafting_grid[0] = player_store.stackForItem(registry.item_diamond_pickaxe_id, 1);
+    const expected_cursor = player.cursor_stack;
+    const expected_crafting = container.crafting_grid[0];
+    const before = playerItemCount(player) + containerItemCount(container);
+
+    _ = state.blocks.materializeGeneratedChunk(state.world, .{ .x = 0, .z = 0 }, 0);
+    var held = try state.items.reserve(state.items.active.len);
+    defer state.items.cancelReservation(&held);
+    var recipes: vanilla_recipes.Recipes = .{};
+    var runtime = InventoryRuntime{
+        .deps = .{
+            .random = &state.random,
+            .world = &state.blocks,
+            .players = &state.players,
+            .items = &state.items,
+            .inputs = &state.inputs,
+            .containers = &state.containers,
+            .recipes = &recipes,
+            .collision_projection = undefined,
+        },
+        .outputs = undefined,
+    };
+
+    try std.testing.expectError(error.WorkingMemoryExceeded, disconnectPlayer(&runtime, .{
+        .slot = 0,
+        .connection = .{ .index = 0, .generation = 1 },
+        .reason = .peer_closed,
+    }));
+    try std.testing.expectEqualDeep(expected_cursor, player.cursor_stack);
+    try std.testing.expectEqualDeep(expected_crafting, container.crafting_grid[0]);
+    try std.testing.expectEqual(container.kind, .crafting_table);
+    try std.testing.expectEqual(before, playerItemCount(player) + containerItemCount(container));
+    try std.testing.expectEqual(@as(usize, 0), state.items.active_count);
+}
+
+test "disconnect normalizes inventory before canonical save and relogin" {
+    var state: lightning_rod.test_support.state.State = undefined;
+    try state.init(std.testing.allocator, 0x9c31);
+    defer state.deinit();
+
+    state.players.beginConnection(&state.random, 0);
+    _ = try state.players.login(&state.random, 0, "saved-inventory", 0x91);
+    state.players.transition(0, .configuration);
+    state.players.transition(0, .play);
+    const player = &state.players.records[0];
+    player.cursor_stack = player_store.stackForItem(registry.item_diamond_shovel_id, 1);
+    const container = &state.containers.open[0];
+    container.kind = .crafting_table;
+    container.crafting_grid[0] = player_store.stackForItem(registry.item_diamond_pickaxe_id, 1);
+
+    var recipes: vanilla_recipes.Recipes = .{};
+    var runtime = InventoryRuntime{
+        .deps = .{
+            .random = &state.random,
+            .world = &state.blocks,
+            .players = &state.players,
+            .items = &state.items,
+            .inputs = &state.inputs,
+            .containers = &state.containers,
+            .recipes = &recipes,
+            .collision_projection = undefined,
+        },
+        .outputs = undefined,
+    };
+    try disconnectPlayer(&runtime, .{
+        .slot = 0,
+        .connection = .{ .index = 0, .generation = 1 },
+        .reason = .peer_closed,
+    });
+    try std.testing.expect(player.cursor_stack.isEmpty());
+    try std.testing.expect(container.crafting_grid[0].isEmpty());
+    try std.testing.expectEqual(@as(u32, 2), playerItemCount(player));
+
+    state.players.beginDisconnect(0);
+    try state.players.persistDisconnect(std.testing.io, 0);
+    state.players.releaseDisconnected(0);
+    state.containers.releaseDisconnected(0);
+    state.players.beginConnection(&state.random, 1);
+    try std.testing.expectEqual(
+        player_store.LoginDisposition.restored_player,
+        try state.players.login(&state.random, 1, "saved-inventory", 0x91),
+    );
+    try std.testing.expectEqual(@as(u32, 2), playerItemCount(&state.players.records[1]));
+    try std.testing.expect(state.players.records[1].cursor_stack.isEmpty());
+}
+
+fn playerItemCount(player: *const player_store.CorePlayer) u32 {
+    var count: u32 = player.cursor_stack.count;
+    for (player.hotbar) |stack| count += stack.count;
+    for (player.main_inventory) |stack| count += stack.count;
+    for (player.crafting_grid) |stack| count += stack.count;
+    return count;
+}
+
+fn containerItemCount(container: *const player_store.OpenContainer) u32 {
+    var count: u32 = 0;
+    for (container.crafting_grid) |stack| count += stack.count;
+    return count;
 }

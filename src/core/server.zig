@@ -12,6 +12,7 @@ const contracts = @import("../runtime/contracts.zig");
 const session_driver = @import("../sessions/driver.zig");
 const session_api = @import("../session_api.zig");
 const std = @import("std");
+const TickScratch = @import("../tick_arena.zig").Arena;
 
 const Attachment = struct {
     connection: exchange.Connection,
@@ -20,7 +21,7 @@ const Attachment = struct {
 
 const BridgeStorage = struct {
     attachments: []?Attachment,
-    connection_slots: []?u16,
+    connection_slots: []u16,
     packet_views: []core_exchange.PacketView,
     joined: []lifecycle.PlayerJoined,
     left: []lifecycle.PlayerLeft,
@@ -34,7 +35,7 @@ fn allocateBridgeStorage(
 ) !BridgeStorage {
     const attachments = try allocator.alloc(?Attachment, player_count);
     errdefer allocator.free(attachments);
-    const connection_slots = try allocator.alloc(?u16, player_count);
+    const connection_slots = try allocator.alloc(u16, player_count);
     errdefer allocator.free(connection_slots);
     const packet_views = try allocator.alloc(core_exchange.PacketView, input_capacity);
     errdefer allocator.free(packet_views);
@@ -44,7 +45,6 @@ fn allocateBridgeStorage(
     errdefer allocator.free(left);
     const play_started = try allocator.alloc(lifecycle.PlayStarted, player_count);
     @memset(attachments, null);
-    @memset(connection_slots, null);
     return .{
         .attachments = attachments,
         .connection_slots = connection_slots,
@@ -57,20 +57,39 @@ fn allocateBridgeStorage(
 
 const Boundary = struct {
     attachments: []?Attachment,
-    connection_slots: []?u16,
+    connection_slots: []u16,
+    connection_count: usize = 0,
+
+    fn lowerBound(self: *const Boundary, index: u32) usize {
+        var lo: usize = 0;
+        var hi = self.connection_count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.attachments[self.connection_slots[mid]].?.connection.index < index)
+                lo = mid + 1
+            else
+                hi = mid;
+        }
+        return lo;
+    }
 
     pub fn attach(self: *Boundary, slot: u16, value: exchange.AttachPlayer) bool {
-        if (slot >= self.attachments.len or self.attachments[slot] != null or value.connection.index >= self.connection_slots.len)
+        if (slot >= self.attachments.len or self.attachments[slot] != null or self.connection_count == self.connection_slots.len)
             return false;
-        if (self.connection_slots[value.connection.index] != null) return false;
+        const position = self.lowerBound(value.connection.index);
+        if (position < self.connection_count and self.attachments[self.connection_slots[position]].?.connection.index == value.connection.index)
+            return false;
+        std.mem.copyBackwards(u16, self.connection_slots[position + 1 .. self.connection_count + 1], self.connection_slots[position..self.connection_count]);
         self.attachments[slot] = .{ .connection = value.connection, .protocol = value.protocol };
-        self.connection_slots[value.connection.index] = slot;
+        self.connection_slots[position] = slot;
+        self.connection_count += 1;
         return true;
     }
 
     pub fn player(self: *const Boundary, handle: exchange.Connection) ?u16 {
-        if (handle.index >= self.connection_slots.len) return null;
-        const slot = self.connection_slots[handle.index] orelse return null;
+        const position = self.lowerBound(handle.index);
+        if (position == self.connection_count) return null;
+        const slot = self.connection_slots[position];
         const attachment = self.attachments[slot] orelse return null;
         return if (attachment.connection.eql(handle)) slot else null;
     }
@@ -82,8 +101,10 @@ const Boundary = struct {
 
     pub fn detach(self: *Boundary, handle: exchange.Connection) ?u16 {
         const slot = self.player(handle) orelse return null;
+        const position = self.lowerBound(handle.index);
+        std.mem.copyForwards(u16, self.connection_slots[position .. self.connection_count - 1], self.connection_slots[position + 1 .. self.connection_count]);
+        self.connection_count -= 1;
         self.attachments[slot] = null;
-        self.connection_slots[handle.index] = null;
         return slot;
     }
 };
@@ -93,9 +114,12 @@ pub fn Server(comptime Selections: type) type {
 
     return struct {
         const Self = @This();
+        pub const minimum_tick_scratch_bytes = Composition.minimum_tick_scratch_bytes;
 
         composition: *Composition,
+        ready: bool = false,
         player_store: *players.Players,
+        containers: *players.Containers,
         rng: *random.Random,
         events: *lifecycle.Events,
         packets: *packet_writer.Packets,
@@ -109,36 +133,43 @@ pub fn Server(comptime Selections: type) type {
         left_count: usize = 0,
         play_started_count: usize = 0,
         input: ?exchange.CoreInput = null,
+        inbox: core_exchange.Inbox,
+        input_drain: ?core_exchange.InputDrain = null,
 
-        pub fn init(
+        pub fn create(
             allocator: std.mem.Allocator,
             io: std.Io,
-            selections: Selections,
             persistence_interface: persistence.Interface,
             configuration: composition.Configuration,
             counter: ?profiler.Counter,
-            environment: anytype,
         ) !*Self {
-            const value = try Composition.init(
+            const value = try Composition.create(
                 allocator,
                 io,
-                selections,
                 persistence_interface,
                 configuration,
                 counter,
-                environment,
             );
-            const self = initBridge(value.generation.allocator(), value) catch |err| {
+            errdefer allocator.free(value.storage);
+            const self = try value.generation.allocator().create(Self);
+            self.* = undefined;
+            self.composition = value;
+            self.ready = false;
+            return self;
+        }
+
+        pub fn initialize(self: *Self, selections: Selections, environment: anytype) !void {
+            const value = self.composition;
+            try value.initialize(selections, environment);
+            self.initBridge(value.generation.allocator(), value) catch |err| {
                 if (@as(anyerror, err) == error.OutOfMemory)
                     return error.ConfiguredMemoryMaximumExceeded;
                 return err;
             };
             value.finishInitialization();
-            return self;
         }
 
-        fn initBridge(allocator: std.mem.Allocator, value: *Composition) !*Self {
-            const self = try allocator.create(Self);
+        fn initBridge(self: *Self, allocator: std.mem.Allocator, value: *Composition) !void {
             const player_store = value.get(players.Players);
             const packets = value.get(packet_writer.Packets);
             const storage = try allocateBridgeStorage(
@@ -148,7 +179,9 @@ pub fn Server(comptime Selections: type) type {
             );
             self.* = .{
                 .composition = value,
+                .ready = true,
                 .player_store = player_store,
+                .containers = value.get(players.Containers),
                 .rng = value.get(random.Random),
                 .events = value.get(lifecycle.Events),
                 .packets = packets,
@@ -160,8 +193,8 @@ pub fn Server(comptime Selections: type) type {
                 .joined = storage.joined,
                 .left = storage.left,
                 .play_started = storage.play_started,
+                .inbox = try core_exchange.Inbox.init(allocator, packets.input.records.len, packets.input.bytes.len),
             };
-            return self;
         }
 
         pub inline fn get(self: *Self, comptime Plugin: type) *Plugin {
@@ -173,47 +206,93 @@ pub fn Server(comptime Selections: type) type {
         }
 
         pub fn runtime(self: *Self) contracts.Core {
+            std.debug.assert(self.ready);
             return .{ .context = self, .vtable = &core_vtable, .readiness = self.composition.readiness() };
         }
 
         pub fn sessionsBoundary(self: *Self) session_driver.CoreBoundary {
+            std.debug.assert(self.ready);
             return .{ .context = self, .vtable = &session_vtable };
         }
 
         pub fn bindPacketRuntime(self: *Self, value: session_api.Runtime) void {
             self.packets.bindRuntime(value);
         }
+        pub fn bindInputDrain(self: *Self, value: core_exchange.InputDrain) void {
+            std.debug.assert(self.input_drain == null);
+            self.input_drain = value;
+        }
 
-        fn publishInput(raw: *anyopaque, input: exchange.CoreInput) bool {
+        fn drainInput(raw: *anyopaque) bool {
             const self = from(raw);
             if (self.input != null) return false;
-            self.input = input;
+            const drain = self.input_drain orelse return false;
+            if (!drain.drain(&self.inbox)) {
+                self.composition.markFailed();
+                return false;
+            }
+            self.input = self.inbox.input();
             return true;
         }
 
-        fn releaseInput(raw: *anyopaque) void {
+        fn finishInput(raw: *anyopaque) void {
             const self = from(raw);
             std.debug.assert(self.input != null);
             self.clearPacketViews();
             self.input = null;
+            self.inbox.clear();
         }
 
         fn service(raw: *anyopaque) contracts.Outcome {
             const self = from(raw);
+            if (self.composition.failed) return .failed;
             const input = self.input orelse return .failed;
+            // A service cycle may not overwrite departure records before the
+            // preceding tick has normalized and saved those players.
+            if (self.left_count != 0) {
+                self.composition.markFailed();
+                return .failed;
+            }
             self.beginEvents();
-            if (!self.attachAll(input.attachments)) return .failed;
-            self.detachAll(input.detachments);
-            if (!self.setPacketViews(input.packet_views, input.packet_claimed)) return .failed;
+            if (!self.attachAll(input.attachments)) {
+                self.composition.markFailed();
+                return .failed;
+            }
+            if (!self.detachAll(input.detachments)) {
+                self.composition.markFailed();
+                return .failed;
+            }
+            if (!self.setPacketViews(input.packet_views, input.packet_claimed)) {
+                self.composition.markFailed();
+                return .failed;
+            }
             self.publishEvents();
             return .ok;
         }
 
         fn tick(raw: *anyopaque) contracts.Outcome {
             const self = from(raw);
+            return self.tickWithScratch(self.composition.temporary orelse return .failed);
+        }
+
+        pub fn tickWithScratch(self: *Self, scratch: *TickScratch) contracts.Outcome {
+            std.debug.assert(self.ready);
+            if (scratch.bytes.len < minimum_tick_scratch_bytes) return .failed;
+            const temporary = scratch.begin();
+            defer scratch.finish();
             defer self.clearPacketViews();
-            if (self.composition.tick() != .ok) return .failed;
-            if (self.packets.failure() != null) return .failed;
+            if (self.composition.tickUsing(temporary) != .ok) return .failed;
+            if (!self.completeDisconnects()) {
+                self.composition.markFailed();
+                return .failed;
+            }
+            self.packets.flushAcknowledgements();
+            self.packets.flush();
+            if (self.packets.failure()) |failure| {
+                self.composition.markFailed();
+                std.log.err("event=core_tick_failed packet_writer={s}", .{@tagName(failure)});
+                return .failed;
+            }
             return .ok;
         }
 
@@ -221,16 +300,29 @@ pub fn Server(comptime Selections: type) type {
             return from(raw).composition.captureCheckpoint();
         }
 
+        pub fn stageCheckpoint(self: *Self) contracts.Outcome {
+            std.debug.assert(self.ready);
+            return self.composition.stageCheckpoint();
+        }
+
         fn checkpointProgress(raw: *anyopaque) contracts.Progress {
             return from(raw).composition.checkpointProgress();
         }
 
-        fn beginClose(raw: *anyopaque, deadline_ns: i128) contracts.Outcome {
-            return from(raw).composition.beginClose(deadline_ns);
+        pub fn beginClose(self: *Self, deadline_ns: i128) contracts.Outcome {
+            return self.composition.beginClose(deadline_ns);
         }
 
-        fn closeProgress(raw: *anyopaque) contracts.Progress {
-            return from(raw).composition.closeProgress();
+        pub fn closeProgress(self: *Self) contracts.Progress {
+            return self.composition.closeProgress();
+        }
+
+        fn beginCloseRuntime(raw: *anyopaque, deadline_ns: i128) contracts.Outcome {
+            return from(raw).beginClose(deadline_ns);
+        }
+
+        fn closeProgressRuntime(raw: *anyopaque) contracts.Progress {
+            return from(raw).closeProgress();
         }
 
         fn takeControl(raw: *anyopaque) ?contracts.ControlRequest {
@@ -262,7 +354,8 @@ pub fn Server(comptime Selections: type) type {
             const slot = self.freeSlot() orelse return false;
             self.player_store.beginConnection(self.rng, slot);
             const name = value.name[0..value.name_len];
-            const disposition = self.player_store.login(self.rng, slot, name, value.uuid) catch {
+            const disposition = self.player_store.login(self.rng, slot, name, value.uuid) catch |err| {
+                std.log.err("event=player_restore_failed slot={d} error={s}", .{ slot, @errorName(err) });
                 self.player_store.discardConnection(slot);
                 return false;
             };
@@ -285,7 +378,6 @@ pub fn Server(comptime Selections: type) type {
         fn restoreReconfigured(self: *Self, value: exchange.AttachPlayer) bool {
             const slot = self.freeSlot() orelse return false;
             const name = value.name[0..value.name_len];
-            if (!self.player_store.hasSaved(value.uuid, name)) return false;
             self.player_store.beginConnection(self.rng, slot);
             const disposition = self.player_store.login(self.rng, slot, name, value.uuid) catch {
                 self.player_store.discardConnection(slot);
@@ -314,6 +406,7 @@ pub fn Server(comptime Selections: type) type {
             joined: bool,
             project_to_observers: bool,
         ) bool {
+            self.player_store.records[slot].presentation_ready = false;
             self.player_store.records[slot].client_loaded = false;
             self.player_store.records[slot].pending_teleport_id = 0;
             if (self.play_started_count == self.play_started.len) return false;
@@ -340,13 +433,16 @@ pub fn Server(comptime Selections: type) type {
             return null;
         }
 
-        fn detachAll(self: *Self, values: []const exchange.DetachPlayer) void {
-            for (values) |value| self.detach(value);
+        fn detachAll(self: *Self, values: []const exchange.DetachPlayer) bool {
+            for (values) |value| if (!self.detach(value)) return false;
+            return true;
         }
 
-        fn detach(self: *Self, value: exchange.DetachPlayer) void {
-            const slot = self.boundary.detach(value.connection) orelse return;
-            if (self.left_count == self.left.len) @panic("player lifecycle detach capacity exhausted");
+        fn detach(self: *Self, value: exchange.DetachPlayer) bool {
+            const slot = self.boundary.player(value.connection) orelse return true;
+            if (self.player_store.records[slot].state == .disconnecting) return true;
+            if (self.left_count == self.left.len) return false;
+            self.player_store.beginDisconnect(slot);
             self.left[self.left_count] = .{
                 .slot = slot,
                 .connection = value.connection,
@@ -357,13 +453,31 @@ pub fn Server(comptime Selections: type) type {
                 ),
             };
             self.left_count += 1;
-            self.packets.clearPlayerProtocol(slot);
+            return true;
+        }
+
+        fn completeDisconnects(self: *Self) bool {
+            for (self.left[0..self.left_count]) |left| {
+                const slot = left.slot;
+                self.player_store.persistDisconnect(self.composition.io, slot) catch |err| {
+                    std.log.err("event=player_save_failed slot={d} error={s}", .{ slot, @errorName(err) });
+                    return false;
+                };
+                const detached = self.boundary.detach(left.connection) orelse return false;
+                if (detached != slot) return false;
+                self.player_store.releaseDisconnected(slot);
+                self.containers.releaseDisconnected(slot);
+                self.packets.clearPlayerProtocol(slot);
+            }
+            self.left_count = 0;
+            return true;
         }
 
         fn setPacketViews(self: *Self, values: []const core_exchange.PacketView, claimed: []bool) bool {
             if (values.len > self.packet_views.len or claimed.len != values.len) return false;
             for (values, 0..) |value, index| {
                 const slot = self.boundary.player(value.connection) orelse return false;
+                if (self.player_store.records[slot].state != .play) return false;
                 self.packet_views[index] = value;
                 self.packet_views[index].player = slot;
                 self.packet_views[index].ticket = @intCast(index);
@@ -394,6 +508,11 @@ pub fn Server(comptime Selections: type) type {
             return from(raw).player_store.session(slot);
         }
 
+        fn playerProtocol(raw: *const anyopaque, value: players.Session) ?session_api.Protocol {
+            const self: *const Self = @ptrCast(@alignCast(raw));
+            return self.packets.sessionProtocol(value);
+        }
+
         fn connectionForPlayer(raw: *anyopaque, value: players.Session) ?exchange.Connection {
             const self = from(raw);
             if (!self.player_store.validSession(value)) return null;
@@ -410,9 +529,10 @@ pub fn Server(comptime Selections: type) type {
         }
 
         const session_vtable: session_driver.CoreBoundary.VTable = .{
-            .publish_input = publishInput,
-            .release_input = releaseInput,
+            .drain_input = drainInput,
+            .finish_input = finishInput,
             .player_session = playerSession,
+            .player_protocol = playerProtocol,
             .connection_for_player = connectionForPlayer,
             .packet_views = packetViews,
             .claim_packet = claimPacket,
@@ -422,8 +542,8 @@ pub fn Server(comptime Selections: type) type {
             .tick = tick,
             .capture_checkpoint = checkpoint,
             .checkpoint_progress = checkpointProgress,
-            .begin_close = beginClose,
-            .close_progress = closeProgress,
+            .begin_close = beginCloseRuntime,
+            .close_progress = closeProgressRuntime,
             .take_control = takeControl,
             .control_result = controlResult,
         };
@@ -472,14 +592,12 @@ test "departure snapshots outlive the recycled player slot" {
 
 test "connection mapping attaches once and frees the exact player slot" {
     var attachments = [_]?Attachment{ null, null };
-    var connection_slots = [_]?u16{ null, null, null, null };
+    var connection_slots: [2]u16 = undefined;
     var boundary = Boundary{
-        .packets = undefined,
-        .players = undefined,
         .attachments = &attachments,
         .connection_slots = &connection_slots,
     };
-    const first = exchange.Connection{ .index = 3, .generation = 7 };
+    const first = exchange.Connection{ .index = 65_000, .generation = 7 };
     const attached = exchange.AttachPlayer{
         .connection = first,
         .protocol = 772,
@@ -490,8 +608,21 @@ test "connection mapping attaches once and frees the exact player slot" {
     };
     try std.testing.expect(boundary.attach(1, attached));
     try std.testing.expect(!boundary.attach(1, attached));
+    try std.testing.expect(!boundary.attach(0, attached));
+    var second = attached;
+    second.connection = .{ .index = 3, .generation = 2 };
+    try std.testing.expect(boundary.attach(0, second));
+    try std.testing.expectEqual(@as(?u16, 0), boundary.player(second.connection));
+    try std.testing.expectEqual(@as(?u16, null), boundary.detach(.{ .index = first.index, .generation = first.generation + 1 }));
     try std.testing.expectEqual(@as(?u16, 1), boundary.player(first));
     try std.testing.expectEqual(@as(?u16, 1), boundary.detach(first));
     try std.testing.expectEqual(@as(?u16, null), boundary.player(first));
-    try std.testing.expect(boundary.attach(1, .{ .connection = .{ .index = 3, .generation = 8 }, .protocol = 772, .uuid = 9, .name = @splat(0), .name_len = 0, .reconfiguring = false }));
+    var replacement = attached;
+    replacement.connection.generation += 1;
+    try std.testing.expect(boundary.attach(1, replacement));
+    try std.testing.expectEqual(@as(?u16, null), boundary.player(first));
+    try std.testing.expectEqual(@as(?u16, 0), boundary.detach(second.connection));
+    try std.testing.expectEqual(@as(?u16, 1), boundary.player(replacement.connection));
+    try std.testing.expectEqual(@as(?u16, 1), boundary.detach(replacement.connection));
+    try std.testing.expectEqual(@as(usize, 0), boundary.connection_count);
 }

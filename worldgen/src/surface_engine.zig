@@ -181,6 +181,10 @@ pub fn Engine(comptime data: type, comptime density: type) type {
                 var z_values: [density.sample_lanes]f64 = undefined;
                 inline for (0..density.sample_lanes) |lane|
                     z_values[lane] = @floatFromInt(first_z + @as(i32, lane));
+                return self.columnDepthsAt4(x_values, z_values);
+            }
+
+            fn columnDepthsAt4(self: *const Sampler, x_values: noise.Samples, z_values: noise.Samples) ColumnDepths {
                 const zero: noise.Samples = @splat(0);
                 const run_noise: [density.sample_lanes]f64 = self.noises[data.surface_noise].sample4(
                     x_values,
@@ -195,9 +199,9 @@ pub fn Engine(comptime data: type, comptime density: type) type {
                 var run: [density.sample_lanes]i32 = undefined;
                 inline for (0..density.sample_lanes) |lane| {
                     var source = self.base_splitter.splitPosition(
-                        x,
+                        @intFromFloat(x_values[lane]),
                         0,
-                        first_z + @as(i32, lane),
+                        @intFromFloat(z_values[lane]),
                     );
                     run[lane] = @intFromFloat(run_noise[lane] * 2.75 + 3 + source.nextF64() * 0.25);
                 }

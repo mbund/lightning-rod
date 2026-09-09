@@ -27,16 +27,20 @@ pub const RuntimeError = error{
     ReloaderFailed,
     ShutdownFailed,
     ShutdownTimedOut,
+    CoreTickDeadlineExceeded,
 };
 pub const RunError = RuntimeError || std.Io.Cancelable;
+pub const maximum_tick_ns = contracts.maximum_tick_ns;
 
 pub const Limits = struct {
     completion_budget: usize = 64,
     immediate_pass_limit: usize = 4,
     maximum_auxiliary_backends: usize = 8,
     tick_interval_ns: u64 = 50 * std.time.ns_per_ms,
+    tick_deadline_ns: u64 = maximum_tick_ns,
     checkpoint_interval_ns: u64 = 5 * 60 * std.time.ns_per_s,
     shutdown_timeout_ns: u64 = 30 * std.time.ns_per_s,
+    fail_on_tick_deadline: bool = false,
 };
 
 pub const Server = struct {
@@ -60,7 +64,10 @@ pub fn run(server: Server) RunError!void {
     std.debug.assert(driver.server.limits.immediate_pass_limit > 0);
     var immediate_passes: usize = 0;
     while (!driver.finished()) {
-        try driver.pass();
+        driver.pass() catch |err| {
+            driver.fatalShutdown(err);
+            return err;
+        };
         if (driver.finished()) return;
         if (driver.ready and immediate_passes < server.limits.immediate_pass_limit) {
             immediate_passes += 1;
@@ -118,6 +125,9 @@ const Driver = struct {
     phase: ShutdownPhase = .running,
     shutdown_deadline: ?std.Io.Clock.Timestamp = null,
     ready: bool = false,
+    tick_samples: [100]u64 = @splat(0),
+    tick_sample_count: usize = 0,
+    tick_sample_cursor: usize = 0,
 
     fn init(server: Server, waits: *Coalescing) RuntimeError!Driver {
         if (server.limits.completion_budget == 0) return error.InvalidLimits;
@@ -125,6 +135,7 @@ const Driver = struct {
         if (server.auxiliary_backends.len > server.limits.maximum_auxiliary_backends)
             return error.InvalidLimits;
         if (server.limits.tick_interval_ns == 0) return error.InvalidLimits;
+        if (server.limits.tick_deadline_ns == 0) return error.InvalidLimits;
         if (server.limits.checkpoint_interval_ns == 0) return error.InvalidLimits;
         if (server.limits.shutdown_timeout_ns == 0) return error.InvalidLimits;
         const now = std.Io.Clock.Timestamp.now(server.io, .awake);
@@ -194,7 +205,6 @@ const Driver = struct {
 
     fn beginCoreTick(self: *Driver) RuntimeError!void {
         try require(self.server.sessions.takeInput(), error.SessionsFailed);
-        errdefer self.finishCoreTick() catch {};
         try require(self.server.core.service(), error.CoreFailed);
     }
 
@@ -205,14 +215,36 @@ const Driver = struct {
     fn tickDue(self: *Driver) RuntimeError!void {
         const now = std.Io.Clock.Timestamp.now(self.server.io, .awake);
         if (std.Io.Clock.Timestamp.compare(now, .lt, self.next_tick)) return;
+        const started_at = now;
         try self.beginCoreTick();
-        var input_open = true;
-        errdefer if (input_open) self.finishCoreTick() catch {};
         try require(self.server.core.tick(), error.CoreFailed);
         try self.finishCoreTick();
-        input_open = false;
         const scheduled = self.next_tick.addDuration(tickInterval(self.server.limits));
         const completed_at = std.Io.Clock.Timestamp.now(self.server.io, .awake);
+        const elapsed_ns = completed_at.raw.nanoseconds - started_at.raw.nanoseconds;
+        self.tick_samples[self.tick_sample_cursor] = @intCast(elapsed_ns);
+        self.tick_sample_cursor = (self.tick_sample_cursor + 1) % self.tick_samples.len;
+        self.tick_sample_count = @min(self.tick_sample_count + 1, self.tick_samples.len);
+        if (self.tick_sample_cursor == 0) {
+            var total: u64 = 0;
+            var maximum: u64 = 0;
+            for (self.tick_samples[0..self.tick_sample_count]) |sample| {
+                total += sample;
+                maximum = @max(maximum, sample);
+            }
+            std.log.info("event=core_tick_profile samples={d} avg_us={d} max_us={d}", .{
+                self.tick_sample_count,
+                total / self.tick_sample_count / std.time.ns_per_us,
+                maximum / std.time.ns_per_us,
+            });
+        }
+        if (elapsed_ns > self.server.limits.tick_deadline_ns) {
+            std.log.err("event=core_tick_deadline_exceeded elapsed_us={d} deadline_us={d}", .{
+                @divTrunc(elapsed_ns, std.time.ns_per_us),
+                @divTrunc(self.server.limits.tick_deadline_ns, std.time.ns_per_us),
+            });
+            if (self.server.limits.fail_on_tick_deadline) return error.CoreTickDeadlineExceeded;
+        }
         self.next_tick = if (std.Io.Clock.Timestamp.compare(scheduled, .lt, completed_at)) completed_at else scheduled;
     }
 
@@ -266,7 +298,28 @@ const Driver = struct {
         return error.ContractViolation;
     }
 
+    fn fatalShutdown(self: *Driver, failure: RuntimeError) void {
+        std.log.err("event=fatal_shutdown error={s} checkpoint=false", .{@errorName(failure)});
+        const deadline = std.Io.Clock.Timestamp.now(self.server.io, .awake).addDuration(.{
+            .clock = .awake,
+            .raw = .{ .nanoseconds = self.server.limits.shutdown_timeout_ns },
+        });
+        _ = self.server.sessions.stopAccepting();
+        while (std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(self.server.io, .awake), .lt, deadline)) {
+            const transport = self.server.transport.complete(self.server.io, self.server.limits.completion_budget);
+            const progress = self.server.sessions.fatalDisconnect();
+            const submitted = self.server.transport.submit(self.server.io);
+            _ = self.server.logging.complete(self.server.io, self.server.limits.completion_budget);
+            _ = self.server.logging.submit(self.server.io);
+            if (progress != .pending or transport.outcome == .failed or submitted == .failed) return;
+            std.Io.sleep(self.server.io, .fromMilliseconds(1), .awake) catch return;
+        }
+        std.log.err("event=fatal_disconnect_timeout", .{});
+        _ = self.server.logging.submit(self.server.io);
+    }
+
     fn stopAccepting(self: *Driver) RuntimeError!bool {
+        std.log.info("event=shutdown_started", .{});
         std.debug.assert(self.shutdown_deadline == null);
         self.shutdown_deadline = std.Io.Clock.Timestamp.now(self.server.io, .awake).addDuration(.{
             .clock = .awake,
@@ -283,12 +336,10 @@ const Driver = struct {
     fn detachPlayers(self: *Driver) RuntimeError!bool {
         try require(self.server.sessions.stageFinalDetachments(), error.SessionsFailed);
         try self.beginCoreTick();
-        var input_open = true;
-        errdefer if (input_open) self.finishCoreTick() catch {};
         try require(self.server.core.tick(), error.CoreFailed);
         try self.finishCoreTick();
-        input_open = false;
         self.phase = .checkpoint_close;
+        std.log.info("event=shutdown_final_tick_complete", .{});
         return true;
     }
 
@@ -301,6 +352,7 @@ const Driver = struct {
             },
             .failed => return error.CoreFailed,
         }
+        std.log.info("event=shutdown_checkpoint_captured", .{});
         try require(self.server.core.beginClose(self.shutdown_deadline.?.raw.nanoseconds), error.CoreFailed);
         var failure: ?RuntimeError = null;
         recordOutcome(self.server.transport.beginShutdown(self.server.io), error.TransportFailed, &failure);
@@ -330,7 +382,10 @@ const Driver = struct {
     fn awaitFinal(self: *Driver) RuntimeError!void {
         try require(self.server.sessions.advance(), error.SessionsFailed);
         try self.submitAll();
-        if (try self.finalWorkComplete()) self.phase = .done;
+        if (try self.finalWorkComplete()) {
+            self.phase = .done;
+            std.log.info("event=shutdown_complete", .{});
+        }
     }
 
     fn finalWorkComplete(self: *Driver) RuntimeError!bool {
@@ -354,11 +409,25 @@ const Driver = struct {
     }
 
     fn wait(self: *Driver) std.Io.Cancelable!void {
-        const timeout: std.Io.Timeout = if (self.phase == .running)
-            .{ .deadline = self.next_tick }
-        else
-            .{ .deadline = self.shutdown_deadline.? };
+        var deadline = if (self.phase == .running) self.next_tick else self.shutdown_deadline.?;
+        const now = std.Io.Clock.Timestamp.now(self.server.io, .awake);
+        // submit() may finish the previous write without leaving an IO wake pending.
+        if (self.phase == .checkpoint_close) {
+            const retry = now.addDuration(.{ .clock = .awake, .raw = .{ .nanoseconds = std.time.ns_per_ms } });
+            if (std.Io.Clock.Timestamp.compare(retry, .lt, deadline)) deadline = retry;
+        }
+        self.applyBackendPollDeadline(self.server.transport, now, &deadline);
+        self.applyBackendPollDeadline(self.server.persistence, now, &deadline);
+        self.applyBackendPollDeadline(self.server.logging, now, &deadline);
+        for (self.server.auxiliary_backends) |backend| self.applyBackendPollDeadline(backend, now, &deadline);
+        const timeout: std.Io.Timeout = .{ .deadline = deadline };
         try self.waits.wait(timeout);
+    }
+
+    fn applyBackendPollDeadline(_: *Driver, backend: Backend, now: std.Io.Clock.Timestamp, deadline: *std.Io.Clock.Timestamp) void {
+        const interval = backend.pollIntervalNs() orelse return;
+        const candidate = now.addDuration(.{ .clock = .awake, .raw = .{ .nanoseconds = interval } });
+        if (std.Io.Clock.Timestamp.compare(candidate, .lt, deadline.*)) deadline.* = candidate;
     }
 };
 
@@ -430,6 +499,16 @@ test "driver enforces service and graceful shutdown order" {
     try std.testing.expect(driver.finished());
 }
 
+test "shutdown retries a busy checkpoint without requiring another IO completion" {
+    var state: TestState = .{ .requested = true, .checkpoint_busy_once = true };
+    var server = testServer(&state);
+    server.limits.shutdown_timeout_ns = 40 * std.time.ns_per_ms;
+    try run(server);
+    try std.testing.expectEqual(@as(usize, 1), state.ticks);
+    try std.testing.expectEqual(@as(usize, 2), state.checkpoints);
+    try std.testing.expectEqual(@as(usize, 1), state.closes);
+}
+
 test "driver rejects zero limits and surfaces backend failure" {
     var state: TestState = .{};
     var invalid = testServer(&state);
@@ -441,8 +520,32 @@ test "driver rejects zero limits and surfaces backend failure" {
     invalid.limits.immediate_pass_limit = 0;
     try std.testing.expectError(error.InvalidLimits, Driver.init(invalid, &waits));
 
+    invalid = testServer(&state);
+    invalid.limits.tick_deadline_ns = 0;
+    try std.testing.expectError(error.InvalidLimits, Driver.init(invalid, &waits));
+
     state.backend_failed = true;
     try std.testing.expectError(error.TransportFailed, run(testServer(&state)));
+}
+
+test "fatal partial tick disconnects without another tick or checkpoint" {
+    var state: TestState = .{ .tick_failed = true };
+    try std.testing.expectError(error.CoreFailed, run(testServer(&state)));
+    try std.testing.expectEqual(@as(usize, 1), state.ticks);
+    try std.testing.expectEqual(@as(usize, 1), state.fatal_disconnects);
+    try std.testing.expectEqual(@as(usize, 0), state.checkpoints);
+    try std.testing.expectEqual(@as(usize, 0), state.closes);
+    try std.testing.expectEqual(@as(usize, 0), state.detachments);
+}
+
+test "test profiles can turn the absolute tick deadline into a failure" {
+    var state: TestState = .{};
+    var server = testServer(&state);
+    server.limits.tick_deadline_ns = 1;
+    server.limits.fail_on_tick_deadline = true;
+    var waits = Coalescing.init(server.io);
+    var driver = try Driver.init(server, &waits);
+    try std.testing.expectError(error.CoreTickDeadlineExceeded, driver.pass());
 }
 
 test "only a full completion drain requests an immediate pass" {
@@ -529,12 +632,15 @@ test "driver reports a busy reloader once without retrying it" {
 const TestState = struct {
     requested: bool = false,
     backend_failed: bool = false,
+    tick_failed: bool = false,
+    fatal_disconnects: usize = 0,
     completion_count: usize = 0,
     ticks: usize = 0,
     services: usize = 0,
     stop_accepting: usize = 0,
     detachments: usize = 0,
     checkpoints: usize = 0,
+    checkpoint_busy_once: bool = false,
     closes: usize = 0,
     control_slot: ?u16 = null,
     tick_control_slot: ?u16 = null,
@@ -625,6 +731,10 @@ fn testDetachments(context: *anyopaque) Outcome {
     testState(context).detachments += 1;
     return .ok;
 }
+fn testFatalDisconnect(context: *anyopaque) Progress {
+    testState(context).fatal_disconnects += 1;
+    return .complete;
+}
 
 const test_sessions_vtable: Sessions.VTable = .{
     .advance = testAdvance,
@@ -632,6 +742,7 @@ const test_sessions_vtable: Sessions.VTable = .{
     .finish_input = testFinishInput,
     .stop_accepting = testStopAccepting,
     .stage_final_detachments = testDetachments,
+    .fatal_disconnect = testFatalDisconnect,
     .shutdown_progress = testCompleteProgress,
 };
 
@@ -642,6 +753,7 @@ fn testService(context: *anyopaque) Outcome {
 fn testTick(context: *anyopaque) Outcome {
     const state = testState(context);
     state.ticks += 1;
+    if (state.tick_failed) return .failed;
     if (state.control_slot == null) {
         state.control_slot = state.tick_control_slot;
         state.tick_control_slot = null;
@@ -649,7 +761,12 @@ fn testTick(context: *anyopaque) Outcome {
     return .ok;
 }
 fn testCheckpoint(context: *anyopaque) CheckpointCapture {
-    testState(context).checkpoints += 1;
+    const state = testState(context);
+    state.checkpoints += 1;
+    if (state.checkpoint_busy_once) {
+        state.checkpoint_busy_once = false;
+        return .busy;
+    }
     return .captured;
 }
 fn testClose(context: *anyopaque, _: i128) Outcome {

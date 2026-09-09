@@ -494,6 +494,16 @@ pub fn PlayCodec(comptime ProtocolModule: type, comptime _: type) type {
             return inventory.rest;
         }
 
+        pub fn encodeOpenWindow(buffer: []u8, window_id: i32, inventory_type: i32, title: []const u8) ![]u8 {
+            var component_buffer: [256]u8 = undefined;
+            const component = try writeTextComponent(&component_buffer, title);
+            const packet = ProtocolModule.play.toClient.write(buffer);
+            const open = try packet.open_window();
+            const window = try open.windowId(window_id);
+            const inventory = try window.inventoryType(inventory_type);
+            return (try inventory.windowTitle(component)).finish();
+        }
+
         pub fn encodeCloseWindow(buffer: []u8, window_id: i32) ![]u8 {
             const packet = ProtocolModule.play.toClient.write(buffer);
             const close = try packet.close_window();
@@ -879,13 +889,25 @@ pub fn PlayCodec(comptime ProtocolModule: type, comptime _: type) type {
             return (try disconnect.reason(reason)).finish();
         }
 
-        pub fn encodeEncryptionRequest(buffer: []u8, public_key: []const u8, verify_token: []const u8) ![]u8 {
+        pub fn encodeShutdownDisconnect(buffer: []u8, phase: @import("core_exchange.zig").Phase) ![]u8 {
+            const text = "Server stopped after an internal error. Please reconnect later.";
+            if (phase == .login) return encodeLoginDisconnect(buffer, "{\"text\":\"" ++ text ++ "\"}");
+            var component_buffer: [256]u8 = undefined;
+            const component = try writeTextComponent(&component_buffer, text);
+            return switch (phase) {
+                .configuration => (try (try ProtocolModule.configuration.toClient.write(buffer).disconnect()).reason(component)).finish(),
+                .play => (try (try ProtocolModule.play.toClient.write(buffer).kick_disconnect()).reason(component)).finish(),
+                else => error.InvalidPhase,
+            };
+        }
+
+        pub fn encodeEncryptionRequest(buffer: []u8, request: @import("session_api.zig").Authentication.EncryptionRequest) ![]u8 {
             const packet = ProtocolModule.login.toClient.write(buffer);
             const begin = try packet.encryption_begin();
             const server_id = try begin.serverId("");
-            const key = try server_id.publicKey(public_key);
-            const token = try key.verifyToken(verify_token);
-            return (try token.shouldAuthenticate(false)).finish();
+            const key = try server_id.publicKey(request.public_key);
+            const token = try key.verifyToken(request.verify_token);
+            return (try token.shouldAuthenticate(request.authenticate)).finish();
         }
 
         pub fn encodeSetCompression(buffer: []u8, threshold: i32) ![]u8 {
@@ -1338,6 +1360,9 @@ fn testPlayOutputCodec(comptime ProtocolModule: type, comptime WireCodec: type, 
     rest = try protocol_support.write_u8(rest, 0);
     rest = try protocol_support.write_u8(rest, 0);
     _ = try ProtocolModule.play.toClient.read(bytes[0 .. bytes.len - rest.len]).name();
+
+    const opened = try WireCodec.encodeOpenWindow(bytes, 1, 13, "Crafting");
+    _ = try ProtocolModule.play.toClient.read(opened).name();
 
     const commands = try WireCodec.encodeDeclareCommands(bytes, &.{
         .{ .name = "gamemode", .alternatives = &.{ "survival", "creative", "adventure", "spectator" } },

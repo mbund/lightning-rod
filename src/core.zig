@@ -3,6 +3,8 @@ const server = @import("core/server.zig");
 
 pub const Configuration = composition.Configuration;
 pub const Memory = composition.Memory;
+pub const TickScratch = @import("tick_arena.zig").Arena;
+pub const Composition = composition.Composition;
 
 pub fn Server(comptime Selections: type) type {
     return server.Server(Selections);

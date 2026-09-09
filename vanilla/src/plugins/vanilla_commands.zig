@@ -93,7 +93,7 @@ pub const Commands = struct {
         const name = words.next() orelse return gamemodeUsage(outputs, entry.sender);
         if (words.next() != null) return gamemodeUsage(outputs, entry.sender);
         const mode = parseGamemode(name) orelse return outputs.system(entry.sender, "Unknown gamemode", .{});
-        players.records[entry.sender].gamemode = mode;
+        players.setGameMode(entry.sender, mode);
         outputs.gamemode_changed(.{ .slot = entry.sender, .value = mode });
         outputs.system(entry.sender, "Set own game mode to {s}", .{@tagName(mode)});
     }

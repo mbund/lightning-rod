@@ -21,6 +21,7 @@ pub const PlayerState = enum {
     login,
     configuration,
     play,
+    disconnecting,
 };
 
 pub const GameMode = enum(u8) {
@@ -102,6 +103,7 @@ pub const CorePlayer = struct {
     teleport_epoch: u64 = 0,
     next_teleport_id: i32 = 1,
     pending_teleport_id: i32 = 0,
+    presentation_ready: bool = false,
     client_loaded: bool = false,
     selected_hotbar_slot: u4 = 0,
     on_ground: bool = false,
@@ -123,6 +125,25 @@ pub const CorePlayer = struct {
     }
 };
 
+/// Canonical offline-player storage.  The concrete vanilla persistence plugin
+/// binds this during initialization; Players keeps only connected records.
+pub const SavedPlayerLoadError = error{ StorageUnavailable, StorageCorrupt };
+pub const SavedPlayerSaveError = error{ StorageUnavailable, StorageCorrupt };
+pub const SavedPlayerStorage = struct {
+    context: *anyopaque,
+    load_fn: *const fn (*anyopaque, u128, []const u8, *CorePlayer) SavedPlayerLoadError!bool,
+    save_fn: *const fn (*anyopaque, std.Io, *const CorePlayer) SavedPlayerSaveError!void,
+
+    /// `client_uuid` is zero only for legacy clients without an authenticated
+    /// identity. Storage may use a name alias only in that case.
+    fn load(self: SavedPlayerStorage, client_uuid: u128, name: []const u8, output: *CorePlayer) SavedPlayerLoadError!bool {
+        return self.load_fn(self.context, client_uuid, name, output);
+    }
+    fn save(self: SavedPlayerStorage, io: std.Io, player: *const CorePlayer) SavedPlayerSaveError!void {
+        return self.save_fn(self.context, io, player);
+    }
+};
+
 pub const Players = struct {
     pub const id = "lightning_rod:players";
     pub const Dependencies = struct {
@@ -133,15 +154,12 @@ pub const Players = struct {
         initial_world: world_identity.Key,
         maximum_connections: usize = 80,
         maximum_players: usize = 64,
-        maximum_saved_players: usize = 256,
 
         pub fn validate(self: Configuration) !void {
             if (self.maximum_connections == 0 or self.maximum_connections > std.math.maxInt(u16))
                 return error.InvalidConnectionCapacity;
             if (self.maximum_players == 0 or self.maximum_players > self.maximum_connections)
                 return error.InvalidPlayerCapacity;
-            if (self.maximum_saved_players == 0 or self.maximum_saved_players > std.math.maxInt(u16))
-                return error.InvalidSavedPlayerCapacity;
         }
     };
 
@@ -152,8 +170,7 @@ pub const Players = struct {
     active_slots: []u16 = &.{},
     active_positions: []u16 = &.{},
     active_count: usize = 0,
-    saved: []CorePlayer = &.{},
-    saved_count: usize = 0,
+    saved_storage: ?SavedPlayerStorage = null,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies, configuration: Configuration) !*Players {
         try configuration.validate();
@@ -164,15 +181,26 @@ pub const Players = struct {
         self.session_generations = try preallocated.alloc(u64, allocator, configuration.maximum_connections);
         self.active_slots = try preallocated.alloc(u16, allocator, configuration.maximum_players);
         self.active_positions = try preallocated.alloc(u16, allocator, configuration.maximum_connections);
-        self.saved = try preallocated.alloc(CorePlayer, allocator, configuration.maximum_saved_players);
         @memset(self.records, .{});
         @memset(self.session_generations, 0);
-        @memset(self.saved, .{});
         return self;
+    }
+
+    pub fn bindSavedPlayerStorage(self: *Players, storage: SavedPlayerStorage) !void {
+        if (self.saved_storage != null) return error.SavedPlayerStorageBound;
+        self.saved_storage = storage;
     }
 
     pub inline fn activeSlots(self: *const Players) []const u16 {
         return self.active_slots[0..self.active_count];
+    }
+
+    pub fn activeCount(self: *const Players) usize {
+        return self.active_count;
+    }
+
+    pub fn playerCapacity(self: *const Players) usize {
+        return self.active_slots.len;
     }
 
     pub fn session(self: *const Players, slot: u16) ?Session {
@@ -321,7 +349,6 @@ pub const Players = struct {
     pub fn reset(self: *Players) void {
         @memset(self.records, .{});
         self.active_count = 0;
-        self.saved_count = 0;
     }
 
     pub fn beginConnection(
@@ -346,10 +373,6 @@ pub const Players = struct {
         self.records[slot] = .{};
     }
 
-    pub fn hasSaved(self: *const Players, uuid: u128, username: []const u8) bool {
-        return self.findSaved(uuid, username) != null;
-    }
-
     pub fn transition(self: *Players, slot: u16, state: PlayerState) void {
         std.debug.assert(slot < self.records.len);
         const previous = self.records[slot].state;
@@ -371,10 +394,9 @@ pub const Players = struct {
         const player = &self.records[slot];
         const entity_id = player.entity_id;
         const uuid = if (client_uuid != 0) client_uuid else random.random.uuid_for(slot);
-        const restored = if (self.findSaved(uuid, username)) |saved_index| restored: {
-            player.* = self.saved[saved_index];
-            break :restored true;
-        } else false;
+        var restored_player: CorePlayer = undefined;
+        const restored = try (self.saved_storage orelse return error.StorageUnavailable).load(client_uuid, username, &restored_player);
+        if (restored) player.* = restored_player;
         if (restored) {
             if (self.deps.worlds.getConst(player.world) == null) return error.StaleWorldHandle;
         } else {
@@ -393,13 +415,13 @@ pub const Players = struct {
         player.last_attack_item_id = 0;
         player.sneaking = false;
         player.sprinting = false;
+        player.presentation_ready = false;
         player.client_loaded = false;
         player.pending_teleport_id = 0;
         if (player.next_teleport_id <= 0) player.next_teleport_id = 1;
         @memcpy(player.name[0..username.len], username);
         player.name_len = username.len;
         player.state = .login;
-        try self.savePlayer(slot);
         return if (restored) .restored_player else .new_player;
     }
 
@@ -410,45 +432,31 @@ pub const Players = struct {
         }
     }
 
-    pub fn saveActive(self: *Players) !void {
-        for (self.activeSlots()) |slot| try self.savePlayer(slot);
-    }
-
-    pub fn saveAll(self: *Players) !void {
-        for (self.records, 0..) |player, slot| {
-            if (player.state != .free and player.name_len != 0)
-                try self.savePlayer(@intCast(slot));
-        }
-    }
-
-    pub fn savePlayer(self: *Players, slot: u16) !void {
+    /// Stages the canonical player record. Callers may release the bounded
+    /// slot only after this succeeds.
+    pub fn persistDisconnect(self: *Players, io: std.Io, slot: u16) SavedPlayerSaveError!void {
+        self.assertSlot(slot);
         const player = &self.records[slot];
-        if (player.state == .free or player.name_len == 0 or !world_identity.valid(player.world)) return;
-        const index = self.findSaved(player.uuid, player.name_slice()) orelse index: {
-            if (self.saved_count == self.saved.len) return error.SavedPlayerCapacity;
-            defer self.saved_count += 1;
-            break :index self.saved_count;
-        };
-        self.saved[index] = player.*;
-        self.saved[index].state = .free;
-        self.saved[index].entity_id = 0;
-        self.saved[index].sneaking = false;
-        self.saved[index].sprinting = false;
+        if (player.state != .free and player.name_len != 0 and world_identity.valid(player.world))
+            try (self.saved_storage orelse return error.StorageUnavailable).save(io, player);
     }
 
-    pub fn tick(self: *Players, _: std.mem.Allocator) void {
-        self.processLeft();
+    /// Makes a player unavailable to admission and simulation while the
+    /// lifecycle tick finishes returning cursor and container items.
+    pub fn beginDisconnect(self: *Players, slot: u16) void {
+        self.assertSlot(slot);
+        const player = &self.records[slot];
+        if (player.state == .play) self.removeActive(slot);
+        std.debug.assert(player.state != .free);
+        player.state = .disconnecting;
     }
 
-    fn processLeft(self: *Players) void {
-        for (self.deps.events.left.values) |event| {
-            const slot: usize = event.slot;
-            std.debug.assert(slot < self.records.len);
-            self.savePlayer(@intCast(slot)) catch
-                @panic("failed to save disconnected player");
-            if (self.records[slot].state == .play) self.removeActive(@intCast(slot));
-            self.records[slot] = .{};
-        }
+    /// Called after every left-event consumer has normalized the player's
+    /// inventory and persistence has accepted the canonical record.
+    pub fn releaseDisconnected(self: *Players, slot: u16) void {
+        self.assertSlot(slot);
+        std.debug.assert(self.records[slot].state == .disconnecting);
+        self.records[slot] = .{};
     }
 
     fn removeActive(self: *Players, slot: u16) void {
@@ -468,13 +476,6 @@ pub const Players = struct {
         self.active_count += 1;
     }
 
-    fn findSaved(self: *const Players, uuid: u128, name: []const u8) ?usize {
-        for (self.saved[0..self.saved_count], 0..) |saved, index| {
-            if (uuid != 0 and saved.uuid == uuid) return index;
-            if (std.mem.eql(u8, saved.name_slice(), name)) return index;
-        }
-        return null;
-    }
 };
 
 pub const maximum_name_bytes = limits.username_bytes;
@@ -518,16 +519,12 @@ pub const Containers = struct {
         return open.state_id;
     }
 
-    pub fn tick(self: *Containers, _: std.mem.Allocator) void {
-        self.processLeft();
-    }
-
-    fn processLeft(self: *Containers) void {
-        for (self.deps.events.left.values) |event| {
-            self.drags[event.slot] = .{};
-            self.open[event.slot] = .{};
-            self.counters[event.slot] = 0;
-        }
+    /// Container cleanup follows the inventory left-event handler, which may
+    /// move a crafting grid back into the player's persisted inventory.
+    pub fn releaseDisconnected(self: *Containers, slot: u16) void {
+        self.drags[slot] = .{};
+        self.open[slot] = .{};
+        self.counters[slot] = 0;
     }
 };
 
@@ -704,7 +701,7 @@ fn validStateTransition(previous: PlayerState, next: PlayerState) bool {
         .status => false,
         .login => next == .configuration,
         .configuration => next == .play,
-        .play => false,
+        .play, .disconnecting => false,
     };
 }
 
@@ -721,15 +718,19 @@ const test_world_description = world_store.Description{
 };
 
 fn createTestPlayers(allocator: std.mem.Allocator, lifecycle: *player_lifecycle.Events) !*Players {
-    const worlds = try world_store.Worlds.init(allocator, .{ .initial = &.{test_world_description} });
+    const worlds = try world_store.Worlds.init(allocator, .{ .initial = &.{test_world_description}, .maximum_worlds = 1 });
     return Players.init(allocator, .{ .events = lifecycle, .worlds = worlds }, .{ .initial_world = test_world_key });
 }
+fn testSavedLoad(_: *anyopaque, _: u128, _: []const u8, _: *CorePlayer) SavedPlayerLoadError!bool {
+    return false;
+}
+fn testSavedSave(_: *anyopaque, _: std.Io, _: *const CorePlayer) SavedPlayerSaveError!void {}
 
 test "new player admission resolves the current initial world generation" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lifecycle: player_lifecycle.Events = .{};
-    const worlds = try world_store.Worlds.init(arena.allocator(), .{ .initial = &.{test_world_description} });
+    const worlds = try world_store.Worlds.init(arena.allocator(), .{ .initial = &.{test_world_description}, .maximum_worlds = 1 });
     const first = worlds.find(test_world_key).?;
     try worlds.destroy(first);
     const current = try worlds.add(test_world_description);
@@ -739,6 +740,7 @@ test "new player admission resolves the current initial world generation" {
         .{ .events = &lifecycle, .worlds = worlds },
         .{ .initial_world = test_world_key },
     );
+    try players.bindSavedPlayerStorage(.{ .context = players, .load_fn = testSavedLoad, .save_fn = testSavedSave });
     var random: world_random.Random = .{};
     random.random = world_random.DeterministicRng.init(11);
     players.beginConnection(&random, 0);
@@ -757,60 +759,65 @@ test "player session generation changes when a connection slot is reused" {
     players.beginConnection(&random, 0);
     const first = players.session(0).?;
     try std.testing.expect(first.generation != 0);
-    const event = player_lifecycle.PlayerLeft{
-        .slot = 0,
-        .connection = .{ .index = 0, .generation = 1 },
-        .reason = .peer_closed,
-    };
-    lifecycle.left = .{ .values = &.{event} };
-    players.tick(std.testing.allocator);
+    players.discardConnection(0);
     players.beginConnection(&random, 0);
     try std.testing.expect(!players.validSession(first));
     try std.testing.expect(!players.session(0).?.eql(first));
 }
 
-test "player disconnect saves normalized state before releasing the slot" {
+test "saved-player callback keeps inventory through UUID rename and failed disconnect" {
+    const Memory = struct {
+        player: ?CorePlayer = null,
+        fail_save: bool = false,
+        fn load(raw: *anyopaque, uuid: u128, name: []const u8, output: *CorePlayer) SavedPlayerLoadError!bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const saved = self.player orelse return false;
+            if (uuid != 0 and saved.uuid != uuid) return false;
+            if (uuid == 0 and !std.mem.eql(u8, saved.name_slice(), name)) return false;
+            output.* = saved;
+            return true;
+        }
+        fn save(raw: *anyopaque, _: std.Io, player: *const CorePlayer) SavedPlayerSaveError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail_save) return error.StorageUnavailable;
+            self.player = player.*;
+        }
+    };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lifecycle: player_lifecycle.Events = .{};
     const players = try createTestPlayers(arena.allocator(), &lifecycle);
+    var memory: Memory = .{};
+    try players.bindSavedPlayerStorage(.{ .context = &memory, .load_fn = Memory.load, .save_fn = Memory.save });
     var random: world_random.Random = .{};
-    random.random = world_random.DeterministicRng.init(23);
+    random.random = world_random.DeterministicRng.init(29);
     players.beginConnection(&random, 0);
-    _ = try players.login(&random, 0, "saved-player", 99);
+    _ = try players.login(&random, 0, "old-name", 77);
     players.transition(0, .configuration);
     players.transition(0, .play);
     players.records[0].world = .{ .index = 0, .generation = 1 };
     players.records[0].hotbar[4] = stackForItem(oak_planks_item_id, 7);
-    const event = player_lifecycle.PlayerLeft{
-        .slot = 0,
-        .connection = .{ .index = 0, .generation = 1 },
-        .reason = .peer_closed,
-    };
-    lifecycle.left = .{ .values = &.{event} };
-    players.tick(std.testing.allocator);
-    try std.testing.expectEqual(PlayerState.free, players.records[0].state);
-    try std.testing.expectEqual(@as(usize, 1), players.saved_count);
-    try std.testing.expectEqual(@as(u8, 7), players.saved[0].hotbar[4].count);
-}
-
-test "replacement connection restores the persisted player by UUID and name" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lifecycle: player_lifecycle.Events = .{};
-    const players = try createTestPlayers(arena.allocator(), &lifecycle);
-    var random: world_random.Random = .{};
-    random.random = world_random.DeterministicRng.init(29);
-    players.beginConnection(&random, 0);
-    _ = try players.login(&random, 0, "restore", 77);
-    players.transition(0, .configuration);
-    players.transition(0, .play);
-    players.records[0].world = .{ .index = 0, .generation = 1 };
-    players.records[0].position = .{ .x = 9, .y = 72, .z = -4 };
-    try players.savePlayer(0);
-    players.discardConnection(0);
-    try std.testing.expect(players.hasSaved(77, "restore"));
+    try players.persistDisconnect(std.testing.io, 0);
     players.beginConnection(&random, 1);
-    try std.testing.expectEqual(LoginDisposition.restored_player, try players.login(&random, 1, "restore", 77));
-    try std.testing.expectEqual(@as(f64, 9), players.records[1].position.x);
+    try std.testing.expectEqual(LoginDisposition.new_player, try players.login(&random, 1, "old-name", 78));
+    players.discardConnection(1);
+    players.beginConnection(&random, 1);
+    try std.testing.expectEqual(LoginDisposition.restored_player, try players.login(&random, 1, "new-name", 77));
+    try std.testing.expectEqual(@as(u8, 7), players.records[1].hotbar[4].count);
+    try std.testing.expectEqualStrings("new-name", players.records[1].name_slice());
+    players.transition(1, .configuration);
+    players.transition(1, .play);
+    memory.fail_save = true;
+    try std.testing.expectError(error.StorageUnavailable, players.persistDisconnect(std.testing.io, 1));
+    try std.testing.expectEqual(PlayerState.play, players.records[1].state);
+    try std.testing.expectEqual(@as(u8, 7), players.records[1].hotbar[4].count);
+
+    // Clients without a stable UUID receive a session-generated UUID. Their
+    // same-name return must still use the alias record rather than becoming a
+    // fresh player.
+    memory.fail_save = false;
+    try players.persistDisconnect(std.testing.io, 1);
+    players.beginConnection(&random, 2);
+    try std.testing.expectEqual(LoginDisposition.restored_player, try players.login(&random, 2, "new-name", 0));
+    try std.testing.expectEqual(@as(u8, 7), players.records[2].hotbar[4].count);
 }

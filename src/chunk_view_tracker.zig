@@ -20,7 +20,7 @@ pub const Order = struct {
             .grid_radius = grid_radius,
             .diameter = diameter,
         };
-        initializeRadialIndices(result.indices, radius, grid_radius);
+        initializeStreamOrder(result.indices, radius, grid_radius);
         return result;
     }
 };
@@ -119,6 +119,10 @@ pub const Tracker = struct {
             return false;
         const index = self.viewIndex(pos, self.center) orelse return false;
         return self.bit(index) and !self.dirtyBit(index);
+    }
+
+    pub fn wants(self: *const Tracker, pos: geometry.ChunkPos) bool {
+        return inView(self.stream_radius, pos, self.center) and !self.ready(pos);
     }
 
     pub fn mark(self: *Tracker, pos: geometry.ChunkPos) void {
@@ -357,49 +361,35 @@ fn viewChunkCount(radius: i32, grid_radius: i32) usize {
     return result;
 }
 
-fn initializeRadialIndices(indices: []u16, radius: i32, grid_radius: i32) void {
+fn initializeStreamOrder(indices: []u16, radius: i32, grid_radius: i32) void {
     const diameter: usize = @intCast(grid_radius * 2 + 1);
-    var count: usize = 0;
-    for (0..diameter * diameter) |index| {
-        const position = relativePosition(@intCast(index), grid_radius);
-        if (!inView(radius, position, .{ .x = 0, .z = 0 })) continue;
-        indices[count] = @intCast(index);
-        count += 1;
+    var count: usize = 1;
+    indices[0] = @intCast(@as(usize, @intCast(grid_radius)) * diameter + @as(usize, @intCast(grid_radius)));
+    var x: i32 = 0;
+    var z: i32 = 0;
+    var leg: i32 = 1;
+    const directions = [_]geometry.ChunkPos{
+        .{ .x = 1, .z = 0 },
+        .{ .x = 0, .z = 1 },
+        .{ .x = -1, .z = 0 },
+        .{ .x = 0, .z = -1 },
+    };
+    while (count < indices.len) {
+        for (directions, 0..) |direction, direction_index| {
+            for (0..@as(usize, @intCast(leg))) |_| {
+                x += direction.x;
+                z += direction.z;
+                if (@abs(x) <= grid_radius and @abs(z) <= grid_radius and
+                    inView(radius, .{ .x = x, .z = z }, .{ .x = 0, .z = 0 }))
+                {
+                    indices[count] = @intCast(@as(usize, @intCast(z + grid_radius)) * diameter + @as(usize, @intCast(x + grid_radius)));
+                    count += 1;
+                    if (count == indices.len) return;
+                }
+            }
+            if (direction_index & 1 == 1) leg += 1;
+        }
     }
-    std.debug.assert(count == indices.len);
-
-    var root = indices.len / 2;
-    while (root != 0) {
-        root -= 1;
-        siftDown(indices, root, indices.len, grid_radius);
-    }
-    var end = indices.len;
-    while (end > 1) {
-        end -= 1;
-        std.mem.swap(u16, &indices[0], &indices[end]);
-        siftDown(indices, 0, end, grid_radius);
-    }
-}
-
-fn siftDown(indices: []u16, start: usize, end: usize, radius: i32) void {
-    var root = start;
-    while (root * 2 + 1 < end) {
-        var child = root * 2 + 1;
-        if (child + 1 < end and radialLess(indices[child], indices[child + 1], radius)) child += 1;
-        if (!radialLess(indices[root], indices[child], radius)) return;
-        std.mem.swap(u16, &indices[root], &indices[child]);
-        root = child;
-    }
-}
-
-fn radialLess(left_index: u16, right_index: u16, radius: i32) bool {
-    const left = relativePosition(left_index, radius);
-    const right = relativePosition(right_index, radius);
-    const left_distance = left.x * left.x + left.z * left.z;
-    const right_distance = right.x * right.x + right.z * right.z;
-    if (left_distance != right_distance) return left_distance < right_distance;
-    if (left.z != right.z) return left.z < right.z;
-    return left.x < right.x;
 }
 
 fn relativePosition(index: u16, radius: i32) geometry.ChunkPos {

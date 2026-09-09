@@ -24,6 +24,8 @@ pub const PendingDeath = struct {
     generation: u16,
     attacker_slot: u16,
     cause: Cause,
+    deferred: bool = false,
+    extension_complete: bool = false,
 };
 
 pub const LivingDeaths = struct {
@@ -72,6 +74,24 @@ pub const LivingDeaths = struct {
         return self.pending[0..self.count];
     }
 
+    pub fn deferDeath(self: *LivingDeaths, index: u16, generation: u16) void {
+        for (self.pending[0..self.count]) |*death| {
+            if (death.index == index and death.generation == generation) {
+                death.deferred = true;
+                return;
+            }
+        }
+    }
+
+    pub fn completeExtension(self: *LivingDeaths, index: u16, generation: u16) void {
+        for (self.pending[0..self.count]) |*death| {
+            if (death.index == index and death.generation == generation) {
+                death.extension_complete = true;
+                return;
+            }
+        }
+    }
+
     pub fn process(
         self: *LivingDeaths,
         random: *world_random.Random,
@@ -80,15 +100,28 @@ pub const LivingDeaths = struct {
         items: *entity_store.ItemEntities,
         outputs: *Packets,
     ) void {
-        const pending = self.pending[0..self.count];
+        const pending_count = self.count;
         self.count = 0;
-        for (pending) |death| {
+        for (self.pending[0..pending_count]) |death| {
             const entities = &living.entities;
             if (!entities.active[death.index] or
                 entities.generations[death.index] != death.generation or
                 !entities.dead[death.index]) continue;
+            if (death.deferred) {
+                var retained = death;
+                retained.deferred = false;
+                entities.death_time[death.index] = 0;
+                self.pending[self.count] = retained;
+                self.count += 1;
+                continue;
+            }
             _ = death.cause;
-            dropLoot(random, blocks, living, items, outputs, death.index);
+            if (!commitLoot(random, blocks, living, items, outputs, death.index)) {
+                entities.death_time[death.index] = 0;
+                self.pending[self.count] = death;
+                self.count += 1;
+                continue;
+            }
             outputs.living_died(.{
                 .index = death.index,
                 .attacker_slot = if (death.attacker_slot == no_attacker) 0 else death.attacker_slot,
@@ -96,8 +129,8 @@ pub const LivingDeaths = struct {
         }
     }
 
-    pub fn spawnStack(random: *world_random.Random, blocks: *block_store.Blocks, living: *entity_store.LivingEntities, items: *entity_store.ItemEntities, outputs: *Packets, entity_index: u16, position: geometry.Vec3, stack: player_store.HotbarStack) void {
-        if (stack.isEmpty() or items.active_count == items.active.len) return;
+    pub fn spawnStack(random: *world_random.Random, blocks: *block_store.Blocks, living: *entity_store.LivingEntities, items: *entity_store.ItemEntities, outputs: *Packets, entity_index: u16, position: geometry.Vec3, stack: player_store.HotbarStack) bool {
+        if (stack.isEmpty()) return true;
         const item_index = items.spawn(
             random,
             blocks,
@@ -106,38 +139,61 @@ pub const LivingDeaths = struct {
             .{},
             stack,
             entity_store.block_drop_pickup_delay_ticks,
-        ) catch return;
+        ) catch return false;
         outputs.item_spawned(@intCast(item_index));
+        return true;
     }
 
-    fn dropRandomCount(random: *world_random.Random, blocks: *block_store.Blocks, living: *entity_store.LivingEntities, items: *entity_store.ItemEntities, outputs: *Packets, position: geometry.Vec3, item_id: i32, minimum: u8, maximum: u8, entity_index: u16) void {
-        const count = minimum + @as(u8, @intCast(living.entities.random[entity_index].nextIntBounded(maximum - minimum + 1)));
-        spawnStack(random, blocks, living, items, outputs, entity_index, position, player_store.stackForItem(item_id, count));
-    }
-
-    fn dropLoot(random: *world_random.Random, blocks: *block_store.Blocks, living: *entity_store.LivingEntities, items: *entity_store.ItemEntities, outputs: *Packets, entity_index: u16) void {
+    fn commitLoot(random: *world_random.Random, blocks: *block_store.Blocks, living: *entity_store.LivingEntities, items: *entity_store.ItemEntities, outputs: *Packets, entity_index: u16) bool {
         const entities = &living.entities;
         const position = geometry.Vec3{ .x = entities.position_x[entity_index], .y = entities.position_y[entity_index], .z = entities.position_z[entity_index] };
+        var entity_random = entities.random[entity_index];
+        var specifications: [8]entity_store.ItemEntities.Spawn = undefined;
+        var count: usize = 0;
         switch (entities.entity_types[entity_index]) {
-            .zombie => dropRandomCount(random, blocks, living, items, outputs, position, registry.item_rotten_flesh_id, 0, 2, entity_index),
+            .zombie => appendRandomDrop(&specifications, &count, entities.worlds[entity_index], position, &entity_random, registry.item_rotten_flesh_id, 0, 2),
             .cow => {
-                dropRandomCount(random, blocks, living, items, outputs, position, registry.item_leather_id, 0, 2, entity_index);
-                dropRandomCount(random, blocks, living, items, outputs, position, if (entities.fire_ticks[entity_index] > 0) registry.item_cooked_beef_id else registry.item_beef_id, 1, 3, entity_index);
+                appendRandomDrop(&specifications, &count, entities.worlds[entity_index], position, &entity_random, registry.item_leather_id, 0, 2);
+                appendRandomDrop(&specifications, &count, entities.worlds[entity_index], position, &entity_random, if (entities.fire_ticks[entity_index] > 0) registry.item_cooked_beef_id else registry.item_beef_id, 1, 3);
             },
-            .pig => dropRandomCount(random, blocks, living, items, outputs, position, if (entities.fire_ticks[entity_index] > 0) registry.item_cooked_porkchop_id else registry.item_porkchop_id, 1, 3, entity_index),
+            .pig => appendRandomDrop(&specifications, &count, entities.worlds[entity_index], position, &entity_random, if (entities.fire_ticks[entity_index] > 0) registry.item_cooked_porkchop_id else registry.item_porkchop_id, 1, 3),
             else => {},
         }
         for (0..6) |equipment_slot| {
             const equipped = entities.equipment[entity_index][equipment_slot];
             if (equipped.count == 0) continue;
             const chance: f32 = if (entities.equipment_drop_guaranteed[entity_index][equipment_slot]) 2 else 0.085;
-            if (entities.random[entity_index].nextFloat() >= chance) continue;
+            if (entity_random.nextFloat() >= chance) continue;
             var stack = player_store.stackForItem(equipped.item_id, equipped.count);
             stack.damage = equipped.damage;
-            spawnStack(random, blocks, living, items, outputs, entity_index, position, stack);
+            appendDrop(&specifications, &count, entities.worlds[entity_index], position, stack);
         }
+        for (specifications[0..count]) |specification| items.validateSpawn(blocks, specification) catch return false;
+        var reservation = items.reserve(count) catch return false;
+        var indices: [8]usize = undefined;
+        items.commitReserved(&reservation, random, specifications[0..count], indices[0..count]);
+        entities.random[entity_index] = entity_random;
+        for (indices[0..count]) |index| outputs.item_spawned(@intCast(index));
+        return true;
     }
 };
+
+fn appendRandomDrop(destination: []entity_store.ItemEntities.Spawn, count: *usize, world: lightning_rod.world_identity.Handle, position: geometry.Vec3, random: anytype, item_id: i32, minimum: u8, maximum: u8) void {
+    const amount = minimum + @as(u8, @intCast(random.nextIntBounded(maximum - minimum + 1)));
+    appendDrop(destination, count, world, position, player_store.stackForItem(item_id, amount));
+}
+
+fn appendDrop(destination: []entity_store.ItemEntities.Spawn, count: *usize, world: lightning_rod.world_identity.Handle, position: geometry.Vec3, stack: player_store.HotbarStack) void {
+    if (stack.isEmpty()) return;
+    std.debug.assert(count.* < destination.len);
+    destination[count.*] = .{
+        .world = world,
+        .position = position,
+        .stack = stack,
+        .pickup_delay_ticks = entity_store.block_drop_pickup_delay_ticks,
+    };
+    count.* += 1;
+}
 
 pub const LivingDeathLoot = struct {
     pub const id = "minecraft:living_death_loot";

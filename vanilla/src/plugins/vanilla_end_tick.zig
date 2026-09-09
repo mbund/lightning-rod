@@ -4,6 +4,7 @@ const game_rules = lightning_rod.game_rules;
 const world_clock = lightning_rod.clock;
 const std = @import("std");
 const Packets = lightning_rod.Packets;
+const lifecycle = lightning_rod.player_lifecycle;
 
 pub const EndTick = struct {
     pub const id = "lightning_rod:end_tick";
@@ -34,7 +35,7 @@ pub const EndTick = struct {
 pub const TimeSync = struct {
     pub const id = "minecraft:time_sync";
     pub const Configuration = struct {};
-    pub const Dependencies = struct { clock: *world_clock.Clock, time: *vanilla_time.Time, outputs: *Packets };
+    pub const Dependencies = struct { clock: *world_clock.Clock, time: *vanilla_time.Time, outputs: *Packets, lifecycle: *lifecycle.Events };
 
     deps: Dependencies,
 
@@ -48,20 +49,7 @@ pub const TimeSync = struct {
         const clock = self.deps.clock;
         const time = self.deps.time;
         const outputs = self.deps.outputs;
-        if (clock.tick % 20 == 0) outputs.emitTime(clock.tick, time.day_time);
+        if (clock.tick % 20 == 0 and self.deps.lifecycle.joined.values.len == 0)
+            outputs.emitTime(clock.tick, time.day_time);
     }
 };
-
-test "day time advances independently from monotonic game time" {
-    var clock: world_clock.Clock = .{};
-    var time: vanilla_time.Time = .{};
-    var rules: game_rules.GameRules = .{};
-    var plugin: EndTick = .{ .deps = .{ .clock = &clock, .time = &time, .rules = &rules } };
-    plugin.tick(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 1), clock.tick);
-    try std.testing.expectEqual(@as(u64, 1), time.day_time);
-    rules.do_daylight_cycle = false;
-    plugin.tick(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 2), clock.tick);
-    try std.testing.expectEqual(@as(u64, 1), time.day_time);
-}

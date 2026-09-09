@@ -1,5 +1,4 @@
 const std = @import("std");
-const server_key = @import("server_key.zig");
 
 const rsa_bytes = 128;
 const rsa_bits = rsa_bytes * 8;
@@ -10,7 +9,21 @@ const PrimeInt = u512;
 const PrimeWide = u1024;
 const public_exponent: u32 = 65537;
 
+pub const testing = struct {
+    pub fn identity() Identity {
+        return Identity.init(@import("testing/server_key.zig").privateKey(Identity.PrivateKey));
+    }
+};
+
 pub const Identity = struct {
+    pub const PrivateKey = struct {
+        modulus: RsaInt,
+        p: PrimeInt,
+        q: PrimeInt,
+        dp: PrimeInt,
+        dq: PrimeInt,
+        q_inverse: PrimeInt,
+    };
     modulus: RsaInt,
     p: PrimeInt,
     q: PrimeInt,
@@ -19,15 +32,15 @@ pub const Identity = struct {
     q_inverse: PrimeInt,
     public_key_der: [162]u8,
 
-    pub fn init() Identity {
+    pub fn init(key: PrivateKey) Identity {
         return .{
-            .modulus = server_key.modulus,
-            .p = server_key.p,
-            .q = server_key.q,
-            .dp = server_key.dp,
-            .dq = server_key.dq,
-            .q_inverse = server_key.q_inverse,
-            .public_key_der = encodePublicKey(server_key.modulus),
+            .modulus = key.modulus,
+            .p = key.p,
+            .q = key.q,
+            .dp = key.dp,
+            .dq = key.dq,
+            .q_inverse = key.q_inverse,
+            .public_key_der = encodePublicKey(key.modulus),
         };
     }
 
@@ -268,7 +281,7 @@ test "CFB8 continuation reconstructs the exact stream state" {
 }
 
 test "RSA public key uses the Minecraft 1024-bit DER shape" {
-    var identity = Identity.init();
+    var identity = testing.identity();
     defer identity.deinit();
     try std.testing.expectEqual(@as(usize, 162), identity.publicKey().len);
     try std.testing.expectEqualSlices(u8, &.{ 0x30, 0x81, 0x9f }, identity.publicKey()[0..3]);

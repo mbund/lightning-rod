@@ -1,6 +1,8 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const worldguard = @import("worldguard");
+pub const chat = @import("chat.zig");
+pub const roster = @import("roster.zig");
 
 const storage_magic = "LRSKY003";
 const persistence_key = "state";
@@ -119,10 +121,7 @@ pub const Skyblock = struct {
     }
 
     fn restore(self: *Skyblock) !void {
-        const loaded = self.deps.persistence.load(persistence_key, self.persistence_buffer) catch |err| switch (err) {
-            error.ReadFailed => return,
-            else => return err,
-        };
+        const loaded = try self.deps.persistence.load(persistence_key, self.persistence_buffer);
         switch (loaded) {
             .missing => {},
             .value => |length| {
@@ -190,7 +189,7 @@ pub const Skyblock = struct {
         if (self.island_count == self.islands.len) return error.IslandCapacity;
         if (owner_name.len > lightning_rod.players.maximum_name_bytes) return error.InvalidOwnerName;
         const index = self.island_count;
-        const key = self.uniqueIslandKey(owner);
+        const key = try self.uniqueIslandKey(owner);
         const handle = try self.createIslandWorld(key);
         const island = &self.islands[index];
         island.* = .{
@@ -237,14 +236,14 @@ pub const Skyblock = struct {
         }
     }
 
-    fn uniqueIslandKey(self: *const Skyblock, owner: u128) lightning_rod.world_identity.Key {
+    fn uniqueIslandKey(self: *const Skyblock, owner: u128) !lightning_rod.world_identity.Key {
         var value = owner ^ 0x736b79626c6f636b5f69736c616e6400;
         for (0..self.config.maximum_key_attempts) |attempt| {
             const key = lightning_rod.world_identity.Key{ .value = value };
             if (self.deps.worlds.find(key) == null) return key;
             value +%= @as(u128, attempt) + 0x9e3779b97f4a7c15;
         }
-        @panic("configured island key attempts exhausted");
+        return error.IslandKeyCapacity;
     }
 
     fn createIslandWorld(self: *Skyblock, key: lightning_rod.world_identity.Key) !lightning_rod.world_identity.Handle {
@@ -254,6 +253,7 @@ pub const Skyblock = struct {
     }
 
     fn buildHub(self: *Skyblock, world: lightning_rod.world_identity.Handle) !void {
+        self.ensurePlatformChunks(world);
         var z: i32 = -8;
         while (z <= 8) : (z += 1) {
             var x: i32 = -8;
@@ -264,6 +264,7 @@ pub const Skyblock = struct {
     }
 
     fn buildIsland(self: *Skyblock, island: Island) !void {
+        self.ensurePlatformChunks(island.handle);
         var z: i32 = -2;
         while (z <= 2) : (z += 1) {
             var x: i32 = -2;
@@ -274,6 +275,15 @@ pub const Skyblock = struct {
             }
         }
         try self.buildTree(island);
+    }
+
+    fn ensurePlatformChunks(self: *Skyblock, world: lightning_rod.world_identity.Handle) void {
+        var z: i32 = -1;
+        while (z <= 0) : (z += 1) {
+            var x: i32 = -1;
+            while (x <= 0) : (x += 1)
+                _ = self.deps.blocks.materializeGeneratedChunk(world, .{ .x = x, .z = z }, 0);
+        }
     }
 
     fn buildTree(self: *Skyblock, island: Island) !void {

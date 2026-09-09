@@ -144,7 +144,7 @@ test "status JSON is bounded, escaped, and revised only for content changes" {
         .spawn_x = 0,
         .spawn_y = 64,
         .spawn_z = 0,
-    }} });
+    }}, .maximum_worlds = 1 });
     const players = try lightning_rod.players.Players.init(arena.allocator(), .{ .events = events, .worlds = worlds }, .{ .initial_world = .{ .value = 1 }, .maximum_connections = 2, .maximum_players = 2 });
     var session_settings = lightning_rod.sessions.Sessions.init(772);
     const status = try Status.init(arena.allocator(), .{ .players = players, .sessions = &session_settings }, .{ .motd = "A \"quoted\" line\n", .maximum_json_bytes = 256 });

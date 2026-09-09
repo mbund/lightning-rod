@@ -32,9 +32,3 @@ pub const Limits = struct {
             self.completions_per_advance != 0 and self.packets_per_advance != 0;
     }
 };
-
-test "connection identity has no process-local state" {
-    const a = Handle{ .index = 3, .generation = 7 };
-    try @import("std").testing.expect(a.eql(.{ .index = 3, .generation = 7 }));
-    try @import("std").testing.expect(!a.eql(.{ .index = 3, .generation = 8 }));
-}

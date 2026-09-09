@@ -76,7 +76,7 @@ const Trade = struct {
             if (!stack.isEmpty()) return error.InventoryFull;
             remaining -= count;
         }
-        try work.economy.withdraw(player.uuid, price);
+        try work.economy.ledger.withdraw(player.uuid, price);
         player.hotbar = hotbar;
         player.main_inventory = inventory;
     }
@@ -89,7 +89,7 @@ const Trade = struct {
         removeItem(&inventory, item_id, &remaining);
         if (remaining != 0) return error.InsufficientItems;
         const proceeds = try std.math.mul(u128, unit_price, amount);
-        try work.economy.deposit(player.uuid, player.name_slice(), proceeds);
+        try work.economy.ledger.deposit(player.uuid, player.name_slice(), proceeds);
         player.hotbar = hotbar;
         player.main_inventory = inventory;
     }

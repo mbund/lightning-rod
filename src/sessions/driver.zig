@@ -2,6 +2,106 @@ const api = @import("../session_api.zig");
 const core_exchange = @import("../core_exchange.zig");
 const contracts = @import("../runtime/contracts.zig");
 const exchange = @import("../transport_exchange.zig");
+const std = @import("std");
+
+test "egress fanout preserves sparse mixed protocols and batches never bypass egress" {
+    const Player = @import("../world/players.zig").Session;
+    const Fixture = struct {
+        fallback: bool,
+        encodes: usize = 0,
+        groups: usize = 0,
+        flushes: usize = 0,
+        received: [6]u8 = @splat(0),
+        const versions = [_]?i32{ 772, null, 772, 773, 772, 773 };
+
+        fn protocol(_: *const anyopaque, player: Player) ?api.Protocol {
+            return .{ .value = versions[player.slot] orelse return null };
+        }
+        fn connection(_: *anyopaque, player: Player) ?exchange.Connection {
+            if (player.slot == 4) return null;
+            return .{ .index = 1_000 + @as(u32, player.slot), .generation = @intCast(player.generation) };
+        }
+        fn encode(raw: *const anyopaque, version: api.Protocol, bytes: []u8) ?api.EncodedPacket {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.encodes += 1;
+            std.mem.writeInt(i32, bytes[0..4], version.value, .little);
+            return .{ .payload = bytes[0..4] };
+        }
+        fn stage(raw: *anyopaque, output: core_exchange.Output) api.PacketAdmission {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const slot = output.connection.index - 1_000;
+            std.debug.assert(output.protocol.value == versions[slot].?);
+            std.debug.assert(std.mem.readInt(i32, output.payload[0..4], .little) == versions[slot].?);
+            self.received[slot] += 1;
+            return .accepted;
+        }
+        fn stageFanout(raw: *anyopaque, targets: []const core_exchange.OutputTarget, payload: []const u8) api.PacketAdmission {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.groups += 1;
+            for (targets) |target| {
+                std.debug.assert(target.protocol.eql(targets[0].protocol));
+                _ = stage(raw, .{ .connection = target.connection, .protocol = target.protocol, .phase = target.phase, .class = target.class, .policy = target.policy, .payload = payload });
+            }
+            return .accepted;
+        }
+        fn encodeOne(raw: *anyopaque, target: core_exchange.OutputTarget, encoder: api.PacketEncoder) api.PacketAdmission {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fallback) return .wrong_protocol;
+            var bytes: [4]u8 = undefined;
+            const encoded = encoder.encode(encoder.context, target.protocol, &bytes).?;
+            return stage(raw, .{ .connection = target.connection, .protocol = target.protocol, .phase = target.phase, .class = target.class, .policy = target.policy, .payload = encoded.payload });
+        }
+        fn encodeFanout(raw: *anyopaque, targets: []const core_exchange.OutputTarget, encoder: api.PacketEncoder) api.PacketAdmission {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fallback) return .wrong_protocol;
+            var bytes: [4]u8 = undefined;
+            const encoded = encoder.encode(encoder.context, targets[0].protocol, &bytes).?;
+            return stageFanout(raw, targets, encoded.payload);
+        }
+        fn flush(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.flushes += 1;
+        }
+    };
+    for ([_]bool{ false, true }) |fallback| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var fixture = Fixture{ .fallback = fallback };
+        var core_vtable: CoreBoundary.VTable = undefined;
+        core_vtable.player_protocol = Fixture.protocol;
+        core_vtable.connection_for_player = Fixture.connection;
+        var egress_vtable: core_exchange.Egress.VTable = undefined;
+        egress_vtable.stage = Fixture.stage;
+        egress_vtable.stage_fanout = Fixture.stageFanout;
+        egress_vtable.encode = Fixture.encodeOne;
+        egress_vtable.encode_fanout = Fixture.encodeFanout;
+        egress_vtable.flush = Fixture.flush;
+        var driver: Driver = undefined;
+        driver.core = .{ .context = &fixture, .vtable = &core_vtable };
+        driver.egress = .{ .context = &fixture, .vtable = &egress_vtable };
+        var recipients: [6]Player = undefined;
+        for (&recipients, 0..) |*player, index| player.* = .{ .slot = @intCast(index), .generation = 8 };
+        const encoder = api.PacketEncoder{ .context = &fixture, .phase = .play, .maximum_payload_bytes = 4, .encode = Fixture.encode };
+        const runtime = driver.packetRuntime();
+        const result = try runtime.vtable.fanout(runtime.context, arena.allocator(), &recipients, encoder, .other, .reliable);
+        try std.testing.expectEqual(@as(usize, 4), result.delivered.len);
+        try std.testing.expectEqualSlices(Player, recipients[1..2], result.wrong_protocol);
+        try std.testing.expectEqualSlices(Player, recipients[4..5], result.closed);
+        try std.testing.expectEqual(@as(usize, 2), fixture.encodes);
+        try std.testing.expectEqual(@as(usize, 2), fixture.groups);
+        try std.testing.expectEqualSlices(u8, &.{ 1, 0, 1, 1, 0, 1 }, &fixture.received);
+        const items = [_]api.PacketBatchItem{
+            .{ .recipient = recipients[0], .encoder = encoder },
+            .{ .recipient = recipients[1], .encoder = encoder },
+            .{ .recipient = recipients[4], .encoder = encoder },
+        };
+        const batch = try runtime.vtable.batch(runtime.context, arena.allocator(), &items, .other, .reliable);
+        try std.testing.expectEqualSlices(api.PacketAdmission, &.{ .accepted, .wrong_protocol, .closed }, batch.values);
+        try std.testing.expectEqual(@as(usize, 3), fixture.encodes);
+        runtime.flush();
+        try std.testing.expectEqual(@as(usize, 1), fixture.flushes);
+    }
+}
 
 pub const Clock = struct {
     context: *const anyopaque,
@@ -34,9 +134,10 @@ pub const CoreBoundary = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        publish_input: *const fn (*anyopaque, exchange.CoreInput) bool,
-        release_input: *const fn (*anyopaque) void,
+        drain_input: *const fn (*anyopaque) bool,
+        finish_input: *const fn (*anyopaque) void,
         player_session: *const fn (*anyopaque, u16) ?@import("../world/players.zig").Session,
+        player_protocol: *const fn (*const anyopaque, @import("../world/players.zig").Session) ?api.Protocol,
         connection_for_player: *const fn (*anyopaque, @import("../world/players.zig").Session) ?exchange.Connection,
         packet_views: *const fn (*const anyopaque) []const core_exchange.PacketView,
         claim_packet: *const fn (*anyopaque, core_exchange.PacketView) api.Claim,
@@ -49,7 +150,10 @@ pub const Driver = struct {
     clock: Clock,
     status: Status,
     core: CoreBoundary,
+    egress: ?core_exchange.Egress = null,
+    ingress: ?core_exchange.Ingress = null,
     input_published: bool = false,
+    output_scratch: [@import("../minecraft_session.zig").Codec.max_packet_bytes]u8 = undefined,
 
     pub fn init(
         sessions: api.Sessions,
@@ -63,6 +167,15 @@ pub const Driver = struct {
 
     pub fn runtime(self: *Driver) contracts.Sessions {
         return .{ .context = self, .vtable = &runtime_vtable, .readiness = self.sessions.readiness };
+    }
+
+    pub fn bindEgress(self: *Driver, value: core_exchange.Egress) void {
+        std.debug.assert(self.egress == null);
+        self.egress = value;
+    }
+    pub fn bindIngress(self: *Driver, value: core_exchange.Ingress) void {
+        std.debug.assert(self.ingress == null);
+        self.ingress = value;
     }
 
     pub fn packetRuntime(self: *Driver) api.Runtime {
@@ -82,8 +195,9 @@ pub const Driver = struct {
     fn takeInput(raw: *anyopaque) contracts.Outcome {
         const self = from(raw);
         if (self.input_published) return .failed;
-        const accepted = self.core.vtable.publish_input(self.core.context, self.sessions.takeInput());
-        if (!accepted) return .failed;
+        const ingress = self.ingress orelse return .failed;
+        const accepted = ingress.stage(self.sessions.takeInput());
+        if (!accepted or !self.core.vtable.drain_input(self.core.context)) return .failed;
         self.input_published = true;
         return .ok;
     }
@@ -91,7 +205,7 @@ pub const Driver = struct {
     fn finishInput(raw: *anyopaque) contracts.Outcome {
         const self = from(raw);
         if (!self.input_published) return .failed;
-        self.core.vtable.release_input(self.core.context);
+        self.core.vtable.finish_input(self.core.context);
         self.sessions.finishInput(self.transport);
         self.input_published = false;
         return .ok;
@@ -102,8 +216,9 @@ pub const Driver = struct {
         return self.core.vtable.player_session(self.core.context, slot);
     }
 
-    fn playerProtocol(raw: *anyopaque, player: @import("../world/players.zig").Session) ?api.Protocol {
-        const self = from(raw);
+    fn playerProtocol(raw: *const anyopaque, player: @import("../world/players.zig").Session) ?api.Protocol {
+        const self: *const Driver = @ptrCast(@alignCast(raw));
+        if (self.egress != null) return self.core.vtable.player_protocol(self.core.context, player);
         const connection = self.core.vtable.connection_for_player(self.core.context, player) orelse return null;
         return self.sessions.protocol(connection);
     }
@@ -126,12 +241,22 @@ pub const Driver = struct {
 
     fn sendOne(raw: *anyopaque, player: @import("../world/players.zig").Session, encoder: api.PacketEncoder, class: api.DeliveryClass, policy: api.DeliveryPolicy) api.PacketAdmission {
         const self = from(raw);
+        if (self.egress != null) {
+            var bridge = self.packetBridge();
+            const value = bridge.runtime();
+            return value.vtable.send_one(value.context, player, encoder, class, policy);
+        }
         const connection = self.core.vtable.connection_for_player(self.core.context, player) orelse return .closed;
         return self.sessions.sendOne(self.transport, connection, encoder, class, policy);
     }
 
     fn batch(raw: *anyopaque, temporary: @import("std").mem.Allocator, items: []const api.PacketBatchItem, class: api.DeliveryClass, policy: api.DeliveryPolicy) @import("std").mem.Allocator.Error!api.FanoutAdmissions {
         const self = from(raw);
+        if (self.egress != null) {
+            var bridge = self.packetBridge();
+            const value = bridge.runtime();
+            return value.vtable.batch(value.context, temporary, items, class, policy);
+        }
         const wire = try temporary.alloc(api.WirePacketBatchItem, items.len);
         for (items, wire) |item, *entry| {
             entry.* = .{
@@ -145,11 +270,33 @@ pub const Driver = struct {
 
     fn fanout(raw: *anyopaque, temporary: @import("std").mem.Allocator, players: []const @import("../world/players.zig").Session, encoder: api.PacketEncoder, class: api.DeliveryClass, policy: api.DeliveryPolicy) @import("std").mem.Allocator.Error!api.FanoutResult {
         const self = from(raw);
+        if (self.egress != null) {
+            var bridge = self.packetBridge();
+            const value = bridge.runtime();
+            return value.vtable.fanout(value.context, temporary, players, encoder, class, policy);
+        }
         const connections = try temporary.alloc(exchange.Connection, players.len);
         for (players, connections) |player, *connection|
             connection.* = self.core.vtable.connection_for_player(self.core.context, player) orelse .{ .index = @import("std").math.maxInt(u32), .generation = 0 };
         const admissions = try self.sessions.fanout(self.transport, connections, encoder, class, policy, temporary);
         return api.fanoutResult(temporary, players, admissions.values);
+    }
+
+    fn packetBridge(self: *Driver) @import("packet_bridge.zig").Bridge {
+        return @import("packet_bridge.zig").Bridge.init(self.core, self.egress.?, .{
+            .context = self,
+            .state = connectionOutputState,
+        }, &self.output_scratch);
+    }
+
+    fn connectionOutputState(raw: *const anyopaque, connection: exchange.Connection) ?api.OutputState {
+        const self: *const Driver = @ptrCast(@alignCast(raw));
+        return self.sessions.outputState(self.transport, connection);
+    }
+
+    fn flush(raw: *anyopaque) void {
+        const self = from(raw);
+        if (self.egress) |egress| egress.flush() else self.transport.vtable.submit(self.transport.context);
     }
 
     fn stopAccepting(raw: *anyopaque) contracts.Outcome {
@@ -169,12 +316,21 @@ pub const Driver = struct {
         };
     }
 
+    fn fatalDisconnect(raw: *anyopaque) contracts.Progress {
+        const self = from(raw);
+        return switch (self.sessions.fatalDisconnect(self.transport)) {
+            .pending => .pending,
+            .complete => .complete,
+        };
+    }
+
     const runtime_vtable: contracts.Sessions.VTable = .{
         .advance = advance,
         .take_input = takeInput,
         .finish_input = finishInput,
         .stop_accepting = stopAccepting,
         .stage_final_detachments = stageFinalDetachments,
+        .fatal_disconnect = fatalDisconnect,
         .shutdown_progress = shutdownProgress,
     };
 
@@ -187,6 +343,7 @@ pub const Driver = struct {
         .send_one = sendOne,
         .batch = batch,
         .fanout = fanout,
+        .flush = flush,
     };
 };
 
@@ -245,15 +402,24 @@ test "driver preserves both exchange ownership contracts" {
             state(raw).session_calls += 1;
             return .complete;
         }
-        fn publish(raw: *anyopaque, _: exchange.CoreInput) bool {
+        fn fatal(raw: *anyopaque, _: exchange.Transport) api.ShutdownProgress {
+            return progress(raw);
+        }
+        fn drain(raw: *anyopaque) bool {
             state(raw).published_inputs += 1;
             return true;
         }
         fn releaseInput(raw: *anyopaque) void {
             state(raw).released_inputs += 1;
         }
+        fn ingress(_: *anyopaque, _: core_exchange.CoreInput) bool {
+            return true;
+        }
         fn player(_: *anyopaque, slot: u16) ?@import("../world/players.zig").Session {
             return .{ .slot = slot, .generation = 1 };
+        }
+        fn playerProtocol(_: *const anyopaque, _: @import("../world/players.zig").Session) ?api.Protocol {
+            return .{ .value = 772 };
         }
         fn connection(_: *anyopaque, player_value: @import("../world/players.zig").Session) ?exchange.Connection {
             return .{ .index = player_value.slot, .generation = @intCast(player_value.generation) };
@@ -302,6 +468,7 @@ test "driver preserves both exchange ownership contracts" {
         .fanout = Stub.fanout,
         .stop_accepting = Stub.lifecycle,
         .stage_final_detachments = Stub.lifecycle,
+        .fatal_disconnect = Stub.fatal,
         .shutdown_progress = Stub.progress,
     } };
     const transport = exchange.Transport{ .context = &state, .vtable = &.{
@@ -315,14 +482,16 @@ test "driver preserves both exchange ownership contracts" {
         .submit = Stub.submit,
     } };
     const core = CoreBoundary{ .context = &state, .vtable = &.{
-        .publish_input = Stub.publish,
-        .release_input = Stub.releaseInput,
+        .drain_input = Stub.drain,
+        .finish_input = Stub.releaseInput,
         .player_session = Stub.player,
+        .player_protocol = Stub.playerProtocol,
         .connection_for_player = Stub.connection,
         .packet_views = Stub.views,
         .claim_packet = Stub.claim,
     } };
     var driver = Driver.init(sessions, transport, .{ .context = &state, .vtable = &.{ .now_ns = Stub.now } }, .{ .context = &state, .vtable = &.{ .snapshot = Stub.snapshot } }, core);
+    driver.bindIngress(.{ .context = &state, .vtable = &.{ .stage = Stub.ingress } });
     const runtime = driver.runtime();
 
     try testing.expectEqual(contracts.Outcome.ok, runtime.advance());

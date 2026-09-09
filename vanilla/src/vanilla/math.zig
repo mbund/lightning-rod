@@ -1,18 +1,19 @@
 const std = @import("std");
 
-var sine_table: [65536]f32 = undefined;
-var sine_table_initialized = false;
+const sine_table = makeSineTable();
 const arcsine_tables = makeArcsineTables();
 const arcsine_table = arcsine_tables[0];
 const cosine_of_arcsine_table = arcsine_tables[1];
 const rounder_256ths: f64 = @bitCast(@as(u64, 4805340802404319232));
 
-pub fn initialize() void {
-    for (&sine_table, 0..) |*value, index| {
+fn makeSineTable() [65536]f32 {
+    @setEvalBranchQuota(200000);
+    var table: [65536]f32 = undefined;
+    for (&table, 0..) |*value, index| {
         const radians = @as(f64, @floatFromInt(index)) * std.math.pi * 2.0 / 65536.0;
         value.* = @floatCast(@sin(radians));
     }
-    sine_table_initialized = true;
+    return table;
 }
 
 fn makeArcsineTables() struct { [257]f64, [257]f64 } {
@@ -29,13 +30,11 @@ fn makeArcsineTables() struct { [257]f64, [257]f64 } {
 }
 
 pub inline fn sin(value: f32) f32 {
-    std.debug.assert(sine_table_initialized);
     const scaled: i32 = @intFromFloat(value * @as(f32, 10430.378));
     return sine_table[@as(u16, @truncate(@as(u32, @bitCast(scaled))))];
 }
 
 pub inline fn cos(value: f32) f32 {
-    std.debug.assert(sine_table_initialized);
     const scaled: i32 = @intFromFloat(value * @as(f32, 10430.378) + @as(f32, 16384));
     return sine_table[@as(u16, @truncate(@as(u32, @bitCast(scaled))))];
 }
@@ -102,7 +101,6 @@ inline fn fastInverseSqrt(value: f64) f64 {
 }
 
 test "movement yaw and lookup trigonometry match the first Vanilla westward chase tick" {
-    initialize();
     const angle = atan2(0, -1);
     try std.testing.expectEqual(@as(u64, 0x400921fb54442d18), @as(u64, @bitCast(angle)));
     const degrees = angle * 57.2957763671875;
@@ -112,4 +110,12 @@ test "movement yaw and lookup trigonometry match the first Vanilla westward chas
     const radians = yaw * @as(f32, 0.017453292);
     try std.testing.expectEqual(@as(u32, 0x3f800000), @as(u32, @bitCast(sin(radians))));
     try std.testing.expectEqual(@as(u32, 0x38c90fdb), @as(u32, @bitCast(cos(radians))));
+}
+
+test "immutable lookup table matches runtime generation bit for bit" {
+    for (sine_table, 0..) |value, index| {
+        const radians = @as(f64, @floatFromInt(index)) * std.math.pi * 2.0 / 65536.0;
+        const expected: f32 = @floatCast(@sin(radians));
+        try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(value)));
+    }
 }

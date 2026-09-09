@@ -15,7 +15,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &imports,
     });
+    const test_filter = b.option([]const u8, "test-filter", "Run matching Linux tests");
     const tests = b.addTest(.{
+        .filters = if (test_filter) |filter| &.{filter} else &.{},
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/test.zig"),
             .target = target,
@@ -24,6 +26,20 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.step("test", "Run Linux host tests").dependOn(&b.addRunArtifact(tests).step);
+    if (target.result.os.tag == .linux) {
+        const persistence_benchmark = b.addExecutable(.{
+            .name = "lightning_rod_persistence_benchmark",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/persistence_benchmark.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &imports,
+            }),
+        });
+        const run_persistence_benchmark = b.addRunArtifact(persistence_benchmark);
+        b.step("benchmark-persistence", "Profile batched local persistence reads")
+            .dependOn(&run_persistence_benchmark.step);
+    }
     if (target.result.os.tag == .linux) {
         const integration = b.addExecutable(.{
             .name = "lightning_rod_reexec_integration",

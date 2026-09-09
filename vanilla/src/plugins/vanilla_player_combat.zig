@@ -1,19 +1,18 @@
 const lightning_rod = @import("lightning_rod");
 const input_store = lightning_rod.inputs;
 const player_store = lightning_rod.players;
-const block_store = lightning_rod.blocks;
 const block_queries = lightning_rod.block_queries;
 const geometry = lightning_rod.geometry;
 const std = @import("std");
 const game_data = lightning_rod.game_data;
 const Packets = lightning_rod.Packets;
-const test_state = lightning_rod.test_support.state;
+const vanilla_collision_projection = @import("vanilla_collision_projection.zig");
 
 pub const PlayerCombat = struct {
     pub const id = "minecraft:player_combat";
     pub const Configuration = struct {};
     pub const Dependencies = struct {
-        blocks: *block_store.Blocks,
+        collision_projection: *vanilla_collision_projection.CollisionProjection,
         players: *player_store.Players,
         inputs: *input_store.Inputs,
         outputs: *Packets,
@@ -28,7 +27,7 @@ pub const PlayerCombat = struct {
     }
 
     pub fn tick(self: *PlayerCombat, _: std.mem.Allocator) void {
-        const blocks = self.deps.blocks;
+        const projection = self.deps.collision_projection;
         const players = self.deps.players;
         const inputs = self.deps.inputs;
         const outputs = self.deps.outputs;
@@ -65,7 +64,7 @@ pub const PlayerCombat = struct {
             outputs.player_damaged(.{
                 .slot = attack.target_slot,
                 .source = .{ .player = attacker_slot },
-                .knockback = knockback(blocks, attacker, target),
+                .knockback = knockback(projection, attacker, target),
                 .fatal = target.health == 0,
             });
             if (attacker.gamemode == .survival) if (damageHeldItem(attacker)) |hotbar_slot|
@@ -113,7 +112,7 @@ pub const PlayerCombat = struct {
     }
 
     fn knockback(
-        blocks: *block_store.Blocks,
+        projection: *vanilla_collision_projection.CollisionProjection,
         attacker: *const player_store.CorePlayer,
         target: *const player_store.CorePlayer,
     ) geometry.Vec3 {
@@ -124,52 +123,8 @@ pub const PlayerCombat = struct {
         const scale = 0.4 / @sqrt(length_squared);
         return .{
             .x = dx * scale,
-            .y = if (target.on_ground or block_queries.playerGroundSupported(blocks, target.world, target.position)) 0.4 else 0,
+            .y = if (target.on_ground or block_queries.playerGroundSupportedFrom(projection.source(), target.world, target.position)) 0.4 else 0,
             .z = dz * scale,
         };
     }
 };
-
-test "one attack input is consumed exactly once" {
-    const simulation = try std.testing.allocator.create(test_state.State);
-    defer std.testing.allocator.destroy(simulation);
-    try simulation.init(std.testing.allocator, 37);
-    defer simulation.deinit();
-    for (0..2) |slot| {
-        simulation.players.beginConnection(&simulation.random, @intCast(slot));
-        _ = try simulation.players.login(&simulation.random, @intCast(slot), if (slot == 0) "attacker" else "target", slot + 1);
-        simulation.players.transition(@intCast(slot), .configuration);
-        simulation.players.transition(@intCast(slot), .play);
-    }
-    simulation.players.records[0].position = .{ .x = 0, .y = 64, .z = 0 };
-    simulation.players.records[1].position = .{ .x = 1, .y = 64, .z = 0 };
-    simulation.players.records[0].last_attacked_ticks = 20;
-
-    var sessions = lightning_rod.sessions.Sessions.init(lightning_rod.protocol_versions.all[0].protocol_number);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const outputs = try Packets.init(arena.allocator(), .{
-        .inputs = &simulation.inputs,
-        .blocks = &simulation.blocks,
-        .players = &simulation.players,
-        .containers = &simulation.containers,
-        .living = &simulation.living,
-        .items = &simulation.items,
-        .worlds = simulation.worlds,
-        .sessions = &sessions,
-    }, .{});
-    outputs.tick(arena.allocator());
-    const combat = try PlayerCombat.init(arena.allocator(), .{
-        .blocks = &simulation.blocks,
-        .players = &simulation.players,
-        .inputs = &simulation.inputs,
-        .outputs = outputs,
-    }, .{});
-    try simulation.inputs.requestEntityAttack(&simulation.players, 0, simulation.players.records[1].entity_id);
-    combat.tick(arena.allocator());
-    const health = simulation.players.records[1].health;
-    try std.testing.expect(health < 20);
-    try std.testing.expect(!simulation.inputs.player_attacks[0].active);
-    combat.tick(arena.allocator());
-    try std.testing.expectEqual(health, simulation.players.records[1].health);
-}

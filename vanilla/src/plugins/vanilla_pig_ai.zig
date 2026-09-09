@@ -9,7 +9,8 @@ const block_store = lightning_rod.blocks;
 const world_random = lightning_rod.random;
 const registry = lightning_rod.registry_data;
 const Packets = lightning_rod.Packets;
-const active_chunks = @import("../vanilla/active_chunks.zig");
+const simulation_admission = @import("../vanilla/simulation_admission.zig");
+const vanilla_collision_projection = @import("vanilla_collision_projection.zig");
 
 const pig_food = [_]i32{
     registry.item_carrot_id,
@@ -31,8 +32,9 @@ pub const PigAi = struct {
     pub const Dependencies = struct {
         random: *world_random.Random,
         blocks: *block_store.Blocks,
+        collision_projection: *vanilla_collision_projection.CollisionProjection,
         players: *player_store.Players,
-        active: *active_chunks.ActiveChunks,
+        active: *simulation_admission.SimulationAdmission,
         living: *entity_store.LivingEntities,
         inputs: *input_store.Inputs,
         packets: *Packets,
@@ -56,7 +58,7 @@ pub const PigAi = struct {
         const inputs = self.deps.inputs;
         const packets = self.deps.packets;
         self.processInteractions(players, living, inputs, packets);
-        var context = goals.initContext(&self.state, blocks, players, self.deps.active, living);
+        var context = goals.initContext(&self.state, blocks, self.deps.collision_projection, players, self.deps.active, living);
         const entities = &living.entities;
         const count = entities.active_count;
         for (entities.active_indices[0..count]) |living_index| {
@@ -84,7 +86,7 @@ pub const PigAi = struct {
         const previous_pitch = entities.pitch[index];
         const previous_head_yaw = entities.head_yaw[index];
         goals.tickLifecycle(entities, index);
-        if (goals.isWater(context.blocks, entities, index) and entities.random[index].nextFloat() < 0.8)
+        if (goals.isWater(context, entities, index) and entities.random[index].nextFloat() < 0.8)
             entities.jump_requested[index] = true;
         if ((entities.age[index] & 1) == 0) self.tickGoals(context, random, packets, index);
         entities.jump_requested[index] = entities.jump_requested[index] or goals.tickNavigation(context.living, index);

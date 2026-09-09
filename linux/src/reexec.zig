@@ -318,3 +318,53 @@ pub fn Production(
         }
     };
 }
+
+pub fn ProductionWorker(comptime WorkerType: type, comptime maximum_arguments: usize) type {
+    const Execve = executor.Execve(maximum_arguments);
+    return struct {
+        const Self = @This();
+
+        worker: *WorkerType = undefined,
+        executor: Execve = undefined,
+        reloader: reload.Reloader = undefined,
+
+        pub const Configuration = struct {
+            worker: *WorkerType,
+            core: contracts.Core,
+            candidate: reload.Candidate,
+            candidate_fd: *?std.posix.fd_t,
+            arguments: []const [:0]const u8,
+            environment: [:null]const ?[*:0]const u8,
+            image: []u8,
+            continuation: []u8,
+        };
+
+        pub fn init(self: *Self, configuration: Configuration) void {
+            self.worker = configuration.worker;
+            self.executor = .{
+                .arguments = configuration.arguments,
+                .environment = configuration.environment,
+                .candidate_fd = configuration.candidate_fd,
+            };
+            self.reloader = .{
+                .candidate = configuration.candidate,
+                .core = configuration.core,
+                .sessions = self.worker.reloaderSessions(),
+                .transport = self.worker.reloaderTransport(),
+                .executor = self.executor.executor(),
+                .image = configuration.image,
+                .continuation = configuration.continuation,
+            };
+        }
+
+        pub fn operation(self: *Self) contracts.Reloader {
+            return self.reloader.operation();
+        }
+
+        pub fn restore(self: *Self, image: *Resume) Error!void {
+            defer image.close();
+            self.reloader.restoreConnections(image.bytes) catch return error.InvalidHandoff;
+            self.worker.transport.beginRestored() catch return error.InvalidHandoff;
+        }
+    };
+}

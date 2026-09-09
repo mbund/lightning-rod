@@ -1,33 +1,33 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const registry = lightning_rod.registry_data;
-const diagnostics = lightning_rod.diagnostics;
 const game_data = lightning_rod.game_data;
 const Packets = lightning_rod.Packets;
 const block_writer = lightning_rod.block_writer;
 const container_menu = lightning_rod.container_menu;
-const leaf_behavior = @import("../vanilla/leaf_behavior.zig");
 const geometry = lightning_rod.geometry;
 const block_store = lightning_rod.blocks;
-const entity_store = lightning_rod.entities;
 const input_store = lightning_rod.inputs;
 const player_store = lightning_rod.players;
 const world_clock = lightning_rod.clock;
-const world_random = lightning_rod.random;
-const vanilla_block_loot = @import("vanilla_block_loot.zig");
+const block_destruction = @import("vanilla_block_destruction.zig");
+const chests_plugin = @import("vanilla_chests.zig");
+const furnaces_plugin = @import("vanilla_furnaces.zig");
+const vanilla_collision_projection = @import("vanilla_collision_projection.zig");
 
 pub const Mining = struct {
     pub const id = "minecraft:mining";
     pub const Configuration = struct {};
     pub const Dependencies = struct {
         clock: *world_clock.Clock,
-        random: *world_random.Random,
         blocks: *block_store.Blocks,
+        collision_projection: *vanilla_collision_projection.CollisionProjection,
         players: *player_store.Players,
-        items: *entity_store.ItemEntities,
         inputs: *input_store.Inputs,
         containers: *player_store.Containers,
-        loot: *vanilla_block_loot.BlockLoot,
+        chests: *chests_plugin.Chests,
+        furnaces: *furnaces_plugin.Furnaces,
+        destruction: *block_destruction.BlockDestruction,
         outputs: *Packets,
     };
 
@@ -46,25 +46,19 @@ pub const Mining = struct {
 
     pub fn tick(self: *Mining, _: std.mem.Allocator) void {
         const clock = self.deps.clock;
-        const random = self.deps.random;
         const blocks = self.deps.blocks;
         const players = self.deps.players;
-        const items = self.deps.items;
         const inputs = self.deps.inputs;
         const containers = self.deps.containers;
-        const loot = self.deps.loot;
         const outputs = self.deps.outputs;
         const block_changes = BlockChanges.init(blocks, outputs);
         self.applyPendingDigActions(clock, blocks, players, inputs, outputs);
-        self.updateBlockDigs(blocks, players, inputs, outputs);
+        self.updateBlockDigs(clock, blocks, players, inputs, outputs);
         for (inputs.block_requests[0..inputs.block_request_count]) |request| {
             self.applyBlockRequest(
-                random,
                 blocks,
                 players,
-                items,
                 containers,
-                loot,
                 outputs,
                 block_changes,
                 request,
@@ -82,23 +76,13 @@ pub const Mining = struct {
         outputs: *Packets,
     ) void {
         for (players.activeSlots()) |slot| {
-            const pending = &inputs.dig_actions[slot];
-            const action = pending.*;
-            pending.* = .none;
-            switch (action) {
+            for (inputs.digActions(slot)) |action| switch (action) {
                 .none => {},
-                .cancel => self.cancelBlockDig(slot, outputs),
+                .cancel => |cancel| self.abortBlockDig(players, slot, cancel.pos, outputs),
                 .start => |start| self.beginBlockDig(clock, blocks, players, inputs, outputs, slot, start.pos, start.face, start.sequence),
-                .start_and_cancel => |start| {
-                    self.beginBlockDig(clock, blocks, players, inputs, outputs, slot, start.pos, start.face, start.sequence);
-                    self.cancelBlockDig(slot, outputs);
-                },
-                .start_and_finish => |start| {
-                    self.beginBlockDig(clock, blocks, players, inputs, outputs, slot, start.pos, start.face, start.sequence);
-                    self.finishBlockDig(clock, blocks, players, inputs, outputs, slot, start.pos, start.sequence);
-                },
                 .finish => |finish| self.finishBlockDig(clock, blocks, players, inputs, outputs, slot, finish.pos, finish.sequence),
-            }
+            };
+            inputs.clearDigActions(slot);
         }
     }
 
@@ -114,34 +98,44 @@ pub const Mining = struct {
         face: i32,
         sequence: i32,
     ) void {
-        self.cancelBlockDig(slot, outputs);
         const player = &players.records[slot];
         if (!canMine(player, pos)) return;
         const current = blocks.blockAt(player.world, pos);
         if (current == registry.block_air_default_state) return;
         if (player.gamemode == .creative) {
-            enqueueBlockRequest(inputs, .{
+            if (!enqueueBlockRequest(inputs, .{
                 .world = player.world,
                 .slot = slot,
                 .kind = .break_block,
                 .pos = pos,
                 .face = face,
                 .sequence = sequence,
-            });
+            })) outputs.block_correction(.{ .slot = slot, .pos = pos });
             return;
         }
-        const damage = game_data.blockDamageQ32(current, selectedHotbarStack(player).item_id);
-        const stage: i8 = @intCast(@min(@as(u64, 9), (damage * 10) >> 32));
-        self.progress[slot] = .{
-            .active = true,
-            .world = player.world,
-            .pos = pos,
-            .face = face,
-            .sequence = sequence,
-            .start_tick = clock.tick,
-            .damage_q32 = damage,
-            .last_stage = stage,
-        };
+        const damage = blockDamagePerTick(self.deps.collision_projection, player, current);
+        if (damage >= 1) {
+            if (!enqueueBlockRequest(inputs, .{
+                .world = player.world,
+                .slot = slot,
+                .kind = .break_block,
+                .pos = pos,
+                .face = face,
+                .sequence = sequence,
+            })) outputs.block_correction(.{ .slot = slot, .pos = pos });
+            return;
+        }
+        const stage = blockBreakStage(damage);
+        const progress = &self.progress[slot];
+        if (progress.mining) outputs.block_correction(.{ .slot = slot, .pos = progress.pos });
+        progress.mining = true;
+        progress.world = player.world;
+        progress.pos = pos;
+        progress.face = face;
+        progress.sequence = sequence;
+        progress.start_tick = clock.tick;
+        progress.damage = damage;
+        progress.last_stage = stage;
         outputs.block_break_animation(.{ .world = player.world, .slot = slot, .pos = pos, .stage = stage });
     }
 
@@ -158,25 +152,33 @@ pub const Mining = struct {
     ) void {
         const player = &players.records[slot];
         const progress = &self.progress[slot];
-        if (!progress.active or !progress.world.eql(player.world) or !geometry.sameBlock(progress.pos, pos)) return;
+        if (!progress.mining or !progress.world.eql(player.world) or !geometry.sameBlock(progress.pos, pos)) return;
         progress.sequence = sequence;
         const current = blocks.blockAt(player.world, pos);
         if (current == registry.block_air_default_state) return;
         const elapsed = clock.tick -% progress.start_tick + 1;
-        const damage = game_data.blockDamageQ32(current, selectedHotbarStack(player).item_id);
-        progress.damage_q32 = @min(@as(u64, 1) << 32, std.math.mul(u64, damage, elapsed) catch std.math.maxInt(u64));
-        if (progress.damage_q32 < (@as(u64, 7) << 32) / 10) {
-            progress.active = true;
-            progress.failed_to_mine = true;
+        const damage = blockDamagePerTick(self.deps.collision_projection, player, current) * @as(f32, @floatFromInt(elapsed));
+        progress.damage = damage;
+        if (damage < 0.7) {
+            if (!progress.failed_to_mine) {
+                progress.mining = false;
+                progress.failed_to_mine = true;
+                progress.failed_world = progress.world;
+                progress.failed_pos = progress.pos;
+                progress.failed_face = progress.face;
+                progress.failed_sequence = sequence;
+                progress.failed_start_tick = progress.start_tick;
+            }
             return;
         }
-        enqueueBlockRequest(inputs, blockRequest(player.world, slot, progress.*));
-        progress.* = .{};
+        if (!enqueueBlockRequest(inputs, blockRequest(progress.world, slot, progress.pos, progress.face, sequence))) return;
+        progress.mining = false;
         outputs.block_break_animation(.{ .world = player.world, .slot = slot, .pos = pos, .stage = -1 });
     }
 
     fn updateBlockDigs(
         self: *Mining,
+        clock: *const world_clock.Clock,
         blocks: *block_store.Blocks,
         players: *player_store.Players,
         inputs: *input_store.Inputs,
@@ -184,39 +186,56 @@ pub const Mining = struct {
     ) void {
         for (players.activeSlots()) |slot| {
             const progress = &self.progress[slot];
-            if (!progress.active) continue;
             const player = &players.records[slot];
+            if (progress.failed_to_mine) {
+                const current = blocks.blockAt(progress.failed_world, progress.failed_pos);
+                if (current == registry.block_air_default_state) {
+                    progress.failed_to_mine = false;
+                    continue;
+                }
+                const elapsed = clock.tick -% progress.failed_start_tick + 2;
+                const damage = blockDamagePerTick(self.deps.collision_projection, player, current) * @as(f32, @floatFromInt(elapsed));
+                progress.damage = damage;
+                const stage = blockBreakStage(damage);
+                if (stage != progress.last_stage) {
+                    progress.last_stage = stage;
+                    outputs.block_break_animation(.{ .world = progress.failed_world, .slot = slot, .pos = progress.failed_pos, .stage = stage });
+                }
+                if (damage >= 1) {
+                    if (!enqueueBlockRequest(inputs, blockRequest(progress.failed_world, slot, progress.failed_pos, progress.failed_face, progress.failed_sequence))) continue;
+                    progress.failed_to_mine = false;
+                }
+                continue;
+            }
+            if (!progress.mining) continue;
             if (!progress.world.eql(player.world)) {
-                self.cancelBlockDig(slot, outputs);
+                progress.mining = false;
+                outputs.block_break_animation(.{ .world = progress.world, .slot = slot, .pos = progress.pos, .stage = -1 });
                 continue;
             }
             const current = blocks.blockAt(progress.world, progress.pos);
             if (current == registry.block_air_default_state or !player_store.playerCanReachBlock(player, progress.pos)) {
-                self.cancelBlockDig(slot, outputs);
+                progress.mining = false;
+                progress.last_stage = -1;
+                outputs.block_break_animation(.{ .world = progress.world, .slot = slot, .pos = progress.pos, .stage = -1 });
                 continue;
             }
-            const damage = game_data.blockDamageQ32(current, selectedHotbarStack(player).item_id);
-            progress.damage_q32 = @min(@as(u64, 1) << 32, progress.damage_q32 + damage);
-            if (progress.damage_q32 == @as(u64, 1) << 32 and progress.failed_to_mine) {
-                enqueueBlockRequest(inputs, blockRequest(player.world, slot, progress.*));
-                self.cancelBlockDig(slot, outputs);
-                continue;
+            const elapsed = clock.tick -% progress.start_tick + 2;
+            const damage = blockDamagePerTick(self.deps.collision_projection, player, current) * @as(f32, @floatFromInt(elapsed));
+            progress.damage = damage;
+            const stage = blockBreakStage(damage);
+            if (stage != progress.last_stage) {
+                progress.last_stage = stage;
+                outputs.block_break_animation(.{ .world = progress.world, .slot = slot, .pos = progress.pos, .stage = stage });
             }
-            const stage: i8 = @intCast(@min(@as(u64, std.math.maxInt(i8)), (progress.damage_q32 * 10) >> 32));
-            if (stage == progress.last_stage) continue;
-            progress.last_stage = stage;
-            outputs.block_break_animation(.{ .world = progress.world, .slot = slot, .pos = progress.pos, .stage = stage });
         }
     }
 
     fn applyBlockRequest(
         self: *Mining,
-        random: *world_random.Random,
         blocks: *block_store.Blocks,
         players: *player_store.Players,
-        items: *entity_store.ItemEntities,
         containers: *player_store.Containers,
-        loot: *vanilla_block_loot.BlockLoot,
         outputs: *Packets,
         block_changes: BlockChanges,
         request: input_store.BlockRequest,
@@ -234,7 +253,7 @@ pub const Mining = struct {
             return;
         }
         switch (request.kind) {
-            .break_block => self.breakBlock(random, blocks, players, items, loot, outputs, block_changes, request, current),
+            .break_block => self.breakBlock(players, outputs, request, current),
             .use_item_on => self.placeBlock(blocks, players, outputs, block_changes, request, current),
         }
     }
@@ -258,47 +277,30 @@ pub const Mining = struct {
     }
 
     fn breakBlock(
-        _: *Mining,
-        random: *world_random.Random,
-        blocks: *block_store.Blocks,
+        self: *Mining,
         players: *player_store.Players,
-        items: *entity_store.ItemEntities,
-        loot: *vanilla_block_loot.BlockLoot,
         outputs: *Packets,
-        block_changes: BlockChanges,
         request: input_store.BlockRequest,
         current: i32,
     ) void {
         if (current == registry.block_air_default_state) return;
-        const changed = block_changes.set(request.world, request.pos, registry.block_air_default_state) catch {
+        const player = &players.records[request.slot];
+        const changed = self.deps.destruction.destroy(
+            request.world,
+            request.pos,
+            selectedHotbarStack(player),
+            player.gamemode == .creative,
+        ) catch {
             outputs.block_correction(.{ .slot = request.slot, .pos = request.pos });
             return;
         };
-        const player = &players.records[request.slot];
         if (!changed or player.gamemode == .creative) return;
-        if (leaf_behavior.isOak(current)) {
-            _ = leaf_behavior.spawnOakDrops(random, blocks, items, request.world, request.pos, outputs);
-        } else {
-            const drops = loot.evaluate(current, selectedHotbarStack(player));
-            for (drops.stacks[0..drops.count]) |stack| {
-                const index = items.spawn(
-                    random,
-                    blocks,
-                    request.world,
-                    entity_store.blockDropPosition(request.pos),
-                    .{ .y = 0.1 },
-                    stack,
-                    entity_store.block_drop_pickup_delay_ticks,
-                ) catch return;
-                outputs.item_spawned(@intCast(index));
-            }
-        }
         if (damageSelectedItem(player)) |hotbar_slot|
             outputs.hotbar_changed(.{ .slot = request.slot, .hotbar_slot = hotbar_slot });
     }
 
     fn placeBlock(
-        _: *Mining,
+        self: *Mining,
         blocks: *block_store.Blocks,
         players: *player_store.Players,
         outputs: *Packets,
@@ -313,40 +315,57 @@ pub const Mining = struct {
             outputs.hotbar_changed(.{ .slot = request.slot, .hotbar_slot = hotbar_slot });
             return;
         }
+        var chest_placement: ?chests_plugin.Chests.Placement = null;
+        var furnace_placement: ?furnaces_plugin.Furnaces.Placement = null;
+        if (isChest(request.block_state)) {
+            chest_placement = self.deps.chests.reservePlacement(request.world, request.pos) catch {
+                outputs.block_correction(.{ .slot = request.slot, .pos = request.pos });
+                outputs.hotbar_changed(.{ .slot = request.slot, .hotbar_slot = hotbar_slot });
+                return;
+            };
+        } else if (isFurnace(request.block_state)) {
+            furnace_placement = self.deps.furnaces.reservePlacement(request.world, request.pos, request.block_state) catch {
+                outputs.block_correction(.{ .slot = request.slot, .pos = request.pos });
+                outputs.hotbar_changed(.{ .slot = request.slot, .hotbar_slot = hotbar_slot });
+                return;
+            };
+        }
         outputs.block_correction(.{ .slot = request.slot, .pos = request.against_pos });
         const changed = block_changes.set(request.world, request.pos, request.block_state) catch {
             outputs.block_correction(.{ .slot = request.slot, .pos = request.pos });
             return;
         };
         if (changed) {
+            if (chest_placement) |placement| self.deps.chests.commitPlacement(placement);
+            if (furnace_placement) |placement| self.deps.furnaces.commitPlacement(placement);
             if (player.gamemode != .creative) consumeSelectedBlock(player, request.block_state);
             outputs.block_correction(.{ .slot = request.slot, .pos = request.pos });
         }
         outputs.hotbar_changed(.{ .slot = request.slot, .hotbar_slot = hotbar_slot });
     }
 
-    fn cancelBlockDig(self: *Mining, slot: u16, outputs: *Packets) void {
-        const progress = self.progress[slot];
-        if (!progress.active) return;
-        self.progress[slot] = .{};
-        outputs.block_break_animation(.{ .world = progress.world, .slot = slot, .pos = progress.pos, .stage = -1 });
+    fn abortBlockDig(self: *Mining, players: *const player_store.Players, slot: u16, pos: geometry.BlockPos, outputs: *Packets) void {
+        const progress = &self.progress[slot];
+        progress.mining = false;
+        const world = players.records[slot].world;
+        if (!geometry.sameBlock(progress.pos, pos))
+            outputs.block_break_animation(.{ .world = world, .slot = slot, .pos = progress.pos, .stage = -1 });
+        outputs.block_break_animation(.{ .world = world, .slot = slot, .pos = pos, .stage = -1 });
     }
 
-    fn enqueueBlockRequest(inputs: *input_store.Inputs, request: input_store.BlockRequest) void {
-        if (inputs.block_request_count == inputs.block_requests.len)
-            diagnostics.panic("mining block-request capacity exhausted", &.{});
-        inputs.block_requests[inputs.block_request_count] = request;
-        inputs.block_request_count += 1;
+    fn enqueueBlockRequest(inputs: *input_store.Inputs, request: input_store.BlockRequest) bool {
+        inputs.enqueueBlockRequest(request) catch return false;
+        return true;
     }
 
-    fn blockRequest(world: lightning_rod.world_identity.Handle, slot: u16, progress: input_store.BlockDigProgress) input_store.BlockRequest {
+    fn blockRequest(world: lightning_rod.world_identity.Handle, slot: u16, pos: geometry.BlockPos, face: i32, sequence: i32) input_store.BlockRequest {
         return .{
             .world = world,
             .slot = slot,
             .kind = .break_block,
-            .pos = progress.pos,
-            .face = progress.face,
-            .sequence = progress.sequence,
+            .pos = pos,
+            .face = face,
+            .sequence = sequence,
         };
     }
 
@@ -356,6 +375,19 @@ pub const Mining = struct {
             player.gamemode != .spectator and
             player_store.validBuildY(pos.y) and
             player_store.playerCanReachBlock(player, pos);
+    }
+
+    fn blockDamagePerTick(projection: *vanilla_collision_projection.CollisionProjection, player: *const player_store.CorePlayer, block_state: i32) f32 {
+        var damage = game_data.blockDamagePerTick(block_state, selectedHotbarStack(player).item_id);
+        const eye = geometry.BlockPos{
+            .x = geometry.blockCoord(player.position.x),
+            .y = @intCast(geometry.blockCoord(player.position.y + 1.62)),
+            .z = geometry.blockCoord(player.position.z),
+        };
+        const eye_state = projection.blockState(player.world, eye) orelse registry.block_air_default_state;
+        if (eye_state == registry.state_water_level_0 or registry.stateIsWaterlogged(eye_state)) damage /= 5;
+        if (!player.on_ground) damage /= 5;
+        return damage;
     }
 
     fn validPlacement(blocks: *const block_store.Blocks, player: *const player_store.CorePlayer, request: input_store.BlockRequest, current: i32) bool {
@@ -377,6 +409,16 @@ pub const Mining = struct {
             player_store.sameBlockType(player_store.playerPlacedBlockState(stack.block_state), block_state);
     }
 
+    fn isChest(block_state: i32) bool {
+        return block_state >= 0 and block_state < registry.block_state_to_block.len and
+            registry.block_state_to_block[@intCast(block_state)] == registry.block_chest_id;
+    }
+
+    fn isFurnace(block_state: i32) bool {
+        return block_state >= 0 and block_state < registry.block_state_to_block.len and
+            registry.block_state_to_block[@intCast(block_state)] == registry.block_furnace_id;
+    }
+
     fn consumeSelectedBlock(player: *player_store.CorePlayer, block_state: i32) void {
         const stack = &player.hotbar[player.selected_hotbar_slot];
         std.debug.assert(!stack.isEmpty());
@@ -396,3 +438,8 @@ pub const Mining = struct {
         return hotbar_slot;
     }
 };
+
+fn blockBreakStage(damage: f32) i8 {
+    if (!std.math.isFinite(damage) or damage <= 0) return 0;
+    return @intFromFloat(@min(@as(f32, std.math.maxInt(i8)), damage * 10));
+}

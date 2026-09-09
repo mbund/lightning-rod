@@ -24,6 +24,50 @@ pub const SectionShape = struct {
     bits_per_block: u4 = 0,
 };
 
+/// Immutable shape metadata borrowed from an encoded chunk record.
+/// The referenced storage must outlive this view.
+pub const ShapeView = struct {
+    chunk_x: i32,
+    chunk_z: i32,
+    sections: [limits.section_count]SectionShape,
+    storage: []const u8,
+
+    pub fn sectionPaletteState(self: *const ShapeView, section: usize, palette_index: usize) i32 {
+        const descriptor = self.sections[section];
+        std.debug.assert(palette_index < descriptor.palette_count);
+        const offset = @as(usize, descriptor.palette_offset) + palette_index * @sizeOf(i32);
+        return std.mem.readInt(i32, self.storage[offset..][0..@sizeOf(i32)], .little);
+    }
+
+    pub fn sectionPaletteIndex(self: *const ShapeView, section: usize, local_index: u16) error{InvalidChunkShapePaletteIndex}!u16 {
+        const descriptor = self.sections[section];
+        if (descriptor.bits_per_block == 0) return 0;
+        const bit_offset = @as(usize, local_index) * descriptor.bits_per_block;
+        const byte_offset = @as(usize, descriptor.data_offset) + bit_offset / 8;
+        const shift: u4 = @intCast(bit_offset & 7);
+        var encoded: u16 = self.storage[byte_offset];
+        if (shift + descriptor.bits_per_block > 8)
+            encoded |= @as(u16, self.storage[byte_offset + 1]) << 8;
+        const mask: u16 = (@as(u16, 1) << descriptor.bits_per_block) - 1;
+        const palette_index = (encoded >> shift) & mask;
+        if (palette_index >= descriptor.palette_count) return error.InvalidChunkShapePaletteIndex;
+        return @intCast(palette_index);
+    }
+
+    pub fn blockAt(self: *const ShapeView, x: i32, y: i16, z: i32) error{InvalidChunkShapePaletteIndex}!i32 {
+        std.debug.assert(@divFloor(x, 16) == self.chunk_x);
+        std.debug.assert(@divFloor(z, 16) == self.chunk_z);
+        if (y < limits.min_y or y > limits.top_y) return registry.block_air_default_state;
+        const local_x: usize = @intCast(x & 15);
+        const local_z: usize = @intCast(z & 15);
+        const relative_y: usize = @intCast(y - limits.min_y);
+        const local_index: u16 = @intCast(local_x | (local_z << 4) | ((relative_y & 15) << 8));
+        const section = relative_y / 16;
+        const palette_index = try self.sectionPaletteIndex(section, local_index);
+        return self.sectionPaletteState(section, palette_index);
+    }
+};
+
 pub const ChunkShape = struct {
     chunk_x: i32,
     chunk_z: i32,
@@ -397,9 +441,27 @@ fn markRandomTickBlocks(
     masks: *[limits.section_count][random_tick_mask_words]u64,
     counts: *[limits.section_count]u16,
 ) u32 {
-    var blocks: [blocks_per_section]i32 = undefined;
     var section_mask: u32 = 0;
     for (0..limits.section_count) |section| {
+        const palette_count = shape.sectionPaletteCount(section);
+        std.debug.assert(palette_count != 0);
+        var has_tickable = false;
+        for (0..palette_count) |palette_index| {
+            if (registry.randomTickState(shape.sectionPaletteState(section, palette_index)).kind != .none) {
+                has_tickable = true;
+                break;
+            }
+        }
+        if (!has_tickable) continue;
+
+        if (palette_count == 1) {
+            masks[section] = [_]u64{std.math.maxInt(u64)} ** random_tick_mask_words;
+            counts[section] = blocks_per_section;
+            section_mask |= @as(u32, 1) << @intCast(section);
+            continue;
+        }
+
+        var blocks: [blocks_per_section]i32 = undefined;
         fillSectionFromShape(shape, section, &blocks);
         for (blocks, 0..) |block_state, local_index| {
             if (registry.randomTickState(block_state).kind == .none) continue;
@@ -445,6 +507,41 @@ test "random tick masks include every tickable block" {
         );
     }
     try std.testing.expect(sections != 0);
+    try expectTickMasksMatchStates(&shape, &masks);
+}
+
+test "random tick masks preserve mixed and uniform palette semantics" {
+    var storage: [chunk_storage_capacity]u8 = undefined;
+    var shape = ChunkShape{
+        .chunk_x = 0,
+        .chunk_z = 0,
+        .heights = [_]i16{limits.min_y} ** (16 * 16),
+        .storage = &storage,
+    };
+    for (0..limits.section_count) |section|
+        try shape.encodeUniformSection(section, registry.block_air_default_state);
+
+    try shape.encodeUniformSection(0, registry.block_grass_block_default_state);
+    try shape.encodeUniformSection(1, registry.block_stone_default_state);
+    var mixed = [_]i32{registry.block_stone_default_state} ** blocks_per_section;
+    mixed[0] = registry.block_grass_block_default_state;
+    mixed[511] = registry.block_grass_block_default_state;
+    mixed[4095] = registry.block_grass_block_default_state;
+    try shape.encodeSection(2, &mixed);
+
+    var masks: [limits.section_count][random_tick_mask_words]u64 = undefined;
+    var counts: [limits.section_count]u16 = undefined;
+    @memset(&masks, [_]u64{0} ** random_tick_mask_words);
+    @memset(&counts, 0);
+    const sections = markRandomTickBlocks(&shape, &masks, &counts);
+
+    try std.testing.expectEqual(@as(u16, blocks_per_section), counts[0]);
+    for (masks[0]) |word| try std.testing.expectEqual(std.math.maxInt(u64), word);
+    try std.testing.expectEqual(@as(u16, 0), counts[1]);
+    try std.testing.expectEqual(@as(u16, 3), counts[2]);
+    try std.testing.expect(sections & (@as(u32, 1) << 0) != 0);
+    try std.testing.expect(sections & (@as(u32, 1) << 1) == 0);
+    try std.testing.expect(sections & (@as(u32, 1) << 2) != 0);
     try expectTickMasksMatchStates(&shape, &masks);
 }
 

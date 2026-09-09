@@ -1,21 +1,20 @@
 const lightning_rod = @import("lightning_rod");
 const entity_store = lightning_rod.entities;
 const player_store = lightning_rod.players;
-const block_store = lightning_rod.blocks;
+const block_queries = lightning_rod.block_queries;
 const geometry = lightning_rod.geometry;
-const world_clock = lightning_rod.clock;
 const std = @import("std");
 const plugin_profiler = lightning_rod.plugin_profiler;
 const registry = lightning_rod.registry_data;
 const Packets = lightning_rod.Packets;
+const vanilla_collision_projection = @import("vanilla_collision_projection.zig");
 
 pub const ItemEntities = struct {
     pub const id = "minecraft:item_entity_tick";
     pub const Configuration = struct {};
     pub const Trace = ItemEntityTrace;
     pub const Dependencies = struct {
-        clock: *world_clock.Clock,
-        blocks: *block_store.Blocks,
+        collision_projection: *vanilla_collision_projection.CollisionProjection,
         players: *player_store.Players,
         items: *entity_store.ItemEntities,
         outputs: *Packets,
@@ -36,12 +35,10 @@ pub const ItemEntities = struct {
     }
 
     pub fn tick(self: *ItemEntities, _: std.mem.Allocator) void {
-        const clock = self.deps.clock;
-        const blocks = self.deps.blocks;
         const players = self.deps.players;
         const items = self.deps.items;
         const outputs = self.deps.outputs;
-        self.run(clock, blocks, players, items, outputs);
+        self.run(self.deps.collision_projection, players, items, outputs);
     }
 
     const item_gravity_per_tick: f64 = 0.04;
@@ -66,14 +63,14 @@ pub const ItemEntities = struct {
         return distanceSquared(player.position, item_position) <= 2.25;
     }
 
-    fn run(self: *ItemEntities, clock: *world_clock.Clock, blocks: *block_store.Blocks, players: *player_store.Players, items: *entity_store.ItemEntities, outputs: *Packets) void {
+    fn run(self: *ItemEntities, projection: *vanilla_collision_projection.CollisionProjection, players: *player_store.Players, items: *entity_store.ItemEntities, outputs: *Packets) void {
         for (self.pending_metadata[0..self.pending_metadata_count]) |index|
             if (items.active[index]) outputs.item_metadata_changed(index);
         self.pending_metadata_count = 0;
 
         var batch_start: usize = 0;
         while (batch_start < items.active_count) : (batch_start += 4) {
-            self.tickItemPhysicsBatch(clock, blocks, items, batch_start, @min(4, items.active_count - batch_start), outputs);
+            self.tickItemPhysicsBatch(projection, items, batch_start, @min(4, items.active_count - batch_start), outputs);
         }
         var active_position: usize = 0;
         while (active_position < items.active_count) {
@@ -93,8 +90,7 @@ pub const ItemEntities = struct {
 
     fn tickItemPhysicsBatch(
         self: *ItemEntities,
-        clock: *world_clock.Clock,
-        blocks: *block_store.Blocks,
+        projection: *vanilla_collision_projection.CollisionProjection,
         items: *entity_store.ItemEntities,
         active_start: usize,
         lane_count: usize,
@@ -105,7 +101,7 @@ pub const ItemEntities = struct {
         batch.px += batch.vx;
         batch.py += batch.vy;
         batch.pz += batch.vz;
-        resolveGround(clock, blocks, items, &batch, lane_count);
+        resolveGround(projection, items, &batch, lane_count);
         applyItemFriction(&batch);
         self.commitPhysicsBatch(items, &batch, lane_count, outputs);
     }
@@ -146,21 +142,14 @@ pub const ItemEntities = struct {
         return result;
     }
 
-    fn resolveGround(clock: *const world_clock.Clock, blocks: *block_store.Blocks, items: *const entity_store.ItemEntities, batch: *PhysicsBatch, lane_count: usize) void {
+    fn resolveGround(projection: *vanilla_collision_projection.CollisionProjection, items: *const entity_store.ItemEntities, batch: *PhysicsBatch, lane_count: usize) void {
         var moved_y: [4]f64 = batch.py;
         const moved_x: [4]f64 = batch.px;
         const moved_z: [4]f64 = batch.pz;
         for (0..lane_count) |lane| {
             const position = geometry.Vec3{ .x = moved_x[lane], .y = moved_y[lane], .z = moved_z[lane] };
-            const chunk = geometry.ChunkPos{
-                .x = @divFloor(geometry.blockCoord(position.x), 16),
-                .z = @divFloor(geometry.blockCoord(position.z), 16),
-            };
             const world = items.worlds[batch.indices[lane]];
-            if (blocks.residentChunk(world, chunk) == null) {
-                _ = blocks.generatedHeightChunkRef(world, chunk, clock.tick);
-            }
-            if (entity_store.itemGroundY(blocks, world, position)) |ground_y| {
+            if (block_queries.itemGroundYFrom(projection.source(), world, position)) |ground_y| {
                 if (moved_y[lane] <= ground_y) {
                     moved_y[lane] = ground_y;
                     batch.grounded[lane] = true;

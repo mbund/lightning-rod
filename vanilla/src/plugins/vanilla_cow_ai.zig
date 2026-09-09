@@ -9,7 +9,8 @@ const block_store = lightning_rod.blocks;
 const world_random = lightning_rod.random;
 const registry = lightning_rod.registry_data;
 const Packets = lightning_rod.Packets;
-const active_chunks = @import("../vanilla/active_chunks.zig");
+const simulation_admission = @import("../vanilla/simulation_admission.zig");
+const vanilla_collision_projection = @import("vanilla_collision_projection.zig");
 
 const cow_food = [_]i32{registry.item_wheat_id};
 const breeding_cooldown = 6_000;
@@ -25,8 +26,9 @@ pub const CowAi = struct {
     pub const Dependencies = struct {
         random: *world_random.Random,
         blocks: *block_store.Blocks,
+        collision_projection: *vanilla_collision_projection.CollisionProjection,
         players: *player_store.Players,
-        active: *active_chunks.ActiveChunks,
+        active: *simulation_admission.SimulationAdmission,
         living: *entity_store.LivingEntities,
         items: *entity_store.ItemEntities,
         inputs: *input_store.Inputs,
@@ -52,7 +54,7 @@ pub const CowAi = struct {
         const inputs = self.deps.inputs;
         const packets = self.deps.packets;
         self.processInteractions(random, blocks, players, living, items, inputs, packets);
-        var context = goals.initContext(&self.state, blocks, players, self.deps.active, living);
+        var context = goals.initContext(&self.state, blocks, self.deps.collision_projection, players, self.deps.active, living);
         const entities = &living.entities;
         const count = entities.active_count;
         for (entities.active_indices[0..count]) |living_index| {
@@ -81,7 +83,7 @@ pub const CowAi = struct {
         const previous_head_yaw = entities.head_yaw[index];
         goals.tickLifecycle(entities, index);
         self.emitAmbient(context, random, packets, index);
-        if (goals.isWater(context.blocks, entities, index) and entities.random[index].nextFloat() < 0.8)
+        if (goals.isWater(context, entities, index) and entities.random[index].nextFloat() < 0.8)
             entities.jump_requested[index] = true;
         if ((entities.age[index] & 1) == 0) self.tickGoals(context, random, packets, index);
         entities.jump_requested[index] = entities.jump_requested[index] or goals.tickNavigation(context.living, index);
@@ -260,28 +262,38 @@ pub const CowAi = struct {
         if (stack.item_id != registry.item_bucket_id or stack.count == 0) return false;
         if (player.gamemode == .creative) return true;
         if (stack.count == 1) stack.* = player_store.stackForItem(milk_bucket_id, 1) else {
-            stack.count -= 1;
+            var staged_hotbar = player.hotbar;
+            var staged_main_inventory = player.main_inventory;
+            var staged_offhand = player.offhand;
+            const staged_held = if (hand == 1) &staged_offhand else &staged_hotbar[player.selected_hotbar_slot];
+            staged_held.count -= 1;
             var milk_stack = player_store.stackForItem(milk_bucket_id, 1);
-            player_store.moveStackInto(&player.hotbar, &milk_stack);
-            if (!milk_stack.isEmpty()) player_store.moveStackInto(&player.main_inventory, &milk_stack);
-            if (!milk_stack.isEmpty()) dropMilk(random, blocks, player, items, packets, milk_stack);
+            player_store.moveStackInto(&staged_hotbar, &milk_stack);
+            if (!milk_stack.isEmpty()) player_store.moveStackInto(&staged_main_inventory, &milk_stack);
+            var reservation: ?entity_store.ItemEntities.Reservation = null;
+            const specification = entity_store.ItemEntities.Spawn{
+                .world = player.world,
+                .position = player.position,
+                .stack = milk_stack,
+                .pickup_delay_ticks = entity_store.block_drop_pickup_delay_ticks,
+            };
+            if (!milk_stack.isEmpty()) {
+                items.validateSpawn(blocks, specification) catch return false;
+                reservation = items.reserve(1) catch return false;
+            }
+            player.hotbar = staged_hotbar;
+            player.main_inventory = staged_main_inventory;
+            player.offhand = staged_offhand;
+            if (reservation) |*value| {
+                var output: [1]usize = undefined;
+                items.commitReserved(value, random, &.{specification}, &output);
+                packets.item_spawned(@intCast(output[0]));
+            }
             packets.inventory_changed(slot);
             return true;
         }
         interaction.emitHeldStack(players, packets, slot, hand);
         return true;
-    }
-
-    fn dropMilk(
-        random: *world_random.Random,
-        blocks: *block_store.Blocks,
-        player: *const player_store.CorePlayer,
-        items: *entity_store.ItemEntities,
-        packets: *Packets,
-        stack: player_store.HotbarStack,
-    ) void {
-        const dropped = items.spawn(random, blocks, player.world, player.position, .{}, stack, entity_store.block_drop_pickup_delay_ticks) catch return;
-        packets.item_spawned(@intCast(dropped));
     }
 
     fn emitAmbient(

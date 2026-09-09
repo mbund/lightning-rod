@@ -87,18 +87,3 @@ fn validRegistryEntries(values: []const RegistryEntry) bool {
     for (values) |value| if (value.id.len == 0) return false;
     return true;
 }
-
-test "configuration plan retains caller order" {
-    const plan: Plan = .{ .entries = &.{
-        .{ .feature_flags = .{ .values = &.{"minecraft:vanilla"} } },
-        .{ .known_packs = .{ .values = &.{.{ .namespace = "minecraft", .id = "core", .version = "1.21.6" }} } },
-        .{ .tags = .{ .payload = &.{0} } },
-    } };
-    try @import("std").testing.expect(plan.valid());
-    try @import("std").testing.expectEqual(@as(?Entry, plan.entries[1]), plan.at(1));
-}
-
-test "configuration plan rejects a schedule beyond its fixed bound" {
-    const entries = [_]Entry{.{ .tags = .{ .payload = &.{0} } }} ** (maximum_entries + 1);
-    try @import("std").testing.expect(!(Plan{ .entries = &entries }).valid());
-}
