@@ -1,0 +1,14 @@
+{
+  "client": "TeleportFixture",
+  "variants": [
+    {
+      "name": "teleport-multi",
+      "versions": ["1.21.6", "1.21.8"],
+      "fixture": "teleport",
+      "peers": [
+        "alice",
+        "bob"
+      ]
+    }
+  ]
+}

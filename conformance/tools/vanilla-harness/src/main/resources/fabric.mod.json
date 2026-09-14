@@ -1,9 +1,0 @@
-{
-  "schemaVersion": 1,
-  "id": "lightning-rod-vanilla-conformance-harness",
-  "version": "${version}",
-  "environment": "server",
-  "entrypoints": { "main": ["dev.mbund.lightningrod.vanillaharness.VanillaHarnessMod"] },
-  "mixins": ["lightning-rod-vanilla-harness.mixins.json"],
-  "depends": { "fabricloader": ">=0.19.3", "minecraft": "1.21.8", "fabric-api": "*", "java": ">=21" }
-}

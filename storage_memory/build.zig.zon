@@ -1,0 +1,1 @@
+.{ .fingerprint = 0xd16ec03479eccdc1, .name = .storage_memory, .version = "0.1.0", .minimum_zig_version = "0.16.0", .dependencies = .{ .storage = .{ .path = "../storage" } }, .paths = .{ "build.zig", "build.zig.zon", "src" } }

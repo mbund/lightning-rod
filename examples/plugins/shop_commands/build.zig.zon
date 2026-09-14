@@ -1,0 +1,1 @@
+.{ .name = .shop_commands, .fingerprint = 0x4186e9ba3aa3c540, .version = "0.1.0", .dependencies = .{ .shop = .{ .path = "../shop" }, .vanilla = .{ .path = "../../../vanilla" } }, .paths = .{ "build.zig", "build.zig.zon", "src" } }

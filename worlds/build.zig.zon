@@ -1,0 +1,8 @@
+.{
+    .fingerprint = 0xf4e1a830d2f082fd,
+    .name = .worlds,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{ .storage = .{ .path = "../storage" } },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

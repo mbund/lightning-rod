@@ -1,0 +1,8 @@
+.{
+    .fingerprint = 0x9c9d5846f39f9d98,
+    .name = .records,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{ .metrics = .{ .path = "../metrics" }, .storage = .{ .path = "../storage" } },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

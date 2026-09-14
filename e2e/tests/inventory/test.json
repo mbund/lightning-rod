@@ -1,0 +1,9 @@
+{
+  "client": "InventoryFixture",
+  "variants": [
+    {
+      "name": "inventory",
+      "fixture": "inventory"
+    }
+  ]
+}

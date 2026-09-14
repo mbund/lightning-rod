@@ -1,0 +1,14 @@
+{
+  "client": "CommandsFixture",
+  "variants": [
+    {
+      "name": "commands-multi",
+      "versions": ["1.21.6", "1.21.8"],
+      "fixture": "commands",
+      "peers": [
+        "alice",
+        "bob"
+      ]
+    }
+  ]
+}

@@ -4,8 +4,8 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        .lightning_rod = .{ .path = ".." },
-        .lightning_rod_tui = .{ .path = "../tui" },
+        .profiles = .{ .path = "../profiles" },
+        .network_uring = .{ .path = "../network_uring" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

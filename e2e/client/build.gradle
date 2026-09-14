@@ -1,0 +1,71 @@
+plugins { id 'fabric-loom' version "${loom_version}" }
+version = project.mod_version
+group = project.maven_group
+loom {
+    splitEnvironmentSourceSets()
+    mods { recorder { sourceSet sourceSets.main; sourceSet sourceSets.client } }
+    runs {
+        client { runDir = System.getProperty("mcc.runDir", "run") }
+        registrySnapshot {
+            server()
+            runDir = 'build/snapshot-run'
+            property 'mcc.snapshotOutput', providers.gradleProperty('snapshotOutput').getOrElse(layout.buildDirectory.file('registries.bin').get().asFile.absolutePath)
+        }
+    }
+}
+dependencies {
+    minecraft "com.mojang:minecraft:${minecraft_version}"
+    mappings "net.fabricmc:yarn:${yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${fabric_api_version}"
+}
+processResources {
+    inputs.property "version", project.version
+    inputs.property "minecraft_version", project.minecraft_version
+    filesMatching("fabric.mod.json") { expand "version": project.version, "minecraft_version": project.minecraft_version }
+}
+tasks.withType(JavaCompile).configureEach { options.release = 21 }
+def testsDirectory = file('../tests')
+def generatedTests = layout.buildDirectory.dir('generated/e2e')
+sourceSets.client.java.srcDir(testsDirectory)
+sourceSets.client.java.srcDir(generatedTests)
+sourceSets.client.resources.srcDir(testsDirectory)
+sourceSets.client.resources.exclude '**/*.java', '**/*.zig', '**/test.json'
+def discoverTests = tasks.register('discoverTests') {
+    inputs.files(fileTree(testsDirectory) { include '*/test.json' })
+    outputs.dir(generatedTests)
+    doLast {
+        def names = new HashSet<String>()
+        def cases = []
+        fileTree(testsDirectory).matching { include '*/test.json' }.files.sort().each { manifest ->
+            def test = new groovy.json.JsonSlurper().parse(manifest)
+            if (!(test.client ==~ /[A-Za-z][A-Za-z0-9]*/)) throw new GradleException("Invalid test class: ${manifest}")
+            test.variants.each { variant ->
+                if (!(variant.name ==~ /[a-z][a-z0-9-]*/) || !names.add(variant.name)) throw new GradleException("Invalid or duplicate test: ${variant.name}")
+                cases.add("case \"${variant.name}\" -> new ${test.client}(r);")
+            }
+        }
+        def output = generatedTests.get().file('dev/lightningrod/e2e/DiscoveredTests.java').asFile
+        output.parentFile.mkdirs()
+        output.text = """package dev.lightningrod.e2e;
+final class DiscoveredTests {
+    static Fixture create(Recorder r, String name) {
+        return switch (name) {
+            ${cases.join('\n            ')}
+            default -> throw new IllegalArgumentException("Unknown E2E test: " + name);
+        };
+    }
+}
+"""
+    }
+}
+tasks.named('compileClientJava') { dependsOn discoverTests }
+tasks.register('registrySnapshot') { dependsOn 'runRegistrySnapshot' }
+tasks.withType(JavaExec).configureEach {
+    maxHeapSize = '1G'
+    jvmArgs '-XX:ActiveProcessorCount=2'
+    ["mcc.events", "mcc.artifacts", "mcc.peer", "mcc.server", "mcc.scenario", "mcc.expectedPeers", "mcc.targetChunks", "mcc.minimumRadius", "mcc.maximumStallTicks", "mcc.maximumStreamTicks", "mcc.minimumSoakTicks", "mcc.timeoutTicks", "mcc.connectTick"].each {
+        key -> if (System.getProperty(key) != null) systemProperty key, System.getProperty(key)
+    }
+    if (System.getProperty("mcc.peer") != null) args "--username", System.getProperty("mcc.peer")
+}

@@ -1,0 +1,1 @@
+.{ .fingerprint = 0x97920b943e2e9bd6, .name = .network_uring, .version = "0.1.0", .dependencies = .{ .networking = .{ .path = "../networking" } }, .paths = .{ "build.zig", "build.zig.zon", "src" } }

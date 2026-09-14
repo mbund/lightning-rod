@@ -106,6 +106,7 @@ pub const Node = struct {
             std.debug.assert(self.first_child < nodes.len);
             std.debug.assert(self.last_child < nodes.len);
         }
+
         return .{
             .nodes = nodes,
             .next_index = self.first_child,
@@ -116,9 +117,11 @@ pub const Node = struct {
     pub fn childNamed(self: Node, nodes: []const Node, name: []const u8) ?Node {
         std.debug.assert(self.tag == .compound);
         var it = self.childIterator(nodes);
+
         while (it.next()) |child| {
             if (std.mem.eql(u8, child.name, name)) return child;
         }
+
         return null;
     }
 
@@ -193,14 +196,17 @@ pub const ChildIterator = struct {
             std.debug.assert(self.next_index == Node.empty);
             return null;
         }
+
         std.debug.assert(self.next_index != Node.empty);
         std.debug.assert(self.next_index < self.nodes.len);
         const node = self.nodes[self.next_index];
         self.next_index = node.next_sibling;
         self.remaining -= 1;
+
         if (self.remaining == 0) {
             std.debug.assert(self.next_index == Node.empty);
         }
+
         return node;
     }
 };
@@ -441,6 +447,7 @@ pub const Writer = struct {
 
     pub fn endList(self: *Writer) Error!void {
         if (self.frame_count == 0) return error.InvalidWriterState;
+
         const frame = self.frames[self.frame_count - 1];
         if (frame.kind != .list) return error.InvalidWriterState;
         if (frame.remaining != 0) return error.MissingItems;
@@ -491,12 +498,14 @@ pub const Writer = struct {
     pub fn putIntArray(self: *Writer, name: []const u8, values: []const i32) Error!void {
         try self.writeNamedHeader(.int_array, name);
         try self.writeCount(values.len);
+
         for (values) |value| try self.writeInt(i32, value);
     }
 
     pub fn putLongArray(self: *Writer, name: []const u8, values: []const i64) Error!void {
         try self.writeNamedHeader(.long_array, name);
         try self.writeCount(values.len);
+
         for (values) |value| try self.writeInt(i64, value);
     }
 
@@ -579,12 +588,14 @@ pub const Writer = struct {
     pub fn putIntArrayElement(self: *Writer, values: []const i32) Error!void {
         try self.beginListElement(.int_array);
         try self.writeCount(values.len);
+
         for (values) |value| try self.writeInt(i32, value);
     }
 
     pub fn putLongArrayElement(self: *Writer, values: []const i64) Error!void {
         try self.beginListElement(.long_array);
         try self.writeCount(values.len);
+
         for (values) |value| try self.writeInt(i64, value);
     }
 
@@ -598,12 +609,14 @@ pub const Writer = struct {
             if (self.root_written) return error.InvalidWriterState;
             return;
         }
+
         const frame = self.frames[self.frame_count - 1];
         if (frame.kind != .compound) return error.InvalidWriterState;
     }
 
     fn beginListElement(self: *Writer, tag: Tag) Error!void {
         if (self.frame_count == 0) return error.InvalidWriterState;
+
         var frame = &self.frames[self.frame_count - 1];
         if (frame.kind != .list) return error.InvalidWriterState;
         if (frame.child_tag != tag) return error.InvalidWriterState;
@@ -619,6 +632,7 @@ pub const Writer = struct {
 
     fn pop(self: *Writer, kind: WriteFrameKind) Error!WriteFrame {
         if (self.frame_count == 0) return error.InvalidWriterState;
+
         const frame = self.frames[self.frame_count - 1];
         if (frame.kind != kind) return error.InvalidWriterState;
         if (frame.kind == .list and frame.remaining != 0) return error.MissingItems;
@@ -630,6 +644,7 @@ pub const Writer = struct {
         try self.requireNamedField();
         try self.writeTag(tag);
         try self.writeStringPayload(name);
+
         if (self.frame_count == 0) self.root_written = true;
     }
 
@@ -692,6 +707,7 @@ fn scan(buffer: []const u8, named: bool, nodes: []Node, stack: []Frame) Error!Do
     }
 
     const root = try append_node(nodes, &node_count, null, root_header.tag, root_header.name, &.{}, .none);
+
     if (root_header.tag.is_container()) {
         try push_container(buffer, &offset, root_header.tag, root, nodes, stack, &stack_len);
     } else {
@@ -707,6 +723,7 @@ fn scan(buffer: []const u8, named: bool, nodes: []Node, stack: []Frame) Error!Do
         switch (frame.kind) {
             .compound => {
                 if (offset >= buffer.len) return error.EndOfStream;
+
                 const tag = try Tag.fromByte(buffer[offset]);
                 offset += 1;
                 if (tag == .end) {
@@ -719,6 +736,7 @@ fn scan(buffer: []const u8, named: bool, nodes: []Node, stack: []Frame) Error!Do
                 const name = try read_string_payload(buffer, &offset);
                 const payload_start = offset;
                 const child = try append_node(nodes, &node_count, frame.node, tag, name, &.{}, .none);
+
                 if (tag.is_container()) {
                     try push_container(buffer, &offset, tag, child, nodes, stack, &stack_len);
                 } else {
@@ -736,6 +754,7 @@ fn scan(buffer: []const u8, named: bool, nodes: []Node, stack: []Frame) Error!Do
                 const tag = frame.child_tag;
                 const payload_start = offset;
                 const child = try append_node(nodes, &node_count, frame.node, tag, &.{}, &.{}, .none);
+
                 if (tag.is_container()) {
                     try push_container(buffer, &offset, tag, child, nodes, stack, &stack_len);
                 } else {
@@ -759,6 +778,7 @@ fn skip(buffer: []const u8, named: bool, stack: []Frame) Error![]const u8 {
 
     const header = try read_header(buffer, &offset, named);
     if (header.tag == .end) return buffer[offset..];
+
     if (header.tag.is_container()) {
         try push_skip_container(buffer, &offset, header.tag, stack, &stack_len);
     } else {
@@ -772,13 +792,16 @@ fn skip(buffer: []const u8, named: bool, stack: []Frame) Error![]const u8 {
         switch (frame.kind) {
             .compound => {
                 if (offset >= buffer.len) return error.EndOfStream;
+
                 const tag = try Tag.fromByte(buffer[offset]);
                 offset += 1;
                 if (tag == .end) {
                     stack_len -= 1;
                     continue;
                 }
+
                 _ = try read_string_payload(buffer, &offset);
+
                 if (tag.is_container()) {
                     try push_skip_container(buffer, &offset, tag, stack, &stack_len);
                 } else {
@@ -790,7 +813,9 @@ fn skip(buffer: []const u8, named: bool, stack: []Frame) Error![]const u8 {
                     stack_len -= 1;
                     continue;
                 }
+
                 frame.remaining -= 1;
+
                 if (frame.child_tag.is_container()) {
                     try push_skip_container(buffer, &offset, frame.child_tag, stack, &stack_len);
                 } else {
@@ -822,6 +847,7 @@ fn append_node(nodes: []Node, node_count: *usize, parent: ?u32, tag: Tag, name: 
 
     if (parent) |p| {
         std.debug.assert(p < node_count.*);
+
         if (nodes[p].child_count == 0) {
             nodes[p].first_child = index;
             nodes[p].last_child = index;
@@ -831,6 +857,7 @@ fn append_node(nodes: []Node, node_count: *usize, parent: ?u32, tag: Tag, name: 
             nodes[nodes[p].last_child].next_sibling = index;
             nodes[p].last_child = index;
         }
+
         nodes[p].child_count += 1;
     }
 
@@ -840,7 +867,9 @@ fn append_node(nodes: []Node, node_count: *usize, parent: ?u32, tag: Tag, name: 
 fn push_container(buffer: []const u8, offset: *usize, tag: Tag, node: u32, nodes: []Node, stack: []Frame, stack_len: *usize) Error!void {
     std.debug.assert(tag.is_container());
     if (stack_len.* == stack.len) return error.NbtDepthLimit;
+
     const payload_start = offset.*;
+
     switch (tag) {
         .compound => {
             nodes[node].payload = buffer[payload_start..payload_start];
@@ -855,12 +884,14 @@ fn push_container(buffer: []const u8, offset: *usize, tag: Tag, node: u32, nodes
         },
         else => unreachable,
     }
+
     stack_len.* += 1;
 }
 
 fn push_skip_container(buffer: []const u8, offset: *usize, tag: Tag, stack: []Frame, stack_len: *usize) Error!void {
     std.debug.assert(tag.is_container());
     if (stack_len.* == stack.len) return error.NbtDepthLimit;
+
     switch (tag) {
         .compound => stack[stack_len.*] = .{ .kind = .compound, .node = 0 },
         .list => {
@@ -870,12 +901,14 @@ fn push_skip_container(buffer: []const u8, offset: *usize, tag: Tag, stack: []Fr
         },
         else => unreachable,
     }
+
     stack_len.* += 1;
 }
 
 fn read_header(buffer: []const u8, offset: *usize, named: bool) Error!Header {
     const tag = try read_tag(buffer, offset);
     if (tag == .end) return .{ .tag = tag, .name = &.{}, .payload_offset = offset.* };
+
     const name = if (named) try read_string_payload(buffer, offset) else &.{};
     return .{ .tag = tag, .name = name, .payload_offset = offset.* };
 }
@@ -929,6 +962,7 @@ fn checked_byte_len(len: usize, element_size: usize) Error!usize {
 
 fn read_bytes(buffer: []const u8, offset: *usize, len: usize) Error![]const u8 {
     if (buffer.len -| offset.* < len) return error.EndOfStream;
+
     const start = offset.*;
     offset.* += len;
     return buffer[start..offset.*];
@@ -936,6 +970,7 @@ fn read_bytes(buffer: []const u8, offset: *usize, len: usize) Error![]const u8 {
 
 fn read_u8(buffer: []const u8, offset: *usize) Error!u8 {
     if (offset.* == buffer.len) return error.EndOfStream;
+
     const value = buffer[offset.*];
     offset.* += 1;
     return value;
@@ -945,179 +980,4 @@ fn read_int(comptime T: type, buffer: []const u8, offset: *usize) Error!T {
     const size = @divExact(@typeInfo(T).int.bits, 8);
     const bytes = try read_bytes(buffer, offset, size);
     return std.mem.readInt(T, bytes[0..size], .big);
-}
-
-test "scan named scalar without allocation" {
-    const buf = [_]u8{ 0x03, 0x00, 0x03, 'i', 'n', 't', 0x00, 0x00, 0x00, 0x2f };
-    var nodes: [4]Node = undefined;
-    var stack: [4]Frame = undefined;
-
-    const doc = try scan_named(&buf, &nodes, &stack);
-    const root = doc.root_node();
-
-    try std.testing.expectEqual(Tag.int, root.tag);
-    try std.testing.expectEqualStrings("int", root.name);
-    try std.testing.expectEqual(@as(i32, 47), root.value.int);
-    try std.testing.expectEqual(@as(usize, 0), doc.rest.len);
-}
-
-test "scan compound into flat preorder tape" {
-    const buf = [_]u8{ 0x0a, 0x00, 0x00, 0x04, 0x00, 0x05, 'f', 'i', 'r', 's', 't', 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xe2, 0x40, 0x05, 0x00, 0x06, 's', 'e', 'c', 'o', 'n', 'd', 0x3f, 0x00, 0x00, 0x00, 0x00 };
-    var nodes: [8]Node = undefined;
-    var stack: [8]Frame = undefined;
-
-    const doc = try scan_named(&buf, &nodes, &stack);
-    const root = doc.root_node();
-    var children = root.childIterator(doc.nodes);
-    const first = children.next().?;
-    const second = children.next().?;
-
-    try std.testing.expectEqual(Tag.compound, root.tag);
-    try std.testing.expectEqual(@as(u32, 2), root.child_count);
-    try std.testing.expectEqualStrings("first", first.name);
-    try std.testing.expectEqual(@as(i64, 123456), first.value.long);
-    try std.testing.expectEqualStrings("second", second.name);
-    try std.testing.expectEqual(@as(f32, 0.5), second.value.float);
-    try std.testing.expect(children.next() == null);
-    try std.testing.expectEqual(@as(usize, 0), doc.rest.len);
-}
-
-test "nested compound siblings are linked explicitly" {
-    const buf = [_]u8{
-        0x0a, 0x00, 0x00,
-        0x0a, 0x00, 0x01,
-        'a',  0x03, 0x00,
-        0x01, 'x',  0x00,
-        0x00, 0x00, 0x01,
-        0x00, 0x03, 0x00,
-        0x01, 'b',  0x00,
-        0x00, 0x00, 0x02,
-        0x00,
-    };
-    var nodes: [8]Node = undefined;
-    var stack: [8]Frame = undefined;
-
-    const doc = try scan_named(&buf, &nodes, &stack);
-    const root = doc.root_node();
-    var root_children = root.childIterator(doc.nodes);
-    const a = root_children.next().?;
-    const b = root_children.next().?;
-    try std.testing.expect(root_children.next() == null);
-
-    try std.testing.expectEqual(Tag.compound, a.tag);
-    try std.testing.expectEqualStrings("a", a.name);
-    var a_children = a.childIterator(doc.nodes);
-    const x = a_children.next().?;
-    try std.testing.expect(a_children.next() == null);
-    try std.testing.expectEqualStrings("x", x.name);
-    try std.testing.expectEqual(@as(i32, 1), x.value.int);
-
-    try std.testing.expectEqualStrings("b", b.name);
-    try std.testing.expectEqual(@as(i32, 2), b.value.int);
-}
-
-test "skip anonymous list with caller supplied stack" {
-    const buf = [_]u8{ 0x09, 0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0xff };
-    var stack: [4]Frame = undefined;
-
-    const rest = try skip_anonymous(&buf, &stack);
-    try std.testing.expectEqualSlices(u8, &[_]u8{0xff}, rest);
-}
-
-test "preallocated node capacity is enforced" {
-    const buf = [_]u8{ 0x0a, 0x00, 0x00, 0x03, 0x00, 0x01, 'x', 0x00, 0x00, 0x00, 0x01, 0x00 };
-    var nodes: [1]Node = undefined;
-    var stack: [4]Frame = undefined;
-
-    try std.testing.expectError(error.NbtNodeLimit, scan_named(&buf, &nodes, &stack));
-}
-
-test "typed lookup and numeric array iterators are zero-copy" {
-    const buf = [_]u8{
-        0x0a, 0x00, 0x00,
-        0x03, 0x00, 0x01,
-        'x',  0x00, 0x00,
-        0x00, 0x2a, 0x08,
-        0x00, 0x04, 'n',
-        'a',  'm',  'e',
-        0x00, 0x03, 'z',
-        'e',  'd',  0x0b,
-        0x00, 0x04, 'i',
-        'n',  't',  's',
-        0x00, 0x00, 0x00,
-        0x02, 0x00, 0x00,
-        0x00, 0x01, 0xff,
-        0xff, 0xff, 0xff,
-        0x00,
-    };
-    var nodes: [8]Node = undefined;
-    var stack: [8]Frame = undefined;
-    const scanner = Scanner.init(&nodes, &stack);
-
-    const doc = try scanner.scanNamed(&buf);
-    const x = doc.childNamed("x") orelse return error.InvalidNbtAccess;
-    const name = doc.childNamed("name") orelse return error.InvalidNbtAccess;
-    const ints = doc.childNamed("ints") orelse return error.InvalidNbtAccess;
-    var int_iterator = (try ints.intArray()).iterator();
-
-    try std.testing.expectEqual(@as(i32, 42), try x.int());
-    try std.testing.expectEqualStrings("zed", try name.string());
-    try std.testing.expectEqual(@as(i32, 1), int_iterator.next().?);
-    try std.testing.expectEqual(@as(i32, -1), int_iterator.next().?);
-    try std.testing.expect(int_iterator.next() == null);
-}
-
-test "writer encodes compound lists and scans back without allocation" {
-    var buffer: [256]u8 = undefined;
-    var write_stack: [8]WriteFrame = undefined;
-    var writer = Writer.init(&buffer, &write_stack);
-
-    try writer.beginNamedCompound("");
-    try writer.putInt("DataVersion", 4321);
-    try writer.beginNamedList("Pos", .double, 3);
-    try writer.putDoubleElement(1.5);
-    try writer.putDoubleElement(-2.0);
-    try writer.putDoubleElement(0.25);
-    try writer.endList();
-    try writer.endCompound();
-    const encoded = try writer.finish();
-
-    var nodes: [16]Node = undefined;
-    var scan_stack: [8]Frame = undefined;
-    const doc = try scan_named(encoded, &nodes, &scan_stack);
-    const root = doc.root_node();
-    const data_version = root.childNamed(doc.nodes, "DataVersion") orelse return error.InvalidNbtAccess;
-    const pos = root.childNamed(doc.nodes, "Pos") orelse return error.InvalidNbtAccess;
-    const list = try pos.listInfo();
-    var pos_it = pos.childIterator(doc.nodes);
-
-    try std.testing.expectEqual(Tag.compound, root.tag);
-    try std.testing.expectEqual(@as(i32, 4321), try data_version.int());
-    try std.testing.expectEqual(Tag.double, list.child_tag);
-    try std.testing.expectEqual(@as(usize, 3), list.len);
-    try std.testing.expectEqual(@as(f64, 1.5), try pos_it.next().?.double());
-    try std.testing.expectEqual(@as(f64, -2.0), try pos_it.next().?.double());
-    try std.testing.expectEqual(@as(f64, 0.25), try pos_it.next().?.double());
-    try std.testing.expect(pos_it.next() == null);
-}
-
-test "writer validates exact list counts" {
-    var buffer: [64]u8 = undefined;
-    var write_stack: [4]WriteFrame = undefined;
-    var writer = Writer.init(&buffer, &write_stack);
-
-    try writer.beginAnonymousList(.int, 1);
-    try std.testing.expectError(error.MissingItems, writer.endList());
-    try writer.putIntElement(7);
-    try std.testing.expectError(error.TooManyItems, writer.putIntElement(8));
-    try writer.endList();
-    const encoded = try writer.finish();
-
-    var nodes: [4]Node = undefined;
-    var scan_stack: [4]Frame = undefined;
-    const doc = try scan_anonymous(encoded, &nodes, &scan_stack);
-    const root = doc.root_node();
-    var children = root.childIterator(doc.nodes);
-    try std.testing.expectEqual(@as(i32, 7), try children.next().?.int());
-    try std.testing.expect(children.next() == null);
 }

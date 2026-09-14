@@ -4,7 +4,8 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        .lightning_rod = .{ .path = "../../.." },
+        .vanilla = .{ .path = "../../../vanilla" },
+        .protocols = .{ .path = "../../../protocols" },
         .economy = .{ .path = "../economy" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },

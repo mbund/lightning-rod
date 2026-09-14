@@ -1,0 +1,1 @@
+.{ .name = .commands, .fingerprint = 0x9a3e132c434bb75d, .version = "0.1.0", .paths = .{ "build.zig", "build.zig.zon", "src" } }

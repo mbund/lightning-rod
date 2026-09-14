@@ -1,0 +1,64 @@
+{
+  "client": "ChunksFixture",
+  "variants": [
+    {
+      "name": "chunks"
+    },
+    {
+      "name": "chunks-disk",
+      "prepare": "chunks-prepare"
+    },
+    {
+      "name": "chunks-multi",
+      "peers": [
+        "alice",
+        "bob"
+      ]
+    },
+    {
+      "name": "chunks-disk-multi",
+      "backends": ["uring", "stdio"],
+      "peers": [
+        "alice",
+        "bob"
+      ],
+      "prepare": "chunks-prepare-multi"
+    },
+    {
+      "name": "chunks-encrypted-multi",
+      "peers": [
+        "alice",
+        "bob"
+      ],
+      "fixture": "encryption"
+    },
+    {
+      "name": "chunks-simulations-multi",
+      "peers": [
+        "alice",
+        "bob"
+      ],
+      "fixture": "simulations"
+    },
+    {
+      "name": "chunks-isolation",
+      "peers": [
+        "alice",
+        "bob"
+      ],
+      "fixture": "isolation"
+    },
+    {
+      "name": "chunks-prepare",
+      "internal": true
+    },
+    {
+      "name": "chunks-prepare-multi",
+      "peers": [
+        "alice",
+        "bob"
+      ],
+      "internal": true
+    }
+  ]
+}

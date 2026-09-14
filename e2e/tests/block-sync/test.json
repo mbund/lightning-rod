@@ -1,0 +1,13 @@
+{
+  "client": "BlockSyncFixture",
+  "variants": [
+    {
+      "name": "block-sync-multi",
+      "fixture": "block_sync",
+      "peers": [
+        "alice",
+        "bob"
+      ]
+    }
+  ]
+}

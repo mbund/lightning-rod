@@ -1,31 +1,8 @@
 .{
     .fingerprint = 0x96542973218a6f7d,
     .name = .lightning_rod,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{
-        .lightning_rod_test_runner = .{
-            .path = "test-runner",
-        },
-        .nbt = .{
-            .path = "nbt",
-        },
-        .minecraft_registry = .{
-            .path = "minecraft-registry",
-        },
-        .minecraft_data = .{
-            .url = "git+https://github.com/PrismarineJS/minecraft-data#3.99.1",
-            .hash = "N-V-__8AAMLHwRStW6njOmmly5KMd1jTqR4TxZt78Y3XFKjS",
-        },
-    },
-    .paths = .{
-        "build.zig",
-        "build.zig.zon",
-        "build",
-        "codegen",
-        "src",
-        "test-runner",
-        "nbt",
-        "minecraft-registry",
-    },
+    .dependencies = .{ .metrics = .{ .path = "metrics" }, .storage = .{ .path = "storage" } },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "storage", "metrics" },
 }

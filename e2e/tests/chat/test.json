@@ -1,0 +1,12 @@
+{
+  "client": "ChatFixture",
+  "variants": [
+    {
+      "name": "chat-multi",
+      "peers": [
+        "alice",
+        "bob"
+      ]
+    }
+  ]
+}

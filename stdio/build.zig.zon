@@ -1,0 +1,11 @@
+.{
+    .fingerprint = 0xcc4f1723557615f3,
+    .name = .lightning_rod_stdio,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .profiles = .{ .path = "../profiles" },
+        .network_stdio = .{ .path = "../network_stdio" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

@@ -1,0 +1,13 @@
+{
+  "client": "TransferFixture",
+  "variants": [
+    {
+      "name": "transfer-multi",
+      "fixture": "transfer",
+      "peers": [
+        "alice",
+        "bob"
+      ]
+    }
+  ]
+}

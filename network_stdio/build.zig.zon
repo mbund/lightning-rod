@@ -1,0 +1,1 @@
+.{ .fingerprint = 0x74fb2c4ec0dcf1b6, .name = .network_stdio, .version = "0.1.0", .dependencies = .{ .networking = .{ .path = "../networking" } }, .paths = .{ "build.zig", "build.zig.zon", "src" } }

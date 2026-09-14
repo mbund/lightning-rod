@@ -1,0 +1,1 @@
+.{ .name = .bossbars, .version = "0.1.0", .fingerprint = 0xb5e904be92be190d, .dependencies = .{ .vanilla = .{ .path = "../vanilla" }, .sessions = .{ .path = "../sessions" }, .protocols = .{ .path = "../protocols" } }, .paths = .{ "build.zig", "build.zig.zon", "src" } }

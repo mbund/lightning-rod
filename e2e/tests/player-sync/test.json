@@ -1,0 +1,15 @@
+{
+  "client": "PlayerSyncFixture",
+  "variants": [
+    {
+      "name": "player-sync",
+      "versions": ["1.21.6", "1.21.8"],
+      "peers": [
+        "alice",
+        "bob",
+        "carol"
+      ],
+      "last_peer_connect_tick": 180
+    }
+  ]
+}

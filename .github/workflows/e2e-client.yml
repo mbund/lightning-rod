@@ -1,0 +1,71 @@
+name: E2E client
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.tests.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tests
+        shell: bash
+        run: |
+          matrix=$(jq -sc '
+              [.[].variants[] | select(.internal != true) |
+              (.versions // ["1.21.8"])[] as $version |
+              (.backends // ["uring"])[] as $io |
+              {scenario: .name, version: $version, io: $io}] |
+              sort_by(.scenario, .version, .io) | {include: .}
+            ' e2e/tests/*/test.json)
+          jq -e '.include | length > 0 and length <= 256' <<< "$matrix" > /dev/null
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Compile Fabric client
+        working-directory: e2e/client
+        run: ./gradlew --no-daemon compileClientJava
+
+  foundation:
+    needs: discover
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Cross-compile portable Windows server
+        if: matrix.scenario == 'chunks-disk-multi' && matrix.io == 'stdio'
+        run: nix develop --command bash -c 'cd examples/vanilla && zig build -j2 --release=safe -Dio=stdio -Dtarget=x86_64-windows'
+      - name: Real-client acceptance
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+          VERSION: ${{ matrix.version }}
+          IO: ${{ matrix.io }}
+        run: |
+          nix develop --command bash -c '
+            cd e2e
+            timeout --signal=INT --kill-after=10s 300s zig build -j2 --release=safe e2e -Dscenario="$SCENARIO" -Dclient-version="$VERSION" -Dio="$IO" -Dcrypto-directory="$OPENSSL_LIB_DIR"
+          '
+      - name: Preserve evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-${{ matrix.scenario }}-${{ matrix.version }}-${{ matrix.io }}
+          path: |
+            e2e/artifacts/**/summary.json
+            e2e/artifacts/**/*.metrics.json
+            e2e/artifacts/**/*.result
+            e2e/artifacts/**/*.log
+            e2e/artifacts/**/*.jsonl
+            e2e/artifacts/**/screenshots/*.png
+          if-no-files-found: warn
+          retention-days: 7

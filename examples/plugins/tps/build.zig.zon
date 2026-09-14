@@ -1,0 +1,7 @@
+.{
+    .name = .tps,
+    .version = "0.1.0",
+    .fingerprint = 0x4a8a40ee718b8814,
+    .dependencies = .{ .lightning_rod = .{ .path = "../../.." }, .bossbars = .{ .path = "../../../bossbars" } },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

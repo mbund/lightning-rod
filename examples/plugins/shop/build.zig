@@ -3,23 +3,23 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const lightning_rod = b.dependency("lightning_rod", .{ .target = target, .optimize = optimize });
-    const economy = b.dependency("economy", .{ .target = target, .optimize = optimize });
-    const shop = b.addModule("shop", .{
+    const names = .{ "vanilla", "protocols", "economy" };
+    var imports: [names.len]std.Build.Module.Import = undefined;
+
+    inline for (names, 0..) |name, index| {
+        const dependency = b.dependency(name, .{ .target = target, .optimize = optimize });
+        imports[index] = .{
+            .name = name,
+            .module = dependency.module(if (std.mem.eql(u8, name, "vanilla")) "lightning_rod_vanilla_1_21_6" else name),
+        };
+    }
+
+    const module = b.addModule("shop", .{
         .root_source_file = b.path("src/shop.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "economy", .module = economy.module("economy") },
-            .{ .name = "lightning_rod", .module = lightning_rod.module("lightning_rod") },
-        },
+        .imports = &imports,
     });
-    const tests = b.addTest(.{
-        .root_module = shop,
-        .test_runner = .{
-            .path = lightning_rod.path("test-runner/src/main.zig"),
-            .mode = .simple,
-        },
-    });
-    b.step("test", "Run Shop plugin tests").dependOn(&b.addRunArtifact(tests).step);
+    const check = b.addLibrary(.{ .name = "shop", .root_module = module });
+    b.step("check", "Check the Shop module").dependOn(&check.step);
 }

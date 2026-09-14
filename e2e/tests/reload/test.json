@@ -1,0 +1,15 @@
+{
+  "client": "ReloadFixture",
+  "variants": [
+    {
+      "name": "reload-multi",
+      "backends": ["uring", "stdio"],
+      "versions": ["1.21.6", "1.21.8"],
+      "fixture": "reload",
+      "peers": [
+        "alice",
+        "bob"
+      ]
+    }
+  ]
+}

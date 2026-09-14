@@ -1,0 +1,14 @@
+{
+  "client": "CreativeFixture",
+  "variants": [
+    {
+      "name": "creative-multi",
+      "versions": ["1.21.6", "1.21.8"],
+      "fixture": "encryption",
+      "peers": [
+        "alice",
+        "bob"
+      ]
+    }
+  ]
+}

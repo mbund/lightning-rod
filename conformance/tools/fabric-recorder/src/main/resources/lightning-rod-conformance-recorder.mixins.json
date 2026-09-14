@@ -1,1 +1,0 @@
-{ "required": true, "package": "dev.mbund.lightningrod.conformance.mixin", "compatibilityLevel": "JAVA_21", "client": ["BlockListCheckerMixin", "BossBarHudAccessor", "ChunkStreamingMixin", "DecoderHandlerMixin", "EncoderHandlerMixin", "GameStateChangeReasonAccessor", "MinecraftClientMixin"] }

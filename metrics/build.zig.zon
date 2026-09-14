@@ -1,0 +1,1 @@
+.{ .name = .metrics, .fingerprint = 0x228aaae730d0c907, .version = "0.1.0", .minimum_zig_version = "0.16.0", .paths = .{ "build.zig", "build.zig.zon", "src" } }

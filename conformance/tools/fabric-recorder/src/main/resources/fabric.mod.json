@@ -1,9 +1,0 @@
-{
-  "schemaVersion": 1,
-  "id": "lightning-rod-conformance-recorder",
-  "version": "${version}",
-  "environment": "client",
-  "entrypoints": { "client": ["dev.mbund.lightningrod.conformance.RecorderClient"] },
-  "mixins": ["lightning-rod-conformance-recorder.mixins.json"],
-  "depends": { "fabricloader": ">=0.19.3", "minecraft": "1.21.8", "fabric-api": "*", "java": ">=21" }
-}

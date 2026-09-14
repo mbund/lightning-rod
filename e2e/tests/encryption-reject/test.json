@@ -1,0 +1,9 @@
+{
+  "client": "EncryptionRejectFixture",
+  "variants": [
+    {
+      "name": "encryption-reject",
+      "fixture": "encryption_reject"
+    }
+  ]
+}

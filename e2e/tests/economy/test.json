@@ -1,0 +1,22 @@
+{
+  "client": "EconomyFixture",
+  "variants": [
+    {
+      "name": "economy-multi",
+      "application": "vanilla-plus",
+      "peers": [
+        "alice",
+        "bob"
+      ]
+    },
+    {
+      "name": "economy-reopen-multi",
+      "application": "vanilla-plus",
+      "prepare": "economy-multi",
+      "peers": [
+        "alice",
+        "bob"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+.{ .name = .networking, .fingerprint = 0xc2bcd5ce545952cd, .version = "0.1.0", .paths = .{ "build.zig", "build.zig.zon", "src" } }

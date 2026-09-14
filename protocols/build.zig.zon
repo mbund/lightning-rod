@@ -1,0 +1,14 @@
+.{
+    .fingerprint = 0x47681748e6938d7a,
+    .name = .lightning_rod_protocols,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .nbt = .{ .path = "../nbt" },
+        .minecraft_data = .{
+            .url = "git+https://github.com/PrismarineJS/minecraft-data#3.99.1",
+            .hash = "N-V-__8AAMLHwRStW6njOmmly5KMd1jTqR4TxZt78Y3XFKjS",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "build", "codegen", "schemas", "src" },
+}
