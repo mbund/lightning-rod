@@ -1,0 +1,9 @@
+[
+  {"release": "1.21.5", "api": "legacy", "fabric": "0.128.2+1.21.5"},
+  {"release": "1.21.6", "api": "legacy", "fabric": "0.128.2+1.21.6"},
+  {"release": "1.21.8", "api": "legacy", "fabric": "0.136.1+1.21.8"},
+  {"release": "1.21.9", "api": "input", "fabric": "0.134.1+1.21.9"},
+  {"release": "1.21.11", "api": "network", "fabric": "0.141.6+1.21.11"},
+  {"release": "26.1", "api": "modern", "fabric": "0.145.1+26.1"},
+  {"release": "26.2", "api": "current", "fabric": "0.161.0+26.2"}
+]

@@ -3,7 +3,11 @@
   "variants": [
     {
       "name": "encryption-reject",
-      "fixture": "encryption_reject"
+      "fixture": "encryption_reject",
+      "required_logs": [
+        { "text": "reason=InvalidEncryption", "at_least": true }
+      ],
+      "forbidden_logs": ["event=session_play_attached"]
     }
   ]
 }

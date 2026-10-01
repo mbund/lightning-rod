@@ -4,11 +4,18 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .minecraft_java = .{ .path = "../minecraft_java" },
+        .game_data = .{ .path = "../game_data" },
+        .encoding = .{ .path = "../protocol_encoding" },
+        .sessions = .{ .path = "../sessions" },
         .nbt = .{ .path = "../nbt" },
-        .minecraft_data = .{
-            .url = "git+https://github.com/PrismarineJS/minecraft-data#3.99.1",
-            .hash = "N-V-__8AAMLHwRStW6njOmmly5KMd1jTqR4TxZt78Y3XFKjS",
-        },
+        .v1_21_5 = .{ .path = "../protocol_versions/v1_21_5" },
+        .v1_21_6 = .{ .path = "../protocol_versions/v1_21_6" },
+        .v1_21_8 = .{ .path = "../protocol_versions/v1_21_8" },
+        .v1_21_9 = .{ .path = "../protocol_versions/v1_21_9" },
+        .v1_21_11 = .{ .path = "../protocol_versions/v1_21_11" },
+        .v26_1 = .{ .path = "../protocol_versions/v26_1" },
+        .v26_2 = .{ .path = "../protocol_versions/v26_2" },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "build", "codegen", "schemas", "src" },
+    .paths = .{ "build.zig", "build.zig.zon", "catalog.zig", "src" },
 }

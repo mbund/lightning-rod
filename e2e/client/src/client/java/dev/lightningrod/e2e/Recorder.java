@@ -7,20 +7,19 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.screens.ConnectScreen;
+import net.minecraft.client.gui.screens.DisconnectedScreen;
+import net.minecraft.client.gui.screens.TitleScreen;
+import net.minecraft.client.multiplayer.ServerData;
+import net.minecraft.client.multiplayer.resolver.ServerAddress;
+import net.minecraft.core.BlockPos;
+import net.minecraft.util.Mth;
+import net.minecraft.world.level.LightLayer;
+import net.minecraft.world.level.chunk.status.ChunkStatus;
+import net.minecraft.world.level.levelgen.Heightmap;
 import dev.lightningrod.e2e.mixin.BossBarHudAccessor;
 import dev.lightningrod.e2e.mixin.ClientConnectionAccessor;
-import net.minecraft.client.MinecraftClient;
-import net.minecraft.client.gui.screen.TitleScreen;
-import net.minecraft.client.gui.screen.DisconnectedScreen;
-import net.minecraft.client.gui.screen.multiplayer.ConnectScreen;
-import net.minecraft.client.network.ServerAddress;
-import net.minecraft.client.network.ServerInfo;
-import net.minecraft.client.util.ScreenshotRecorder;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.MathHelper;
-import net.minecraft.world.Heightmap;
-import net.minecraft.world.LightType;
-import net.minecraft.world.chunk.ChunkStatus;
 
 public final class Recorder {
     Fixture fixture;
@@ -58,6 +57,8 @@ public final class Recorder {
     int minimumSoakTicks = 0;
     int timeoutTicks = 2400;
     int connectTick = 40;
+    boolean ready;
+    boolean started;
     int lastLoaded = -1;
     int lastMissing = -1;
     int maximumBossBars;
@@ -99,7 +100,7 @@ public final class Recorder {
             Files.createDirectories(artifacts.resolve("screenshots"));
             events = Files.newBufferedWriter(eventsPath, StandardCharsets.UTF_8);
             enabled = true;
-            event("probe_started", "scenario", scenario);
+            event("probe_started", "scenario", scenario, "version", ClientCompatibility.version());
         } catch (IOException error) {
             throw new IllegalStateException("cannot initialize e2e probe", error);
         }
@@ -131,42 +132,55 @@ public final class Recorder {
     public void configurationStarted() { protocolPhase = "configuration"; }
     public void playStarted() { protocolPhase = "play"; }
     public void disconnected() { protocolPhase = "disconnected"; }
-    public synchronized void advance(MinecraftClient client) {
+    public synchronized void advance(Minecraft client) {
         if (!enabled || written) return;
         client.options.pauseOnLostFocus = false;
+        if (!started) {
+            if (GuiApi.overlay(client) != null) return;
+            if (!ready) {
+                marker(peer + ".ready");
+                ready = true;
+            }
+            if (!Files.exists(artifacts.resolve("clients.start"))) return;
+            started = true;
+        }
         tick++;
         if (completed && resultPublished && tick >= stopTick) {
-            client.scheduleStop();
+            client.stop();
             return;
         }
         if (completed) return;
-        if (!connectionAttempted && server != null && tick >= connectTick && client.getOverlay() == null) {
-            client.options.getViewDistance().setValue(32);
+        if (!connectionAttempted && server != null && tick >= connectTick && GuiApi.overlay(client) == null) {
+            if (!ClientCompatibility.version().equals(System.getProperty("mcc.version"))) {
+                fail(client, "unexpected_client_version");
+                return;
+            }
+            client.options.renderDistance().set(32);
             connectionAttempted = true;
             connectNanos = System.nanoTime();
             event("connect", "server", server);
-            ConnectScreen.connect(new TitleScreen(), client, ServerAddress.parse(server),
-                new ServerInfo("Lightning Rod E2E", server, ServerInfo.ServerType.OTHER), false,
+            ConnectScreen.startConnecting(new TitleScreen(), client, ServerAddress.parseString(server),
+                new ServerData("Lightning Rod E2E", server, ServerData.Type.OTHER), false,
                 null);
         }
         String phase = protocolPhase;
         fixture.poll(client);
-        String screen = client.currentScreen == null ? "none" : client.currentScreen.getClass().getSimpleName();
+        String screen = GuiApi.screen(client) == null ? "none" : GuiApi.screen(client).getClass().getSimpleName();
         if (!phase.equals(lastPhase)) {
             event("phase", "value", phase);
             lastPhase = phase;
         }
         if (!screen.equals(lastScreen)) {
-            String title = client.currentScreen == null ? "" : client.currentScreen.getTitle().getString();
+            String title = GuiApi.screen(client) == null ? "" : GuiApi.screen(client).getTitle().getString();
             event("screen", "value", screen, "title", title);
             lastScreen = screen;
-            if (client.currentScreen instanceof DisconnectedScreen && connectionAttempted) {
+            if (GuiApi.screen(client) instanceof DisconnectedScreen && connectionAttempted) {
                 fixture.disconnected(client, title);
             }
         }
-        if (phase.equals("play") && client.world != null && client.player != null) {
+        if (phase.equals("play") && client.level != null && client.player != null) {
             if (fixture.encrypted()) {
-                var channel = ((ClientConnectionAccessor) client.getNetworkHandler().getConnection()).lightningRod$channel();
+                var channel = ((ClientConnectionAccessor) client.getConnection().getConnection()).lightningRod$channel();
                 if (channel.pipeline().get("decrypt") == null || channel.pipeline().get("encrypt") == null) {
                     fail(client, "encryption_was_bypassed");
                     return;
@@ -178,23 +192,23 @@ public final class Recorder {
                 playNanos = System.nanoTime();
                 screenshot(client, "first_play");
             }
-            int loaded = client.world.getChunkManager().getLoadedChunkCount();
+            int loaded = client.level.getChunkSource().getLoadedChunksCount();
             if (loaded > 0 && firstChunkTick < 0) {
                 firstChunkTick = tick;
                 firstChunkNanos = System.nanoTime();
             }
-            if (loaded > 0 && terrainTick < 0 && client.currentScreen == null) {
+            if (loaded > 0 && terrainTick < 0 && GuiApi.screen(client) == null) {
                 terrainTick = tick;
                 terrainNanos = System.nanoTime();
             }
             if (terrainTick >= 0 && tick == terrainTick + 2) screenshot(client, "first_terrain");
             if (!fixture.prepare(client)) return;
             int missing = missingChunks(client, minimumRadius);
-            int bossBars = ((BossBarHudAccessor) client.inGameHud.getBossBarHud()).lightningRod$bossBars().size();
+            int bossBars = ((BossBarHudAccessor) GuiApi.bossBars(client)).lightningRod$bossBars().size();
             maximumBossBars = Math.max(maximumBossBars, bossBars);
-            BlockPos position = client.player.getBlockPos();
-            int top = client.world.getTopY(Heightmap.Type.WORLD_SURFACE, position.getX(), position.getZ()) + 1;
-            int sky = client.world.getLightLevel(LightType.SKY, new BlockPos(position.getX(), top, position.getZ()));
+            BlockPos position = client.player.blockPosition();
+            int top = client.level.getHeight(Heightmap.Types.WORLD_SURFACE, position.getX(), position.getZ()) + 1;
+            int sky = client.level.getBrightness(LightLayer.SKY, new BlockPos(position.getX(), top, position.getZ()));
             if (loaded != lastLoaded || missing != lastMissing || tick % 20 == 0) {
                 event("world", "loaded", loaded, "missing", missing, "sky", sky, "bossbars", bossBars,
                     "x", position.getX(), "y", position.getY(), "z", position.getZ(),
@@ -215,10 +229,23 @@ public final class Recorder {
         return Math.abs(actual - expected) <= tolerance;
     }
 
-    static boolean angleClose(float actual, float expected) {
-        return Math.abs(MathHelper.wrapDegrees(actual - expected)) <= 2.0f;
+    public synchronized void packetFailed(byte[] bytes, Exception error) {
+        if (!enabled || written) return;
+        try {
+            var packet = artifacts.resolve(peer + "-failed-packet.bin");
+            if (Files.exists(packet)) return;
+            Files.write(packet, bytes);
+            Files.writeString(artifacts.resolve(peer + "-failed-packet.txt"), error.toString());
+            error.printStackTrace();
+        } catch (IOException failure) {
+            error.addSuppressed(failure);
+        }
     }
-    public synchronized void write(MinecraftClient client) {
+
+    static boolean angleClose(float actual, float expected) {
+        return Math.abs(Mth.wrapDegrees(actual - expected)) <= 2.0f;
+    }
+    public synchronized void write(Minecraft client) {
         if (!enabled || written) return;
         written = true;
         try {
@@ -236,19 +263,19 @@ public synchronized void chatReceived(String text) {
         fixture.chat(text);
     }
 
-    int missingChunks(MinecraftClient client, int radius) {
-        int centerX = client.player.getChunkPos().x;
-        int centerZ = client.player.getChunkPos().z;
+    int missingChunks(Minecraft client, int radius) {
+        int centerX = (client.player.getBlockX() >> 4);
+        int centerZ = (client.player.getBlockZ() >> 4);
         int missing = 0;
         for (int z = centerZ - radius; z <= centerZ + radius; z++) {
             for (int x = centerX - radius; x <= centerX + radius; x++) {
-                if (client.world.getChunkManager().getChunk(x, z, ChunkStatus.FULL, false) == null) missing++;
+                if (client.level.getChunkSource().getChunk(x, z, ChunkStatus.FULL, false) == null) missing++;
             }
         }
         return missing;
     }
 
-    void pass(MinecraftClient client, String reason) {
+    void pass(Minecraft client, String reason) {
         if (completed) return;
         completed = true;
         stopTick = tick + 20;
@@ -257,7 +284,7 @@ public synchronized void chatReceived(String text) {
         screenshot(client, "success");
     }
 
-    void fail(MinecraftClient client, String reason) {
+    void fail(Minecraft client, String reason) {
         if (completed) return;
         completed = true;
         stopTick = tick + 20;
@@ -291,17 +318,17 @@ public synchronized void chatReceived(String text) {
         }
     }
 
-    void screenshot(MinecraftClient client, String name) {
+    void screenshot(Minecraft client, String name) {
         pendingScreenshots.add(name);
     }
 
-    public synchronized void rendered(MinecraftClient client) {
-        if (!enabled || written || client.getFramebuffer() == null ||
-            client.getOverlay() != null && (!completed || resultPassed)) return;
+    public synchronized void rendered(Minecraft client) {
+        if (!enabled || written || GuiApi.target(client) == null ||
+            GuiApi.overlay(client) != null && (!completed || resultPassed)) return;
         for (String name : pendingScreenshots) {
             boolean terminal = name.equals("success") || name.equals("failure");
             String filename = peer + "-" + tick + "-" + name + ".png";
-            ScreenshotRecorder.saveScreenshot(artifacts.toFile(), filename, client.getFramebuffer(), 1, message -> {
+            ClientCompatibility.screenshot(artifacts.toFile(), filename, GuiApi.target(client), message -> {
                 synchronized (this) {
                     event("screenshot", "name", name, "message", message.getString());
                     if (terminal && !resultPublished) {

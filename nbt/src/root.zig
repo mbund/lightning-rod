@@ -118,15 +118,17 @@ pub const Node = struct {
         std.debug.assert(self.tag == .compound);
         var it = self.childIterator(nodes);
 
-        while (it.next()) |child| {
-            if (std.mem.eql(u8, child.name, name)) return child;
-        }
+        while (it.next()) |child|
+            if (std.mem.eql(u8, child.name, name))
+                return child;
 
         return null;
     }
 
     pub fn expectTag(self: Node, tag: Tag) Error!Node {
-        if (self.tag != tag) return error.InvalidNbtAccess;
+        if (self.tag != tag)
+            return error.InvalidNbtAccess;
+
         return self;
     }
 
@@ -234,10 +236,13 @@ pub const IntArrayIterator = struct {
     index: usize = 0,
 
     pub fn next(self: *IntArrayIterator) ?i32 {
-        if (self.index == self.bytes.len) return null;
+        if (self.index == self.bytes.len)
+            return null;
+
         std.debug.assert(self.index < self.bytes.len);
         const value = std.mem.readInt(i32, self.bytes[self.index..][0..4], .big);
         self.index += 4;
+
         return value;
     }
 };
@@ -265,10 +270,13 @@ pub const LongArrayIterator = struct {
     index: usize = 0,
 
     pub fn next(self: *LongArrayIterator) ?i64 {
-        if (self.index == self.bytes.len) return null;
+        if (self.index == self.bytes.len)
+            return null;
+
         std.debug.assert(self.index < self.bytes.len);
         const value = std.mem.readInt(i64, self.bytes[self.index..][0..8], .big);
         self.index += 8;
+
         return value;
     }
 };
@@ -331,38 +339,10 @@ pub fn skip_optional(buffer: []const u8, stack: []Frame) Error![]const u8 {
     return skip_anonymous(buffer, stack);
 }
 
-pub const Scanner = struct {
-    nodes: []Node,
-    stack: []Frame,
-
-    pub fn init(nodes: []Node, stack: []Frame) Scanner {
-        std.debug.assert(nodes.len > 0);
-        std.debug.assert(stack.len > 0);
-        return .{ .nodes = nodes, .stack = stack };
-    }
-
-    pub fn scanNamed(self: Scanner, buffer: []const u8) Error!Document {
-        return scan_named(buffer, self.nodes, self.stack);
-    }
-
-    pub fn scanAnonymous(self: Scanner, buffer: []const u8) Error!Document {
-        return scan_anonymous(buffer, self.nodes, self.stack);
-    }
-
-    pub fn skipNamed(self: Scanner, buffer: []const u8) Error![]const u8 {
-        return skip_named(buffer, self.stack);
-    }
-
-    pub fn skipAnonymous(self: Scanner, buffer: []const u8) Error![]const u8 {
-        return skip_anonymous(buffer, self.stack);
-    }
-
-    pub fn skipOptional(self: Scanner, buffer: []const u8) Error![]const u8 {
-        return skip_optional(buffer, self.stack);
-    }
+const WriteFrameKind = enum {
+    compound,
+    list,
 };
-
-const WriteFrameKind = enum { compound, list };
 
 pub const WriteFrame = struct {
     kind: WriteFrameKind,
@@ -393,7 +373,9 @@ pub const Writer = struct {
 
     pub fn finish(self: Writer) Error![]u8 {
         if (!self.root_written) return error.InvalidWriterState;
+
         if (self.frame_count != 0) return error.MissingItems;
+
         return self.written();
     }
 
@@ -411,7 +393,9 @@ pub const Writer = struct {
     }
 
     pub fn beginAnonymousList(self: *Writer, child_tag: Tag, len: usize) Error!void {
-        if (child_tag == .end and len != 0) return error.InvalidWriterState;
+        if (child_tag == .end and len != 0)
+            return error.InvalidWriterState;
+
         try self.requireRoot();
         try self.writeTag(.list);
         try self.writeListHeader(child_tag, len);
@@ -431,7 +415,9 @@ pub const Writer = struct {
     }
 
     pub fn beginNamedList(self: *Writer, name: []const u8, child_tag: Tag, len: usize) Error!void {
-        if (child_tag == .end and len != 0) return error.InvalidWriterState;
+        if (child_tag == .end and len != 0)
+            return error.InvalidWriterState;
+
         try self.requireNamedField();
         try self.writeNamedHeader(.list, name);
         try self.writeListHeader(child_tag, len);
@@ -439,18 +425,25 @@ pub const Writer = struct {
     }
 
     pub fn beginListElementList(self: *Writer, child_tag: Tag, len: usize) Error!void {
-        if (child_tag == .end and len != 0) return error.InvalidWriterState;
+        if (child_tag == .end and len != 0)
+            return error.InvalidWriterState;
+
         try self.beginListElement(.list);
         try self.writeListHeader(child_tag, len);
         try self.push(.{ .kind = .list, .child_tag = child_tag, .remaining = len });
     }
 
     pub fn endList(self: *Writer) Error!void {
-        if (self.frame_count == 0) return error.InvalidWriterState;
+        if (self.frame_count == 0)
+            return error.InvalidWriterState;
 
         const frame = self.frames[self.frame_count - 1];
-        if (frame.kind != .list) return error.InvalidWriterState;
-        if (frame.remaining != 0) return error.MissingItems;
+        if (frame.kind != .list)
+            return error.InvalidWriterState;
+
+        if (frame.remaining != 0)
+            return error.MissingItems;
+
         self.frame_count -= 1;
     }
 
@@ -596,36 +589,52 @@ pub const Writer = struct {
         try self.beginListElement(.long_array);
         try self.writeCount(values.len);
 
-        for (values) |value| try self.writeInt(i64, value);
+        for (values) |value|
+            try self.writeInt(i64, value);
     }
 
     fn requireRoot(self: Writer) Error!void {
-        if (self.frame_count != 0) return error.InvalidWriterState;
-        if (self.root_written) return error.InvalidWriterState;
+        if (self.frame_count != 0)
+            return error.InvalidWriterState;
+
+        if (self.root_written)
+            return error.InvalidWriterState;
     }
 
     fn requireNamedField(self: Writer) Error!void {
         if (self.frame_count == 0) {
-            if (self.root_written) return error.InvalidWriterState;
+            if (self.root_written)
+                return error.InvalidWriterState;
+
             return;
         }
 
         const frame = self.frames[self.frame_count - 1];
-        if (frame.kind != .compound) return error.InvalidWriterState;
+        if (frame.kind != .compound)
+            return error.InvalidWriterState;
     }
 
     fn beginListElement(self: *Writer, tag: Tag) Error!void {
-        if (self.frame_count == 0) return error.InvalidWriterState;
+        if (self.frame_count == 0)
+            return error.InvalidWriterState;
 
         var frame = &self.frames[self.frame_count - 1];
-        if (frame.kind != .list) return error.InvalidWriterState;
-        if (frame.child_tag != tag) return error.InvalidWriterState;
-        if (frame.remaining == 0) return error.TooManyItems;
+        if (frame.kind != .list)
+            return error.InvalidWriterState;
+
+        if (frame.child_tag != tag)
+            return error.InvalidWriterState;
+
+        if (frame.remaining == 0)
+            return error.TooManyItems;
+
         frame.remaining -= 1;
     }
 
     fn push(self: *Writer, frame: WriteFrame) Error!void {
-        if (self.frame_count == self.frames.len) return error.NbtDepthLimit;
+        if (self.frame_count == self.frames.len)
+            return error.NbtDepthLimit;
+
         self.frames[self.frame_count] = frame;
         self.frame_count += 1;
     }
@@ -634,8 +643,12 @@ pub const Writer = struct {
         if (self.frame_count == 0) return error.InvalidWriterState;
 
         const frame = self.frames[self.frame_count - 1];
-        if (frame.kind != kind) return error.InvalidWriterState;
-        if (frame.kind == .list and frame.remaining != 0) return error.MissingItems;
+        if (frame.kind != kind)
+            return error.InvalidWriterState;
+
+        if (frame.kind == .list and frame.remaining != 0)
+            return error.MissingItems;
+
         self.frame_count -= 1;
         return frame;
     }
@@ -645,7 +658,8 @@ pub const Writer = struct {
         try self.writeTag(tag);
         try self.writeStringPayload(name);
 
-        if (self.frame_count == 0) self.root_written = true;
+        if (self.frame_count == 0)
+            self.root_written = true;
     }
 
     fn writeAnonymousHeader(self: *Writer, tag: Tag) Error!void {
@@ -664,31 +678,41 @@ pub const Writer = struct {
     }
 
     fn writeCount(self: *Writer, len: usize) Error!void {
-        if (len > @as(usize, @intCast(std.math.maxInt(i32)))) return error.LengthOverflow;
+        if (len > @as(usize, @intCast(std.math.maxInt(i32))))
+            return error.LengthOverflow;
+
         try self.writeInt(i32, @intCast(len));
     }
 
     fn writeStringPayload(self: *Writer, value: []const u8) Error!void {
-        if (value.len > std.math.maxInt(u16)) return error.NameTooLong;
+        if (value.len > std.math.maxInt(u16))
+            return error.NameTooLong;
+
         try self.writeInt(u16, @intCast(value.len));
         try self.writeBytes(value);
     }
 
     fn writeInt(self: *Writer, comptime T: type, value: T) Error!void {
         const size = @divExact(@typeInfo(T).int.bits, 8);
-        if (self.rest.len < size) return error.EndOfStream;
+        if (self.rest.len < size)
+            return error.EndOfStream;
+
         std.mem.writeInt(T, self.rest[0..size], value, .big);
         self.rest = self.rest[size..];
     }
 
     fn writeByte(self: *Writer, value: u8) Error!void {
-        if (self.rest.len == 0) return error.EndOfStream;
+        if (self.rest.len == 0)
+            return error.EndOfStream;
+
         self.rest[0] = value;
         self.rest = self.rest[1..];
     }
 
     fn writeBytes(self: *Writer, bytes: []const u8) Error!void {
-        if (self.rest.len < bytes.len) return error.EndOfStream;
+        if (self.rest.len < bytes.len)
+            return error.EndOfStream;
+
         @memcpy(self.rest[0..bytes.len], bytes);
         self.rest = self.rest[bytes.len..];
     }
@@ -722,7 +746,8 @@ fn scan(buffer: []const u8, named: bool, nodes: []Node, stack: []Frame) Error!Do
 
         switch (frame.kind) {
             .compound => {
-                if (offset >= buffer.len) return error.EndOfStream;
+                if (offset >= buffer.len)
+                    return error.EndOfStream;
 
                 const tag = try Tag.fromByte(buffer[offset]);
                 offset += 1;
@@ -777,7 +802,8 @@ fn skip(buffer: []const u8, named: bool, stack: []Frame) Error![]const u8 {
     var stack_len: usize = 0;
 
     const header = try read_header(buffer, &offset, named);
-    if (header.tag == .end) return buffer[offset..];
+    if (header.tag == .end)
+        return buffer[offset..];
 
     if (header.tag.is_container()) {
         try push_skip_container(buffer, &offset, header.tag, stack, &stack_len);
@@ -791,7 +817,8 @@ fn skip(buffer: []const u8, named: bool, stack: []Frame) Error![]const u8 {
 
         switch (frame.kind) {
             .compound => {
-                if (offset >= buffer.len) return error.EndOfStream;
+                if (offset >= buffer.len)
+                    return error.EndOfStream;
 
                 const tag = try Tag.fromByte(buffer[offset]);
                 offset += 1;
@@ -829,7 +856,9 @@ fn skip(buffer: []const u8, named: bool, stack: []Frame) Error![]const u8 {
 }
 
 fn append_node(nodes: []Node, node_count: *usize, parent: ?u32, tag: Tag, name: []const u8, payload: []const u8, value: Value) Error!u32 {
-    if (node_count.* == nodes.len) return error.NbtNodeLimit;
+    if (node_count.* == nodes.len)
+        return error.NbtNodeLimit;
+
     std.debug.assert(node_count.* < nodes.len);
     const index: u32 = @intCast(node_count.*);
     nodes[node_count.*] = .{
@@ -866,21 +895,32 @@ fn append_node(nodes: []Node, node_count: *usize, parent: ?u32, tag: Tag, name: 
 
 fn push_container(buffer: []const u8, offset: *usize, tag: Tag, node: u32, nodes: []Node, stack: []Frame, stack_len: *usize) Error!void {
     std.debug.assert(tag.is_container());
-    if (stack_len.* == stack.len) return error.NbtDepthLimit;
+    if (stack_len.* == stack.len)
+        return error.NbtDepthLimit;
 
     const payload_start = offset.*;
 
     switch (tag) {
         .compound => {
             nodes[node].payload = buffer[payload_start..payload_start];
-            stack[stack_len.*] = .{ .kind = .compound, .node = node, .payload_start = payload_start };
+            stack[stack_len.*] = .{
+                .kind = .compound,
+                .node = node,
+                .payload_start = payload_start,
+            };
         },
         .list => {
             const child_tag = try read_tag(buffer, offset);
             const len = try read_len_i32(buffer, offset);
             nodes[node].payload = buffer[payload_start..offset.*];
             nodes[node].value = .{ .list = .{ .child_tag = child_tag, .len = len } };
-            stack[stack_len.*] = .{ .kind = .list, .node = node, .payload_start = payload_start, .child_tag = child_tag, .remaining = len };
+            stack[stack_len.*] = .{
+                .kind = .list,
+                .node = node,
+                .payload_start = payload_start,
+                .child_tag = child_tag,
+                .remaining = len,
+            };
         },
         else => unreachable,
     }
@@ -890,14 +930,20 @@ fn push_container(buffer: []const u8, offset: *usize, tag: Tag, node: u32, nodes
 
 fn push_skip_container(buffer: []const u8, offset: *usize, tag: Tag, stack: []Frame, stack_len: *usize) Error!void {
     std.debug.assert(tag.is_container());
-    if (stack_len.* == stack.len) return error.NbtDepthLimit;
+    if (stack_len.* == stack.len)
+        return error.NbtDepthLimit;
 
     switch (tag) {
         .compound => stack[stack_len.*] = .{ .kind = .compound, .node = 0 },
         .list => {
             const child_tag = try read_tag(buffer, offset);
             const len = try read_len_i32(buffer, offset);
-            stack[stack_len.*] = .{ .kind = .list, .node = 0, .child_tag = child_tag, .remaining = len };
+            stack[stack_len.*] = .{
+                .kind = .list,
+                .node = 0,
+                .child_tag = child_tag,
+                .remaining = len,
+            };
         },
         else => unreachable,
     }
@@ -907,10 +953,20 @@ fn push_skip_container(buffer: []const u8, offset: *usize, tag: Tag, stack: []Fr
 
 fn read_header(buffer: []const u8, offset: *usize, named: bool) Error!Header {
     const tag = try read_tag(buffer, offset);
-    if (tag == .end) return .{ .tag = tag, .name = &.{}, .payload_offset = offset.* };
+    if (tag == .end)
+        return .{
+            .tag = tag,
+            .name = &.{},
+            .payload_offset = offset.*,
+        };
 
     const name = if (named) try read_string_payload(buffer, offset) else &.{};
-    return .{ .tag = tag, .name = name, .payload_offset = offset.* };
+
+    return .{
+        .tag = tag,
+        .name = name,
+        .payload_offset = offset.*,
+    };
 }
 
 fn read_value(buffer: []const u8, offset: *usize, tag: Tag) Error!Value {
@@ -952,7 +1008,9 @@ fn read_string_payload(buffer: []const u8, offset: *usize) Error![]const u8 {
 
 fn read_len_i32(buffer: []const u8, offset: *usize) Error!usize {
     const len = try read_int(i32, buffer, offset);
-    if (len < 0) return error.NegativeLength;
+    if (len < 0)
+        return error.NegativeLength;
+
     return @intCast(len);
 }
 
@@ -961,7 +1019,8 @@ fn checked_byte_len(len: usize, element_size: usize) Error!usize {
 }
 
 fn read_bytes(buffer: []const u8, offset: *usize, len: usize) Error![]const u8 {
-    if (buffer.len -| offset.* < len) return error.EndOfStream;
+    if (buffer.len -| offset.* < len)
+        return error.EndOfStream;
 
     const start = offset.*;
     offset.* += len;
@@ -969,7 +1028,8 @@ fn read_bytes(buffer: []const u8, offset: *usize, len: usize) Error![]const u8 {
 }
 
 fn read_u8(buffer: []const u8, offset: *usize) Error!u8 {
-    if (offset.* == buffer.len) return error.EndOfStream;
+    if (offset.* == buffer.len)
+        return error.EndOfStream;
 
     const value = buffer[offset.*];
     offset.* += 1;

@@ -1,0 +1,7 @@
+.{
+    .name = .protocol_encoding,
+    .fingerprint = 0xced18c86338cea65,
+    .version = "0.1.0",
+    .dependencies = .{ .nbt = .{ .path = "../nbt" } },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

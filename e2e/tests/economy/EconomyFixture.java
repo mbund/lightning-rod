@@ -1,7 +1,7 @@
 package dev.lightningrod.e2e;
 
 import java.nio.file.Files;
-import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.Minecraft;
 
 final class EconomyFixture extends Fixture {
     private int economyStage;
@@ -9,17 +9,17 @@ final class EconomyFixture extends Fixture {
 
     EconomyFixture(Recorder r) { super(r); }
 
-    public void tick(MinecraftClient client, int loaded, int missing) {
+    public void tick(Minecraft client, int loaded, int missing) {
         if (r.terrainTick < 0 || loaded < 9) return;
         if (r.scenario.equals("economy-reopen-multi")) {
             if (economyStage == 0) {
                 economyStage = 1;
-                client.getNetworkHandler().sendChatCommand("balance");
+                client.getConnection().sendCommand("balance");
             }
             int bread = 0;
-            for (int slot = 0; slot < client.player.getInventory().size(); slot++) {
-                var stack = client.player.getInventory().getStack(slot);
-                if (stack.isOf(net.minecraft.item.Items.BREAD)) bread += stack.getCount();
+            for (int slot = 0; slot < client.player.getInventory().getContainerSize(); slot++) {
+                var stack = client.player.getInventory().getItem(slot);
+                if (stack.is(net.minecraft.world.item.Items.BREAD)) bread += stack.getCount();
             }
             if (r.receivedChat.contains(r.peer.equals("alice") ? "7.800 credit" : "11.000 credit")
                 && bread == (r.peer.equals("alice") ? 1 : 0)) {
@@ -43,9 +43,9 @@ final class EconomyFixture extends Fixture {
             }
         } else {
             int bread = 0;
-            for (int slot = 0; slot < client.player.getInventory().size(); slot++) {
-                var stack = client.player.getInventory().getStack(slot);
-                if (stack.isOf(net.minecraft.item.Items.BREAD)) bread += stack.getCount();
+            for (int slot = 0; slot < client.player.getInventory().getContainerSize(); slot++) {
+                var stack = client.player.getInventory().getItem(slot);
+                if (stack.is(net.minecraft.world.item.Items.BREAD)) bread += stack.getCount();
             }
             if (economyStage == 0) command = "buy bread 2";
             else if (economyStage == 1 && r.receivedChat.contains("Purchase complete") && bread == 2) command = "sell bread 1";
@@ -62,7 +62,7 @@ final class EconomyFixture extends Fixture {
         if (command != null) {
             r.receivedChat.clear();
             economyStage++;
-            client.getNetworkHandler().sendChatCommand(command);
+            client.getConnection().sendCommand(command);
             r.event("economy_command", "command", command);
         }
     }

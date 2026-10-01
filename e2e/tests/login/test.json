@@ -3,6 +3,10 @@
   "variants": [
     {
       "name": "login"
+    },
+    {
+      "name": "status-plugin",
+      "fixture": "isolation"
     }
   ]
 }

@@ -1,7 +1,7 @@
 const std = @import("std");
 const economy = @import("economy");
 const vanilla = @import("vanilla");
-const protocols = @import("protocols");
+const game_data = @import("game_data");
 
 pub const Offer = struct {
     item: []const u8,
@@ -16,7 +16,7 @@ pub const Shop = struct {
 
     pub const Dependencies = struct {
         players: *vanilla.Players,
-        menus: *vanilla.Menus,
+        menus: *vanilla.PlayerInventory,
         economy: *economy.Economy,
     };
 
@@ -27,7 +27,7 @@ pub const Shop = struct {
         if (config.offers.len > 256) return error.TooManyOffers;
 
         for (config.offers, 0..) |offer, index| {
-            if (offer.buy == 0 or offer.sell > offer.buy or protocols.registry.itemId(offer.item) == null) return error.InvalidOffer;
+            if (offer.buy == 0 or offer.sell > offer.buy or game_data.registry.itemId(offer.item) == null) return error.InvalidOffer;
 
             for (config.offers[0..index]) |previous| if (std.mem.eql(u8, previous.item, offer.item)) return error.DuplicateOffer;
         }

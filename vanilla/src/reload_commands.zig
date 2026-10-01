@@ -1,6 +1,7 @@
 const std = @import("std");
 const reload = @import("reload");
 const commands = @import("commands");
+const sessions = @import("sessions");
 const Players = @import("players.zig").Players;
 const Chat = @import("chat.zig").Chat;
 
@@ -14,6 +15,7 @@ pub const ReloadCommands = struct {
         players: *Players,
         chat: *Chat,
         commands: *commands.Commands,
+        sessions: *sessions.Service,
     };
 
     pub const notification_permission: commands.Permission = .{ .name = "server.reload.notify", .description = "Receive signal reload results" };
@@ -56,9 +58,9 @@ pub const ReloadCommands = struct {
     }
 
     pub fn tick(self: *ReloadCommands) !void {
-        const request = self.deps.reload.deps.reload_request orelse return;
+        const request = self.deps.reload.latest() orelse return;
 
-        for (self.deps.players.deps.sessions.input_events) |event| if (event == .joined and event.joined.cause != .reload) {
+        for (self.deps.sessions.input_events) |event| if (event == .joined and event.joined.cause != .reload) {
             self.seen[event.joined.handle.index] = request.sequence;
         };
 
@@ -81,8 +83,7 @@ pub const ReloadCommands = struct {
             seen.* = request.sequence;
 
             if (signal) {
-                const policy = self.deps.commands.deps.permission_policy orelse continue;
-                if (!policy.allows(policy.context, recipient.uuid, &notification_permission)) continue;
+                if (!self.deps.commands.permits(recipient.uuid, &notification_permission)) continue;
             } else if (std.mem.readInt(u128, token[player_prefix.len..][0..16], .big) != recipient.uuid) continue;
             self.deps.chat.system(handle, message);
         }

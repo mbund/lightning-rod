@@ -27,7 +27,7 @@ pub fn Simulation(comptime Selections: type) type {
         io: std.Io,
         state: State = .created,
         bytes: []align(64) u8,
-        instances: runtime.Instances(Selections) = .{},
+        instances: plugin.Instances(Selections) = .{},
         permanent: memory.Allocator,
         temporary: std.heap.FixedBufferAllocator,
         measurements: metrics.Metrics,
@@ -116,7 +116,7 @@ pub fn Simulation(comptime Selections: type) type {
             try runtime.tick(&self.instances, &self.temporary, &self.measurements, self.io, self.transaction.?);
             const simulated = std.Io.Clock.now(.awake, self.io);
             self.simulation_ns = @intCast(simulated.nanoseconds - started.nanoseconds);
-            try runtime.checkpoint(&self.instances, self.io, self.transaction.?);
+            try runtime.checkpoint(&self.instances, &self.measurements, self.io, self.transaction.?);
             const staged = std.Io.Clock.now(.awake, self.io);
             self.checkpoint_ns = @intCast(staged.nanoseconds - simulated.nanoseconds);
             try self.transaction.?.submit();
@@ -149,7 +149,9 @@ pub fn Simulation(comptime Selections: type) type {
             }
 
             if (self.transaction == null) self.transaction = try self.storage.begin(self.io, try std.math.add(u64, self.completed_tick, 1));
-            return self.work.progress(self.io);
+            const result = try self.work.progress(self.io);
+            if (result == .progressed) try self.transaction.?.preflush();
+            return result;
         }
 
         pub fn close(self: *Self, deadline: std.Io.Clock.Timestamp) !void {

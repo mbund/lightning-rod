@@ -36,6 +36,8 @@ pub const Store = struct {
     root_sync_ns: u64 = 0,
     pages_end: u64 = 0,
     values_end: u64 = 0,
+    checkpoint_pages_end: u64 = 0,
+    checkpoint_values_end: u64 = 0,
     failed: bool = false,
     active: bool = false,
     workspace: index.Workspace = .{},
@@ -288,7 +290,7 @@ pub const Store = struct {
     }
 
     pub fn deinit(self: *Store, io: std.Io) void {
-        if (self.syncing != null or self.durable_tick < self.last_tick)
+        if (self.syncing != null or (!self.failed and self.durable_tick < self.last_tick))
             flush(self, io) catch |err| std.log.err("event=storage_close_failed reason={s}", .{@errorName(err)});
         self.metrics.log("storage_reads");
         self.worker_metrics.log("storage_read_workers");
@@ -376,7 +378,7 @@ pub const Store = struct {
             .values_end = self.values_end,
             .open = true,
         };
-        return .{ .context = &self.transaction, .lease = self.lease, .vtable = &.{ .namespace = namespace, .submit = submit, .abort = abort } };
+        return .{ .context = &self.transaction, .lease = self.lease, .vtable = &.{ .namespace = namespace, .preflush = preflush, .submit = submit, .abort = abort } };
     }
 
     fn namespace(raw: *anyopaque, lease: u64, bytes: []const u8) storage.Error!storage.Namespace {
@@ -728,22 +730,39 @@ pub const Store = struct {
         return .{ .count = count, .more = false };
     }
 
+    fn preflush(raw: *anyopaque, lease: u64) storage.Error!void {
+        const tx: *Transaction = @ptrCast(@alignCast(raw));
+        if (tx.lease != lease) return error.Closed;
+        if (!tx.open or tx.store.failed) return error.Closed;
+        if (tx.store.pending_count < 64 and
+            tx.store.value_buffer.used < tx.store.value_buffer.bytes.len / 2 and
+            tx.store.page_buffer.used < tx.store.page_buffer.bytes.len / 2) return;
+        try flushPending(tx);
+    }
+
+    fn flushPending(tx: *Transaction) storage.Error!void {
+        try flushIndex(tx);
+        tx.store.value_buffer.flush(tx.store.values, tx.io) catch return tx.store.fail();
+        try flushPages(tx);
+    }
+
     fn submit(raw: *anyopaque, lease: u64) storage.Error!void {
         const tx: *Transaction = @ptrCast(@alignCast(raw));
         if (tx.lease != lease) return error.Closed;
         if (!tx.open or tx.store.failed) return error.Closed;
-        try flushIndex(tx);
-        tx.store.value_buffer.flush(tx.store.values, tx.io) catch return tx.store.fail();
-        try flushPages(tx);
-        const unchanged = std.meta.eql(tx.root, tx.store.root) and tx.pages_end == tx.store.pages_end and tx.values_end == tx.store.values_end;
-
-        // Empty ticks share the pending root. Flush publishes their latest tick.
-        if (!unchanged or tx.store.syncing == null) {
+        try flushPending(tx);
+        if (tx.store.syncing != null and tx.store.checkpoint.done.load(.acquire))
             try tx.store.finishCheckpoint(tx.io);
+
+        if (tx.store.syncing == null) {
             try tx.store.startCheckpoint(tx.io, tx.tick, tx.root, tx.pages_end, tx.values_end);
+        } else {
+            tx.store.root = tx.root;
+            tx.store.pages_end = tx.pages_end;
+            tx.store.values_end = tx.values_end;
+            tx.store.last_tick = tx.tick;
         }
 
-        tx.store.last_tick = tx.tick;
         tx.open = false;
         tx.store.active = false;
     }
@@ -768,14 +787,16 @@ pub const Store = struct {
             .pages = self.pages,
             .super = self.super[@intCast(s.generation & 1)],
             .root = s,
-            .values_changed = values_end != self.values_end,
-            .pages_changed = pages_end != self.pages_end,
+            .values_changed = values_end != self.checkpoint_values_end,
+            .pages_changed = pages_end != self.checkpoint_pages_end,
         };
         self.root = root;
         self.generation = s.generation;
         self.last_tick = tick;
         self.pages_end = pages_end;
         self.values_end = values_end;
+        self.checkpoint_pages_end = pages_end;
+        self.checkpoint_values_end = values_end;
         self.syncing = io.async(Checkpoint.run, .{&self.checkpoint});
     }
 
@@ -827,6 +848,8 @@ pub const Store = struct {
             self.root = .{ .page = s.root_page, .count = s.count };
             self.pages_end = s.pages_end;
             self.values_end = s.values_end;
+            self.checkpoint_pages_end = s.pages_end;
+            self.checkpoint_values_end = s.values_end;
             self.pages.setLength(io, s.pages_end) catch return error.IoFailure;
             self.values.setLength(io, s.values_end) catch return error.IoFailure;
         }
@@ -1006,6 +1029,8 @@ test "batched private pages preserve committed data across abort and reopen" {
 
             if (i % 127 == 0) try replacements.put(&key, null);
         }
+
+        try abandoned.preflush();
 
         try first.interface().flush(io);
         try std.testing.expectEqual(@as(u64, 1), first.interface().durableTick());

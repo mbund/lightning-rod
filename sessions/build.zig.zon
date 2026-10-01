@@ -1,1 +1,1 @@
-.{ .name = .sessions, .fingerprint = 0x9a609d135c422992, .version = "0.1.0", .dependencies = .{ .metrics = .{ .path = "../metrics" }, .networking = .{ .path = "../networking" }, .protocols = .{ .path = "../protocols" } }, .paths = .{ "build.zig", "build.zig.zon", "src" } }
+.{ .name = .sessions, .fingerprint = 0x9a609d135c422992, .version = "0.1.0", .dependencies = .{ .metrics = .{ .path = "../metrics" }, .networking = .{ .path = "../networking" } }, .paths = .{ "build.zig", "build.zig.zon", "src" } }

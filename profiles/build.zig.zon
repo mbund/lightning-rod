@@ -4,11 +4,10 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .storage = .{ .path = "../storage" },
         .reload = .{ .path = "../reload" },
         .lightning_rod = .{ .path = ".." },
         .sessions = .{ .path = "../sessions" },
-        .storage_local = .{ .path = "../storage_local" },
-        .reload_execve = .{ .path = "../reload_execve" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

@@ -19,7 +19,7 @@
             zls
             openssl
             gradle
-            jdk21
+            jdk25
             jq
             curl
             xorg-server

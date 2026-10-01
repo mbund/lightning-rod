@@ -3,8 +3,7 @@
   "variants": [
     {
       "name": "doors-multi",
-      "peers": ["alice", "bob"],
-      "versions": ["1.21.6", "1.21.8"]
+      "peers": ["alice", "bob"]
     }
   ]
 }

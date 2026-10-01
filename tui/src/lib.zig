@@ -1,5 +1,5 @@
 const std = @import("std");
-const rod = @import("lightning_rod");
+const lightning_rod = @import("lightning_rod");
 
 pub const Plugin = struct {
     pub const id = "lightning_rod:tui";
@@ -26,7 +26,7 @@ pub const Plugin = struct {
         self.ticks += 1;
         if (self.ticks < self.config.interval_ticks) return;
         self.ticks = 0;
-        const metrics = rod.metrics.snapshot() orelse return;
+        const metrics = lightning_rod.metrics.snapshot() orelse return;
         var bytes: [16 * 1024]u8 = undefined;
         var output = std.Io.Writer.fixed(&bytes);
         output.writeAll("\x1b[H\x1b[2JLightning Rod — Simulation\n\nPlugin                              last us     max us    memory KiB\n") catch unreachable;

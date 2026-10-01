@@ -1,0 +1,16 @@
+{
+  "client": "EnvironmentFixture",
+  "variants": [
+    {
+      "name": "environment",
+      "peers": ["alice", "bob"],
+      "peer_versions": ["1.21.8", "26.2"],
+      "required_logs": [
+        {"text": "event=environment_restored "},
+        {"text": "event=weather_expiry_verified "},
+        {"text": "event=reload_resumed "}
+      ],
+      "forbidden_logs": ["event=reload_fallback "]
+    }
+  ]
+}

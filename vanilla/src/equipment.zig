@@ -1,12 +1,16 @@
 const std = @import("std");
+const wire_1_21_5 = @import("wire_1_21_5");
+const packets = @import("minecraft_packets");
 const placement = @import("placement.zig");
 const mining = @import("mining.zig");
 const item_pickup = @import("item_pickup.zig");
 const sessions = @import("sessions");
 const inventories = @import("inventories");
-const protocols = @import("protocols");
+const item_packets = @import("item_packets.zig");
 const Replication = @import("replication.zig").Replication;
-const Menus = @import("menus.zig").Menus;
+const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
+const Items = @import("items.zig").Items;
+const Players = @import("players.zig").Players;
 
 pub const Equipment = struct {
     pub const id = "minecraft:equipment";
@@ -15,7 +19,12 @@ pub const Equipment = struct {
 
     pub const Dependencies = struct {
         replication: *Replication,
-        menus: *Menus,
+        menus: *PlayerInventory,
+        players: *Players,
+        inventories: *inventories.Inventories,
+        items: *Items,
+        sessions: *sessions.Service,
+        packets: *packets.Packets,
         placement: *placement.Placement,
         mining: *mining.Mining,
         pickup: *item_pickup.ItemPickup,
@@ -36,10 +45,11 @@ pub const Equipment = struct {
     deps: Dependencies,
     subjects: []Subject,
     seen: []Seen,
+    presentation: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Equipment {
         const self = try allocator.create(Equipment);
-        const count = deps.menus.deps.players.records.len;
+        const count = deps.players.records.len;
         const subjects = try allocator.alloc(Subject, count);
         const seen = try allocator.alloc(Seen, count * count);
         @memset(subjects, .{});
@@ -49,8 +59,10 @@ pub const Equipment = struct {
     }
 
     pub fn tick(self: *Equipment) !void {
-        const players = self.deps.menus.deps.players;
-        const service = players.deps.sessions;
+        const players = self.deps.players;
+        const service = self.deps.sessions;
+        const presentation_changed = self.presentation != self.deps.items.components.revision;
+        self.presentation = self.deps.items.components.revision;
 
         for (players.records, self.subjects, 0..) |player, *subject, index| {
             const handle = player.handle orelse continue;
@@ -62,8 +74,8 @@ pub const Equipment = struct {
                 slot.* = .{ .owner = player.uuid, .index = number };
 
             var contents: [6]inventories.Contents = undefined;
-            try self.deps.menus.deps.inventories.getMany(&slots, &contents);
-            var changed: u6 = if (subject.generation != handle.generation or subject.life != player.life) 63 else 0;
+            try self.deps.inventories.getMany(&slots, &contents);
+            var changed: u6 = if (presentation_changed or subject.generation != handle.generation or subject.life != player.life) 63 else 0;
 
             for (contents, &subject.stacks, 0..) |value, *previous, slot| {
                 if (!std.meta.eql(value.stack, previous.*)) changed |= @as(u6, 1) << @intCast(slot);
@@ -90,15 +102,16 @@ pub const Equipment = struct {
                 const flag = @as(u6, 1) << @intCast(slot);
                 if (pending & flag == 0) continue;
 
-                var capacity: usize = 32;
+                var capacity: usize = 32 + self.deps.items.components.extra_bytes;
 
                 if (stack) |held| {
-                    const definition = try self.deps.menus.deps.inventories.acquireItem(held.item);
+                    const definition = try self.deps.inventories.acquireItem(held.item);
                     defer definition.release();
                     capacity += definition.read().?.len;
                 }
 
-                for ([_]i32{ 771, 772 }) |protocol| {
+                for (service.config.protocols) |*selected| {
+                    const protocol = selected.number;
                     var recipients: [256]sessions.Handle = undefined;
                     var count: usize = 0;
 
@@ -117,18 +130,41 @@ pub const Equipment = struct {
                     }
 
                     if (count == 0) continue;
+                    const groups = if (self.deps.items.components.personalized) count else 1;
+                    for (0..groups) |group| {
+                        const targets = if (groups == 1) recipients[0..count] else recipients[group..][0..1];
+                        var packet = service.reserve(capacity) catch continue;
+                        defer packet.cancel();
+                        const bytes = self.deps.packets.writePacket(writeEquipment, protocol, packet.bytes, .{
+                            self.deps.items, @as(i32, @intCast(index + 1)), @as(u8, @intCast(slot)), stack, players.records[targets[0].index].uuid,
+                        }) catch |err| switch (err) {
+                            error.EndOfStream, error.UnsupportedItem, error.UnsupportedComponent => {
+                                for (targets) |recipient| service.disconnect(recipient);
+                                continue;
+                            },
+                            else => return err,
+                        };
+                        const accepted = packet.publishReady(bytes.len, targets);
 
-                    var packet = service.reserve(capacity) catch continue;
-                    defer packet.cancel();
-                    var rest = try protocols.support.write_varint(packet.bytes, protocols.wire.play.toClient.packetId(.entity_equipment));
-                    rest = try protocols.support.write_varint(rest, @intCast(index + 1));
-                    rest[0] = @intCast(slot);
-                    rest = try self.deps.menus.deps.items.writeStack(protocol, rest[1..], stack);
-                    const accepted = packet.publishReady(packet.bytes.len - rest.len, recipients[0..count]);
-
-                    for (accepted) |recipient| row[recipient.index].dirty &= ~flag;
+                        for (accepted) |recipient| row[recipient.index].dirty &= ~flag;
+                    }
                 }
             }
         }
+    }
+
+    fn writeEquipment(packet: wire_1_21_5.play.toClient.packet_entity_equipment.Writer, registry: packets.Registry, store: *Items, entity: i32, slot: u8, stack: ?inventories.Stack, recipient: u128) ![]u8 {
+        var equipments = try (try packet.entityId(entity)).equipments(1);
+        const entry = (try equipments.next()).?;
+        const slotted = try entry.slot(@intCast(slot));
+        var item = try slotted.item();
+        const done = try item_packets.writeSlot(try item.begin(), .{
+            .registry = registry,
+            .items = store,
+            .stack = stack,
+            .recipient = recipient,
+        });
+        try equipments.advance(try item.advance(done));
+        return (try equipments.finish()).finish();
     }
 };

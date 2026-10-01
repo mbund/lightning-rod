@@ -15,7 +15,7 @@ pub const Fixture = struct {
     }
 
     pub fn tick(self: *Fixture, deps: Dependencies) !void {
-        for (deps.players.deps.sessions.input_events) |event| {
+        for (deps.sessions.input_events) |event| {
             if (event == .joined and event.joined.cause == .reload) self.given[event.joined.handle.index] = event.joined.handle.generation;
         }
 

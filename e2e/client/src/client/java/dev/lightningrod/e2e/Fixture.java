@@ -1,7 +1,7 @@
 package dev.lightningrod.e2e;
 
-import net.minecraft.client.MinecraftClient;
-import net.minecraft.util.math.BlockPos;
+import net.minecraft.client.Minecraft;
+import net.minecraft.core.BlockPos;
 
 abstract class Fixture {
     final Recorder r;
@@ -12,12 +12,12 @@ abstract class Fixture {
         return DiscoveredTests.create(r, name);
     }
 
-    void poll(MinecraftClient client) {}
-    void connected(MinecraftClient client) {}
+    void poll(Minecraft client) {}
+    void connected(Minecraft client) {}
     boolean encrypted() { return false; }
-    void disconnected(MinecraftClient client, String title) { r.fail(client, "disconnected: " + title); }
-    boolean prepare(MinecraftClient client) { return true; }
-    abstract void tick(MinecraftClient client, int loaded, int missing);
+    void disconnected(Minecraft client, String title) { r.fail(client, "disconnected: " + title); }
+    boolean prepare(Minecraft client) { return true; }
+    abstract void tick(Minecraft client, int loaded, int missing);
     void chat(String text) { r.receivedChat.add(text); }
     void blockBreaking(BlockPos position, int stage) {}
     void reconfigurationEncoded() {}

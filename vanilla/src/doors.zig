@@ -2,7 +2,8 @@ const std = @import("std");
 const players = @import("players.zig");
 const block_sync = @import("block_sync.zig");
 const chunks = @import("chunks");
-const registry = @import("protocols").registry;
+const worlds = @import("worlds");
+const registry = @import("game_data").registry;
 const BlockActions = @import("block_actions.zig").BlockActions;
 
 const assert = std.debug.assert;
@@ -16,6 +17,7 @@ pub const Doors = struct {
         actions: *BlockActions,
         chunks: *chunks.Chunks,
         players: *players.Players,
+        worlds: *worlds.Worlds,
         synchronization: *block_sync.BlockSynchronization,
     };
 
@@ -60,7 +62,7 @@ pub const Doors = struct {
 
         if (request.action != .place and offset & 8 == 0) bottom.y -= 1;
         const top: chunks.Position = .{ .x = bottom.x, .y = bottom.y + 1, .z = bottom.z };
-        const dimension = self.deps.players.deps.worlds.get(world).?.dimension;
+        const dimension = self.deps.worlds.get(world).?.dimension;
         const minimum_y = dimension.minimumSection() * 16;
         const maximum_y = minimum_y + @as(i32, @intCast(dimension.sectionCount() * 16));
         if (bottom.y < minimum_y or top.y >= maximum_y) {

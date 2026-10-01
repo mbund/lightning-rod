@@ -3,13 +3,24 @@
   "variants": [
     {
       "name": "player-sync",
-      "versions": ["1.21.6", "1.21.8"],
+      "peer_versions": ["1.21.6", "1.21.8", "1.21.9", "1.21.11", "26.1", "26.2"],
       "peers": [
         "alice",
         "bob",
-        "carol"
+        "carol",
+        "dave",
+        "eve",
+        "frank"
       ],
       "last_peer_connect_tick": 180
+    },
+    {
+      "name": "player-sync-legacy",
+      "server_releases": "1.21.5,1.21.6",
+      "versions": ["1.21.5"],
+      "peer_versions": ["1.21.5", "1.21.6"],
+      "peers": ["alice", "bob"],
+      "last_peer_connect_tick": 80
     }
   ]
 }

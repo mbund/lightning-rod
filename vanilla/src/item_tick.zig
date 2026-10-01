@@ -1,13 +1,15 @@
 const std = @import("std");
 const inventories = @import("inventories");
-const rod = @import("lightning_rod");
+const lightning_rod = @import("lightning_rod");
 const entities = @import("entities");
+const worlds = @import("worlds");
 const ItemEntities = @import("item_entities.zig").ItemEntities;
 const ItemPhysics = @import("item_physics.zig").ItemPhysics;
 const ItemMerging = @import("item_merging.zig").ItemMerging;
 const ItemPickup = @import("item_pickup.zig").ItemPickup;
 const Players = @import("players.zig").Players;
 const item = @import("item.zig");
+const Items = @import("items.zig").Items;
 
 const assert = std.debug.assert;
 
@@ -22,6 +24,10 @@ pub const ItemTick = struct {
         merging: *ItemMerging,
         pickup: *ItemPickup,
         players: *Players,
+        entities: *entities.Entities,
+        inventories: *inventories.Inventories,
+        items: *Items,
+        worlds: *worlds.Worlds,
     };
 
     deps: Dependencies,
@@ -42,7 +48,7 @@ pub const ItemTick = struct {
             var metadata = try dropped.get(row.id);
             if (!metadata.alive) continue;
 
-            var body = (try dropped.deps.entities.get(row.id)) orelse return error.Corrupt;
+            var body = (try self.deps.entities.get(row.id)) orelse return error.Corrupt;
             var simulated = false;
 
             for (self.deps.players.records) |player| {
@@ -69,8 +75,8 @@ pub const ItemTick = struct {
             self.stepped += 1;
             const interval: u32 = if (advanced.crossed_block) 2 else 40;
             if (metadata.ticks % interval == 0 and metadata.age != -32768 and metadata.age < 6000 and metadata.pickup_delay != 32767) {
-                const held = (try dropped.deps.inventories.get(ItemEntities.slot(body))).stack orelse return error.Corrupt;
-                const maximum = try dropped.deps.items.stackLimit(held);
+                const held = (try self.deps.inventories.get(ItemEntities.slot(body))).stack orelse return error.Corrupt;
+                const maximum = try self.deps.items.stackLimit(held);
                 if (held.count < maximum) {
                     const low: [3]i32 = .{ @intFromFloat(@floor((body.position[0] - 0.75) / 16)), @intFromFloat(@floor((body.position[1] - 0.25) / 16)), @intFromFloat(@floor((body.position[2] - 0.75) / 16)) };
                     const high: [3]i32 = .{ @intFromFloat(@floor((body.position[0] + 0.75) / 16)), @intFromFloat(@floor((body.position[1] + 0.25) / 16)), @intFromFloat(@floor((body.position[2] + 0.75) / 16)) };
@@ -87,10 +93,10 @@ pub const ItemTick = struct {
                                 cell.position = .{ @as(f64, @floatFromInt(x)) * 16, @as(f64, @floatFromInt(y)) * 16, @as(f64, @floatFromInt(z)) * 16 };
                                 const prefix = ItemEntities.spatialKey(0, cell);
                                 var after = prefix;
-                                var position: rod.storage.ScanCursor = .{ .after = &after, .after_len = 17 };
+                                var position: lightning_rod.storage.ScanCursor = .{ .after = &after, .after_len = 17 };
                                 var keys: [16][25]u8 = undefined;
                                 var values: [16][54]u8 = undefined;
-                                var entries: [16]rod.storage.ScanEntry = undefined;
+                                var entries: [16]lightning_rod.storage.ScanEntry = undefined;
 
                                 for (&entries, &keys, &values) |*entry, *key, *value| entry.* = .{ .key = key, .value = value };
 
@@ -112,13 +118,13 @@ pub const ItemTick = struct {
                                         var other_meta = try dropped.get(other_id);
                                         if (!other_meta.alive) continue;
 
-                                        const other = (try dropped.deps.entities.get(other_id)) orelse return error.Corrupt;
+                                        const other = (try self.deps.entities.get(other_id)) orelse return error.Corrupt;
                                         assert(other.world == body.world);
                                         if (@abs(body.position[0] - other.position[0]) >= 0.75 or @abs(body.position[1] - other.position[1]) >= 0.25 or @abs(body.position[2] - other.position[2]) >= 0.75)
                                             continue;
 
-                                        const first = try dropped.deps.inventories.get(ItemEntities.slot(body));
-                                        const second = try dropped.deps.inventories.get(ItemEntities.slot(other));
+                                        const first = try self.deps.inventories.get(ItemEntities.slot(body));
+                                        const second = try self.deps.inventories.get(ItemEntities.slot(other));
                                         if (first.stack == null or second.stack == null) return error.Corrupt;
                                         if (!inventories.Stack.sameItem(first.stack.?, second.stack.?)) continue;
 
@@ -139,7 +145,7 @@ pub const ItemTick = struct {
                                             },
                                         ) orelse continue;
                                         const remainder = if (merged.source) |source| source.stack else null;
-                                        const committed = try dropped.deps.inventories.editMany(&.{
+                                        const committed = try self.deps.inventories.editMany(&.{
                                             .{
                                                 .slot = ItemEntities.slot(body),
                                                 .revision = first.revision,
@@ -174,12 +180,12 @@ pub const ItemTick = struct {
             }
 
             if (metadata.alive and metadata.age != -32768) metadata.age += 1;
-            const world = dropped.deps.worlds.get(body.world) orelse return error.UnknownWorld;
+            const world = self.deps.worlds.get(body.world) orelse return error.UnknownWorld;
             const void_y: f64 = @floatFromInt(world.dimension.minimumSection() * 16 - 64);
 
             if (metadata.alive and (metadata.age >= 6000 or body.position[1] < void_y)) {
-                const held = try dropped.deps.inventories.get(ItemEntities.slot(body));
-                const removed = try dropped.deps.inventories.set(ItemEntities.slot(body), held.revision, null);
+                const held = try self.deps.inventories.get(ItemEntities.slot(body));
+                const removed = try self.deps.inventories.set(ItemEntities.slot(body), held.revision, null);
                 assert(removed);
                 try dropped.retire(row.id, body, &metadata);
             }

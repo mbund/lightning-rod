@@ -1,5 +1,5 @@
 const std = @import("std");
-const rod = @import("lightning_rod");
+const lightning_rod = @import("lightning_rod");
 const bossbars = @import("bossbars");
 
 pub const Tps = struct {
@@ -46,7 +46,7 @@ pub const Tps = struct {
     }
 
     pub fn tick(self: *Tps) !void {
-        const metrics = rod.metrics.snapshot() orelse return;
+        const metrics = lightning_rod.metrics.snapshot() orelse return;
         const sample = metrics.completed_tick;
         if (sample.sequence == 0 or sample.sequence == self.previous) return;
 

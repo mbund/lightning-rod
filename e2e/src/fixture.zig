@@ -9,11 +9,12 @@ const block_sync_fixture = @import("../tests/block-sync/server.zig");
 const transfer_fixture = @import("../tests/transfer/server.zig");
 const sessions = @import("sessions");
 const vanilla = @import("vanilla");
+const bossbars = @import("bossbars");
 
 pub const Context = struct {
     players: *vanilla.Players,
-    menus: *vanilla.Menus,
-    input: *vanilla.Input,
+    menus: *vanilla.PlayerInventory,
+    command_dispatch: *vanilla.CommandDispatch,
     chat: *vanilla.Chat,
     chunks: *vanilla.Chunks,
     synchronization: *vanilla.BlockSynchronization,
@@ -21,6 +22,10 @@ pub const Context = struct {
     dropped: *vanilla.ItemEntities,
     item_tick: *vanilla.ItemTick,
     reload: *vanilla.Reload,
+    bars: *bossbars.Bossbars,
+    sessions: *sessions.Service,
+    inventories: *vanilla.Inventories,
+    entities: *vanilla.Entities,
 };
 
 pub const Kind = enum { none, inventory, respawn, reload, items, block_sync, transfer };
@@ -65,6 +70,7 @@ pub const Plugin = struct {
             inline else => |kind| @unionInit(State, @tagName(kind), try @FieldType(State, @tagName(kind)).init(allocator, deps)),
         };
         self.* = .{ .deps = deps, .state = state };
+        try deps.command_dispatch.observeCommand(self, onCommand);
 
         if (self.state == .transfer) self.state.transfer = .{
             .inventory = if (config.inventory) try inventory_fixture.Fixture.init(allocator, deps) else null,
@@ -73,6 +79,17 @@ pub const Plugin = struct {
         };
 
         return self;
+    }
+
+    fn onCommand(self: *Plugin, handle: sessions.Handle, text: []const u8) !void {
+        switch (self.state) {
+            .inventory => |*selected| try selected.command(self.deps, handle, text),
+            .reload => |*selected| try selected.command(self.deps, handle, text),
+            .items => |*selected| try selected.command(self.deps, handle, text),
+            .block_sync => |*selected| try selected.command(self.deps, handle, text),
+            .transfer => |*selected| try selected.command(self.deps, handle, text),
+            .none, .respawn => {},
+        }
     }
 
     pub fn tick(self: *Plugin) !void {

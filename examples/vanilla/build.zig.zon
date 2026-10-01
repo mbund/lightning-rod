@@ -4,6 +4,8 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .minecraft_packets = .{ .path = "../../minecraft_packets" },
+        .protocols = .{ .path = "../../protocols" },
         .bossbars = .{ .path = "../../bossbars" },
         .tps = .{ .path = "../plugins/tps" },
         .lightning_rod_tui = .{ .path = "../../tui" },

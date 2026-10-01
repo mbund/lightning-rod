@@ -1,5 +1,5 @@
 const std = @import("std");
-const rod = @import("lightning_rod");
+const lightning_rod = @import("lightning_rod");
 const sessions = @import("sessions");
 
 const assert = std.debug.assert;
@@ -7,10 +7,10 @@ const assert = std.debug.assert;
 pub fn Scheduler(comptime Plugins: type) type {
     return struct {
         pub const Job = struct {
-            simulation: *rod.Simulation(Plugins),
+            simulation: *lightning_rod.Simulation(Plugins),
             endpoint: *sessions.Service,
             deadline: i96,
-            work: rod.Work.Result = .idle,
+            work: lightning_rod.Work.Result = .idle,
             operation: enum { tick, work } = .tick,
             running: bool = false,
             done: std.atomic.Value(bool) = .init(false),
@@ -46,7 +46,8 @@ pub fn Scheduler(comptime Plugins: type) type {
                             return;
                         };
 
-                        if (self.simulation.work_ns > 50 * std.time.ns_per_ms) std.log.warn("event=slow_tick work_ns={d}", .{self.simulation.work_ns});
+                        if (self.simulation.work_ns > 50 * std.time.ns_per_ms)
+                            std.log.warn("event=slow_tick work_ns={d}", .{self.simulation.work_ns});
                     },
                 }
             }
@@ -61,13 +62,19 @@ pub fn Scheduler(comptime Plugins: type) type {
         pub fn run(io: std.Io, jobs: []Job, slots: []Slot, stop: *std.atomic.Value(bool), wakeup: *std.Io.Event) !void {
             assert(jobs.len > 0 and slots.len > 0);
 
-            for (jobs) |job| assert(!job.running);
+            for (jobs) |job|
+                assert(!job.running);
 
-            for (slots) |slot| assert(slot.job == null and slot.future == null);
+            for (slots) |slot|
+                assert(slot.job == null and slot.future == null);
+
             defer for (slots) |*slot| {
-                if (slot.future) |*future| future.await(io);
+                if (slot.future) |*future|
+                    future.await(io);
 
-                if (slot.job) |job| job.running = false;
+                if (slot.job) |job|
+                    job.running = false;
+
                 slot.* = .{};
             };
             var next: usize = 0;
@@ -77,25 +84,32 @@ pub fn Scheduler(comptime Plugins: type) type {
 
                 for (slots) |*slot| {
                     const job = slot.job orelse continue;
-                    if (!job.done.load(.acquire)) continue;
+                    if (!job.done.load(.acquire))
+                        continue;
 
-                    if (slot.future) |*future| future.await(io);
+                    if (slot.future) |*future|
+                        future.await(io);
+
                     slot.* = .{};
                     job.running = false;
-                    if (job.failure) |err| return err;
+                    if (job.failure) |err|
+                        return err;
                 }
 
                 const now = std.Io.Clock.now(.awake, io).nanoseconds;
 
                 for (slots) |*slot| {
-                    if (slot.job != null) continue;
+                    if (slot.job != null)
+                        continue;
 
                     var selected: ?*Job = null;
 
                     for (0..jobs.len) |_| {
                         const job = &jobs[next];
                         next = (next + 1) % jobs.len;
-                        if (job.running) continue;
+                        if (job.running)
+                            continue;
+
                         if (job.deadline <= now) {
                             selected = job;
                             job.operation = .tick;
@@ -103,16 +117,20 @@ pub fn Scheduler(comptime Plugins: type) type {
                         }
                     }
 
-                    if (selected == null) for (0..jobs.len) |_| {
-                        const job = &jobs[next];
-                        next = (next + 1) % jobs.len;
-                        if (job.running) continue;
-                        if (job.work == .progressed or (job.work == .blocked and job.endpoint.output_progress.isSet())) {
-                            selected = job;
-                            job.operation = .work;
-                            break;
+                    if (selected == null) {
+                        for (0..jobs.len) |_| {
+                            const job = &jobs[next];
+                            next = (next + 1) % jobs.len;
+                            if (job.running)
+                                continue;
+
+                            if (job.work == .progressed or (job.work == .blocked and job.endpoint.output_progress.isSet())) {
+                                selected = job;
+                                job.operation = .work;
+                                break;
+                            }
                         }
-                    };
+                    }
 
                     const job = selected orelse break;
                     job.endpoint.output_progress.reset();
@@ -128,11 +146,15 @@ pub fn Scheduler(comptime Plugins: type) type {
                 var deadline = now + 50 * std.time.ns_per_ms;
                 var available = false;
 
-                for (slots) |slot| available = available or slot.job == null;
+                for (slots) |slot|
+                    available = available or slot.job == null;
 
-                if (available) for (jobs) |job| {
-                    if (!job.running) deadline = @min(deadline, job.deadline);
-                };
+                if (available) {
+                    for (jobs) |job| {
+                        if (!job.running)
+                            deadline = @min(deadline, job.deadline);
+                    }
+                }
 
                 wakeup.waitTimeout(io, .{ .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = deadline } } }) catch |err| switch (err) {
                     error.Timeout => {},

@@ -1,7 +1,7 @@
 const std = @import("std");
 const chunks = @import("chunks");
 const entities = @import("entities");
-const registry = @import("protocols").registry;
+const registry = @import("game_data").registry;
 
 const assert = std.debug.assert;
 

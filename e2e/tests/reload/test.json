@@ -3,13 +3,22 @@
   "variants": [
     {
       "name": "reload-multi",
-      "backends": ["uring", "stdio"],
-      "versions": ["1.21.6", "1.21.8"],
       "fixture": "reload",
+      "reload": true,
       "peers": [
         "alice",
         "bob"
       ]
+    },
+    {
+      "name": "reload-creative",
+      "fixture": "reload_creative",
+      "reload": true,
+      "protocol_mismatch": true,
+      "required_logs": [
+        { "text": "event=reload_fallback reason=ReloadProtocolUnsupported" }
+      ],
+      "peers": ["alice", "bob"]
     }
   ]
 }

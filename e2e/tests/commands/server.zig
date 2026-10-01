@@ -40,7 +40,7 @@ pub const Probe = struct {
         commands: *commands.Commands,
         players: *vanilla.Players,
         chunks: *vanilla.Chunks,
-        menus: *vanilla.Menus,
+        menus: *vanilla.PlayerInventory,
         dropped: *vanilla.ItemEntities,
         state: *State,
         label: []const u8,

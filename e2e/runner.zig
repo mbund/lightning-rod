@@ -3,9 +3,9 @@ const builtin = @import("builtin");
 const allMarkers = @import("src/artifacts.zig").allMarkers;
 const process_cleanup = @import("src/process_cleanup.zig");
 const catalog = @import("src/catalog.zig");
-const ReloadTest = @import("tests/reload/server.zig").Test;
+const ReloadTest = @import("tests/reload/test.zig").Test;
 
-const max_processes = 5;
+const max_processes = catalog.maximum_peers + 2;
 const scenario_timeout_s = 180;
 
 const Arguments = struct {
@@ -16,7 +16,7 @@ const Arguments = struct {
     address: []const u8,
     strace: bool,
     client_version: []const u8,
-    gradle: [3][]const u8,
+    gradle: [5][]const u8,
 };
 
 const ManagedChild = struct {
@@ -45,7 +45,7 @@ const ManagedChild = struct {
     }
 };
 
-var process_groups: [max_processes]std.atomic.Value(std.posix.pid_t) = .{ .init(0), .init(0), .init(0), .init(0), .init(0) };
+var process_groups: [max_processes]std.atomic.Value(std.posix.pid_t) = @splat(.init(0));
 var interrupted = std.atomic.Value(bool).init(false);
 
 pub fn main(init: std.process.Init) !void {
@@ -53,9 +53,17 @@ pub fn main(init: std.process.Init) !void {
     try process_cleanup.enable();
     defer _ = process_cleanup.finish(init.io) catch {};
     installSignalHandlers();
-    const cases = try catalog.load(init.arena.allocator(), init.io, "tests");
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len == 2 and std.mem.eql(u8, args[1], "--list")) {
+    var tests_root: []const u8 = "tests";
+    for (args, 0..) |arg, index| {
+        if (!std.mem.eql(u8, arg, "--tests")) continue;
+        if (index + 1 == args.len) return error.MissingArgumentValue;
+        tests_root = args[index + 1];
+    }
+    const cases = try catalog.load(init.arena.allocator(), init.io, tests_root);
+    const absolute_tests = try std.Io.Dir.cwd().realPathFileAlloc(init.io, tests_root, init.arena.allocator());
+    try init.environ_map.put("LIGHTNING_ROD_E2E_TEST_ROOT", absolute_tests);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--list")) {
         for (cases) |case| {
             if (case.internal) continue;
 
@@ -66,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const arguments = try parse(args, cases);
+    const arguments = try parse(init, args, cases);
     try ensureExecutable(init.io, arguments.server);
     try run(init, arguments, cases);
 }
@@ -81,6 +89,7 @@ fn run(init: std.process.Init, arguments: Arguments, cases: []const catalog.Case
     defer init.gpa.free(server);
     const client = try cwd.realPathFileAlloc(init.io, arguments.client, init.gpa);
     defer init.gpa.free(client);
+    try init.environ_map.put("LIGHTNING_ROD_E2E_CLIENT_SOURCE", client);
     try cwd.createDirPath(init.io, arguments.artifacts);
     const root = try cwd.realPathFileAlloc(init.io, arguments.artifacts, init.gpa);
     defer init.gpa.free(root);
@@ -88,10 +97,17 @@ fn run(init: std.process.Init, arguments: Arguments, cases: []const catalog.Case
     defer init.gpa.free(artifacts);
     try cwd.createDir(init.io, artifacts, .default_dir);
     std.log.info("event=e2e_started scenario={s} artifacts={s}", .{ arguments.scenario.name, artifacts });
-    {
+    const client_versions = if (arguments.scenario.peer_versions.len == 0) &.{arguments.client_version} else arguments.scenario.peer_versions;
+    for (client_versions, 0..) |version, index| {
+        var duplicate = false;
+        for (client_versions[0..index]) |previous| duplicate = duplicate or std.mem.eql(u8, previous, version);
+        if (duplicate) continue;
+        const gradle = try clientArguments(init, client, version);
         const wrapper = try std.fs.path.join(init.gpa, &.{ client, "gradlew" });
         defer init.gpa.free(wrapper);
-        var compile_client = try spawn(init, &.{ wrapper, "--no-daemon", "compileClientJava", arguments.gradle[0], arguments.gradle[1], arguments.gradle[2] }, artifacts, client, "client-build.log");
+        const log = try std.fmt.allocPrint(init.gpa, "client-build-{s}.log", .{version});
+        defer init.gpa.free(log);
+        var compile_client = try spawn(init, &.{ wrapper, "--no-daemon", "compileClientJava", gradle[0], gradle[1], gradle[2], gradle[3], gradle[4] }, artifacts, client, log);
         process_groups[0].store(compile_client.group, .release);
         defer {
             compile_client.stop(init.io);
@@ -133,7 +149,7 @@ fn run(init: std.process.Init, arguments: Arguments, cases: []const catalog.Case
     std.log.info("event=e2e_passed artifacts={s}", .{artifacts});
 }
 
-fn runScenario(init: std.process.Init, test_case: catalog.Case, server_path: []const u8, client_dir: []const u8, artifacts: []const u8, world: []const u8, address: []const u8, strace: bool, gradle: [3][]const u8) !void {
+fn runScenario(init: std.process.Init, test_case: catalog.Case, server_path: []const u8, client_dir: []const u8, artifacts: []const u8, world: []const u8, address: []const u8, strace: bool, gradle: [5][]const u8) !void {
     const scenario = test_case.name;
     const test_directory = try std.Io.Dir.cwd().realPathFileAlloc(init.io, test_case.directory, init.gpa);
     defer init.gpa.free(test_directory);
@@ -141,6 +157,7 @@ fn runScenario(init: std.process.Init, test_case: catalog.Case, server_path: []c
     try init.environ_map.put("LIGHTNING_ROD_E2E_ADDRESS", address);
     const port = try std.fmt.allocPrint(init.gpa, "--port={s}", .{address[(std.mem.lastIndexOfScalar(u8, address, ':') orelse return error.InvalidAddress) + 1 ..]});
     defer init.gpa.free(port);
+    try init.environ_map.put("LIGHTNING_ROD_PORT", port[7..]);
     const fixture = test_case.fixture;
     const fixture_arg = if (fixture) |name| try std.fmt.allocPrint(init.gpa, "--fixture={s}", .{name}) else null;
     defer if (fixture_arg) |arg| init.gpa.free(arg);
@@ -161,7 +178,6 @@ fn runScenario(init: std.process.Init, test_case: catalog.Case, server_path: []c
         argc += 2;
     }
 
-    const reload = std.mem.eql(u8, scenario, "reload-multi");
     var server = try spawn(init, argv[0..argc], artifacts, world, "server.log");
     process_groups[0].store(server.group, .release);
     defer {
@@ -176,7 +192,7 @@ fn runScenario(init: std.process.Init, test_case: catalog.Case, server_path: []c
     }
     try std.Io.sleep(init.io, .fromMilliseconds(1_500), .awake);
     const peers = test_case.peers;
-    var clients: [3]ManagedChild = undefined;
+    var clients: [catalog.maximum_peers]ManagedChild = undefined;
     var count: usize = 0;
     defer for (clients[0..count], 0..) |*child, index| {
         child.stop(init.io);
@@ -185,13 +201,25 @@ fn runScenario(init: std.process.Init, test_case: catalog.Case, server_path: []c
 
     for (peers) |peer| {
         const connect_tick: usize = if (count + 1 == peers.len) test_case.last_peer_connect_tick else 40;
-        clients[count] = try spawnClient(init, client_dir, artifacts, scenario, peer, peers, connect_tick, address, gradle);
+        const peer_gradle = if (test_case.peer_versions.len == 0) gradle else try clientArguments(init, client_dir, test_case.peer_versions[count]);
+        clients[count] = try spawnClient(init, client_dir, artifacts, scenario, peer, peers, connect_tick, address, peer_gradle);
         process_groups[count + 2].store(clients[count].group, .release);
         count += 1;
+        const startup_deadline = std.Io.Clock.Timestamp.now(init.io, .awake).raw.nanoseconds + 120 * std.time.ns_per_s;
+        while (!try allMarkers(init, artifacts, &.{peer}, ".ready")) {
+            if (interrupted.load(.monotonic)) return error.Interrupted;
+            if (std.Io.Clock.Timestamp.now(init.io, .awake).raw.nanoseconds >= startup_deadline) return error.ClientStartupTimeout;
+            try std.Io.sleep(init.io, .fromMilliseconds(50), .awake);
+        }
     }
 
-    try waitForResults(init, artifacts, peers, if (reload) .{ .world = world, .executable = server_path } else null);
-    const passed = try resultsPassed(init, artifacts, peers);
+    const start_path = try std.fs.path.join(init.gpa, &.{ artifacts, "clients.start" });
+    defer init.gpa.free(start_path);
+    const start = try std.Io.Dir.cwd().createFile(init.io, start_path, .{});
+    start.close(init.io);
+
+    try waitForResults(init, artifacts, peers, if (test_case.reload) .{ .world = world, .executable = server_path, .protocol_mismatch = test_case.protocol_mismatch } else null);
+    if (!try resultsPassed(init, artifacts, peers)) return error.EndToEndAssertionFailed;
     {
         const path = try std.fmt.allocPrint(init.gpa, "{s}/server.log", .{artifacts});
         defer init.gpa.free(path);
@@ -199,19 +227,26 @@ fn runScenario(init: std.process.Init, test_case: catalog.Case, server_path: []c
         defer init.gpa.free(log);
         if (!strace and std.mem.indexOf(u8, log, "event=slow_tick ") != null) return error.TickBudgetExceeded;
 
-        if (reload) try ReloadTest.verify(log, peers.len);
-        if (std.mem.eql(u8, scenario, "chunks-simulations-multi") and (std.mem.count(u8, log, "event=simulation_ready ") != 2 or std.mem.indexOf(u8, log, "event=session_routed endpoint=0 ") == null or std.mem.indexOf(u8, log, "event=session_routed endpoint=1 ") == null))
-            return error.SimulationRoutingFailed;
-        if (std.mem.indexOf(u8, scenario, "encrypted") != null and std.mem.count(u8, log, "event=session_encrypted ") != peers.len)
-            return error.EncryptionBypassed;
-        if (std.mem.eql(u8, scenario, "transfer-multi") and std.mem.count(u8, log, "event=session_transfer ") != 2) return error.TransferFailed;
-        if (std.mem.eql(u8, scenario, "encryption-reject") and (std.mem.indexOf(u8, log, "reason=InvalidEncryption") == null or std.mem.indexOf(u8, log, "event=session_play_attached") != null))
-            return error.InvalidEncryptionAccepted;
-        if (std.mem.startsWith(u8, scenario, "chunks-disk") and std.mem.indexOf(u8, log, "event=terrain_generation_started") != null)
-            return error.UnexpectedTerrainGeneration;
+        if (test_case.reload) try ReloadTest.verify(log, peers.len);
+
+        for (test_case.required_logs) |rule| {
+            const expected = rule.count * (if (rule.per_peer) peers.len else @as(usize, 1));
+            const actual = std.mem.count(u8, log, rule.text);
+            if (if (rule.at_least) actual < expected else actual != expected) {
+                std.log.err("event=e2e_log_count_mismatch text={s} expected={d}", .{ rule.text, expected });
+                return error.LogCountMismatch;
+            }
+        }
+
+        for (test_case.forbidden_logs) |text| {
+            if (std.mem.indexOf(u8, log, text) != null) {
+                std.log.err("event=e2e_forbidden_log text={s}", .{text});
+                return error.ForbiddenLog;
+            }
+        }
     }
-    try writeSummary(init, artifacts, scenario, passed, if (passed) "passed" else "client_failed");
-    if (!passed) return error.EndToEndAssertionFailed;
+    try writeSummary(init, artifacts, scenario, true, "passed");
+    if (test_case.crash_after) try std.posix.kill(-server.group, .KILL);
 }
 
 fn spawn(init: std.process.Init, argv: []const []const u8, artifacts: []const u8, working_directory: []const u8, name: []const u8) !ManagedChild {
@@ -231,8 +266,10 @@ fn spawn(init: std.process.Init, argv: []const []const u8, artifacts: []const u8
     return .{ .child = child, .group = child.id orelse return error.ProcessIdUnavailable };
 }
 
-fn spawnClient(init: std.process.Init, client_dir: []const u8, artifacts: []const u8, scenario: []const u8, peer: []const u8, peers: []const []const u8, connect_tick: usize, address: []const u8, gradle: [3][]const u8) !ManagedChild {
+fn spawnClient(init: std.process.Init, client_dir: []const u8, artifacts: []const u8, scenario: []const u8, peer: []const u8, peers: []const []const u8, connect_tick: usize, address: []const u8, gradle: [5][]const u8) !ManagedChild {
     const allocator = init.gpa;
+    const version = try std.fmt.allocPrint(allocator, "-Dmcc.version={s}", .{gradle[0]["-Pminecraft_version=".len..]});
+    defer allocator.free(version);
     const address_arg = try std.fmt.allocPrint(allocator, "-Dmcc.server={s}", .{address});
     defer allocator.free(address_arg);
     const expected_peers = try std.mem.join(allocator, ",", peers);
@@ -262,7 +299,7 @@ fn spawnClient(init: std.process.Init, client_dir: []const u8, artifacts: []cons
     const log = try std.Io.Dir.cwd().createFile(init.io, log_path, .{});
     defer log.close(init.io);
     const child = try std.process.spawn(init.io, .{
-        .argv = &.{ wrapper, "--no-daemon", "-p", client_dir, "runClient", gradle[0], gradle[1], gradle[2], address_arg, events, output, peer_arg, expected, scenario_arg, connect_arg, run_dir },
+        .argv = &.{ wrapper, "--no-daemon", "runClient", gradle[0], gradle[1], gradle[2], gradle[3], gradle[4], version, address_arg, events, output, peer_arg, expected, scenario_arg, connect_arg, run_dir },
         .environ_map = &environment,
         .stdin = .ignore,
         .stdout = .{ .file = log },
@@ -308,7 +345,10 @@ fn resultsPassed(init: std.process.Init, artifacts: []const u8, peers: []const [
         defer init.gpa.free(path);
         const result = try std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .limited(1024));
         defer init.gpa.free(result);
-        if (!std.mem.startsWith(u8, result, "PASS ")) return false;
+        if (!std.mem.startsWith(u8, result, "PASS ")) {
+            std.log.err("event=e2e_client_failed peer={s} result={s}", .{ peer, result });
+            return false;
+        }
     }
 
     return true;
@@ -324,14 +364,14 @@ fn writeSummary(init: std.process.Init, artifacts: []const u8, scenario: []const
     try file.writeStreamingAll(init.io, summary);
 }
 
-fn parse(values: []const [:0]const u8, cases: []const catalog.Case) !Arguments {
+fn parse(init: std.process.Init, values: []const [:0]const u8, cases: []const catalog.Case) !Arguments {
     var strace = false;
     var address: []const u8 = "127.0.0.1:25565";
     var server: ?[]const u8 = null;
     var client: []const u8 = "client";
     var artifacts: []const u8 = "artifacts";
     var scenario: ?catalog.Case = null;
-    var version: []const u8 = "1.21.8";
+    var version: ?[]const u8 = null;
     var index: usize = 1;
 
     while (index < values.len) : (index += 2) {
@@ -339,16 +379,12 @@ fn parse(values: []const [:0]const u8, cases: []const catalog.Case) !Arguments {
 
         const key = values[index];
         const value = values[index + 1];
+        if (std.mem.eql(u8, key, "--tests")) continue;
 
         if (std.mem.eql(u8, key, "--client-version")) version = value else if (std.mem.eql(u8, key, "--server")) server = value else if (std.mem.eql(u8, key, "--strace")) strace = std.mem.eql(u8, value, "true") else if (std.mem.eql(u8, key, "--address")) address = value else if (std.mem.eql(u8, key, "--client")) client = value else if (std.mem.eql(u8, key, "--artifacts")) artifacts = value else if (std.mem.eql(u8, key, "--scenario")) scenario = catalog.find(cases, value) orelse return error.UnknownScenario else return error.UnknownArgument;
     }
 
-    const gradle: [3][]const u8 = if (std.mem.eql(u8, version, "1.21.6"))
-        .{ "-Pminecraft_version=1.21.6", "-Pyarn_mappings=1.21.6+build.1", "-Pfabric_api_version=0.128.2+1.21.6" }
-    else if (std.mem.eql(u8, version, "1.21.8"))
-        .{ "-Pminecraft_version=1.21.8", "-Pyarn_mappings=1.21.8+build.1", "-Pfabric_api_version=0.136.1+1.21.8" }
-    else
-        return error.UnsupportedClientVersion;
+    const client_version = version orelse return error.MissingClientVersion;
     return .{
         .strace = strace,
         .address = address,
@@ -356,8 +392,37 @@ fn parse(values: []const [:0]const u8, cases: []const catalog.Case) !Arguments {
         .client = client,
         .artifacts = artifacts,
         .scenario = scenario orelse return error.MissingScenario,
-        .client_version = version,
-        .gradle = gradle,
+        .client_version = client_version,
+        .gradle = try clientArguments(init, client, client_version),
+    };
+}
+
+fn clientArguments(init: std.process.Init, client: []const u8, version: []const u8) ![5][]const u8 {
+    const allocator = init.arena.allocator();
+    const Version = struct { release: []const u8, api: []const u8, fabric: []const u8 };
+    const path = try std.fs.path.join(allocator, &.{ client, "versions.json" });
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(64 * 1024));
+    const versions = try std.json.parseFromSliceLeaky([]const Version, allocator, bytes, .{});
+    var selected: ?Version = null;
+    for (versions) |entry| if (std.mem.eql(u8, entry.release, version)) {
+        if (selected != null) return error.DuplicateClientVersion;
+        selected = entry;
+    };
+    const entry = selected orelse return error.UnsupportedClientVersion;
+    const directory = try std.Io.Dir.cwd().realPathFileAlloc(init.io, client, allocator);
+    const project = try std.fs.path.join(allocator, &.{ directory, "build", "clients", entry.release });
+    try std.Io.Dir.cwd().createDirPath(init.io, project);
+    for ([_][]const u8{ "build.gradle", "settings.gradle", "gradle.properties" }) |name| {
+        const source = try std.fs.path.join(allocator, &.{ directory, name });
+        const destination = try std.fs.path.join(allocator, &.{ project, name });
+        try std.Io.Dir.cwd().copyFile(source, .cwd(), destination, init.io, .{});
+    }
+    return .{
+        try std.fmt.allocPrint(allocator, "-Pminecraft_version={s}", .{entry.release}),
+        try std.fmt.allocPrint(allocator, "-Pclient_api={s}", .{entry.api}),
+        try std.fmt.allocPrint(allocator, "-Pfabric_api_version={s}", .{entry.fabric}),
+        "-p",
+        project,
     };
 }
 

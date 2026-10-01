@@ -51,12 +51,17 @@ pub const Transaction = struct {
 
     pub const VTable = struct {
         namespace: *const fn (*anyopaque, u64, []const u8) Error!Namespace,
+        preflush: *const fn (*anyopaque, u64) Error!void,
         submit: *const fn (*anyopaque, u64) Error!void,
         abort: *const fn (*anyopaque, u64) void,
     };
 
     pub fn namespace(self: Transaction, bytes: []const u8) Error!Namespace {
         return self.vtable.namespace(self.context, self.lease, bytes);
+    }
+
+    pub fn preflush(self: Transaction) Error!void {
+        return self.vtable.preflush(self.context, self.lease);
     }
 
     /// Seal one complete tick. The backend owns its immutable writes until durable completion.

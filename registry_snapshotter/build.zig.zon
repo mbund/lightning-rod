@@ -1,0 +1,7 @@
+.{
+    .fingerprint = 0x35af176b35de8e6b,
+    .name = .registry_snapshotter,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{ "build.zig", "build.zig.zon", "build.gradle", "settings.gradle", "gradle.properties", "versions.json", "extract.sh", "extract.bat", "gradlew", "gradlew.bat", "gradle", "src" },
+}

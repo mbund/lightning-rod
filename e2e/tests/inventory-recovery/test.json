@@ -1,0 +1,26 @@
+{
+  "client": "InventoryRecoveryFixture",
+  "variants": [
+    {
+      "name": "inventory-restart",
+      "fixture": "inventory_creative",
+      "prepare": "inventory-recovery-seed"
+    },
+    {
+      "name": "inventory-crash",
+      "fixture": "inventory_creative",
+      "prepare": "inventory-crash-seed"
+    },
+    {
+      "name": "inventory-recovery-seed",
+      "fixture": "inventory_creative",
+      "internal": true
+    },
+    {
+      "name": "inventory-crash-seed",
+      "fixture": "inventory_creative",
+      "crash_after": true,
+      "internal": true
+    }
+  ]
+}

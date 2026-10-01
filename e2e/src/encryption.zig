@@ -1,5 +1,5 @@
 const std = @import("std");
-const sessions = @import("sessions");
+const vanilla = @import("vanilla");
 
 pub const Encryption = struct {
     key: *Key,
@@ -29,7 +29,7 @@ pub const Encryption = struct {
         EVP_PKEY_free(self.key);
     }
 
-    pub fn interface(self: *Encryption) sessions.Encryption {
+    pub fn interface(self: *Encryption) vanilla.LoginEncryption.Key {
         return .{ .context = self, .public_key_der = self.der[0..self.length], .decrypt = decrypt };
     }
 };

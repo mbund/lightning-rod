@@ -11,26 +11,24 @@ jobs:
     outputs:
       matrix: ${{ steps.tests.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
-      - id: tests
-        shell: bash
-        run: |
-          matrix=$(jq -sc '
-              [.[].variants[] | select(.internal != true) |
-              (.versions // ["1.21.8"])[] as $version |
-              (.backends // ["uring"])[] as $io |
-              {scenario: .name, version: $version, io: $io}] |
-              sort_by(.scenario, .version, .io) | {include: .}
-            ' e2e/tests/*/test.json)
-          jq -e '.include | length > 0 and length <= 256' <<< "$matrix" > /dev/null
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v7
+      - name: Install Zig
+        run: bash .github/scripts/install-zig.sh
+      - name: Check generated cursor contracts
+        working-directory: protocol_codegen
+        run: zig build check
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: '21'
-      - name: Compile Fabric client
-        working-directory: e2e/client
-        run: ./gradlew --no-daemon compileClientJava
+          java-version: '25'
+      - name: Verify independent package distribution
+        run: timeout --kill-after=10s 300s python3 e2e/tests/protocol-extension/packages.py
+      - id: tests
+        shell: bash
+        working-directory: e2e
+        run: |
+          matrix=$(zig build e2e-matrix)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   foundation:
     needs: discover
@@ -40,26 +38,30 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v31
-      - name: Cross-compile portable Windows server
-        if: matrix.scenario == 'chunks-disk-multi' && matrix.io == 'stdio'
-        run: nix develop --command bash -c 'cd examples/vanilla && zig build -j2 --release=safe -Dio=stdio -Dtarget=x86_64-windows'
+      - uses: actions/checkout@v7
+      - name: Install Zig
+        run: bash .github/scripts/install-zig.sh
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Install native client and server dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev xvfb libgl1-mesa-dri libglx-mesa0 libgl1 libxrandr2 libxinerama1 libxcursor1 libxi6 libasound2t64
       - name: Real-client acceptance
+        working-directory: e2e
         env:
           SCENARIO: ${{ matrix.scenario }}
           VERSION: ${{ matrix.version }}
-          IO: ${{ matrix.io }}
+          LIBGL_ALWAYS_SOFTWARE: '1'
         run: |
-          nix develop --command bash -c '
-            cd e2e
-            timeout --signal=INT --kill-after=10s 300s zig build -j2 --release=safe e2e -Dscenario="$SCENARIO" -Dclient-version="$VERSION" -Dio="$IO" -Dcrypto-directory="$OPENSSL_LIB_DIR"
-          '
+          timeout --signal=INT --kill-after=10s 900s zig build -j2 --release=safe e2e -Dscenario="$SCENARIO" -Dclient-version="$VERSION" -Dio=uring
       - name: Preserve evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: e2e-${{ matrix.scenario }}-${{ matrix.version }}-${{ matrix.io }}
+          name: e2e-${{ matrix.scenario }}-${{ matrix.version }}
           path: |
             e2e/artifacts/**/summary.json
             e2e/artifacts/**/*.metrics.json
@@ -67,5 +69,6 @@ jobs:
             e2e/artifacts/**/*.log
             e2e/artifacts/**/*.jsonl
             e2e/artifacts/**/screenshots/*.png
+            e2e/artifacts/**/*-failed-packet.*
           if-no-files-found: warn
           retention-days: 7

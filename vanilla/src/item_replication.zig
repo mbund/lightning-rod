@@ -1,10 +1,16 @@
 const std = @import("std");
+const Items = @import("items.zig").Items;
 const inventories = @import("inventories");
-const rod = @import("lightning_rod");
+const entities = @import("entities");
+const lightning_rod = @import("lightning_rod");
 const records = @import("records");
 const sessions = @import("sessions");
-const minecraft = @import("minecraft");
-const protocols = @import("protocols");
+const minecraft = @import("minecraft_model");
+const game_data = @import("game_data");
+const item_packets = @import("item_packets.zig");
+const packets = @import("minecraft_packets");
+const wire_1_21_5 = @import("wire_1_21_5");
+const wire_1_21_9 = @import("wire_1_21_9");
 const ItemEntities = @import("item_entities.zig").ItemEntities;
 const ItemTick = @import("item_tick.zig").ItemTick;
 const Players = @import("players.zig").Players;
@@ -22,7 +28,19 @@ pub const ItemReplication = struct {
         item_tick: *ItemTick,
         players: *Players,
         streaming: *Streaming,
-        storage: rod.storage.Namespace,
+        sessions: *sessions.Service,
+        packets: *packets.Packets,
+        entities: *entities.Entities,
+        inventories: *inventories.Inventories,
+        items: *Items,
+        storage: lightning_rod.storage.Namespace,
+    };
+
+    const Spawn = struct {
+        entity_id: i32,
+        uuid: u128,
+        position: minecraft.Position,
+        velocity: [3]f64,
     };
 
     const View = struct {
@@ -44,6 +62,7 @@ pub const ItemReplication = struct {
     deps: Dependencies,
     cache: records.Cache,
     epoch: u64,
+    presentation: u64 = 0,
     connections: []Connection,
     recipients: []sessions.Handle,
 
@@ -60,6 +79,7 @@ pub const ItemReplication = struct {
         @memset(connections, .{});
         self.* = .{
             .deps = deps,
+
             .epoch = previous + 1,
             .connections = connections,
             .recipients = try allocator.alloc(sessions.Handle, connections.len),
@@ -69,7 +89,9 @@ pub const ItemReplication = struct {
     }
 
     pub fn tick(self: *ItemReplication) !void {
-        const service = self.deps.players.deps.sessions;
+        const service = self.deps.sessions;
+        const presentation_changed = self.presentation != self.deps.items.components.revision;
+        self.presentation = self.deps.items.components.revision;
         var valid: u256 = 0;
         var reset: u256 = 0;
 
@@ -126,7 +148,7 @@ pub const ItemReplication = struct {
                 view.collected = 0;
             }
 
-            const body = if (row.metadata.alive) (try self.deps.dropped.deps.entities.get(row.id) orelse return error.Corrupt) else null;
+            const body = if (row.metadata.alive) (try self.deps.entities.get(row.id) orelse return error.Corrupt) else null;
             var interested: u256 = 0;
             if (body) |value| for (self.deps.players.records, 0..) |player, index| {
                 if (player.handle == null or player.stage != .ready or value.world != player.world) continue;
@@ -136,14 +158,15 @@ pub const ItemReplication = struct {
                     interested |= @as(u256, 1) << @intCast(index);
             };
 
-            const held = if (body != null and interested != 0) try self.deps.dropped.deps.inventories.get(ItemEntities.slot(body.?)) else inventories.Contents{};
+            const held = if (body != null and interested != 0) try self.deps.inventories.get(ItemEntities.slot(body.?)) else inventories.Contents{};
 
-            if (held.revision != view.inventory_revision) {
+            if (presentation_changed or held.revision != view.inventory_revision) {
                 view.inventory_revision = held.revision;
                 view.stacks |= view.spawned;
             }
 
-            for ([_]i32{ 771, 772 }) |protocol| {
+            for (service.config.protocols) |*selected| {
+                const protocol = selected.number;
                 for (0..5) |phase| {
                     const wanted = switch (phase) {
                         0 => interested & ~view.spawned,
@@ -157,9 +180,9 @@ pub const ItemReplication = struct {
 
                     var capacity: usize = 128;
                     if (phase == 1) {
-                        const definition = try self.deps.dropped.deps.inventories.acquireItem((held.stack orelse return error.Corrupt).item);
+                        const definition = try self.deps.inventories.acquireItem((held.stack orelse return error.Corrupt).item);
                         defer definition.release();
-                        capacity = definition.read().?.len + 16;
+                        capacity = definition.read().?.len + 16 + self.deps.items.components.extra_bytes;
                     }
 
                     var count: usize = 0;
@@ -179,72 +202,73 @@ pub const ItemReplication = struct {
                     }
 
                     if (count == 0) continue;
+                    const groups = if (phase == 1 and self.deps.items.components.personalized) count else 1;
+                    for (0..groups) |group| {
+                        const targets = if (groups == 1) self.recipients[0..count] else self.recipients[group..][0..1];
+                        var packet = service.reserve(capacity) catch continue;
+                        defer packet.cancel();
+                        const entity_id = ItemEntities.networkId(row.id);
+                        var length: usize = undefined;
 
-                    var packet = service.reserve(capacity) catch continue;
-                    defer packet.cancel();
-                    const entity_id = ItemEntities.networkId(row.id);
-                    var length: usize = undefined;
-
-                    if (phase == 1) {
-                        var rest = try protocols.support.write_varint(packet.bytes, protocols.wire.play.toClient.packetId(.entity_metadata));
-                        rest = try protocols.support.write_varint(rest, entity_id);
-                        rest[0..2].* = .{ 8, 7 };
-                        rest = rest[2..];
-                        if (held.stack == null) return error.Corrupt;
-                        rest = try self.deps.dropped.deps.items.writeStack(protocol, rest, held.stack);
-                        if (rest.len == 0) return error.PacketTooLarge;
-                        rest[0] = 255;
-                        length = packet.bytes.len - rest.len + 1;
-                    } else {
-                        const output: minecraft.Output = switch (phase) {
-                            0 => .{ .spawn = .{
+                        if (phase == 0) {
+                            length = (try self.deps.packets.writePacket(.{ writeSpawnLegacy, writeSpawnPacked }, protocol, packet.bytes, .{Spawn{
                                 .entity_id = entity_id,
                                 .uuid = body.?.uuid,
-                                .entity_type = @intCast(body.?.kind),
                                 .position = .{ .x = body.?.position[0], .y = body.?.position[1], .z = body.?.position[2] },
-                                .pitch = 0,
-                                .yaw = 0,
-                                .head_yaw = 0,
-                                .data = 0,
-                                .velocity_x = velocity(body.?.velocity[0]),
-                                .velocity_y = velocity(body.?.velocity[1]),
-                                .velocity_z = velocity(body.?.velocity[2]),
-                            } },
-                            2 => .{ .entity_teleport = .{
-                                .entity_id = entity_id,
-                                .position = .{ .x = body.?.position[0], .y = body.?.position[1], .z = body.?.position[2] },
-                                .velocity = .{ .x = body.?.velocity[0], .y = body.?.velocity[1], .z = body.?.velocity[2] },
-                                .rotation = .{ .yaw = 0, .pitch = 0 },
-                                .on_ground = row.metadata.on_ground,
-                            } },
-                            3 => .{ .collect = .{ .item = entity_id, .player = row.metadata.collector, .count = row.metadata.collected } },
-                            4 => .{ .entity_remove = entity_id },
+                                .velocity = body.?.velocity,
+                            }})).len;
+                        } else if (phase == 2) {
+                            length = (try self.deps.packets.writePacket(writePosition, protocol, packet.bytes, .{
+                                entity_id,
+                                minecraft.Position{ .x = body.?.position[0], .y = body.?.position[1], .z = body.?.position[2] },
+                                minecraft.Position{ .x = body.?.velocity[0], .y = body.?.velocity[1], .z = body.?.velocity[2] },
+                                minecraft.Rotation{ .yaw = 0, .pitch = 0 },
+                                row.metadata.on_ground,
+                            })).len;
+                        } else if (phase == 4) {
+                            length = (try self.deps.packets.writePacket(writeRemove, protocol, packet.bytes, .{entity_id})).len;
+                        } else if (phase == 3) {
+                            length = (try self.deps.packets.writePacket(writeCollect, protocol, packet.bytes, .{
+                                entity_id, row.metadata.collector, row.metadata.collected,
+                            })).len;
+                        } else if (phase == 1) {
+                            if (held.stack == null) return error.Corrupt;
+                            const bytes = self.deps.packets.writePacket(writeItemStack, protocol, packet.bytes, .{
+                                self.deps.items, entity_id, held.stack, self.deps.players.records[targets[0].index].uuid,
+                            }) catch |err| switch (err) {
+                                error.EndOfStream, error.UnsupportedItem, error.UnsupportedComponent => {
+                                    for (targets) |handle| service.disconnect(handle);
+                                    continue;
+                                },
+                                else => return err,
+                            };
+                            length = bytes.len;
+                        } else {
+                            unreachable;
+                        }
+
+                        var delivered: u256 = 0;
+
+                        for (packet.publishReady(length, targets)) |handle| delivered |= @as(u256, 1) << @intCast(handle.index);
+
+                        switch (phase) {
+                            0 => {
+                                view.spawned |= delivered;
+                                view.dirty |= delivered;
+                                view.stacks |= delivered;
+                                view.collected |= delivered;
+                            },
+                            1 => view.stacks &= ~delivered,
+                            2 => view.dirty &= ~delivered,
+                            3 => view.collected |= delivered,
+                            4 => {
+                                view.spawned &= ~delivered;
+                                view.dirty &= ~delivered;
+                                view.collected &= ~delivered;
+                                view.stacks &= ~delivered;
+                            },
                             else => unreachable,
-                        };
-                        length = (try minecraft.Generated(protocols.wire).write(protocol, packet.bytes, output)).len;
-                    }
-
-                    var delivered: u256 = 0;
-
-                    for (packet.publishReady(length, self.recipients[0..count])) |handle| delivered |= @as(u256, 1) << @intCast(handle.index);
-
-                    switch (phase) {
-                        0 => {
-                            view.spawned |= delivered;
-                            view.dirty |= delivered;
-                            view.stacks |= delivered;
-                            view.collected |= delivered;
-                        },
-                        1 => view.stacks &= ~delivered,
-                        2 => view.dirty &= ~delivered,
-                        3 => view.collected |= delivered,
-                        4 => {
-                            view.spawned &= ~delivered;
-                            view.dirty &= ~delivered;
-                            view.collected &= ~delivered;
-                            view.stacks &= ~delivered;
-                        },
-                        else => unreachable,
+                        }
                     }
                 }
             }
@@ -270,12 +294,97 @@ pub const ItemReplication = struct {
         };
     }
 
-    pub fn checkpoint(self: *ItemReplication, _: rod.storage.Namespace) !void {
+    fn writeSpawnLegacy(packet: wire_1_21_5.play.toClient.packet_spawn_entity.Writer, registry: packets.Registry, value: Spawn) ![]u8 {
+        const entity = try packet.entityId(value.entity_id);
+        const uuid = try entity.objectUUID(value.uuid);
+        const kind = try uuid.type(try registry.entityId(game_data.entities.item));
+        const x = try kind.x(value.position.x);
+        const y = try x.y(value.position.y);
+        const z = try y.z(value.position.z);
+
+        const pitch = try z.pitch(0);
+        const yaw = try pitch.yaw(0);
+        const head = try yaw.headPitch(0);
+        const data = try head.objectData(0);
+        var velocity = try data.velocity();
+        return (try velocity.advance(try packets.nested(.{writeVelocity}).write(try velocity.begin(), value.velocity))).finish();
+    }
+
+    fn writeVelocity(packet: wire_1_21_5.vec3i16.Writer, motion: [3]f64) !wire_1_21_5.vec3i16.Writer.Done {
+        const x = try packet.x(encodedVelocity(motion[0]));
+        const y = try x.y(encodedVelocity(motion[1]));
+        return y.z(encodedVelocity(motion[2]));
+    }
+
+    fn writeSpawnPacked(packet: wire_1_21_9.play.toClient.packet_spawn_entity.Writer, registry: packets.Registry, value: Spawn) ![]u8 {
+        const entity = try packet.entityId(value.entity_id);
+        const uuid = try entity.objectUUID(value.uuid);
+        const kind = try uuid.type(try registry.entityId(game_data.entities.item));
+        const x = try kind.x(value.position.x);
+        const y = try x.y(value.position.y);
+        const z = try y.z(value.position.z);
+        const velocity = try z.velocity(.{
+            .x = @as(f64, @floatFromInt(encodedVelocity(value.velocity[0]))) / 8000,
+            .y = @as(f64, @floatFromInt(encodedVelocity(value.velocity[1]))) / 8000,
+            .z = @as(f64, @floatFromInt(encodedVelocity(value.velocity[2]))) / 8000,
+        });
+        const pitch = try velocity.pitch(0);
+        const yaw = try pitch.yaw(0);
+        const head = try yaw.headPitch(0);
+        return (try head.objectData(0)).finish();
+    }
+
+    fn writeRemove(packet: wire_1_21_5.play.toClient.packet_entity_destroy.Writer, entity_id: i32) ![]u8 {
+        const ids = try packet.entityIds(1);
+        const entry = try ids.element(entity_id);
+        return (try entry.finish()).finish();
+    }
+
+    fn writePosition(packet: wire_1_21_5.play.toClient.packet_sync_entity_position.Writer, entity_id: i32, at: minecraft.Position, motion: minecraft.Position, rotation: minecraft.Rotation, on_ground: bool) ![]u8 {
+        const entity = try packet.entityId(entity_id);
+        const x = try entity.x(at.x);
+        const y = try x.y(at.y);
+        const z = try y.z(at.z);
+        const vx = try z.dx(motion.x);
+        const vy = try vx.dy(motion.y);
+        const vz = try vy.dz(motion.z);
+        const yaw = try vz.yaw(rotation.yaw);
+        return (try (try yaw.pitch(rotation.pitch)).onGround(on_ground)).finish();
+    }
+
+    fn writeCollect(packet: wire_1_21_5.play.toClient.packet_collect.Writer, item: i32, player: i32, count: i32) ![]u8 {
+        const collected = try packet.collectedEntityId(item);
+        const collector = try collected.collectorEntityId(player);
+        return (try collector.pickupItemCount(count)).finish();
+    }
+
+    pub fn writeItemStack(packet: wire_1_21_5.play.toClient.packet_entity_metadata.Writer, registry: packets.Registry, store: *Items, entity: i32, stack: ?inventories.Stack, recipient: u128) ![]u8 {
+        var metadata = try (try packet.entityId(entity)).metadata();
+        const done = try packets.nested(.{writeStackMetadata}).write(try metadata.begin(), .{ .registry = registry, .items = store, .stack = stack, .recipient = recipient });
+        return (try metadata.advance(done)).finish();
+    }
+
+    fn writeStackMetadata(packet: wire_1_21_5.entityMetadata.Writer, args: item_packets.SlotArguments) !wire_1_21_5.entityMetadata.Writer.Done {
+        var entries = try packet.value(1);
+        const entry = (try entries.next()).?;
+        try entries.advance(try packets.nested(.{writeStackEntry}).write(entry, args));
+        return entries.finish();
+    }
+
+    const StackEntry = wire_1_21_5.entityMetadataEntry.cases.value.item_stack.Writer;
+
+    fn writeStackEntry(packet: StackEntry, args: item_packets.SlotArguments) !StackEntry.Done {
+        const typed = try (try packet.key(8)).type();
+        var item = try typed.value();
+        return item.advance(try item_packets.writeSlot(try item.begin(), args));
+    }
+
+    pub fn checkpoint(self: *ItemReplication, _: lightning_rod.storage.Namespace) !void {
         try self.cache.flush();
     }
 };
 
-fn velocity(value: f64) i16 {
+fn encodedVelocity(value: f64) i16 {
     assert(std.math.isFinite(value));
     return @intFromFloat(std.math.clamp(value, -3.9, 3.9) * 8000);
 }

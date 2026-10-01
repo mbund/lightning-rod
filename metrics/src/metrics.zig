@@ -2,7 +2,12 @@ const std = @import("std");
 
 const assert = std.debug.assert;
 
-pub const Counter = enum { bytes, records, misses, waits };
+pub const Counter = enum {
+    bytes,
+    records,
+    misses,
+    waits,
+};
 
 pub const Options = struct {
     enabled: bool = true,
@@ -38,7 +43,8 @@ pub const Recorder = struct {
 
     pub fn begin(self: *Recorder, index: usize) Scope {
         assert(index < self.records.len);
-        if (!self.enabled) return .{};
+        if (!self.enabled)
+            return .{};
 
         const record = &self.records[index];
         var ancestor = self.current;
@@ -77,7 +83,9 @@ pub const Recorder = struct {
 
         for (self.records, source) |*target, record| {
             assert(std.mem.eql(u8, target.name, record.name));
-            if (record.calls == 0) continue;
+            if (record.calls == 0)
+                continue;
+
             assert(target.calls == 0 or target.parent == record.parent);
             target.parent = record.parent;
             target.calls +|= record.calls;
@@ -90,7 +98,8 @@ pub const Recorder = struct {
             target.child_ns +|= record.child_ns;
             target.child_cpu_ns +|= record.child_cpu_ns;
 
-            for (&target.counters, record.counters) |*value, addend| value.* +|= addend;
+            for (&target.counters, record.counters) |*value, addend|
+                value.* +|= addend;
         }
     }
 
@@ -98,8 +107,23 @@ pub const Recorder = struct {
         assert(self.current == null and self.depth == 0);
 
         for (self.records) |record| {
-            if (record.calls == 0) continue;
-            std.log.info("event=scope subsystem={s} name={s} parent={s} calls={d} ns={d} exclusive_ns={d} cpu_ns={d} max_ns={d} bytes={d} records={d} misses={d} waits={d}", .{ subsystem, record.name, if (record.parent) |p| self.records[p].name else "-", record.calls, record.total_ns, record.exclusive_ns, record.cpu_ns, record.max_ns, record.counters[0], record.counters[1], record.counters[2], record.counters[3] });
+            if (record.calls == 0)
+                continue;
+
+            std.log.info("event=scope subsystem={s} name={s} parent={s} calls={d} ns={d} exclusive_ns={d} cpu_ns={d} max_ns={d} bytes={d} records={d} misses={d} waits={d}", .{
+                subsystem,
+                record.name,
+                if (record.parent) |p| self.records[p].name else "-",
+                record.calls,
+                record.total_ns,
+                record.exclusive_ns,
+                record.cpu_ns,
+                record.max_ns,
+                record.counters[0],
+                record.counters[1],
+                record.counters[2],
+                record.counters[3],
+            });
         }
     }
 };
@@ -149,19 +173,32 @@ pub const Scope = struct {
 pub fn Metrics(comptime Names: type) type {
     const fields = @typeInfo(Names).@"enum".fields;
 
-    for (fields, 0..) |field, i| if (field.value != i) @compileError("metric scope enum must be contiguous from zero");
+    for (fields, 0..) |field, i|
+        if (field.value != i)
+            @compileError("metric scope enum must be contiguous from zero");
+
     return struct {
         const Self = @This();
         records: [fields.len]Record = initRecords(),
         recorder: Recorder = undefined,
 
         pub fn init(io: std.Io, options: Options) Self {
-            return .{ .recorder = .{ .io = io, .records = &.{}, .enabled = options.enabled, .cpu = options.cpu } };
+            return .{
+                .recorder = .{
+                    .io = io,
+                    .records = &.{},
+                    .enabled = options.enabled,
+                    .cpu = options.cpu,
+                },
+            };
         }
 
         pub fn begin(self: *Self, name: Names) TypedScope {
             self.recorder.records = &self.records;
-            return .{ .owner = self, .scope = self.recorder.begin(@intFromEnum(name)) };
+            return .{
+                .owner = self,
+                .scope = self.recorder.begin(@intFromEnum(name)),
+            };
         }
 
         pub fn get(self: *const Self, name: Names) *const Record {
@@ -204,7 +241,8 @@ pub fn Metrics(comptime Names: type) type {
         fn initRecords() [fields.len]Record {
             var result: [fields.len]Record = undefined;
 
-            for (&result, fields) |*record, field| record.* = .{ .name = field.name };
+            for (&result, fields) |*record, field|
+                record.* = .{ .name = field.name };
 
             return result;
         }

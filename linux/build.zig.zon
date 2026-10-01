@@ -4,6 +4,8 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .storage_local = .{ .path = "../storage_local" },
+        .reload_execve = .{ .path = "../reload_execve" },
         .profiles = .{ .path = "../profiles" },
         .network_uring = .{ .path = "../network_uring" },
     },

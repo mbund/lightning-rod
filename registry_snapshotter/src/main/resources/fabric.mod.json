@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "id": "lightning-rod-registry-snapshotter",
+  "version": "${version}",
+  "environment": "*",
+  "entrypoints": { "main": ["dev.lightningrod.registry.RegistrySnapshot"] },
+  "depends": { "fabricloader": ">=0.19.3", "minecraft": "${minecraft_version}", "java": ">=21" }
+}

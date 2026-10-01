@@ -1,1 +1,1 @@
-.{ .name = .bossbars, .version = "0.1.0", .fingerprint = 0xb5e904be92be190d, .dependencies = .{ .vanilla = .{ .path = "../vanilla" }, .sessions = .{ .path = "../sessions" }, .protocols = .{ .path = "../protocols" } }, .paths = .{ "build.zig", "build.zig.zon", "src" } }
+.{ .name = .bossbars, .version = "0.1.0", .fingerprint = 0xb5e904be92be190d, .dependencies = .{ .vanilla = .{ .path = "../vanilla" }, .sessions = .{ .path = "../sessions" }, .protocol_1_21_5 = .{ .path = "../protocol_versions/v1_21_5" } }, .paths = .{ "build.zig", "build.zig.zon", "src" } }

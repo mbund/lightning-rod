@@ -2,7 +2,6 @@ const std = @import("std");
 const network = @import("networking");
 const engine = @import("engine.zig");
 const shared = @import("shared.zig");
-const compression = @import("compression.zig");
 
 const assert = std.debug.assert;
 const Metrics = @import("metrics").Metrics;
@@ -74,7 +73,7 @@ pub const Service = struct {
     pub const active: u64 = 1 << 31;
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, transport: network.Transport, config: Configuration) !*Service {
-        if (config.page_bytes == 0 or config.page_bytes > compression.maximum or config.buffer_bytes < framedBound(config.page_bytes) or config.buffer_bytes >= active or config.connections == 0 or config.connections > std.math.maxInt(u16))
+        if (config.page_bytes == 0 or config.protocols.len == 0 or config.buffer_bytes < frameBound(config.protocols, config.page_bytes) or config.buffer_bytes >= active or config.connections == 0 or config.connections > std.math.maxInt(u16))
             return error.InvalidConfiguration;
 
         const self = try allocator.create(Service);
@@ -294,7 +293,7 @@ pub const Service = struct {
     }
 
     fn publish(self: *Service, reservation: shared.Reservation, recipients: []const network.Handle) SendError!void {
-        const charge = framedBound(reservation.bytes.len);
+        const charge = self.framedBound(reservation.bytes.len);
         var admitted: usize = 0;
         errdefer for (recipients[0..admitted]) |handle| self.refund(handle, charge);
 
@@ -321,18 +320,44 @@ pub const Service = struct {
         if (self.published_since_flush >= @max(1, self.config.pages / 2)) self.flush();
     }
 
-    /// Adapts a normal (protocol, destination, arguments) encoder. No payload staging copy.
-    pub fn send(self: *Service, comptime encode: anytype, protocol: i32, recipients: []const network.Handle, arguments: *const @typeInfo(@TypeOf(encode)).@"fn".params[2].type.?, maximum_bytes: usize) !void {
+    pub fn send(self: *Service, comptime implementations: anytype, comptime Encoder: type, protocol: i32, recipients: []const network.Handle, arguments: anytype, maximum_bytes: usize) !void {
         var packet = try self.reserve(maximum_bytes);
         defer packet.cancel();
-        const bytes = try encode(protocol, packet.bytes, arguments.*);
-        assert(bytes.ptr == packet.bytes.ptr);
-        assert(bytes.len <= packet.bytes.len);
-        try packet.publish(bytes.len, recipients);
+        inline for (implementations) |Version| {
+            if (protocol == Version.protocol_number) {
+                const bytes = try Encoder.write(Version, packet.bytes, arguments);
+                assert(bytes.ptr == packet.bytes.ptr);
+                assert(bytes.len <= packet.bytes.len);
+                return packet.publish(bytes.len, recipients);
+            }
+        }
+        return error.UnsupportedProtocol;
+    }
+
+    /// The encoder may run twice if the small reservation fills.
+    pub fn sendRetrying(self: *Service, comptime implementations: anytype, comptime Encoder: type, protocol: i32, recipients: []const network.Handle, arguments: anytype, maximum_bytes: usize) !void {
+        inline for (implementations) |Version| {
+            if (protocol == Version.protocol_number) {
+                var capacity: usize = @min(maximum_bytes, 4096);
+                while (true) {
+                    var packet = try self.reserve(capacity);
+                    defer packet.cancel();
+                    const bytes = Encoder.write(Version, packet.bytes, arguments) catch |err| {
+                        if (err != error.EndOfStream or capacity == maximum_bytes) return err;
+                        capacity = maximum_bytes;
+                        continue;
+                    };
+                    assert(bytes.ptr == packet.bytes.ptr);
+                    assert(bytes.len <= packet.bytes.len);
+                    return packet.publish(bytes.len, recipients);
+                }
+            }
+        }
+        return error.UnsupportedProtocol;
     }
 
     /// One encoding per protocol. Each target reports admission independently.
-    pub fn fanout(self: *Service, comptime encode: anytype, targets: []const Target, arguments: *const @typeInfo(@TypeOf(encode)).@"fn".params[2].type.?, maximum_bytes: usize, delivered: []Delivery) !void {
+    pub fn fanout(self: *Service, comptime implementations: anytype, comptime Encoder: type, targets: []const Target, arguments: anytype, maximum_bytes: usize, delivered: []Delivery) !void {
         assert(targets.len == delivered.len);
         assert(targets.len <= self.config.connections);
         @memset(delivered, .backpressured);
@@ -340,44 +365,51 @@ pub const Service = struct {
         for (targets) |target| {
             var supported = false;
 
-            for (self.config.protocols) |protocol| supported = supported or protocol.number == target.protocol;
+            inline for (implementations) |Version| supported = supported or Version.protocol_number == target.protocol;
             if (!supported) return error.UnsupportedProtocol;
         }
 
-        for (self.config.protocols) |protocol| {
+        inline for (implementations) |Version| {
             var count: usize = 0;
 
-            for (targets) |recipient| if (recipient.protocol == protocol.number) {
+            for (targets) |recipient| if (recipient.protocol == Version.protocol_number) {
                 self.recipients[count] = recipient.handle;
                 count += 1;
             };
 
-            if (count == 0) continue;
+            if (count != 0) {
+                var packet = self.reserve(maximum_bytes) catch |err| switch (err) {
+                    error.Backpressured => return,
+                    else => return err,
+                };
+                defer packet.cancel();
+                const bytes = try Encoder.write(Version, packet.bytes, arguments);
+                assert(bytes.ptr == packet.bytes.ptr);
+                assert(bytes.len <= packet.bytes.len);
+                const accepted = packet.publishReady(bytes.len, self.recipients[0..count]);
 
-            var packet = self.reserve(maximum_bytes) catch |err| switch (err) {
-                error.Backpressured => return,
-                else => return err,
-            };
-            defer packet.cancel();
-            const bytes = try encode(protocol.number, packet.bytes, arguments.*);
-            assert(bytes.ptr == packet.bytes.ptr);
-            assert(bytes.len <= packet.bytes.len);
-            const accepted = packet.publishReady(bytes.len, self.recipients[0..count]);
+                var accepted_index: usize = 0;
 
-            for (targets, delivered) |recipient, *result| {
-                if (recipient.protocol != protocol.number) continue;
-                if (recipient.handle.index >= self.credit.len) {
-                    result.* = .closed;
-                    continue;
+                for (targets, delivered) |recipient, *result| {
+                    if (recipient.protocol != Version.protocol_number) continue;
+
+                    if (accepted_index < accepted.len and std.meta.eql(accepted[accepted_index], recipient.handle)) {
+                        result.* = .queued;
+                        accepted_index += 1;
+                        continue;
+                    }
+
+                    if (recipient.handle.index >= self.credit.len) {
+                        result.* = .closed;
+                        continue;
+                    }
+
+                    const credit = self.credit[recipient.handle.index].load(.acquire);
+
+                    if (credit >> 32 != recipient.handle.generation or credit & active == 0) result.* = .closed;
                 }
 
-                const credit = self.credit[recipient.handle.index].load(.acquire);
-
-                if (credit >> 32 != recipient.handle.generation or credit & active == 0) result.* = .closed;
-
-                for (accepted) |handle| if (std.meta.eql(handle, recipient.handle)) {
-                    result.* = .queued;
-                };
+                assert(accepted_index == accepted.len);
             }
         }
     }
@@ -391,12 +423,12 @@ pub const Service = struct {
     }
 
     pub fn canSend(self: *Service, handle: network.Handle, length: usize) bool {
-        return length <= self.config.page_bytes and self.outputCredit(handle) >= framedBound(length);
+        return length <= self.config.page_bytes and self.outputCredit(handle) >= self.framedBound(length);
     }
 
     pub fn packetCapacity(self: *Service, handle: network.Handle, maximum_bytes: usize) usize {
         if (maximum_bytes > self.config.page_bytes) return 0;
-        return self.outputCredit(handle) / framedBound(maximum_bytes);
+        return self.outputCredit(handle) / self.framedBound(maximum_bytes);
     }
 
     /// Bounded by the caller's remaining work time, including socket stalls.
@@ -418,8 +450,8 @@ pub const Service = struct {
         return true;
     }
 
-    pub fn framedBound(length: usize) usize {
-        return length + length / 1000 + 128 + compression.headroom;
+    pub fn framedBound(self: *const Service, length: usize) usize {
+        return frameBound(self.config.protocols, length);
     }
 
     pub fn refund(self: *Service, handle: network.Handle, bytes: usize) void {
@@ -517,3 +549,9 @@ pub const Service = struct {
         return true;
     }
 };
+
+fn frameBound(protocols: []const engine.Protocol, length: usize) usize {
+    var maximum: usize = 0;
+    for (protocols) |protocol| maximum = @max(maximum, protocol.frame_bound.bytes(length));
+    return maximum;
+}

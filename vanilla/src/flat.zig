@@ -1,7 +1,7 @@
 const std = @import("std");
 const worlds = @import("worlds");
 const chunks = @import("chunks");
-const registry = @import("protocols").registry;
+const registry = @import("game_data").registry;
 
 pub const Flat = struct {
     pub const id = "minecraft:world_source";

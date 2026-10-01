@@ -4,7 +4,7 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
-import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.Minecraft;
 import dev.lightningrod.e2e.mixin.BossBarHudAccessor;
 
 final class BossbarsFixture extends Fixture {
@@ -19,16 +19,16 @@ final class BossbarsFixture extends Fixture {
 
     BossbarsFixture(Recorder r) { super(r); }
 
-    @Override boolean prepare(MinecraftClient client) {
-        client.getTutorialManager().setStep(net.minecraft.client.tutorial.TutorialStep.NONE);
+    @Override boolean prepare(Minecraft client) {
+        client.getTutorial().setStep(net.minecraft.client.tutorial.TutorialSteps.NONE);
         return true;
     }
 
-    public void tick(MinecraftClient client, int loaded, int missing) {
-        if (r.terrainTick < 0 || client.player == null || client.currentScreen != null) return;
+    public void tick(Minecraft client, int loaded, int missing) {
+        if (r.terrainTick < 0 || client.player == null || GuiApi.screen(client) != null) return;
         if (started < 0) started = r.tick;
         if (r.tick - started > 1900) { r.fail(client, "bossbar_timeout"); return; }
-        var bars = ((BossBarHudAccessor) client.inGameHud.getBossBarHud()).lightningRod$bossBars();
+        var bars = ((BossBarHudAccessor) GuiApi.bossBars(client)).lightningRod$bossBars();
         int count = 0;
         double shortMspt = -1, mediumMspt = -1;
         Set<Integer> windows = new HashSet<>();
@@ -44,7 +44,7 @@ final class BossbarsFixture extends Fixture {
             if (!match.matches()) continue;
             int window = Integer.parseInt(match.group(1));
             double tps = Double.parseDouble(match.group(2)), mspt = Double.parseDouble(match.group(3));
-            if (!windows.add(window) || !Double.isFinite(tps) || !Double.isFinite(mspt) || tps < 0 || tps > 20 || mspt < 0 || bar.getPercent() < 0 || bar.getPercent() > 1) {
+            if (!windows.add(window) || !Double.isFinite(tps) || !Double.isFinite(mspt) || tps < 0 || tps > 20 || mspt < 0 || bar.getProgress() < 0 || bar.getProgress() > 1) {
                 r.fail(client, "invalid_bossbar_metrics"); return;
             }
             if (window == 1) shortMspt = mspt;
@@ -58,12 +58,12 @@ final class BossbarsFixture extends Fixture {
         if (spike && shortMspt < 3 && mediumMspt > shortMspt + 0.2 && !recovered) { recovered = true; r.screenshot(client, "bossbars_rolling_recovery"); }
         if (r.joins == 1 && r.tick - started >= 1300 && privateSeen && recovered && bars.size() == 3 && !requested) {
             r.screenshot(client, "bossbars_full_windows");
-            if (r.peer.equals("alice")) client.getNetworkHandler().sendChatCommand("reload");
+            if (r.peer.equals("alice")) client.getConnection().sendCommand("reload");
             requested = true;
         }
         if (r.joins == 2) {
             if (resumed < 0) resumed = r.tick;
-            if (r.tick - resumed < 170 || bars.size() != 3 || client.world.getPlayers().size() != 2) return;
+            if (r.tick - resumed < 170 || bars.size() != 3 || client.level.players().size() != 2) return;
             if (!privateSeen || !recovered) { r.fail(client, "bossbar_coverage_missing"); return; }
             r.screenshot(client, "bossbars_after_reload");
             r.pass(client, "three_rolling_windows_and_bossbar_lifecycle_verified");

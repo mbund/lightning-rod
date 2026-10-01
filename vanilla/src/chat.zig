@@ -1,7 +1,7 @@
 const std = @import("std");
+const wire_1_21_5 = @import("wire_1_21_5");
 const sessions = @import("sessions");
-const protocols = @import("protocols");
-const minecraft = @import("minecraft");
+const packets = @import("minecraft_packets");
 const Players = @import("players.zig").Players;
 const Input = @import("input.zig").Input;
 
@@ -13,6 +13,8 @@ pub const Chat = struct {
     pub const Dependencies = struct {
         players: *Players,
         input: *Input,
+        sessions: *sessions.Service,
+        packets: *packets.Packets,
     };
 
     const Message = struct {
@@ -39,58 +41,46 @@ pub const Chat = struct {
             message.* = .{ .recipients = recipients[index * deps.players.records.len ..][0..deps.players.records.len] };
 
         self.* = .{ .deps = deps, .messages = messages, .delivered = try allocator.alloc(sessions.Service.Delivery, deps.players.records.len) };
+        try deps.input.on(.chat_message, self, onChat);
         return self;
     }
 
     pub fn tick(self: *Chat) !void {
-        const service = self.deps.players.deps.sessions;
+        try self.flush();
+    }
 
-        // Drain previous output before admitting this tick's messages, then drain again.
-        for (0..2) |phase| {
-            if (phase == 1) for (self.deps.players.records) |player| {
-                const handle = player.handle orelse continue;
-                if (player.stage != .ready) continue;
-
-                for (self.deps.input.values(handle)) |event| {
-                    if (event != .chat) continue;
-
-                    const text = event.chat.message;
-                    if (text.len > 1024 or !std.unicode.utf8ValidateSlice(text) or self.write - self.read == self.messages.len) {
-                        service.disconnect(handle);
-                        break;
-                    }
-
-                    const message = &self.messages[self.write % self.messages.len];
-                    // Input loans expire this tick. Bounded owned text permits deferred delivery.
-                    const formatted = try std.fmt.bufPrint(message.bytes[3 .. message.bytes.len - 1], "<{s}> {s}", .{ player.name[0..player.name_len], text });
-                    message.bytes[0] = 8;
-                    std.mem.writeInt(u16, message.bytes[1..3], @intCast(formatted.len), .big);
-                    message.bytes[3 + formatted.len] = 0;
-                    message.length = formatted.len + 4;
-                    message.count = 0;
-
-                    for (self.deps.players.records) |recipient| {
-                        const target = recipient.handle orelse continue;
-                        if (recipient.stage != .ready) continue;
-                        message.recipients[message.count] = .{ .handle = target, .protocol = recipient.protocol };
-                        message.count += 1;
-                    }
-
-                    self.write += 1;
-                }
-            };
-
-            try self.flush();
+    fn onChat(self: *Chat, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_chat_message.Reader) !void {
+        const service = self.deps.sessions;
+        const text, _ = body.message() catch return error.InvalidPacket;
+        const player = self.deps.players.records[handle.index];
+        if (!player.inPlay()) return;
+        if (text.len > 1024 or !std.unicode.utf8ValidateSlice(text) or self.write - self.read == self.messages.len) {
+            service.disconnect(handle);
+            return;
         }
+
+        const message = &self.messages[self.write % self.messages.len];
+        const formatted = std.fmt.bufPrint(message.bytes[3 .. message.bytes.len - 1], "<{s}> {s}", .{ player.name[0..player.name_len], text }) catch unreachable;
+        message.bytes[0] = 8;
+        std.mem.writeInt(u16, message.bytes[1..3], @intCast(formatted.len), .big);
+        message.length = formatted.len + 3;
+        message.count = 0;
+
+        for (self.deps.players.records) |recipient| {
+            const target = recipient.handle orelse continue;
+            if (!recipient.inPlay()) continue;
+            message.recipients[message.count] = .{ .handle = target, .protocol = recipient.protocol };
+            message.count += 1;
+        }
+        self.write += 1;
     }
 
     pub fn flush(self: *Chat) !void {
-        const service = self.deps.players.deps.sessions;
+        const service = self.deps.sessions;
 
         while (self.read != self.write) {
             const message = &self.messages[self.read % self.messages.len];
-            const output: minecraft.Output = .{ .chat = message.bytes[0..message.length] };
-            try service.fanout(minecraft.Generated(protocols.wire).write, message.recipients[0..message.count], &output, message.length + 8, self.delivered[0..message.count]);
+            try self.deps.packets.fanout(writeChat, message.recipients[0..message.count], .{message.bytes[0..message.length]}, message.length + 8, self.delivered[0..message.count]);
             var remaining: usize = 0;
 
             for (message.recipients[0..message.count], self.delivered[0..message.count]) |target, result| {
@@ -110,12 +100,16 @@ pub const Chat = struct {
         }
     }
 
+    fn writeChat(packet: wire_1_21_5.play.toClient.packet_system_chat.Writer, content: []const u8) ![]u8 {
+        return (try (try packet.content(content)).isActionBar(false)).finish();
+    }
+
     pub fn system(self: *Chat, handle: sessions.Handle, text: []const u8) void {
         std.debug.assert(text.len <= 1096);
         const player = self.deps.players.records[handle.index];
         if (player.handle == null or !std.meta.eql(player.handle.?, handle)) return;
         if (self.write - self.read == self.messages.len) {
-            self.deps.players.deps.sessions.disconnect(handle);
+            self.deps.sessions.disconnect(handle);
             return;
         }
 
@@ -123,8 +117,7 @@ pub const Chat = struct {
         message.bytes[0] = 8;
         std.mem.writeInt(u16, message.bytes[1..3], @intCast(text.len), .big);
         @memcpy(message.bytes[3..][0..text.len], text);
-        message.bytes[3 + text.len] = 0;
-        message.length = text.len + 4;
+        message.length = text.len + 3;
         message.recipients[0] = .{ .handle = handle, .protocol = player.protocol };
         message.count = 1;
         self.write += 1;

@@ -1,10 +1,10 @@
 package dev.lightningrod.e2e.mixin;
 
-import net.minecraft.network.packet.s2c.play.GameStateChangeS2CPacket;
+import net.minecraft.network.protocol.game.ClientboundGameEventPacket;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.gen.Accessor;
 
-@Mixin(GameStateChangeS2CPacket.Reason.class)
+@Mixin(ClientboundGameEventPacket.Type.class)
 public interface GameStateChangeReasonAccessor {
     @Accessor("id")
     int lightningRod$id();

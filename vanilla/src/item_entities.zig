@@ -1,10 +1,10 @@
 const std = @import("std");
 const worlds = @import("worlds");
-const rod = @import("lightning_rod");
+const lightning_rod = @import("lightning_rod");
 const entities = @import("entities");
 const inventories = @import("inventories");
 const records = @import("records");
-const registry = @import("protocols").registry;
+const registry = @import("game_data").registry;
 const Items = @import("items.zig").Items;
 
 const assert = std.debug.assert;
@@ -19,7 +19,7 @@ pub const ItemEntities = struct {
         inventories: *inventories.Inventories,
         items: *Items,
         worlds: *worlds.Worlds,
-        storage: rod.storage.Namespace,
+        storage: lightning_rod.storage.Namespace,
     };
 
     pub const Metadata = struct {
@@ -77,7 +77,7 @@ pub const ItemEntities = struct {
         const uuid = @as(u128, 0x4c524954454d40008000000000000000) | self.deps.entities.next_id;
         const body: entities.State = .{
             .uuid = uuid,
-            .kind = registry.entity_item_type_id,
+            .kind = comptime registry.entityId("minecraft:item").?,
             .world = world,
             .position = position,
             .velocity = velocity,
@@ -154,11 +154,11 @@ pub const ItemEntities = struct {
     }
 
     pub fn scan(self: *ItemEntities, cursor: *Cursor) ![]const Row {
-        var entries: [16]rod.storage.ScanEntry = undefined;
+        var entries: [16]lightning_rod.storage.ScanEntry = undefined;
 
         for (&entries, &cursor.keys, &cursor.values) |*entry, *key, *value| entry.* = .{ .key = key, .value = value };
 
-        var position: rod.storage.ScanCursor = .{ .after = &cursor.after, .after_len = cursor.after_len };
+        var position: lightning_rod.storage.ScanCursor = .{ .after = &cursor.after, .after_len = cursor.after_len };
         const batch = try self.cache.scan(&position, &entries);
         cursor.after_len = position.after_len;
         cursor.more = batch.more;
@@ -178,12 +178,12 @@ pub const ItemEntities = struct {
         return cursor.rows[0..count];
     }
 
-    pub fn checkpoint(self: *ItemEntities, _: rod.storage.Namespace) !void {
+    pub fn checkpoint(self: *ItemEntities, _: lightning_rod.storage.Namespace) !void {
         try self.cache.flush();
     }
 
     pub fn slot(body: entities.State) inventories.Slot {
-        assert(body.kind == registry.entity_item_type_id);
+        assert(body.kind == comptime registry.entityId("minecraft:item").?);
         return .{ .owner = body.uuid, .index = 0 };
     }
 

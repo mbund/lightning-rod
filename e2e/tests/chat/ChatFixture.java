@@ -1,7 +1,7 @@
 package dev.lightningrod.e2e;
 
 import java.nio.file.Files;
-import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.Minecraft;
 
 final class ChatFixture extends Fixture {
     private boolean chatSent;
@@ -11,37 +11,37 @@ final class ChatFixture extends Fixture {
 
     ChatFixture(Recorder r) { super(r); }
 
-    public void tick(MinecraftClient client, int loaded, int missing) {
+    public void tick(Minecraft client, int loaded, int missing) {
         if (r.terrainTick < 0 || loaded < 9) return;
-        if (client.currentScreen != null) client.setScreen(null);
+        if (GuiApi.screen(client) != null) GuiApi.screen(client, null);
         if (chatWalkTick < 0) {
             chatWalkTick = r.tick;
-            client.player.setYaw(r.peer.equals(r.expectedPeers.getFirst()) ? 90 : -90);
-            client.player.setPitch(45);
-            client.options.forwardKey.setPressed(true);
+            client.player.setYRot(r.peer.equals(r.expectedPeers.getFirst()) ? 90 : -90);
+            client.player.setXRot(45);
+            client.options.keyUp.setDown(true);
         }
         if (r.tick - chatWalkTick < 10) return;
-        client.options.forwardKey.setPressed(false);
+        client.options.keyUp.setDown(false);
         if (!readyPublished) {
             r.marker(r.peer + ".chat-ready");
             readyPublished = true;
         }
         if (!chatSent && r.expectedPeers.stream().allMatch(value -> Files.exists(r.artifacts.resolve(value + ".chat-ready")))) {
-            client.getNetworkHandler().sendChatMessage("e2e-chat:" + r.peer + ":short");
-            client.getNetworkHandler().sendChatMessage("e2e-chat:" + r.peer + ":" + "\u2603".repeat(200));
+            client.getConnection().sendChat("e2e-chat:" + r.peer + ":short");
+            client.getConnection().sendChat("e2e-chat:" + r.peer + ":" + "\u2603".repeat(200));
             chatSent = true;
             r.event("chat_sent");
         }
         if (chatInvalid) r.fail(client, "chat_duplicate_or_reordered");
         else if (chatSent && r.receivedChat.size() == r.expectedPeers.size() * 2) {
-            var roster = client.getNetworkHandler().getPlayerList();
+            var roster = client.getConnection().getOnlinePlayers();
             boolean rosterReady = roster.size() == r.expectedPeers.size()
                     && r.expectedPeers.stream().allMatch(name -> roster.stream()
-                    .anyMatch(entry -> entry.getProfile().getName().equals(name)));
+                    .anyMatch(entry -> ClientApi.profileName(entry.getProfile()).equals(name)));
             if (!rosterReady) return;
             r.event("roster_received", "players", roster.size());
-            client.getToastManager().clear();
-            client.options.playerListKey.setPressed(true);
+            GuiApi.toasts(client).clear();
+            client.options.keyPlayerList.setDown(true);
             r.pass(client, "shared_chat_and_roster_received_by_all_peers");
         }
     }

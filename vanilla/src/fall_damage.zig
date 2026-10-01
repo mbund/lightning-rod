@@ -1,6 +1,7 @@
 const std = @import("std");
+const sessions = @import("sessions");
+const minecraft = @import("minecraft_model");
 const Players = @import("players.zig").Players;
-const Input = @import("input.zig").Input;
 
 pub const FallDamage = struct {
     pub const id = "minecraft:fall_damage";
@@ -9,7 +10,6 @@ pub const FallDamage = struct {
 
     pub const Dependencies = struct {
         players: *Players,
-        input: *Input,
     };
 
     const Fall = struct {
@@ -27,7 +27,28 @@ pub const FallDamage = struct {
         const falls = try allocator.alloc(Fall, deps.players.records.len);
         @memset(falls, .{});
         self.* = .{ .deps = deps, .falls = falls };
+        try deps.players.observeMovement(self, onMovement);
         return self;
+    }
+
+    fn onMovement(self: *FallDamage, handle: sessions.Handle, movement: minecraft.Movement) void {
+        const player = &self.deps.players.records[handle.index];
+        const fall = &self.falls[handle.index];
+        if (fall.generation != handle.generation or fall.teleport_id != player.teleport_id)
+            fall.* = .{ .generation = handle.generation, .teleport_id = player.teleport_id, .y = player.position.y };
+
+        const y = if (movement.position) |position| position.y else fall.y;
+        if (!std.math.isFinite(y) or @abs(y) > 30_000_000) return;
+        if (player.gamemode == .creative or player.gamemode == .spectator) {
+            fall.distance = 0;
+        } else if (y < fall.y) fall.distance += fall.y - y;
+        fall.y = y;
+
+        if (movement.on_ground) {
+            const damage = @max(0, @ceil(fall.distance - 3));
+            player.health = @max(0, player.health - @as(f32, @floatCast(damage)));
+            fall.distance = 0;
+        }
     }
 
     pub fn tick(self: *FallDamage) void {
@@ -40,29 +61,11 @@ pub const FallDamage = struct {
 
             if (player.stage != .ready) continue;
 
-            for (self.deps.input.values(handle)) |event| {
-                if (event != .movement) continue;
-
-                const movement = event.movement;
-                const y = if (movement.position) |position| position.y else fall.y;
-                if (!std.math.isFinite(y) or @abs(y) > 30_000_000) continue;
-
-                if (player.gamemode == .creative or player.gamemode == .spectator) {
-                    fall.distance = 0;
-                } else if (y < fall.y) fall.distance += fall.y - y;
-                fall.y = y;
-
-                if (movement.on_ground) {
-                    const damage = @max(0, @ceil(fall.distance - 3));
-                    player.health = @max(0, player.health - @as(f32, @floatCast(damage)));
-                    fall.distance = 0;
-                }
-            }
-
             if (player.stage != .ready or player.health == player.health_sent) continue;
 
-            if (self.deps.players.send(player.protocol, &.{handle}, .{ .health = .{ .health = player.health, .food = 20, .saturation = 5 } }))
+            if (self.deps.players.sendHealth(player.protocol, &.{handle}, player.health))
                 player.health_sent = player.health;
         }
     }
+
 };

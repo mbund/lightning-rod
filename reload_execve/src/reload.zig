@@ -5,13 +5,19 @@ const linux = std.os.linux;
 const assert = std.debug.assert;
 
 pub const section_name = ".lightning_rod.resume";
-pub const manifest: [16]u8 = "LRRESUME".* ++ [_]u8{ 3, 0, 0, 0, 1, 0, 0, 0 };
+pub const manifest: [16]u8 = "LRRESUME".* ++ [_]u8{ 5, 0, 0, 0, 1, 0, 0, 0 };
+
+pub fn executableManifest(comptime Endpoint: type) [manifest.len + Endpoint.resume_manifest.len]u8 {
+    return manifest ++ Endpoint.resume_manifest;
+}
 pub const environment_key = "LIGHTNING_ROD_RESUME_FD";
 
 pub const Configuration = struct { executable: ?[]const u8 = null };
 
 pub const Image = struct {
     file: std.Io.File,
+    protocols_offset: u64,
+    protocols_bytes: u64,
 
     /// Validate the exact open image, not a path that can change before execveat.
     pub fn open(io: std.Io, path: []const u8) !Image {
@@ -47,25 +53,51 @@ pub const Image = struct {
         const names_len = std.mem.readInt(u64, section[32..40], .little);
         if (names > stat.size or names_len > stat.size - names) return error.InvalidExecutable;
 
+        var compatible = false;
+        var protocols_offset: u64 = 0;
+        var protocols_bytes: u64 = 0;
         for (0..count) |index| {
             if (try file.readPositionalAll(io, &section, offset + index * size) != section.len) return error.InvalidExecutable;
 
             const name = std.mem.readInt(u32, section[0..4], .little);
-            if (name >= names_len or section_name.len + 1 > names_len - name) continue;
+            if (name >= names_len) continue;
 
-            var bytes: [section_name.len + 1]u8 = undefined;
-            if (try file.readPositionalAll(io, &bytes, names + name) != bytes.len) return error.InvalidExecutable;
-            if (!std.mem.eql(u8, &bytes, section_name ++ "\x00")) continue;
+            var bytes: [64]u8 = undefined;
+            const name_bytes = bytes[0..@min(bytes.len, names_len - name)];
+            if (try file.readPositionalAll(io, name_bytes, names + name) != name_bytes.len) return error.InvalidExecutable;
+            const resumption = std.mem.startsWith(u8, name_bytes, section_name ++ "\x00");
+            if (!resumption) continue;
 
             const location = std.mem.readInt(u64, section[24..32], .little);
             const length = std.mem.readInt(u64, section[32..40], .little);
+            if (location > stat.size or length > stat.size - location) return error.InvalidExecutable;
             var actual: [manifest.len]u8 = undefined;
-            if (length != actual.len or location > stat.size or length > stat.size - location or try file.readPositionalAll(io, &actual, location) != actual.len or !std.mem.eql(u8, &actual, &manifest))
+            if (length <= actual.len or (length - actual.len) % 12 != 0 or try file.readPositionalAll(io, &actual, location) != actual.len or !std.mem.eql(u8, &actual, &manifest))
                 return error.IncompatibleResume;
-            return .{ .file = file };
+            if (compatible) return error.InvalidExecutable;
+            compatible = true;
+            protocols_offset = location + manifest.len;
+            protocols_bytes = length - manifest.len;
         }
 
-        return error.MissingResumeManifest;
+        if (!compatible) return error.MissingResumeManifest;
+        return .{ .file = file, .protocols_offset = protocols_offset, .protocols_bytes = protocols_bytes };
+    }
+
+    pub fn supports(self: Image, io: std.Io, protocol: i32, format: ?u64) !bool {
+        var offset: u64 = 0;
+        var buffer: [252]u8 = undefined;
+        while (offset < self.protocols_bytes) {
+            const bytes = buffer[0..@min(buffer.len, self.protocols_bytes - offset)];
+            if (try self.file.readPositionalAll(io, bytes, self.protocols_offset + offset) != bytes.len) return error.InvalidExecutable;
+            var index: usize = 0;
+            while (index < bytes.len) : (index += 12) {
+                if (std.mem.readInt(i32, bytes[index..][0..4], .little) == protocol and
+                    (format == null or std.mem.readInt(u64, bytes[index + 4 ..][0..8], .little) == format.?)) return true;
+            }
+            offset += bytes.len;
+        }
+        return false;
     }
 
     pub fn close(self: Image, io: std.Io) void {

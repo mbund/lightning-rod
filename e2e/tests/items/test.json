@@ -2,13 +2,29 @@
   "client": "ItemsFixture",
   "variants": [
     {
+      "name": "items-plaintext",
+      "fixture": "items_plaintext",
+      "required_logs": [{ "text": "event=reload_resumed " }],
+      "forbidden_logs": ["event=reload_fallback ", "event=session_encrypted "],
+      "peers": ["alice", "bob"]
+    },
+    {
       "name": "items-multi",
-      "versions": ["1.21.6", "1.21.8"],
       "fixture": "items",
+      "required_logs": [{ "text": "event=reload_resumed " }],
+      "forbidden_logs": ["event=reload_fallback "],
       "peers": [
         "alice",
         "bob"
       ]
+    },
+    {
+      "name": "items-mixed-protocols",
+      "fixture": "items",
+      "required_logs": [{ "text": "event=reload_resumed " }],
+      "forbidden_logs": ["event=reload_fallback "],
+      "peer_versions": ["26.2", "1.21.8"],
+      "peers": ["alice", "bob"]
     }
   ]
 }

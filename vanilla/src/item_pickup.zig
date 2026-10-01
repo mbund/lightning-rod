@@ -1,9 +1,11 @@
 const std = @import("std");
 const inventories = @import("inventories");
+const entities = @import("entities");
 const Players = @import("players.zig").Players;
-const Menus = @import("menus.zig").Menus;
+const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
 const item = @import("item.zig");
 const ItemEntities = @import("item_entities.zig").ItemEntities;
+const Items = @import("items.zig").Items;
 
 const assert = std.debug.assert;
 
@@ -14,8 +16,10 @@ pub const ItemPickup = struct {
 
     pub const Dependencies = struct {
         players: *Players,
-        menus: *Menus,
+        menus: *PlayerInventory,
         inventories: *inventories.Inventories,
+        entities: *entities.Entities,
+        items: *Items,
         dropped: *ItemEntities,
     };
 
@@ -35,7 +39,7 @@ pub const ItemPickup = struct {
             var metadata = row.metadata;
             if (!metadata.alive or metadata.pickup_delay != 0) continue;
 
-            const body = (try dropped.deps.entities.get(row.id)) orelse return error.Corrupt;
+            const body = (try self.deps.entities.get(row.id)) orelse return error.Corrupt;
 
             for (self.deps.players.records, 0..) |player, index| {
                 if (player.handle == null or player.stage != .ready or player.world != body.world) continue;
@@ -46,7 +50,7 @@ pub const ItemPickup = struct {
                 const held = (try self.deps.inventories.get(source)).stack orelse return error.Corrupt;
                 const count = try self.collect(index, source, .{
                     .stack = held,
-                    .maximum_stack = try dropped.deps.items.stackLimit(held),
+                    .maximum_stack = try self.deps.items.stackLimit(held),
                     .age = metadata.age,
                     .pickup_delay = metadata.pickup_delay,
                     .owner = metadata.owner,

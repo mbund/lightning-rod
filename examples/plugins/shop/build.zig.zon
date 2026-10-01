@@ -5,7 +5,7 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .vanilla = .{ .path = "../../../vanilla" },
-        .protocols = .{ .path = "../../../protocols" },
+        .game_data = .{ .path = "../../../game_data" },
         .economy = .{ .path = "../economy" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },

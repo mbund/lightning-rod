@@ -20,9 +20,13 @@ pub const State = struct {
 pub const Entities = struct {
     pub const id = "lightning_rod:entities";
 
-    pub const Configuration = struct { cache_records: usize = 256 };
+    pub const Configuration = struct {
+        cache_records: usize = 256,
+    };
 
-    pub const Dependencies = struct { storage: storage.Namespace };
+    pub const Dependencies = struct {
+        storage: storage.Namespace,
+    };
 
     deps: Dependencies,
     cache: records.Cache,
@@ -32,10 +36,12 @@ pub const Entities = struct {
     pub fn init(allocator: std.mem.Allocator, io: std.Io, configuration: Configuration, deps: Dependencies) !*Entities {
         var sequence: [8]u8 = undefined;
         const length = try deps.storage.get(&.{0}, &sequence);
-        if (length != null and length.? != sequence.len) return error.Corrupt;
+        if (length != null and length.? != sequence.len)
+            return error.Corrupt;
 
         const next_id = if (length != null) std.mem.readInt(Id, &sequence, .little) else 1;
-        if (next_id == 0) return error.Corrupt;
+        if (next_id == 0)
+            return error.Corrupt;
 
         const self = try allocator.create(Entities);
         self.* = .{
@@ -53,14 +59,19 @@ pub const Entities = struct {
     }
 
     pub fn create(self: *Entities, state: State) !Id {
-        if (self.next_id == std.math.maxInt(Id)) return error.IdExhausted;
-        if (!valid(state)) return error.InvalidEntity;
+        if (self.next_id == std.math.maxInt(Id))
+            return error.IdExhausted;
+
+        if (!valid(state))
+            return error.InvalidEntity;
 
         const result = self.next_id;
         const key = encodeKey(result);
         const lease = try self.cache.acquire(&key);
         defer lease.release();
-        if (lease.read() != null) return error.Corrupt;
+        if (lease.read() != null)
+            return error.Corrupt;
+
         encode(state, lease.edit());
         lease.commit(encoded_bytes);
         self.next_id += 1;
@@ -69,7 +80,8 @@ pub const Entities = struct {
     }
 
     pub fn get(self: *Entities, entity: Id) !?State {
-        if (entity == 0) return error.InvalidEntity;
+        if (entity == 0)
+            return error.InvalidEntity;
 
         const key = encodeKey(entity);
         const lease = try self.cache.acquire(&key);
@@ -79,24 +91,32 @@ pub const Entities = struct {
     }
 
     pub fn put(self: *Entities, entity: Id, state: State) !void {
-        if (entity == 0) return error.InvalidEntity;
-        if (!valid(state)) return error.InvalidEntity;
+        if (entity == 0)
+            return error.InvalidEntity;
+
+        if (!valid(state))
+            return error.InvalidEntity;
 
         const key = encodeKey(entity);
         const lease = try self.cache.acquire(&key);
         defer lease.release();
-        if (lease.read() == null) return error.UnknownEntity;
+        if (lease.read() == null)
+            return error.UnknownEntity;
+
         encode(state, lease.edit());
         lease.commit(encoded_bytes);
     }
 
     pub fn remove(self: *Entities, entity: Id) !void {
-        if (entity == 0) return error.InvalidEntity;
+        if (entity == 0)
+            return error.InvalidEntity;
 
         const key = encodeKey(entity);
         const lease = try self.cache.acquire(&key);
         defer lease.release();
-        if (lease.read() == null) return error.UnknownEntity;
+        if (lease.read() == null)
+            return error.UnknownEntity;
+
         lease.remove();
     }
 
@@ -108,16 +128,26 @@ pub const Entities = struct {
         for (&entries, &cursor.keys, &cursor.values) |*entry, *key, *value|
             entry.* = .{ .key = key, .value = value };
 
-        var position: storage.ScanCursor = .{ .after = &cursor.after, .after_len = cursor.after_len };
+        var position: storage.ScanCursor = .{
+            .after = &cursor.after,
+            .after_len = cursor.after_len,
+        };
         const batch = try self.cache.scan(&position, &entries);
         cursor.after_len = position.after_len;
         cursor.more = batch.more;
         var count: usize = 0;
 
         for (entries[0..batch.count]) |entry| {
-            if (entry.key_len == 1 and entry.key[0] == 0) continue;
-            if (entry.key_len != 9 or entry.key[0] != 1) return error.Corrupt;
-            cursor.rows[count] = .{ .id = std.mem.readInt(Id, entry.key[1..9], .big), .state = try decode(entry.value[0..entry.value_len]) };
+            if (entry.key_len == 1 and entry.key[0] == 0)
+                continue;
+
+            if (entry.key_len != 9 or entry.key[0] != 1)
+                return error.Corrupt;
+
+            cursor.rows[count] = .{
+                .id = std.mem.readInt(Id, entry.key[1..9], .big),
+                .state = try decode(entry.value[0..entry.value_len]),
+            };
             count += 1;
         }
 
@@ -126,7 +156,8 @@ pub const Entities = struct {
 
     pub fn checkpoint(self: *Entities, namespace: storage.Namespace) !void {
         try self.cache.flush();
-        if (self.next_id == self.checkpointed_id) return;
+        if (self.next_id == self.checkpointed_id)
+            return;
 
         var sequence: [8]u8 = undefined;
         std.mem.writeInt(Id, &sequence, self.next_id, .little);
@@ -162,7 +193,9 @@ fn encodeKey(entity: Id) [9]u8 {
 fn valid(state: State) bool {
     var finite = std.math.isFinite(state.yaw) and std.math.isFinite(state.pitch);
 
-    for (state.position ++ state.velocity) |value| finite = finite and std.math.isFinite(value);
+    for (state.position ++ state.velocity) |value|
+        finite = finite and std.math.isFinite(value);
+
     return finite;
 }
 
@@ -175,13 +208,15 @@ fn encode(state: State, bytes: []u8) void {
 
     for (state.position ++ state.velocity, 0..) |value, i|
         std.mem.writeInt(u64, bytes[24 + i * 8 ..][0..8], @bitCast(value), .little);
+
     std.mem.writeInt(u32, bytes[72..76], @bitCast(state.yaw), .little);
     std.mem.writeInt(u32, bytes[76..80], @bitCast(state.pitch), .little);
     bytes[80] = state.flags;
 }
 
 fn decode(bytes: []const u8) !State {
-    if (bytes.len != encoded_bytes) return error.Corrupt;
+    if (bytes.len != encoded_bytes)
+        return error.Corrupt;
 
     var state: State = .{
         .uuid = std.mem.readInt(u128, bytes[0..16], .little),
@@ -199,6 +234,9 @@ fn decode(bytes: []const u8) !State {
 
     for (&state.velocity, 0..) |*value, i|
         value.* = @bitCast(std.mem.readInt(u64, bytes[48 + i * 8 ..][0..8], .little));
-    if (!valid(state)) return error.Corrupt;
+
+    if (!valid(state))
+        return error.Corrupt;
+
     return state;
 }

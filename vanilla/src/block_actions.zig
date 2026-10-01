@@ -1,6 +1,6 @@
 const std = @import("std");
 const chunks = @import("chunks");
-const minecraft = @import("minecraft");
+const minecraft = @import("minecraft_model");
 const Players = @import("players.zig").Players;
 
 pub const BlockActions = struct {

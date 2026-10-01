@@ -4,6 +4,12 @@
     {
       "name": "transfer-multi",
       "fixture": "transfer",
+      "required_logs": [
+        { "text": "event=session_transfer ", "count": 2 },
+        { "text": "event=session_configuration_plugin ", "count": 2, "at_least": true },
+        { "text": "event=session_login_plugin ", "count": 2, "at_least": true },
+        { "text": "round=3", "count": 1 }
+      ],
       "peers": [
         "alice",
         "bob"

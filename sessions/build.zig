@@ -5,12 +5,11 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const metrics = b.dependency("metrics", .{ .target = target, .optimize = optimize }).module("metrics");
     const networking = b.dependency("networking", .{}).module("networking");
-    const protocols = b.dependency("protocols", .{ .target = target, .optimize = optimize }).module("protocols");
     const module = b.addModule("sessions", .{
         .root_source_file = b.path("src/sessions.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "metrics", .module = metrics }, .{ .name = "networking", .module = networking }, .{ .name = "protocols", .module = protocols } },
+        .imports = &.{ .{ .name = "metrics", .module = metrics }, .{ .name = "networking", .module = networking } },
     });
     const check = b.addLibrary(.{ .name = "sessions", .root_module = module });
     b.step("check", "Check the Sessions module").dependOn(&check.step);

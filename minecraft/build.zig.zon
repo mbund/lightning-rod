@@ -1,8 +1,0 @@
-.{
-    .fingerprint = 0x354fdd0566bc8fd3,
-    .name = .minecraft,
-    .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
-    .dependencies = .{ .protocols = .{ .path = "../protocols" } },
-    .paths = .{ "build.zig", "build.zig.zon", "src" },
-}

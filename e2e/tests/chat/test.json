@@ -7,6 +7,12 @@
         "alice",
         "bob"
       ]
+    },
+    {
+      "name": "chat-legacy",
+      "server_releases": "1.21.5,1.21.6",
+      "versions": ["1.21.5"],
+      "peers": ["alice", "bob"]
     }
   ]
 }

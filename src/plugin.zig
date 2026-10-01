@@ -2,6 +2,78 @@ const std = @import("std");
 const lifecycle = @import("plugin_lifecycle.zig");
 const storage = @import("storage");
 
+pub fn initialize(comptime Plugin: type, allocator: std.mem.Allocator, io: std.Io, configuration: Plugin.Configuration, dependencies: anytype, source: anytype) !*Plugin {
+    var args: std.meta.ArgsTuple(@TypeOf(Plugin.init)) = undefined;
+
+    inline for (@typeInfo(@TypeOf(Plugin.init)).@"fn".params, 0..) |parameter, argument| {
+        const T = parameter.type.?;
+        args[argument] = if (T == std.mem.Allocator) allocator else if (T == std.Io) io else if (T == Plugin.Configuration) configuration else if (@hasDecl(Plugin, "Dependencies") and T == Plugin.Dependencies) dependencies else if (@hasDecl(Plugin, "Meta") and T == Plugin.Meta) metadata(T, source) else @compileError("unsupported init parameter in plugin " ++ Plugin.id);
+    }
+
+    return @call(.never_inline, Plugin.init, args);
+}
+
+pub fn close(comptime Plugin: type, instance: *Plugin, io: std.Io, closing: *lifecycle.Closing) void {
+    if (!@hasDecl(Plugin, "close")) return;
+    var args: std.meta.ArgsTuple(@TypeOf(Plugin.close)) = undefined;
+    args[0] = instance;
+
+    inline for (@typeInfo(@TypeOf(Plugin.close)).@"fn".params[1..], 1..) |parameter, argument| {
+        args[argument] = if (parameter.type == std.Io) io else if (parameter.type == *lifecycle.Closing) closing else @compileError("unsupported close parameter in plugin " ++ Plugin.id);
+    }
+
+    @call(.never_inline, Plugin.close, args);
+}
+
+pub fn dependency(comptime name: []const u8, comptime T: type, instances: anytype, values: anytype, comptime before: usize) T {
+    const Selections = @TypeOf(instances.*).selections;
+    if (comptime serviceProvider(Selections, T)) |index| {
+        const Provider = selectedPlugin(selectedType(Selections, index));
+        if (index >= before) @compileError("service provider must appear earlier: " ++ Provider.id);
+        const Contract = if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
+        return instances.get(Provider).service(Contract);
+    }
+    if (comptime dependencyPlugin(T)) |Dependency| {
+        if (comptime indexOfId(Selections, Dependency.id)) |index| {
+            if (index >= before) @compileError("plugin dependency must appear earlier: " ++ Dependency.id);
+            return instances.get(Dependency);
+        }
+    }
+    return environmental(name, T, values);
+}
+
+pub fn Instances(comptime Selections: type) type {
+    validate(Selections);
+    const types = comptime pointerTypes(Selections);
+
+    return struct {
+        pub const selections = Selections;
+        pointers: std.meta.Tuple(&types) = undefined,
+        initialized: usize = 0,
+
+        pub fn get(self: *const @This(), comptime Plugin: type) *Plugin {
+            const index = comptime indexOfId(Selections, Plugin.id) orelse
+                @compileError("plugin is not selected: " ++ Plugin.id);
+
+            if (selectedPlugin(selectedType(Selections, index)) != Plugin)
+                @compileError("selected plugin has a different type: " ++ Plugin.id);
+            std.debug.assert(index < self.initialized);
+            return self.pointers[index];
+        }
+    };
+}
+
+fn pointerTypes(comptime Selections: type) [selectedCount(Selections)]type {
+    var types: [selectedCount(Selections)]type = undefined;
+
+    for (0..types.len) |index| {
+        const Plugin = selectedPlugin(selectedType(Selections, index));
+        types[index] = *Plugin;
+    }
+
+    return types;
+}
+
 pub fn environment(base: anytype, extra: anytype) Environment(@TypeOf(base), @TypeOf(extra)) {
     var result: Environment(@TypeOf(base), @TypeOf(extra)) = undefined;
 
@@ -42,14 +114,6 @@ pub fn Selection(comptime Plugin: type) type {
         pub const plugin = Plugin;
         configuration: Plugin.Configuration,
     };
-}
-
-pub fn SelectionTuple(comptime Plugins: type) type {
-    const fields = comptime tupleFields(Plugins);
-    comptime var result: [fields.len]type = undefined;
-
-    inline for (fields, 0..) |field, index| result[index] = Selection(field.type);
-    return std.meta.Tuple(&result);
 }
 
 pub fn selectedCount(comptime Selections: type) usize {
@@ -139,11 +203,6 @@ pub fn indexOfId(comptime Selections: type, comptime id: []const u8) ?usize {
     }
 
     return null;
-}
-
-pub fn typeOfId(comptime Selections: type, comptime id: []const u8) ?type {
-    const index = indexOfId(Selections, id) orelse return null;
-    return selectedPlugin(selectedType(Selections, index));
 }
 
 pub fn compose(parts: anytype) Compose(@TypeOf(parts)) {
@@ -437,12 +496,34 @@ fn validateClose(comptime Plugin: type) void {
 
 fn validateDependencies(comptime Selections: type, comptime Plugin: type, comptime plugin_index: usize) void {
     inline for (@typeInfo(dependenciesType(Plugin)).@"struct".fields) |field| {
+        if (comptime serviceProvider(Selections, field.type)) |index| {
+            if (index >= plugin_index) @compileError("service provider must appear before " ++ Plugin.id ++ "." ++ field.name);
+            continue;
+        }
         const Dependency = dependencyPlugin(field.type) orelse continue;
         const found = comptime indexOfId(Selections, Dependency.id);
 
         if (found) |index| if (index >= plugin_index)
             @compileError("plugin dependencies must appear earlier: '" ++ Plugin.id ++ "' -> '" ++ Dependency.id ++ "'");
     }
+}
+
+/// Providers declare `Services = .{Contract}` and return it from `service(self, Contract)`.
+/// The dependency keeps its concrete contract type. No erased pointer crosses this boundary.
+pub fn serviceProvider(comptime Selections: type, comptime T: type) ?usize {
+    const Required = if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
+    var found: ?usize = null;
+    inline for (comptime tupleFields(Selections), 0..) |field, index| {
+        const Provider = selectedPlugin(field.type);
+        if (!@hasDecl(Provider, "Services")) continue;
+        inline for (Provider.Services) |Contract| {
+            if (Contract != Required) continue;
+            if (found != null) @compileError("multiple providers for service " ++ @typeName(Required));
+            if (!@hasDecl(Provider, "service")) @compileError(Provider.id ++ " declares Services without service()");
+            found = index;
+        }
+    }
+    return found;
 }
 
 pub fn dependenciesType(comptime Plugin: type) type {
@@ -476,4 +557,48 @@ fn tupleFields(comptime Selections: type) []const std.builtin.Type.StructField {
     if (info != .@"struct" or !info.@"struct".is_tuple)
         @compileError("plugin selections must be a tuple");
     return info.@"struct".fields;
+}
+pub fn environmental(comptime name: []const u8, comptime T: type, values: anytype) T {
+    if (@hasField(@TypeOf(values), name)) {
+        return @field(values, name);
+    }
+
+    const Child = if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
+    if (@typeInfo(Child) != .pointer or @typeInfo(Child).pointer.size != .one) {
+        if (@typeInfo(T) == .optional) return null;
+        @compileError("missing named environment dependency: " ++ name);
+    }
+
+    comptime var match: ?[]const u8 = null;
+
+    inline for (@typeInfo(@TypeOf(values)).@"struct".fields) |field| {
+        if (comptime !compatible(T, field.type)) continue;
+
+        if (match != null) @compileError("ambiguous environment dependency: " ++ name);
+        match = field.name;
+    }
+
+    if (match) |field| return @field(values, field);
+    if (@typeInfo(T) == .optional) return null;
+    @compileError("missing environment dependency: " ++ name);
+}
+
+fn compatible(comptime Expected: type, comptime Actual: type) bool {
+    return Expected == Actual or (@typeInfo(Expected) == .optional and @typeInfo(Expected).optional.child == Actual);
+}
+
+pub fn metadata(comptime T: type, source: anytype) T {
+    var result: T = undefined;
+
+    inline for (@typeInfo(T).@"struct".fields) |field| {
+        if (@hasField(@TypeOf(source), field.name)) {
+            @field(result, field.name) = @field(source, field.name);
+        } else if (@typeInfo(field.type) == .optional) {
+            @field(result, field.name) = null;
+        } else {
+            @compileError("missing required plugin metadata: " ++ field.name);
+        }
+    }
+
+    return result;
 }

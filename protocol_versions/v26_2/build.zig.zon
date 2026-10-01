@@ -1,0 +1,19 @@
+.{
+    .fingerprint = 0xa81054b13044f3cc,
+    .name = .lightning_rod_protocol_26_2,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .protocol_codegen = .{ .path = "../../protocol_codegen" },
+        .game_data = .{ .path = "../../game_data" },
+        .minecraft_java = .{ .path = "../../minecraft_java" },
+        .registry_snapshotter = .{ .path = "../../registry_snapshotter" },
+        .encoding = .{ .path = "../../protocol_encoding" },
+        // Pinned pc_26_2 revision. The release data is not on master yet.
+        .minecraft_data = .{
+            .url = "git+https://github.com/PrismarineJS/minecraft-data#68ea7b59e7aa318be86cf265be45ee1b79572528",
+            .hash = "N-V-__8AAArvDht45bV81w8QOe23megSo3SsY1FAzPZY7TTw",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

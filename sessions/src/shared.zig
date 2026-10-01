@@ -1,6 +1,6 @@
 const std = @import("std");
 const networking = @import("networking");
-const headroom = @import("compression.zig").headroom;
+pub const headroom = 6;
 
 pub const PageId = u16;
 
@@ -13,6 +13,7 @@ pub const Configuration = struct {
 pub const Frame = struct {
     id: i32,
     payload: []const u8,
+    body: []const u8,
     length: usize,
 };
 
@@ -25,10 +26,10 @@ pub fn frame(bytes: []const u8, max_packet: usize) error{ Incomplete, Malformed 
     const n: usize = @intCast(length);
     if (rest.len < n) return error.Incomplete;
     const id, const payload = try readVarint(rest[0..n]);
-    return .{ .id = id, .payload = payload, .length = bytes.len - rest.len + n };
+    return .{ .id = id, .payload = payload, .body = rest[0..n], .length = bytes.len - rest.len + n };
 }
 
-fn readVarint(bytes: []const u8) error{ Incomplete, Malformed }!struct { i32, []const u8 } {
+pub fn readVarint(bytes: []const u8) error{ Incomplete, Malformed }!struct { i32, []const u8 } {
     var value: u32 = 0;
 
     for (0..5) |i| {

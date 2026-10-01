@@ -14,7 +14,7 @@ pub const Operators = struct {
         const self = try allocator.create(Operators);
         self.* = .{ .config = config };
 
-        if (deps.commands.deps.permission_policy == null) deps.commands.deps.permission_policy = .{ .context = self, .allows = allows };
+        deps.commands.installPolicyIfUnset(.{ .context = self, .allows = allows });
 
         return self;
     }

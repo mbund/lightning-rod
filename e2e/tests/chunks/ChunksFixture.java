@@ -2,9 +2,9 @@ package dev.lightningrod.e2e;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import net.minecraft.client.Minecraft;
+import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import dev.lightningrod.e2e.mixin.ClientConnectionAccessor;
-import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
-import net.minecraft.client.MinecraftClient;
 
 final class ChunksFixture extends Fixture {
     private boolean relocated;
@@ -19,15 +19,15 @@ final class ChunksFixture extends Fixture {
     }
     @Override boolean encrypted() { return r.scenario.contains("encrypted"); }
 
-    @Override public void tick(MinecraftClient client, int loaded, int missing) {
+    @Override public void tick(Minecraft client, int loaded, int missing) {
         if (loaded >= r.targetChunks && missing == 0 && r.terrainTick >= 0) {
             if (r.scenario.equals("chunks-simulations-multi")) {
-                if (client.world.getPlayers().size() != 1 || client.getNetworkHandler().getPlayerList().size() != 1) {
+                if (client.level.players().size() != 1 || client.getConnection().getOnlinePlayers().size() != 1) {
                     r.fail(client, "simulation_players_leaked");
                     return;
                 }
-                var stack = client.player.getInventory().getStack(0);
-                if (r.peer.equals("alice") ? !stack.isOf(net.minecraft.item.Items.BREAD) || stack.getCount() != 17 : !stack.isEmpty()) {
+                var stack = client.player.getInventory().getItem(0);
+                if (r.peer.equals("alice") ? !stack.is(net.minecraft.world.item.Items.BREAD) || stack.getCount() != 17 : !stack.isEmpty()) {
                     r.fail(client, "simulation_inventory_leaked");
                     return;
                 }
@@ -56,7 +56,7 @@ final class ChunksFixture extends Fixture {
 
     }
 
-    @Override public boolean prepare(MinecraftClient client) {
+    @Override public boolean prepare(Minecraft client) {
         if (r.scenario.startsWith("chunks-") && r.scenario.endsWith("-multi") || r.scenario.equals("chunks-isolation")) {
             if (r.terrainTick < 0) return false;
             if (!relocated) {
@@ -66,15 +66,15 @@ final class ChunksFixture extends Fixture {
                     for (String other : r.expectedPeers) if (!Files.exists(r.artifacts.resolve(other + ".ready"))) return false;
                 } catch (IOException error) { throw new IllegalStateException(error); }
                 double x = r.peer.equals("alice") ? -4095.5 : 4096.5;
-                if (!client.player.getAbilities().allowFlying) {
+                if (!client.player.getAbilities().mayfly) {
                     r.fail(client, "creative_flight_not_available");
                     return false;
                 }
                 client.player.getAbilities().flying = true;
-                client.player.sendAbilitiesUpdate();
-                client.player.setPosition(x, 65, x);
-                client.player.setPitch(30);
-                client.getNetworkHandler().sendPacket(new PlayerMoveC2SPacket.PositionAndOnGround(x, 65, x, true, false));
+                client.player.onUpdateAbilities();
+                client.player.setPos(x, 65, x);
+                client.player.setXRot(30);
+                client.getConnection().send(new ServerboundMovePlayerPacket.Pos(x, 65, x, true, false));
                 relocated = true;
                 r.firstChunkTick = r.tick;
                 r.firstChunkNanos = System.nanoTime();
@@ -89,7 +89,7 @@ final class ChunksFixture extends Fixture {
                 return false;
             }
             if (r.scenario.equals("chunks-isolation") && r.peer.equals("bob")) {
-                var channel = ((ClientConnectionAccessor) client.getNetworkHandler().getConnection()).lightningRod$channel();
+                var channel = ((ClientConnectionAccessor) client.getConnection().getConnection()).lightningRod$channel();
                 if (!readsPaused) {
                     channel.config().setAutoRead(false);
                     readsPaused = true;

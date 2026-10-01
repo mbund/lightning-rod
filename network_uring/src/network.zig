@@ -18,10 +18,19 @@ pub fn Transport(comptime limits: network.Limits) type {
     network.validLimits(limits);
     return struct {
         const Self = @This();
+        pub const capacity = limits;
 
-        const State = enum { free, open, closing, closed };
+        const State = enum {
+            free,
+            open,
+            closing,
+            closed,
+        };
 
-        const Kind = enum { receive, send };
+        const Kind = enum {
+            receive,
+            send,
+        };
 
         const Conn = struct {
             state: State = .free,
@@ -57,14 +66,17 @@ pub fn Transport(comptime limits: network.Limits) type {
 
         pub fn init(io: std.Io, config: Configuration) !Self {
             _ = io;
-            if (config.ring_entries < 4) return error.InvalidConfiguration;
+            if (config.ring_entries < 4)
+                return error.InvalidConfiguration;
 
             var ring = try linux.IoUring.init(config.ring_entries, 0);
             errdefer ring.deinit();
-            if (ring.features & linux.IORING_FEAT_EXT_ARG == 0) return error.UnsupportedKernel;
+            if (ring.features & linux.IORING_FEAT_EXT_ARG == 0)
+                return error.UnsupportedKernel;
 
             const wake = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
-            if (linux.errno(wake) != .SUCCESS) return error.WakeupUnavailable;
+            if (linux.errno(wake) != .SUCCESS)
+                return error.WakeupUnavailable;
 
             const wake_fd: posix.fd_t = @intCast(wake);
             errdefer fdClose(wake_fd);
@@ -81,14 +93,16 @@ pub fn Transport(comptime limits: network.Limits) type {
             fdClose(self.listener);
             fdClose(self.wake_fd);
 
-            for (self.connections) |c| fdClose(c.fd);
+            for (self.connections) |c|
+                fdClose(c.fd);
+
             self.* = undefined;
         }
 
         pub fn transport(self: *Self) network.Transport {
             return .{
                 .context = self,
-                .vtable = &vtable,
+                .vtable = network.Transport.adapter(Self),
                 .inheritance = .{
                     .context = self,
                     .pause = pauseAccept,
@@ -104,7 +118,8 @@ pub fn Transport(comptime limits: network.Limits) type {
             const self: *Self = @ptrCast(@alignCast(context));
             self.accepting = !pause;
 
-            if (pause) self.notify(io);
+            if (pause)
+                self.notify(io);
         }
 
         fn paused(context: *anyopaque) bool {
@@ -240,13 +255,15 @@ pub fn Transport(comptime limits: network.Limits) type {
                     op.cancel_requested = true;
                 }
 
-                if (!op.used or op.submitted) continue;
+                if (!op.used or op.submitted)
+                    continue;
 
                 const c = self.conn(op.handle) orelse {
                     self.release(i);
                     continue;
                 };
-                if (c.state != .open) continue;
+                if (c.state != .open)
+                    continue;
 
                 const sqe = self.ring.get_sqe() catch return;
 
@@ -273,17 +290,23 @@ pub fn Transport(comptime limits: network.Limits) type {
             }
 
             if (cqe.user_data == accept_tag or cqe.user_data >= cancel_tag_base) {
-                if (cqe.user_data == accept_tag) self.accept_pending = false;
+                if (cqe.user_data == accept_tag)
+                    self.accept_pending = false;
 
-                if (cqe.res >= 0 and cqe.user_data == accept_tag) self.admit(@intCast(cqe.res));
+                if (cqe.res >= 0 and cqe.user_data == accept_tag)
+                    self.admit(@intCast(cqe.res));
+
                 return;
             }
 
-            if (cqe.user_data >= limits.operations) return;
+            if (cqe.user_data >= limits.operations)
+                return;
 
             const i: usize = @intCast(cqe.user_data);
             const op = &self.operations[i];
-            if (!op.used) return;
+            if (!op.used)
+                return;
+
             op.submitted = false;
             const bytes: usize = if (cqe.res > 0) @intCast(cqe.res) else 0;
             assert(bytes <= op.bytes.len);
@@ -295,12 +318,14 @@ pub fn Transport(comptime limits: network.Limits) type {
             });
             self.release(i);
 
-            if (cqe.res <= 0) self.beginClose(h, if (cqe.res == 0) .peer_closed else .io_failure);
+            if (cqe.res <= 0)
+                self.beginClose(h, if (cqe.res == 0) .peer_closed else .io_failure);
         }
 
         fn queue(self: *Self, h: network.Handle, k: Kind, b: []u8) network.QueueError!void {
             const c = self.conn(h) orelse return error.InvalidHandle;
-            if ((k == .receive and c.recv != null) or (k == .send and c.send != null)) return error.Busy;
+            if ((k == .receive and c.recv != null) or (k == .send and c.send != null))
+                return error.Busy;
 
             const i = self.freeOp() orelse return error.Full;
             self.operations[i] = .{ .used = true, .kind = k, .handle = h, .bytes = b };
@@ -326,7 +351,9 @@ pub fn Transport(comptime limits: network.Limits) type {
                 // A staged-but-not-submitted buffer has no CQE. Return it now. Submitted buffers
                 // remain pinned until their CQEs are consumed.
                 for (&self.operations, 0..) |*op, i| {
-                    if (!(op.used and !op.submitted and std.meta.eql(op.handle, h))) continue;
+                    if (!(op.used and !op.submitted and std.meta.eql(op.handle, h)))
+                        continue;
+
                     self.push(switch (op.kind) {
                         .receive => .{ .received = .{ .handle = h, .result = .{ .bytes = 0, .errno = @intFromEnum(linux.E.CANCELED) } } },
                         .send => .{ .sent = .{ .handle = h, .result = .{ .bytes = 0, .errno = @intFromEnum(linux.E.CANCELED) } } },
@@ -338,7 +365,9 @@ pub fn Transport(comptime limits: network.Limits) type {
 
         fn finishClose(self: *Self) void {
             for (&self.connections, 0..) |*c, i| {
-                if (c.state != .closing or c.recv != null or c.send != null) continue;
+                if (c.state != .closing or c.recv != null or c.send != null)
+                    continue;
+
                 self.push(.{ .closed = .{ .handle = .{ .index = @intCast(i), .generation = c.generation }, .reason = c.reason.? } });
                 fdClose(c.fd);
                 c.fd = -1;
@@ -368,26 +397,34 @@ pub fn Transport(comptime limits: network.Limits) type {
         }
 
         fn conn(self: *Self, h: network.Handle) ?*Conn {
-            if (h.index >= limits.connections) return null;
+            if (h.index >= limits.connections)
+                return null;
 
             const c = &self.connections[h.index];
             return if (c.state == .open and c.generation == h.generation) c else null;
         }
 
         fn owner(self: *Self, h: network.Handle) ?*Conn {
-            if (h.index >= limits.connections) return null;
+            if (h.index >= limits.connections)
+                return null;
 
             const c = &self.connections[h.index];
             return if (c.state != .free and c.generation == h.generation) c else null;
         }
 
         fn freeConn(self: *Self) ?usize {
-            for (self.connections, 0..) |c, i| if (c.state == .free) return i;
+            for (self.connections, 0..) |c, i|
+                if (c.state == .free)
+                    return i;
+
             return null;
         }
 
         fn freeOp(self: *Self) ?usize {
-            for (self.operations, 0..) |op, i| if (!op.used) return i;
+            for (self.operations, 0..) |op, i|
+                if (!op.used)
+                    return i;
+
             return null;
         }
 
@@ -409,10 +446,6 @@ pub fn Transport(comptime limits: network.Limits) type {
             return n;
         }
 
-        fn raw(p: *anyopaque) *Self {
-            return @ptrCast(@alignCast(p));
-        }
-
         const accept_tag = std.math.maxInt(u64);
         const wake_tag = accept_tag - 1;
         const cancel_tag_base = wake_tag - limits.operations;
@@ -420,36 +453,6 @@ pub fn Transport(comptime limits: network.Limits) type {
         fn cancelTag(i: usize) u64 {
             return cancel_tag_base + i;
         }
-
-        const vtable: network.Transport.VTable = .{ .queue_receive = struct {
-            fn f(p: *anyopaque, io: std.Io, h: network.Handle, b: []u8) network.QueueError!void {
-                return raw(p).queueReceive(io, h, b);
-            }
-        }.f, .queue_send = struct {
-            fn f(p: *anyopaque, io: std.Io, h: network.Handle, b: []const u8) network.QueueError!void {
-                return raw(p).queueSend(io, h, b);
-            }
-        }.f, .close = struct {
-            fn f(p: *anyopaque, io: std.Io, h: network.Handle, r: network.CloseReason) void {
-                raw(p).close(io, h, r);
-            }
-        }.f, .release = struct {
-            fn f(p: *anyopaque, io: std.Io, h: network.Handle) void {
-                raw(p).releaseConnection(io, h);
-            }
-        }.f, .notify = struct {
-            fn f(p: *anyopaque, io: std.Io) void {
-                raw(p).notify(io);
-            }
-        }.f, .submit = struct {
-            fn f(p: *anyopaque, io: std.Io) anyerror!void {
-                return raw(p).submit(io);
-            }
-        }.f, .poll = struct {
-            fn f(p: *anyopaque, io: std.Io, d: ?std.Io.Timeout, e: []network.Event) anyerror!usize {
-                return raw(p).poll(io, d, e);
-            }
-        }.f };
     };
 }
 
@@ -465,22 +468,32 @@ fn listener(a: std.Io.net.IpAddress, backlog: u32) !posix.socket_t {
         .ip6 => linux.AF.INET6,
     };
     const raw = linux.socket(domain, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP);
-    if (linux.errno(raw) != .SUCCESS) return posix.unexpectedErrno(linux.errno(raw));
+    if (linux.errno(raw) != .SUCCESS)
+        return posix.unexpectedErrno(linux.errno(raw));
 
     const fd: posix.socket_t = @intCast(raw);
     errdefer fdClose(fd);
     const enabled: c_int = 1;
     const reuse = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&enabled), @sizeOf(c_int));
-    if (linux.errno(reuse) != .SUCCESS) return posix.unexpectedErrno(linux.errno(reuse));
+    if (linux.errno(reuse) != .SUCCESS)
+        return posix.unexpectedErrno(linux.errno(reuse));
 
     var store: Addr = undefined;
     const sa: *const posix.sockaddr, const len: posix.socklen_t = switch (a) {
         .ip4 => |x| b: {
-            store.ip4 = .{ .port = std.mem.nativeToBig(u16, x.port), .addr = @bitCast(x.bytes) };
+            store.ip4 = .{
+                .port = std.mem.nativeToBig(u16, x.port),
+                .addr = @bitCast(x.bytes),
+            };
             break :b .{ &store.any, @sizeOf(posix.sockaddr.in) };
         },
         .ip6 => |x| b: {
-            store.ip6 = .{ .port = std.mem.nativeToBig(u16, x.port), .flowinfo = x.flow, .addr = x.bytes, .scope_id = x.interface.index };
+            store.ip6 = .{
+                .port = std.mem.nativeToBig(u16, x.port),
+                .flowinfo = x.flow,
+                .addr = x.bytes,
+                .scope_id = x.interface.index,
+            };
             break :b .{ &store.any, @sizeOf(posix.sockaddr.in6) };
         },
     };
@@ -493,7 +506,9 @@ fn listener(a: std.Io.net.IpAddress, backlog: u32) !posix.socket_t {
     }
 
     const q = linux.listen(fd, backlog);
-    if (linux.errno(q) != .SUCCESS) return posix.unexpectedErrno(linux.errno(q));
+    if (linux.errno(q) != .SUCCESS)
+        return posix.unexpectedErrno(linux.errno(q));
+
     return fd;
 }
 

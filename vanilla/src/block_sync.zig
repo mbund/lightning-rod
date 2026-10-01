@@ -1,8 +1,10 @@
 const std = @import("std");
-const rod = @import("lightning_rod");
+const lightning_rod = @import("lightning_rod");
 const chunks = @import("chunks");
-const protocols = @import("protocols");
 const sessions = @import("sessions");
+const packets = @import("minecraft_packets");
+const worlds = @import("worlds");
+const wire_1_21_5 = @import("wire_1_21_5");
 const Players = @import("players.zig").Players;
 const Streaming = @import("streaming.zig").Streaming;
 
@@ -18,7 +20,10 @@ pub const BlockSynchronization = struct {
         chunks: *chunks.Chunks,
         players: *Players,
         streaming: *Streaming,
-        work: *rod.Work,
+        work: *lightning_rod.Work,
+        sessions: *sessions.Service,
+        packets: *packets.Packets,
+        worlds: *worlds.Worlds,
     };
 
     const Observer = struct {
@@ -52,7 +57,7 @@ pub const BlockSynchronization = struct {
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies, config: Configuration) !*BlockSynchronization {
         if (config.delta_sections == 0) return error.InvalidConfiguration;
-        if (deps.players.deps.sessions.config.page_bytes < 16 + 4096 * 4) return error.PacketPageTooSmall;
+        if (deps.sessions.config.page_bytes < 16 + 4096 * 4) return error.PacketPageTooSmall;
 
         const self = try allocator.create(BlockSynchronization);
         const observers = try allocator.alloc(Observer, deps.players.records.len);
@@ -87,7 +92,7 @@ pub const BlockSynchronization = struct {
 
     fn changed(context: *anyopaque, section: chunks.Section, edits: []const chunks.BlockEdit) void {
         const self: *BlockSynchronization = @ptrCast(@alignCast(context));
-        const world = self.deps.players.deps.worlds.get(section.world) orelse return;
+        const world = self.deps.worlds.get(section.world) orelse return;
         const minimum = world.dimension.minimumSection();
         if (section.y < minimum or section.y >= minimum + @as(i32, @intCast(world.dimension.sectionCount()))) return;
 
@@ -150,10 +155,10 @@ pub const BlockSynchronization = struct {
         for (edits) |edit| self.masks[slot][edit.index / 64] |= @as(u64, 1) << @intCast(edit.index % 64);
     }
 
-    fn progress(context: *anyopaque, _: std.Io, maximum_items: usize) !rod.Work.Result {
+    fn progress(context: *anyopaque, _: std.Io, maximum_items: usize) !lightning_rod.Work.Result {
         const self: *BlockSynchronization = @ptrCast(@alignCast(context));
         const players = self.deps.players;
-        const service = players.deps.sessions;
+        const service = self.deps.sessions;
         assert(maximum_items > 0 and maximum_items <= 8);
         var advanced = false;
         var completed: usize = 0;
@@ -267,25 +272,9 @@ pub const BlockSynchronization = struct {
             const lease = try self.deps.chunks.acquire(section);
             defer lease.release();
             const view = lease.view();
-            var rest = try protocols.support.write_varint(packet.bytes, protocols.wire.play.toClient.packetId(.multi_block_change));
-            const packed_x: u64 = @as(u22, @truncate(@as(u32, @bitCast(section.x))));
-            const packed_z: u64 = @as(u22, @truncate(@as(u32, @bitCast(section.z))));
-            const packed_y: u64 = @as(u20, @truncate(@as(u32, @bitCast(section.y))));
-            std.mem.writeInt(u64, rest[0..8], (packed_x << 42) | (packed_z << 20) | packed_y, .big);
-            rest = try protocols.support.write_varint(rest[8..], changed_count);
+            const bytes = try self.deps.packets.writePacket(writeChanges, player.protocol, packet.bytes, .{ section, view, mask });
 
-            for (mask, 0..) |value, word| {
-                var bits = value;
-
-                while (bits != 0) {
-                    const index: u12 = @intCast(word * 64 + @ctz(bits));
-                    bits &= bits - 1;
-                    const local: u12 = ((index & 15) << 8) | (((index >> 4) & 15) << 4) | (index >> 8);
-                    rest = try protocols.support.write_varlong(rest, (@as(i64, view.get(index)) << 12) | local);
-                }
-            }
-
-            const accepted = packet.publishReady(packet.bytes.len - rest.len, self.recipients[0..ready]);
+            const accepted = packet.publishReady(bytes.len, self.recipients[0..ready]);
 
             for (accepted) |handle| {
                 const word = handle.index * self.words + at / 64;
@@ -323,6 +312,31 @@ pub const BlockSynchronization = struct {
 
         for (self.observers) |observer| if (observer.pending != 0) return .blocked;
         return .idle;
+    }
+
+    fn writeChanges(packet: wire_1_21_5.play.toClient.packet_multi_block_change.Writer, registry: packets.Registry, section: chunks.Section, view: chunks.View, mask: *const [64]u64) ![]u8 {
+        var count: u32 = 0;
+        for (mask) |bits| count += @popCount(bits);
+
+        const positioned = try packet.chunkCoordinates(.{ .x = section.x, .z = section.z, .y = section.y });
+        var records = try positioned.records(count);
+
+        for (mask, 0..) |word, index| {
+            var bits = word;
+
+            while (bits != 0) {
+                const at: u12 = @intCast(index * 64 + @ctz(bits));
+                bits &= bits - 1;
+                const local: u12 = ((at & 15) << 8) | (((at >> 4) & 15) << 4) | (at >> 8);
+                const canonical = view.get(at);
+                const mapped = registry.blockState(@intCast(canonical)) catch return error.UnsupportedBlock;
+                const record = (@as(u64, @intCast(mapped)) << 12) | local;
+                if (record > std.math.maxInt(i32)) return error.UnsupportedBlock;
+                records = try records.element(@intCast(record));
+            }
+        }
+
+        return (try records.finish()).finish();
     }
 
     fn bitIndex(self: *const BlockSynchronization, section: chunks.Section) usize {

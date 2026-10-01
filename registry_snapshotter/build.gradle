@@ -1,0 +1,45 @@
+plugins {
+    id 'fabric-loom' version "${loom_version}" apply false
+    id 'net.fabricmc.fabric-loom' version "${loom_version}" apply false
+}
+
+def versions = new groovy.json.JsonSlurper().parse(file('versions.json'))
+def release = versions.find { it.release == minecraft_version }
+def api = providers.gradleProperty('registry_api').getOrElse(release == null ? 'current' : release.api)
+if (!['legacy', 'input', 'network', 'modern', 'current'].contains(api)) throw new GradleException("Unsupported registry API: ${api}")
+def modern = ['modern', 'current'].contains(api)
+apply plugin: modern ? 'net.fabricmc.fabric-loom' : 'fabric-loom'
+
+version = project.mod_version
+group = project.maven_group
+layout.buildDirectory = file(providers.gradleProperty('buildRoot').getOrElse('build'))
+
+loom {
+    enableModProvidedJavadoc = false
+    runs {
+        registrySnapshot {
+            server()
+            runDir = 'build/snapshot-run'
+            property 'mcc.snapshotOutput', providers.gradleProperty('snapshotOutput').get()
+            property 'mcc.minecraftVersion', minecraft_version
+        }
+    }
+}
+
+sourceSets.main.java.srcDir(modern ? 'src/modern-loader/java' : 'src/legacy-loader/java')
+sourceSets.main.java.srcDir(['legacy', 'input'].contains(api) ? 'src/legacy-registry/java' : 'src/current-registry/java')
+
+dependencies {
+    minecraft "com.mojang:minecraft:${minecraft_version}"
+    if (!modern) mappings loom.officialMojangMappings()
+    add(modern ? 'implementation' : 'modImplementation', "net.fabricmc:fabric-loader:${loader_version}")
+}
+
+processResources {
+    inputs.property 'version', project.version
+    inputs.property 'minecraft_version', project.minecraft_version
+    filesMatching('fabric.mod.json') { expand 'version': project.version, 'minecraft_version': project.minecraft_version }
+}
+
+tasks.withType(JavaCompile).configureEach { options.release = modern ? 25 : 21 }
+tasks.register('registrySnapshot') { dependsOn 'runRegistrySnapshot' }

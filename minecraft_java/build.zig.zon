@@ -1,0 +1,12 @@
+.{
+    .name = .minecraft_java,
+    .fingerprint = 0xe71670b606b3a3fb,
+    .version = "0.1.0",
+    .dependencies = .{
+        .sessions = .{ .path = "../sessions" },
+        .chunks = .{ .path = "../chunks" },
+        .encoding = .{ .path = "../protocol_encoding" },
+        .minecraft_model = .{ .path = "../minecraft_model" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

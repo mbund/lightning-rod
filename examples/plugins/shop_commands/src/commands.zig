@@ -12,6 +12,7 @@ pub const ShopCommands = struct {
     pub const Dependencies = struct {
         shop: *Shop,
         commands: *commands.Commands,
+        players: *vanilla.Players,
     };
 
     pub const buy_permission: commands.Permission = .{ .name = "shop.buy", .description = "Purchase items" };
@@ -53,7 +54,7 @@ pub const ShopCommands = struct {
     }
 
     fn trade(self: *ShopCommands, context: commands.Context, args: TradeArgs, buying: bool) !void {
-        for (self.deps.shop.deps.players.records, 0..) |player, index| {
+        for (self.deps.players.records, 0..) |player, index| {
             if (player.handle == null or player.uuid != context.sender) continue;
             self.deps.shop.trade(index, args.item, args.amount orelse 1, buying) catch |err| {
                 context.reply(switch (err) {

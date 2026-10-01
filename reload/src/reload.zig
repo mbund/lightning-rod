@@ -45,6 +45,10 @@ pub const Reload = struct {
         return if (self.deps.reload_request) |request| request.enabled else false;
     }
 
+    pub fn latest(self: *const Reload) ?*const Request {
+        return self.deps.reload_request;
+    }
+
     pub fn stage(self: *Reload, reply_token: []const u8) error{ Unavailable, AlreadyPending }!void {
         if (!self.available()) return error.Unavailable;
         try self.deps.reload_request.?.stage(reply_token);

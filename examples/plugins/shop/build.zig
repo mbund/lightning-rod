@@ -3,7 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const names = .{ "vanilla", "protocols", "economy" };
+    const names = .{ "vanilla", "game_data", "economy" };
     var imports: [names.len]std.Build.Module.Import = undefined;
 
     inline for (names, 0..) |name, index| {

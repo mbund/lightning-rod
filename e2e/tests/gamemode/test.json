@@ -1,0 +1,10 @@
+{
+  "client": "GamemodeFixture",
+  "variants": [
+    {
+      "name": "gamemode-multi",
+      "fixture": "gamemode",
+      "peers": ["alice", "bob"]
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+.{
+    .name = .lightning_rod_game_data,
+    .fingerprint = 0x65228a0b1b0bac95,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .protocol_codegen = .{ .path = "../protocol_codegen" },
+        .registry_snapshotter = .{ .path = "../registry_snapshotter" },
+        .encoding = .{ .path = "../protocol_encoding" },
+        .minecraft_data = .{
+            .url = "git+https://github.com/PrismarineJS/minecraft-data#f59168c3ce23158527ea7c3743ac16f18f96cf25",
+            .hash = "N-V-__8AAFXUwxriGAbVVALGcyTN3vNwdm1KkaoBAUbzQZyB",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

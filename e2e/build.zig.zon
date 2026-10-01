@@ -4,6 +4,9 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .protocol_1_21_5 = .{ .path = "../protocol_versions/v1_21_5" },
+        .minecraft_packets = .{ .path = "../minecraft_packets" },
+        .reload_execve = .{ .path = "../reload_execve" },
         .bossbars = .{ .path = "../bossbars" },
         .tps = .{ .path = "../examples/plugins/tps" },
         .lightning_rod = .{ .path = ".." },
@@ -11,9 +14,7 @@
         .vanilla = .{ .path = "../vanilla" },
         .sessions = .{ .path = "../sessions" },
         .protocols = .{ .path = "../protocols" },
-        .vanilla_server = .{ .path = "../examples/vanilla" },
-        .@"vanilla-plus_server" = .{ .path = "../examples/vanilla-plus" },
         .lightning_rod_stdio = .{ .path = "../stdio" },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "server.zig", "runner.zig", "src", "tests", "client/build.gradle", "client/settings.gradle", "client/gradle.properties", "client/gradlew", "client/gradlew.bat", "client/gradle", "client/src" },
+    .paths = .{ "build.zig", "build.zig.zon", "server.zig", "runner.zig", "src", "tests", "client/build.gradle", "client/versions.json", "client/settings.gradle", "client/gradle.properties", "client/gradlew", "client/gradlew.bat", "client/gradle", "client/src" },
 }

@@ -1,0 +1,8 @@
+.{
+    .name = .lightning_rod_protocol_codegen,
+    .fingerprint = 0x29adce01dfcd1325,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{ .encoding = .{ .path = "../protocol_encoding" } },
+    .paths = .{ "build.zig", "build.zig.zon", "codegen.zig", "java_version.zig", "contracts.zig", "src" },
+}

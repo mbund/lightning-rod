@@ -49,13 +49,13 @@ pub const TeleportCommands = struct {
 
     fn parse(self: *TeleportCommands, _: commands.Context, name: []const u8) commands.ParseError!u128 {
         for (self.deps.players.records) |player|
-            if (player.handle != null and player.stage == .ready and std.ascii.eqlIgnoreCase(player.name[0..player.name_len], name)) return player.uuid;
+            if (player.inPlay() and std.ascii.eqlIgnoreCase(player.name[0..player.name_len], name)) return player.uuid;
         return error.InvalidArgument;
     }
 
     fn suggest(self: *TeleportCommands, context: commands.CompletionContext, output: *commands.Suggestions) void {
         for (self.deps.players.records) |player| {
-            if (player.handle == null or player.stage != .ready) continue;
+            if (!player.inPlay()) continue;
 
             const name = player.name[0..player.name_len];
             if (std.ascii.startsWithIgnoreCase(name, context.prefix)) output.add(.{ .text = name }) catch return;

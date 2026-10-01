@@ -1,0 +1,10 @@
+.{
+    .fingerprint = 0x9dd2db0e92efc3d6,
+    .name = .minecraft_model,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .chunks = .{ .path = "../chunks" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

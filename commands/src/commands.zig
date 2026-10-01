@@ -1,5 +1,7 @@
 const std = @import("std");
 
+pub const wire = @import("wire.zig");
+
 const assert = std.debug.assert;
 pub const max_arguments = 16;
 pub const max_input = 1024;
@@ -32,14 +34,19 @@ pub const Grants = struct {
         const self: *const Grants = @ptrCast(@alignCast(context));
         var granted = false;
 
-        for (self.everyone) |entry| granted = granted or std.mem.eql(u8, entry.name, permission.name);
+        for (self.everyone) |entry|
+            granted = granted or std.mem.eql(u8, entry.name, permission.name);
 
         for (self.users) |user| {
-            if (user.uuid != uuid) continue;
+            if (user.uuid != uuid)
+                continue;
 
-            for (user.deny) |entry| if (std.mem.eql(u8, entry.name, permission.name)) return false;
+            for (user.deny) |entry|
+                if (std.mem.eql(u8, entry.name, permission.name))
+                    return false;
 
-            for (user.allow) |entry| granted = granted or std.mem.eql(u8, entry.name, permission.name);
+            for (user.allow) |entry|
+                granted = granted or std.mem.eql(u8, entry.name, permission.name);
         }
 
         return granted;
@@ -83,23 +90,43 @@ pub const Suggestions = struct {
         text: []const u8,
         tooltip: []const u8 = "",
     }) error{Full}!void {
-        if (self.count == self.entries.len or entry.text.len + entry.tooltip.len > self.bytes.len - self.used) return error.Full;
+        if (self.count == self.entries.len or entry.text.len + entry.tooltip.len > self.bytes.len - self.used)
+            return error.Full;
 
-        for (self.entries[0..self.count]) |previous| if (std.mem.eql(u8, previous.text, entry.text)) return;
+        for (self.entries[0..self.count]) |previous|
+            if (std.mem.eql(u8, previous.text, entry.text))
+                return;
+
         const text = self.bytes[self.used..][0..entry.text.len];
         const tooltip = self.bytes[self.used + text.len ..][0..entry.tooltip.len];
+
         // Callbacks may supply stack-local formatting buffers.
         @memcpy(text, entry.text);
         @memcpy(tooltip, entry.tooltip);
-        self.entries[self.count] = .{ .text = text, .tooltip = tooltip };
+
+        self.entries[self.count] = .{
+            .text = text,
+            .tooltip = tooltip,
+        };
         self.count += 1;
         self.used += text.len + tooltip.len;
     }
 };
 
-pub const ParseError = error{InvalidArgument};
+pub const ParseError = error{
+    InvalidArgument,
+};
 
-pub const Kind = enum { word, greedy, boolean, integer, long, float, double };
+pub const Kind = enum {
+    word,
+    players,
+    greedy,
+    boolean,
+    integer,
+    long,
+    float,
+    double,
+};
 
 pub const ArgumentInfo = struct {
     kind: Kind,
@@ -121,6 +148,7 @@ pub const Definition = struct {
 
 pub fn Argument(comptime Owner: type, comptime T: type) type {
     return struct {
+        kind: ?Kind = null,
         parse: ?*const fn (*Owner, Context, []const u8) ParseError!T = null,
         suggest: ?*const fn (*Owner, CompletionContext, *Suggestions) void = null,
         greedy: bool = false,
@@ -133,7 +161,9 @@ pub fn Arguments(comptime Owner: type, comptime Args: type) type {
     const fields = std.meta.fields(Args);
     comptime var types: [fields.len]type = undefined;
 
-    inline for (fields, 0..) |field, index| types[index] = Argument(Owner, Value(field.type));
+    inline for (fields, 0..) |field, index|
+        types[index] = Argument(Owner, Value(field.type));
+
     return @Struct(.auto, null, std.meta.fieldNames(Args), &types, &@splat(.{}));
 }
 
@@ -150,7 +180,9 @@ pub fn Leaf(comptime Owner: type, comptime Args: type) type {
 pub fn leaf(comptime Owner: type, comptime Args: type, comptime definition: Leaf(Owner, Args)) Definition {
     const fields = std.meta.fields(Args);
 
-    if (fields.len > max_arguments) @compileError("too many command arguments");
+    if (fields.len > max_arguments)
+        @compileError("too many command arguments");
+
     const Adapter = struct {
         fn invoke(pointer: *anyopaque, context: Context, values: []const []const u8) !void {
             assert(values.len <= fields.len);
@@ -162,6 +194,7 @@ pub fn leaf(comptime Owner: type, comptime Args: type, comptime definition: Leaf
                 if (index < values.len) {
                     const parse = spec.parse orelse Parser(Owner, Value(field.type)).parse;
                     const value = try parse(@ptrCast(@alignCast(pointer)), context, values[index]);
+
                     if (comptime @typeInfo(Value(field.type)) == .int) {
                         if (spec.minimum) |minimum| if (value < minimum) return error.InvalidArgument;
                         if (spec.maximum) |maximum| if (value > maximum) return error.InvalidArgument;
@@ -184,31 +217,56 @@ pub fn leaf(comptime Owner: type, comptime Args: type, comptime definition: Leaf
             const T = Value(field.type);
             const spec = @field(definition.arguments, field.name);
 
-            if (field.name.len > 64) @compileError("command argument name is too long");
+            if (field.name.len > 64)
+                @compileError("command argument name is too long");
 
-            if (spec.minimum != null and spec.maximum != null and spec.minimum.? > spec.maximum.?) @compileError("inverted argument bounds");
+            if (spec.minimum != null and spec.maximum != null and spec.minimum.? > spec.maximum.?)
+                @compileError("inverted argument bounds");
 
-            if ((spec.minimum != null or spec.maximum != null) and @typeInfo(T) != .int) @compileError("bounds require an integer argument");
+            if ((spec.minimum != null or spec.maximum != null) and @typeInfo(T) != .int)
+                @compileError("bounds require an integer argument");
 
-            if (optional and @typeInfo(field.type) != .optional) @compileError("optional arguments must be trailing");
+            if (optional and @typeInfo(field.type) != .optional)
+                @compileError("optional arguments must be trailing");
+
             optional = @typeInfo(field.type) == .optional;
 
-            if (spec.greedy and index + 1 != fields.len) @compileError("greedy argument must be last");
+            if (spec.greedy and index + 1 != fields.len)
+                @compileError("greedy argument must be last");
+
             const AdapterSuggest = struct {
                 fn suggest(pointer: *anyopaque, context: CompletionContext, suggestions: *Suggestions) void {
-                    if (spec.suggest) |callback| return callback(@ptrCast(@alignCast(pointer)), context, suggestions);
+                    if (spec.suggest) |callback|
+                        return callback(@ptrCast(@alignCast(pointer)), context, suggestions);
+
                     if (comptime @typeInfo(T) == .@"enum") inline for (std.meta.fields(T)) |tag| {
                         if (std.mem.startsWith(u8, tag.name, context.prefix)) suggestions.add(.{ .text = tag.name }) catch return;
                     };
                 }
             };
-            output[index] = .{
-                .kind = if (spec.greedy) .greedy else if (spec.parse != null) .word else switch (@typeInfo(T)) {
+
+            const kind = blk: {
+                if (spec.kind) |kind| break :blk kind;
+                if (spec.greedy) break :blk .greedy;
+                if (spec.parse != null) break :blk .word;
+
+                break :blk switch (@typeInfo(T)) {
                     .bool => .boolean,
-                    .int => |integer| if (integer.bits <= 31 or (integer.signedness == .signed and integer.bits <= 32)) .integer else if (integer.bits <= 63 or (integer.signedness == .signed and integer.bits <= 64)) .long else .word,
+                    .int => |integer| if (integer.bits <= 31 or
+                        (integer.signedness == .signed and integer.bits <= 32))
+                        .integer
+                    else if (integer.bits <= 63 or
+                        (integer.signedness == .signed and integer.bits <= 64))
+                        .long
+                    else
+                        .word,
                     .float => |float| if (float.bits <= 32) .float else .double,
                     else => .word,
-                },
+                };
+            };
+
+            output[index] = .{
+                .kind = kind,
                 .optional = optional,
                 .minimum = spec.minimum,
                 .maximum = spec.maximum,
@@ -217,10 +275,12 @@ pub fn leaf(comptime Owner: type, comptime Args: type, comptime definition: Leaf
 
             if (output[index].kind == .integer) {
                 if (spec.minimum) |minimum|
-                    if (minimum < std.math.minInt(i32) or minimum > std.math.maxInt(i32)) @compileError("minimum exceeds wire integer range");
+                    if (minimum < std.math.minInt(i32) or minimum > std.math.maxInt(i32))
+                        @compileError("minimum exceeds wire integer range");
 
                 if (spec.maximum) |maximum|
-                    if (maximum < std.math.minInt(i32) or maximum > std.math.maxInt(i32)) @compileError("maximum exceeds wire integer range");
+                    if (maximum < std.math.minInt(i32) or maximum > std.math.maxInt(i32))
+                        @compileError("maximum exceeds wire integer range");
             }
         }
 
@@ -267,7 +327,9 @@ pub const Commands = struct {
         help_page_size: usize = 6,
     };
 
-    pub const Dependencies = struct { permission_policy: ?Policy };
+    pub const Dependencies = struct {
+        permission_policy: ?Policy,
+    };
 
     pub const Node = struct {
         parent: u16 = 0,
@@ -286,7 +348,9 @@ pub const Commands = struct {
     config: Configuration,
     deps: Dependencies,
 
-    const HelpArgs = struct { page: ?u32 };
+    const HelpArgs = struct {
+        page: ?u32,
+    };
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Commands {
         if (config.maximum_nodes < 3 or config.maximum_nodes > 1024 or config.help_page_size == 0 or config.help_page_size > 10)
@@ -295,13 +359,20 @@ pub const Commands = struct {
         const self = try allocator.create(Commands);
         const nodes = try allocator.alloc(Node, config.maximum_nodes);
         @memset(nodes, .{});
-        self.* = .{ .allocator = allocator, .nodes = nodes, .config = config, .deps = deps };
+        self.* = .{
+            .allocator = allocator,
+            .nodes = nodes,
+            .config = config,
+            .deps = deps,
+        };
+
         _ = try self.register(self, leaf(Commands, HelpArgs, .{
             .name = "help",
             .description = "List commands you can use",
             .handler = help,
             .arguments = .{ .page = .{ .minimum = 1 } },
         }));
+
         return self;
     }
 
@@ -311,6 +382,15 @@ pub const Commands = struct {
 
     pub fn register(self: *Commands, owner: anytype, comptime definition: Definition) !Branch {
         return (Branch{ .commands = self, .index = 0 }).add(owner, definition);
+    }
+
+    pub fn installPolicyIfUnset(self: *Commands, policy: Policy) void {
+        if (self.deps.permission_policy == null) self.deps.permission_policy = policy;
+    }
+
+    pub fn permits(self: *const Commands, sender: u128, permission: *const Permission) bool {
+        const policy = self.deps.permission_policy orelse return false;
+        return policy.allows(policy.context, sender, permission);
     }
 
     pub fn allowed(self: *const Commands, sender: u128, index: usize) bool {
@@ -344,19 +424,28 @@ pub const Commands = struct {
         var cursor: usize = 0;
 
         while (cursor < input.len) {
-            while (cursor < input.len and input[cursor] == ' ') cursor += 1;
-            if (cursor == input.len) break;
+            while (cursor < input.len and input[cursor] == ' ')
+                cursor += 1;
+
+            if (cursor == input.len)
+                break;
 
             const start = cursor;
 
-            while (cursor < input.len and input[cursor] != ' ') cursor += 1;
+            while (cursor < input.len and input[cursor] != ' ')
+                cursor += 1;
+
             var found: ?usize = null;
             var argument: ?usize = null;
-
             for (self.nodes[1..self.count], 1..) |child, index| {
-                if (child.parent != node or !self.allowed(context.sender, index)) continue;
+                if (child.parent != node or !self.allowed(context.sender, index))
+                    continue;
 
-                if (child.argument != null) argument = index else if (std.mem.eql(u8, child.name, input[start..cursor])) found = index;
+                if (child.argument != null) {
+                    argument = index;
+                } else if (std.mem.eql(u8, child.name, input[start..cursor])) {
+                    found = index;
+                }
             }
 
             node = found orelse argument orelse {
@@ -369,7 +458,8 @@ pub const Commands = struct {
                     return;
                 }
 
-                if (spec.kind == .greedy) cursor = input.len;
+                if (spec.kind == .greedy)
+                    cursor = input.len;
                 words[count] = input[start..cursor];
                 count += 1;
             }
@@ -394,19 +484,22 @@ pub const Commands = struct {
         assert(visible.len == self.count);
         visible[0] = true;
 
-        for (self.nodes[1..self.count], 1..) |node, index| visible[index] = node.invoke != null and self.allowed(sender, index);
-        var index: usize = self.count;
+        for (self.nodes[1..self.count], 1..) |node, index|
+            visible[index] = node.invoke != null and self.allowed(sender, index);
 
+        var index: usize = self.count;
         while (index > 1) {
             index -= 1;
 
-            if (visible[index]) visible[self.nodes[index].parent] = true;
+            if (visible[index])
+                visible[self.nodes[index].parent] = true;
         }
     }
 
     pub fn complete(self: *Commands, sender: u128, input: []const u8, output: *Suggestions) void {
         self.sealed = true;
-        if (input.len > max_input) return;
+        if (input.len > max_input)
+            return;
 
         var visible: [1024]bool = undefined;
         self.visibility(sender, visible[0..self.count]);
@@ -416,17 +509,22 @@ pub const Commands = struct {
         var cursor: usize = @intFromBool(std.mem.startsWith(u8, input, "/"));
 
         while (true) {
-            while (cursor < input.len and input[cursor] == ' ') cursor += 1;
+            while (cursor < input.len and input[cursor] == ' ')
+                cursor += 1;
+
             const start = cursor;
 
-            while (cursor < input.len and input[cursor] != ' ') cursor += 1;
+            while (cursor < input.len and input[cursor] != ' ')
+                cursor += 1;
+
             const prefix = input[start..cursor];
             if (cursor == input.len) {
                 output.start = start;
                 output.length = cursor - start;
 
                 for (self.nodes[1..self.count], 1..) |child, index| {
-                    if (child.parent != node or !visible[index]) continue;
+                    if (child.parent != node or !visible[index])
+                        continue;
 
                     if (child.argument) |argument| {
                         if (argument.suggest) |suggest| suggest(child.context, .{
@@ -448,32 +546,40 @@ pub const Commands = struct {
 
             var found: ?usize = null;
             var argument: ?usize = null;
-
             for (self.nodes[1..self.count], 1..) |child, index| {
-                if (child.parent != node or !visible[index]) continue;
+                if (child.parent != node or !visible[index])
+                    continue;
 
-                if (child.argument != null) argument = index else if (std.mem.eql(u8, child.name, prefix)) found = index;
+                if (child.argument != null)
+                    argument = index
+                else if (std.mem.eql(u8, child.name, prefix))
+                    found = index;
             }
 
             node = found orelse argument orelse return;
-            if (self.nodes[node].argument) |spec| if (spec.kind == .greedy) {
-                output.start = start;
-                output.length = input.len - start;
+            if (self.nodes[node].argument) |spec| {
+                if (spec.kind == .greedy) {
+                    output.start = start;
+                    output.length = input.len - start;
 
-                if (spec.suggest) |suggest|
-                    suggest(self.nodes[node].context, .{
-                        .sender = sender,
-                        .input = input,
-                        .prefix = input[start..],
-                        .argument = self.nodes[node].name,
-                        .preceding = preceding[0..count],
-                        .start = start,
-                        .cursor = input.len,
-                    }, output);
+                    if (spec.suggest) |suggest|
+                        suggest(self.nodes[node].context, .{
+                            .sender = sender,
+                            .input = input,
+                            .prefix = input[start..],
+                            .argument = self.nodes[node].name,
+                            .preceding = preceding[0..count],
+                            .start = start,
+                            .cursor = input.len,
+                        }, output);
+
+                    return;
+                }
+            }
+
+            if (count == preceding.len)
                 return;
-            };
 
-            if (count == preceding.len) return;
             preceding[count] = prefix;
             count += 1;
         }
@@ -483,7 +589,8 @@ pub const Commands = struct {
         var total: usize = 0;
 
         for (self.nodes[1..self.count], 1..) |node, index| {
-            if (node.invoke == null or !self.allowed(context.sender, index)) continue;
+            if (node.invoke == null or !self.allowed(context.sender, index))
+                continue;
 
             var extended = false;
 
@@ -505,15 +612,18 @@ pub const Commands = struct {
         var ordinal: usize = 0;
 
         for (self.nodes[1..self.count], 1..) |node, index| {
-            if (node.invoke == null or !self.allowed(context.sender, index)) continue;
+            if (node.invoke == null or !self.allowed(context.sender, index))
+                continue;
 
             var extended = false;
-
             for (self.nodes[index + 1 .. self.count]) |child|
                 extended = extended or (child.parent == index and child.argument != null and child.invoke == node.invoke);
-            if (extended) continue;
+            if (extended)
+                continue;
+
             ordinal += 1;
-            if (ordinal <= (page - 1) * self.config.help_page_size or ordinal > page * self.config.help_page_size) continue;
+            if (ordinal <= (page - 1) * self.config.help_page_size or ordinal > page * self.config.help_page_size)
+                continue;
 
             var path: [32]usize = undefined;
             var length: usize = 0;
@@ -532,16 +642,21 @@ pub const Commands = struct {
                 length -= 1;
                 const part = self.nodes[path[length]];
 
-                if (part.argument) |argument| try writer.print("{s}{s}{s}", .{ if (argument.optional) "[" else "<", part.name, if (argument.optional) "]" else ">" }) else try writer.writeAll(part.name);
+                if (part.argument) |argument|
+                    try writer.print("{s}{s}{s}", .{ if (argument.optional) "[" else "<", part.name, if (argument.optional) "]" else ">" })
+                else
+                    try writer.writeAll(part.name);
 
-                if (length > 0) try writer.writeByte(' ');
+                if (length > 0)
+                    try writer.writeByte(' ');
             }
 
             try writer.print(" — {s}", .{node.description});
             context.reply(writer.buffered());
         }
 
-        if (page < pages) context.reply(try std.fmt.bufPrint(&buffer, "Next: /help {d}", .{page + 1}));
+        if (page < pages)
+            context.reply(try std.fmt.bufPrint(&buffer, "Next: /help {d}", .{page + 1}));
     }
 };
 
@@ -557,15 +672,23 @@ pub const Branch = struct {
 
     pub fn literal(self: Branch, definition: Literal) !Branch {
         const commands = self.commands;
-        if (commands.sealed) return error.RegistrationClosed;
-        if (definition.name.len == 0 or definition.name.len > 64 or definition.description.len > 256) return error.InvalidCommand;
+        if (commands.sealed)
+            return error.RegistrationClosed;
+
+        if (definition.name.len == 0 or definition.name.len > 64 or definition.description.len > 256)
+            return error.InvalidCommand;
 
         for (definition.name) |byte|
-            if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-' and byte != ':') return error.InvalidCommand;
-        if (commands.count == commands.nodes.len) return error.CommandCapacity;
+            if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-' and byte != ':')
+                return error.InvalidCommand;
+
+        if (commands.count == commands.nodes.len)
+            return error.CommandCapacity;
 
         for (commands.nodes[1..commands.count]) |node|
-            if (node.parent == self.index and node.argument == null and std.mem.eql(u8, node.name, definition.name)) return error.DuplicateCommand;
+            if (node.parent == self.index and node.argument == null and std.mem.eql(u8, node.name, definition.name))
+                return error.DuplicateCommand;
+
         var depth: usize = 1;
         var path_bytes: usize = definition.name.len + 1;
         var parent = self.index;
@@ -575,31 +698,51 @@ pub const Branch = struct {
             path_bytes += commands.nodes[parent].name.len + 3;
         }
 
-        if (path_bytes > 512) return error.CommandTooLong;
-        if (depth + max_arguments > 32) return error.CommandDepth;
+        if (path_bytes > 512)
+            return error.CommandTooLong;
+
+        if (depth + max_arguments > 32)
+            return error.CommandDepth;
 
         const index = commands.count;
         const name = try commands.allocator.dupe(u8, definition.name);
         const description = try commands.allocator.dupe(u8, definition.description);
-        commands.nodes[index] = .{ .parent = self.index, .name = name, .description = description, .permission = definition.permission };
+        commands.nodes[index] = .{
+            .parent = self.index,
+            .name = name,
+            .description = description,
+            .permission = definition.permission,
+        };
         commands.count += 1;
         return .{ .commands = commands, .index = index };
     }
 
     pub fn add(self: Branch, owner: anytype, comptime definition: Definition) !Branch {
-        if (@TypeOf(owner) != *definition.Owner) @compileError("command owner must be *" ++ @typeName(definition.Owner));
+        if (@TypeOf(owner) != *definition.Owner)
+            @compileError("command owner must be *" ++ @typeName(definition.Owner));
+
         var path_bytes: usize = definition.name.len + 1;
 
-        for (definition.argument_names) |name| path_bytes += name.len + 3;
+        for (definition.argument_names) |name|
+            path_bytes += name.len + 3;
         var ancestor = self.index;
 
-        while (ancestor != 0) : (ancestor = self.commands.nodes[ancestor].parent) path_bytes += self.commands.nodes[ancestor].name.len + 3;
-        if (path_bytes > 512) return error.CommandTooLong;
-        if (self.commands.nodes.len - self.commands.count < definition.arguments.len + 1) return error.CommandCapacity;
+        while (ancestor != 0) : (ancestor = self.commands.nodes[ancestor].parent)
+            path_bytes += self.commands.nodes[ancestor].name.len + 3;
 
-        const branch = try self.literal(.{ .name = definition.name, .description = definition.description, .permission = definition.permission });
+        if (path_bytes > 512)
+            return error.CommandTooLong;
+
+        if (self.commands.nodes.len - self.commands.count < definition.arguments.len + 1)
+            return error.CommandCapacity;
+
+        const branch = try self.literal(.{
+            .name = definition.name,
+            .description = definition.description,
+            .permission = definition.permission,
+        });
+
         var parent = branch.index;
-
         for (definition.arguments, definition.argument_names) |argument, name| {
             if (argument.optional) {
                 self.commands.nodes[parent].invoke = definition.invoke;

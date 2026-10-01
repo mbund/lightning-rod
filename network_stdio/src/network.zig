@@ -14,10 +14,19 @@ pub fn Transport(comptime limits: network.Limits) type {
     network.validLimits(limits);
     return struct {
         const Self = @This();
+        pub const capacity = limits;
 
-        const State = enum { free, open, closing, closed };
+        const State = enum {
+            free,
+            open,
+            closing,
+            closed,
+        };
 
-        const Kind = enum { receive, send };
+        const Kind = enum {
+            receive,
+            send,
+        };
 
         const Connection = struct {
             state: State = .free,
@@ -63,16 +72,20 @@ pub fn Transport(comptime limits: network.Limits) type {
             self.tasks.cancel(io);
             self.accept_tasks.cancel(io);
 
-            if (self.listener) |*listener| listener.deinit(io);
+            if (self.listener) |*listener|
+                listener.deinit(io);
 
-            for (&self.connections) |*item| if (item.state != .free and !item.stream_closed) item.stream.close(io);
+            for (&self.connections) |*item|
+                if (item.state != .free and !item.stream_closed)
+                    item.stream.close(io);
+
             self.* = undefined;
         }
 
         pub fn transport(self: *Self) network.Transport {
             return .{
                 .context = self,
-                .vtable = &vtable,
+                .vtable = network.Transport.adapter(Self),
                 .inheritance = if (builtin.os.tag == .linux) .{
                     .context = self,
                     .pause = pauseAccept,
@@ -90,7 +103,8 @@ pub fn Transport(comptime limits: network.Limits) type {
             self.accepting = !pause;
             self.mutex.unlock(io);
 
-            if (pause) self.accept_tasks.cancel(io);
+            if (pause)
+                self.accept_tasks.cancel(io);
         }
 
         fn paused(context: *anyopaque) bool {
@@ -166,6 +180,7 @@ pub fn Transport(comptime limits: network.Limits) type {
                 self.scheduleAccept(io);
                 self.mutex.lockUncancelable(io);
                 self.finishCloses(io);
+
                 const count = @min(destination.len, self.event_count);
 
                 for (destination[0..count]) |*event| {
@@ -177,9 +192,14 @@ pub fn Transport(comptime limits: network.Limits) type {
                 const notified = self.notified;
                 self.notified = false;
 
-                if (self.event_count == 0) self.wake.reset();
+                if (self.event_count == 0)
+                    self.wake.reset();
+
                 self.mutex.unlock(io);
-                if (count != 0 or notified) return count;
+
+                if (count != 0 or notified)
+                    return count;
+
                 self.wake.waitTimeout(io, deadline) catch |err| switch (err) {
                     error.Timeout => return 0,
                     else => return err,
@@ -194,6 +214,7 @@ pub fn Transport(comptime limits: network.Limits) type {
                 return err;
             };
             self.mutex.unlock(io);
+
             self.tasks.concurrent(io, operationTask, .{ self, io, index }) catch {
                 self.mutex.lockUncancelable(io);
                 self.release(index);
@@ -204,12 +225,23 @@ pub fn Transport(comptime limits: network.Limits) type {
 
         fn queue(self: *Self, handle: network.Handle, kind: Kind, bytes: []u8) network.QueueError!usize {
             const item = self.connection(handle) orelse return error.InvalidHandle;
-            if ((kind == .receive and item.receive != null) or (kind == .send and item.send != null)) return error.Busy;
+            if ((kind == .receive and item.receive != null) or (kind == .send and item.send != null))
+                return error.Busy;
 
             const index = self.freeOperation() orelse return error.Full;
-            self.operations[index] = .{ .used = true, .kind = kind, .handle = handle, .bytes = bytes };
+            self.operations[index] = .{
+                .used = true,
+                .kind = kind,
+                .handle = handle,
+                .bytes = bytes,
+            };
 
-            if (kind == .receive) item.receive = index else item.send = index;
+            if (kind == .receive) {
+                item.receive = index;
+            } else {
+                item.send = index;
+            }
+
             return index;
         }
 
@@ -222,6 +254,7 @@ pub fn Transport(comptime limits: network.Limits) type {
             const kind = operation.kind;
             const bytes = operation.bytes;
             self.mutex.unlock(io);
+
             var result: network.Result = .{ .bytes = 0 };
             var failed = false;
 
@@ -234,7 +267,10 @@ pub fn Transport(comptime limits: network.Limits) type {
                             break :blk 0;
                         };
                     };
-                    result = .{ .bytes = count, .errno = if (failed or count == 0) 1 else null };
+                    result = .{
+                        .bytes = count,
+                        .errno = if (failed or count == 0) 1 else null,
+                    };
                 },
                 .send => {
                     const data: [1][]const u8 = .{bytes};
@@ -243,7 +279,10 @@ pub fn Transport(comptime limits: network.Limits) type {
                         break :blk 0;
                     };
                     assert(count <= bytes.len);
-                    result = .{ .bytes = count, .errno = if (failed or count == 0) 1 else null };
+                    result = .{
+                        .bytes = count,
+                        .errno = if (failed or count == 0) 1 else null,
+                    };
                 },
             }
 
@@ -306,8 +345,9 @@ pub fn Transport(comptime limits: network.Limits) type {
 
             if (self.freeConnection()) |index| {
                 var generation = self.connections[index].generation +% 1;
+                if (generation == 0)
+                    generation = 1;
 
-                if (generation == 0) generation = 1;
                 self.connections[index] = .{ .state = .open, .stream = stream, .generation = generation };
                 self.push(.{ .accepted = .{ .index = @intCast(index), .generation = generation } });
                 self.wake.set(io);
@@ -327,7 +367,8 @@ pub fn Transport(comptime limits: network.Limits) type {
 
         fn finishCloses(self: *Self, io: std.Io) void {
             for (&self.connections, 0..) |*item, index| {
-                if (item.state != .closing or item.receive != null or item.send != null) continue;
+                if (item.state != .closing or item.receive != null or item.send != null)
+                    continue;
 
                 const handle: network.Handle = .{ .index = @intCast(index), .generation = item.generation };
                 item.stream.close(io);
@@ -338,26 +379,34 @@ pub fn Transport(comptime limits: network.Limits) type {
         }
 
         fn connection(self: *Self, handle: network.Handle) ?*Connection {
-            if (handle.index >= limits.connections) return null;
+            if (handle.index >= limits.connections)
+                return null;
 
             const c = &self.connections[handle.index];
             return if (c.state == .open and c.generation == handle.generation) c else null;
         }
 
         fn owner(self: *Self, handle: network.Handle) ?*Connection {
-            if (handle.index >= limits.connections) return null;
+            if (handle.index >= limits.connections)
+                return null;
 
             const c = &self.connections[handle.index];
             return if (c.state != .free and c.generation == handle.generation) c else null;
         }
 
         fn freeConnection(self: *Self) ?usize {
-            for (self.connections, 0..) |c, i| if (c.state == .free) return i;
+            for (self.connections, 0..) |c, i|
+                if (c.state == .free)
+                    return i;
+
             return null;
         }
 
         fn freeOperation(self: *Self) ?usize {
-            for (self.operations, 0..) |operation, i| if (!operation.used) return i;
+            for (self.operations, 0..) |operation, i|
+                if (!operation.used)
+                    return i;
+
             return null;
         }
 
@@ -367,36 +416,6 @@ pub fn Transport(comptime limits: network.Limits) type {
             self.event_count += 1;
         }
 
-        fn raw(context: *anyopaque) *Self {
-            return @ptrCast(@alignCast(context));
-        }
-
-        const vtable: network.Transport.VTable = .{ .queue_receive = struct {
-            fn f(c: *anyopaque, io: std.Io, h: network.Handle, b: []u8) network.QueueError!void {
-                return raw(c).queueReceive(io, h, b);
-            }
-        }.f, .queue_send = struct {
-            fn f(c: *anyopaque, io: std.Io, h: network.Handle, b: []const u8) network.QueueError!void {
-                return raw(c).queueSend(io, h, b);
-            }
-        }.f, .close = struct {
-            fn f(c: *anyopaque, io: std.Io, h: network.Handle, r: network.CloseReason) void {
-                raw(c).close(io, h, r);
-            }
-        }.f, .release = struct {
-            fn f(c: *anyopaque, io: std.Io, h: network.Handle) void {
-                raw(c).releaseConnection(io, h);
-            }
-        }.f, .notify = struct {
-            fn f(c: *anyopaque, io: std.Io) void {
-                raw(c).notify(io);
-            }
-        }.f, .submit = struct {
-            fn f(_: *anyopaque, _: std.Io) anyerror!void {}
-        }.f, .poll = struct {
-            fn f(c: *anyopaque, io: std.Io, t: ?std.Io.Timeout, e: []network.Event) anyerror!usize {
-                return raw(c).poll(io, t, e);
-            }
-        }.f };
+        pub fn submit(_: *Self, _: std.Io) !void {}
     };
 }

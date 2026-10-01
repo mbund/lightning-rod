@@ -1,0 +1,27 @@
+.{
+    .fingerprint = 0x64dd5e0eae2aae06,
+    .name = .protocol_extension_example,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .reload = .{ .path = "../../../reload" },
+        .protocol_codegen = .{ .path = "../../../protocol_codegen" },
+        .registry_snapshotter = .{ .path = "../../../registry_snapshotter" },
+        .storage_local = .{ .path = "../../../storage_local" },
+        .lightning_rod = .{ .path = "../../.." },
+        .reload_execve = .{ .path = "../../../reload_execve" },
+        .profiles = .{ .path = "../../../profiles" },
+        .network_stdio = .{ .path = "../../../network_stdio" },
+        .vanilla = .{ .path = "../../../vanilla" },
+        .sessions = .{ .path = "../../../sessions" },
+        .game_data = .{ .path = "../../../game_data" },
+        .encoding = .{ .path = "../../../protocol_encoding" },
+        .minecraft_data = .{
+            .url = "git+https://github.com/PrismarineJS/minecraft-data#f59168c3ce23158527ea7c3743ac16f18f96cf25",
+            .hash = "N-V-__8AAFXUwxriGAbVVALGcyTN3vNwdm1KkaoBAUbzQZyB",
+        },
+        .minecraft_packets = .{ .path = "../../../minecraft_packets" },
+        .minecraft_java = .{ .path = "../../../minecraft_java" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "canonical.zig", "main.zig", "protocol.zig", "extra_negotiation.zig" },
+}
