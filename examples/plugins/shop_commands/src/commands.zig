@@ -1,8 +1,8 @@
 const std = @import("std");
 const vanilla = @import("vanilla");
+const Shop = @import("shop").Shop;
 
 const commands = vanilla.commands;
-const Shop = @import("shop").Shop;
 
 pub const ShopCommands = struct {
     pub const id = "shop:commands";

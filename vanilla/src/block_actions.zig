@@ -22,7 +22,23 @@ pub const BlockActions = struct {
         minimum: u16,
         maximum: u16,
         context: *anyopaque,
-        apply: *const fn (*anyopaque, Request) anyerror!Result,
+        vtable: *const VTable,
+
+        pub const VTable = struct {
+            apply: *const fn (*anyopaque, Request) anyerror!Result,
+        };
+
+        pub fn init(owner: anytype, minimum: u16, maximum: u16, comptime handler: anytype) Handler {
+            const Adapter = struct {
+                const vtable: VTable = .{ .apply = @This().invoke };
+
+                fn invoke(raw: *anyopaque, request: Request) anyerror!Result {
+                    const typed: @TypeOf(owner) = @ptrCast(@alignCast(raw));
+                    return handler(typed, request);
+                }
+            };
+            return .{ .context = owner, .minimum = minimum, .maximum = maximum, .vtable = &Adapter.vtable };
+        }
     };
 
     handlers: []Handler,
@@ -48,7 +64,7 @@ pub const BlockActions = struct {
 
     pub fn apply(self: *BlockActions, request: Request) !Result {
         for (self.handlers[0..self.count]) |handler| {
-            if (request.state >= handler.minimum and request.state <= handler.maximum) return handler.apply(handler.context, request);
+            if (request.state >= handler.minimum and request.state <= handler.maximum) return handler.vtable.apply(handler.context, request);
         }
 
         return .pass;

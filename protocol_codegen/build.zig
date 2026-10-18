@@ -1,10 +1,10 @@
 const std = @import("std");
 const codegen = @import("codegen.zig");
 const contracts = @import("contracts.zig");
+pub const JavaVersion = @import("java_version.zig").JavaVersion;
 
 pub const Codegen = codegen.Codegen;
 pub const Json = codegen.Json;
-pub const JavaVersion = @import("java_version.zig").JavaVersion;
 
 pub fn build(b: *std.Build) void {
     inline for (.{ "protocol", "registry" }) |name| {

@@ -14,6 +14,11 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(ClientPacketListener.class)
 abstract class ChunkStreamingMixin {
+    @Inject(method = "handleContainerContent", at = @At("TAIL"))
+    private void inventory(net.minecraft.network.protocol.game.ClientboundContainerSetContentPacket packet, CallbackInfo info) {
+        Recorder.instance().inventorySynced(packet.containerId());
+    }
+
     @Inject(method = "handleBlockDestruction", at = @At("TAIL"))
     private void breaking(net.minecraft.network.protocol.game.ClientboundBlockDestructionPacket packet, CallbackInfo info) {
         Recorder.instance().blockBreaking(packet.getPos(), packet.getProgress());
@@ -29,9 +34,8 @@ abstract class ChunkStreamingMixin {
         Recorder.instance().gameStateChange(((GameStateChangeReasonAccessor) (Object) packet.getEvent()).lightningRod$id(), packet.getParam());
     }
 
-    // NetworkThreadUtils schedules this handler onto the client thread. At HEAD that produces an
-    // observation for the scheduling attempt and the actual handler invocation. TAIL observes only
-    // successfully handled packets.
+    // HEAD runs both when scheduling and when handling the packet on the client thread.
+    // TAIL counts only successfully handled packets.
     @Inject(method = "handleLevelChunkWithLight", at = @At("TAIL"))
     private void chunkData(ClientboundLevelChunkWithLightPacket packet, CallbackInfo info) {
         Recorder.instance().chunkData(

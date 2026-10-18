@@ -1,3 +1,4 @@
+const RegistryIdentity = @import("registry_identity.zig").RegistryIdentity;
 const std = @import("std");
 const Worlds = @import("worlds").Worlds;
 
@@ -6,7 +7,7 @@ pub const VanillaWorlds = struct {
 
     pub const Configuration = struct {};
 
-    pub const Dependencies = struct { worlds: *Worlds };
+    pub const Dependencies = struct { registry_identity: *RegistryIdentity, worlds: *Worlds };
 
     pub const dimensions = struct {
         pub const overworld: Worlds.Dimension = .{ .name = "minecraft:overworld", .minimum_section = -4, .section_count = 24, .skylight = true };

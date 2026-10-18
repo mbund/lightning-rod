@@ -18,7 +18,7 @@ pub fn treePacket(packet: anytype, tree: *const commands.Commands, visible: []co
         if (!visible[at]) continue;
 
         const argument = node.argument;
-        const flags: u8 = @as(u8, if (at == 0) 0 else if (argument == null) 1 else 2) | @as(u8, if (node.invoke != null) 4 else 0) | @as(u8, if (argument != null and argument.?.suggest != null) 16 else 0);
+        const flags: u8 = @as(u8, if (at == 0) 0 else if (argument == null) 1 else 2) | @as(u8, if (node.vtable != null) 4 else 0) | @as(u8, if (argument != null and argument.?.suggest != null) 16 else 0);
         try writer.writeByte(flags);
         var children: u16 = 0;
 

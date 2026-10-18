@@ -1,5 +1,6 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
+const metrics = lightning_rod.metrics;
 const bossbars = @import("bossbars");
 
 pub const Tps = struct {
@@ -7,7 +8,7 @@ pub const Tps = struct {
 
     pub const Configuration = struct { update_interval_ms: u32 = 500 };
 
-    pub const Dependencies = struct { bossbars: *bossbars.Bossbars };
+    pub const Dependencies = struct { bossbars: *bossbars.Bossbars, metrics: *metrics.Registry };
 
     pub const windows = [_]u64{ 1, 10, 60 };
     const quantum = 100 * std.time.ns_per_ms;
@@ -46,27 +47,26 @@ pub const Tps = struct {
     }
 
     pub fn tick(self: *Tps) !void {
-        const metrics = lightning_rod.metrics.snapshot() orelse return;
-        const sample = metrics.completed_tick;
+        const sample = self.deps.metrics.find("server.tick") orelse return;
         if (sample.sequence == 0 or sample.sequence == self.previous) return;
 
-        const started_ns = if (self.previous == 0) sample.ended_ns - sample.duration_ns else self.previous_ns;
+        const started_ns = if (self.previous == 0) sample.recorded_ns - sample.value else self.previous_ns;
         self.previous = sample.sequence;
-        self.previous_ns = sample.ended_ns;
-        const stamp: u64 = @intCast(@divTrunc(sample.ended_ns, quantum));
+        self.previous_ns = sample.recorded_ns;
+        const stamp: u64 = @intCast(@divTrunc(sample.recorded_ns, quantum));
         const bucket = &self.buckets[stamp % self.buckets.len];
 
         if (bucket.stamp != stamp) bucket.* = .{ .stamp = stamp, .started_ns = started_ns };
 
         bucket.ticks += 1;
-        bucket.ns += sample.duration_ns;
-        if (sample.ended_ns - self.updated_ns < @as(i96, self.config.update_interval_ms) * std.time.ns_per_ms) return;
-        self.updated_ns = sample.ended_ns;
+        bucket.ns += sample.value;
+        if (sample.recorded_ns - self.updated_ns < @as(i96, self.config.update_interval_ms) * std.time.ns_per_ms) return;
+        self.updated_ns = sample.recorded_ns;
 
         for (windows, self.bars) |seconds, bar| {
             var count: u64 = 0;
             var duration: u64 = 0;
-            var oldest_ns = sample.ended_ns;
+            var oldest_ns = sample.recorded_ns;
 
             for (self.buckets) |entry| {
                 if (entry.stamp > stamp or stamp - entry.stamp >= seconds * 10) continue;
@@ -75,7 +75,7 @@ pub const Tps = struct {
                 oldest_ns = @min(oldest_ns, entry.started_ns);
             }
 
-            const elapsed: f64 = @floatFromInt(@max(1, @min(sample.ended_ns - oldest_ns, @as(i96, seconds) * std.time.ns_per_s)));
+            const elapsed: f64 = @floatFromInt(@max(1, @min(sample.recorded_ns - oldest_ns, @as(i96, seconds) * std.time.ns_per_s)));
             const tps = @min(20, @as(f64, @floatFromInt(count)) * std.time.ns_per_s / elapsed);
             const mspt = @as(f64, @floatFromInt(duration)) / @as(f64, @floatFromInt(@max(1, count))) / std.time.ns_per_ms;
             var title: [96]u8 = undefined;

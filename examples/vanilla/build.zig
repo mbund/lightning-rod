@@ -27,6 +27,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "minecraft_java", .module = b.dependency("minecraft_java", .{ .target = target, .optimize = optimize }).module("minecraft_java") },
                 .{ .name = "protocols", .module = protocols.module("protocols") },
                 .{ .name = "lightning_rod", .module = lightning_rod.module("lightning_rod") },
                 .{ .name = "profile", .module = profile.module(profile_name) },
@@ -44,4 +45,18 @@ pub fn build(b: *std.Build) void {
 
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run the Vanilla server").dependOn(&run.step);
+
+    const startup_benchmark = b.addExecutable(.{
+        .name = "startup-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/startup.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "profile", .module = profile.module(profile_name) }},
+        }),
+    });
+    const benchmark = b.addRunArtifact(startup_benchmark);
+    benchmark.addArtifactArg(executable);
+    if (b.args) |args| benchmark.addArgs(args);
+    b.step("bench-startup", "Measure startup and graceful shutdown against an existing world").dependOn(&benchmark.step);
 }

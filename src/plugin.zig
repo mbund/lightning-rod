@@ -134,14 +134,6 @@ pub fn minimumTickScratchBytes(comptime Selections: type) usize {
     };
 }
 
-pub fn traceCount(comptime Selections: type) usize {
-    var count: usize = 0;
-
-    inline for (comptime tupleFields(Selections)) |field|
-        count += pluginTraceCount(selectedPlugin(field.type));
-    return count;
-}
-
 pub fn closeTokenCount(comptime Selections: type) usize {
     var count: usize = 0;
 
@@ -152,34 +144,6 @@ pub fn closeTokenCount(comptime Selections: type) usize {
     }
 
     return count;
-}
-
-pub fn traceBase(comptime Selections: type, comptime plugin_index: usize) usize {
-    const selected_count = comptime selectedCount(Selections);
-    @setEvalBranchQuota(1000 + selected_count * 128);
-
-    if (plugin_index >= selected_count)
-        @compileError("plugin trace index is out of bounds");
-    var count: usize = 0;
-
-    inline for (comptime tupleFields(Selections)[0..plugin_index]) |field|
-        count += pluginTraceCount(selectedPlugin(field.type));
-    return count;
-}
-
-pub fn pluginTraceCount(comptime Plugin: type) usize {
-    if (!@hasDecl(Plugin, "Trace")) return 0;
-
-    const info = @typeInfo(Plugin.Trace);
-
-    if (info != .@"enum") @compileError(Plugin.id ++ ".Trace must be an enum");
-
-    inline for (info.@"enum".fields, 0..) |field, index| {
-        if (field.value != index)
-            @compileError(Plugin.id ++ ".Trace values must be contiguous from zero");
-    }
-
-    return info.@"enum".fields.len;
 }
 
 pub fn selectedType(comptime Selections: type, comptime index: usize) type {
@@ -394,7 +358,6 @@ fn validatePlugin(comptime Plugin: type) void {
 
     if (@hasDecl(Plugin, "Meta") and @typeInfo(Plugin.Meta) != .@"struct")
         @compileError(Plugin.id ++ ".Meta must be a struct");
-    _ = pluginTraceCount(Plugin);
     validateInit(Plugin);
     validateLifecycle(Plugin);
 }
@@ -445,11 +408,11 @@ fn validateTick(comptime Plugin: type) void {
         @compileError(Plugin.id ++ ".tick must return void or !void");
 
     if (info.params.len < 1 or info.params.len > 4 or info.params[0].type != *Plugin)
-        @compileError(Plugin.id ++ ".tick must take *Self and optional Allocator, std.Io, storage.Namespace");
+        @compileError(Plugin.id ++ ".tick must take *Self and optional Allocator, std.Io, storage.Space");
     var seen: u8 = 0;
 
     for (info.params[1..]) |parameter| {
-        const bit: u8 = if (parameter.type == std.mem.Allocator) 1 else if (parameter.type == std.Io) 2 else if (parameter.type == storage.Namespace) 4 else @compileError(Plugin.id ++ ".tick accepts only Allocator, std.Io and storage.Namespace after *Self");
+        const bit: u8 = if (parameter.type == std.mem.Allocator) 1 else if (parameter.type == std.Io) 2 else if (parameter.type == storage.Space) 4 else @compileError(Plugin.id ++ ".tick accepts only Allocator, std.Io and storage.Space after *Self");
 
         if (seen & bit != 0) @compileError(Plugin.id ++ ".tick has a duplicate injected parameter");
         seen |= bit;
@@ -461,20 +424,20 @@ fn validateCheckpoint(comptime Plugin: type) void {
     const result = info.return_type orelse
         @compileError(Plugin.id ++ ".checkpoint must return !void");
 
-    if (info.params.len < 2 or info.params.len > 3 or info.params[0].type != *Plugin or
+    if (info.params.len < 2 or info.params.len > 4 or info.params[0].type != *Plugin or
         @typeInfo(result) != .error_union or
         @typeInfo(result).error_union.payload != void)
-        @compileError(Plugin.id ++ ".checkpoint requires *Self, storage.Namespace, optional std.Io and an error union void result");
+        @compileError(Plugin.id ++ ".checkpoint requires *Self, storage.Space, optional Allocator and std.Io, and an error union void result");
     var seen: u8 = 0;
 
     for (info.params[1..]) |parameter| {
-        const bit: u8 = if (parameter.type == storage.Namespace) 1 else if (parameter.type == std.Io) 2 else @compileError(Plugin.id ++ ".checkpoint accepts only storage.Namespace and std.Io after *Self");
+        const bit: u8 = if (parameter.type == storage.Space) 1 else if (parameter.type == std.Io) 2 else if (parameter.type == std.mem.Allocator) 4 else @compileError(Plugin.id ++ ".checkpoint accepts only storage.Space, std.Io and Allocator after *Self");
 
         if (seen & bit != 0) @compileError(Plugin.id ++ ".checkpoint has a duplicate injected parameter");
         seen |= bit;
     }
 
-    if (seen & 1 == 0) @compileError(Plugin.id ++ ".checkpoint requires storage.Namespace");
+    if (seen & 1 == 0) @compileError(Plugin.id ++ ".checkpoint requires storage.Space");
 }
 
 fn validateClose(comptime Plugin: type) void {

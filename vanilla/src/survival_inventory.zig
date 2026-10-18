@@ -72,14 +72,17 @@ pub const SurvivalInventory = struct {
         var contents: [47]inventories.Contents = undefined;
         try menu.load(player_index, &slots, &contents);
 
-        for (0..1) |_| {
+        const before = state.*;
+        action: {
+            var drops: [5]inventories.Stack = undefined;
+            var drop_count: usize = 0;
             var next: [47]?inventories.Stack = undefined;
 
             for (&next, contents) |*stack, value| stack.* = value.stack;
 
             switch (event) {
                 .inventory_close => |window| {
-                    if (window != 0) continue;
+                    if (window != 0) break :action;
                     state.close = false;
                     state.drag = 0;
                     state.drag_button = null;
@@ -99,55 +102,59 @@ pub const SurvivalInventory = struct {
                             next[target] = .{ .item = held.item, .count = previous + amount };
                             remaining -= amount;
                         };
-                        if (remaining != 0) try menu.drop(player.*, .{ .item = held.item, .count = remaining });
+                        if (remaining != 0) {
+                            drops[drop_count] = .{ .item = held.item, .count = remaining };
+                            drop_count += 1;
+                        }
                         next[source] = null;
                     }
                 },
                 .dig => |dig| {
-                    if (player.gamemode == .spectator or player.health == 0) continue;
+                    if (player.gamemode == .spectator or player.health == 0) break :action;
 
                     const at = 36 + @as(usize, state.selected);
 
                     if (dig.action == .swap_hands) {
                         std.mem.swap(?inventories.Stack, &next[at], &next[45]);
                     } else if (dig.action == .drop_item or dig.action == .drop_stack) {
-                        const held = next[at] orelse continue;
+                        const held = next[at] orelse break :action;
                         const amount = if (dig.action == .drop_stack) held.count else 1;
-                        try menu.drop(player.*, .{ .item = held.item, .count = amount });
+                        drops[drop_count] = .{ .item = held.item, .count = amount };
+                        drop_count += 1;
                         next[at] = if (amount == held.count) null else .{ .item = held.item, .count = held.count - amount };
-                    } else continue;
+                    } else break :action;
                 },
                 .inventory_click => |click| {
                     if (click.mode != 5) state.dirty = all_slots;
-                    if (click.window_id != 0 or player.gamemode == .spectator) continue;
+                    if (click.window_id != 0 or player.gamemode == .spectator) break :action;
 
                     if (click.mode == 5) {
-                        if (click.button < 0 or click.button > 6) continue;
+                        if (click.button < 0 or click.button > 6) break :action;
 
                         const button = @divTrunc(click.button, 4);
                         const phase = @mod(click.button, 4);
-                        const held = next[cursor] orelse continue;
+                        const held = next[cursor] orelse break :action;
                         if (phase == 0) {
                             state.drag = 0;
                             state.drag_button = button;
-                            continue;
+                            break :action;
                         }
 
-                        if (state.drag_button == null or state.drag_button.? != button) continue;
+                        if (state.drag_button == null or state.drag_button.? != button) break :action;
                         if (phase == 1) {
-                            if (click.slot < 1 or click.slot > 45) continue;
-                            if (@popCount(state.drag) >= held.count) continue;
+                            if (click.slot < 1 or click.slot > 45) break :action;
+                            if (@popCount(state.drag) >= held.count) break :action;
 
                             const target = next[@intCast(click.slot)];
                             const maximum = try menu.slotLimit(@intCast(click.slot), held);
-                            if (target != null and !inventories.Stack.sameItem(held, target.?)) continue;
-                            if (maximum == 0 or (target != null and target.?.count >= maximum)) continue;
+                            if (target != null and !inventories.Stack.sameItem(held, target.?)) break :action;
+                            if (maximum == 0 or (target != null and target.?.count >= maximum)) break :action;
                             state.drag |= @as(u64, 1) << @intCast(click.slot);
-                            continue;
+                            break :action;
                         }
 
                         const count = @popCount(state.drag);
-                        if (phase != 2 or count == 0) continue;
+                        if (phase != 2 or count == 0) break :action;
 
                         const each = if (button == 0) held.count / count else @as(u16, 1);
                         var remaining = held.count;
@@ -170,23 +177,24 @@ pub const SurvivalInventory = struct {
                         state.drag_button = null;
                     } else {
                         if (click.slot == -999 and click.mode == 0 and (click.button == 0 or click.button == 1)) {
-                            const held = next[cursor] orelse continue;
+                            const held = next[cursor] orelse break :action;
                             const amount = if (click.button == 0) held.count else 1;
-                            try menu.drop(player.*, .{ .item = held.item, .count = amount });
+                            drops[drop_count] = .{ .item = held.item, .count = amount };
+                            drop_count += 1;
                             next[cursor] = if (amount == held.count) null else .{ .item = held.item, .count = held.count - amount };
                         } else {
-                            if (click.slot < 0 or click.slot > 45) continue;
+                            if (click.slot < 0 or click.slot > 45) break :action;
 
                             const at: usize = @intCast(click.slot);
-                            if (at == 0) continue;
+                            if (at == 0) break :action;
 
                             switch (click.mode) {
                                 0 => {
-                                    if (click.button != 0 and click.button != 1) continue;
+                                    if (click.button != 0 and click.button != 1) break :action;
 
                                     if (next[cursor]) |held| {
                                         const maximum = try menu.slotLimit(at, held);
-                                        if (maximum == 0) continue;
+                                        if (maximum == 0) break :action;
 
                                         if (next[at]) |target| {
                                             if (inventories.Stack.sameItem(held, target)) {
@@ -206,7 +214,7 @@ pub const SurvivalInventory = struct {
                                     }
                                 },
                                 1 => {
-                                    const source = next[at] orelse continue;
+                                    const source = next[at] orelse break :action;
                                     var remaining = source.count;
                                     const maximum = try self.deps.items.stackLimit(source);
                                     const equipment = try menu.deps.equipment.slot(source);
@@ -235,13 +243,13 @@ pub const SurvivalInventory = struct {
                                     next[at] = if (remaining == 0) null else .{ .item = source.item, .count = remaining };
                                 },
                                 2 => {
-                                    if (click.button < 0 or (click.button > 8 and click.button != 40)) continue;
+                                    if (click.button < 0 or (click.button > 8 and click.button != 40)) break :action;
 
                                     const to: usize = if (click.button == 40) 45 else 36 + @as(usize, @intCast(click.button));
                                     var split = false;
                                     if (next[to]) |stack| {
                                         const maximum = try menu.slotLimit(at, stack);
-                                        if (maximum == 0) continue;
+                                        if (maximum == 0) break :action;
                                         if (stack.count > maximum) {
                                             const displaced = next[at];
                                             next[at] = .{ .item = stack.item, .count = maximum };
@@ -261,7 +269,10 @@ pub const SurvivalInventory = struct {
                                                     next[target] = .{ .item = held.item, .count = previous + amount };
                                                     remaining -= amount;
                                                 };
-                                                if (remaining != 0) try menu.drop(player.*, .{ .item = held.item, .count = remaining });
+                                                if (remaining != 0) {
+                                                    drops[drop_count] = .{ .item = held.item, .count = remaining };
+                                                    drop_count += 1;
+                                                }
                                             }
                                             split = true;
                                         }
@@ -269,16 +280,17 @@ pub const SurvivalInventory = struct {
                                     if (!split) std.mem.swap(?inventories.Stack, &next[at], &next[to]);
                                 },
                                 4 => {
-                                    if ((click.button != 0 and click.button != 1) or next[cursor] != null) continue;
+                                    if ((click.button != 0 and click.button != 1) or next[cursor] != null) break :action;
 
-                                    const held = next[at] orelse continue;
+                                    const held = next[at] orelse break :action;
                                     const amount = if (click.button == 1) held.count else 1;
-                                    try menu.drop(player.*, .{ .item = held.item, .count = amount });
+                                    drops[drop_count] = .{ .item = held.item, .count = amount };
+                                    drop_count += 1;
                                     next[at] = if (amount == held.count) null else .{ .item = held.item, .count = held.count - amount };
                                 },
                                 6 => {
-                                    if (click.button != 0 and click.button != 1 or next[at] != null) continue;
-                                    const held = next[cursor] orelse continue;
+                                    if (click.button != 0 and click.button != 1 or next[at] != null) break :action;
+                                    const held = next[cursor] orelse break :action;
                                     const maximum = try self.deps.items.stackLimit(held);
 
                                     for (0..2) |pass| for (1..46) |offset| {
@@ -293,13 +305,19 @@ pub const SurvivalInventory = struct {
                                         source.* = if (amount == stack.count) null else .{ .item = stack.item, .count = stack.count - amount };
                                     };
                                 },
-                                else => continue,
+                                else => break :action,
                             }
                         }
                     }
                 },
             }
 
+            if (!try menu.dropMany(player.*, drops[0..drop_count])) {
+                state.* = before;
+                state.dirty = all_slots;
+                if (event == .inventory_close) state.close = true;
+                break :action;
+            }
             try menu.commit(state, &slots, &contents, &next);
         }
     }

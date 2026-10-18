@@ -13,8 +13,11 @@ pub fn Dispatch(comptime schemas: anytype, comptime name: []const u8, comptime f
 
         const Codec = struct {
             tag: i128,
-            read: *const fn (*anyopaque, cursor.State(.read), ReadContext) anyerror!cursor.State(.read),
-            write: *const fn (*anyopaque, cursor.State(.write), WriteContext) anyerror!cursor.State(.write),
+            vtable: *const VTable,
+            const VTable = struct {
+                read: *const fn (*anyopaque, cursor.State(.read), ReadContext) anyerror!cursor.State(.read),
+                write: *const fn (*anyopaque, cursor.State(.write), WriteContext) anyerror!cursor.State(.write),
+            };
         };
         pub const Entry = struct {
             key: Key,
@@ -64,28 +67,36 @@ pub fn Dispatch(comptime schemas: anytype, comptime name: []const u8, comptime f
                     Reader.requireCompatible(Case.Payload.Reader);
                     Writer.requireCompatible(Case.Payload.Writer);
                 }
+                const Adapter = struct {
+                    const vtable: Codec.VTable = .{ .read = readOpaque, .write = writeOpaque };
+
+                    fn readOpaque(raw: *anyopaque, state: cursor.State(.read), arguments: ReadContext) anyerror!cursor.State(.read) {
+                        return @This().read(@ptrCast(@alignCast(raw)), state, arguments);
+                    }
+
+                    fn writeOpaque(raw: *anyopaque, state: cursor.State(.write), arguments: WriteContext) anyerror!cursor.State(.write) {
+                        return @This().write(@ptrCast(@alignCast(raw)), state, arguments);
+                    }
+
+                    fn read(plugin: @TypeOf(context), state: cursor.State(.read), arguments: ReadContext) !cursor.State(.read) {
+                        const done = try readers[read_index](Reader{ ._cursor = state }, plugin, arguments);
+                        var validated = state;
+                        try validated.accept(done._cursor, validated.owner, validated.serial);
+                        return validated;
+                    }
+
+                    fn write(plugin: @TypeOf(context), state: cursor.State(.write), arguments: WriteContext) !cursor.State(.write) {
+                        const record: Case.Writer = .{ ._cursor = state };
+                        const payload = try @field(Case.Writer, Cases.tag_field)(record);
+                        const done = try writers[write_index](Writer{ ._cursor = payload._cursor, ._context = cursor.context(Writer.Context, payload._context) }, plugin, arguments);
+                        var validated = state;
+                        try validated.accept(done._cursor, validated.owner, validated.serial);
+                        return validated;
+                    }
+                };
                 entry.codecs[index] = .{
                     .tag = @intFromEnum(@field(Cases.Tag, @tagName(tag))),
-                    .read = struct {
-                        fn read(raw: *anyopaque, state: cursor.State(.read), arguments: ReadContext) !cursor.State(.read) {
-                            const plugin: @TypeOf(context) = @ptrCast(@alignCast(raw));
-                            const done = try readers[read_index](Reader{ ._cursor = state }, plugin, arguments);
-                            var validated = state;
-                            try validated.accept(done._cursor, validated.owner, validated.serial);
-                            return validated;
-                        }
-                    }.read,
-                    .write = struct {
-                        fn write(raw: *anyopaque, state: cursor.State(.write), arguments: WriteContext) !cursor.State(.write) {
-                            const plugin: @TypeOf(context) = @ptrCast(@alignCast(raw));
-                            const record: Case.Writer = .{ ._cursor = state };
-                            const payload = try @field(Case.Writer, Cases.tag_field)(record);
-                            const done = try writers[write_index](Writer{ ._cursor = payload._cursor, ._context = cursor.context(Writer.Context, payload._context) }, plugin, arguments);
-                            var validated = state;
-                            try validated.accept(done._cursor, validated.owner, validated.serial);
-                            return validated;
-                        }
-                    }.write,
+                    .vtable = &Adapter.vtable,
                 };
             }
             self.entries[self.count] = entry;
@@ -103,7 +114,7 @@ pub fn Dispatch(comptime schemas: anytype, comptime name: []const u8, comptime f
                 if (protocol == Schema.protocol_number) {
                     for (self.entries[0..self.count]) |*entry| {
                         if (entry.codecs[index].tag != tag) continue;
-                        const done = try entry.codecs[index].read(entry.context, .{ .buffer = bytes, .rest = bytes, .origin = @intFromPtr(bytes.ptr), .protocol_number = protocol, .layout_protocol = @field(Schema, name).Reader.protocol_number }, arguments);
+                        const done = try entry.codecs[index].vtable.read(entry.context, .{ .buffer = bytes, .rest = bytes, .origin = bytes.ptr, .protocol_number = protocol, .layout_protocol = @field(Schema, name).Reader.protocol_number }, arguments);
                         if (done.rest.len != 0) return error.ExtraDataAfterEndOfPacket;
                         return entry.key;
                     }
@@ -137,7 +148,7 @@ pub fn Dispatch(comptime schemas: anytype, comptime name: []const u8, comptime f
                     var state = destination._cursor;
                     state.tags = Schema.case_tags;
                     state.layout_protocol = @field(Schema, name).Writer.protocol_number;
-                    const done = try entry.codecs[index].write(entry.context, state, arguments);
+                    const done = try entry.codecs[index].vtable.write(entry.context, state, arguments);
                     try state.accept(done, state.owner, state.serial);
                     state.tags = destination._cursor.tags;
                     state.layout_protocol = destination._cursor.layout_protocol;

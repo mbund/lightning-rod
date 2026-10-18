@@ -15,7 +15,8 @@ pub const Session = struct {
     const Subscription = struct {
         channel: []const u8,
         context: *anyopaque,
-        call: *const fn (*anyopaque, sessions.InputScope, []const u8, []u8) anyerror!sessions.ConfigurationInputEffect,
+        vtable: *const VTable,
+        const VTable = struct { call: *const fn (*anyopaque, sessions.InputScope, []const u8, []u8) anyerror!sessions.ConfigurationInputEffect };
     };
 
     subscriptions: []Subscription,
@@ -34,15 +35,17 @@ pub const Session = struct {
         if (comptime !validChannel(channel)) @compileError("invalid payload channel");
         if (self.count == self.subscriptions.len) return error.PayloadSubscriptionCapacity;
 
+        const Adapter = struct {
+            const vtable: Subscription.VTable = .{ .call = @This().invoke };
+            fn invoke(raw: *anyopaque, scope: sessions.InputScope, bytes: []const u8, output: []u8) anyerror!sessions.ConfigurationInputEffect {
+                const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
+                return handler(typed, scope, bytes, output);
+            }
+        };
         self.subscriptions[self.count] = .{
             .channel = channel,
             .context = context,
-            .call = struct {
-                fn call(raw: *anyopaque, scope: sessions.InputScope, bytes: []const u8, output: []u8) anyerror!sessions.ConfigurationInputEffect {
-                    const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
-                    return handler(typed, scope, bytes, output);
-                }
-            }.call,
+            .vtable = &Adapter.vtable,
         };
         self.count += 1;
     }
@@ -61,7 +64,7 @@ pub const Session = struct {
         var result: sessions.ConfigurationInputEffect = .none;
         for (self.subscriptions[0..self.count]) |subscription| {
             if (!std.mem.eql(u8, subscription.channel, channel)) continue;
-            const effect = try subscription.call(subscription.context, scope, bytes, output);
+            const effect = try subscription.vtable.call(subscription.context, scope, bytes, output);
             if (effect == .none) continue;
             if (result != .none) return error.MultiplePayloadResponses;
             result = effect;
@@ -78,7 +81,8 @@ pub const Play = struct {
     const Subscription = struct {
         channel: []const u8,
         context: *anyopaque,
-        call: *const fn (*anyopaque, sessions.Handle, []const u8, std.mem.Allocator) anyerror!void,
+        vtable: *const VTable,
+        const VTable = struct { call: *const fn (*anyopaque, sessions.Handle, []const u8, std.mem.Allocator) anyerror!void };
     };
 
     deps: Dependencies,
@@ -98,15 +102,17 @@ pub const Play = struct {
         if (comptime !validChannel(channel)) @compileError("invalid payload channel");
         if (self.count == self.subscriptions.len) return error.PayloadSubscriptionCapacity;
 
+        const Adapter = struct {
+            const vtable: Subscription.VTable = .{ .call = @This().invoke };
+            fn invoke(raw: *anyopaque, handle: sessions.Handle, bytes: []const u8, temporary: std.mem.Allocator) anyerror!void {
+                const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
+                try handler(typed, handle, bytes, temporary);
+            }
+        };
         self.subscriptions[self.count] = .{
             .channel = channel,
             .context = context,
-            .call = struct {
-                fn call(raw: *anyopaque, handle: sessions.Handle, bytes: []const u8, temporary: std.mem.Allocator) anyerror!void {
-                    const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
-                    try handler(typed, handle, bytes, temporary);
-                }
-            }.call,
+            .vtable = &Adapter.vtable,
         };
         self.count += 1;
     }
@@ -131,7 +137,7 @@ pub const Play = struct {
 
         for (self.subscriptions[0..self.count]) |subscription| {
             if (std.mem.eql(u8, subscription.channel, channel))
-                try subscription.call(subscription.context, handle, bytes, temporary);
+                try subscription.vtable.call(subscription.context, handle, bytes, temporary);
         }
     }
 };

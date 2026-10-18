@@ -20,7 +20,9 @@ loom {
         registrySnapshot {
             server()
             runDir = 'build/snapshot-run'
-            property 'mcc.snapshotOutput', providers.gradleProperty('snapshotOutput').get()
+            // IDE imports configure runs without invoking the snapshot task.
+            property 'mcc.snapshotOutput', providers.gradleProperty('snapshotOutput').getOrElse(
+                layout.buildDirectory.file('snapshot.json').get().asFile.absolutePath)
             property 'mcc.minecraftVersion', minecraft_version
         }
     }

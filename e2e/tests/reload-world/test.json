@@ -1,0 +1,4 @@
+{
+  "client": "ReloadWorldFixture",
+  "variants": [{ "name": "reload-world", "peers": ["alice", "bob"], "full_protocols": true }]
+}

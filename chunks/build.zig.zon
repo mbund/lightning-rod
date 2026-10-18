@@ -4,8 +4,10 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .metrics = .{ .path = "../metrics" },
         .records = .{ .path = "../records" },
         .storage = .{ .path = "../storage" },
+        .nbt = .{ .path = "../nbt" },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "src" },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "bench" },
 }

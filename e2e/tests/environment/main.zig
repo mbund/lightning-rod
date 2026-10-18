@@ -1,37 +1,145 @@
+const records = @import("records");
+const e2e = @import("e2e");
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
-const protocols = @import("protocols");
-const profile = @import("lightning_rod_linux");
 const vanilla = @import("vanilla");
-const fixture = @import("server.zig");
-
-pub export const lightning_rod_resume_manifest linksection(profile.Reload.section_name) = profile.Reload.executableManifest(protocols.Endpoint);
+const sessions = @import("sessions");
+const bootstrap = e2e.server;
 
 pub fn main(init: std.process.Init) !void {
-    const address = init.environ_map.get("LIGHTNING_ROD_E2E_ADDRESS") orelse "127.0.0.1:25565";
-    const port = try std.fmt.parseInt(u16, address[(std.mem.lastIndexOfScalar(u8, address, ':') orelse return error.InvalidAddress) + 1 ..], 10);
-    const plugin = lightning_rod.plugin;
-    const plugins = plugin.compose(.{
-        plugin.replace(vanilla.plugins(), .{
-            plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .maximum = 2, .render_distance = 4 }),
+    const plugins = lightning_rod.plugin.compose(.{
+        lightning_rod.plugin.replace(bootstrap.plugins(), .{
+            lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 2, .render_distance = 2 }),
         }),
-        plugin.configured(fixture.Probe, fixture.Probe.Configuration{}),
+        lightning_rod.plugin.configured(Probe, .{}),
     });
-    var selected = try protocols.Default.init(init.gpa);
-    defer selected.deinit(init.gpa);
-    const session_plugins = plugin.compose(.{
-        plugin.configured(protocols.Handshake, protocols.Handshake.Configuration{}),
-        vanilla.session_plugins(&selected),
-    });
-    const router = profile.SingleSimulation{};
-    try profile.Server(@TypeOf(plugins), protocols.Endpoint, @TypeOf(session_plugins), @TypeOf(router)).run(init, .{
-        .plugins = plugins,
-        .session_plugins = session_plugins,
-        .router = router,
-        .reload_manifest = &lightning_rod_resume_manifest,
-        .max_players = 2,
-        .protocols = &selected,
-        .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } },
-        .reload = .{ .executable = "/proc/self/exe" },
-    });
+    try bootstrap.run(init, plugins, .{ .plaintext = true, .reload_executable = "/proc/self/exe" });
 }
+
+const storage = lightning_rod.storage;
+
+const Probe = struct {
+    pub const id = "e2e:environment";
+    pub const Configuration = struct {};
+    pub const Dependencies = struct {
+        time: *vanilla.Time,
+        weather: *vanilla.Weather,
+        environment: *vanilla.Environment,
+        players: *vanilla.Players,
+        worlds: *vanilla.VanillaWorlds,
+        control: *e2e.Control,
+        reload: *vanilla.Reload,
+        storage: storage.Space,
+    };
+
+    const Snapshot = extern struct {
+        game_time: i64,
+        day_time: i64,
+        random: [4]u64,
+        rain: f32,
+        thunder: f32,
+        clear_ticks: i32,
+        rain_ticks: i32,
+        thunder_ticks: i32,
+        raining: u8,
+        thundering: u8,
+        daylight_cycle: u8,
+        weather_cycle: u8,
+    };
+
+    deps: Dependencies,
+    previous_age: i64,
+    expiry: enum { idle, first, expires, duration } = .idle,
+
+    pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Probe {
+        const self = try allocator.create(Probe);
+        self.* = .{ .deps = deps, .previous_age = deps.time.game_time };
+        var bytes: [@sizeOf(Snapshot)]u8 = undefined;
+        if (try records.Value.init(deps.storage).read(&bytes)) |length| {
+            if (length != bytes.len or !std.meta.eql(self.snapshot(), std.mem.bytesToValue(Snapshot, &bytes))) return error.EnvironmentReloadMismatch;
+            std.log.info("event=environment_restored age={d} day={d} rain={d} thunder={d}", .{ deps.time.game_time, deps.time.day_time, deps.weather.rain_level, deps.weather.thunder_level });
+        }
+        deps.control.on(self, onMessage);
+        return self;
+    }
+
+    fn onMessage(self: *Probe, handle: sessions.Handle, message: []const u8) !e2e.Control.Result {
+        const time = self.deps.time;
+        const weather = self.deps.weather;
+        if (std.mem.eql(u8, message, "environment freeze")) {
+            time.set(6000);
+            time.setDaylightCycle(false);
+            weather.set(.thunder, 12000);
+            weather.weather_cycle = false;
+        } else if (std.mem.eql(u8, message, "environment clear")) {
+            time.set(18000);
+            weather.weather_cycle = true;
+            weather.set(.clear, 12000);
+        } else if (std.mem.eql(u8, message, "environment expiry")) {
+            weather.clear_ticks = 0;
+            weather.rain_ticks = 2;
+            weather.thunder_ticks = 2;
+            weather.raining = false;
+            weather.thundering = false;
+            self.expiry = .first;
+        } else if (std.mem.eql(u8, message, "environment resume")) {
+            time.set(0);
+            time.setDaylightCycle(true);
+            weather.set(.clear, 12000);
+        } else if (std.mem.eql(u8, message, "environment reload")) {
+            try self.deps.reload.stage("environment");
+        } else if (std.mem.eql(u8, message, "environment nether") or std.mem.eql(u8, message, "environment overworld")) {
+            const player = &self.deps.players.records[handle.index];
+            const destination = if (std.mem.endsWith(u8, message, " nether")) self.deps.worlds.nether else self.deps.worlds.overworld;
+            try self.deps.players.teleport(player, destination, .{ .x = 2.5, .y = 65, .z = 0.5 }, .{ .yaw = 0, .pitch = 0 });
+        } else return .unhandled;
+        return .handled;
+    }
+
+    pub fn tick(self: *Probe) !void {
+        const time = self.deps.time;
+        const weather = self.deps.weather;
+        if (time.game_time != self.previous_age + 1) return error.EnvironmentTickOrder;
+        self.previous_age = time.game_time;
+        switch (self.expiry) {
+            .idle => {},
+            .first => {
+                if (weather.rain_ticks != 1 or weather.raining) return error.WeatherExpiryEarly;
+                self.expiry = .expires;
+            },
+            .expires => {
+                if (weather.rain_ticks != 0 or !weather.raining or !weather.thundering or weather.rain_level != 0.01) return error.WeatherExpiryLate;
+                self.expiry = .duration;
+            },
+            .duration => {
+                if (weather.rain_ticks < 12000 or weather.rain_ticks > 24000 or weather.thunder_ticks < 3600 or weather.thunder_ticks > 15600) return error.WeatherDuration;
+                std.log.info("event=weather_expiry_verified rain_ticks={d} thunder_ticks={d}", .{ weather.rain_ticks, weather.thunder_ticks });
+                self.expiry = .idle;
+            },
+        }
+    }
+
+    pub fn checkpoint(self: *Probe, space: storage.Space) !void {
+        const value = self.snapshot();
+        try records.Value.init(space).write(std.mem.asBytes(&value));
+    }
+
+    fn snapshot(self: *const Probe) Snapshot {
+        const time = self.deps.time;
+        const weather = self.deps.weather;
+        return .{
+            .game_time = time.game_time,
+            .day_time = time.day_time,
+            .random = weather.random.s,
+            .rain = weather.rain_level,
+            .thunder = weather.thunder_level,
+            .clear_ticks = weather.clear_ticks,
+            .rain_ticks = weather.rain_ticks,
+            .thunder_ticks = weather.thunder_ticks,
+            .raining = @intFromBool(weather.raining),
+            .thundering = @intFromBool(weather.thundering),
+            .daylight_cycle = @intFromBool(time.daylight_cycle),
+            .weather_cycle = @intFromBool(weather.weather_cycle),
+        };
+    }
+};

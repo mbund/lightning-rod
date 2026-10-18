@@ -14,21 +14,127 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install Zig
         run: bash .github/scripts/install-zig.sh
-      - name: Check generated cursor contracts
-        working-directory: protocol_codegen
-        run: zig build check
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '25'
+      - name: Check generated cursor contracts
+        working-directory: protocol_codegen
+        run: zig build check
+      - name: Verify simulation checkpoints and work attribution
+        run: timeout --kill-after=10s 300s zig build -j2 --release=safe test
+      - name: Verify reload executable metadata
+        working-directory: reload_execve
+        run: timeout --kill-after=10s 300s zig build -j2 --release=safe test
+      - name: Verify bounded NBT parsing
+        working-directory: nbt
+        run: timeout --kill-after=10s 300s zig build -j2 --release=safe test
+      - name: Verify atomic storage recovery under power loss
+        working-directory: storage
+        run: timeout --kill-after=10s 900s zig build -j2 --release=safe test
+      - name: Verify inventory storage and item reclamation
+        working-directory: inventories
+        run: timeout --kill-after=10s 300s zig build -j2 --release=safe test
+      - name: Verify atomic mixed plugin saves and recovery
+        working-directory: tests/storage
+        run: timeout --kill-after=10s 300s zig build -j2 --release=safe test
+      - name: Verify record trees, cache ownership, and atomic recovery
+        working-directory: records
+        run: timeout --kill-after=10s 300s zig build -j2 --release=safe test
+      - name: Compare record storage with SQLite under growth and churn
+        working-directory: records
+        run: timeout --kill-after=10s 300s zig build -j2 --release=safe bench
+      - name: Preserve storage comparison
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: record-storage-comparison
+          path: records/.zig-cache/storage-comparison/results.json
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Verify incremental chunk storage and encoding
+        working-directory: chunks
+        run: timeout --kill-after=10s 300s zig build -j2 --release=safe test test-bench
+      - name: Verify session packet storage ownership
+        working-directory: sessions
+        run: timeout --kill-after=10s 300s zig build -j2 --release=safe test
+      - name: Verify io_uring socket handoff
+        working-directory: network_uring
+        run: timeout --kill-after=10s 300s zig build -j2 --release=safe test
+      - name: Verify portable socket handoff
+        working-directory: network_stdio
+        run: timeout --kill-after=10s 300s zig build -j2 --release=safe test
+      - name: Verify metrics recording and export
+        working-directory: metrics
+        run: timeout --kill-after=10s 300s zig build -j2 --release=safe test
+      - name: Verify bounded gameplay batches and replication
+        working-directory: vanilla
+        run: timeout --kill-after=10s 300s zig build -j2 --release=safe test
+      - name: Verify packet compression
+        working-directory: minecraft_java
+        run: timeout --kill-after=10s 300s zig build -j2 --release=safe test
       - name: Verify independent package distribution
-        run: timeout --kill-after=10s 300s python3 e2e/tests/protocol-extension/packages.py
+        run: timeout --kill-after=10s 300s zig run e2e/tests/protocol-extension/packages.zig
       - id: tests
         shell: bash
         working-directory: e2e
         run: |
+          zig build test-performance test-harness test-artifacts test-client
           matrix=$(zig build e2e-matrix)
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Zig
+        run: bash .github/scripts/install-zig.sh
+      - name: Fuzz page transactions and WAL recovery
+        working-directory: storage
+        run: |
+          timeout --kill-after=10s 900s zig build -j2 --release=safe test -Dtest-filter=fuzz --fuzz=500
+          # Zig 0.16 can exit successfully after saving a fuzz crash.
+          test ! -e .zig-cache/f/crash
+      - name: Preserve fuzz failure input
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: storage-fuzz-crash
+          path: storage/.zig-cache/f/crash
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Fuzz record indexes and overflow pages
+        working-directory: records
+        run: |
+          timeout --kill-after=10s 300s zig build -j2 --release=safe test -Dtest-filter=fuzz --fuzz=500
+          test ! -e .zig-cache/f/crash
+      - name: Preserve record fuzz failure input
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: records-fuzz-crash
+          path: records/.zig-cache/f/crash
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Fuzz chunk section encodings
+        working-directory: chunks
+        run: |
+          timeout --kill-after=10s 300s zig build -j2 --release=safe test -Dtest-filter=fuzz --fuzz=1000
+          test ! -e .zig-cache/f/crash
+      - name: Preserve chunk fuzz failure input
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: chunks-fuzz-crash
+          path: chunks/.zig-cache/f/crash
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
 
   foundation:
     needs: discover
@@ -48,7 +154,7 @@ jobs:
       - name: Install native client and server dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libssl-dev xvfb libgl1-mesa-dri libglx-mesa0 libgl1 libxrandr2 libxinerama1 libxcursor1 libxi6 libasound2t64
+          sudo apt-get install -y --no-install-recommends xvfb libgl1-mesa-dri libglx-mesa0 libgl1 libxrandr2 libxinerama1 libxcursor1 libxi6 libasound2t64
       - name: Real-client acceptance
         working-directory: e2e
         env:
@@ -63,12 +169,12 @@ jobs:
         with:
           name: e2e-${{ matrix.scenario }}-${{ matrix.version }}
           path: |
-            e2e/artifacts/**/summary.json
-            e2e/artifacts/**/*.metrics.json
-            e2e/artifacts/**/*.result
-            e2e/artifacts/**/*.log
-            e2e/artifacts/**/*.jsonl
-            e2e/artifacts/**/screenshots/*.png
-            e2e/artifacts/**/*-failed-packet.*
+            e2e/tests/*/artifacts/**/summary.json
+            e2e/tests/*/artifacts/**/*.metrics.json
+            e2e/tests/*/artifacts/**/*.result
+            e2e/tests/*/artifacts/**/*.log
+            e2e/tests/*/artifacts/**/*.jsonl
+            e2e/tests/*/artifacts/**/screenshots/*.png
+            e2e/tests/*/artifacts/**/*-failed-packet.*
           if-no-files-found: warn
           retention-days: 7

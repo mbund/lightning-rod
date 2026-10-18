@@ -25,6 +25,8 @@ sourceSets.client.java.srcDir(new File(clientSource, ['current', 'modern', 'netw
 sourceSets.client.java.srcDir(new File(clientSource, clientApi == 'current' ? 'src/current-gui/java' : 'src/legacy-gui/java'))
 sourceSets.client.java.srcDir(new File(clientSource, clientApi == 'legacy' ? 'src/legacy-input/java' : 'src/current-input/java'))
 sourceSets.client.java.srcDir(new File(clientSource, ['legacy', 'input'].contains(clientApi) ? 'src/legacy-network/java' : 'src/current-network/java'))
+sourceSets.client.java.srcDir(new File(clientSource, unobfuscated ? 'src/modern-payload/java' : 'src/legacy-payload/java'))
+sourceSets.client.java.srcDir(new File(clientSource, minecraft_version == '1.21.5' ? 'src/legacy-terrain/java' : ['legacy', 'input'].contains(clientApi) ? 'src/mesh-terrain/java' : 'src/fading-terrain/java'))
 sourceSets.client.java.srcDir(new File(clientSource, minecraft_version == '1.21.5' ? 'src/older-client/java' : 'src/newer-client/java'))
 dependencies {
     minecraft "com.mojang:minecraft:${minecraft_version}"
@@ -39,12 +41,18 @@ processResources {
 }
 tasks.withType(JavaCompile).configureEach { options.release = unobfuscated ? 25 : 21 }
 def testsDirectory = file(System.getenv('LIGHTNING_ROD_E2E_TEST_ROOT') ?: new File(clientSource, '../tests'))
+def testManifests = fileTree(testsDirectory).matching { include '*/test.json' }.files.sort()
 def generatedTests = layout.buildDirectory.dir('generated/e2e')
-sourceSets.client.java.srcDir(testsDirectory)
+// Keep fixtures with their scenarios while giving each one a package-correct
+// source root that both javac and JDT LS can import.
+sourceSets.client.java.srcDirs(testManifests.collect { new File(it.parentFile, 'client') })
 sourceSets.client.java.exclude '**/.zig-cache/**', '**/zig-out/**', '**/zig-pkg/**'
 sourceSets.client.java.srcDir(generatedTests)
+sourceSets.test.java.setSrcDirs([new File(clientSource, 'src/test/java')])
+sourceSets.test.compileClasspath += sourceSets.client.output + sourceSets.client.compileClasspath
+sourceSets.test.runtimeClasspath += sourceSets.client.output + sourceSets.client.runtimeClasspath
 sourceSets.client.resources.srcDir(testsDirectory)
-sourceSets.client.resources.exclude '**/*.java', '**/*.zig', '**/build.zig.zon', '**/test.json', '**/.zig-cache/**', '**/zig-out/**', '**/zig-pkg/**'
+sourceSets.client.resources.exclude '**/*.java', '**/*.zig', '**/build.zig.zon', '**/test.json', '**/.zig-cache/**', '**/zig-out/**', '**/zig-pkg/**', '**/artifacts/**'
 def discoverTests = tasks.register('discoverTests') {
     inputs.files(fileTree(testsDirectory) { include '*/test.json' })
     outputs.dir(generatedTests)
@@ -74,11 +82,21 @@ final class DiscoveredTests {
     }
 }
 tasks.named('compileClientJava') { dependsOn discoverTests }
+// Buildship/JDT LS must generate the fixture factory on the first IDE import,
+// before the editor compiles Fixture.java or any test source.
+eclipse.synchronizationTasks(discoverTests)
+tasks.named('eclipseClasspath') { dependsOn discoverTests }
 tasks.withType(JavaExec).configureEach {
     maxHeapSize = '1G'
     jvmArgs '-XX:ActiveProcessorCount=2'
-    ["mcc.version", "mcc.events", "mcc.artifacts", "mcc.peer", "mcc.server", "mcc.scenario", "mcc.expectedPeers", "mcc.targetChunks", "mcc.minimumRadius", "mcc.maximumStallTicks", "mcc.maximumStreamTicks", "mcc.minimumSoakTicks", "mcc.timeoutTicks", "mcc.connectTick"].each {
+    ["mcc.version", "mcc.events", "mcc.artifacts", "mcc.peer", "mcc.server", "mcc.scenario", "mcc.expectedPeers", "mcc.targetChunks", "mcc.minimumRadius", "mcc.minimumSoakTicks", "mcc.timeoutTicks", "mcc.connectTick"].each {
         key -> if (System.getProperty(key) != null) systemProperty key, System.getProperty(key)
     }
     if (System.getProperty("mcc.peer") != null) args "--username", System.getProperty("mcc.peer")
+}
+
+tasks.register('testFixtureApi', JavaExec) {
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.lightningrod.e2e.FixtureApiTest'
 }

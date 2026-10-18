@@ -1,11 +1,25 @@
+const metrics = @import("metrics");
 const std = @import("std");
 const network = @import("networking");
 const protocol_api = @import("protocol.zig");
-
-const assert = std.debug.assert;
 const framing = @import("shared.zig");
 
-const Trace = @import("metrics").Metrics(enum { pump, poll });
+const assert = std.debug.assert;
+
+pub const Instrumentation = struct {
+    pump: metrics.Timer = .{},
+    poll: metrics.Timer = .{},
+    sent_bytes: metrics.Counter = .{},
+
+    pub fn init(registry: ?*metrics.Registry, namespace: []const u8) !Instrumentation {
+        const owner = registry orelse return .{};
+        return .{
+            .pump = try owner.timer(.{ .namespace = namespace, .name = "pump", .description = "Drive network connections" }),
+            .poll = try owner.timer(.{ .namespace = namespace, .name = "poll", .description = "Poll transport events" }),
+            .sent_bytes = try owner.counter(.{ .namespace = namespace, .name = "sent_bytes", .description = "Bytes sent through transport", .unit = .bytes }),
+        };
+    }
+};
 
 pub const Protocol = protocol_api.Protocol;
 
@@ -21,13 +35,15 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             max_players: ?usize = null,
             buffer_bytes: usize = 128 * 1024,
             max_packet: usize = 128 * 1024 - 3,
+            configuration_bytes: usize = 4 * 1024 * 1024,
             protocols: *const Endpoint.Protocols,
             observer: *Observer,
             compression_threshold: ?usize = null,
-            metrics_cpu: bool = false,
+            metrics: ?*metrics.Registry = null,
         };
 
         pub const endpoint = Endpoint;
+        const control_bytes_max = 256;
         const Connection = struct {
             handle: ?network.Handle = null,
             protocol: ?*const Protocol = null,
@@ -38,6 +54,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             receiving: bool = false,
             loan: std.atomic.Value(bool) = .init(false),
             output: []const u8 = &.{},
+            control_output: std.ArrayList(u8) = .empty,
             sending: bool = false,
             output_read: usize = 0,
             output_write: usize = 0,
@@ -45,7 +62,8 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             closed: bool = false,
             attached: bool = false,
             resumed: bool = false,
-            control_bytes: [256]u8 = undefined,
+            control_bytes: [control_bytes_max]u8 = undefined,
+            parked: bool = false,
             output_control: bool = false,
             disconnecting: bool = false,
             admitted: bool = false,
@@ -58,16 +76,15 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
         networking: network.Transport,
         config: Configuration,
         connections: []Connection,
-        input: []u8,
-        output: []u8,
+        input: []align(64) u8,
+        output: []align(64) u8,
         events: []network.Event,
         workspaces: Endpoint.Workspaces,
-        decoded: []u8,
-        scratch: []u8,
+        decoded: []align(64) u8,
+        scratch: []align(64) u8,
         stopping: bool = false,
         stop_deadline: i96 = 0,
-        metrics: Trace,
-        sent_bytes: u64 = 0,
+        instruments: Instrumentation,
         admitted: usize = 0,
         reloading: bool = false,
 
@@ -75,8 +92,8 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             if (config.protocols.values.len == 0) return error.InvalidConfiguration;
             if ((config.max_players orelse config.connections) == 0 or (config.max_players orelse config.connections) > config.connections)
                 return error.InvalidConfiguration;
-            if (config.connections == 0 or config.connections > std.math.maxInt(u16) or config.buffer_bytes < 512 or
-                config.max_packet == 0 or config.max_packet > config.buffer_bytes - 3 or
+            if (config.connections == 0 or config.connections > std.math.maxInt(u16) or config.buffer_bytes < 512 or config.buffer_bytes > std.math.maxInt(u32) / 4 or
+                config.max_packet == 0 or config.max_packet > config.buffer_bytes - 3 or config.configuration_bytes < config.buffer_bytes + 2 * control_bytes_max or config.configuration_bytes > std.math.maxInt(u32) - 2 * config.buffer_bytes - 57 or
                 (config.compression_threshold != null and config.compression_threshold.? > config.max_packet)) return error.InvalidConfiguration;
 
             for (config.protocols.values, 0..) |protocol, i| {
@@ -84,19 +101,21 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             }
 
             const bytes = try std.math.mul(usize, config.connections, config.buffer_bytes);
+            const instrumentation = try Instrumentation.init(config.metrics, "session.engine");
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
             const connections = try allocator.alloc(Connection, config.connections);
             errdefer allocator.free(connections);
-            const input = try allocator.alloc(u8, bytes);
+            const input = try allocator.alignedAlloc(u8, .@"64", bytes);
             errdefer allocator.free(input);
-            const output = try allocator.alloc(u8, bytes);
+            const output_stride = try std.math.add(usize, config.buffer_bytes, 2 * control_bytes_max);
+            const output = try allocator.alignedAlloc(u8, .@"64", try std.math.mul(usize, config.connections, output_stride));
             errdefer allocator.free(output);
             const events = try allocator.alloc(network.Event, config.connections * 3);
             errdefer allocator.free(events);
-            const decoded = try allocator.alloc(u8, if (Endpoint.needsDecoded(config.compression_threshold)) bytes else 0);
+            const decoded = try allocator.alignedAlloc(u8, .@"64", if (Endpoint.needsDecoded(config.compression_threshold)) bytes else 0);
             errdefer allocator.free(decoded);
-            const scratch = try allocator.alloc(u8, config.buffer_bytes);
+            const scratch = try allocator.alignedAlloc(u8, .@"64", config.buffer_bytes);
             errdefer allocator.free(scratch);
 
             for (connections) |*connection| connection.* = .{};
@@ -110,10 +129,10 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 .input = input,
                 .output = output,
                 .events = events,
-                .workspaces = Endpoint.initWorkspaces(),
+                .workspaces = try Endpoint.initWorkspaces(allocator),
                 .decoded = decoded,
                 .scratch = scratch,
-                .metrics = Trace.init(io, .{ .cpu = config.metrics_cpu }),
+                .instruments = instrumentation,
             };
             return self;
         }
@@ -122,11 +141,13 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             assert(self.drained());
             assert(self.admitted == 0);
 
+            Endpoint.deinitWorkspaces(&self.workspaces);
             self.allocator.free(self.scratch);
             self.allocator.free(self.decoded);
             self.allocator.free(self.events);
             self.allocator.free(self.output);
             self.allocator.free(self.input);
+            for (self.connections) |*connection| connection.control_output.deinit(self.allocator);
             self.allocator.free(self.connections);
             self.allocator.destroy(self);
         }
@@ -152,16 +173,36 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
         }
 
         pub fn park(self: *Self) !bool {
-            self.reloading = true;
+            assert(self.reloading);
+            if (!self.networking.inheritance.?.ready()) return false;
             var ready = true;
-
-            for (self.connections) |*connection| {
-                const handle = connection.handle orelse continue;
-
-                if (connection.state.phase == .play and !connection.closing and connection.disconnect_deadline == null) _ = try self.reconfigure(handle);
-                ready = ready and connection.state.phase == .parked and !connection.receiving and !connection.sending and connection.output.len == 0 and !connection.loan.load(.acquire);
+            for (self.connections, 0..) |*connection, index| {
+                if (connection.handle == null) continue;
+                if (connection.closing or connection.receiving or connection.sending or connection.loan.load(.acquire)) {
+                    ready = false;
+                    continue;
+                }
+                if (connection.parked) continue;
+                const output = self.outputBuffer(index);
+                const queued = connection.output_write -% connection.output_read;
+                assert(queued <= self.config.buffer_bytes);
+                const at = connection.output_read % self.config.buffer_bytes;
+                const first = @min(queued, self.config.buffer_bytes - at);
+                @memcpy(self.scratch[0..first], output[at..][0..first]);
+                @memcpy(self.scratch[first..queued], output[0 .. queued - first]);
+                const prefix = if (connection.output_control) connection.output else &.{};
+                if (connection.control_output.items.len != 0) {
+                    std.mem.copyForwards(u8, connection.control_output.items[0..prefix.len], prefix);
+                    connection.control_output.items.len = prefix.len;
+                } else try connection.control_output.appendSlice(self.allocator, prefix);
+                try connection.control_output.appendSlice(self.allocator, self.scratch[0..queued]);
+                if (try self.advance(connection, .park)) |packet| try self.appendControl(connection, packet, self.config.configuration_bytes);
+                connection.output = connection.control_output.items;
+                connection.output_control = true;
+                connection.output_read = 0;
+                connection.output_write = 0;
+                connection.parked = true;
             }
-
             return ready;
         }
 
@@ -170,12 +211,13 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
 
             for (self.connections) |*connection| {
                 if (connection.handle == null) continue;
-                assert(connection.state.phase == .parked);
+                assert(connection.parked);
                 _ = self.advance(connection, .restore) catch |err| {
                     std.log.err("event=session_restore_failed reason={s}", .{@errorName(err)});
                     connection.closing = true;
                     continue;
                 };
+                connection.parked = false;
                 connection.attached = false;
                 connection.resumed = true;
                 connection.admission_deadline = std.Io.Clock.now(.awake, self.io).nanoseconds + 30 * std.time.ns_per_s;
@@ -195,22 +237,23 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
 
             for (self.connections, 0..) |*connection, index| {
                 const handle = connection.handle orelse continue;
-                assert(connection.state.phase == .parked and !connection.receiving and !connection.sending and !connection.loan.load(.acquire));
+                assert(connection.parked and !connection.receiving and !connection.sending and !connection.loan.load(.acquire));
                 const input = self.input[index * self.config.buffer_bytes ..][connection.input_start..connection.input_end];
-                const state = try Endpoint.save(&connection.lifecycle.?, self.scratch);
-                assert(state.len <= self.scratch.len);
-                try writer.writeInt(i32, native.descriptor(native.context, handle), .little);
+                const codec = try Endpoint.save(&connection.lifecycle.?, self.scratch);
+                try writer.writeInt(i32, native.descriptor(handle), .little);
                 try writer.writeInt(u32, 1, .little);
-                try writer.writeInt(u32, @intCast(53 + state.len + input.len), .little);
+                try writer.writeInt(u32, @intCast(57 + codec.len + input.len + connection.output.len), .little);
                 try writer.writeInt(i32, connection.protocol.?.number, .little);
                 try writer.writeInt(u64, Endpoint.resumeFormat(&connection.lifecycle.?), .little);
-                try writer.writeInt(u32, @intCast(state.len), .little);
-                try writer.writeAll(state);
+                try writer.writeInt(u32, @intCast(codec.len), .little);
+                try writer.writeAll(codec);
                 try writer.writeInt(u128, connection.state.uuid, .little);
                 try writer.writeByte(@intCast(connection.state.name_len));
                 try writer.writeAll(&connection.state.name);
                 try writer.writeInt(u32, @intCast(input.len), .little);
                 try writer.writeAll(input);
+                try writer.writeInt(u32, @intCast(connection.output.len), .little);
+                try writer.writeAll(connection.output);
 
                 if (input.len != 0) std.log.info("event=reload_input_saved bytes={d} encrypted={}", .{ input.len, Endpoint.encrypted(&connection.lifecycle.?) });
             }
@@ -226,14 +269,14 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 const fd = try reader.takeInt(i32, .little);
                 const kind = try reader.takeInt(u32, .little);
                 const length = try reader.takeInt(u32, .little);
-                if (fd < 3 or kind != 1 or length < 53 or length - 53 > self.config.buffer_bytes + self.scratch.len) return error.InvalidResume;
+                if (fd < 3 or kind != 1 or length < 57 or length - 57 > self.config.buffer_bytes + self.config.configuration_bytes + self.scratch.len) return error.InvalidResume;
 
                 var connection: Connection = .{ .admitted = true, .resumed = true };
                 const number = try reader.takeInt(i32, .little);
                 const format = try reader.takeInt(u64, .little);
-                const state_len = try reader.takeInt(u32, .little);
-                if (state_len > self.scratch.len or state_len > length - 53) return error.InvalidResume;
-                try reader.readSliceAll(self.scratch[0..state_len]);
+                const codec_len = try reader.takeInt(u32, .little);
+                if (codec_len > self.scratch.len or codec_len > length - 57) return error.InvalidResume;
+                try reader.readSliceAll(self.scratch[0..codec_len]);
 
                 for (&self.config.protocols.values) |*protocol| if (protocol.number == number) {
                     connection.protocol = protocol;
@@ -241,12 +284,12 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 };
 
                 if (connection.protocol == null) return error.UnsupportedProtocol;
-                connection.lifecycle = try Endpoint.restore(number, format, self.scratch[0..state_len]);
+                connection.lifecycle = try Endpoint.restore(number, format, self.scratch[0..codec_len]);
                 connection.state.phase = .parked;
                 connection.state.uuid = try reader.takeInt(u128, .little);
 
                 for (self.connections) |previous| if (previous.handle) |handle| {
-                    if (native.descriptor(native.context, handle) == fd or previous.state.uuid == connection.state.uuid) return error.InvalidResume;
+                    if (native.descriptor(handle) == fd or previous.state.uuid == connection.state.uuid) return error.InvalidResume;
                 };
 
                 connection.state.name_len = try reader.takeByte();
@@ -255,14 +298,21 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                     return error.InvalidResume;
 
                 const input_len = try reader.takeInt(u32, .little);
-                if (input_len > self.config.buffer_bytes or input_len != length - 53 - state_len) return error.InvalidResume;
+                if (input_len > self.config.buffer_bytes or input_len > length - 57 - codec_len) return error.InvalidResume;
 
-                const handle = try native.adopt(native.context, fd);
+                const handle = try native.adopt(fd);
                 connection.handle = handle;
-                _ = try self.advance(&connection, .restore);
                 connection.input_end = input_len;
                 connection.admission_deadline = std.Io.Clock.now(.awake, self.io).nanoseconds + 30 * std.time.ns_per_s;
                 try reader.readSliceAll(self.input[@as(usize, handle.index) * self.config.buffer_bytes ..][0..input_len]);
+                const output_len = try reader.takeInt(u32, .little);
+                if (output_len > self.config.configuration_bytes or output_len != length - 57 - codec_len - input_len) return error.InvalidResume;
+                errdefer connection.control_output.deinit(self.allocator);
+                try connection.control_output.resize(self.allocator, output_len);
+                try reader.readSliceAll(connection.control_output.items);
+                connection.output = connection.control_output.items;
+                connection.output_control = true;
+                if (!connection.closing) _ = try self.advance(&connection, .restore);
 
                 if (input_len != 0) std.log.info("event=reload_input_restored bytes={d} encrypted={}", .{ input_len, Endpoint.encrypted(&connection.lifecycle.?) });
                 self.connections[handle.index] = connection;
@@ -314,7 +364,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
 
             const used = connection.output_write -% connection.output_read;
             assert(used <= self.config.buffer_bytes and bytes.len <= self.config.buffer_bytes - used);
-            const buffer = self.output[@as(usize, handle.index) * self.config.buffer_bytes ..][0..self.config.buffer_bytes];
+            const buffer = self.outputBuffer(handle.index)[0..self.config.buffer_bytes];
             const start = connection.output_write % buffer.len;
             const first = @min(bytes.len, buffer.len - start);
 
@@ -327,11 +377,11 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
         }
 
         pub fn pump(self: *Self, timeout: ?std.Io.Timeout) !usize {
-            var pumping = self.metrics.begin(.pump);
+            var pumping = self.instruments.pump.start();
             defer pumping.end();
             self.progress();
             const count = blk: {
-                const polling = pumping.begin(.poll);
+                const polling = self.instruments.poll.start();
                 defer polling.end();
                 break :blk try self.networking.poll(self.io, timeout, self.events);
             };
@@ -364,6 +414,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                             assert(connection.receiving);
                             connection.receiving = false;
 
+                            if (self.reloading and result.result.errno == @intFromEnum(std.posix.E.CANCELED)) continue;
                             if (result.result.errno != null or result.result.bytes == 0 or result.result.bytes > self.config.buffer_bytes - connection.input_end) {
                                 connection.closing = true;
                             } else {
@@ -379,10 +430,11 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                             assert(connection.sending);
                             connection.sending = false;
 
+                            if (self.reloading and result.result.errno == @intFromEnum(std.posix.E.CANCELED)) continue;
                             if (result.result.errno != null or result.result.bytes == 0 or result.result.bytes > connection.output.len) {
                                 connection.closing = true;
                             } else {
-                                self.sent_bytes += result.result.bytes;
+                                self.instruments.sent_bytes.add(result.result.bytes);
                                 connection.output = connection.output[result.result.bytes..];
 
                                 if (connection.state.phase == .play and !connection.output_control) {
@@ -390,7 +442,10 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                                     self.config.observer.sent(handle, result.result.bytes);
                                 }
 
-                                if (connection.output.len == 0) connection.output_control = false;
+                                if (connection.output.len == 0) {
+                                    connection.output_control = false;
+                                    connection.control_output.clearRetainingCapacity();
+                                }
                             }
                         },
                         .closed => {
@@ -409,17 +464,22 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             return count;
         }
 
+        fn outputBuffer(self: *Self, index: usize) []u8 {
+            const stride = self.config.buffer_bytes + 2 * control_bytes_max;
+            return self.output[index * stride ..][0..stride];
+        }
+
         fn progress(self: *Self) void {
             const now = std.Io.Clock.now(.awake, self.io).nanoseconds;
 
             for (self.connections, 0..) |*connection, index| {
                 const handle = connection.handle orelse continue;
                 const input = self.input[index * self.config.buffer_bytes ..][0..self.config.buffer_bytes];
-                const output = self.output[index * self.config.buffer_bytes ..][0..self.config.buffer_bytes];
+                const output = self.outputBuffer(index);
 
                 if (connection.state.phase != .play and connection.state.phase != .parked and now >= connection.admission_deadline) connection.closing = true;
 
-                if (self.reloading and !connection.attached) connection.closing = true;
+                if (self.reloading and (!connection.attached or connection.disconnect_deadline != null)) connection.closing = true;
 
                 if (connection.state.phase == .rejected and connection.output.len == 0) connection.closing = true;
                 const stopping = self.stopping or connection.disconnect_deadline != null;
@@ -461,12 +521,15 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                             }
 
                             if (connection.lifecycle) |*lifecycle| Endpoint.clear(lifecycle);
+                            connection.control_output.deinit(self.allocator);
                             connection.* = .{};
                         }
                     }
 
                     continue;
                 }
+
+                if (self.reloading) continue;
 
                 while (!stopping and connection.state.phase != .parked and (connection.state.phase == .play or connection.output.len == 0) and !connection.loan.load(.acquire)) {
                     if (connection.lifecycle != null and connection.output.len == 0 and connection.output_read == connection.output_write) {
@@ -476,11 +539,17 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                             break;
                         };
                         if (response) |bytes| {
-                            connection.output = self.control(connection, bytes, if (connection.state.phase == .play) &connection.control_bytes else output) catch {
+                            if (connection.state.phase == .play) {
+                                connection.output = self.control(connection, bytes, &connection.control_bytes) catch {
+                                    connection.closing = true;
+                                    break;
+                                };
+                                connection.output_control = true;
+                            } else self.queueControl(connection, bytes) catch |err| {
+                                std.log.warn("event=session_output_rejected reason={s}", .{@errorName(err)});
                                 connection.closing = true;
                                 break;
                             };
-                            connection.output_control = connection.state.phase == .play;
                             break;
                         }
                     }
@@ -656,10 +725,18 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                         Endpoint.receive(&connection.lifecycle.?, tail);
                     }
 
-                    if (response) |bytes| connection.output = self.control(connection, bytes, output) catch {
-                        connection.closing = true;
-                        break;
-                    };
+                    if (response) |bytes| {
+                        if (connection.state.phase == .play) {
+                            connection.output = self.control(connection, bytes, output) catch {
+                                connection.closing = true;
+                                break;
+                            };
+                        } else self.queueControl(connection, bytes) catch |err| {
+                            std.log.warn("event=session_output_rejected reason={s}", .{@errorName(err)});
+                            connection.closing = true;
+                            break;
+                        };
+                    }
                 }
 
                 if (connection.closing) {
@@ -669,9 +746,9 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
 
                 if (connection.state.phase == .play and connection.output.len == 0) {
                     const queued = connection.output_write -% connection.output_read;
-                    const at = connection.output_read % output.len;
+                    const at = connection.output_read % self.config.buffer_bytes;
                     // Equal byte quanta per ready connection, replenished on completion, not per tick.
-                    connection.output = output[at..][0..@min(queued, output.len - at, 64 * 1024)];
+                    connection.output = output[at..][0..@min(queued, self.config.buffer_bytes - at, 64 * 1024)];
                 }
 
                 if (connection.output.len != 0 and !connection.sending) {
@@ -707,6 +784,34 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 };
                 connection.receiving = true;
             }
+        }
+
+        fn appendControl(self: *Self, connection: *Connection, packet: []const u8, maximum: usize) !void {
+            const bound = connection.protocol.?.frame_bound.bytes(packet.len);
+            assert(connection.control_output.items.len <= maximum);
+            if (bound > maximum - connection.control_output.items.len) return error.ConfigurationTooLarge;
+            const required = connection.control_output.items.len + bound;
+            if (required > connection.control_output.capacity) {
+                const capacity = @min(maximum, @max(required, connection.control_output.capacity + connection.control_output.capacity / 2 + 4096));
+                try connection.control_output.ensureTotalCapacityPrecise(self.allocator, capacity);
+            }
+            const destination = connection.control_output.unusedCapacitySlice()[0..bound];
+            const bytes = try self.control(connection, packet, destination);
+            std.mem.copyForwards(u8, destination[0..bytes.len], bytes);
+            connection.control_output.items.len += bytes.len;
+        }
+
+        fn queueControl(self: *Self, connection: *Connection, packet: []const u8) !void {
+            assert(!connection.sending and connection.output.len == 0);
+            connection.control_output.clearRetainingCapacity();
+            try self.appendControl(connection, packet, self.config.configuration_bytes - 2 * control_bytes_max);
+            // Finish configuration generation before lending output to I/O so reload only needs wire bytes.
+            while (connection.state.phase == .negotiating) {
+                const next = (try self.advance(connection, .poll)) orelse break;
+                try self.appendControl(connection, next, self.config.configuration_bytes - 2 * control_bytes_max);
+            }
+            connection.output = connection.control_output.items;
+            connection.output_control = true;
         }
 
         fn control(self: *Self, connection: *Connection, bytes: []const u8, output: []u8) ![]const u8 {

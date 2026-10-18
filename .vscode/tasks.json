@@ -1,0 +1,13 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Java: prepare project imports",
+      "type": "shell",
+      "command": "bash",
+      "args": ["scripts/java-setup"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    }
+  ]
+}

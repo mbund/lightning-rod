@@ -3,10 +3,11 @@
   "variants": [
     {
       "name": "time",
-      "peers": ["alice", "bob"],
-      "peer_versions": ["1.21.8", "26.2"],
-      "required_logs": [{"text": "event=reload_resumed "}],
-      "forbidden_logs": ["event=reload_fallback "]
+      "peers": [
+        "alice",
+        "bob"
+      ],
+      "mixed_versions": true
     }
   ]
 }

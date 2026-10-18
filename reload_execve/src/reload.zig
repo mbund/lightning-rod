@@ -4,11 +4,24 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const assert = std.debug.assert;
 
-pub const section_name = ".lightning_rod.resume";
-pub const manifest: [16]u8 = "LRRESUME".* ++ [_]u8{ 5, 0, 0, 0, 1, 0, 0, 0 };
+const section_name = ".lightning_rod.resume";
+pub const manifest: [16]u8 = "LRRESUME".* ++ [_]u8{ 10, 0, 0, 0, 1, 0, 0, 0 };
 
-pub fn executableManifest(comptime Endpoint: type) [manifest.len + Endpoint.resume_manifest.len]u8 {
-    return manifest ++ Endpoint.resume_manifest;
+pub fn retainManifest(comptime Endpoint: type) void {
+    if (comptime builtin.os.tag == .linux) {
+        const Executable = struct {
+            const bytes linksection(section_name) = manifest ++ Endpoint.resume_manifest;
+            comptime {
+                // A fixed symbol rejects conflicting endpoint manifests in one executable.
+                @export(&bytes, .{
+                    .name = "lightning_rod_resume_manifest",
+                    .linkage = .strong,
+                    .visibility = .hidden,
+                });
+            }
+        };
+        std.mem.doNotOptimizeAway(&Executable.bytes);
+    }
 }
 pub const environment_key = "LIGHTNING_ROD_RESUME_FD";
 
@@ -104,8 +117,8 @@ pub const Image = struct {
         self.file.close(io);
     }
 
-    pub fn execute(self: Image, init: std.process.Init, snapshot: std.Io.File, descriptors: []const i32) !noreturn {
-        var arena = std.heap.ArenaAllocator.init(init.gpa);
+    pub fn execute(self: Image, backing_allocator: std.mem.Allocator, init: std.process.Init, snapshot: std.Io.File, descriptors: []const i32) !noreturn {
+        var arena = std.heap.ArenaAllocator.init(backing_allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
         const arguments = try init.minimal.args.toSlice(allocator);
@@ -123,7 +136,8 @@ pub const Image = struct {
             count += 1;
         }
 
-        environ[count] = (try std.fmt.allocPrintSentinel(allocator, "{s}={d}", .{ environment_key, snapshot.handle }, 0)).ptr;
+        var resume_environment: [128]u8 = undefined;
+        const resume_index = count;
         count += 1;
         environ[count] = null;
         var inherited: usize = 0;
@@ -136,6 +150,9 @@ pub const Image = struct {
 
         try cloexec(snapshot.handle, false);
         defer cloexec(snapshot.handle, true) catch unreachable;
+        // Only formatting and execveat remain after this timestamp.
+        const executing_ns = std.Io.Clock.now(.awake, init.io).nanoseconds;
+        environ[resume_index] = (std.fmt.bufPrintSentinel(&resume_environment, "{s}={d},{d}", .{ environment_key, snapshot.handle, executing_ns }, 0) catch unreachable).ptr;
         const result = linux.execveat(self.file.handle, "", argv.ptr, environ.ptr, .{ .EMPTY_PATH = true, .SYMLINK_NOFOLLOW = false });
         std.log.err("event=execve_failed errno={s}", .{@tagName(linux.errno(result))});
         return error.ExecFailed;
@@ -158,14 +175,18 @@ pub fn cloexec(fd: i32, enabled: bool) !void {
     if (linux.errno(linux.fcntl(fd, linux.F.SETFD, if (enabled) @as(u32, linux.FD_CLOEXEC) else 0)) != .SUCCESS) return error.DescriptorFlagsFailed;
 }
 
-pub fn incoming(init: std.process.Init) !?std.Io.File {
+pub const Incoming = struct { file: std.Io.File, executing_ns: i96 };
+
+pub fn incoming(init: std.process.Init) !?Incoming {
     if (builtin.os.tag != .linux) return null;
 
     const value = init.environ_map.get(environment_key) orelse return null;
-    const fd = try std.fmt.parseInt(i32, value, 10);
-    if (fd < 3) return error.InvalidResume;
+    var fields = std.mem.splitScalar(u8, value, ',');
+    const fd = try std.fmt.parseInt(i32, fields.next().?, 10);
+    const executing_ns = try std.fmt.parseInt(i96, fields.next() orelse return error.InvalidResume, 10);
+    if (fd < 3 or executing_ns <= 0 or fields.next() != null) return error.InvalidResume;
     try cloexec(fd, true);
     const seals = linux.fcntl(fd, linux.F.GET_SEALS, 0);
     if (linux.errno(seals) != .SUCCESS or seals & linux.F.SEAL_WRITE == 0) return error.InvalidResume;
-    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    return .{ .file = .{ .handle = fd, .flags = .{ .nonblocking = false } }, .executing_ns = executing_ns };
 }

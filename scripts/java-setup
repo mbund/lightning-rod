@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Run inside `nix develop`. Eclipse metadata gives JDT LS linked source roots
+# for the fixtures outside e2e/client and resolved Minecraft dependencies.
+repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+(
+    cd "$repo_dir/e2e/client"
+    ./gradlew --no-daemon discoverTests eclipse "$@"
+)
+(
+    cd "$repo_dir/registry_snapshotter"
+    ./gradlew --no-daemon eclipse "$@"
+)

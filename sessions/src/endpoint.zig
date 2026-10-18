@@ -8,6 +8,22 @@ pub fn Endpoint(comptime implementations: anytype, comptime bootstrap: type, com
         for (implementations, &types) |Implementation, *ConnectionType| ConnectionType.* = Implementation.Connection;
         break :block types;
     };
+    const workspace_layout = block: {
+        var types: [implementations.len]type = undefined;
+        var indices: [implementations.len]usize = undefined;
+        var count: usize = 0;
+        for (connection_types, 0..) |ConnectionType, version_index| {
+            const index = for (types[0..count], 0..) |Workspace, index| {
+                if (Workspace == ConnectionType.Wire.Workspace) break index;
+            } else count;
+            if (index == count) {
+                types[count] = ConnectionType.Wire.Workspace;
+                count += 1;
+            }
+            indices[version_index] = index;
+        }
+        break :block .{ .types = types[0..count].*, .indices = indices };
+    };
     return struct {
         pub const Bootstrap = bootstrap;
         pub const versions = implementations;
@@ -33,16 +49,28 @@ pub fn Endpoint(comptime implementations: anytype, comptime bootstrap: type, com
             const Tag = @Enum(u16, .exhaustive, &names, &tags);
             break :block @Union(.auto, Tag, &names, &types, &@splat(.{}));
         };
-        pub const Workspaces = block: {
-            var types: [implementations.len]type = undefined;
-            for (connection_types, &types) |ConnectionType, *workspace| workspace.* = ConnectionType.Wire.Workspace;
-            break :block std.meta.Tuple(&types);
-        };
+        /// One workspace per type. Operations run sequentially on the owning session thread.
+        pub const Workspaces = std.meta.Tuple(&workspace_layout.types);
 
-        pub fn initWorkspaces() Workspaces {
+        pub fn initWorkspaces(allocator: std.mem.Allocator) !Workspaces {
             var result: Workspaces = undefined;
-            inline for (implementations, 0..) |_, index| result[index] = .{};
+            var initialized: usize = 0;
+            errdefer inline for (workspace_layout.types, 0..) |Workspace, index| {
+                if (@hasDecl(Workspace, "deinit")) {
+                    if (index < initialized) result[index].deinit();
+                }
+            };
+            inline for (workspace_layout.types, 0..) |Workspace, index| {
+                result[index] = if (@hasDecl(Workspace, "init")) try Workspace.init(allocator) else .{};
+                initialized += 1;
+            }
             return result;
+        }
+
+        pub fn deinitWorkspaces(workspaces: *Workspaces) void {
+            inline for (workspace_layout.types, 0..) |Workspace, index| {
+                if (@hasDecl(Workspace, "deinit")) workspaces[index].deinit();
+            }
         }
 
         pub fn frame(connection: ?*const Connection, bytes: []const u8, maximum: usize) !protocol.Frame {
@@ -56,20 +84,20 @@ pub fn Endpoint(comptime implementations: anytype, comptime bootstrap: type, com
 
         pub fn decode(connection: *Connection, workspaces: *Workspaces, bytes: []const u8, destination: []u8, threshold: ?usize) ![]const u8 {
             return switch (connection.*) {
-                inline else => |*state, tag| state.decode(bytes, destination, &workspaces[@intFromEnum(tag)], threshold),
+                inline else => |*state, tag| state.decode(bytes, destination, &workspaces[workspace_layout.indices[@intFromEnum(tag)]], threshold),
             };
         }
 
         pub fn control(connection: *Connection, workspaces: *Workspaces, packet: []const u8, scratch: []u8, output: []u8, threshold: ?usize) ![]const u8 {
             return switch (connection.*) {
-                inline else => |*state, tag| state.frameControl(packet, scratch, output, &workspaces[@intFromEnum(tag)], threshold),
+                inline else => |*state, tag| state.frameControl(packet, scratch, output, &workspaces[workspace_layout.indices[@intFromEnum(tag)]], threshold),
             };
         }
 
         pub fn sharedFrame(number: i32, workspaces: *Workspaces, storage: []u8, length: usize, threshold: ?usize, destination: []u8) ![]const u8 {
             inline for (implementations, 0..) |Implementation, index| {
                 if (number == Implementation.protocol_number)
-                    return connection_types[index].Wire.shared(&workspaces[index], storage, length, threshold, destination);
+                    return connection_types[index].Wire.shared(&workspaces[workspace_layout.indices[index]], storage, length, threshold, destination);
             }
             return error.UnsupportedProtocol;
         }

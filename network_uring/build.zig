@@ -4,12 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const networking = b.dependency("networking", .{}).module("networking");
+    const dependency = b.dependency("networking", .{});
+    const networking = dependency.module("networking");
 
-    _ = b.addModule("network_uring", .{
+    const module = b.addModule("network_uring", .{
         .root_source_file = b.path("src/network.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "networking", .module = networking }},
+        .imports = &.{ .{ .name = "networking", .module = networking }, .{ .name = "networking_test", .module = dependency.module("networking_test") } },
     });
+    const tests = b.addTest(.{ .root_module = module });
+    b.step("test", "Verify socket handoff without peer progress").dependOn(&b.addRunArtifact(tests).step);
 }

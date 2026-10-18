@@ -1,14 +1,11 @@
 const lightning_rod = @import("lightning_rod");
 const std = @import("std");
-
-const plugin = lightning_rod.plugin;
 pub const Packets = @import("minecraft_packets").Packets;
 pub const Status = @import("session_status.zig").Status;
 pub const PayloadChannels = @import("payload_channels.zig");
 pub const OfflineAuthentication = @import("offline_authentication.zig").OfflineAuthentication;
 pub const Keepalive = @import("session_keepalive.zig").Keepalive;
 pub const SessionConfiguration = @import("session_configuration.zig").Plugin;
-pub const ConfigurationFinish = @import("session_configuration_finish.zig").ConfigurationFinish;
 pub const LoginStart = @import("session_login_start.zig").LoginStart;
 pub const LoginSuccess = @import("session_login_success.zig").LoginSuccess;
 pub const LoginEncryption = @import("session_encryption.zig").LoginEncryption;
@@ -26,6 +23,7 @@ pub const TeleportCommands = @import("teleport_commands.zig").TeleportCommands;
 pub const GamemodeCommands = @import("gamemode_commands.zig").GamemodeCommands;
 pub const Input = @import("input.zig").Input;
 pub const Chat = @import("chat.zig").Chat;
+pub const JoinLeaveMessages = @import("join_leave_messages.zig").JoinLeaveMessages;
 pub const commands = @import("commands");
 pub const Reload = @import("reload").Reload;
 pub const ReloadCommands = @import("reload_commands.zig").ReloadCommands;
@@ -35,7 +33,9 @@ pub const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
 pub const SurvivalInventory = @import("survival_inventory.zig").SurvivalInventory;
 pub const CreativeInventory = @import("creative_inventory.zig").CreativeInventory;
 pub const Replication = @import("replication.zig").Replication;
+pub const ChunkSource = @import("chunks").Source;
 pub const Chunks = @import("chunks").Chunks;
+pub const Section = @import("chunks").Section;
 pub const BlockEdit = @import("chunks").BlockEdit;
 pub const SectionEdits = @import("chunks").SectionEdits;
 pub const Entities = @import("entities").Entities;
@@ -64,8 +64,12 @@ pub const item = @import("item.zig");
 pub const Flat = @import("flat.zig").Flat;
 pub const Streaming = @import("streaming.zig").Streaming;
 pub const BlockSynchronization = @import("block_sync.zig").BlockSynchronization;
+pub const RegistryIdentity = @import("registry_identity.zig").RegistryIdentity;
+
+const plugin = lightning_rod.plugin;
 
 const defaults = plugin.compose(.{
+    plugin.configured(RegistryIdentity, RegistryIdentity.Configuration{}),
     plugin.configured(Packets, Packets.Configuration{}),
     plugin.configured(Input, Input.Configuration{}),
     plugin.configured(PayloadChannels.Play, PayloadChannels.Play.Configuration{}),
@@ -76,6 +80,7 @@ const defaults = plugin.compose(.{
     plugin.configured(Weather, Weather.Configuration{}),
     plugin.configured(Environment, Environment.Configuration{}),
     plugin.configured(Chat, Chat.Configuration{}),
+    plugin.configured(JoinLeaveMessages, JoinLeaveMessages.Configuration{}),
     plugin.configured(commands.Commands, commands.Commands.Configuration{}),
     plugin.configured(Operators, Operators.Configuration{}),
     plugin.configured(TeleportCommands, TeleportCommands.Configuration{}),
@@ -130,7 +135,6 @@ pub fn SessionPlugins(comptime Catalog: type) type {
         plugin.Selection(Status),
         plugin.Selection(PayloadChannels.Session),
         plugin.Selection(SessionConfiguration(Catalog)),
-        plugin.Selection(ConfigurationFinish),
     });
 }
 
@@ -147,6 +151,5 @@ pub fn session_plugins(protocols: anytype) SessionPlugins(@typeInfo(@TypeOf(prot
         plugin.configured(Status, Status.Configuration{}),
         plugin.configured(PayloadChannels.Session, PayloadChannels.Session.Configuration{}),
         plugin.configured(ConfigurationPlugin, ConfigurationPlugin.Configuration{ .protocols = protocols }),
-        plugin.configured(ConfigurationFinish, ConfigurationFinish.Configuration{}),
     };
 }

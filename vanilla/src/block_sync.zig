@@ -31,6 +31,8 @@ pub const BlockSynchronization = struct {
         life: u32 = 0,
         pending: usize = 0,
         cursor: usize = 0,
+        pending_bits: []u64 = &.{},
+        full_bits: []u64 = &.{},
     };
 
     const Delta = struct {
@@ -61,13 +63,11 @@ pub const BlockSynchronization = struct {
 
         const self = try allocator.create(BlockSynchronization);
         const observers = try allocator.alloc(Observer, deps.players.records.len);
-        @memset(observers, .{});
+        for (observers, deps.players.records) |*observer, player| observer.* = .{ .life = player.life };
         const side = deps.players.config.render_distance * 2 + 1;
         const words = (@as(usize, @intCast(side * side)) * 24 + 63) / 64;
         const pending = try allocator.alloc(u64, words * observers.len);
         const full = try allocator.alloc(u64, pending.len);
-        @memset(pending, 0);
-        @memset(full, 0);
         const deltas = try allocator.alloc(Delta, config.delta_sections);
         @memset(deltas, .{});
         self.* = .{
@@ -81,8 +81,8 @@ pub const BlockSynchronization = struct {
             .masks = try allocator.alloc([64]u64, deltas.len),
             .recipients = try allocator.alloc(sessions.Handle, observers.len),
         };
-        try deps.chunks.observe(.{ .context = self, .changed = changed });
-        try deps.work.register(.{ .context = self, .maximum_items = 8, .run = progress });
+        try deps.chunks.observe(chunks.Observer.init(self, changed));
+        try deps.work.register(self, 8, progress);
         return self;
     }
 
@@ -90,8 +90,7 @@ pub const BlockSynchronization = struct {
         changed(self, chunks.sectionAt(world, position), &.{.{ .index = chunks.localIndex(position), .state = 0 }});
     }
 
-    fn changed(context: *anyopaque, section: chunks.Section, edits: []const chunks.BlockEdit) void {
-        const self: *BlockSynchronization = @ptrCast(@alignCast(context));
+    fn changed(self: *BlockSynchronization, section: chunks.Section, edits: []const chunks.BlockEdit) void {
         const world = self.deps.worlds.get(section.world) orelse return;
         const minimum = world.dimension.minimumSection();
         if (section.y < minimum or section.y >= minimum + @as(i32, @intCast(world.dimension.sectionCount()))) return;
@@ -104,16 +103,14 @@ pub const BlockSynchronization = struct {
             const handle = player.handle orelse continue;
 
             if (observer.generation != handle.generation or observer.life != player.life) {
-                observer.* = .{ .generation = handle.generation, .life = player.life };
-                @memset(self.pending[index * self.words ..][0..self.words], 0);
-                @memset(self.full[index * self.words ..][0..self.words], 0);
+                self.resetObserver(index, handle.generation, player.life);
             }
 
             if (!self.deps.streaming.visible(index, section.world, section.x, section.z)) continue;
 
-            const word = index * self.words + bit / 64;
-            observer.pending += @intFromBool(self.pending[word] & flag == 0);
-            self.pending[word] |= flag;
+            const word = bit / 64;
+            observer.pending += @intFromBool(observer.pending_bits[word] & flag == 0);
+            observer.pending_bits[word] |= flag;
             interested = true;
         }
 
@@ -137,11 +134,12 @@ pub const BlockSynchronization = struct {
                 const previous_bit = self.bitIndex(previous);
                 const previous_flag = @as(u64, 1) << @intCast(previous_bit % 64);
 
-                for (self.observers, 0..) |_, index| {
-                    const word = index * self.words + previous_bit / 64;
+                for (self.observers, 0..) |other, index| {
+                    if (other.pending == 0) continue;
+                    const word = previous_bit / 64;
 
-                    if (self.pending[word] & previous_flag != 0 and self.deps.streaming.visible(index, previous.world, previous.x, previous.z))
-                        self.full[word] |= previous_flag;
+                    if (other.pending_bits[word] & previous_flag != 0 and self.deps.streaming.visible(index, previous.world, previous.x, previous.z))
+                        other.full_bits[word] |= previous_flag;
                 }
 
                 self.evictions += 1;
@@ -155,8 +153,7 @@ pub const BlockSynchronization = struct {
         for (edits) |edit| self.masks[slot][edit.index / 64] |= @as(u64, 1) << @intCast(edit.index % 64);
     }
 
-    fn progress(context: *anyopaque, _: std.Io, maximum_items: usize) !lightning_rod.Work.Result {
-        const self: *BlockSynchronization = @ptrCast(@alignCast(context));
+    fn progress(self: *BlockSynchronization, _: std.Io, maximum_items: usize) !lightning_rod.Work.Result {
         const players = self.deps.players;
         const service = self.deps.sessions;
         assert(maximum_items > 0 and maximum_items <= 8);
@@ -173,9 +170,7 @@ pub const BlockSynchronization = struct {
             const generation = if (player.handle) |handle| handle.generation else 0;
 
             if (observer.generation != generation or observer.life != player.life) {
-                observer.* = .{ .generation = generation, .life = player.life };
-                @memset(self.pending[selected * self.words ..][0..self.words], 0);
-                @memset(self.full[selected * self.words ..][0..self.words], 0);
+                self.resetObserver(selected, generation, player.life);
             }
 
             if (observer.pending == 0 or player.handle == null or player.stage != .ready) continue;
@@ -184,7 +179,7 @@ pub const BlockSynchronization = struct {
 
             for (0..self.words + 1) |step| {
                 const word = (observer.cursor / 64 + step) % self.words;
-                var bits = self.pending[selected * self.words + word];
+                var bits = observer.pending_bits[word];
                 const offset: u6 = @intCast(observer.cursor % 64);
 
                 if (step == 0) bits &= @as(u64, std.math.maxInt(u64)) << offset;
@@ -212,8 +207,8 @@ pub const BlockSynchronization = struct {
             };
             assert(self.bitIndex(section) == at);
             if (!self.deps.streaming.visible(selected, section.world, section.x, section.z)) {
-                self.pending[selected * self.words + at / 64] &= ~flag;
-                self.full[selected * self.words + at / 64] &= ~flag;
+                observer.pending_bits[at / 64] &= ~flag;
+                observer.full_bits[at / 64] &= ~flag;
                 observer.pending -= 1;
                 advanced = true;
                 completed += 1;
@@ -227,17 +222,18 @@ pub const BlockSynchronization = struct {
                 break;
             };
 
-            const full = slot == null or self.full[selected * self.words + at / 64] & flag != 0;
+            const full = slot == null or observer.full_bits[at / 64] & flag != 0;
             var count: usize = 0;
 
             for (players.records, 0..) |recipient, index| {
                 const handle = recipient.handle orelse continue;
-                if (recipient.protocol != player.protocol or recipient.stage != .ready or !self.deps.streaming.visible(index, section.world, section.x, section.z))
+                if (self.observers[index].pending == 0 or recipient.protocol != player.protocol or recipient.stage != .ready or !self.deps.streaming.visible(index, section.world, section.x, section.z))
                     continue;
 
-                const word = index * self.words + at / 64;
-                if (self.pending[word] & flag == 0) continue;
-                if ((slot == null or self.full[word] & flag != 0) != full) continue;
+                const other = &self.observers[index];
+                const word = at / 64;
+                if (other.pending_bits[word] & flag == 0) continue;
+                if ((slot == null or other.full_bits[word] & flag != 0) != full) continue;
                 self.recipients[count] = handle;
                 count += 1;
             }
@@ -277,11 +273,12 @@ pub const BlockSynchronization = struct {
             const accepted = packet.publishReady(bytes.len, self.recipients[0..ready]);
 
             for (accepted) |handle| {
-                const word = handle.index * self.words + at / 64;
-                assert(self.pending[word] & flag != 0);
-                self.pending[word] &= ~flag;
-                self.full[word] &= ~flag;
-                self.observers[handle.index].pending -= 1;
+                const other = &self.observers[handle.index];
+                const word = at / 64;
+                assert(other.pending_bits[word] & flag != 0);
+                other.pending_bits[word] &= ~flag;
+                other.full_bits[word] &= ~flag;
+                other.pending -= 1;
             }
 
             if (accepted.len > 0) {
@@ -294,12 +291,13 @@ pub const BlockSynchronization = struct {
             if (slot) |cached| {
                 var retained = false;
 
-                for (self.observers, 0..) |_, index| {
-                    const word = index * self.words + at / 64;
-                    if (self.pending[word] & flag == 0 or !self.deps.streaming.visible(index, section.world, section.x, section.z)) continue;
+                for (self.observers, 0..) |other, index| {
+                    if (other.pending == 0) continue;
+                    const word = at / 64;
+                    if (other.pending_bits[word] & flag == 0 or !self.deps.streaming.visible(index, section.world, section.x, section.z)) continue;
 
-                    if (!full and accepted.len > 0) self.full[word] |= flag;
-                    retained = retained or self.full[word] & flag == 0;
+                    if (!full and accepted.len > 0) other.full_bits[word] |= flag;
+                    retained = retained or other.full_bits[word] & flag == 0;
                 }
 
                 if (!retained) self.deltas[cached].live = false;
@@ -312,6 +310,15 @@ pub const BlockSynchronization = struct {
 
         for (self.observers) |observer| if (observer.pending != 0) return .blocked;
         return .idle;
+    }
+
+    fn resetObserver(self: *BlockSynchronization, index: usize, generation: u32, life: u32) void {
+        const count = if (generation == 0) 0 else self.words;
+        const pending = self.pending[index * self.words ..][0..count];
+        const full = self.full[index * self.words ..][0..count];
+        @memset(pending, 0);
+        @memset(full, 0);
+        self.observers[index] = .{ .generation = generation, .life = life, .pending_bits = pending, .full_bits = full };
     }
 
     fn writeChanges(packet: wire_1_21_5.play.toClient.packet_multi_block_change.Writer, registry: packets.Registry, section: chunks.Section, view: chunks.View, mask: *const [64]u64) ![]u8 {

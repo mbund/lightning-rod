@@ -4,10 +4,11 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .e2e_control = .{ .path = "../../control" },
         .reload = .{ .path = "../../../reload" },
         .protocol_codegen = .{ .path = "../../../protocol_codegen" },
         .registry_snapshotter = .{ .path = "../../../registry_snapshotter" },
-        .storage_local = .{ .path = "../../../storage_local" },
+        .storage = .{ .path = "../../../storage" },
         .lightning_rod = .{ .path = "../../.." },
         .reload_execve = .{ .path = "../../../reload_execve" },
         .profiles = .{ .path = "../../../profiles" },

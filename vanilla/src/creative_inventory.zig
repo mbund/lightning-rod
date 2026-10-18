@@ -14,6 +14,7 @@ const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
 const Items = @import("items.zig").Items;
 const Players = @import("players.zig").Players;
 const Input = @import("input.zig").Input;
+const lightning_rod = @import("lightning_rod");
 
 const assert = std.debug.assert;
 
@@ -45,6 +46,8 @@ pub const CreativeInventory = struct {
 
     deps: Dependencies,
     batches: []?*Batch,
+    decode_scratch: []u8,
+    decode_definition: []u8,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*CreativeInventory {
         const self = try allocator.create(CreativeInventory);
@@ -52,6 +55,8 @@ pub const CreativeInventory = struct {
         self.* = .{
             .deps = deps,
             .batches = try allocator.alloc(?*Batch, count),
+            .decode_scratch = try allocator.alloc(u8, deps.inventories.config.max_item_bytes),
+            .decode_definition = try allocator.alloc(u8, deps.inventories.config.max_item_bytes),
         };
         @memset(self.batches, null);
         try deps.input.on(.set_creative_slot, self, onCreativeSlot);
@@ -65,9 +70,12 @@ pub const CreativeInventory = struct {
     }
 
     fn onCreativeSlot(self: *CreativeInventory, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_set_creative_slot.Reader, temporary: std.mem.Allocator) !void {
+        const player = self.deps.players.records[handle.index];
+        if (player.handle == null or player.stage != .ready or player.gamemode != .creative) return;
         const slot, const next = body.slot() catch return error.InvalidPacket;
+        if (slot != -1 and (slot < 1 or slot > 45)) return;
         const selected = try self.deps.packets.definition(body.protocolNumber());
-        const value = item_packets.readStack(self.deps.items, temporary, next._cursor.rest, selected, self.deps.players.records[handle.index].uuid) catch |err| {
+        const value = item_packets.readStack(self.deps.items, self.decode_scratch, self.decode_definition, next._cursor.rest, selected, self.deps.players.records[handle.index].uuid) catch |err| {
             std.log.warn("event=creative_item_rejected protocol={d} error={s}", .{ selected.number, @errorName(err) });
             self.deps.inventory.states[handle.index].dirty = PlayerInventory.all_slots;
             return;
@@ -88,6 +96,14 @@ pub const CreativeInventory = struct {
         var slots: [47]inventories.Slot = undefined;
         var contents: [47]inventories.Contents = undefined;
         try menu.load(player_index, &slots, &contents);
+        const dropping = if (action) |event| switch (event) {
+            .creative_slot => |set| set.slot == -1 and set.item != null,
+            .dig => |dig| dig.action == .drop_item or dig.action == .drop_stack,
+        } else false;
+        if (dropping and !menu.deps.dropped.canCreate(1)) {
+            state.dirty = PlayerInventory.all_slots;
+            return;
+        }
         var next: [47]?inventories.Stack = undefined;
         for (&next, contents) |*stack, value| stack.* = value.stack;
 
@@ -228,18 +244,8 @@ pub const CreativeInventory = struct {
             const balance = balances[index];
             const held: inventories.Stack = .{ .item = balance.item, .count = 1 };
             const amount: u16 = @intCast(@min(balance.count, try self.deps.items.stackLimit(held)));
-            const previous = lease.read();
-            if (previous == null or !std.mem.eql(u8, previous.?[0..32], &balance.item) or
-                std.mem.readInt(u16, previous.?[32..34], .little) != amount or
-                std.mem.readInt(u16, previous.?[34..36], .little) != balance.origin)
-            {
-                const bytes = lease.edit();
-                bytes[0..32].* = balance.item;
-                std.mem.writeInt(u16, bytes[32..34], amount, .little);
-                std.mem.writeInt(u16, bytes[34..36], balance.origin, .little);
-                lease.commit(36);
-            }
-        } else if (lease.read() != null) lease.remove();
+            try menu.writeRecovery(lease, .{ .stack = .{ .item = balance.item, .count = amount }, .origin = balance.origin });
+        } else try menu.writeRecovery(lease, null);
         try menu.commit(state, &slots, &contents, &next);
         if (batch) |current| current.revision = state.revision;
         // A computed presentation differs from the client's accepted proposal.

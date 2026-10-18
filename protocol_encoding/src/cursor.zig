@@ -6,6 +6,8 @@ pub const Nested = @import("nested.zig").Encoder;
 
 pub const Error = wire.ReadError || wire.WriteError || error{DepthLimit};
 
+pub const Owner = struct { marker: u8 = 0 };
+
 pub const Mode = enum { read, write };
 
 /// A named output boundary carries no source-version fields.
@@ -30,8 +32,8 @@ pub fn State(comptime mode: Mode) type {
         pub const Bytes = if (mode == .read) []const u8 else []u8;
         buffer: Bytes,
         rest: Bytes,
-        owner: ?*const anyopaque = null,
-        origin: usize = 0,
+        owner: ?*const Owner = null,
+        origin: ?[*]const u8 = null,
         serial: usize = 0,
         value: i128 = 0,
         first_mask: u8 = 255,
@@ -55,19 +57,19 @@ pub fn State(comptime mode: Mode) type {
             return .{ .buffer = bytes, .rest = bytes };
         }
 
-        fn child(self: @This(), owner: *const anyopaque, serial: usize) @This() {
+        fn child(self: @This(), owner: *const Owner, serial: usize) @This() {
             var result = self;
             result.owner = owner;
-            result.origin = @intFromPtr(self.rest.ptr);
+            result.origin = self.rest.ptr;
             result.serial = serial;
             return result;
         }
 
-        pub fn accept(self: *@This(), completed: @This(), owner: ?*const anyopaque, serial: usize) Error!void {
-            if (completed.protocol_number != self.protocol_number or completed.layout_protocol != self.layout_protocol or completed.owner != owner or completed.serial != serial or completed.origin != @intFromPtr(self.rest.ptr) or
+        pub fn accept(self: *@This(), completed: @This(), owner: ?*const Owner, serial: usize) Error!void {
+            if (completed.protocol_number != self.protocol_number or completed.layout_protocol != self.layout_protocol or completed.owner != owner or completed.serial != serial or completed.origin != self.rest.ptr or
                 completed.tags.ptr != self.tags.ptr or completed.tags.len != self.tags.len or
                 completed.buffer.ptr != self.buffer.ptr or completed.buffer.len != self.buffer.len or
-                completed.rest.len > self.rest.len or @intFromPtr(completed.rest.ptr) != @intFromPtr(self.rest.ptr) + self.rest.len - completed.rest.len) return error.InvalidCompletion;
+                completed.rest.len > self.rest.len or completed.rest.ptr != self.rest.ptr + (self.rest.len - completed.rest.len)) return error.InvalidCompletion;
             self.rest = completed.rest;
             self.value = completed.value;
             self.first_mask = completed.first_mask;
@@ -108,17 +110,18 @@ pub fn Child(comptime Entry: type, comptime Next: type, comptime mode: Mode, com
     return struct {
         next_value: Next,
         child_context: Entry.Context,
+        owner_token: Owner = .{},
         phase: enum { ready, active, complete } = .ready,
 
         pub fn begin(self: *@This()) Error!Entry {
             if (self.phase != .ready) return error.InvalidCompletion;
             self.phase = .active;
-            return .{ ._cursor = self.next_value._cursor.child(self, 0), ._context = self.child_context };
+            return .{ ._cursor = self.next_value._cursor.child(&self.owner_token, 0), ._context = self.child_context };
         }
 
         pub fn advance(self: *@This(), completed: Entry.Done) Error!Next {
             if (self.phase != .active) return error.InvalidCompletion;
-            try self.next_value._cursor.accept(completed._cursor, self, 0);
+            try self.next_value._cursor.accept(completed._cursor, &self.owner_token, 0);
 
             if (capture.len != 0) @field(self.next_value._context, capture) = completed._cursor.value;
             self.phase = .complete;
@@ -140,6 +143,7 @@ pub fn Sequence(comptime Entry: type, comptime Next: type, comptime mode: Mode, 
     return struct {
         next_value: Next,
         child_context: Entry.Context,
+        owner_token: Owner = .{},
         remaining: usize,
         start: usize = 0,
         active: bool = false,
@@ -160,7 +164,7 @@ pub fn Sequence(comptime Entry: type, comptime Next: type, comptime mode: Mode, 
 
             if (self.remaining == 0) return null;
             self.active = true;
-            var state = self.next_value._cursor.child(self, self.remaining);
+            var state = self.next_value._cursor.child(&self.owner_token, self.remaining);
 
             if (mode == .read and termination == .high_bit) state.first_mask = 127;
             return .{ ._cursor = state, ._context = self.child_context };
@@ -176,7 +180,7 @@ pub fn Sequence(comptime Entry: type, comptime Next: type, comptime mode: Mode, 
                 if (termination == .high_bit and start[0] >= 128) return error.InvalidTag;
             }
 
-            try self.next_value._cursor.accept(completed._cursor, self, self.remaining);
+            try self.next_value._cursor.accept(completed._cursor, &self.owner_token, self.remaining);
             self.remaining -= 1;
             if (termination == .high_bit) {
                 if (mode == .write) {

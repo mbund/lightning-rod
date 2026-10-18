@@ -1,5 +1,3 @@
-const chunks = @import("chunks");
-
 pub const Position = struct {
     x: f64,
     y: f64,
@@ -85,13 +83,4 @@ pub const Login = struct {
     hashed_seed: i64,
     gamemode: i8,
     sea_level: i32,
-};
-
-pub const Chunk = struct {
-    x: i32,
-    z: i32,
-    sections: []const chunks.Lease,
-    biome: i32,
-    minimum_section: i32,
-    skylight: bool,
 };

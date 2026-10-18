@@ -7,13 +7,13 @@ const sessions = @import("sessions");
 const worlds = @import("worlds");
 const minecraft = @import("minecraft_model");
 const registry = @import("game_data").registry;
-
-const Chunks = chunks.Chunks;
 const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
 const Players = @import("players.zig").Players;
 const Input = @import("input.zig").Input;
 const Items = @import("items.zig").Items;
 const BlockSynchronization = @import("block_sync.zig").BlockSynchronization;
+
+const Chunks = chunks.Chunks;
 
 pub const Placement = struct {
     pub const id = "minecraft:placement";
@@ -152,7 +152,7 @@ pub const Placement = struct {
 
         if (custom == .denied) allowed = false;
         if (custom == .pass) for (players.records) |other| {
-            if (other.handle == null or other.world != player.world or other.stage != .ready or other.gamemode == .spectator) continue;
+            if (!other.inWorld() or other.world != player.world or other.gamemode == .spectator) continue;
 
             const x: f64 = @floatFromInt(position.x);
             const y: f64 = @floatFromInt(position.y);

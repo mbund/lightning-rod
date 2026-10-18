@@ -11,5 +11,6 @@ import org.spongepowered.asm.mixin.Mixin; import org.spongepowered.asm.mixin.inj
   if (p instanceof ServerboundChunkBatchReceivedPacket packet) Recorder.instance().chunkBatchAcknowledged(packet.desiredChunksPerTick());
   if (p instanceof ServerboundPlayerLoadedPacket) Recorder.instance().playerLoadedSent();
   if (p instanceof net.minecraft.network.protocol.game.ServerboundConfigurationAcknowledgedPacket) Recorder.instance().reconfigurationEncoded();
+  if (p instanceof net.minecraft.network.protocol.login.ServerboundKeyPacket) Recorder.instance().encryptionResponseEncoded(b);
  }
 }

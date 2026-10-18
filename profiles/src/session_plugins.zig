@@ -63,7 +63,7 @@ pub fn Runtime(comptime Endpoint: type, comptime Selections: type) type {
             }
             self.inputs.seal();
             self.phases.sealed = true;
-            if (self.inputs.handshake.call == null) return error.MissingHandshakeHandler;
+            if (self.inputs.handshake.handler == null) return error.MissingHandshakeHandler;
             return self;
         }
 
@@ -123,7 +123,7 @@ pub fn Runtime(comptime Endpoint: type, comptime Selections: type) type {
                     const entry, const header = (try input_set.entry(packet)) orelse return .none;
                     inline for (0..count) |index| {
                         if (entry.owner == index) {
-                            const effect = try entry.call(entry.context, scope, &connection.values[index], header, output);
+                            const effect = try entry.vtable.call(entry.context, scope, &connection.values[index], header, output);
                             if (effect == .send) {
                                 const bytes = effect.send;
                                 if (bytes.len == 0 or bytes.len > output.len or bytes.ptr != output.ptr)
@@ -152,7 +152,7 @@ pub fn Runtime(comptime Endpoint: type, comptime Selections: type) type {
                         inline for (0..count) |index| {
                             const entry = self.phases.entries[index];
                             if (entry.play) |handler| {
-                                if (try handler.call(handler.context, profile, &connection.values[index], event, output)) |bytes| {
+                                if (try handler.vtable.call(handler.context, profile, &connection.values[index], event, output)) |bytes| {
                                     if (event == .attached or result != null or bytes.len == 0 or bytes.len > output.len or bytes.ptr != output.ptr)
                                         return error.InvalidPhaseOutput;
                                     result = bytes;
@@ -166,7 +166,7 @@ pub fn Runtime(comptime Endpoint: type, comptime Selections: type) type {
                         const entry = self.phases.entries[index];
                         if (connection.play_index <= index) {
                             if (entry.play) |handler| {
-                                const bytes = try handler.call(handler.context, profile, &connection.values[index], event, output);
+                                const bytes = try handler.vtable.call(handler.context, profile, &connection.values[index], event, output);
                                 if (bytes) |result| {
                                     if (result.len == 0 or result.len > output.len) return error.InvalidPhaseOutput;
                                     connection.play_index = index + 1;
@@ -207,7 +207,7 @@ pub fn Runtime(comptime Endpoint: type, comptime Selections: type) type {
                     if (handler) |registered| {
                         var plugin_scope = scope;
                         if (phase_kind == .login) plugin_scope.profile.uuid = scope.identity.?.*;
-                        const step = try registered.call(registered.context, plugin_scope, &connection.values[index], current, output);
+                        const step = try registered.vtable.call(registered.context, plugin_scope, &connection.values[index], current, output);
                         switch (step) {
                             .send => |bytes| {
                                 if (bytes.len == 0 or bytes.len > output.len) return error.InvalidPhaseOutput;
@@ -234,7 +234,7 @@ pub fn Runtime(comptime Endpoint: type, comptime Selections: type) type {
             if (connection.generation != handle.generation) return;
 
             inline for (0..count) |index| {
-                if (self.phases.entries[index].closed) |handler| handler.call(handler.context, handle, &connection.values[index]);
+                if (self.phases.entries[index].closed) |handler| handler.vtable.call(handler.context, handle, &connection.values[index]);
             }
             connection.* = .{};
         }

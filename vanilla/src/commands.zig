@@ -38,7 +38,8 @@ pub const CommandDispatch = struct {
 
     const Listener = struct {
         context: *anyopaque,
-        call: *const fn (*anyopaque, sessions.Handle, []const u8) anyerror!void,
+        vtable: *const VTable,
+        const VTable = struct { call: *const fn (*anyopaque, sessions.Handle, []const u8) anyerror!void };
     };
 
     deps: Dependencies,
@@ -102,21 +103,23 @@ pub const CommandDispatch = struct {
         const player = self.deps.players.records[handle.index];
         if (!player.inPlay()) return;
         var reply: Reply = .{ .chat = self.deps.chat, .handle = handle };
-        try self.deps.commands.execute(.{ .sender = player.uuid, .output = &reply, .write = writeReply }, value);
+        try self.deps.commands.execute(.{ .sender = player.uuid, .output = commands.Reply.init(&reply, writeReply) }, value);
         for (self.listeners[0..self.listener_count]) |listener|
-            try listener.call(listener.context, handle, value);
+            try listener.vtable.call(listener.context, handle, value);
     }
 
     pub fn observeCommand(self: *CommandDispatch, context: anytype, comptime handler: anytype) !void {
         if (self.listener_count == self.listeners.len) return error.CommandObserverCapacity;
+        const Adapter = struct {
+            const vtable: Listener.VTable = .{ .call = @This().invoke };
+            fn invoke(raw: *anyopaque, handle: sessions.Handle, value: []const u8) anyerror!void {
+                const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
+                try @call(.auto, handler, .{ typed, handle, value });
+            }
+        };
         self.listeners[self.listener_count] = .{
             .context = context,
-            .call = struct {
-                fn call(raw: *anyopaque, handle: sessions.Handle, value: []const u8) anyerror!void {
-                    const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
-                    try @call(.auto, handler, .{ typed, handle, value });
-                }
-            }.call,
+            .vtable = &Adapter.vtable,
         };
         self.listener_count += 1;
     }
@@ -141,8 +144,7 @@ pub const CommandDispatch = struct {
         state.completion = request_id;
     }
 
-    fn writeReply(context: *anyopaque, text: []const u8) void {
-        const reply: *Reply = @ptrCast(@alignCast(context));
+    fn writeReply(reply: *Reply, text: []const u8) void {
         reply.chat.system(reply.handle, text);
     }
 

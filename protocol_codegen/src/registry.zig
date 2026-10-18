@@ -79,14 +79,26 @@ pub fn main(init: std.process.Init) !void {
         const min_state: usize = @intCast(try intField(block, "minStateId"));
         const max_state: usize = @intCast(try intField(block, "maxStateId"));
         const states = block.get("states").?.array.items;
+        const is_door = std.mem.endsWith(u8, block.get("name").?.string, "_door");
         var state_count: usize = 1;
 
         for (states) |state| state_count *= @intCast(try intField(state.object, "num_values"));
         if (state_count != max_state - min_state + 1) return error.InvalidBlockStateProduct;
+        if (is_door and state_count != 64) return error.InvalidDoorStates;
 
         for (0..state_count) |offset| {
             try output.appendSlice("    \"");
+            const name_start = output.items.len;
             try writeBlockStateName(&output, block, offset);
+            if (is_door) {
+                const name = output.items[name_start..];
+                if (std.mem.indexOf(u8, name, ([_][]const u8{ "facing=north", "facing=south", "facing=west", "facing=east" })[offset / 16]) == null or
+                    std.mem.indexOf(u8, name, if (offset & 8 == 0) "half=upper" else "half=lower") == null or
+                    std.mem.indexOf(u8, name, if (offset & 4 == 0) "hinge=left" else "hinge=right") == null or
+                    std.mem.indexOf(u8, name, if (offset & 2 == 0) "open=true" else "open=false") == null or
+                    std.mem.indexOf(u8, name, if (offset & 1 == 0) "powered=true" else "powered=false") == null)
+                    return error.InvalidDoorStates;
+            }
             try output.appendSlice("\",\n");
         }
     }
@@ -102,6 +114,14 @@ pub fn main(init: std.process.Init) !void {
             "    return null;\n" ++
             "}\n\n",
     );
+
+    try output.appendSlice("pub const door_state_ranges = [_]struct { minimum: u16, maximum: u16 }{\n");
+    for (blocks.array.items) |entry| {
+        const block = entry.object;
+        if (!std.mem.endsWith(u8, block.get("name").?.string, "_door")) continue;
+        try output.print("    .{{ .minimum = {}, .maximum = {} }},\n", .{ try intField(block, "minStateId"), try intField(block, "maxStateId") });
+    }
+    try output.appendSlice("};\n\n");
 
     try writeNamedRegistry(&output, "item", items.array.items);
     try output.append('\n');

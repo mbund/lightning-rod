@@ -6,8 +6,6 @@ const worlds = @import("worlds");
 const registry = @import("game_data").registry;
 const BlockActions = @import("block_actions.zig").BlockActions;
 
-const assert = std.debug.assert;
-
 pub const Doors = struct {
     pub const id = "minecraft:doors";
 
@@ -27,33 +25,13 @@ pub const Doors = struct {
         const self = try allocator.create(Doors);
         self.* = .{ .deps = deps };
 
-        for (registry.blocks) |block| {
-            const name = registry.blockStateName(block.default_state).?;
-            if (std.mem.indexOf(u8, name, "_door[") == null) continue;
-            assert(block.max_state - block.min_state == 63);
-
-            for (0..64) |offset| {
-                const state = registry.blockStateName(block.min_state + @as(i32, @intCast(offset))).?;
-                assert(std.mem.indexOf(u8, state, ([_][]const u8{ "facing=north", "facing=south", "facing=west", "facing=east" })[offset / 16]) != null);
-                assert(std.mem.indexOf(u8, state, if (offset & 8 == 0) "half=upper" else "half=lower") != null);
-                assert(std.mem.indexOf(u8, state, if (offset & 4 == 0) "hinge=left" else "hinge=right") != null);
-                assert(std.mem.indexOf(u8, state, if (offset & 2 == 0) "open=true" else "open=false") != null);
-                assert(std.mem.indexOf(u8, state, if (offset & 1 == 0) "powered=true" else "powered=false") != null);
-            }
-
-            try deps.actions.register(.{
-                .minimum = @intCast(block.min_state),
-                .maximum = @intCast(block.max_state),
-                .context = self,
-                .apply = apply,
-            });
-        }
+        for (registry.door_state_ranges) |range|
+            try deps.actions.register(BlockActions.Handler.init(self, range.minimum, range.maximum, apply));
 
         return self;
     }
 
-    fn apply(raw: *anyopaque, request: BlockActions.Request) !BlockActions.Result {
-        const self: *Doors = @ptrCast(@alignCast(raw));
+    fn apply(self: *Doors, request: BlockActions.Request) !BlockActions.Result {
         const world = request.player.world;
         const block = registry.blocks[registry.block_state_to_block[request.state]];
         const minimum: u16 = @intCast(block.min_state);
@@ -118,7 +96,7 @@ pub const Doors = struct {
             const shape = registry.collision_shapes[registry.block_state_collision_shape[minimum + offset]];
 
             for (self.deps.players.records) |player| {
-                if (player.handle == null or player.world != world or player.stage != .ready or player.gamemode == .spectator) continue;
+                if (!player.inWorld() or player.world != world or player.gamemode == .spectator) continue;
 
                 for (registry.collision_boxes[shape.offset..][0..shape.count]) |box| {
                     const bx: f64 = @floatFromInt(bottom.x);

@@ -1,24 +1,28 @@
 const std = @import("std");
 const catalog = @import("src/catalog.zig");
+const selection = @import("src/selection.zig");
 const protocol_catalog = @import("protocols").catalog;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
 
-    if (b.release_mode == .off) b.release_mode = .safe;
     const optimize = b.standardOptimizeOption(.{});
+    const realtime = b.option(bool, "realtime", "Run the server and its threads with FIFO scheduling") orelse false;
     const tests_root = b.option([]const u8, "tests", "Directory containing E2E fixtures") orelse "tests";
     const server_releases = b.option([]const u8, "server-releases", "Minecraft releases selected for the test server");
-    const client_version = b.option([]const u8, "client-version", "Minecraft client release") orelse protocol_catalog.latest.minecraft_version;
+    const requested_version = b.option([]const u8, "client-version", "Minecraft client release");
     const scenario = b.option([]const u8, "scenario", "Run one E2E scenario (default: all)");
     const cases = catalog.load(b.allocator, b.graph.io, b.pathFromRoot(tests_root)) catch |err| std.debug.panic("Cannot discover E2E tests: {s}", .{@errorName(err)});
     const selected_case = if (scenario) |name| catalog.find(cases, name) orelse
         std.debug.panic("Unknown E2E test '{s}'; use zig build list-tests", .{name}) else null;
-    const selected_releases = server_releases orelse if (selected_case) |selected|
-        selected.server_releases orelse if (selected.peer_versions.len != 0)
-            std.mem.join(b.allocator, ",", selected.peer_versions) catch @panic("out of memory")
-        else
-            client_version
+    const client_version = requested_version orelse (if (selected_case) |selected| selected.version else null) orelse protocol_catalog.latest.minecraft_version;
+    const peer_versions = if (selected_case) |selected|
+        selection.peerVersions(protocol_catalog, b.allocator, selected, client_version) catch |err|
+            std.debug.panic("Cannot select E2E clients: {s}", .{@errorName(err)})
+    else
+        &.{};
+    const selected_releases = server_releases orelse if (selected_case != null and !selected_case.?.full_protocols)
+        std.mem.join(b.allocator, ",", peer_versions) catch @panic("out of memory")
     else
         "";
     const protocols = b.dependency("protocols", .{
@@ -26,6 +30,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .releases = selected_releases,
     });
+    const protocol_catalog_module = b.createModule(.{ .root_source_file = protocols.path("catalog.zig") });
     const matrix = b.addExecutable(.{
         .name = "e2e-matrix",
         .root_module = b.createModule(.{
@@ -34,18 +39,19 @@ pub fn build(b: *std.Build) void {
             .optimize = .Debug,
             .imports = &.{.{
                 .name = "protocol_catalog",
-                .module = b.createModule(.{ .root_source_file = protocols.path("catalog.zig") }),
+                .module = protocol_catalog_module,
             }},
         }),
     });
     const emit_matrix = b.addRunArtifact(matrix);
     emit_matrix.setCwd(b.path("."));
     emit_matrix.addArg(b.pathFromRoot(tests_root));
+    if (requested_version) |version| emit_matrix.addArg(version);
     b.step("e2e-matrix", "Print the GitHub Actions E2E matrix as JSON").dependOn(&emit_matrix.step);
 
     const backend = b.option(enum { uring, stdio }, "io", "Fixture networking implementation") orelse .uring;
     const profile = if (backend == .uring) "lightning_rod_linux" else "lightning_rod_stdio";
-    const names = .{ "lightning_rod", "lightning_rod_linux", "vanilla", "sessions", "protocols", "bossbars", "tps" };
+    const names = .{ "records", "lightning_rod", "lightning_rod_linux", "vanilla", "minecraft_java", "sessions", "protocols", "bossbars", "tps", "economy", "shop", "economy_commands", "shop_commands", "e2e_control" };
     b.dependency("minecraft_packets", .{ .target = target, .optimize = optimize }).module("minecraft_packets").addImport("protocols", protocols.module("protocols"));
     b.dependency("vanilla", .{ .target = target, .optimize = optimize }).module("lightning_rod_vanilla_1_21_6").addImport("protocols", protocols.module("protocols"));
     var imports: [names.len]std.Build.Module.Import = undefined;
@@ -59,39 +65,69 @@ pub fn build(b: *std.Build) void {
         };
     }
 
-    const fixture_server = b.addExecutable(.{
-        .name = "fixture-server",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("server.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &imports,
-            .link_libc = true,
-        }),
-    });
-    fixture_server.root_module.addImport("wire_1_21_5", b.dependency("protocol_1_21_5", .{ .target = target, .optimize = optimize }).module("wire"));
-
-    if (b.option([]const u8, "crypto-directory", "OpenSSL library directory for the fixture server") orelse b.graph.environ_map.get("OPENSSL_LIB_DIR")) |directory| {
-        fixture_server.root_module.addLibraryPath(.{ .cwd_relative = directory });
-        fixture_server.root_module.addRPath(.{ .cwd_relative = directory });
-    }
-
-    fixture_server.root_module.linkSystemLibrary("crypto", .{ .use_pkg_config = .no });
-    b.step("fixture-server", "Build the server fixtures (requires OpenSSL)").dependOn(&b.addInstallArtifact(fixture_server, .{}).step);
     const runner = b.addExecutable(.{
         .name = "lightning-rod-e2e",
         .root_module = b.createModule(.{
             .root_source_file = b.path("runner.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{
-                .name = "reload_execve",
-                .module = b.dependency("reload_execve", .{ .target = target, .optimize = optimize }).module("reload_execve"),
-            }},
+            .imports = &.{
+                .{ .name = "protocol_catalog", .module = protocol_catalog_module },
+                .{
+                    .name = "reload_execve",
+                    .module = b.dependency("reload_execve", .{ .target = target, .optimize = optimize }).module("reload_execve"),
+                },
+            },
         }),
     });
+    const selection_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/selection_test.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "protocol_catalog", .module = protocol_catalog_module }},
+    }) });
     const check_runner = b.step("check-runner", "Compile the E2E runner without starting Java");
     check_runner.dependOn(&runner.step);
+    const performance_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/performance.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const test_performance = b.addRunArtifact(performance_tests);
+    b.step("test-performance", "Test performance budget accumulation and statistics").dependOn(&test_performance.step);
+    const child_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/child.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const test_harness = b.step("test-harness", "Verify E2E version selection and shutdown outcomes");
+    const cleanup_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/process_cleanup.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    test_harness.dependOn(&b.addRunArtifact(cleanup_tests).step);
+    const scheduling_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/scheduling.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    test_harness.dependOn(&b.addRunArtifact(scheduling_tests).step);
+    test_harness.dependOn(&b.addRunArtifact(child_tests).step);
+    test_harness.dependOn(&b.addRunArtifact(selection_tests).step);
+    const artifacts_compile = b.addSystemCommand(&.{ "javac", "-d" });
+    const artifacts_classes = artifacts_compile.addOutputDirectoryArg("classes");
+    artifacts_compile.addFileArg(b.path("client/src/client/java/dev/lightningrod/e2e/Artifacts.java"));
+    artifacts_compile.addFileArg(b.path("client/src/test/java/dev/lightningrod/e2e/ArtifactsTest.java"));
+    const artifacts_test = b.addSystemCommand(&.{ "java", "-cp" });
+    artifacts_test.addDirectoryArg(artifacts_classes);
+    artifacts_test.addArg("dev.lightningrod.e2e.ArtifactsTest");
+    b.step("test-artifacts", "Verify atomic Java artifact publication").dependOn(&artifacts_test.step);
+
+    const client_test = b.addSystemCommand(&.{ "./gradlew", "--no-daemon", "testFixtureApi" });
+    client_test.setCwd(b.path("client"));
+    b.step("test-client", "Verify fixture messages and screenshot completion").dependOn(&client_test.step);
+
     const list = b.addRunArtifact(runner);
     list.setCwd(b.path("."));
     list.addArg("--list");
@@ -100,12 +136,21 @@ pub fn build(b: *std.Build) void {
 
     const server = b.option([]const u8, "server", "Override the test's server executable");
     const address = b.option([]const u8, "address", "Minecraft server address") orelse "127.0.0.1:25565";
-    const strace = b.option(bool, "strace", "Collect server syscall counts (distorts timings)") orelse false;
-    const artifacts = b.option([]const u8, "artifacts", "Artifact directory") orelse "artifacts";
+    const artifacts = b.option([]const u8, "artifacts", "Override artifact root (default: each test directory's artifacts/)");
     const suite = b.step("e2e", "Run all discovered E2E tests sequentially (or select -Dscenario)");
     const servers = b.step("build-test-servers", "Build servers for the selected E2E tests without running Java");
     var previous: ?*std.Build.Step = null;
+    var test_servers: std.StringHashMap(*std.Build.Step.Compile) = .init(b.allocator);
 
+    const harness_module = b.createModule(.{ .root_source_file = b.path("src/lib.zig"), .target = target, .optimize = optimize, .imports = &imports });
+    harness_module.addImport("wire_1_21_5", b.dependency("protocol_1_21_5", .{ .target = target, .optimize = optimize }).module("wire"));
+    const control_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.dependency("e2e_control", .{ .target = target, .optimize = optimize }).path("src/control.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &imports,
+    }) });
+    test_harness.dependOn(&b.addRunArtifact(control_tests).step);
     for (cases) |selected| {
         if (scenario) |name| {
             if (!std.mem.eql(u8, selected.name, name)) continue;
@@ -118,11 +163,12 @@ pub fn build(b: *std.Build) void {
         if (previous) |step| run.step.dependOn(step);
         previous = &run.step;
         run.setCwd(b.path("."));
-        run.addArgs(&.{ "--scenario", selected.name, "--artifacts", artifacts, "--client", "client" });
+        run.setEnvironmentVariable("LIGHTNING_ROD_E2E_KEY", b.dependency("minecraft_java", .{ .target = target, .optimize = optimize }).path("tests/fixtures/rsa-key.der").getPath(b));
+        run.addArgs(&.{ "--scenario", selected.name, "--client", "client", "--realtime", if (realtime) "true" else "false" });
+        if (artifacts) |directory| run.addArgs(&.{ "--artifacts", directory });
         run.addArgs(&.{ "--address", address });
         run.addArgs(&.{ "--client-version", client_version });
         run.addArgs(&.{ "--tests", b.pathFromRoot(tests_root) });
-        run.addArgs(&.{ "--strace", if (strace) "true" else "false" });
 
         if (server) |path| {
             run.addArgs(&.{ "--server", path });
@@ -143,8 +189,13 @@ pub fn build(b: *std.Build) void {
 
             if (file) |source| {
                 source.close(b.graph.io);
+                if (test_servers.get(selected.directory)) |test_server| {
+                    run.addArg("--server");
+                    run.addArtifactArg(test_server);
+                    continue;
+                }
                 const test_server = b.addExecutable(.{
-                    .name = b.fmt("e2e-{s}", .{selected.name}),
+                    .name = b.fmt("e2e-{s}", .{std.fs.path.basename(selected.directory)}),
                     .root_module = b.createModule(.{
                         .root_source_file = .{ .cwd_relative = main_path },
                         .target = target,
@@ -152,13 +203,14 @@ pub fn build(b: *std.Build) void {
                         .imports = &imports,
                     }),
                 });
+                test_server.root_module.addImport("e2e", harness_module);
+                test_server.root_module.addImport("wire_1_21_5", b.dependency("protocol_1_21_5", .{ .target = target, .optimize = optimize }).module("wire"));
+                test_servers.put(selected.directory, test_server) catch @panic("out of memory");
                 run.addArg("--server");
                 run.addArtifactArg(test_server);
                 servers.dependOn(&test_server.step);
             } else if (selected.fixture != null) {
-                run.addArg("--server");
-                run.addArtifactArg(fixture_server);
-                servers.dependOn(&fixture_server.step);
+                std.debug.panic("E2E fixture {s} needs a main.zig in {s}", .{ selected.name, selected.directory });
             } else {
                 const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "-j2", b.fmt("-Doptimize={s}", .{@tagName(optimize)}), b.fmt("-Dio={s}", .{@tagName(backend)}) });
                 if (selected_releases.len != 0)
@@ -174,5 +226,31 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    suite.dependOn(previous orelse std.debug.panic("No E2E tests discovered", .{}));
+    if (scenario != null) {
+        suite.dependOn(previous orelse std.debug.panic("No E2E tests discovered", .{}));
+    } else {
+        const suite_matrix = b.addRunArtifact(matrix);
+        suite_matrix.setCwd(b.path("."));
+        suite_matrix.addArg(b.pathFromRoot(tests_root));
+        if (requested_version) |version| suite_matrix.addArg(version);
+        const suite_runner = b.addExecutable(.{ .name = "e2e-suite", .root_module = b.createModule(.{
+            .root_source_file = b.path("src/suite.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }) });
+        const run_suite = b.addRunArtifact(suite_runner);
+        run_suite.addFileArg(suite_matrix.captureStdOut(.{}));
+        run_suite.addArgs(&.{ b.graph.zig_exe, "-j2", b.fmt("-Doptimize={s}", .{@tagName(optimize)}), b.fmt("-Dio={s}", .{@tagName(backend)}), b.fmt("-Dtests={s}", .{tests_root}), b.fmt("-Daddress={s}", .{address}) });
+        run_suite.addArg(b.fmt("-Drealtime={s}", .{if (realtime) "true" else "false"}));
+        if (!target.query.isNative()) {
+            run_suite.addArg(b.fmt("-Dtarget={s}", .{target.query.zigTriple(b.allocator) catch @panic("out of memory")}));
+            run_suite.addArg(b.fmt("-Dcpu={s}", .{target.query.serializeCpuAlloc(b.allocator) catch @panic("out of memory")}));
+        }
+        if (server_releases) |releases| run_suite.addArg(b.fmt("-Dserver-releases={s}", .{releases}));
+        if (server) |path| run_suite.addArg(b.fmt("-Dserver={s}", .{path}));
+        if (artifacts) |path| run_suite.addArg(b.fmt("-Dartifacts={s}", .{path}));
+        run_suite.has_side_effects = true;
+        run_suite.setCwd(b.path("."));
+        suite.dependOn(&run_suite.step);
+    }
 }

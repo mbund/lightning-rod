@@ -65,7 +65,7 @@ pub const GamemodeCommands = struct {
         }
 
         for (players.records) |*player| {
-            if (!player.inPlay()) continue;
+            if (!player.inWorld()) continue;
             const matches = if (selector) switch (target[1]) {
                 's' => player == sender,
                 'a', 'p', 'r' => true,
@@ -132,7 +132,7 @@ pub const GamemodeCommands = struct {
             if (std.mem.startsWith(u8, selector, context.prefix)) output.add(.{ .text = selector }) catch return;
         }
         for (self.deps.players.records) |player| {
-            if (!player.inPlay()) continue;
+            if (!player.inWorld()) continue;
             const name = player.name[0..player.name_len];
             if (std.ascii.startsWithIgnoreCase(name, context.prefix)) output.add(.{ .text = name }) catch return;
         }

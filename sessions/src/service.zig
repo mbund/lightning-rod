@@ -2,11 +2,22 @@ const std = @import("std");
 const network = @import("networking");
 const engine = @import("engine.zig");
 const shared = @import("shared.zig");
+const metrics = @import("metrics");
 
 const assert = std.debug.assert;
-const Metrics = @import("metrics").Metrics;
 
-const ProducerTrace = Metrics(enum { output_wait });
+pub const Instrumentation = struct {
+    output_wait: metrics.Timer = .{},
+    reserve_failures: metrics.Counter = .{},
+
+    pub fn init(registry: ?*metrics.Registry, namespace: []const u8) !Instrumentation {
+        const owner = registry orelse return .{};
+        return .{
+            .output_wait = try owner.timer(.{ .namespace = namespace, .name = "output_wait", .description = "Wait for output capacity" }),
+            .reserve_failures = try owner.counter(.{ .namespace = namespace, .name = "reserve_failures", .description = "Output reservations denied" }),
+        };
+    }
+};
 
 pub const Configuration = struct {
     connections: usize = 32,
@@ -14,7 +25,7 @@ pub const Configuration = struct {
     pages: usize = 32,
     page_bytes: usize = 384 * 1024,
     protocols: []const engine.Protocol,
-    metrics_cpu: bool = false,
+    metrics: ?*metrics.Registry = null,
 };
 
 pub const Event = union(enum) {
@@ -25,6 +36,7 @@ pub const Event = union(enum) {
         name: [16]u8,
         name_len: u8,
         cause: enum { login, transfer, reload } = .login,
+        ready: bool = true,
     },
     input: struct {
         handle: network.Handle,
@@ -32,6 +44,7 @@ pub const Event = union(enum) {
         bytes: []const u8,
     },
     left: network.Handle,
+    ready: network.Handle,
 };
 
 pub const Service = struct {
@@ -42,6 +55,8 @@ pub const Service = struct {
         generation: u32 = 0,
         boundary: usize = 0,
     };
+
+    pub const Owner = struct { marker: u8 = 0 };
 
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -66,9 +81,8 @@ pub const Service = struct {
     routes: []?network.Handle,
     occupied: []std.atomic.Value(bool),
     moves: []Move,
-    owner: ?*anyopaque = null,
-    reserve_failures: u64 = 0,
-    producer_metrics: ProducerTrace,
+    owner: ?*const Owner = null,
+    instruments: Instrumentation,
 
     pub const active: u64 = 1 << 31;
 
@@ -76,6 +90,7 @@ pub const Service = struct {
         if (config.page_bytes == 0 or config.protocols.len == 0 or config.buffer_bytes < frameBound(config.protocols, config.page_bytes) or config.buffer_bytes >= active or config.connections == 0 or config.connections > std.math.maxInt(u16))
             return error.InvalidConfiguration;
 
+        const instrumentation = try Instrumentation.init(config.metrics, "session.producer");
         const self = try allocator.create(Service);
         errdefer allocator.destroy(self);
         var output = try shared.SharedPages.init(allocator, .{
@@ -134,7 +149,7 @@ pub const Service = struct {
             .routes = routes,
             .occupied = occupied,
             .moves = moves,
-            .producer_metrics = ProducerTrace.init(io, .{ .cpu = config.metrics_cpu }),
+            .instruments = instrumentation,
         };
         return self;
     }
@@ -150,7 +165,6 @@ pub const Service = struct {
         for (self.routes) |route| assert(route == null);
 
         for (self.releases) |*value| assert(value.load(.acquire) == 0);
-        self.producer_metrics.log("session_producer");
         self.output.deinit();
         self.allocator.free(self.moves);
         self.allocator.free(self.occupied);
@@ -285,7 +299,7 @@ pub const Service = struct {
         if (length == 0 or length > self.config.page_bytes) return error.InvalidPacketSize;
 
         const reservation = self.output.reserve(length) orelse {
-            self.reserve_failures += 1;
+            self.instruments.reserve_failures.add(1);
             return error.Backpressured;
         };
         assert(reservation.bytes.len == length);
@@ -442,7 +456,7 @@ pub const Service = struct {
 
         if (!pending) return false;
 
-        const timing = self.producer_metrics.begin(.output_wait);
+        const timing = self.instruments.output_wait.start();
         defer timing.end();
         self.flush();
         self.output_progress.waitTimeout(self.io, deadline) catch return false;

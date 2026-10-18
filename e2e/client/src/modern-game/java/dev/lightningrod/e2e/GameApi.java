@@ -8,6 +8,7 @@ final class GameApi {
     static void inventoryClick(Minecraft client, int slot, int button, ClickType type) {
         client.gameMode.handleContainerInput(0, slot, button, click(type), client.player);
     }
+    static Identifier fixtureChannel() { return Identifier.fromNamespaceAndPath("lightning_rod", "e2e"); }
     static Identifier id(String path) { return Identifier.withDefaultNamespace(path); }
     static String dimension(Minecraft client) { return client.level.dimension().identifier().toString(); }
     static net.minecraft.world.inventory.ContainerInput click(ClickType type) {

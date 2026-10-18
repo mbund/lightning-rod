@@ -1,3 +1,4 @@
+const metrics = @import("metrics");
 const std = @import("std");
 const network = @import("networking");
 const engine = @import("engine.zig");
@@ -5,12 +6,36 @@ const session_protocol = @import("protocol.zig");
 const session_protocol_input = @import("input.zig");
 const Service = @import("service.zig").Service;
 const Event = @import("service.zig").Event;
+pub const Route = @import("router.zig").Route;
 
 const assert = std.debug.assert;
 
-const Trace = @import("metrics").Metrics(enum { pump, compression, fanout, networking });
+pub const Instrumentation = struct {
+    pump: metrics.Timer = .{},
+    compression: metrics.Timer = .{},
+    fanout: metrics.Timer = .{},
+    networking: metrics.Timer = .{},
+    encoded_packets: metrics.Counter = .{},
+    encoded_bytes: metrics.Counter = .{},
+    framed_bytes: metrics.Counter = .{},
+    send_copy_bytes: metrics.Counter = .{},
+    empty_preparations: metrics.Counter = .{},
 
-pub const Route = @import("router.zig").Route;
+    pub fn init(registry: ?*metrics.Registry, namespace: []const u8) !Instrumentation {
+        const owner = registry orelse return .{};
+        return .{
+            .pump = try owner.timer(.{ .namespace = namespace, .name = "pump", .description = "Drive session pipeline" }),
+            .compression = try owner.timer(.{ .namespace = namespace, .name = "compression", .description = "Frame and compress packets" }),
+            .fanout = try owner.timer(.{ .namespace = namespace, .name = "fanout", .description = "Copy framed packets to recipients" }),
+            .networking = try owner.timer(.{ .namespace = namespace, .name = "networking", .description = "Drive network engine" }),
+            .encoded_packets = try owner.counter(.{ .namespace = namespace, .name = "encoded_packets", .description = "Packets framed" }),
+            .encoded_bytes = try owner.counter(.{ .namespace = namespace, .name = "encoded_bytes", .description = "Bytes before framing", .unit = .bytes }),
+            .framed_bytes = try owner.counter(.{ .namespace = namespace, .name = "framed_bytes", .description = "Bytes after framing", .unit = .bytes }),
+            .send_copy_bytes = try owner.counter(.{ .namespace = namespace, .name = "send_copy_bytes", .description = "Framed bytes copied", .unit = .bytes }),
+            .empty_preparations = try owner.counter(.{ .namespace = namespace, .name = "empty_preparations", .description = "Batches without packets" }),
+        };
+    }
+};
 
 /// One owner drives the Engine and all endpoints. Each endpoint has exactly one Simulation
 /// producer. Different endpoints may run concurrently.
@@ -22,9 +47,10 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             connections: usize = 40,
             max_players: usize = 32,
             buffer_bytes: usize = 512 * 1024,
+            configuration_bytes: usize = 4 * 1024 * 1024,
             protocols: *const Endpoint.Protocols,
             compression_threshold: ?usize = 256,
-            metrics_cpu: bool = false,
+            metrics: ?*metrics.Registry = null,
             hooks: *Hooks,
             router: *Router,
             wakeup: ?*std.Io.Event = null,
@@ -56,21 +82,16 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
         router: *Router,
         engine: *Engine,
         endpoints: []const *Service,
+        owner_token: Service.Owner = .{},
         bindings: []?Binding,
         selected_routes: []?SelectedRoute,
-        compressed: []u8,
-        workspaces: Endpoint.Workspaces,
+        compressed: []align(64) u8,
         next_endpoint: usize = 0,
         stopping: std.atomic.Value(bool) = .init(false),
         reload_state: std.atomic.Value(enum(u8) { running, requested, parked }) = .init(.running),
         quiescing: bool = false,
         reload_removed: [Endpoint.versions.len]bool = @splat(false),
-        metrics: Trace,
-        encoded_packets: u64 = 0,
-        encoded_bytes: u64 = 0,
-        framed_bytes: u64 = 0,
-        send_copy_bytes: u64 = 0,
-        empty_preparations: u64 = 0,
+        instruments: Instrumentation,
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, transport: network.Transport, config: Configuration, endpoints: []const *Service) !*Self {
             if (endpoints.len == 0 or config.connections == 0 or config.connections > std.math.maxInt(u16) or config.max_players == 0 or config.max_players > config.connections)
@@ -93,6 +114,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                 maximum = @max(maximum, endpoint.framedBound(endpoint.config.page_bytes));
             }
 
+            const instrumentation = try Instrumentation.init(config.metrics, "session.worker");
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
             const bindings = try allocator.alloc(?Binding, config.connections);
@@ -101,7 +123,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             const selected_routes = try allocator.alloc(?SelectedRoute, config.connections);
             errdefer allocator.free(selected_routes);
             @memset(selected_routes, null);
-            const compressed = try allocator.alloc(u8, maximum);
+            const compressed = try allocator.alignedAlloc(u8, .@"64", maximum);
             errdefer allocator.free(compressed);
             self.* = .{
                 .allocator = allocator,
@@ -114,21 +136,21 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                 .bindings = bindings,
                 .selected_routes = selected_routes,
                 .compressed = compressed,
-                .workspaces = Endpoint.initWorkspaces(),
-                .metrics = Trace.init(io, .{ .cpu = config.metrics_cpu }),
+                .instruments = instrumentation,
             };
             self.engine = try Engine.init(allocator, io, transport, .{
                 .connections = config.connections,
                 .max_players = config.max_players,
                 .buffer_bytes = config.buffer_bytes,
                 .max_packet = config.buffer_bytes - 3,
+                .configuration_bytes = config.configuration_bytes,
                 .protocols = config.protocols,
                 .compression_threshold = config.compression_threshold,
-                .metrics_cpu = config.metrics_cpu,
+                .metrics = config.metrics,
                 .observer = self,
             });
 
-            for (endpoints) |endpoint| endpoint.owner = self;
+            for (endpoints) |endpoint| endpoint.owner = &self.owner_token;
             return self;
         }
 
@@ -136,18 +158,6 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             assert(self.drained());
 
             for (self.bindings) |binding| assert(binding == null);
-            var reserve_failures: u64 = 0;
-            var wait_ns: u64 = 0;
-
-            for (self.endpoints) |endpoint| {
-                reserve_failures += endpoint.reserve_failures;
-                wait_ns += endpoint.producer_metrics.get(.output_wait).total_ns;
-            }
-
-            std.log.info("event=session_totals packets={d} raw_bytes={d} framed_bytes={d} compression_ns={d} reserve_failures={d}", .{ self.encoded_packets, self.encoded_bytes, self.framed_bytes, self.metrics.get(.compression).total_ns, reserve_failures });
-            std.log.info("event=session_pipeline output_wait_ns={d} copy_ns={d} copy_bytes={d} empty_preparations={d} poll_ns={d} sent_bytes={d}", .{ wait_ns, self.metrics.get(.fanout).total_ns, self.send_copy_bytes, self.empty_preparations, self.engine.metrics.get(.poll).total_ns, self.engine.sent_bytes });
-            self.metrics.log("sessions");
-            self.engine.metrics.log("session_engine");
             self.engine.deinit();
 
             for (self.endpoints) |endpoint| endpoint.owner = null;
@@ -190,7 +200,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             @memset(self.selected_routes, null);
             self.engine.restart();
             const native = self.engine.networking.inheritance.?;
-            native.pause(native.context, self.io, false);
+            native.pause(self.io, false);
             self.quiescing = false;
             self.reload_state.store(.running, .release);
         }
@@ -206,14 +216,15 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
         }
 
         pub fn pump(self: *Self, timeout: ?std.Io.Timeout) !void {
-            var pumping = self.metrics.begin(.pump);
+            var pumping = self.instruments.pump.start();
             defer pumping.end();
 
             if (self.stopping.load(.acquire)) self.engine.beginShutdown();
 
             if (self.reload_state.load(.acquire) == .requested and !self.quiescing) {
                 const native = self.engine.networking.inheritance.?;
-                native.pause(native.context, self.io, true);
+                self.engine.reloading = true;
+                native.pause(self.io, true);
                 self.quiescing = true;
                 for (self.engine.connections) |connection| {
                     const handle = connection.handle orelse continue;
@@ -336,14 +347,12 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                         if (recipients == 0) continue;
 
                         const bytes = blk: {
-                            var timing = pumping.begin(.compression);
+                            var timing = self.instruments.compression.start();
                             defer timing.end();
-                            timing.add(.bytes, packet.bytes.len);
-                            timing.add(.records, 1);
-                            break :blk try Endpoint.sharedFrame(selected.number, &self.workspaces, endpoint.output.framingStorage(packet), packet.bytes.len, if (compression_enabled) self.config.compression_threshold else null, self.compressed);
+                            break :blk try Endpoint.sharedFrame(selected.number, &self.engine.workspaces, endpoint.output.framingStorage(packet), packet.bytes.len, if (compression_enabled) self.config.compression_threshold else null, self.compressed);
                         };
                         assert(bytes.len <= charge);
-                        var fanout = pumping.begin(.fanout);
+                        var fanout = self.instruments.fanout.start();
                         defer fanout.end();
 
                         for (packet.recipients) |handle| {
@@ -360,20 +369,19 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                                 else => return err,
                             };
                             endpoint.refund(handle, charge - bytes.len);
-                            self.send_copy_bytes += bytes.len;
-                            fanout.add(.bytes, bytes.len);
+                            self.instruments.send_copy_bytes.add(bytes.len);
                         }
-                        self.encoded_packets += 1;
-                        self.encoded_bytes += packet.bytes.len;
-                        self.framed_bytes += bytes.len;
+                        self.instruments.encoded_packets.add(1);
+                        self.instruments.encoded_bytes.add(packet.bytes.len);
+                        self.instruments.framed_bytes.add(bytes.len);
                         batch_bytes += packet.bytes.len;
                     }
                 }
                 batch_packets += 1;
             }
 
-            self.empty_preparations += @intFromBool(batch_packets == 0);
-            const networking = pumping.begin(.networking);
+            self.instruments.empty_preparations.add(@intFromBool(batch_packets == 0));
+            const networking = self.instruments.networking.start();
             defer networking.end();
             _ = try self.engine.pump(if (batch_bytes >= 1024 * 1024 or batch_packets == 64) .{ .duration = .{ .clock = .awake, .raw = .zero } } else timeout);
 
@@ -386,7 +394,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                     const parked = try self.engine.park();
                     const native = self.engine.networking.inheritance.?;
 
-                    if (parked and native.ready(native.context)) self.reload_state.store(.parked, .release);
+                    if (parked and native.ready()) self.reload_state.store(.parked, .release);
                 }
             }
         }
@@ -394,6 +402,16 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
         pub fn attached(self: *Self, profile: engine.Profile) bool {
             if (self.bindings[profile.connection.index]) |*binding| {
                 assert(binding.configuring and std.meta.eql(binding.native, profile.connection));
+                if (binding.previous == null) {
+                    const endpoint = binding.endpoint;
+                    endpoint.credit[binding.handle.index].store((@as(u64, binding.handle.generation) << 32) | Service.active | endpoint.config.buffer_bytes, .release);
+                    if (!endpoint.push(.{ .ready = binding.handle })) {
+                        _ = endpoint.credit[binding.handle.index].fetchAnd(~Service.active, .acq_rel);
+                        return false;
+                    }
+                    binding.configuring = false;
+                    return true;
+                }
                 const previous = binding.previous.?;
                 if (previous.endpoint.departed[previous.handle.index].load(.acquire) < previous.handle.generation) return false;
 
@@ -418,6 +436,20 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                 return true;
             }
 
+            return self.bind(profile, .play);
+        }
+
+        pub fn restorePlayers(self: *Self) !void {
+            for (self.engine.connections) |*connection| {
+                const handle = connection.handle orelse continue;
+                assert(connection.resumed);
+                if (connection.closing) continue;
+                if (!self.bind(.{ .connection = handle, .protocol = connection.protocol.?.number, .uuid = connection.state.uuid, .name = connection.state.name[0..connection.state.name_len] }, .configuring)) return error.ResumeRouteUnavailable;
+                connection.attached = true;
+            }
+        }
+
+        fn bind(self: *Self, profile: engine.Profile, readiness: enum { configuring, play }) bool {
             assert(self.bindings[profile.connection.index] == null);
             const decision = self.select(profile);
             const selected = switch (decision) {
@@ -459,13 +491,14 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                     .uuid = profile.uuid,
                     .name = undefined,
                     .name_len = @intCast(profile.name.len),
+                    .ready = readiness == .play,
                 } };
 
                 if (self.engine.connections[profile.connection.index].resumed) event.joined.cause = .reload;
                 @memcpy(event.joined.name[0..profile.name.len], profile.name);
                 route.* = profile.connection;
-                self.bindings[profile.connection.index] = .{ .endpoint = endpoint, .handle = handle, .native = profile.connection };
-                endpoint.credit[index].store((generation << 32) | Service.active | endpoint.config.buffer_bytes, .release);
+                self.bindings[profile.connection.index] = .{ .endpoint = endpoint, .handle = handle, .native = profile.connection, .configuring = readiness == .configuring };
+                endpoint.credit[index].store((generation << 32) | (if (readiness == .play) Service.active | endpoint.config.buffer_bytes else @as(u64, 0)), .release);
                 if (endpoint.push(event)) {
                     std.log.info("event=session_routed endpoint={d} local={d}:{d} connection={d}:{d}", .{ selected, handle.index, handle.generation, profile.connection.index, profile.connection.generation });
                     return true;
@@ -572,7 +605,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             const binding = self.bindings[handle.index].?;
             assert(std.meta.eql(binding.native, handle));
             _ = binding.endpoint.credit[binding.handle.index].fetchAnd(~Service.active, .acq_rel);
-            if (!binding.configuring and !binding.endpoint.push(.{ .left = binding.handle })) return false;
+            if ((!binding.configuring or binding.previous == null) and !binding.endpoint.push(.{ .left = binding.handle })) return false;
             binding.endpoint.routes[binding.handle.index] = null;
             self.bindings[handle.index] = null;
             const held = binding.endpoint.occupied[binding.handle.index].swap(false, .release);

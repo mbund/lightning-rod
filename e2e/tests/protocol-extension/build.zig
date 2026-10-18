@@ -1,5 +1,6 @@
 const std = @import("std");
 const protocol_codegen = @import("protocol_codegen");
+const game_data_build = @import("game_data");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -28,6 +29,7 @@ pub fn build(b: *std.Build) void {
         types.put(b.allocator, "PartialComponentMatcher", node) catch @panic("out of memory");
         matcher.* = .{ .string = "PartialComponentMatcher" };
     }
+    const canonical_registry = generator.registry(.{ .data = canonical_data, .canonical = canonical_data, .canonical_snapshot = snapshot, .output = "canonical_registry.zig" });
     const canonical = b.createModule(.{
         .root_source_file = b.path("canonical.zig"),
         .target = target,
@@ -35,13 +37,14 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "base_data", .module = game_data.module("game_data") },
             .{ .name = "schema", .module = generator.schema(.{ .input = canonical_schema.write(), .version = canonical_data.path(b, "version.json"), .output = "canonical_schema.zig" }) },
-            .{ .name = "registry", .module = generator.registry(.{ .data = canonical_data, .canonical = canonical_data, .canonical_snapshot = snapshot, .output = "canonical_registry.zig" }) },
+            .{ .name = "registry", .module = canonical_registry },
         },
     });
     canonical.addAnonymousImport("registry_snapshot", .{ .root_source_file = snapshot });
+    canonical.addAnonymousImport("canonical_identity", .{ .root_source_file = game_data_build.identity(game_data.builder, canonical_registry, "1.21.9") });
     b.dependency("vanilla", .{ .target = target, .optimize = optimize }).module("lightning_rod_vanilla_1_21_6").addImport("game_data", canonical);
-    const names = .{ "lightning_rod", "profiles", "reload_execve", "network_stdio", "vanilla", "sessions", "minecraft_packets", "minecraft_java", "storage_local", "game_data", "reload" };
-    var imports: [names.len + 3]std.Build.Module.Import = undefined;
+    const names = .{ "lightning_rod", "profiles", "reload_execve", "network_stdio", "vanilla", "sessions", "minecraft_packets", "minecraft_java", "storage", "game_data", "reload" };
+    var imports: [names.len + 4]std.Build.Module.Import = undefined;
     inline for (names, 0..) |name, index| {
         const package = b.dependency(name, .{ .target = target, .optimize = optimize });
         imports[index] = .{ .name = name, .module = if (std.mem.eql(u8, name, "game_data")) canonical else package.module(if (std.mem.eql(u8, name, "vanilla")) "lightning_rod_vanilla_1_21_6" else name) };
@@ -67,6 +70,7 @@ pub fn build(b: *std.Build) void {
     imports[names.len + 2] = .{ .name = "protocols", .module = protocols };
     b.dependency("minecraft_packets", .{ .target = target, .optimize = optimize }).module("minecraft_packets").addImport("protocols", protocols);
     b.dependency("vanilla", .{ .target = target, .optimize = optimize }).module("lightning_rod_vanilla_1_21_6").addImport("protocols", protocols);
+    imports[names.len + 3] = .{ .name = "e2e_control", .module = b.dependency("e2e_control", .{ .target = target, .optimize = optimize }).module("e2e_control") };
     b.installArtifact(b.addExecutable(.{
         .name = "lightning_rod",
         .root_module = b.createModule(.{

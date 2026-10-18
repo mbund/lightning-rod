@@ -1,0 +1,13 @@
+{
+  "client": "JoinLeaveFixture",
+  "variants": [
+    {
+      "name": "join-leave",
+      "peers": [
+        "alice",
+        "bob"
+      ],
+      "mixed_versions": true
+    }
+  ]
+}

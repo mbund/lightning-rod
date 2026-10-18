@@ -59,7 +59,7 @@ pub const FallDamage = struct {
                 continue;
             }
 
-            if (player.stage != .ready) continue;
+            if (!player.inWorld()) continue;
 
             if (player.stage != .ready or player.health == player.health_sent) continue;
 
@@ -67,5 +67,4 @@ pub const FallDamage = struct {
                 player.health_sent = player.health;
         }
     }
-
 };

@@ -1,10 +1,9 @@
-const std = @import("std");
-const protocols = @import("protocols");
-const wire_1_21_5 = @import("wire_1_21_5");
 const metrics = @import("metrics");
+const std = @import("std");
+const wire_1_21_5 = @import("wire_1_21_5");
 const lightning_rod = @import("lightning_rod");
 const chunks = @import("chunks");
-const minecraft = @import("minecraft_model");
+const chunk_encoding = @import("chunk_encoding.zig");
 const game_data = @import("game_data");
 const sessions = @import("sessions");
 const packets = @import("minecraft_packets");
@@ -13,17 +12,15 @@ const players = @import("players.zig");
 
 const assert = std.debug.assert;
 
-const Trace = metrics.Metrics(enum { acquisition, encoding });
-
 pub const Streaming = struct {
     pub const id = "minecraft:chunk_streaming";
 
     pub const Configuration = struct {
         biome: i32 = game_data.registry.biomeId("minecraft:plains").?,
-        metrics: metrics.Options = .{},
     };
 
     pub const Dependencies = struct {
+        metrics: *metrics.Registry,
         players: *players.Players,
         chunks: *chunks.Chunks,
         work: *lightning_rod.Work,
@@ -59,6 +56,11 @@ pub const Streaming = struct {
         owner: usize,
     };
 
+    acquired_chunks: metrics.Counter,
+    encoded_bytes: metrics.Counter,
+    acquisition: metrics.Timer,
+    encoding_duration: metrics.Timer,
+    publication: metrics.Timer,
     deps: Dependencies,
     config: Configuration,
     streams: []Stream,
@@ -68,10 +70,9 @@ pub const Streaming = struct {
     sent: []u64,
     words_per_player: usize,
     next_player: usize = 0,
-    metrics: Trace,
-    encoded_chunks: u64 = 0,
+    encoding: *chunk_encoding.Workspace,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Configuration, deps: Dependencies) !*Streaming {
+    pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Streaming {
         if (deps.chunks.cache.entries.len < 24) return error.ChunkCacheTooSmall;
 
         const self = try allocator.create(Streaming);
@@ -85,6 +86,12 @@ pub const Streaming = struct {
         @memset(sent, 0);
         const planning = try allocator.alloc(usize, streams.len * 2);
         self.* = .{
+            .acquired_chunks = try deps.metrics.counter(.{ .name = "streaming.acquired_chunks", .description = "Chunks acquired for streaming" }),
+            .encoded_bytes = try deps.metrics.counter(.{ .name = "streaming.encoded_bytes", .description = "Encoded chunk packet bytes", .unit = .bytes }),
+            .acquisition = try deps.metrics.timer(.{ .name = "streaming.acquisition", .description = "Acquire chunk sections" }),
+            .encoding_duration = try deps.metrics.timer(.{ .name = "streaming.encoding", .description = "Encode chunk packets" }),
+            .publication = try deps.metrics.timer(.{ .name = "streaming.publication", .description = "Publish chunk packet batches" }),
+            .encoding = try chunk_encoding.Workspace.init(allocator, deps.chunks.cache.entries.len),
             .deps = deps,
             .config = config,
             .streams = streams,
@@ -93,14 +100,12 @@ pub const Streaming = struct {
             .planned = planning[streams.len..],
             .sent = sent,
             .words_per_player = words,
-            .metrics = Trace.init(io, config.metrics),
         };
-        try deps.work.register(.{ .context = self, .maximum_items = batch_max, .run = progress });
+        try deps.work.register(self, batch_max, progress);
         return self;
     }
 
-    fn progress(context: *anyopaque, _: std.Io, maximum_items: usize) !lightning_rod.Work.Result {
-        const self: *Streaming = @ptrCast(@alignCast(context));
+    fn progress(self: *Streaming, _: std.Io, maximum_items: usize) !lightning_rod.Work.Result {
         const service = self.deps.sessions;
         const radius = self.deps.players.config.render_distance;
         const side: usize = @intCast(2 * radius + 1);
@@ -263,8 +268,9 @@ pub const Streaming = struct {
         }
 
         {
-            const acquisition = self.metrics.begin(.acquisition);
+            const acquisition = self.acquisition.start();
             defer acquisition.end();
+            self.acquired_chunks.add(count);
             try self.deps.chunks.acquireMany(sections[0..offsets[count]], leases[0..offsets[count]]);
         }
         defer for (leases[0..offsets[count]]) |lease| lease.release();
@@ -283,40 +289,33 @@ pub const Streaming = struct {
             }
 
             assert(recipients != 0);
-            const bytes = blk: {
-                var encoding = self.metrics.begin(.encoding);
+            const dimension = self.deps.worlds.get(item.world).?.dimension;
+            const encoded = encode: {
+                const encoding = self.encoding_duration.start();
                 defer encoding.end();
-                const dimension = self.deps.worlds.get(item.world).?.dimension;
-                const bytes = try self.deps.packets.writePacket(writeChunk, item.protocol, item.packet.bytes, .{minecraft.Chunk{
+                break :encode try self.deps.packets.writePacket(chunk_encoding.write, item.protocol, item.packet.bytes, .{ chunk_encoding.Chunk{
                     .x = item.at.x,
                     .z = item.at.z,
                     .sections = leases[offsets[i]..offsets[i + 1]],
                     .biome = self.config.biome,
                     .minimum_section = dimension.minimumSection(),
                     .skylight = dimension.skylight,
-                }});
-                encoding.add(.bytes, bytes.len);
-                encoding.add(.records, 1);
-                break :blk bytes;
+                    .workspace = self.encoding,
+                }, try self.deps.packets.definition(item.protocol) });
             };
-            self.encoded_chunks += 1;
-            self.streams[item.owner].packet_bytes = bytes.len;
-            const accepted = item.packet.publishReady(bytes.len, self.recipients[0..recipients]);
+            const publication = self.publication.start();
+            defer publication.end();
+            self.encoded_bytes.add(encoded.len);
+            self.streams[item.owner].packet_bytes = encoded.len;
+            const accepted = item.packet.publishReady(encoded.len, self.recipients[0..recipients]);
             assert(item.packet.reservation == null);
             released += 1;
 
             for (accepted) |handle| {
                 self.markSent(handle.index, item.at, true);
                 const stream = &self.streams[handle.index];
-                stream.packet_bytes = bytes.len;
+                stream.packet_bytes = encoded.len;
                 stream.delivered += 1;
-
-                if (stream.delivered == side * side)
-                    std.log.info("event=chunk_stream_complete player={d} chunks={d} encoded={d} read_ns={d} encode_ns={d}", .{ handle.index, side * side, self.encoded_chunks, self.metrics.get(.acquisition).total_ns, self.metrics.get(.encoding).total_ns });
-
-                if (stream.delivered == side * side) self.metrics.log("chunk_streaming");
-
-                if (stream.delivered == side * side) self.deps.chunks.cache.metrics.log("chunk_cache");
             }
 
             progressed = progressed or accepted.len != 0;
@@ -378,14 +377,6 @@ pub const Streaming = struct {
 
     fn writeViewCenter(packet: wire_1_21_5.play.toClient.packet_update_view_position.Writer, at: Position) ![]u8 {
         return (try (try packet.chunkX(at.x)).chunkZ(at.z)).finish();
-    }
-
-    fn writeChunk(packet: wire_1_21_5.play.toClient.packet_map_chunk.Writer, chunk: minecraft.Chunk) ![]u8 {
-        inline for (protocols.implementations) |Version| {
-            if (packet.protocolNumber() == Version.protocol_number)
-                return Version.writeChunk(.{ ._cursor = packet._cursor }, chunk);
-        }
-        return error.UnsupportedProtocol;
     }
 };
 

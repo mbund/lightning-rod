@@ -1,3 +1,4 @@
+const metrics = @import("metrics");
 const std = @import("std");
 const storage = @import("storage");
 const records = @import("records");
@@ -12,7 +13,7 @@ pub const Economy = struct {
         initial_balance: u128 = 0,
     };
 
-    pub const Dependencies = struct { storage: storage.Namespace };
+    pub const Dependencies = struct { metrics: *metrics.Registry, storage: storage.Space };
 
     config: Configuration,
     deps: Dependencies,
@@ -40,7 +41,7 @@ pub const Economy = struct {
         self.* = .{
             .config = config,
             .deps = deps,
-            .cache = try records.Cache.init(allocator, io, deps.storage, .{ .slots = config.cache_accounts, .key_bytes = 16, .value_bytes = 34 }),
+            .cache = try records.Cache.init(allocator, io, records.Table.init(deps.storage), .{ .metrics = deps.metrics, .metrics_namespace = "economy.cache", .slots = config.cache_accounts, .key_bytes = 16, .value_bytes = 34 }),
         };
         return self;
     }
@@ -92,7 +93,7 @@ pub const Economy = struct {
         return true;
     }
 
-    pub fn checkpoint(self: *Economy, _: storage.Namespace) !void {
+    pub fn checkpoint(self: *Economy, _: storage.Space) !void {
         try self.cache.flush();
     }
 };

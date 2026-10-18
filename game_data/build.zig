@@ -42,9 +42,29 @@ pub fn build(b: *std.Build) void {
             .{ .name = "support", .module = support },
         },
     });
+    const version = b.addOptions();
+    version.addOption([]const u8, "value", minecraft_version);
+    module.addOptions("canonical_version", version);
+    module.addAnonymousImport("canonical_identity", .{ .root_source_file = identity(b, registry, minecraft_version) });
     module.addAnonymousImport("registry_snapshot", .{ .root_source_file = snapshot });
     b.step("check", "Check the generated gameplay data module").dependOn(&b.addLibrary(.{
         .name = "game_data",
         .root_module = module,
     }).step);
+}
+
+pub fn identity(b: *std.Build, registry: *std.Build.Module, version_name: []const u8) std.Build.LazyPath {
+    const version = b.addOptions();
+    version.addOption([]const u8, "value", version_name);
+    const executable = b.addExecutable(.{
+        .name = "registry-identity",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/identity.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "registry", .module = b.createModule(.{ .root_source_file = registry.root_source_file }) }},
+        }),
+    });
+    executable.root_module.addOptions("canonical_version", version);
+    return b.addRunArtifact(executable).addOutputFileArg("identity.bin");
 }

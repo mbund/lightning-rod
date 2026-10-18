@@ -44,13 +44,44 @@ pub const JavaVersion = struct {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "minecraft_java", .module = java.module("minecraft_java") },
-                .{ .name = "game_data", .module = gameplay.module("game_data") },
                 .{ .name = "wire", .module = schema },
                 .{ .name = "registry", .module = registry },
             },
         });
         b.modules.put(b.allocator, "wire", schema) catch @panic("out of memory");
         module.addAnonymousImport("registry_snapshot", .{ .root_source_file = snapshot });
+        const host_support = b.dependency("encoding", .{ .target = b.graph.host, .optimize = .Debug }).module("encoding");
+        const host_sessions = java.builder.dependency("sessions", .{ .target = b.graph.host, .optimize = .Debug }).module("sessions");
+        const host_wire = b.createModule(.{
+            .root_source_file = schema.root_source_file,
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "protocol_support", .module = host_support }},
+        });
+        const prepare = b.addExecutable(.{
+            .name = "prepare-registries",
+            .root_module = b.createModule(.{
+                .root_source_file = java.path("src/prepare_registries.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+                .imports = &.{
+                    .{ .name = "wire", .module = host_wire },
+                    .{ .name = "support", .module = host_support },
+                    .{ .name = "sessions", .module = host_sessions },
+                },
+            }),
+        });
+        const command = b.addRunArtifact(prepare);
+        command.addFileArg(snapshot);
+        command.addArg(self.minecraft_version);
+        const prepared = b.createModule(.{
+            .root_source_file = command.addOutputFileArg("registry_packets.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "minecraft_java", .module = java.module("minecraft_java") }},
+        });
+        prepared.addAnonymousImport("registry_packet_bytes", .{ .root_source_file = command.addOutputFileArg("registry_packets.bin") });
+        module.addImport("registry_packets", prepared);
         b.getInstallStep().dependOn(&b.addLibrary(.{ .name = "protocol", .root_module = module }).step);
         return module;
     }

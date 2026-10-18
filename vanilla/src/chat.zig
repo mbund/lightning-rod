@@ -104,6 +104,28 @@ pub const Chat = struct {
         return (try (try packet.content(content)).isActionBar(false)).finish();
     }
 
+    /// Queues one shared message. Returns false when the bounded queue is full.
+    pub fn broadcast(self: *Chat, text: []const u8) bool {
+        std.debug.assert(text.len <= 1096);
+        if (self.write - self.read == self.messages.len) return false;
+
+        const message = &self.messages[self.write % self.messages.len];
+        message.bytes[0] = 8;
+        std.mem.writeInt(u16, message.bytes[1..3], @intCast(text.len), .big);
+        @memcpy(message.bytes[3..][0..text.len], text);
+        message.length = text.len + 3;
+        message.count = 0;
+
+        for (self.deps.players.records) |player| {
+            if (!player.inPlay()) continue;
+            message.recipients[message.count] = .{ .handle = player.handle.?, .protocol = player.protocol };
+            message.count += 1;
+        }
+
+        self.write += 1;
+        return true;
+    }
+
     pub fn system(self: *Chat, handle: sessions.Handle, text: []const u8) void {
         std.debug.assert(text.len <= 1096);
         const player = self.deps.players.records[handle.index];

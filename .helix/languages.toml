@@ -1,0 +1,16 @@
+[[language]]
+name = "java"
+# Fixtures are outside e2e/client, so use the repository as the workspace.
+roots = ["flake.nix"]
+language-servers = ["jdtls"]
+
+[language-server.jdtls]
+command = "jdtls"
+timeout = 180
+
+[language-server.jdtls.config.java]
+autobuild.enabled = true
+configuration.updateBuildConfiguration = "automatic"
+import.gradle.enabled = true
+import.gradle.wrapper.enabled = true
+import.exclusions = ["**/.git/**", "**/.gradle/**", "**/build/**", "**/.zig-cache/**", "**/zig-out/**", "**/zig-pkg/**"]

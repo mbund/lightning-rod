@@ -3,46 +3,26 @@ const builtin = @import("builtin");
 const allMarkers = @import("src/artifacts.zig").allMarkers;
 const process_cleanup = @import("src/process_cleanup.zig");
 const catalog = @import("src/catalog.zig");
+const selection = @import("src/selection.zig");
+const protocol_catalog = @import("protocol_catalog");
+const scheduling = @import("src/scheduling.zig");
+const performance = @import("src/performance.zig");
 const ReloadTest = @import("tests/reload/test.zig").Test;
+const ManagedChild = @import("src/child.zig").ManagedChild;
 
 const max_processes = catalog.maximum_peers + 2;
 const scenario_timeout_s = 180;
 
 const Arguments = struct {
+    realtime: bool = false,
     server: []const u8,
     client: []const u8,
-    artifacts: []const u8,
+    artifacts: ?[]const u8,
     scenario: catalog.Case,
     address: []const u8,
-    strace: bool,
     client_version: []const u8,
+    peer_versions: []const []const u8,
     gradle: [5][]const u8,
-};
-
-const ManagedChild = struct {
-    child: std.process.Child,
-    group: std.posix.pid_t,
-
-    fn stop(self: *ManagedChild, io: std.Io) void {
-        std.posix.kill(-self.group, .TERM) catch {};
-        const deadline = std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds + std.time.ns_per_s;
-
-        while (std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds < deadline) {
-            var info: std.os.linux.siginfo_t = undefined;
-            @memset(std.mem.asBytes(&info), 0);
-
-            switch (std.os.linux.errno(std.os.linux.waitid(.PID, self.group, &info, std.os.linux.W.EXITED | std.os.linux.W.NOHANG | std.os.linux.W.NOWAIT, null))) {
-                .SUCCESS => if (info.code != 0) break,
-                .INTR => continue,
-                else => break,
-            }
-
-            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch break;
-        }
-
-        std.posix.kill(-self.group, .KILL) catch {};
-        self.child.kill(io);
-    }
 };
 
 var process_groups: [max_processes]std.atomic.Value(std.posix.pid_t) = @splat(.init(0));
@@ -50,10 +30,17 @@ var interrupted = std.atomic.Value(bool).init(false);
 
 pub fn main(init: std.process.Init) !void {
     if (builtin.os.tag != .linux) return error.E2eRequiresLinux;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "--server-exec")) {
+        try scheduling.enable();
+        var watchdog: std.os.linux.rlimit = undefined;
+        if (std.os.linux.errno(std.os.linux.getrlimit(.RTTIME, &watchdog)) != .SUCCESS) return error.SchedulerConfigurationFailed;
+        std.log.info("event=e2e_server_scheduler policy=fifo priority={d} rttime_soft_us={d} rttime_hard_us={d}", .{ scheduling.priority, watchdog.cur, watchdog.max });
+        return std.process.replace(init.io, .{ .argv = args[2..], .environ_map = init.environ_map });
+    }
     try process_cleanup.enable();
     defer _ = process_cleanup.finish(init.io) catch {};
     installSignalHandlers();
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
     var tests_root: []const u8 = "tests";
     for (args, 0..) |arg, index| {
         if (!std.mem.eql(u8, arg, "--tests")) continue;
@@ -75,6 +62,11 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const arguments = try parse(init, args, cases);
+    if (arguments.realtime) scheduling.preflight() catch |err| {
+        if (err == error.RealtimePermissionRequired)
+            std.log.err("FIFO scheduling requires CAP_SYS_NICE or RLIMIT_RTPRIO >= 1. In your shell, run: sudo prlimit --pid $$ --rtprio=1:1 . Use -Drealtime=false for normal scheduling.", .{});
+        return err;
+    };
     try ensureExecutable(init.io, arguments.server);
     try run(init, arguments, cases);
 }
@@ -90,14 +82,25 @@ fn run(init: std.process.Init, arguments: Arguments, cases: []const catalog.Case
     const client = try cwd.realPathFileAlloc(init.io, arguments.client, init.gpa);
     defer init.gpa.free(client);
     try init.environ_map.put("LIGHTNING_ROD_E2E_CLIENT_SOURCE", client);
-    try cwd.createDirPath(init.io, arguments.artifacts);
-    const root = try cwd.realPathFileAlloc(init.io, arguments.artifacts, init.gpa);
+    const artifact_root = arguments.artifacts orelse try std.fs.path.join(init.arena.allocator(), &.{ arguments.scenario.directory, "artifacts" });
+    try cwd.createDirPath(init.io, artifact_root);
+    const root = try cwd.realPathFileAlloc(init.io, artifact_root, init.gpa);
     defer init.gpa.free(root);
-    const artifacts = try std.fmt.allocPrint(init.gpa, "{s}/{s}-{s}-{d}", .{ root, arguments.scenario.name, arguments.client_version, std.Io.Clock.Timestamp.now(init.io, .real).raw.nanoseconds });
+    const artifacts = try std.fmt.allocPrint(init.gpa, "{s}/{s}-{s}", .{ root, arguments.scenario.name, arguments.client_version });
     defer init.gpa.free(artifacts);
+    const lock_path = try std.fmt.allocPrint(init.gpa, "{s}.lock", .{artifacts});
+    defer init.gpa.free(lock_path);
+    const lock = cwd.createFile(init.io, lock_path, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true }) catch |err| {
+        if (err == error.WouldBlock) return error.ScenarioAlreadyRunning;
+        return err;
+    };
+    defer lock.close(init.io);
+    // A run must start without result files, coordination markers, or world data
+    // from the previous run of this scenario.
+    try cwd.deleteTree(init.io, artifacts);
     try cwd.createDir(init.io, artifacts, .default_dir);
     std.log.info("event=e2e_started scenario={s} artifacts={s}", .{ arguments.scenario.name, artifacts });
-    const client_versions = if (arguments.scenario.peer_versions.len == 0) &.{arguments.client_version} else arguments.scenario.peer_versions;
+    const client_versions = arguments.peer_versions;
     for (client_versions, 0..) |version, index| {
         var duplicate = false;
         for (client_versions[0..index]) |previous| duplicate = duplicate or std.mem.eql(u8, previous, version);
@@ -119,55 +122,49 @@ fn run(init: std.process.Init, arguments: Arguments, cases: []const catalog.Case
     const world = try std.fs.path.join(init.gpa, &.{ artifacts, "server" });
     defer init.gpa.free(world);
     try cwd.createDir(init.io, world, .default_dir);
-    var preparation_failure: ?anyerror = null;
     const preparation_scenario = arguments.scenario.prepare;
+    var preparation_performance_failed = false;
     if (preparation_scenario) |scenario| {
         const preparation = try std.fs.path.join(init.gpa, &.{ artifacts, "prepare" });
         defer init.gpa.free(preparation);
         try cwd.createDir(init.io, preparation, .default_dir);
-        runScenario(init, catalog.find(cases, scenario).?, server, client, preparation, world, arguments.address, arguments.strace, arguments.gradle) catch |err| {
+        runScenario(init, catalog.find(cases, scenario).?, server, client, preparation, world, arguments.address, arguments.gradle, &.{}, arguments.realtime) catch |err| {
             try writeSummary(init, preparation, scenario, false, @errorName(err));
-            if (err != error.TickBudgetExceeded) {
+            if (err == error.PerformanceBudgetExceeded) preparation_performance_failed = true else {
                 try writeSummary(init, artifacts, arguments.scenario.name, false, @errorName(err));
                 return err;
             }
-
-            preparation_failure = err;
         };
     }
 
-    runScenario(init, arguments.scenario, server, client, artifacts, world, arguments.address, arguments.strace, arguments.gradle) catch |err| {
+    runScenario(init, arguments.scenario, server, client, artifacts, world, arguments.address, arguments.gradle, arguments.peer_versions, arguments.realtime) catch |err| {
         writeSummary(init, artifacts, arguments.scenario.name, false, @errorName(err)) catch {};
         std.log.err("event=e2e_failed reason={s} artifacts={s}", .{ @errorName(err), artifacts });
         return err;
     };
-    if (preparation_failure) |err| {
-        try writeSummary(init, artifacts, arguments.scenario.name, false, "preparation_tick_budget_exceeded");
-        return err;
+    if (preparation_performance_failed) {
+        try writeSummary(init, artifacts, arguments.scenario.name, false, "PreparationPerformanceBudgetExceeded");
+        return error.PreparationPerformanceBudgetExceeded;
     }
-
     std.log.info("event=e2e_passed artifacts={s}", .{artifacts});
 }
 
-fn runScenario(init: std.process.Init, test_case: catalog.Case, server_path: []const u8, client_dir: []const u8, artifacts: []const u8, world: []const u8, address: []const u8, strace: bool, gradle: [5][]const u8) !void {
+fn runScenario(init: std.process.Init, test_case: catalog.Case, server_path: []const u8, client_dir: []const u8, artifacts: []const u8, world: []const u8, address: []const u8, gradle: [5][]const u8, peer_versions: []const []const u8, realtime: bool) !void {
+    std.debug.assert(peer_versions.len == 0 or peer_versions.len == test_case.peers.len);
     const scenario = test_case.name;
     const test_directory = try std.Io.Dir.cwd().realPathFileAlloc(init.io, test_case.directory, init.gpa);
     defer init.gpa.free(test_directory);
     try init.environ_map.put("LIGHTNING_ROD_E2E_TEST_DIRECTORY", test_directory);
     try init.environ_map.put("LIGHTNING_ROD_E2E_ADDRESS", address);
+    try init.environ_map.put("LIGHTNING_ROD_METRICS_DIRECTORY", artifacts);
     const port = try std.fmt.allocPrint(init.gpa, "--port={s}", .{address[(std.mem.lastIndexOfScalar(u8, address, ':') orelse return error.InvalidAddress) + 1 ..]});
     defer init.gpa.free(port);
     try init.environ_map.put("LIGHTNING_ROD_PORT", port[7..]);
     const fixture = test_case.fixture;
     const fixture_arg = if (fixture) |name| try std.fmt.allocPrint(init.gpa, "--fixture={s}", .{name}) else null;
     defer if (fixture_arg) |arg| init.gpa.free(arg);
-    var argv: [8][]const u8 = undefined;
+    var argv: [3][]const u8 = undefined;
     var argc: usize = 0;
-
-    if (strace) for ([_][]const u8{ "strace", "-f", "-c", "-o", "syscalls.txt" }) |arg| {
-        argv[argc] = arg;
-        argc += 1;
-    };
 
     argv[argc] = server_path;
     argc += 1;
@@ -178,19 +175,30 @@ fn runScenario(init: std.process.Init, test_case: catalog.Case, server_path: []c
         argc += 2;
     }
 
-    var server = try spawn(init, argv[0..argc], artifacts, world, "server.log");
+    var evidence_checked = false;
+    defer if (!evidence_checked) {
+        _ = performance.summarize(init, artifacts, if (test_case.crash_after) .intentional_crash else .complete) catch false;
+    };
+    var server_stopped = false;
+    var launch: [5][]const u8 = undefined;
+    if (realtime) {
+        launch[0] = try std.process.executablePathAlloc(init.io, init.arena.allocator());
+        launch[1] = "--server-exec";
+        @memcpy(launch[2..][0..argc], argv[0..argc]);
+    }
+    var server = try spawn(init, if (realtime) launch[0 .. argc + 2] else argv[0..argc], artifacts, world, "server.log");
     process_groups[0].store(server.group, .release);
     defer {
-        server.stop(init.io);
+        if (!server_stopped) server.stop(init.io);
         process_groups[0].store(0, .release);
     }
-    var xvfb = try spawn(init, &.{ "Xvfb", ":97", "-screen", "0", "1280x720x24", "-nolisten", "tcp" }, artifacts, artifacts, "display.log");
+    var xvfb = try spawnDisplay(init, artifacts);
     process_groups[1].store(xvfb.group, .release);
     defer {
         xvfb.stop(init.io);
         process_groups[1].store(0, .release);
     }
-    try std.Io.sleep(init.io, .fromMilliseconds(1_500), .awake);
+    const display = try waitForDisplay(init, artifacts);
     const peers = test_case.peers;
     var clients: [catalog.maximum_peers]ManagedChild = undefined;
     var count: usize = 0;
@@ -201,8 +209,8 @@ fn runScenario(init: std.process.Init, test_case: catalog.Case, server_path: []c
 
     for (peers) |peer| {
         const connect_tick: usize = if (count + 1 == peers.len) test_case.last_peer_connect_tick else 40;
-        const peer_gradle = if (test_case.peer_versions.len == 0) gradle else try clientArguments(init, client_dir, test_case.peer_versions[count]);
-        clients[count] = try spawnClient(init, client_dir, artifacts, scenario, peer, peers, connect_tick, address, peer_gradle);
+        const peer_gradle = if (peer_versions.len == 0) gradle else try clientArguments(init, client_dir, peer_versions[count]);
+        clients[count] = try spawnClient(init, client_dir, artifacts, scenario, peer, peers, connect_tick, address, peer_gradle, display);
         process_groups[count + 2].store(clients[count].group, .release);
         count += 1;
         const startup_deadline = std.Io.Clock.Timestamp.now(init.io, .awake).raw.nanoseconds + 120 * std.time.ns_per_s;
@@ -215,38 +223,31 @@ fn runScenario(init: std.process.Init, test_case: catalog.Case, server_path: []c
 
     const start_path = try std.fs.path.join(init.gpa, &.{ artifacts, "clients.start" });
     defer init.gpa.free(start_path);
-    const start = try std.Io.Dir.cwd().createFile(init.io, start_path, .{});
-    start.close(init.io);
+    const pending_path = try std.fmt.allocPrint(init.gpa, "{s}.pending", .{start_path});
+    defer init.gpa.free(pending_path);
+    var start_bytes: [64]u8 = undefined;
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = pending_path,
+        .data = try std.fmt.bufPrint(&start_bytes, "{d}\n", .{std.Io.Clock.now(.awake, init.io).nanoseconds}),
+    });
+    try std.Io.Dir.cwd().rename(pending_path, .cwd(), start_path, init.io);
 
     try waitForResults(init, artifacts, peers, if (test_case.reload) .{ .world = world, .executable = server_path, .protocol_mismatch = test_case.protocol_mismatch } else null);
-    if (!try resultsPassed(init, artifacts, peers)) return error.EndToEndAssertionFailed;
-    {
-        const path = try std.fmt.allocPrint(init.gpa, "{s}/server.log", .{artifacts});
-        defer init.gpa.free(path);
-        const log = try std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .limited(16 * 1024 * 1024));
-        defer init.gpa.free(log);
-        if (!strace and std.mem.indexOf(u8, log, "event=slow_tick ") != null) return error.TickBudgetExceeded;
-
-        if (test_case.reload) try ReloadTest.verify(log, peers.len);
-
-        for (test_case.required_logs) |rule| {
-            const expected = rule.count * (if (rule.per_peer) peers.len else @as(usize, 1));
-            const actual = std.mem.count(u8, log, rule.text);
-            if (if (rule.at_least) actual < expected else actual != expected) {
-                std.log.err("event=e2e_log_count_mismatch text={s} expected={d}", .{ rule.text, expected });
-                return error.LogCountMismatch;
-            }
-        }
-
-        for (test_case.forbidden_logs) |text| {
-            if (std.mem.indexOf(u8, log, text) != null) {
-                std.log.err("event=e2e_forbidden_log text={s}", .{text});
-                return error.ForbiddenLog;
-            }
-        }
-    }
+    const clients_passed = try resultsPassed(init, artifacts, peers);
+    if (test_case.crash_after) try performance.seal(init, artifacts);
+    // Simulation flush and session draining each have their own shutdown deadline.
+    // Allow both phases across multiple simulations, then assert the actual exit status.
+    server.shutdown(init.io, test_case.crash_after, .fromSeconds(30)) catch |err| {
+        std.log.err("event=e2e_server_shutdown_failed reason={s} termination={any}", .{ @errorName(err), server.termination });
+        return err;
+    };
+    server_stopped = true;
+    process_groups[0].store(0, .release);
+    const server_passed = try performance.summarize(init, artifacts, if (test_case.crash_after) .intentional_crash else .complete);
+    evidence_checked = true;
+    if (!clients_passed) return error.EndToEndAssertionFailed;
+    if (!server_passed) return error.PerformanceBudgetExceeded;
     try writeSummary(init, artifacts, scenario, true, "passed");
-    if (test_case.crash_after) try std.posix.kill(-server.group, .KILL);
 }
 
 fn spawn(init: std.process.Init, argv: []const []const u8, artifacts: []const u8, working_directory: []const u8, name: []const u8) !ManagedChild {
@@ -266,7 +267,41 @@ fn spawn(init: std.process.Init, argv: []const []const u8, artifacts: []const u8
     return .{ .child = child, .group = child.id orelse return error.ProcessIdUnavailable };
 }
 
-fn spawnClient(init: std.process.Init, client_dir: []const u8, artifacts: []const u8, scenario: []const u8, peer: []const u8, peers: []const []const u8, connect_tick: usize, address: []const u8, gradle: [5][]const u8) !ManagedChild {
+fn spawnDisplay(init: std.process.Init, artifacts: []const u8) !ManagedChild {
+    const number_path = try std.fs.path.join(init.arena.allocator(), &.{ artifacts, "display.number" });
+    const log_path = try std.fs.path.join(init.arena.allocator(), &.{ artifacts, "display.log" });
+    const number = try std.Io.Dir.cwd().createFile(init.io, number_path, .{});
+    defer number.close(init.io);
+    const log = try std.Io.Dir.cwd().createFile(init.io, log_path, .{});
+    defer log.close(init.io);
+    const child = try std.process.spawn(init.io, .{
+        .argv = &.{ "Xvfb", "-displayfd", "1", "-screen", "0", "1280x720x24", "-nolisten", "tcp" },
+        .environ_map = init.environ_map,
+        .stdin = .ignore,
+        .stdout = .{ .file = number },
+        .stderr = .{ .file = log },
+        .pgid = 0,
+    });
+    return .{ .child = child, .group = child.id orelse return error.ProcessIdUnavailable };
+}
+
+fn waitForDisplay(init: std.process.Init, artifacts: []const u8) ![]const u8 {
+    const path = try std.fs.path.join(init.arena.allocator(), &.{ artifacts, "display.number" });
+    const until = std.Io.Clock.now(.awake, init.io).nanoseconds + 10 * std.time.ns_per_s;
+    while (std.Io.Clock.now(.awake, init.io).nanoseconds < until) {
+        if (interrupted.load(.acquire)) return error.Interrupted;
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .limited(32));
+        defer init.gpa.free(bytes);
+        if (std.mem.indexOfScalar(u8, bytes, '\n')) |end| {
+            const number = try std.fmt.parseInt(u16, bytes[0..end], 10);
+            return std.fmt.allocPrint(init.arena.allocator(), ":{d}", .{number});
+        }
+        try std.Io.sleep(init.io, .fromMilliseconds(10), .awake);
+    }
+    return error.DisplayStartupTimeout;
+}
+
+fn spawnClient(init: std.process.Init, client_dir: []const u8, artifacts: []const u8, scenario: []const u8, peer: []const u8, peers: []const []const u8, connect_tick: usize, address: []const u8, gradle: [5][]const u8, display: []const u8) !ManagedChild {
     const allocator = init.gpa;
     const version = try std.fmt.allocPrint(allocator, "-Dmcc.version={s}", .{gradle[0]["-Pminecraft_version=".len..]});
     defer allocator.free(version);
@@ -286,11 +321,11 @@ fn spawnClient(init: std.process.Init, client_dir: []const u8, artifacts: []cons
     defer allocator.free(scenario_arg);
     const connect_arg = try std.fmt.allocPrint(allocator, "-Dmcc.connectTick={d}", .{connect_tick});
     defer allocator.free(connect_arg);
-    const run_dir = try std.fmt.allocPrint(allocator, "-Dmcc.runDir=.e2e/{s}-{s}", .{ scenario, peer });
+    const run_dir = try std.fmt.allocPrint(allocator, "-Dmcc.runDir={s}/run/{s}", .{ artifacts, peer });
     defer allocator.free(run_dir);
     var environment = try init.environ_map.clone(allocator);
     defer environment.deinit();
-    try environment.put("DISPLAY", ":97");
+    try environment.put("DISPLAY", display);
     try environment.put("LP_NUM_THREADS", "2");
     const wrapper = try std.fs.path.join(allocator, &.{ client_dir, "gradlew" });
     defer allocator.free(wrapper);
@@ -316,6 +351,10 @@ fn waitForResults(init: std.process.Init, artifacts: []const u8, peers: []const 
     while (std.Io.Clock.Timestamp.now(init.io, .awake).raw.nanoseconds < deadline) {
         if (interrupted.load(.acquire)) return error.Interrupted;
         if (try allMarkers(init, artifacts, peers, ".result")) return;
+        for (peers) |peer| {
+            if (try allMarkers(init, artifacts, &.{peer}, ".result") and
+                !try resultsPassed(init, artifacts, &.{peer})) return error.EndToEndAssertionFailed;
+        }
 
         if (reload_test) |*test_case| try test_case.poll(init, artifacts, peers, deadline, &interrupted);
 
@@ -365,11 +404,11 @@ fn writeSummary(init: std.process.Init, artifacts: []const u8, scenario: []const
 }
 
 fn parse(init: std.process.Init, values: []const [:0]const u8, cases: []const catalog.Case) !Arguments {
-    var strace = false;
+    var realtime = false;
     var address: []const u8 = "127.0.0.1:25565";
     var server: ?[]const u8 = null;
     var client: []const u8 = "client";
-    var artifacts: []const u8 = "artifacts";
+    var artifacts: ?[]const u8 = null;
     var scenario: ?catalog.Case = null;
     var version: ?[]const u8 = null;
     var index: usize = 1;
@@ -381,19 +420,24 @@ fn parse(init: std.process.Init, values: []const [:0]const u8, cases: []const ca
         const value = values[index + 1];
         if (std.mem.eql(u8, key, "--tests")) continue;
 
-        if (std.mem.eql(u8, key, "--client-version")) version = value else if (std.mem.eql(u8, key, "--server")) server = value else if (std.mem.eql(u8, key, "--strace")) strace = std.mem.eql(u8, value, "true") else if (std.mem.eql(u8, key, "--address")) address = value else if (std.mem.eql(u8, key, "--client")) client = value else if (std.mem.eql(u8, key, "--artifacts")) artifacts = value else if (std.mem.eql(u8, key, "--scenario")) scenario = catalog.find(cases, value) orelse return error.UnknownScenario else return error.UnknownArgument;
+        if (std.mem.eql(u8, key, "--realtime")) {
+            if (std.mem.eql(u8, value, "true")) realtime = true else if (std.mem.eql(u8, value, "false")) realtime = false else return error.InvalidRealtimeMode;
+        } else if (std.mem.eql(u8, key, "--client-version")) version = value else if (std.mem.eql(u8, key, "--server")) server = value else if (std.mem.eql(u8, key, "--address")) address = value else if (std.mem.eql(u8, key, "--client")) client = value else if (std.mem.eql(u8, key, "--artifacts")) artifacts = value else if (std.mem.eql(u8, key, "--scenario")) scenario = catalog.find(cases, value) orelse return error.UnknownScenario else return error.UnknownArgument;
     }
 
     const client_version = version orelse return error.MissingClientVersion;
+    const selected = scenario orelse return error.MissingScenario;
+    const peer_versions = try selection.peerVersions(protocol_catalog, init.arena.allocator(), selected, client_version);
     return .{
-        .strace = strace,
+        .realtime = realtime,
         .address = address,
         .server = server orelse return error.MissingServerExecutable,
         .client = client,
         .artifacts = artifacts,
-        .scenario = scenario orelse return error.MissingScenario,
-        .client_version = client_version,
-        .gradle = try clientArguments(init, client, client_version),
+        .scenario = selected,
+        .client_version = peer_versions[0],
+        .peer_versions = peer_versions,
+        .gradle = try clientArguments(init, client, peer_versions[0]),
     };
 }
 

@@ -14,19 +14,39 @@ import net.minecraft.client.gui.screens.TitleScreen;
 import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.resolver.ServerAddress;
 import net.minecraft.core.BlockPos;
-import net.minecraft.util.Mth;
 import net.minecraft.world.level.LightLayer;
-import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.level.levelgen.Heightmap;
 import dev.lightningrod.e2e.mixin.BossBarHudAccessor;
 import dev.lightningrod.e2e.mixin.ClientConnectionAccessor;
+import io.netty.buffer.ByteBuf;
 
 public final class Recorder {
     Fixture fixture;
+    boolean functionalPassed;
+    String fixtureReason;
 
     public void reconfigurationEncoded() { if (fixture != null) fixture.reconfigurationEncoded(); }
+    public void encryptionResponseEncoded(ByteBuf encoded) { if (fixture != null) fixture.encryptionResponseEncoded(encoded); }
     static final Recorder INSTANCE = new Recorder();
-    final List<String> pendingScreenshots = new ArrayList<>();
+    static final class Capture {
+        private final String name;
+        private final boolean terminal;
+        private final boolean checkpoint;
+        private boolean renderReady;
+        private boolean finished;
+        private boolean saved;
+
+        Capture(String name, boolean terminal, boolean checkpoint) {
+            this.name = name;
+            this.terminal = terminal;
+            this.checkpoint = checkpoint;
+        }
+        String name() { return name; }
+        boolean terminal() { return terminal; }
+        boolean done() { return finished && saved; }
+    }
+    final List<Capture> pendingScreenshots = new ArrayList<>();
+    private Capture terminalCapture;
     boolean resultPublished;
     boolean resultPassed;
     String resultReason;
@@ -41,19 +61,17 @@ public final class Recorder {
     long playTick = -1;
     long firstChunkTick = -1;
     long terrainTick = -1;
-    long targetTick = -1;
+    private long targetTick = -1;
+    private long streamStartTick = -1;
+    private long streamStartNanos;
     long connectNanos;
     long playNanos;
     long firstChunkNanos;
     long terrainNanos;
-    long targetNanos;
-    int targetLoaded;
-    long lastProgressTick = -1;
-    int targetChunks = 4225;
-    int minimumRadius = 32;
-    int maximumStallTicks = 100;
-    int maximumStreamTicks = 100;
-    int maximumTerrainTicks = 40;
+    private long targetNanos;
+    private int targetLoaded;
+    int targetChunks;
+    int minimumRadius;
     int minimumSoakTicks = 0;
     int timeoutTicks = 2400;
     int connectTick = 40;
@@ -86,19 +104,17 @@ public final class Recorder {
         scenario = System.getProperty("mcc.scenario", scenario);
         server = System.getProperty("mcc.server");
         expectedPeers = List.of(System.getProperty("mcc.expectedPeers", peer).split(","));
-        targetChunks = integer("mcc.targetChunks", targetChunks);
-        minimumRadius = integer("mcc.minimumRadius", minimumRadius);
-        maximumStallTicks = integer("mcc.maximumStallTicks", maximumStallTicks);
-        maximumStreamTicks = integer("mcc.maximumStreamTicks", maximumStreamTicks);
-        maximumTerrainTicks = integer("mcc.maximumTerrainTicks", maximumTerrainTicks);
         minimumSoakTicks = integer("mcc.minimumSoakTicks", minimumSoakTicks);
         timeoutTicks = integer("mcc.timeoutTicks", timeoutTicks);
         connectTick = integer("mcc.connectTick", connectTick);
         fixture = Fixture.create(this, scenario);
+        int distance = fixture.renderDistance();
+        minimumRadius = integer("mcc.minimumRadius", distance);
+        targetChunks = integer("mcc.targetChunks", (2 * distance + 1) * (2 * distance + 1));
         try {
             Files.createDirectories(eventsPath.getParent());
             Files.createDirectories(artifacts.resolve("screenshots"));
-            events = Files.newBufferedWriter(eventsPath, StandardCharsets.UTF_8);
+            events = Files.newBufferedWriter(eventsPath);
             enabled = true;
             event("probe_started", "scenario", scenario, "version", ClientCompatibility.version());
         } catch (IOException error) {
@@ -134,6 +150,12 @@ public final class Recorder {
     public void disconnected() { protocolPhase = "disconnected"; }
     public synchronized void advance(Minecraft client) {
         if (!enabled || written) return;
+        advanceFixture(client);
+        if (started && !completed && tick >= timeoutTicks) fail("timeout");
+    }
+
+    private void advanceFixture(Minecraft client) {
+        if (!enabled || written) return;
         client.options.pauseOnLostFocus = false;
         if (!started) {
             if (GuiApi.overlay(client) != null) return;
@@ -152,10 +174,10 @@ public final class Recorder {
         if (completed) return;
         if (!connectionAttempted && server != null && tick >= connectTick && GuiApi.overlay(client) == null) {
             if (!ClientCompatibility.version().equals(System.getProperty("mcc.version"))) {
-                fail(client, "unexpected_client_version");
+                fail("unexpected_client_version");
                 return;
             }
-            client.options.renderDistance().set(32);
+            client.options.renderDistance().set(fixture.renderDistance());
             connectionAttempted = true;
             connectNanos = System.nanoTime();
             event("connect", "server", server);
@@ -182,7 +204,7 @@ public final class Recorder {
             if (fixture.encrypted()) {
                 var channel = ((ClientConnectionAccessor) client.getConnection().getConnection()).lightningRod$channel();
                 if (channel.pipeline().get("decrypt") == null || channel.pipeline().get("encrypt") == null) {
-                    fail(client, "encryption_was_bypassed");
+                    fail("encryption_was_bypassed");
                     return;
                 }
             }
@@ -190,20 +212,21 @@ public final class Recorder {
             if (playTick < 0) {
                 playTick = tick;
                 playNanos = System.nanoTime();
-                screenshot(client, "first_play");
+                screenshot("first_play");
             }
             int loaded = client.level.getChunkSource().getLoadedChunksCount();
             if (loaded > 0 && firstChunkTick < 0) {
                 firstChunkTick = tick;
                 firstChunkNanos = System.nanoTime();
+                if (streamStartTick < 0) restartStream();
             }
             if (loaded > 0 && terrainTick < 0 && GuiApi.screen(client) == null) {
                 terrainTick = tick;
                 terrainNanos = System.nanoTime();
             }
-            if (terrainTick >= 0 && tick == terrainTick + 2) screenshot(client, "first_terrain");
+            if (terrainTick >= 0 && tick == terrainTick + 2) screenshot("first_terrain");
             if (!fixture.prepare(client)) return;
-            int missing = missingChunks(client, minimumRadius);
+            int missing = Fixture.missingChunks(client, minimumRadius);
             int bossBars = ((BossBarHudAccessor) GuiApi.bossBars(client)).lightningRod$bossBars().size();
             maximumBossBars = Math.max(maximumBossBars, bossBars);
             BlockPos position = client.player.blockPosition();
@@ -216,17 +239,12 @@ public final class Recorder {
                     "elapsed_ms", (System.nanoTime() - connectNanos) / 1_000_000);
             }
             if (targetTick < 0 && tick % 100 == 0 && progressScreenshots < 6)
-                screenshot(client, "stream_progress_" + ++progressScreenshots);
-            if (loaded > lastLoaded) lastProgressTick = tick;
+                screenshot("stream_progress_" + ++progressScreenshots);
             lastLoaded = loaded;
             lastMissing = missing;
             fixture.tick(client, loaded, missing);
         }
-        if (!completed && tick >= timeoutTicks) fail(client, "timeout");
-    }
-
-    static boolean close(double actual, double expected, double tolerance) {
-        return Math.abs(actual - expected) <= tolerance;
+        if (!completed && tick >= timeoutTicks) fail("timeout");
     }
 
     public synchronized void packetFailed(byte[] bytes, Exception error) {
@@ -235,17 +253,14 @@ public final class Recorder {
             var packet = artifacts.resolve(peer + "-failed-packet.bin");
             if (Files.exists(packet)) return;
             Files.write(packet, bytes);
-            Files.writeString(artifacts.resolve(peer + "-failed-packet.txt"), error.toString());
+            Artifacts.publish(artifacts.resolve(peer + "-failed-packet.txt"), error.toString());
             error.printStackTrace();
         } catch (IOException failure) {
             error.addSuppressed(failure);
         }
     }
 
-    static boolean angleClose(float actual, float expected) {
-        return Math.abs(Mth.wrapDegrees(actual - expected)) <= 2.0f;
-    }
-    public synchronized void write(Minecraft client) {
+    public synchronized void write() {
         if (!enabled || written) return;
         written = true;
         try {
@@ -257,40 +272,35 @@ public final class Recorder {
         } catch (IOException error) { throw new IllegalStateException("cannot write e2e artifacts", error); }
     }
 
-public synchronized void chatReceived(String text) {
-        if (completed) return;
+    public synchronized void chatReceived(String text) {
+        if (!enabled || resultPublished) return;
         event("server_message", "text", text);
         fixture.chat(text);
     }
 
-    int missingChunks(Minecraft client, int radius) {
-        int centerX = (client.player.getBlockX() >> 4);
-        int centerZ = (client.player.getBlockZ() >> 4);
-        int missing = 0;
-        for (int z = centerZ - radius; z <= centerZ + radius; z++) {
-            for (int x = centerX - radius; x <= centerX + radius; x++) {
-                if (client.level.getChunkSource().getChunk(x, z, ChunkStatus.FULL, false) == null) missing++;
-            }
-        }
-        return missing;
-    }
-
-    void pass(Minecraft client, String reason) {
+    void pass(String reason) {
         if (completed) return;
         completed = true;
         stopTick = tick + 20;
+        functionalPassed = true;
+        fixtureReason = reason;
         resultPassed = true;
         resultReason = reason;
-        screenshot(client, "success");
+        terminalCapture = new Capture("success", true, false);
+        pendingScreenshots.add(terminalCapture);
     }
 
-    void fail(Minecraft client, String reason) {
-        if (completed) return;
+    void fail(String reason) {
+        if (resultPublished || completed && !resultPassed) return;
         completed = true;
         stopTick = tick + 20;
+        functionalPassed = false;
         resultPassed = false;
         resultReason = reason;
-        screenshot(client, "failure");
+        fixtureReason = reason;
+        pendingScreenshots.removeIf(Capture::terminal);
+        terminalCapture = new Capture("failure", true, false);
+        pendingScreenshots.add(terminalCapture);
     }
 
     void result(boolean passed, String reason) {
@@ -299,10 +309,9 @@ public synchronized void chatReceived(String text) {
             "maximum_bossbars", maximumBossBars, "timing", "monotonic_wall");
         try {
             events.flush();
-            Files.writeString(artifacts.resolve(peer + ".result"), (passed ? "PASS " : "FAIL ") + reason + "\n", StandardCharsets.UTF_8);
             long streamEndNanos = targetTick >= 0 ? targetNanos : System.nanoTime();
-            long streamMilliseconds = firstChunkTick < 0 ? -1 : (streamEndNanos - firstChunkNanos) / 1_000_000;
-            double streamSeconds = firstChunkTick < 0 ? 0.0 : (streamEndNanos - firstChunkNanos) / 1_000_000_000.0;
+            long streamMilliseconds = streamStartTick < 0 ? -1 : (streamEndNanos - streamStartNanos) / 1_000_000;
+            double streamSeconds = streamStartTick < 0 ? 0.0 : (streamEndNanos - streamStartNanos) / 1_000_000_000.0;
             double chunksPerSecond = streamSeconds <= 0.0 ? 0.0 : Math.max(0, targetTick >= 0 ? targetLoaded : lastLoaded) / streamSeconds;
             long loginMilliseconds = playTick < 0 ? -1 : (playNanos - connectNanos) / 1_000_000;
             long firstChunkMilliseconds = firstChunkTick < 0 ? -1 : (firstChunkNanos - connectNanos) / 1_000_000;
@@ -312,47 +321,103 @@ public synchronized void chatReceived(String text) {
                 escape(scenario), escape(peer), passed, escape(reason), tick, playTick, firstChunkTick, terrainTick,
                 loginMilliseconds, firstChunkMilliseconds, terrainMilliseconds, streamMilliseconds, lastLoaded, lastMissing, chunksPerSecond,
                 maximumBossBars);
-            Files.writeString(artifacts.resolve(peer + ".metrics.json"), metrics, StandardCharsets.UTF_8);
+            metrics = metrics.stripTrailing();
+            metrics = metrics.substring(0, metrics.length() - 1)
+                + ",\"stream_start_tick\":" + streamStartTick
+                + ",\"stream_target_tick\":" + targetTick
+                + ",\"functional_passed\":" + functionalPassed
+                + ",\"fixture_reason\":\"" + escape(fixtureReason == null ? reason : fixtureReason) + "\""
+                + "}\n";
+            Artifacts.publish(artifacts.resolve(peer + ".metrics.json"), metrics);
+            Artifacts.publish(artifacts.resolve(peer + ".result"), (passed ? "PASS " : "FAIL ") + reason + "\n");
         } catch (IOException error) {
             throw new IllegalStateException("cannot write e2e result", error);
         }
     }
 
-    void screenshot(Minecraft client, String name) {
-        pendingScreenshots.add(name);
+    void restartStream() {
+        streamStartTick = tick;
+        streamStartNanos = System.nanoTime();
+        targetTick = -1;
+        targetNanos = 0;
+        targetLoaded = 0;
+        progressScreenshots = 0;
+    }
+
+    long streamTarget(int loaded) {
+        if (streamStartTick < 0) throw new IllegalStateException("stream has not started");
+        if (targetTick < 0) {
+            targetTick = tick;
+            targetNanos = System.nanoTime();
+            targetLoaded = loaded;
+            event("chunk_target_reached", "loaded", loaded);
+        }
+        return targetTick;
+    }
+
+    Capture screenshot(String name) {
+        Capture capture = new Capture(name, false, false);
+        pendingScreenshots.add(capture);
+        return capture;
+    }
+
+    Capture checkpoint(String name) {
+        Capture capture = new Capture(name, false, true);
+        pendingScreenshots.add(capture);
+        return capture;
     }
 
     public synchronized void rendered(Minecraft client) {
-        if (!enabled || written || GuiApi.target(client) == null ||
+        if (!enabled || written || pendingScreenshots.isEmpty() || GuiApi.target(client) == null ||
             GuiApi.overlay(client) != null && (!completed || resultPassed)) return;
-        for (String name : pendingScreenshots) {
-            boolean terminal = name.equals("success") || name.equals("failure");
-            String filename = peer + "-" + tick + "-" + name + ".png";
+        List<Capture> captures = new ArrayList<>(pendingScreenshots);
+        for (Capture capture : captures) {
+            if (capture.checkpoint || capture.terminal && resultPassed && client.level != null) {
+                boolean ready = client.player != null && client.level != null
+                    && Fixture.missingChunks(client, minimumRadius) == 0
+                    && TerrainApi.ready(client);
+                boolean rendered = capture.renderReady;
+                capture.renderReady = ready;
+                // A ready renderer at frame end may have uploaded terrain after drawing this frame.
+                if (!ready || !rendered) continue;
+            }
+            pendingScreenshots.remove(capture);
+            String filename = peer + "-" + tick + "-" + capture.name() + ".png";
             ClientCompatibility.screenshot(artifacts.toFile(), filename, GuiApi.target(client), message -> {
                 synchronized (this) {
-                    event("screenshot", "name", name, "message", message.getString());
-                    if (terminal && !resultPublished) {
-                        Path image = artifacts.resolve("screenshots").resolve(filename);
-                        boolean saved;
-                        try {
-                            saved = Files.isRegularFile(image) && Files.size(image) > 0;
-                        } catch (IOException error) {
-                            saved = false;
-                        }
-                        result(resultPassed && saved, saved ? resultReason : "terminal_screenshot_missing");
-                        resultPublished = true;
+                    event("screenshot", "name", capture.name(), "message", message.getString());
+                    Path image = artifacts.resolve("screenshots").resolve(filename);
+                    boolean saved;
+                    try {
+                        saved = Files.isRegularFile(image) && Files.size(image) > 0;
+                    } catch (IOException error) {
+                        saved = false;
                     }
+                    captureFinished(capture, saved);
                 }
             });
         }
-        pendingScreenshots.clear();
+    }
+
+    void captureFinished(Capture capture, boolean saved) {
+        if (capture.finished) return;
+        capture.saved = saved;
+        capture.finished = true;
+        if (capture.checkpoint && !saved) fail("checkpoint_screenshot_missing_" + capture.name());
+        if (!saved) event("screenshot_missing", "name", capture.name());
+        if (!capture.terminal() || capture != terminalCapture || resultPublished) return;
+        result(resultPassed && saved, !saved && resultPassed ? "terminal_screenshot_missing" : resultReason);
+        resultPublished = true;
     }
 
     public synchronized void blockBreaking(BlockPos position, int stage) { if (fixture != null) fixture.blockBreaking(position, stage); }
+    public synchronized void inventorySynced(int containerId) {
+        if (containerId == 0 && fixture != null) fixture.inventorySynced(Minecraft.getInstance());
+    }
 
     void marker(String name) {
         try {
-            Files.writeString(artifacts.resolve(name), "ready\n", StandardCharsets.UTF_8);
+            Artifacts.publish(artifacts.resolve(name), "ready\n");
         } catch (IOException error) {
             throw new IllegalStateException("cannot write e2e marker", error);
         }
@@ -362,6 +427,7 @@ public synchronized void chatReceived(String text) {
         if (events == null) return;
         try {
             StringBuilder line = new StringBuilder("{\"tick\":").append(tick)
+                .append(",\"unix_ms\":").append(System.currentTimeMillis())
                 .append(",\"peer\":\"").append(escape(peer)).append("\",\"event\":\"").append(escape(name)).append('"');
             for (int index = 0; index < fields.length; index += 2) {
                 line.append(",\"").append(escape(fields[index].toString())).append("\":");

@@ -33,16 +33,22 @@ pub const ItemPickup = struct {
 
     pub fn tick(self: *ItemPickup) !void {
         const dropped = self.deps.dropped;
-        var cursor: ItemEntities.Cursor = .{};
-
-        while (cursor.more) for (try dropped.scan(&cursor)) |row| {
-            var metadata = row.metadata;
+        self.deps.players.refreshSpatial();
+        var iterator = dropped.iterate(dropped.nearby(self.deps.players, 1));
+        defer iterator.deinit();
+        while (try iterator.next()) |batch| for (batch) |record| {
+            const row = .{ .id = record.id };
+            var metadata = try record.read();
             if (!metadata.alive or metadata.pickup_delay != 0) continue;
 
-            const body = (try self.deps.entities.get(row.id)) orelse return error.Corrupt;
+            const body = (try record.body.read()) orelse return error.Corrupt;
 
-            for (self.deps.players.records, 0..) |player, index| {
-                if (player.handle == null or player.stage != .ready or player.world != body.world) continue;
+            var candidates = self.deps.players.nearby(body.world, .{ .x = body.position[0], .y = body.position[1], .z = body.position[2] }, 1);
+            while (candidates != 0) {
+                const index: usize = @intCast(@ctz(candidates));
+                candidates &= candidates - 1;
+                const player = self.deps.players.records[index];
+                if (!player.inWorld() or player.world != body.world) continue;
                 if (@abs(body.position[0] - player.position.x) >= 1.425 or @abs(body.position[2] - player.position.z) >= 1.425 or
                     body.position[1] + 0.25 <= player.position.y - 0.5 or body.position[1] >= player.position.y + 2.3) continue;
 
@@ -65,7 +71,7 @@ pub const ItemPickup = struct {
                     break;
                 }
 
-                try dropped.put(row.id, metadata);
+                record.write(metadata);
             }
         };
     }
@@ -76,7 +82,7 @@ pub const ItemPickup = struct {
         assert(player_index < self.deps.players.records.len);
         assert(state.valid());
         const player = &self.deps.players.records[player_index];
-        if (player.handle == null or player.stage != .ready or player.health == 0) return 0;
+        if (!player.inWorld() or player.health == 0) return 0;
         if (player.gamemode == .spectator or state.pickup_delay != 0) return 0;
         if (state.owner) |owner| if (owner != player.uuid) return 0;
 

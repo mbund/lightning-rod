@@ -3,7 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const names = .{ "lightning_rod", "game_data", "minecraft_packets", "sessions", "chunks", "entities", "inventories", "metrics", "records", "commands", "reload", "worlds" };
+    const names = .{ "lightning_rod", "game_data", "minecraft_packets", "minecraft_java", "sessions", "chunks", "entities", "inventories", "metrics", "records", "commands", "reload", "worlds", "storage" };
     var imports: [names.len + 2]std.Build.Module.Import = undefined;
 
     inline for (names, 0..) |name, i| {
@@ -41,6 +41,15 @@ pub fn build(b: *std.Build) void {
             module.addImport("protocols", protocols.module("protocols"));
             b.dependency("minecraft_packets", .{ .target = target, .optimize = optimize }).module("minecraft_packets").addImport("protocols", protocols.module("protocols"));
         }
+    }
+
+    const test_step = b.step("test", "Verify encoding and batched gameplay records");
+    for ([_][]const u8{ "src/chunk_encoding.zig", "src/batch_test.zig", "src/replication.zig", "src/configuration_test.zig" }) |source| {
+        const test_module = b.createModule(.{ .root_source_file = b.path(source), .target = target, .optimize = optimize });
+        for (module.import_table.keys(), module.import_table.values()) |name, dependency|
+            test_module.addImport(name, dependency);
+        const tests = b.addTest(.{ .root_module = test_module });
+        test_step.dependOn(&b.addRunArtifact(tests).step);
     }
 
     const check = b.addLibrary(.{ .name = "vanilla", .root_module = module });

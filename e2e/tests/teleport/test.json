@@ -8,6 +8,14 @@
         "alice",
         "bob"
       ]
+    },
+    {
+      "name": "teleport-world-isolation",
+      "fixture": "teleport",
+      "peers": [
+        "alice",
+        "bob"
+      ]
     }
   ]
 }

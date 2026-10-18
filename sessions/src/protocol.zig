@@ -36,7 +36,6 @@ pub const LoginStep = union(enum) {
 
 pub const ConfigurationStep = union(enum) {
     send: []const u8,
-    wait,
     done,
     reject: []const u8,
 };

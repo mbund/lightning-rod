@@ -3,7 +3,6 @@ const Items = @import("items.zig").Items;
 const inventories = @import("inventories");
 const entities = @import("entities");
 const lightning_rod = @import("lightning_rod");
-const records = @import("records");
 const sessions = @import("sessions");
 const minecraft = @import("minecraft_model");
 const game_data = @import("game_data");
@@ -21,7 +20,7 @@ const assert = std.debug.assert;
 pub const ItemReplication = struct {
     pub const id = "minecraft:item_replication";
 
-    pub const Configuration = struct { cache_records: usize = 256 };
+    pub const Configuration = struct {};
 
     pub const Dependencies = struct {
         dropped: *ItemEntities,
@@ -33,7 +32,6 @@ pub const ItemReplication = struct {
         entities: *entities.Entities,
         inventories: *inventories.Inventories,
         items: *Items,
-        storage: lightning_rod.storage.Namespace,
     };
 
     const Spawn = struct {
@@ -44,7 +42,7 @@ pub const ItemReplication = struct {
     };
 
     const View = struct {
-        epoch: u64 = 0,
+        entity: entities.Id = 0,
         revision: u64 = 0,
         collection: u64 = 0,
         spawned: u256 = 0,
@@ -60,36 +58,24 @@ pub const ItemReplication = struct {
     };
 
     deps: Dependencies,
-    cache: records.Cache,
-    epoch: u64,
+    views: []View,
     presentation: u64 = 0,
     connections: []Connection,
     recipients: []sessions.Handle,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Configuration, deps: Dependencies) !*ItemReplication {
-        var bytes: [8]u8 = @splat(0);
-        if (try deps.storage.get(&.{0}, &bytes)) |length| if (length != 8) return error.Corrupt;
-
-        const previous = std.mem.readInt(u64, &bytes, .little);
-        if (previous == std.math.maxInt(u64)) return error.IdExhausted;
-        std.mem.writeInt(u64, &bytes, previous + 1, .little);
-        try deps.storage.put(&.{0}, &bytes);
+    pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*ItemReplication {
         const self = try allocator.create(ItemReplication);
         const connections = try allocator.alloc(Connection, deps.players.records.len);
         @memset(connections, .{});
-        self.* = .{
-            .deps = deps,
-
-            .epoch = previous + 1,
-            .connections = connections,
-            .recipients = try allocator.alloc(sessions.Handle, connections.len),
-            .cache = try records.Cache.init(allocator, io, deps.storage, .{ .slots = config.cache_records, .key_bytes = 9, .value_bytes = 160 }),
-        };
+        const views = try allocator.alloc(View, deps.dropped.residents.len);
+        @memset(views, .{});
+        self.* = .{ .deps = deps, .connections = connections, .recipients = try allocator.alloc(sessions.Handle, connections.len), .views = views };
         return self;
     }
 
     pub fn tick(self: *ItemReplication) !void {
         const service = self.deps.sessions;
+        self.deps.players.refreshSpatial();
         const presentation_changed = self.presentation != self.deps.items.components.revision;
         self.presentation = self.deps.items.components.revision;
         var valid: u256 = 0;
@@ -106,192 +92,194 @@ pub const ItemReplication = struct {
             }
         }
 
-        var cursor: ItemEntities.Cursor = .{};
-
-        while (cursor.more) for (try self.deps.dropped.scan(&cursor)) |row| {
-            var key: [9]u8 = undefined;
-            key[0] = 1;
-            std.mem.writeInt(u64, key[1..9], row.id, .big);
-            const lease = try self.cache.acquire(&key);
-            defer lease.release();
-            var view: View = .{ .epoch = self.epoch };
-            var initialized = false;
-            if (lease.read()) |bytes| {
-                if (bytes.len != 160) return error.Corrupt;
-                initialized = std.mem.readInt(u64, bytes[0..8], .little) == self.epoch;
-
-                if (initialized) view = .{
-                    .epoch = self.epoch,
-                    .revision = std.mem.readInt(u64, bytes[8..16], .little),
-                    .collection = std.mem.readInt(u64, bytes[16..24], .little),
-                    .spawned = std.mem.readInt(u256, bytes[24..56], .little),
-                    .dirty = std.mem.readInt(u256, bytes[56..88], .little),
-                    .collected = std.mem.readInt(u256, bytes[88..120], .little),
-                    .inventory_revision = std.mem.readInt(u64, bytes[120..128], .little),
-                    .stacks = std.mem.readInt(u256, bytes[128..160], .little),
-                };
-            }
-
-            const previous = view;
-            view.spawned &= valid & ~reset;
-            view.dirty &= view.spawned;
-            view.collected &= view.spawned;
-            view.stacks &= view.spawned;
-
-            if (view.revision != row.metadata.revision) {
-                view.dirty |= view.spawned;
-                view.revision = row.metadata.revision;
-            }
-
-            if (view.collection != row.metadata.collection) {
-                view.collection = row.metadata.collection;
-                view.collected = 0;
-            }
-
-            const body = if (row.metadata.alive) (try self.deps.entities.get(row.id) orelse return error.Corrupt) else null;
-            var interested: u256 = 0;
-            if (body) |value| for (self.deps.players.records, 0..) |player, index| {
-                if (player.handle == null or player.stage != .ready or value.world != player.world) continue;
-                if (@abs(value.position[0] - player.position.x) > 96 or @abs(value.position[2] - player.position.z) > 96) continue;
-
-                if (self.deps.streaming.visible(index, value.world, @intFromFloat(@floor(value.position[0] / 16)), @intFromFloat(@floor(value.position[2] / 16))))
-                    interested |= @as(u256, 1) << @intCast(index);
-            };
-
-            const held = if (body != null and interested != 0) try self.deps.inventories.get(ItemEntities.slot(body.?)) else inventories.Contents{};
-
-            if (presentation_changed or held.revision != view.inventory_revision) {
-                view.inventory_revision = held.revision;
-                view.stacks |= view.spawned;
-            }
-
-            for (service.config.protocols) |*selected| {
-                const protocol = selected.number;
-                for (0..5) |phase| {
-                    const wanted = switch (phase) {
-                        0 => interested & ~view.spawned,
-                        1 => interested & view.spawned & view.stacks,
-                        2 => interested & view.spawned & view.dirty & ~view.stacks,
-                        3 => if (row.metadata.collected > 0) view.spawned & ~view.collected else @as(u256, 0),
-                        4 => view.spawned & ~interested & (if (row.metadata.collected > 0) view.collected else std.math.maxInt(u256)),
-                        else => unreachable,
-                    };
-                    if (wanted == 0) continue;
-
-                    var capacity: usize = 128;
-                    if (phase == 1) {
-                        const definition = try self.deps.inventories.acquireItem((held.stack orelse return error.Corrupt).item);
-                        defer definition.release();
-                        capacity = definition.read().?.len + 16 + self.deps.items.components.extra_bytes;
+        _ = self.deps.dropped.nearby(self.deps.players, self.deps.players.config.render_distance);
+        const dropped = self.deps.dropped;
+        var cursor: usize = 0;
+        while (cursor < dropped.residents.len) {
+            var ids: [16]entities.Id = undefined;
+            var selected_count: usize = 0;
+            while (cursor < dropped.residents.len and selected_count < ids.len) : (cursor += 1) {
+                const resident_entry = dropped.residents[cursor];
+                if (resident_entry.id == 0) continue;
+                const view = &self.views[cursor];
+                if (view.entity != resident_entry.id) view.* = .{ .entity = resident_entry.id };
+                if (!dropped.marked[cursor] and view.spawned == 0) {
+                    if (!resident_entry.alive) {
+                        try dropped.forget(resident_entry.id);
+                        view.* = .{};
                     }
+                    continue;
+                }
+                ids[selected_count] = resident_entry.id;
+                selected_count += 1;
+            }
+            var iterator = dropped.iterate(ids[0..selected_count]);
+            defer iterator.deinit();
+            while (try iterator.next()) |batch| for (batch) |record| {
+                const slot_index = dropped.ids.get(record.id).?;
+                const stored_view = &self.views[slot_index];
+                var view = stored_view.*;
+                const row = .{ .id = record.id, .metadata = try record.read() };
+                view.spawned &= valid & ~reset;
+                view.dirty &= view.spawned;
+                view.collected &= view.spawned;
+                view.stacks &= view.spawned;
 
-                    var count: usize = 0;
+                if (view.revision != row.metadata.revision) {
+                    view.dirty |= view.spawned;
+                    view.revision = row.metadata.revision;
+                }
 
-                    for (self.deps.players.records, 0..) |player, index| {
-                        const handle = player.handle orelse continue;
-                        if (player.protocol != protocol or wanted & (@as(u256, 1) << @intCast(index)) == 0) continue;
-                        if (capacity > service.config.page_bytes) {
-                            std.log.err("event=item_packet_too_large entity={d} bytes={d} capacity={d}", .{ row.id, capacity, service.config.page_bytes });
-                            service.disconnect(handle);
-                            continue;
-                        }
+                if (view.collection != row.metadata.collection) {
+                    view.collection = row.metadata.collection;
+                    view.collected = 0;
+                }
 
-                        if (!service.canSend(handle, capacity)) continue;
-                        self.recipients[count] = handle;
-                        count += 1;
+                const body = if (row.metadata.alive) (try record.body.read() orelse return error.Corrupt) else null;
+                var interested: u256 = 0;
+                if (body) |value| {
+                    const position: minecraft.Position = .{ .x = value.position[0], .y = value.position[1], .z = value.position[2] };
+                    var candidates = self.deps.players.nearby(value.world, position, 6);
+                    while (candidates != 0) {
+                        const index: usize = @intCast(@ctz(candidates));
+                        candidates &= candidates - 1;
+                        const player = self.deps.players.records[index];
+                        if (player.handle == null or player.stage != .ready or value.world != player.world) continue;
+                        if (@abs(value.position[0] - player.position.x) > 96 or @abs(value.position[2] - player.position.z) > 96) continue;
+
+                        if (self.deps.streaming.visible(index, value.world, @intFromFloat(@floor(value.position[0] / 16)), @intFromFloat(@floor(value.position[2] / 16))))
+                            interested |= @as(u256, 1) << @intCast(index);
                     }
+                }
 
-                    if (count == 0) continue;
-                    const groups = if (phase == 1 and self.deps.items.components.personalized) count else 1;
-                    for (0..groups) |group| {
-                        const targets = if (groups == 1) self.recipients[0..count] else self.recipients[group..][0..1];
-                        var packet = service.reserve(capacity) catch continue;
-                        defer packet.cancel();
-                        const entity_id = ItemEntities.networkId(row.id);
-                        var length: usize = undefined;
+                const held = if (body != null and interested != 0) try self.deps.inventories.get(ItemEntities.slot(body.?)) else inventories.Contents{};
 
-                        if (phase == 0) {
-                            length = (try self.deps.packets.writePacket(.{ writeSpawnLegacy, writeSpawnPacked }, protocol, packet.bytes, .{Spawn{
-                                .entity_id = entity_id,
-                                .uuid = body.?.uuid,
-                                .position = .{ .x = body.?.position[0], .y = body.?.position[1], .z = body.?.position[2] },
-                                .velocity = body.?.velocity,
-                            }})).len;
-                        } else if (phase == 2) {
-                            length = (try self.deps.packets.writePacket(writePosition, protocol, packet.bytes, .{
-                                entity_id,
-                                minecraft.Position{ .x = body.?.position[0], .y = body.?.position[1], .z = body.?.position[2] },
-                                minecraft.Position{ .x = body.?.velocity[0], .y = body.?.velocity[1], .z = body.?.velocity[2] },
-                                minecraft.Rotation{ .yaw = 0, .pitch = 0 },
-                                row.metadata.on_ground,
-                            })).len;
-                        } else if (phase == 4) {
-                            length = (try self.deps.packets.writePacket(writeRemove, protocol, packet.bytes, .{entity_id})).len;
-                        } else if (phase == 3) {
-                            length = (try self.deps.packets.writePacket(writeCollect, protocol, packet.bytes, .{
-                                entity_id, row.metadata.collector, row.metadata.collected,
-                            })).len;
-                        } else if (phase == 1) {
-                            if (held.stack == null) return error.Corrupt;
-                            const bytes = self.deps.packets.writePacket(writeItemStack, protocol, packet.bytes, .{
-                                self.deps.items, entity_id, held.stack, self.deps.players.records[targets[0].index].uuid,
-                            }) catch |err| switch (err) {
-                                error.EndOfStream, error.UnsupportedItem, error.UnsupportedComponent => {
-                                    for (targets) |handle| service.disconnect(handle);
-                                    continue;
-                                },
-                                else => return err,
-                            };
-                            length = bytes.len;
-                        } else {
-                            unreachable;
-                        }
+                if (presentation_changed or held.revision != view.inventory_revision) {
+                    view.inventory_revision = held.revision;
+                    view.stacks |= view.spawned;
+                }
 
-                        var delivered: u256 = 0;
-
-                        for (packet.publishReady(length, targets)) |handle| delivered |= @as(u256, 1) << @intCast(handle.index);
-
-                        switch (phase) {
-                            0 => {
-                                view.spawned |= delivered;
-                                view.dirty |= delivered;
-                                view.stacks |= delivered;
-                                view.collected |= delivered;
-                            },
-                            1 => view.stacks &= ~delivered,
-                            2 => view.dirty &= ~delivered,
-                            3 => view.collected |= delivered,
-                            4 => {
-                                view.spawned &= ~delivered;
-                                view.dirty &= ~delivered;
-                                view.collected &= ~delivered;
-                                view.stacks &= ~delivered;
-                            },
+                for (service.config.protocols) |*selected| {
+                    const protocol = selected.number;
+                    for (0..5) |phase| {
+                        const wanted = switch (phase) {
+                            0 => interested & ~view.spawned,
+                            1 => interested & view.spawned & view.stacks,
+                            2 => interested & view.spawned & view.dirty & ~view.stacks,
+                            3 => if (row.metadata.collected > 0) view.spawned & ~view.collected else @as(u256, 0),
+                            4 => view.spawned & ~interested & (if (row.metadata.collected > 0) view.collected else std.math.maxInt(u256)),
                             else => unreachable,
+                        };
+                        if (wanted == 0) continue;
+
+                        var capacity: usize = 128;
+                        if (phase == 1) {
+                            const definition = try self.deps.inventories.acquireItem((held.stack orelse return error.Corrupt).item);
+                            defer definition.release();
+                            capacity = definition.read().?.len + 16 + self.deps.items.components.extra_bytes;
+                        }
+
+                        var count: usize = 0;
+
+                        var candidates = wanted;
+                        while (candidates != 0) {
+                            const index: usize = @intCast(@ctz(candidates));
+                            candidates &= candidates - 1;
+                            const player = self.deps.players.records[index];
+                            const handle = player.handle orelse continue;
+                            if (player.protocol != protocol or wanted & (@as(u256, 1) << @intCast(index)) == 0) continue;
+                            if (capacity > service.config.page_bytes) {
+                                std.log.err("event=item_packet_too_large entity={d} bytes={d} capacity={d}", .{ row.id, capacity, service.config.page_bytes });
+                                service.disconnect(handle);
+                                continue;
+                            }
+
+                            if (!service.canSend(handle, capacity)) continue;
+                            self.recipients[count] = handle;
+                            count += 1;
+                        }
+
+                        if (count == 0) continue;
+                        const groups = if (phase == 1 and self.deps.items.components.personalized) count else 1;
+                        for (0..groups) |group| {
+                            const targets = if (groups == 1) self.recipients[0..count] else self.recipients[group..][0..1];
+                            var packet = service.reserve(capacity) catch continue;
+                            defer packet.cancel();
+                            const entity_id = ItemEntities.networkId(row.id);
+                            var length: usize = undefined;
+
+                            if (phase == 0) {
+                                length = (try self.deps.packets.writePacket(.{ writeSpawnLegacy, writeSpawnPacked }, protocol, packet.bytes, .{Spawn{
+                                    .entity_id = entity_id,
+                                    .uuid = body.?.uuid,
+                                    .position = .{ .x = body.?.position[0], .y = body.?.position[1], .z = body.?.position[2] },
+                                    .velocity = body.?.velocity,
+                                }})).len;
+                            } else if (phase == 2) {
+                                length = (try self.deps.packets.writePacket(writePosition, protocol, packet.bytes, .{
+                                    entity_id,
+                                    minecraft.Position{ .x = body.?.position[0], .y = body.?.position[1], .z = body.?.position[2] },
+                                    minecraft.Position{ .x = body.?.velocity[0], .y = body.?.velocity[1], .z = body.?.velocity[2] },
+                                    minecraft.Rotation{ .yaw = 0, .pitch = 0 },
+                                    row.metadata.on_ground,
+                                })).len;
+                            } else if (phase == 4) {
+                                length = (try self.deps.packets.writePacket(writeRemove, protocol, packet.bytes, .{entity_id})).len;
+                            } else if (phase == 3) {
+                                length = (try self.deps.packets.writePacket(writeCollect, protocol, packet.bytes, .{
+                                    entity_id, row.metadata.collector, row.metadata.collected,
+                                })).len;
+                            } else if (phase == 1) {
+                                if (held.stack == null) return error.Corrupt;
+                                const bytes = self.deps.packets.writePacket(writeItemStack, protocol, packet.bytes, .{
+                                    self.deps.items, entity_id, held.stack, self.deps.players.records[targets[0].index].uuid,
+                                }) catch |err| switch (err) {
+                                    error.EndOfStream, error.UnsupportedItem, error.UnsupportedComponent => {
+                                        for (targets) |handle| service.disconnect(handle);
+                                        continue;
+                                    },
+                                    else => return err,
+                                };
+                                length = bytes.len;
+                            } else {
+                                unreachable;
+                            }
+
+                            var delivered: u256 = 0;
+
+                            for (packet.publishReady(length, targets)) |handle| delivered |= @as(u256, 1) << @intCast(handle.index);
+
+                            switch (phase) {
+                                0 => {
+                                    view.spawned |= delivered;
+                                    view.dirty |= delivered;
+                                    view.stacks |= delivered;
+                                    view.collected |= delivered;
+                                },
+                                1 => view.stacks &= ~delivered,
+                                2 => view.dirty &= ~delivered,
+                                3 => view.collected |= delivered,
+                                4 => {
+                                    view.spawned &= ~delivered;
+                                    view.dirty &= ~delivered;
+                                    view.collected &= ~delivered;
+                                    view.stacks &= ~delivered;
+                                },
+                                else => unreachable,
+                            }
                         }
                     }
                 }
-            }
 
-            if (!row.metadata.alive and view.spawned == 0) {
-                lease.remove();
-                try self.deps.dropped.forget(row.id);
-                continue;
-            }
+                if (!row.metadata.alive and view.spawned == 0) {
+                    stored_view.* = .{};
+                    try self.deps.dropped.forget(row.id);
+                    continue;
+                }
 
-            if (initialized and std.meta.eql(previous, view)) continue;
-
-            const bytes = lease.edit();
-            std.mem.writeInt(u64, bytes[0..8], view.epoch, .little);
-            std.mem.writeInt(u64, bytes[8..16], view.revision, .little);
-            std.mem.writeInt(u64, bytes[16..24], view.collection, .little);
-            std.mem.writeInt(u256, bytes[24..56], view.spawned, .little);
-            std.mem.writeInt(u256, bytes[56..88], view.dirty, .little);
-            std.mem.writeInt(u256, bytes[88..120], view.collected, .little);
-            std.mem.writeInt(u64, bytes[120..128], view.inventory_revision, .little);
-            std.mem.writeInt(u256, bytes[128..160], view.stacks, .little);
-            lease.commit(160);
-        };
+                stored_view.* = view;
+            };
+        }
     }
 
     fn writeSpawnLegacy(packet: wire_1_21_5.play.toClient.packet_spawn_entity.Writer, registry: packets.Registry, value: Spawn) ![]u8 {
@@ -377,10 +365,6 @@ pub const ItemReplication = struct {
         const typed = try (try packet.key(8)).type();
         var item = try typed.value();
         return item.advance(try item_packets.writeSlot(try item.begin(), args));
-    }
-
-    pub fn checkpoint(self: *ItemReplication, _: lightning_rod.storage.Namespace) !void {
-        try self.cache.flush();
     }
 };
 

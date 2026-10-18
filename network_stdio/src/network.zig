@@ -1,6 +1,8 @@
 const std = @import("std");
+const networking_test = @import("networking_test");
 const builtin = @import("builtin");
 const network = @import("networking");
+const posix = std.posix;
 
 const assert = std.debug.assert;
 
@@ -51,34 +53,30 @@ pub fn Transport(comptime limits: network.Limits) type {
         events: [limits.events]network.Event = undefined,
         event_head: usize = 0,
         event_count: usize = 0,
-        mutex: std.Io.Mutex = .init,
-        tasks: std.Io.Group = .init,
-        accept_tasks: std.Io.Group = .init,
         accepting: bool = true,
-        wake: std.Io.Event = .unset,
-        accept_pending: bool = false,
-        notified: bool = false,
+        wake_pipe: [2]posix.fd_t,
+        notified: std.atomic.Value(bool) = .init(false),
 
         pub fn init(io: std.Io, configuration: Configuration) !Self {
-            var address = configuration.address;
-            if (builtin.os.tag == .linux)
-                if (configuration.inherited_listener) |fd|
-                    return .{ .listener = .{ .socket = .{ .handle = fd, .address = address }, .options = {} } };
-
-            return .{ .listener = try address.listen(io, .{ .kernel_backlog = configuration.backlog, .reuse_address = true }) };
+            const address = configuration.address;
+            var listener = if (builtin.os.tag == .linux and configuration.inherited_listener != null)
+                std.Io.net.Server{ .socket = .{ .handle = configuration.inherited_listener.?, .address = address }, .options = {} }
+            else
+                try address.listen(io, .{ .kernel_backlog = configuration.backlog, .reuse_address = true });
+            errdefer listener.deinit(io);
+            try nonblocking(listener.socket.handle);
+            var pipe: [2]posix.fd_t = undefined;
+            if (posix.errno(posix.system.pipe(&pipe)) != .SUCCESS) return error.SystemResources;
+            errdefer for (pipe) |fd| closeFd(fd);
+            for (pipe) |fd| try nonblocking(fd);
+            return .{ .listener = listener, .wake_pipe = pipe };
         }
 
         pub fn deinit(self: *Self, io: std.Io) void {
-            self.tasks.cancel(io);
-            self.accept_tasks.cancel(io);
-
-            if (self.listener) |*listener|
-                listener.deinit(io);
-
+            if (self.listener) |*listener| listener.deinit(io);
             for (&self.connections) |*item|
-                if (item.state != .free and !item.stream_closed)
-                    item.stream.close(io);
-
+                if (item.state != .free and !item.stream_closed) item.stream.close(io);
+            for (self.wake_pipe) |fd| closeFd(fd);
             self.* = undefined;
         }
 
@@ -86,48 +84,40 @@ pub fn Transport(comptime limits: network.Limits) type {
             return .{
                 .context = self,
                 .vtable = network.Transport.adapter(Self),
-                .inheritance = if (builtin.os.tag == .linux) .{
-                    .context = self,
-                    .pause = pauseAccept,
-                    .ready = paused,
-                    .listener = listenerDescriptor,
-                    .descriptor = descriptor,
-                    .adopt = adopt,
-                } else null,
+                .inheritance = if (builtin.os.tag == .linux) network.Inheritance.init(Self, self) else null,
             };
         }
 
-        fn pauseAccept(context: *anyopaque, io: std.Io, pause: bool) void {
-            const self: *Self = @ptrCast(@alignCast(context));
-            self.mutex.lockUncancelable(io);
-            self.accepting = !pause;
-            self.mutex.unlock(io);
-
-            if (pause)
-                self.accept_tasks.cancel(io);
+        pub fn pause(self: *Self, _: std.Io, enabled: bool) void {
+            self.accepting = !enabled;
+            if (enabled) for (self.operations, 0..) |op, index| {
+                if (!op.used) continue;
+                const completion: network.Completion = .{ .handle = op.handle, .result = .{ .bytes = 0, .errno = @intFromEnum(posix.E.CANCELED) } };
+                self.push(if (op.kind == .receive) .{ .received = completion } else .{ .sent = completion });
+                self.release(index);
+            };
         }
 
-        fn paused(context: *anyopaque) bool {
-            const self: *Self = @ptrCast(@alignCast(context));
-            return !self.accepting and !self.accept_pending;
+        pub fn paused(self: *Self) bool {
+            if (self.accepting or self.event_count != 0) return false;
+            for (self.operations) |op| if (op.used) return false;
+            return true;
         }
 
-        fn listenerDescriptor(context: *anyopaque) i32 {
-            const self: *Self = @ptrCast(@alignCast(context));
+        pub fn listenerDescriptor(self: *Self) i32 {
             return self.listener.?.socket.handle;
         }
 
-        fn descriptor(context: *anyopaque, handle: network.Handle) i32 {
-            const self: *Self = @ptrCast(@alignCast(context));
+        pub fn descriptor(self: *Self, handle: network.Handle) i32 {
             const item = self.connection(handle).?;
             assert(item.receive == null and item.send == null);
             return item.stream.socket.handle;
         }
 
-        fn adopt(context: *anyopaque, fd: i32) !network.Handle {
-            const self: *Self = @ptrCast(@alignCast(context));
+        pub fn adopt(self: *Self, fd: i32) !network.Handle {
             const index = self.freeConnection() orelse return error.Full;
             assert(fd >= 0 and self.connections[index].generation == 0);
+            try nonblocking(fd);
             self.connections[index] = .{
                 .state = .open,
                 .stream = .{ .socket = .{ .handle = fd, .address = self.listener.?.socket.address } },
@@ -144,83 +134,81 @@ pub fn Transport(comptime limits: network.Limits) type {
             return self.start(io, handle, .send, @constCast(bytes));
         }
 
-        pub fn close(self: *Self, io: std.Io, handle: network.Handle, reason: network.CloseReason) void {
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-
+        pub fn close(self: *Self, _: std.Io, handle: network.Handle, reason: network.CloseReason) void {
             if (self.connection(handle)) |item| {
                 item.close = reason;
                 item.state = .closing;
-                item.stream.shutdown(io, .both) catch {};
-                self.wake.set(io);
             }
         }
 
-        pub fn releaseConnection(self: *Self, io: std.Io, handle: network.Handle) void {
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
+        pub fn releaseConnection(self: *Self, _: std.Io, handle: network.Handle) void {
             const item = &self.connections[handle.index];
             assert(item.state == .closed and item.generation == handle.generation);
             assert(item.receive == null and item.send == null and item.stream_closed);
             item.* = .{ .generation = item.generation };
         }
 
-        pub fn notify(self: *Self, io: std.Io) void {
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-            self.notified = true;
-            self.wake.set(io);
+        pub fn notify(self: *Self, _: std.Io) void {
+            if (self.notified.swap(true, .acq_rel)) return;
+            const byte = [_]u8{1};
+            while (true) {
+                const result = posix.system.write(self.wake_pipe[1], &byte, byte.len);
+                switch (posix.errno(result)) {
+                    .SUCCESS, .AGAIN => return,
+                    .INTR => continue,
+                    else => unreachable,
+                }
+            }
         }
 
         pub fn poll(self: *Self, io: std.Io, timeout: ?std.Io.Timeout, destination: []network.Event) !usize {
             assert(destination.len != 0);
-            const deadline = (timeout orelse @as(std.Io.Timeout, .none)).toDeadline(io);
-
-            while (true) {
-                self.scheduleAccept(io);
-                self.mutex.lockUncancelable(io);
-                self.finishCloses(io);
-
-                const count = @min(destination.len, self.event_count);
-
-                for (destination[0..count]) |*event| {
-                    event.* = self.events[self.event_head];
-                    self.event_head = (self.event_head + 1) % limits.events;
+            self.finishCloses(io);
+            if (self.paused()) return 0;
+            if (self.event_count == 0) {
+                var fds: [limits.connections + 2]posix.pollfd = undefined;
+                fds[0] = .{ .fd = if (self.accepting and self.freeConnection() != null) self.listener.?.socket.handle else -1, .events = posix.POLL.IN, .revents = 0 };
+                fds[1] = .{ .fd = self.wake_pipe[0], .events = posix.POLL.IN, .revents = 0 };
+                for (self.connections, fds[2..]) |item, *fd| {
+                    fd.* = .{ .fd = if (item.state == .open and (item.receive != null or item.send != null)) item.stream.socket.handle else -1, .events = 0, .revents = 0 };
+                    if (item.receive != null) fd.events |= posix.POLL.IN;
+                    if (item.send != null) fd.events |= posix.POLL.OUT;
                 }
-
-                self.event_count -= count;
-                const notified = self.notified;
-                self.notified = false;
-
-                if (self.event_count == 0)
-                    self.wake.reset();
-
-                self.mutex.unlock(io);
-
-                if (count != 0 or notified)
-                    return count;
-
-                self.wake.waitTimeout(io, deadline) catch |err| switch (err) {
-                    error.Timeout => return 0,
-                    else => return err,
-                };
+                const duration = (timeout orelse @as(std.Io.Timeout, .none)).toDurationFromNow(io);
+                const milliseconds: i32 = if (duration) |value| @intCast(@min(std.math.maxInt(i32), @max(0, @divFloor(value.raw.toNanoseconds() + std.time.ns_per_ms - 1, std.time.ns_per_ms)))) else -1;
+                _ = try posix.poll(&fds, milliseconds);
+                if (fds[1].revents != 0) {
+                    var bytes: [128]u8 = undefined;
+                    while (true) {
+                        const result = posix.system.read(self.wake_pipe[0], &bytes, bytes.len);
+                        switch (posix.errno(result)) {
+                            .SUCCESS => if (result == 0) break,
+                            .AGAIN => break,
+                            .INTR => continue,
+                            else => return error.Unexpected,
+                        }
+                    }
+                    _ = self.notified.swap(false, .acq_rel);
+                }
+                if (fds[0].revents & posix.POLL.IN != 0) try self.acceptReady(io);
+                for (self.connections, fds[2..]) |item, fd| {
+                    if (fd.revents == 0 or item.state != .open) continue;
+                    if (item.receive) |index| if (fd.revents & (posix.POLL.IN | posix.POLL.ERR | posix.POLL.HUP) != 0) self.operationReady(index);
+                    if (item.send) |index| if (fd.revents & (posix.POLL.OUT | posix.POLL.ERR | posix.POLL.HUP) != 0) self.operationReady(index);
+                }
+                self.finishCloses(io);
             }
+            const count = @min(destination.len, self.event_count);
+            for (destination[0..count]) |*event| {
+                event.* = self.events[self.event_head];
+                self.event_head = (self.event_head + 1) % limits.events;
+            }
+            self.event_count -= count;
+            return count;
         }
 
-        fn start(self: *Self, io: std.Io, handle: network.Handle, kind: Kind, bytes: []u8) network.QueueError!void {
-            self.mutex.lockUncancelable(io);
-            const index = self.queue(handle, kind, bytes) catch |err| {
-                self.mutex.unlock(io);
-                return err;
-            };
-            self.mutex.unlock(io);
-
-            self.tasks.concurrent(io, operationTask, .{ self, io, index }) catch {
-                self.mutex.lockUncancelable(io);
-                self.release(index);
-                self.mutex.unlock(io);
-                return error.Full;
-            };
+        fn start(self: *Self, _: std.Io, handle: network.Handle, kind: Kind, bytes: []u8) network.QueueError!void {
+            _ = try self.queue(handle, kind, bytes);
         }
 
         fn queue(self: *Self, handle: network.Handle, kind: Kind, bytes: []u8) network.QueueError!usize {
@@ -245,114 +233,48 @@ pub fn Transport(comptime limits: network.Limits) type {
             return index;
         }
 
-        fn operationTask(self: *Self, io: std.Io, index: usize) std.Io.Cancelable!void {
-            self.mutex.lockUncancelable(io);
-            const operation = &self.operations[index];
+        fn operationReady(self: *Self, index: usize) void {
+            const operation = self.operations[index];
             const item = self.owner(operation.handle).?;
-            const stream = item.stream;
-            const handle = operation.handle;
-            const kind = operation.kind;
+            const fd = item.stream.socket.handle;
             const bytes = operation.bytes;
-            self.mutex.unlock(io);
-
-            var result: network.Result = .{ .bytes = 0 };
-            var failed = false;
-
-            switch (kind) {
-                .receive => {
-                    var buffers: [1][]u8 = .{bytes};
-                    const count = blk: {
-                        break :blk io.vtable.netRead(io.userdata, stream.socket.handle, &buffers) catch {
-                            failed = true;
-                            break :blk 0;
-                        };
-                    };
-                    result = .{
-                        .bytes = count,
-                        .errno = if (failed or count == 0) 1 else null,
-                    };
-                },
-                .send => {
-                    const data: [1][]const u8 = .{bytes};
-                    const count = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &data, 1) catch blk: {
-                        failed = true;
-                        break :blk 0;
-                    };
-                    assert(count <= bytes.len);
-                    result = .{
-                        .bytes = count,
-                        .errno = if (failed or count == 0) 1 else null,
-                    };
-                },
-            }
-
-            self.mutex.lockUncancelable(io);
-            if (!self.operations[index].used) {
-                self.mutex.unlock(io);
-                return;
-            }
-
-            self.push(switch (kind) {
-                .receive => .{ .received = .{ .handle = handle, .result = result } },
-                .send => .{ .sent = .{ .handle = handle, .result = result } },
+            const result = switch (operation.kind) {
+                .receive => posix.system.recvfrom(fd, bytes.ptr, bytes.len, 0, null, null),
+                .send => posix.system.sendto(fd, bytes.ptr, bytes.len, if (@hasDecl(posix.MSG, "NOSIGNAL")) posix.MSG.NOSIGNAL else 0, null, 0),
+            };
+            const errno = posix.errno(result);
+            if (errno == .AGAIN or errno == .INTR) return;
+            const count: usize = if (errno == .SUCCESS) @intCast(result) else 0;
+            const completion: network.Completion = .{ .handle = operation.handle, .result = .{ .bytes = count, .errno = if (errno == .SUCCESS and count != 0) null else 1 } };
+            self.push(switch (operation.kind) {
+                .receive => .{ .received = completion },
+                .send => .{ .sent = completion },
             });
-            self.wake.set(io);
             self.release(index);
+            if (completion.result.errno != null) {
+                item.state = .closing;
+                item.close = if (operation.kind == .receive) .peer_closed else .io_failure;
+            }
+        }
 
-            if (result.errno != null) {
-                if (self.connection(handle)) |live| {
-                    live.state = .closing;
-                    live.close = if (kind == .receive) .peer_closed else .io_failure;
-                    live.stream.shutdown(io, .both) catch {};
+        fn acceptReady(self: *Self, io: std.Io) !void {
+            while (self.freeConnection()) |index| {
+                const result = posix.system.accept(self.listener.?.socket.handle, null, null);
+                switch (posix.errno(result)) {
+                    .SUCCESS => {},
+                    .AGAIN => return,
+                    .INTR, .CONNABORTED => continue,
+                    else => return error.Unexpected,
                 }
-            }
-
-            self.mutex.unlock(io);
-        }
-
-        fn scheduleAccept(self: *Self, io: std.Io) void {
-            self.mutex.lockUncancelable(io);
-            if (!self.accepting or self.accept_pending or self.listener == null or self.freeConnection() == null) {
-                self.mutex.unlock(io);
-                return;
-            }
-
-            self.accept_pending = true;
-            self.mutex.unlock(io);
-            self.accept_tasks.concurrent(io, acceptTask, .{ self, io }) catch {
-                self.mutex.lockUncancelable(io);
-                self.accept_pending = false;
-                self.mutex.unlock(io);
-            };
-        }
-
-        fn acceptTask(self: *Self, io: std.Io) std.Io.Cancelable!void {
-            self.mutex.lockUncancelable(io);
-            var server = self.listener orelse {
-                self.accept_pending = false;
-                self.mutex.unlock(io);
-                return;
-            };
-            self.mutex.unlock(io);
-            const stream = server.accept(io) catch {
-                self.mutex.lockUncancelable(io);
-                self.accept_pending = false;
-                self.mutex.unlock(io);
-                return;
-            };
-            self.mutex.lockUncancelable(io);
-            self.accept_pending = false;
-
-            if (self.freeConnection()) |index| {
+                const fd: posix.fd_t = @intCast(result);
+                errdefer closeFd(fd);
+                try nonblocking(fd);
                 var generation = self.connections[index].generation +% 1;
-                if (generation == 0)
-                    generation = 1;
-
-                self.connections[index] = .{ .state = .open, .stream = stream, .generation = generation };
+                if (generation == 0) generation = 1;
+                self.connections[index] = .{ .state = .open, .stream = .{ .socket = .{ .handle = fd, .address = self.listener.?.socket.address } }, .generation = generation };
                 self.push(.{ .accepted = .{ .index = @intCast(index), .generation = generation } });
-                self.wake.set(io);
-            } else stream.close(io);
-            self.mutex.unlock(io);
+            }
+            _ = io;
         }
 
         fn release(self: *Self, index: usize) void {
@@ -367,8 +289,13 @@ pub fn Transport(comptime limits: network.Limits) type {
 
         fn finishCloses(self: *Self, io: std.Io) void {
             for (&self.connections, 0..) |*item, index| {
-                if (item.state != .closing or item.receive != null or item.send != null)
-                    continue;
+                if (item.state != .closing) continue;
+                const pending = [_]?usize{ item.receive, item.send };
+                for (pending) |slot| if (slot) |at| {
+                    const completion: network.Completion = .{ .handle = self.operations[at].handle, .result = .{ .bytes = 0, .errno = 1 } };
+                    self.push(if (self.operations[at].kind == .receive) .{ .received = completion } else .{ .sent = completion });
+                    self.release(at);
+                };
 
                 const handle: network.Handle = .{ .index = @intCast(index), .generation = item.generation };
                 item.stream.close(io);
@@ -416,6 +343,24 @@ pub fn Transport(comptime limits: network.Limits) type {
             self.event_count += 1;
         }
 
-        pub fn submit(_: *Self, _: std.Io) !void {}
+        pub fn submit(self: *Self, _: std.Io) !void {
+            for (self.operations, 0..) |op, index| if (op.used) self.operationReady(index);
+        }
     };
+}
+
+fn nonblocking(fd: posix.fd_t) !void {
+    const flags = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+    if (posix.errno(flags) != .SUCCESS) return error.Unexpected;
+    const nonblock: u32 = @bitCast(posix.O{ .NONBLOCK = true });
+    if (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, @as(usize, @intCast(flags)) | nonblock)) != .SUCCESS) return error.Unexpected;
+    if (posix.errno(posix.system.fcntl(fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC))) != .SUCCESS) return error.Unexpected;
+}
+
+fn closeFd(fd: posix.fd_t) void {
+    _ = posix.system.close(fd);
+}
+
+test "pause returns socket buffer ownership without waiting for the peer" {
+    try networking_test.pause(Transport(.{ .connections = 2, .operations = 8, .events = 16 }));
 }

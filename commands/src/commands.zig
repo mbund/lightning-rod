@@ -1,5 +1,4 @@
 const std = @import("std");
-
 pub const wire = @import("wire.zig");
 
 const assert = std.debug.assert;
@@ -13,7 +12,27 @@ pub const Permission = struct {
 
 pub const Policy = struct {
     context: *anyopaque,
-    allows: *const fn (*anyopaque, u128, *const Permission) bool,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        allows: *const fn (*anyopaque, u128, *const Permission) bool,
+    };
+
+    pub fn init(owner: anytype, comptime handler: anytype) Policy {
+        const Adapter = struct {
+            const vtable: VTable = .{ .allows = @This().invoke };
+
+            fn invoke(raw: *anyopaque, uuid: u128, permission: *const Permission) bool {
+                const typed: @TypeOf(owner) = @ptrCast(@alignCast(raw));
+                return handler(typed, uuid, permission);
+            }
+        };
+        return .{ .context = owner, .vtable = &Adapter.vtable };
+    }
+
+    pub fn allows(self: Policy, uuid: u128, permission: *const Permission) bool {
+        return self.vtable.allows(self.context, uuid, permission);
+    }
 };
 
 pub const Grants = struct {
@@ -27,11 +46,10 @@ pub const Grants = struct {
     users: []const User = &.{},
 
     pub fn policy(self: *Grants) Policy {
-        return .{ .context = self, .allows = allows };
+        return Policy.init(self, allows);
     }
 
-    fn allows(context: *anyopaque, uuid: u128, permission: *const Permission) bool {
-        const self: *const Grants = @ptrCast(@alignCast(context));
+    fn allows(self: *const Grants, uuid: u128, permission: *const Permission) bool {
         var granted = false;
 
         for (self.everyone) |entry|
@@ -53,13 +71,37 @@ pub const Grants = struct {
     }
 };
 
+pub const Reply = struct {
+    context: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        write: *const fn (*anyopaque, []const u8) void,
+    };
+
+    pub fn init(owner: anytype, comptime handler: anytype) Reply {
+        const Adapter = struct {
+            const vtable: VTable = .{ .write = @This().invoke };
+
+            fn invoke(raw: *anyopaque, text: []const u8) void {
+                const typed: @TypeOf(owner) = @ptrCast(@alignCast(raw));
+                return handler(typed, text);
+            }
+        };
+        return .{ .context = owner, .vtable = &Adapter.vtable };
+    }
+
+    pub fn write(self: Reply, text: []const u8) void {
+        return self.vtable.write(self.context, text);
+    }
+};
+
 pub const Context = struct {
     sender: u128,
-    output: *anyopaque,
-    write: *const fn (*anyopaque, []const u8) void,
+    output: Reply,
 
     pub fn reply(self: Context, text: []const u8) void {
-        self.write(self.output, text);
+        self.output.write(text);
     }
 };
 
@@ -128,12 +170,20 @@ pub const Kind = enum {
     double,
 };
 
+pub const SuggestVTable = struct {
+    suggest: *const fn (*anyopaque, CompletionContext, *Suggestions) void,
+};
+
+pub const CommandVTable = struct {
+    invoke: *const fn (*anyopaque, Context, []const []const u8) anyerror!void,
+};
+
 pub const ArgumentInfo = struct {
     kind: Kind,
     optional: bool,
     minimum: ?i64,
     maximum: ?i64,
-    suggest: ?*const fn (*anyopaque, CompletionContext, *Suggestions) void,
+    suggest: ?*const SuggestVTable,
 };
 
 pub const Definition = struct {
@@ -143,7 +193,7 @@ pub const Definition = struct {
     permission: ?*const Permission,
     argument_names: []const []const u8,
     arguments: []const ArgumentInfo,
-    invoke: *const fn (*anyopaque, Context, []const []const u8) anyerror!void,
+    vtable: *const CommandVTable,
 };
 
 pub fn Argument(comptime Owner: type, comptime T: type) type {
@@ -184,7 +234,13 @@ pub fn leaf(comptime Owner: type, comptime Args: type, comptime definition: Leaf
         @compileError("too many command arguments");
 
     const Adapter = struct {
-        fn invoke(pointer: *anyopaque, context: Context, values: []const []const u8) !void {
+        const vtable: CommandVTable = .{ .invoke = @This().invoke };
+
+        fn invoke(pointer: *anyopaque, context: Context, values: []const []const u8) anyerror!void {
+            return execute(@ptrCast(@alignCast(pointer)), context, values);
+        }
+
+        fn execute(owner: *Owner, context: Context, values: []const []const u8) !void {
             assert(values.len <= fields.len);
             var args: Args = undefined;
 
@@ -193,7 +249,7 @@ pub fn leaf(comptime Owner: type, comptime Args: type, comptime definition: Leaf
 
                 if (index < values.len) {
                     const parse = spec.parse orelse Parser(Owner, Value(field.type)).parse;
-                    const value = try parse(@ptrCast(@alignCast(pointer)), context, values[index]);
+                    const value = try parse(owner, context, values[index]);
 
                     if (comptime @typeInfo(Value(field.type)) == .int) {
                         if (spec.minimum) |minimum| if (value < minimum) return error.InvalidArgument;
@@ -206,7 +262,7 @@ pub fn leaf(comptime Owner: type, comptime Args: type, comptime definition: Leaf
                 } else return error.InvalidArgument;
             }
 
-            try definition.handler(@ptrCast(@alignCast(pointer)), context, args);
+            try definition.handler(owner, context, args);
         }
     };
     const arguments = comptime block: {
@@ -235,9 +291,15 @@ pub fn leaf(comptime Owner: type, comptime Args: type, comptime definition: Leaf
                 @compileError("greedy argument must be last");
 
             const AdapterSuggest = struct {
-                fn suggest(pointer: *anyopaque, context: CompletionContext, suggestions: *Suggestions) void {
+                const vtable: SuggestVTable = .{ .suggest = @This().invoke };
+
+                fn invoke(pointer: *anyopaque, context: CompletionContext, suggestions: *Suggestions) void {
+                    return suggest(@ptrCast(@alignCast(pointer)), context, suggestions);
+                }
+
+                fn suggest(owner: *Owner, context: CompletionContext, suggestions: *Suggestions) void {
                     if (spec.suggest) |callback|
-                        return callback(@ptrCast(@alignCast(pointer)), context, suggestions);
+                        return callback(owner, context, suggestions);
 
                     if (comptime @typeInfo(T) == .@"enum") inline for (std.meta.fields(T)) |tag| {
                         if (std.mem.startsWith(u8, tag.name, context.prefix)) suggestions.add(.{ .text = tag.name }) catch return;
@@ -270,7 +332,7 @@ pub fn leaf(comptime Owner: type, comptime Args: type, comptime definition: Leaf
                 .optional = optional,
                 .minimum = spec.minimum,
                 .maximum = spec.maximum,
-                .suggest = if (spec.suggest != null or @typeInfo(T) == .@"enum") AdapterSuggest.suggest else null,
+                .suggest = if (spec.suggest != null or @typeInfo(T) == .@"enum") &AdapterSuggest.vtable else null,
             };
 
             if (output[index].kind == .integer) {
@@ -293,7 +355,7 @@ pub fn leaf(comptime Owner: type, comptime Args: type, comptime definition: Leaf
         .permission = definition.permission,
         .argument_names = std.meta.fieldNames(Args),
         .arguments = &arguments,
-        .invoke = Adapter.invoke,
+        .vtable = &Adapter.vtable,
     };
 }
 
@@ -325,10 +387,7 @@ pub const Commands = struct {
     pub const Configuration = struct {
         maximum_nodes: usize = 128,
         help_page_size: usize = 6,
-    };
-
-    pub const Dependencies = struct {
-        permission_policy: ?Policy,
+        permission_policy: ?Policy = null,
     };
 
     pub const Node = struct {
@@ -338,7 +397,7 @@ pub const Commands = struct {
         permission: ?*const Permission = null,
         argument: ?ArgumentInfo = null,
         context: *anyopaque = undefined,
-        invoke: ?*const fn (*anyopaque, Context, []const []const u8) anyerror!void = null,
+        vtable: ?*const CommandVTable = null,
     };
 
     allocator: std.mem.Allocator,
@@ -346,13 +405,12 @@ pub const Commands = struct {
     count: u16 = 1,
     sealed: bool = false,
     config: Configuration,
-    deps: Dependencies,
 
     const HelpArgs = struct {
         page: ?u32,
     };
 
-    pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Commands {
+    pub fn init(allocator: std.mem.Allocator, config: Configuration) !*Commands {
         if (config.maximum_nodes < 3 or config.maximum_nodes > 1024 or config.help_page_size == 0 or config.help_page_size > 10)
             return error.InvalidConfiguration;
 
@@ -363,7 +421,6 @@ pub const Commands = struct {
             .allocator = allocator,
             .nodes = nodes,
             .config = config,
-            .deps = deps,
         };
 
         _ = try self.register(self, leaf(Commands, HelpArgs, .{
@@ -385,12 +442,12 @@ pub const Commands = struct {
     }
 
     pub fn installPolicyIfUnset(self: *Commands, policy: Policy) void {
-        if (self.deps.permission_policy == null) self.deps.permission_policy = policy;
+        if (self.config.permission_policy == null) self.config.permission_policy = policy;
     }
 
     pub fn permits(self: *const Commands, sender: u128, permission: *const Permission) bool {
-        const policy = self.deps.permission_policy orelse return false;
-        return policy.allows(policy.context, sender, permission);
+        const policy = self.config.permission_policy orelse return false;
+        return policy.allows(sender, permission);
     }
 
     pub fn allowed(self: *const Commands, sender: u128, index: usize) bool {
@@ -400,8 +457,8 @@ pub const Commands = struct {
         while (current != 0) {
             const node = self.nodes[current];
             if (node.permission) |permission| {
-                const policy = self.deps.permission_policy orelse return false;
-                if (!policy.allows(policy.context, sender, permission)) return false;
+                const policy = self.config.permission_policy orelse return false;
+                if (!policy.allows(sender, permission)) return false;
             }
 
             assert(node.parent < current);
@@ -465,7 +522,7 @@ pub const Commands = struct {
             }
         }
 
-        const invoke = self.nodes[node].invoke orelse {
+        const vtable = self.nodes[node].vtable orelse {
             context.reply("Missing arguments. Use /help.");
             return;
         };
@@ -474,7 +531,7 @@ pub const Commands = struct {
             return;
         }
 
-        invoke(self.nodes[node].context, context, words[0..count]) catch |err| switch (err) {
+        vtable.invoke(self.nodes[node].context, context, words[0..count]) catch |err| switch (err) {
             error.InvalidArgument => context.reply("Invalid argument. Use /help for usage."),
             else => return err,
         };
@@ -485,7 +542,7 @@ pub const Commands = struct {
         visible[0] = true;
 
         for (self.nodes[1..self.count], 1..) |node, index|
-            visible[index] = node.invoke != null and self.allowed(sender, index);
+            visible[index] = node.vtable != null and self.allowed(sender, index);
 
         var index: usize = self.count;
         while (index > 1) {
@@ -527,7 +584,7 @@ pub const Commands = struct {
                         continue;
 
                     if (child.argument) |argument| {
-                        if (argument.suggest) |suggest| suggest(child.context, .{
+                        if (argument.suggest) |vtable| vtable.suggest(child.context, .{
                             .sender = sender,
                             .input = input,
                             .prefix = prefix,
@@ -562,8 +619,8 @@ pub const Commands = struct {
                     output.start = start;
                     output.length = input.len - start;
 
-                    if (spec.suggest) |suggest|
-                        suggest(self.nodes[node].context, .{
+                    if (spec.suggest) |vtable|
+                        vtable.suggest(self.nodes[node].context, .{
                             .sender = sender,
                             .input = input,
                             .prefix = input[start..],
@@ -589,13 +646,13 @@ pub const Commands = struct {
         var total: usize = 0;
 
         for (self.nodes[1..self.count], 1..) |node, index| {
-            if (node.invoke == null or !self.allowed(context.sender, index))
+            if (node.vtable == null or !self.allowed(context.sender, index))
                 continue;
 
             var extended = false;
 
             for (self.nodes[index + 1 .. self.count]) |child|
-                extended = extended or (child.parent == index and child.argument != null and child.invoke == node.invoke);
+                extended = extended or (child.parent == index and child.argument != null and child.vtable == node.vtable);
 
             if (!extended) total += 1;
         }
@@ -612,12 +669,12 @@ pub const Commands = struct {
         var ordinal: usize = 0;
 
         for (self.nodes[1..self.count], 1..) |node, index| {
-            if (node.invoke == null or !self.allowed(context.sender, index))
+            if (node.vtable == null or !self.allowed(context.sender, index))
                 continue;
 
             var extended = false;
             for (self.nodes[index + 1 .. self.count]) |child|
-                extended = extended or (child.parent == index and child.argument != null and child.invoke == node.invoke);
+                extended = extended or (child.parent == index and child.argument != null and child.vtable == node.vtable);
             if (extended)
                 continue;
 
@@ -745,7 +802,7 @@ pub const Branch = struct {
         var parent = branch.index;
         for (definition.arguments, definition.argument_names) |argument, name| {
             if (argument.optional) {
-                self.commands.nodes[parent].invoke = definition.invoke;
+                self.commands.nodes[parent].vtable = definition.vtable;
                 self.commands.nodes[parent].context = owner;
             }
 
@@ -761,7 +818,7 @@ pub const Branch = struct {
             parent = index;
         }
 
-        self.commands.nodes[parent].invoke = definition.invoke;
+        self.commands.nodes[parent].vtable = definition.vtable;
         self.commands.nodes[parent].context = owner;
         assert(parent < self.commands.count);
         return branch;

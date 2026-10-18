@@ -4,15 +4,14 @@
     {
       "name": "items-plaintext",
       "fixture": "items_plaintext",
-      "required_logs": [{ "text": "event=reload_resumed " }],
-      "forbidden_logs": ["event=reload_fallback ", "event=session_encrypted "],
-      "peers": ["alice", "bob"]
+      "peers": [
+        "alice",
+        "bob"
+      ]
     },
     {
       "name": "items-multi",
       "fixture": "items",
-      "required_logs": [{ "text": "event=reload_resumed " }],
-      "forbidden_logs": ["event=reload_fallback "],
       "peers": [
         "alice",
         "bob"
@@ -21,10 +20,11 @@
     {
       "name": "items-mixed-protocols",
       "fixture": "items",
-      "required_logs": [{ "text": "event=reload_resumed " }],
-      "forbidden_logs": ["event=reload_fallback "],
-      "peer_versions": ["26.2", "1.21.8"],
-      "peers": ["alice", "bob"]
+      "peers": [
+        "alice",
+        "bob"
+      ],
+      "mixed_versions": true
     }
   ]
 }

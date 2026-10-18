@@ -1,3 +1,4 @@
+const metrics = @import("metrics");
 const std = @import("std");
 const storage = @import("storage");
 const records = @import("records");
@@ -25,7 +26,8 @@ pub const Entities = struct {
     };
 
     pub const Dependencies = struct {
-        storage: storage.Namespace,
+        metrics: *metrics.Registry,
+        storage: storage.Space,
     };
 
     deps: Dependencies,
@@ -35,7 +37,7 @@ pub const Entities = struct {
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, configuration: Configuration, deps: Dependencies) !*Entities {
         var sequence: [8]u8 = undefined;
-        const length = try deps.storage.get(&.{0}, &sequence);
+        const length = try records.Table.init(deps.storage).get(&.{0}, &sequence);
         if (length != null and length.? != sequence.len)
             return error.Corrupt;
 
@@ -46,7 +48,9 @@ pub const Entities = struct {
         const self = try allocator.create(Entities);
         self.* = .{
             .deps = deps,
-            .cache = try records.Cache.init(allocator, io, deps.storage, .{
+            .cache = try records.Cache.init(allocator, io, records.Table.init(deps.storage), .{
+                .metrics = deps.metrics,
+                .metrics_namespace = "entities.cache",
                 .slots = configuration.cache_records,
                 .key_bytes = 9,
                 .value_bytes = encoded_bytes,
@@ -79,56 +83,74 @@ pub const Entities = struct {
         return result;
     }
 
-    pub fn get(self: *Entities, entity: Id) !?State {
-        if (entity == 0)
-            return error.InvalidEntity;
+    pub const Lease = struct {
+        record: records.Cache.Lease,
 
-        const key = encodeKey(entity);
-        const lease = try self.cache.acquire(&key);
-        defer lease.release();
-        const bytes = lease.read() orelse return null;
-        return try decode(bytes);
+        pub fn read(self: Lease) !?State {
+            return if (self.record.read()) |bytes| try decode(bytes) else null;
+        }
+
+        pub fn write(self: Lease, state: State) !void {
+            if (!valid(state)) return error.InvalidEntity;
+            if (self.record.read() == null) return error.UnknownEntity;
+            encode(state, self.record.edit());
+            self.record.commit(encoded_bytes);
+        }
+
+        pub fn release(self: Lease) void {
+            self.record.release();
+        }
+    };
+
+    pub fn acquireMany(self: *Entities, ids: []const Id, output: []Lease) !void {
+        return self.acquireBatch(128, ids, output);
+    }
+
+    fn acquireBatch(self: *Entities, comptime capacity: usize, ids: []const Id, output: []Lease) !void {
+        if (ids.len != output.len or ids.len > capacity) return error.WorkingSetTooLarge;
+        var keys: [capacity][9]u8 = undefined;
+        var slices: [capacity][]const u8 = undefined;
+        var leases: [capacity]records.Cache.Lease = undefined;
+        for (ids, 0..) |entity, i| {
+            if (entity == 0) return error.InvalidEntity;
+            keys[i] = encodeKey(entity);
+            slices[i] = &keys[i];
+        }
+        try self.cache.acquireMany(slices[0..ids.len], leases[0..ids.len]);
+        for (output, leases[0..ids.len]) |*lease, record| lease.* = .{ .record = record };
+    }
+
+    pub fn get(self: *Entities, entity: Id) !?State {
+        var leases: [1]Lease = undefined;
+        try self.acquireBatch(1, &.{entity}, &leases);
+        defer leases[0].release();
+        return leases[0].read();
     }
 
     pub fn put(self: *Entities, entity: Id, state: State) !void {
-        if (entity == 0)
-            return error.InvalidEntity;
-
-        if (!valid(state))
-            return error.InvalidEntity;
-
-        const key = encodeKey(entity);
-        const lease = try self.cache.acquire(&key);
-        defer lease.release();
-        if (lease.read() == null)
-            return error.UnknownEntity;
-
-        encode(state, lease.edit());
-        lease.commit(encoded_bytes);
+        var leases: [1]Lease = undefined;
+        try self.acquireBatch(1, &.{entity}, &leases);
+        defer leases[0].release();
+        try leases[0].write(state);
     }
 
     pub fn remove(self: *Entities, entity: Id) !void {
-        if (entity == 0)
-            return error.InvalidEntity;
-
-        const key = encodeKey(entity);
-        const lease = try self.cache.acquire(&key);
-        defer lease.release();
-        if (lease.read() == null)
-            return error.UnknownEntity;
-
-        lease.remove();
+        var leases: [1]Lease = undefined;
+        try self.acquireBatch(1, &.{entity}, &leases);
+        defer leases[0].release();
+        if (leases[0].record.read() == null) return error.UnknownEntity;
+        leases[0].record.remove();
     }
 
     /// Ordered by stable entity ID. Storage may be read synchronously in bounded batches. The
     /// returned values belong to this cursor.
     pub fn scan(self: *Entities, cursor: *Cursor) ![]const Row {
-        var entries: [16]storage.ScanEntry = undefined;
+        var entries: [16]records.ScanEntry = undefined;
 
         for (&entries, &cursor.keys, &cursor.values) |*entry, *key, *value|
             entry.* = .{ .key = key, .value = value };
 
-        var position: storage.ScanCursor = .{
+        var position: records.ScanCursor = .{
             .after = &cursor.after,
             .after_len = cursor.after_len,
         };
@@ -154,14 +176,14 @@ pub const Entities = struct {
         return cursor.rows[0..count];
     }
 
-    pub fn checkpoint(self: *Entities, namespace: storage.Namespace) !void {
+    pub fn checkpoint(self: *Entities, space: storage.Space) !void {
         try self.cache.flush();
         if (self.next_id == self.checkpointed_id)
             return;
 
         var sequence: [8]u8 = undefined;
         std.mem.writeInt(Id, &sequence, self.next_id, .little);
-        try namespace.put(&.{0}, &sequence);
+        try records.Table.init(space).put(&.{0}, &sequence);
         self.checkpointed_id = self.next_id;
     }
 };

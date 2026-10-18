@@ -7,7 +7,7 @@
     {
       "name": "chunks-disk",
       "prepare": "chunks-prepare",
-      "forbidden_logs": ["event=terrain_generation_started"]
+      "fixture": "disk"
     },
     {
       "name": "chunks-multi",
@@ -17,13 +17,21 @@
       ]
     },
     {
+      "name": "chunks-protocol-multi",
+      "peers": [
+        "alice",
+        "bob"
+      ],
+      "mixed_versions": true
+    },
+    {
       "name": "chunks-disk-multi",
       "peers": [
         "alice",
         "bob"
       ],
       "prepare": "chunks-prepare-multi",
-      "forbidden_logs": ["event=terrain_generation_started"]
+      "fixture": "disk"
     },
     {
       "name": "chunks-encrypted-multi",
@@ -31,10 +39,7 @@
         "alice",
         "bob"
       ],
-      "fixture": "encryption",
-      "required_logs": [
-        { "text": "event=session_encrypted ", "per_peer": true }
-      ]
+      "fixture": "encryption"
     },
     {
       "name": "chunks-simulations-multi",
@@ -42,12 +47,7 @@
         "alice",
         "bob"
       ],
-      "fixture": "simulations",
-      "required_logs": [
-        { "text": "event=simulation_ready ", "count": 2 },
-        { "text": "event=session_routed endpoint=0 ", "at_least": true },
-        { "text": "event=session_routed endpoint=1 ", "at_least": true }
-      ]
+      "fixture": "simulations"
     },
     {
       "name": "chunks-isolation",

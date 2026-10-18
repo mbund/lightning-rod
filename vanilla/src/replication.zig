@@ -1,12 +1,14 @@
 const std = @import("std");
-
-const assert = std.debug.assert;
+const protocols = @import("protocols");
+const sessions = @import("sessions");
 const Players = @import("players.zig").Players;
 const game_data = @import("game_data");
 const minecraft = @import("minecraft_model");
 const packets = @import("minecraft_packets");
 const wire_1_21_5 = @import("wire_1_21_5");
 const wire_1_21_9 = @import("wire_1_21_9");
+
+const assert = std.debug.assert;
 
 pub const Replication = struct {
     pub const id = "minecraft:player_replication";
@@ -40,11 +42,30 @@ pub const Replication = struct {
     const Observer = struct {
         generation: u32 = 0,
         world: u32 = 0,
+        spawned: u256 = 0,
+        pending: u256 = 0,
     };
 
     deps: Dependencies,
     seen: []Seen,
     observers: []Observer,
+    subjects: []Subject,
+    viewer_masks: []u256,
+
+    const Subject = struct { generation: u32 = 0, gamemode: minecraft.GameMode = .survival };
+
+    const Group = struct { protocol: i32, absolute: bool, baseline: [3]i64 };
+    const Target = struct {
+        group: Group,
+        handle: sessions.Handle,
+
+        fn less(_: void, a: Target, b: Target) bool {
+            const protocol = std.math.order(a.group.protocol, b.group.protocol);
+            const absolute = std.math.order(@intFromBool(a.group.absolute), @intFromBool(b.group.absolute));
+            const baseline = std.mem.order(i64, &a.group.baseline, &b.group.baseline);
+            return protocol == .lt or (protocol == .eq and (absolute == .lt or (absolute == .eq and baseline == .lt)));
+        }
+    };
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Replication {
         const self = try allocator.create(Replication);
@@ -52,25 +73,42 @@ pub const Replication = struct {
         @memset(seen, .{});
         const observers = try allocator.alloc(Observer, deps.players.records.len);
         @memset(observers, .{});
-        self.* = .{ .deps = deps, .seen = seen, .observers = observers };
+        const subjects = try allocator.alloc(Subject, deps.players.records.len);
+        @memset(subjects, .{});
+        const viewer_masks = try allocator.alloc(u256, deps.players.records.len);
+        @memset(viewer_masks, 0);
+        self.* = .{ .deps = deps, .seen = seen, .observers = observers, .subjects = subjects, .viewer_masks = viewer_masks };
         return self;
     }
 
     pub fn tick(self: *Replication) void {
         const players = self.deps.players;
+        players.refreshSpatial();
+        var changed: u256 = 0;
+        var connected: u256 = 0;
+        for (players.records, self.subjects, 0..) |player, *subject, index| {
+            const generation = if (player.handle) |handle| handle.generation else 0;
+            if (generation != 0) connected |= @as(u256, 1) << @intCast(index);
+            if (generation != subject.generation or player.gamemode != subject.gamemode) changed |= @as(u256, 1) << @intCast(index);
+            subject.* = .{ .generation = generation, .gamemode = player.gamemode };
+        }
+        @memset(self.viewer_masks, 0);
+        var updates: [256]u256 = @splat(0);
 
         for (players.records, 0..) |observer, observer_index| {
             const row = self.seen[observer_index * players.records.len ..][0..players.records.len];
             const recipient = observer.handle orelse {
                 @memset(row, .{});
+                self.observers[observer_index] = .{};
                 continue;
             };
 
             if (self.observers[observer_index].generation != recipient.generation) {
                 @memset(row, .{});
-                self.observers[observer_index] = .{ .generation = recipient.generation, .world = observer.world };
+                self.observers[observer_index] = .{ .generation = recipient.generation, .world = observer.world, .pending = connected };
             }
 
+            self.observers[observer_index].pending |= changed;
             if (observer.stage != .ready) continue;
 
             if (self.observers[observer_index].world != observer.world) {
@@ -83,10 +121,28 @@ pub const Replication = struct {
                 self.observers[observer_index].world = observer.world;
             }
 
-            for (players.records, row, 0..) |subject, *seen, index| {
+            const watching = &self.observers[observer_index];
+            const interested = players.nearby(observer.world, observer.position, players.config.render_distance);
+            var candidates = watching.pending | interested | watching.spawned | (@as(u256, 1) << @intCast(observer_index));
+            while (candidates != 0) {
+                const index: usize = @intCast(@ctz(candidates));
+                const flag = @as(u256, 1) << @intCast(index);
+                candidates &= ~flag;
+                watching.pending &= ~flag;
+                const subject = players.records[index];
+                const seen = &row[index];
+                var listed_complete = false;
+                defer {
+                    if (!listed_complete) watching.pending |= flag;
+                    if (seen.stage == .spawned) {
+                        watching.spawned |= flag;
+                        self.viewer_masks[index] |= @as(u256, 1) << @intCast(observer_index);
+                    } else watching.spawned &= ~flag;
+                }
                 if (index == observer_index) {
                     if (seen.gamemode != subject.gamemode and players.sendPacket(writeMode, observer.protocol, &.{recipient}, .{ subject.uuid, subject.gamemode }))
                         seen.gamemode = subject.gamemode;
+                    listed_complete = seen.gamemode == subject.gamemode;
                     continue;
                 }
                 const entity_id: i32 = @intCast(index + 1);
@@ -104,7 +160,10 @@ pub const Replication = struct {
                     seen.* = .{ .generation = generation, .uuid = subject.uuid };
                 }
 
-                if (subject.handle == null) continue;
+                if (subject.handle == null) {
+                    listed_complete = true;
+                    continue;
+                }
                 assert(generation != 0);
                 const position: [3]i64 = .{ fixed(subject.position.x), fixed(subject.position.y), fixed(subject.position.z) };
                 const yaw = angle(subject.rotation.yaw);
@@ -121,7 +180,8 @@ pub const Replication = struct {
                     seen.gamemode = subject.gamemode;
                 }
 
-                if (subject.world != observer.world) {
+                listed_complete = true;
+                if (interested & flag == 0) {
                     if (seen.stage == .spawned) {
                         if (!players.sendPacket(writeRemove, observer.protocol, &.{recipient}, .{entity_id})) continue;
                         seen.stage = .listed;
@@ -132,7 +192,7 @@ pub const Replication = struct {
                     continue;
                 }
 
-                if (subject.stage != .ready) continue;
+                if (!subject.inWorld()) continue;
                 if (seen.stage == .listed) {
                     if (!players.sendPacket(.{ writeSpawnLegacy, writeSpawnPacked }, observer.protocol, &.{recipient}, .{Spawn{
                         .entity_id = entity_id,
@@ -150,41 +210,96 @@ pub const Replication = struct {
                 }
 
                 assert(seen.stage == .spawned);
-                if (!std.meta.eql(position, seen.position) or yaw != seen.yaw or pitch != seen.pitch or subject.on_ground != seen.on_ground) {
-                    const dx = position[0] - seen.position[0];
-                    const dy = position[1] - seen.position[1];
-                    const dz = position[2] - seen.position[2];
+                updates[index] |= @as(u256, 1) << @intCast(observer_index);
+            }
+        }
 
-                    if (dx < -32768 or dx > 32767 or dy < -32768 or dy > 32767 or dz < -32768 or dz > 32767) {
-                        if (!players.sendPacket(writePosition, observer.protocol, &.{recipient}, .{
-                            entity_id, subject.position, minecraft.Position{ .x = 0, .y = 0, .z = 0 }, subject.rotation, subject.on_ground,
-                        }))
-                            continue;
-                    } else {
-                        if (!players.sendPacket(writeMove, observer.protocol, &.{recipient}, .{
-                            entity_id, @as(i16, @intCast(dx)), @as(i16, @intCast(dy)), @as(i16, @intCast(dz)),
-                            yaw,       pitch,                  subject.on_ground,
-                        }))
-                            continue;
+        for (players.records, updates[0..players.records.len], 0..) |subject, watching, index| {
+            if (watching == 0) continue;
+            const position: [3]i64 = .{ fixed(subject.position.x), fixed(subject.position.y), fixed(subject.position.z) };
+            const yaw = angle(subject.rotation.yaw);
+            const pitch = angle(subject.rotation.pitch);
+            const entity_id: i32 = @intCast(index + 1);
+            var eligible = watching;
+            inline for (std.enums.values(enum { movement, head, flags })) |phase| {
+                var targets: [256]Target = undefined;
+                var target_count: usize = 0;
+                var uniform = true;
+                var candidates = eligible;
+                while (candidates != 0) {
+                    const other: usize = @intCast(@ctz(candidates));
+                    candidates &= candidates - 1;
+                    const observer = players.records[other];
+                    const seen = self.seen[other * players.records.len + index];
+                    const needed = switch (phase) {
+                        .movement => !std.meta.eql(position, seen.position) or yaw != seen.yaw or pitch != seen.pitch or subject.on_ground != seen.on_ground,
+                        .head => seen.head == null or seen.head.? != yaw,
+                        .flags => seen.flags == null or !std.meta.eql(seen.flags.?, subject.flags),
+                    };
+                    if (!needed) continue;
+                    const absolute = phase == .movement and !relative(position, seen.position);
+                    const group: Group = .{ .protocol = observer.protocol, .absolute = absolute, .baseline = if (phase == .movement and !absolute) seen.position else @splat(0) };
+                    if (target_count != 0) uniform = uniform and std.meta.eql(targets[0].group, group);
+                    targets[target_count] = .{ .group = group, .handle = observer.handle.? };
+                    target_count += 1;
+                }
+                if (!uniform) std.mem.sort(Target, targets[0..target_count], {}, Target.less);
+                var start: usize = 0;
+                while (start < target_count) {
+                    const key = targets[start].group;
+                    const protocol = key.protocol;
+                    const absolute = key.absolute;
+                    var stop = start + 1;
+                    while (stop < target_count and std.meta.eql(targets[stop].group, key)) : (stop += 1) {}
+                    var recipients: [256]sessions.Handle = undefined;
+                    const count = stop - start;
+                    var group: u256 = 0;
+                    for (targets[start..stop], recipients[0..count]) |target, *recipient| {
+                        recipient.* = target.handle;
+                        group |= @as(u256, 1) << @intCast(target.handle.index);
                     }
-
-                    seen.position = position;
-                    seen.yaw = yaw;
-                    seen.pitch = pitch;
-                    seen.on_ground = subject.on_ground;
-                }
-
-                if (seen.head == null or seen.head.? != yaw) {
-                    if (!players.sendPacket(writeHeadRotation, observer.protocol, &.{recipient}, .{ entity_id, yaw })) continue;
-                    seen.head = yaw;
-                }
-
-                if (seen.flags == null or !std.meta.eql(seen.flags.?, subject.flags)) {
-                    if (!players.sendPacket(writeFlags, observer.protocol, &.{recipient}, .{ entity_id, subject.flags })) continue;
-                    seen.flags = subject.flags;
+                    start = stop;
+                    var packet = players.deps.sessions.reserve(2048) catch |err| switch (err) {
+                        error.Closed, error.Backpressured => {
+                            eligible &= ~group;
+                            continue;
+                        },
+                        else => std.debug.panic("invalid server packet: {s}", .{@errorName(err)}),
+                    };
+                    defer packet.cancel();
+                    const bytes = switch (phase) {
+                        .movement => if (absolute)
+                            players.deps.packets.writePacket(writePosition, protocol, packet.bytes, .{ entity_id, subject.position, minecraft.Position{ .x = 0, .y = 0, .z = 0 }, subject.rotation, subject.on_ground })
+                        else
+                            players.deps.packets.writePacket(writeMove, protocol, packet.bytes, .{
+                                entity_id, @as(i16, @intCast(position[0] - key.baseline[0])), @as(i16, @intCast(position[1] - key.baseline[1])), @as(i16, @intCast(position[2] - key.baseline[2])), yaw, pitch, subject.on_ground,
+                            }),
+                        .head => players.deps.packets.writePacket(writeHeadRotation, protocol, packet.bytes, .{ entity_id, yaw }),
+                        .flags => players.deps.packets.writePacket(writeFlags, protocol, packet.bytes, .{ entity_id, subject.flags }),
+                    } catch |err| std.debug.panic("invalid server packet: {s}", .{@errorName(err)});
+                    var delivered: u256 = 0;
+                    for (packet.publishReady(bytes.len, recipients[0..count])) |handle| {
+                        delivered |= @as(u256, 1) << @intCast(handle.index);
+                        const seen = &self.seen[handle.index * players.records.len + index];
+                        switch (phase) {
+                            .movement => {
+                                seen.position = position;
+                                seen.yaw = yaw;
+                                seen.pitch = pitch;
+                                seen.on_ground = subject.on_ground;
+                            },
+                            .head => seen.head = yaw,
+                            .flags => seen.flags = subject.flags,
+                        }
+                    }
+                    eligible &= ~(group & ~delivered);
                 }
             }
         }
+    }
+
+    pub fn viewers(self: *const Replication, subject: usize) u256 {
+        return self.viewer_masks[subject];
     }
 
     fn writeSpawnLegacy(packet: wire_1_21_5.play.toClient.packet_spawn_entity.Writer, registry: packets.Registry, value: Spawn) ![]u8 {
@@ -314,6 +429,82 @@ fn angle(value: f32) i8 {
     return @bitCast(@as(u8, @intFromFloat(@mod(@floor(@as(f64, value) * 256.0 / 360.0), 256.0))));
 }
 
+fn relative(position: [3]i64, baseline: [3]i64) bool {
+    const dx = position[0] - baseline[0];
+    const dy = position[1] - baseline[1];
+    const dz = position[2] - baseline[2];
+    return dx >= -32768 and dx <= 32767 and dy >= -32768 and dy <= 32767 and dz >= -32768 and dz <= 32767;
+}
+
 fn fixed(value: f64) i64 {
     return @intFromFloat(@floor(value * 4096.0));
+}
+
+test "movement fanout preserves independent admission and observer baselines" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const selected = comptime definitions: {
+        var result: [protocols.implementations.len]sessions.Protocol = undefined;
+        for (protocols.implementations, 0..) |Version, i| result[i] = .{ .number = Version.protocol_number };
+        break :definitions result;
+    };
+    const service = try sessions.Service.init(allocator, std.testing.io, undefined, .{
+        .connections = 3,
+        .pages = 128,
+        .page_bytes = 4096,
+        .buffer_bytes = 32768,
+        .protocols = &selected,
+    });
+    const packet_service = try packets.Packets.init(allocator, .{ .sessions = service });
+    var records: [3]Players.Player = undefined;
+    for (&records, 0..) |*player, i| {
+        player.* = .{ .handle = .{ .index = @intCast(i), .generation = 1 }, .uuid = i + 1, .protocol = selected[0].number, .name = @splat(0), .name_len = 1, .stage = .ready };
+        player.name[0] = @intCast('a' + i);
+        service.credit[i].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+    }
+    var players: Players = .{
+        .deps = .{ .sessions = service, .packets = packet_service, .input = undefined, .storage = undefined, .worlds = undefined, .vanilla_worlds = undefined },
+        .config = .{ .maximum = 3, .render_distance = 2 },
+        .spawn_world = 0,
+        .records = &records,
+        .dig_handlers = &.{},
+    };
+    const replication = try Replication.init(allocator, .{ .players = &players });
+    const Drain = struct {
+        fn run(endpoint: *sessions.Service, recipients: usize) !usize {
+            var count: usize = 0;
+            while (endpoint.output.takeReady()) |packet| {
+                if (recipients != 0) try std.testing.expectEqual(recipients, packet.recipients.len);
+                try std.testing.expect(endpoint.output.releaseReady(packet.page, packet.generation));
+                _ = endpoint.preparing.fetchSub(1, .release);
+                count += 1;
+            }
+            return count;
+        }
+    };
+    replication.tick();
+    _ = try Drain.run(service, 0);
+    records[0].position.x += 1;
+    replication.tick();
+    try std.testing.expectEqual(@as(usize, 1), try Drain.run(service, 2));
+    service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active, .release);
+    records[0].position.x += 1;
+    replication.tick();
+    try std.testing.expectEqual(@as(usize, 1), try Drain.run(service, 1));
+    try std.testing.expect(replication.seen[3].position[0] != replication.seen[6].position[0]);
+    service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+    records[0].position.x += 1;
+    replication.tick();
+    try std.testing.expectEqual(@as(usize, 2), try Drain.run(service, 1));
+    try std.testing.expectEqual(replication.seen[3].position[0], replication.seen[6].position[0]);
+    records[0].position.x += 16;
+    replication.tick();
+    try std.testing.expectEqual(@as(usize, 1), try Drain.run(service, 2));
+    if (comptime selected.len > 1) {
+        records[2].protocol = selected[1].number;
+        records[0].position.x += 1;
+        replication.tick();
+        try std.testing.expectEqual(@as(usize, 2), try Drain.run(service, 1));
+    }
 }

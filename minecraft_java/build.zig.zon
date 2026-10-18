@@ -3,10 +3,12 @@
     .fingerprint = 0xe71670b606b3a3fb,
     .version = "0.1.0",
     .dependencies = .{
+        .libdeflate = .{
+            .url = "https://github.com/ebiggers/libdeflate/archive/refs/tags/v1.25.tar.gz",
+            .hash = "N-V-__8AACODCwCL9flGfJkJ2IlkP36ExXwOhPuIUgIFfB8l",
+        },
         .sessions = .{ .path = "../sessions" },
-        .chunks = .{ .path = "../chunks" },
         .encoding = .{ .path = "../protocol_encoding" },
-        .minecraft_model = .{ .path = "../minecraft_model" },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "src" },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "tests" },
 }

@@ -40,6 +40,7 @@ pub const Equipment = struct {
         generation: u32 = 0,
         life: u32 = 0,
         stacks: [6]?inventories.Stack = @splat(null),
+        watchers: u256 = 0,
     };
 
     deps: Dependencies,
@@ -65,8 +66,11 @@ pub const Equipment = struct {
         self.presentation = self.deps.items.components.revision;
 
         for (players.records, self.subjects, 0..) |player, *subject, index| {
-            const handle = player.handle orelse continue;
-            if (player.stage != .ready) continue;
+            if (!player.inWorld()) {
+                subject.watchers = 0;
+                continue;
+            }
+            const handle = player.handle.?;
 
             var slots: [6]inventories.Slot = undefined;
 
@@ -87,16 +91,26 @@ pub const Equipment = struct {
             const row = self.seen[index * players.records.len ..][0..players.records.len];
             var pending: u6 = 0;
 
-            for (players.records, row, 0..) |observer, *seen, other| {
+            const watching = self.deps.replication.viewers(index);
+            var candidates = watching;
+            while (candidates != 0) {
+                const other: usize = @intCast(@ctz(candidates));
+                const flag = @as(u256, 1) << @intCast(other);
+                candidates &= ~flag;
+                const observer = players.records[other];
+                const seen = &row[other];
                 const recipient = observer.handle orelse continue;
 
                 if (seen.generation != recipient.generation or seen.life != observer.life)
                     seen.* = .{ .generation = recipient.generation, .life = observer.life };
 
+                if (subject.watchers & flag == 0) seen.dirty = 63;
                 seen.dirty |= changed;
 
                 if (other != index and observer.stage == .ready) pending |= seen.dirty;
             }
+
+            subject.watchers = watching;
 
             for (subject.stacks, 0..) |stack, slot| {
                 const flag = @as(u6, 1) << @intCast(slot);
@@ -115,10 +129,14 @@ pub const Equipment = struct {
                     var recipients: [256]sessions.Handle = undefined;
                     var count: usize = 0;
 
-                    for (players.records, 0..) |observer, other| {
+                    var targets_remaining = watching;
+                    while (targets_remaining != 0) {
+                        const other: usize = @intCast(@ctz(targets_remaining));
+                        targets_remaining &= targets_remaining - 1;
+                        const observer = players.records[other];
                         const recipient = observer.handle orelse continue;
                         if (other == index or observer.world != player.world or observer.stage != .ready or observer.protocol != protocol) continue;
-                        if (row[other].dirty & flag == 0 or self.deps.replication.seen[other * players.records.len + index].stage != .spawned) continue;
+                        if (row[other].dirty & flag == 0) continue;
                         if (capacity > service.config.page_bytes) {
                             service.disconnect(recipient);
                             continue;

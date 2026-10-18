@@ -140,15 +140,60 @@ pub const Transport = struct {
     }
 };
 
-/// Optional native-descriptor ownership boundary. The Session owner pauses
-/// admission, drains operations, then exports. Import happens before polling.
+/// Pausing cancels existing operations without closing sockets. Completions
+/// return every buffer loan before descriptors can be exported.
 pub const Inheritance = struct {
     context: *anyopaque,
-    pause: *const fn (*anyopaque, std.Io, bool) void,
-    ready: *const fn (*anyopaque) bool,
-    listener: *const fn (*anyopaque) i32,
-    descriptor: *const fn (*anyopaque, Handle) i32,
-    adopt: *const fn (*anyopaque, i32) anyerror!Handle,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        pause: *const fn (*anyopaque, std.Io, bool) void,
+        ready: *const fn (*anyopaque) bool,
+        listener: *const fn (*anyopaque) i32,
+        descriptor: *const fn (*anyopaque, Handle) i32,
+        adopt: *const fn (*anyopaque, i32) anyerror!Handle,
+    };
+
+    pub fn init(comptime Implementation: type, implementation: *Implementation) Inheritance {
+        const Adapter = struct {
+            fn instance(raw: *anyopaque) *Implementation {
+                return @ptrCast(@alignCast(raw));
+            }
+
+            const vtable: VTable = .{ .pause = @This().invoke_pause, .ready = @This().invoke_ready, .listener = @This().invoke_listener, .descriptor = @This().invoke_descriptor, .adopt = @This().invoke_adopt };
+            fn invoke_pause(raw: *anyopaque, io: std.Io, paused: bool) void {
+                return instance(raw).pause(io, paused);
+            }
+            fn invoke_ready(raw: *anyopaque) bool {
+                return instance(raw).paused();
+            }
+            fn invoke_listener(raw: *anyopaque) i32 {
+                return instance(raw).listenerDescriptor();
+            }
+            fn invoke_descriptor(raw: *anyopaque, handle: Handle) i32 {
+                return instance(raw).descriptor(handle);
+            }
+            fn invoke_adopt(raw: *anyopaque, fd: i32) anyerror!Handle {
+                return instance(raw).adopt(fd);
+            }
+        };
+        return .{ .context = implementation, .vtable = &Adapter.vtable };
+    }
+    pub fn pause(self: Inheritance, io: std.Io, paused: bool) void {
+        return self.vtable.pause(self.context, io, paused);
+    }
+    pub fn ready(self: Inheritance) bool {
+        return self.vtable.ready(self.context);
+    }
+    pub fn listener(self: Inheritance) i32 {
+        return self.vtable.listener(self.context);
+    }
+    pub fn descriptor(self: Inheritance, handle: Handle) i32 {
+        return self.vtable.descriptor(self.context, handle);
+    }
+    pub fn adopt(self: Inheritance, fd: i32) anyerror!Handle {
+        return self.vtable.adopt(self.context, fd);
+    }
 };
 
 pub fn validLimits(comptime x: Limits) void {

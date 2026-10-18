@@ -2,20 +2,21 @@ const std = @import("std");
 const support = @import("support");
 const sessions = @import("sessions");
 
+pub const EmbeddedRegistries = struct {
+    /// Sessions adds transport framing, compression, and encryption.
+    pub const Packet = struct {
+        bytes: []const u8,
+    };
+
+    packets: []const Packet,
+    registries: []const sessions.Protocol.Registry,
+};
+
 pub fn RegistryPackets(comptime Wire: type) type {
     return struct {
         const framing_headroom = 3;
 
-        /// Sessions adds transport framing, compression, and encryption.
-        pub const Packet = struct {
-            bytes: []const u8,
-            storage: []u8,
-
-            fn deinit(self: *Packet, allocator: std.mem.Allocator) void {
-                allocator.free(self.storage);
-                self.* = undefined;
-            }
-        };
+        pub const Packet = EmbeddedRegistries.Packet;
 
         pub const RegistryEntry = struct {
             id: []const u8,
@@ -83,21 +84,12 @@ pub fn RegistryPackets(comptime Wire: type) type {
         };
 
         pub const PacketList = struct {
-            values: []Packet,
-
-            fn deinit(self: *PacketList, allocator: std.mem.Allocator) void {
-                for (self.values) |*packet| packet.deinit(allocator);
-                allocator.free(self.values);
-                self.* = undefined;
-            }
+            values: []const Packet,
         };
 
-        /// Use `known` only after `select` verifies the exact vanilla core pack.
-        /// Use `full` when the client does not acknowledge that pack.
         pub const PreparedRegistries = struct {
             protocol_number: i32,
-            known: PacketList,
-            full: PacketList,
+            packets: PacketList,
             registry_memory: std.heap.ArenaAllocator,
             registries: []const sessions.Protocol.Registry,
 
@@ -108,29 +100,43 @@ pub fn RegistryPackets(comptime Wire: type) type {
                 };
             }
 
-            pub fn deinit(self: *PreparedRegistries, allocator: std.mem.Allocator) void {
-                self.known.deinit(allocator);
-                self.full.deinit(allocator);
+            pub fn deinit(self: *PreparedRegistries, _: std.mem.Allocator) void {
                 self.registry_memory.deinit();
                 self.* = undefined;
             }
         };
 
         /// Connection-independent packets include their IDs but exclude the transport length prefix.
+        pub fn read(allocator: std.mem.Allocator, protocol_number: i32, bytes: []const u8, version: []const u8) !PreparedRegistries {
+            const snapshot = try Snapshot.read(allocator, bytes, version);
+            defer snapshot.deinit(allocator);
+            return prepare(allocator, protocol_number, snapshot);
+        }
+
+        pub fn readEmbedded(allocator: std.mem.Allocator, comptime Version: type) !PreparedRegistries {
+            const prepared = Version.registry_packets;
+            return .{
+                .protocol_number = Version.protocol_number,
+                .packets = .{ .values = prepared.packets },
+                .registries = prepared.registries,
+                .registry_memory = std.heap.ArenaAllocator.init(allocator),
+            };
+        }
+
         pub fn build(
             allocator: std.mem.Allocator,
             protocol_number: i32,
             snapshot: Snapshot,
         ) !PreparedRegistries {
             try validateSnapshot(snapshot);
-            var known = try writeVariant(allocator, snapshot, true);
-            errdefer known.deinit(allocator);
-            var full = try writeVariant(allocator, snapshot, false);
-            errdefer full.deinit(allocator);
+            return prepare(allocator, protocol_number, snapshot);
+        }
 
+        fn prepare(allocator: std.mem.Allocator, protocol_number: i32, snapshot: Snapshot) !PreparedRegistries {
             var registry_memory = std.heap.ArenaAllocator.init(allocator);
             errdefer registry_memory.deinit();
             const arena = registry_memory.allocator();
+            const packets = try writePackets(arena, snapshot);
             const registries = try arena.alloc(sessions.Protocol.Registry, snapshot.registries.len);
             for (snapshot.registries, registries) |source, *destination| {
                 const entries = try arena.alloc([]const u8, source.entries.len);
@@ -140,43 +146,32 @@ pub fn RegistryPackets(comptime Wire: type) type {
 
             return .{
                 .protocol_number = protocol_number,
-                .known = known,
-                .full = full,
+                .packets = packets,
                 .registry_memory = registry_memory,
                 .registries = registries,
             };
         }
 
-        fn allocatePacketList(allocator: std.mem.Allocator, count: usize) !PacketList {
-            const values = try allocator.alloc(Packet, count);
-            return .{ .values = values };
-        }
-
-        fn writeVariant(allocator: std.mem.Allocator, snapshot: Snapshot, known: bool) !PacketList {
+        fn writePackets(allocator: std.mem.Allocator, snapshot: Snapshot) !PacketList {
             var count: usize = 1;
             for (snapshot.registries) |registry| count += @intFromBool(registry.synchronized);
-            var packets = try allocatePacketList(allocator, count);
+            const values = try allocator.alloc(Packet, count);
             var initialized: usize = 0;
-            errdefer {
-                for (packets.values[0..initialized]) |*packet| packet.deinit(allocator);
-                allocator.free(packets.values);
-            }
 
             for (snapshot.registries) |registry| {
                 if (!registry.synchronized) continue;
-                packets.values[initialized] = try writeRegistry(allocator, registry, known);
+                const storage = try allocatePacket(allocator, registryPacketCapacity(registry));
+                values[initialized] = .{ .bytes = try encodeRegistry(storage, registry) };
                 initialized += 1;
             }
 
-            packets.values[initialized] = try writeTags(allocator, snapshot.tags);
-            initialized += 1;
-            return packets;
+            const storage = try allocatePacket(allocator, snapshot.tags.len + 5);
+            values[initialized] = .{ .bytes = try encodeTags(storage, snapshot.tags) };
+            return .{ .values = values };
         }
 
-        fn writeRegistry(allocator: std.mem.Allocator, registry: Registry, known: bool) !Packet {
-            var packet = try allocatePacket(allocator, registryPacketCapacity(registry));
-            errdefer packet.deinit(allocator);
-            var cursor = try (try Wire.configuration.toClient.write(packet.storage[framing_headroom..])
+        fn encodeRegistry(storage: []u8, registry: Registry) ![]const u8 {
+            var cursor = try (try Wire.configuration.toClient.write(storage[framing_headroom..])
                 .registry_data())
                 .id(registry.id);
             var entries = try cursor.entries(registry.entries.len);
@@ -185,31 +180,23 @@ pub fn RegistryPackets(comptime Wire: type) type {
                 const value = try (try entries.next()).?.key(entry.id);
                 var optional = try value.value();
                 const child = try optional.begin();
-                const completed = if (known)
-                    try child.none()
-                else
-                    try child.some(entry.nbt);
+                const completed = try child.some(entry.nbt);
                 try entries.advance(try optional.advance(completed));
             }
 
             const final = try entries.finish();
-            packet.bytes = final.finish();
-            return packet;
+            return final.finish();
         }
 
-        fn writeTags(allocator: std.mem.Allocator, tags: []const u8) !Packet {
-            var packet = try allocatePacket(allocator, tags.len + 5);
-            errdefer packet.deinit(allocator);
-            const output = packet.storage[framing_headroom..];
+        fn encodeTags(storage: []u8, tags: []const u8) ![]const u8 {
+            const output = storage[framing_headroom..];
             const rest = try support.write_varint(output, Wire.configuration.toClient.packetId(.tags));
             @memcpy(rest[0..tags.len], tags);
-            packet.bytes = output[0 .. output.len - rest.len + tags.len];
-            return packet;
+            return output[0 .. output.len - rest.len + tags.len];
         }
 
-        fn allocatePacket(allocator: std.mem.Allocator, capacity: usize) !Packet {
-            const storage = try allocator.alloc(u8, capacity + framing_headroom);
-            return .{ .bytes = undefined, .storage = storage };
+        fn allocatePacket(allocator: std.mem.Allocator, capacity: usize) ![]u8 {
+            return allocator.alloc(u8, capacity + framing_headroom);
         }
 
         fn registryPacketCapacity(registry: Registry) usize {
@@ -221,6 +208,7 @@ pub fn RegistryPackets(comptime Wire: type) type {
 
         fn validateSnapshot(snapshot: Snapshot) !void {
             if (snapshot.registries.len == 0 or snapshot.tags.len == 0) return error.IncompleteRegistrySnapshot;
+            var scratch: support.NbtScratch = undefined;
 
             const tags = try Wire.configuration.toClient.readBody(.tags, .{
                 .id = Wire.configuration.toClient.packetId(.tags),
@@ -235,7 +223,7 @@ pub fn RegistryPackets(comptime Wire: type) type {
                     if (entry.id.len == 0) return error.IncompleteRegistrySnapshot;
                     if (registry.synchronized) {
                         if (entry.nbt.len == 0) return error.IncompleteRegistrySnapshot;
-                        if ((try support.skip_anonymous_nbt(entry.nbt)).len != 0) return error.InvalidSnapshot;
+                        if ((try support.skip_anonymous_nbt_with_scratch(entry.nbt, &scratch)).len != 0) return error.InvalidSnapshot;
                     } else if (entry.nbt.len != 0) return error.InvalidSnapshot;
                 }
             }

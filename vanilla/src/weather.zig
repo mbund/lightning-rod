@@ -1,3 +1,4 @@
+const records = @import("records");
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const storage = lightning_rod.storage;
@@ -5,7 +6,7 @@ const storage = lightning_rod.storage;
 pub const Weather = struct {
     pub const id = "minecraft:weather";
     pub const Configuration = struct { seed: u64 = 0, weather_cycle: bool = true };
-    pub const Dependencies = struct { storage: storage.Namespace };
+    pub const Dependencies = struct { storage: storage.Space };
     pub const Kind = enum { clear, rain, thunder };
 
     clear_ticks: i32 = 0,
@@ -22,7 +23,7 @@ pub const Weather = struct {
     pub fn init(allocator: std.mem.Allocator, configuration: Configuration, deps: Dependencies) !*Weather {
         const self = try allocator.create(Weather);
         self.* = .{ .weather_cycle = configuration.weather_cycle, .random = .init(configuration.seed) };
-        if (try deps.storage.get("weather", &self.saved)) |length| {
+        if (try records.Value.init(deps.storage).read(&self.saved)) |length| {
             const bytes = &self.saved;
             if (length != bytes.len or bytes[0] != 1 or bytes[13] > 1 or bytes[14] > 1 or bytes[15] > 1) return error.CorruptWeather;
             self.clear_ticks = std.mem.readInt(i32, bytes[1..5], .little);
@@ -52,7 +53,7 @@ pub const Weather = struct {
         self.thundering = kind == .thunder;
     }
 
-    pub fn checkpoint(self: *Weather, namespace: storage.Namespace) !void {
+    pub fn checkpoint(self: *Weather, space: storage.Space) !void {
         var bytes: [56]u8 = undefined;
         bytes[0] = 1;
         std.mem.writeInt(i32, bytes[1..5], self.clear_ticks, .little);
@@ -65,7 +66,7 @@ pub const Weather = struct {
         std.mem.writeInt(u32, bytes[20..24], @bitCast(self.thunder_level), .little);
         for (self.random.s, 0..) |word, index| std.mem.writeInt(u64, bytes[24 + index * 8 ..][0..8], word, .little);
         if (std.mem.eql(u8, &bytes, &self.saved)) return;
-        try namespace.put("weather", &bytes);
+        try records.Value.init(space).write(&bytes);
         self.saved = bytes;
     }
 };

@@ -7,27 +7,31 @@ pub const Phase = enum { login, configuration, play };
 
 pub const HandshakeInput = struct {
     const Self = @This();
-    const Handler = *const fn (*anyopaque, []const u8) anyerror!protocol.Handshake;
+    const Handler = struct {
+        context: *anyopaque,
+        vtable: *const VTable,
+        const VTable = struct { call: *const fn (*anyopaque, []const u8) anyerror!protocol.Handshake };
+    };
 
-    context: ?*anyopaque = null,
-    call: ?Handler = null,
+    handler: ?Handler = null,
     sealed: bool = false,
 
     pub fn on(self: *Self, context: anytype, comptime handler: anytype) !void {
         if (self.sealed) return error.InputRegistrationClosed;
-        if (self.call != null) return error.DuplicateHandshakeOwner;
-        self.context = context;
-        self.call = struct {
-            fn call(raw: *anyopaque, packet: []const u8) anyerror!protocol.Handshake {
+        if (self.handler != null) return error.DuplicateHandshakeOwner;
+        const Adapter = struct {
+            const vtable: Handler.VTable = .{ .call = @This().invoke };
+            fn invoke(raw: *anyopaque, packet: []const u8) anyerror!protocol.Handshake {
                 const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
                 return handler(typed, packet);
             }
-        }.call;
+        };
+        self.handler = .{ .context = context, .vtable = &Adapter.vtable };
     }
 
     pub fn dispatch(self: *const Self, packet: []const u8) !protocol.Handshake {
-        const call = self.call orelse return error.MissingHandshakeHandler;
-        return call(self.context.?, packet);
+        const handler = self.handler orelse return error.MissingHandshakeHandler;
+        return handler.vtable.call(handler.context, packet);
     }
 };
 
@@ -46,7 +50,6 @@ pub const ConfigurationEffect = union(enum) {
 pub const PlayEffect = union(enum) {
     none,
     send: []const u8,
-    reconfigure,
 };
 
 pub fn Effect(comptime phase: Phase) type {
@@ -69,10 +72,26 @@ pub const Phases = struct {
     const ConfigurationCall = *const fn (*anyopaque, protocol.PhaseScope, *anyopaque, protocol.PhaseEvent, []u8) anyerror!protocol.ConfigurationStep;
     const PlayCall = *const fn (*anyopaque, protocol.Profile, *anyopaque, protocol.PlayEvent, []u8) anyerror!?[]const u8;
     const ClosedCall = *const fn (*anyopaque, network.Handle, *anyopaque) void;
-    const Login = struct { context: *anyopaque, call: LoginCall };
-    const Configuration = struct { context: *anyopaque, call: ConfigurationCall };
-    const Play = struct { context: *anyopaque, call: PlayCall };
-    const Closed = struct { context: *anyopaque, call: ClosedCall };
+    const Login = struct {
+        context: *anyopaque,
+        vtable: *const VTable,
+        const VTable = struct { call: LoginCall };
+    };
+    const Configuration = struct {
+        context: *anyopaque,
+        vtable: *const VTable,
+        const VTable = struct { call: ConfigurationCall };
+    };
+    const Play = struct {
+        context: *anyopaque,
+        vtable: *const VTable,
+        const VTable = struct { call: PlayCall };
+    };
+    const Closed = struct {
+        context: *anyopaque,
+        vtable: *const VTable,
+        const VTable = struct { call: ClosedCall };
+    };
 
     pub const Entry = struct {
         login: ?Login = null,
@@ -96,13 +115,15 @@ pub const Phases = struct {
         const entry = &self.entries[self.owner].login;
         if (entry.* != null) return error.DuplicatePhaseOwner;
         const Plugin = @typeInfo(@TypeOf(context)).pointer.child;
-        entry.* = .{ .context = context, .call = struct {
-            fn call(raw: *anyopaque, scope: protocol.PhaseScope, state: *anyopaque, event: protocol.PhaseEvent, output: []u8) anyerror!protocol.LoginStep {
+        const Adapter = struct {
+            const vtable: Login.VTable = .{ .call = @This().invoke };
+            fn invoke(raw: *anyopaque, scope: protocol.PhaseScope, state: *anyopaque, event: protocol.PhaseEvent, output: []u8) anyerror!protocol.LoginStep {
                 const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
                 const typed_state: *Plugin.SessionState = @ptrCast(@alignCast(state));
                 return handler(typed, scope, &typed_state.login, event, output);
             }
-        }.call };
+        };
+        entry.* = .{ .context = context, .vtable = &Adapter.vtable };
     }
 
     pub fn onConfiguration(self: *Self, context: anytype, comptime handler: anytype) !void {
@@ -110,13 +131,15 @@ pub const Phases = struct {
         const entry = &self.entries[self.owner].configuration;
         if (entry.* != null) return error.DuplicatePhaseOwner;
         const Plugin = @typeInfo(@TypeOf(context)).pointer.child;
-        entry.* = .{ .context = context, .call = struct {
-            fn call(raw: *anyopaque, scope: protocol.PhaseScope, state: *anyopaque, event: protocol.PhaseEvent, output: []u8) anyerror!protocol.ConfigurationStep {
+        const Adapter = struct {
+            const vtable: Configuration.VTable = .{ .call = @This().invoke };
+            fn invoke(raw: *anyopaque, scope: protocol.PhaseScope, state: *anyopaque, event: protocol.PhaseEvent, output: []u8) anyerror!protocol.ConfigurationStep {
                 const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
                 const typed_state: *Plugin.SessionState = @ptrCast(@alignCast(state));
                 return handler(typed, scope, &typed_state.configuration, event, output);
             }
-        }.call };
+        };
+        entry.* = .{ .context = context, .vtable = &Adapter.vtable };
     }
 
     pub fn onPlay(self: *Self, context: anytype, comptime handler: anytype) !void {
@@ -124,13 +147,15 @@ pub const Phases = struct {
         const entry = &self.entries[self.owner].play;
         if (entry.* != null) return error.DuplicatePhaseOwner;
         const Plugin = @typeInfo(@TypeOf(context)).pointer.child;
-        entry.* = .{ .context = context, .call = struct {
-            fn call(raw: *anyopaque, profile: protocol.Profile, state: *anyopaque, event: protocol.PlayEvent, output: []u8) anyerror!?[]const u8 {
+        const Adapter = struct {
+            const vtable: Play.VTable = .{ .call = @This().invoke };
+            fn invoke(raw: *anyopaque, profile: protocol.Profile, state: *anyopaque, event: protocol.PlayEvent, output: []u8) anyerror!?[]const u8 {
                 const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
                 const typed_state: *Plugin.SessionState = @ptrCast(@alignCast(state));
                 return handler(typed, profile, &typed_state.play, event, output);
             }
-        }.call };
+        };
+        entry.* = .{ .context = context, .vtable = &Adapter.vtable };
     }
 
     pub fn onClosed(self: *Self, context: anytype, comptime handler: anytype) !void {
@@ -138,13 +163,15 @@ pub const Phases = struct {
         const entry = &self.entries[self.owner].closed;
         if (entry.* != null) return error.DuplicatePhaseOwner;
         const Plugin = @typeInfo(@TypeOf(context)).pointer.child;
-        entry.* = .{ .context = context, .call = struct {
-            fn call(raw: *anyopaque, handle: network.Handle, state: *anyopaque) void {
+        const Adapter = struct {
+            const vtable: Closed.VTable = .{ .call = @This().invoke };
+            fn invoke(raw: *anyopaque, handle: network.Handle, state: *anyopaque) void {
                 const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
                 const typed_state: *Plugin.SessionState = @ptrCast(@alignCast(state));
                 handler(typed, handle, typed_state);
             }
-        }.call };
+        };
+        entry.* = .{ .context = context, .vtable = &Adapter.vtable };
     }
 };
 
@@ -169,7 +196,8 @@ pub fn Input(comptime Version: type, comptime phase: Phase) type {
         pub const Entry = struct {
             owner: usize,
             context: *anyopaque,
-            call: *const fn (*anyopaque, Scope, *anyopaque, Server.Header, []u8) anyerror!Effect(phase),
+            vtable: *const VTable,
+            pub const VTable = struct { call: *const fn (*anyopaque, Scope, *anyopaque, Server.Header, []u8) anyerror!Effect(phase) };
         };
 
         owners: [maximum + 1]?Entry = @splat(null),
@@ -182,22 +210,24 @@ pub fn Input(comptime Version: type, comptime phase: Phase) type {
             if (self.owners[id] != null) return error.DuplicatePacketOwner;
             const Plugin = @typeInfo(@TypeOf(context)).pointer.child;
             const State = @FieldType(Plugin.SessionState, @tagName(phase));
+            const Adapter = struct {
+                const vtable: Entry.VTable = .{ .call = @This().invoke };
+                fn invoke(raw: *anyopaque, scope: Scope, state: *anyopaque, header: Server.Header, output: []u8) anyerror!Effect(phase) {
+                    const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
+                    const plugin_state: *Plugin.SessionState = @ptrCast(@alignCast(state));
+                    const typed_state: *State = &@field(plugin_state.*, @tagName(phase));
+                    const handlers = comptime packet_api.candidates(handler);
+                    const callback = handlers[comptime packet_api.select(Version, handler)];
+                    const Reader = packet_api.Cursor(callback);
+                    comptime packet_api.validateReader(Reader, @tagName(phase), @tagName(packet));
+                    const reader: Reader = .{ ._cursor = .{ .buffer = header.body, .rest = header.body, .protocol_number = Version.protocol_number, .layout_protocol = Version.Protocol.protocol_number } };
+                    return @call(.auto, callback, .{ typed, scope, typed_state, reader, output });
+                }
+            };
             self.owners[id] = .{
                 .owner = self.owner,
                 .context = context,
-                .call = struct {
-                    fn call(raw: *anyopaque, scope: Scope, state: *anyopaque, header: Server.Header, output: []u8) anyerror!Effect(phase) {
-                        const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
-                        const plugin_state: *Plugin.SessionState = @ptrCast(@alignCast(state));
-                        const typed_state: *State = &@field(plugin_state.*, @tagName(phase));
-                        const handlers = comptime packet_api.candidates(handler);
-                        const callback = handlers[comptime packet_api.select(Version, handler)];
-                        const Reader = packet_api.Cursor(callback);
-                        comptime packet_api.validateReader(Reader, @tagName(phase), @tagName(packet));
-                        const reader: Reader = .{ ._cursor = .{ .buffer = header.body, .rest = header.body, .protocol_number = Version.protocol_number, .layout_protocol = Version.Protocol.protocol_number } };
-                        return @call(.auto, callback, .{ typed, scope, typed_state, reader, output });
-                    }
-                }.call,
+                .vtable = &Adapter.vtable,
             };
         }
 
@@ -225,7 +255,11 @@ pub fn StatusInput(comptime Version: type) type {
     return struct {
         const Self = @This();
         const Handler = *const fn (*anyopaque, protocol.StatusRequest, Server.Header, []u8) anyerror!?[]const u8;
-        const Entry = struct { context: *anyopaque, call: Handler };
+        const Entry = struct {
+            context: *anyopaque,
+            vtable: *const VTable,
+            const VTable = struct { call: Handler };
+        };
 
         owners: [maximum + 1]?Entry = @splat(null),
         sealed: bool = false,
@@ -234,20 +268,22 @@ pub fn StatusInput(comptime Version: type) type {
             if (self.sealed) return error.InputRegistrationClosed;
             const id: usize = @intCast(Server.packetId(packet));
             if (self.owners[id] != null) return error.DuplicatePacketOwner;
+            const Adapter = struct {
+                const vtable: Entry.VTable = .{ .call = @This().invoke };
+                fn invoke(raw: *anyopaque, request: protocol.StatusRequest, header: Server.Header, output: []u8) anyerror!?[]const u8 {
+                    const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
+                    const handlers = comptime packet_api.candidates(handler);
+                    const callback = handlers[comptime packet_api.select(Version, handler)];
+                    const Reader = packet_api.Cursor(callback);
+                    comptime packet_api.validateReader(Reader, "status", @tagName(packet));
+                    const reader: Reader = .{ ._cursor = .{ .buffer = header.body, .rest = header.body, .protocol_number = Version.protocol_number, .layout_protocol = Version.Protocol.protocol_number } };
+                    const bytes = try @call(.auto, callback, .{ typed, request, reader, output });
+                    return bytes;
+                }
+            };
             self.owners[id] = .{
                 .context = context,
-                .call = struct {
-                    fn call(raw: *anyopaque, request: protocol.StatusRequest, header: Server.Header, output: []u8) anyerror!?[]const u8 {
-                        const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
-                        const handlers = comptime packet_api.candidates(handler);
-                        const callback = handlers[comptime packet_api.select(Version, handler)];
-                        const Reader = packet_api.Cursor(callback);
-                        comptime packet_api.validateReader(Reader, "status", @tagName(packet));
-                        const reader: Reader = .{ ._cursor = .{ .buffer = header.body, .rest = header.body, .protocol_number = Version.protocol_number, .layout_protocol = Version.Protocol.protocol_number } };
-                        const bytes = try @call(.auto, callback, .{ typed, request, reader, output });
-                        return bytes;
-                    }
-                }.call,
+                .vtable = &Adapter.vtable,
             };
         }
 
@@ -256,7 +292,7 @@ pub fn StatusInput(comptime Version: type) type {
             if (header.id < 0 or @as(usize, @intCast(header.id)) >= self.owners.len)
                 return error.UnexpectedStatusPacket;
             const entry = self.owners[@intCast(header.id)] orelse return error.UnexpectedStatusPacket;
-            if (try entry.call(entry.context, request, header, output)) |bytes| {
+            if (try entry.vtable.call(entry.context, request, header, output)) |bytes| {
                 if (bytes.len == 0 or bytes.len > output.len or bytes.ptr != output.ptr)
                     return error.InvalidPhaseOutput;
                 return bytes;

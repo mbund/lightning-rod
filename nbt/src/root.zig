@@ -811,7 +811,12 @@ fn skip(buffer: []const u8, named: bool, stack: []Frame) Error![]const u8 {
         _ = try read_value(buffer, &offset, header.tag);
     }
 
+    // A list element can enter an unnamed compound without consuming a byte.
+    // Its end tag pays for both entry and exit, so allow two steps per byte.
+    var work_remaining = buffer.len *| 2;
     while (stack_len != 0) {
+        if (work_remaining == 0) return error.NbtNodeLimit;
+        work_remaining -= 1;
         const frame_index = stack_len - 1;
         var frame = &stack[frame_index];
 
@@ -912,6 +917,7 @@ fn push_container(buffer: []const u8, offset: *usize, tag: Tag, node: u32, nodes
         .list => {
             const child_tag = try read_tag(buffer, offset);
             const len = try read_len_i32(buffer, offset);
+            if (child_tag == .end and len != 0) return error.InvalidNbtTag;
             nodes[node].payload = buffer[payload_start..offset.*];
             nodes[node].value = .{ .list = .{ .child_tag = child_tag, .len = len } };
             stack[stack_len.*] = .{
@@ -938,6 +944,7 @@ fn push_skip_container(buffer: []const u8, offset: *usize, tag: Tag, stack: []Fr
         .list => {
             const child_tag = try read_tag(buffer, offset);
             const len = try read_len_i32(buffer, offset);
+            if (child_tag == .end and len != 0) return error.InvalidNbtTag;
             stack[stack_len.*] = .{
                 .kind = .list,
                 .node = 0,
@@ -1040,4 +1047,32 @@ fn read_int(comptime T: type, buffer: []const u8, offset: *usize) Error!T {
     const size = @divExact(@typeInfo(T).int.bits, 8);
     const bytes = try read_bytes(buffer, offset, size);
     return std.mem.readInt(T, bytes[0..size], .big);
+}
+
+test "nonempty end-tag lists reject even huge counts without traversing elements" {
+    var frames: [8]Frame = undefined;
+    var nodes: [8]Node = undefined;
+    for ([_]u32{ 1, 0x7fffffff }) |count| {
+        var encoded: [6]u8 = .{ 9, 0, 0, 0, 0, 0 };
+        std.mem.writeInt(u32, encoded[2..6], count, .big);
+        try std.testing.expectError(error.InvalidNbtTag, skip_anonymous(&encoded, &frames));
+        try std.testing.expectError(error.InvalidNbtTag, scan_anonymous(&encoded, &nodes, &frames));
+    }
+    const empty_list = [_]u8{ 9, 0, 0, 0, 0, 0 };
+    try std.testing.expectEqual(@as(usize, 0), (try skip_anonymous(&empty_list, &frames)).len);
+    const document = try scan_anonymous(&empty_list, &nodes, &frames);
+    try std.testing.expectEqual(@as(usize, 0), document.root_node().value.list.len);
+}
+
+test "unnamed empty compounds in lists fit the byte-derived work budget" {
+    const encoded = [_]u8{ 9, 10, 0, 0, 0, 3, 0, 0, 0, 0xaa };
+    var frames: [8]Frame = undefined;
+    var nodes: [4]Node = undefined;
+    try std.testing.expectEqualSlices(u8, &.{0xaa}, try skip_anonymous(&encoded, &frames));
+    const document = try scan_anonymous(&encoded, &nodes, &frames);
+    try std.testing.expectEqual(@as(usize, 9), document.consumed().len);
+    try std.testing.expectEqual(@as(u32, 3), document.root_node().child_count);
+    for (0..9) |length| try std.testing.expectError(error.EndOfStream, skip_anonymous(encoded[0..length], &frames));
+    try std.testing.expectError(error.NbtDepthLimit, skip_anonymous(&encoded, frames[0..1]));
+    try std.testing.expectError(error.NbtNodeLimit, scan_anonymous(&encoded, nodes[0..1], &frames));
 }

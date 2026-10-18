@@ -9,12 +9,17 @@ import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 
 public final class RecorderClient implements ClientModInitializer {
     @Override public void onInitializeClient() {
+        TestClient.register();
         Recorder.instance().configure();
         ClientReceiveMessageEvents.GAME.register((message, overlay) -> Recorder.instance().chatReceived(message.getString()));
         ClientConfigurationConnectionEvents.START.register((handler, client) -> Recorder.instance().configurationStarted());
-        ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> Recorder.instance().playStarted());
+        ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
+            Recorder recorder = Recorder.instance();
+            recorder.playStarted();
+            if (recorder.enabled) recorder.fixture.client.send("sync");
+        });
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> Recorder.instance().disconnected());
         ClientTickEvents.END_CLIENT_TICK.register(client -> Recorder.instance().advance(client));
-        ClientLifecycleEvents.CLIENT_STOPPING.register(client -> Recorder.instance().write(client));
+        ClientLifecycleEvents.CLIENT_STOPPING.register(client -> Recorder.instance().write());
     }
 }

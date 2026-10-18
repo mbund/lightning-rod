@@ -63,7 +63,7 @@ pub const SharedPages = struct {
     page_bytes: usize,
     unit_bytes: usize,
     recipients_per_page: usize,
-    bytes: []u8,
+    bytes: []align(64) u8,
     pages: []Page,
     recipients: []networking.Handle,
     ready: Ring,
@@ -116,7 +116,7 @@ pub const SharedPages = struct {
         if (units > std.math.maxInt(PageId)) return error.InvalidConfiguration;
 
         const recipient_count = std.math.mul(usize, units, c.recipients_per_page) catch return error.InvalidConfiguration;
-        const bytes = try a.alloc(u8, units * unit_bytes);
+        const bytes = try a.alignedAlloc(u8, .@"64", units * unit_bytes);
         errdefer a.free(bytes);
         const pages = try a.alloc(Page, units);
         errdefer a.free(pages);

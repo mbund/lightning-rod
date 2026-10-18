@@ -1,3 +1,4 @@
+const RegistryIdentity = @import("registry_identity.zig").RegistryIdentity;
 const std = @import("std");
 const worlds = @import("worlds");
 const chunks = @import("chunks");
@@ -9,6 +10,7 @@ pub const Flat = struct {
     pub const Configuration = struct {};
 
     pub const Dependencies = struct {
+        registry_identity: *RegistryIdentity,
         chunks: *chunks.Chunks,
         worlds: *worlds.Worlds,
     };
@@ -20,12 +22,11 @@ pub const Flat = struct {
         const self = try allocator.create(Flat);
         self.* = .{ .deps = deps };
         std.debug.assert(deps.chunks.source == null);
-        deps.chunks.source = .{ .context = self, .read = read };
+        deps.chunks.source = chunks.Source.init(self, read);
         return self;
     }
 
-    fn read(context: *anyopaque, section: chunks.Section, output: []u8) !usize {
-        const self: *Flat = @ptrCast(@alignCast(context));
+    fn read(self: *Flat, section: chunks.Section, output: []u8) !usize {
         const world = self.deps.worlds.get(section.world) orelse return error.UnknownWorld;
 
         if (self.generated_sections == 0) std.log.info("event=terrain_generation_started", .{});

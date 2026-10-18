@@ -1,0 +1,4 @@
+{
+  "client": "ReloadProgressFixture",
+  "variants": [{ "name": "reload-progress", "peers": ["alice", "bob"] }]
+}

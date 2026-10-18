@@ -10,7 +10,7 @@ const Items = @import("items.zig").Items;
 
 pub const Incoming = struct { count: u16, definition: []const u8 };
 
-pub fn readStack(items: *Items, allocator: std.mem.Allocator, bytes: []const u8, selected: *const sessions.Protocol, recipient: u128) !?Incoming {
+pub fn readStack(items: *Items, scratch: []u8, definition: []u8, bytes: []const u8, selected: *const sessions.Protocol, recipient: u128) !?Incoming {
     const packet = wire.UntrustedSlot.read(bytes);
     const count, const counted = try packet.itemCount();
     var choice = try counted.anon_1();
@@ -39,8 +39,6 @@ pub fn readStack(items: *Items, allocator: std.mem.Allocator, bytes: []const u8,
     var entries: [data.maximum_components]data.Component = undefined;
     var seen: [data.maximum_components]u64 = undefined;
     var seen_count: usize = 0;
-    const scratch = try allocator.alloc(u8, items.deps.inventories.config.max_item_bytes);
-    defer allocator.free(scratch);
     var output = scratch;
     var added_entries = try counts.components();
     var index: usize = 0;
@@ -71,8 +69,6 @@ pub fn readStack(items: *Items, allocator: std.mem.Allocator, bytes: []const u8,
         try removed_entries.advance(done);
     }
     try (try choice.advance(try contents.advance(try removed_entries.finish()))).finish();
-    const definition = try allocator.alloc(u8, 10 + index * 12 + scratch.len - output.len);
-    errdefer allocator.free(definition);
     const encoded = try data.encode(definition, kind orelse return error.UnsupportedProtocol, entries[0..index]);
     if (count > try Items.maximum(try data.View.parse(encoded))) return error.InvalidItemCount;
     return .{ .count = @intCast(count), .definition = encoded };
@@ -83,6 +79,8 @@ pub const SlotArguments = struct {
     items: *Items,
     stack: ?inventories.Stack,
     recipient: u128,
+    /// Borrowed from a pinned definition for the duration of encoding.
+    view: ?data.View = null,
 };
 
 pub const writeSlot: fn (destination: wire.Slot.Destination, args: SlotArguments) anyerror!wire.Slot.Completion = packets.nested(.{encodeSlot}).write;
@@ -96,9 +94,9 @@ fn encodeSlot(packet: wire.Slot.Writer, args: SlotArguments) !wire.Slot.Writer.D
     var choice = try counted.anon_1();
     const branch = try choice.begin();
     const value = stack orelse return choice.advance(try branch.case_0());
-    const lease = try items.deps.inventories.acquireItem(value.item);
-    defer lease.release();
-    const view = try data.View.parse(lease.read().?);
+    const prepared = if (args.view == null) try items.acquire(value) else null;
+    defer if (prepared) |held| held.release();
+    const view = args.view orelse prepared.?.view;
     var emitted: [data.maximum_components]usize = undefined;
     var added: usize = 0;
     var removed: usize = 0;

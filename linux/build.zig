@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const names = .{ "profiles", "storage_local", "reload_execve", "network_uring" };
+    const names = .{ "profiles", "storage", "reload_execve", "network_uring" };
     var imports: [names.len]std.Build.Module.Import = undefined;
     inline for (names, 0..) |name, index| {
         const dependency = b.dependency(name, .{ .target = target, .optimize = optimize });
@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &imports,
     });
+    module.addObjectFile(b.dependency("lightning_rod", .{ .target = target, .optimize = optimize }).namedLazyPath("runtime"));
 
     const check = b.addLibrary(.{ .name = "lightning_rod_linux", .root_module = module });
     b.step("check", "Check the Linux profile module").dependOn(&check.step);

@@ -1,3 +1,4 @@
+const persistent_records = @import("records");
 const std = @import("std");
 const inventories = @import("inventories");
 const lightning_rod = @import("lightning_rod");
@@ -16,7 +17,7 @@ const assert = std.debug.assert;
 pub const ItemTick = struct {
     pub const id = "minecraft:item_tick";
 
-    pub const Configuration = struct {};
+    pub const Configuration = struct { merge_candidates: usize = 4096 };
 
     pub const Dependencies = struct {
         dropped: *ItemEntities,
@@ -33,33 +34,37 @@ pub const ItemTick = struct {
     deps: Dependencies,
     stepped: u64 = 0,
     merged: u64 = 0,
+    merge_candidates: usize,
+    merge_after: entities.Id = 0,
 
-    pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*ItemTick {
+    pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*ItemTick {
         const self = try allocator.create(ItemTick);
-        self.* = .{ .deps = deps };
+        if (config.merge_candidates == 0) return error.InvalidConfiguration;
+        self.* = .{ .deps = deps, .merge_candidates = config.merge_candidates };
         return self;
     }
 
     pub fn tick(self: *ItemTick) !void {
         const dropped = self.deps.dropped;
-        var cursor: ItemEntities.Cursor = .{};
-
-        while (cursor.more) for (try dropped.scan(&cursor)) |row| {
-            var metadata = try dropped.get(row.id);
+        var merge_remaining = self.merge_candidates;
+        const active = dropped.nearby(self.deps.players, self.deps.players.config.simulation_distance);
+        var start_low: usize = 0;
+        var start_high = active.len;
+        while (start_low < start_high) {
+            const middle = start_low + (start_high - start_low) / 2;
+            if (active[middle] <= self.merge_after) start_low = middle + 1 else start_high = middle;
+        }
+        // Start after the last merge candidate so dense, unmergeable piles cannot starve others.
+        var iterator = dropped.iterate(active);
+        defer iterator.deinit();
+        iterator.start = start_low;
+        while (try iterator.next()) |records| for (records) |record| {
+            const entity = record.id;
+            const row = .{ .id = entity };
+            var metadata = try record.read();
             if (!metadata.alive) continue;
 
-            var body = (try self.deps.entities.get(row.id)) orelse return error.Corrupt;
-            var simulated = false;
-
-            for (self.deps.players.records) |player| {
-                if (player.handle == null or player.stage != .ready or body.world != player.world) continue;
-
-                const radius: f64 = @floatFromInt(self.deps.players.config.simulation_distance);
-                simulated = simulated or (@abs(@floor(body.position[0] / 16) - @floor(player.position.x / 16)) <= radius and
-                    @abs(@floor(body.position[2] / 16) - @floor(player.position.z / 16)) <= radius);
-            }
-
-            if (!simulated) continue;
+            var body = (try record.body.read()) orelse return error.Corrupt;
             metadata.ticks +%= 1;
 
             if (metadata.pickup_delay > 0 and metadata.pickup_delay != 32767) metadata.pickup_delay -= 1;
@@ -67,14 +72,14 @@ pub const ItemTick = struct {
             metadata.on_ground = advanced.on_ground;
 
             if (!std.meta.eql(body, advanced.body)) {
-                try dropped.move(row.id, body, advanced.body);
+                try dropped.move(record, body, advanced.body);
                 metadata.revision += 1;
                 body = advanced.body;
             }
 
             self.stepped += 1;
             const interval: u32 = if (advanced.crossed_block) 2 else 40;
-            if (metadata.ticks % interval == 0 and metadata.age != -32768 and metadata.age < 6000 and metadata.pickup_delay != 32767) {
+            if (merge_remaining != 0 and metadata.ticks % interval == 0 and metadata.age != -32768 and metadata.age < 6000 and metadata.pickup_delay != 32767) {
                 const held = (try self.deps.inventories.get(ItemEntities.slot(body))).stack orelse return error.Corrupt;
                 const maximum = try self.deps.items.stackLimit(held);
                 if (held.count < maximum) {
@@ -93,10 +98,10 @@ pub const ItemTick = struct {
                                 cell.position = .{ @as(f64, @floatFromInt(x)) * 16, @as(f64, @floatFromInt(y)) * 16, @as(f64, @floatFromInt(z)) * 16 };
                                 const prefix = ItemEntities.spatialKey(0, cell);
                                 var after = prefix;
-                                var position: lightning_rod.storage.ScanCursor = .{ .after = &after, .after_len = 17 };
+                                var position: persistent_records.ScanCursor = .{ .after = &after, .after_len = 17 };
                                 var keys: [16][25]u8 = undefined;
                                 var values: [16][54]u8 = undefined;
-                                var entries: [16]lightning_rod.storage.ScanEntry = undefined;
+                                var entries: [16]persistent_records.ScanEntry = undefined;
 
                                 for (&entries, &keys, &values) |*entry, *key, *value| entry.* = .{ .key = key, .value = value };
 
@@ -107,6 +112,9 @@ pub const ItemTick = struct {
                                     more = batch.more;
 
                                     for (entries[0..batch.count]) |entry| {
+                                        if (merge_remaining == 0) break :neighbors;
+                                        merge_remaining -= 1;
+                                        self.merge_after = entity;
                                         if (entry.key_len != 25 or !std.mem.eql(u8, entry.key[0..17], prefix[0..17])) {
                                             more = false;
                                             break;
@@ -123,8 +131,9 @@ pub const ItemTick = struct {
                                         if (@abs(body.position[0] - other.position[0]) >= 0.75 or @abs(body.position[1] - other.position[1]) >= 0.25 or @abs(body.position[2] - other.position[2]) >= 0.75)
                                             continue;
 
-                                        const first = try self.deps.inventories.get(ItemEntities.slot(body));
-                                        const second = try self.deps.inventories.get(ItemEntities.slot(other));
+                                        var contents: [2]inventories.Contents = undefined;
+                                        try self.deps.inventories.getMany(&.{ ItemEntities.slot(body), ItemEntities.slot(other) }, &contents);
+                                        const first, const second = contents;
                                         if (first.stack == null or second.stack == null) return error.Corrupt;
                                         if (!inventories.Stack.sameItem(first.stack.?, second.stack.?)) continue;
 
@@ -190,7 +199,7 @@ pub const ItemTick = struct {
                 try dropped.retire(row.id, body, &metadata);
             }
 
-            try dropped.put(row.id, metadata);
+            record.write(metadata);
         };
     }
 };

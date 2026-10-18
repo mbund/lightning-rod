@@ -3,8 +3,11 @@
   "variants": [
     {
       "name": "item-components",
-      "peer_versions": ["1.21.8", "26.2"],
-      "peers": ["alice", "bob"]
+      "peers": [
+        "alice",
+        "bob"
+      ],
+      "mixed_versions": true
     }
   ]
 }

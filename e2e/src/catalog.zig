@@ -2,13 +2,6 @@ const std = @import("std");
 
 pub const maximum_peers = 8;
 
-pub const LogRule = struct {
-    text: []const u8,
-    count: usize = 1,
-    per_peer: bool = false,
-    at_least: bool = false,
-};
-
 pub const Case = struct {
     name: []const u8,
     directory: []const u8 = "",
@@ -18,15 +11,13 @@ pub const Case = struct {
     last_peer_connect_tick: usize = 40,
     internal: bool = false,
     crash_after: bool = false,
-    versions: []const []const u8 = &.{},
-    peer_versions: []const []const u8 = &.{},
-    server_releases: ?[]const u8 = null,
+    version: ?[]const u8 = null,
+    mixed_versions: bool = false,
+    full_protocols: bool = false,
     application: []const u8 = "vanilla",
     standalone: bool = false,
     reload: bool = false,
     protocol_mismatch: bool = false,
-    required_logs: []const LogRule = &.{},
-    forbidden_logs: []const []const u8 = &.{},
 };
 
 const Manifest = struct {
@@ -54,11 +45,8 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, root: []const u8) ![]Case 
 
         for (manifest.variants) |variant| {
             if (variant.name.len == 0 or variant.peers.len == 0 or variant.peers.len > maximum_peers) return error.InvalidTest;
-            if (variant.peer_versions.len != 0 and variant.peer_versions.len != variant.peers.len) return error.InvalidPeerVersions;
+            if (variant.mixed_versions and variant.peers.len < 2) return error.InvalidPeerVersions;
             if (variant.protocol_mismatch and !variant.reload) return error.InvalidTest;
-
-            for (variant.required_logs) |rule| if (rule.text.len == 0 or rule.count == 0) return error.InvalidLogRule;
-            for (variant.forbidden_logs) |text| if (text.len == 0) return error.InvalidLogRule;
 
             for (variant.name) |character|
                 if (!std.ascii.isLower(character) and !std.ascii.isDigit(character) and character != '-') return error.InvalidTestName;

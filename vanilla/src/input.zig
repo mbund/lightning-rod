@@ -8,15 +8,22 @@ pub const Input = struct {
     pub const Dependencies = struct { sessions: *sessions.Service };
 
     const Handler = *const fn (*anyopaque, sessions.Handle, []const u8, std.mem.Allocator) anyerror!void;
-    const Entry = struct { context: *anyopaque, call: Handler };
+    const Entry = struct {
+        context: *anyopaque,
+        vtable: *const VTable,
+        const VTable = struct { call: Handler };
+    };
     const Slot = struct { valid: bool = false, entry: ?Entry = null };
-    const Lifecycle = *const fn (*anyopaque, sessions.Event) anyerror!void;
+    const Lifecycle = struct {
+        context: *anyopaque,
+        vtable: *const VTable,
+        const VTable = struct { call: *const fn (*anyopaque, sessions.Event) anyerror!void };
+    };
 
     deps: Dependencies,
     tables: [protocols.implementations.len][]Slot,
     rejected: []u32,
-    lifecycle_context: ?*anyopaque = null,
-    lifecycle_handler: ?Lifecycle = null,
+    lifecycle: ?Lifecycle = null,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Input {
         const self = try allocator.create(Input);
@@ -64,45 +71,48 @@ pub const Input = struct {
         const slot = &self.tables[index][number];
         std.debug.assert(slot.valid);
         if (slot.entry != null) return error.DuplicatePacketOwner;
+        const Adapter = struct {
+            const vtable: Entry.VTable = .{ .call = @This().invoke };
+            fn invoke(raw: *anyopaque, handle: sessions.Handle, body: []const u8, temporary: std.mem.Allocator) anyerror!void {
+                const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
+                const handlers = comptime sessions.packet_api.candidates(handler);
+                const callback = handlers[comptime sessions.packet_api.select(Version, handler)];
+                const Reader = sessions.packet_api.Cursor(callback);
+                comptime sessions.packet_api.validateReader(Reader, "play", name);
+                const reader: Reader = .{ ._cursor = .{ .buffer = body, .rest = body, .protocol_number = Version.protocol_number } };
+                comptime if (@typeInfo(@TypeOf(callback)).@"fn".params.len != 3 and @typeInfo(@TypeOf(callback)).@"fn".params.len != 4)
+                    @compileError("packet handler takes context, handle, Reader, and optionally temporary allocator");
+                if (comptime @typeInfo(@TypeOf(callback)).@"fn".params.len == 3)
+                    try @call(.auto, callback, .{ typed, handle, reader })
+                else
+                    try @call(.auto, callback, .{ typed, handle, reader, temporary });
+            }
+        };
         slot.entry = .{
             .context = context,
-            .call = struct {
-                fn call(raw: *anyopaque, handle: sessions.Handle, body: []const u8, temporary: std.mem.Allocator) anyerror!void {
-                    const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
-                    const handlers = comptime sessions.packet_api.candidates(handler);
-                    const callback = handlers[comptime sessions.packet_api.select(Version, handler)];
-                    const Reader = sessions.packet_api.Cursor(callback);
-                    comptime sessions.packet_api.validateReader(Reader, "play", name);
-                    const reader: Reader = .{ ._cursor = .{ .buffer = body, .rest = body, .protocol_number = Version.protocol_number } };
-                    comptime if (@typeInfo(@TypeOf(callback)).@"fn".params.len != 3 and @typeInfo(@TypeOf(callback)).@"fn".params.len != 4)
-                        @compileError("packet handler takes context, handle, Reader, and optionally temporary allocator");
-                    if (comptime @typeInfo(@TypeOf(callback)).@"fn".params.len == 3)
-                        try @call(.auto, callback, .{ typed, handle, reader })
-                    else
-                        try @call(.auto, callback, .{ typed, handle, reader, temporary });
-                }
-            }.call,
+            .vtable = &Adapter.vtable,
         };
     }
 
     pub fn onLifecycle(self: *Input, context: anytype, comptime handler: anytype) !void {
-        if (self.lifecycle_handler != null) return error.DuplicateLifecycleOwner;
-        self.lifecycle_context = context;
-        self.lifecycle_handler = struct {
-            fn call(raw: *anyopaque, event: sessions.Event) anyerror!void {
+        if (self.lifecycle != null) return error.DuplicateLifecycleOwner;
+        const Adapter = struct {
+            const vtable: Lifecycle.VTable = .{ .call = @This().invoke };
+            fn invoke(raw: *anyopaque, event: sessions.Event) anyerror!void {
                 const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
-                try @call(.auto, handler, .{ typed, event });
+                return handler(typed, event);
             }
-        }.call;
+        };
+        self.lifecycle = .{ .context = context, .vtable = &Adapter.vtable };
     }
 
     pub fn tick(self: *Input, temporary: std.mem.Allocator) !void {
         @memset(self.rejected, 0);
         for (self.deps.sessions.input_events) |event| {
             switch (event) {
-                .joined, .left => {
-                    if (self.lifecycle_handler) |handler|
-                        try handler(self.lifecycle_context.?, event);
+                .joined, .left, .ready => {
+                    if (self.lifecycle) |handler|
+                        try handler.vtable.call(handler.context, event);
                 },
                 .input => |input| {
                     if (self.rejected[input.handle.index] == input.handle.generation) continue;
@@ -129,7 +139,7 @@ pub const Input = struct {
                                     self.reject(input.handle, "UnknownPacket");
                                     break :packets;
                                 }
-                                if (slot.entry) |entry| entry.call(entry.context, input.handle, header.body, temporary) catch |err| {
+                                if (slot.entry) |entry| entry.vtable.call(entry.context, input.handle, header.body, temporary) catch |err| {
                                     if (err != error.InvalidPacket) return err;
                                     self.reject(input.handle, "InvalidPacket");
                                     break :packets;

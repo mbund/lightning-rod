@@ -1,0 +1,14 @@
+.{
+    .fingerprint = 0x86fb5de0d44d803a,
+    .name = .storage_validation,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .storage = .{ .path = "../../storage" },
+        .records = .{ .path = "../../records" },
+        .chunks = .{ .path = "../../chunks" },
+        .inventories = .{ .path = "../../inventories" },
+        .metrics = .{ .path = "../../metrics" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

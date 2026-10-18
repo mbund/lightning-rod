@@ -1,4 +1,12 @@
 {
   "client": "BossbarsFixture",
-  "variants": [{ "name": "bossbars-multi", "peers": ["alice", "bob"], "versions": ["1.21.6", "1.21.8"] }]
+  "variants": [
+    {
+      "name": "bossbars-multi",
+      "peers": [
+        "alice",
+        "bob"
+      ]
+    }
+  ]
 }

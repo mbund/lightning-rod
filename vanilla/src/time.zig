@@ -1,3 +1,4 @@
+const records = @import("records");
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const storage = lightning_rod.storage;
@@ -6,7 +7,7 @@ const storage = lightning_rod.storage;
 pub const Time = struct {
     pub const id = "minecraft:time";
     pub const Configuration = struct { day_time: i64 = 0, daylight_cycle: bool = true };
-    pub const Dependencies = struct { storage: storage.Namespace };
+    pub const Dependencies = struct { storage: storage.Space };
 
     game_time: i64 = 0,
     day_time: i64,
@@ -17,7 +18,7 @@ pub const Time = struct {
         const self = try allocator.create(Time);
         self.* = .{ .day_time = configuration.day_time, .daylight_cycle = configuration.daylight_cycle };
         var bytes: [18]u8 = undefined;
-        if (try deps.storage.get("clock", &bytes)) |length| {
+        if (try records.Value.init(deps.storage).read(&bytes)) |length| {
             if (length != bytes.len or bytes[0] != 1 or bytes[17] > 1) return error.CorruptClock;
             self.game_time = std.mem.readInt(i64, bytes[1..9], .little);
             self.day_time = std.mem.readInt(i64, bytes[9..17], .little);
@@ -36,12 +37,12 @@ pub const Time = struct {
         self.revision +%= 1;
     }
 
-    pub fn checkpoint(self: *Time, namespace: storage.Namespace) !void {
+    pub fn checkpoint(self: *Time, space: storage.Space) !void {
         var bytes: [18]u8 = undefined;
         bytes[0] = 1;
         std.mem.writeInt(i64, bytes[1..9], self.game_time, .little);
         std.mem.writeInt(i64, bytes[9..17], self.day_time, .little);
         bytes[17] = @intFromBool(self.daylight_cycle);
-        try namespace.put("clock", &bytes);
+        try records.Value.init(space).write(&bytes);
     }
 };

@@ -4,11 +4,23 @@ zig-out/
 zig-pkg/
 lightning-rod-data/
 logs/
-perf.data*
 e2e/client/.gradle/
 e2e/client/build/
 e2e/client/run/
 registry_snapshotter/.gradle/
 registry_snapshotter/build/
 e2e/client/.e2e/
-/e2e/artifacts/
+/e2e/tests/*/artifacts/
+e2e/client/.classpath
+e2e/client/.project
+e2e/client/.settings/
+registry_snapshotter/.classpath
+registry_snapshotter/.project
+registry_snapshotter/.settings/
+e2e/client/bin/
+registry_snapshotter/bin/
+# Keep repository Java configuration even when editors are globally ignored.
+!/.vscode/
+!/.vscode/extensions.json
+!/.vscode/settings.json
+!/.vscode/tasks.json

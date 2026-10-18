@@ -14,14 +14,12 @@ pub const Operators = struct {
         const self = try allocator.create(Operators);
         self.* = .{ .config = config };
 
-        deps.commands.installPolicyIfUnset(.{ .context = self, .allows = allows });
+        deps.commands.installPolicyIfUnset(commands.Policy.init(self, allows));
 
         return self;
     }
 
-    fn allows(context: *anyopaque, uuid: u128, _: *const commands.Permission) bool {
-        const self: *const Operators = @ptrCast(@alignCast(context));
-
+    fn allows(self: *const Operators, uuid: u128, _: *const commands.Permission) bool {
         for (self.config.operators) |operator| if (operator == uuid) return true;
         return false;
     }

@@ -9,14 +9,17 @@ pub const Plugin = struct {
         interval_ticks: u32 = 20,
     };
 
+    pub const Dependencies = struct { metrics: *lightning_rod.metrics.Registry };
+
+    deps: Dependencies,
     config: Configuration,
     ticks: u32 = 0,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, configuration: Configuration) !*Plugin {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, configuration: Configuration, deps: Dependencies) !*Plugin {
         if (configuration.interval_ticks == 0) return error.InvalidConfiguration;
 
         const self = try allocator.create(Plugin);
-        self.* = .{ .config = configuration };
+        self.* = .{ .config = configuration, .deps = deps };
         self.config.enabled = configuration.enabled and try std.Io.File.stdout().supportsAnsiEscapeCodes(io);
         return self;
     }
@@ -26,13 +29,18 @@ pub const Plugin = struct {
         self.ticks += 1;
         if (self.ticks < self.config.interval_ticks) return;
         self.ticks = 0;
-        const metrics = lightning_rod.metrics.snapshot() orelse return;
         var bytes: [16 * 1024]u8 = undefined;
         var output = std.Io.Writer.fixed(&bytes);
         output.writeAll("\x1b[H\x1b[2JLightning Rod — Simulation\n\nPlugin                              last us     max us    memory KiB\n") catch unreachable;
 
-        for (metrics.plugins) |record| {
-            output.print("{s:<35} {d:>8} {d:>10} {d:>13}\n", .{ record.name, record.last_ns / 1000, record.max_ns / 1000, record.persistent_bytes / 1024 }) catch break;
+        for (0..self.deps.metrics.count) |index| {
+            const record = self.deps.metrics.at(index);
+            if (record.kind != .timer or !std.mem.endsWith(u8, record.name, ".tick")) continue;
+            const plugin = record.name[0 .. record.name.len - ".tick".len];
+            var name: [160]u8 = undefined;
+            const memory_name = std.fmt.bufPrint(&name, "{s}.persistent_memory", .{plugin}) catch unreachable;
+            const memory = self.deps.metrics.find(memory_name) orelse continue;
+            output.print("{s:<35} {d:>8} {d:>10} {d:>13}\n", .{ plugin, record.value / 1000, record.maximum / 1000, memory.value / 1024 }) catch break;
         }
 
         std.Io.File.stdout().writeStreamingAll(io, output.buffered()) catch {

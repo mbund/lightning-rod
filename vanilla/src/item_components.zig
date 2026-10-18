@@ -40,7 +40,8 @@ pub const Dispatch = support.cursor.Dispatch(schemas, "SlotComponent", "data", R
 pub const Components = struct {
     pub const Provider = struct {
         context: *anyopaque,
-        present: ?*const fn (*anyopaque, data.View, u128) bool,
+        vtable: *const VTable,
+        const VTable = struct { present: ?*const fn (*anyopaque, data.View, u128) bool };
     };
 
     dispatch: Dispatch,
@@ -65,15 +66,15 @@ pub const Components = struct {
         try self.dispatch.on(tag, owner, callbacks);
         self.extra_bytes = total;
         self.has_presentation = self.has_presentation or @hasField(@TypeOf(callbacks), "present");
-        self.providers[index] = .{
-            .context = owner,
-            .present = if (@hasField(@TypeOf(callbacks), "present")) struct {
-                fn present(raw: *anyopaque, view: data.View, recipient: u128) bool {
-                    const typed: @TypeOf(owner) = @ptrCast(@alignCast(raw));
-                    return callbacks.present(typed, view, recipient);
-                }
-            }.present else null,
+        const Adapter = struct {
+            const vtable: Provider.VTable = .{ .present = if (@hasField(@TypeOf(callbacks), "present")) invoke else null };
+
+            fn invoke(raw: *anyopaque, view: data.View, recipient: u128) bool {
+                const typed: @TypeOf(owner) = @ptrCast(@alignCast(raw));
+                return callbacks.present(typed, view, recipient);
+            }
         };
+        self.providers[index] = .{ .context = owner, .vtable = &Adapter.vtable };
         if (@hasField(@TypeOf(callbacks), "personalized")) self.personalized = self.personalized or callbacks.personalized;
     }
 
@@ -84,7 +85,7 @@ pub const Components = struct {
 
     pub fn present(self: *const Components, index: usize, view: data.View, recipient: u128) bool {
         const provider = self.providers[index];
-        if (provider.present) |call| return call(provider.context, view, recipient);
+        if (provider.vtable.present) |call| return call(provider.context, view, recipient);
         const entry = view.get(self.dispatch.entries[index].key) orelse return false;
         return entry.value != null;
     }

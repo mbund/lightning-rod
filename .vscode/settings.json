@@ -1,0 +1,17 @@
+{
+  "java.server.launchMode": "Standard",
+  "java.configuration.updateBuildConfiguration": "automatic",
+  "java.import.gradle.enabled": true,
+  "java.import.gradle.wrapper.enabled": true,
+  "java.import.exclusions": [
+    "**/.git/**",
+    "**/.gradle/**",
+    "**/build/**",
+    "**/.zig-cache/**",
+    "**/zig-out/**",
+    "**/zig-pkg/**"
+  ],
+  "java.autobuild.enabled": true,
+  "java.maxConcurrentBuilds": 1,
+  "java.errors.incompleteClasspath.severity": "warning"
+}

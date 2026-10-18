@@ -1,39 +1,22 @@
+const e2e_control = @import("e2e_control");
 const std = @import("std");
 const reload_execve = @import("reload_execve");
-const sessions = @import("sessions");
 const lightning_rod = @import("lightning_rod");
 const selected_protocol = @import("protocols");
 const profiles = @import("profiles");
 const networking = @import("network_stdio");
 const vanilla = @import("vanilla");
-const persistence = @import("storage_local");
+const persistence = @import("storage");
 const reload = @import("reload");
 const ExtraNegotiation = @import("extra_negotiation.zig").ExtraNegotiation;
-
-pub export const lightning_rod_resume_manifest linksection(reload_execve.section_name) = reload_execve.executableManifest(selected_protocol.Endpoint);
-
-const ReloadProbe = struct {
-    pub const id = "example:reload_probe";
-    pub const Configuration = struct {};
-    pub const Dependencies = struct { command_dispatch: *vanilla.CommandDispatch, reload_request: *reload.Request };
-    deps: Dependencies,
-
-    pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*ReloadProbe {
-        const self = try allocator.create(ReloadProbe);
-        self.* = .{ .deps = deps };
-        try deps.command_dispatch.observeCommand(self, onCommand);
-        return self;
-    }
-
-    fn onCommand(self: *ReloadProbe, _: sessions.Handle, text: []const u8) !void {
-        if (std.mem.eql(u8, text, "protocol_reload")) try self.deps.reload_request.stage("protocol-extension");
-    }
-};
 
 const WorldProvider = struct {
     pub const id = vanilla.VanillaWorlds.id;
     pub const Configuration = struct {};
-    pub const Dependencies = vanilla.VanillaWorlds.Dependencies;
+    pub const Dependencies = struct {
+        registry_identity: *vanilla.RegistryIdentity,
+        worlds: *vanilla.Worlds,
+    };
     pub const Services = .{*vanilla.VanillaWorlds};
 
     worlds: vanilla.VanillaWorlds,
@@ -56,17 +39,19 @@ const WorldProvider = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    const startup = profiles.Startup.capture(init.io);
+    const allocator = init.gpa;
     const address = init.environ_map.get("LIGHTNING_ROD_E2E_ADDRESS") orelse "127.0.0.1:25565";
     const port = try std.fmt.parseInt(u16, address[(std.mem.lastIndexOfScalar(u8, address, ':') orelse return error.InvalidAddress) + 1 ..], 10);
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(vanilla.plugins(), .{
             lightning_rod.plugin.configured(WorldProvider, WorldProvider.Configuration{}),
-            lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .maximum = 2, .render_distance = 4 }),
+            lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .maximum = 2, .render_distance = 2 }),
         }),
-        lightning_rod.plugin.configured(ReloadProbe, ReloadProbe.Configuration{}),
+        lightning_rod.plugin.configured(e2e_control.Control, .{}),
     });
-    var selected = try selected_protocol.Protocols.init(init.gpa);
-    defer selected.deinit(init.gpa);
+    var selected = try selected_protocol.Protocols.init(allocator);
+    defer selected.deinit(allocator);
     const ConfigurationPlugin = vanilla.SessionConfiguration(selected_protocol.Protocols);
     const session_plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.configured(selected_protocol.Handshake, selected_protocol.Handshake.Configuration{}),
@@ -75,30 +60,31 @@ pub fn main(init: std.process.Init) !void {
         lightning_rod.plugin.configured(vanilla.Disconnect, vanilla.Disconnect.Configuration{}),
         lightning_rod.plugin.configured(vanilla.OfflineAuthentication, vanilla.OfflineAuthentication.Configuration{}),
         lightning_rod.plugin.configured(vanilla.LoginCompression, vanilla.LoginCompression.Configuration{}),
+        lightning_rod.plugin.configured(ExtraNegotiation, ExtraNegotiation.Configuration{}),
         lightning_rod.plugin.configured(vanilla.LoginSuccess, vanilla.LoginSuccess.Configuration{}),
         lightning_rod.plugin.configured(vanilla.Keepalive, vanilla.Keepalive.Configuration{}),
         lightning_rod.plugin.configured(vanilla.Status, vanilla.Status.Configuration{}),
         lightning_rod.plugin.configured(ConfigurationPlugin, ConfigurationPlugin.Configuration{ .protocols = &selected }),
-        lightning_rod.plugin.configured(ExtraNegotiation, ExtraNegotiation.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.ConfigurationFinish, vanilla.ConfigurationFinish.Configuration{}),
     });
-    var store = try persistence.Store.init(init.gpa, init.io, .{ .path = "custom-store", .max_value_bytes = 64 * 1024 });
-    defer store.deinit(init.io);
+    var store = try persistence.Store.init(allocator, init.io, .{ .path = "custom-store" });
+    defer store.deinit();
     const router = profiles.SingleSimulation{};
     const Server = profiles.Server(@TypeOf(plugins), selected_protocol.Endpoint, networking.Transport(.{
         .connections = 32,
         .operations = 256,
         .events = 320,
-    }), persistence.Store, reload_execve, @TypeOf(session_plugins), @TypeOf(router));
-    try Server.run(init, .{
+    }), reload_execve, @TypeOf(session_plugins), @TypeOf(router));
+    try Server.run(allocator, init, .{
+        .metrics_export = if (init.environ_map.get("LIGHTNING_ROD_METRICS_DIRECTORY")) |directory| .{ .directory = directory, .stop_file = "metrics.stop" } else null,
         .plugins = plugins,
+        .simulation = .{ .memory_bytes = 32 * 1024 * 1024, .temporary_bytes = 256 * 1024, .autosave = .{ .ticks = null } },
         .session_plugins = session_plugins,
-        .reload_manifest = &lightning_rod_resume_manifest,
+        .startup = startup,
         .router = router,
         .max_players = 2,
         .protocols = &selected,
-        .persistence = store.interface(),
+        .persistence = &store,
         .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } },
         .reload = .{ .executable = "/proc/self/exe" },
-    });
+    }, .{});
 }

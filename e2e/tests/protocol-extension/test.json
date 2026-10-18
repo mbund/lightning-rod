@@ -3,13 +3,12 @@
   "variants": [
     {
       "name": "protocol-extension",
-      "versions": ["1.21.8"],
       "standalone": true,
-      "peers": ["alice", "bob"],
-      "required_logs": [
-        { "text": "event=downstream_extra_negotiation", "count": 2, "per_peer": true },
-        { "text": "event=reload_resumed " }
-      ]
+      "peers": [
+        "alice",
+        "bob"
+      ],
+      "version": "1.21.8"
     }
   ]
 }

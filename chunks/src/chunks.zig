@@ -1,7 +1,11 @@
+const ChunkStore = @import("store.zig").Store;
+const metrics = @import("metrics");
 const std = @import("std");
 const records = @import("records");
 const storage = @import("storage");
+const encoding = @import("encoding.zig");
 
+const Cache = records.CacheFor(ChunkStore);
 const assert = std.debug.assert;
 
 pub const World = u32;
@@ -31,13 +35,53 @@ pub const SectionEdits = struct {
 
 pub const Observer = struct {
     context: *anyopaque,
-    /// Edits are borrowed. Record invalidation here, without changing the world.
-    changed: *const fn (*anyopaque, Section, []const BlockEdit) void,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        changed: *const fn (*anyopaque, Section, []const BlockEdit) void,
+    };
+
+    pub fn init(owner: anytype, comptime handler: anytype) Observer {
+        const Adapter = struct {
+            const vtable: VTable = .{ .changed = @This().invoke };
+
+            fn invoke(raw: *anyopaque, section: Section, edits: []const BlockEdit) void {
+                const typed: @TypeOf(owner) = @ptrCast(@alignCast(raw));
+                return handler(typed, section, edits);
+            }
+        };
+        return .{ .context = owner, .vtable = &Adapter.vtable };
+    }
+
+    /// Edits are borrowed. Record invalidation without changing the world.
+    pub fn changed(self: Observer, section: Section, edits: []const BlockEdit) void {
+        return self.vtable.changed(self.context, section, edits);
+    }
 };
 
 pub const Source = struct {
     context: *anyopaque,
-    read: *const fn (*anyopaque, Section, []u8) anyerror!usize,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        read: *const fn (*anyopaque, Section, []u8) anyerror!usize,
+    };
+
+    pub fn init(owner: anytype, comptime handler: anytype) Source {
+        const Adapter = struct {
+            const vtable: VTable = .{ .read = @This().invoke };
+
+            fn invoke(raw: *anyopaque, section: Section, output: []u8) anyerror!usize {
+                const typed: @TypeOf(owner) = @ptrCast(@alignCast(raw));
+                return handler(typed, section, output);
+            }
+        };
+        return .{ .context = owner, .vtable = &Adapter.vtable };
+    }
+
+    pub fn read(self: Source, section: Section, output: []u8) anyerror!usize {
+        return self.vtable.read(self.context, section, output);
+    }
 };
 
 pub const Chunks = struct {
@@ -45,14 +89,16 @@ pub const Chunks = struct {
 
     pub const Configuration = struct {
         cache_sections: usize = 192,
+        cache_tiles: usize = 32,
         observers: usize = 8,
     };
 
     pub const Dependencies = struct {
-        storage: storage.Namespace,
+        metrics: *metrics.Registry,
+        storage: storage.Space,
     };
 
-    cache: records.Cache,
+    cache: Cache,
     source: ?Source = null,
     observers: []Observer,
     observer_count: usize = 0,
@@ -61,10 +107,13 @@ pub const Chunks = struct {
     pub fn init(allocator: std.mem.Allocator, io: std.Io, configuration: Configuration, deps: Dependencies) !*Chunks {
         const self = try allocator.create(Chunks);
         self.* = .{
-            .cache = try records.Cache.init(allocator, io, deps.storage, .{
+            .cache = try Cache.init(allocator, io, try ChunkStore.init(allocator, io, deps.storage, configuration.cache_tiles, deps.metrics), .{
+                .metrics = deps.metrics,
+                .metrics_namespace = "chunks.cache",
                 .slots = configuration.cache_sections,
                 .key_bytes = 16,
                 .value_bytes = 8193,
+                .codec = encoding.codec,
             }),
             .observers = try allocator.alloc(Observer, configuration.observers),
         };
@@ -139,7 +188,7 @@ pub const Chunks = struct {
             for (sections[start..][0..count], changed[0..count]) |section, did_change| {
                 if (!did_change) continue;
                 for (self.observers[0..self.observer_count]) |observer|
-                    observer.changed(observer.context, section.section, section.edits);
+                    observer.changed(section.section, section.edits);
             }
             self.notifying = false;
             start += count;
@@ -161,7 +210,7 @@ pub const Chunks = struct {
         errdefer for (output[0..done]) |lease| lease.release();
         var keys: [192][16]u8 = undefined;
         var key_slices: [192][]const u8 = undefined;
-        var leases: [192]records.Cache.Lease = undefined;
+        var leases: [192]Cache.Lease = undefined;
 
         while (done < sections.len) {
             const count = @min(keys.len, sections.len - done);
@@ -181,7 +230,7 @@ pub const Chunks = struct {
                         return error.Corrupt;
                 } else if (self.source) |source| {
                     const bytes = lease.edit();
-                    const length = try source.read(source.context, sections[done], bytes);
+                    const length = try source.read(sections[done], bytes);
                     if (length == 0 or (bytes[0] == 0 and length != 3) or (bytes[0] == 1 and length != 8193) or bytes[0] > 1)
                         return error.InvalidSection;
                     lease.commit(length);
@@ -233,13 +282,13 @@ pub const Chunks = struct {
         };
     }
 
-    pub fn checkpoint(self: *Chunks, _: storage.Namespace) !void {
+    pub fn checkpoint(self: *Chunks, _: storage.Space) !void {
         try self.cache.flush();
     }
 };
 
 pub const Lease = struct {
-    record: records.Cache.Lease,
+    record: Cache.Lease,
 
     pub fn view(self: Lease) View {
         const bytes = self.record.read() orelse return .{ .uniform = 0 };

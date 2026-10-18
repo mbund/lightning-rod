@@ -33,6 +33,7 @@ const SEGMENT_BITS = 0x7F;
 const CONTINUE_BIT = 0x80;
 pub const maximum_sequence_elements: usize = 65_536;
 const nbt_max_depth = 128;
+pub const NbtScratch = [nbt_max_depth]nbt_codec.Frame;
 
 pub const UUID = u128;
 pub const lpVec3 = struct { x: f64, y: f64, z: f64 };
@@ -392,8 +393,12 @@ pub fn skip_nbt(buffer: []const u8) ReadError![]const u8 {
 }
 
 pub fn skip_anonymous_nbt(buffer: []const u8) ReadError![]const u8 {
-    var stack: [nbt_max_depth]nbt_codec.Frame = undefined;
-    return map_nbt_read_error(nbt_codec.skip_anonymous(buffer, &stack));
+    var stack: NbtScratch = undefined;
+    return skip_anonymous_nbt_with_scratch(buffer, &stack);
+}
+
+pub fn skip_anonymous_nbt_with_scratch(buffer: []const u8, stack: *NbtScratch) ReadError![]const u8 {
+    return map_nbt_read_error(nbt_codec.skip_anonymous(buffer, stack));
 }
 
 pub fn skip_optional_nbt(buffer: []const u8) ReadError![]const u8 {

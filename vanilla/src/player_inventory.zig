@@ -1,3 +1,4 @@
+const metrics = @import("metrics");
 const std = @import("std");
 const wire_1_21_5 = @import("wire_1_21_5");
 const packets = @import("minecraft_packets");
@@ -22,13 +23,14 @@ pub const PlayerInventory = struct {
     pub const Configuration = struct {};
 
     pub const Dependencies = struct {
+        metrics: *metrics.Registry,
         players: *Players,
         input: *Input,
         inventories: *inventories.Inventories,
         items: *Items,
         equipment: *EquipmentSlots,
         dropped: *item_entities.ItemEntities,
-        storage: lightning_rod.storage.Namespace,
+        storage: lightning_rod.storage.Space,
     };
 
     pub const State = struct {
@@ -51,14 +53,32 @@ pub const PlayerInventory = struct {
         assert(contents.len == 47);
         const body = try (try packet.windowId(0)).stateId(revision);
         var items = try body.items(46);
-        for (contents[0..46]) |entry| {
-            const item = (try items.next()).?;
-            try items.advance(try item_packets.writeSlot(item, .{
-                .registry = registry,
-                .items = store,
-                .stack = entry.stack,
-                .recipient = recipient,
-            }));
+        var base: usize = 0;
+        while (base < 46) {
+            const count = @min(16, store.views.len, 46 - base);
+            var stacks: [16]inventories.Stack = undefined;
+            var prepared: [16]Items.Prepared = undefined;
+            var occupied: usize = 0;
+            for (contents[base..][0..count]) |entry| if (entry.stack) |stack| {
+                stacks[occupied] = stack;
+                occupied += 1;
+            };
+            try store.acquireMany(stacks[0..occupied], prepared[0..occupied]);
+            defer for (prepared[0..occupied]) |held| held.release();
+            var index: usize = 0;
+            for (contents[base..][0..count]) |entry| {
+                const view = if (entry.stack != null) prepared[index].view else null;
+                index += @intFromBool(entry.stack != null);
+                const item = (try items.next()).?;
+                try items.advance(try item_packets.writeSlot(item, .{
+                    .registry = registry,
+                    .items = store,
+                    .stack = entry.stack,
+                    .recipient = recipient,
+                    .view = view,
+                }));
+            }
+            base += count;
         }
         const carried = try items.finish();
         var item = try carried.carriedItem();
@@ -88,7 +108,9 @@ pub const PlayerInventory = struct {
         self.* = .{
             .deps = deps,
             .states = states,
-            .recovery = try records.Cache.init(allocator, io, deps.storage, .{
+            .recovery = try records.Cache.init(allocator, io, records.Table.init(deps.storage), .{
+                .metrics = deps.metrics,
+                .metrics_namespace = "inventory.recovery",
                 .slots = @max(1, states.len),
                 .key_bytes = 16,
                 .value_bytes = 36,
@@ -137,12 +159,36 @@ pub const PlayerInventory = struct {
             next[target] = .{ .item = held.item, .count = previous + amount };
             remaining -= amount;
         };
-        if (remaining != 0) try self.drop(player.*, .{ .item = held.item, .count = remaining });
+        // Keep the recovery record and inventory intact until its overflow can be dropped.
+        if (remaining != 0) {
+            if (!self.deps.dropped.canCreate(1)) return;
+            try self.drop(player.*, .{ .item = held.item, .count = remaining });
+        }
         try self.commit(state, slots, contents, &next);
-        lease.remove();
+        try self.writeRecovery(lease, null);
     }
 
     pub const Recovery = struct { stack: inventories.Stack, origin: u16 };
+
+    pub fn writeRecovery(self: *PlayerInventory, lease: records.Cache.Lease, next: ?Recovery) !void {
+        std.debug.assert(lease.cache == &self.recovery);
+        errdefer self.deps.storage.fail();
+        const previous = if (lease.read()) |bytes| try decodeRecovery(bytes) else null;
+        const same = previous != null and next != null and std.mem.eql(u8, &previous.?.stack.item, &next.?.stack.item);
+        if (!same) {
+            if (next) |value| try self.deps.inventories.retainItems(&.{value.stack.item});
+            if (previous) |value| try self.deps.inventories.releaseItems(&.{value.stack.item});
+        }
+        if (next) |value| {
+            var bytes: [36]u8 = undefined;
+            bytes[0..32].* = value.stack.item;
+            std.mem.writeInt(u16, bytes[32..34], value.stack.count, .little);
+            std.mem.writeInt(u16, bytes[34..36], value.origin, .little);
+            if (lease.read()) |old| if (std.mem.eql(u8, old, &bytes)) return;
+            @memcpy(lease.edit(), &bytes);
+            lease.commit(bytes.len);
+        } else if (previous != null) lease.remove();
+    }
 
     pub fn decodeRecovery(bytes: []const u8) !Recovery {
         if (bytes.len != 36) return error.Corrupt;
@@ -154,7 +200,7 @@ pub const PlayerInventory = struct {
         return result;
     }
 
-    pub fn checkpoint(self: *PlayerInventory, _: lightning_rod.storage.Namespace) !void {
+    pub fn checkpoint(self: *PlayerInventory, _: lightning_rod.storage.Space) !void {
         try self.recovery.flush();
     }
 
@@ -181,12 +227,20 @@ pub const PlayerInventory = struct {
     }
 
     pub fn drop(self: *PlayerInventory, player: Players.Player, stack: inventories.Stack) !void {
+        assert(self.deps.dropped.canCreate(1));
         const yaw = @as(f64, player.rotation.yaw) * std.math.pi / 180;
         const pitch = @as(f64, player.rotation.pitch) * std.math.pi / 180;
         const entity = try self.deps.dropped.create(player.world, .{ player.position.x, player.position.y + 1.32, player.position.z }, .{ -@sin(yaw) * @cos(pitch) * 0.3, -@sin(pitch) * 0.3 + 0.1, @cos(yaw) * @cos(pitch) * 0.3 }, stack);
         var metadata = try self.deps.dropped.get(entity);
         metadata.pickup_delay = 40;
         try self.deps.dropped.put(entity, metadata);
+    }
+
+    /// All drops in an action are admitted together. No other producer interleaves on this owner.
+    pub fn dropMany(self: *PlayerInventory, player: Players.Player, stacks: []const inventories.Stack) !bool {
+        if (!self.deps.dropped.canCreate(stacks.len)) return false;
+        for (stacks) |stack| try self.drop(player, stack);
+        return true;
     }
 
     pub fn give(self: *PlayerInventory, player: usize, name: []const u8, count: u16) !bool {

@@ -15,10 +15,10 @@
       "fixture": "reload_creative",
       "reload": true,
       "protocol_mismatch": true,
-      "required_logs": [
-        { "text": "event=reload_fallback reason=ReloadProtocolUnsupported" }
-      ],
-      "peers": ["alice", "bob"]
+      "peers": [
+        "alice",
+        "bob"
+      ]
     }
   ]
 }

@@ -1,7 +1,6 @@
 const std = @import("std");
 const java = @import("minecraft_java");
 const sessions = @import("sessions");
-const game_data = @import("game_data");
 const wire = @import("wire");
 const registry = @import("registry");
 
@@ -37,11 +36,9 @@ pub const Custom = struct {
     });
     pub const Protocol = wire;
     pub const Registry = registry;
-    const Chunk = java.ChunkCodec(game_data, Protocol, Registry);
-    pub const writeChunk = Chunk.write;
     pub const protocol_number = 9001;
     pub const minecraft_name: ?[]const u8 = null;
-    pub const Connection = java.Connection;
+    pub const Connection = java.Connection(Protocol);
 
     pub const Bootstrap = struct {
         pub fn frame(bytes: []const u8, maximum: usize) !sessions.protocol.Frame {
@@ -79,7 +76,6 @@ pub const Crypt = struct {
     pub const minecraft_name: ?[]const u8 = null;
     pub const Protocol = Custom.Protocol;
     pub const Registry = Custom.Registry;
-    pub const writeChunk = Custom.writeChunk;
 
     pub const Wire = struct {
         pub const Workspace = java.Wire.Workspace;
@@ -104,7 +100,7 @@ pub const Crypt = struct {
 
     pub const Connection = struct {
         pub const Wire = Crypt.Wire;
-        pub const resume_format = std.hash.Wyhash.hash(0, "example:fixed-frame-xor:1");
+        pub const resume_format = std.hash.Wyhash.hash(0, "example:fixed-frame-xor:3");
 
         base: Custom.Connection,
 

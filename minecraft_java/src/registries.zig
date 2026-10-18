@@ -12,9 +12,7 @@ pub fn Registries(comptime Version: type) type {
         }
 
         pub fn init(allocator: std.mem.Allocator) !PreparedRegistries {
-            const data = try snapshot(allocator);
-            defer data.deinit(allocator);
-            return Builder.build(allocator, Version.protocol_number, data);
+            return Builder.readEmbedded(allocator, Version);
         }
     };
 }

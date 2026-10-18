@@ -7,9 +7,9 @@ const router = @import("router.zig");
 const networking = @import("networking");
 const input = @import("input.zig");
 pub const packet_api = @import("packet_api.zig");
+pub const protocol = @import("protocol.zig");
 
 pub const Endpoint = endpoint.Endpoint;
-pub const protocol = @import("protocol.zig");
 pub const Service = service.Service;
 pub const Worker = worker.Worker;
 pub const Route = router.Route;

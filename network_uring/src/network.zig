@@ -1,9 +1,10 @@
 //! Buffers are caller-owned and never registered.
 const std = @import("std");
+const networking_test = @import("networking_test");
+const network = @import("networking");
 
 const linux = std.os.linux;
 const posix = std.posix;
-const network = @import("networking");
 
 const assert = std.debug.assert;
 
@@ -45,6 +46,9 @@ pub fn Transport(comptime limits: network.Limits) type {
             used: bool = false,
             submitted: bool = false,
             cancel_requested: bool = false,
+            cancel_pending: bool = false,
+            completed: bool = false,
+            cancel: bool = false,
             kind: Kind = .receive,
             handle: network.Handle = undefined,
             bytes: []u8 = undefined,
@@ -103,44 +107,38 @@ pub fn Transport(comptime limits: network.Limits) type {
             return .{
                 .context = self,
                 .vtable = network.Transport.adapter(Self),
-                .inheritance = .{
-                    .context = self,
-                    .pause = pauseAccept,
-                    .ready = paused,
-                    .listener = listenerDescriptor,
-                    .descriptor = descriptor,
-                    .adopt = adopt,
-                },
+                .inheritance = network.Inheritance.init(Self, self),
             };
         }
 
-        fn pauseAccept(context: *anyopaque, io: std.Io, pause: bool) void {
-            const self: *Self = @ptrCast(@alignCast(context));
-            self.accepting = !pause;
+        pub fn pause(self: *Self, io: std.Io, enabled: bool) void {
+            self.accepting = !enabled;
 
-            if (pause)
+            if (enabled) {
+                for (&self.operations) |*op| if (op.used) {
+                    op.cancel = true;
+                };
                 self.notify(io);
+            }
         }
 
-        fn paused(context: *anyopaque) bool {
-            const self: *Self = @ptrCast(@alignCast(context));
-            return !self.accepting and !self.accept_pending and !self.accept_cancel_pending and !self.wake_pending;
+        pub fn paused(self: *Self) bool {
+            if (self.accepting or self.accept_pending or self.accept_cancel_pending or self.wake_pending or self.event_count != 0) return false;
+            for (self.operations) |op| if (op.used) return false;
+            return true;
         }
 
-        fn listenerDescriptor(context: *anyopaque) i32 {
-            const self: *Self = @ptrCast(@alignCast(context));
+        pub fn listenerDescriptor(self: *Self) i32 {
             return self.listener;
         }
 
-        fn descriptor(context: *anyopaque, handle: network.Handle) i32 {
-            const self: *Self = @ptrCast(@alignCast(context));
+        pub fn descriptor(self: *Self, handle: network.Handle) i32 {
             const connection = self.conn(handle).?;
             assert(connection.recv == null and connection.send == null);
             return connection.fd;
         }
 
-        fn adopt(context: *anyopaque, fd: i32) !network.Handle {
-            const self: *Self = @ptrCast(@alignCast(context));
+        pub fn adopt(self: *Self, fd: i32) !network.Handle {
             const index = self.freeConn() orelse return error.Full;
             assert(fd >= 0 and self.connections[index].generation == 0);
             self.connections[index] = .{ .state = .open, .fd = fd, .generation = 1 };
@@ -191,9 +189,13 @@ pub fn Transport(comptime limits: network.Limits) type {
 
         pub fn poll(self: *Self, io: std.Io, deadline: ?std.Io.Timeout, out: []network.Event) !usize {
             assert(out.len != 0);
+            self.finishClose();
             const ready = self.takeEvents(out);
             if (ready != 0) return ready;
             self.stage();
+            const staged = self.takeEvents(out);
+            if (staged != 0) return staged;
+            if (self.paused()) return 0;
             var timeout: linux.kernel_timespec = undefined;
             var arguments: linux.io_uring_getevents_arg = .{ .sigmask = 0, .sigmask_sz = 0, .pad = 0, .ts = 0 };
 
@@ -250,13 +252,22 @@ pub fn Transport(comptime limits: network.Limits) type {
             }
 
             for (&self.operations, 0..) |*op, i| {
-                if (op.used and op.submitted and !op.cancel_requested and self.owner(op.handle).?.state == .closing) {
+                if (op.completed) continue;
+                if (op.used and op.submitted and !op.cancel_requested and (op.cancel or self.owner(op.handle).?.state == .closing)) {
                     _ = self.ring.cancel(cancelTag(i), @intCast(i), 0) catch continue;
                     op.cancel_requested = true;
+                    op.cancel_pending = true;
                 }
 
                 if (!op.used or op.submitted)
                     continue;
+
+                if (op.cancel) {
+                    const completion: network.Completion = .{ .handle = op.handle, .result = .{ .bytes = 0, .errno = @intFromEnum(linux.E.CANCELED) } };
+                    self.push(if (op.kind == .receive) .{ .received = completion } else .{ .sent = completion });
+                    self.release(i);
+                    continue;
+                }
 
                 const c = self.conn(op.handle) orelse {
                     self.release(i);
@@ -289,13 +300,17 @@ pub fn Transport(comptime limits: network.Limits) type {
                 return;
             }
 
-            if (cqe.user_data == accept_tag or cqe.user_data >= cancel_tag_base) {
-                if (cqe.user_data == accept_tag)
-                    self.accept_pending = false;
+            if (cqe.user_data == accept_tag) {
+                self.accept_pending = false;
+                if (cqe.res >= 0) self.admit(@intCast(cqe.res));
+                return;
+            }
 
-                if (cqe.res >= 0 and cqe.user_data == accept_tag)
-                    self.admit(@intCast(cqe.res));
-
+            if (cqe.user_data >= cancel_tag_base) {
+                const op = &self.operations[@intCast(cqe.user_data - cancel_tag_base)];
+                assert(op.cancel_pending);
+                op.cancel_pending = false;
+                if (op.completed) op.used = false;
                 return;
             }
 
@@ -312,13 +327,14 @@ pub fn Transport(comptime limits: network.Limits) type {
             assert(bytes <= op.bytes.len);
             const result: network.Result = .{ .bytes = bytes, .errno = if (cqe.res < 0) -cqe.res else null };
             const h = op.handle;
+            const canceled = op.cancel and cqe.res == -@as(i32, @intFromEnum(linux.E.CANCELED));
             self.push(switch (op.kind) {
                 .receive => .{ .received = .{ .handle = h, .result = result } },
                 .send => .{ .sent = .{ .handle = h, .result = result } },
             });
             self.release(i);
 
-            if (cqe.res <= 0)
+            if (cqe.res <= 0 and !canceled)
                 self.beginClose(h, if (cqe.res == 0) .peer_closed else .io_failure);
         }
 
@@ -340,7 +356,9 @@ pub fn Transport(comptime limits: network.Limits) type {
                 if (op.kind == .receive) c.recv = null else c.send = null;
             }
 
-            self.operations[i].used = false;
+            self.operations[i].completed = true;
+            // The cancellation CQE must arrive before this operation slot can be reused.
+            self.operations[i].used = self.operations[i].cancel_pending;
         }
 
         fn beginClose(self: *Self, h: network.Handle, reason: network.CloseReason) void {
@@ -351,7 +369,7 @@ pub fn Transport(comptime limits: network.Limits) type {
                 // A staged-but-not-submitted buffer has no CQE. Return it now. Submitted buffers
                 // remain pinned until their CQEs are consumed.
                 for (&self.operations, 0..) |*op, i| {
-                    if (!(op.used and !op.submitted and std.meta.eql(op.handle, h)))
+                    if (!(op.used and !op.submitted and !op.completed and std.meta.eql(op.handle, h)))
                         continue;
 
                     self.push(switch (op.kind) {
@@ -514,4 +532,8 @@ fn listener(a: std.Io.net.IpAddress, backlog: u32) !posix.socket_t {
 
 fn fdClose(fd: posix.socket_t) void {
     if (fd >= 0) _ = linux.close(fd);
+}
+
+test "pause returns socket buffer ownership without waiting for the peer" {
+    try networking_test.pause(Transport(.{ .connections = 2, .operations = 8, .events = 16 }));
 }

@@ -17,10 +17,11 @@
           buildInputs = with pkgs; [
             zig
             zls
-            openssl
             gradle
             jdk25
+            (jdt-language-server.override { jdk = pkgs.jdk25; })
             jq
+            sqlite
             curl
             xorg-server
             mesa
@@ -28,10 +29,12 @@
           ];
 
           shellHook = ''
+            # VS Code's Java extension and Gradle must use the same JDK as JDT LS.
+            export JAVA_HOME="${pkgs.jdk25}/lib/openjdk"
+            export JDK_HOME="$JAVA_HOME"
             ulimit -S -l 32768 2>/dev/null || true
             export LIBGL_DRIVERS_PATH="${pkgs.mesa}/lib/dri''${LIBGL_DRIVERS_PATH:+:$LIBGL_DRIVERS_PATH}"
-            export LD_LIBRARY_PATH="${pkgs.mesa}/lib:${pkgs.libglvnd}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-            export OPENSSL_LIB_DIR="${pkgs.openssl.out}/lib"
+            export LD_LIBRARY_PATH="${pkgs.mesa}/lib:${pkgs.libglvnd}/lib:${pkgs.sqlite.out}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           '';
         };
       }

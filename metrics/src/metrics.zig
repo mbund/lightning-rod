@@ -1,250 +1,428 @@
 const std = @import("std");
-
 const assert = std.debug.assert;
 
-pub const Counter = enum {
-    bytes,
-    records,
-    misses,
-    waits,
+pub const Exporter = @import("exporter.zig").Exporter;
+pub const Unit = enum { count, bytes, nanoseconds };
+pub const Kind = enum { counter, gauge, histogram, timer };
+pub const Clock = enum { wall, thread_cpu };
+pub const bucket_max = 16;
+pub const duration_buckets = &[_]u64{ 1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000, 20_000_000, 50_000_000, 100_000_000, 500_000_000, 1_000_000_000 };
+
+const Definition = struct {
+    namespace: []const u8 = "",
+    name: []const u8,
+    description: []const u8,
+    unit: Unit = .count,
+    clock: Clock = .wall,
+    buckets: []const u64 = &.{},
 };
 
-pub const Options = struct {
-    enabled: bool = true,
-    cpu: bool = false,
+const ValueDefinition = struct {
+    namespace: []const u8 = "",
+    name: []const u8,
+    description: []const u8,
+    unit: Unit = .count,
 };
 
-pub const Record = struct {
-    name: []const u8 = "",
-    parent: ?usize = null,
-    calls: u64 = 0,
-    last_ns: u64 = 0,
-    max_ns: u64 = 0,
-    total_ns: u64 = 0,
-    exclusive_ns: u64 = 0,
-    cpu_ns: u64 = 0,
-    exclusive_cpu_ns: u64 = 0,
-    child_ns: u64 = 0,
-    child_cpu_ns: u64 = 0,
-    counters: [4]u64 = @splat(0),
-    persistent_bytes: u64 = 0,
-    temporary_bytes: u64 = 0,
+pub const Snapshot = struct {
+    name: []const u8,
+    description: []const u8,
+    kind: Kind,
+    unit: Unit,
+    clock: Clock,
+    count: u64 = 0,
+    value: u64 = 0,
+    total: u64 = 0,
+    maximum: u64 = 0,
+    recorded_ns: i96 = 0,
+    sequence: u64 = 0,
+    bounds: [bucket_max]u64 = @splat(0),
+    // Disjoint buckets include their upper bound. The final bucket contains overflow.
+    buckets: [bucket_max + 1]u64 = @splat(0),
+    bounds_count: u8 = 0,
 };
 
-/// One owner thread. Read snapshots only at a quiescent boundary, or copy them
-/// through the owner's existing message channel. Async jobs own separate records.
-pub const Recorder = struct {
+pub const Sample = struct {
+    name: []const u8,
+    clock: Clock,
+    sequence: u64,
+    recorded_ns: i96,
+    value: u64,
+};
+
+/// One producer and one consumer. Overflow invalidates the captured stream.
+pub const Stream = struct {
+    samples: []Sample,
+    head: std.atomic.Value(u64) = .init(0),
+    tail: std.atomic.Value(u64) = .init(0),
+    overflow: std.atomic.Value(bool) = .init(false),
+    freeze: std.atomic.Value(bool) = .init(false),
+    sealed: std.atomic.Value(bool) = .init(false),
+
+    fn push(self: *Stream, sample: Sample) void {
+        if (self.sealed.load(.monotonic)) return;
+        const tail = self.tail.load(.monotonic);
+        if (tail - self.head.load(.acquire) == self.samples.len) {
+            self.overflow.store(true, .release);
+            return;
+        }
+        self.samples[tail % self.samples.len] = sample;
+        self.tail.store(tail + 1, .release);
+        // Include the observation already in flight when a cutoff is requested.
+        if (self.freeze.load(.acquire)) self.sealed.store(true, .release);
+    }
+
+    pub fn next(self: *Stream) ?Sample {
+        const head = self.head.load(.monotonic);
+        if (head == self.tail.load(.acquire)) return null;
+        const sample = self.samples[head % self.samples.len];
+        self.head.store(head + 1, .release);
+        return sample;
+    }
+};
+
+const Record = struct {
+    snapshot: Snapshot,
+    stream: ?*Stream = null,
+    name: [128]u8,
+    description: [256]u8,
+};
+
+/// A registry is one recording lane. Keep its address stable after creating timer handles.
+/// Transfer ownership only at a quiescent boundary.
+/// Concurrent workers use separate registries and publish snapshots through their channels.
+pub const Registry = struct {
+    pub const Configuration = struct { capacity: usize = 256, enabled: bool = true };
+    pub const Error = error{ OutOfMemory, Capacity, ConflictingDefinition, InvalidDefinition, Sealed };
+
+    allocator: std.mem.Allocator,
     io: std.Io,
     records: []Record,
+    count: usize = 0,
     enabled: bool = true,
-    cpu: bool = false,
-    current: ?usize = null,
-    depth: usize = 0,
+    sealed: bool = false,
+    sequence: u64 = 0,
 
-    pub fn begin(self: *Recorder, index: usize) Scope {
-        assert(index < self.records.len);
-        if (!self.enabled)
-            return .{};
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Configuration) Error!Registry {
+        return .{ .allocator = allocator, .io = io, .records = try allocator.alloc(Record, if (config.enabled) config.capacity else 0), .enabled = config.enabled };
+    }
 
-        const record = &self.records[index];
-        var ancestor = self.current;
+    pub fn deinit(self: *Registry) void {
+        self.allocator.free(self.records);
+        self.* = undefined;
+    }
 
-        while (ancestor) |id| {
-            assert(id != index);
-            ancestor = self.records[id].parent;
+    pub fn counter(self: *Registry, definition: Counter.Definition) Error!Counter {
+        return .{ .record = try self.register(.counter, .{
+            .namespace = definition.namespace,
+            .name = definition.name,
+            .description = definition.description,
+            .unit = definition.unit,
+        }) };
+    }
+
+    pub fn gauge(self: *Registry, definition: Gauge.Definition) Error!Gauge {
+        return .{ .record = try self.register(.gauge, .{
+            .namespace = definition.namespace,
+            .name = definition.name,
+            .description = definition.description,
+            .unit = definition.unit,
+        }) };
+    }
+
+    pub fn histogram(self: *Registry, definition: Histogram.Definition) Error!Histogram {
+        return .{ .record = try self.register(.histogram, .{
+            .namespace = definition.namespace,
+            .name = definition.name,
+            .description = definition.description,
+            .unit = definition.unit,
+            .buckets = definition.buckets,
+        }) };
+    }
+
+    pub fn timer(self: *Registry, definition: Timer.Definition) Error!Timer {
+        return .{ .registry = self, .record = try self.register(.timer, .{
+            .namespace = definition.namespace,
+            .name = definition.name,
+            .description = definition.description,
+            .unit = .nanoseconds,
+            .clock = definition.clock,
+            .buckets = definition.buckets,
+        }) };
+    }
+
+    pub fn seal(self: *Registry) void {
+        self.sealed = true;
+    }
+
+    pub fn at(self: *const Registry, index: usize) Snapshot {
+        assert(index < self.count);
+        return self.records[index].snapshot;
+    }
+
+    pub fn find(self: *const Registry, name: []const u8) ?Snapshot {
+        for (self.records[0..self.count]) |*record| {
+            if (std.mem.eql(u8, record.snapshot.name, name)) return record.snapshot;
         }
-
-        assert(record.calls == 0 or record.parent == self.current);
-        record.parent = self.current;
-        const scope: Scope = .{
-            .owner = self,
-            .index = index,
-            .parent = self.current,
-            .depth = self.depth,
-            .started = std.Io.Clock.now(.awake, self.io).nanoseconds,
-            .cpu_started = if (self.cpu) std.Io.Clock.now(.cpu_thread, self.io).nanoseconds else 0,
-            .children = record.child_ns,
-            .children_cpu = record.child_cpu_ns,
-        };
-        self.current = index;
-        self.depth += 1;
-        return scope;
+        return null;
     }
 
-    pub fn snapshot(self: *const Recorder, destination: []Record) void {
-        assert(self.current == null and self.depth == 0);
-        assert(destination.len == self.records.len);
-        @memcpy(destination, self.records);
+    /// Names and descriptions borrow this registry and must outlive snapshot consumers.
+    pub fn snapshot(self: *const Registry, destination: []Snapshot) []Snapshot {
+        assert(destination.len >= self.count);
+        for (self.records[0..self.count], destination[0..self.count]) |record, *output| output.* = record.snapshot;
+        return destination[0..self.count];
     }
 
-    pub fn merge(self: *Recorder, source: []const Record) void {
-        assert(self.current == null and self.depth == 0);
-        assert(source.len == self.records.len);
-
-        for (self.records, source) |*target, record| {
-            assert(std.mem.eql(u8, target.name, record.name));
-            if (record.calls == 0)
-                continue;
-
-            assert(target.calls == 0 or target.parent == record.parent);
-            target.parent = record.parent;
-            target.calls +|= record.calls;
-            target.last_ns = record.last_ns;
-            target.max_ns = @max(target.max_ns, record.max_ns);
-            target.total_ns +|= record.total_ns;
-            target.exclusive_ns +|= record.exclusive_ns;
-            target.cpu_ns +|= record.cpu_ns;
-            target.exclusive_cpu_ns +|= record.exclusive_cpu_ns;
-            target.child_ns +|= record.child_ns;
-            target.child_cpu_ns +|= record.child_cpu_ns;
-
-            for (&target.counters, record.counters) |*value, addend|
-                value.* +|= addend;
+    /// Change subscriptions only while the producer is quiescent.
+    pub fn subscribe(self: *Registry, name: []const u8, stream: *Stream) !void {
+        for (self.records[0..self.count]) |*record| {
+            if (!std.mem.eql(u8, record.snapshot.name, name)) continue;
+            if (record.snapshot.kind != .timer or record.stream != null) return error.InvalidSubscription;
+            record.stream = stream;
+            return;
         }
+        return error.MetricNotFound;
     }
 
-    pub fn log(self: *const Recorder, subsystem: []const u8) void {
-        assert(self.current == null and self.depth == 0);
-
-        for (self.records) |record| {
-            if (record.calls == 0)
-                continue;
-
-            std.log.info("event=scope subsystem={s} name={s} parent={s} calls={d} ns={d} exclusive_ns={d} cpu_ns={d} max_ns={d} bytes={d} records={d} misses={d} waits={d}", .{
-                subsystem,
-                record.name,
-                if (record.parent) |p| self.records[p].name else "-",
-                record.calls,
-                record.total_ns,
-                record.exclusive_ns,
-                record.cpu_ns,
-                record.max_ns,
-                record.counters[0],
-                record.counters[1],
-                record.counters[2],
-                record.counters[3],
-            });
+    fn register(self: *Registry, kind: Kind, definition: Definition) Error!?*Record {
+        if (self.sealed) return error.Sealed;
+        if (definition.name.len == 0 or definition.name.len > 127 or definition.namespace.len > 127 or definition.namespace.len + definition.name.len > 127 or definition.description.len == 0 or definition.description.len > 256 or definition.buckets.len > bucket_max) return error.InvalidDefinition;
+        for (definition.buckets, 0..) |bound, i| {
+            if (i != 0 and bound <= definition.buckets[i - 1]) return error.InvalidDefinition;
         }
-    }
-};
-
-pub const Scope = struct {
-    owner: ?*Recorder = null,
-    index: usize = 0,
-    parent: ?usize = null,
-    depth: usize = 0,
-    started: i96 = 0,
-    cpu_started: i96 = 0,
-    children: u64 = 0,
-    children_cpu: u64 = 0,
-
-    pub fn add(self: Scope, counter: Counter, amount: u64) void {
-        const owner = self.owner orelse return;
-        assert(owner.current == self.index and owner.depth == self.depth + 1);
-        owner.records[self.index].counters[@intFromEnum(counter)] +|= amount;
-    }
-
-    pub fn end(self: Scope) void {
-        const owner = self.owner orelse return;
-        assert(owner.current == self.index and owner.depth == self.depth + 1);
-        const elapsed: u64 = @intCast(std.Io.Clock.now(.awake, owner.io).nanoseconds - self.started);
-        const cpu: u64 = if (owner.cpu) @intCast(std.Io.Clock.now(.cpu_thread, owner.io).nanoseconds - self.cpu_started) else 0;
-        const record = &owner.records[self.index];
-        assert(elapsed >= record.child_ns - self.children);
-        assert(cpu >= record.child_cpu_ns - self.children_cpu);
-        record.last_ns = elapsed;
-        record.max_ns = @max(record.max_ns, elapsed);
-        record.total_ns +|= elapsed;
-        record.exclusive_ns +|= elapsed - (record.child_ns - self.children);
-        record.cpu_ns +|= cpu;
-        record.exclusive_cpu_ns +|= cpu - (record.child_cpu_ns - self.children_cpu);
-        record.calls +|= 1;
-
-        if (self.parent) |parent| {
-            owner.records[parent].child_ns +|= elapsed;
-            owner.records[parent].child_cpu_ns +|= cpu;
+        if (kind != .histogram and kind != .timer and definition.buckets.len != 0) return error.InvalidDefinition;
+        if (!self.enabled) return null;
+        var name_buffer: [128]u8 = undefined;
+        const prefix = definition.namespace.len + @intFromBool(definition.namespace.len != 0);
+        const name = name_buffer[0 .. prefix + definition.name.len];
+        if (definition.namespace.len != 0) {
+            @memcpy(name[0..definition.namespace.len], definition.namespace);
+            name[definition.namespace.len] = '.';
         }
-
-        owner.current = self.parent;
-        owner.depth -= 1;
+        @memcpy(name[prefix..], definition.name);
+        for (self.records[0..self.count]) |*record| {
+            const existing = &record.snapshot;
+            if (!std.mem.eql(u8, existing.name, name)) continue;
+            if (existing.kind != kind or existing.unit != definition.unit or existing.clock != definition.clock or !std.mem.eql(u8, existing.description, definition.description) or !std.mem.eql(u64, existing.bounds[0..existing.bounds_count], definition.buckets)) return error.ConflictingDefinition;
+            return record;
+        }
+        if (self.count == self.records.len) return error.Capacity;
+        const record = &self.records[self.count];
+        @memcpy(record.name[0..name.len], name);
+        @memcpy(record.description[0..definition.description.len], definition.description);
+        record.snapshot = .{ .name = record.name[0..name.len], .description = record.description[0..definition.description.len], .kind = kind, .unit = definition.unit, .clock = definition.clock, .bounds_count = @intCast(definition.buckets.len) };
+        record.stream = null;
+        @memcpy(record.snapshot.bounds[0..definition.buckets.len], definition.buckets);
+        self.count += 1;
+        return record;
     }
 };
 
-pub fn Metrics(comptime Names: type) type {
-    const fields = @typeInfo(Names).@"enum".fields;
+pub const Counter = struct {
+    pub const Definition = ValueDefinition;
 
-    for (fields, 0..) |field, i|
-        if (field.value != i)
-            @compileError("metric scope enum must be contiguous from zero");
+    record: ?*Record = null,
 
-    return struct {
-        const Self = @This();
-        records: [fields.len]Record = initRecords(),
-        recorder: Recorder = undefined,
+    pub fn add(self: Counter, amount: u64) void {
+        const record = self.record orelse return;
+        record.snapshot.value +|= amount;
+    }
 
-        pub fn init(io: std.Io, options: Options) Self {
-            return .{
-                .recorder = .{
-                    .io = io,
-                    .records = &.{},
-                    .enabled = options.enabled,
-                    .cpu = options.cpu,
-                },
-            };
-        }
+    pub fn value(self: Counter) u64 {
+        return if (self.record) |record| record.snapshot.value else 0;
+    }
+};
 
-        pub fn begin(self: *Self, name: Names) TypedScope {
-            self.recorder.records = &self.records;
-            return .{
-                .owner = self,
-                .scope = self.recorder.begin(@intFromEnum(name)),
-            };
-        }
+pub const Gauge = struct {
+    pub const Definition = ValueDefinition;
 
-        pub fn get(self: *const Self, name: Names) *const Record {
-            return &self.records[@intFromEnum(name)];
-        }
+    record: ?*Record = null,
 
-        pub fn merge(self: *Self, records: []const Record) void {
-            self.recorder.records = &self.records;
-            self.recorder.merge(records);
-        }
+    pub fn set(self: Gauge, value: u64) void {
+        const record = self.record orelse return;
+        record.snapshot.value = value;
+    }
+};
 
-        pub fn snapshot(self: *Self, destination: []Record) void {
-            self.recorder.records = &self.records;
-            self.recorder.snapshot(destination);
-        }
-
-        pub fn log(self: *Self, subsystem: []const u8) void {
-            self.recorder.records = &self.records;
-            self.recorder.log(subsystem);
-        }
-
-        pub const TypedScope = struct {
-            owner: *Self,
-            scope: Scope,
-
-            pub fn begin(self: TypedScope, name: Names) TypedScope {
-                assert(!self.owner.recorder.enabled or self.owner.recorder.current == self.scope.index);
-                return self.owner.begin(name);
-            }
-
-            pub fn add(self: TypedScope, counter: Counter, amount: u64) void {
-                self.scope.add(counter, amount);
-            }
-
-            pub fn end(self: TypedScope) void {
-                self.scope.end();
-            }
-        };
-
-        fn initRecords() [fields.len]Record {
-            var result: [fields.len]Record = undefined;
-
-            for (&result, fields) |*record, field|
-                record.* = .{ .name = field.name };
-
-            return result;
-        }
+pub const Histogram = struct {
+    pub const Definition = struct {
+        namespace: []const u8 = "",
+        name: []const u8,
+        description: []const u8,
+        unit: Unit = .count,
+        buckets: []const u64,
     };
+
+    record: ?*Record = null,
+
+    pub fn observe(self: Histogram, value: u64) void {
+        const record = self.record orelse return;
+        recordObservation(record, value);
+    }
+};
+
+fn recordObservation(record: *Record, value: u64) void {
+    const snapshot = &record.snapshot;
+    snapshot.count +|= 1;
+    snapshot.value = value;
+    snapshot.total +|= value;
+    snapshot.maximum = @max(snapshot.maximum, value);
+    var bucket: usize = 0;
+    while (bucket < snapshot.bounds_count and value > snapshot.bounds[bucket]) : (bucket += 1) {}
+    snapshot.buckets[bucket] +|= 1;
+}
+
+pub const Timer = struct {
+    pub const Definition = struct {
+        namespace: []const u8 = "",
+        name: []const u8,
+        description: []const u8,
+        clock: Clock = .wall,
+        buckets: []const u64 = duration_buckets,
+    };
+
+    registry: ?*Registry = null,
+    record: ?*Record = null,
+
+    pub fn start(self: Timer) Span {
+        const record = self.record orelse return .{};
+        return .{ .timer = self, .started = std.Io.Clock.now(if (record.snapshot.clock == .wall) .awake else .cpu_thread, self.registry.?.io).nanoseconds };
+    }
+
+    pub fn observe(self: Timer, nanoseconds: u64) void {
+        if (self.record == null) return;
+        self.recordAt(nanoseconds, std.Io.Clock.now(.awake, self.registry.?.io).nanoseconds);
+    }
+
+    fn recordAt(self: Timer, nanoseconds: u64, recorded_ns: i96) void {
+        const target = self.record orelse return;
+        const registry = self.registry.?;
+        recordObservation(target, nanoseconds);
+        target.snapshot.recorded_ns = recorded_ns;
+        target.snapshot.sequence = registry.sequence;
+        if (target.stream) |stream| stream.push(.{
+            .name = target.snapshot.name,
+            .clock = target.snapshot.clock,
+            .sequence = registry.sequence,
+            .recorded_ns = recorded_ns,
+            .value = nanoseconds,
+        });
+    }
+
+    pub fn read(self: Timer) ?Snapshot {
+        return if (self.record) |record| record.snapshot else null;
+    }
+};
+
+/// A thread CPU span must start and end on the same operating system thread.
+pub const Span = struct {
+    timer: Timer = .{},
+    started: i96 = 0,
+
+    pub fn elapsed(self: Span) u64 {
+        const record = self.timer.record orelse return 0;
+        const now = std.Io.Clock.now(if (record.snapshot.clock == .wall) .awake else .cpu_thread, self.timer.registry.?.io).nanoseconds;
+        assert(now >= self.started);
+        return @intCast(now - self.started);
+    }
+    pub fn end(self: Span) void {
+        const record = self.timer.record orelse return;
+        const registry = self.timer.registry.?;
+        const ended = std.Io.Clock.now(if (record.snapshot.clock == .wall) .awake else .cpu_thread, registry.io).nanoseconds;
+        assert(ended >= self.started);
+        self.timer.recordAt(@intCast(ended - self.started), if (record.snapshot.clock == .wall) ended else std.Io.Clock.now(.awake, registry.io).nanoseconds);
+    }
+};
+
+test "typed instruments share definitions, own names, and reject conflicts" {
+    var registry = try Registry.init(std.testing.allocator, std.testing.io, .{ .capacity = 4 });
+    defer registry.deinit();
+    const counter = try registry.counter(.{ .name = "bytes", .namespace = "network", .description = "Sent bytes", .unit = .bytes });
+    const same = try registry.counter(.{ .name = "network.bytes", .description = "Sent bytes", .unit = .bytes });
+    counter.add(7);
+    same.add(3);
+    try std.testing.expectEqual(@as(u64, 10), counter.value());
+    try std.testing.expectError(error.ConflictingDefinition, registry.gauge(.{ .name = "network.bytes", .description = "Sent bytes", .unit = .bytes }));
+    const gauge = try registry.gauge(.{ .name = "queue", .description = "Pending writes" });
+    gauge.set(9);
+    gauge.set(2);
+    try std.testing.expectEqual(@as(u64, 2), registry.find("queue").?.value);
+    const histogram = try registry.histogram(.{ .name = "batch", .description = "Batch size", .buckets = &.{ 1, 4 } });
+    for ([_]u64{ 0, 1, 2, 4, 5 }) |value| histogram.observe(value);
+    const snapshot = registry.find("batch").?;
+    try std.testing.expectEqualSlices(u64, &.{ 2, 2, 1 }, snapshot.buckets[0..3]);
+    try std.testing.expectEqual(@as(u64, 12), snapshot.total);
+    try std.testing.expectEqual(@as(u64, 5), snapshot.maximum);
+    registry.seal();
+    try std.testing.expectError(error.Sealed, registry.counter(.{ .name = "late", .description = "Too late" }));
+}
+
+test "registry owns bounded metadata without allocating during registration" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var registry = try Registry.init(failing.allocator(), std.testing.io, .{ .capacity = 2 });
+    defer registry.deinit();
+    var namespace = "server".*;
+    var name = "tick".*;
+    var description = "Tick duration".*;
+    const counter = try registry.counter(.{ .namespace = &namespace, .name = &name, .description = &description });
+    @memset(&namespace, 'x');
+    @memset(&name, 'x');
+    @memset(&description, 'x');
+    const same = try registry.counter(.{ .name = "server.tick", .description = "Tick duration" });
+    counter.add(7);
+    same.add(3);
+    try std.testing.expectEqual(@as(u64, 10), registry.find("server.tick").?.value);
+    try std.testing.expectEqualStrings("Tick duration", registry.find("server.tick").?.description);
+    const maximum_name: [126]u8 = @splat('a');
+    const maximum_description: [256]u8 = @splat('b');
+    _ = try registry.counter(.{ .namespace = "n", .name = &maximum_name, .description = &maximum_description });
+    try std.testing.expectEqual(@as(usize, 128), registry.at(1).name.len);
+    try std.testing.expectEqualStrings(&maximum_description, registry.at(1).description);
+    try std.testing.expectError(error.ConflictingDefinition, registry.gauge(.{ .name = "server.tick", .description = "Tick duration" }));
+    try std.testing.expectError(error.Capacity, registry.counter(.{ .name = "full", .description = "Full registry" }));
+    const oversized_name: [128]u8 = @splat('a');
+    try std.testing.expectError(error.InvalidDefinition, registry.counter(.{ .name = &oversized_name, .description = "Too long" }));
+}
+
+test "timer streams preserve order, detect overflow, and acknowledge cutoff" {
+    var registry = try Registry.init(std.testing.allocator, std.testing.io, .{ .capacity = 2 });
+    defer registry.deinit();
+    const timer = try registry.timer(.{ .name = "tick.duration", .description = "Complete tick" });
+    var samples: [2]Sample = undefined;
+    var stream: Stream = .{ .samples = &samples };
+    try registry.subscribe("tick.duration", &stream);
+    registry.sequence = 7;
+    timer.observe(50_000_000);
+    registry.sequence = 8;
+    timer.observe(1);
+    timer.observe(2);
+    try std.testing.expect(stream.overflow.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 7), stream.next().?.sequence);
+    try std.testing.expectEqual(@as(u64, 8), stream.next().?.sequence);
+    try std.testing.expect(stream.next() == null);
+    stream.freeze.store(true, .release);
+    timer.observe(3);
+    try std.testing.expect(stream.sealed.load(.acquire));
+    timer.observe(4);
+    try std.testing.expectEqual(@as(u64, 3), stream.next().?.value);
+    try std.testing.expect(stream.next() == null);
+    try std.testing.expectEqual(@as(u64, 5), timer.read().?.count);
+}
+
+test "disabled handles are inert, capacities bounded, and CPU timers supported" {
+    const disabled: Timer = .{};
+    disabled.start().end();
+    var registry = try Registry.init(std.testing.allocator, std.testing.io, .{ .capacity = 1 });
+    defer registry.deinit();
+    try std.testing.expectError(error.InvalidDefinition, registry.histogram(.{ .name = "bad", .description = "Unsorted", .buckets = &.{ 2, 1 } }));
+    const timer = try registry.timer(.{ .name = "cpu", .description = "Thread CPU time", .clock = .thread_cpu });
+    timer.start().end();
+    try std.testing.expectEqual(@as(u64, 1), timer.read().?.count);
+    try std.testing.expectEqual(Clock.thread_cpu, timer.read().?.clock);
+    try std.testing.expectError(error.Capacity, registry.counter(.{ .name = "full", .description = "Capacity exhausted" }));
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }

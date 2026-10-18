@@ -4,6 +4,13 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .records = .{ .path = "../records" },
+        .e2e_control = .{ .path = "control" },
+        .minecraft_java = .{ .path = "../minecraft_java" },
+        .economy = .{ .path = "../examples/plugins/economy" },
+        .shop = .{ .path = "../examples/plugins/shop" },
+        .economy_commands = .{ .path = "../examples/plugins/economy_commands" },
+        .shop_commands = .{ .path = "../examples/plugins/shop_commands" },
         .protocol_1_21_5 = .{ .path = "../protocol_versions/v1_21_5" },
         .minecraft_packets = .{ .path = "../minecraft_packets" },
         .reload_execve = .{ .path = "../reload_execve" },
@@ -16,5 +23,5 @@
         .protocols = .{ .path = "../protocols" },
         .lightning_rod_stdio = .{ .path = "../stdio" },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "server.zig", "runner.zig", "src", "tests", "client/build.gradle", "client/versions.json", "client/settings.gradle", "client/gradle.properties", "client/gradlew", "client/gradlew.bat", "client/gradle", "client/src" },
+    .paths = .{ "build.zig", "build.zig.zon", "runner.zig", "src", "tests", "client/build.gradle", "client/versions.json", "client/settings.gradle", "client/gradle.properties", "client/gradlew", "client/gradlew.bat", "client/gradle", "client/src" },
 }

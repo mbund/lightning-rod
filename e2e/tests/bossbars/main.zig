@@ -1,105 +1,106 @@
-const protocol_set = @import("protocols");
+const sessions = @import("sessions");
+const e2e = @import("e2e");
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
-const profile = @import("lightning_rod_linux");
 const vanilla = @import("vanilla");
 const bossbars = @import("bossbars");
-const tps = @import("tps");
-
-pub export const lightning_rod_resume_manifest linksection(profile.Reload.section_name) = profile.Reload.executableManifest(protocol_set.Endpoint);
+const bootstrap = e2e.server;
 
 pub fn main(init: std.process.Init) !void {
-    const address = init.environ_map.get("LIGHTNING_ROD_E2E_ADDRESS") orelse "127.0.0.1:25565";
-    const port = try std.fmt.parseInt(u16, address[(std.mem.lastIndexOfScalar(u8, address, ':') orelse return error.InvalidAddress) + 1 ..], 10);
-    var uuid: [16]u8 = undefined;
-    std.crypto.hash.Md5.hash("OfflinePlayer:alice", &uuid, .{});
-    uuid[6] = (uuid[6] & 15) | 0x30;
-    uuid[8] = (uuid[8] & 63) | 0x80;
-    const operators = [_]u128{std.mem.readInt(u128, &uuid, .big)};
     const plugins = lightning_rod.plugin.compose(.{
-        lightning_rod.plugin.replace(vanilla.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .maximum = 2, .render_distance = 4 }),
-            lightning_rod.plugin.configured(vanilla.Operators, vanilla.Operators.Configuration{ .operators = &operators }),
+        lightning_rod.plugin.replace(bootstrap.plugins(), .{
+            lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 2, .render_distance = 2 }),
         }),
-        lightning_rod.plugin.configured(bossbars.Bossbars, bossbars.Bossbars.Configuration{}),
-        lightning_rod.plugin.configured(tps.Tps, tps.Tps.Configuration{}),
-        lightning_rod.plugin.configured(Probe, Probe.Configuration{}),
+        lightning_rod.plugin.configured(bossbars.Bossbars, .{}),
+        lightning_rod.plugin.configured(Probe, .{}),
     });
-    var protocols = try protocol_set.Default.init(init.gpa);
-    defer protocols.deinit(init.gpa);
-    const ConfigurationPlugin = vanilla.SessionConfiguration(protocol_set.Default);
-    const session_plugins = lightning_rod.plugin.compose(.{
-        lightning_rod.plugin.configured(protocol_set.Handshake, protocol_set.Handshake.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.LoginStart, vanilla.LoginStart.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.LoginEncryption, vanilla.LoginEncryption.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.Disconnect, vanilla.Disconnect.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.OfflineAuthentication, vanilla.OfflineAuthentication.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.LoginCompression, vanilla.LoginCompression.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.LoginSuccess, vanilla.LoginSuccess.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.Keepalive, vanilla.Keepalive.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.Status, vanilla.Status.Configuration{}),
-        lightning_rod.plugin.configured(ConfigurationPlugin, ConfigurationPlugin.Configuration{ .protocols = &protocols }),
-        lightning_rod.plugin.configured(vanilla.ConfigurationFinish, vanilla.ConfigurationFinish.Configuration{}),
-    });
-    const router = profile.SingleSimulation{};
-    try profile.Server(@TypeOf(plugins), protocol_set.Endpoint, @TypeOf(session_plugins), @TypeOf(router)).run(init, .{
-        .plugins = plugins,
-        .session_plugins = session_plugins,
-        .reload_manifest = &lightning_rod_resume_manifest,
-        .router = router,
-        .max_players = 2,
-        .protocols = &protocols,
-
-        .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } },
-        .reload = .{ .executable = "/proc/self/exe" },
-    });
+    try bootstrap.run(init, plugins, .{ .plaintext = true, .reload_executable = "/proc/self/exe" });
 }
 
 const Probe = struct {
     pub const id = "e2e:bossbars";
-
     pub const Configuration = struct {};
-
     pub const Dependencies = struct {
         players: *vanilla.Players,
         bars: *bossbars.Bossbars,
+        control: *e2e.Control,
+        reload: *vanilla.Reload,
     };
+    const Phase = enum { waiting, created, updated, alice, bob, removed, recreated, reloaded };
 
     deps: Dependencies,
-    ticks: u32 = 0,
+    phase: Phase = .waiting,
+    observed: u2 = 0,
     bar: ?bossbars.Handle = null,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Probe {
         const self = try allocator.create(Probe);
         self.* = .{ .deps = deps };
+        if (deps.reload.latest()) |request| {
+            // The sequence is restored before init. The reload result is assigned afterwards.
+            if (request.sequence > 0) {
+                self.phase = .reloaded;
+                self.bar = try deps.bars.create(.{ .title = "Fixture restored", .progress = 0.75, .color = .purple, .division = .ten });
+            }
+        }
+        deps.control.on(self, message);
         return self;
     }
 
-    pub fn tick(self: *Probe, io: std.Io) !void {
-        for (self.deps.players.records) |player| if (player.handle == null or player.stage != .ready or !player.loaded) return;
-        self.ticks += 1;
+    fn message(self: *Probe, handle: sessions.Handle, text: []const u8) !e2e.Control.Result {
+        if (!std.mem.eql(u8, text, "ready") and !std.mem.eql(u8, text, "observed")) return .unhandled;
+        if (!std.mem.eql(u8, text, if (self.phase == .waiting or self.phase == .reloaded) "ready" else "observed")) return error.UnexpectedBossbarMessage;
+        std.debug.assert(handle.index < 2);
+        const bit = @as(u2, 1) << @as(u1, @intCast(handle.index));
+        if (self.observed & bit != 0) return error.DuplicateBossbarObservation;
+        self.observed |= bit;
+        if (self.observed != 3) return .handled;
+        self.observed = 0;
 
-        if (self.ticks == 1) for (self.deps.players.records) |*player| {
-            const alice = std.mem.eql(u8, player.name[0..player.name_len], "alice");
-            try self.deps.players.teleport(player, player.world, .{ .x = if (alice) -3.5 else 3.5, .y = 65, .z = 3.5 }, .{ .yaw = if (alice) -90 else 90, .pitch = 0 });
-        };
-
-        if (self.ticks == 1 or self.ticks == 81) {
-            const name = if (self.ticks == 1) "alice" else "bob";
-
-            for (self.deps.players.records) |player| if (std.mem.eql(u8, player.name[0..player.name_len], name)) {
-                self.bar = try self.deps.bars.create(.{
-                    .title = if (self.ticks == 1) "Private alice" else "Private bob",
-                    .audience = .{ .player = player.uuid },
-                });
-            };
+        switch (self.phase) {
+            .waiting => {
+                for (self.deps.players.records) |*player| {
+                    std.debug.assert(player.handle != null and player.stage == .ready and player.loaded);
+                    const alice = std.mem.eql(u8, player.name[0..player.name_len], "alice");
+                    try self.deps.players.teleport(player, player.world, .{ .x = if (alice) -3.5 else 3.5, .y = 65, .z = 3.5 }, .{ .yaw = if (alice) -90 else 90, .pitch = 0 });
+                }
+                self.bar = try self.deps.bars.create(.{ .title = "Fixture created", .progress = 0.25 });
+                self.phase = .created;
+            },
+            .created => {
+                try self.deps.bars.update(self.bar.?, .{ .title = "Fixture updated", .progress = 0.75, .color = .purple, .division = .ten });
+                self.phase = .updated;
+            },
+            .updated, .alice => {
+                const audience = if (self.phase == .updated) "alice" else "bob";
+                for (self.deps.players.records) |player| {
+                    if (!std.mem.eql(u8, player.name[0..player.name_len], audience)) continue;
+                    try self.deps.bars.update(self.bar.?, .{
+                        .title = if (self.phase == .updated) "Private alice" else "Private bob",
+                        .progress = 0.5,
+                        .color = .blue,
+                        .division = .six,
+                        .audience = .{ .player = player.uuid },
+                    });
+                }
+                self.phase = if (self.phase == .updated) .alice else .bob;
+            },
+            .bob => {
+                try self.deps.bars.remove(self.bar.?);
+                self.bar = null;
+                self.phase = .removed;
+            },
+            .removed => {
+                self.bar = try self.deps.bars.create(.{ .title = "Fixture recreated", .progress = 0.75, .color = .purple, .division = .ten });
+                self.phase = .recreated;
+            },
+            .recreated => {
+                try self.deps.reload.stage("e2e:bossbars");
+                return .handled;
+            },
+            .reloaded => {},
         }
-
-        if (self.ticks == 61 or self.ticks == 141) {
-            try self.deps.bars.remove(self.bar.?);
-            self.bar = null;
-        }
-
-        if (self.ticks >= 200 and self.ticks < 220) try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+        for (self.deps.players.records) |player| try self.deps.control.send(player.handle.?, @tagName(self.phase));
+        return .handled;
     }
 };

@@ -5,6 +5,7 @@ pub const Registry = struct {
     items: []const i32,
     blocks: []const i32,
     block_states: []const i32,
+    block_state_bits: u8,
     sounds: []const i32,
     effects: []const i32,
     attributes: []const i32,

@@ -4,6 +4,8 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .storage = .{ .path = "../storage" },
+        .minecraft_java = .{ .path = "../../minecraft_java" },
         .minecraft_packets = .{ .path = "../../minecraft_packets" },
         .protocols = .{ .path = "../../protocols" },
         .bossbars = .{ .path = "../../bossbars" },
@@ -14,5 +16,5 @@
         .lightning_rod_stdio = .{ .path = "../../stdio" },
         .lightning_rod_vanilla_1_21_6 = .{ .path = "../../vanilla" },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "src" },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "bench" },
 }

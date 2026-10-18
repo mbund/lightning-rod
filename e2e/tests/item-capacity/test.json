@@ -1,0 +1,7 @@
+{
+  "client": "ItemCapacityFixture",
+  "variants": [
+    { "name": "item-capacity", "fixture": "survival" },
+    { "name": "item-capacity-creative", "fixture": "creative" }
+  ]
+}

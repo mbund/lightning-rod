@@ -1,19 +1,22 @@
 const std = @import("std");
 const catalog = @import("catalog.zig");
 const protocols = @import("protocol_catalog");
+const selection = @import("selection.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
-    const cases = try catalog.load(allocator, init.io, if (args.len == 2) args[1] else "tests");
+    if (args.len > 3) return error.UnexpectedArgument;
+    const cases = try catalog.load(allocator, init.io, if (args.len >= 2) args[1] else "tests");
+    const requested = if (args.len == 3) args[2] else null;
 
     const Entry = struct { scenario: []const u8, version: []const u8 };
     var entries: std.ArrayList(Entry) = .empty;
     for (cases) |case| {
         if (case.internal) continue;
-        const versions = if (case.versions.len == 0) &.{protocols.latest.minecraft_version} else case.versions;
+        const versions = try selection.matrixVersions(protocols, allocator, case, requested);
         for (versions) |version| {
-            if (protocols.releaseIndex(version) == null) return error.UnsupportedClientVersion;
+            _ = try selection.peerVersions(protocols, allocator, case, version);
             try entries.append(allocator, .{ .scenario = case.name, .version = version });
         }
     }

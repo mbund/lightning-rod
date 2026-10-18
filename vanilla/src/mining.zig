@@ -9,8 +9,6 @@ const registry = @import("game_data").registry;
 const inventories = @import("inventories");
 const sessions = @import("sessions");
 const worlds = @import("worlds");
-
-const Chunks = chunks.Chunks;
 const Players = @import("players.zig").Players;
 const Input = @import("input.zig").Input;
 const Items = @import("items.zig").Items;
@@ -18,6 +16,8 @@ const Durability = @import("item_properties.zig").Durability;
 const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
 const BlockLoot = @import("block_loot.zig").BlockLoot;
 const ItemEntities = @import("item_entities.zig").ItemEntities;
+
+const Chunks = chunks.Chunks;
 
 const assert = std.debug.assert;
 
@@ -53,6 +53,7 @@ pub const Mining = struct {
         sequence: i32 = -1,
         selected_slot: u4 = 0,
         visible: bool = false,
+        watchers: u256 = 0,
     };
 
     const Seen = struct {
@@ -85,11 +86,22 @@ pub const Mining = struct {
         const players = self.deps.players;
         const player = players.records[handle.index];
         if (player.stage != .ready) return;
-        for (players.records, 0..) |observer, other| {
+        players.refreshSpatial();
+        var candidates = players.nearby(player.world, player.position, players.config.render_distance);
+        var targets: [256]sessions.Service.Target = undefined;
+        var deliveries: [256]sessions.Service.Delivery = undefined;
+        var count: usize = 0;
+        while (candidates != 0) {
+            const other: usize = @intCast(@ctz(candidates));
+            candidates &= candidates - 1;
+            const observer = players.records[other];
             const recipient = observer.handle orelse continue;
             if (other == handle.index or observer.world != player.world or observer.stage != .ready) continue;
-            _ = players.sendPacket(writeAnimation, observer.protocol, &.{recipient}, .{ @as(i32, @intCast(handle.index + 1)), @as(u8, if (hand == 0) 0 else 3) });
+            targets[count] = .{ .handle = recipient, .protocol = observer.protocol };
+            count += 1;
         }
+        players.deps.packets.fanout(writeAnimation, targets[0..count], .{ @as(i32, @intCast(handle.index + 1)), @as(u8, if (hand == 0) 0 else 3) }, 2048, deliveries[0..count]) catch |err|
+            std.debug.panic("invalid server packet: {s}", .{@errorName(err)});
     }
 
     fn onDig(self: *Mining, handle: sessions.Handle, dig: minecraft.Dig) !void {
@@ -101,7 +113,7 @@ pub const Mining = struct {
         if (player.stage != .ready or player.health == 0) return;
         const state = &self.states[handle.index];
         if (state.generation != handle.generation or state.teleport_id != player.teleport_id)
-            state.* = .{ .generation = handle.generation, .teleport_id = player.teleport_id, .selected_slot = player.selected_slot, .visible = state.visible };
+            state.* = .{ .generation = handle.generation, .teleport_id = player.teleport_id, .selected_slot = player.selected_slot, .visible = state.visible, .watchers = state.watchers };
         state.selected_slot = player.selected_slot;
         state.sequence = @max(state.sequence, sequence);
         if (action == .cancel) {
@@ -142,6 +154,7 @@ pub const Mining = struct {
     }
 
     pub fn tick(self: *Mining) !void {
+        self.deps.players.refreshSpatial();
         const players = self.deps.players;
 
         for (players.records, self.states, 0..) |player, *state, index| {
@@ -159,6 +172,7 @@ pub const Mining = struct {
                     .teleport_id = player.teleport_id,
                     .selected_slot = player.selected_slot,
                     .visible = state.visible,
+                    .watchers = state.watchers,
                 };
 
             if (state.sequence >= 0 and self.deps.blocks.observers[index].pending == 0 and players.sendBlockAck(player.protocol, &.{handle}, state.sequence))
@@ -180,6 +194,14 @@ pub const Mining = struct {
                     const progress = if (info.hardness < 0) @as(f32, 0) else if (info.hardness == 0) @as(f32, 1) else loot.speed / info.hardness / @as(f32, if (loot.harvest) 30 else 100) / @as(f32, if (player.on_ground) 1 else 5) * @as(f32, @floatFromInt(players.ticks - state.started + 1));
                     complete = complete or (state.finishing and progress >= 1);
                     stage = @intFromFloat(@min(9, @floor(progress * 10)));
+                    if (complete and player.gamemode != .creative and loot.stack != null and !self.deps.dropped.canCreate(1)) {
+                        self.deps.blocks.correct(player.world, position);
+                        state.active = false;
+                        state.finishing = false;
+                        state.complete = false;
+                        complete = false;
+                        stage = -1;
+                    }
                     if (complete) {
                         var worn = held.stack;
 
@@ -214,11 +236,21 @@ pub const Mining = struct {
                             self.deps.menus.changed(index);
                         }
 
-                        for (players.records, 0..) |observer, other| {
+                        var candidates = players.nearby(player.world, player.position, players.config.render_distance);
+                        var targets: [256]sessions.Service.Target = undefined;
+                        var deliveries: [256]sessions.Service.Delivery = undefined;
+                        var count: usize = 0;
+                        while (candidates != 0) {
+                            const other: usize = @intCast(@ctz(candidates));
+                            candidates &= candidates - 1;
+                            const observer = players.records[other];
                             const recipient = observer.handle orelse continue;
                             if (other == index or observer.world != player.world or observer.stage != .ready) continue;
-                            _ = players.sendPacket(writeWorldEvent, observer.protocol, &.{recipient}, .{ state.position, block });
+                            targets[count] = .{ .handle = recipient, .protocol = observer.protocol };
+                            count += 1;
                         }
+                        players.deps.packets.fanout(writeWorldEvent, targets[0..count], .{ state.position, block }, 2048, deliveries[0..count]) catch |err|
+                            std.debug.panic("invalid server packet: {s}", .{@errorName(err)});
 
                         state.active = false;
                         state.finishing = false;
@@ -236,7 +268,19 @@ pub const Mining = struct {
 
             const row = self.seen[index * self.states.len ..][0..self.states.len];
 
-            for (players.records, row, 0..) |observer, *seen, other| {
+            const subject = players.records[index];
+            const interested = players.nearby(subject.world, subject.position, players.config.render_distance);
+            var candidates = interested | state.watchers;
+            state.watchers = 0;
+            while (candidates != 0) {
+                const other: usize = @intCast(@ctz(candidates));
+                const flag = @as(u256, 1) << @intCast(other);
+                candidates &= ~flag;
+                const observer = players.records[other];
+                const seen = &row[other];
+                defer if (seen.stage >= 0) {
+                    state.watchers |= flag;
+                };
                 const recipient = observer.handle orelse {
                     seen.* = .{};
                     continue;
@@ -247,7 +291,7 @@ pub const Mining = struct {
 
                 if (other == index or observer.stage != .ready) continue;
 
-                const same_world = observer.world == players.records[index].world;
+                const same_world = interested & flag != 0;
                 if (seen.stage >= 0 and (!same_world or state.stage < 0 or !std.meta.eql(seen.position, state.position))) {
                     if (!players.sendPacket(writeBlockProgress, observer.protocol, &.{recipient}, .{
                         @as(i32, @intCast(index + 1)), seen.position, @as(i8, -1),
@@ -267,9 +311,7 @@ pub const Mining = struct {
                 }
             }
 
-            state.visible = false;
-
-            for (row) |seen| state.visible = state.visible or seen.stage >= 0;
+            state.visible = state.watchers != 0;
         }
     }
 

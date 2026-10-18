@@ -1,3 +1,4 @@
+const records = @import("records");
 const std = @import("std");
 const storage = @import("storage");
 
@@ -37,7 +38,7 @@ pub const Worlds = struct {
 
     pub const Configuration = struct { maximum: usize = 16 };
 
-    pub const Dependencies = struct { storage: storage.Namespace };
+    pub const Dependencies = struct { storage: storage.Space };
 
     entries: []World,
     labels: [][64]u8,
@@ -63,7 +64,7 @@ pub const Worlds = struct {
             .names = names[0..0],
         };
         const encoded = self.encoded;
-        if (try deps.storage.get("catalog", encoded)) |length| {
+        if (try records.Value.init(deps.storage).read(encoded)) |length| {
             if (length < 5 or !std.mem.eql(u8, encoded[0..4], "LRWD")) return error.CorruptWorldCatalog;
             if (encoded[4] != 2) return error.UnsupportedWorldCatalog;
             if (length < 7) return error.CorruptWorldCatalog;
@@ -152,7 +153,7 @@ pub const Worlds = struct {
         return self.entries[0..self.count];
     }
 
-    pub fn checkpoint(self: *Worlds, namespace: storage.Namespace) !void {
+    pub fn checkpoint(self: *Worlds, space: storage.Space) !void {
         if (self.checkpointed == self.count) return;
 
         const encoded = self.encoded[0 .. 7 + self.count * 140];
@@ -171,7 +172,7 @@ pub const Worlds = struct {
             @memcpy(entry[76..][0..world.dimension.name.len], world.dimension.name);
         }
 
-        try namespace.put("catalog", encoded);
+        try records.Value.init(space).write(encoded);
         self.checkpointed = self.count;
     }
 };
