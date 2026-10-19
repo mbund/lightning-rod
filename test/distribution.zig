@@ -104,6 +104,6 @@ pub fn main(init: std.process.Init) !void {
     const consumer = try std.fs.path.join(allocator, &.{ root, "consumer" });
     try std.Io.Dir.cwd().createDirPath(init.io, consumer);
     _ = try packager.run(&.{ "tar", "-xzf", archive.path, "-C", consumer }, null);
-    _ = try packager.run(&.{ "zig", "build", "-j2", "-Doptimize=Debug" }, consumer);
+    _ = try packager.run(&.{ "zig", "build" }, consumer);
     std.debug.print("Isolated downstream build passed with {d} packages.\n", .{packager.packages.count()});
 }

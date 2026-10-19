@@ -23,6 +23,7 @@ pub const Players = struct {
         brand: []const u8 = "Lightning Rod v0.1.0 (Vanilla)",
         gamemode: minecraft.GameMode = .creative,
         spawn: minecraft.Position = .{ .x = 0.5, .y = 65, .z = 0.5 },
+        spawn_for_player: ?*const fn (*const Player) minecraft.Position = null,
         dig_observers: usize = 16,
     };
 
@@ -245,6 +246,11 @@ pub const Players = struct {
 
                     if (version == 2) player.world = try reader.takeInt(u32, .little);
                     if (self.deps.worlds.get(player.world) == null) return error.UnknownWorld;
+                } else if (self.config.spawn_for_player) |spawn| {
+                    player.position = spawn(player);
+                    inline for (.{ player.position.x, player.position.y, player.position.z }) |value| {
+                        if (!std.math.isFinite(value) or @abs(value) > 30_000_000) return error.InvalidSpawnPosition;
+                    }
                 }
             },
             .ready => |handle| {
@@ -769,6 +775,11 @@ fn normalizeRotation(rotation: minecraft.Rotation) error{InvalidRotation}!minecr
 }
 
 test "disconnect stages player state until the next complete checkpoint" {
+    const Spawn = struct {
+        fn select(player: *const Players.Player) minecraft.Position {
+            return .{ .x = @floatFromInt(player.uuid), .y = 65, .z = -32 };
+        }
+    };
     const io = std.testing.io;
     for ([_]bool{ false, true }) |previous_save| {
         var directory = std.testing.tmpDir(.{});
@@ -788,7 +799,7 @@ test "disconnect stages player state until the next complete checkpoint" {
         var records: [1]Players.Player = @splat(.{});
         var players: Players = .{
             .deps = .{ .sessions = undefined, .packets = undefined, .input = undefined, .storage = space, .worlds = dimensions, .vanilla_worlds = undefined },
-            .config = .{},
+            .config = .{ .spawn_for_player = if (previous_save) Spawn.select else null },
             .spawn_world = world,
             .records = &records,
             .dig_handlers = &.{},
@@ -796,6 +807,7 @@ test "disconnect stages player state until the next complete checkpoint" {
         const handle: sessions.Handle = .{ .index = 0, .generation = 1 };
         const joined: sessions.Event = .{ .joined = .{ .handle = handle, .uuid = 1, .protocol = 0, .name = @splat(0), .name_len = 1 } };
         try players.onLifecycle(joined);
+        try std.testing.expectEqualDeep(if (previous_save) Spawn.select(&records[0]) else players.config.spawn, records[0].position);
         records[0].stage = .ready;
         if (previous_save) try players.checkpoint(space);
         _ = try store.commit(1);

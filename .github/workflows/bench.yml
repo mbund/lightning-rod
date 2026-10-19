@@ -1,0 +1,125 @@
+name: Benchmarks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  record-benchmark:
+    name: Record storage comparison
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Zig
+        run: bash .github/scripts/install-zig.sh
+      - name: Compare record storage with SQLite under growth and churn
+        working-directory: bench/records
+        run: zig build --release=safe bench
+      - name: Preserve storage comparison
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: record-storage-comparison
+          path: bench/records/.zig-cache/storage-comparison/results.json
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
+  chunk-benchmark:
+    name: Chunk workload benchmark
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      MINECRAFT_SERVER_SHA1: 823e2250d24b3ddac457a60c92a6a941943fcd6a
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Zig
+        run: bash .github/scripts/install-zig.sh
+      - uses: actions/cache@v5
+        id: corpus
+        with:
+          path: |
+            ${{ runner.temp }}/benchmark-world/corpus.bin
+            ${{ runner.temp }}/benchmark-world/corpus.json
+          key: benchmark-corpus-${{ env.MINECRAFT_SERVER_SHA1 }}-${{ hashFiles('build.zig.zon', 'bench/chunks/src/prepare.zig', 'bench/chunks/src/anvil.zig', 'bench/chunks/src/corpus.zig', 'bench/chunks/src/common.zig', 'nbt/src/**') }}
+      - uses: actions/setup-java@v6
+        if: steps.corpus.outputs.cache-hit != 'true'
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Download Minecraft 26.2
+        if: steps.corpus.outputs.cache-hit != 'true'
+        run: |
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://piston-data.mojang.com/v1/objects/$MINECRAFT_SERVER_SHA1/server.jar" \
+            -o "$RUNNER_TEMP/benchmark-minecraft.jar"
+          printf '%s  %s\n' "$MINECRAFT_SERVER_SHA1" "$RUNNER_TEMP/benchmark-minecraft.jar" | sha1sum --check --status
+      - name: Generate vanilla terrain corpus
+        if: steps.corpus.outputs.cache-hit != 'true'
+        working-directory: bench/chunks
+        run: |
+          zig build --release=safe world -- \
+            --server "$RUNNER_TEMP/benchmark-minecraft.jar" \
+            --output "$RUNNER_TEMP/benchmark-world"
+      - name: Run all chunk workloads
+        working-directory: bench/chunks
+        run: |
+          zig build --release=safe bench -- \
+            --corpus "$RUNNER_TEMP/benchmark-world/corpus.bin"
+      - name: Preserve chunk benchmark
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: chunk-benchmark
+          path: |
+            bench/chunks/.zig-cache/world-bench/results/results.json
+            bench/chunks/.zig-cache/world-bench/results/*.jsonl
+            ${{ runner.temp }}/benchmark-world/corpus.json
+            ${{ runner.temp }}/benchmark-world/generator/*.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
+  startup-benchmark:
+    name: Startup and shutdown benchmark
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Zig
+        run: bash .github/scripts/install-zig.sh
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Generate persisted server world
+        working-directory: bench/startup-world
+        run: |
+          zig build --release=safe run -- \
+            "$RUNNER_TEMP/benchmark-database/world"
+      - name: Measure startup and shutdown
+        working-directory: bench/startup
+        env:
+          WORLD: ${{ runner.temp }}/benchmark-database/world
+        run: |
+          zig build --release=safe bench -- \
+            --world "$WORLD"
+      - name: Preserve startup benchmark
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: startup-benchmark
+          path: |
+            bench/startup/.zig-cache/startup-bench/results.json
+            bench/startup/.zig-cache/startup-bench/server.log
+            bench/startup/.zig-cache/startup-bench/metrics/**
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+

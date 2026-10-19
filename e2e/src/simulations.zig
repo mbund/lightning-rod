@@ -83,7 +83,6 @@ pub fn run(init: std.process.Init, plugins: anytype, endpoints: []*sessions.Serv
     std.debug.assert(plugins.len == endpoints.len);
     std.debug.assert(plugins.len == 2 or plugins.len == 3);
     const limits = .{
-        lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .maximum = 1, .render_distance = config.render_distance }),
         lightning_rod.plugin.configured(vanilla.Chunks, vanilla.Chunks.Configuration{ .cache_sections = 24, .cache_tiles = 6 }),
         lightning_rod.plugin.configured(vanilla.BlockSynchronization, vanilla.BlockSynchronization.Configuration{ .delta_sections = 8 }),
         lightning_rod.plugin.configured(vanilla.Entities, vanilla.Entities.Configuration{ .cache_records = 16 }),
@@ -105,8 +104,15 @@ pub fn run(init: std.process.Init, plugins: anytype, endpoints: []*sessions.Serv
     const paths = [_][]const u8{ "lightning-rod-data/alice", "lightning-rod-data/bob", "lightning-rod-data/destination" };
     var instances: [plugins.len]Server.Instance = undefined;
     inline for (plugins, 0..) |selection, index| {
+        const players_index = comptime lightning_rod.plugin.indexOfId(@TypeOf(selection), vanilla.Players.id).?;
+        var players = selection[players_index].configuration;
+        players.maximum = 1;
+        players.render_distance = config.render_distance;
+        const bounded = lightning_rod.plugin.replace(lightning_rod.plugin.insertAfter(selection, vanilla.Reload, lightning_rod.plugin.configured(control.Control, .{})), limits);
         instances[index] = .{
-            .plugins = lightning_rod.plugin.replace(lightning_rod.plugin.insertAfter(selection, vanilla.Reload, lightning_rod.plugin.configured(control.Control, .{})), limits),
+            .plugins = lightning_rod.plugin.replace(bounded, .{
+                lightning_rod.plugin.configured(vanilla.Players, players),
+            }),
             .endpoint = &endpoints[index],
             .storage_path = paths[index],
             .max_players = 1,

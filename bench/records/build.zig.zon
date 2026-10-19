@@ -1,0 +1,16 @@
+.{
+    .name = .bench_records,
+    .fingerprint = 0x8314752c50b67829,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .records = .{ .path = "../../records" },
+        .storage = .{ .path = "../../storage" },
+        .metrics = .{ .path = "../../metrics" },
+        .sqlite = .{
+            .url = "https://sqlite.org/2026/sqlite-autoconf-3510200.tar.gz",
+            .hash = "N-V-__8AAIIHvwBww-VcziMwpkRxCAYzT1M8amgHL6cI0t6A",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

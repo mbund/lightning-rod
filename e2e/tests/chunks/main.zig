@@ -4,6 +4,7 @@ const protocols = @import("protocols");
 const vanilla = @import("vanilla");
 const e2e = @import("e2e");
 const sessions = @import("sessions");
+const minecraft = @import("minecraft_model");
 const registry = protocols.registry;
 const bootstrap = e2e.server;
 const simulations = e2e.simulations;
@@ -11,7 +12,7 @@ const simulations = e2e.simulations;
 pub fn main(init: std.process.Init) !void {
     const args = try bootstrap.arguments(init);
     const terrain_plugins = lr.plugin.replace(bootstrap.plugins(), .{
-        lr.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = 32 }),
+        lr.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = 32, .spawn_for_player = spawn }),
     });
     if (std.mem.eql(u8, args.fixture, "simulations")) {
         var endpoints: [2]*sessions.Service = undefined;
@@ -31,6 +32,11 @@ pub fn main(init: std.process.Init) !void {
     });
     if (disk) return bootstrap.run(init, lr.plugin.replace(plugins, .{lr.plugin.configured(NoGeneration, .{})}), .{ .plaintext = true });
     try bootstrap.run(init, plugins, .{ .plaintext = !std.mem.eql(u8, args.fixture, "encryption"), .compression_threshold = if (std.mem.eql(u8, args.fixture, "isolation")) null else 256 });
+}
+
+fn spawn(player: *const vanilla.Players.Player) minecraft.Position {
+    const coordinate: f64 = if (std.mem.eql(u8, player.name[0..player.name_len], "alice")) -4095.5 else 4096.5;
+    return .{ .x = coordinate, .y = 65, .z = coordinate };
 }
 
 // Disk scenarios must resolve every section from storage, including unchanged air sections.

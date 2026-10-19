@@ -1,6 +1,6 @@
 const std = @import("std");
-const native = @import("bench.zig");
-const sqlite = @import("sqlite_bench.zig");
+const native = @import("native.zig");
+const sqlite = @import("sqlite.zig");
 
 const Pattern = enum { ordered, shuffled, churn };
 const Workload = struct { bytes: []const u8, digest: [64]u8, rows: usize };
@@ -86,14 +86,11 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
     var output: []const u8 = ".zig-cache/storage-comparison";
-    var library: []const u8 = "libsqlite3.so.0";
     var index: usize = 1;
     while (index < args.len) : (index += 2) {
         if (index + 1 == args.len) return error.MissingArgument;
-        if (std.mem.eql(u8, args[index], "--output")) output = args[index + 1] else if (std.mem.eql(u8, args[index], "--sqlite")) library = args[index + 1] else return error.UnknownArgument;
+        if (std.mem.eql(u8, args[index], "--output")) output = args[index + 1] else return error.UnknownArgument;
     }
-    var reference = try sqlite.Sqlite.init(library);
-    defer reference.deinit();
     try std.Io.Dir.cwd().createDirPath(init.io, output);
     var cases: std.ArrayList(Case) = .empty;
     for (std.enums.values(Pattern)) |pattern| {
@@ -111,7 +108,7 @@ pub fn main(init: std.process.Init) !void {
             const label = if (engine == 0) "native" else try std.fmt.allocPrint(allocator, "sqlite-{d}-{s}", .{ page_size, if (without_rowid) "without-rowid" else "rowid" });
             const path = try std.fmt.allocPrint(allocator, "{s}/{s}.{s}", .{ output, @tagName(pattern), label });
             try clean(allocator, init.io, path);
-            const result = if (engine == 0) try native.run(allocator, init.io, path, trace.bytes) else try reference.run(allocator, init.io, path, trace.bytes, page_size, without_rowid);
+            const result = if (engine == 0) try native.run(allocator, init.io, path, trace.bytes) else try sqlite.run(allocator, init.io, path, trace.bytes, page_size, without_rowid);
             if (!std.mem.eql(u8, &trace.digest, result.digest) or result.rows != trace.rows) return error.RecordMismatch;
             try cases.append(allocator, .{ .workload = pattern, .engine = label, .trace_sha256 = trace_hash, .result = result });
             std.debug.print("{s:9} {s:30} files={d:9} live={d:9} payload={d:9} writes={d:10}\n", .{ @tagName(pattern), label, result.after_checkpoint.database + result.after_checkpoint.wal, (result.pages - result.free_pages) * result.page_size, result.payload, result.submitted_bytes });
@@ -121,7 +118,7 @@ pub fn main(init: std.process.Init) !void {
     defer file.close(init.io);
     var buffer: [16384]u8 = undefined;
     var writer = file.writer(init.io, &buffer);
-    try std.json.Stringify.value(.{ .sqlite_version = reference.version(), .trace_seed = @as(u64, 0x4c5253514c), .configuration = .{ .native_submission = "standard", .sqlite_synchronous = "FULL", .sqlite_cache_kib = 2048, .durable_commits = true, .native_batching = "whole transaction, bounded key sorting", .vacuum = false }, .cases = cases.items }, .{ .whitespace = .indent_2 }, &writer.interface);
+    try std.json.Stringify.value(.{ .sqlite_version = sqlite.version(), .trace_seed = @as(u64, 0x4c5253514c), .configuration = .{ .native_submission = "standard", .sqlite_synchronous = "FULL", .sqlite_cache_kib = 2048, .durable_commits = true, .native_batching = "whole transaction, bounded key sorting", .vacuum = false }, .cases = cases.items }, .{ .whitespace = .indent_2 }, &writer.interface);
     try writer.interface.writeByte('\n');
     try writer.interface.flush();
 }

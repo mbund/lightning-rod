@@ -23,12 +23,17 @@ pub const Control = struct {
     };
     const Name = struct { bytes: [128]u8, len: u8 };
     const Fence = struct { name: Name, handle: sessions.Handle, remaining: u2 = 2, durable: ?u64 = null };
+    const Cursor = struct { generation: u32 = 0, next: usize = 0 };
+    const maximum_players = vanilla.Players.maximum_players;
 
     deps: Dependencies,
     handlers: [8]Handler = undefined,
     handler_count: usize = 0,
     marks: [256]Name = undefined,
     mark_count: usize = 0,
+    cursors: [maximum_players]Cursor = @splat(.{}),
+    targets: [maximum_players]sessions.Service.Target = undefined,
+    delivered: [maximum_players]sessions.Service.Delivery = undefined,
     fences: [64]Fence = undefined,
     fence_count: usize = 0,
 
@@ -65,9 +70,7 @@ pub const Control = struct {
             var buffer: [64]u8 = undefined;
             try self.send(handle, try std.fmt.bufPrint(&buffer, "reload {s}", .{@tagName(result)}));
         } else if (std.mem.eql(u8, message, "sync")) {
-            var buffer: [133]u8 = undefined;
-            for (self.marks[0..self.mark_count]) |mark|
-                try self.send(handle, try std.fmt.bufPrint(&buffer, "mark {s}", .{mark.bytes[0..mark.len]}));
+            self.cursors[handle.index] = .{ .generation = handle.generation };
         } else if (std.mem.startsWith(u8, message, "mark ")) {
             const name = message[5..];
             if (name.len == 0 or name.len > 128) return error.InvalidFixtureMarker;
@@ -78,7 +81,6 @@ pub const Control = struct {
             mark.len = @intCast(name.len);
             @memcpy(mark.bytes[0..mark.len], name);
             self.mark_count += 1;
-            try self.broadcast(message);
         } else if (std.mem.startsWith(u8, message, "broadcast ")) {
             if (message.len == 10) return error.InvalidFixtureMessage;
             try self.broadcast(message[10..]);
@@ -107,6 +109,26 @@ pub const Control = struct {
     }
 
     pub fn tick(self: *Control) !void {
+        for (self.deps.players.records, 0..) |player, index| {
+            const handle = player.handle orelse continue;
+            if (self.cursors[index].generation != handle.generation)
+                self.cursors[index] = .{ .generation = handle.generation };
+        }
+        for (self.marks[0..self.mark_count], 0..) |mark, index| {
+            var count: usize = 0;
+            for (self.deps.players.records) |player| {
+                const handle = player.handle orelse continue;
+                if (player.stage != .ready or self.cursors[handle.index].next != index) continue;
+                self.targets[count] = .{ .handle = handle, .protocol = player.protocol };
+                count += 1;
+            }
+            if (count == 0) continue;
+            var buffer: [133]u8 = undefined;
+            try self.fanout(self.targets[0..count], try std.fmt.bufPrint(&buffer, "mark {s}", .{mark.bytes[0..mark.len]}));
+            for (self.targets[0..count], self.delivered[0..count]) |target, delivered| {
+                if (delivered == .queued) self.cursors[target.handle.index].next += 1;
+            }
+        }
         var pending: usize = 0;
         for (self.fences[0..self.fence_count]) |*fence| {
             const player = self.deps.players.records[fence.handle.index];
@@ -116,29 +138,41 @@ pub const Control = struct {
             // regardless of where this control plugin appears in dependency order.
             if (fence.remaining == 0 and player.stage == .ready and (fence.durable == null or self.deps.persistence.?.durableTick() >= fence.durable.?)) {
                 var buffer: [134]u8 = undefined;
-                try self.send(fence.handle, try std.fmt.bufPrint(&buffer, "fence {s}", .{fence.name.bytes[0..fence.name.len]}));
-            } else {
-                self.fences[pending] = fence.*;
-                pending += 1;
+                const target: sessions.Service.Target = .{ .handle = fence.handle, .protocol = player.protocol };
+                try self.fanout(&.{target}, try std.fmt.bufPrint(&buffer, "fence {s}", .{fence.name.bytes[0..fence.name.len]}));
+                if (self.delivered[0] != .backpressured) continue;
             }
+            self.fences[pending] = fence.*;
+            pending += 1;
         }
         self.fence_count = pending;
     }
 
     pub fn broadcast(self: *Control, message: []const u8) !void {
+        var count: usize = 0;
         for (self.deps.players.records) |player| {
             const handle = player.handle orelse continue;
             if (player.stage != .ready) continue;
-            try self.send(handle, message);
+            self.targets[count] = .{ .handle = handle, .protocol = player.protocol };
+            count += 1;
         }
+        if (count == 0) return;
+        try self.fanout(self.targets[0..count], message);
+        for (self.delivered[0..count]) |delivered|
+            if (delivered == .backpressured) return error.Backpressured;
     }
 
     pub fn send(self: *Control, handle: sessions.Handle, message: []const u8) !void {
-        std.debug.assert(message.len > 0 and message.len <= message_bytes);
-        std.debug.assert(std.unicode.utf8ValidateSlice(message));
         const player = self.deps.players.records[handle.index];
         std.debug.assert(std.meta.eql(player.handle, handle));
-        try self.deps.payloads.send(player.protocol, &.{handle}, channel, message);
+        try self.fanout(&.{.{ .handle = handle, .protocol = player.protocol }}, message);
+        if (self.delivered[0] == .backpressured) return error.Backpressured;
+    }
+
+    fn fanout(self: *Control, targets: []const sessions.Service.Target, message: []const u8) !void {
+        std.debug.assert(message.len > 0 and message.len <= message_bytes);
+        std.debug.assert(std.unicode.utf8ValidateSlice(message));
+        try self.deps.payloads.fanout(targets, channel, message, self.delivered[0..targets.len]);
     }
 };
 
@@ -170,4 +204,76 @@ test "custom messages must be claimed and handler errors must propagate" {
     try control.receive(handle, "claimed", std.testing.allocator);
     second.fail = true;
     try std.testing.expectError(error.InvalidProbeState, control.receive(handle, "claimed", std.testing.allocator));
+}
+
+test "markers catch up after readiness backpressure and connection reuse" {
+    const protocol: i32 = 772;
+    const service = try sessions.Service.init(std.testing.allocator, std.testing.io, undefined, .{
+        .connections = 2,
+        .pages = 64,
+        .page_bytes = 512,
+        .buffer_bytes = 8192,
+        .protocols = &.{.{ .number = protocol }},
+    });
+    defer {
+        while (service.output.takeReady()) |packet| {
+            _ = service.preparing.fetchSub(1, .release);
+            std.debug.assert(service.output.releaseReady(packet.page, packet.generation));
+        }
+        service.deinit();
+    }
+    const alice: sessions.Handle = .{ .index = 0, .generation = 1 };
+    const bob: sessions.Handle = .{ .index = 1, .generation = 1 };
+    for ([_]sessions.Handle{ alice, bob }) |handle|
+        service.credit[handle.index].store((@as(u64, handle.generation) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+
+    var records: [2]vanilla.Players.Player = .{
+        .{ .handle = alice, .protocol = protocol, .stage = .ready },
+        .{ .handle = bob, .protocol = protocol, .stage = .awaiting_teleport },
+    };
+    var players: vanilla.Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &records, .dig_handlers = &.{} };
+    var packets: vanilla.Packets = .{ .deps = .{ .sessions = service } };
+    var payloads: vanilla.PayloadChannels.Play = .{ .deps = .{ .input = undefined, .packets = &packets }, .subscriptions = &.{} };
+    var control: Control = .{ .deps = .{ .players = &players, .payloads = &payloads, .reload = undefined, .persistence = null, .checkpoint = undefined } };
+
+    try control.receive(bob, "sync", std.testing.allocator);
+    try control.receive(alice, "mark alice.ready", std.testing.allocator);
+    try control.tick();
+    try std.testing.expectEqual(@as(usize, 1), control.cursors[0].next);
+    try std.testing.expectEqual(@as(usize, 0), control.cursors[1].next);
+    records[1].stage = .ready;
+    try control.tick();
+    try std.testing.expectEqual(@as(usize, 1), control.cursors[1].next);
+    const replay = service.output.takeReady().?;
+    try std.testing.expect(std.mem.indexOf(u8, replay.bytes, "mark alice.ready") != null);
+    try std.testing.expectEqualSlices(sessions.Handle, &.{alice}, replay.recipients);
+    _ = service.preparing.fetchSub(1, .release);
+    try std.testing.expect(service.output.releaseReady(replay.page, replay.generation));
+    const catchup = service.output.takeReady().?;
+    try std.testing.expect(std.mem.indexOf(u8, catchup.bytes, "mark alice.ready") != null);
+    try std.testing.expectEqualSlices(sessions.Handle, &.{bob}, catchup.recipients);
+    _ = service.preparing.fetchSub(1, .release);
+    try std.testing.expect(service.output.releaseReady(catchup.page, catchup.generation));
+
+    service.credit[1].store((@as(u64, bob.generation) << 32) | sessions.Service.active, .release);
+    try control.receive(alice, "mark alice.observed", std.testing.allocator);
+    try control.tick();
+    try std.testing.expectEqual(@as(usize, 2), control.cursors[0].next);
+    try std.testing.expectEqual(@as(usize, 1), control.cursors[1].next);
+    service.credit[1].store((@as(u64, bob.generation) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+    try control.tick();
+    try std.testing.expectEqual(@as(usize, 2), control.cursors[1].next);
+
+    const reconnected: sessions.Handle = .{ .index = 1, .generation = 2 };
+    records[1].handle = reconnected;
+    service.credit[1].store((@as(u64, reconnected.generation) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+    try control.tick();
+    try std.testing.expectEqual(reconnected.generation, control.cursors[1].generation);
+    try std.testing.expectEqual(@as(usize, 2), control.cursors[1].next);
+
+    service.credit[1].store(0, .release);
+    try control.broadcast("completed");
+    try std.testing.expectEqual(sessions.Service.Delivery.queued, control.delivered[0]);
+    try std.testing.expectEqual(sessions.Service.Delivery.closed, control.delivered[1]);
+    try control.send(reconnected, "closed");
 }

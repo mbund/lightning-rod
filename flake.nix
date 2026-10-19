@@ -21,7 +21,6 @@
             jdk25
             (jdt-language-server.override { jdk = pkgs.jdk25; })
             jq
-            sqlite
             curl
             xorg-server
             mesa
@@ -34,7 +33,7 @@
             export JDK_HOME="$JAVA_HOME"
             ulimit -S -l 32768 2>/dev/null || true
             export LIBGL_DRIVERS_PATH="${pkgs.mesa}/lib/dri''${LIBGL_DRIVERS_PATH:+:$LIBGL_DRIVERS_PATH}"
-            export LD_LIBRARY_PATH="${pkgs.mesa}/lib:${pkgs.libglvnd}/lib:${pkgs.sqlite.out}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export LD_LIBRARY_PATH="${pkgs.mesa}/lib:${pkgs.libglvnd}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           '';
         };
       }

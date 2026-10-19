@@ -7,7 +7,6 @@
         .metrics = .{ .path = "../metrics" },
         .records = .{ .path = "../records" },
         .storage = .{ .path = "../storage" },
-        .nbt = .{ .path = "../nbt" },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "src", "bench" },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

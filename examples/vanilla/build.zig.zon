@@ -16,5 +16,5 @@
         .lightning_rod_stdio = .{ .path = "../../stdio" },
         .lightning_rod_vanilla_1_21_6 = .{ .path = "../../vanilla" },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "src", "bench" },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

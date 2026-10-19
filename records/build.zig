@@ -12,16 +12,6 @@ pub fn build(b: *std.Build) void {
         .imports = &.{ .{ .name = "metrics", .module = metrics }, .{ .name = "storage", .module = storage.module("storage") } },
     });
     const filter = b.option([]const u8, "test-filter", "Run matching record tests");
-    const benchmark = b.addExecutable(.{ .name = "records-bench", .root_module = b.createModule(.{
-        .root_source_file = b.path("comparison.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{ .{ .name = "records", .module = module }, .{ .name = "metrics", .module = metrics }, .{ .name = "storage", .module = storage.module("storage") } },
-    }) });
-    const comparison = b.addRunArtifact(benchmark);
-    if (b.args) |args| comparison.addArgs(args);
-    b.step("bench", "Compare record growth and churn against SQLite using identical operations").dependOn(&comparison.step);
     const test_step = b.step("test", "Verify cached records and persistent indexes");
     const fault = b.createModule(.{ .root_source_file = storage.path("src/fault_disk.zig"), .target = target, .optimize = optimize });
     const storage_testing = b.createModule(.{ .root_source_file = storage.path("src/testing.zig"), .target = target, .optimize = optimize });

@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
 
     const backend = b.option(enum { uring, stdio }, "io", "Fixture networking implementation") orelse .uring;
     const profile = if (backend == .uring) "lightning_rod_linux" else "lightning_rod_stdio";
-    const names = .{ "records", "lightning_rod", "lightning_rod_linux", "vanilla", "minecraft_java", "sessions", "protocols", "bossbars", "tps", "economy", "shop", "economy_commands", "shop_commands", "e2e_control" };
+    const names = .{ "records", "lightning_rod", "lightning_rod_linux", "vanilla", "minecraft_java", "minecraft_model", "sessions", "protocols", "bossbars", "tps", "economy", "shop", "economy_commands", "shop_commands", "e2e_control" };
     b.dependency("minecraft_packets", .{ .target = target, .optimize = optimize }).module("minecraft_packets").addImport("protocols", protocols.module("protocols"));
     b.dependency("vanilla", .{ .target = target, .optimize = optimize }).module("lightning_rod_vanilla_1_21_6").addImport("protocols", protocols.module("protocols"));
     var imports: [names.len]std.Build.Module.Import = undefined;
@@ -126,6 +126,7 @@ pub fn build(b: *std.Build) void {
 
     const client_test = b.addSystemCommand(&.{ "./gradlew", "--no-daemon", "testFixtureApi" });
     client_test.setCwd(b.path("client"));
+    client_test.stdio = .inherit;
     b.step("test-client", "Verify fixture messages and screenshot completion").dependOn(&client_test.step);
 
     const list = b.addRunArtifact(runner);
@@ -173,7 +174,9 @@ pub fn build(b: *std.Build) void {
         if (server) |path| {
             run.addArgs(&.{ "--server", path });
         } else if (selected.standalone) {
-            const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "-j2", b.fmt("-Doptimize={s}", .{@tagName(optimize)}), "--prefix" });
+            const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "build", b.fmt("-Doptimize={s}", .{@tagName(optimize)}) });
+            if (b.graph.max_jobs) |jobs| compile.addArg(b.fmt("-j{d}", .{jobs}));
+            compile.addArg("--prefix");
             compile.has_side_effects = true;
             compile.setCwd(.{ .cwd_relative = selected.directory });
             const output = compile.addOutputDirectoryArg("server");
@@ -212,7 +215,8 @@ pub fn build(b: *std.Build) void {
             } else if (selected.fixture != null) {
                 std.debug.panic("E2E fixture {s} needs a main.zig in {s}", .{ selected.name, selected.directory });
             } else {
-                const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "-j2", b.fmt("-Doptimize={s}", .{@tagName(optimize)}), b.fmt("-Dio={s}", .{@tagName(backend)}) });
+                const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "build", b.fmt("-Doptimize={s}", .{@tagName(optimize)}), b.fmt("-Dio={s}", .{@tagName(backend)}) });
+                if (b.graph.max_jobs) |jobs| compile.addArg(b.fmt("-j{d}", .{jobs}));
                 if (selected_releases.len != 0)
                     compile.addArg(b.fmt("-Dreleases={s}", .{selected_releases}));
                 compile.addArg("--prefix");
@@ -240,7 +244,8 @@ pub fn build(b: *std.Build) void {
         }) });
         const run_suite = b.addRunArtifact(suite_runner);
         run_suite.addFileArg(suite_matrix.captureStdOut(.{}));
-        run_suite.addArgs(&.{ b.graph.zig_exe, "-j2", b.fmt("-Doptimize={s}", .{@tagName(optimize)}), b.fmt("-Dio={s}", .{@tagName(backend)}), b.fmt("-Dtests={s}", .{tests_root}), b.fmt("-Daddress={s}", .{address}) });
+        run_suite.addArgs(&.{ b.graph.zig_exe, b.fmt("-Doptimize={s}", .{@tagName(optimize)}), b.fmt("-Dio={s}", .{@tagName(backend)}), b.fmt("-Dtests={s}", .{tests_root}), b.fmt("-Daddress={s}", .{address}) });
+        if (b.graph.max_jobs) |jobs| run_suite.addArg(b.fmt("-j{d}", .{jobs}));
         run_suite.addArg(b.fmt("-Drealtime={s}", .{if (realtime) "true" else "false"}));
         if (!target.query.isNative()) {
             run_suite.addArg(b.fmt("-Dtarget={s}", .{target.query.zigTriple(b.allocator) catch @panic("out of memory")}));

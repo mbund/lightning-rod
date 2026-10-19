@@ -1,0 +1,12 @@
+.{
+    .name = .bench_startup_world,
+    .fingerprint = 0xffefab11a09f81b2,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .lightning_rod = .{ .path = "../.." },
+        .vanilla = .{ .path = "../../vanilla" },
+        .chunks = .{ .path = "../../chunks" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

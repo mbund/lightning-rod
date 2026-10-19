@@ -1,0 +1,11 @@
+.{
+    .name = .bench_startup,
+    .fingerprint = 0xfb077d9c8bd15e30,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .server = .{ .path = "../../examples/vanilla" },
+        .linux = .{ .path = "../../linux" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

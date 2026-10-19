@@ -4,5 +4,5 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{ .metrics = .{ .path = "../metrics" }, .storage = .{ .path = "../storage" } },
-    .paths = .{ "build.zig", "build.zig.zon", "src", "bench.zig", "comparison.zig", "sqlite_bench.zig" },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

@@ -1,0 +1,55 @@
+name: Fuzz
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [storage, records, chunks]
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Zig
+        run: bash .github/scripts/install-zig.sh
+      - name: Check Debug fuzzer
+        working-directory: fuzz
+        run: |
+          zig build "$TARGET" --fuzz=1
+          # Zig 0.16 can exit successfully after saving a fuzz crash.
+          test ! -e .zig-cache/f/crash
+      - name: Warm ReleaseSafe fuzzer
+        working-directory: fuzz
+        run: |
+          zig build --release=safe "$TARGET" --fuzz=1
+          test ! -e .zig-cache/f/crash
+      - name: Fuzz for 15 minutes
+        working-directory: fuzz
+        run: |
+          status=0
+          timeout --signal=INT --kill-after=30s 900s zig build --release=safe "$TARGET" --fuzz || status=$?
+          printf 'Fuzzer exit status: %s (124 means the 15-minute budget elapsed)\n' "$status"
+          test "$status" -eq 124
+          test ! -e .zig-cache/f/crash
+      - name: Preserve fuzz failure input
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}-fuzz-crash
+          path: fuzz/.zig-cache/f/crash
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+

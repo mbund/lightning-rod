@@ -2,13 +2,11 @@ package dev.lightningrod.e2e;
 
 import java.nio.file.Files;
 import net.minecraft.client.Minecraft;
-import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import dev.lightningrod.e2e.mixin.ClientConnectionAccessor;
 
 final class ChunksFixture extends Fixture {
     private long targetTick = -1;
     private boolean stampRequested;
-    private boolean relocated;
     private boolean readsPaused;
     private boolean readsResumed;
 
@@ -59,54 +57,32 @@ final class ChunksFixture extends Fixture {
     }
 
     @Override public boolean prepare(Minecraft game) {
-        if (r.scenario.startsWith("chunks-") && r.scenario.endsWith("-multi") || r.scenario.equals("chunks-isolation")) {
-            if (r.terrainTick < 0) return false;
-            if (!relocated) {
-                if (r.scenario.startsWith("chunks-prepare") && missingChunks(game, r.minimumRadius) != 0) return false;
-                if (r.scenario.equals("chunks-simulations-multi")) {
-                    r.marker(r.peer + ".stream-ready");
-                    for (String other : r.expectedPeers) if (!Files.exists(r.artifacts.resolve(other + ".stream-ready"))) return false;
-                } else {
-                    client.mark(r.peer + ".stream-ready");
-                    for (String other : r.expectedPeers) if (!client.marked(other + ".stream-ready")) return false;
-                }
-                double x = r.peer.equals("alice") ? -4095.5 : 4096.5;
-                if (!game.player.getAbilities().mayfly) {
-                    client.fail("creative_flight_not_available");
-                    return false;
-                }
-                game.player.getAbilities().flying = true;
-                game.player.onUpdateAbilities();
-                game.player.setPos(x, 65, x);
-                game.player.setXRot(30);
-                game.getConnection().send(new ServerboundMovePlayerPacket.Pos(x, 65, x, true, false));
-                relocated = true;
+        if (r.terrainTick < 0) return false;
+        double expected = r.peer.equals("alice") ? -4095.5 : 4096.5;
+        if (Math.abs(game.player.getX() - expected) > 1 || Math.abs(game.player.getY() - 65) > 1
+                || Math.abs(game.player.getZ() - expected) > 1) {
+            var velocity = game.player.getDeltaMovement();
+            client.event("stream_position_changed", "x", game.player.getX(), "y", game.player.getY(), "z", game.player.getZ(),
+                "velocity_x", velocity.x, "velocity_y", velocity.y, "velocity_z", velocity.z,
+                "flying", game.player.getAbilities().flying, "on_ground", game.player.onGround());
+            client.fail("independent_stream_position_changed");
+            return false;
+        }
+        if (r.scenario.equals("chunks-isolation") && r.peer.equals("bob")) {
+            var channel = ((ClientConnectionAccessor) game.getConnection().getConnection()).lightningRod$channel();
+            if (!readsPaused) {
+                channel.config().setAutoRead(false);
+                readsPaused = true;
+                client.event("slow_reader_paused");
+            }
+            if (!readsResumed && Files.exists(r.artifacts.resolve("alice.result"))) {
+                channel.config().setAutoRead(true);
+                readsResumed = true;
                 client.restartStream();
                 targetTick = -1;
-                client.event("stream_relocated", "x", x, "z", x);
-                return false;
+                client.event("slow_reader_resumed");
             }
-            double expected = r.peer.equals("alice") ? -4095.5 : 4096.5;
-            if (Math.abs(game.player.getX() - expected) > 1 || Math.abs(game.player.getZ() - expected) > 1) {
-                client.fail("independent_stream_position_changed");
-                return false;
-            }
-            if (r.scenario.equals("chunks-isolation") && r.peer.equals("bob")) {
-                var channel = ((ClientConnectionAccessor) game.getConnection().getConnection()).lightningRod$channel();
-                if (!readsPaused) {
-                    channel.config().setAutoRead(false);
-                    readsPaused = true;
-                    client.event("slow_reader_paused");
-                }
-                if (!readsResumed && Files.exists(r.artifacts.resolve("alice.result"))) {
-                    channel.config().setAutoRead(true);
-                    readsResumed = true;
-                    client.restartStream();
-                    targetTick = -1;
-                    client.event("slow_reader_resumed");
-                }
-                if (!readsResumed) return false;
-            }
+            if (!readsResumed) return false;
         }
         return true;
     }

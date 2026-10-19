@@ -13,6 +13,7 @@ pub const Work = struct {
         vtable: *const VTable,
 
         item_ns: u64 = std.time.ns_per_ms,
+        batch_ns: u64 = std.time.ns_per_ms,
         duration: metrics.Timer = .{},
 
         pub const VTable = struct {
@@ -20,8 +21,9 @@ pub const Work = struct {
             run: *const fn (*anyopaque, std.Io, usize) anyerror!Result,
         };
 
-        // The work scheduler cannot interrupt a callback. Reserve twice the observed item cost.
+        // Callbacks cannot be interrupted. Reserve for both item cost and fixed batch overhead.
         fn limit(self: Task, remaining_ns: u64) usize {
+            if (remaining_ns / 2 < self.batch_ns) return 0;
             return @intCast(@min(self.maximum_items, remaining_ns / self.item_ns / 2));
         }
     };
@@ -45,6 +47,7 @@ pub const Work = struct {
         assert(!self.sealed);
         assert(task.maximum_items > 0);
         assert(task.item_ns > 0);
+        assert(task.batch_ns > 0);
         if (self.count == self.tasks.len) return error.WorkCapacity;
         self.tasks[self.count] = task;
         self.tasks[self.count].duration = self.registration_timer;
@@ -54,8 +57,10 @@ pub const Work = struct {
 
     // Decay once per tick so a transient stall cannot starve a task.
     pub fn beginTick(self: *Work) void {
-        for (self.tasks[0..self.count]) |*task|
+        for (self.tasks[0..self.count]) |*task| {
             task.item_ns = @max(100 * std.time.ns_per_us, task.item_ns - task.item_ns / 8);
+            task.batch_ns = @max(100 * std.time.ns_per_us, task.batch_ns - task.batch_ns / 8);
+        }
     }
 
     pub fn progress(self: *Work, io: std.Io, deadline: i96) !Result {
@@ -76,6 +81,7 @@ pub const Work = struct {
             const progressed = task.vtable.run(task.context, io, limit);
             const elapsed: u64 = @intCast(std.Io.Clock.now(.awake, io).nanoseconds - started);
             task.item_ns = @max(task.item_ns, std.math.divCeil(u64, elapsed, limit) catch unreachable);
+            task.batch_ns = @max(task.batch_ns, elapsed);
             scope.end();
             switch (try progressed) {
                 .progressed => return .progressed,
@@ -119,9 +125,14 @@ test "work admission scales batches and recovers from slow samples" {
     try std.testing.expectEqual(@as(usize, 1), task.limit(2 * std.time.ns_per_ms));
     try std.testing.expectEqual(@as(usize, 3), task.limit(6 * std.time.ns_per_ms));
     try std.testing.expectEqual(@as(usize, 4), task.limit(20 * std.time.ns_per_ms));
+    task.batch_ns = 8 * std.time.ns_per_ms;
+    try std.testing.expectEqual(@as(usize, 0), task.limit(16 * std.time.ns_per_ms - 1));
+    try std.testing.expectEqual(@as(usize, 4), task.limit(16 * std.time.ns_per_ms));
     var work: Work = .{ .tasks = &tasks, .count = 1, .sealed = true };
     task.item_ns = std.time.ns_per_s;
+    task.batch_ns = std.time.ns_per_s;
     for (0..100) |_| work.beginTick();
     try std.testing.expect(task.item_ns <= std.time.ns_per_ms);
+    try std.testing.expect(task.batch_ns <= std.time.ns_per_ms);
     try std.testing.expectEqual(Work.Result.idle, try work.progress(std.testing.io, 0));
 }

@@ -1,0 +1,13 @@
+.{
+    .name = .bench_chunks,
+    .fingerprint = 0x94e3c066d9e1c036,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .chunks = .{ .path = "../../chunks" },
+        .storage = .{ .path = "../../storage" },
+        .metrics = .{ .path = "../../metrics" },
+        .nbt = .{ .path = "../../nbt" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

@@ -452,7 +452,7 @@ fn verify(table: records.Table, expected: *const [64]Row) !void {
     try std.testing.expectEqual(expected.len, index);
 }
 
-fn model(input: []const u8) !void {
+pub fn run(input: []const u8) !void {
     const io = std.testing.io;
     var temporary = try testing.directory(.{});
     defer temporary.cleanup();
@@ -536,7 +536,7 @@ test "record pages match a reference model through splits deletion reuse and reo
     var input: [3072]u8 = undefined;
     var random = std.Random.DefaultPrng.init(0xe848f71d);
     random.random().bytes(&input);
-    try model(&input);
+    try run(&input);
     for (0..64) |index| {
         input[index * 3] = 0;
         input[index * 3 + 1] = @intCast(index);
@@ -545,17 +545,7 @@ test "record pages match a reference model through splits deletion reuse and reo
         input[192 + index * 3 + 1] = @intCast(index);
         input[192 + index * 3 + 2] = 0;
     }
-    try model(input[0..384]);
-}
-
-fn fuzz(_: void, smith: *std.testing.Smith) !void {
-    var input: [384]u8 = undefined;
-    smith.bytesWithHash(&input, 1);
-    try model(&input);
-}
-
-test "fuzz record transactions against a reference model" {
-    try std.testing.fuzz({}, fuzz, .{ .corpus = &.{&.{ 0, 0, 5, 4, 0, 7, 7, 63, 255, 6, 0, 0, 5, 0, 0, 2, 0, 0, 4, 0, 3, 5, 0, 0, 6, 0, 0 }} });
+    try run(input[0..384]);
 }
 
 test "single values cross page boundaries and reuse their overflow pages" {

@@ -1,0 +1,13 @@
+.{
+    .name = .fuzz,
+    .fingerprint = 0x833d4269250b149,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .storage = .{ .path = "../storage" },
+        .records = .{ .path = "../records" },
+        .chunks = .{ .path = "../chunks" },
+        .metrics = .{ .path = "../metrics" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

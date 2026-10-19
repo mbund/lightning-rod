@@ -122,6 +122,7 @@ test "mixed plugin saves preserve the model through eviction maintenance and int
         var tick: u64 = 0;
         var random = std.Random.DefaultPrng.init(0x4d49584544534156);
         for (0..test_options.rounds) |round| {
+            errdefer |err| std.debug.print("mixed storage backend={t} round={d} tick={d} error={t}\n", .{ options.submission, round, tick, err });
             var store = try storage.Store.init(std.testing.allocator, io, options);
             defer store.deinit();
             var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

@@ -3,5 +3,5 @@
     .name = .registry_snapshotter,
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
-    .paths = .{ "build.zig", "build.zig.zon", "build.gradle", "settings.gradle", "gradle.properties", "versions.json", "extract.sh", "extract.bat", "gradlew", "gradlew.bat", "gradle", "src" },
+    .paths = .{ "build.zig", "build.zig.zon", "build.gradle", "settings.gradle", "gradle.properties", "versions.json", "gradlew", "gradlew.bat", "gradle", "src" },
 }

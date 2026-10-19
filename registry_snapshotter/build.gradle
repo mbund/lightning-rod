@@ -19,7 +19,7 @@ loom {
     runs {
         registrySnapshot {
             server()
-            runDir = 'build/snapshot-run'
+            runDir = layout.buildDirectory.dir('snapshot-run').get().asFile.absolutePath
             // IDE imports configure runs without invoking the snapshot task.
             property 'mcc.snapshotOutput', providers.gradleProperty('snapshotOutput').getOrElse(
                 layout.buildDirectory.file('snapshot.json').get().asFile.absolutePath)

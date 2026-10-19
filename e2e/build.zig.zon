@@ -7,6 +7,7 @@
         .records = .{ .path = "../records" },
         .e2e_control = .{ .path = "control" },
         .minecraft_java = .{ .path = "../minecraft_java" },
+        .minecraft_model = .{ .path = "../minecraft_model" },
         .economy = .{ .path = "../examples/plugins/economy" },
         .shop = .{ .path = "../examples/plugins/shop" },
         .economy_commands = .{ .path = "../examples/plugins/economy_commands" },

@@ -206,7 +206,7 @@ pub const Store = struct {
         paths_started.end();
         const database_started = database_timer.start();
         const database = try directory.createFile(io, name, .{ .read = true, .truncate = false });
-        errdefer database.close(io);
+        errdefer closeDatabase(io, database);
         if (builtin.os.tag == .linux) {
             const result = std.os.linux.flock(database.handle, std.posix.LOCK.EX | std.posix.LOCK.NB);
             if (std.os.linux.errno(result) != .SUCCESS) return error.DatabaseLocked;
@@ -317,6 +317,15 @@ pub const Store = struct {
     fn syncDirectory(io: std.Io, directory: std.Io.Dir) !void {
         const file: std.Io.File = .{ .handle = directory.handle, .flags = .{ .nonblocking = false } };
         try file.sync(io);
+    }
+
+    fn closeDatabase(io: std.Io, file: std.Io.File) void {
+        if (builtin.os.tag == .linux) {
+            // io_uring can retain the open file description after the ring closes.
+            const result = std.os.linux.flock(file.handle, std.posix.LOCK.UN);
+            assert(std.os.linux.errno(result) == .SUCCESS);
+        }
+        file.close(io);
     }
 
     fn recover(self: *Store, valid_database: bool, registry: ?*metrics.Registry) !void {
@@ -986,7 +995,7 @@ pub const Store = struct {
         self.checkpoint_io.deinit();
         if (self.replacement) |file| file.close(self.io);
         self.wal.close(self.io);
-        self.database.close(self.io);
+        closeDatabase(self.io, self.database);
         self.directory.close(self.io);
         self.locations.deinit(self.allocator);
         self.allocator.free(self.checksums);
