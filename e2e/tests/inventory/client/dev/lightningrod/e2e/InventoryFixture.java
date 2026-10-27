@@ -22,6 +22,7 @@ final class InventoryFixture extends Fixture {
     private final List<String> failures = new ArrayList<>();
     private int dropped;
     private int passed;
+    private String pendingFailure;
 
     InventoryFixture(Recorder r) {
         super(r);
@@ -68,6 +69,7 @@ final class InventoryFixture extends Fixture {
 
     public void tick(Minecraft game, int loaded, int missing) {
         if (r.terrainTick < 0) return;
+        if (pendingFailure != null) { failed(game, pendingFailure); return; }
         boolean creative = game.player.hasInfiniteMaterials();
         if (test == cases.size()) {
             if (failures.isEmpty()) client.pass("inventory_actions_and_authoritative_slots_verified_" + passed);
@@ -133,9 +135,6 @@ final class InventoryFixture extends Fixture {
                         expected[36] = new ItemStack(net.minecraft.world.item.Items.BREAD, BREAD_COUNT);
                         expected[1] = ItemStack.EMPTY;
                         expected[46] = ItemStack.EMPTY;
-                    } else {
-                        expected[46] = new ItemStack(net.minecraft.world.item.Items.BREAD, BREAD_COUNT);
-                        client.send("inventory_refresh");
                     }
                     phase = Phase.WAIT_CHECK;
                     client.fence("inventory-" + current.name + "-" + clickIndex);
@@ -159,18 +158,13 @@ final class InventoryFixture extends Fixture {
     }
 
     @Override public void poll(Minecraft game) {
+        if (pendingFailure != null) return;
         if (phase != Phase.WAIT_CHECK || game.player == null || !client.fenced("inventory-" + cases.get(test).name + "-" + clickIndex)) return;
         String label = cases.get(test).name + "_" + clickIndex;
         if (!equal(game, expected, label)) return;
         if (!label.equals(requested)) {
             requested = label;
             StringBuilder command = new StringBuilder("inventory_check ").append(label);
-            String name = cases.get(test).name;
-            if (game.player.hasInfiniteMaterials() && !name.startsWith("clone") && !name.equals("drag_fill") && !name.equals("creative_delete_all")) {
-                ItemStack recovery = name.equals("creative_delete") ? new ItemStack(net.minecraft.world.item.Items.BREAD, BREAD_COUNT) : expected[46];
-                command.append(" pending/").append(recovery.isEmpty() ? "empty" : BuiltInRegistries.ITEM.getKey(recovery.getItem()))
-                    .append('/').append(recovery.getCount());
-            }
             for (int slot = 0; slot < expected.length; slot++) {
                 ItemStack stack = expected[slot];
                 if (!stack.isEmpty()) command.append(' ').append(slot).append('/').append(BuiltInRegistries.ITEM.getKey(stack.getItem())).append('/').append(stack.getCount());
@@ -201,7 +195,9 @@ final class InventoryFixture extends Fixture {
     }
 
     private void failed(Minecraft game, String label) {
+        pendingFailure = label;
         if (!client.screenshot(label).done()) return;
+        pendingFailure = null;
         failures.add(label);
         test++;
         clickIndex = 0;

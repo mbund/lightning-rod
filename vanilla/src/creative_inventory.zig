@@ -1,10 +1,13 @@
 const std = @import("std");
+const storage = @import("storage");
+const records = @import("records");
+const metrics = @import("metrics");
+const worlds = @import("worlds");
+const entities = @import("entities");
+const ItemEntities = @import("item_entities.zig").ItemEntities;
+const SurvivalInventory = @import("survival_inventory.zig").SurvivalInventory;
+const protocols = @import("protocols");
 const wire_1_21_5 = @import("wire_1_21_5");
-const wire_1_21_6 = @import("wire_1_21_6");
-const wire_1_21_9 = @import("wire_1_21_9");
-const wire_1_21_11 = @import("wire_1_21_11");
-const wire_26_1 = @import("wire_26_1");
-const wire_26_2 = @import("wire_26_2");
 const packets = @import("minecraft_packets");
 const inventories = @import("inventories");
 const sessions = @import("sessions");
@@ -15,7 +18,6 @@ const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
 const Items = @import("items.zig").Items;
 const Players = @import("players.zig").Players;
 const Input = @import("input.zig").Input;
-const lightning_rod = @import("lightning_rod");
 
 const assert = std.debug.assert;
 
@@ -32,35 +34,16 @@ pub const CreativeInventory = struct {
         items: *Items,
     };
     const Action = union(enum) { creative_slot: struct { slot: i16, item: ?item_packets.Incoming }, dig: minecraft.Dig };
-    const Balance = struct {
-        item: inventories.ItemId,
-        count: i32 = 0,
-        origin: u16,
-        order: usize = 0,
-    };
-    const Batch = struct {
-        balances: [47]Balance,
-        count: usize,
-        revision: i32,
-        order: usize = 0,
-    };
-
     deps: Dependencies,
-    batches: []?*Batch,
-    batch_storage: []Batch,
     decode_scratch: []u8,
     decode_components: [item_data.maximum_components]item_data.Component = undefined,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*CreativeInventory {
         const self = try allocator.create(CreativeInventory);
-        const count = deps.players.records.len;
         self.* = .{
             .deps = deps,
-            .batches = try allocator.alloc(?*Batch, count),
-            .batch_storage = try allocator.alloc(Batch, count),
             .decode_scratch = try allocator.alloc(u8, deps.inventories.config.max_item_bytes),
         };
-        @memset(self.batches, null);
         try deps.input.on(.set_creative_slot, self, onCreativeSlot);
         try deps.players.observeDig(self, onDig);
         return self;
@@ -85,7 +68,7 @@ pub const CreativeInventory = struct {
         try self.apply(handle.index, .{ .creative_slot = .{ .slot = slot, .item = value } });
     }
 
-    fn apply(self: *CreativeInventory, player_index: usize, action: ?Action) !void {
+    fn apply(self: *CreativeInventory, player_index: usize, action: Action) !void {
         const menu = self.deps.inventory;
         const service = self.deps.sessions;
         errdefer menu.fail();
@@ -98,10 +81,10 @@ pub const CreativeInventory = struct {
         var slots: [47]inventories.Slot = undefined;
         var contents: [47]inventories.Contents = undefined;
         try menu.load(player_index, &slots, &contents);
-        const dropping = if (action) |event| switch (event) {
+        const dropping = switch (action) {
             .creative_slot => |set| set.slot == -1 and set.item != null,
             .dig => |dig| dig.action == .drop_item or dig.action == .drop_stack,
-        } else false;
+        };
         if (dropping and !menu.deps.dropped.canCreate(1)) {
             state.dirty = PlayerInventory.all_slots;
             return;
@@ -109,147 +92,59 @@ pub const CreativeInventory = struct {
         var next: [47]?inventories.Stack = undefined;
         for (&next, contents) |*stack, value| stack.* = value.stack;
 
-        var key: [16]u8 = undefined;
-        std.mem.writeInt(u128, &key, player.uuid, .big);
-        const lease = try menu.recovery.acquire(&key);
-        defer lease.release();
-        var pending: ?inventories.Stack = null;
-        var origin: u16 = 36;
-        if (lease.read()) |bytes| {
-            const recovery = try PlayerInventory.decodeRecovery(bytes);
-            pending = recovery.stack;
-            origin = recovery.origin;
-        }
-        if (next[PlayerInventory.cursor]) |held| {
-            assert(pending == null);
-            pending = held;
-            origin = 36 + @as(u16, state.selected);
-            next[PlayerInventory.cursor] = null;
-        }
-        state.close = false;
-
-        var balances: [47]Balance = undefined;
-        var count: usize = 0;
-        var batch = self.batches[player_index];
-        if (batch) |current| if (current.revision != state.revision) {
-            batch = null;
-            self.batches[player_index] = null;
-        };
-        if (batch) |current| {
-            balances = current.balances;
-            count = current.count;
-        } else {
-            if (pending) |held| {
-                balances[0] = .{ .item = held.item, .count = held.count, .origin = origin };
-                count = 1;
-            }
-            for (next[1..46], 1..) |stack, at| if (stack) |held| {
-                var index: usize = 0;
-                while (index < count and !std.mem.eql(u8, &balances[index].item, &held.item)) : (index += 1) {}
-                if (index == count) {
-                    assert(count < balances.len);
-                    balances[count] = .{ .item = held.item, .origin = @intCast(at) };
-                    count += 1;
-                }
-                balances[index].count += held.count;
-            };
-            if (action != null) {
-                batch = &self.batch_storage[player_index];
-                batch.?.* = .{ .balances = balances, .count = count, .revision = state.revision };
-                self.batches[player_index] = batch;
-            }
-        }
+        if (state.close) return;
+        // Creative packets replace slots. The client does not report its cursor.
+        assert(next[PlayerInventory.cursor] == null);
         var accepted: u64 = 0;
+        var drops: [1]inventories.Stack = undefined;
+        var drop_count: usize = 0;
+        switch (action) {
+            .creative_slot => |set| set_action: {
+                if (set.slot != -1 and (set.slot < 1 or set.slot > 45)) break :set_action;
+                const target: usize = if (set.slot == -1) PlayerInventory.cursor else @intCast(set.slot);
+                if (set.slot != -1) {
+                    state.dirty |= @as(u64, 1) << @intCast(target);
+                    accepted &= ~(@as(u64, 1) << @intCast(target));
+                }
+                var stack: ?inventories.Stack = null;
+                if (set.item) |value| {
+                    const amount = value.count;
+                    if (amount <= 0 or amount > 99) break :set_action;
+                    if (value.encoded_bytes > self.deps.inventories.config.max_item_bytes or value.encoded_bytes + 256 > service.config.page_bytes) break :set_action;
+                    stack = .{ .item = try item_data.define(self.deps.inventories, value.kind, value.components), .count = @intCast(amount) };
+                }
 
-        const events: []const Action = if (action) |value| &.{value} else &.{};
-        for (events) |event| {
-            if (batch) |current| current.order += 1;
-            const order = if (batch) |current| current.order else 0;
-            switch (event) {
-                .creative_slot => |set| {
-                    if (set.slot != -1 and (set.slot < 1 or set.slot > 45)) continue;
-                    const target: usize = if (set.slot == -1) PlayerInventory.cursor else @intCast(set.slot);
-                    if (set.slot != -1) {
-                        state.dirty |= @as(u64, 1) << @intCast(target);
-                        accepted &= ~(@as(u64, 1) << @intCast(target));
+                if (set.slot == -1) {
+                    if (stack) |held| {
+                        drops[0] = held;
+                        drop_count = 1;
                     }
-                    var stack: ?inventories.Stack = null;
-                    if (set.item) |value| {
-                        const amount = value.count;
-                        if (amount <= 0 or amount > 99) continue;
-                        if (value.encoded_bytes > self.deps.inventories.config.max_item_bytes or value.encoded_bytes + 256 > service.config.page_bytes) continue;
-                        stack = .{ .item = try item_data.define(self.deps.inventories, value.kind, value.components), .count = @intCast(amount) };
-                    }
-
-                    if (set.slot == -1) {
-                        if (stack) |held| {
-                            try menu.drop(player.*, held);
-                            for (balances[0..count]) |*balance| if (std.mem.eql(u8, &balance.item, &held.item)) {
-                                balance.count -= held.count;
-                            };
-                            if (batch) |current| for (current.balances[0..count]) |*balance| {
-                                if (std.mem.eql(u8, &balance.item, &held.item)) balance.count -= held.count;
-                            };
-                        }
-                        continue;
-                    }
-                    if (next[target]) |before| {
-                        const retained = if (stack) |after| if (inventories.Stack.sameItem(before, after)) after.count else 0 else 0;
-                        if (retained < before.count) for (balances[0..count]) |*balance| if (std.mem.eql(u8, &balance.item, &before.item)) {
-                            balance.origin = @intCast(target);
-                            balance.order = order;
-                        };
-                        if (retained < before.count) if (batch) |current| for (current.balances[0..count]) |*balance| {
-                            if (std.mem.eql(u8, &balance.item, &before.item)) {
-                                balance.origin = @intCast(target);
-                                balance.order = order;
-                            }
-                        };
-                    }
-                    next[target] = stack;
-                    accepted |= @as(u64, 1) << @intCast(target);
-                },
-                .dig => |dig| {
-                    if (player.health == 0) continue;
-                    const at = 36 + @as(usize, state.selected);
-                    if (dig.action == .swap_hands) {
-                        std.mem.swap(?inventories.Stack, &next[at], &next[45]);
-                        accepted &= ~((@as(u64, 1) << @intCast(at)) | (@as(u64, 1) << 45));
-                    } else if (dig.action == .drop_item or dig.action == .drop_stack) {
-                        const held = next[at] orelse continue;
-                        const amount = if (dig.action == .drop_stack) held.count else 1;
-                        try menu.drop(player.*, .{ .item = held.item, .count = amount });
-                        next[at] = if (amount == held.count) null else .{ .item = held.item, .count = held.count - amount };
-                        accepted &= ~(@as(u64, 1) << @intCast(at));
-                        for (balances[0..count]) |*balance| if (std.mem.eql(u8, &balance.item, &held.item)) {
-                            balance.count -= amount;
-                        };
-                        if (batch) |current| for (current.balances[0..count]) |*balance| {
-                            if (std.mem.eql(u8, &balance.item, &held.item)) balance.count -= amount;
-                        };
-                    }
-                },
-            }
+                    break :set_action;
+                }
+                next[target] = stack;
+                accepted |= @as(u64, 1) << @intCast(target);
+            },
+            .dig => |dig| dig_action: {
+                if (player.health == 0) break :dig_action;
+                const at = 36 + @as(usize, state.selected);
+                if (dig.action == .swap_hands) {
+                    std.mem.swap(?inventories.Stack, &next[at], &next[45]);
+                    accepted &= ~((@as(u64, 1) << @intCast(at)) | (@as(u64, 1) << 45));
+                } else if (dig.action == .drop_item or dig.action == .drop_stack) {
+                    const held = next[at] orelse break :dig_action;
+                    const amount = if (dig.action == .drop_stack) held.count else 1;
+                    drops[0] = .{ .item = held.item, .count = amount };
+                    drop_count = 1;
+                    next[at] = if (amount == held.count) null else .{ .item = held.item, .count = held.count - amount };
+                    accepted &= ~(@as(u64, 1) << @intCast(at));
+                }
+            },
         }
 
-        for (next[1..46]) |stack| if (stack) |held| {
-            for (balances[0..count]) |*balance| if (std.mem.eql(u8, &balance.item, &held.item)) {
-                balance.count -= held.count;
-            };
-        };
-        var selected: ?usize = null;
-        for (balances[0..count], 0..) |balance, index| {
-            if (balance.count <= 0) continue;
-            if (selected == null or balance.order >= balances[selected.?].order) selected = index;
+        if (!try menu.apply(player_index, &slots, &contents, &next, drops[0..drop_count])) {
+            state.dirty = PlayerInventory.all_slots;
+            return;
         }
-        if (selected) |index| {
-            const balance = balances[index];
-            const held: inventories.Stack = .{ .item = balance.item, .count = 1 };
-            const amount: u16 = @intCast(@min(balance.count, try self.deps.items.stackLimit(held)));
-            try menu.writeRecovery(lease, .{ .stack = .{ .item = balance.item, .count = amount }, .origin = balance.origin });
-        } else try menu.writeRecovery(lease, null);
-        try menu.commit(state, &slots, &contents, &next);
-        if (batch) |current| current.revision = state.revision;
         // A computed presentation differs from the client's accepted proposal.
         if (!self.deps.items.components.has_presentation) state.dirty &= ~accepted;
     }
@@ -260,22 +155,13 @@ pub const CreativeInventory = struct {
         connections: for (self.deps.players.activeSlots()) |player_index| {
             const player = &self.deps.players.records[player_index];
             const state = &menu.states[player_index];
-            const handle = player.handle orelse {
-                self.batches[player_index] = null;
-                continue;
-            };
-            if (player.stage != .ready or !player.loaded or player.gamemode != .creative) {
-                self.batches[player_index] = null;
-                continue;
-            }
-            const pending_batch = self.batches[player_index] != null;
+            const handle = player.handle orelse continue;
+            if (player.stage != .ready or !player.loaded or player.gamemode != .creative) continue;
             if (state.presentation != self.deps.items.components.revision) {
                 state.presentation = self.deps.items.components.revision;
                 state.dirty = PlayerInventory.all_slots;
             }
-            if (!pending_batch and state.dirty == 0 and state.generation == handle.generation and state.life == player.life and state.gamemode == player.gamemode) continue;
-            try self.apply(player_index, null);
-            self.batches[player_index] = null;
+            if (state.dirty == 0 and state.generation == handle.generation and state.life == player.life and state.gamemode == player.gamemode) continue;
             menu.synchronize(player_index, self.deps.packets, service) catch |err| switch (err) {
                 error.EndOfStream, error.UnsupportedItem, error.UnsupportedComponent => service.disconnect(handle),
                 error.Backpressured, error.Closed => continue :connections,
@@ -284,3 +170,230 @@ pub const CreativeInventory = struct {
         }
     }
 };
+
+const InventoryFixture = struct {
+    service: *sessions.Service,
+    input: *Input,
+    players: *Players,
+    ownership: *inventories.Inventories,
+    items: *Items,
+    menu: *PlayerInventory,
+    creative: *CreativeInventory,
+    bodies: *entities.Entities,
+    dropped: *ItemEntities,
+
+    fn init(allocator: std.mem.Allocator, store: *storage.Store, registry: *metrics.Registry, selected: []const sessions.Protocol) !InventoryFixture {
+        const io = std.testing.io;
+        const workspaces = try records.Workspaces.init(allocator, io, .{});
+        const service = try sessions.Service.init(allocator, io, undefined, .{ .connections = 1, .pages = 2, .page_bytes = 65536, .buffer_bytes = 128 * 1024, .protocols = selected });
+        errdefer service.deinit();
+        const input = try Input.init(allocator, .{ .sessions = service });
+        const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
+        const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
+        const players = try Players.init(allocator, .{ .maximum = 1, .world = world }, .{
+            .record_workspaces = workspaces,
+            .sessions = service,
+            .packets = undefined,
+            .input = input,
+            .storage = try store.openSpace("players"),
+            .worlds = dimensions,
+            .vanilla_worlds = undefined,
+        });
+        players.records[0] = .{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .loaded = true, .gamemode = .creative };
+        players.rebuildIndexes();
+        const ownership = try inventories.Inventories.init(allocator, io, .{ .cache_slots = 64, .cache_items = 8, .max_item_bytes = 1024 }, .{
+            .metrics = registry,
+            .storage = try store.openSpace("inventory"),
+            .record_workspaces = workspaces,
+        });
+        const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
+        const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 16 }, .{ .metrics = registry, .storage = try store.openSpace("entities"), .record_workspaces = workspaces });
+        const dropped = try ItemEntities.init(allocator, io, .{ .cache_records = 32, .maximum = 8 }, .{
+            .metrics = registry,
+            .storage = try store.openSpace("drops"),
+            .record_workspaces = workspaces,
+            .entities = bodies,
+            .inventories = ownership,
+            .items = items,
+            .worlds = dimensions,
+        });
+        const menu = try PlayerInventory.init(allocator, .{
+            .players = players,
+            .inventories = ownership,
+            .items = items,
+            .equipment = undefined,
+            .dropped = dropped,
+        });
+        const creative = try CreativeInventory.init(allocator, .{
+            .inventory = menu,
+            .input = input,
+            .players = players,
+            .sessions = service,
+            .packets = undefined,
+            .inventories = ownership,
+            .items = items,
+        });
+        _ = try SurvivalInventory.init(allocator, .{ .inventory = menu, .input = input, .players = players, .inventories = ownership, .items = items, .packets = undefined, .sessions = service });
+        return .{ .service = service, .input = input, .players = players, .ownership = ownership, .items = items, .menu = menu, .creative = creative, .bodies = bodies, .dropped = dropped };
+    }
+};
+
+test "creative replacements persist exact packet prefixes without inventing a cursor" {
+    const io = std.testing.io;
+    const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    for ([_]bool{ false, true }) |reverse| for (0..4) |received| {
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var path_buffer: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/creative", .{directory.sub_path});
+        var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .enabled = false });
+        defer registry.deinit();
+        {
+            var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
+            defer store.deinit();
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const fixture = try InventoryFixture.init(arena.allocator(), &store, &registry, &selected);
+            defer fixture.service.deinit();
+            const bread: inventories.Stack = .{ .item = try fixture.items.define("minecraft:bread"), .count = 17 };
+            const stone: inventories.Stack = .{ .item = try fixture.items.define("minecraft:stone"), .count = 9 };
+            try std.testing.expect(try fixture.ownership.editMany(&.{
+                .{ .slot = .{ .owner = 1, .index = 36 }, .revision = 0, .stack = bread },
+                .{ .slot = .{ .owner = 1, .index = 45 }, .revision = 0, .stack = stone },
+            }));
+            const actions = [_]CreativeInventory.Action{
+                .{ .creative_slot = .{ .slot = 36, .item = .{ .count = stone.count, .kind = try fixture.items.kind(stone), .components = &.{}, .encoded_bytes = 10 } } },
+                .{ .creative_slot = .{ .slot = 45, .item = .{ .count = bread.count, .kind = try fixture.items.kind(bread), .components = &.{}, .encoded_bytes = 10 } } },
+            };
+            for (0..@min(received, 2)) |index| {
+                try fixture.creative.apply(0, actions[index ^ @intFromBool(reverse)]);
+                try fixture.creative.tick();
+            }
+            if (received == 3) {
+                try fixture.creative.apply(0, .{ .creative_slot = .{ .slot = 36, .item = null } });
+                try fixture.menu.closeMenu(0);
+                try std.testing.expect((try fixture.ownership.get(.{ .owner = 1, .index = 36 })).stack == null);
+            }
+            try fixture.ownership.checkpoint(fixture.ownership.deps.storage);
+            _ = try store.commit(1);
+            try store.waitDurable(store.lastCommit());
+        }
+        {
+            var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
+            defer store.deinit();
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const fixture = try InventoryFixture.init(arena.allocator(), &store, &registry, &selected);
+            defer fixture.service.deinit();
+            var slots: [47]inventories.Slot = undefined;
+            var contents: [47]inventories.Contents = undefined;
+            try fixture.menu.load(0, &slots, &contents);
+            const source_changed = received >= 2 or (received == 1 and !reverse);
+            const offhand_changed = received >= 2 or (received == 1 and reverse);
+            if (received == 3) {
+                try std.testing.expect(contents[36].stack == null);
+            } else {
+                try std.testing.expectEqualStrings(if (source_changed) "minecraft:stone" else "minecraft:bread", protocols.registry.itemName(@intCast(try fixture.items.kind(contents[36].stack.?))).?);
+                try std.testing.expectEqual(@as(u16, if (source_changed) 9 else 17), contents[36].stack.?.count);
+            }
+            try std.testing.expectEqualStrings(if (offhand_changed) "minecraft:bread" else "minecraft:stone", protocols.registry.itemName(@intCast(try fixture.items.kind(contents[45].stack.?))).?);
+            try std.testing.expectEqual(@as(u16, if (offhand_changed) 17 else 9), contents[45].stack.?.count);
+            try std.testing.expect(contents[PlayerInventory.cursor].stack == null);
+            const once = contents;
+            try fixture.menu.load(0, &slots, &contents);
+            try std.testing.expectEqualDeep(once, contents);
+        }
+    };
+}
+
+test "survival cursor placements drops and close preserve ownership across restart" {
+    const io = std.testing.io;
+    const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    const Cut = enum { picked, placed, dropped, closed };
+    for (std.enums.values(Cut)) |cut| {
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var path_buffer: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/cursor", .{directory.sub_path});
+        var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .enabled = false });
+        defer registry.deinit();
+        {
+            var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
+            defer store.deinit();
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const fixture = try InventoryFixture.init(arena.allocator(), &store, &registry, &selected);
+            defer fixture.service.deinit();
+            fixture.players.records[0].gamemode = .survival;
+            const bread: inventories.Stack = .{ .item = try fixture.items.define("minecraft:bread"), .count = 17 };
+            try std.testing.expect(try fixture.ownership.set(.{ .owner = 1, .index = 36 }, 0, bread));
+            var slots: [47]inventories.Slot = undefined;
+            var contents: [47]inventories.Contents = undefined;
+            try fixture.menu.load(0, &slots, &contents);
+            var next: [47]?inventories.Stack = undefined;
+            for (&next, contents) |*stack, entry| stack.* = entry.stack;
+            next[36] = null;
+            next[PlayerInventory.cursor] = bread;
+            try std.testing.expect(try fixture.menu.apply(0, &slots, &contents, &next, &.{}));
+            try std.testing.expect((try fixture.ownership.get(slots[36])).stack == null);
+            try std.testing.expectEqual(bread, (try fixture.ownership.get(slots[PlayerInventory.cursor])).stack.?);
+            if (cut != .picked) {
+                next[38] = .{ .item = bread.item, .count = 1 };
+                next[PlayerInventory.cursor].?.count = 16;
+                try std.testing.expect(try fixture.menu.apply(0, &slots, &contents, &next, &.{}));
+                try std.testing.expectEqual(@as(u16, 1), (try fixture.ownership.get(slots[38])).stack.?.count);
+            }
+            if (cut == .dropped or cut == .closed) {
+                next[PlayerInventory.cursor].?.count = 15;
+                try std.testing.expect(try fixture.menu.apply(0, &slots, &contents, &next, &.{.{ .item = bread.item, .count = 1 }}));
+                try std.testing.expectEqual(@as(usize, 7), fixture.dropped.free_count);
+            }
+            if (cut == .closed) {
+                var buffer: [16]u8 = undefined;
+                const packet = try protocols.implementations[0].Protocol.play.toServer.write(&buffer).close_window();
+                const incoming = [_][]const u8{(try packet.windowId(0)).finish()};
+                const events = [_]sessions.Event{.{ .input = .{ .handle = fixture.players.records[0].handle.?, .protocol = selected[0].number, .packets = .{ .packets = &incoming } } }};
+                fixture.service.input_events = &events;
+                try fixture.input.tick(std.testing.failing_allocator);
+                fixture.service.input_events = &.{};
+                try std.testing.expect((try fixture.ownership.get(slots[PlayerInventory.cursor])).stack == null);
+            }
+            try fixture.ownership.checkpoint(fixture.ownership.deps.storage);
+            try fixture.bodies.checkpoint(fixture.bodies.deps.storage);
+            try fixture.dropped.checkpoint(fixture.dropped.deps.storage);
+            _ = try store.commit(1);
+            try store.waitDurable(store.lastCommit());
+        }
+        {
+            var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
+            defer store.deinit();
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const fixture = try InventoryFixture.init(arena.allocator(), &store, &registry, &selected);
+            defer fixture.service.deinit();
+            var slots: [47]inventories.Slot = undefined;
+            var contents: [47]inventories.Contents = undefined;
+            try fixture.menu.load(0, &slots, &contents);
+            try std.testing.expect(contents[PlayerInventory.cursor].stack == null);
+            if (cut == .picked) {
+                try std.testing.expectEqual(@as(u16, 17), contents[36].stack.?.count);
+                try std.testing.expect(contents[38].stack == null);
+            } else {
+                try std.testing.expect(contents[36].stack == null);
+                try std.testing.expectEqual(@as(u16, if (cut == .placed) 17 else 16), contents[38].stack.?.count);
+            }
+            var total: u32 = 0;
+            for (contents) |entry| if (entry.stack) |stack| {
+                total += stack.count;
+            };
+            for (fixture.dropped.residents) |resident| {
+                if (resident.id == 0 or !resident.alive) continue;
+                const body = (try fixture.bodies.get(resident.id)).?;
+                const stack = (try fixture.ownership.get(ItemEntities.slot(body))).stack.?;
+                try std.testing.expectEqual(@as(u16, 1), stack.count);
+                total += stack.count;
+            }
+            try std.testing.expectEqual(@as(u32, 17), total);
+        }
+    }
+}

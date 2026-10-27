@@ -24,7 +24,7 @@ pub const SurvivalInventory = struct {
         packets: *packets.Packets,
         sessions: *sessions.Service,
     };
-    const Action = union(enum) { inventory_close: i32, inventory_click: minecraft.InventoryClick, dig: minecraft.Dig };
+    const Action = union(enum) { inventory_click: minecraft.InventoryClick, dig: minecraft.Dig };
     deps: Dependencies,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*SurvivalInventory {
@@ -44,7 +44,7 @@ pub const SurvivalInventory = struct {
     fn onClose(self: *SurvivalInventory, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_close_window.Reader) !void {
         const window, const done = body.windowId() catch return error.InvalidPacket;
         done.finish() catch return error.InvalidPacket;
-        try self.apply(handle.index, .{ .inventory_close = window });
+        if (window == 0) try self.deps.inventory.closeMenu(handle.index);
     }
 
     fn onClick(self: *SurvivalInventory, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_window_click.Reader) !void {
@@ -81,34 +81,6 @@ pub const SurvivalInventory = struct {
             for (&next, contents) |*stack, value| stack.* = value.stack;
 
             switch (event) {
-                .inventory_close => |window| {
-                    if (window != 0) break :action;
-                    state.close = false;
-                    state.drag = 0;
-                    state.drag_button = null;
-                    for ([_]usize{ cursor, 1, 2, 3, 4 }) |source| {
-                        const held = next[source] orelse continue;
-                        var remaining = held.count;
-                        const maximum = try self.deps.items.stackLimit(held);
-                        for (0..2) |pass| for (0..38) |offset| {
-                            const target: usize = if (offset == 0) 36 + @as(usize, state.selected) else if (offset == 1) 45 else if (offset < 11) offset + 34 else offset - 2;
-                            if (remaining == 0) break;
-                            const previous = if (next[target]) |stack| stack.count else 0;
-                            if (pass == 0) {
-                                if (next[target] == null or !inventories.Stack.sameItem(held, next[target].?)) continue;
-                            } else if (next[target] != null or offset < 2) continue;
-                            const amount = @min(remaining, maximum -| previous);
-                            if (amount == 0) continue;
-                            next[target] = .{ .item = held.item, .count = previous + amount };
-                            remaining -= amount;
-                        };
-                        if (remaining != 0) {
-                            drops[drop_count] = .{ .item = held.item, .count = remaining };
-                            drop_count += 1;
-                        }
-                        next[source] = null;
-                    }
-                },
                 .dig => |dig| {
                     if (player.gamemode == .spectator or player.health == 0) break :action;
 
@@ -312,13 +284,11 @@ pub const SurvivalInventory = struct {
                 },
             }
 
-            if (!try menu.dropMany(player.*, drops[0..drop_count])) {
+            if (!try menu.apply(player_index, &slots, &contents, &next, drops[0..drop_count])) {
                 state.* = before;
                 state.dirty = all_slots;
-                if (event == .inventory_close) state.close = true;
                 break :action;
             }
-            try menu.commit(state, &slots, &contents, &next);
         }
     }
 
@@ -334,7 +304,7 @@ pub const SurvivalInventory = struct {
                 state.presentation = self.deps.items.components.revision;
                 state.dirty = PlayerInventory.all_slots;
             }
-            if (state.close) try self.apply(player_index, .{ .inventory_close = 0 });
+            if (state.close) try menu.closeMenu(player_index);
             if (state.dirty == 0 and state.generation == handle.generation and state.life == player.life and state.gamemode == player.gamemode) continue;
             menu.synchronize(player_index, self.deps.packets, service) catch |err| switch (err) {
                 error.EndOfStream, error.UnsupportedItem, error.UnsupportedComponent => service.disconnect(handle),

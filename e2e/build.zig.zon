@@ -6,6 +6,7 @@
     .dependencies = .{
         .host = .{ .path = "../host" },
         .records = .{ .path = "../records" },
+        .inventories = .{ .path = "../inventories" },
         .e2e_profile = .{ .path = "profile" },
         .e2e_control = .{ .path = "control" },
         .minecraft_java = .{ .path = "../minecraft_java" },

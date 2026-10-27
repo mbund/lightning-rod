@@ -4,6 +4,7 @@ const protocols = @import("protocols");
 const vanilla = @import("vanilla");
 const e2e = @import("e2e");
 const sessions = @import("sessions");
+const inventories = @import("inventories");
 
 pub fn main(init: std.process.Init) !void {
     const args = try e2e.profile.arguments(init);
@@ -126,18 +127,29 @@ const Probe = struct {
                 const previous = try self.deps.inventories.get(.{ .owner = player.uuid, .index = @intCast(slot) });
                 if (!try self.deps.inventories.set(.{ .owner = player.uuid, .index = @intCast(slot) }, previous.revision, .{ .item = stone, .count = 64 })) return error.SetupFailed;
             }
-            for ([_]u16{ 1, 2, 3, 4, std.math.maxInt(u16) }) |slot| {
+            for ([_]u16{ 1, 2, 3, 4 }) |slot| {
                 const previous = try self.deps.inventories.get(.{ .owner = player.uuid, .index = slot });
                 if (!try self.deps.inventories.set(.{ .owner = player.uuid, .index = slot }, previous.revision, .{ .item = stone, .count = 1 })) return error.SetupFailed;
             }
             self.deps.menus.changed(handle.index);
+            var slots: [47]inventories.Slot = undefined;
+            var contents: [47]inventories.Contents = undefined;
+            try self.deps.menus.load(handle.index, &slots, &contents);
+            var next: [47]?inventories.Stack = undefined;
+            for (&next, contents) |*stack, entry| stack.* = entry.stack;
+            next[36].?.count -= 1;
+            next[vanilla.PlayerInventory.cursor] = .{ .item = stone, .count = 1 };
+            if (!try self.deps.menus.apply(handle.index, &slots, &contents, &next, &.{})) return error.SetupFailed;
             self.phase = .preparing_close;
         } else if (std.mem.eql(u8, text, "capacity_close_check")) {
             if (self.phase != .close_ready) return error.UnexpectedCapacityPhase;
             if (self.deps.dropped.free_count != 1) return error.PartialCloseDrop;
-            for ([_]u16{ 1, 2, 3, 4, std.math.maxInt(u16) }) |slot| {
-                const contents = (try self.deps.inventories.get(.{ .owner = player.uuid, .index = slot })).stack orelse return error.CloseInventoryLost;
-                if (contents.count != 1) return error.CloseInventoryLost;
+            var slots: [47]inventories.Slot = undefined;
+            var contents: [47]inventories.Contents = undefined;
+            try self.deps.menus.load(handle.index, &slots, &contents);
+            for ([_]usize{ 1, 2, 3, 4, vanilla.PlayerInventory.cursor }) |slot| {
+                const stack = contents[slot].stack orelse return error.CloseInventoryLost;
+                if (stack.count != 1) return error.CloseInventoryLost;
             }
             self.phase = .verified;
             try self.deps.control.send(handle, "capacity close preserved");

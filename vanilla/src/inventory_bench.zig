@@ -98,22 +98,18 @@ pub fn benchmark() !void {
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &players_buffer, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        const menu = try PlayerInventory.init(allocator, io, .{
-            .record_workspaces = workspaces,
-            .metrics = &registry,
+        const menu = try PlayerInventory.init(allocator, .{
             .players = &players,
-            .input = undefined,
             .inventories = ownership,
             .items = items,
             .equipment = undefined,
             .dropped = undefined,
-            .storage = try store.openSpace("menu"),
         });
         var survival: SurvivalInventory = .{ .deps = .{ .inventory = menu, .players = &players, .inventories = ownership, .items = items, .packets = encoding, .sessions = service, .input = undefined } };
         const Mode = enum { survival_dirty_one, survival_dirty_many, survival_cursor, survival_full, full_direct, single_slot_direct };
         for ([_]bool{ true, false }) |available| for (std.enums.values(Mode)) |mode| {
             const player = players_buffer[0];
-            menu.states[0] = .{ .generation = handle.generation, .life = player.life, .dirty = @as(u64, 1) << 36, .close = false, .gamemode = .survival, .revision = 12 };
+            menu.states[0] = .{ .generation = handle.generation, .life = player.life, .dirty = @as(u64, 1) << 36, .close = false, .gamemode = .survival, .revision = 12, .synchronized = true };
             const expected_slots: usize = switch (mode) {
                 .survival_full, .full_direct => 47,
                 .survival_dirty_many => 3,
@@ -379,16 +375,12 @@ pub fn benchmarkPickup() !void {
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        const menu = try PlayerInventory.init(allocator, io, .{
-            .record_workspaces = workspaces,
-            .metrics = &registry,
+        const menu = try PlayerInventory.init(allocator, .{
             .players = &players,
-            .input = undefined,
             .inventories = ownership,
             .items = items,
             .equipment = undefined,
             .dropped = undefined,
-            .storage = try store.openSpace("menu"),
         });
         const bodies = try entities.Entities.allocate(allocator, io, .{ .cache_records = 2 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.allocate(allocator, .{ .maximum = 1 });
@@ -754,16 +746,12 @@ pub fn benchmarkDrops() !void {
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        const menu = try PlayerInventory.init(allocator, io, .{
-            .record_workspaces = workspaces,
-            .metrics = &registry,
+        const menu = try PlayerInventory.init(allocator, .{
             .players = &players,
-            .input = undefined,
             .inventories = ownership,
             .items = items,
             .equipment = undefined,
             .dropped = dropped,
-            .storage = try store.openSpace("menu"),
         });
         var stacks: [64]inventories.Stack = @splat(stack);
         const next_id = bodies.next_id;
@@ -1072,16 +1060,12 @@ pub fn benchmarkPickupAdmission() !void {
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = player_records[0..player_count], .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        const menu = try PlayerInventory.init(allocator, io, .{
-            .record_workspaces = workspaces,
-            .metrics = &registry,
+        const menu = try PlayerInventory.init(allocator, .{
             .players = &players,
-            .input = undefined,
             .inventories = ownership,
             .items = items,
             .equipment = undefined,
             .dropped = undefined,
-            .storage = try store.openSpace("menu"),
         });
         const bodies = try entities.Entities.allocate(allocator, io, .{ .cache_records = 2 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.allocate(allocator, .{ .maximum = 1 });

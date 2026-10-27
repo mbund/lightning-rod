@@ -44,7 +44,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const test_step = b.step("test", "Verify encoding and batched gameplay records");
-    for ([_][]const u8{ "src/chunk_encoding.zig", "src/block_sync.zig", "src/streaming.zig", "src/batch_test.zig", "src/pickup_test.zig", "src/merge_test.zig", "src/item_spatial_test.zig", "src/item_selection_test.zig", "src/placement_test.zig", "src/command_dispatch_test.zig", "src/replication.zig", "src/visibility.zig", "src/visibility_replication_test.zig", "src/environment_test.zig", "src/configuration_test.zig", "src/session_keepalive.zig", "src/generation.zig", "src/random.zig" }) |source| {
+    for ([_][]const u8{ "src/chunk_encoding.zig", "src/block_sync.zig", "src/streaming.zig", "src/batch_test.zig", "src/pickup_test.zig", "src/merge_test.zig", "src/item_spatial_test.zig", "src/item_selection_test.zig", "src/placement_test.zig", "src/creative_inventory.zig", "src/command_dispatch_test.zig", "src/replication.zig", "src/visibility.zig", "src/visibility_replication_test.zig", "src/environment_test.zig", "src/configuration_test.zig", "src/session_keepalive.zig", "src/generation.zig", "src/random.zig" }) |source| {
         const test_module = b.createModule(.{ .root_source_file = b.path(source), .target = target, .optimize = optimize });
         for (module.import_table.keys(), module.import_table.values()) |name, dependency|
             test_module.addImport(name, dependency);

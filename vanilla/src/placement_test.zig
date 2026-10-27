@@ -60,16 +60,12 @@ const Fixture = struct {
             .record_workspaces = workspaces,
         });
         const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
-        const menus = try PlayerInventory.init(allocator, io, .{
-            .record_workspaces = workspaces,
-            .metrics = registry,
+        const menus = try PlayerInventory.init(allocator, .{
             .players = players,
-            .input = input,
             .inventories = ownership,
             .items = items,
             .equipment = undefined,
             .dropped = undefined,
-            .storage = try store.openSpace("menus"),
         });
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 0, .cache_tiles = 8 }, .{
             .metrics = registry,

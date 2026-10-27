@@ -79,16 +79,12 @@ test "pickup batches preserve player priority item order and partial collection"
             var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
             try players.initIndexes(allocator);
             players.rebuildIndexes();
-            const menu = try PlayerInventory.init(allocator, io, .{
-                .record_workspaces = workspaces,
-                .metrics = &registry,
+            const menu = try PlayerInventory.init(allocator, .{
                 .players = &players,
-                .input = undefined,
                 .inventories = ownership,
                 .items = items,
                 .equipment = undefined,
                 .dropped = dropped,
-                .storage = try store.openSpace("menu"),
             });
             const pickup = try ItemPickup.init(allocator, .{ .players = &players, .menus = menu, .inventories = ownership, .entities = bodies, .items = items, .dropped = dropped });
             var ids: [3]entities.Id = undefined;
