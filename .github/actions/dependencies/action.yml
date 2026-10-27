@@ -1,0 +1,68 @@
+name: Prepared dependencies
+description: Restore this workflow's toolchain and dependency artifacts
+inputs:
+  java:
+    description: Restore the JDK and Gradle dependencies
+    default: 'false'
+  native:
+    description: Install the Minecraft client's native libraries
+    default: 'false'
+  world:
+    description: Restore the chunk benchmark corpus
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@v8
+      with:
+        name: ci-zig
+        path: ${{ runner.temp }}/ci-dependencies
+    - shell: bash
+      run: |
+        bundle="$RUNNER_TEMP/ci-dependencies"
+        tar --zstd -xf "$bundle/toolchain.tar.zst" -C "$bundle"
+        mkdir -p "$RUNNER_TEMP/ci-zig-cache"
+        tar --zstd -xf "$bundle/zig.tar.zst" -C "$RUNNER_TEMP/ci-zig-cache"
+        rm "$bundle/toolchain.tar.zst" "$bundle/zig.tar.zst"
+        echo "$bundle/zig" >> "$GITHUB_PATH"
+        echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/ci-zig-cache" >> "$GITHUB_ENV"
+    - uses: actions/download-artifact@v8
+      if: inputs.java == 'true'
+      with:
+        name: ci-java
+        path: ${{ runner.temp }}/ci-dependencies
+    - if: inputs.java == 'true'
+      shell: bash
+      run: |
+        bundle="$RUNNER_TEMP/ci-dependencies"
+        mkdir -p "$RUNNER_TEMP/ci-jdk" "$RUNNER_TEMP/ci-gradle/init.d"
+        tar --zstd -xf "$bundle/jdk.tar.zst" -C "$RUNNER_TEMP/ci-jdk"
+        tar --zstd -xf "$bundle/gradle.tar.zst" -C "$RUNNER_TEMP/ci-gradle"
+        rm "$bundle/jdk.tar.zst" "$bundle/gradle.tar.zst"
+        echo 'gradle.startParameter.offline = true' > "$RUNNER_TEMP/ci-gradle/init.d/offline.gradle"
+        echo "$RUNNER_TEMP/ci-jdk/bin" >> "$GITHUB_PATH"
+        echo "JAVA_HOME=$RUNNER_TEMP/ci-jdk" >> "$GITHUB_ENV"
+        echo "GRADLE_USER_HOME=$RUNNER_TEMP/ci-gradle" >> "$GITHUB_ENV"
+    - uses: actions/download-artifact@v8
+      if: inputs.native == 'true'
+      with:
+        name: ci-native
+        path: ${{ runner.temp }}/ci-dependencies
+    - if: inputs.native == 'true'
+      shell: bash
+      run: |
+        mkdir -p "$RUNNER_TEMP/ci-native"
+        tar --zstd -xf "$RUNNER_TEMP/ci-dependencies/native.tar.zst" -C "$RUNNER_TEMP/ci-native"
+        sudo dpkg -i "$RUNNER_TEMP"/ci-native/*.deb
+        rm -rf "$RUNNER_TEMP/ci-native" "$RUNNER_TEMP/ci-dependencies/native.tar.zst"
+    - uses: actions/download-artifact@v8
+      if: inputs.world == 'true'
+      with:
+        name: ci-world
+        path: ${{ runner.temp }}/ci-dependencies
+    - if: inputs.world == 'true'
+      shell: bash
+      run: |
+        mkdir -p "$RUNNER_TEMP/benchmark-world"
+        tar --zstd -xf "$RUNNER_TEMP/ci-dependencies/world.tar.zst" -C "$RUNNER_TEMP/benchmark-world"
+        rm "$RUNNER_TEMP/ci-dependencies/world.tar.zst"

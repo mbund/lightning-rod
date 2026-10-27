@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Prepare dependencies
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - id: image
+        run: |
+          echo "version=$ImageVersion" >> "$GITHUB_OUTPUT"
+          previous=$(git ls-tree -r HEAD^ | awk '$4 ~ /(^|\/)build.zig.zon$/ { print }' | sha256sum | cut -d ' ' -f 1)
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v5
+        id: dependencies
+        with:
+          path: ${{ runner.temp }}/ci-dependencies
+          key: ci-dependencies-${{ runner.os }}-${{ steps.image.outputs.version }}-${{ steps.image.outputs.previous }}-${{ hashFiles('**/build.zig.zon', '**/*.gradle', '**/gradle.properties', '**/versions.json', '**/gradle/wrapper/*', '.github/workflows/ci.yml', '.github/scripts/install-zig.sh', '.github/scripts/prepare-dependencies.sh', 'bench/chunks/src/**', 'nbt/src/**') }}
+      - name: Install Zig
+        if: steps.dependencies.outputs.cache-hit != 'true'
+        run: bash .github/scripts/install-zig.sh "$RUNNER_TEMP/ci-dependencies/zig"
+      - uses: actions/setup-java@v6
+        if: steps.dependencies.outputs.cache-hit != 'true'
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Fetch dependencies and prepare the benchmark corpus
+        if: steps.dependencies.outputs.cache-hit != 'true'
+        run: |
+          bash .github/scripts/prepare-dependencies.sh
+          tar --zstd -cf "$RUNNER_TEMP/ci-dependencies/toolchain.tar.zst" -C "$RUNNER_TEMP/ci-dependencies" zig
+          rm -rf "$RUNNER_TEMP/ci-dependencies/zig"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-zig
+          path: |
+            ${{ runner.temp }}/ci-dependencies/toolchain.tar.zst
+            ${{ runner.temp }}/ci-dependencies/zig.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-java
+          path: |
+            ${{ runner.temp }}/ci-dependencies/jdk.tar.zst
+            ${{ runner.temp }}/ci-dependencies/gradle.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-native
+          path: ${{ runner.temp }}/ci-dependencies/native.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-world
+          path: ${{ runner.temp }}/ci-dependencies/world.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  tests:
+    needs: prepare
+    uses: ./.github/workflows/test.yml
+  fuzz:
+    needs: prepare
+    uses: ./.github/workflows/fuzz.yml
+  benchmarks:
+    needs: prepare
+    uses: ./.github/workflows/bench.yml
+  e2e:
+    needs: prepare
+    uses: ./.github/workflows/e2e.yml

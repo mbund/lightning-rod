@@ -45,3 +45,12 @@ processResources {
 
 tasks.withType(JavaCompile).configureEach { options.release = modern ? 25 : 21 }
 tasks.register('registrySnapshot') { dependsOn 'runRegistrySnapshot' }
+
+tasks.register('prepareDependencies') {
+    dependsOn tasks.named('configureLaunch')
+    doLast {
+        sourceSets.main.compileClasspath.files
+        sourceSets.main.runtimeClasspath.files
+        sourceSets.main.annotationProcessorPath.files
+    }
+}

@@ -1,13 +1,7 @@
 name: Tests
 
 on:
-  pull_request:
-  push:
-    branches: [main]
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: true
+  workflow_call:
 
 jobs:
   test:
@@ -16,13 +10,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - name: Install Zig
-        run: bash .github/scripts/install-zig.sh
-      - uses: actions/setup-java@v6
+      - uses: ./.github/actions/dependencies
         with:
-          distribution: temurin
-          java-version: '25'
-      - run: zig build --release=safe test
+          java: 'true'
+      - run: bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe test
 
   codegen:
     name: Generated cursor contracts
@@ -30,10 +21,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - name: Install Zig
-        run: bash .github/scripts/install-zig.sh
+      - uses: ./.github/actions/dependencies
       - working-directory: protocol_codegen
-        run: zig build check
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build check
 
   examples:
     name: Example (${{ matrix.example }})
@@ -45,14 +35,11 @@ jobs:
         example: [vanilla, embedded, vanilla-plus, skyblock]
     steps:
       - uses: actions/checkout@v7
-      - name: Install Zig
-        run: bash .github/scripts/install-zig.sh
-      - uses: actions/setup-java@v6
+      - uses: ./.github/actions/dependencies
         with:
-          distribution: temurin
-          java-version: '25'
+          java: 'true'
       - working-directory: examples/${{ matrix.example }}
-        run: zig build --release=safe
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe
 
   distribution:
     name: Package distribution
@@ -60,11 +47,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - name: Install Zig
-        run: bash .github/scripts/install-zig.sh
-      - uses: actions/setup-java@v6
+      - uses: ./.github/actions/dependencies
         with:
-          distribution: temurin
-          java-version: '25'
-      - run: zig run test/distribution.zig
+          java: 'true'
+      - run: bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig run test/distribution.zig
 

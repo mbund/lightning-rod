@@ -100,3 +100,14 @@ tasks.register('testFixtureApi', JavaExec) {
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'dev.lightningrod.e2e.FixtureApiTest'
 }
+
+tasks.register('prepareDependencies') {
+    dependsOn tasks.named('configureClientLaunch')
+    doLast {
+        [sourceSets.main, sourceSets.client, sourceSets.test].each {
+            it.compileClasspath.files
+            it.runtimeClasspath.files
+            it.annotationProcessorPath.files
+        }
+    }
+}

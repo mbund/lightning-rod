@@ -1,13 +1,7 @@
 name: E2E
 
 on:
-  pull_request:
-  push:
-    branches: [main]
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: true
+  workflow_call:
 
 jobs:
   discover:
@@ -17,13 +11,12 @@ jobs:
       matrix: ${{ steps.tests.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
-      - name: Install Zig
-        run: bash .github/scripts/install-zig.sh
+      - uses: ./.github/actions/dependencies
       - id: tests
         shell: bash
         working-directory: e2e
         run: |
-          matrix=$(zig build e2e-matrix)
+          matrix=$(bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build e2e-matrix)
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   e2e:
@@ -38,24 +31,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 2
-      - name: Install Zig
-        run: bash .github/scripts/install-zig.sh
-      - uses: actions/setup-java@v6
+      - uses: ./.github/actions/dependencies
         with:
-          distribution: temurin
-          java-version: '25'
-      - name: Install native client dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends xvfb libgl1-mesa-dri libglx-mesa0 libgl1 libxrandr2 libxinerama1 libxcursor1 libxi6 libasound2t64
-      - name: Fetch Zig dependencies
-        working-directory: e2e
-        run: |
-          for attempt in 1 2 3; do
-            if zig build --fetch=all; then exit 0; fi
-            if test "$attempt" -eq 3; then exit 1; fi
-            sleep "$attempt"
-          done
+          java: 'true'
+          native: 'true'
       - name: Real-client acceptance
         working-directory: e2e
         env:
@@ -63,7 +42,7 @@ jobs:
           VERSION: ${{ matrix.version }}
           LIBGL_ALWAYS_SOFTWARE: '1'
         run: |
-          zig build --release=safe e2e -Dscenario="$SCENARIO" -Dclient-version="$VERSION"
+          bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe e2e -Dscenario="$SCENARIO" -Dclient-version="$VERSION"
       - name: Preserve evidence
         if: always()
         uses: actions/upload-artifact@v7
