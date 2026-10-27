@@ -1,0 +1,53 @@
+name: E2E group
+
+on:
+  workflow_call:
+    inputs:
+      matrix:
+        type: string
+        required: true
+
+jobs:
+  e2e:
+    name: E2E (${{ matrix.scenario }}, ${{ matrix.version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - uses: ./.github/actions/dependencies
+        with:
+          jdk: 'true'
+          registries: 'true'
+          clients: ${{ matrix.clients }}
+          assets: 'true'
+          native: 'true'
+          previous: ${{ matrix.upgrade }}
+      - name: Real-client acceptance
+        working-directory: e2e
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+          VERSION: ${{ matrix.version }}
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe e2e -Dscenario="$SCENARIO" -Dclient-version="$VERSION"
+      - name: Preserve evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-${{ matrix.scenario }}-${{ matrix.version }}
+          path: |
+            e2e/tests/*/artifacts/**/summary.json
+            e2e/tests/*/artifacts/**/upgrade.json
+            e2e/tests/*/artifacts/**/*.metrics.json
+            e2e/tests/*/artifacts/**/*.result
+            e2e/tests/*/artifacts/**/*.log
+            e2e/tests/*/artifacts/**/*.jsonl
+            e2e/tests/*/artifacts/**/screenshots/*.png
+            e2e/tests/*/artifacts/**/*-failed-packet.*
+          if-no-files-found: warn
+          retention-days: 7

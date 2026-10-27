@@ -10,7 +10,7 @@ pub fn main(init: std.process.Init) !void {
     const cases = try catalog.load(allocator, init.io, if (args.len >= 2) args[1] else "tests");
     const requested = if (args.len == 3) args[2] else null;
 
-    const Entry = struct { scenario: []const u8, version: []const u8, clients: []const u8, upgrade: bool };
+    const Entry = struct { scenario: []const u8, version: []const u8, clients: []const u8, group: []const u8, upgrade: bool };
     var entries: std.ArrayList(Entry) = .empty;
     for (cases) |case| {
         if (case.internal) continue;
@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !void {
                 for (clients.items) |existing| duplicate = duplicate or std.mem.eql(u8, peer, existing);
                 if (!duplicate) try clients.append(allocator, peer);
             }
-            try entries.append(allocator, .{ .scenario = case.name, .version = version, .clients = try std.mem.join(allocator, ",", clients.items), .upgrade = case.upgrade });
+            try entries.append(allocator, .{ .scenario = case.name, .version = version, .clients = try std.mem.join(allocator, ",", clients.items), .group = if (clients.items.len > 1) "mixed" else version, .upgrade = case.upgrade });
         }
     }
     if (entries.items.len == 0 or entries.items.len > 256) return error.InvalidMatrixSize;
