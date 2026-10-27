@@ -86,6 +86,8 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             decoded: ?Buffers.Lease = null,
             input_burst: ?Buffers.Lease = null,
             output_burst: ?Buffers.Lease = null,
+            // Shared framing can outlive completion of the connection's codec task.
+            frame_targets: usize = 0,
             control_burst: ?Buffers.Lease = null,
             control_raw: ?Buffers.Lease = null,
             control_used: usize = 0,
@@ -392,7 +394,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             var ready = true;
             for (self.connections, 0..) |*connection, index| {
                 if (connection.handle == null) continue;
-                if (connection.closing or connection.receiving or connection.sending or connection.loan.load(.acquire) or connection.codec.state.load(.acquire) != .idle or connection.control_building or connection.received != 0 or connection.receive_tail != 0 or connection.group != null) {
+                if (connection.closing or connection.receiving or connection.sending or connection.loan.load(.acquire) or connection.frame_targets != 0 or connection.codec.state.load(.acquire) != .idle or connection.control_building or connection.received != 0 or connection.receive_tail != 0 or connection.group != null) {
                     ready = false;
                     continue;
                 }
@@ -569,6 +571,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
         /// The caller has stopped new Play output. Existing output and input loans must drain before
         /// changing the codec phase. Cipher streams stay intact.
         pub fn reconfigure(self: *Self, io: std.Io, handle: network.Handle) !bool {
+            if (self.connections[handle.index].frame_targets != 0) return false;
             if (self.connections[handle.index].codec.state.load(.acquire) != .idle or self.connections[handle.index].received != 0 or self.connections[handle.index].receive_tail != 0 or self.connections[handle.index].decoded_result != null) return false;
             const connection = &self.connections[handle.index];
             assert(connection.handle != null and std.meta.eql(connection.handle.?, handle));
@@ -1012,6 +1015,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
         pub fn releaseBuffers(self: *Self, index: usize) void {
             self.delivery_ready = true;
             const connection = &self.connections[index];
+            assert(connection.frame_targets == 0);
             connection.group = null;
             assert(connection.codec.state.load(.acquire) == .idle);
             assert(!connection.receiving and !connection.sending and !connection.loan.load(.acquire));
@@ -1425,7 +1429,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
 
                 if (connection.state.phase == .rejected and connection.output.len == 0) connection.closing = true;
                 const stopping = self.stopping or connection.disconnect_deadline != null;
-                if (stopping) {
+                if (stopping and !connection.closing) {
                     if (connection.state.phase != .play or now >= (connection.disconnect_deadline orelse self.stop_deadline)) {
                         connection.closing = true;
                     } else if (connection.group != null) {
@@ -1458,7 +1462,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 if (connection.closing) {
                     if (!connection.closed) self.networking.close(io, handle, .local_close);
 
-                    if (connection.closed and !connection.loan.load(.acquire)) {
+                    if (connection.closed and !connection.loan.load(.acquire) and connection.frame_targets == 0) {
                         if (!connection.attached or self.config.observer.detached(handle)) {
                             self.config.observer.closed(handle);
                             self.networking.release(io, handle);

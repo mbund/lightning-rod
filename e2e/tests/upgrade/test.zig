@@ -83,6 +83,7 @@ pub const Test = struct {
             .current_executable = current,
         }, .{});
         try cwd.writeFile(init.io, .{ .sub_path = try std.fs.path.join(allocator, &.{ artifacts, "upgrade.json" }), .data = evidence });
+        try validateImages(init.io, executable, replacement);
         const key = init.environ_map.get("LIGHTNING_ROD_E2E_KEY") orelse return error.MissingEncryptionKey;
         return .{
             .executable = executable,
@@ -99,17 +100,6 @@ pub const Test = struct {
         if (!self.replaced and try artifacts_api.allMarkers(init, artifacts, peers[0..2], ".upgrade-before") and
             try artifacts_api.allMarkers(init, artifacts, peers[2..3], ".upgrade-rejected"))
         {
-            const previous = reload.Image.open(init.io, self.executable) catch |err| {
-                std.log.err("event=upgrade_incompatible_previous reason={t}", .{err});
-                return error.UpgradeHandoffIncompatible;
-            };
-            defer previous.close(init.io);
-            const next = try reload.Image.open(init.io, self.replacement);
-            defer next.close(init.io);
-            if (previous.supports(protocols.latest.protocol_number, null)) return error.LatestProtocolNotWithheld;
-            if (!next.supports(protocols.latest.protocol_number, null)) return error.LatestProtocolNotAdded;
-            const existing = protocols.versions[protocols.releaseIndex(protocols.latest.minecraft_version).? - 1];
-            if (!previous.supports(existing.protocol_number, null) or !next.supports(existing.protocol_number, null)) return error.ExistingProtocolRemoved;
             try std.Io.Dir.cwd().rename(self.replacement, .cwd(), self.executable, init.io);
             try std.posix.kill(server, .USR1);
             self.replaced = true;
@@ -137,4 +127,18 @@ fn command(init: std.process.Init, argv: []const []const u8, directory: ?[]const
         return error.UpgradeCommandFailed;
     }
     return result.stdout;
+}
+
+fn validateImages(io: std.Io, previous_path: []const u8, replacement_path: []const u8) !void {
+    const previous = reload.Image.open(io, previous_path) catch |err| {
+        std.log.err("event=upgrade_incompatible_previous reason={t}", .{err});
+        return error.UpgradeHandoffIncompatible;
+    };
+    defer previous.close(io);
+    const next = try reload.Image.open(io, replacement_path);
+    defer next.close(io);
+    if (previous.supports(protocols.latest.protocol_number, null)) return error.LatestProtocolNotWithheld;
+    if (!next.supports(protocols.latest.protocol_number, null)) return error.LatestProtocolNotAdded;
+    const existing = protocols.versions[protocols.releaseIndex(protocols.latest.minecraft_version).? - 1];
+    if (!previous.supports(existing.protocol_number, null) or !next.supports(existing.protocol_number, null)) return error.ExistingProtocolRemoved;
 }

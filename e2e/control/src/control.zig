@@ -11,7 +11,7 @@ pub const Control = struct {
         payloads: *vanilla.PayloadChannels.Play,
         players: *vanilla.Players,
         reload: *vanilla.Reload,
-        persistence: ?*lightning_rod.storage.Store,
+        persistence: *lightning_rod.storage.Store,
         checkpoint: *lightning_rod.Checkpoint,
     };
     pub const channel = "lightning_rod:e2e";
@@ -98,8 +98,7 @@ pub const Control = struct {
             const fence = &self.fences[self.fence_count];
             fence.* = .{ .name = .{ .bytes = undefined, .len = @intCast(name.len) }, .handle = handle };
             if (durable) {
-                const persistence = self.deps.persistence orelse return error.DurabilityUnavailable;
-                fence.durable = try std.math.add(u64, persistence.lastTick(), 1);
+                fence.durable = try std.math.add(u64, self.deps.persistence.lastTick(), 1);
                 self.deps.checkpoint.request();
             }
             @memcpy(fence.name.bytes[0..fence.name.len], name);
@@ -142,7 +141,7 @@ pub const Control = struct {
             fence.remaining -|= 1;
             // Input precedes plugin ticks. Waiting for the following tick covers every plugin,
             // regardless of where this control plugin appears in dependency order.
-            if (fence.remaining == 0 and player.stage == .ready and (fence.durable == null or self.deps.persistence.?.durableTick() >= fence.durable.?)) {
+            if (fence.remaining == 0 and player.stage == .ready and (fence.durable == null or self.deps.persistence.durableTick() >= fence.durable.?)) {
                 var buffer: [134]u8 = undefined;
                 const target: sessions.Service.Target = .{ .handle = fence.handle, .protocol = player.protocol };
                 try self.fanout(&.{target}, try std.fmt.bufPrint(&buffer, "fence {s}", .{fence.name.bytes[0..fence.name.len]}));
@@ -243,7 +242,7 @@ test "markers catch up after readiness backpressure and connection reuse" {
     var cursors: [2]Control.Cursor = @splat(.{});
     var targets: [2]sessions.Service.Target = undefined;
     var delivered: [2]sessions.Service.Delivery = undefined;
-    var control: Control = .{ .deps = .{ .players = &players, .payloads = &payloads, .reload = undefined, .persistence = null, .checkpoint = undefined }, .cursors = &cursors, .targets = &targets, .delivered = &delivered };
+    var control: Control = .{ .deps = .{ .players = &players, .payloads = &payloads, .reload = undefined, .persistence = undefined, .checkpoint = undefined }, .cursors = &cursors, .targets = &targets, .delivered = &delivered };
 
     try control.receive(bob, "sync", std.testing.allocator);
     try control.receive(alice, "mark alice.ready", std.testing.allocator);
@@ -255,12 +254,12 @@ test "markers catch up after readiness backpressure and connection reuse" {
     try std.testing.expectEqual(@as(usize, 1), control.cursors[1].next);
     const replay = service.output.takeReady().?;
     try std.testing.expect(std.mem.indexOf(u8, replay.bytes, "mark alice.ready") != null);
-    try std.testing.expectEqualSlices(sessions.Handle, &.{alice}, replay.recipients);
+    try std.testing.expect(replay.recipients.eqlSlice(&.{alice}));
     _ = service.preparing.fetchSub(1, .release);
     try std.testing.expect(service.output.releaseReady(replay.page, replay.generation));
     const catchup = service.output.takeReady().?;
     try std.testing.expect(std.mem.indexOf(u8, catchup.bytes, "mark alice.ready") != null);
-    try std.testing.expectEqualSlices(sessions.Handle, &.{bob}, catchup.recipients);
+    try std.testing.expect(catchup.recipients.eqlSlice(&.{bob}));
     _ = service.preparing.fetchSub(1, .release);
     try std.testing.expect(service.output.releaseReady(catchup.page, catchup.generation));
 

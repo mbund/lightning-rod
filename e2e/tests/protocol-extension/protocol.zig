@@ -136,6 +136,11 @@ pub const Crypt = struct {
             self.receive(bytes);
         }
 
+        pub fn encrypt(_: *Connection, source: []const u8, destination: []u8) void {
+            std.debug.assert(source.len == destination.len);
+            for (source, destination) |byte, *out| out.* = byte ^ 0x5a;
+        }
+
         pub fn clear(self: *Connection) void {
             self.base.clear();
         }
@@ -148,12 +153,16 @@ pub const Crypt = struct {
             return bytes;
         }
 
-        pub fn frameControl(self: *Connection, packet: []const u8, _: []u8, output: []u8, _: *Crypt.Wire.Workspace, _: ?usize) ![]const u8 {
-            if (packet.len > std.math.maxInt(u16) or output.len < packet.len + 2) return error.BufferTooSmall;
-            std.mem.writeInt(u16, output[0..2], @intCast(packet.len), .big);
-            @memcpy(output[2..][0..packet.len], packet);
-            self.send(output[0 .. packet.len + 2]);
-            return output[0 .. packet.len + 2];
+        pub fn frameControl(self: *Connection, packet: sessions.protocol.Packet, output: []u8, _: *Crypt.Wire.Workspace, _: ?usize) !sessions.protocol.Fragments {
+            const bytes = switch (packet) {
+                .buffered => |value| value.storage[sessions.shared_headroom..][0..value.length],
+                .borrowed => |value| value,
+            };
+            if (bytes.len > std.math.maxInt(u16) or output.len < bytes.len + 2) return error.BufferTooSmall;
+            std.mem.writeInt(u16, output[0..2], @intCast(bytes.len), .big);
+            self.send(output[0..2]);
+            self.encrypt(bytes, output[2..][0..bytes.len]);
+            return .{ .first = output[0 .. bytes.len + 2] };
         }
 
         pub fn playBorrowed(_: *const Connection) bool {

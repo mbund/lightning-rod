@@ -146,42 +146,42 @@ pub fn Runtime(comptime Endpoint: type, comptime Selections: type) type {
             const connection = &self.connections[handle.index];
             if (connection.generation != handle.generation) return error.InvalidConnection;
 
-            inline for (versions) |Version| {
-                if (profile.protocol == Version.protocol_number) {
-                    if (event == .attached or event == .park or event == .disconnect) {
-                        connection.play_index = 0;
-                        var result: ?[]const u8 = null;
-                        inline for (0..count) |index| {
-                            const entry = self.phases.entries[index];
-                            if (entry.play) |handler| {
-                                if (try handler.vtable.call(handler.context, profile, &connection.values[index], event, output)) |bytes| {
-                                    if (event == .attached or result != null or bytes.len == 0 or bytes.len > output.len or bytes.ptr != output.ptr)
-                                        return error.InvalidPhaseOutput;
-                                    result = bytes;
-                                }
-                            }
-                        }
-                        return result;
-                    }
+            const supported = inline for (versions) |Version| {
+                if (profile.protocol == Version.protocol_number) break true;
+            } else false;
+            if (!supported) return error.UnsupportedProtocol;
 
-                    inline for (0..count) |index| {
-                        const entry = self.phases.entries[index];
-                        if (connection.play_index <= index) {
-                            if (entry.play) |handler| {
-                                const bytes = try handler.vtable.call(handler.context, profile, &connection.values[index], event, output);
-                                if (bytes) |result| {
-                                    if (result.len == 0 or result.len > output.len) return error.InvalidPhaseOutput;
-                                    connection.play_index = index + 1;
-                                    return result;
-                                }
-                            }
+            if (event == .attached or event == .park or event == .disconnect) {
+                connection.play_index = 0;
+                var result: ?[]const u8 = null;
+                inline for (0..count) |index| {
+                    const entry = self.phases.entries[index];
+                    if (entry.play) |handler| {
+                        if (try handler.vtable.call(handler.context, profile, &connection.values[index], event, output)) |bytes| {
+                            if (event == .attached or result != null or bytes.len == 0 or bytes.len > output.len or bytes.ptr != output.ptr)
+                                return error.InvalidPhaseOutput;
+                            result = bytes;
                         }
                     }
-                    connection.play_index = 0;
-                    return null;
+                }
+                return result;
+            }
+
+            inline for (0..count) |index| {
+                const entry = self.phases.entries[index];
+                if (connection.play_index <= index) {
+                    if (entry.play) |handler| {
+                        const bytes = try handler.vtable.call(handler.context, profile, &connection.values[index], event, output);
+                        if (bytes) |result| {
+                            if (result.len == 0 or result.len > output.len) return error.InvalidPhaseOutput;
+                            connection.play_index = index + 1;
+                            return result;
+                        }
+                    }
                 }
             }
-            return error.UnsupportedProtocol;
+            connection.play_index = 0;
+            return null;
         }
 
         pub fn phase(self: *Self, comptime phase_kind: PhaseKind, scope: sessions.PhaseScope, event: sessions.PhaseEvent, output: []u8) !(if (phase_kind == .login) sessions.LoginStep else sessions.ConfigurationStep) {

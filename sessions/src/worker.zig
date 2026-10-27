@@ -440,6 +440,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                 connection.receiving = false;
                 connection.sending = false;
                 connection.loan.store(false, .release);
+                connection.frame_targets = 0;
                 if (connection.handle) |handle| {
                     self.closed(handle);
                     if (connection.lifecycle) |*lifecycle| Endpoint.clear(lifecycle);
@@ -592,6 +593,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                 if (compressed) |selected| if (selected != compression) continue;
                 self.engine.reserveOutput(native, candidate.required) catch continue;
                 const destination = self.engine.prepareSend(native) catch continue;
+                connection.frame_targets += 1;
                 self.engine.claimGroup(native, origin, group);
                 compressed = compression;
                 protocol = connection.protocol.?.number;
@@ -805,19 +807,21 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                     const packet = pending.packet;
                     const charge = endpoint.framedBound(packet.bytes.len);
                     var checking = pending.remaining.iterator(.{});
-                    while (checking.next()) |recipient| {
-                        const handle = packet.recipients.at(recipient);
-                        const credit = endpoint.credit[handle.index].load(.acquire);
-                        if (credit >> 32 != handle.generation or credit & Service.active == 0) {
-                            pending.complete(recipient);
-                            self.delivery_ready = true;
-                            continue;
-                        }
-                        const native = endpoint.routes[handle.index] orelse unreachable;
-                        if (self.engine.discardGroup(native)) {
-                            endpoint.refund(handle, charge);
-                            pending.complete(recipient);
-                            self.delivery_ready = true;
+                    if (pending.frame == null or pending.frame.?.ready) {
+                        while (checking.next()) |recipient| {
+                            const handle = packet.recipients.at(recipient);
+                            const credit = endpoint.credit[handle.index].load(.acquire);
+                            if (credit >> 32 != handle.generation or credit & Service.active == 0) {
+                                pending.complete(recipient);
+                                self.delivery_ready = true;
+                                continue;
+                            }
+                            const native = endpoint.routes[handle.index] orelse unreachable;
+                            if (self.engine.discardGroup(native)) {
+                                endpoint.refund(handle, charge);
+                                pending.complete(recipient);
+                                self.delivery_ready = true;
+                            }
                         }
                     }
                     const needs_frame = pending.remaining_count != 0;
@@ -870,6 +874,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                                             },
                                         };
                                         self.engine.claimGroup(native, index, packet.group);
+                                        connection.frame_targets += 1;
                                         self.target_free_count -= 1;
                                         const slot = self.target_free[self.target_free_count];
                                         const destination = &self.send_targets[slot];
@@ -914,6 +919,10 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                                 var next_target = frame.targets;
                                 while (next_target) |target| {
                                     next_target = target.next;
+                                    const recipient_index = if (frame.sequence != null) target.recipient else packet.recipients.at(target.recipient).index;
+                                    const native = endpoint.routes[recipient_index].?;
+                                    const connection = &self.engine.connections[native.index];
+                                    assert(connection.frame_targets > 0);
                                     if (target.sent) {
                                         if (frame.sequence != null) {
                                             var member: ?*Frame = frame;
@@ -927,7 +936,6 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                                                 const encoded = entry.frame.?.sequence.?.bytes;
                                                 const handle = entry.packet.recipients.at(recipient);
                                                 assert(handle.index == target.recipient);
-                                                const native = endpoint.routes[handle.index].?;
                                                 entry.complete(recipient);
                                                 self.delivery_ready = true;
                                                 self.engine.completeGroupPacket(native, index, entry.packet.group);
@@ -939,13 +947,14 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                                             assert(pending.remaining.isSet(target.recipient));
                                             pending.complete(target.recipient);
                                             self.delivery_ready = true;
-                                            const native = endpoint.routes[packet.recipients.at(target.recipient).index].?;
                                             self.engine.completeGroupPacket(native, index, packet.group);
                                             const bytes = (try result).bytes;
                                             endpoint.refund(packet.recipients.at(target.recipient), charge - bytes.len);
                                             self.instruments.fanout_bytes.add(bytes.len);
                                         }
                                     }
+                                    connection.frame_targets -= 1;
+                                    self.engine.readiness.signal(native.index).notify();
                                     self.target_free[self.target_free_count] = target.index;
                                     self.target_free_count += 1;
                                 }
@@ -1444,6 +1453,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
         }
 
         pub fn detached(self: *Self, handle: network.Handle) bool {
+            if (self.engine.connections[handle.index].frame_targets != 0) return false;
             const binding = self.bindings[handle.index].?;
             assert(std.meta.eql(binding.native, handle));
             _ = binding.endpoint.credit[binding.handle.index].fetchAnd(~Service.active, .acq_rel);
@@ -2078,7 +2088,7 @@ test "capacity released by a later endpoint wakes an earlier waiting endpoint" {
     try std.testing.expectEqual(@as(usize, 2), owner.engine.connections[1].output_write);
 }
 
-test "encrypted sequences batch rotating exclusions without extra handoffs" {
+test "encrypted sequences batch rotating exclusions and retain closing recipients until completion" {
     for ([_]bool{ false, true }) |compact| {
         for ([_]bool{ false, true }) |exclude_self| {
             const Owner = Worker(TestEndpoint, TestHooks, SingleSimulation);
@@ -2171,6 +2181,9 @@ test "encrypted sequences batch rotating exclusions without extra handoffs" {
             }
             try codec.start();
             codec.stop();
+            owner.engine.connections[0].closing = true;
+            try std.testing.expectEqual(@as(usize, 1), owner.engine.connections[0].frame_targets);
+            try std.testing.expect(!owner.detached(handles[0]));
             for (owner.engine.connections, 0..) |*connection, recipient| {
                 const result = try (Owner.Codec.take(&connection.codec) orelse return error.MissingSendCompletion);
                 var offset: usize = 0;
@@ -2186,6 +2199,7 @@ test "encrypted sequences batch rotating exclusions without extra handoffs" {
             try owner.deliver(std.testing.io);
             try std.testing.expectEqual(@as(usize, 0), endpoint.preparing.load(.acquire));
             try std.testing.expect(owner.queues[0].head == null);
+            for (owner.engine.connections) |connection| try std.testing.expectEqual(@as(usize, 0), connection.frame_targets);
         }
     }
 }

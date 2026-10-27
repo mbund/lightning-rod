@@ -122,7 +122,7 @@ pub fn Simulation(comptime Selections: type) type {
             errdefer self.state = .failed;
             const transaction = self.transaction;
             errdefer transaction.fail();
-            try runtime.initialize(reserve_only, &self.instances, selections, &self.permanent, &self.metrics, &self.plugin_metrics, self.io, transaction, plugin.environment(.{ .checkpoint = &self.save_requested }, environment));
+            try runtime.initialize(reserve_only, &self.instances, selections, &self.permanent, &self.metrics, &self.plugin_metrics, self.io, transaction, plugin.environment(.{ .checkpoint = &self.save_requested, .persistence = self.storage }, environment));
             self.metrics.seal();
             self.permanent.seal();
         }

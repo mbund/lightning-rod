@@ -248,6 +248,11 @@ pub const Exporter = struct {
             state.stream.ready.set(io);
             return;
         }
+        if (state.finished) return;
+        if (state.stream.sealed.load(.acquire) and state.pending_sample == null and state.snapshot_at == state.snapshot_count and state.stream.head.load(.acquire) == state.stream.tail.load(.acquire)) {
+            try state.drain(io, 0);
+            return;
+        }
         const now = std.Io.Clock.now(.awake, io).nanoseconds;
         if (state.snapshot_at == state.snapshot_count and now >= state.next_snapshot) {
             state.snapshot_count = (try state.registry.?.snapshotTree(state.snapshots)).len;
@@ -447,6 +452,12 @@ test "exporter drains standard observations and acknowledges only a producer cut
     }
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, complete_path, .{}));
     timer.observe(60_000_000);
+    while (!exporter.state.finished) {
+        try exporter.poll(io);
+        if (std.Io.Clock.now(.awake, io).nanoseconds >= deadline) return error.TestTimeout;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.Io.Dir.cwd().access(io, complete_path, .{});
     try exporter.finish(io);
     try exporter.deinit(allocator, io, &registry);
     closed = true;

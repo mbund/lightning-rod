@@ -290,17 +290,10 @@ fn runCase(init: std.process.Init, source: *corpus.Corpus, trace: *const traces.
 }
 
 const CodecResult = struct { sections: usize, decoded_bytes: u64, encoded_bytes: u64, representations: [3]usize, encoded_size_bounds: [6]usize, encoded_size_counts: [6]usize, encode: Measurement, decode: Measurement };
-fn benchmarkCodec(init: std.process.Init, source: *const corpus.Corpus, base: []const u8) !CodecResult {
+fn benchmarkCodec(init: std.process.Init, source: *const corpus.Corpus) !CodecResult {
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var registry = try metrics.Registry.init(init.gpa, init.io, .{ .capacity = 128 });
-    defer registry.deinit();
-    var store = try storage.Store.init(init.gpa, init.io, .{ .path = base });
-    defer store.deinit();
-    defer store.transaction().fail();
-    const world = try chunks.Chunks.init(allocator, init.io, .{}, .{ .metrics = &registry, .storage = try store.openSpace(chunks.Chunks.id), .record_workspaces = try records.Workspaces.init(allocator, init.io, .{}) });
-    const codec = world.cache.codec.?;
     const encoded = try allocator.alloc([corpus.section_bytes]u8, corpus.section_count);
     const decoded = try allocator.alloc([corpus.section_bytes]u8, corpus.section_count);
     const encoding_samples = try Samples.init(allocator, source.columns.len);
@@ -314,11 +307,9 @@ fn benchmarkCodec(init: std.process.Init, source: *const corpus.Corpus, base: []
         var slices: [corpus.section_count][]const u8 = undefined;
         var lengths: [corpus.section_count]usize = undefined;
         const start = common.Stamp.now(init.io);
-        for (column.sections, encoded, &slices) |section, *destination, *slice| slice.* = try codec.encode(section, destination);
+        for (column.sections, encoded, &slices) |section, *destination, *slice| slice.* = try chunks.encoding.encode(section, destination);
         encoding_samples.set(i, common.Stamp.now(init.io).since(start));
-        for (column.sections, slices, decoded, &lengths) |section, bytes, *destination, *length| {
-            @memcpy(destination[0..bytes.len], bytes);
-            length.* = bytes.len;
+        for (column.sections, slices) |section, bytes| {
             input_bytes += section.len;
             output_bytes += bytes.len;
             representations[bytes[0]] += 1;
@@ -328,7 +319,7 @@ fn benchmarkCodec(init: std.process.Init, source: *const corpus.Corpus, base: []
             };
         }
         const decode_start = common.Stamp.now(init.io);
-        for (decoded, &lengths) |*destination, *length| length.* = try codec.decode(destination, length.*);
+        for (slices, decoded, &lengths) |bytes, *destination, *length| length.* = try chunks.encoding.decodeTo(bytes, destination);
         decoding_samples.set(i, common.Stamp.now(init.io).since(decode_start));
         for (column.sections, decoded, lengths) |section, *bytes, length| if (!std.mem.eql(u8, section, bytes[0..length])) return error.CodecMismatch;
     }
@@ -380,7 +371,7 @@ fn run(init: std.process.Init) !void {
     try source.replicate(allocator, options.copies);
     const base = try std.fs.path.join(allocator, &.{ options.output, "base.world" });
     _ = try terrain.seedDatabase(init, &source, base);
-    const codec = try benchmarkCodec(init, &source, base);
+    const codec = try benchmarkCodec(init, &source);
     std.debug.print("Codec: {d} sections, {d} decoded -> {d} encoded bytes, CPU encode {d:.2}ms decode {d:.2}ms\n", .{ codec.sections, codec.decoded_bytes, codec.encoded_bytes, @as(f64, @floatFromInt(codec.encode.cpu.total_ns)) / 1e6, @as(f64, @floatFromInt(codec.decode.cpu.total_ns)) / 1e6 });
     var results: std.ArrayList(Result) = .empty;
     for (std.enums.values(traces.Pattern)) |pattern| {

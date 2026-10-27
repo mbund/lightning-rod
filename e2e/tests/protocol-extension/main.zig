@@ -37,6 +37,7 @@ const WorldProvider = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    const maximum_players = 2;
     const startup = profile.Startup.capture(init.io);
     const metrics_output: lightning_rod.metrics.Exporter.Configuration = .{
         .directory = init.environ_map.get("LIGHTNING_ROD_METRICS_DIRECTORY") orelse return error.MissingMetricsDirectory,
@@ -50,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
     const gameplay_plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(vanilla.plugins(), .{
             lightning_rod.plugin.configured(WorldProvider, WorldProvider.Configuration{}),
-            lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .maximum = 2, .render_distance = 2 }),
+            lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .maximum = maximum_players, .render_distance = 2 }),
         }),
         lightning_rod.plugin.configured(e2e_control.Control, .{}),
     });
@@ -78,8 +79,8 @@ pub fn main(init: std.process.Init) !void {
             .plugins = session_plugins,
             .protocols = &selected,
             .router = .{},
-            .endpoints = &.{.{ .id = 0 }},
-            .max_players = 2,
+            .endpoints = &.{.{ .id = 0, .connections = maximum_players }},
+            .max_players = maximum_players,
             .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } },
         },
         .metrics_export = metrics_output,

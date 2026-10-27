@@ -118,6 +118,11 @@ const Endpoint = struct {
                 @memcpy(context.output[0..bytes.len], bytes);
                 return context.output[0..bytes.len];
             },
+            .disconnect => {
+                context.observer.disconnects += 1;
+                context.output[0] = 0;
+                return context.output[0..1];
+            },
             else => return error.UnexpectedEvent,
         }
         return null;
@@ -130,6 +135,7 @@ const Observer = struct {
     due: ?i96 = null,
     restored: usize = 0,
     sent_bytes: usize = 0,
+    disconnects: usize = 0,
     payloads: [2][]const u8 = @splat(&.{}),
     pub fn closed(_: *Observer, _: network.Handle) void {}
     pub fn handshake(_: *Observer, _: []const u8) !protocol.Handshake {
@@ -161,6 +167,7 @@ const Native = struct {
     sends: [2]?[]const u8 = @splat(null),
     send_vectors: [2][]const std.posix.iovec_const = @splat(&.{}),
     send_calls: usize = 0,
+    released: usize = 0,
     send_full: bool = false,
     wake: ?*std.Io.Event = null,
     events: [2]network.Event = undefined,
@@ -181,8 +188,8 @@ const Native = struct {
     pub fn close(_: *Native, _: std.Io, _: network.Handle, _: network.CloseReason) void {
         unreachable;
     }
-    pub fn releaseConnection(_: *Native, _: std.Io, _: network.Handle) void {
-        unreachable;
+    pub fn releaseConnection(self: *Native, _: std.Io, _: network.Handle) void {
+        self.released += 1;
     }
     pub fn submit(_: *Native, _: std.Io) !void {}
     pub fn poll(self: *Native, _: std.Io, _: ?std.Io.Timeout, output: []network.Event) !usize {
@@ -216,6 +223,39 @@ const Native = struct {
         return .{ .index = @intCast(fd - 100), .generation = 1 };
     }
 };
+
+test "closed play connections cannot enqueue disconnect work during shutdown" {
+    const Engine = engine.Engine(Endpoint, Observer);
+    const Codec = packet_codec.Codec(Endpoint);
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |shutdown| {
+        var native: Native = .{};
+        const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
+        var observer: Observer = .{};
+        var catalog: Endpoint.Protocols = .{};
+        const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
+        defer owner.deinit();
+        const codec = try Codec.init(std.testing.allocator, io, transport, 1, null);
+        defer codec.deinit();
+        try owner.attachCodec(codec);
+        owner.setHandle(0, .{ .index = 0, .generation = 1 });
+        const connection = &owner.connections[0];
+        connection.lifecycle = 0;
+        connection.protocol = &catalog.values[0];
+        connection.state.phase = .play;
+        connection.closed = true;
+        connection.closing = true;
+        if (shutdown) owner.beginShutdown(io) else {
+            connection.disconnect_deadline = std.Io.Clock.now(.awake, io).nanoseconds + std.time.ns_per_s;
+            owner.wakeAll();
+        }
+        owner.progress(io);
+        try std.testing.expectEqual(@as(usize, 0), observer.disconnects);
+        try std.testing.expectEqual(@as(usize, 1), native.released);
+        try std.testing.expectEqual(@as(usize, 0), codec.write.load(.acquire));
+        try std.testing.expect(owner.drained());
+    }
+}
 
 pub fn benchmarkSocketBatch() !void {
     const Engine = engine.Engine(Endpoint, Observer);

@@ -67,7 +67,7 @@ test "scoped simulations stage independent ticks for one coordinated commit" {
 const Probe = struct {
     pub const id = "test:checkpoint";
     pub const Configuration = struct {};
-    pub const Dependencies = struct { checkpoint: *lightning_rod.Checkpoint };
+    pub const Dependencies = struct { checkpoint: *lightning_rod.Checkpoint, persistence: *storage.Store };
     deps: Dependencies,
     value: u64 = 0,
     saved: u64 = 0,
@@ -176,6 +176,7 @@ test "disabled autosave saves the complete tick on shutdown" {
     defer simulation.deinit(std.testing.allocator);
     try simulation.initialize(plugins, .{});
     const probe = simulation.get(Probe);
+    try std.testing.expect(probe.deps.persistence == &database.store);
     for (0..300) |_| try simulation.tick();
     try std.testing.expectEqual(@as(u64, 0), database.store.lastTick());
     try std.testing.expectEqual(@as(usize, 0), probe.checkpoints);
