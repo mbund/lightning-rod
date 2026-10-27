@@ -35,8 +35,8 @@ test "corpus validates framing ordering and complete section boundaries" {
     try std.testing.expectEqual(@as(?u32, 0), world.find(0, 0));
     try std.testing.expectEqual(@as(?u32, null), world.find(32, 0));
     var bytes: [8193]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 3), try world.read(.{ .world = 0, .x = 0, .z = 0, .y = -4 }, &bytes));
-    try std.testing.expectError(error.SectionOutsideCorpus, world.read(.{ .world = 0, .x = 0, .z = 0, .y = 20 }, &bytes));
+    try std.testing.expectEqual(@as(usize, 3), try world.readOne(std.testing.io, .{ .world = 0, .x = 0, .z = 0, .y = -4 }, &bytes));
+    try std.testing.expectError(error.SectionOutsideCorpus, world.readOne(std.testing.io, .{ .world = 0, .x = 0, .z = 0, .y = 20 }, &bytes));
     try std.testing.expectError(error.InvalidCorpus, corpus.Corpus.parse(allocator, world.bytes[0..15]));
     try std.testing.expectError(error.InvalidCorpus, corpus.Corpus.parse(allocator, world.bytes[0 .. world.bytes.len - 1]));
     const damaged = try allocator.dupe(u8, world.bytes);
@@ -60,7 +60,7 @@ test "mapped corpus ownership survives repeated opens and spatial replication" {
         try std.testing.expectEqualSlices(u8, &original.hash, &mapped.hash);
         try mapped.replicate(std.testing.allocator, 4);
         var bytes: [8193]u8 = undefined;
-        try std.testing.expectEqual(@as(usize, 3), try mapped.read(.{ .world = 0, .x = 3072, .z = 0, .y = -4 }, &bytes));
+        try std.testing.expectEqual(@as(usize, 3), try mapped.readOne(io, .{ .world = 0, .x = 3072, .z = 0, .y = -4 }, &bytes));
         try std.testing.expectEqualSlices(u8, original.columns[0].sections[0], bytes[0..3]);
     }
 }

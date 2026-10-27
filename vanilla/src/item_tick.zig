@@ -1,7 +1,5 @@
-const persistent_records = @import("records");
 const std = @import("std");
 const inventories = @import("inventories");
-const lightning_rod = @import("lightning_rod");
 const entities = @import("entities");
 const worlds = @import("worlds");
 const ItemEntities = @import("item_entities.zig").ItemEntities;
@@ -9,7 +7,6 @@ const ItemPhysics = @import("item_physics.zig").ItemPhysics;
 const ItemMerging = @import("item_merging.zig").ItemMerging;
 const ItemPickup = @import("item_pickup.zig").ItemPickup;
 const Players = @import("players.zig").Players;
-const item = @import("item.zig");
 const Items = @import("items.zig").Items;
 
 const assert = std.debug.assert;
@@ -36,18 +33,19 @@ pub const ItemTick = struct {
     merged: u64 = 0,
     merge_candidates: usize,
     merge_after: entities.Id = 0,
+    query: ItemEntities.Query,
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*ItemTick {
         const self = try allocator.create(ItemTick);
         if (config.merge_candidates == 0) return error.InvalidConfiguration;
-        self.* = .{ .deps = deps, .merge_candidates = config.merge_candidates };
+        self.* = .{ .deps = deps, .merge_candidates = config.merge_candidates, .query = try ItemEntities.Query.init(allocator, deps.dropped, deps.players) };
         return self;
     }
 
     pub fn tick(self: *ItemTick) !void {
         const dropped = self.deps.dropped;
         var merge_remaining = self.merge_candidates;
-        const active = dropped.nearby(self.deps.players, self.deps.players.config.simulation_distance);
+        const active = self.query.read(self.deps.players.config.simulation_distance);
         var start_low: usize = 0;
         var start_high = active.len;
         while (start_low < start_high) {
@@ -55,12 +53,13 @@ pub const ItemTick = struct {
             if (active[middle] <= self.merge_after) start_low = middle + 1 else start_high = middle;
         }
         // Start after the last merge candidate so dense, unmergeable piles cannot starve others.
+        var neighborhood = self.deps.physics.readWindow();
+        defer neighborhood.deinit();
         var iterator = dropped.iterate(active);
         defer iterator.deinit();
         iterator.start = start_low;
         while (try iterator.next()) |records| for (records) |record| {
             const entity = record.id;
-            const row = .{ .id = entity };
             var metadata = try record.read();
             if (!metadata.alive) continue;
 
@@ -68,7 +67,7 @@ pub const ItemTick = struct {
             metadata.ticks +%= 1;
 
             if (metadata.pickup_delay > 0 and metadata.pickup_delay != 32767) metadata.pickup_delay -= 1;
-            const advanced = try self.deps.physics.advance(@intCast(ItemEntities.networkId(row.id)), metadata.ticks, body, metadata.on_ground);
+            const advanced = try self.deps.physics.advance(&neighborhood, @intCast(entity), metadata.ticks, body, metadata.on_ground);
             metadata.on_ground = advanced.on_ground;
 
             if (!std.meta.eql(body, advanced.body)) {
@@ -80,9 +79,7 @@ pub const ItemTick = struct {
             self.stepped += 1;
             const interval: u32 = if (advanced.crossed_block) 2 else 40;
             if (merge_remaining != 0 and metadata.ticks % interval == 0 and metadata.age != -32768 and metadata.age < 6000 and metadata.pickup_delay != 32767) {
-                const held = (try self.deps.inventories.get(ItemEntities.slot(body))).stack orelse return error.Corrupt;
-                const maximum = try self.deps.items.stackLimit(held);
-                if (held.count < maximum) {
+                if (!dropped.fullStack(record)) {
                     const low: [3]i32 = .{ @intFromFloat(@floor((body.position[0] - 0.75) / 16)), @intFromFloat(@floor((body.position[1] - 0.25) / 16)), @intFromFloat(@floor((body.position[2] - 0.75) / 16)) };
                     const high: [3]i32 = .{ @intFromFloat(@floor((body.position[0] + 0.75) / 16)), @intFromFloat(@floor((body.position[1] + 0.25) / 16)), @intFromFloat(@floor((body.position[2] + 0.75) / 16)) };
                     var x = low[0];
@@ -94,49 +91,72 @@ pub const ItemTick = struct {
                             var y = low[1];
 
                             while (y <= high[1]) : (y += 1) {
-                                var cell = body;
-                                cell.position = .{ @as(f64, @floatFromInt(x)) * 16, @as(f64, @floatFromInt(y)) * 16, @as(f64, @floatFromInt(z)) * 16 };
-                                const prefix = ItemEntities.spatialKey(0, cell);
-                                var after = prefix;
-                                var position: persistent_records.ScanCursor = .{ .after = &after, .after_len = 17 };
-                                var keys: [16][25]u8 = undefined;
-                                var values: [16][54]u8 = undefined;
-                                var entries: [16]persistent_records.ScanEntry = undefined;
-
-                                for (&entries, &keys, &values) |*entry, *key, *value| entry.* = .{ .key = key, .value = value };
-
-                                var more = true;
-
-                                while (more) {
-                                    const batch = try dropped.cache.scan(&position, &entries);
-                                    more = batch.more;
-
-                                    for (entries[0..batch.count]) |entry| {
-                                        if (merge_remaining == 0) break :neighbors;
-                                        merge_remaining -= 1;
-                                        self.merge_after = entity;
-                                        if (entry.key_len != 25 or !std.mem.eql(u8, entry.key[0..17], prefix[0..17])) {
-                                            more = false;
-                                            break;
-                                        }
-
-                                        const other_id = std.mem.readInt(u64, entry.key[17..25], .big);
-                                        if (other_id == row.id) continue;
-
-                                        var other_meta = try dropped.get(other_id);
-                                        if (!other_meta.alive) continue;
-
-                                        const other = (try self.deps.entities.get(other_id)) orelse return error.Corrupt;
-                                        assert(other.world == body.world);
-                                        if (@abs(body.position[0] - other.position[0]) >= 0.75 or @abs(body.position[1] - other.position[1]) >= 0.25 or @abs(body.position[2] - other.position[2]) >= 0.75)
+                                var after: entities.Id = 0;
+                                while (merge_remaining != 0) {
+                                    var candidate_ids: [16]entities.Id = undefined;
+                                    const capacity = @min(candidate_ids.len, dropped.cache.entries.len / 4, self.deps.entities.cache.entries.len / 2, self.deps.inventories.cache.entries.len - 1, merge_remaining);
+                                    assert(capacity > 0);
+                                    const batch = dropped.inSection(.{ .world = body.world, .x = x, .y = y, .z = z }, &after, candidate_ids[0..capacity]);
+                                    if (batch.len == 0) break;
+                                    merge_remaining -= batch.len;
+                                    self.merge_after = entity;
+                                    var count: usize = 0;
+                                    for (batch) |candidate_id| {
+                                        if (candidate_id == entity) continue;
+                                        candidate_ids[count] = candidate_id;
+                                        count += 1;
+                                    }
+                                    if (count == 0) continue;
+                                    var metadata_leases: [16]ItemEntities.MetadataLease = undefined;
+                                    var metadata_values: [16]ItemEntities.Metadata = undefined;
+                                    try dropped.acquireMetadataMany(candidate_ids[0..count], metadata_leases[0..count]);
+                                    var metadata_count = count;
+                                    defer for (metadata_leases[0..metadata_count]) |lease| lease.release();
+                                    for (metadata_leases[0..count], metadata_values[0..count]) |lease, *value| value.* = try lease.read();
+                                    var accepted: usize = 0;
+                                    for (candidate_ids[0..count], metadata_leases[0..count], metadata_values[0..count]) |candidate_id, lease, value| {
+                                        if (!value.alive or value.owner != metadata.owner or value.age == -32768 or value.age >= 6000 or value.pickup_delay == 32767) {
+                                            lease.release();
                                             continue;
-
-                                        var contents: [2]inventories.Contents = undefined;
-                                        try self.deps.inventories.getMany(&.{ ItemEntities.slot(body), ItemEntities.slot(other) }, &contents);
-                                        const first, const second = contents;
+                                        }
+                                        candidate_ids[accepted] = candidate_id;
+                                        metadata_leases[accepted] = lease;
+                                        metadata_values[accepted] = value;
+                                        accepted += 1;
+                                    }
+                                    metadata_count = accepted;
+                                    count = accepted;
+                                    if (count == 0) continue;
+                                    var body_leases: [16]entities.Entities.Lease = undefined;
+                                    var bodies: [16]entities.State = undefined;
+                                    try self.deps.entities.acquireMany(candidate_ids[0..count], body_leases[0..count]);
+                                    defer for (body_leases[0..count]) |lease| lease.release();
+                                    var mapping: [16]usize = undefined;
+                                    var slots: [17]inventories.Slot = undefined;
+                                    var contents: [17]inventories.Contents = undefined;
+                                    slots[0] = ItemEntities.slot(body);
+                                    accepted = 0;
+                                    for (body_leases[0..count], bodies[0..count], 0..) |lease, *other, index| {
+                                        other.* = (try lease.read()) orelse return error.Corrupt;
+                                        assert(other.world == body.world);
+                                        if (@abs(body.position[0] - other.position[0]) >= 0.75 or @abs(body.position[1] - other.position[1]) >= 0.25 or @abs(body.position[2] - other.position[2]) >= 0.75) continue;
+                                        mapping[accepted] = index;
+                                        slots[accepted + 1] = ItemEntities.slot(other.*);
+                                        accepted += 1;
+                                    }
+                                    if (accepted == 0) continue;
+                                    try self.deps.inventories.getMany(slots[0 .. accepted + 1], contents[0 .. accepted + 1]);
+                                    var first = contents[0];
+                                    const held = first.stack orelse return error.Corrupt;
+                                    const maximum = try dropped.mergeLimit(record, held);
+                                    if (held.count >= maximum) break :neighbors;
+                                    for (mapping[0..accepted], contents[1..][0..accepted]) |index, second| {
+                                        const other_id = candidate_ids[index];
+                                        const other = bodies[index];
+                                        var other_meta = metadata_values[index];
+                                        const candidate: ItemEntities.Record = .{ .id = other_id, .metadata = metadata_leases[index], .body = body_leases[index] };
                                         if (first.stack == null or second.stack == null) return error.Corrupt;
                                         if (!inventories.Stack.sameItem(first.stack.?, second.stack.?)) continue;
-
                                         const merged = self.deps.merging.merge(
                                             .{
                                                 .stack = first.stack.?,
@@ -174,12 +194,17 @@ pub const ItemTick = struct {
                                         destination.pickup_delay = merged.destination.pickup_delay;
 
                                         if (merged.source == null) {
-                                            if (merged.destination_is_first) try dropped.retire(other_id, other, &other_meta) else try dropped.retire(row.id, body, &metadata);
+                                            if (merged.destination_is_first) try dropped.retire(other_id, other, &other_meta) else try dropped.retire(entity, body, &metadata);
                                         }
 
-                                        try dropped.put(other_id, other_meta);
+                                        candidate.write(other_meta);
+                                        first.revision += 1;
+                                        first.stack = if (merged.destination_is_first) merged.destination.stack else remainder;
+                                        if (metadata.alive) _ = try dropped.mergeLimit(record, first.stack.?);
+                                        if (other_meta.alive) _ = try dropped.mergeLimit(candidate, if (merged.destination_is_first) remainder.? else merged.destination.stack);
                                         self.merged += 1;
                                         if (!metadata.alive) break :neighbors;
+                                        if (first.stack.?.count >= maximum) break :neighbors;
                                     }
                                 }
                             }
@@ -196,7 +221,7 @@ pub const ItemTick = struct {
                 const held = try self.deps.inventories.get(ItemEntities.slot(body));
                 const removed = try self.deps.inventories.set(ItemEntities.slot(body), held.revision, null);
                 assert(removed);
-                try dropped.retire(row.id, body, &metadata);
+                try dropped.retire(entity, body, &metadata);
             }
 
             record.write(metadata);

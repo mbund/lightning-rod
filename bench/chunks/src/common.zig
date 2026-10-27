@@ -29,8 +29,8 @@ pub fn drain(store: *storage.Store) !void {
     defer store.limits.checkpoint_bytes = threshold;
     try store.waitDurable(store.lastCommit());
     while (store.end != 64 or store.phase != .idle) {
-        _ = try store.maintain(storage.batch_size);
-        if (store.checkpoint_io.pending) try store.checkpoint_io.wait(null);
+        _ = try store.pollMaintenance(.{ .index_entries = storage.batch_size, .pages = storage.batch_size });
+        if (store.maintenance_io.active) try store.maintenance_io.drain();
         if (store.filesystem.pending) try store.filesystem.wait(null);
     }
 }

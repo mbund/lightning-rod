@@ -2,6 +2,7 @@ const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
 const chunks = @import("chunks");
+const records = @import("records");
 
 const side = 64;
 const columns_per_batch = 8;
@@ -20,18 +21,19 @@ pub fn main(init: std.process.Init) !void {
     var store = try lightning_rod.storage.Store.init(allocator, init.io, .{ .path = path });
     defer store.deinit();
     const plugins = lightning_rod.plugin.compose(.{
+        lightning_rod.plugin.configured(records.Workspaces, .{}),
         lightning_rod.plugin.configured(vanilla.RegistryIdentity, .{}),
         lightning_rod.plugin.configured(vanilla.Worlds, .{}),
         lightning_rod.plugin.configured(vanilla.VanillaWorlds, .{}),
-        lightning_rod.plugin.configured(vanilla.Chunks, .{ .cache_sections = columns_per_batch * section_count }),
+        lightning_rod.plugin.configured(vanilla.Chunks, .{ .demand_sections = 0, .cache_sections = columns_per_batch * section_count }),
         lightning_rod.plugin.configured(vanilla.Flat, .{}),
     });
     const simulation = try lightning_rod.Simulation(@TypeOf(plugins)).init(allocator, init.io, &store, .{
-        .memory_bytes = 8 * 1024 * 1024,
+        .memory_bytes = 16 * 1024 * 1024,
         .metrics = .{ .enabled = false },
         .autosave = .{ .ticks = null },
     });
-    try simulation.initialize(plugins, .{ .metrics = &simulation.metrics });
+    try simulation.initialize(plugins, .{ .metrics = &simulation.metrics, .persistence = &store });
     const world = simulation.get(vanilla.VanillaWorlds).overworld;
     const sections = simulation.get(vanilla.Chunks);
     for (0..side) |x| for (0..side / columns_per_batch) |batch| {

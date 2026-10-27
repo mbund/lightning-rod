@@ -31,6 +31,7 @@ final class TestClient {
     private final Recorder recorder;
     private final Map<String, Recorder.Capture> screenshots = new HashMap<>();
     private final Set<String> marks = new HashSet<>();
+    private final Set<String> sentMarks = new HashSet<>();
     private final LinkedHashSet<String> messages = new LinkedHashSet<>();
 
     TestClient(Recorder recorder) { this.recorder = recorder; }
@@ -60,6 +61,12 @@ final class TestClient {
     void pass(String reason) { recorder.pass(reason); }
     void fail(String reason) { recorder.fail(reason); }
     void event(String name, Object... fields) { recorder.event(name, fields); }
+    void marker(String name) { recorder.marker(name); }
+    boolean hasMarker(String name) { return java.nio.file.Files.exists(recorder.artifacts.resolve(name)); }
+    void reconnect() {
+        if (!recorder.protocolPhase.equals("disconnected")) throw new IllegalStateException("reconnect requires a disconnected client");
+        recorder.connectionAttempted = false;
+    }
     void restartStream() { recorder.restartStream(); }
     long streamTarget(int loaded) { return recorder.streamTarget(loaded); }
     // Checkpoint names identify a capture across fixture ticks, just like fence names.
@@ -77,8 +84,11 @@ final class TestClient {
     }
     void reload() { send("reload"); }
     void mark(String name) {
-        if (!marks.contains(name)) {
-            rememberMark(name);
+        if (!sentMarks.contains(name)) {
+            if (name.isEmpty() || name.getBytes(StandardCharsets.UTF_8).length > 128)
+                throw new IllegalArgumentException("invalid fixture marker");
+            if (sentMarks.size() == 256) throw new IllegalStateException("fixture marker capacity exceeded");
+            sentMarks.add(name);
             send("mark " + name);
         }
     }

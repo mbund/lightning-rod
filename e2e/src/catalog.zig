@@ -17,6 +17,7 @@ pub const Case = struct {
     application: []const u8 = "vanilla",
     standalone: bool = false,
     reload: bool = false,
+    upgrade: bool = false,
     protocol_mismatch: bool = false,
 };
 
@@ -47,6 +48,7 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, root: []const u8) ![]Case 
             if (variant.name.len == 0 or variant.peers.len == 0 or variant.peers.len > maximum_peers) return error.InvalidTest;
             if (variant.mixed_versions and variant.peers.len < 2) return error.InvalidPeerVersions;
             if (variant.protocol_mismatch and !variant.reload) return error.InvalidTest;
+            if (variant.upgrade and (variant.peers.len != 3 or variant.reload or variant.standalone or variant.fixture != null or variant.prepare != null)) return error.InvalidTest;
 
             for (variant.name) |character|
                 if (!std.ascii.isLower(character) and !std.ascii.isDigit(character) and character != '-') return error.InvalidTestName;

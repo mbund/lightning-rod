@@ -1,13 +1,12 @@
 const records = @import("records");
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
-const storage = lightning_rod.storage;
 
 /// Vanilla's dimensions share the simulation clock. This is not wall-clock time.
 pub const Time = struct {
     pub const id = "minecraft:time";
     pub const Configuration = struct { day_time: i64 = 0, daylight_cycle: bool = true };
-    pub const Dependencies = struct { storage: storage.Space };
+    pub const Dependencies = struct { storage: lightning_rod.storage.Space };
 
     game_time: i64 = 0,
     day_time: i64,
@@ -15,8 +14,7 @@ pub const Time = struct {
     revision: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, configuration: Configuration, deps: Dependencies) !*Time {
-        const self = try allocator.create(Time);
-        self.* = .{ .day_time = configuration.day_time, .daylight_cycle = configuration.daylight_cycle };
+        const self = try allocate(allocator, configuration);
         var bytes: [18]u8 = undefined;
         if (try records.Value.init(deps.storage).read(&bytes)) |length| {
             if (length != bytes.len or bytes[0] != 1 or bytes[17] > 1) return error.CorruptClock;
@@ -24,6 +22,12 @@ pub const Time = struct {
             self.day_time = std.mem.readInt(i64, bytes[9..17], .little);
             self.daylight_cycle = bytes[17] != 0;
         }
+        return self;
+    }
+
+    pub fn allocate(allocator: std.mem.Allocator, configuration: Configuration) !*Time {
+        const self = try allocator.create(Time);
+        self.* = .{ .day_time = configuration.day_time, .daylight_cycle = configuration.daylight_cycle };
         return self;
     }
 
@@ -37,7 +41,7 @@ pub const Time = struct {
         self.revision +%= 1;
     }
 
-    pub fn checkpoint(self: *Time, space: storage.Space) !void {
+    pub fn checkpoint(self: *Time, space: lightning_rod.storage.Space) !void {
         var bytes: [18]u8 = undefined;
         bytes[0] = 1;
         std.mem.writeInt(i64, bytes[1..9], self.game_time, .little);

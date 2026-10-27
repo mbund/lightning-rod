@@ -133,12 +133,24 @@ pub fn inspect(table: records.Table) !Shape {
     if (try table.space.getRoot()) |root| _ = try inspector.tree(@intFromEnum(root), 0);
     if (inspector.next_leaf != 0) return error.Corrupt;
     var free = store.metadata.free;
+    var free_count = store.metadata.free_count;
+    var free_pages: u64 = 0;
     while (free != 0) {
         try inspector.claim(free);
         const block = try readBlock(store, free);
         if (std.mem.readInt(u32, block[4..8], .little) != std.math.maxInt(u32)) return error.Corrupt;
+        if (free_count == 0 or free_count > 32 or free_count > std.mem.readInt(u16, block[42..44], .little)) return error.Corrupt;
+        free_pages += free_count;
+        for (0..free_count - 1) |index| {
+            const id = std.mem.readInt(u64, block[44 + index * 8 ..][0..8], .little);
+            try inspector.claim(id);
+            const member = try readBlock(store, id);
+            if (std.mem.readInt(u32, member[4..8], .little) != std.math.maxInt(u32)) return error.Corrupt;
+        }
         free = std.mem.readInt(u64, block[32..40], .little);
+        free_count = std.mem.readInt(u16, block[40..42], .little);
     }
+    if (free_pages != store.metadata.free_pages) return error.Corrupt;
     for (1..seen.len) |id| {
         const block = try readBlock(store, id);
         const owner = std.mem.readInt(u32, block[4..8], .little);

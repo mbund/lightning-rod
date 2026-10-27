@@ -1,9 +1,7 @@
 const std = @import("std");
 
-const linux = std.os.linux;
-
 pub fn enable() !void {
-    if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)) != .SUCCESS)
+    if (std.os.linux.errno(std.os.linux.prctl(@intFromEnum(std.os.linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)) != .SUCCESS)
         return error.SubreaperUnavailable;
 }
 
@@ -28,14 +26,14 @@ pub fn finish(io: std.Io) !usize {
             var words = std.mem.tokenizeAny(u8, children, " \n");
 
             while (words.next()) |word| {
-                const pid = try std.fmt.parseInt(linux.pid_t, word, 10);
+                const pid = try std.fmt.parseInt(std.os.linux.pid_t, word, 10);
                 if (pid <= 1) return error.InvalidChildPid;
                 found += 1;
-                const result = linux.kill(pid, .KILL);
+                const result = std.os.linux.kill(pid, .KILL);
 
-                if (linux.errno(result) == .SUCCESS) killed += 1;
+                if (std.os.linux.errno(result) == .SUCCESS) killed += 1;
                 var status: u32 = 0;
-                _ = linux.waitpid(pid, &status, linux.W.NOHANG);
+                _ = std.os.linux.waitpid(pid, &status, std.os.linux.W.NOHANG);
             }
         }
 

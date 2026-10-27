@@ -1,7 +1,7 @@
+const game_data = @import("game_data");
 const std = @import("std");
 const chunks = @import("chunks");
 const entities = @import("entities");
-const registry = @import("game_data").registry;
 
 const assert = std.debug.assert;
 
@@ -11,6 +11,8 @@ pub const ItemPhysics = struct {
     pub const Configuration = struct {};
 
     pub const Dependencies = struct { chunks: *chunks.Chunks };
+
+    pub const Window = chunks.ReadWindow(8);
 
     pub const Result = struct {
         body: entities.State,
@@ -26,8 +28,12 @@ pub const ItemPhysics = struct {
         return self;
     }
 
-    pub fn advance(self: *ItemPhysics, entity_id: u32, ticks: u32, body: entities.State, on_ground: bool) !Result {
-        assert(entity_id > 0);
+    pub fn readWindow(self: *const ItemPhysics) Window {
+        return Window.init(self.deps.chunks);
+    }
+
+    pub fn advance(self: *ItemPhysics, neighborhood: *Window, entity_id: u32, ticks: u32, body: entities.State, on_ground: bool) !Result {
+        assert(entity_id > 0 and neighborhood.owner == self.deps.chunks);
         var next = body;
 
         for (body.position ++ body.velocity) |value| assert(std.math.isFinite(value));
@@ -63,7 +69,7 @@ pub const ItemPhysics = struct {
 
                 while (cursor < nx * ny * nz) {
                     var sections: [8]chunks.Section = undefined;
-                    var leases: [8]chunks.Lease = undefined;
+                    var views: [8]chunks.View = undefined;
                     const count = @min(sections.len, self.deps.chunks.cache.entries.len, nx * ny * nz - cursor);
                     assert(count > 0);
 
@@ -77,11 +83,16 @@ pub const ItemPhysics = struct {
                         };
                     }
 
-                    try self.deps.chunks.acquireMany(sections[0..count], leases[0..count]);
-                    defer for (leases[0..count]) |lease| lease.release();
+                    try neighborhood.readMany(sections[0..count], views[0..count]);
                     cursor += count;
 
-                    for (sections[0..count], leases[0..count]) |section, lease| {
+                    for (sections[0..count], views[0..count]) |section, view| {
+                        if (view == .uniform) {
+                            const state = view.uniform;
+                            if (state >= game_data.registry.block_state_collision_shape.len) return error.Corrupt;
+                            const shape = game_data.registry.collision_shapes[game_data.registry.block_state_collision_shape[state]];
+                            if (shape.count == 0) continue;
+                        }
                         var y = @max(first[1], section.y * 16);
 
                         while (y <= @min(last[1], section.y * 16 + 15)) : (y += 1) {
@@ -91,13 +102,13 @@ pub const ItemPhysics = struct {
                                 var x = @max(first[0], section.x * 16);
 
                                 while (x <= @min(last[0], section.x * 16 + 15)) : (x += 1) {
-                                    const state = lease.get(chunks.localIndex(.{ .x = x, .y = y, .z = z }));
-                                    if (state >= registry.block_state_collision_shape.len) return error.Corrupt;
+                                    const state = view.get(chunks.localIndex(.{ .x = x, .y = y, .z = z }));
+                                    if (state >= game_data.registry.block_state_collision_shape.len) return error.Corrupt;
 
-                                    const shape = registry.collision_shapes[registry.block_state_collision_shape[state]];
+                                    const shape = game_data.registry.collision_shapes[game_data.registry.block_state_collision_shape[state]];
                                     const offset: [3]f64 = .{ @floatFromInt(x), @floatFromInt(y), @floatFromInt(z) };
 
-                                    for (registry.collision_boxes[shape.offset..][0..shape.count]) |box| {
+                                    for (game_data.registry.collision_boxes[shape.offset..][0..shape.count]) |box| {
                                         const low: [3]f64 = .{ offset[0] + @as(f64, @floatFromInt(box.min_x)) / 64, offset[1] + @as(f64, @floatFromInt(box.min_y)) / 64, offset[2] + @as(f64, @floatFromInt(box.min_z)) / 64 };
                                         const high: [3]f64 = .{ offset[0] + @as(f64, @floatFromInt(box.max_x)) / 64, offset[1] + @as(f64, @floatFromInt(box.max_y)) / 64, offset[2] + @as(f64, @floatFromInt(box.max_z)) / 64 };
                                         const a = (axis + 1) % 3;
@@ -124,12 +135,15 @@ pub const ItemPhysics = struct {
 
             var friction: f32 = 0.98;
             if (grounded) {
-                const below = try self.deps.chunks.getBlock(body.world, .{
+                const position: chunks.Position = .{
                     .x = @intFromFloat(@floor(next.position[0])),
                     .y = @intFromFloat(@floor(next.position[1] - @as(f64, @as(f32, 0.999999)))),
                     .z = @intFromFloat(@floor(next.position[2])),
-                });
-                const name = registry.blockStateName(below) orelse return error.Corrupt;
+                };
+                var views: [1]chunks.View = undefined;
+                try neighborhood.readMany(&.{chunks.sectionAt(body.world, position)}, &views);
+                const below = views[0].get(chunks.localIndex(position));
+                const name = game_data.registry.blockStateName(below) orelse return error.Corrupt;
                 const slipperiness: f32 = if (std.mem.eql(u8, name, "minecraft:slime_block")) 0.8 else if (std.mem.eql(u8, name, "minecraft:blue_ice")) 0.989 else if (std.mem.eql(u8, name, "minecraft:ice") or std.mem.eql(u8, name, "minecraft:packed_ice") or std.mem.startsWith(u8, name, "minecraft:frosted_ice[")) 0.98 else 0.6;
                 friction *= slipperiness;
             }

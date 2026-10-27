@@ -33,7 +33,7 @@ pub const Workspace = struct {
 
     /// Payload starts at headroom. Uncompressed framing borrows it in place. Compressed framing
     /// borrows destination. Neither survives reuse of its owner.
-    pub fn encode(self: *Workspace, storage: []u8, length: usize, threshold: ?usize, destination: []u8) Error![]const u8 {
+    pub fn encode(self: *Workspace, storage: []u8, length: usize, threshold: ?usize, destination: []u8) Error![]u8 {
         if (length == 0 or length > maximum) return error.InvalidPacket;
         if (storage.len < headroom or length > storage.len - headroom) return error.BufferTooSmall;
         if (threshold) |limit| {
@@ -55,7 +55,7 @@ pub const Workspace = struct {
         return storage[start..end];
     }
 
-    pub fn compress(self: *Workspace, packet: []const u8, destination: []u8) Error![]const u8 {
+    pub fn compress(self: *Workspace, packet: []const u8, destination: []u8) Error![]u8 {
         if (packet.len == 0 or packet.len > maximum) return error.InvalidPacket;
         if (destination.len < headroom + 9) return error.BufferTooSmall;
 

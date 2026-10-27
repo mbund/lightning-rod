@@ -9,12 +9,42 @@ pub const header_size = 64;
 pub const maximum_spaces = 48;
 pub const maximum_name = 63;
 pub const free_owner = std.math.maxInt(u32);
+pub const free_batch = 32;
+pub const FreePages = struct {
+    next: u64,
+    next_count: u16,
+    count: u16,
+    ids: [free_batch - 1]u64 = undefined,
+
+    pub const encoded_size = 12 + (free_batch - 1) * 8;
+
+    pub fn encode(self: *const FreePages, bytes: *[encoded_size]u8) void {
+        std.debug.assert(self.count > 0 and self.count <= free_batch);
+        std.debug.assert((self.next == 0) == (self.next_count == 0));
+        put(u64, bytes, 0, self.next);
+        put(u16, bytes, 8, self.next_count);
+        put(u16, bytes, 10, self.count);
+        @memset(bytes[12..], 0);
+        for (self.ids[0 .. self.count - 1], 0..) |id, index| put(u64, bytes, 12 + index * 8, id);
+    }
+
+    pub fn decode(bytes: []const u8, head: u64, remaining: u16, pages: u64) Error!FreePages {
+        var self: FreePages = .{ .next = get(u64, bytes, 0), .next_count = get(u16, bytes, 8), .count = get(u16, bytes, 10) };
+        if (self.count == 0 or self.count > free_batch or remaining == 0 or remaining > self.count or
+            self.next >= pages or self.next == head or self.next_count > free_batch or (self.next == 0) != (self.next_count == 0)) return error.Corrupt;
+        for (self.ids[0 .. remaining - 1], 0..) |*id, index| {
+            id.* = get(u64, bytes, 12 + index * 8);
+            if (id.* == 0 or id.* >= pages or id.* == head or id.* == self.next or std.mem.indexOfScalar(u64, self.ids[0..index], id.*) != null) return error.Corrupt;
+        }
+        return self;
+    }
+};
 const checksum_seed = 0x4c52504147455231;
 pub const PageId = enum(u64) { _ };
 pub const SpaceId = enum(u32) { _ };
 pub const CommitId = enum(u64) { _ };
 
-pub const Error = error{ Timeout, InvalidArgument, BufferTooSmall, Corrupt, UnsupportedFormat, IoFailure, NoSpace, FailedTransaction, OutOfMemory };
+pub const Error = error{ CachePinned, Timeout, InvalidArgument, BufferTooSmall, Corrupt, UnsupportedFormat, IoFailure, NoSpace, FailedTransaction, OutOfMemory };
 
 pub fn get(comptime T: type, bytes: []const u8, offset: usize) T {
     return std.mem.readInt(T, bytes[offset..][0..@sizeOf(T)], .little);
@@ -25,13 +55,15 @@ pub fn put(comptime T: type, bytes: []u8, offset: usize, value: T) void {
 pub fn checksum(bytes: []const u8) u64 {
     return std.hash.XxHash64.hash(checksum_seed, bytes);
 }
-pub fn seal(block: *Block, id: u64, owner: u32, sequence: u64, page: *const Page) void {
+pub fn seal(block: *Block, id: u64, owner: u32, sequence: u64, page: []const u8) void {
     @memcpy(block[0..4], "LRPG");
     put(u32, block, 4, owner);
     put(u64, block, 8, id);
     put(u64, block, 16, sequence);
     put(u64, block, 24, 0);
-    @memcpy(block[32..], page);
+    std.debug.assert(page.len <= page_size);
+    if (block[32..].ptr != page.ptr) @memcpy(block[32..][0..page.len], page);
+    @memset(block[32 + page.len ..], 0);
     put(u64, block, 24, checksum(block));
 }
 pub fn validate(block: *Block, id: u64, owner: ?u32) Error!void {
@@ -56,7 +88,7 @@ pub fn frame(output: *Frame, block: *const Block, offset: u64, digest: ?u64) u64
     @memcpy(output[0..8], if (digest != null) "LRCOMMIT" else "LRFRAME2");
     put(u64, output, 8, offset);
     put(u64, output, 24, digest orelse 0);
-    @memcpy(output[32..], block);
+    if (output[32..].ptr != block.ptr) @memcpy(output[32..], block);
     const hash = checksum(output);
     put(u64, output, 16, hash);
     return hash;
@@ -78,20 +110,24 @@ pub const Metadata = struct {
     tick: u64 = 0,
     pages: u64 = 1,
     free: u64 = 0,
+    free_count: u16 = 0,
+    free_pages: u64 = 0,
     spaces: [maximum_spaces]Space = @splat(.{}),
 
     pub const Space = struct { name: [maximum_name]u8 = @splat(0), length: u8 = 0, root: u64 = 0 };
 
     pub fn encode(self: *const Metadata) Page {
         var bytes: Page = @splat(0);
-        @memcpy(bytes[0..8], "LRMETA01");
+        @memcpy(bytes[0..8], "LRMETA02");
         @memcpy(bytes[8..24], &self.identity);
         put(u64, &bytes, 24, self.sequence);
         put(u64, &bytes, 32, self.tick);
         put(u64, &bytes, 40, self.pages);
         put(u64, &bytes, 48, self.free);
+        put(u64, &bytes, 56, self.free_pages);
+        put(u16, &bytes, 64, self.free_count);
         for (self.spaces, 0..) |space, index| {
-            const at = 64 + index * 80;
+            const at = 72 + index * 80;
             bytes[at] = space.length;
             @memcpy(bytes[at + 1 ..][0..maximum_name], &space.name);
             put(u64, &bytes, at + 64, space.root);
@@ -100,11 +136,12 @@ pub const Metadata = struct {
     }
 
     pub fn decode(bytes: *const Page) Error!Metadata {
-        if (!std.mem.eql(u8, bytes[0..8], "LRMETA01")) return error.UnsupportedFormat;
-        var self: Metadata = .{ .identity = bytes[8..24].*, .sequence = get(u64, bytes, 24), .tick = get(u64, bytes, 32), .pages = get(u64, bytes, 40), .free = get(u64, bytes, 48) };
-        if (self.pages == 0 or self.free >= self.pages) return error.Corrupt;
+        if (!std.mem.eql(u8, bytes[0..8], "LRMETA02")) return error.UnsupportedFormat;
+        var self: Metadata = .{ .identity = bytes[8..24].*, .sequence = get(u64, bytes, 24), .tick = get(u64, bytes, 32), .pages = get(u64, bytes, 40), .free = get(u64, bytes, 48), .free_pages = get(u64, bytes, 56), .free_count = get(u16, bytes, 64) };
+        if (self.pages == 0 or self.free >= self.pages or self.free_pages >= self.pages or self.free_count > free_batch or self.free_count > self.free_pages or
+            (self.free == 0) != (self.free_count == 0) or (self.free == 0) != (self.free_pages == 0)) return error.Corrupt;
         for (&self.spaces, 0..) |*space, index| {
-            const at = 64 + index * 80;
+            const at = 72 + index * 80;
             space.* = .{ .length = bytes[at], .name = bytes[at + 1 ..][0..maximum_name].*, .root = get(u64, bytes, at + 64) };
             if (space.length > maximum_name or space.root >= self.pages or (space.length == 0 and space.root != 0)) return error.Corrupt;
             if (space.length != 0) for (self.spaces[0..index]) |previous| {

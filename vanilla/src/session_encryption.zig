@@ -9,9 +9,12 @@ pub const LoginEncryption = struct {
     pub const Configuration = struct { key: ?*const java.RsaPrivateKey = null };
     pub const Dependencies = struct { input: *protocols.Input, phases: *sessions.Phases };
     pub const SessionLoginState = struct {
-        stage: enum { initial, challenge_sent, complete } = .initial,
+        stage: enum { initial, challenge_sent, verifying, complete } = .initial,
         token: [4]u8 = undefined,
-        secret: [16]u8 = @splat(0),
+        key: ?*const java.RsaPrivateKey = null,
+        // The connection retains its input until the verification task completes.
+        encrypted_secret: []const u8 = &.{},
+        encrypted_token: []const u8 = &.{},
     };
     pub const SessionState = struct { login: SessionLoginState = .{} };
 
@@ -34,7 +37,7 @@ pub const LoginEncryption = struct {
                 state.stage = .challenge_sent;
                 return .{ .send = bytes };
             },
-            .challenge_sent => return .wait,
+            .challenge_sent, .verifying => return .wait,
             .complete => return .done,
         }
     }
@@ -54,14 +57,26 @@ pub const LoginEncryption = struct {
         if (encrypted_secret.len != java.RsaPrivateKey.ciphertext_bytes or encrypted_token.len != encrypted_secret.len)
             return error.InvalidEncryption;
 
-        errdefer std.crypto.secureZero(u8, &state.secret);
+        state.key = self.key orelse return error.InvalidEncryption;
+        state.encrypted_secret = encrypted_secret;
+        state.encrypted_token = encrypted_token;
+        state.stage = .verifying;
+        return .{ .verify = sessions.protocol.LoginVerification.init(state, verify) };
+    }
+
+    fn verify(state: *SessionLoginState) ![16]u8 {
+        std.debug.assert(state.stage == .verifying);
+        defer state.encrypted_secret = &.{};
+        defer state.encrypted_token = &.{};
+        var secret: [16]u8 = undefined;
+        errdefer std.crypto.secureZero(u8, &secret);
         var token: [4]u8 = undefined;
         defer std.crypto.secureZero(u8, &token);
-        const encryption = self.key orelse return error.InvalidEncryption;
-        encryption.decrypt(encrypted_secret, &state.secret) catch return error.InvalidEncryption;
-        encryption.decrypt(encrypted_token, &token) catch return error.InvalidEncryption;
+        const encryption = state.key.?;
+        encryption.decrypt(state.encrypted_secret, &secret) catch return error.InvalidEncryption;
+        encryption.decrypt(state.encrypted_token, &token) catch return error.InvalidEncryption;
         if (!std.crypto.timing_safe.eql([4]u8, token, state.token)) return error.InvalidEncryption;
         state.stage = .complete;
-        return .{ .encryption = &state.secret };
+        return secret;
     }
 };

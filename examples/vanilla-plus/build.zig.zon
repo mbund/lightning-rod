@@ -4,11 +4,11 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .sessions = .{ .path = "../../sessions" },
         .minecraft_packets = .{ .path = "../../minecraft_packets" },
         .protocols = .{ .path = "../../protocols" },
         .lightning_rod = .{ .path = "../.." },
         .lightning_rod_linux = .{ .path = "../../linux" },
-        .lightning_rod_stdio = .{ .path = "../../stdio" },
         .lightning_rod_tui = .{ .path = "../../tui" },
         .lightning_rod_vanilla_1_21_6 = .{ .path = "../../vanilla" },
         .economy = .{ .path = "../plugins/economy" },

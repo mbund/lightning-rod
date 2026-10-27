@@ -1,14 +1,17 @@
 const std = @import("std");
 const commands = @import("commands");
 const minecraft = @import("minecraft_model");
+const storage = @import("storage");
+const Random = @import("random.zig").Random;
 const Players = @import("players.zig").Players;
 const Chat = @import("chat.zig").Chat;
 
 pub const GamemodeCommands = struct {
     pub const id = "minecraft:gamemode_commands";
-    pub const Configuration = struct {};
+    pub const Configuration = struct { seed: u64 = 0 };
 
     pub const Dependencies = struct {
+        storage: storage.Space,
         commands: *commands.Commands,
         players: *Players,
         chat: *Chat,
@@ -23,11 +26,18 @@ pub const GamemodeCommands = struct {
 
     deps: Dependencies,
     command: u16 = 0,
-    random: std.Random.DefaultPrng = .init(0),
+    random: Random,
+    selected: []*Players.Player,
 
-    pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*GamemodeCommands {
+    pub fn init(allocator: std.mem.Allocator, configuration: Configuration, deps: Dependencies) !*GamemodeCommands {
+        const self = try allocate(allocator, configuration, deps);
+        self.random = try .init(configuration.seed, deps.storage);
+        return self;
+    }
+
+    pub fn allocate(allocator: std.mem.Allocator, configuration: Configuration, deps: Dependencies) !*GamemodeCommands {
         const self = try allocator.create(GamemodeCommands);
-        self.* = .{ .deps = deps };
+        self.* = .{ .deps = deps, .random = .{ .source = .init(configuration.seed) }, .selected = try allocator.alloc(*Players.Player, deps.players.records.len) };
         const command = try deps.commands.register(self, commands.leaf(GamemodeCommands, Arguments, .{
             .name = "gamemode",
             .description = "Change your game mode or another player's game mode",
@@ -39,11 +49,15 @@ pub const GamemodeCommands = struct {
         return self;
     }
 
+    pub fn checkpoint(self: *GamemodeCommands, space: storage.Space) !void {
+        try self.random.checkpoint(space);
+    }
+
     fn execute(self: *GamemodeCommands, context: commands.Context, args: Arguments) !void {
         const players = self.deps.players;
         const sender = players.find(context.sender) orelse return error.InvalidArgument;
         const target = args.target orelse "@s";
-        var selected: [256]*Players.Player = undefined;
+        const selected = self.selected;
         var count: usize = 0;
         const selector = target.len == 2 and target[0] == '@';
         if (std.mem.startsWith(u8, target, "@") and (!selector or std.mem.indexOfScalar(u8, "aspr", target[1]) == null))

@@ -1,26 +1,24 @@
 const e2e = @import("e2e");
 const std = @import("std");
-const lr = @import("lightning_rod");
+const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
 const sessions = @import("sessions");
-const bootstrap = e2e.server;
-const simulations = e2e.simulations;
 
 pub fn main(init: std.process.Init) !void {
     var endpoints: [3]*sessions.Service = undefined;
-    const plugins = lr.plugin.compose(.{
-        bootstrap.plugins(),
-        lr.plugin.configured(e2e.Inventory, .{}),
-        lr.plugin.configured(Probe, .{}),
+    const plugins = lightning_rod.plugin.compose(.{
+        e2e.profile.plugins(),
+        lightning_rod.plugin.configured(e2e.Inventory, .{}),
+        lightning_rod.plugin.configured(Probe, .{}),
     });
-    const source = lr.plugin.replace(plugins, .{
-        lr.plugin.configured(e2e.Inventory, .{ .starting_bread = Probe.bread_count }),
-        lr.plugin.configured(Probe, .{ .verify_inventory = true, .destination = &endpoints[2], .full_destination = &endpoints[1] }),
+    const source = lightning_rod.plugin.replace(plugins, .{
+        lightning_rod.plugin.configured(e2e.Inventory, .{ .starting_bread = Probe.bread_count }),
+        lightning_rod.plugin.configured(Probe, .{ .verify_inventory = true, .destination = &endpoints[2], .full_destination = &endpoints[1] }),
     });
-    const destination = lr.plugin.replace(plugins, .{
-        lr.plugin.configured(Probe, .{ .destination = &endpoints[0] }),
+    const destination = lightning_rod.plugin.replace(plugins, .{
+        lightning_rod.plugin.configured(Probe, .{ .destination = &endpoints[0] }),
     });
-    try simulations.run(init, .{ source, plugins, destination }, &endpoints, .{});
+    try e2e.simulations.run(init, .{ source, plugins, destination }, &endpoints, .{}, .{});
 }
 
 const Probe = struct {

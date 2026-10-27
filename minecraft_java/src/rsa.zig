@@ -1,6 +1,4 @@
 const std = @import("std");
-const asn1 = std.crypto.codecs.asn1;
-const der = asn1.der;
 const modulus_bits = 2048;
 const Modulus = std.crypto.ff.Modulus(modulus_bits);
 const Prime = std.crypto.ff.Modulus(modulus_bits / 2);
@@ -38,14 +36,14 @@ pub const PrivateKey = struct {
 
     fn parse(encoded: []const u8) !PrivateKey {
         if (encoded.len == 0 or encoded.len > 4096) return error.InvalidEncryptionKey;
-        var document: der.Decoder = .{ .bytes = encoded };
-        var envelope: der.Decoder = .{ .bytes = try element(&document, .sequence) };
+        var document: std.crypto.codecs.asn1.der.Decoder = .{ .bytes = encoded };
+        var envelope: std.crypto.codecs.asn1.der.Decoder = .{ .bytes = try element(&document, .sequence) };
         if (document.index != encoded.len) return error.InvalidEncryptionKey;
         if (!std.mem.eql(u8, try integer(&envelope), &.{0})) return error.InvalidEncryptionKey;
         if (!std.mem.eql(u8, try element(&envelope, .sequence), rsa_algorithm)) return error.InvalidEncryptionKey;
-        var private: der.Decoder = .{ .bytes = try element(&envelope, .octetstring) };
+        var private: std.crypto.codecs.asn1.der.Decoder = .{ .bytes = try element(&envelope, .octetstring) };
         if (envelope.index != envelope.bytes.len) return error.InvalidEncryptionKey;
-        var fields: der.Decoder = .{ .bytes = try element(&private, .sequence) };
+        var fields: std.crypto.codecs.asn1.der.Decoder = .{ .bytes = try element(&private, .sequence) };
         if (private.index != private.bytes.len) return error.InvalidEncryptionKey;
         if (!std.mem.eql(u8, try integer(&fields), &.{0})) return error.InvalidEncryptionKey;
         const n = try integer(&fields);
@@ -132,20 +130,20 @@ pub const PrivateKey = struct {
     }
 };
 
-fn element(decoder: *der.Decoder, tag: asn1.Tag.Number) ![]const u8 {
+fn element(decoder: *std.crypto.codecs.asn1.der.Decoder, tag: std.crypto.codecs.asn1.Tag.Number) ![]const u8 {
     const value = try decoder.element(.init(tag, tag == .sequence, .universal));
     decoder.index = value.slice.end;
     return decoder.view(value);
 }
 
-fn integer(decoder: *der.Decoder) ![]const u8 {
+fn integer(decoder: *std.crypto.codecs.asn1.der.Decoder) ![]const u8 {
     const bytes = try element(decoder, .integer);
     if (bytes.len == 0 or bytes[0] & 0x80 != 0) return error.InvalidEncryptionKey;
     if (bytes.len > 1 and bytes[0] == 0 and bytes[1] & 0x80 == 0) return error.InvalidEncryptionKey;
     return bytes;
 }
 
-fn unsignedInteger(decoder: *der.Decoder) ![]const u8 {
+fn unsignedInteger(decoder: *std.crypto.codecs.asn1.der.Decoder) ![]const u8 {
     const bytes = try integer(decoder);
     return if (bytes.len > 1 and bytes[0] == 0) bytes[1..] else bytes;
 }

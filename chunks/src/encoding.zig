@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const records = @import("records");
 const storage = @import("storage");
 
@@ -75,6 +76,45 @@ pub fn decode(buffer: []u8, length: usize) storage.Error!usize {
     // Expansion overlaps both the palette and indices in the destination.
     var encoded: [decoded_bytes]u8 = undefined;
     @memcpy(encoded[0..length], buffer[0..length]);
+    return decodeTo(encoded[0..length], buffer);
+}
+
+pub fn decodeTo(input: []const u8, output: []u8) storage.Error!usize {
+    if (input.len == 0) return error.Corrupt;
+    switch (input[0]) {
+        0 => {
+            if (input.len != 3) return error.Corrupt;
+            if (output.len < 3) return error.BufferTooSmall;
+            @memcpy(output[0..3], input);
+            return 3;
+        },
+        1 => {
+            if (input.len != decoded_bytes) return error.Corrupt;
+            if (output.len < decoded_bytes) return error.BufferTooSmall;
+            @memcpy(output[0..decoded_bytes], input);
+            return decoded_bytes;
+        },
+        2 => {},
+        else => return error.Corrupt,
+    }
+    if (input.len < 3) return error.Corrupt;
+    const count = std.mem.readInt(u16, input[1..3], .little);
+    if (count < 2 or count >= palette_capacity or encodedBytes(count) >= decoded_bytes or encodedBytes(count) != input.len) return error.Corrupt;
+    if (output.len < decoded_bytes) return error.BufferTooSmall;
+    if (count == 2) {
+        const first: @Vector(8, u16) = @splat(std.mem.readInt(u16, input[3..5], .little));
+        const second: @Vector(8, u16) = @splat(std.mem.readInt(u16, input[5..7], .little));
+        const masks: @Vector(8, u8) = .{ 1, 2, 4, 8, 16, 32, 64, 128 };
+        std.debug.assert(input.len == 7 + blocks / 8);
+        for (input[7..][0 .. blocks / 8], 0..) |byte, index| {
+            const bytes: @Vector(8, u8) = @splat(byte);
+            const states = @select(u16, (bytes & masks) != @as(@Vector(8, u8), @splat(0)), second, first);
+            const encoded = if (builtin.cpu.arch.endian() == .little) states else @byteSwap(states);
+            output[1 + index * 16 ..][0..16].* = @bitCast(encoded);
+        }
+        output[0] = 1;
+        return decoded_bytes;
+    }
     const bits: u5 = @intCast(std.math.log2_int_ceil(u16, count));
     const mask = (@as(u32, 1) << bits) - 1;
     var pending: u32 = 0;
@@ -82,19 +122,19 @@ pub fn decode(buffer: []u8, length: usize) storage.Error!usize {
     var at: usize = 3 + @as(usize, count) * 2;
     for (0..blocks) |i| {
         while (pending_bits < bits) {
-            pending |= @as(u32, encoded[at]) << pending_bits;
+            pending |= @as(u32, input[at]) << pending_bits;
             at += 1;
             pending_bits += 8;
         }
         const index = pending & mask;
         if (index >= count) return error.Corrupt;
-        const state = std.mem.readInt(u16, encoded[3 + index * 2 ..][0..2], .little);
-        std.mem.writeInt(u16, buffer[1 + i * 2 ..][0..2], state, .little);
+        const state = std.mem.readInt(u16, input[3 + index * 2 ..][0..2], .little);
+        std.mem.writeInt(u16, output[1 + i * 2 ..][0..2], state, .little);
         pending >>= bits;
         pending_bits -= bits;
     }
-    std.debug.assert(pending_bits == 0 and at == length);
-    buffer[0] = 1;
+    std.debug.assert(pending_bits == 0 and at == input.len);
+    output[0] = 1;
     return decoded_bytes;
 }
 

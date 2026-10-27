@@ -77,7 +77,9 @@ pub const ReloadCommands = struct {
             .rejected => "Reload rejected; server unchanged",
         }, request.elapsed_ms });
 
-        for (self.deps.players.records, self.seen) |recipient, *seen| {
+        for (self.deps.players.activeSlots()) |index| {
+            const recipient = self.deps.players.records[index];
+            const seen = &self.seen[index];
             const handle = recipient.handle orelse continue;
             if (recipient.stage != .ready or seen.* == request.sequence) continue;
             seen.* = request.sequence;

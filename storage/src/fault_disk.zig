@@ -6,6 +6,13 @@ const assert = std.debug.assert;
 const metadata_bytes = 4096;
 
 pub const Disk = struct {
+    pub const IoGate = struct {
+        file: std.Io.File,
+        offset: u64,
+        thread: std.atomic.Value(std.Thread.Id) = .init(0),
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+    };
     pub const Mode = enum { discard, persist, alternating, alternating_inverse, torn, torn_inverse, metadata_first, metadata_first_inverse };
     const capacity = 1024 * 1024;
     const sector_bytes = 512;
@@ -28,6 +35,8 @@ pub const Disk = struct {
     cut: usize,
     failed: bool = false,
     short_writes: bool,
+    read_gate: ?*IoGate = null,
+    write_gate: ?*IoGate = null,
     // Tests run one disk at a time. Preserve the underlying userdata so all unwrapped
     // std.Io operations keep their original implementation and worker ownership.
     var active: ?*Disk = null;
@@ -100,6 +109,12 @@ pub const Disk = struct {
 
     fn write(_: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
         const self = active.?;
+        if (self.write_gate) |gate| {
+            if (file.handle == gate.file.handle and offset == gate.offset and gate.thread.load(.acquire) == std.Thread.getCurrentId()) {
+                gate.entered.set(self.underlying);
+                gate.release.waitUncancelable(self.underlying);
+            }
+        }
         self.mutex.lockUncancelable(self.underlying);
         defer self.mutex.unlock(self.underlying);
         const image = self.find(file) orelse return self.underlying.vtable.fileWritePositional(self.underlying.userdata, file, header, data, splat, offset);
@@ -117,6 +132,12 @@ pub const Disk = struct {
 
     fn read(_: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
         const self = active.?;
+        if (self.read_gate) |gate| {
+            if (file.handle == gate.file.handle and offset == gate.offset and gate.thread.load(.acquire) == std.Thread.getCurrentId()) {
+                gate.entered.set(self.underlying);
+                gate.release.waitUncancelable(self.underlying);
+            }
+        }
         self.mutex.lockUncancelable(self.underlying);
         defer self.mutex.unlock(self.underlying);
         const image = self.find(file) orelse return self.underlying.vtable.fileReadPositional(self.underlying.userdata, file, data, offset);

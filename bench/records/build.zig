@@ -29,6 +29,16 @@ pub fn build(b: *std.Build) void {
     });
     executable.root_module.addIncludePath(source.path(""));
     executable.root_module.linkLibrary(sqlite);
+    const backend = b.addModule("sqlite", .{
+        .root_source_file = b.path("src/sqlite.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    for (executable.root_module.import_table.keys(), executable.root_module.import_table.values()) |name, module|
+        backend.addImport(name, module);
+    backend.addIncludePath(source.path(""));
+    backend.linkLibrary(sqlite);
     const run = b.addRunArtifact(executable);
     if (b.args) |args| run.addArgs(args);
     b.step("bench", "Compare record growth and churn against SQLite").dependOn(&run.step);

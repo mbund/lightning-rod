@@ -44,6 +44,12 @@ pub const View = struct {
         return .{ .rest = self.bytes[header_bytes..] };
     }
 
+    pub fn at(self: View, offset: usize) Component {
+        std.debug.assert(offset >= header_bytes and offset <= self.bytes.len and entry_bytes <= self.bytes.len - offset);
+        var it: Iterator = .{ .rest = self.bytes[offset..] };
+        return it.next().?;
+    }
+
     pub fn get(self: View, id: u64) ?Component {
         var it = self.iterator();
         while (it.next()) |component| {
@@ -73,9 +79,8 @@ pub const Iterator = struct {
 };
 
 /// Canonical ordering makes identity independent of client component ordering.
-/// Payloads are copied into the immutable definition owned by Inventories.
-pub fn encode(buffer: []u8, kind: u32, components: []const Component) ![]const u8 {
-    if (components.len > maximum_components or buffer.len < header_bytes) return error.ItemTooLarge;
+pub fn define(store: *inventories.Inventories, kind: u32, components: []const Component) !inventories.ItemId {
+    if (components.len > maximum_components) return error.ItemTooLarge;
     var sorted: [maximum_components]Component = undefined;
     @memcpy(sorted[0..components.len], components);
     std.mem.sort(Component, sorted[0..components.len], {}, struct {
@@ -83,42 +88,44 @@ pub fn encode(buffer: []u8, kind: u32, components: []const Component) ![]const u
             return a.key < b.key;
         }
     }.less);
-    @memcpy(buffer[0..4], "LRI2");
-    std.mem.writeInt(u32, buffer[4..8], kind, .little);
-    std.mem.writeInt(u16, buffer[8..10], @intCast(components.len), .little);
-    var rest = buffer[header_bytes..];
-    for (sorted[0..components.len], 0..) |component, index| {
+    var header: [header_bytes]u8 = undefined;
+    @memcpy(header[0..4], "LRI2");
+    std.mem.writeInt(u32, header[4..8], kind, .little);
+    std.mem.writeInt(u16, header[8..10], @intCast(components.len), .little);
+    var headers: [maximum_components][entry_bytes]u8 = undefined;
+    var parts: [1 + maximum_components * 2][]const u8 = undefined;
+    parts[0] = &header;
+    var count: usize = 1;
+    for (sorted[0..components.len], headers[0..components.len], 0..) |component, *entry, index| {
         if (index != 0 and sorted[index - 1].key == component.key) return error.DuplicateComponent;
-        const length = if (component.value) |payload| payload.len else 0;
-        if (length >= removed or rest.len < entry_bytes or length > rest.len - entry_bytes) return error.ItemTooLarge;
-        std.mem.writeInt(u64, rest[0..8], component.key, .little);
-        std.mem.writeInt(u32, rest[8..12], if (component.value != null) @intCast(length) else removed, .little);
-        rest = rest[entry_bytes..];
-        if (component.value) |payload| @memcpy(rest[0..length], payload);
-        rest = rest[length..];
+        const length = if (component.value) |bytes| bytes.len else 0;
+        if (length >= removed) return error.ItemTooLarge;
+        std.mem.writeInt(u64, entry[0..8], component.key, .little);
+        std.mem.writeInt(u32, entry[8..12], if (component.value != null) @intCast(length) else removed, .little);
+        parts[count] = entry;
+        count += 1;
+        if (component.value) |bytes| {
+            parts[count] = bytes;
+            count += 1;
+        }
     }
-    return buffer[0 .. buffer.len - rest.len];
+    return store.defineItem(parts[0..count]);
 }
 
 pub fn replace(store: *inventories.Inventories, stack: inventories.Stack, component: Component) !inventories.Stack {
-    var buffer: [64 * 1024]u8 = undefined;
-    var length: usize = undefined;
-    {
-        const lease = try store.acquireItem(stack.item);
-        defer lease.release();
-        const view = try View.parse(lease.read().?);
-        var entries: [maximum_components]Component = undefined;
-        var count: usize = 0;
-        var it = view.iterator();
-        while (it.next()) |entry| {
-            if (entry.key == component.key) continue;
-            if (count == entries.len) return error.ItemTooLarge;
-            entries[count] = entry;
-            count += 1;
-        }
+    const lease = try store.acquireItem(stack.item);
+    defer lease.release();
+    const view = try View.parse(lease.read().?);
+    var entries: [maximum_components]Component = undefined;
+    var count: usize = 0;
+    var it = view.iterator();
+    while (it.next()) |entry| {
+        if (entry.key == component.key) continue;
         if (count == entries.len) return error.ItemTooLarge;
-        entries[count] = component;
-        length = (try encode(&buffer, view.kind, entries[0 .. count + 1])).len;
+        entries[count] = entry;
+        count += 1;
     }
-    return .{ .item = try store.defineItem(buffer[0..length]), .count = stack.count };
+    if (count == entries.len) return error.ItemTooLarge;
+    entries[count] = component;
+    return .{ .item = try define(store, view.kind, entries[0 .. count + 1]), .count = stack.count };
 }

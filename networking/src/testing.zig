@@ -18,7 +18,7 @@ pub fn pause(comptime Transport: type) !void {
         var input: [32]u8 = undefined;
         var output: [256 * 1024]u8 = @splat(23);
         try transport.queueReceive(io, handle, &input);
-        try transport.queueSend(io, handle, &output);
+        try transport.queueSend(io, handle, &.{.{ .base = &output, .len = output.len }});
         if (submit) try transport.submit(io);
         native.pause(io, true);
         const deadline = std.Io.Clock.now(.awake, io).addDuration(.fromSeconds(2));

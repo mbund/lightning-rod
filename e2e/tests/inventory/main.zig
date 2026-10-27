@@ -1,16 +1,15 @@
 const e2e = @import("e2e");
 const std = @import("std");
-const lr = @import("lightning_rod");
+const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
-const bootstrap = e2e.server;
 
 pub fn main(init: std.process.Init) !void {
-    const args = try bootstrap.arguments(init);
-    const plugins = lr.plugin.compose(.{
-        lr.plugin.replace(bootstrap.plugins(), .{
-            lr.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = 2, .gamemode = if (std.mem.eql(u8, args.fixture, "inventory_creative")) .creative else .survival }),
+    const args = try e2e.profile.arguments(init);
+    const plugins = lightning_rod.plugin.compose(.{
+        lightning_rod.plugin.replace(e2e.profile.plugins(), .{
+            lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = 2, .gamemode = if (std.mem.eql(u8, args.fixture, "inventory_creative")) .creative else .survival }),
         }),
-        lr.plugin.configured(e2e.Inventory, .{ .starting_bread = 17 }),
+        lightning_rod.plugin.configured(e2e.Inventory, .{ .starting_bread = 17 }),
     });
-    try bootstrap.run(init, plugins, .{});
+    try e2e.profile.run(init, plugins, .{});
 }

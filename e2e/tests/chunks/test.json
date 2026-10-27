@@ -25,6 +25,14 @@
       "mixed_versions": true
     },
     {
+      "name": "chunks-parallel-multi",
+      "peers": [
+        "alice",
+        "bob"
+      ],
+      "fixture": "parallel"
+    },
+    {
       "name": "chunks-disk-multi",
       "peers": [
         "alice",

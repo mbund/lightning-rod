@@ -1,37 +1,34 @@
 const std = @import("std");
-const lr = @import("lightning_rod");
+const lightning_rod = @import("lightning_rod");
 const protocols = @import("protocols");
 const vanilla = @import("vanilla");
 const e2e = @import("e2e");
 const sessions = @import("sessions");
 const minecraft = @import("minecraft_model");
-const registry = protocols.registry;
-const bootstrap = e2e.server;
-const simulations = e2e.simulations;
 
 pub fn main(init: std.process.Init) !void {
-    const args = try bootstrap.arguments(init);
-    const terrain_plugins = lr.plugin.replace(bootstrap.plugins(), .{
-        lr.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = 32, .spawn_for_player = spawn }),
+    const args = try e2e.profile.arguments(init);
+    const terrain_plugins = lightning_rod.plugin.replace(e2e.profile.plugins(), .{
+        lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = 32, .spawn_for_player = spawn }),
     });
     if (std.mem.eql(u8, args.fixture, "simulations")) {
         var endpoints: [2]*sessions.Service = undefined;
-        const plugins = lr.plugin.compose(.{
+        const plugins = lightning_rod.plugin.compose(.{
             terrain_plugins,
-            lr.plugin.configured(e2e.Inventory, .{}),
+            lightning_rod.plugin.configured(e2e.Inventory, .{}),
         });
-        const alice = lr.plugin.replace(plugins, .{
-            lr.plugin.configured(e2e.Inventory, .{ .starting_bread = 17 }),
+        const alice = lightning_rod.plugin.replace(plugins, .{
+            lightning_rod.plugin.configured(e2e.Inventory, .{ .starting_bread = 17 }),
         });
-        return simulations.run(init, .{ alice, plugins }, &endpoints, .{ .plaintext = true, .render_distance = 32 });
+        return e2e.simulations.run(init, .{ alice, plugins }, &endpoints, .{}, .{ .plaintext = true, .render_distance = 32 });
     }
     const disk = std.mem.eql(u8, args.fixture, "disk");
-    const plugins = lr.plugin.compose(.{
+    const plugins = lightning_rod.plugin.compose(.{
         terrain_plugins,
-        lr.plugin.configured(Probe, .{ .disk = disk }),
+        lightning_rod.plugin.configured(Probe, .{ .disk = disk }),
     });
-    if (disk) return bootstrap.run(init, lr.plugin.replace(plugins, .{lr.plugin.configured(NoGeneration, .{})}), .{ .plaintext = true });
-    try bootstrap.run(init, plugins, .{ .plaintext = !std.mem.eql(u8, args.fixture, "encryption"), .compression_threshold = if (std.mem.eql(u8, args.fixture, "isolation")) null else 256 });
+    if (disk) return e2e.profile.run(init, lightning_rod.plugin.replace(plugins, .{lightning_rod.plugin.configured(NoGeneration, .{})}), .{ .plaintext = true });
+    try e2e.profile.run(init, plugins, .{ .plaintext = !std.mem.eql(u8, args.fixture, "encryption"), .compression_threshold = if (std.mem.eql(u8, args.fixture, "isolation")) null else 256, .generation_workers = if (std.mem.eql(u8, args.fixture, "parallel")) 4 else 0 });
 }
 
 fn spawn(player: *const vanilla.Players.Player) minecraft.Position {
@@ -48,12 +45,15 @@ const NoGeneration = struct {
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*NoGeneration {
         const self = try allocator.create(NoGeneration);
         self.* = .{};
-        std.debug.assert(deps.chunks.source == null);
-        deps.chunks.source = vanilla.ChunkSource.init(self, read);
+        deps.chunks.setSource(vanilla.ChunkSource.init(self, read));
         return self;
     }
 
-    fn read(_: *NoGeneration, _: vanilla.Section, _: []u8) !usize {
+    fn read(self: *NoGeneration, io: std.Io, batch: vanilla.ChunkSource.Batch) void {
+        for (batch.requests) |*request| request.result = self.readOne(io, request.section, request.output);
+    }
+
+    fn readOne(_: *NoGeneration, _: std.Io, _: vanilla.Section, _: []u8) !usize {
         return error.E2eUnexpectedTerrainGeneration;
     }
 };
@@ -83,7 +83,7 @@ const Probe = struct {
         const x: i32 = @intFromFloat(@floor(player.position.x));
         const z: i32 = @intFromFloat(@floor(player.position.z));
         for ([_][]const u8{ "minecraft:gold_block", "minecraft:diamond_block", "minecraft:emerald_block" }, 0..) |name, i|
-            try self.deps.chunks.setBlock(player.world, .{ .x = x + 2 + @as(i32, @intCast(i)), .y = 65, .z = z + 2 }, @intCast(registry.blockStateId(name).?));
+            try self.deps.chunks.setBlock(player.world, .{ .x = x + 2 + @as(i32, @intCast(i)), .y = 65, .z = z + 2 }, @intCast(protocols.registry.blockStateId(name).?));
         return .handled;
     }
 };

@@ -1,16 +1,15 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
-const metrics = lightning_rod.metrics;
-const bossbars = @import("bossbars");
+const vanilla = @import("vanilla");
 
 pub const Tps = struct {
     pub const id = "lightning_rod:tps";
 
     pub const Configuration = struct { update_interval_ms: u32 = 500 };
 
-    pub const Dependencies = struct { bossbars: *bossbars.Bossbars, metrics: *metrics.Registry };
+    pub const Dependencies = struct { bossbars: *vanilla.Bossbars, metrics: *lightning_rod.metrics.Registry };
 
-    pub const windows = [_]u64{ 1, 10, 60 };
+    pub const windows = [_]u64{ 1, 10 };
     const quantum = 100 * std.time.ns_per_ms;
 
     const Bucket = struct {
@@ -22,8 +21,8 @@ pub const Tps = struct {
 
     deps: Dependencies,
     config: Configuration,
-    bars: [3]bossbars.Handle,
-    buckets: [601]Bucket = @splat(.{}),
+    bars: [windows.len]vanilla.Bossbars.Handle,
+    buckets: [windows[windows.len - 1] * std.time.ns_per_s / quantum + 1]Bucket = @splat(.{}),
     previous: u64 = 0,
     previous_ns: i96 = 0,
     updated_ns: i96 = 0,

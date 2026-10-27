@@ -17,7 +17,7 @@ pub const Input = struct {
     const Lifecycle = struct {
         context: *anyopaque,
         vtable: *const VTable,
-        const VTable = struct { call: *const fn (*anyopaque, sessions.Event) anyerror!void };
+        const VTable = struct { call: *const fn (*anyopaque, []const sessions.Event) anyerror!void };
     };
 
     deps: Dependencies,
@@ -33,6 +33,7 @@ pub const Input = struct {
             .rejected = try allocator.alloc(u32, deps.sessions.config.connections),
         };
 
+        @memset(self.rejected, 0);
         inline for (protocols.implementations, 0..) |Version, index| {
             const Packet = Version.Protocol.play.toServer;
             var maximum: usize = 0;
@@ -98,35 +99,41 @@ pub const Input = struct {
         if (self.lifecycle != null) return error.DuplicateLifecycleOwner;
         const Adapter = struct {
             const vtable: Lifecycle.VTable = .{ .call = @This().invoke };
-            fn invoke(raw: *anyopaque, event: sessions.Event) anyerror!void {
+            fn invoke(raw: *anyopaque, events: []const sessions.Event) anyerror!void {
                 const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
-                return handler(typed, event);
+                return handler(typed, events);
             }
         };
         self.lifecycle = .{ .context = context, .vtable = &Adapter.vtable };
     }
 
     pub fn tick(self: *Input, temporary: std.mem.Allocator) !void {
-        @memset(self.rejected, 0);
-        for (self.deps.sessions.input_events) |event| {
+        const events = self.deps.sessions.input_events;
+        defer for (events) |event| {
+            if (event == .input) self.rejected[event.input.handle.index] = 0;
+        };
+        var cursor: usize = 0;
+        while (cursor < events.len) {
+            const event = events[cursor];
+            cursor += 1;
             switch (event) {
                 .joined, .left, .ready => {
+                    const begin = cursor - 1;
+                    while (cursor < events.len and events[cursor] != .input) cursor += 1;
                     if (self.lifecycle) |handler|
-                        try handler.vtable.call(handler.context, event);
+                        try handler.vtable.call(handler.context, events[begin..cursor]);
                 },
                 .input => |input| {
                     if (self.rejected[input.handle.index] == input.handle.generation) continue;
-                    var bytes = input.bytes;
-                    packets: while (bytes.len != 0) {
-                        const frame = sessions.frame(bytes, self.deps.sessions.config.buffer_bytes) catch unreachable;
-                        bytes = bytes[frame.length..];
+                    var incoming = input.packets;
+                    packets: while (incoming.next() catch unreachable) |packet| {
                         var matched = false;
 
                         inline for (protocols.implementations, 0..) |Version, index| {
                             if (input.protocol == Version.protocol_number) {
                                 matched = true;
                                 const Packet = Version.Protocol.play.toServer;
-                                const header = Packet.readHeader(frame.body) catch {
+                                const header = Packet.readHeader(packet) catch {
                                     self.reject(input.handle, "Header");
                                     break :packets;
                                 };

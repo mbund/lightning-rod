@@ -3,6 +3,7 @@ const storage = @import("storage");
 const records = @import("records");
 
 pub const References = struct {
+    pub const write_batch_size = records.Table.write_batch_size;
     counts: records.Table,
     retired: records.Table,
 
@@ -11,7 +12,7 @@ pub const References = struct {
     }
     pub fn putBatch(self: References, writes: []const records.Write) storage.Error!void {
         errdefer self.fail();
-        var retired: [192]records.Write = undefined;
+        var retired: [write_batch_size]records.Write = undefined;
         if (writes.len > retired.len) return error.InvalidArgument;
         for (writes, retired[0..writes.len]) |write, *update| {
             const count = if (write.value) |bytes| count: {

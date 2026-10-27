@@ -19,11 +19,16 @@ pub const Input = struct {
 };
 
 pub fn checkpoint(store: *storage.Store) !void {
-    for (0..10000) |_| {
-        _ = try store.maintain(storage.batch_size);
+    const deadline = std.Io.Clock.Timestamp.fromNow(store.io, .{ .clock = .awake, .raw = .fromSeconds(30) });
+    while (true) {
+        const progress = try store.pollMaintenance(.{ .index_entries = storage.batch_size, .pages = storage.batch_size });
         if (store.end == 64 and store.phase == .idle) return;
+        if (std.Io.Clock.now(.awake, store.io).nanoseconds >= deadline.raw.nanoseconds) return error.CheckpointDidNotFinish;
+        if (progress == .pending) {
+            if (store.filesystem.pending) try store.filesystem.wait(deadline);
+            if (store.maintenance_io.active) try store.maintenance_io.drain();
+        }
     }
-    return error.CheckpointDidNotFinish;
 }
 
 fn sizes(store: *storage.Store) ![2]u64 {
@@ -64,16 +69,19 @@ pub const Result = struct {
     digest: []const u8,
 };
 
-pub fn run(allocator: std.mem.Allocator, io: std.Io, path: []const u8, trace: []const u8) !Result {
+pub fn run(allocator: std.mem.Allocator, base_io: std.Io, path: []const u8, trace: []const u8) !Result {
+    const table_resources = try records.Resources.init(allocator, base_io, .{ .readers = 1, .writers = 1 });
+    defer table_resources.deinit();
+    const io = base_io;
     var input: Input = .{ .bytes = trace };
     const header = try input.read(12);
     if (!std.mem.eql(u8, header[0..8], "LRBENCH1")) return error.InvalidTrace;
     const transactions = std.mem.readInt(u32, header[8..12], .little);
     var registry = try metrics.Registry.init(allocator, io, .{ .capacity = 64 });
     defer registry.deinit();
-    var store = try storage.Store.init(allocator, io, .{ .path = path, .submission = .standard, .checkpoint_bytes = 64, .metrics = &registry });
+    var store = try storage.Store.init(allocator, io, .{ .path = path, .checkpoint_bytes = 64, .metrics = &registry });
     defer store.deinit();
-    const table = records.Table.init(try store.openSpace("records"));
+    const table = records.Table.init(try store.openSpace("records"), table_resources);
     const values = try allocator.alloc([value_capacity]u8, batch_size);
     defer allocator.free(values);
     var keys: [batch_size][16]u8 = undefined;
@@ -103,15 +111,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, path: []const u8, trace: []
     try checkpoint(&store);
     const after = try sizes(&store);
     const io_after = try ioCounts(io);
-    var free = store.metadata.free;
-    var free_pages: u64 = 0;
-    while (free != 0) {
-        if (free >= store.metadata.pages or free_pages == store.metadata.pages) return error.Corrupt;
-        var next: [8]u8 = undefined;
-        if (try store.database.readPositionalAll(io, &next, free * 4096 + 32) != next.len) return error.Corrupt;
-        free = std.mem.readInt(u64, &next, .little);
-        free_pages += 1;
-    }
+    const free_pages = store.metadata.free_pages;
     var cursor_key: [64]u8 = undefined;
     var cursor: records.ScanCursor = .{ .after = &cursor_key };
     var entries: [batch_size]records.ScanEntry = undefined;
@@ -135,5 +135,5 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, path: []const u8, trace: []
     var hash: [32]u8 = undefined;
     digest.final(&hash);
     const hex = std.fmt.bytesToHex(hash, .lower);
-    return .{ .before_checkpoint = .{ .database = before[0], .wal = before[1] }, .after_checkpoint = .{ .database = after[0], .wal = after[1] }, .submitted_bytes = io_after[0] - io_before[0], .kernel_write_bytes = io_after[1] - io_before[1], .submitted_wal_bytes = store.wal_bytes.value(), .maintenance_bytes = store.checkpoint_bytes.value(), .page_size = 4096, .pages = store.metadata.pages, .free_pages = free_pages, .rows = rows, .payload = payload, .digest = try allocator.dupe(u8, &hex) };
+    return .{ .before_checkpoint = .{ .database = before[0], .wal = before[1] }, .after_checkpoint = .{ .database = after[0], .wal = after[1] }, .submitted_bytes = store.wal_bytes.value() + store.checkpoint_bytes.value(), .kernel_write_bytes = io_after[1] - io_before[1], .submitted_wal_bytes = store.wal_bytes.value(), .maintenance_bytes = store.checkpoint_bytes.value(), .page_size = 4096, .pages = store.metadata.pages, .free_pages = free_pages, .rows = rows, .payload = payload, .digest = try allocator.dupe(u8, &hex) };
 }

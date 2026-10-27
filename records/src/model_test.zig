@@ -4,19 +4,59 @@ const storage = @import("storage");
 const metrics = @import("metrics");
 const structure = @import("structure_test.zig");
 const testing = @import("storage_testing");
+const fault = @import("fault_disk");
 
 const Row = struct { bytes: [8193]u8 = undefined, length: usize = 0, present: bool = false };
 
+test "record workspaces remain bounded after initialization across splits and deletion" {
+    var temporary = try testing.directory(.{});
+    defer temporary.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/workspace", .{temporary.sub_path});
+    var memory = storage.system.Memory.init(std.testing.allocator, std.testing.io);
+    defer memory.deinit();
+    const allocator = memory.allocator("records");
+    const table_resources = try records.Resources.init(allocator, std.testing.io, .{ .readers = 1, .writers = 1 });
+    defer table_resources.deinit();
+    var store = try storage.Store.init(allocator, std.testing.io, .{ .path = path, .maximum_wal_pages = 256 });
+    defer store.deinit();
+    const table = records.Table.init(try store.openSpace("records"), table_resources);
+    const reserved = memory.assigned_bytes;
+    memory.seal();
+    var keys: [256][2]u8 = undefined;
+    var writes: [256]records.Write = undefined;
+    const value: [700]u8 = @splat(17);
+    for (&keys, &writes, 0..) |*key, *write, index| {
+        std.mem.writeInt(u16, key, @intCast(index), .big);
+        write.* = .{ .key = key, .value = &value };
+    }
+    try table.putBatch(&writes);
+    try store.waitDurable(try store.commit(1));
+    var output: [700]u8 = undefined;
+    for (keys) |key| {
+        try std.testing.expectEqual(@as(?usize, value.len), try table.get(&key, &output));
+        try std.testing.expectEqualSlices(u8, &value, &output);
+    }
+    for (&writes) |*write| write.value = null;
+    try table.putBatch(&writes);
+    try store.waitDurable(try store.commit(2));
+    try std.testing.expectEqual(null, try table.space.getRoot());
+    try std.testing.expectEqual(reserved, memory.assigned_bytes);
+    try std.testing.expectEqual(@as(usize, 0), table_resources.borrowed.load(.acquire));
+}
+
 test "overflow remainders share a leaf and recover across representation changes" {
+    const table_resources = try records.Resources.init(std.testing.allocator, std.testing.io, .{ .readers = 1, .writers = 1 });
+    defer table_resources.deinit();
     const io = std.testing.io;
     var temporary = try testing.directory(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/prefix", .{temporary.sub_path});
     defer std.testing.allocator.free(path);
-    const options: storage.Store.Options = .{ .path = path, .submission = .standard };
+    const options: storage.Store.Options = .{ .path = path };
     var store = try storage.Store.init(std.testing.allocator, io, options);
     defer store.deinit();
-    var table = records.Table.init(try store.openSpace("records"));
+    var table = records.Table.init(try store.openSpace("records"), table_resources);
     var keys: [2][64]u8 = @splat(@splat(0));
     keys[1][0] = 1;
     var payload: [7064]u8 = undefined;
@@ -27,7 +67,7 @@ test "overflow remainders share a leaf and recover across representation changes
     try store.waitDurable(try store.commit(1));
     store.deinit();
     store = try storage.Store.init(std.testing.allocator, io, options);
-    table = records.Table.init(try store.openSpace("records"));
+    table = records.Table.init(try store.openSpace("records"), table_resources);
     var output: [7064]u8 = undefined;
     for (&keys) |key| {
         try std.testing.expectEqual(@as(?usize, 5964), try table.get(&key, &output));
@@ -37,7 +77,7 @@ test "overflow remainders share a leaf and recover across representation changes
     try store.waitDurable(try store.commit(2));
     store.deinit();
     store = try storage.Store.init(std.testing.allocator, io, options);
-    table = records.Table.init(try store.openSpace("records"));
+    table = records.Table.init(try store.openSpace("records"), table_resources);
     for (&keys, [_]usize{ 1500, payload.len }) |key, length| {
         try std.testing.expectEqual(@as(?usize, length), try table.get(&key, &output));
         try std.testing.expectEqualSlices(u8, payload[0..length], output[0..length]);
@@ -49,16 +89,18 @@ test "overflow remainders share a leaf and recover across representation changes
 }
 
 test "record decoding rejects invalid inline prefixes and older node versions" {
+    const table_resources = try records.Resources.init(std.testing.allocator, std.testing.io, .{ .readers = 1, .writers = 1 });
+    defer table_resources.deinit();
     const io = std.testing.io;
     var temporary = try testing.directory(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/prefix", .{temporary.sub_path});
     defer std.testing.allocator.free(path);
-    const options: storage.Store.Options = .{ .path = path, .submission = .standard };
+    const options: storage.Store.Options = .{ .path = path };
     {
         var store = try storage.Store.init(std.testing.allocator, io, options);
         defer store.deinit();
-        const table = records.Table.init(try store.openSpace("records"));
+        const table = records.Table.init(try store.openSpace("records"), table_resources);
         const value: [5964]u8 = @splat(17);
         try table.put("key", &value);
         try store.waitDurable(try store.commit(1));
@@ -84,11 +126,13 @@ test "record decoding rejects invalid inline prefixes and older node versions" {
         std.mem.writeInt(u32, page[20..24], invalid.length, .little);
         try space.writePages(&.{.{ .id = root, .source = &page }});
         var value: [5964]u8 = undefined;
-        try std.testing.expectError(error.Corrupt, records.Table.init(space).get("key", &value));
+        try std.testing.expectError(error.Corrupt, records.Table.init(space, table_resources).get("key", &value));
     }
 }
 
 test "overflow reads share submissions across records and preserve caller ordering" {
+    const table_resources = try records.Resources.init(std.testing.allocator, std.testing.io, .{ .readers = 1, .writers = 1 });
+    defer table_resources.deinit();
     const io = std.testing.io;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -96,10 +140,12 @@ test "overflow reads share submissions across records and preserve caller orderi
     defer std.testing.allocator.free(path);
     var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .capacity = 64 });
     defer registry.deinit();
-    const options: storage.Store.Options = .{ .path = path, .submission = .standard, .metrics = &registry };
+    const page_resources = try storage.Resources.init(std.testing.allocator, io, .{ .cache_pages = 1 });
+    defer page_resources.deinit();
+    const options: storage.Store.Options = .{ .path = path, .metrics = &registry, .resources = page_resources };
     var store = try storage.Store.init(std.testing.allocator, io, options);
     defer store.deinit();
-    var table = records.Table.init(try store.openSpace("records"));
+    var table = records.Table.init(try store.openSpace("records"), table_resources);
     const count = 64;
     const values = try std.testing.allocator.alloc([8193]u8, count);
     defer std.testing.allocator.free(values);
@@ -114,7 +160,7 @@ test "overflow reads share submissions across records and preserve caller orderi
     try store.waitDurable(try store.commit(1));
     store.deinit();
     store = try storage.Store.init(std.testing.allocator, io, options);
-    table = records.Table.init(try store.openSpace("records"));
+    table = records.Table.init(try store.openSpace("records"), table_resources);
     var reads: [count]records.Get = undefined;
     var lengths: [count]?usize = undefined;
     for (&reads, values, 0..) |*read, *value, i| read.* = .{ .key = &keys[count - 1 - i], .destination = value };
@@ -128,15 +174,17 @@ test "overflow reads share submissions across records and preserve caller orderi
 }
 
 test "record trees reclaim sparse leaves and branches through shrink growth and aborted saves" {
+    const table_resources = try records.Resources.init(std.testing.allocator, std.testing.io, .{ .readers = 1, .writers = 1 });
+    defer table_resources.deinit();
     const io = std.testing.io;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/world", .{temporary.sub_path});
     defer std.testing.allocator.free(path);
-    const options: storage.Store.Options = .{ .path = path, .submission = .standard, .maximum_wal_pages = 8192 };
+    const options: storage.Store.Options = .{ .path = path, .maximum_wal_pages = 8192 };
     var store = try storage.Store.init(std.testing.allocator, io, options);
     defer store.deinit();
-    var table = records.Table.init(try store.openSpace("records"));
+    var table = records.Table.init(try store.openSpace("records"), table_resources);
     const count = 2048;
     const values = try std.testing.allocator.alloc([8193]u8, 192);
     defer std.testing.allocator.free(values);
@@ -170,12 +218,12 @@ test "record trees reclaim sparse leaves and branches through shrink growth and 
             if (phase == 3 and attempt == 0) {
                 store.deinit();
                 store = try storage.Store.init(std.testing.allocator, io, options);
-                table = records.Table.init(try store.openSpace("records"));
+                table = records.Table.init(try store.openSpace("records"), table_resources);
             } else {
                 try store.waitDurable(try store.commit(phase + 1));
                 store.deinit();
                 store = try storage.Store.init(std.testing.allocator, io, options);
-                table = records.Table.init(try store.openSpace("records"));
+                table = records.Table.init(try store.openSpace("records"), table_resources);
             }
             _ = try structure.inspect(table);
             const expected_phase = if (phase == 3 and attempt == 0) phase - 1 else phase;
@@ -205,14 +253,16 @@ fn churnLength(phase: usize, id: usize) usize {
 }
 
 test "structural inspection rejects lost pages and scanning rejects cyclic leaf links" {
+    const table_resources = try records.Resources.init(std.testing.allocator, std.testing.io, .{ .readers = 1, .writers = 1 });
+    defer table_resources.deinit();
     const io = std.testing.io;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/world", .{temporary.sub_path});
     defer std.testing.allocator.free(path);
-    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path, .submission = .standard });
+    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
     defer store.deinit();
-    const table = records.Table.init(try store.openSpace("records"));
+    const table = records.Table.init(try store.openSpace("records"), table_resources);
     try table.put("key", "value");
     var leaked: [1]storage.PageId = undefined;
     try table.space.allocatePages(&leaked);
@@ -236,14 +286,16 @@ test "structural inspection rejects lost pages and scanning rejects cyclic leaf 
 }
 
 test "a failed scan batch preserves its cursor for retry" {
+    const table_resources = try records.Resources.init(std.testing.allocator, std.testing.io, .{ .readers = 1, .writers = 1 });
+    defer table_resources.deinit();
     const io = std.testing.io;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/world", .{temporary.sub_path});
     defer std.testing.allocator.free(path);
-    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path, .submission = .standard });
+    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
     defer store.deinit();
-    const table = records.Table.init(try store.openSpace("records"));
+    const table = records.Table.init(try store.openSpace("records"), table_resources);
     try table.putBatch(&.{ .{ .key = "a", .value = "first" }, .{ .key = "b", .value = "second" }, .{ .key = "c", .value = "third" } });
     var after: [16]u8 = undefined;
     var cursor: records.ScanCursor = .{ .after = &after, .after_len = 1 };
@@ -264,15 +316,17 @@ test "a failed scan batch preserves its cursor for retry" {
 }
 
 test "an overflowing leaf uses space on its left before allocating another page" {
+    const table_resources = try records.Resources.init(std.testing.allocator, std.testing.io, .{ .readers = 1, .writers = 1 });
+    defer table_resources.deinit();
     const io = std.testing.io;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/world", .{temporary.sub_path});
     defer std.testing.allocator.free(path);
-    const options: storage.Store.Options = .{ .path = path, .submission = .standard };
+    const options: storage.Store.Options = .{ .path = path };
     var store = try storage.Store.init(std.testing.allocator, io, options);
     defer store.deinit();
-    var table = records.Table.init(try store.openSpace("sections"));
+    var table = records.Table.init(try store.openSpace("sections"), table_resources);
     var keys: [21][16]u8 = undefined;
     var writes: [21]records.Write = undefined;
     const value: [519]u8 = @splat(17);
@@ -292,7 +346,7 @@ test "an overflowing leaf uses space on its left before allocating another page"
     try store.waitDurable(try store.commit(2));
     store.deinit();
     store = try storage.Store.init(std.testing.allocator, io, options);
-    table = records.Table.init(try store.openSpace("sections"));
+    table = records.Table.init(try store.openSpace("sections"), table_resources);
     var buffer: [value.len]u8 = undefined;
     for (keys, 0..) |key, index| {
         const length = try table.get(&key, &buffer);
@@ -319,6 +373,8 @@ test "an overflowing leaf uses space on its left before allocating another page"
 }
 
 test "one record batch writes a shared parent only once" {
+    const table_resources = try records.Resources.init(std.testing.allocator, std.testing.io, .{ .readers = 1, .writers = 1 });
+    defer table_resources.deinit();
     const io = std.testing.io;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -326,9 +382,9 @@ test "one record batch writes a shared parent only once" {
     defer std.testing.allocator.free(path);
     var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .capacity = 64 });
     defer registry.deinit();
-    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path, .submission = .standard, .metrics = &registry });
+    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path, .metrics = &registry });
     defer store.deinit();
-    const table = records.Table.init(try store.openSpace("sections"));
+    const table = records.Table.init(try store.openSpace("sections"), table_resources);
     var keys: [192][16]u8 = undefined;
     var writes: [192]records.Write = undefined;
     const value: [519]u8 = @splat(17);
@@ -353,6 +409,8 @@ test "one record batch writes a shared parent only once" {
 }
 
 test "fresh section indexes stay shallow and packed for every insertion order and batch size" {
+    const table_resources = try records.Resources.init(std.testing.allocator, std.testing.io, .{ .readers = 1, .writers = 1 });
+    defer table_resources.deinit();
     const count = 2048;
     const Order = enum { ascending, descending, shuffled };
     const io = std.testing.io;
@@ -363,10 +421,10 @@ test "fresh section indexes stay shallow and packed for every insertion order an
             defer temporary.cleanup();
             const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/world", .{temporary.sub_path});
             defer std.testing.allocator.free(path);
-            const options: storage.Store.Options = .{ .path = path, .submission = .standard, .maximum_wal_pages = 4096 };
+            const options: storage.Store.Options = .{ .path = path, .maximum_wal_pages = 4096 };
             var store = try storage.Store.init(std.testing.allocator, io, options);
             defer store.deinit();
-            var table = records.Table.init(try store.openSpace("sections"));
+            var table = records.Table.init(try store.openSpace("sections"), table_resources);
             var order: [count]u16 = undefined;
             for (&order, 0..) |*id, index| id.* = @intCast(if (pattern == .descending) count - 1 - index else index);
             if (pattern == .shuffled) {
@@ -395,7 +453,7 @@ test "fresh section indexes stay shallow and packed for every insertion order an
             try store.waitDurable(try store.commit(1));
             store.deinit();
             store = try storage.Store.init(std.testing.allocator, io, options);
-            table = records.Table.init(try store.openSpace("sections"));
+            table = records.Table.init(try store.openSpace("sections"), table_resources);
             var after: [16]u8 = undefined;
             var cursor: records.ScanCursor = .{ .after = &after };
             var entries: [192]records.ScanEntry = undefined;
@@ -458,11 +516,17 @@ pub fn run(input: []const u8) !void {
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/world", .{temporary.sub_path});
     defer std.testing.allocator.free(path);
-    const options: storage.Store.Options = .{ .path = path, .submission = .standard, .maximum_wal_pages = 4096, .checkpoint_bytes = 64 };
+    try runAt(io, path, input);
+}
+
+pub fn runAt(io: std.Io, path: []const u8, input: []const u8) !void {
+    const table_resources = try records.Resources.init(std.testing.allocator, io, .{ .readers = 1, .writers = 1 });
+    defer table_resources.deinit();
+    const options: storage.Store.Options = .{ .path = path, .maximum_wal_pages = 4096, .checkpoint_bytes = 64, .io_mode = .standard };
     var store = try storage.Store.init(std.testing.allocator, io, options);
     defer store.deinit();
     try std.testing.expectEqual(@as(u64, 0), store.lastTick());
-    var table = records.Table.init(try store.openSpace("model"));
+    var table = records.Table.init(try store.openSpace("model"), table_resources);
     var expected: [64]Row = @splat(.{});
     var saved = expected;
     var tick: u64 = 0;
@@ -495,12 +559,12 @@ pub fn run(input: []const u8) !void {
                 tick += 1;
                 try store.waitDurable(try store.commit(tick));
                 saved = expected;
-                for (0..input[step + 2] % 8) |_| _ = try store.maintain(4);
+                for (0..input[step + 2] % 8) |_| _ = try store.pollMaintenance(.{ .index_entries = 4, .pages = 4 });
             },
             5 => {
                 store.deinit();
                 store = try storage.Store.init(std.testing.allocator, io, options);
-                table = records.Table.init(try store.openSpace("model"));
+                table = records.Table.init(try store.openSpace("model"), table_resources);
                 expected = saved;
                 try verify(table, &expected);
             },
@@ -554,7 +618,7 @@ test "single values cross page boundaries and reuse their overflow pages" {
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/world", .{temporary.sub_path});
     defer std.testing.allocator.free(path);
-    const options: storage.Store.Options = .{ .path = path, .submission = .standard, .maximum_wal_pages = 1024 };
+    const options: storage.Store.Options = .{ .path = path, .maximum_wal_pages = 1024 };
     var payload: [65536]u8 = undefined;
     for (&payload, 0..) |*byte, index| byte.* = @truncate(index *% 31);
     var store = try storage.Store.init(std.testing.allocator, io, options);
@@ -574,15 +638,17 @@ test "single values cross page boundaries and reuse their overflow pages" {
 }
 
 test "batched records preserve ordering through a three-level tree and complete deletion" {
+    const table_resources = try records.Resources.init(std.testing.allocator, std.testing.io, .{ .readers = 1, .writers = 1 });
+    defer table_resources.deinit();
     const io = std.testing.io;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/world", .{temporary.sub_path});
     defer std.testing.allocator.free(path);
-    const options: storage.Store.Options = .{ .path = path, .submission = .standard, .maximum_wal_pages = 4096 };
+    const options: storage.Store.Options = .{ .path = path, .maximum_wal_pages = 4096 };
     var store = try storage.Store.init(std.testing.allocator, io, options);
     defer store.deinit();
-    var table = records.Table.init(try store.openSpace("records"));
+    var table = records.Table.init(try store.openSpace("records"), table_resources);
     var order: [2048]u16 = undefined;
     for (&order, 0..) |*id, index| id.* = @intCast(index);
     var random = std.Random.DefaultPrng.init(0xb8532a96);
@@ -611,7 +677,7 @@ test "batched records preserve ordering through a three-level tree and complete 
     try store.waitDurable(try store.commit(2));
     store.deinit();
     store = try storage.Store.init(std.testing.allocator, io, options);
-    table = records.Table.init(try store.openSpace("records"));
+    table = records.Table.init(try store.openSpace("records"), table_resources);
     var reads: [128]records.Get = undefined;
     var lengths: [128]?usize = undefined;
     for (&keys, &values, &reads, 0..) |*key, *value, *read, index| {
@@ -632,15 +698,17 @@ test "batched records preserve ordering through a three-level tree and complete 
 }
 
 test "one batch grows multiple tree levels and changes overflow representations" {
+    const table_resources = try records.Resources.init(std.testing.allocator, std.testing.io, .{ .readers = 1, .writers = 1 });
+    defer table_resources.deinit();
     const io = std.testing.io;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/world", .{temporary.sub_path});
     defer std.testing.allocator.free(path);
-    const options: storage.Store.Options = .{ .path = path, .submission = .standard, .maximum_wal_pages = 1024 };
+    const options: storage.Store.Options = .{ .path = path, .maximum_wal_pages = 1024 };
     var store = try storage.Store.init(std.testing.allocator, io, options);
     defer store.deinit();
-    var table = records.Table.init(try store.openSpace("records"));
+    var table = records.Table.init(try store.openSpace("records"), table_resources);
     var keys: [192][64]u8 = @splat(@splat(0));
     const value: [1277]u8 = @splat(17);
     var writes: [192]records.Write = undefined;
@@ -652,7 +720,7 @@ test "one batch grows multiple tree levels and changes overflow representations"
     try store.waitDurable(try store.commit(1));
     store.deinit();
     store = try storage.Store.init(std.testing.allocator, io, options);
-    table = records.Table.init(try store.openSpace("records"));
+    table = records.Table.init(try store.openSpace("records"), table_resources);
     var destination: [1277]u8 = undefined;
     for (&keys) |*key| {
         try std.testing.expectEqual(@as(?usize, value.len), try table.get(key, &destination));
@@ -671,7 +739,7 @@ test "one batch grows multiple tree levels and changes overflow representations"
         try store.waitDurable(try store.commit(tick + 2));
         store.deinit();
         store = try storage.Store.init(std.testing.allocator, io, options);
-        table = records.Table.init(try store.openSpace("records"));
+        table = records.Table.init(try store.openSpace("records"), table_resources);
         try std.testing.expectEqual(@as(?usize, length), try table.get(&keys[0], restored));
         try std.testing.expectEqualSlices(u8, payload[0..length], restored[0..length]);
         _ = try structure.inspect(table);
@@ -679,18 +747,20 @@ test "one batch grows multiple tree levels and changes overflow representations"
 }
 
 test "bulk sorting bounds writes and preserves last writes across sorting windows" {
+    const table_resources = try records.Resources.init(std.testing.allocator, std.testing.io, .{ .readers = 1, .writers = 1 });
+    defer table_resources.deinit();
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/bulk", .{temporary.sub_path});
     defer allocator.free(path);
-    const options: storage.Store.Options = .{ .path = path, .submission = .standard };
+    const options: storage.Store.Options = .{ .path = path };
     var registry = try metrics.Registry.init(allocator, io, .{ .capacity = 64 });
     defer registry.deinit();
-    var store = try storage.Store.init(allocator, io, .{ .path = path, .submission = .standard, .metrics = &registry });
+    var store = try storage.Store.init(allocator, io, .{ .path = path, .metrics = &registry });
     defer store.deinit();
-    var table = records.Table.init(try store.openSpace("records"));
+    var table = records.Table.init(try store.openSpace("records"), table_resources);
     const keys = try allocator.alloc([16]u8, 4096);
     defer allocator.free(keys);
     const writes = try allocator.alloc(records.Write, 8192);
@@ -712,7 +782,7 @@ test "bulk sorting bounds writes and preserves last writes across sorting window
     try store.waitDurable(try store.commit(1));
     store.deinit();
     store = try storage.Store.init(allocator, io, options);
-    table = records.Table.init(try store.openSpace("records"));
+    table = records.Table.init(try store.openSpace("records"), table_resources);
     _ = try structure.inspect(table);
     var bytes: [519]u8 = undefined;
     for (keys, 0..) |*key, id| {
@@ -724,4 +794,247 @@ test "bulk sorting bounds writes and preserves last writes across sorting window
             try std.testing.expectEqualStrings("last", bytes[0..length.?]);
         }
     }
+}
+
+test "batched multi-index blobs survive reopen deletion and page reuse" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const resources = try records.Resources.init(allocator, io, .{ .readers = 1, .writers = 1 });
+    defer resources.deinit();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/large", .{temporary.sub_path});
+    const options: storage.Store.Options = .{ .path = path };
+    var store = try storage.Store.init(allocator, io, options);
+    defer store.deinit();
+    var table = records.Table.init(try store.openSpace("records"), resources);
+    const size = 1400000;
+    const source = try allocator.alloc(u8, size);
+    defer allocator.free(source);
+    const destination = try allocator.alloc(u8, size * 2);
+    defer allocator.free(destination);
+    for (source, 0..) |*byte, index| byte.* = @truncate(index *% 31);
+    const writes = [_]records.Write{ .{ .key = "a", .value = source }, .{ .key = "b", .value = source[0 .. size - 17] } };
+    try table.putBatch(&writes);
+    try store.waitDurable(try store.commit(1));
+    const pages = store.metadata.pages;
+    store.deinit();
+    store = try storage.Store.init(allocator, io, options);
+    table = records.Table.init(try store.openSpace("records"), resources);
+    const requests = [_]records.Get{ .{ .key = "b", .destination = destination[0..size] }, .{ .key = "a", .destination = destination[size..] } };
+    var lengths: [2]?usize = undefined;
+    try table.getBatch(&requests, &lengths);
+    try std.testing.expectEqual(@as(?usize, size - 17), lengths[0]);
+    try std.testing.expectEqual(@as(?usize, size), lengths[1]);
+    try std.testing.expectEqualSlices(u8, source[0 .. size - 17], destination[0 .. size - 17]);
+    try std.testing.expectEqualSlices(u8, source, destination[size..]);
+    try table.putBatch(&.{ .{ .key = "a", .value = null }, .{ .key = "b", .value = null } });
+    try table.putBatch(&writes);
+    try std.testing.expectEqual(pages, store.metadata.pages);
+    try store.waitDurable(try store.commit(2));
+    _ = try structure.inspect(table);
+}
+
+test "independent lookups and mutations progress around a paused read on small stacks" {
+    const Actor = struct {
+        table: records.Table,
+        length: usize,
+        expected: u8,
+        write: bool = false,
+        gate: ?*fault.Disk.IoGate = null,
+        bytes: [8193]u8 = undefined,
+        done: std.Io.Event = .unset,
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            if (self.gate) |gate| gate.thread.store(std.Thread.getCurrentId(), .release);
+            self.result = self.execute();
+            self.done.set(std.testing.io);
+        }
+        fn execute(self: *@This()) !void {
+            if (self.write) {
+                @memset(self.bytes[0..self.length], self.expected);
+                try self.table.put("key", self.bytes[0..self.length]);
+            }
+            try std.testing.expectEqual(@as(?usize, self.length), try self.table.get("key", &self.bytes));
+            try std.testing.expect(std.mem.allEqual(u8, self.bytes[0..self.length], self.expected));
+        }
+    };
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = try testing.directory(.{});
+    defer temporary.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/readers", .{temporary.sub_path});
+    defer allocator.free(path);
+    const pages = try storage.Resources.init(allocator, io, .{ .cache_pages = 1, .readers = 2, .io_mode = .standard });
+    defer pages.deinit();
+    var store = try storage.Store.init(allocator, io, .{ .path = path, .io_mode = .standard, .resources = pages, .maximum_wal_pages = 128 });
+    defer store.deinit();
+    const resources = try records.Resources.init(allocator, io, .{ .readers = 2, .writers = 1 });
+    defer resources.deinit();
+    const a = try store.openSpace("a");
+    const b = try store.openSpace("b");
+    const c = try store.openSpace("c");
+    const first = records.Table.init(a, resources);
+    const second = records.Table.init(b, resources);
+    const third = records.Table.init(c, resources);
+    const large: [8193]u8 = @splat(31);
+    const small: [32]u8 = @splat(22);
+    try first.put("key", &large);
+    try second.put("key", &small);
+    const root = (try a.getRoot()).?;
+    const offset = store.locations.get(@intFromEnum(root)).?.current;
+    var disk = try fault.Disk.init(allocator, io, &.{ store.database, store.wal }, std.math.maxInt(usize), false);
+    defer disk.deinit();
+    const modeled = disk.interface();
+    defer disk.detach();
+    store.bindIo(modeled);
+    var gate: fault.Disk.IoGate = .{ .file = store.wal, .offset = offset + 32 };
+    disk.read_gate = &gate;
+    var paused: Actor = .{ .table = first, .length = large.len, .expected = 31, .gate = &gate };
+    const background = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, Actor.run, .{&paused});
+    defer background.join();
+    defer gate.release.set(io);
+    try gate.entered.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
+    var lookup: Actor = .{ .table = second, .length = small.len, .expected = 22 };
+    const reader = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, Actor.run, .{&lookup});
+    defer reader.join();
+    defer gate.release.set(io);
+    try lookup.done.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
+    try lookup.result;
+    var mutation: Actor = .{ .table = third, .length = 32, .expected = 17, .write = true };
+    const writer = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, Actor.run, .{&mutation});
+    defer writer.join();
+    defer gate.release.set(io);
+    try mutation.done.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
+    try mutation.result;
+    try std.testing.expect(!paused.done.isSet());
+    gate.release.set(io);
+    try paused.done.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
+    try paused.result;
+}
+
+test "batched checkpoint retains upcoming leaves and recovers complete replacements" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/prefetch", .{temporary.sub_path});
+    var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .capacity = 128 });
+    defer registry.deinit();
+    const resources = try records.Resources.init(std.testing.allocator, io, .{ .readers = 1, .writers = 1 });
+    defer resources.deinit();
+    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path, .metrics = &registry });
+    defer store.deinit();
+    var table = records.Table.init(try store.openSpace("records"), resources);
+    const count = 512;
+    const values = try std.testing.allocator.alloc([2048]u8, count);
+    defer std.testing.allocator.free(values);
+    var keys: [count][8]u8 = undefined;
+    var writes: [count]records.Write = undefined;
+    for (&keys, values, &writes, 0..) |*key, *value, *write, index| {
+        std.mem.writeInt(u64, key, index, .big);
+        @memset(value, @truncate(index));
+        write.* = .{ .key = key, .value = value };
+    }
+    try table.putBatch(&writes);
+    try store.waitDurable(try store.commit(1));
+    const shape = try structure.inspect(table);
+    try std.testing.expectEqual(@as(usize, count), shape.records);
+    for (values, 0..) |*value, index| @memset(value, @truncate(index + 1));
+    const before = store.read_batches.value();
+    try table.putBatch(&writes);
+    const windows = try std.math.divCeil(usize, count, storage.batch_size);
+    try std.testing.expect(store.read_batches.value() - before <= windows * (shape.height + 1));
+    try store.waitDurable(try store.commit(2));
+    store.deinit();
+    store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
+    try std.testing.expectEqual(@as(u64, 2), store.lastTick());
+    table = records.Table.init(try store.openSpace("records"), resources);
+    var bytes: [2048]u8 = undefined;
+    for (keys, values) |key, value| {
+        try std.testing.expectEqual(@as(?usize, bytes.len), try table.get(&key, &bytes));
+        try std.testing.expectEqualSlices(u8, &value, &bytes);
+    }
+    try std.testing.expectEqual(@as(usize, count), (try structure.inspect(table)).records);
+}
+
+test "sparse record batches preserve duplicate missing and caller ordered results" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/audit", .{temporary.sub_path});
+    defer std.testing.allocator.free(path);
+    const resources = try records.Resources.init(std.testing.allocator, io, .{ .readers = 1, .writers = 1 });
+    defer resources.deinit();
+    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path, .maximum_wal_pages = 16384 });
+    defer store.deinit();
+    var table = records.Table.init(try store.openSpace("records"), resources);
+    var keys: [192][16]u8 = undefined;
+    var values: [192][1035]u8 = undefined;
+    var writes: [192]records.Write = undefined;
+    var start: usize = 0;
+    while (start < 2048) {
+        const count = @min(writes.len, 2048 - start);
+        for (keys[0..count], values[0..count], writes[0..count], 0..) |*key, *value, *write, index| {
+            std.mem.writeInt(u128, key, start + index, .big);
+            @memset(value, 0);
+            std.mem.writeInt(u32, value[0..4], @intCast(start + index), .little);
+            write.* = .{ .key = key, .value = value };
+        }
+        try table.putBatch(writes[0..count]);
+        start += count;
+    }
+    _ = try store.commit(1);
+    for ([_]usize{ 1, 24, 96, 192 }) |count| {
+        var reads: [192]records.Get = undefined;
+        var lengths: [192]?usize = undefined;
+        for (keys[0..count], values[0..count], reads[0..count], 0..) |*key, *value, *read, index| {
+            const id = if (index % 11 == 0) 3000 + index else if (index % 7 == 0) 0 else index * 2048 / count;
+            std.mem.writeInt(u128, key, id, .big);
+            read.* = .{ .key = key, .destination = value };
+        }
+        try table.getBatch(reads[0..count], lengths[0..count]);
+        for (lengths[0..count], values[0..count], 0..) |length, value, index| {
+            if (index % 11 == 0) {
+                try std.testing.expectEqual(null, length);
+            } else {
+                const id = if (index % 7 == 0) 0 else index * 2048 / count;
+                try std.testing.expectEqual(@as(?usize, 1035), length);
+                try std.testing.expectEqual(@as(u32, @intCast(id)), std.mem.readInt(u32, value[0..4], .little));
+            }
+        }
+    }
+}
+
+test "borrowed node navigation invalidates after page rewrite and detects new corruption" {
+    var temporary = try testing.directory(.{});
+    defer temporary.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/navigation", .{temporary.sub_path});
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const resources = try records.Resources.init(allocator, std.testing.io, .{ .readers = 1, .writers = 1, .navigation_pages = 1 });
+    defer resources.deinit();
+    var store = try storage.Store.init(allocator, std.testing.io, .{ .path = path });
+    defer store.deinit();
+    const space = try store.openSpace("records");
+    const table = records.Table.init(space, resources);
+    var value: [16]u8 = undefined;
+    try table.put("key", "first");
+    try std.testing.expectEqual(@as(?usize, 5), try table.get("key", &value));
+    try std.testing.expectEqualSlices(u8, "first", value[0..5]);
+    const root = (try space.getRoot()).?;
+    var held: [1]storage.PageLease = undefined;
+    try space.borrowPages(&.{root}, &held);
+    defer held[0].release();
+    try table.put("key", "second");
+    try std.testing.expectEqual(@as(?usize, 6), try table.get("key", &value));
+    try std.testing.expectEqualSlices(u8, "second", value[0..6]);
+    var page: storage.Page = undefined;
+    try space.readPages(&.{.{ .id = (try space.getRoot()).?, .destination = &page }});
+    std.mem.writeInt(u16, page[16..18], 0, .little);
+    try space.writePages(&.{.{ .id = (try space.getRoot()).?, .source = &page }});
+    try std.testing.expectError(error.Corrupt, table.get("key", &value));
 }

@@ -22,7 +22,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/test.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "inventories", .module = module }, .{ .name = "storage", .module = storage.module("storage") }, .{ .name = "metrics", .module = metrics } },
+        .imports = &.{ .{ .name = "inventories", .module = module }, .{ .name = "storage", .module = storage.module("storage") }, .{ .name = "metrics", .module = metrics }, .{ .name = "records", .module = records.module("records") } },
     }) });
     b.step("test", "Verify slot blocks, shared definitions, and transactional reclamation").dependOn(&b.addRunArtifact(tests).step);
 }

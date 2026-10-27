@@ -82,6 +82,22 @@ fn clean(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
 }
 
 const Case = struct { workload: Pattern, engine: []const u8, trace_sha256: []const u8, result: native.Result };
+
+fn summary(writer: *std.Io.Writer, cases: []const Case) !void {
+    try writer.writeAll("\nRecord storage comparison (MiB = 1,048,576 bytes, lower is better)\n\n");
+    try writer.print("{s: <10} {s: <30} {s: >10} {s: >10} {s: >10} {s: >10}\n", .{ "Workload", "Format", "File MiB", "Live MiB", "Data MiB", "Write MiB" });
+    try writer.writeAll("-------------------------------------------------------------------------------------\n");
+    for (cases) |case| {
+        const result = case.result;
+        try writer.print("{s: <10} {s: <30} {d: >10.3} {d: >10.3} {d: >10.3} {d: >10.3}\n", .{
+            @tagName(case.workload),                                                                           case.engine,
+            @as(f64, @floatFromInt(result.after_checkpoint.database + result.after_checkpoint.wal)) / 1048576, @as(f64, @floatFromInt((result.pages - result.free_pages) * result.page_size)) / 1048576,
+            @as(f64, @floatFromInt(result.payload)) / 1048576,                                                 @as(f64, @floatFromInt(result.submitted_bytes)) / 1048576,
+        });
+    }
+    try writer.writeAll("\nFiles include retained free pages. Writes include WAL and checkpoint writes.\n");
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
@@ -111,14 +127,28 @@ pub fn main(init: std.process.Init) !void {
             const result = if (engine == 0) try native.run(allocator, init.io, path, trace.bytes) else try sqlite.run(allocator, init.io, path, trace.bytes, page_size, without_rowid);
             if (!std.mem.eql(u8, &trace.digest, result.digest) or result.rows != trace.rows) return error.RecordMismatch;
             try cases.append(allocator, .{ .workload = pattern, .engine = label, .trace_sha256 = trace_hash, .result = result });
-            std.debug.print("{s:9} {s:30} files={d:9} live={d:9} payload={d:9} writes={d:10}\n", .{ @tagName(pattern), label, result.after_checkpoint.database + result.after_checkpoint.wal, (result.pages - result.free_pages) * result.page_size, result.payload, result.submitted_bytes });
         }
     }
     const file = try std.Io.Dir.cwd().createFile(init.io, try std.fs.path.join(allocator, &.{ output, "results.json" }), .{});
     defer file.close(init.io);
     var buffer: [16384]u8 = undefined;
     var writer = file.writer(init.io, &buffer);
-    try std.json.Stringify.value(.{ .sqlite_version = sqlite.version(), .trace_seed = @as(u64, 0x4c5253514c), .configuration = .{ .native_submission = "standard", .sqlite_synchronous = "FULL", .sqlite_cache_kib = 2048, .durable_commits = true, .native_batching = "whole transaction, bounded key sorting", .vacuum = false }, .cases = cases.items }, .{ .whitespace = .indent_2 }, &writer.interface);
+    try std.json.Stringify.value(.{ .sqlite_version = sqlite.version(), .trace_seed = @as(u64, 0x4c5253514c), .configuration = .{
+        .native_submission = "system.io_uring",
+        .native_submitted_bytes = "WAL frame bytes plus database checkpoint page bytes",
+        .sqlite_submitted_bytes = "process wchar difference",
+        .kernel_write_bytes = "process write_bytes difference; io_uring writes may be attributed to kernel workers",
+        .sqlite_synchronous = "FULL",
+        .sqlite_cache_kib = 2048,
+        .durable_commits = true,
+        .native_batching = "whole transaction, bounded key sorting",
+        .vacuum = false,
+    }, .cases = cases.items }, .{ .whitespace = .indent_2 }, &writer.interface);
     try writer.interface.writeByte('\n');
     try writer.interface.flush();
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    try summary(&stdout.interface, cases.items);
+    try stdout.interface.print("Detailed results: {s}/results.json\n", .{output});
+    try stdout.interface.flush();
 }

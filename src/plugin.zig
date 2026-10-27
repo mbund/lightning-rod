@@ -3,14 +3,29 @@ const lifecycle = @import("plugin_lifecycle.zig");
 const storage = @import("storage");
 
 pub fn initialize(comptime Plugin: type, allocator: std.mem.Allocator, io: std.Io, configuration: Plugin.Configuration, dependencies: anytype, source: anytype) !*Plugin {
-    var args: std.meta.ArgsTuple(@TypeOf(Plugin.init)) = undefined;
+    return construct(Plugin, Plugin.init, allocator, io, configuration, dependencies, source);
+}
 
-    inline for (@typeInfo(@TypeOf(Plugin.init)).@"fn".params, 0..) |parameter, argument| {
+/// Persistent plugins share their allocation path with init and defer storage access to init.
+pub fn reserve(comptime Plugin: type, allocator: std.mem.Allocator, io: std.Io, configuration: Plugin.Configuration, dependencies: anytype, source: anytype) !*Plugin {
+    if (@hasDecl(Plugin, "Dependencies")) {
+        inline for (std.meta.fields(Plugin.Dependencies)) |field| {
+            if (field.type == storage.Space and !@hasDecl(Plugin, "allocate"))
+                @compileError("persistent plugin must provide allocation without storage access: " ++ Plugin.id);
+        }
+    }
+    return construct(Plugin, if (@hasDecl(Plugin, "allocate")) Plugin.allocate else Plugin.init, allocator, io, configuration, dependencies, source);
+}
+
+fn construct(comptime Plugin: type, comptime constructor: anytype, allocator: std.mem.Allocator, io: std.Io, configuration: Plugin.Configuration, dependencies: anytype, source: anytype) !*Plugin {
+    var args: std.meta.ArgsTuple(@TypeOf(constructor)) = undefined;
+
+    inline for (@typeInfo(@TypeOf(constructor)).@"fn".params, 0..) |parameter, argument| {
         const T = parameter.type.?;
         args[argument] = if (T == std.mem.Allocator) allocator else if (T == std.Io) io else if (T == Plugin.Configuration) configuration else if (@hasDecl(Plugin, "Dependencies") and T == Plugin.Dependencies) dependencies else if (@hasDecl(Plugin, "Meta") and T == Plugin.Meta) metadata(T, source) else @compileError("unsupported init parameter in plugin " ++ Plugin.id);
     }
 
-    return @call(.never_inline, Plugin.init, args);
+    return @call(.never_inline, constructor, args);
 }
 
 pub fn close(comptime Plugin: type, instance: *Plugin, io: std.Io, closing: *lifecycle.Closing) void {
@@ -27,11 +42,11 @@ pub fn close(comptime Plugin: type, instance: *Plugin, io: std.Io, closing: *lif
 
 pub fn dependency(comptime name: []const u8, comptime T: type, instances: anytype, values: anytype, comptime before: usize) T {
     const Selections = @TypeOf(instances.*).selections;
-    if (comptime serviceProvider(Selections, T)) |index| {
+    if (comptime provider(Selections, T)) |index| {
         const Provider = selectedPlugin(selectedType(Selections, index));
-        if (index >= before) @compileError("service provider must appear earlier: " ++ Provider.id);
+        if (index >= before) @compileError("dependency provider must appear earlier: " ++ Provider.id);
         const Contract = if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
-        return instances.get(Provider).service(Contract);
+        return instances.get(Provider).provide(Contract);
     }
     if (comptime dependencyPlugin(T)) |Dependency| {
         if (comptime indexOfId(Selections, Dependency.id)) |index| {
@@ -399,6 +414,17 @@ fn validateLifecycle(comptime Plugin: type) void {
     if (@hasDecl(Plugin, "checkpoint")) validateCheckpoint(Plugin);
 
     if (@hasDecl(Plugin, "close")) validateClose(Plugin);
+
+    if (@hasDecl(Plugin, "beginTick")) validateBoundary(Plugin, "beginTick", false);
+    if (@hasDecl(Plugin, "endTick")) validateBoundary(Plugin, "endTick", true);
+    if (@hasDecl(Plugin, "publish")) validateBoundary(Plugin, "publish", false);
+}
+
+fn validateBoundary(comptime Plugin: type, comptime name: []const u8, comptime success: bool) void {
+    const info = @typeInfo(@TypeOf(@field(Plugin, name))).@"fn";
+    if (info.params.len != (if (success) @as(usize, 2) else 1) or info.params[0].type != *Plugin or info.return_type != void)
+        @compileError(Plugin.id ++ "." ++ name ++ " has an invalid lifecycle signature");
+    if (success and info.params[1].type != bool) @compileError(Plugin.id ++ ".endTick requires a success bool");
 }
 
 fn validateTick(comptime Plugin: type) void {
@@ -459,8 +485,8 @@ fn validateClose(comptime Plugin: type) void {
 
 fn validateDependencies(comptime Selections: type, comptime Plugin: type, comptime plugin_index: usize) void {
     inline for (@typeInfo(dependenciesType(Plugin)).@"struct".fields) |field| {
-        if (comptime serviceProvider(Selections, field.type)) |index| {
-            if (index >= plugin_index) @compileError("service provider must appear before " ++ Plugin.id ++ "." ++ field.name);
+        if (comptime provider(Selections, field.type)) |index| {
+            if (index >= plugin_index) @compileError("dependency provider must appear before " ++ Plugin.id ++ "." ++ field.name);
             continue;
         }
         const Dependency = dependencyPlugin(field.type) orelse continue;
@@ -471,18 +497,18 @@ fn validateDependencies(comptime Selections: type, comptime Plugin: type, compti
     }
 }
 
-/// Providers declare `Services = .{Contract}` and return it from `service(self, Contract)`.
+/// Providers declare `Provides = .{Contract}` and return it from `provide(self, Contract)`.
 /// The dependency keeps its concrete contract type. No erased pointer crosses this boundary.
-pub fn serviceProvider(comptime Selections: type, comptime T: type) ?usize {
+pub fn provider(comptime Selections: type, comptime T: type) ?usize {
     const Required = if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
     var found: ?usize = null;
     inline for (comptime tupleFields(Selections), 0..) |field, index| {
         const Provider = selectedPlugin(field.type);
-        if (!@hasDecl(Provider, "Services")) continue;
-        inline for (Provider.Services) |Contract| {
+        if (!@hasDecl(Provider, "Provides")) continue;
+        inline for (Provider.Provides) |Contract| {
             if (Contract != Required) continue;
-            if (found != null) @compileError("multiple providers for service " ++ @typeName(Required));
-            if (!@hasDecl(Provider, "service")) @compileError(Provider.id ++ " declares Services without service()");
+            if (found != null) @compileError("multiple providers for contract " ++ @typeName(Required));
+            if (!@hasDecl(Provider, "provide")) @compileError(Provider.id ++ " declares Provides without provide()");
             found = index;
         }
     }

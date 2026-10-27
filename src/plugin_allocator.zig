@@ -1,14 +1,36 @@
 const std = @import("std");
 
+/// Initialization allocations remain reserved until deinit, including freed temporaries.
 pub const PluginAllocator = struct {
-    storage: std.heap.FixedBufferAllocator,
+    const Allocation = struct {
+        next: ?*Allocation,
+        bytes: []u8,
+        payload: []u8,
+        alignment: std.mem.Alignment,
+        owner: ?usize,
+        released: bool = false,
+    };
+
+    backing: std.mem.Allocator,
+    limit: usize,
+    allocated: usize = 0,
+    first: ?*Allocation = null,
     sealed: bool = false,
     owner: ?usize = null,
     owner_start: usize = 0,
     plugin_bytes: []u64 = &.{},
 
-    pub fn init(bytes: []u8) PluginAllocator {
-        return .{ .storage = std.heap.FixedBufferAllocator.init(bytes) };
+    pub fn init(backing: std.mem.Allocator, limit: usize) PluginAllocator {
+        return .{ .backing = backing, .limit = limit };
+    }
+
+    pub fn deinit(self: *PluginAllocator) void {
+        var next = self.first;
+        while (next) |allocation| {
+            next = allocation.next;
+            self.backing.rawFree(allocation.bytes, allocation.alignment, @returnAddress());
+        }
+        self.* = undefined;
     }
 
     pub fn allocator(self: *PluginAllocator) std.mem.Allocator {
@@ -16,18 +38,16 @@ pub const PluginAllocator = struct {
     }
 
     pub fn seal(self: *PluginAllocator) void {
-        std.debug.assert(!self.sealed);
+        std.debug.assert(!self.sealed and self.owner == null);
         self.sealed = true;
     }
 
     pub fn used(self: *const PluginAllocator) usize {
-        return self.storage.end_index;
+        return self.allocated;
     }
 
     pub fn owns(self: *const PluginAllocator, pointer: anytype) bool {
-        const address = @intFromPtr(pointer);
-        const begin = @intFromPtr(self.storage.buffer.ptr);
-        return address >= begin and address - begin < self.storage.buffer.len;
+        return self.find(@intFromPtr(pointer), 1) != null;
     }
 
     pub fn ownsCurrentPluginAllocation(self: *const PluginAllocator, pointer: anytype) bool {
@@ -36,100 +56,103 @@ pub const PluginAllocator = struct {
             const expected = std.mem.Alignment.of(Pointer.child).backward(std.math.maxInt(usize));
             return @intFromPtr(pointer) == expected;
         }
-
-        const start = self.owner_start;
-        const end = self.storage.end_index;
         std.debug.assert(self.owner != null);
-        if (start == end) return false;
+        const allocation = self.find(@intFromPtr(pointer), @sizeOf(Pointer.child)) orelse return false;
+        return allocation.owner == self.owner;
+    }
 
-        const address = @intFromPtr(pointer);
-        const begin = @intFromPtr(self.storage.buffer.ptr);
-        if (address < begin) return false;
-
-        const offset = address - begin;
-        return offset >= start and offset < end and @sizeOf(Pointer.child) <= end - offset;
+    // A plugin may return an unrelated pointer. Do not read a header through it.
+    fn find(self: *const PluginAllocator, address: usize, size: usize) ?*Allocation {
+        var next = self.first;
+        while (next) |allocation| : (next = allocation.next) {
+            if (allocation.released) continue;
+            const begin = @intFromPtr(allocation.payload.ptr);
+            if (address < begin) continue;
+            const offset = address - begin;
+            if (offset <= allocation.payload.len and size <= allocation.payload.len - offset) return allocation;
+        }
+        return null;
     }
 
     pub fn currentPluginBytes(self: *const PluginAllocator) usize {
         std.debug.assert(self.owner != null);
-        return self.storage.end_index - self.owner_start;
+        return self.allocated - self.owner_start;
     }
 
     pub fn trackPlugins(self: *PluginAllocator, plugin_bytes: []u64) void {
         self.requireOpen();
-        std.debug.assert(self.owner == null);
-        std.debug.assert(self.plugin_bytes.len == 0);
+        std.debug.assert(self.owner == null and self.plugin_bytes.len == 0);
         self.plugin_bytes = plugin_bytes;
         @memset(plugin_bytes, 0);
     }
 
     pub fn beginPlugin(self: *PluginAllocator, index: usize) void {
         self.requireOpen();
-        std.debug.assert(self.owner == null);
-        std.debug.assert(index < self.plugin_bytes.len);
+        std.debug.assert(self.owner == null and index < self.plugin_bytes.len);
         self.owner = index;
-        self.owner_start = self.storage.end_index;
+        self.owner_start = self.allocated;
     }
 
     pub fn endPlugin(self: *PluginAllocator) void {
         const index = self.owner orelse unreachable;
-        std.debug.assert(self.storage.end_index >= self.owner_start);
-        self.plugin_bytes[index] = @intCast(self.storage.end_index - self.owner_start);
+        self.plugin_bytes[index] = @intCast(self.currentPluginBytes());
         self.owner = null;
         self.owner_start = 0;
     }
 
     fn requireOpen(self: *const PluginAllocator) void {
-        if (self.sealed)
-            @panic("plugin used its initialization allocator after initialization completed");
+        if (self.sealed) @panic("plugin used its initialization allocator after initialization completed");
     }
 
-    fn alloc(self: *PluginAllocator, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+    fn alloc(self: *PluginAllocator, length: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
         self.requireOpen();
-        return std.heap.FixedBufferAllocator.alloc(&self.storage, len, alignment, return_address);
+        const prefix = alignment.forward(@sizeOf(Allocation));
+        const total = std.math.add(usize, prefix, length) catch return null;
+        if (total > self.limit - self.allocated) return null;
+        const backing_alignment = alignment.max(.of(Allocation));
+        const bytes = (self.backing.rawAlloc(total, backing_alignment, return_address) orelse return null)[0..total];
+        const header_bytes: []align(@alignOf(Allocation)) u8 = @alignCast(bytes[0..@sizeOf(Allocation)]);
+        const allocation = std.mem.bytesAsValue(Allocation, header_bytes);
+        allocation.* = .{ .next = self.first, .bytes = bytes, .payload = bytes[prefix..], .alignment = backing_alignment, .owner = self.owner };
+        self.first = allocation;
+        self.allocated += total;
+        return allocation.payload.ptr;
     }
 
-    fn resize(self: *PluginAllocator, bytes: []u8, alignment: std.mem.Alignment, len: usize, return_address: usize) bool {
+    fn resize(self: *PluginAllocator, bytes: []u8, _: std.mem.Alignment, length: usize, _: usize) bool {
         self.requireOpen();
-        return std.heap.FixedBufferAllocator.resize(&self.storage, bytes, alignment, len, return_address);
+        const allocation = self.find(@intFromPtr(bytes.ptr), bytes.len) orelse unreachable;
+        std.debug.assert(allocation.payload.ptr == bytes.ptr and allocation.payload.len == bytes.len);
+        const prefix = @intFromPtr(bytes.ptr) - @intFromPtr(allocation.bytes.ptr);
+        if (length > allocation.bytes.len - prefix) return false;
+        allocation.payload.len = length;
+        return true;
     }
 
-    fn remap(self: *PluginAllocator, bytes: []u8, alignment: std.mem.Alignment, len: usize, return_address: usize) ?[*]u8 {
+    fn free(self: *PluginAllocator, bytes: []u8, _: std.mem.Alignment, _: usize) void {
         self.requireOpen();
-        return std.heap.FixedBufferAllocator.remap(&self.storage, bytes, alignment, len, return_address);
-    }
-
-    fn free(self: *PluginAllocator, bytes: []u8, alignment: std.mem.Alignment, return_address: usize) void {
-        self.requireOpen();
-        std.heap.FixedBufferAllocator.free(&self.storage, bytes, alignment, return_address);
+        const allocation = self.find(@intFromPtr(bytes.ptr), bytes.len) orelse unreachable;
+        std.debug.assert(allocation.payload.ptr == bytes.ptr and allocation.payload.len == bytes.len);
+        allocation.released = true;
     }
 
     const Adapter = struct {
-        const vtable: std.mem.Allocator.VTable = .{
-            .alloc = Adapter.allocate,
-            .resize = @This().resize,
-            .remap = @This().remap,
-            .free = @This().free,
-        };
+        const vtable: std.mem.Allocator.VTable = .{ .alloc = Adapter.allocate, .resize = Adapter.resize, .remap = Adapter.remap, .free = Adapter.free };
 
         fn instance(raw: *anyopaque) *PluginAllocator {
             return @ptrCast(@alignCast(raw));
         }
-
-        fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
-            return PluginAllocator.alloc(instance(raw), len, alignment, return_address);
+        fn allocate(raw: *anyopaque, length: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+            return instance(raw).alloc(length, alignment, return_address);
         }
-
-        fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, return_address: usize) bool {
-            return PluginAllocator.resize(instance(raw), bytes, alignment, len, return_address);
+        fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, length: usize, return_address: usize) bool {
+            return instance(raw).resize(bytes, alignment, length, return_address);
         }
-
-        fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, return_address: usize) ?[*]u8 {
-            return PluginAllocator.remap(instance(raw), bytes, alignment, len, return_address);
+        fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, length: usize, return_address: usize) ?[*]u8 {
+            return if (instance(raw).resize(bytes, alignment, length, return_address)) bytes.ptr else null;
         }
-
         fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, return_address: usize) void {
-            PluginAllocator.free(instance(raw), bytes, alignment, return_address);
+            instance(raw).free(bytes, alignment, return_address);
         }
     };
 };

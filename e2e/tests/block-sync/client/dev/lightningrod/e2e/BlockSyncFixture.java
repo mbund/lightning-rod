@@ -37,7 +37,6 @@ final class BlockSyncFixture extends Fixture {
         if (phase == Phase.ADDED && game.level.getBlockState(first).is(net.minecraft.world.level.block.Blocks.STONE)
             && game.level.getBlockState(second).is(net.minecraft.world.level.block.Blocks.DIRT)
             && game.level.getBlockState(negative).is(net.minecraft.world.level.block.Blocks.STONE)) {
-            if (!game.levelRenderer.hasRenderedAllSections()) return;
             if (!client.screenshot("blocks_added").done()) return;
             client.mark(r.peer + ".blocks-added");
             phase = Phase.REMOVE;

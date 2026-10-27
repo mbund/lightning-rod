@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) void {
     canonical.addAnonymousImport("registry_snapshot", .{ .root_source_file = snapshot });
     canonical.addAnonymousImport("canonical_identity", .{ .root_source_file = game_data_build.identity(game_data.builder, canonical_registry, "1.21.9") });
     b.dependency("vanilla", .{ .target = target, .optimize = optimize }).module("lightning_rod_vanilla_1_21_6").addImport("game_data", canonical);
-    const names = .{ "lightning_rod", "profiles", "reload_execve", "network_stdio", "vanilla", "sessions", "minecraft_packets", "minecraft_java", "storage", "game_data", "reload" };
+    const names = .{ "lightning_rod", "e2e_profile", "vanilla", "sessions", "minecraft_packets", "minecraft_java", "storage", "game_data" };
     var imports: [names.len + 4]std.Build.Module.Import = undefined;
     inline for (names, 0..) |name, index| {
         const package = b.dependency(name, .{ .target = target, .optimize = optimize });

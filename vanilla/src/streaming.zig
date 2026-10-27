@@ -1,3 +1,4 @@
+const SpatialIndex = @import("player_spatial.zig").Index;
 const metrics = @import("metrics");
 const std = @import("std");
 const wire_1_21_5 = @import("wire_1_21_5");
@@ -23,7 +24,6 @@ pub const Streaming = struct {
         metrics: *metrics.Registry,
         players: *players.Players,
         chunks: *chunks.Chunks,
-        work: *lightning_rod.Work,
         sessions: *sessions.Service,
         packets: *packets.Packets,
         worlds: *worlds.Worlds,
@@ -34,6 +34,46 @@ pub const Streaming = struct {
     pub const Position = struct {
         x: i32,
         z: i32,
+    };
+
+    pub const View = struct {
+        handle: ?sessions.Handle,
+        world: u32,
+        protocol: i32,
+        life: u32,
+        ready: bool,
+        loaded: bool,
+        center: Position,
+
+        pub fn capture(player: players.Players.Player) View {
+            return .{
+                .handle = player.handle,
+                .world = player.world,
+                .protocol = player.protocol,
+                .life = player.life,
+                .ready = player.stage == .ready,
+                .loaded = player.loaded,
+                .center = .{ .x = @intFromFloat(@floor(player.position.x / 16)), .z = @intFromFloat(@floor(player.position.z / 16)) },
+            };
+        }
+    };
+
+    const Published = struct {
+        mutex: std.Io.Mutex = .init,
+        views: []View,
+        streams: []Stream,
+        sent: []u64,
+        dirty_words: std.DynamicBitSetUnmanaged,
+        changed_views: lightning_rod.system.IndexSet,
+        dirty_streams: lightning_rod.system.IndexSet,
+        epoch: u64 = 0,
+        updated: bool = true,
+
+        pub fn setStream(self: *Published, index: usize, stream: Stream) void {
+            if (std.meta.eql(self.streams[index], stream)) return;
+            self.streams[index] = stream;
+            self.dirty_streams.insert(index);
+        }
     };
 
     const Stream = struct {
@@ -62,6 +102,17 @@ pub const Streaming = struct {
     encoding_duration: metrics.Timer,
     publication: metrics.Timer,
     deps: Dependencies,
+    io: std.Io,
+    native_io: std.Io,
+    published: *Published,
+    tracked_views: lightning_rod.system.IndexSet,
+    views: []View,
+    changed_players: lightning_rod.system.IndexSet,
+    background_players: lightning_rod.system.IndexSet,
+    observers_index: SpatialIndex,
+    generation_updates: []chunks.Generation.Update,
+    epoch: u64 = 0,
+    pending: bool = true,
     config: Configuration,
     streams: []Stream,
     recipients: []sessions.Handle,
@@ -69,11 +120,15 @@ pub const Streaming = struct {
     planned: []usize,
     sent: []u64,
     words_per_player: usize,
+    visibility: Visibility,
+    dirty_words: std.DynamicBitSetUnmanaged,
     next_player: usize = 0,
     encoding: *chunk_encoding.Workspace,
+    changed: *std.Io.Event,
+    wake_pending: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Streaming {
-        if (deps.chunks.cache.entries.len < 24) return error.ChunkCacheTooSmall;
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Configuration, deps: Dependencies) !*Streaming {
+        if (deps.chunks.backgroundCapacity() < 24) return error.ChunkCacheTooSmall;
 
         const self = try allocator.create(Streaming);
         const streams = try allocator.alloc(Stream, deps.players.records.len);
@@ -85,7 +140,26 @@ pub const Streaming = struct {
         const sent = try allocator.alloc(u64, streams.len * words);
         @memset(sent, 0);
         const planning = try allocator.alloc(usize, streams.len * 2);
+        const published = try allocator.create(Published);
+        published.* = .{
+            .views = try allocator.alloc(View, streams.len),
+            .streams = try allocator.alloc(Stream, streams.len),
+            .sent = try allocator.alloc(u64, sent.len),
+            .dirty_words = try .initEmpty(allocator, sent.len),
+            .changed_views = try lightning_rod.system.IndexSet.init(allocator, streams.len),
+            .dirty_streams = try lightning_rod.system.IndexSet.init(allocator, streams.len),
+        };
+        @memset(published.streams, .{});
+        @memset(published.sent, 0);
+        for (deps.players.records, published.views) |player, *view| view.* = View.capture(player);
+        for (deps.players.activeSlots()) |index| published.changed_views.insert(index);
         self.* = .{
+            .io = io,
+            .native_io = io,
+            .changed = deps.chunks.ready(),
+            .published = published,
+            .tracked_views = try lightning_rod.system.IndexSet.init(allocator, deps.players.records.len),
+            .views = try allocator.dupe(View, published.views),
             .acquired_chunks = try deps.metrics.counter(.{ .name = "streaming.acquired_chunks", .description = "Chunks acquired for streaming" }),
             .encoded_bytes = try deps.metrics.counter(.{ .name = "streaming.encoded_bytes", .description = "Encoded chunk packet bytes", .unit = .bytes }),
             .acquisition = try deps.metrics.timer(.{ .name = "streaming.acquisition", .description = "Acquire chunk sections" }),
@@ -93,61 +167,161 @@ pub const Streaming = struct {
             .publication = try deps.metrics.timer(.{ .name = "streaming.publication", .description = "Publish chunk packet batches" }),
             .encoding = try chunk_encoding.Workspace.init(allocator, deps.chunks.cache.entries.len),
             .deps = deps,
+            .changed_players = try lightning_rod.system.IndexSet.init(allocator, streams.len),
+            .background_players = try lightning_rod.system.IndexSet.init(allocator, streams.len),
+            .observers_index = try SpatialIndex.init(allocator, streams.len),
+            .generation_updates = try allocator.alloc(chunks.Generation.Update, streams.len),
             .config = config,
             .streams = streams,
-            .recipients = try allocator.alloc(sessions.Handle, streams.len),
+            .recipients = try allocator.alloc(sessions.Handle, streams.len * batch_max),
             .cursors = planning[0..streams.len],
             .planned = planning[streams.len..],
             .sent = sent,
+            .dirty_words = try .initEmpty(allocator, sent.len),
             .words_per_player = words,
+            .visibility = .{
+                .reset = try lightning_rod.system.IndexSet.init(allocator, streams.len),
+                .streams = try allocator.alloc(Stream, streams.len),
+                .sent = try allocator.alloc(u64, sent.len),
+                .changed = try allocator.alloc(u64, sent.len),
+                .changed_words = try lightning_rod.system.IndexSet.init(allocator, sent.len),
+                .words_per_player = words,
+                .side = @intCast(side),
+                .radius = deps.players.config.render_distance,
+            },
         };
-        try deps.work.register(self, batch_max, progress);
+        for (deps.players.activeSlots()) |index| self.updateAudience(index);
+        @memset(self.visibility.streams, .{});
+        @memset(self.visibility.sent, 0);
+        try deps.sessions.subscribeOutput(self.changed);
+        try deps.chunks.subscribeReady(self.changed);
         return self;
     }
 
-    fn progress(self: *Streaming, _: std.Io, maximum_items: usize) !lightning_rod.Work.Result {
+    pub fn close(self: *Streaming, _: *lightning_rod.Closing) void {
+        self.deps.sessions.unsubscribeOutput(self.changed);
+        self.deps.chunks.unsubscribeReady(self.changed);
+    }
+
+    pub fn endTick(self: *Streaming, completed: bool) void {
+        if (!completed) return;
+        const published = self.published;
+        published.mutex.lockUncancelable(self.native_io);
+        defer published.mutex.unlock(self.native_io);
+        var changed = false;
+        for (self.deps.players.activeSlots()) |index| self.tracked_views.insert(index);
+        var view_index: usize = 0;
+        while (view_index < self.tracked_views.count) {
+            const index = self.tracked_views.indices[view_index];
+            const player = self.deps.players.records[index];
+            const view = &published.views[index];
+            if (player.handle == null) self.tracked_views.remove(index) else view_index += 1;
+            const current = View.capture(player);
+            if (!std.meta.eql(view.*, current)) {
+                view.* = current;
+                published.changed_views.insert(index);
+                changed = true;
+            }
+        }
+        published.updated = published.updated or changed;
+        published.epoch = self.deps.sessions.backgroundEpoch() + 1;
+        self.wake_pending = changed;
+    }
+
+    pub fn publish(self: *Streaming) void {
+        if (!self.wake_pending) return;
+        self.wake_pending = false;
+        self.changed.set(self.io);
+    }
+
+    pub fn poll(self: *Streaming, io: std.Io) !bool {
+        if (!self.deps.chunks.ownsCurrentThread()) return error.InvalidChunkOwner;
+        defer self.deps.sessions.retryBackground(self.epoch);
+        const progressed = try self.sendBatch(io, batch_max);
+        self.deps.sessions.flush();
+        if (progressed) self.changed.set(io);
+        return progressed;
+    }
+
+    fn sendBatch(self: *Streaming, _: std.Io, maximum_items: usize) !bool {
+        const changed = &self.changed_players;
+        changed.clear();
+        self.published.mutex.lockUncancelable(self.native_io);
+        self.epoch = self.published.epoch;
+        self.pending = self.pending or self.published.updated;
+        self.published.updated = false;
+        if (!self.pending) {
+            self.published.mutex.unlock(self.native_io);
+            return false;
+        }
+        for (self.published.changed_views.values()) |index| {
+            const previous = &self.views[index];
+            const current = self.published.views[index];
+            self.background_players.insert(index);
+            if (!std.meta.eql(previous.handle, current.handle) or previous.world != current.world or previous.ready != current.ready or !std.meta.eql(previous.center, current.center) or (current.handle != null and !self.observers_index.contains(index))) {
+                changed.insert(index);
+            }
+            previous.* = current;
+        }
+        self.published.changed_views.clear();
+        self.published.mutex.unlock(self.native_io);
+        const updates = self.generation_updates;
+        var update_count: usize = 0;
+        for (changed.values()) |index| {
+            const current = self.views[index];
+            self.updateAudience(index);
+            updates[update_count] = .{ .player = index, .interest = if (current.handle != null and current.ready) .{
+                .world = current.world,
+                .x = current.center.x,
+                .z = current.center.z,
+                .radius = @intCast(self.deps.players.config.render_distance),
+            } else null };
+            update_count += 1;
+        }
+        self.deps.chunks.generation.updateMany(updates[0..update_count]);
+        if (self.epoch != self.deps.sessions.backgroundEpoch() or self.epoch & 1 != 0) return false;
+        defer self.publishVisibility();
         const service = self.deps.sessions;
         const radius = self.deps.players.config.render_distance;
         const side: usize = @intCast(2 * radius + 1);
         assert(maximum_items > 0 and maximum_items <= batch_max);
-        const batch_limit = @min(maximum_items, self.deps.chunks.cache.entries.len / 24);
+        const batch_limit = @min(maximum_items, self.deps.chunks.backgroundCapacity() / 24);
         var pending: [batch_max]Pending = undefined;
         var count: usize = 0;
+        var reserved: usize = 0;
         var released: usize = 0;
-        defer for (pending[released..count]) |*item| item.packet.cancel();
+        defer for (pending[released..reserved]) |*item| item.packet.cancel();
         const cursors = self.cursors;
         const planned = self.planned;
-        @memset(planned, 0);
-
-        for (self.streams, cursors) |stream, *cursor| cursor.* = stream.cursor;
-        var progressed = false;
-        var pending_work = false;
-
-        for (self.deps.players.records, self.streams) |player, stream| {
-            if (player.handle) |handle| pending_work = pending_work or stream.generation != handle.generation or stream.delivered != side * side;
+        for (self.background_players.values()) |index| {
+            planned[index] = 0;
+            cursors[index] = self.streams[index].cursor;
         }
-
+        var progressed = false;
+        self.pending = false;
         var idle: usize = 0;
 
-        for (0..batch_limit * self.streams.len) |_| {
-            if (count == batch_limit or idle == self.streams.len) break;
-
-            const index = self.next_player;
-            self.next_player = (index + 1) % self.streams.len;
+        for (0..batch_limit * self.background_players.count) |_| {
+            if (count == batch_limit or idle == self.background_players.count) break;
+            const position = self.next_player % self.background_players.count;
+            const index = self.background_players.indices[position];
+            self.next_player = (position + 1) % self.background_players.count;
             idle += 1;
-            const player = &self.deps.players.records[index];
+            const player = &self.views[index];
             const stream = &self.streams[index];
             const handle = player.handle orelse continue;
-            if (player.stage != .ready) continue;
+            if (!player.ready) continue;
 
-            const center: Position = .{ .x = @intFromFloat(@floor(player.position.x / 16)), .z = @intFromFloat(@floor(player.position.z / 16)) };
+            const center = player.center;
 
             if (stream.generation != handle.generation or stream.life != player.life) {
                 stream.* = .{ .generation = handle.generation, .life = player.life, .center = center, .target = center };
                 cursors[index] = 0;
                 @memset(self.sent[index * self.words_per_player ..][0..self.words_per_player], 0);
+                self.dirty_words.setRangeValue(.{ .start = index * self.words_per_player, .end = (index + 1) * self.words_per_player }, true);
             }
 
+            self.pending = self.pending or stream.setup != .streaming or stream.cursor < side * side or !std.meta.eql(center, stream.center);
             if (!service.canSend(handle, 1)) continue;
 
             if (stream.setup == .streaming and !std.meta.eql(center, stream.center)) {
@@ -158,27 +332,24 @@ pub const Streaming = struct {
             }
 
             if (stream.setup == .unloading) {
-                while (stream.unload_cursor < side * side) {
-                    const at: Position = .{
-                        .x = stream.center.x + @as(i32, @intCast(stream.unload_cursor % side)) - radius,
-                        .z = stream.center.z + @as(i32, @intCast(stream.unload_cursor / side)) - radius,
-                    };
-                    if ((@abs(at.x - stream.target.x) > radius or @abs(at.z - stream.target.z) > radius) and self.hasSent(index, at)) break;
+                var departing = departingPosition(stream.center, stream.target, radius, stream.unload_cursor);
+                while (departing) |at| {
+                    if (self.hasSent(index, at)) break;
                     stream.unload_cursor += 1;
+                    departing = departingPosition(stream.center, stream.target, radius, stream.unload_cursor);
                 }
 
-                if (stream.unload_cursor == side * side) {
+                if (departing == null) {
                     stream.center = stream.target;
+                    self.updateAudience(index);
                     stream.cursor = 0;
                     cursors[index] = 0;
                     stream.setup = .center;
                 } else {
-                    const at: Position = .{
-                        .x = stream.center.x + @as(i32, @intCast(stream.unload_cursor % side)) - radius,
-                        .z = stream.center.z + @as(i32, @intCast(stream.unload_cursor / side)) - radius,
-                    };
-                    var packet = service.reserve(64) catch |err| switch (err) {
+                    const at = departing.?;
+                    var packet = service.reserveBackground(64, self.epoch) catch |err| switch (err) {
                         error.Backpressured => continue,
+                        error.Closed => return false,
                         else => return err,
                     };
                     defer packet.cancel();
@@ -197,8 +368,9 @@ pub const Streaming = struct {
             }
 
             if (stream.setup != .streaming) {
-                var packet = service.reserve(64) catch |err| switch (err) {
+                var packet = service.reserveBackground(64, self.epoch) catch |err| switch (err) {
                     error.Backpressured => continue,
+                    error.Closed => return false,
                     else => return err,
                 };
                 defer packet.cancel();
@@ -241,50 +413,80 @@ pub const Streaming = struct {
                 continue;
             }
 
-            const packet = service.reserve(service.config.page_bytes) catch |err| switch (err) {
-                error.Backpressured => break,
-                else => return err,
-            };
-            pending[count] = .{ .at = at, .world = player.world, .protocol = player.protocol, .packet = packet, .owner = index };
+            pending[count] = .{ .at = at, .world = player.world, .protocol = player.protocol, .packet = undefined, .owner = index };
             count += 1;
             planned[index] += 1;
             cursors[index] += 1;
             idle = 0;
         }
 
-        if (count == 0) return if (progressed) .progressed else if (pending_work) .blocked else .idle;
+        if (count == 0) return progressed;
+        if (service.backgroundEpoch() != self.epoch) return progressed;
+        var reservations: [batch_max]sessions.Service.Packet = undefined;
+        count = try service.reserveMany(service.config.page_bytes, reservations[0..count]);
+        for (pending[0..count], reservations[0..count]) |*item, packet| {
+            item.packet = packet;
+            item.packet.epoch = self.epoch;
+        }
+        reserved = count;
+        if (count == 0) return progressed;
 
         var sections: [batch_max * 24]chunks.Section = undefined;
         var leases: [batch_max * 24]chunks.Lease = undefined;
         var offsets: [batch_max + 1]usize = undefined;
+        var preparations: [batch_max]chunks.Chunks.Preparation = undefined;
+        var ready: [batch_max]bool = undefined;
         offsets[0] = 0;
-
-        for (pending[0..count], 0..) |item, i| {
+        for (pending[0..count], 0..) |item, index| {
             const dimension = self.deps.worlds.get(item.world).?.dimension;
-            offsets[i + 1] = offsets[i] + dimension.sectionCount();
-
-            for (sections[offsets[i]..offsets[i + 1]], 0..) |*section, y|
-                section.* = .{ .world = item.world, .x = item.at.x, .y = @as(i32, @intCast(y)) + dimension.minimumSection(), .z = item.at.z };
+            offsets[index + 1] = offsets[index] + dimension.sectionCount();
+            const required = sections[offsets[index]..offsets[index + 1]];
+            for (required, 0..) |*section, y| section.* = .{ .world = item.world, .x = item.at.x, .y = @as(i32, @intCast(y)) + dimension.minimumSection(), .z = item.at.z };
+            const center = self.streams[item.owner].center;
+            const distance = @max(@abs(item.at.x - center.x), @abs(item.at.z - center.z));
+            preparations[index] = .{ .sections = required, .leases = leases[offsets[index]..offsets[index + 1]], .priority = .{ .urgency = if (distance == 0) .occupied else .streaming, .player = item.owner, .distance = distance } };
         }
-
         {
             const acquisition = self.acquisition.start();
             defer acquisition.end();
-            self.acquired_chunks.add(count);
-            try self.deps.chunks.acquireMany(sections[0..offsets[count]], leases[0..offsets[count]]);
+            try self.deps.chunks.prepareMany(preparations[0..count], ready[0..count]);
         }
-        defer for (leases[0..offsets[count]]) |lease| lease.release();
+        var prepared: usize = 0;
+        var section_count: usize = 0;
+        for (preparations[0..count], ready[0..count], 0..) |preparation, complete, index| {
+            if (!complete) {
+                pending[index].packet.cancel();
+                continue;
+            }
+            pending[prepared] = pending[index];
+            std.mem.copyForwards(chunks.Lease, leases[section_count..][0..preparation.leases.len], preparation.leases);
+            section_count += preparation.sections.len;
+            prepared += 1;
+            offsets[prepared] = section_count;
+        }
+        defer self.deps.chunks.releaseMany(leases[0..section_count]);
+        count = prepared;
+        reserved = count;
+        if (count == 0 or service.backgroundEpoch() != self.epoch) return progressed;
 
+        self.acquired_chunks.add(count);
+
+        var publications: [batch_max]sessions.Service.Publication = undefined;
+        var accepted: [batch_max]usize = undefined;
         for (pending[0..count], 0..) |*item, i| {
             var recipients: usize = 0;
+            const targets = self.recipients[i * self.views.len ..][0..self.views.len];
 
-            for (self.deps.players.records, self.streams, 0..) |*player, *stream, index| {
+            var nearby = self.observers_index.query(.{ .world = item.world, .x = item.at.x, .z = item.at.z }, @intCast(radius));
+            while (nearby.next()) |index| {
+                const player = &self.views[index];
+                const stream = &self.streams[index];
                 const handle = player.handle orelse continue;
-                if (player.world != item.world or player.stage != .ready or player.protocol != item.protocol or stream.setup != .streaming or stream.generation != handle.generation)
+                if (player.world != item.world or !player.ready or player.protocol != item.protocol or stream.setup != .streaming or stream.generation != handle.generation)
                     continue;
                 if (@abs(item.at.x - stream.center.x) > radius or @abs(item.at.z - stream.center.z) > radius or self.hasSent(index, item.at)) continue;
                 if (!player.loaded and (@abs(item.at.x - stream.center.x) > 1 or @abs(item.at.z - stream.center.z) > 1)) continue;
-                self.recipients[recipients] = handle;
+                targets[recipients] = handle;
                 recipients += 1;
             }
 
@@ -303,58 +505,168 @@ pub const Streaming = struct {
                     .workspace = self.encoding,
                 }, try self.deps.packets.definition(item.protocol) });
             };
-            const publication = self.publication.start();
-            defer publication.end();
             self.encoded_bytes.add(encoded.len);
             self.streams[item.owner].packet_bytes = encoded.len;
-            const accepted = item.packet.publishReady(encoded.len, self.recipients[0..recipients]);
-            assert(item.packet.reservation == null);
-            released += 1;
-
-            for (accepted) |handle| {
+            publications[i] = .{ .packet = &item.packet, .length = encoded.len, .recipients = targets[0..recipients] };
+        }
+        {
+            const publication = self.publication.start();
+            defer publication.end();
+            service.publishManyReady(publications[0..count], accepted[0..count]);
+        }
+        released = count;
+        for (pending[0..count], publications[0..count], accepted[0..count]) |*item, publication, admitted| {
+            for (publication.recipients[0..admitted]) |handle| {
                 self.markSent(handle.index, item.at, true);
                 const stream = &self.streams[handle.index];
-                stream.packet_bytes = encoded.len;
+                stream.packet_bytes = publication.length;
                 stream.delivered += 1;
+                while (stream.cursor < side * side) {
+                    const offset = spiral(stream.cursor);
+                    if (!self.hasSent(handle.index, .{ .x = stream.center.x + offset.x, .z = stream.center.z + offset.z })) break;
+                    stream.cursor += 1;
+                }
             }
 
-            progressed = progressed or accepted.len != 0;
-        }
-
-        for (self.streams, 0..) |*stream, index| {
-            while (stream.cursor < side * side) {
-                const offset = spiral(stream.cursor);
-                if (!self.hasSent(index, .{ .x = stream.center.x + offset.x, .z = stream.center.z + offset.z })) break;
-                stream.cursor += 1;
-            }
+            progressed = progressed or admitted != 0;
         }
 
         assert(released == count);
         assert(count <= maximum_items);
-        return if (progressed) .progressed else if (pending_work) .blocked else .idle;
+        return progressed;
     }
 
-    pub fn visible(self: *const Streaming, player: usize, world: u32, x: i32, z: i32) bool {
-        const stream = self.streams[player];
-        const record = self.deps.players.records[player];
-        if (record.world != world) return false;
+    fn publishVisibility(self: *Streaming) void {
+        const published = self.published;
+        published.mutex.lockUncancelable(self.native_io);
+        defer published.mutex.unlock(self.native_io);
+        var position: usize = 0;
+        while (position < self.background_players.count) {
+            const index = self.background_players.indices[position];
+            if (self.views[index].handle == null) {
+                self.streams[index] = .{};
+                @memset(self.sent[index * self.words_per_player ..][0..self.words_per_player], 0);
+                self.dirty_words.setRangeValue(.{ .start = index * self.words_per_player, .end = (index + 1) * self.words_per_player }, true);
+                self.background_players.remove(index);
+            } else position += 1;
+            const stream = self.streams[index];
+            published.setStream(index, stream);
+        }
+        var dirty = self.dirty_words.iterator(.{});
+        while (dirty.next()) |word| {
+            published.sent[word] = self.sent[word];
+            published.dirty_words.set(word);
+            self.dirty_words.unset(word);
+        }
+    }
 
-        const handle = record.handle orelse return false;
+    pub const Visibility = struct {
+        reset: lightning_rod.system.IndexSet,
+        changed: []u64,
+        changed_words: lightning_rod.system.IndexSet,
+        streams: []Stream,
+        sent: []u64,
+        words_per_player: usize,
+        side: i32,
+        radius: i32,
+
+        fn capture(self: *Visibility, published: *Published, io: std.Io) void {
+            published.mutex.lockUncancelable(io);
+            defer published.mutex.unlock(io);
+            self.reset.clear();
+            self.changed_words.clear();
+            for (published.dirty_streams.values()) |player| {
+                const stream = published.streams[player];
+                const destination = &self.streams[player];
+                if (stream.generation != destination.generation or stream.life != destination.life or stream.setup != destination.setup or !std.meta.eql(stream.center, destination.center)) self.reset.insert(player);
+                destination.* = stream;
+            }
+            var dirty = published.dirty_words.iterator(.{});
+            while (dirty.next()) |word| {
+                const changed = self.sent[word] ^ published.sent[word];
+                if (changed != 0) {
+                    self.changed[word] = changed;
+                    self.changed_words.insert(@intCast(word));
+                }
+                self.sent[word] = published.sent[word];
+                published.dirty_words.unset(word);
+            }
+            published.dirty_streams.clear();
+        }
+
+        pub fn viewCenter(self: *const Visibility, player: usize) Position {
+            return self.streams[player].center;
+        }
+
+        pub fn visible(self: *const Visibility, player: usize, record: *const players.Players.Player, world: u32, x: i32, z: i32) bool {
+            const stream = self.streams[player];
+            if (record.world != world) return false;
+
+            const handle = record.handle orelse return false;
+            const radius: u64 = @intCast(self.radius);
+            const slot = sentIndexFor(self.words_per_player, self.side, player, .{ .x = x, .z = z });
+            return stream.generation == handle.generation and stream.life == record.life and stream.setup != .terrain and
+                @abs(@as(i64, x) - stream.center.x) <= radius and @abs(@as(i64, z) - stream.center.z) <= radius and
+                self.sent[slot.word] & slot.mask != 0;
+        }
+    };
+
+    /// The simulation owns this view until its next snapshot.
+    pub fn snapshotVisibility(self: *Streaming) *const Visibility {
+        self.visibility.capture(self.published, self.native_io);
+        return &self.visibility;
+    }
+
+    fn updateAudience(self: *Streaming, index: usize) void {
+        const view = self.views[index];
+        const stream = self.streams[index];
+        const handle = view.handle orelse {
+            self.observers_index.update(index, null);
+            return;
+        };
+        const center = if (stream.generation == handle.generation and stream.life == view.life) stream.center else view.center;
+        self.observers_index.update(index, .{ .world = view.world, .x = center.x, .z = center.z });
+    }
+
+    pub const Observers = struct {
+        owner: *const Streaming,
+        views: []const View,
+        query: SpatialIndex.Query,
+        world: u32,
+        at: Position,
+
+        pub fn next(self: *Observers) ?usize {
+            while (self.query.next()) |index| {
+                if (self.owner.visibleView(index, self.views[index], self.world, self.at.x, self.at.z)) return index;
+            }
+            return null;
+        }
+    };
+
+    /// Borrows a background snapshot and delivered chunk membership until either changes.
+    pub fn visibleObservers(self: *const Streaming, views: []const View, world: u32, x: i32, z: i32) Observers {
+        assert(views.len == self.views.len);
+        return .{ .owner = self, .views = views, .world = world, .at = .{ .x = x, .z = z }, .query = self.observers_index.query(.{ .world = world, .x = x, .z = z }, self.deps.players.config.render_distance) };
+    }
+
+    pub fn visibleView(self: *const Streaming, index: usize, view: View, world: u32, x: i32, z: i32) bool {
+        const handle = view.handle orelse return false;
+        const stream = self.streams[index];
         const radius: u64 = @intCast(self.deps.players.config.render_distance);
-        return stream.generation == handle.generation and stream.life == record.life and stream.setup != .terrain and @abs(@as(i64, x) - stream.center.x) <= radius and @abs(@as(i64, z) - stream.center.z) <= radius and self.hasSent(player, .{ .x = x, .z = z });
+        return view.world == world and stream.generation == handle.generation and stream.life == view.life and
+            stream.setup != .terrain and @abs(@as(i64, x) - stream.center.x) <= radius and
+            @abs(@as(i64, z) - stream.center.z) <= radius and self.hasSent(index, .{ .x = x, .z = z });
     }
 
-    pub fn viewCenter(self: *const Streaming, player: usize) Position {
-        return self.streams[player].center;
-    }
+    const SentIndex = struct { word: usize, mask: u64 };
 
-    fn sentIndex(self: *const Streaming, index: usize, at: Position) struct {
-        word: usize,
-        mask: u64,
-    } {
-        const side = self.deps.players.config.render_distance * 2 + 1;
+    fn sentIndexFor(words: usize, side: i32, index: usize, at: Position) SentIndex {
         const slot: usize = @intCast(@mod(at.z, side) * side + @mod(at.x, side));
-        return .{ .word = index * self.words_per_player + slot / 64, .mask = @as(u64, 1) << @intCast(slot % 64) };
+        return .{ .word = index * words + slot / 64, .mask = @as(u64, 1) << @intCast(slot % 64) };
+    }
+
+    fn sentIndex(self: *const Streaming, index: usize, at: Position) SentIndex {
+        return sentIndexFor(self.words_per_player, self.deps.players.config.render_distance * 2 + 1, index, at);
     }
 
     fn hasSent(self: *const Streaming, index: usize, at: Position) bool {
@@ -365,6 +677,7 @@ pub const Streaming = struct {
     fn markSent(self: *Streaming, index: usize, at: Position, value: bool) void {
         const slot = self.sentIndex(index, at);
         self.sent[slot.word] = (self.sent[slot.word] & ~slot.mask) | (slot.mask * @intFromBool(value));
+        self.dirty_words.set(slot.word);
     }
 
     fn writeUnload(packet: wire_1_21_5.play.toClient.packet_unload_chunk.Writer, at: Position) ![]u8 {
@@ -379,6 +692,37 @@ pub const Streaming = struct {
         return (try (try packet.chunkX(at.x)).chunkZ(at.z)).finish();
     }
 };
+
+fn departingPosition(center: Streaming.Position, target: Streaming.Position, radius: i32, cursor: usize) ?Streaming.Position {
+    assert(radius >= 0 and radius <= 32);
+    const side = radius * 2 + 1;
+    const low: Streaming.Position = .{ .x = center.x - radius, .z = center.z - radius };
+    const high: Streaming.Position = .{ .x = center.x + radius, .z = center.z + radius };
+    const overlap_low: Streaming.Position = .{ .x = @max(low.x, target.x - radius), .z = @max(low.z, target.z - radius) };
+    const overlap_high: Streaming.Position = .{ .x = @min(high.x, target.x + radius), .z = @min(high.z, target.z + radius) };
+    const Rectangle = struct { x: i32, z: i32, width: i32, height: i32 };
+    if (overlap_low.x > overlap_high.x or overlap_low.z > overlap_high.z) {
+        const width: usize = @intCast(side);
+        if (cursor >= width * width) return null;
+        return .{ .x = low.x + @as(i32, @intCast(cursor % width)), .z = low.z + @as(i32, @intCast(cursor / width)) };
+    }
+    const rectangles = [_]Rectangle{
+        .{ .x = low.x, .z = low.z, .width = side, .height = overlap_low.z - low.z },
+        .{ .x = low.x, .z = overlap_low.z, .width = overlap_low.x - low.x, .height = overlap_high.z - overlap_low.z + 1 },
+        .{ .x = overlap_high.x + 1, .z = overlap_low.z, .width = high.x - overlap_high.x, .height = overlap_high.z - overlap_low.z + 1 },
+        .{ .x = low.x, .z = overlap_high.z + 1, .width = side, .height = high.z - overlap_high.z },
+    };
+    var remaining = cursor;
+    for (rectangles) |rectangle| {
+        const count: usize = @intCast(rectangle.width * rectangle.height);
+        if (remaining < count) {
+            const width: usize = @intCast(rectangle.width);
+            return .{ .x = rectangle.x + @as(i32, @intCast(remaining % width)), .z = rectangle.z + @as(i32, @intCast(remaining / width)) };
+        }
+        remaining -= count;
+    }
+    return null;
+}
 
 fn spiral(index: usize) struct {
     x: i32,
@@ -397,4 +741,85 @@ fn spiral(index: usize) struct {
         3 => .{ .x = -ring + 1 + (offset - 3 * side), .z = -ring },
         else => unreachable,
     };
+}
+
+test "visibility snapshots remain stable until the simulation captures another publication" {
+    var streams = [_]Streaming.Stream{.{ .generation = 1, .life = 4, .setup = .streaming }};
+    var sent = [_]u64{1};
+    var published: Streaming.Published = .{
+        .views = &.{},
+        .streams = &streams,
+        .sent = &sent,
+        .dirty_words = try .initEmpty(std.testing.allocator, sent.len),
+        .changed_views = try lightning_rod.system.IndexSet.init(std.testing.allocator, streams.len),
+        .dirty_streams = try lightning_rod.system.IndexSet.init(std.testing.allocator, streams.len),
+    };
+    defer published.dirty_words.deinit(std.testing.allocator);
+    defer published.changed_views.deinit(std.testing.allocator);
+    defer published.dirty_streams.deinit(std.testing.allocator);
+    published.dirty_streams.insert(0);
+    var snapshot_streams: [1]Streaming.Stream = @splat(.{});
+    var changed: [1]u64 = undefined;
+    var snapshot_sent = [_]u64{0};
+    var snapshot: Streaming.Visibility = .{ .reset = try lightning_rod.system.IndexSet.init(std.testing.allocator, snapshot_streams.len), .changed = &changed, .changed_words = try lightning_rod.system.IndexSet.init(std.testing.allocator, sent.len), .streams = &snapshot_streams, .sent = &snapshot_sent, .words_per_player = 1, .side = 3, .radius = 1 };
+    defer snapshot.changed_words.deinit(std.testing.allocator);
+    defer snapshot.reset.deinit(std.testing.allocator);
+    var player: players.Players.Player = .{ .handle = .{ .index = 0, .generation = 1 }, .world = 0, .life = 4 };
+    published.dirty_words.set(0);
+    snapshot.capture(&published, std.testing.io);
+    try std.testing.expect(snapshot.visible(0, &player, 0, 0, 0));
+    try std.testing.expectEqualSlices(usize, &.{0}, snapshot.reset.values());
+    try std.testing.expectEqualSlices(usize, &.{0}, snapshot.changed_words.values());
+    snapshot.capture(&published, std.testing.io);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.reset.count);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.changed_words.count);
+    sent[0] = 0;
+    published.dirty_words.set(0);
+    try std.testing.expect(snapshot.visible(0, &player, 0, 0, 0));
+    snapshot.capture(&published, std.testing.io);
+    try std.testing.expect(!snapshot.visible(0, &player, 0, 0, 0));
+    try std.testing.expectEqual(@as(usize, 0), snapshot.reset.count);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.changed[0]);
+    sent[0] = 1;
+    streams[0].generation = 2;
+    published.dirty_streams.insert(0);
+    published.dirty_words.set(0);
+    snapshot.capture(&published, std.testing.io);
+    try std.testing.expect(!snapshot.visible(0, &player, 0, 0, 0));
+    player.handle.?.generation = 2;
+    try std.testing.expect(snapshot.visible(0, &player, 0, 0, 0));
+    player.life += 1;
+    try std.testing.expect(!snapshot.visible(0, &player, 0, 0, 0));
+}
+
+test "departing strips match rectangle subtraction for movement and teleports" {
+    const center: Streaming.Position = .{ .x = -17, .z = 31 };
+    for ([_]i32{ 0, 2, 8, 32 }) |radius| for ([_]i32{ -65, -3, -1, 0, 1, 3, 65 }) |dx| for ([_]i32{ -65, -3, -1, 0, 1, 3, 65 }) |dz| {
+        const target: Streaming.Position = .{ .x = center.x + dx, .z = center.z + dz };
+        const side: usize = @intCast(radius * 2 + 1);
+        var seen: [65 * 65]bool = @splat(false);
+        var count: usize = 0;
+        while (departingPosition(center, target, radius, count)) |at| : (count += 1) {
+            try std.testing.expect(@abs(at.x - center.x) <= radius and @abs(at.z - center.z) <= radius);
+            try std.testing.expect(@abs(at.x - target.x) > radius or @abs(at.z - target.z) > radius);
+            const x: usize = @intCast(at.x - center.x + radius);
+            const z: usize = @intCast(at.z - center.z + radius);
+            const index = z * side + x;
+            try std.testing.expect(!seen[index]);
+            seen[index] = true;
+        }
+        var expected: usize = 0;
+        for (0..side * side) |index| {
+            const x = center.x + @as(i32, @intCast(index % side)) - radius;
+            const z = center.z + @as(i32, @intCast(index / side)) - radius;
+            const outside = @abs(x - target.x) > radius or @abs(z - target.z) > radius;
+            try std.testing.expectEqual(outside, seen[index]);
+            expected += @intFromBool(outside);
+        }
+        try std.testing.expectEqual(expected, count);
+        try std.testing.expectEqual(null, departingPosition(center, target, radius, count + 1));
+    };
+    var count: usize = 0;
+    while (departingPosition(center, .{ .x = center.x + 1, .z = center.z }, 32, count) != null) : (count += 1) {}
+    try std.testing.expectEqual(@as(usize, 65), count);
 }

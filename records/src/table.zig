@@ -31,28 +31,6 @@ const Direct = struct {
     }
 };
 
-const DataBatch = struct {
-    space: storage.Space,
-    pages: *[storage.batch_size]storage.Page,
-    writes: *[storage.batch_size]storage.Write,
-    count: usize = 0,
-
-    fn flush(self: *DataBatch) storage.Error!void {
-        if (self.count == 0) return;
-        try self.space.writePages(self.writes[0..self.count]);
-        self.count = 0;
-    }
-    fn append(self: *DataBatch, id: storage.PageId, value: []const u8) storage.Error!void {
-        assert(value.len <= storage.page_size);
-        if (self.count == storage.batch_size) try self.flush();
-        const page = &self.pages[self.count];
-        @memset(page[value.len..], 0);
-        @memcpy(page[0..value.len], value);
-        self.writes[self.count] = .{ .id = id, .source = page };
-        self.count += 1;
-    }
-};
-
 const NodeBatch = struct {
     space: storage.Space,
     ids: *[storage.batch_size]storage.PageId,
@@ -81,21 +59,13 @@ const NodeBatch = struct {
         try self.space.readPages(missing[0..count]);
     }
 
-    fn write(self: *NodeBatch, writes: []const storage.Write) storage.Error!void {
-        for (writes) |request| {
-            var at = for (self.ids[0..self.count], 0..) |id, index| {
-                if (id == request.id) break index;
-            } else self.count;
-            if (at == self.count) {
-                if (self.count == self.ids.len) {
-                    try self.flush();
-                    at = 0;
-                }
-                self.ids[at] = request.id;
-                self.count += 1;
-            }
-            self.pages[at] = request.source.*;
-        }
+    fn reserve(self: *NodeBatch, id: storage.PageId) storage.Error!*storage.Page {
+        for (self.ids[0..self.count], 0..) |cached, at| if (cached == id) return &self.pages[at];
+        if (self.count == self.ids.len) try self.flush();
+        const at = self.count;
+        self.ids[at] = id;
+        self.count += 1;
+        return &self.pages[at];
     }
 
     fn discard(self: *NodeBatch, id: storage.PageId) void {
@@ -117,6 +87,95 @@ const NodeBatch = struct {
     }
 };
 
+const CellView = struct {
+    key: []const u8,
+    value: []const u8,
+    length: u32,
+    reference: u64,
+    flags: u16,
+    prefix: u16,
+
+    fn decode(page: *const storage.Page, at: usize, branch: bool) storage.Error!CellView {
+        if (at > page.len or page.len - at < cell_header_size) return error.Corrupt;
+        const key_len = std.mem.readInt(u16, page[at..][0..2], .little);
+        const representation = std.mem.readInt(u16, page[at + 2 ..][0..2], .little);
+        const flags = representation & 3;
+        const prefix = representation >> 2;
+        const length = std.mem.readInt(u32, page[at + 4 ..][0..4], .little);
+        if (key_len == 0 or key_len > maximum_key or (branch != (flags == 2)) or (branch and length != 0) or (flags == 1 and length == 0)) return error.Corrupt;
+        if ((flags != 3 and prefix != 0) or (flags == 3 and (length == 0 or prefix > length or (prefix != 0 and prefix != length % storage.page_size)))) return error.Corrupt;
+        const size: usize = if (flags == 0) length else if (flags == 3) Direct.layout(length, prefix).bytes() else 8;
+        if ((flags == 0 or flags == 3) and size > maximum_local) return error.Corrupt;
+        if (flags == 3 and Direct.layout(length, prefix).pages == 0) return error.Corrupt;
+        const start = at + cell_header_size;
+        if (key_len > page.len - start or size > page.len - start - key_len) return error.Corrupt;
+        const value = page[start + key_len ..][0..size];
+        const reference = if (flags == 1 or flags == 2) std.mem.readInt(u64, value[0..8], .little) else 0;
+        if ((flags == 1 or flags == 2) and reference == 0) return error.Corrupt;
+        return .{ .key = page[start..][0..key_len], .value = value, .length = length, .reference = reference, .flags = flags, .prefix = prefix };
+    }
+
+    fn bytes(self: CellView) usize {
+        return cell_header_size + self.key.len + self.value.len;
+    }
+};
+
+const Navigation = struct {
+    version: ?storage.PageLease.Version = null,
+    offsets: [maximum_cells]u16 = undefined,
+    count: usize = 0,
+    branch: bool = false,
+    next: u64 = 0,
+
+    fn decode(self: *Navigation, page: *const storage.Page) storage.Error!void {
+        self.version = null;
+        if (!std.mem.eql(u8, page[0..4], "LRBT") or page[4] > 1 or page[5] != 1) return error.Corrupt;
+        const count = std.mem.readInt(u16, page[6..8], .little);
+        const branch = page[4] != 0;
+        const next = std.mem.readInt(u64, page[8..16], .little);
+        if (count > maximum_cells or (branch and (count == 0 or next != 0))) return error.Corrupt;
+        var at: usize = node_header_size;
+        var previous: []const u8 = &.{};
+        for (0..count) |index| {
+            const cell = try CellView.decode(page, at, branch);
+            if (index != 0 and std.mem.order(u8, previous, cell.key) != .lt) return error.Corrupt;
+            self.offsets[index] = @intCast(at);
+            previous = cell.key;
+            at += cell.bytes();
+        }
+        self.count = count;
+        self.branch = branch;
+        self.next = next;
+    }
+};
+
+const NodeView = struct {
+    page: *const storage.Page,
+    navigation: *const Navigation,
+
+    fn cell(self: NodeView, index: usize) CellView {
+        assert(index < self.navigation.count);
+        return CellView.decode(self.page, self.navigation.offsets[index], self.navigation.branch) catch unreachable;
+    }
+
+    fn keyAt(self: NodeView, index: usize) []const u8 {
+        assert(index < self.navigation.count);
+        const at = self.navigation.offsets[index];
+        const length = std.mem.readInt(u16, self.page[at..][0..2], .little);
+        return self.page[at + cell_header_size ..][0..length];
+    }
+
+    fn lowerBound(self: NodeView, key: []const u8) usize {
+        var low: usize = 0;
+        var high = self.navigation.count;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (std.mem.order(u8, self.keyAt(middle), key) == .lt) low = middle + 1 else high = middle;
+        }
+        return low;
+    }
+};
+
 const ValueReads = struct {
     data: blob.ReadBatch,
 
@@ -124,7 +183,7 @@ const ValueReads = struct {
         try self.data.flush();
     }
 
-    fn append(self: *ValueReads, cell: *const Cell, destination: []u8) storage.Error!usize {
+    fn append(self: *ValueReads, cell: CellView, destination: []u8) storage.Error!usize {
         if (destination.len < cell.length) return error.BufferTooSmall;
         if (cell.flags == 0) {
             @memcpy(destination[0..cell.length], cell.value);
@@ -164,6 +223,9 @@ const Cell = struct {
     fn bytes(self: *const Cell) usize {
         return 8 + @as(usize, self.key_len) + if (self.flags == 0 or self.flags == 3) self.value.len else @as(usize, 8);
     }
+    fn view(self: *const Cell) CellView {
+        return .{ .key = self.keySlice(), .value = self.value, .length = self.length, .reference = self.reference, .flags = self.flags, .prefix = self.prefix };
+    }
     fn keySlice(self: *const Cell) []const u8 {
         return self.key[0..self.key_len];
     }
@@ -176,9 +238,162 @@ const UpdateWorkspace = struct {
     peer_cells: [2][maximum_cells]Cell = undefined,
     peer_pages: [2]storage.Page = undefined,
     descriptors: [maximum_batch][local_limit]u8 = undefined,
-    pages: [storage.batch_size]storage.Page = undefined,
     writes: [storage.batch_size]storage.Write = undefined,
     children: [maximum_outputs]Cell = undefined,
+};
+
+const TableIdentity = struct {
+    store: *storage.Store,
+    space: storage.SpaceId,
+    root: @FieldType(storage.Space, "root"),
+    directory: ?storage.PageId,
+    offset: u16,
+};
+
+fn WorkspacePool(comptime Workspace: type) type {
+    return struct {
+        const Self = @This();
+        const Slot = struct { workspace: Workspace = undefined, table: ?TableIdentity = null };
+        const Lease = struct {
+            pool: *Self,
+            resources: *Resources,
+            slot: *Slot,
+            workspace: *Workspace,
+
+            fn end(self: Lease) void {
+                self.resources.mutex.lockUncancelable(self.resources.io);
+                assert(self.slot.table != null);
+                self.slot.table = null;
+                const before = self.resources.borrowed.fetchSub(1, .release);
+                assert(before > 0);
+                self.resources.mutex.unlock(self.resources.io);
+                self.pool.queue.putOneUncancelable(self.resources.io, self.slot) catch unreachable;
+            }
+        };
+        slots: []Slot,
+        available: []*Slot,
+        queue: std.Io.Queue(*Slot),
+
+        fn init(allocator: std.mem.Allocator, io: std.Io, capacity: usize) !Self {
+            const slots = try allocator.alloc(Slot, capacity);
+            errdefer allocator.free(slots);
+            const available = try allocator.alloc(*Slot, capacity);
+            var self: Self = .{ .slots = slots, .available = available, .queue = .init(available) };
+            for (slots) |*slot| {
+                slot.table = null;
+                self.queue.putOneUncancelable(io, slot) catch unreachable;
+            }
+            return self;
+        }
+
+        fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            for (self.slots) |*slot| assert(slot.table == null);
+            allocator.free(self.available);
+            allocator.free(self.slots);
+        }
+
+        fn acquire(self: *Self, resources: *Resources) Lease {
+            var slot: [1]*Slot = undefined;
+            const count = self.queue.getUncancelable(resources.io, &slot, 1) catch unreachable;
+            assert(count == 1);
+            return .{ .pool = self, .resources = resources, .slot = slot[0], .workspace = &slot[0].workspace };
+        }
+
+        fn memoryBytes(self: *const Self) usize {
+            return self.slots.len * @sizeOf(Slot) + self.available.len * @sizeOf(*Slot);
+        }
+    };
+}
+
+pub const Resources = struct {
+    pub const Configuration = struct { readers: usize = 2, writers: usize = 1, navigation_pages: usize = 64 };
+    const ReadWorkspace = struct { pages: [storage.batch_size]storage.Page, cells: [maximum_cells]Cell, navigation: []Navigation, fallback: Navigation };
+    const WriteWorkspace = struct {
+        update: UpdateWorkspace,
+        ids: [storage.batch_size]storage.PageId,
+        pages: [storage.batch_size]storage.Page,
+        order: [maximum_sorted_batch]u16,
+        sorted: [maximum_batch]Write,
+    };
+    const Readers = WorkspacePool(ReadWorkspace);
+    const Writers = WorkspacePool(WriteWorkspace);
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    readers: Readers,
+    navigation: []Navigation,
+    writers: Writers,
+    mutex: std.Io.Mutex = .init,
+    borrowed: std.atomic.Value(usize) = .init(0),
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Configuration) !*Resources {
+        if (config.readers == 0 or config.readers > 64 or config.writers == 0 or config.writers > 64 or config.navigation_pages == 0) return error.InvalidArgument;
+        const self = try allocator.create(Resources);
+        errdefer allocator.destroy(self);
+        var readers = try Readers.init(allocator, io, config.readers);
+        errdefer readers.deinit(allocator);
+        const navigation = try allocator.alloc(Navigation, try std.math.mul(usize, config.readers, config.navigation_pages));
+        errdefer allocator.free(navigation);
+        @memset(navigation, .{});
+        for (readers.slots, 0..) |*slot, index| slot.workspace.navigation = navigation[index * config.navigation_pages ..][0..config.navigation_pages];
+        const writers = try Writers.init(allocator, io, config.writers);
+        self.* = .{ .allocator = allocator, .io = io, .readers = readers, .writers = writers, .navigation = navigation };
+        return self;
+    }
+
+    pub fn deinit(self: *Resources) void {
+        assert(self.borrowed.load(.acquire) == 0);
+        const allocator = self.allocator;
+        allocator.free(self.navigation);
+        self.readers.deinit(allocator);
+        self.writers.deinit(allocator);
+        allocator.destroy(self);
+    }
+
+    fn acquireRead(self: *Resources, table: TableIdentity) Readers.Lease {
+        const lease = self.readers.acquire(self);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.writers.slots) |*slot| if (slot.table) |writer| {
+            assert(!std.meta.eql(writer, table));
+        };
+        assert(lease.slot.table == null);
+        lease.slot.table = table;
+        _ = self.borrowed.fetchAdd(1, .acquire);
+        return lease;
+    }
+
+    fn acquireWrite(self: *Resources, table: TableIdentity) Writers.Lease {
+        const lease = self.writers.acquire(self);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.readers.slots) |*slot| if (slot.table) |reader| {
+            assert(!std.meta.eql(reader, table));
+        };
+        for (self.writers.slots) |*slot| if (slot.table) |writer| {
+            assert(!std.meta.eql(writer, table));
+        };
+        assert(lease.slot.table == null);
+        lease.slot.table = table;
+        _ = self.borrowed.fetchAdd(1, .acquire);
+        return lease;
+    }
+
+    pub fn memoryBytes(self: *const Resources) usize {
+        return @sizeOf(Resources) + self.readers.memoryBytes() + self.writers.memoryBytes() + self.navigation.len * @sizeOf(Navigation);
+    }
+};
+
+pub const Workspaces = struct {
+    pub const id = "lightning_rod:record_workspaces";
+    pub const Configuration = struct { shared: ?*Resources = null, readers: usize = 2, writers: usize = 1, navigation_pages: usize = 64 };
+    resources: *Resources,
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Configuration) !*Workspaces {
+        const self = try allocator.create(Workspaces);
+        errdefer allocator.destroy(self);
+        self.* = .{ .resources = config.shared orelse try Resources.init(allocator, io, .{ .readers = config.readers, .writers = config.writers, .navigation_pages = config.navigation_pages }) };
+        return self;
+    }
 };
 
 const Node = struct {
@@ -191,36 +406,19 @@ const Node = struct {
         if (!std.mem.eql(u8, page[0..4], "LRBT") or page[4] > 1 or page[5] != 1) return error.Corrupt;
         var self: Node = .{ .cells = cells, .count = std.mem.readInt(u16, page[6..8], .little), .branch = page[4] != 0, .next = std.mem.readInt(u64, page[8..16], .little) };
         if (self.count > maximum_cells or self.count > cells.len or (self.branch and self.next != 0)) return error.Corrupt;
-        var at: usize = 16;
+        var at: usize = node_header_size;
         for (self.cells[0..self.count], 0..) |*cell, index| {
-            if (page.len - at < 8) return error.Corrupt;
-            const key_len = std.mem.readInt(u16, page[at..][0..2], .little);
-            const representation = std.mem.readInt(u16, page[at + 2 ..][0..2], .little);
-            const flags = representation & 3;
-            const prefix = representation >> 2;
-            const length = std.mem.readInt(u32, page[at + 4 ..][0..4], .little);
-            if (key_len == 0 or key_len > maximum_key or (self.branch != (flags == 2)) or (self.branch and length != 0) or (flags == 1 and length == 0)) return error.Corrupt;
-            if ((flags != 3 and prefix != 0) or (flags == 3 and (length == 0 or prefix > length or (prefix != 0 and prefix != length % storage.page_size)))) return error.Corrupt;
-            at += 8;
-            const value_size: usize = if (flags == 0) length else if (flags == 3) Direct.layout(length, prefix).bytes() else 8;
-            if ((flags == 0 or flags == 3) and value_size > maximum_local) return error.Corrupt;
-            if (flags == 3 and Direct.layout(length, prefix).pages == 0) return error.Corrupt;
-            if (key_len > page.len - at or value_size > page.len - at - key_len) return error.Corrupt;
-            cell.* = .{ .key_len = @intCast(key_len), .flags = flags, .length = length, .prefix = prefix };
-            @memcpy(cell.key[0..key_len], page[at..][0..key_len]);
-            at += key_len;
-            if (flags == 0 or flags == 3) cell.value = page[at..][0..value_size] else {
-                cell.reference = std.mem.readInt(u64, page[at..][0..8], .little);
-                if (cell.reference == 0) return error.Corrupt;
-            }
-            at += value_size;
+            const view = try CellView.decode(page, at, self.branch);
+            cell.* = .{ .key_len = @intCast(view.key.len), .value = if (view.flags == 0 or view.flags == 3) view.value else &.{}, .length = view.length, .reference = view.reference, .flags = view.flags, .prefix = view.prefix };
+            @memcpy(cell.key[0..view.key.len], view.key);
+            at += view.bytes();
             if (index != 0 and std.mem.order(u8, self.cells[index - 1].keySlice(), cell.keySlice()) != .lt) return error.Corrupt;
         }
         if (self.branch and self.count == 0) return error.Corrupt;
         return self;
     }
-    fn encode(self: *const Node, begin: usize, end: usize, next: u64) storage.Page {
-        var page: storage.Page = @splat(0);
+    fn encode(self: *const Node, page: *storage.Page, begin: usize, end: usize, next: u64) void {
+        @memset(page, 0);
         @memcpy(page[0..4], "LRBT");
         page[4] = @intFromBool(self.branch);
         page[5] = 1;
@@ -243,7 +441,6 @@ const Node = struct {
                 at += 8;
             }
         }
-        return page;
     }
     fn lowerBound(self: *const Node, key: []const u8) usize {
         var low: usize = 0;
@@ -267,23 +464,30 @@ const Node = struct {
     }
 };
 
+/// Mutations require exclusive ownership of the table. Independent tables may share workspaces.
 pub const Table = struct {
+    pub const write_batch_size = maximum_batch;
     space: storage.Space,
+    resources: *Resources,
     directory: ?storage.PageId = null,
     root_offset: u16 = 0,
 
-    pub fn init(space: storage.Space) Table {
-        return .{ .space = space };
+    fn identity(self: Table) TableIdentity {
+        return .{ .store = self.space.store, .space = self.space.id, .root = self.space.root, .directory = self.directory, .offset = self.root_offset };
     }
-    pub fn rooted(space: storage.Space, directory: storage.PageId, offset: u16) Table {
+
+    pub fn init(space: storage.Space, resources: *Resources) Table {
+        return .{ .space = space, .resources = resources };
+    }
+    pub fn rooted(space: storage.Space, directory: storage.PageId, offset: u16, resources: *Resources) Table {
         assert(offset <= storage.page_size - 8);
-        return .{ .space = space, .directory = directory, .root_offset = offset };
+        return .{ .space = space, .directory = directory, .root_offset = offset, .resources = resources };
     }
     fn getRoot(self: Table) storage.Error!?storage.PageId {
         const directory = self.directory orelse return self.space.getRoot();
-        var page: storage.Page = undefined;
-        try self.space.readPages(&.{.{ .id = directory, .destination = &page }});
-        const id = std.mem.readInt(u64, page[self.root_offset..][0..8], .little);
+        var bytes: [8]u8 = undefined;
+        try self.space.readPages(&.{.{ .id = directory, .offset = self.root_offset, .destination = &bytes }});
+        const id = std.mem.readInt(u64, &bytes, .little);
         return if (id == 0) null else @enumFromInt(id);
     }
     fn setRoot(self: Table, root: ?storage.PageId) storage.Error!void {
@@ -298,72 +502,92 @@ pub const Table = struct {
     }
 
     pub fn get(self: Table, key: []const u8, destination: []u8) storage.Error!?usize {
-        if (key.len == 0 or key.len > maximum_key) return error.InvalidArgument;
-        var id = try self.getRoot() orelse return null;
-        var depth: usize = 0;
-        var cells: [maximum_cells]Cell = undefined;
-        var values: ValueReads = .{ .data = .{ .space = self.space } };
-        while (depth < maximum_depth) : (depth += 1) {
-            var page: storage.Page = undefined;
-            try self.space.readPages(&.{.{ .id = id, .destination = &page }});
-            const node = try Node.decode(&page, &cells);
-            const at = node.lowerBound(key);
-            if (node.branch) {
-                id = @enumFromInt(node.cells[@min(at, node.count - 1)].reference);
-                continue;
-            }
-            if (at == node.count or !std.mem.eql(u8, node.cells[at].keySlice(), key)) return null;
-            const length = try values.append(&node.cells[at], destination);
-            try values.flush();
-            return length;
-        }
-        return error.Corrupt;
+        var lengths: [1]?usize = undefined;
+        try self.getBatch(&.{.{ .key = key, .destination = destination }}, &lengths);
+        return lengths[0];
     }
     pub fn getBatch(self: Table, requests: []const Get, lengths: []?usize) storage.Error!void {
         if (requests.len != lengths.len) return error.InvalidArgument;
+        const lease = self.resources.acquireRead(self.identity());
+        defer lease.end();
         @memset(lengths, null);
         for (requests) |request| if (request.key.len == 0 or request.key.len > maximum_key) return error.InvalidArgument;
         const root = try self.getRoot() orelse return;
         var values: ValueReads = .{ .data = .{ .space = self.space } };
-        var pages: [storage.batch_size]storage.Page = undefined;
-        var cells: [maximum_cells]Cell = undefined;
+        const pages = &lease.workspace.pages;
         var begin: usize = 0;
         while (begin < requests.len) {
             const count = @min(storage.batch_size, requests.len - begin);
             var ids: [storage.batch_size]storage.PageId = @splat(root);
             var active: [storage.batch_size]bool = @splat(true);
-            var mapping: [storage.batch_size]usize = undefined;
+            var first: [storage.batch_size]usize = undefined;
+            var tails: [storage.batch_size]usize = undefined;
+            var next: [storage.batch_size]usize = undefined;
             var unique: [storage.batch_size]storage.PageId = undefined;
-            var reads: [storage.batch_size]storage.Read = undefined;
+            var borrowed: [storage.batch_size]storage.PageLease = undefined;
             var depth: usize = 0;
             while (true) : (depth += 1) {
                 var reading: usize = 0;
-                for (ids[0..count], active[0..count], mapping[0..count]) |id, live, *page| {
+                const slots = comptime std.math.ceilPowerOfTwoAssert(usize, storage.batch_size * 2);
+                var groups: [slots]usize = @splat(storage.batch_size);
+                for (ids[0..count], active[0..count], 0..) |id, live, index| {
                     if (!live) continue;
-                    var index: usize = 0;
-                    while (index < reading and unique[index] != id) index += 1;
-                    page.* = index;
-                    if (index == reading) {
+                    var slot: usize = @intCast(std.hash.Wyhash.hash(0, std.mem.asBytes(&id)) & (slots - 1));
+                    while (groups[slot] != storage.batch_size and unique[groups[slot]] != id) slot = (slot + 1) & (slots - 1);
+                    const group = groups[slot];
+                    if (group == storage.batch_size) {
+                        groups[slot] = reading;
                         unique[reading] = id;
-                        reads[reading] = .{ .id = id, .destination = &pages[reading] };
+                        first[reading] = index;
+                        tails[reading] = index;
                         reading += 1;
+                    } else {
+                        next[tails[group]] = index;
+                        tails[group] = index;
                     }
+                    next[index] = storage.batch_size;
                 }
                 if (reading == 0) break;
                 if (depth == maximum_depth) return error.Corrupt;
-                try self.space.readPages(reads[0..reading]);
-                for (pages[0..reading], 0..) |*page, page_index| {
-                    const node = try Node.decode(page, &cells);
-                    for (requests[begin..][0..count], 0..) |request, index| {
-                        if (!active[index] or mapping[index] != page_index) continue;
-                        if (request.key.len == 0 or request.key.len > maximum_key) return error.InvalidArgument;
-                        const position = node.lowerBound(request.key);
-                        if (node.branch) {
-                            ids[index] = @enumFromInt(node.cells[@min(position, node.count - 1)].reference);
-                        } else {
-                            active[index] = false;
-                            if (position < node.count and std.mem.eql(u8, node.cells[position].keySlice(), request.key))
-                                lengths[begin + index] = try values.append(&node.cells[position], request.destination);
+                {
+                    var views: [storage.batch_size]*const storage.Page = undefined;
+                    var held: usize = 0;
+                    assert(reading <= storage.batch_size);
+                    if (self.space.borrowPages(unique[0..reading], borrowed[0..reading])) |_| {
+                        held = reading;
+                        for (borrowed[0..reading], views[0..reading]) |page, *view| view.* = page.bytes();
+                    } else |err| {
+                        if (err != error.CachePinned) return err;
+                        var reads: [storage.batch_size]storage.Read = undefined;
+                        for (unique[0..reading], pages[0..reading], reads[0..reading], views[0..reading]) |id, *page, *read, *view| {
+                            read.* = .{ .id = id, .destination = page };
+                            view.* = page;
+                        }
+                        try self.space.readPages(reads[0..reading]);
+                    }
+                    defer storage.PageLease.releaseMany(borrowed[0..held]);
+                    for (views[0..reading], 0..) |bytes, page_index| {
+                        const navigation = if (held == 0) &lease.workspace.fallback else &lease.workspace.navigation[borrowed[page_index].index % lease.workspace.navigation.len];
+                        const version = if (held == 0) null else borrowed[page_index].version();
+                        if (version == null or navigation.version == null or !std.meta.eql(version.?, navigation.version.?)) {
+                            try navigation.decode(bytes);
+                            navigation.version = version;
+                        }
+                        const node: NodeView = .{ .page = bytes, .navigation = navigation };
+                        var index = first[page_index];
+                        while (index != storage.batch_size) : (index = next[index]) {
+                            assert(index < count and active[index] and ids[index] == unique[page_index]);
+                            const request = requests[begin + index];
+                            const position = node.lowerBound(request.key);
+                            if (navigation.branch) {
+                                ids[index] = @enumFromInt(node.cell(@min(position, navigation.count - 1)).reference);
+                            } else {
+                                active[index] = false;
+                                if (position < navigation.count) {
+                                    const cell = node.cell(position);
+                                    if (std.mem.eql(u8, cell.key, request.key)) lengths[begin + index] = try values.append(cell, request.destination);
+                                }
+                            }
                         }
                     }
                 }
@@ -372,21 +596,7 @@ pub const Table = struct {
         }
         try values.flush();
     }
-    fn freeValue(self: Table, cell: *const Cell) storage.Error!void {
-        if (cell.flags == 1) try blob.free(self.space, @enumFromInt(cell.reference), cell.length);
-        if (cell.flags == 3) {
-            const layout = Direct.layout(cell.length, cell.prefix);
-            var begin: usize = 0;
-            while (begin < layout.pages) {
-                const count = @min(storage.batch_size, layout.pages - begin);
-                var ids: [storage.batch_size]storage.PageId = undefined;
-                for (ids[0..count], 0..) |*id, at| id.* = @enumFromInt(std.mem.readInt(u64, cell.value[(begin + at) * 8 ..][0..8], .little));
-                try self.space.freePages(ids[0..count]);
-                begin += count;
-            }
-        }
-    }
-    fn makeCell(self: Table, key: []const u8, value: []const u8, occupied: usize, descriptor: *[local_limit]u8, data: *DataBatch) storage.Error!Cell {
+    fn makeCell(self: Table, key: []const u8, value: []const u8, occupied: usize, descriptor: *[local_limit]u8, data: *blob.WriteBatch) storage.Error!Cell {
         assert(occupied <= storage.page_size - node_header_size);
         if (key.len == 0 or key.len > maximum_key or value.len > std.math.maxInt(u32)) return error.InvalidArgument;
         var cell: Cell = .{ .key_len = @intCast(key.len), .length = @intCast(value.len), .value = value };
@@ -426,7 +636,7 @@ pub const Table = struct {
                 assert(offset == value.len);
             } else {
                 cell.flags = 1;
-                cell.reference = @intFromEnum(try blob.write(self.space, value));
+                cell.reference = @intFromEnum(try data.write(value));
             }
         }
         return cell;
@@ -438,16 +648,16 @@ pub const Table = struct {
     pub fn putBatch(self: Table, writes: []const Write) storage.Error!void {
         if (writes.len == 0) return;
         errdefer self.fail();
-        var ids: [storage.batch_size]storage.PageId = undefined;
-        var pages: [storage.batch_size]storage.Page = undefined;
-        var nodes: NodeBatch = .{ .space = self.space, .ids = &ids, .pages = &pages };
-        var workspace: UpdateWorkspace = .{};
+        const lease = self.resources.acquireWrite(self.identity());
+        defer lease.end();
+        const workspace = lease.workspace;
+        var nodes: NodeBatch = .{ .space = self.space, .ids = &workspace.ids, .pages = &workspace.pages };
         var begin: usize = 0;
         while (begin < writes.len) {
             const count = @min(writes.len - begin, maximum_sorted_batch);
             const batch = writes[begin..][0..count];
-            var order: [maximum_sorted_batch]u16 = undefined;
-            var sorted: [maximum_batch]Write = undefined;
+            const order = &workspace.order;
+            const sorted = &workspace.sorted;
             for (batch, order[0..count], 0..) |write, *index, at| {
                 if (write.key.len == 0 or write.key.len > maximum_key) return error.InvalidArgument;
                 index.* = @intCast(at);
@@ -469,11 +679,88 @@ pub const Table = struct {
                     unique += 1;
                 }
                 var applied: usize = 0;
-                while (applied < unique) applied += try self.update(sorted[applied..unique], &nodes, &workspace);
+                const window = @min(storage.batch_size, @max(1, self.space.borrowCapacity() / 2));
+                while (applied < unique) {
+                    const limit = applied + @min(window, unique - applied);
+                    var held: [storage.batch_size]storage.PageLease = undefined;
+                    const kept = try self.prefetch(sorted[applied..limit], &nodes, &workspace.update.cells, &held);
+                    assert(kept <= limit - applied);
+                    defer storage.PageLease.releaseMany(held[0..kept]);
+                    while (applied < limit) {
+                        const consumed = try self.update(sorted[applied..unique], &nodes, &workspace.update);
+                        assert(consumed > 0 and consumed <= unique - applied);
+                        applied += consumed;
+                    }
+                }
             }
             begin += count;
         }
         try nodes.flush();
+    }
+
+    /// Retains leaf leases in held[0..result] until the caller finishes its update window.
+    fn prefetch(self: Table, writes: []const Write, nodes: *const NodeBatch, cells: []Cell, held: []storage.PageLease) storage.Error!usize {
+        assert(writes.len <= storage.batch_size and held.len >= writes.len);
+        if (writes.len < 2) return 0;
+        const root = try self.getRoot() orelse return 0;
+        var ids: [storage.batch_size]storage.PageId = @splat(root);
+        var active: [storage.batch_size]bool = @splat(true);
+        var depth: usize = 0;
+        while (depth < maximum_depth) : (depth += 1) {
+            var unique: [storage.batch_size]storage.PageId = undefined;
+            var mapping: [storage.batch_size]usize = undefined;
+            var views: [storage.batch_size]*const storage.Page = undefined;
+            var missing: [storage.batch_size]storage.PageId = undefined;
+            var missing_positions: [storage.batch_size]usize = undefined;
+            var reading: usize = 0;
+            var misses: usize = 0;
+            for (ids[0..writes.len], active[0..writes.len], mapping[0..writes.len]) |id, live, *mapped| {
+                if (!live) continue;
+                var index: usize = 0;
+                while (index < reading and unique[index] != id) index += 1;
+                mapped.* = index;
+                if (index != reading) continue;
+                unique[reading] = id;
+                reading += 1;
+                // Dirty nodes may contain child links that have not reached storage yet.
+                const pending = for (nodes.ids[0..nodes.count], nodes.pages[0..nodes.count]) |cached, *page| {
+                    if (cached == id) break page;
+                } else null;
+                if (pending) |page| {
+                    views[index] = page;
+                } else {
+                    missing_positions[misses] = index;
+                    missing[misses] = id;
+                    misses += 1;
+                }
+            }
+            if (reading == 0) return 0;
+            if (misses != 0) self.space.borrowPages(missing[0..misses], held[0..misses]) catch |err| {
+                if (err == error.CachePinned) return 0;
+                return err;
+            };
+            var retained = false;
+            defer if (!retained) storage.PageLease.releaseMany(held[0..misses]);
+            for (held[0..misses], missing_positions[0..misses]) |lease, index| views[index] = lease.bytes();
+            for (views[0..reading], 0..) |bytes, page_index| {
+                const node = try Node.decode(bytes, cells);
+                for (writes, 0..) |write, index| {
+                    if (!active[index] or mapping[index] != page_index) continue;
+                    if (node.branch) {
+                        const position = node.lowerBound(write.key);
+                        ids[index] = @enumFromInt(node.cells[@min(position, node.count - 1)].reference);
+                    } else active[index] = false;
+                }
+            }
+            const pending = for (active[0..writes.len]) |live| {
+                if (live) break true;
+            } else false;
+            if (!pending) {
+                retained = true;
+                return misses;
+            }
+        }
+        return error.Corrupt;
     }
 
     fn update(self: Table, writes: []const Write, nodes: *NodeBatch, workspace: *UpdateWorkspace) storage.Error!usize {
@@ -496,8 +783,7 @@ pub const Table = struct {
             try self.space.allocatePages(&allocated);
             ids[0] = allocated[0];
             const empty: Node = .{};
-            path[0] = empty.encode(0, 0, 0);
-            try nodes.write(&.{.{ .id = ids[0], .source = &path[0] }});
+            empty.encode(try nodes.reserve(ids[0]), 0, 0, 0);
             try self.setRoot(ids[0]);
         }
         var node: Node = undefined;
@@ -517,9 +803,22 @@ pub const Table = struct {
         var used: usize = 0;
         var changed = false;
         const descriptors = &workspace.descriptors;
-        var data: DataBatch = .{ .space = self.space, .pages = &workspace.pages, .writes = &workspace.writes };
+        var data: blob.WriteBatch = .{ .space = self.space, .writes = &workspace.writes };
         var accounted: usize = 0;
         var leaf_bytes: usize = 0;
+        var freeing: blob.FreeBatch = .{ .space = self.space };
+        for (writes) |write| {
+            if (!rightmost and upper != null and std.mem.order(u8, write.key, upper.?.keySlice()) == .gt) break;
+            const at = node.lowerBound(write.key);
+            if (at == node.count or !std.mem.eql(u8, node.cells[at].keySlice(), write.key)) continue;
+            const cell = &node.cells[at];
+            if (cell.flags == 1) try freeing.appendBlob(@enumFromInt(cell.reference), cell.length);
+            if (cell.flags == 3) {
+                const layout = Direct.layout(cell.length, cell.prefix);
+                for (0..layout.pages) |index| try freeing.appendPage(@enumFromInt(std.mem.readInt(u64, cell.value[index * 8 ..][0..8], .little)));
+            }
+        }
+        try freeing.flush();
         for (writes) |write| {
             if (!rightmost and upper != null and std.mem.order(u8, write.key, upper.?.keySlice()) == .gt) break;
             const at = node.lowerBound(write.key);
@@ -527,10 +826,7 @@ pub const Table = struct {
             used += 1;
             if (exists and write.value != null and node.cells[at].flags == 0 and std.mem.eql(u8, node.cells[at].value, write.value.?)) continue;
             if (!exists and write.value == null) continue;
-            if (exists) {
-                try self.freeValue(&node.cells[at]);
-                node.remove(at);
-            }
+            if (exists and write.value == null) node.remove(at);
             for (node.cells[accounted..at]) |*cell| {
                 if (leaf_bytes + cell.bytes() > storage.page_size - node_header_size) leaf_bytes = 0;
                 leaf_bytes += cell.bytes();
@@ -538,7 +834,7 @@ pub const Table = struct {
             accounted = at;
             if (write.value) |value| {
                 const cell = try self.makeCell(write.key, value, leaf_bytes, &descriptors[used - 1], &data);
-                node.insert(at, cell);
+                if (exists) node.cells[at] = cell else node.insert(at, cell);
                 if (leaf_bytes + cell.bytes() > storage.page_size - node_header_size) leaf_bytes = 0;
                 leaf_bytes += cell.bytes();
                 accounted += 1;
@@ -654,8 +950,7 @@ pub const Table = struct {
                             var preceding = try Node.decode(&preceding_page, &peer_cells[0]);
                             if (!preceding.branch) {
                                 if (preceding.next != @intFromEnum(ids[depth])) return error.Corrupt;
-                                const page = preceding.encode(0, preceding.count, node.next);
-                                try nodes.write(&.{.{ .id = predecessor, .source = &page }});
+                                preceding.encode(try nodes.reserve(predecessor), 0, preceding.count, node.next);
                                 break;
                             }
                             if (steps == maximum_depth) return error.Corrupt;
@@ -724,13 +1019,10 @@ pub const Table = struct {
                 var begin: usize = 0;
                 while (begin < child_count) {
                     const count = @min(storage.batch_size, child_count - begin);
-                    const pages = &workspace.pages;
-                    const output = &workspace.writes;
-                    for (pages[0..count], output[0..count], 0..) |*page, *write, offset| {
+                    for (0..count) |offset| {
                         const at = begin + offset;
                         const next = if (node.branch) 0 else if (at + 1 < child_count) @intFromEnum(output_ids[at + 1]) else node.next;
-                        page.* = node.encode(boundaries[at], boundaries[at + 1], next);
-                        write.* = .{ .id = output_ids[at], .source = page };
+                        node.encode(try nodes.reserve(output_ids[at]), boundaries[at], boundaries[at + 1], next);
                         children[at] = node.cells[boundaries[at + 1] - 1];
                         children[at].flags = 2;
                         children[at].length = 0;
@@ -738,7 +1030,6 @@ pub const Table = struct {
                         children[at].reference = @intFromEnum(output_ids[at]);
                         children[at].prefix = 0;
                     }
-                    try nodes.write(output[0..count]);
                     begin += count;
                 }
             }
@@ -767,6 +1058,8 @@ pub const Table = struct {
 
     pub fn scan(self: Table, cursor: *ScanCursor, output: []ScanEntry) storage.Error!ScanResult {
         if (output.len == 0 or cursor.after_len > cursor.after.len or cursor.after_len > maximum_key) return error.InvalidArgument;
+        const lease = self.resources.acquireRead(self.identity());
+        defer lease.end();
         const saved_length = cursor.after_len;
         var saved: [maximum_key]u8 = undefined;
         @memcpy(saved[0..saved_length], cursor.after[0..saved_length]);
@@ -778,13 +1071,13 @@ pub const Table = struct {
         var count: usize = 0;
         var depth: usize = 0;
         var page: storage.Page = undefined;
-        var cells: [maximum_cells]Cell = undefined;
+        const cells = &lease.workspace.cells;
         var values: ValueReads = .{ .data = .{ .space = self.space } };
         var node: Node = undefined;
         while (true) {
             if (depth == maximum_depth) return error.Corrupt;
             try self.space.readPages(&.{.{ .id = id, .destination = &page }});
-            node = try Node.decode(&page, &cells);
+            node = try Node.decode(&page, cells);
             if (!node.branch) break;
             depth += 1;
             const at = @min(node.lowerBound(cursor.after[0..cursor.after_len]), node.count - 1);
@@ -800,7 +1093,7 @@ pub const Table = struct {
                 if (row.key.len < cell.key_len or cursor.after.len < cell.key_len) return error.BufferTooSmall;
                 @memcpy(row.key[0..cell.key_len], cell.keySlice());
                 row.key_len = cell.key_len;
-                row.value_len = try values.append(cell, row.value);
+                row.value_len = try values.append(cell.view(), row.value);
                 @memcpy(cursor.after[0..cell.key_len], cell.keySlice());
                 cursor.after_len = cell.key_len;
                 count += 1;
@@ -812,7 +1105,7 @@ pub const Table = struct {
             const last = node.cells[node.count - 1];
             id = @enumFromInt(node.next);
             try self.space.readPages(&.{.{ .id = id, .destination = &page }});
-            node = try Node.decode(&page, &cells);
+            node = try Node.decode(&page, cells);
             if (node.branch or node.count == 0 or std.mem.order(u8, last.keySlice(), node.cells[0].keySlice()) != .lt) return error.Corrupt;
             at = 0;
         }

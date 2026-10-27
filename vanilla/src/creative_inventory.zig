@@ -9,6 +9,7 @@ const packets = @import("minecraft_packets");
 const inventories = @import("inventories");
 const sessions = @import("sessions");
 const minecraft = @import("minecraft_model");
+const item_data = @import("item_data.zig");
 const item_packets = @import("item_packets.zig");
 const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
 const Items = @import("items.zig").Items;
@@ -46,8 +47,9 @@ pub const CreativeInventory = struct {
 
     deps: Dependencies,
     batches: []?*Batch,
+    batch_storage: []Batch,
     decode_scratch: []u8,
-    decode_definition: []u8,
+    decode_components: [item_data.maximum_components]item_data.Component = undefined,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*CreativeInventory {
         const self = try allocator.create(CreativeInventory);
@@ -55,8 +57,8 @@ pub const CreativeInventory = struct {
         self.* = .{
             .deps = deps,
             .batches = try allocator.alloc(?*Batch, count),
+            .batch_storage = try allocator.alloc(Batch, count),
             .decode_scratch = try allocator.alloc(u8, deps.inventories.config.max_item_bytes),
-            .decode_definition = try allocator.alloc(u8, deps.inventories.config.max_item_bytes),
         };
         @memset(self.batches, null);
         try deps.input.on(.set_creative_slot, self, onCreativeSlot);
@@ -64,26 +66,26 @@ pub const CreativeInventory = struct {
         return self;
     }
 
-    fn onDig(self: *CreativeInventory, handle: sessions.Handle, dig: minecraft.Dig, temporary: std.mem.Allocator) !void {
+    fn onDig(self: *CreativeInventory, handle: sessions.Handle, dig: minecraft.Dig) !void {
         if (dig.action != .swap_hands and dig.action != .drop_item and dig.action != .drop_stack) return;
-        try self.apply(handle.index, .{ .dig = dig }, temporary);
+        try self.apply(handle.index, .{ .dig = dig });
     }
 
-    fn onCreativeSlot(self: *CreativeInventory, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_set_creative_slot.Reader, temporary: std.mem.Allocator) !void {
+    fn onCreativeSlot(self: *CreativeInventory, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_set_creative_slot.Reader) !void {
         const player = self.deps.players.records[handle.index];
         if (player.handle == null or player.stage != .ready or player.gamemode != .creative) return;
         const slot, const next = body.slot() catch return error.InvalidPacket;
         if (slot != -1 and (slot < 1 or slot > 45)) return;
         const selected = try self.deps.packets.definition(body.protocolNumber());
-        const value = item_packets.readStack(self.deps.items, self.decode_scratch, self.decode_definition, next._cursor.rest, selected, self.deps.players.records[handle.index].uuid) catch |err| {
+        const value = item_packets.readStack(self.deps.items, self.decode_scratch, &self.decode_components, next._cursor.rest, selected, self.deps.players.records[handle.index].uuid) catch |err| {
             std.log.warn("event=creative_item_rejected protocol={d} error={s}", .{ selected.number, @errorName(err) });
             self.deps.inventory.states[handle.index].dirty = PlayerInventory.all_slots;
             return;
         };
-        try self.apply(handle.index, .{ .creative_slot = .{ .slot = slot, .item = value } }, temporary);
+        try self.apply(handle.index, .{ .creative_slot = .{ .slot = slot, .item = value } });
     }
 
-    fn apply(self: *CreativeInventory, player_index: usize, action: ?Action, temporary: ?std.mem.Allocator) !void {
+    fn apply(self: *CreativeInventory, player_index: usize, action: ?Action) !void {
         const menu = self.deps.inventory;
         const service = self.deps.sessions;
         errdefer menu.fail();
@@ -152,7 +154,7 @@ pub const CreativeInventory = struct {
                 balances[index].count += held.count;
             };
             if (action != null) {
-                batch = try temporary.?.create(Batch);
+                batch = &self.batch_storage[player_index];
                 batch.?.* = .{ .balances = balances, .count = count, .revision = state.revision };
                 self.batches[player_index] = batch;
             }
@@ -175,8 +177,8 @@ pub const CreativeInventory = struct {
                     if (set.item) |value| {
                         const amount = value.count;
                         if (amount <= 0 or amount > 99) continue;
-                        if (value.definition.len > self.deps.inventories.config.max_item_bytes or value.definition.len + 256 > service.config.page_bytes) continue;
-                        stack = .{ .item = try self.deps.inventories.defineItem(value.definition), .count = @intCast(amount) };
+                        if (value.encoded_bytes > self.deps.inventories.config.max_item_bytes or value.encoded_bytes + 256 > service.config.page_bytes) continue;
+                        stack = .{ .item = try item_data.define(self.deps.inventories, value.kind, value.components), .count = @intCast(amount) };
                     }
 
                     if (set.slot == -1) {
@@ -255,7 +257,9 @@ pub const CreativeInventory = struct {
     pub fn tick(self: *CreativeInventory) !void {
         const menu = self.deps.inventory;
         const service = self.deps.sessions;
-        connections: for (self.deps.players.records, menu.states, 0..) |*player, *state, player_index| {
+        connections: for (self.deps.players.activeSlots()) |player_index| {
+            const player = &self.deps.players.records[player_index];
+            const state = &menu.states[player_index];
             const handle = player.handle orelse {
                 self.batches[player_index] = null;
                 continue;
@@ -270,59 +274,13 @@ pub const CreativeInventory = struct {
                 state.dirty = PlayerInventory.all_slots;
             }
             if (!pending_batch and state.dirty == 0 and state.generation == handle.generation and state.life == player.life and state.gamemode == player.gamemode) continue;
-            try self.apply(player_index, null, null);
+            try self.apply(player_index, null);
             self.batches[player_index] = null;
-            var slots: [47]inventories.Slot = undefined;
-            var contents: [47]inventories.Contents = undefined;
-            try menu.load(player_index, &slots, &contents);
-            state.dirty &= ~(@as(u64, 1) << PlayerInventory.cursor);
-            if (state.dirty == (PlayerInventory.all_slots & ~(@as(u64, 1) << PlayerInventory.cursor))) {
-                var key: [16]u8 = undefined;
-                std.mem.writeInt(u128, &key, player.uuid, .big);
-                const recovery = try menu.recovery.acquire(&key);
-                defer recovery.release();
-                if (recovery.read()) |bytes| contents[PlayerInventory.cursor].stack = (try PlayerInventory.decodeRecovery(bytes)).stack;
-                self.deps.packets.sendPacketRetrying(PlayerInventory.writeInventory, player.protocol, &.{handle}, .{
-                    self.deps.items, state.revision, &contents, player.uuid,
-                }, service.config.page_bytes) catch |err| switch (err) {
-                    error.EndOfStream, error.UnsupportedItem, error.UnsupportedComponent => {
-                        service.disconnect(handle);
-                        continue :connections;
-                    },
-                    error.Backpressured, error.Closed => continue :connections,
-                    else => return err,
-                };
-                state.dirty = 0;
-                continue;
-            }
-            while (state.dirty != 0) {
-                const index = @ctz(state.dirty);
-                self.deps.packets.sendPacketRetrying(writeSlot, player.protocol, &.{handle}, .{
-                    self.deps.items, state.revision, @as(i16, @intCast(index)), contents[index].stack, player.uuid,
-                }, service.config.page_bytes) catch |err| switch (err) {
-                    error.EndOfStream, error.UnsupportedItem, error.UnsupportedComponent => {
-                        service.disconnect(handle);
-                        continue :connections;
-                    },
-                    error.Backpressured, error.Closed => continue :connections,
-                    else => return err,
-                };
-                state.dirty &= ~(@as(u64, 1) << @intCast(index));
-            }
+            menu.synchronize(player_index, self.deps.packets, service) catch |err| switch (err) {
+                error.EndOfStream, error.UnsupportedItem, error.UnsupportedComponent => service.disconnect(handle),
+                error.Backpressured, error.Closed => continue :connections,
+                else => return err,
+            };
         }
-    }
-
-    pub fn writeSlot(packet: wire_1_21_5.play.toClient.packet_set_slot.Writer, registry: packets.Registry, store: *Items, revision: i32, slot: i16, stack: ?inventories.Stack, recipient: u128) ![]u8 {
-        const window = try packet.windowId(0);
-        const state = try window.stateId(revision);
-        const position = try state.slot(slot);
-        var item = try position.item();
-        const done = try item_packets.writeSlot(try item.begin(), .{
-            .registry = registry,
-            .items = store,
-            .stack = stack,
-            .recipient = recipient,
-        });
-        return (try item.advance(done)).finish();
     }
 };

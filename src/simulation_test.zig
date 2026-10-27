@@ -12,7 +12,7 @@ const Database = struct {
         errdefer directory.cleanup();
         const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/world", .{directory.sub_path});
         errdefer std.testing.allocator.free(path);
-        return .{ .directory = directory, .path = path, .store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path, .submission = .standard, .maximum_wal_pages = 1024 }) };
+        return .{ .directory = directory, .path = path, .store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path, .maximum_wal_pages = 1024 }) };
     }
     fn deinit(self: *Database) void {
         self.store.deinit();
@@ -22,6 +22,47 @@ const Database = struct {
 };
 fn deadline() std.Io.Clock.Timestamp {
     return .fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromSeconds(5) });
+}
+
+test "scoped simulations stage independent ticks for one coordinated commit" {
+    var database = try Database.init();
+    defer database.deinit();
+    const directory = try database.store.openSpace("worlds");
+    var scopes = [_]storage.Scope{ try .create(directory), try .create(directory) };
+    const plugins = .{lightning_rod.plugin.configured(Probe, .{})};
+    const Simulation = lightning_rod.Simulation(@TypeOf(plugins));
+    var simulations: [2]*Simulation = undefined;
+    var initialized: usize = 0;
+    defer for (simulations[0..initialized]) |simulation| {
+        simulation.unload(deadline()) catch unreachable;
+        simulation.deinit(std.testing.allocator);
+    };
+    for (&simulations, &scopes) |*simulation, *scope| {
+        simulation.* = try Simulation.init(std.testing.allocator, std.testing.io, &database.store, .{
+            .scope = scope,
+            .autosave = .{ .ticks = 1 },
+        });
+        initialized += 1;
+        try simulation.*.initialize(plugins, .{});
+    }
+    try simulations[0].tick();
+    try simulations[1].tick();
+    try simulations[1].tick();
+    for (simulations) |simulation| try std.testing.expect(simulation.save_requested.requested);
+    const previous = database.store.lastCommit();
+    for (simulations) |simulation| try simulation.stageCheckpoint();
+    try std.testing.expectEqual(previous, database.store.lastCommit());
+    try std.testing.expectEqual(@as(u64, 1), scopes[0].tick);
+    try std.testing.expectEqual(@as(u64, 2), scopes[1].tick);
+    try database.store.waitDurable(try database.store.commit(1));
+    for (simulations) |simulation| {
+        try std.testing.expect(!simulation.save_requested.requested);
+        try std.testing.expectEqual(@as(usize, 1), simulation.get(Probe).checkpoints);
+    }
+    for (&scopes, 0..) |scope, index| {
+        const restored = try storage.Scope.open(directory, scope.page);
+        try std.testing.expectEqual(@as(u64, index + 1), restored.tick);
+    }
 }
 const Probe = struct {
     pub const id = "test:checkpoint";
@@ -100,6 +141,32 @@ const CheckpointScratchFollower = struct {
         self.checkpoints += 1;
     }
 };
+
+test "providers retain concrete required and optional contract types" {
+    const Contract = struct { value: usize };
+    const Provider = struct {
+        pub const id = "test:root_provider";
+        pub const Configuration = struct {};
+        pub const Provides = .{*Contract};
+        contract: Contract,
+        pub fn init(allocator: std.mem.Allocator) !*@This() {
+            const self = try allocator.create(@This());
+            self.* = .{ .contract = .{ .value = 42 } };
+            return self;
+        }
+        pub fn provide(self: *@This(), comptime T: type) T {
+            if (T == *Contract) return &self.contract;
+            @compileError("unknown contract");
+        }
+    };
+    const selected = .{lightning_rod.plugin.configured(Provider, .{})};
+    var provider: Provider = .{ .contract = .{ .value = 42 } };
+    var root: lightning_rod.plugin.Instances(@TypeOf(selected)) = .{ .pointers = .{&provider}, .initialized = 1 };
+    const contract = lightning_rod.plugin.dependency("routing", *Contract, &root, .{}, 1);
+    const optional = lightning_rod.plugin.dependency("routing", ?*Contract, &root, .{}, 1);
+    try std.testing.expectEqual(&provider.contract, contract);
+    try std.testing.expectEqual(&provider.contract, optional.?);
+}
 
 test "disabled autosave saves the complete tick on shutdown" {
     var database = try Database.init();
@@ -194,6 +261,45 @@ const FirstSave = struct {
         try space.writePages(&.{.{ .id = root, .source = &page }});
     }
 };
+
+test "sequential simulations borrow worker scratch and unload without forcing durability" {
+    var first_database = try Database.init();
+    defer first_database.deinit();
+    var second_database = try Database.init();
+    defer second_database.deinit();
+    const scratch = try std.testing.allocator.alloc(u8, 1024);
+    defer std.testing.allocator.free(scratch);
+    const plugins = .{ lightning_rod.plugin.configured(CheckpointScratch, .{}), lightning_rod.plugin.configured(FirstSave, .{}) };
+    const Sim = lightning_rod.Simulation(@TypeOf(plugins));
+    const config: lightning_rod.Configuration = .{
+        .memory_bytes = 16 * 1024,
+        .scratch = scratch,
+        .metrics = .{ .enabled = false },
+        .autosave = .{ .ticks = null },
+    };
+    const first = try Sim.init(std.testing.allocator, std.testing.io, &first_database.store, config);
+    defer first.deinit(std.testing.allocator);
+    const second = try Sim.init(std.testing.allocator, std.testing.io, &second_database.store, config);
+    defer second.deinit(std.testing.allocator);
+    try first.initialize(plugins, .{});
+    try second.initialize(plugins, .{});
+    try first.tick();
+    try second.tick();
+    try std.testing.expectEqual(@intFromPtr(scratch.ptr), first.get(CheckpointScratch).address);
+    try std.testing.expectEqual(first.get(CheckpointScratch).address, second.get(CheckpointScratch).address);
+    try first.unload(deadline());
+    try second.unload(deadline());
+    for ([_]*storage.Store{ &first_database.store, &second_database.store }) |store| {
+        try std.testing.expectEqual(@as(u64, 1), store.lastTick());
+        try std.testing.expectEqual(@as(u64, 0), store.durableTick());
+        const space = try store.openSpace(FirstSave.id);
+        var page: storage.Page = undefined;
+        try space.readPages(&.{.{ .id = (try space.getRoot()).?, .destination = &page }});
+        for (page) |byte| try std.testing.expectEqual(@as(u8, 1), byte);
+        try store.waitDurable(store.lastCommit());
+        try std.testing.expectEqual(@as(u64, 1), store.durableTick());
+    }
+}
 const SecondSave = struct {
     pub const id = "test:second_save";
     pub const Configuration = struct {};
@@ -220,10 +326,49 @@ test "a failed plugin save cannot publish an earlier plugin's staged pages" {
     try simulation.close(deadline());
     simulation.deinit(std.testing.allocator);
     database.store.deinit();
-    database.store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = database.path, .submission = .standard, .maximum_wal_pages = 1024 });
+    database.store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = database.path, .maximum_wal_pages = 1024 });
     try std.testing.expectEqual(@as(u64, 1), database.store.lastTick());
     const space = try database.store.openSpace(FirstSave.id);
     var page: storage.Page = undefined;
     try space.readPages(&.{.{ .id = (try space.getRoot()).?, .destination = &page }});
     for (page) |byte| try std.testing.expectEqual(@as(u8, 1), byte);
+}
+
+test "configured reservation allocates capacity without restoring or checkpointing" {
+    const Reserved = struct {
+        const Self = @This();
+        pub const id = "test:reservation";
+        pub const Configuration = struct { capacity: usize };
+        pub const Dependencies = struct { storage: storage.Space };
+        bytes: []u8,
+
+        pub fn allocate(allocator: std.mem.Allocator, config: Configuration) !*Self {
+            const self = try allocator.create(Self);
+            self.* = .{ .bytes = try allocator.alloc(u8, config.capacity) };
+            return self;
+        }
+        pub fn init(_: std.mem.Allocator) !*Self {
+            return error.RestoreWasCalled;
+        }
+        pub fn checkpoint(_: *Self, _: storage.Space) !void {
+            return error.CheckpointWasCalled;
+        }
+    };
+    var database = try Database.init();
+    defer database.deinit();
+    var previous: usize = 0;
+    for ([_]usize{ 64, 256 }) |capacity| {
+        const plugins = .{lightning_rod.plugin.configured(Reserved, .{ .capacity = capacity })};
+        const Simulation = lightning_rod.Simulation(@TypeOf(plugins));
+        const simulation = try Simulation.init(std.testing.allocator, std.testing.io, &database.store, .{});
+        try simulation.reserve(plugins, .{});
+        try std.testing.expectEqual(Simulation.State.reserved, simulation.state);
+        try std.testing.expectEqual(capacity, simulation.get(Reserved).bytes.len);
+        try std.testing.expect(try (try database.store.openSpace(Reserved.id)).getRoot() == null);
+        const assigned = simulation.permanent.used();
+        if (previous != 0) try std.testing.expectEqual(@as(usize, 192), assigned - previous);
+        previous = assigned;
+        try simulation.unload(deadline());
+        simulation.deinit(std.testing.allocator);
+    }
 }

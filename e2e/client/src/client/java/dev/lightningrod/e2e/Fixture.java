@@ -19,12 +19,14 @@ abstract class Fixture {
     void poll(Minecraft game) {}
     void connected(Minecraft game) {}
     boolean encrypted() { return false; }
+    boolean canConnect() { return true; }
     int renderDistance() { return 2; }
     void disconnected(Minecraft game, String title) { client.fail("disconnected: " + title); }
     boolean prepare(Minecraft game) { return true; }
     abstract void tick(Minecraft game, int loaded, int missing);
     void message(String text) {}
     void chat(String text) { r.receivedChat.add(text); }
+    void chatAction(String text, String command, String hover) {}
     void blockBreaking(BlockPos position, int stage) {}
     void inventorySynced(Minecraft game) {}
     void reconfigurationEncoded() {}

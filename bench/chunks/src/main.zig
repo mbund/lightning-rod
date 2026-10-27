@@ -1,4 +1,6 @@
 const std = @import("std");
+const records = @import("records");
+const terrain = @import("terrain.zig");
 const chunks = @import("chunks");
 const storage = @import("storage");
 const metrics = @import("metrics");
@@ -88,50 +90,6 @@ fn sizes(store: *const storage.Store) !Files {
     return .{ .database = (try store.database.stat(store.io)).size, .wal = (try store.wal.stat(store.io)).size };
 }
 
-fn acquireColumns(world: *chunks.Chunks, source: *const corpus.Corpus, ids: []const u32) !void {
-    var start: usize = 0;
-    while (start < ids.len) {
-        const count: usize = @min(8, ids.len - start);
-        var sections: [192]chunks.Section = undefined;
-        var leases: [192]chunks.Lease = undefined;
-        for (ids[start..][0..count], 0..) |id, index| {
-            const column = source.columns[id];
-            for (0..corpus.section_count) |y| sections[index * corpus.section_count + y] = .{ .world = 0, .x = column.x, .z = column.z, .y = @as(i32, @intCast(y)) + corpus.minimum_y };
-        }
-        const n = count * corpus.section_count;
-        try world.acquireMany(sections[0..n], leases[0..n]);
-        for (leases[0..n]) |lease| lease.release();
-        start += count;
-    }
-}
-
-fn seedDatabase(init: std.process.Init, source: *corpus.Corpus, path: []const u8) !void {
-    var arena = std.heap.ArenaAllocator.init(init.gpa);
-    defer arena.deinit();
-    var registry = try metrics.Registry.init(init.gpa, init.io, .{ .capacity = 64 });
-    defer registry.deinit();
-    try common.removeDatabase(init.gpa, init.io, path);
-    var store = try storage.Store.init(init.gpa, init.io, .{ .path = path, .metrics = &registry });
-    defer store.deinit();
-    const space = try store.openSpace(chunks.Chunks.id);
-    const world = try chunks.Chunks.init(arena.allocator(), init.io, .{}, .{ .metrics = &registry, .storage = space });
-    world.source = chunks.Source.init(source, corpus.Corpus.read);
-    var ids: [128]u32 = undefined;
-    var start: usize = 0;
-    var tick: u64 = 0;
-    while (start < source.columns.len) {
-        const count = @min(ids.len, source.columns.len - start);
-        for (ids[0..count], 0..) |*id, index| id.* = @intCast(start + index);
-        try acquireColumns(world, source, ids[0..count]);
-        try world.checkpoint(space);
-        tick += 1;
-        try store.waitDurable(try store.commit(tick));
-        try common.drain(&store);
-        start += count;
-    }
-    std.debug.print("Seeded {d} columns ({d} source columns, {d} copies), database {d} bytes\n", .{ source.columns.len, source.columns.len / source.copies, source.copies, (try sizes(&store)).database });
-}
-
 fn copyDatabase(allocator: std.mem.Allocator, io: std.Io, from: []const u8, to: []const u8, cold: bool) !void {
     try common.removeDatabase(allocator, io, to);
     for ([_][]const u8{ "", ".wal" }) |suffix| {
@@ -160,13 +118,13 @@ fn copyDatabase(allocator: std.mem.Allocator, io: std.Io, from: []const u8, to: 
 fn verify(init: std.process.Init, source: *const corpus.Corpus, trace: *const traces.Trace, path: []const u8) !usize {
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
-    var registry = try metrics.Registry.init(init.gpa, init.io, .{ .capacity = 64 });
+    var registry = try metrics.Registry.init(init.gpa, init.io, .{ .capacity = 128 });
     defer registry.deinit();
     var store = try storage.Store.init(init.gpa, init.io, .{ .path = path });
     defer store.deinit();
     defer store.transaction().fail();
     const space = try store.openSpace(chunks.Chunks.id);
-    const world = try chunks.Chunks.init(arena.allocator(), init.io, .{}, .{ .metrics = &registry, .storage = space });
+    const world = try chunks.Chunks.init(arena.allocator(), init.io, .{}, .{ .metrics = &registry, .storage = space, .record_workspaces = try records.Workspaces.init(arena.allocator(), init.io, .{}) });
     const changed = try arena.allocator().alloc(bool, source.columns.len * corpus.section_count);
     @memset(changed, false);
     var iterator = trace.final_edits.keyIterator();
@@ -232,8 +190,8 @@ fn runCase(init: std.process.Init, source: *corpus.Corpus, trace: *const traces.
         var store = try storage.Store.init(init.gpa, init.io, .{ .path = path, .metrics = &registry, .maximum_wal_pages = options.wal_pages, .checkpoint_bytes = options.checkpoint_bytes });
         defer store.deinit();
         const space = try store.openSpace(chunks.Chunks.id);
-        const world = try chunks.Chunks.init(allocator, init.io, .{ .cache_sections = cache }, .{ .metrics = &registry, .storage = space });
-        if (pattern == .exploration) world.source = chunks.Source.init(source, corpus.Corpus.read);
+        const world = try chunks.Chunks.init(allocator, init.io, .{ .demand_sections = 0, .cache_sections = cache }, .{ .metrics = &registry, .storage = space, .record_workspaces = try records.Workspaces.init(arena.allocator(), init.io, .{}) });
+        if (pattern == .exploration) world.setSource(chunks.Source.init(source, corpus.Corpus.read));
         const wall_timer = try registry.timer(.{ .namespace = "bench", .name = "step", .description = "One logical second of the access trace" });
         const cpu_timer = try registry.timer(.{ .namespace = "bench", .name = "step_cpu", .description = "Simulation thread CPU per trace step", .clock = .thread_cpu });
         const counters_before = Counters.read(&store, &registry, source);
@@ -245,7 +203,7 @@ fn runCase(init: std.process.Init, source: *corpus.Corpus, trace: *const traces.
             errdefer std.debug.print("Failed step={d} WAL pages={d}/{d} bytes={d} maintenance={t} copied={d}/{d} committed={d} durable={d} dirty={d}\n", .{ index, store.locations.count(), store.limits.maximum_wal_pages, store.end, store.phase, store.checkpoint_at, store.checkpoint_count, store.saved.sequence, store.durable_sequence, store.dirty_count });
             const start = common.Stamp.now(init.io);
             var phase_start = start;
-            try acquireColumns(world, source, step.columns);
+            try terrain.acquireColumns(world, source, step.columns);
             var now = common.Stamp.now(init.io);
             phases[@intFromEnum(Phase.load)].set(index, now.since(phase_start));
             phase_start = now;
@@ -273,7 +231,7 @@ fn runCase(init: std.process.Init, source: *corpus.Corpus, trace: *const traces.
             var remaining = options.maintenance_pages;
             while (remaining != 0) {
                 const pages = @min(remaining, storage.batch_size);
-                _ = try store.maintain(pages);
+                _ = try store.pollMaintenance(.{ .index_entries = pages, .pages = pages });
                 remaining -= pages;
             }
             now = common.Stamp.now(init.io);
@@ -298,15 +256,7 @@ fn runCase(init: std.process.Init, source: *corpus.Corpus, trace: *const traces.
         try common.drain(&store);
         const maintenance = common.Stamp.now(init.io).since(maintenance_start);
         const maintenance_io = (try common.IoCounts.read(init.io)).subtract(maintenance_io_before);
-        var free = store.metadata.free;
-        var free_pages: u64 = 0;
-        while (free != 0) {
-            if (free >= store.metadata.pages or free_pages >= store.metadata.pages) return error.CorruptFreelist;
-            var next: [8]u8 = undefined;
-            if (try store.database.readPositionalAll(init.io, &next, free * 4096 + 32) != 8) return error.CorruptFreelist;
-            free = std.mem.readInt(u64, &next, .little);
-            free_pages += 1;
-        }
+        const free_pages = store.metadata.free_pages;
         const snapshot = try std.Io.Dir.cwd().createFile(init.io, try std.fmt.allocPrint(allocator, "{s}.metrics.jsonl", .{stem}), .{});
         defer snapshot.close(init.io);
         var buffer: [16384]u8 = undefined;
@@ -344,12 +294,12 @@ fn benchmarkCodec(init: std.process.Init, source: *const corpus.Corpus, base: []
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var registry = try metrics.Registry.init(init.gpa, init.io, .{ .capacity = 64 });
+    var registry = try metrics.Registry.init(init.gpa, init.io, .{ .capacity = 128 });
     defer registry.deinit();
     var store = try storage.Store.init(init.gpa, init.io, .{ .path = base });
     defer store.deinit();
     defer store.transaction().fail();
-    const world = try chunks.Chunks.init(allocator, init.io, .{}, .{ .metrics = &registry, .storage = try store.openSpace(chunks.Chunks.id) });
+    const world = try chunks.Chunks.init(allocator, init.io, .{}, .{ .metrics = &registry, .storage = try store.openSpace(chunks.Chunks.id), .record_workspaces = try records.Workspaces.init(allocator, init.io, .{}) });
     const codec = world.cache.codec.?;
     const encoded = try allocator.alloc([corpus.section_bytes]u8, corpus.section_count);
     const decoded = try allocator.alloc([corpus.section_bytes]u8, corpus.section_count);
@@ -386,6 +336,10 @@ fn benchmarkCodec(init: std.process.Init, source: *const corpus.Corpus, base: []
 }
 
 pub fn main(init: std.process.Init) !void {
+    try run(init);
+}
+
+fn run(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
     var options: Options = .{};
@@ -425,7 +379,7 @@ pub fn main(init: std.process.Init) !void {
     const source_columns = source.columns.len;
     try source.replicate(allocator, options.copies);
     const base = try std.fs.path.join(allocator, &.{ options.output, "base.world" });
-    try seedDatabase(init, &source, base);
+    _ = try terrain.seedDatabase(init, &source, base);
     const codec = try benchmarkCodec(init, &source, base);
     std.debug.print("Codec: {d} sections, {d} decoded -> {d} encoded bytes, CPU encode {d:.2}ms decode {d:.2}ms\n", .{ codec.sections, codec.decoded_bytes, codec.encoded_bytes, @as(f64, @floatFromInt(codec.encode.cpu.total_ns)) / 1e6, @as(f64, @floatFromInt(codec.decode.cpu.total_ns)) / 1e6 });
     var results: std.ArrayList(Result) = .empty;
@@ -443,7 +397,7 @@ pub fn main(init: std.process.Init) !void {
     defer report.close(init.io);
     var buffer: [32768]u8 = undefined;
     var writer = report.writer(init.io, &buffer);
-    try std.json.Stringify.value(.{ .corpus_sha256 = &source.hash, .source_columns = source_columns, .copies = source.copies, .columns = source.columns.len, .trace_seed = options.seed, .submission = "io_uring", .filesystem_cache = if (options.filesystem_cache == .cold) "file-local DONTNEED requested after sync" else "warm, not dropped", .wal_pages = options.wal_pages, .checkpoint_bytes = options.checkpoint_bytes, .maintenance_pages_per_second = options.maintenance_pages, .application_cache = "cold at each run", .step_seconds = 1, .walking_blocks_per_second = 4.317, .autosave_seconds = 32, .phase_order = .{ "load", "edit", "save", "maintain" }, .codec = codec, .results = results.items }, .{ .whitespace = .indent_2 }, &writer.interface);
+    try std.json.Stringify.value(.{ .corpus_sha256 = &source.hash, .source_columns = source_columns, .copies = source.copies, .columns = source.columns.len, .trace_seed = options.seed, .submission = "system.io_uring", .filesystem_cache = if (options.filesystem_cache == .cold) "file-local DONTNEED requested after sync" else "warm, not dropped", .wal_pages = options.wal_pages, .checkpoint_bytes = options.checkpoint_bytes, .maintenance_pages_per_second = options.maintenance_pages, .application_cache = "cold at each run", .step_seconds = 1, .walking_blocks_per_second = 4.317, .autosave_seconds = 32, .phase_order = .{ "load", "edit", "save", "maintain" }, .codec = codec, .results = results.items }, .{ .whitespace = .indent_2 }, &writer.interface);
     try writer.interface.writeByte('\n');
     try writer.interface.flush();
 }

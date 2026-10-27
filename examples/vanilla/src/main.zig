@@ -3,21 +3,21 @@ const java = @import("minecraft_java");
 const protocol_set = @import("protocols");
 const lightning_rod = @import("lightning_rod");
 const profile = @import("profile");
+const sessions = @import("sessions");
 const vanilla = @import("lightning_rod_vanilla_1_21_6");
-const tui = @import("lightning_rod_tui");
-const bossbars = @import("bossbars");
 const tps = @import("tps");
 
 pub const std_options: std.Options = .{ .log_level = .debug };
 
 pub fn main(init: std.process.Init) !void {
     var startup = profile.Startup.capture(init.io);
-    const allocator = std.heap.smp_allocator;
+    var memory = lightning_rod.Memory.init(std.heap.page_allocator, init.io);
+    defer memory.deinit();
+    const allocator = memory.allocator("bootstrap");
     var args = try init.minimal.args.iterateAllocator(allocator);
     defer args.deinit();
 
     var compression: ?usize = 256;
-    var terminal = false;
     var encryption_key_path: ?[]const u8 = null;
     var metrics_export: ?lightning_rod.metrics.Exporter.Configuration = null;
     var storage_path: []const u8 = "lightning-rod-data/world";
@@ -27,8 +27,6 @@ pub fn main(init: std.process.Init) !void {
     while (args.next()) |argument| {
         if (std.mem.eql(u8, argument, "--no-compression")) {
             compression = null;
-        } else if (std.mem.eql(u8, argument, "--tui")) {
-            terminal = true;
         } else if (std.mem.startsWith(u8, argument, "--encryption-key=")) {
             const path = argument["--encryption-key=".len..];
             if (path.len == 0) return error.InvalidEncryptionKeyPath;
@@ -53,15 +51,13 @@ pub fn main(init: std.process.Init) !void {
     digest[8] = (digest[8] & 63) | 0x80;
     const operators = [_]u128{std.mem.readInt(u128, &digest, .big)};
 
-    const plugins = lightning_rod.plugin.compose(.{
+    const gameplay_plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(vanilla.plugins(), .{
             lightning_rod.plugin.configured(vanilla.Operators, vanilla.Operators.Configuration{
                 .operators = &operators,
             }),
         }),
-        lightning_rod.plugin.configured(tui.Plugin, tui.Plugin.Configuration{ .enabled = terminal }),
-        lightning_rod.plugin.configured(bossbars.Bossbars, bossbars.Bossbars.Configuration{}),
-        lightning_rod.plugin.configured(tps.Tps, tps.Tps.Configuration{}),
+        lightning_rod.plugin.configured(tps.Tps, .{}),
     });
     var protocols = try protocol_set.Default.init(allocator);
     defer protocols.deinit(allocator);
@@ -73,18 +69,19 @@ pub fn main(init: std.process.Init) !void {
             lightning_rod.plugin.configured(vanilla.LoginEncryption, .{ .key = if (key) |*value| value else null }),
         }),
     });
-    const router = profile.SingleSimulation{};
-    const Server = profile.Server(@TypeOf(plugins), protocol_set.Endpoint, @TypeOf(session_plugins), @TypeOf(router));
     std.log.info("Starting Lightning Rod", .{});
-    try Server.run(allocator, init, .{
-        .plugins = plugins,
+    try profile.Server(@TypeOf(gameplay_plugins), protocol_set.Endpoint, @TypeOf(session_plugins), sessions.SingleSimulation).run(&memory, init, .{
+        .plugins = gameplay_plugins,
+        .network = .{
+            .plugins = session_plugins,
+            .protocols = &protocols,
+            .router = .{},
+            .endpoints = &.{.{ .id = 0 }},
+            .compression_threshold = compression,
+            .address = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = port } },
+        },
+        .metrics_export = metrics_export,
         .startup = startup,
         .storage_path = storage_path,
-        .session_plugins = session_plugins,
-        .router = router,
-        .protocols = &protocols,
-        .compression_threshold = compression,
-        .metrics_export = metrics_export,
-        .address = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = port } },
     }, .{});
 }

@@ -1,6 +1,6 @@
+const game_data = @import("game_data");
 const std = @import("std");
 const inventories = @import("inventories");
-const registry = @import("game_data").registry;
 const Items = @import("items.zig").Items;
 
 pub const BlockLoot = struct {
@@ -8,42 +8,63 @@ pub const BlockLoot = struct {
 
     pub const Configuration = struct {};
 
-    pub const Dependencies = struct { items: *Items };
+    pub const Tool = struct {
+        item: ?inventories.ItemId = null,
+        kind: ?u32 = null,
+
+        pub fn resolve(self: *Tool, items: *Items, stack: ?inventories.Stack) !?u32 {
+            const item_id: ?inventories.ItemId = if (stack) |held| held.item else null;
+            if (!std.meta.eql(self.item, item_id)) {
+                const kind = if (stack) |held| try items.kind(held) else null;
+                self.* = .{ .item = item_id, .kind = kind };
+            }
+            std.debug.assert((self.item == null) == (self.kind == null));
+            return self.kind;
+        }
+    };
+
+    pub const Drop = struct {
+        kind: u32,
+        count: u16,
+
+        pub fn materialize(self: Drop, items: *Items) !inventories.Stack {
+            std.debug.assert(self.kind < game_data.registry.items.len and self.count > 0);
+            return .{ .item = try items.define(game_data.registry.itemName(@intCast(self.kind)).?), .count = self.count };
+        }
+    };
 
     pub const Result = struct {
         speed: f32,
         harvest: bool,
-        stack: ?inventories.Stack,
+        drop: ?Drop,
     };
 
-    deps: Dependencies,
-
-    pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*BlockLoot {
+    pub fn init(allocator: std.mem.Allocator) !*BlockLoot {
         const self = try allocator.create(BlockLoot);
-        self.* = .{ .deps = deps };
+        self.* = .{};
         return self;
     }
 
-    pub fn evaluate(self: *BlockLoot, state: u16, tool: ?inventories.Stack) !Result {
-        std.debug.assert(state < registry.block_state_to_block.len);
-        const block = registry.blocks[registry.block_state_to_block[state]];
-        const held = if (tool) |stack| try self.deps.items.kind(stack) else null;
+    pub fn evaluate(_: *const BlockLoot, state: u16, held: ?u32) Result {
+        std.debug.assert(state < game_data.registry.block_state_to_block.len);
+        const block = game_data.registry.blocks[game_data.registry.block_state_to_block[state]];
+        if (held) |kind| std.debug.assert(kind < game_data.registry.items.len);
         var speed: f32 = 1;
         var harvest = block.harvest_count == 0;
 
         if (held) |info| {
-            for (registry.material_tools[block.material_offset..][0..block.material_count]) |entry| {
+            for (game_data.registry.material_tools[block.material_offset..][0..block.material_count]) |entry| {
                 if (entry.item_id == info) speed = entry.multiplier;
             }
 
-            for (registry.harvest_tools[block.harvest_offset..][0..block.harvest_count]) |entry| {
+            for (game_data.registry.harvest_tools[block.harvest_offset..][0..block.harvest_count]) |entry| {
                 harvest = harvest or entry == info;
             }
         }
 
-        if (!harvest or !block.diggable or block.drop_item < 0) return .{ .speed = speed, .harvest = harvest, .stack = null };
+        if (!harvest or !block.diggable or block.drop_item < 0) return .{ .speed = speed, .harvest = harvest, .drop = null };
 
-        const name = registry.blockStateName(state).?;
+        const name = game_data.registry.blockStateName(state).?;
         const base = name[0 .. std.mem.indexOfScalar(u8, name, '[') orelse name.len];
         const drop = block.drop_item;
         var count: u16 = 1;
@@ -57,7 +78,7 @@ pub const BlockLoot = struct {
         return .{
             .speed = speed,
             .harvest = harvest,
-            .stack = .{ .item = try self.deps.items.define(registry.itemName(drop).?), .count = count },
+            .drop = .{ .kind = @intCast(drop), .count = count },
         };
     }
 };

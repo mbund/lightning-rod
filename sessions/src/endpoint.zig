@@ -88,9 +88,10 @@ pub fn Endpoint(comptime implementations: anytype, comptime bootstrap: type, com
             };
         }
 
-        pub fn control(connection: *Connection, workspaces: *Workspaces, packet: []const u8, scratch: []u8, output: []u8, threshold: ?usize) ![]const u8 {
+        /// Framing settings belong to the packet, before subsequent protocol polling changes them.
+        pub fn control(connection: *Connection, workspaces: *Workspaces, packet: protocol.Packet, output: []u8, threshold: ?usize) !protocol.Fragments {
             return switch (connection.*) {
-                inline else => |*state, tag| state.frameControl(packet, scratch, output, &workspaces[workspace_layout.indices[@intFromEnum(tag)]], threshold),
+                inline else => |*state, tag| state.frameControl(packet, output, &workspaces[workspace_layout.indices[@intFromEnum(tag)]], threshold),
             };
         }
 
@@ -161,6 +162,12 @@ pub fn Endpoint(comptime implementations: anytype, comptime bootstrap: type, com
         pub fn send(connection: *Connection, bytes: []u8) void {
             switch (connection.*) {
                 inline else => |*state| state.send(bytes),
+            }
+        }
+
+        pub fn encrypt(connection: *Connection, source: []const u8, destination: []u8) void {
+            switch (connection.*) {
+                inline else => |*state| state.encrypt(source, destination),
             }
         }
 

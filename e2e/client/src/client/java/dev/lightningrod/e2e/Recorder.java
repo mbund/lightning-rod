@@ -172,7 +172,7 @@ public final class Recorder {
             return;
         }
         if (completed) return;
-        if (!connectionAttempted && server != null && tick >= connectTick && GuiApi.overlay(client) == null) {
+        if (!connectionAttempted && server != null && tick >= connectTick && GuiApi.overlay(client) == null && fixture.canConnect()) {
             if (!ClientCompatibility.version().equals(System.getProperty("mcc.version"))) {
                 fail("unexpected_client_version");
                 return;
@@ -373,9 +373,10 @@ public final class Recorder {
         List<Capture> captures = new ArrayList<>(pendingScreenshots);
         for (Capture capture : captures) {
             if (capture.checkpoint || capture.terminal && resultPassed && client.level != null) {
-                boolean ready = client.player != null && client.level != null
-                    && Fixture.missingChunks(client, minimumRadius) == 0
-                    && TerrainApi.ready(client);
+                boolean ready = client.level == null && GuiApi.screen(client) instanceof DisconnectedScreen
+                    || client.player != null && client.level != null
+                        && Fixture.missingChunks(client, minimumRadius) == 0
+                        && TerrainApi.ready(client);
                 boolean rendered = capture.renderReady;
                 capture.renderReady = ready;
                 // A ready renderer at frame end may have uploaded terrain after drawing this frame.

@@ -2,9 +2,12 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 pub const Location = struct {
+    epoch: u64 = 0,
     current: u64,
     owner: u32,
     committed: u64 = 0,
+    // Null follows committed. Zero preserves absence in the active checkpoint snapshot.
+    checkpoint: ?u64 = null,
     uncommitted: u64 = 0,
     materialized: u64 = 0,
     replacement: u64 = 0,
@@ -44,6 +47,12 @@ pub const Index = struct {
 
     pub fn count(self: *const Index) usize {
         return self.length;
+    }
+
+    pub fn position(self: *const Index, id: u64) usize {
+        const at = self.slot(id);
+        assert(self.isOccupied(at));
+        return self.slots[at];
     }
 
     pub fn memoryBytes(self: *const Index) usize {

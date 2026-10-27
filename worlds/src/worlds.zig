@@ -47,10 +47,21 @@ pub const Worlds = struct {
     name_storage: [][]const u8,
     names: []const []const u8,
     count: usize = 0,
+    published: std.atomic.Value(usize) = .init(0),
     checkpointed: usize = 0,
     next_id: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Worlds {
+        const self = try allocate(allocator, config);
+        const encoded = self.encoded;
+        if (try records.Value.init(deps.storage).read(encoded)) |length| {
+            try self.decode(length);
+        }
+        self.published.store(self.count, .release);
+        return self;
+    }
+
+    pub fn allocate(allocator: std.mem.Allocator, config: Configuration) !*Worlds {
         if (config.maximum == 0 or config.maximum > std.math.maxInt(u16)) return error.InvalidWorldCapacity;
 
         const self = try allocator.create(Worlds);
@@ -63,48 +74,49 @@ pub const Worlds = struct {
             .name_storage = names,
             .names = names[0..0],
         };
+        return self;
+    }
+
+    fn decode(self: *Worlds, length: usize) !void {
         const encoded = self.encoded;
-        if (try records.Value.init(deps.storage).read(encoded)) |length| {
-            if (length < 5 or !std.mem.eql(u8, encoded[0..4], "LRWD")) return error.CorruptWorldCatalog;
-            if (encoded[4] != 2) return error.UnsupportedWorldCatalog;
-            if (length < 7) return error.CorruptWorldCatalog;
-            const count = std.mem.readInt(u16, encoded[5..7], .little);
-            if (count > config.maximum) return error.WorldCapacity;
-            if (length != 7 + @as(usize, count) * 140) return error.CorruptWorldCatalog;
+        const names = self.name_storage;
+        if (length < 5 or !std.mem.eql(u8, encoded[0..4], "LRWD")) return error.CorruptWorldCatalog;
+        if (encoded[4] != 2) return error.UnsupportedWorldCatalog;
+        if (length < 7) return error.CorruptWorldCatalog;
+        const count = std.mem.readInt(u16, encoded[5..7], .little);
+        if (count > self.entries.len) return error.WorldCapacity;
+        if (length != 7 + @as(usize, count) * 140) return error.CorruptWorldCatalog;
 
-            for (0..count) |index| {
-                const entry = encoded[7 + index * 140 ..][0..140];
-                if (entry[10] == 0 or entry[10] > 64 or entry[11] == 0 or entry[11] > 64) return error.CorruptWorldCatalog;
+        for (0..count) |index| {
+            const entry = encoded[7 + index * 140 ..][0..140];
+            if (entry[10] == 0 or entry[10] > 64 or entry[11] == 0 or entry[11] > 64) return error.CorruptWorldCatalog;
 
-                const name = entry[12..][0..entry[10]];
-                validateName(name) catch return error.CorruptWorldCatalog;
-                const world_id = std.mem.readInt(u32, entry[0..4], .little);
-                const dimension: Dimension = .{
-                    .name = entry[76..][0..entry[11]],
-                    .minimum_section = std.mem.readInt(i32, entry[4..8], .little),
-                    .section_count = std.mem.readInt(u16, entry[8..10], .little) & 0x7fff,
-                    .skylight = entry[9] & 0x80 != 0,
-                };
-                validateDimension(dimension) catch return error.CorruptWorldCatalog;
+            const name = entry[12..][0..entry[10]];
+            validateName(name) catch return error.CorruptWorldCatalog;
+            const world_id = std.mem.readInt(u32, entry[0..4], .little);
+            const dimension: Dimension = .{
+                .name = entry[76..][0..entry[11]],
+                .minimum_section = std.mem.readInt(i32, entry[4..8], .little),
+                .section_count = std.mem.readInt(u16, entry[8..10], .little) & 0x7fff,
+                .skylight = entry[9] & 0x80 != 0,
+            };
+            validateDimension(dimension) catch return error.CorruptWorldCatalog;
 
-                for (self.entries[0..index]) |previous| {
-                    if (previous.id == world_id or std.mem.eql(u8, previous.name, name)) return error.CorruptWorldCatalog;
-                    if (std.mem.eql(u8, previous.dimension.name, dimension.name) and !previous.dimension.eql(dimension)) return error.CorruptWorldCatalog;
-                }
-                @memcpy(self.labels[index][0..name.len], name);
-                @memcpy(self.dimension_labels[index][0..dimension.name.len], dimension.name);
-                names[index] = self.labels[index][0..name.len];
-                self.entries[index] = .{ .id = world_id, .name = names[index], .dimension = dimension };
-                self.entries[index].dimension.name = self.dimension_labels[index][0..dimension.name.len];
-                self.next_id = @max(self.next_id, @as(u64, world_id) + 1);
+            for (self.entries[0..index]) |previous| {
+                if (previous.id == world_id or std.mem.eql(u8, previous.name, name)) return error.CorruptWorldCatalog;
+                if (std.mem.eql(u8, previous.dimension.name, dimension.name) and !previous.dimension.eql(dimension)) return error.CorruptWorldCatalog;
             }
-
-            self.count = count;
-            self.checkpointed = self.count;
-            self.names = names[0..self.count];
+            @memcpy(self.labels[index][0..name.len], name);
+            @memcpy(self.dimension_labels[index][0..dimension.name.len], dimension.name);
+            names[index] = self.labels[index][0..name.len];
+            self.entries[index] = .{ .id = world_id, .name = names[index], .dimension = dimension };
+            self.entries[index].dimension.name = self.dimension_labels[index][0..dimension.name.len];
+            self.next_id = @max(self.next_id, @as(u64, world_id) + 1);
         }
 
-        return self;
+        self.count = count;
+        self.checkpointed = self.count;
+        self.names = names[0..self.count];
     }
 
     /// Idempotent by name. Copies the name into reserved storage. No runtime allocation is needed.
@@ -136,6 +148,7 @@ pub const Worlds = struct {
         self.count += 1;
         self.next_id += 1;
         self.names = self.name_storage[0..self.count];
+        self.published.store(self.count, .release);
         return world_id;
     }
 
@@ -150,7 +163,7 @@ pub const Worlds = struct {
     }
 
     pub fn all(self: *const Worlds) []const World {
-        return self.entries[0..self.count];
+        return self.entries[0..self.published.load(.acquire)];
     }
 
     pub fn checkpoint(self: *Worlds, space: storage.Space) !void {

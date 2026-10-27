@@ -19,9 +19,10 @@ const Plugins = struct {
     inventory: *inventories.Inventories,
 
     fn init(allocator: std.mem.Allocator, store: *storage.Store, registry: *metrics.Registry) !Plugins {
+        const workspaces = try records.Workspaces.init(allocator, store.io, .{});
         return .{
-            .world = try chunks.Chunks.init(allocator, store.io, .{ .cache_sections = 2, .cache_tiles = 1 }, .{ .metrics = registry, .storage = try store.openSpace(chunks.Chunks.id) }),
-            .inventory = try inventories.Inventories.init(allocator, store.io, .{ .cache_slots = 2, .cache_items = 2 }, .{ .metrics = registry, .storage = try store.openSpace(inventories.Inventories.id) }),
+            .world = try chunks.Chunks.init(allocator, store.io, .{ .demand_sections = 0, .cache_sections = 2, .cache_tiles = 1 }, .{ .metrics = registry, .storage = try store.openSpace(chunks.Chunks.id), .record_workspaces = workspaces }),
+            .inventory = try inventories.Inventories.init(allocator, store.io, .{ .cache_slots = 2, .cache_items = 2 }, .{ .metrics = registry, .storage = try store.openSpace(inventories.Inventories.id), .record_workspaces = workspaces }),
         };
     }
 
@@ -86,7 +87,7 @@ fn mutate(plugins: Plugins, model: *Model, random: std.Random, step: usize) !voi
     const tag: u32 = if (step % 4 == 0) 0 else random.uintLessThan(u32, 256) + 1;
     const count_items: u16 = if (tag == 0) 0 else 1 + random.uintLessThan(u16, 64);
     var bytes: [65536]u8 = undefined;
-    const item = if (tag == 0) null else try plugins.inventory.defineItem(definition(tag, &bytes));
+    const item = if (tag == 0) null else try plugins.inventory.defineItem(&.{definition(tag, &bytes)});
     try std.testing.expect(try plugins.inventory.set(slot(target), previous.revision, if (item) |key| .{ .item = key, .count = count_items } else null));
     model.slots[target] = .{ .tag = tag, .count = count_items, .revision = previous.revision + 1 };
     if (step % 3 == 0) {
@@ -105,14 +106,13 @@ fn mutate(plugins: Plugins, model: *Model, random: std.Random, step: usize) !voi
 }
 
 test "mixed plugin saves preserve the model through eviction maintenance and interrupted ticks" {
-    const io = std.testing.io;
-    const configurations = [_]storage.Store.Options{ .{ .path = "", .submission = .standard }, .{ .path = "", .submission = .uring } };
-    for (configurations[0..if (builtin.os.tag == .linux) 2 else 1]) |configured| {
+    for (0..if (builtin.os.tag == .linux) @as(usize, 2) else 1) |backend_index| {
+        const io = std.testing.io;
         var directory = try testing.directory(.{});
         defer directory.cleanup();
         const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/mixed", .{directory.sub_path});
         defer std.testing.allocator.free(path);
-        var options = configured;
+        var options: storage.Store.Options = .{ .path = path, .io_mode = if (backend_index == 0) .standard else .uring };
         options.path = path;
         options.maximum_wal_pages = 4096;
         options.maximum_pages = 4096;
@@ -122,7 +122,7 @@ test "mixed plugin saves preserve the model through eviction maintenance and int
         var tick: u64 = 0;
         var random = std.Random.DefaultPrng.init(0x4d49584544534156);
         for (0..test_options.rounds) |round| {
-            errdefer |err| std.debug.print("mixed storage backend={t} round={d} tick={d} error={t}\n", .{ options.submission, round, tick, err });
+            errdefer |err| std.debug.print("mixed storage backend={d} round={d} tick={d} error={t}\n", .{ backend_index, round, tick, err });
             var store = try storage.Store.init(std.testing.allocator, io, options);
             defer store.deinit();
             var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -134,7 +134,7 @@ test "mixed plugin saves preserve the model through eviction maintenance and int
             try plugins.verify(&saved);
             model = saved;
             for (0..8) |step| {
-                errdefer std.debug.print("mixed storage backend={t} round={d} step={d} phase={t}\n", .{ options.submission, round, step, store.phase });
+                errdefer std.debug.print("mixed storage backend={d} round={d} step={d} phase={t}\n", .{ backend_index, round, step, store.phase });
                 try mutate(plugins, &model, random.random(), round * 8 + step);
                 if (step == 3 or (step == 7 and round % 4 != 0)) {
                     try plugins.checkpoint(&store);
@@ -142,7 +142,7 @@ test "mixed plugin saves preserve the model through eviction maintenance and int
                     try store.submitSync(try store.commit(tick));
                     saved = model;
                 }
-                for (0..16) |_| _ = try store.maintain(32);
+                for (0..16) |_| _ = try store.pollMaintenance(.{ .index_entries = 32, .pages = 32 });
             }
             try plugins.verify(&model);
             try store.waitDurable(store.lastCommit());
@@ -170,7 +170,7 @@ fn change(store: *storage.Store, tick: u64) !void {
     try plugins.world.setBlocks(section(0), &edits);
     try plugins.world.setBlocks(section(9), &edits);
     var buffer: [65536]u8 = undefined;
-    const item = try plugins.inventory.defineItem(definition(@intCast(tick + 2), &buffer));
+    const item = try plugins.inventory.defineItem(&.{definition(@intCast(tick + 2), &buffer)});
     for ([_]usize{ 0, 31 }) |id| {
         const previous = try plugins.inventory.get(slot(id));
         try std.testing.expect(try plugins.inventory.set(slot(id), previous.revision, .{ .item = item, .count = @intCast(tick) }));
@@ -224,7 +224,7 @@ test "power loss cannot mix chunk inventory item and metadata versions" {
     defer directory.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/atomic", .{directory.sub_path});
     defer std.testing.allocator.free(path);
-    const options: storage.Store.Options = .{ .path = path, .submission = .standard, .maximum_wal_pages = 1024 };
+    const options: storage.Store.Options = .{ .path = path, .maximum_wal_pages = 1024, .io_mode = .standard };
     {
         var store = try storage.Store.init(std.testing.allocator, io, options);
         defer store.deinit();
@@ -240,7 +240,7 @@ test "power loss cannot mix chunk inventory item and metadata versions" {
             const modeled = disk.interface();
             store.io = modeled;
             store.filesystem.io = modeled;
-            store.checkpoint_io.io = modeled;
+            store.maintenance_io.io = modeled;
             var acknowledged: u64 = 1;
             try scenario(&store, &acknowledged);
             events = disk.events;
@@ -255,7 +255,7 @@ test "power loss cannot mix chunk inventory item and metadata versions" {
             const modeled = disk.interface();
             store.io = modeled;
             store.filesystem.io = modeled;
-            store.checkpoint_io.io = modeled;
+            store.maintenance_io.io = modeled;
             var acknowledged: u64 = 1;
             scenario(&store, &acknowledged) catch |err| switch (err) {
                 error.IoFailure, error.FailedTransaction, error.NoSpace => {},

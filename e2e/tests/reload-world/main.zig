@@ -1,11 +1,10 @@
 const records = @import("records");
 const std = @import("std");
-const lr = @import("lightning_rod");
+const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
 const protocols = @import("protocols");
 const sessions = @import("sessions");
 const e2e = @import("e2e");
-const bootstrap = e2e.server;
 
 const render_distance = 32;
 const player_names = [_][]const u8{ "alice", "bob" };
@@ -15,11 +14,11 @@ const bob_resumed_health = 14;
 const progress_ticks = 10;
 
 pub fn main(init: std.process.Init) !void {
-    const plugins = lr.plugin.compose(.{
-        lr.plugin.replace(vanilla.plugins(), .{lr.plugin.configured(vanilla.Players, .{ .render_distance = render_distance })}),
-        lr.plugin.configured(Probe, .{}),
+    const plugins = lightning_rod.plugin.compose(.{
+        lightning_rod.plugin.replace(vanilla.plugins(), .{lightning_rod.plugin.configured(vanilla.Players, .{ .render_distance = render_distance })}),
+        lightning_rod.plugin.configured(Probe, .{}),
     });
-    try bootstrap.run(init, plugins, .{ .reload_executable = "/proc/self/exe" });
+    try e2e.profile.run(init, plugins, .{ .reload_executable = "/proc/self/exe" });
 }
 
 const Probe = struct {
@@ -31,8 +30,8 @@ const Probe = struct {
         chunks: *vanilla.Chunks,
         reload: *vanilla.Reload,
         control: *e2e.Control,
-        storage: lr.storage.Space,
-        metrics: *lr.metrics.Registry,
+        storage: lightning_rod.storage.Space,
+        metrics: *lightning_rod.metrics.Registry,
     };
     const Phase = enum { loading, reloading, resumed, complete };
     const blocks = [_][]const u8{ "minecraft:gold_block", "minecraft:diamond_block" };
@@ -45,9 +44,9 @@ const Probe = struct {
     uuids: [player_names.len]u128 = @splat(0),
     ticks: u64 = 0,
     configuring_ticks: u64 = 0,
-    first_players: lr.metrics.Gauge,
-    presence_ticks: lr.metrics.Counter,
-    slow_ticks: lr.metrics.Counter,
+    first_players: lightning_rod.metrics.Gauge,
+    presence_ticks: lightning_rod.metrics.Counter,
+    slow_ticks: lightning_rod.metrics.Counter,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Probe {
         const self = try allocator.create(Probe);
@@ -76,9 +75,10 @@ const Probe = struct {
         if (player.handle == null or !std.meta.eql(player.handle.?, handle) or player.stage != .ready) return error.ReloadPlayerNotReady;
         const name = player.name[0..player.name_len];
         const index: u1 = if (std.mem.eql(u8, name, player_names[0])) 0 else if (std.mem.eql(u8, name, player_names[1])) 1 else return error.UnexpectedReloadPlayer;
-        const center = self.deps.streaming.viewCenter(handle.index);
+        const visibility = self.deps.streaming.snapshotVisibility();
+        const center = visibility.viewCenter(handle.index);
         for (0..2 * render_distance + 1) |z| for (0..2 * render_distance + 1) |x| {
-            if (!self.deps.streaming.visible(handle.index, player.world, center.x + @as(i32, @intCast(x)) - render_distance, center.z + @as(i32, @intCast(z)) - render_distance)) return error.ReloadTerrainIncomplete;
+            if (!visibility.visible(handle.index, player, player.world, center.x + @as(i32, @intCast(x)) - render_distance, center.z + @as(i32, @intCast(z)) - render_distance)) return error.ReloadTerrainIncomplete;
         };
         if (self.ready & (@as(u2, 1) << index) != 0) return error.DuplicateReloadReadiness;
         self.ready |= @as(u2, 1) << index;
@@ -92,7 +92,7 @@ const Probe = struct {
         return .handled;
     }
 
-    pub fn checkpoint(self: *Probe, space: lr.storage.Space) !void {
+    pub fn checkpoint(self: *Probe, space: lightning_rod.storage.Space) !void {
         if (self.phase == .loading) return;
         var saved: [saved_bytes]u8 = undefined;
         for (self.uuids, 0..) |uuid, index| std.mem.writeInt(u128, saved[index * @sizeOf(u128) ..][0..@sizeOf(u128)], uuid, .little);

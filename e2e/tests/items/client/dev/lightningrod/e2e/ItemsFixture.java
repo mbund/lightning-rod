@@ -15,8 +15,12 @@ final class ItemsFixture extends Fixture {
         RELOADED, COMPLETE
     }
     private Phase phase = Phase.READY;
+    private Phase timedPhase;
+    private long phaseStarted;
     private boolean aimedAfterReload;
     private int mergedEntity = -1;
+    private int observedEntities = -1;
+    private int observedTotal = -1;
     private int breakingStages;
     private boolean breakingCleared;
     private boolean sawMiningSwing;
@@ -33,7 +37,11 @@ final class ItemsFixture extends Fixture {
             }
         }
         if (r.terrainTick < 0 || missingChunks(game, 2) != 0) return;
-        if (r.tick - r.terrainTick > 600) { client.fail("items_timeout_stage_" + phase); return; }
+        if (timedPhase != phase) {
+            timedPhase = phase;
+            phaseStarted = r.tick;
+        }
+        if (r.tick - phaseStarted > 600) { client.fail("items_timeout_stage_" + phase); return; }
         if (phase == Phase.HAND_MINED && r.peer.equals("bob")) {
             for (var player : game.level.players()) {
                 if (player.getName().getString().equals("alice") && player.swinging && !sawMiningSwing) {
@@ -66,6 +74,11 @@ final class ItemsFixture extends Fixture {
             highest = Math.max(highest, item.getY());
             last = item;
             if ((switch (phase) { case READY, CREATE, SPAWNED, SPAWN_OBSERVED, MERGED, PICKUP, COLLECTED, CHECK, CHECKED -> true; default -> false; }) && !item.getItem().is(net.minecraft.world.item.Items.BREAD)) { client.fail("wrong_item_type"); return; }
+        }
+        if (count != observedEntities || total != observedTotal) {
+            client.event("items_observed", "phase", phase.name(), "entities", count, "total", total, "highest", highest);
+            observedEntities = count;
+            observedTotal = total;
         }
         if ((phase == Phase.SPAWNED || phase == Phase.SPAWN_OBSERVED || phase == Phase.MERGED) && last != null) {
             var direction = last.getBoundingBox().getCenter().subtract(game.player.getEyePosition());
@@ -159,6 +172,8 @@ final class ItemsFixture extends Fixture {
                 game.player.setYRot((float)Math.toDegrees(Math.atan2(-1, -2)));
                 game.player.setXRot((float)Math.toDegrees(Math.atan2(game.player.getEyeY() - 65.5, Math.sqrt(5))));
                 game.options.keyAttack.setDown(true);
+            } else if (r.peer.equals("alice")) {
+                game.options.keyAttack.setDown(false);
             }
             if (game.level.getBlockState(second).isAir() && count == 1 && last.getItem().is(net.minecraft.world.item.Items.COBBLESTONE)) {
                 game.options.keyAttack.setDown(false);

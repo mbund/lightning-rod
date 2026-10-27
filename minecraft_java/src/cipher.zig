@@ -1,14 +1,12 @@
 const std = @import("std");
 
-const Aes = std.crypto.core.aes;
-
 pub const Cipher = struct {
-    key: Aes.AesEncryptCtx(Aes.Aes128),
+    key: std.crypto.core.aes.AesEncryptCtx(std.crypto.core.aes.Aes128),
     feedback: [16]u8,
     secret: [16]u8,
 
     pub fn init(secret: [16]u8) Cipher {
-        return .{ .key = Aes.Aes128.initEnc(secret), .feedback = secret, .secret = secret };
+        return .{ .key = std.crypto.core.aes.Aes128.initEnc(secret), .feedback = secret, .secret = secret };
     }
 
     /// Each connection has independent receive and send streams. Packet and
@@ -20,7 +18,26 @@ pub const Cipher = struct {
             std.debug.assert(@intFromPtr(input.ptr) + input.len <= @intFromPtr(output.ptr) or @intFromPtr(output.ptr) + output.len <= @intFromPtr(input.ptr));
         }
 
-        for (input, output) |source, *destination| {
+        var offset: usize = 0;
+        if (comptime direction == .decrypt and std.crypto.core.aes.has_hardware_support) {
+            const lanes = 8;
+            while (input.len - offset >= lanes) : (offset += lanes) {
+                var blocks: [16 * lanes]u8 = undefined;
+                var masks: [16 * lanes]u8 = undefined;
+                // Decryption feedback uses ciphertext already present in this batch.
+                inline for (0..lanes) |lane| {
+                    @memcpy(blocks[lane * 16 ..][0 .. 16 - lane], self.feedback[lane..]);
+                    @memcpy(blocks[lane * 16 + 16 - lane ..][0..lane], input[offset..][0..lane]);
+                }
+                self.key.encryptWide(lanes, &masks, &blocks);
+                var feedback: [16]u8 = undefined;
+                @memcpy(feedback[0 .. 16 - lanes], self.feedback[lanes..]);
+                @memcpy(feedback[16 - lanes ..], input[offset..][0..lanes]);
+                self.feedback = feedback;
+                inline for (0..lanes) |lane| output[offset + lane] = input[offset + lane] ^ masks[lane * 16];
+            }
+        }
+        for (input[offset..], output[offset..]) |source, *destination| {
             var mask: [16]u8 = undefined;
             self.key.encrypt(&mask, &self.feedback);
             const result = source ^ mask[0];

@@ -1,54 +1,57 @@
 const std = @import("std");
-const lr = @import("lightning_rod");
+const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
-const bossbars = @import("bossbars");
 const e2e = @import("e2e");
 const sessions = @import("sessions");
-const bootstrap = e2e.server;
 
 pub fn main(init: std.process.Init) !void {
-    const args = try bootstrap.arguments(init);
+    const args = try e2e.profile.arguments(init);
     var permissions: Permissions = .{};
-    const plugins = lr.plugin.compose(.{
-        lr.plugin.replace(bootstrap.plugins(), .{
-            lr.plugin.configured(vanilla.commands.Commands, .{
+    const plugins = lightning_rod.plugin.compose(.{
+        lightning_rod.plugin.replace(e2e.profile.plugins(), .{
+            lightning_rod.plugin.configured(vanilla.commands.Commands, .{
                 .permission_policy = vanilla.commands.Policy.init(&permissions, Permissions.allows),
             }),
-            lr.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = 2, .gamemode = if (std.mem.eql(u8, args.fixture, "reload_creative")) .creative else .survival }),
+            lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = 2, .gamemode = if (std.mem.eql(u8, args.fixture, "reload_creative")) .creative else .survival }),
         }),
-        lr.plugin.configured(bossbars.Bossbars, .{}),
-        lr.plugin.configured(e2e.Inventory, .{ .starting_bread = 17 }),
-        lr.plugin.configured(Probe, .{ .permissions = &permissions }),
+        lightning_rod.plugin.configured(e2e.Inventory, .{ .starting_bread = 17 }),
+        lightning_rod.plugin.configured(Probe, .{ .permissions = &permissions }),
     });
-    try bootstrap.run(init, plugins, .{ .reload_executable = "reload-target" });
+    try e2e.profile.run(init, plugins, .{ .reload_executable = "reload-target" });
 }
 
 const Probe = struct {
     pub const id = "e2e:reload";
     pub const Configuration = struct { permissions: *Permissions };
     pub const Dependencies = struct {
-        bars: *bossbars.Bossbars,
+        bars: *vanilla.Bossbars,
         control: *e2e.Control,
         players: *vanilla.Players,
         reload: *vanilla.Reload,
     };
     deps: Dependencies,
+    reload_bars: []?vanilla.Bossbars.Handle,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies, config: Configuration) !*Probe {
         const self = try allocator.create(Probe);
-        self.* = .{ .deps = deps };
+        self.* = .{ .deps = deps, .reload_bars = try allocator.alloc(?vanilla.Bossbars.Handle, deps.players.records.len) };
+        @memset(self.reload_bars, null);
         config.permissions.players = deps.players;
         deps.control.on(self, message);
         return self;
     }
 
     fn message(self: *Probe, handle: sessions.Handle, text: []const u8) !e2e.Control.Result {
-        if (!std.mem.eql(u8, text, "reload_bar") and !std.mem.eql(u8, text, "reload_opaque") and !std.mem.eql(u8, text, "reload_signal")) return .unhandled;
+        if (!std.mem.eql(u8, text, "reload_bar") and !std.mem.eql(u8, text, "reload_opaque") and !std.mem.eql(u8, text, "reload_signal") and !std.mem.eql(u8, text, "reload_selection")) return .unhandled;
         const player = &self.deps.players.records[handle.index];
         if (player.stage != .ready or !player.loaded) return error.FixturePlayerNotReady;
 
-        if (std.mem.eql(u8, text, "reload_bar")) {
-            _ = try self.deps.bars.create(.{ .title = "Reload probe", .audience = .{ .player = player.uuid } });
+        if (std.mem.eql(u8, text, "reload_bar") or std.mem.eql(u8, text, "reload_selection")) {
+            const expected_slot: u4 = if (std.mem.eql(u8, player.name[0..player.name_len], "alice")) 4 else 7;
+            if (player.selected_slot != expected_slot) return error.ReloadSelectedSlotIncorrect;
+            if (std.mem.eql(u8, text, "reload_selection")) return .handled;
+            if (self.reload_bars[handle.index] == null)
+                self.reload_bars[handle.index] = try self.deps.bars.create(.{ .title = "Reload probe", .audience = .{ .player = player.uuid } });
             return .handled;
         }
         if (!std.mem.eql(u8, player.name[0..player.name_len], "alice")) return error.ReloadRequiresAlice;

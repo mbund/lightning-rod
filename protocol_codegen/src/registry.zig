@@ -1,7 +1,5 @@
 const std = @import("std");
 
-const block_symbols = [_][]const u8{ "stone", "grass_block", "dirt", "netherrack", "end_stone" };
-
 pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -60,8 +58,9 @@ pub fn main(init: std.process.Init) !void {
             "pub const LightFace = [4]u64;\n\n",
     );
 
-    for (block_symbols) |name| {
-        const block = try findObjectByName(blocks, name);
+    for (blocks.array.items) |entry| {
+        const block = entry.object;
+        const name = block.get("name").?.string;
         try output.print("pub const block_{s}_default_state: i32 = {};\n", .{ name, try intField(block, "defaultState") });
     }
 
@@ -523,11 +522,6 @@ fn writeRegistryLookup(output: *std.array_list.Managed(u8), comptime names: []co
 fn parseFile(io: std.Io, cwd: std.Io.Dir, allocator: std.mem.Allocator, path: []const u8) !std.json.Value {
     const bytes = try cwd.readFileAlloc(io, path, allocator, .limited(64 * 1024 * 1024));
     return (try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{})).value;
-}
-
-fn findObjectByName(root: std.json.Value, name: []const u8) !std.json.ObjectMap {
-    for (root.array.items) |entry| if (std.mem.eql(u8, entry.object.get("name").?.string, name)) return entry.object;
-    return error.RegistryNameNotFound;
 }
 
 fn writeBlockStateName(output: *std.array_list.Managed(u8), block: std.json.ObjectMap, offset: usize) !void {

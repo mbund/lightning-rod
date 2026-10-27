@@ -1,9 +1,9 @@
+const game_data = @import("game_data");
 const std = @import("std");
 const players = @import("players.zig");
 const block_sync = @import("block_sync.zig");
 const chunks = @import("chunks");
 const worlds = @import("worlds");
-const registry = @import("game_data").registry;
 const BlockActions = @import("block_actions.zig").BlockActions;
 
 pub const Doors = struct {
@@ -25,7 +25,7 @@ pub const Doors = struct {
         const self = try allocator.create(Doors);
         self.* = .{ .deps = deps };
 
-        for (registry.door_state_ranges) |range|
+        for (game_data.registry.door_state_ranges) |range|
             try deps.actions.register(BlockActions.Handler.init(self, range.minimum, range.maximum, apply));
 
         return self;
@@ -33,7 +33,7 @@ pub const Doors = struct {
 
     fn apply(self: *Doors, request: BlockActions.Request) !BlockActions.Result {
         const world = request.player.world;
-        const block = registry.blocks[registry.block_state_to_block[request.state]];
+        const block = game_data.registry.blocks[game_data.registry.block_state_to_block[request.state]];
         const minimum: u16 = @intCast(block.min_state);
         var offset = request.state - minimum;
         var bottom = request.position;
@@ -53,29 +53,59 @@ pub const Doors = struct {
             self.deps.synchronization.correct(world, top);
             if (bottom.y == minimum_y) return .denied;
 
-            const below = try self.deps.chunks.getBlock(world, .{ .x = bottom.x, .y = bottom.y - 1, .z = bottom.z });
-            const support = registry.collisionLightFace(registry.block_state_collision_shape[below], 3);
-            if (!std.mem.allEqual(u64, &support, std.math.maxInt(u64))) return .denied;
-
+            var positions: [5]chunks.Position = undefined;
+            positions[0] = .{ .x = bottom.x, .y = bottom.y - 1, .z = bottom.z };
             const facing: usize = @intFromFloat(@mod(@floor(request.player.rotation.yaw / 90.0 + 0.5), 4));
             const directions = [_][2]i32{ .{ 0, 1 }, .{ -1, 0 }, .{ 0, -1 }, .{ 1, 0 } };
             const dx = directions[facing][0];
             const dz = directions[facing][1];
+            for (0..2) |side| for (0..2) |height| {
+                const sign: i32 = if (side == 0) 1 else -1;
+                positions[1 + side * 2 + height] = .{
+                    .x = bottom.x + dz * sign,
+                    .y = bottom.y + @as(i32, @intCast(height)),
+                    .z = bottom.z - dx * sign,
+                };
+            };
+            var neighborhood: [5]chunks.Section = undefined;
+            var mapping: [5]usize = undefined;
+            var needed: usize = 0;
+            for (positions, &mapping) |position, *mapped| {
+                const section = chunks.sectionAt(world, position);
+                mapped.* = for (neighborhood[0..needed], 0..) |present, index| {
+                    if (std.meta.eql(present, section)) break index;
+                } else blk: {
+                    neighborhood[needed] = section;
+                    needed += 1;
+                    break :blk needed - 1;
+                };
+            }
+            var held: [5]chunks.Lease = undefined;
+            var states: [5]u16 = undefined;
+            var iterator = self.deps.chunks.iterate(neighborhood[0..needed], &held);
+            defer iterator.deinit();
+            var first: usize = 0;
+            while (try iterator.next()) |batch| {
+                for (positions, mapping, &states) |position, mapped, *state| {
+                    if (mapped >= first and mapped < first + batch.len)
+                        state.* = batch[mapped - first].get(chunks.localIndex(position));
+                }
+                first += batch.len;
+            }
+            const below = states[0];
+            const support = game_data.registry.collisionLightFace(game_data.registry.block_state_collision_shape[below], 3);
+            if (!std.mem.allEqual(u64, &support, std.math.maxInt(u64))) return .denied;
+
             var score: i8 = 0;
             var neighbors: [2]bool = .{ false, false };
 
             for (0..2) |side| {
-                const sign: i32 = if (side == 0) 1 else -1;
-
                 for (0..2) |height| {
-                    const state = try self.deps.chunks.getBlock(world, .{
-                        .x = bottom.x + dz * sign,
-                        .y = bottom.y + @as(i32, @intCast(height)),
-                        .z = bottom.z - dx * sign,
-                    });
-                    const shape = registry.collision_shapes[registry.block_state_collision_shape[state]];
+                    const index = 1 + side * 2 + height;
+                    const state = states[index];
+                    const shape = game_data.registry.collision_shapes[game_data.registry.block_state_collision_shape[state]];
 
-                    if (shape.count == 1 and std.meta.eql(registry.collision_boxes[shape.offset], .{
+                    if (shape.count == 1 and std.meta.eql(game_data.registry.collision_boxes[shape.offset], .{
                         .min_x = 0,
                         .min_y = 0,
                         .min_z = 0,
@@ -83,8 +113,8 @@ pub const Doors = struct {
                         .max_y = 64,
                         .max_z = 64,
                     })) score += if (side == 0) @as(i8, -1) else 1;
-                    const info = registry.blocks[registry.block_state_to_block[state]];
-                    neighbors[side] = neighbors[side] or (height == 0 and std.mem.indexOf(u8, registry.blockStateName(state).?, "_door[") != null and (state - @as(u16, @intCast(info.min_state))) & 8 != 0);
+                    const info = game_data.registry.blocks[game_data.registry.block_state_to_block[state]];
+                    neighbors[side] = neighbors[side] or (height == 0 and std.mem.indexOf(u8, game_data.registry.blockStateName(state).?, "_door[") != null and (state - @as(u16, @intCast(info.min_state))) & 8 != 0);
                 }
             }
 
@@ -93,12 +123,18 @@ pub const Doors = struct {
             const z = @as(f64, @floatFromInt(hit.position.z - bottom.z)) + hit.cursor[2];
             const right = if ((neighbors[0] and !neighbors[1]) or score > 0) true else if ((neighbors[1] and !neighbors[0]) or score < 0) false else (dx < 0 and z < 0.5) or (dx > 0 and z > 0.5) or (dz < 0 and x > 0.5) or (dz > 0 and x < 0.5);
             offset = ([_]u16{ 1, 2, 0, 3 })[facing] * 16 + 8 + @as(u16, @intFromBool(right)) * 4 + 3;
-            const shape = registry.collision_shapes[registry.block_state_collision_shape[minimum + offset]];
+            const shape = game_data.registry.collision_shapes[game_data.registry.block_state_collision_shape[minimum + offset]];
 
-            for (self.deps.players.records) |player| {
+            var candidates = self.deps.players.nearby(world, .{
+                .x = @as(f64, @floatFromInt(bottom.x)) + 0.5,
+                .y = @floatFromInt(bottom.y),
+                .z = @as(f64, @floatFromInt(bottom.z)) + 0.5,
+            }, 1);
+            while (candidates.next()) |index| {
+                const player = self.deps.players.records[index];
                 if (!player.inWorld() or player.world != world or player.gamemode == .spectator) continue;
 
-                for (registry.collision_boxes[shape.offset..][0..shape.count]) |box| {
+                for (game_data.registry.collision_boxes[shape.offset..][0..shape.count]) |box| {
                     const bx: f64 = @floatFromInt(bottom.x);
                     const by: f64 = @floatFromInt(bottom.y);
                     const bz: f64 = @floatFromInt(bottom.z);
@@ -113,14 +149,15 @@ pub const Doors = struct {
         const count: usize = if (std.meta.eql(sections[0], sections[1])) 1 else 2;
         var leases: [2]chunks.Lease = undefined;
         try self.deps.chunks.acquireMany(sections[0..count], leases[0..count]);
-        defer for (leases[0..count]) |lease| lease.release();
+        var borrowed = true;
+        defer if (borrowed) self.deps.chunks.releaseMany(leases[0..count]);
         const lower = leases[0].get(chunks.localIndex(bottom));
         const upper = leases[count - 1].get(chunks.localIndex(top));
 
         switch (request.action) {
             .place => if (lower != 0 or upper != 0) return .denied,
             .use => {
-                if (std.mem.startsWith(u8, registry.blockStateName(request.state).?, "minecraft:iron_door[")) return .pass;
+                if (std.mem.startsWith(u8, game_data.registry.blockStateName(request.state).?, "minecraft:iron_door[")) return .pass;
                 if (lower < minimum or lower > minimum + 63 or upper < minimum or upper > minimum + 63 or (lower - minimum) & 8 == 0 or (upper - minimum) & 8 != 0)
                     return .denied;
                 offset = (lower - minimum) ^ 2;
@@ -133,13 +170,18 @@ pub const Doors = struct {
             .{ .index = chunks.localIndex(top), .state = if (request.action == .remove) 0 else minimum + (offset & ~@as(u16, 8)) },
         };
 
+        self.deps.chunks.releaseMany(leases[0..count]);
+        borrowed = false;
+
         if (request.action == .remove and (lower < minimum or lower > minimum + 63 or upper < minimum or upper > minimum + 63)) {
             try self.deps.chunks.setBlock(world, request.position, 0);
         } else if (count == 1) {
             try self.deps.chunks.setBlocks(sections[0], &edits);
         } else {
-            try self.deps.chunks.setBlocks(sections[0], edits[0..1]);
-            try self.deps.chunks.setBlocks(sections[1], edits[1..2]);
+            try self.deps.chunks.setSections(&.{
+                .{ .section = sections[0], .edits = edits[0..1] },
+                .{ .section = sections[1], .edits = edits[1..2] },
+            });
         }
 
         return .applied;

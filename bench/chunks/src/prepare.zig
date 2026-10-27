@@ -141,6 +141,11 @@ fn exportWorld(init: std.process.Init, options: Options, world: []const u8, regi
     const allocator = init.arena.allocator();
     var reader = try anvil.Reader.init(allocator, init.io, world, options.data_version);
     const registry = try anvil.Registry.load(allocator, init.io, registry_path);
+    const anvil_directory = try std.fs.path.join(allocator, &.{ options.output, "anvil", "region" });
+    try std.Io.Dir.cwd().deleteTree(init.io, anvil_directory);
+    try std.Io.Dir.cwd().createDirPath(init.io, anvil_directory);
+    const registry_bytes = try common.readFile(allocator, init.io, registry_path, 32 * 1024 * 1024);
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = try std.fs.path.join(allocator, &.{ options.output, "registry.json" }), .data = registry_bytes });
     const count = origins.len * options.side * options.side;
     const index = try allocator.alloc([24]u8, count);
     const path = try std.fs.path.join(allocator, &.{ options.output, "corpus.partial" });
@@ -154,6 +159,7 @@ fn exportWorld(init: std.process.Init, options: Options, world: []const u8, regi
     try output.writePositionalAll(init.io, &header, 0);
     var offset: u64 = 16 + @as(u64, count) * 24;
     var at: usize = 0;
+    var anvil_submitted_bytes: u64 = 0;
     var section_buffer: [corpus.section_bytes]u8 = undefined;
     // Numeric x,z order is shared with the corpus lookup and trace generator.
     for ([_]i32{ 0, 128 }) |ox| {
@@ -165,6 +171,7 @@ fn exportWorld(init: std.process.Init, options: Options, world: []const u8, regi
                     const x = ox + dx;
                     const z = oz + dz;
                     const doc = try reader.load(x, z);
+                    anvil_submitted_bytes += try anvil.writeTerrain(init.gpa, init.io, anvil_directory, doc);
                     var sections: [corpus.section_count]?nbt.Node = @splat(null);
                     const list = doc.childNamed("sections") orelse return error.MissingSections;
                     var iterator = list.childIterator(doc.nodes);
@@ -205,7 +212,7 @@ fn exportWorld(init: std.process.Init, options: Options, world: []const u8, regi
     try std.Io.Dir.cwd().rename(path, .cwd(), final, init.io);
     var loaded = try corpus.Corpus.load(allocator, init.io, final);
     defer loaded.deinit(allocator, init.io);
-    const manifest = try std.json.Stringify.valueAlloc(allocator, .{ .format = "LRWORLD2", .seed = if (options.world == null) options.seed else @as(?i64, null), .source = world, .data_version = options.data_version, .side = options.side, .origins = origins, .registry_sha256 = &registry.hash, .corpus_sha256 = &loaded.hash, .columns = count, .sections = count * corpus.section_count, .bytes = offset, .scope = "Overworld block states only. No entities, inventories, lighting, or heightmaps." }, .{ .whitespace = .indent_2 });
+    const manifest = try std.json.Stringify.valueAlloc(allocator, .{ .format = "LRWORLD2", .seed = if (options.world == null) options.seed else @as(?i64, null), .source = world, .data_version = options.data_version, .side = options.side, .origins = origins, .registry_sha256 = &registry.hash, .corpus_sha256 = &loaded.hash, .columns = count, .sections = count * corpus.section_count, .bytes = offset, .anvil_submitted_bytes = anvil_submitted_bytes, .scope = "Overworld block states only. No entities, inventories, lighting, or heightmaps." }, .{ .whitespace = .indent_2 });
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = try std.fs.path.join(allocator, &.{ options.output, "corpus.json" }), .data = manifest });
     std.debug.print("Exported {d} columns, {d} sections, {d} bytes. SHA256 {s}\n", .{ count, count * corpus.section_count, offset, loaded.hash });
 }

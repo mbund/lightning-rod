@@ -46,13 +46,18 @@ pub const Components = struct {
 
     dispatch: Dispatch,
     providers: []Provider,
+    order: []usize,
     personalized: bool = false,
     has_presentation: bool = false,
     revision: u64 = 0,
     extra_bytes: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !Components {
-        return .{ .dispatch = try Dispatch.init(allocator, capacity), .providers = try allocator.alloc(Provider, capacity) };
+        const dispatch = try Dispatch.init(allocator, capacity);
+        errdefer allocator.free(dispatch.entries);
+        const providers = try allocator.alloc(Provider, capacity);
+        errdefer allocator.free(providers);
+        return .{ .dispatch = dispatch, .providers = providers, .order = try allocator.alloc(usize, capacity) };
     }
 
     /// One owner per component. The owner defines its stored payload format and
@@ -64,6 +69,9 @@ pub const Components = struct {
         if (@hasField(@TypeOf(callbacks), "present") and !@hasField(@TypeOf(callbacks), "maximum_extra_bytes"))
             @compileError("computed components must declare their maximum additional encoded bytes");
         try self.dispatch.on(tag, owner, callbacks);
+        var position = index;
+        while (position != 0 and self.dispatch.entries[self.order[position - 1]].key > self.dispatch.entries[index].key) : (position -= 1) self.order[position] = self.order[position - 1];
+        self.order[position] = index;
         self.extra_bytes = total;
         self.has_presentation = self.has_presentation or @hasField(@TypeOf(callbacks), "present");
         const Adapter = struct {
@@ -83,10 +91,33 @@ pub const Components = struct {
         self.revision += 1;
     }
 
-    pub fn present(self: *const Components, index: usize, view: data.View, recipient: u128) bool {
+    /// Offsets borrow the pinned definition. Bindings stay stable after registration is sealed.
+    pub fn resolve(self: *const Components, view: data.View, offsets: []usize) !void {
+        std.debug.assert(offsets.len == self.dispatch.count);
+        var it = view.iterator();
+        var offset = view.bytes.len - it.rest.len;
+        var next = it.next();
+        for (self.order[0..self.dispatch.count]) |index| {
+            const key = self.dispatch.entries[index].key;
+            if (next) |component| {
+                if (component.key < key) return error.UnsupportedComponent;
+                if (component.key == key) {
+                    offsets[index] = offset;
+                    offset = view.bytes.len - it.rest.len;
+                    next = it.next();
+                    continue;
+                }
+            }
+            offsets[index] = std.math.maxInt(usize);
+        }
+        if (next != null) return error.UnsupportedComponent;
+    }
+
+    pub fn present(self: *const Components, index: usize, view: data.View, recipient: u128, stored: ?data.Component) bool {
+        std.debug.assert(index < self.dispatch.count);
+        if (stored) |component| std.debug.assert(component.key == self.dispatch.entries[index].key);
         const provider = self.providers[index];
         if (provider.vtable.present) |call| return call(provider.context, view, recipient);
-        const entry = view.get(self.dispatch.entries[index].key) orelse return false;
-        return entry.value != null;
+        return if (stored) |component| component.value != null else false;
     }
 };

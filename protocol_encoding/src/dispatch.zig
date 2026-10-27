@@ -140,9 +140,22 @@ pub fn Dispatch(comptime schemas: anytype, comptime name: []const u8, comptime f
             return error.UnsupportedProtocol;
         }
 
+        pub fn tagAt(self: *const Self, protocol: i32, index: usize) !i128 {
+            std.debug.assert(index < self.count);
+            inline for (schemas, 0..) |Schema, selected| if (protocol == Schema.protocol_number) return self.entries[index].codecs[selected].tag;
+            return error.UnsupportedProtocol;
+        }
+
         pub fn write(self: *Self, destination: cursor.Destination(name), identifier: Key, arguments: WriteContext) !cursor.Destination(name).Done {
             self.sealed = true;
-            const entry = self.find(identifier) orelse return error.UnsupportedComponent;
+            for (self.entries[0..self.count], 0..) |entry, index| if (entry.key == identifier) return self.writeAt(destination, index, arguments);
+            return error.UnsupportedComponent;
+        }
+
+        pub fn writeAt(self: *Self, destination: cursor.Destination(name), binding: usize, arguments: WriteContext) !cursor.Destination(name).Done {
+            std.debug.assert(binding < self.count);
+            self.sealed = true;
+            const entry = &self.entries[binding];
             inline for (schemas, 0..) |Schema, index| {
                 if (destination._cursor.protocol_number == Schema.protocol_number) {
                     var state = destination._cursor;

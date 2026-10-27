@@ -40,6 +40,7 @@ pub const LoginEffect = union(enum) {
     send: []const u8,
     name: []const u8,
     encryption: []u8,
+    verify: protocol.LoginVerification,
 };
 
 pub const ConfigurationEffect = union(enum) {

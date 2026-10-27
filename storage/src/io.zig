@@ -1,12 +1,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const system = @import("system");
 const format = @import("format.zig");
 
-pub const Mode = enum { standard, uring };
+pub const Mode = system.FileBatch.Mode;
 pub const maximum_batch = 32;
 const Ring = std.os.linux.IoUring;
-const IoRead = struct { file: std.Io.File, offset: u64, bytes: []u8 };
-const IoWrite = struct { file: std.Io.File, offset: u64, bytes: []const u8 };
+const IoRead = system.FileBatch.Read;
+const IoWrite = system.FileBatch.Write;
 pub const Io = if (builtin.os.tag == .linux) LinuxIo else StandardIo;
 
 const LinuxIo = struct {
@@ -37,23 +38,38 @@ const LinuxIo = struct {
         if (reads.len > maximum_batch) return error.InvalidArgument;
         if (self.failed) return error.IoFailure;
         if (self.ring) |*ring| {
-            for (reads, 0..) |request, index| {
-                _ = ring.read(index, request.file.handle, .{ .buffer = request.bytes }, request.offset) catch unreachable;
-            }
-            try self.submit();
-            var left = reads.len;
-            while (left != 0) {
-                const cqe = try self.completion(true) orelse continue;
-                if (self.background(cqe)) continue;
-                std.debug.assert(cqe.user_data < reads.len);
-                const request = reads[@intCast(cqe.user_data)];
-                if (cqe.res < 0) {
-                    self.failed = true;
-                } else if (cqe.res != request.bytes.len) {
-                    // Retain every borrowed destination until all submitted reads finish.
-                    self.failed = true;
+            var vectors: [maximum_batch]std.posix.iovec = undefined;
+            var lengths: [maximum_batch]usize = undefined;
+            var left: usize = 0;
+            var index: usize = 0;
+            while (index < reads.len) {
+                const first = index;
+                const request = reads[first];
+                var length: usize = 0;
+                while (index < reads.len) : (index += 1) {
+                    const next = reads[index];
+                    if (next.file.handle != request.file.handle or next.offset != request.offset + length) break;
+                    vectors[index] = .{ .base = next.bytes.ptr, .len = next.bytes.len };
+                    length += next.bytes.len;
                 }
-                left -= 1;
+                lengths[first] = length;
+                const buffer: Ring.ReadBuffer = if (index == first + 1) .{ .buffer = request.bytes } else .{ .iovecs = vectors[first..index] };
+                _ = ring.read(first, request.file.handle, buffer, request.offset) catch unreachable;
+                left += 1;
+            }
+            try self.submit(1);
+            var completions: [maximum_batch + 2]std.os.linux.io_uring_cqe = undefined;
+            while (left != 0) {
+                const count = try self.reap(&completions, @intCast(left));
+                std.debug.assert(count <= completions.len);
+                for (completions[0..count]) |cqe| {
+                    if (self.background(cqe)) continue;
+                    std.debug.assert(left > 0 and cqe.user_data < reads.len);
+                    const expected = lengths[@intCast(cqe.user_data)];
+                    // Retain every destination until the whole batch has completed, including errors.
+                    if (cqe.res < 0 or cqe.res != expected) self.failed = true;
+                    left -= 1;
+                }
             }
             if (self.failed) return error.IoFailure;
         } else for (reads) |request| {
@@ -77,9 +93,9 @@ const LinuxIo = struct {
                     hint.user_data = std.math.maxInt(u64) - 1;
                     self.writeback_pending = true;
                 }
-                try self.submit();
+                try self.submit(1);
                 while (true) {
-                    const cqe = try self.completion(true) orelse continue;
+                    const cqe = try self.completion(1) orelse continue;
                     if (self.background(cqe)) continue;
                     std.debug.assert(cqe.user_data == 0);
                     if (cqe.res < 0) return self.writeError(cqe.res);
@@ -101,23 +117,57 @@ const LinuxIo = struct {
         if (self.failed) return error.IoFailure;
         if (self.ring) |*ring| {
             var positions: [maximum_batch]usize = @splat(0);
+            var vectors: [maximum_batch]std.posix.iovec_const = undefined;
+            var lengths: [maximum_batch]usize = undefined;
+            var completions: [maximum_batch + 2]std.os.linux.io_uring_cqe = undefined;
             while (true) {
                 var pending: usize = 0;
-                for (writes, positions[0..writes.len], 0..) |request, position, index| {
-                    if (position == request.bytes.len) continue;
-                    _ = ring.write(index, request.file.handle, request.bytes[position..], request.offset + position) catch unreachable;
+                var index: usize = 0;
+                while (index < writes.len) {
+                    const request = writes[index];
+                    const position = positions[index];
+                    if (position == request.bytes.len) {
+                        index += 1;
+                        continue;
+                    }
+                    const first = index;
+                    var length: usize = 0;
+                    while (index < writes.len) : (index += 1) {
+                        const next = writes[index];
+                        if (next.file.handle != request.file.handle or next.offset + positions[index] != request.offset + position + length) break;
+                        const bytes = next.bytes[positions[index]..];
+                        vectors[index] = .{ .base = bytes.ptr, .len = bytes.len };
+                        length += bytes.len;
+                    }
+                    lengths[first] = length;
+                    if (index == first + 1) {
+                        _ = ring.write(first, request.file.handle, request.bytes[position..], request.offset + position) catch unreachable;
+                    } else {
+                        _ = ring.writev(first, request.file.handle, vectors[first..index], request.offset + position) catch unreachable;
+                    }
                     pending += 1;
                 }
                 if (pending == 0) return;
-                try self.submit();
+                try self.submit(1);
                 while (pending != 0) {
-                    const cqe = try self.completion(true) orelse continue;
-                    if (self.background(cqe)) continue;
-                    std.debug.assert(cqe.user_data < writes.len);
-                    const index: usize = @intCast(cqe.user_data);
-                    const left = writes[index].bytes.len - positions[index];
-                    if (cqe.res <= 0 or cqe.res > left) self.failed = true else positions[index] += @intCast(cqe.res);
-                    pending -= 1;
+                    const count = try self.reap(&completions, @intCast(pending));
+                    std.debug.assert(count <= completions.len);
+                    for (completions[0..count]) |cqe| {
+                        if (self.background(cqe)) continue;
+                        std.debug.assert(pending > 0 and cqe.user_data < writes.len);
+                        var at: usize = @intCast(cqe.user_data);
+                        if (cqe.res <= 0 or cqe.res > lengths[at]) {
+                            self.failed = true;
+                        } else {
+                            var completed: usize = @intCast(cqe.res);
+                            while (completed != 0) : (at += 1) {
+                                const size = @min(completed, writes[at].bytes.len - positions[at]);
+                                positions[at] += size;
+                                completed -= size;
+                            }
+                        }
+                        pending -= 1;
+                    }
                 }
                 if (self.failed) return error.IoFailure;
             }
@@ -136,9 +186,10 @@ const LinuxIo = struct {
         if (self.failed) return error.IoFailure;
         self.sync_complete = false;
         if (self.ring) |*ring| {
-            _ = ring.fsync(std.math.maxInt(u64), file.handle, 0) catch unreachable;
+            const sync = ring.fsync(std.math.maxInt(u64), file.handle, 0) catch unreachable;
+            sync.flags |= std.os.linux.IOSQE_ASYNC;
             self.pending = true;
-            try self.submit();
+            try self.submit(0);
         } else {
             file.sync(self.io) catch return error.IoFailure;
             self.sync_complete = true;
@@ -147,7 +198,7 @@ const LinuxIo = struct {
 
     pub fn poll(self: *LinuxIo) format.Error!void {
         while (self.pending or self.writeback_pending) {
-            if (try self.completion(false)) |entry| {
+            if (try self.completion(0)) |entry| {
                 const handled = self.background(entry);
                 std.debug.assert(handled);
             } else break;
@@ -173,7 +224,7 @@ const LinuxIo = struct {
     }
 
     fn receive(self: *LinuxIo, blocking: bool) format.Error!void {
-        if (try self.completion(blocking)) |entry| {
+        if (try self.completion(@intFromBool(blocking))) |entry| {
             const handled = self.background(entry);
             std.debug.assert(handled);
         }
@@ -199,10 +250,10 @@ const LinuxIo = struct {
         return false;
     }
 
-    fn submit(self: *LinuxIo) format.Error!void {
+    fn submit(self: *LinuxIo, wait_for: u32) format.Error!void {
         const ring = &self.ring.?;
         while (ring.sq_ready() != 0) {
-            _ = ring.submit() catch |err| switch (err) {
+            _ = ring.submit_and_wait(wait_for) catch |err| switch (err) {
                 error.SignalInterrupt => continue,
                 // Submission failure leaves kernel ownership of caller buffers uncertain.
                 else => std.debug.panic("io_uring submission failed: {t}", .{err}),
@@ -210,13 +261,19 @@ const LinuxIo = struct {
         }
     }
 
-    fn completion(self: *LinuxIo, blocking: bool) format.Error!?std.os.linux.io_uring_cqe {
+    fn completion(self: *LinuxIo, minimum: u32) format.Error!?std.os.linux.io_uring_cqe {
         var entries: [1]std.os.linux.io_uring_cqe = undefined;
-        const count = self.ring.?.copy_cqes(&entries, @intFromBool(blocking)) catch |err| switch (err) {
-            error.SignalInterrupt => return null,
+        return if (try self.reap(&entries, minimum) == 0) null else entries[0];
+    }
+
+    fn reap(self: *LinuxIo, entries: []std.os.linux.io_uring_cqe, minimum: u32) format.Error!usize {
+        std.debug.assert(entries.len > 0);
+        const count = self.ring.?.copy_cqes(entries, minimum) catch |err| switch (err) {
+            error.SignalInterrupt => return 0,
             else => std.debug.panic("io_uring completion failed: {t}", .{err}),
         };
-        return if (count == 0) null else entries[0];
+        std.debug.assert(count <= entries.len);
+        return count;
     }
 };
 

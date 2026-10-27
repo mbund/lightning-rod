@@ -23,6 +23,11 @@ test "embedded registry preparation matches runtime validation and packet encodi
 
 const Observer = struct {
     configurations: usize = 0,
+    closed_connections: usize = 0,
+
+    pub fn closed(self: *Observer, _: sessions.Handle) void {
+        self.closed_connections += 1;
+    }
 
     pub fn handshake(_: *Observer, _: []const u8) !sessions.protocol.Handshake {
         return error.UnexpectedHandshake;
@@ -30,10 +35,10 @@ const Observer = struct {
     pub fn status(_: *Observer, _: i32, _: []const u8, _: []u8) !?[]const u8 {
         return error.UnexpectedStatus;
     }
-    pub fn login(_: *Observer, _: sessions.Handle, _: *sessions.protocol.State, _: i32, _: sessions.PhaseEvent, _: []u8) !sessions.LoginStep {
+    pub fn login(_: *Observer, _: std.Io, _: sessions.Handle, _: *sessions.protocol.State, _: i32, _: sessions.PhaseEvent, _: []u8) !sessions.LoginStep {
         return error.UnexpectedLogin;
     }
-    pub fn configuration(self: *Observer, _: sessions.Handle, _: *sessions.protocol.State, _: i32, event: sessions.PhaseEvent, _: []u8) !sessions.ConfigurationStep {
+    pub fn configuration(self: *Observer, _: std.Io, _: sessions.Handle, _: *sessions.protocol.State, _: i32, event: sessions.PhaseEvent, _: []u8) !sessions.ConfigurationStep {
         try std.testing.expectEqual(sessions.PhaseEvent.begin, event);
         self.configurations += 1;
         return .done;
@@ -72,14 +77,14 @@ fn pendingOutput(comptime Version: type) !void {
     const transport: Transport = .{ .context = &paused, .vtable = undefined, .inheritance = Inheritance.init(PausedTransport, &paused) };
     var catalog: Endpoint.Protocols = .{ .values = .{.{ .number = Version.protocol_number }} };
     var observer: Observer = .{};
-    const config: Engine.Configuration = .{ .connections = 1, .buffer_bytes = 1024, .max_packet = 1021, .configuration_bytes = 64 * 1024, .protocols = &catalog, .observer = &observer };
-    const old = try Engine.init(std.testing.allocator, std.testing.io, transport, config);
+    const config: Engine.Configuration = .{ .connections = 1, .buffer_bytes = 1024, .max_packet = 1021, .max_pending_wire_bytes = 64 * 1024, .protocols = &catalog, .observer = &observer };
+    const old = try Engine.init(std.testing.allocator, transport, config);
     defer {
-        old.connections[0].handle = null;
+        old.setHandle(0, null);
         old.deinit();
     }
     const connection = &old.connections[0];
-    connection.handle = .{ .index = 0, .generation = 1 };
+    old.setHandle(0, .{ .index = 0, .generation = 1 });
     connection.protocol = &catalog.values[0];
     connection.state = .{ .phase = .negotiating, .uuid = 123, .name_len = 5 };
     @memcpy(connection.state.name[0..5], "alice");
@@ -90,7 +95,9 @@ fn pendingOutput(comptime Version: type) !void {
             value.wire.install(@splat(17));
         },
     }
-    try connection.control_output.resize(std.testing.allocator, 32 * 1024);
+    const lease = old.configurations.acquire().?;
+    connection.control_burst = lease;
+    connection.control_output = .{ .items = lease.bytes[0 .. 32 * 1024], .capacity = lease.bytes.len };
     @memset(connection.control_output.items, 23);
     Endpoint.send(&connection.lifecycle.?, connection.control_output.items);
     const accepted = 123;
@@ -99,29 +106,32 @@ fn pendingOutput(comptime Version: type) !void {
     connection.output = connection.control_output.items[accepted..];
     connection.output_control = true;
     old.reloading = true;
-    try std.testing.expect(try old.park());
-    try std.testing.expectEqualSlices(u8, pending, connection.output[0..pending.len]);
-    try std.testing.expect(connection.output.len > pending.len);
+    try std.testing.expect(try old.park(std.testing.io));
+    const queued = connection.saved_output.length;
+    try std.testing.expect(queued > pending.len);
 
     var handoff = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer handoff.deinit();
     try old.writeResume(&handoff.writer);
+    try std.testing.expectEqualSlices(u8, pending, handoff.written()[handoff.written().len - queued ..][0..pending.len]);
     try std.testing.expectEqual(@as(u32, 51), std.mem.readInt(u32, handoff.written()[28..32], .little));
-    const restored = try Engine.init(std.testing.allocator, std.testing.io, transport, config);
+    const restored = try Engine.init(std.testing.allocator, transport, config);
     defer {
-        restored.connections[0].handle = null;
+        restored.setHandle(0, null);
         restored.admitted = 0;
         restored.deinit();
     }
     var reader: std.Io.Reader = .fixed(handoff.written());
-    try restored.readResume(&reader);
+    try restored.readResume(std.testing.io, &reader, null);
     try std.testing.expectEqual(handoff.written().len, reader.seek);
     const resumed = &restored.connections[0];
-    try std.testing.expectEqualSlices(u8, connection.output, resumed.output);
     restored.reloading = true;
-    try std.testing.expect(try restored.park());
-    try std.testing.expectEqualSlices(u8, connection.output, resumed.output);
-    restored.restart();
+    try std.testing.expect(try restored.park(std.testing.io));
+    var roundtrip = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer roundtrip.deinit();
+    try restored.writeResume(&roundtrip.writer);
+    try std.testing.expectEqualSlices(u8, handoff.written(), roundtrip.written());
+    restored.restart(std.testing.io);
 
     var original_bytes: [16]u8 = @splat(42);
     var resumed_bytes = original_bytes;
@@ -130,7 +140,8 @@ fn pendingOutput(comptime Version: type) !void {
     try std.testing.expectEqualSlices(u8, &original_bytes, &resumed_bytes);
 
     var output: [128]u8 = undefined;
-    const context: sessions.protocol.Context(Observer) = .{ .connection = resumed.handle.?, .state = &resumed.state, .protocol = resumed.protocol.?, .output = &output, .io = std.testing.io, .now = 0, .reloading = false, .compression_threshold = null, .observer = &observer };
+    var poll: sessions.protocol.Poll = .{};
+    const context: sessions.protocol.Context(Observer) = .{ .connection = resumed.handle.?, .state = &resumed.state, .protocol = resumed.protocol.?, .output = &output, .io = std.testing.io, .now = 0, .poll = &poll, .reloading = false, .compression_threshold = null, .observer = &observer };
     var packet: [64]u8 = undefined;
     const finish = (try Version.Protocol.configuration.toServer.write(&packet).finish_configuration()).finish();
     try std.testing.expectEqual(null, try Endpoint.advance(Observer, &resumed.lifecycle.?, .{ .packet = finish }, context));
@@ -140,6 +151,7 @@ fn pendingOutput(comptime Version: type) !void {
     const header = try Version.Protocol.configuration.toClient.readHeader(generated);
     try std.testing.expectEqual(Version.Protocol.configuration.toClient.packetId(.finish_configuration), header.id);
     try std.testing.expectEqual(@as(usize, 1), observer.configurations);
+    try std.testing.expectEqual(@as(usize, 0), observer.closed_connections);
 }
 
 test "reload retains encrypted partial output and restarts configuration without plugin state" {
@@ -149,6 +161,7 @@ test "reload retains encrypted partial output and restarts configuration without
 test "handoff phase tags have fixed encodings independent of internal enum order" {
     inline for (protocols.implementations) |Version| {
         const Connection = Version.Connection;
+        try std.testing.expectEqual(@as(u64, 0x07e23a42aaa36cdd), Connection.resume_format);
         const cases = [_]struct { phase: @FieldType(Connection, "phase"), tag: u8 }{
             .{ .phase = .before_ack, .tag = 0 },
             .{ .phase = .reconfiguration_ack, .tag = 1 },
@@ -170,5 +183,31 @@ test "handoff phase tags have fixed encodings independent of internal enum order
         try std.testing.expectError(error.InvalidResume, Connection.restore(&invalid));
         var connection = Connection.init(.login);
         try std.testing.expectError(error.InvalidResume, connection.save(&invalid));
+    }
+}
+
+test "frozen Minecraft handoff retains compression and independent cipher feedback" {
+    const frozen = "\x02\x01\x01" ++ "\x11" ** 16 ++ "\x22" ** 16 ++ "\x33" ** 16;
+    inline for (protocols.implementations) |Version| {
+        var connection = Version.Connection.init(.login);
+        connection.phase = .restart_finish_ack;
+        connection.wire.compressed = true;
+        connection.wire.install(@splat(0x11));
+        connection.wire.receive_cipher.?.feedback = @splat(0x22);
+        connection.wire.send_cipher.?.feedback = @splat(0x33);
+        var buffer: [51]u8 = undefined;
+        try std.testing.expectEqualSlices(u8, frozen, try connection.save(&buffer));
+        const restored = try Version.Connection.restore(frozen);
+        try std.testing.expectEqual(connection.phase, restored.phase);
+        try std.testing.expect(restored.wire.compressed);
+        try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0x11)), &restored.wire.receive_cipher.?.secret);
+        try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0x22)), &restored.wire.receive_cipher.?.feedback);
+        try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0x33)), &restored.wire.send_cipher.?.feedback);
+        var original_output: [16]u8 = @splat(0x44);
+        var restored_output = original_output;
+        var resumed = restored;
+        connection.send(&original_output);
+        resumed.send(&restored_output);
+        try std.testing.expectEqualSlices(u8, &original_output, &restored_output);
     }
 }

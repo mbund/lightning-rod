@@ -42,6 +42,7 @@ final class TeleportFixture extends Fixture {
     private static final String ISOLATION_SETUP = "world-isolation-setup";
     private static final String ISOLATION_SEPARATED = "world-isolation-separated";
     private static final String ISOLATION_DONE = "world-isolation-done";
+    private static final String ISOLATION_OBSERVED = "world-isolation-observed";
     private static final String BOB_NOT_OPERATOR = "bob-not-op";
     private static final String TELEPORT_REPLY = "Teleported alice to bob";
 
@@ -57,13 +58,14 @@ final class TeleportFixture extends Fixture {
 
     private enum AlicePhase {
         WAIT_FOR_PEERS, WAIT_FOR_MINING, WAIT_FOR_SEPARATION, WAIT_FOR_PLACEMENT, WAIT_FOR_REUNION,
+        WAIT_FOR_ISOLATION_ACK,
         WAIT_FOR_PERMISSION_DENIAL, WAIT_FOR_COMPLETION, WAIT_FOR_FIRST_CONFIRMATION,
         WAIT_FOR_REPEATED_CONFIRMATION, WAIT_FOR_SAME_WORLD_POSITION,
         MOVE_BOB, WAIT_FOR_BOB_SEPARATION, WAIT_FOR_ARRIVAL, WAIT_FOR_BOB_ACK, DONE
     }
 
     private enum BobPhase {
-        WAIT_FOR_SETUP, WAIT_BEFORE_MINING, WAIT_FOR_ISOLATION_DONE,
+        WAIT_FOR_SETUP, WAIT_BEFORE_MINING, WAIT_FOR_ISOLATION_DONE, WAIT_FOR_ISOLATION_CAPTURE,
         WAIT_FOR_PERMISSION_DENIAL, OBSERVE_WORLD_TRANSFERS, DONE
     }
 
@@ -145,11 +147,15 @@ final class TeleportFixture extends Fixture {
                 selectSlot(game, BREAD_SLOT);
                 client.mark(ISOLATION_DONE);
                 if (isolation) {
-                    alicePhase = AlicePhase.DONE;
-                    client.pass("world_interactions_isolated");
+                    alicePhase = AlicePhase.WAIT_FOR_ISOLATION_ACK;
                     return;
                 }
                 alicePhase = AlicePhase.WAIT_FOR_PERMISSION_DENIAL;
+            }
+            case WAIT_FOR_ISOLATION_ACK -> {
+                if (!markerExists(ISOLATION_OBSERVED)) return;
+                alicePhase = AlicePhase.DONE;
+                client.pass("world_interactions_isolated");
             }
             case WAIT_FOR_PERMISSION_DENIAL -> {
                 if (!markerExists(BOB_NOT_OPERATOR)) return;
@@ -251,13 +257,17 @@ final class TeleportFixture extends Fixture {
                     if (!dimension(game).equals("overworld") || game.level.players().size() != PEER_COUNT
                         || inventorySyncedPlayer != game.player || GuiApi.screen(game) != null
                         || !game.levelRenderer.hasRenderedAllSections()) return;
-                    if (!client.screenshot("world_interactions_isolated").done()) return;
-                    bobPhase = BobPhase.DONE;
-                    client.pass("world_interactions_isolated");
+                    bobPhase = BobPhase.WAIT_FOR_ISOLATION_CAPTURE;
                     return;
                 }
                 game.getConnection().sendCommand("tp alice");
                 bobPhase = BobPhase.WAIT_FOR_PERMISSION_DENIAL;
+            }
+            case WAIT_FOR_ISOLATION_CAPTURE -> {
+                if (!client.screenshot("world_interactions_isolated").done()) return;
+                client.mark(ISOLATION_OBSERVED);
+                bobPhase = BobPhase.DONE;
+                client.pass("world_interactions_isolated");
             }
             case WAIT_FOR_PERMISSION_DENIAL -> {
                 if (r.receivedChat.stream().noneMatch(text -> text.startsWith("Unknown command or insufficient permission"))) return;

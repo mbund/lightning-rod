@@ -73,3 +73,21 @@ test "suite override selects ordinary and mixed primaries while preserving pins"
     try std.testing.expectEqualStrings("1.21.5", versions[0]);
     try std.testing.expectError(error.UnsupportedClientVersion, selection.matrixVersions(protocols, allocator, pinned, "invalid"));
 }
+
+test "upgrade runs once at latest with two existing clients and one newly supported client" {
+    const allocator = std.testing.allocator;
+    const case: catalog.Case = .{ .name = "upgrade", .upgrade = true, .peers = &.{ "alice", "bob", "newcomer" } };
+    const versions = try selection.matrixVersions(protocols, allocator, case, null);
+    defer allocator.free(versions);
+    try std.testing.expectEqual(@as(usize, 1), versions.len);
+    try std.testing.expectEqualStrings(protocols.latest.minecraft_version, versions[0]);
+    const peers = try selection.peerVersions(protocols, allocator, case, versions[0]);
+    defer allocator.free(peers);
+    try std.testing.expectEqualStrings(peers[0], peers[1]);
+    try std.testing.expect(protocols.versions[protocols.releaseIndex(peers[0]).?].protocol_number < protocols.latest.protocol_number);
+    try std.testing.expectEqualStrings(protocols.latest.minecraft_version, peers[2]);
+    const overridden = try selection.matrixVersions(protocols, allocator, case, peers[0]);
+    defer allocator.free(overridden);
+    try std.testing.expectEqualStrings(protocols.latest.minecraft_version, overridden[0]);
+    try std.testing.expectError(error.UnsupportedTestVersion, selection.peerVersions(protocols, allocator, case, peers[0]));
+}

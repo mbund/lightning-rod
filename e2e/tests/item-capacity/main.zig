@@ -1,22 +1,20 @@
 const std = @import("std");
-const lr = @import("lightning_rod");
+const lightning_rod = @import("lightning_rod");
 const protocols = @import("protocols");
 const vanilla = @import("vanilla");
 const e2e = @import("e2e");
 const sessions = @import("sessions");
-const registry = protocols.registry;
-const bootstrap = e2e.server;
 
 pub fn main(init: std.process.Init) !void {
-    const args = try bootstrap.arguments(init);
-    const plugins = lr.plugin.compose(.{
-        lr.plugin.replace(bootstrap.plugins(), .{
-            lr.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = 2, .gamemode = if (std.mem.eql(u8, args.fixture, "creative")) .creative else .survival }),
-            lr.plugin.configured(vanilla.ItemEntities, vanilla.ItemEntities.Configuration{ .maximum = 2 }),
+    const args = try e2e.profile.arguments(init);
+    const plugins = lightning_rod.plugin.compose(.{
+        lightning_rod.plugin.replace(e2e.profile.plugins(), .{
+            lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = 2, .gamemode = if (std.mem.eql(u8, args.fixture, "creative")) .creative else .survival }),
+            lightning_rod.plugin.configured(vanilla.ItemEntities, vanilla.ItemEntities.Configuration{ .maximum = 2 }),
         }),
-        lr.plugin.configured(Probe, .{}),
+        lightning_rod.plugin.configured(Probe, .{}),
     });
-    try bootstrap.run(init, plugins, .{ .plaintext = true });
+    try e2e.profile.run(init, plugins, .{ .plaintext = true });
 }
 
 const Probe = struct {
@@ -57,7 +55,7 @@ const Probe = struct {
             if (state.active and state.position.x == 1 and state.position.y == 65 and state.position.z == 1)
                 self.mining = .active;
             if (self.mining == .active and !state.active) {
-                if (try self.deps.chunks.getBlock(self.deps.players.records[0].world, .{ .x = 1, .y = 65, .z = 1 }) != registry.block_stone_default_state)
+                if (try self.deps.chunks.getBlock(self.deps.players.records[0].world, .{ .x = 1, .y = 65, .z = 1 }) != protocols.registry.block_stone_default_state)
                     return error.BlockMinedAtCapacity;
                 self.mining = .rejected;
                 try self.deps.control.send(self.deps.players.records[0].handle.?, "capacity mining rejected");
@@ -81,7 +79,7 @@ const Probe = struct {
                 entity.* = try self.deps.dropped.create(player.world, .{ 5.5 + @as(f64, @floatFromInt(i)), 65, 5.5 }, .{ 0, 0, 0 }, .{ .item = stone, .count = 1 });
                 try self.deps.dropped.put(entity.*, .{ .pickup_delay = std.math.maxInt(i16), .age = std.math.minInt(i16) });
             }
-            try self.deps.chunks.setBlock(player.world, .{ .x = 1, .y = 65, .z = 1 }, registry.block_stone_default_state);
+            try self.deps.chunks.setBlock(player.world, .{ .x = 1, .y = 65, .z = 1 }, protocols.registry.block_stone_default_state);
             self.phase = .full;
             try self.deps.control.send(handle, "capacity full");
         } else if (std.mem.eql(u8, text, "capacity_check")) {
@@ -90,7 +88,7 @@ const Probe = struct {
             if (held.count != bread_count or self.deps.dropped.canCreate(1)) return error.CapacityDropApplied;
             const tool = (try self.deps.inventories.get(.{ .owner = player.uuid, .index = 37 })).stack orelse return error.ToolLost;
             if (!std.mem.eql(u8, &tool.item, &self.tool)) return error.ToolWornAtCapacity;
-            if (try self.deps.chunks.getBlock(player.world, .{ .x = 1, .y = 65, .z = 1 }) != registry.block_stone_default_state) return error.BlockMinedAtCapacity;
+            if (try self.deps.chunks.getBlock(player.world, .{ .x = 1, .y = 65, .z = 1 }) != protocols.registry.block_stone_default_state) return error.BlockMinedAtCapacity;
             try self.deps.control.send(handle, "capacity unchanged");
         } else if (std.mem.eql(u8, text, "capacity_free")) {
             if (self.phase != .full) return error.UnexpectedCapacityPhase;

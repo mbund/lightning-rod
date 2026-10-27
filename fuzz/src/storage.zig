@@ -1,21 +1,19 @@
 const std = @import("std");
 const storage = @import("storage");
-const testing = @import("storage_testing");
+const environment = @import("environment.zig");
 
 fn fuzzPager(_: void, smith: *std.testing.Smith) !void {
-    const io = std.testing.io;
-    var temporary = try testing.directory(.{});
-    defer temporary.cleanup();
-    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/world", .{temporary.sub_path});
-    defer std.testing.allocator.free(path);
-    const options: storage.Store.Options = .{ .path = path, .submission = .standard, .maximum_wal_pages = 1024, .checkpoint_bytes = 64 };
+    var program: [96 * 3]u8 = undefined;
+    smith.bytesWithHash(&program, 1);
+    var state = try environment.Environment.init("storage", std.hash.Wyhash.hash(0, &program));
+    defer state.deinit();
+    const io = state.io();
+    const options: storage.Store.Options = .{ .path = state.path, .maximum_wal_pages = 1024, .checkpoint_bytes = 64, .io_mode = .standard };
     var store = try storage.Store.init(std.testing.allocator, io, options);
     defer store.deinit();
     try std.testing.expectEqual(@as(u64, 0), store.lastTick());
     var expected: [16]?u8 = @splat(null);
     var saved = expected;
-    var program: [96 * 3]u8 = undefined;
-    smith.bytesWithHash(&program, 1);
     for (0..96) |step| {
         errdefer std.debug.print("pager step={d} committed={d} phase={t}\n", .{ step, store.lastTick(), store.phase });
         const index = program[step * 3 + 1] % expected.len;
@@ -49,7 +47,7 @@ fn fuzzPager(_: void, smith: *std.testing.Smith) !void {
                 expected = saved;
             },
             5 => {
-                _ = try store.maintain(4);
+                _ = try store.pollMaintenance(.{ .index_entries = 4, .pages = 4 });
             },
             else => unreachable,
         }

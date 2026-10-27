@@ -1,4 +1,5 @@
 const storage = @import("storage");
+const records = @import("records");
 const metrics = @import("metrics");
 const std = @import("std");
 const chunks = @import("chunks");
@@ -303,7 +304,7 @@ test "section summaries invalidate on edits and slot reuse and recover after err
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    var metric_registry = try metrics.Registry.init(std.testing.allocator, io, .{ .capacity = 32 });
+    var metric_registry = try metrics.Registry.init(std.testing.allocator, io, .{ .capacity = 48 });
     defer metric_registry.deinit();
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
@@ -315,7 +316,7 @@ test "section summaries invalidate on edits and slot reuse and recover after err
     defer store.deinit();
     const transaction = store.transaction();
     defer transaction.fail();
-    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .cache_sections = 1 }, .{ .metrics = &metric_registry, .storage = try transaction.openSpace("chunks") });
+    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .demand_sections = 0, .cache_sections = 1 }, .{ .metrics = &metric_registry, .storage = try transaction.openSpace("chunks"), .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}) });
     const workspace = try Workspace.init(arena.allocator(), 1);
     const position: chunks.Section = .{ .world = 0, .x = 0, .y = 0, .z = 0 };
     var lease = try terrain.acquire(position);
@@ -386,6 +387,7 @@ test "section summaries invalidate on edits and slot reuse and recover after err
     lease = try terrain.acquire(position);
     try workspace.prepare(&.{lease});
     try std.testing.expectEqual(@as(u16, 257), workspace.summaries[0].state.count);
+    column.sections = &.{lease};
     const changed = workspace.prepareColumn(column);
     try std.testing.expectEqual(@as(i16, 0), changed.heights[255]);
     try std.testing.expectEqual(@as(i16, 1), changed.heights[0]);

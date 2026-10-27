@@ -1,27 +1,33 @@
+const protocol_definitions = @import("protocols");
 const std = @import("std");
 const catalog = @import("src/catalog.zig");
 const selection = @import("src/selection.zig");
-const protocol_catalog = @import("protocols").catalog;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
 
     const optimize = b.standardOptimizeOption(.{});
+    const single_threaded = b.option(bool, "single-threaded", "Run all fixture services on the simulation owner") orelse false;
     const realtime = b.option(bool, "realtime", "Run the server and its threads with FIFO scheduling") orelse false;
     const tests_root = b.option([]const u8, "tests", "Directory containing E2E fixtures") orelse "tests";
     const server_releases = b.option([]const u8, "server-releases", "Minecraft releases selected for the test server");
     const requested_version = b.option([]const u8, "client-version", "Minecraft client release");
     const scenario = b.option([]const u8, "scenario", "Run one E2E scenario (default: all)");
+    const upgrade_from = b.option([]const u8, "upgrade-from", "Previous revision for the upgrade E2E") orelse "HEAD^";
     const cases = catalog.load(b.allocator, b.graph.io, b.pathFromRoot(tests_root)) catch |err| std.debug.panic("Cannot discover E2E tests: {s}", .{@errorName(err)});
     const selected_case = if (scenario) |name| catalog.find(cases, name) orelse
         std.debug.panic("Unknown E2E test '{s}'; use zig build list-tests", .{name}) else null;
-    const client_version = requested_version orelse (if (selected_case) |selected| selected.version else null) orelse protocol_catalog.latest.minecraft_version;
+    const client_version = requested_version orelse (if (selected_case) |selected| selected.version else null) orelse protocol_definitions.catalog.latest.minecraft_version;
     const peer_versions = if (selected_case) |selected|
-        selection.peerVersions(protocol_catalog, b.allocator, selected, client_version) catch |err|
+        selection.peerVersions(protocol_definitions.catalog, b.allocator, selected, client_version) catch |err|
             std.debug.panic("Cannot select E2E clients: {s}", .{@errorName(err)})
     else
         &.{};
-    const selected_releases = server_releases orelse if (selected_case != null and !selected_case.?.full_protocols)
+    var upgrade_releases: [protocol_definitions.catalog.versions.len][]const u8 = undefined;
+    for (protocol_definitions.catalog.versions, &upgrade_releases) |version, *name| name.* = version.minecraft_version;
+    const selected_releases = server_releases orelse if (selected_case != null and selected_case.?.upgrade)
+        std.mem.join(b.allocator, ",", &upgrade_releases) catch @panic("out of memory")
+    else if (selected_case != null and !selected_case.?.full_protocols)
         std.mem.join(b.allocator, ",", peer_versions) catch @panic("out of memory")
     else
         "";
@@ -49,19 +55,16 @@ pub fn build(b: *std.Build) void {
     if (requested_version) |version| emit_matrix.addArg(version);
     b.step("e2e-matrix", "Print the GitHub Actions E2E matrix as JSON").dependOn(&emit_matrix.step);
 
-    const backend = b.option(enum { uring, stdio }, "io", "Fixture networking implementation") orelse .uring;
-    const profile = if (backend == .uring) "lightning_rod_linux" else "lightning_rod_stdio";
-    const names = .{ "records", "lightning_rod", "lightning_rod_linux", "vanilla", "minecraft_java", "minecraft_model", "sessions", "protocols", "bossbars", "tps", "economy", "shop", "economy_commands", "shop_commands", "e2e_control" };
+    const names = .{ "records", "e2e_profile", "host", "lightning_rod", "vanilla", "minecraft_java", "minecraft_model", "sessions", "protocols", "tps", "economy", "shop", "economy_commands", "shop_commands", "e2e_control", "skyblock" };
     b.dependency("minecraft_packets", .{ .target = target, .optimize = optimize }).module("minecraft_packets").addImport("protocols", protocols.module("protocols"));
     b.dependency("vanilla", .{ .target = target, .optimize = optimize }).module("lightning_rod_vanilla_1_21_6").addImport("protocols", protocols.module("protocols"));
     var imports: [names.len]std.Build.Module.Import = undefined;
 
     inline for (names, 0..) |name, i| {
-        const selected = if (comptime std.mem.eql(u8, name, "lightning_rod_linux")) profile else name;
-        const dependency = if (comptime std.mem.eql(u8, name, "protocols")) protocols else b.dependency(selected, .{ .target = target, .optimize = optimize });
+        const dependency = if (comptime std.mem.eql(u8, name, "protocols")) protocols else if (comptime std.mem.eql(u8, name, "skyblock")) b.dependency(name, .{ .target = target, .optimize = optimize, .releases = selected_releases }) else if (comptime std.mem.eql(u8, name, "e2e_profile")) b.dependency(name, .{ .target = target, .optimize = optimize, .@"single-threaded" = single_threaded }) else b.dependency(name, .{ .target = target, .optimize = optimize });
         imports[i] = .{
             .name = name,
-            .module = dependency.module(if (std.mem.eql(u8, name, "vanilla")) "lightning_rod_vanilla_1_21_6" else selected),
+            .module = dependency.module(if (std.mem.eql(u8, name, "vanilla")) "lightning_rod_vanilla_1_21_6" else name),
         };
     }
 
@@ -101,6 +104,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     const test_harness = b.step("test-harness", "Verify E2E version selection and shutdown outcomes");
+    const listener_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/listener.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    test_harness.dependOn(&b.addRunArtifact(listener_tests).step);
     const cleanup_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/process_cleanup.zig"),
         .target = target,
@@ -136,14 +145,17 @@ pub fn build(b: *std.Build) void {
     b.step("list-tests", "List automatically discovered E2E tests and their directories").dependOn(&list.step);
 
     const server = b.option([]const u8, "server", "Override the test's server executable");
-    const address = b.option([]const u8, "address", "Minecraft server address") orelse "127.0.0.1:25565";
+    const address = b.option([]const u8, "address", "Minecraft server address") orelse "127.0.0.1:0";
     const artifacts = b.option([]const u8, "artifacts", "Override artifact root (default: each test directory's artifacts/)");
     const suite = b.step("e2e", "Run all discovered E2E tests sequentially (or select -Dscenario)");
     const servers = b.step("build-test-servers", "Build servers for the selected E2E tests without running Java");
     var previous: ?*std.Build.Step = null;
     var test_servers: std.StringHashMap(*std.Build.Step.Compile) = .init(b.allocator);
 
+    const execution = b.addOptions();
+    execution.addOption(bool, "single_threaded", single_threaded);
     const harness_module = b.createModule(.{ .root_source_file = b.path("src/lib.zig"), .target = target, .optimize = optimize, .imports = &imports });
+    harness_module.addOptions("execution", execution);
     harness_module.addImport("wire_1_21_5", b.dependency("protocol_1_21_5", .{ .target = target, .optimize = optimize }).module("wire"));
     const control_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.dependency("e2e_control", .{ .target = target, .optimize = optimize }).path("src/control.zig"),
@@ -165,10 +177,12 @@ pub fn build(b: *std.Build) void {
         previous = &run.step;
         run.setCwd(b.path("."));
         run.setEnvironmentVariable("LIGHTNING_ROD_E2E_KEY", b.dependency("minecraft_java", .{ .target = target, .optimize = optimize }).path("tests/fixtures/rsa-key.der").getPath(b));
+        if (selected.upgrade) run.setEnvironmentVariable("LIGHTNING_ROD_E2E_ZIG", b.graph.zig_exe);
         run.addArgs(&.{ "--scenario", selected.name, "--client", "client", "--realtime", if (realtime) "true" else "false" });
         if (artifacts) |directory| run.addArgs(&.{ "--artifacts", directory });
         run.addArgs(&.{ "--address", address });
         run.addArgs(&.{ "--client-version", client_version });
+        if (selected.upgrade) run.addArgs(&.{ "--upgrade-from", upgrade_from });
         run.addArgs(&.{ "--tests", b.pathFromRoot(tests_root) });
 
         if (server) |path| {
@@ -203,6 +217,7 @@ pub fn build(b: *std.Build) void {
                         .root_source_file = .{ .cwd_relative = main_path },
                         .target = target,
                         .optimize = optimize,
+                        .single_threaded = single_threaded,
                         .imports = &imports,
                     }),
                 });
@@ -215,7 +230,7 @@ pub fn build(b: *std.Build) void {
             } else if (selected.fixture != null) {
                 std.debug.panic("E2E fixture {s} needs a main.zig in {s}", .{ selected.name, selected.directory });
             } else {
-                const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "build", b.fmt("-Doptimize={s}", .{@tagName(optimize)}), b.fmt("-Dio={s}", .{@tagName(backend)}) });
+                const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "build", b.fmt("-Doptimize={s}", .{@tagName(optimize)}) });
                 if (b.graph.max_jobs) |jobs| compile.addArg(b.fmt("-j{d}", .{jobs}));
                 if (selected_releases.len != 0)
                     compile.addArg(b.fmt("-Dreleases={s}", .{selected_releases}));
@@ -244,14 +259,16 @@ pub fn build(b: *std.Build) void {
         }) });
         const run_suite = b.addRunArtifact(suite_runner);
         run_suite.addFileArg(suite_matrix.captureStdOut(.{}));
-        run_suite.addArgs(&.{ b.graph.zig_exe, b.fmt("-Doptimize={s}", .{@tagName(optimize)}), b.fmt("-Dio={s}", .{@tagName(backend)}), b.fmt("-Dtests={s}", .{tests_root}), b.fmt("-Daddress={s}", .{address}) });
+        run_suite.addArgs(&.{ b.graph.zig_exe, b.fmt("-Doptimize={s}", .{@tagName(optimize)}), b.fmt("-Dtests={s}", .{tests_root}), b.fmt("-Daddress={s}", .{address}) });
         if (b.graph.max_jobs) |jobs| run_suite.addArg(b.fmt("-j{d}", .{jobs}));
         run_suite.addArg(b.fmt("-Drealtime={s}", .{if (realtime) "true" else "false"}));
+        run_suite.addArg(b.fmt("-Dsingle-threaded={s}", .{if (single_threaded) "true" else "false"}));
         if (!target.query.isNative()) {
             run_suite.addArg(b.fmt("-Dtarget={s}", .{target.query.zigTriple(b.allocator) catch @panic("out of memory")}));
             run_suite.addArg(b.fmt("-Dcpu={s}", .{target.query.serializeCpuAlloc(b.allocator) catch @panic("out of memory")}));
         }
         if (server_releases) |releases| run_suite.addArg(b.fmt("-Dserver-releases={s}", .{releases}));
+        run_suite.addArg(b.fmt("-Dupgrade-from={s}", .{upgrade_from}));
         if (server) |path| run_suite.addArg(b.fmt("-Dserver={s}", .{path}));
         if (artifacts) |path| run_suite.addArg(b.fmt("-Dartifacts={s}", .{path}));
         run_suite.has_side_effects = true;

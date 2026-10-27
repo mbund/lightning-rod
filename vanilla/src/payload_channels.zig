@@ -117,10 +117,10 @@ pub const Play = struct {
         self.count += 1;
     }
 
-    pub fn send(self: *Play, protocol: i32, recipients: []const sessions.Handle, channel: []const u8, bytes: []const u8) !void {
+    pub fn send(self: *Play, protocol: i32, recipient: sessions.Handle, channel: []const u8, bytes: []const u8) !void {
         if (!validChannel(channel)) return error.InvalidPayloadChannel;
         const maximum = try std.math.add(usize, try std.math.add(usize, channel.len, bytes.len), 16);
-        try self.deps.packets.sendPacket(writePlay, protocol, recipients, .{ channel, bytes }, maximum);
+        try self.deps.packets.sendPacket(writePlay, protocol, recipient, .{ channel, bytes }, maximum);
     }
 
     pub fn fanout(self: *Play, recipients: []const sessions.Service.Target, channel: []const u8, bytes: []const u8, delivered: []sessions.Service.Delivery) !void {

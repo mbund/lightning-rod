@@ -1,12 +1,11 @@
 const records = @import("records");
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
-const storage = lightning_rod.storage;
 
 pub const Weather = struct {
     pub const id = "minecraft:weather";
     pub const Configuration = struct { seed: u64 = 0, weather_cycle: bool = true };
-    pub const Dependencies = struct { storage: storage.Space };
+    pub const Dependencies = struct { storage: lightning_rod.storage.Space };
     pub const Kind = enum { clear, rain, thunder };
 
     clear_ticks: i32 = 0,
@@ -21,8 +20,7 @@ pub const Weather = struct {
     saved: [56]u8 = @splat(0),
 
     pub fn init(allocator: std.mem.Allocator, configuration: Configuration, deps: Dependencies) !*Weather {
-        const self = try allocator.create(Weather);
-        self.* = .{ .weather_cycle = configuration.weather_cycle, .random = .init(configuration.seed) };
+        const self = try allocate(allocator, configuration);
         if (try records.Value.init(deps.storage).read(&self.saved)) |length| {
             const bytes = &self.saved;
             if (length != bytes.len or bytes[0] != 1 or bytes[13] > 1 or bytes[14] > 1 or bytes[15] > 1) return error.CorruptWeather;
@@ -43,6 +41,12 @@ pub const Weather = struct {
         return self;
     }
 
+    pub fn allocate(allocator: std.mem.Allocator, configuration: Configuration) !*Weather {
+        const self = try allocator.create(Weather);
+        self.* = .{ .weather_cycle = configuration.weather_cycle, .random = .init(configuration.seed) };
+        return self;
+    }
+
     /// Duration is in simulation ticks. The visual levels still transition gradually.
     pub fn set(self: *Weather, kind: Kind, duration: i32) void {
         std.debug.assert(duration > 0);
@@ -53,7 +57,7 @@ pub const Weather = struct {
         self.thundering = kind == .thunder;
     }
 
-    pub fn checkpoint(self: *Weather, space: storage.Space) !void {
+    pub fn checkpoint(self: *Weather, space: lightning_rod.storage.Space) !void {
         var bytes: [56]u8 = undefined;
         bytes[0] = 1;
         std.mem.writeInt(i32, bytes[1..5], self.clear_ticks, .little);

@@ -7,7 +7,6 @@ import dev.lightningrod.e2e.mixin.LevelRendererAccessor;
 
 final class TerrainApi {
     static boolean ready(Minecraft game) {
-        if (!game.levelRenderer.hasRenderedAllSections()) return false;
         var sections = ((LevelRendererAccessor)game.levelRenderer).lightningRod$visibleSections();
         if (sections.isEmpty()) return false;
         long now = Util.getMillis();

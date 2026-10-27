@@ -10,6 +10,7 @@ pub const Permission = struct {
     description: []const u8,
 };
 
+/// Invalidate the owning Commands after changing decisions used for client visibility.
 pub const Policy = struct {
     context: *anyopaque,
     vtable: *const VTable,
@@ -392,6 +393,9 @@ pub const Commands = struct {
 
     pub const Node = struct {
         parent: u16 = 0,
+        first_child: ?u16 = null,
+        last_child: ?u16 = null,
+        next_sibling: ?u16 = null,
         name: []const u8 = "",
         description: []const u8 = "",
         permission: ?*const Permission = null,
@@ -405,6 +409,8 @@ pub const Commands = struct {
     count: u16 = 1,
     sealed: bool = false,
     config: Configuration,
+    permissions_revision: u64 = 0,
+    packet_capacity: usize = 16,
 
     const HelpArgs = struct {
         page: ?u32,
@@ -433,6 +439,40 @@ pub const Commands = struct {
         return self;
     }
 
+    pub const Children = struct {
+        tree: *const Commands,
+        parent: u16,
+        current: ?u16,
+
+        pub fn next(self: *Children) ?u16 {
+            const index = self.current orelse return null;
+            assert(index > self.parent and index < self.tree.count and self.tree.nodes[index].parent == self.parent);
+            self.current = self.tree.nodes[index].next_sibling;
+            if (self.current) |following| assert(following > index);
+            return index;
+        }
+    };
+
+    pub fn children(self: *const Commands, parent: u16) Children {
+        assert(parent < self.count);
+        return .{ .tree = self, .parent = parent, .current = self.nodes[parent].first_child };
+    }
+
+    fn linkChild(self: *Commands, parent: u16, index: u16) void {
+        assert(parent < index and index < self.count);
+        assert(self.nodes[index].parent == parent and self.nodes[index].next_sibling == null);
+        self.packet_capacity += wire.nodeCapacity(self.nodes[index]);
+        const node = &self.nodes[parent];
+        if (node.last_child) |last| {
+            assert(last < index and self.nodes[last].next_sibling == null);
+            self.nodes[last].next_sibling = index;
+        } else {
+            assert(node.first_child == null);
+            node.first_child = index;
+        }
+        node.last_child = index;
+    }
+
     pub fn literal(self: *Commands, definition: Literal) !Branch {
         return (Branch{ .commands = self, .index = 0 }).literal(definition);
     }
@@ -442,7 +482,16 @@ pub const Commands = struct {
     }
 
     pub fn installPolicyIfUnset(self: *Commands, policy: Policy) void {
-        if (self.config.permission_policy == null) self.config.permission_policy = policy;
+        assert(!self.sealed);
+        if (self.config.permission_policy != null) return;
+        self.config.permission_policy = policy;
+        self.permissionsChanged();
+    }
+
+    /// Policy owners invalidate client visibility after changing permission decisions.
+    /// Execution always checks the live policy, independently of client visibility.
+    pub fn permissionsChanged(self: *Commands) void {
+        self.permissions_revision += 1;
     }
 
     pub fn permits(self: *const Commands, sender: u128, permission: *const Permission) bool {
@@ -494,8 +543,10 @@ pub const Commands = struct {
 
             var found: ?usize = null;
             var argument: ?usize = null;
-            for (self.nodes[1..self.count], 1..) |child, index| {
-                if (child.parent != node or !self.allowed(context.sender, index))
+            var child_iterator = self.children(@intCast(node));
+            while (child_iterator.next()) |index| {
+                const child = self.nodes[index];
+                if (!self.allowed(context.sender, index))
                     continue;
 
                 if (child.argument != null) {
@@ -541,8 +592,15 @@ pub const Commands = struct {
         assert(visible.len == self.count);
         visible[0] = true;
 
+        for (self.nodes[1..self.count], 1..) |node, index| {
+            assert(node.parent < index);
+            visible[index] = visible[node.parent];
+            if (visible[index]) {
+                if (node.permission) |permission| visible[index] = self.permits(sender, permission);
+            }
+        }
         for (self.nodes[1..self.count], 1..) |node, index|
-            visible[index] = node.vtable != null and self.allowed(sender, index);
+            visible[index] = visible[index] and node.vtable != null;
 
         var index: usize = self.count;
         while (index > 1) {
@@ -579,8 +637,10 @@ pub const Commands = struct {
                 output.start = start;
                 output.length = cursor - start;
 
-                for (self.nodes[1..self.count], 1..) |child, index| {
-                    if (child.parent != node or !visible[index])
+                var child_iterator = self.children(@intCast(node));
+                while (child_iterator.next()) |index| {
+                    const child = self.nodes[index];
+                    if (!visible[index])
                         continue;
 
                     if (child.argument) |argument| {
@@ -603,8 +663,10 @@ pub const Commands = struct {
 
             var found: ?usize = null;
             var argument: ?usize = null;
-            for (self.nodes[1..self.count], 1..) |child, index| {
-                if (child.parent != node or !visible[index])
+            var child_iterator = self.children(@intCast(node));
+            while (child_iterator.next()) |index| {
+                const child = self.nodes[index];
+                if (!visible[index])
                     continue;
 
                 if (child.argument != null)
@@ -651,8 +713,11 @@ pub const Commands = struct {
 
             var extended = false;
 
-            for (self.nodes[index + 1 .. self.count]) |child|
-                extended = extended or (child.parent == index and child.argument != null and child.vtable == node.vtable);
+            var child_iterator = self.children(@intCast(index));
+            while (child_iterator.next()) |child_index| {
+                const child = self.nodes[child_index];
+                extended = extended or (child.argument != null and child.vtable == node.vtable);
+            }
 
             if (!extended) total += 1;
         }
@@ -673,8 +738,11 @@ pub const Commands = struct {
                 continue;
 
             var extended = false;
-            for (self.nodes[index + 1 .. self.count]) |child|
-                extended = extended or (child.parent == index and child.argument != null and child.vtable == node.vtable);
+            var child_iterator = self.children(@intCast(index));
+            while (child_iterator.next()) |child_index| {
+                const child = self.nodes[child_index];
+                extended = extended or (child.argument != null and child.vtable == node.vtable);
+            }
             if (extended)
                 continue;
 
@@ -742,9 +810,11 @@ pub const Branch = struct {
         if (commands.count == commands.nodes.len)
             return error.CommandCapacity;
 
-        for (commands.nodes[1..commands.count]) |node|
-            if (node.parent == self.index and node.argument == null and std.mem.eql(u8, node.name, definition.name))
-                return error.DuplicateCommand;
+        var child_iterator = commands.children(self.index);
+        while (child_iterator.next()) |index| {
+            const node = commands.nodes[index];
+            if (node.argument == null and std.mem.eql(u8, node.name, definition.name)) return error.DuplicateCommand;
+        }
 
         var depth: usize = 1;
         var path_bytes: usize = definition.name.len + 1;
@@ -771,6 +841,7 @@ pub const Branch = struct {
             .permission = definition.permission,
         };
         commands.count += 1;
+        commands.linkChild(self.index, index);
         return .{ .commands = commands, .index = index };
     }
 
@@ -815,6 +886,7 @@ pub const Branch = struct {
                 .context = owner,
             };
             self.commands.count += 1;
+            self.commands.linkChild(parent, index);
             parent = index;
         }
 

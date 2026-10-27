@@ -4,6 +4,7 @@ import java.nio.file.Files;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.inventory.InventoryScreen;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.util.Mth;
 import dev.lightningrod.e2e.mixin.BossBarHudAccessor;
 import dev.lightningrod.e2e.mixin.ClientConnectionAccessor;
@@ -44,6 +45,7 @@ final class ReloadFixture extends Fixture {
     private boolean reloadPositioned;
     private int reloadVerified = -1;
     private int reloadBarRequested = -1;
+    private int reloadRestoreRequested = -1;
     private double reloadX;
     private double reloadZ;
     private volatile int requestedMessages;
@@ -85,7 +87,14 @@ final class ReloadFixture extends Fixture {
             }
         }
         Case round = generation < ROUNDS.length ? ROUNDS[generation] : null;
-        if (r.joins == generation + 2 && GuiApi.screen(game) != null) return;
+        if (r.joins == generation + 2) {
+            if (GuiApi.screen(game) != null) return;
+            if (reloadRestoreRequested != generation) {
+                client.fence("reload-return-" + generation);
+                reloadRestoreRequested = generation;
+            }
+            if (!client.fenced("reload-return-" + generation)) return;
+        }
         var stack = game.player.getInventory().getItem(0);
         var cursor = game.player.containerMenu.getCarried();
         int bread = (stack.is(net.minecraft.world.item.Items.BREAD) ? stack.getCount() : 0)
@@ -103,7 +112,12 @@ final class ReloadFixture extends Fixture {
         }
         inventoryMismatchTick = -1;
         if (r.joins == generation + 2) {
+            if (game.player.getInventory().getSelectedSlot() != selectedSlot()) {
+                client.fail("reload_selected_slot_not_restored");
+                return;
+            }
             if (stack.getCount() != BREAD_COUNT || !cursor.isEmpty()) {
+                client.event("reload_cursor_mismatch", "slot", stack.toString(), "cursor", cursor.toString());
                 client.fail("reload_cursor_not_returned_to_inventory");
                 return;
             }
@@ -117,11 +131,13 @@ final class ReloadFixture extends Fixture {
                 client.fail("reload_position_not_restored");
                 return;
             }
-            if (!((BossBarHudAccessor) GuiApi.bossBars(game)).lightningRod$bossBars().isEmpty()) {
-                client.fail("reload_bossbars_not_cleared");
+            int expectedBars = round.outcome == Outcome.ROLLED_BACK ? 1 : 0;
+            if (((BossBarHudAccessor) GuiApi.bossBars(game)).lightningRod$bossBars().size() != expectedBars) {
+                client.fail("reload_bossbar_state_incorrect");
                 return;
             }
             if (!client.screenshot("reload_return_" + round.label()).done()) return;
+            client.send("reload_selection");
             generation++;
             round = generation < ROUNDS.length ? ROUNDS[generation] : null;
             reloadPositioned = false;
@@ -132,6 +148,8 @@ final class ReloadFixture extends Fixture {
             if (game.level.players().size() != 2) return;
             reloadX = (r.peer.equals("alice") ? -3.5 : 3.5) + generation;
             reloadZ = 3.5 + generation;
+            game.player.getInventory().setSelectedSlot(selectedSlot());
+            game.getConnection().send(new ServerboundSetCarriedItemPacket(selectedSlot()));
             game.player.setPos(reloadX, 65, reloadZ);
             game.player.setYRot(r.peer.equals("alice") ? -90 : 90);
             game.getConnection().send(new ServerboundMovePlayerPacket.PosRot(reloadX, 65, reloadZ, game.player.getYRot(), 0, true, false));
@@ -214,6 +232,8 @@ final class ReloadFixture extends Fixture {
         r.marker(r.peer + ".reload-armed-" + round.label());
         reloadVerified = generation;
     }
+
+    private int selectedSlot() { return r.peer.equals("alice") ? 4 : 7; }
 
     private static int commandCount(Outcome outcome) {
         return (int) java.util.Arrays.stream(REQUESTS)

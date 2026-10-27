@@ -1,3 +1,4 @@
+const game_data = @import("game_data");
 const std = @import("std");
 const wire_1_21_5 = @import("wire_1_21_5");
 const block_actions = @import("block_actions.zig");
@@ -6,7 +7,6 @@ const chunks = @import("chunks");
 const sessions = @import("sessions");
 const worlds = @import("worlds");
 const minecraft = @import("minecraft_model");
-const registry = @import("game_data").registry;
 const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
 const Players = @import("players.zig").Players;
 const Input = @import("input.zig").Input;
@@ -54,13 +54,15 @@ pub const Placement = struct {
     pub fn tick(self: *Placement) !void {
         const players = self.deps.players;
 
-        for (players.records, self.states, 0..) |player, *state, index| {
+        for (players.activeSlots()) |index| {
+            const player = players.records[index];
+            const state = &self.states[index];
             const handle = player.handle orelse continue;
 
             if (state.generation != handle.generation or state.teleport_id != player.teleport_id)
                 state.* = .{ .generation = handle.generation, .teleport_id = player.teleport_id, .selected = player.selected_slot };
 
-            if (state.sequence >= 0 and self.deps.blocks.observers[index].pending == 0 and players.sendBlockAck(player.protocol, &.{handle}, state.sequence))
+            if (state.sequence >= 0 and self.deps.blocks.observers[index].pending == 0 and players.sendBlockAck(player.protocol, handle, state.sequence))
                 state.sequence = -1;
         }
     }
@@ -126,6 +128,7 @@ pub const Placement = struct {
         position.y += offset[@intCast(place.face)][1];
         position.z += offset[@intCast(place.face)][2];
         if (position.y < minimum_y or position.y >= minimum_y + @as(i32, @intCast(dimension.sectionCount() * 16))) return;
+        if (!players.insideBorder(.{ .x = @as(f64, @floatFromInt(position.x)) + 0.5, .y = @floatFromInt(position.y), .z = @as(f64, @floatFromInt(position.z)) + 0.5 })) return;
 
         const dx = @as(f64, @floatFromInt(position.x)) + 0.5 - player.position.x;
         const dy = @as(f64, @floatFromInt(position.y)) + 0.5 - player.position.y - 1.62;
@@ -138,7 +141,7 @@ pub const Placement = struct {
 
         if (held.stack) |stack| {
             const kind = try self.deps.items.kind(stack);
-            block = @intCast(registry.items[kind].block_state);
+            block = @intCast(game_data.registry.items[kind].block_state);
         }
 
         var allowed = block != 0 and previous == 0 and player.health > 0 and (player.gamemode == .creative or player.gamemode == .survival);
@@ -151,7 +154,13 @@ pub const Placement = struct {
         }) else .pass;
 
         if (custom == .denied) allowed = false;
-        if (custom == .pass) for (players.records) |other| {
+        var candidates = players.nearby(player.world, .{
+            .x = @as(f64, @floatFromInt(position.x)) + 0.5,
+            .y = @floatFromInt(position.y),
+            .z = @as(f64, @floatFromInt(position.z)) + 0.5,
+        }, 1);
+        if (custom == .pass) while (candidates.next()) |other_index| {
+            const other = players.records[other_index];
             if (!other.inWorld() or other.world != player.world or other.gamemode == .spectator) continue;
 
             const x: f64 = @floatFromInt(position.x);

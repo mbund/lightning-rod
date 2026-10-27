@@ -1,7 +1,24 @@
 const std = @import("std");
 const commands = @import("commands.zig");
 
+pub fn nodeCapacity(node: commands.Commands.Node) usize {
+    // Each child index is charged to its own node. Counts and indexes fit in two VarInt bytes.
+    var size: usize = 5 + 2 + node.name.len;
+    if (node.argument) |argument| {
+        size += 1;
+        size += switch (argument.kind) {
+            .integer => @as(usize, 1) + 4 * (@as(usize, @intFromBool(argument.minimum != null)) + @intFromBool(argument.maximum != null)),
+            .long => @as(usize, 1) + 8 * (@as(usize, @intFromBool(argument.minimum != null)) + @intFromBool(argument.maximum != null)),
+            .boolean => 0,
+            else => 1,
+        };
+        if (argument.suggest != null) size += 1 + "minecraft:ask_server".len;
+    }
+    return size;
+}
+
 pub fn treePacket(packet: anytype, tree: *const commands.Commands, visible: []const bool) ![]u8 {
+    std.debug.assert(tree.count > 0 and tree.count <= 1024 and visible.len == tree.count);
     var mapping: [1024]u16 = undefined;
     var count: u16 = 0;
 
@@ -22,11 +39,13 @@ pub fn treePacket(packet: anytype, tree: *const commands.Commands, visible: []co
         try writer.writeByte(flags);
         var children: u16 = 0;
 
-        for (tree.nodes[1..tree.count], 1..) |child, child_index| children += @intFromBool(child.parent == at and visible[child_index]);
+        var child = tree.children(@intCast(at));
+        while (child.next()) |index| children += @intFromBool(visible[index]);
         try writer.writeUleb128(children);
 
-        for (tree.nodes[1..tree.count], 1..) |child, child_index|
-            if (child.parent == at and visible[child_index]) try writer.writeUleb128(mapping[child_index]);
+        child = tree.children(@intCast(at));
+        while (child.next()) |index|
+            if (visible[index]) try writer.writeUleb128(mapping[index]);
         if (at == 0) continue;
         try string(&writer, node.name);
 

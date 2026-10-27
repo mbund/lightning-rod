@@ -7,6 +7,7 @@
         .lightning_rod = .{ .path = "../.." },
         .vanilla = .{ .path = "../../vanilla" },
         .chunks = .{ .path = "../../chunks" },
+        .records = .{ .path = "../../records" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

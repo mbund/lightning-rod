@@ -1,5 +1,37 @@
 const std = @import("std");
 const network = @import("networking");
+const framing = @import("shared.zig");
+
+pub const Packets = union(enum) {
+    framed: []const u8,
+    packets: []const []const u8,
+
+    pub fn next(self: *Packets) !?[]const u8 {
+        switch (self.*) {
+            .framed => |bytes| {
+                if (bytes.len == 0) return null;
+                const value = try framing.frame(bytes, std.math.maxInt(usize));
+                self.* = .{ .framed = bytes[value.length..] };
+                return value.body;
+            },
+            .packets => |values| {
+                if (values.len == 0) return null;
+                self.* = .{ .packets = values[1..] };
+                return values[0];
+            },
+        }
+    }
+};
+
+pub const Packet = union(enum) {
+    buffered: struct { storage: []u8, length: usize },
+    borrowed: []const u8,
+};
+
+pub const Fragments = struct {
+    first: []const u8,
+    second: []const u8 = &.{},
+};
 
 pub const StatusRequest = struct {
     protocol: i32,
@@ -14,9 +46,18 @@ pub const Keepalive = struct {
 
 pub const PlayEvent = union(enum) {
     attached: i96,
-    poll: i96,
+    poll: *Poll,
     park,
     disconnect: []const u8,
+};
+
+pub const Poll = struct {
+    now: i96 = 0,
+    deadline: ?i96 = null,
+
+    pub fn wakeAt(self: *Poll, deadline: i96) void {
+        self.deadline = @min(self.deadline orelse deadline, deadline);
+    }
 };
 
 pub const PhaseEvent = union(enum) {
@@ -34,6 +75,7 @@ pub const LoginStep = union(enum) {
     enable_compression,
 };
 
+// Responses outside the supplied output buffer must remain immutable until configuration drains.
 pub const ConfigurationStep = union(enum) {
     send: []const u8,
     done,
@@ -69,7 +111,29 @@ pub const State = struct {
     uuid: u128 = 0,
 };
 
+pub const LoginVerification = struct {
+    context: *anyopaque,
+    vtable: *const VTable,
+    const VTable = struct { verify: *const fn (*anyopaque) anyerror![16]u8 };
+
+    pub fn init(context: anytype, comptime verify: anytype) LoginVerification {
+        const Adapter = struct {
+            const vtable: VTable = .{ .verify = invoke };
+            fn invoke(raw: *anyopaque) anyerror![16]u8 {
+                const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
+                return verify(typed);
+            }
+        };
+        return .{ .context = context, .vtable = &Adapter.vtable };
+    }
+
+    pub fn run(self: LoginVerification) ![16]u8 {
+        return self.vtable.verify(self.context);
+    }
+};
+
 pub const Event = union(enum) {
+    verified: [16]u8,
     packet: []const u8,
     poll,
     admitted: ?[]const u8,
@@ -87,9 +151,11 @@ pub fn Context(comptime Observer: type) type {
         output: []u8,
         io: std.Io,
         now: i96,
+        poll: *Poll,
         reloading: bool,
         compression_threshold: ?usize,
         observer: *Observer,
+        verification: ?*?LoginVerification = null,
     };
 }
 

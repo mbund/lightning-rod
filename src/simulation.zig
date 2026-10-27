@@ -5,7 +5,6 @@ const PluginAllocator = @import("plugin_allocator.zig").PluginAllocator;
 const metrics = @import("metrics");
 const lifecycle = @import("plugin_lifecycle.zig");
 const storage = @import("storage");
-const Work = @import("work.zig").Work;
 const Checkpoint = @import("checkpoint.zig").Checkpoint;
 
 const assert = std.debug.assert;
@@ -17,8 +16,12 @@ pub const Autosave = struct {
 
 pub const Configuration = struct {
     autosave: Autosave = .{},
-    memory_bytes: usize = 256 * 1024,
+    /// The caller commits scoped simulations together after staging every checkpoint.
+    scope: ?*storage.Scope = null,
+    memory_bytes: usize = std.math.maxInt(usize),
     temporary_bytes: usize = 16 * 1024,
+    /// Borrowed scratch must outlive this simulation and remain exclusive during ticks and lifecycle hooks.
+    scratch: ?[]u8 = null,
     metrics: metrics.Registry.Configuration = .{ .capacity = 512 },
 };
 
@@ -28,11 +31,11 @@ pub fn Simulation(comptime Selections: type) type {
     return struct {
         const Self = @This();
 
-        pub const State = enum { created, ready, ticking, failed, closing, closed };
+        pub const State = enum { created, reserved, ready, ticking, failed, closing, closed };
 
         io: std.Io,
         state: State = .created,
-        bytes: []align(64) u8,
+        owned_scratch: ?[]align(64) u8,
         instances: plugin.Instances(Selections) = .{},
         permanent: PluginAllocator,
         temporary: std.heap.FixedBufferAllocator,
@@ -47,6 +50,7 @@ pub fn Simulation(comptime Selections: type) type {
         close_hooks: metrics.Timer = .{},
         close_wait: metrics.Timer = .{},
         storage: *storage.Store,
+        scope: ?*storage.Scope,
         transaction: storage.Transaction,
         completed_tick: u64,
         saved_tick: u64,
@@ -54,40 +58,40 @@ pub fn Simulation(comptime Selections: type) type {
         save_requested: Checkpoint = .{},
         closing: lifecycle.Closing = undefined,
         closing_slots: [closing_tokens]std.atomic.Value(bool) = undefined,
-        work: Work,
-        work_overhead_ns: u64 = std.time.ns_per_ms,
         plugin_bytes: [count]u64 = @splat(0),
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, store: *storage.Store, configuration: Configuration) !*Self {
             if (configuration.autosave.ticks == 0) return error.InvalidAutosaveConfiguration;
-            if (configuration.temporary_bytes > configuration.memory_bytes) return error.InvalidMemoryConfiguration;
-            if (configuration.temporary_bytes < plugin.minimumTickScratchBytes(Selections)) return error.InvalidMemoryConfiguration;
+            const scratch_bytes = if (configuration.scratch) |scratch| scratch.len else configuration.temporary_bytes;
+            if (configuration.scratch == null and configuration.temporary_bytes > configuration.memory_bytes) return error.InvalidMemoryConfiguration;
+            if (scratch_bytes < plugin.minimumTickScratchBytes(Selections)) return error.InvalidMemoryConfiguration;
 
-            const bytes = try allocator.alignedAlloc(u8, .@"64", configuration.memory_bytes);
-            errdefer allocator.free(bytes);
-            const end = bytes.len - configuration.temporary_bytes;
-            var bootstrap = std.heap.FixedBufferAllocator.init(bytes[0..end]);
-            const self = try bootstrap.allocator().create(Self);
-            const tasks = try bootstrap.allocator().alloc(Work.Task, count);
-            const transaction = store.transaction();
+            const owned_scratch_bytes = if (configuration.scratch == null) configuration.temporary_bytes else 0;
+            if (configuration.memory_bytes < @sizeOf(Self) or owned_scratch_bytes > configuration.memory_bytes - @sizeOf(Self)) return error.OutOfMemory;
+            const self = try allocator.create(Self);
+            errdefer allocator.destroy(self);
+            const owned_scratch = if (configuration.scratch == null) try allocator.alignedAlloc(u8, .@"64", owned_scratch_bytes) else null;
+            errdefer if (owned_scratch) |bytes| allocator.free(bytes);
+            if (configuration.scope) |scope| assert(scope.space.store == store);
+            const transaction = if (configuration.scope) |scope| scope.transaction() else store.transaction();
             errdefer transaction.fail();
             self.* = .{
                 .io = io,
-                .bytes = bytes,
-                .permanent = PluginAllocator.init(bytes[bootstrap.end_index..end]),
-                .temporary = std.heap.FixedBufferAllocator.init(bytes[end..]),
+                .owned_scratch = owned_scratch,
+                .permanent = PluginAllocator.init(allocator, configuration.memory_bytes - @sizeOf(Self) - owned_scratch_bytes),
+                .temporary = std.heap.FixedBufferAllocator.init(configuration.scratch orelse owned_scratch.?),
                 .metrics = try metrics.Registry.init(allocator, io, configuration.metrics),
-                .work = .{ .tasks = tasks },
                 .storage = store,
+                .scope = configuration.scope,
                 .transaction = transaction,
-                .completed_tick = store.lastTick(),
-                .saved_tick = store.lastTick(),
+                .completed_tick = if (configuration.scope) |scope| scope.tick else store.lastTick(),
+                .saved_tick = if (configuration.scope) |scope| scope.tick else store.lastTick(),
                 .autosave = configuration.autosave,
             };
             errdefer self.metrics.deinit();
             self.permanent.trackPlugins(&self.plugin_bytes);
             self.server_tick = try self.metrics.timer(.{ .name = "server.tick", .description = "Complete tick including session input and output publication" });
-            self.server_work = try self.metrics.timer(.{ .name = "server.work", .description = "Background work including output publication" });
+            self.server_work = try self.metrics.timer(.{ .name = "server.work", .description = "Between-tick storage progress and output publication" });
             self.tick_duration = try self.metrics.timer(.{ .name = "simulation.tick", .description = "Gameplay tick and storage submission" });
             self.checkpoint_duration = try self.metrics.timer(.{ .name = "simulation.checkpoint", .description = "Stage plugin state for submission" });
             self.checkpoint_cpu = try self.metrics.timer(.{ .name = "simulation.checkpoint.cpu", .description = "Plugin checkpoint work on the owning thread", .clock = .thread_cpu });
@@ -99,22 +103,34 @@ pub fn Simulation(comptime Selections: type) type {
         }
 
         pub fn initialize(self: *Self, selections: Selections, environment: anytype) !void {
+            errdefer {
+                self.state = .failed;
+                self.transaction.fail();
+            }
+            try self.construct(false, selections, environment);
+            self.state = .ready;
+        }
+
+        /// Construct configured capacity without restoring saved state.
+        pub fn reserve(self: *Self, selections: Selections, environment: anytype) !void {
+            try self.construct(true, selections, environment);
+            self.state = .reserved;
+        }
+
+        fn construct(self: *Self, comptime reserve_only: bool, selections: Selections, environment: anytype) !void {
             assert(self.state == .created);
             errdefer self.state = .failed;
             const transaction = self.transaction;
             errdefer transaction.fail();
-            try runtime.initialize(&self.instances, selections, &self.permanent, &self.metrics, &self.plugin_metrics, self.io, transaction, &self.work, plugin.environment(.{ .checkpoint = &self.save_requested }, environment));
-            self.work.registration_timer = .{};
+            try runtime.initialize(reserve_only, &self.instances, selections, &self.permanent, &self.metrics, &self.plugin_metrics, self.io, transaction, plugin.environment(.{ .checkpoint = &self.save_requested }, environment));
             self.metrics.seal();
-            self.work.sealed = true;
             self.permanent.seal();
-            self.state = .ready;
         }
 
         pub fn tick(self: *Self) !void {
             assert(self.state == .ready);
             const transaction = self.transaction;
-            self.metrics.sequence = self.completed_tick + 1;
+            self.metrics.sequence.store(self.completed_tick + 1, .release);
             const duration = self.tick_duration.start();
             defer duration.end();
             self.state = .ticking;
@@ -125,18 +141,23 @@ pub fn Simulation(comptime Selections: type) type {
             const next_tick = try std.math.add(u64, self.completed_tick, 1);
 
             self.temporary.reset();
+            runtime.beginTick(&self.instances);
+            var tick_finished = false;
+            defer if (!tick_finished) runtime.endTick(&self.instances, false);
             try runtime.tick(&self.instances, &self.temporary, &self.plugin_metrics, self.io, transaction);
             try transaction.progress();
             const scheduled = if (self.autosave.ticks) |interval| next_tick - self.saved_tick >= interval else false;
             self.completed_tick = next_tick;
             if (self.save_requested.requested or scheduled) {
-                try self.checkpoint(next_tick);
+                self.save_requested.requested = true;
+                if (self.scope == null) try self.checkpoint(next_tick, true);
             }
-            self.work.beginTick();
-            self.work_overhead_ns = @max(std.time.ns_per_ms, self.work_overhead_ns - self.work_overhead_ns / 8);
+            runtime.endTick(&self.instances, true);
+            tick_finished = true;
+            runtime.publish(&self.instances);
             self.temporary.reset();
             self.state = .ready;
-            assert(self.storage.lastTick() == self.saved_tick);
+            assert((if (self.scope) |scope| scope.tick else self.storage.lastTick()) == self.saved_tick);
             assert(self.saved_tick <= self.completed_tick);
         }
 
@@ -145,50 +166,76 @@ pub fn Simulation(comptime Selections: type) type {
             return self.instances.get(Plugin);
         }
 
-        /// Background I/O does not run gameplay hooks. Staged writes publish only
-        /// with a complete plugin checkpoint at a simulation boundary.
-        pub fn progress(self: *Self, deadline: i96) !Work.Result {
+        pub fn poll(self: *Self) !void {
             assert(self.state == .ready);
-            const started = std.Io.Clock.now(.awake, self.io).nanoseconds;
-            if (deadline - started <= self.work_overhead_ns) return .idle;
-            const transaction = self.transaction;
+            const work = self.server_work.start();
+            defer work.end();
             errdefer {
                 self.transaction.fail();
                 self.state = .failed;
             }
-
-            const running = std.Io.Clock.now(.awake, self.io).nanoseconds;
-            const result = try self.work.progress(self.io, deadline - self.work_overhead_ns);
-            const finished = std.Io.Clock.now(.awake, self.io).nanoseconds;
-            if (result == .progressed) try transaction.progress();
-            const overhead: u64 = @intCast(running - started + std.Io.Clock.now(.awake, self.io).nanoseconds - finished);
-            self.work_overhead_ns = @max(self.work_overhead_ns, overhead);
-            if (result == .idle and deadline - std.Io.Clock.now(.awake, self.io).nanoseconds > self.work_overhead_ns) {
-                if (try self.storage.maintain(8) == .progressed) return .progressed;
-            }
-            return result;
+            try self.transaction.progress();
+            runtime.publish(&self.instances);
         }
 
-        fn checkpoint(self: *Self, completed: u64) !void {
+        pub fn checkpointNow(self: *Self) !void {
+            assert(self.state == .ready);
+            assert(self.scope == null);
+            errdefer {
+                self.transaction.fail();
+                self.state = .failed;
+            }
+            try self.checkpoint(self.completed_tick, true);
+        }
+
+        pub fn save(self: *Self, deadline: std.Io.Clock.Timestamp) !void {
+            try self.checkpointNow();
+            try self.storage.waitDurableUntil(self.storage.lastCommit(), deadline);
+        }
+
+        pub fn stageCheckpoint(self: *Self) !void {
+            assert(self.state == .ready);
+            assert(self.scope != null);
+            errdefer {
+                self.transaction.fail();
+                self.state = .failed;
+            }
+            try self.serialize(self.completed_tick);
+        }
+
+        fn serialize(self: *Self, completed: u64) !void {
             const transaction = self.transaction;
-            {
-                const duration = self.checkpoint_duration.start();
-                defer duration.end();
-                const cpu = self.checkpoint_cpu.start();
-                defer cpu.end();
-                try runtime.checkpoint(&self.instances, &self.temporary, &self.plugin_metrics, self.io, transaction);
-            }
-            {
-                const duration = self.submit_duration.start();
-                defer duration.end();
-                const commit = try self.storage.commit(completed);
-                try self.storage.submitSync(commit);
-            }
+            const duration = self.checkpoint_duration.start();
+            defer duration.end();
+            const cpu = self.checkpoint_cpu.start();
+            defer cpu.end();
+            try runtime.checkpoint(&self.instances, &self.temporary, &self.plugin_metrics, self.io, transaction);
+            if (self.scope) |scope| try scope.setTick(completed);
             self.saved_tick = completed;
             self.save_requested.requested = false;
         }
 
+        fn checkpoint(self: *Self, completed: u64, sync: bool) !void {
+            assert(self.scope == null);
+            try self.serialize(completed);
+            {
+                const duration = self.submit_duration.start();
+                defer duration.end();
+                const commit = try self.storage.commit(completed);
+                if (sync) try self.storage.submitSync(commit);
+            }
+        }
+
         pub fn close(self: *Self, deadline: std.Io.Clock.Timestamp) !void {
+            assert(self.scope == null);
+            try self.finish(deadline, true);
+        }
+
+        pub fn unload(self: *Self, deadline: std.Io.Clock.Timestamp) !void {
+            try self.finish(deadline, false);
+        }
+
+        fn finish(self: *Self, deadline: std.Io.Clock.Timestamp, durable: bool) !void {
             assert(self.state != .ticking);
             assert(self.state != .closed);
 
@@ -196,7 +243,9 @@ pub fn Simulation(comptime Selections: type) type {
                 if (self.state == .created or self.state == .ready) {
                     errdefer self.state = .failed;
                     if (self.state == .created) self.transaction.fail();
-                    if (self.state == .ready and (self.completed_tick > self.saved_tick or self.storage.hasWrites())) try self.checkpoint(self.completed_tick);
+                    if (self.state == .ready and (self.completed_tick > self.saved_tick or self.storage.hasWrites())) {
+                        if (self.scope != null) try self.serialize(self.completed_tick) else try self.checkpoint(self.completed_tick, durable);
+                    }
                 }
                 self.state = .closing;
                 self.closing = lifecycle.Closing.init(self.io, deadline, &self.closing_slots);
@@ -209,15 +258,16 @@ pub fn Simulation(comptime Selections: type) type {
             const wait_started = self.close_wait.start();
             try self.closing.wait();
             wait_started.end();
-            try self.storage.waitDurableUntil(self.storage.lastCommit(), deadline);
+            if (durable) try self.storage.waitDurableUntil(self.storage.lastCommit(), deadline);
             self.state = .closed;
         }
 
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             assert(self.state == .closed);
-            const bytes = self.bytes;
             self.metrics.deinit();
-            allocator.free(bytes);
+            self.permanent.deinit();
+            if (self.owned_scratch) |bytes| allocator.free(bytes);
+            allocator.destroy(self);
         }
     };
 }

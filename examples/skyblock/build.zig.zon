@@ -1,0 +1,18 @@
+.{
+    .fingerprint = 0xba2a96c4265241e9,
+    .name = .lightning_rod_skyblock,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .lightning_rod = .{ .path = "../.." },
+        .host = .{ .path = "../../host" },
+        .reload = .{ .path = "../../reload" },
+        .reload_execve = .{ .path = "../../reload_execve" },
+        .sessions = .{ .path = "../../sessions" },
+        .records = .{ .path = "../../records" },
+        .protocols = .{ .path = "../../protocols" },
+        .minecraft_packets = .{ .path = "../../minecraft_packets" },
+        .vanilla = .{ .path = "../../vanilla" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

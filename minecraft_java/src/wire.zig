@@ -30,6 +30,10 @@ pub const Wire = struct {
         if (self.send_cipher) |*cipher| cipher.transform(.encrypt, bytes, bytes);
     }
 
+    pub fn encrypt(self: *Wire, source: []const u8, destination: []u8) void {
+        self.send_cipher.?.transform(.encrypt, source, destination);
+    }
+
     pub fn save(self: *const Wire, bytes: []u8) ![]const u8 {
         if (bytes.len < 50) return error.BufferTooSmall;
         bytes[0] = @intFromBool(self.compressed);
@@ -66,30 +70,42 @@ pub const Wire = struct {
         return if (self.compressed) try workspace.decode(input, threshold, destination) else input;
     }
 
-    pub fn control(self: *Wire, packet: []const u8, scratch: []u8, output: []u8, workspace: *Workspace, threshold: ?usize) ![]const u8 {
-        _ = scratch;
-        const result = if (self.compressed and packet.len >= threshold.?)
-            try workspace.compress(packet, output)
-        else blk: {
-            const zero: usize = @intFromBool(self.compressed);
-            if (packet.len + zero > output.len - 3) return error.BufferTooSmall;
-            output[3] = 0;
-            @memcpy(output[3 + zero ..][0..packet.len], packet);
-            break :blk frameOutput(output, packet.len + zero);
+    pub fn control(self: *Wire, packet: sessions.protocol.Packet, output: []u8, workspace: *Workspace, threshold: ?usize) !sessions.protocol.Fragments {
+        const source = switch (packet) {
+            .buffered => |value| value.storage[compression.headroom..][0..value.length],
+            .borrowed => |bytes| bytes,
         };
-        self.send(@constCast(result));
-        return result;
+        if (source.len == 0 or source.len > compression.maximum) return error.InvalidPacket;
+        if (threshold != null and source.len >= threshold.?) {
+            const result = try workspace.compress(source, output);
+            self.send(result);
+            return .{ .first = result };
+        }
+        if (packet == .buffered) {
+            const value = packet.buffered;
+            const result = try workspace.encode(value.storage, value.length, threshold, output);
+            self.send(result);
+            return .{ .first = result };
+        }
+        const zero: usize = @intFromBool(threshold != null);
+        const body_length = source.len + zero;
+        if (body_length > compression.maximum or output.len < compression.headroom) return error.BufferTooSmall;
+        const width: usize = if (body_length < 128) 1 else if (body_length < 16384) 2 else 3;
+        for (output[0..width], 0..) |*byte, index| {
+            byte.* = @as(u8, @intCast((body_length >> @intCast(index * 7)) & 127)) | (@as(u8, @intFromBool(index + 1 < width)) << 7);
+        }
+        if (threshold != null) output[width] = 0;
+        const prefix = width + zero;
+        if (self.encrypted()) {
+            if (source.len > output.len - prefix) return error.BufferTooSmall;
+            self.send(output[0..prefix]);
+            self.encrypt(source, output[prefix..][0..source.len]);
+            return .{ .first = output[0 .. prefix + source.len] };
+        }
+        return .{ .first = output[0..prefix], .second = source };
     }
 
     pub fn shared(workspace: *Workspace, storage: []u8, length: usize, threshold: ?usize, destination: []u8) ![]const u8 {
         return workspace.encode(storage, length, threshold, destination);
     }
 };
-
-fn frameOutput(storage: []u8, length: usize) []const u8 {
-    std.debug.assert(length > 0 and length <= compression.maximum and length <= storage.len - 3);
-    const prefix: usize = if (length < 128) 1 else if (length < 16384) 2 else 3;
-    for (storage[3 - prefix .. 3], 0..) |*byte, i|
-        byte.* = @as(u8, @intCast((length >> @intCast(i * 7)) & 127)) | (@as(u8, @intFromBool(i + 1 < prefix)) << 7);
-    return storage[3 - prefix .. 3 + length];
-}

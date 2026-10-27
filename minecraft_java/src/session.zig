@@ -36,9 +36,9 @@ pub const Handshake = struct {
 pub const Bootstrap = struct {
     pub const frame = wire.Wire.frame;
 
-    pub fn control(packet: []const u8, scratch: []u8, output: []u8) ![]const u8 {
+    pub fn control(packet: sessions.protocol.Packet, output: []u8) !sessions.protocol.Fragments {
         var codec: wire.Wire = .{};
         var workspace: wire.Wire.Workspace = undefined;
-        return codec.control(packet, scratch, output, &workspace, null);
+        return codec.control(packet, output, &workspace, null);
     }
 };

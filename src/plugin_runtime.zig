@@ -4,7 +4,6 @@ const PluginAllocator = @import("plugin_allocator.zig").PluginAllocator;
 const metrics = @import("metrics");
 const lifecycle = @import("plugin_lifecycle.zig");
 const storage = @import("storage");
-const Work = @import("work.zig").Work;
 
 const assert = std.debug.assert;
 
@@ -12,12 +11,11 @@ pub const Instruments = struct {
     initialization: metrics.Timer,
     tick: metrics.Timer,
     checkpoint: metrics.Timer,
-    work: metrics.Timer,
     persistent_bytes: metrics.Gauge,
     temporary_bytes: metrics.Gauge,
 };
 
-pub fn initialize(instances: anytype, selections: @TypeOf(instances.*).selections, allocator: *PluginAllocator, registry: *metrics.Registry, instruments: []Instruments, io: std.Io, transaction: storage.Transaction, work: *Work, environment: anytype) !void {
+pub fn initialize(comptime reserve: bool, instances: anytype, selections: @TypeOf(instances.*).selections, allocator: *PluginAllocator, registry: *metrics.Registry, instruments: []Instruments, io: std.Io, transaction: storage.Transaction, environment: anytype) !void {
     const Selections = @TypeOf(instances.*).selections;
     assert(instances.initialized == 0);
 
@@ -27,22 +25,48 @@ pub fn initialize(instances: anytype, selections: @TypeOf(instances.*).selection
             .initialization = try registry.timer(.{ .namespace = Plugin.id, .name = "initialize", .description = "Plugin initialization duration" }),
             .tick = try registry.timer(.{ .namespace = Plugin.id, .name = "tick", .description = "Plugin tick duration" }),
             .checkpoint = try registry.timer(.{ .namespace = Plugin.id, .name = "checkpoint", .description = "Plugin checkpoint duration" }),
-            .work = try registry.timer(.{ .namespace = Plugin.id, .name = "work", .description = "Plugin background work duration" }),
             .persistent_bytes = try registry.gauge(.{ .namespace = Plugin.id, .name = "persistent_memory", .description = "Plugin permanent allocations", .unit = .bytes }),
             .temporary_bytes = try registry.gauge(.{ .namespace = Plugin.id, .name = "temporary_memory", .description = "Plugin tick scratch allocations", .unit = .bytes }),
         };
-        work.registration_timer = instruments[index].work;
         allocator.beginPlugin(index);
         defer allocator.endPlugin();
         const timing = instruments[index].initialization.start();
         defer timing.end();
-        const deps = if (@hasDecl(Plugin, "Dependencies")) try dependencies(Plugin.Dependencies, Plugin.id, instances, transaction, work, environment) else .{};
+        const deps = if (@hasDecl(Plugin, "Dependencies")) try dependencies(Plugin.Dependencies, Plugin.id, instances, transaction, environment) else .{};
         const meta = if (@hasField(@TypeOf(environment), "meta")) environment.meta else .{};
-        const instance = try selection.initialize(Plugin, allocator.allocator(), io, selections[index].configuration, deps, meta);
+        const instance = if (reserve)
+            try selection.reserve(Plugin, allocator.allocator(), io, selections[index].configuration, deps, meta)
+        else
+            try selection.initialize(Plugin, allocator.allocator(), io, selections[index].configuration, deps, meta);
         if (!allocator.ownsCurrentPluginAllocation(instance)) return error.PluginAllocationInvalid;
         instruments[index].persistent_bytes.set(allocator.currentPluginBytes());
         instances.pointers[index] = instance;
         instances.initialized += 1;
+    }
+}
+
+pub fn beginTick(instances: anytype) void {
+    const Selections = @TypeOf(instances.*).selections;
+    inline for (0..comptime selection.selectedCount(Selections)) |index| {
+        const Plugin = selection.selectedPlugin(selection.selectedType(Selections, index));
+        if (@hasDecl(Plugin, "beginTick")) instances.get(Plugin).beginTick();
+    }
+}
+
+pub fn endTick(instances: anytype, success: bool) void {
+    const Selections = @TypeOf(instances.*).selections;
+    inline for (0..comptime selection.selectedCount(Selections)) |offset| {
+        const index = comptime selection.selectedCount(Selections) - offset - 1;
+        const Plugin = selection.selectedPlugin(selection.selectedType(Selections, index));
+        if (@hasDecl(Plugin, "endTick")) instances.get(Plugin).endTick(success);
+    }
+}
+
+pub fn publish(instances: anytype) void {
+    const Selections = @TypeOf(instances.*).selections;
+    inline for (0..comptime selection.selectedCount(Selections)) |index| {
+        const Plugin = selection.selectedPlugin(selection.selectedType(Selections, index));
+        if (@hasDecl(Plugin, "publish")) instances.get(Plugin).publish();
     }
 }
 
@@ -114,15 +138,13 @@ pub fn close(instances: anytype, io: std.Io, closing: *lifecycle.Closing) void {
     closing.seal();
 }
 
-fn dependencies(comptime T: type, comptime requester: []const u8, instances: anytype, transaction: storage.Transaction, work: *Work, environment: anytype) !T {
+fn dependencies(comptime T: type, comptime requester: []const u8, instances: anytype, transaction: storage.Transaction, environment: anytype) !T {
     var result: T = undefined;
 
     inline for (@typeInfo(T).@"struct".fields) |field| {
         const Selections = @TypeOf(instances.*).selections;
         if (field.type == storage.Space) {
             @field(result, field.name) = try transaction.openSpace(requester);
-        } else if (field.type == *Work) {
-            @field(result, field.name) = work;
         } else {
             const before = comptime selection.indexOfId(Selections, requester).?;
             @field(result, field.name) = selection.dependency(field.name, field.type, instances, environment, before);

@@ -4,21 +4,18 @@ const lightning_rod = @import("lightning_rod");
 const protocols = @import("protocols");
 const vanilla = @import("vanilla");
 const sessions = @import("sessions");
-const bootstrap = e2e.server;
 
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
-        lightning_rod.plugin.replace(lightning_rod.plugin.remove(bootstrap.plugins(), vanilla.Lore), .{
+        lightning_rod.plugin.replace(lightning_rod.plugin.remove(e2e.profile.plugins(), vanilla.Lore), .{
             lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 2, .render_distance = 2 }),
         }),
         lightning_rod.plugin.configured(Economy, .{}),
         lightning_rod.plugin.configured(PriceLore, .{}),
     });
-    try bootstrap.run(init, plugins, .{ .plaintext = true, .reload_executable = "/proc/self/exe" });
+    try e2e.profile.run(init, plugins, .{ .plaintext = true, .reload_executable = "/proc/self/exe" });
 }
 
-const encoding = protocols.support;
-const nbt = protocols.nbt;
 const Payload = vanilla.item_lore.Payload;
 const ReadContext = vanilla.item_components.ReadContext;
 const WriteContext = vanilla.item_components.WriteContext;
@@ -67,11 +64,11 @@ const Economy = struct {
             defer lease.release();
             const view = try vanilla.item_data.View.parse(lease.read().?);
             const lore = view.value(.lore) orelse return error.MissingOriginalLore;
-            const count, const rest = try encoding.read_varint(lore);
+            const count, const rest = try protocols.support.read_varint(lore);
             if (count != 1) return error.PresentationPersisted;
-            var nodes: [16]nbt.Node = undefined;
-            var frames: [8]nbt.Frame = undefined;
-            const original = try nbt.scan_anonymous(rest, &nodes, &frames);
+            var nodes: [16]protocols.nbt.Node = undefined;
+            var frames: [8]protocols.nbt.Frame = undefined;
+            const original = try protocols.nbt.scan_anonymous(rest, &nodes, &frames);
             const text = if (original.root_node().tag == .string) original.root_node() else original.childNamed("text") orelse return error.InvalidOriginalLore;
             if (!std.mem.eql(u8, try text.string(), "Original lore")) return error.OriginalLoreChanged;
             if ((try store.get(.{ .owner = player.uuid, .index = 38 })).stack != null) return error.UnsupportedComponentAccepted;
@@ -113,8 +110,8 @@ const PriceLore = struct {
         var marker_buffer: [80]u8 = undefined;
         const marker = try sign(&marker_buffer, text, context.value != null);
         var buffer: [256]u8 = undefined;
-        var frames: [2]nbt.WriteFrame = undefined;
-        var writer = nbt.Writer.init(&buffer, &frames);
+        var frames: [2]protocols.nbt.WriteFrame = undefined;
+        var writer = protocols.nbt.Writer.init(&buffer, &frames);
         try writer.beginAnonymousCompound();
         try writer.putString("text", text);
         try writer.putString("insertion", marker);
@@ -134,9 +131,9 @@ const PriceLore = struct {
             try lines.advance(done);
         }
         if (count != 0) {
-            var nodes: [32]nbt.Node = undefined;
-            var frames: [8]nbt.Frame = undefined;
-            const footer = try nbt.scan_anonymous(values[count - 1], &nodes, &frames);
+            var nodes: [32]protocols.nbt.Node = undefined;
+            var frames: [8]protocols.nbt.Frame = undefined;
+            const footer = try protocols.nbt.scan_anonymous(values[count - 1], &nodes, &frames);
             if (footer.root_node().tag == .compound) {
                 if (footer.childNamed("insertion")) |insertion| {
                     const marker = try insertion.string();
@@ -151,8 +148,8 @@ const PriceLore = struct {
                 }
             }
         }
-        context.output.* = try encoding.write_varint(context.output.*, @intCast(count));
-        for (values[0..count]) |value| context.output.* = try encoding.write_bytes(context.output.*, value);
+        context.output.* = try protocols.support.write_varint(context.output.*, @intCast(count));
+        for (values[0..count]) |value| context.output.* = try protocols.support.write_bytes(context.output.*, value);
         return lines.finish();
     }
 };

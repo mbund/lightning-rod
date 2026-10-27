@@ -1,13 +1,17 @@
 const protocol = @import("protocol.zig");
 
-pub const Route = union(enum) {
-    destination: usize,
-    pending,
-    reject,
-};
+pub fn Route(comptime T: type) type {
+    return union(enum) {
+        destination: T,
+        pending,
+        reject,
+    };
+}
 
 pub const SingleSimulation = struct {
-    pub fn route(_: *SingleSimulation, _: protocol.Profile) Route {
+    pub const Destination = u32;
+
+    pub fn route(_: *SingleSimulation, _: protocol.Profile) Route(Destination) {
         return .{ .destination = 0 };
     }
 };

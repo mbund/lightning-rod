@@ -5,9 +5,11 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .chunks = .{ .path = "../../chunks" },
+        .records = .{ .path = "../../records" },
         .storage = .{ .path = "../../storage" },
         .metrics = .{ .path = "../../metrics" },
         .nbt = .{ .path = "../../nbt" },
+        .comparison = .{ .path = "../records" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

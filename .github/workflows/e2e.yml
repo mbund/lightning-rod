@@ -36,6 +36,8 @@ jobs:
       matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
       - name: Install Zig
         run: bash .github/scripts/install-zig.sh
       - uses: actions/setup-java@v6
@@ -46,6 +48,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends xvfb libgl1-mesa-dri libglx-mesa0 libgl1 libxrandr2 libxinerama1 libxcursor1 libxi6 libasound2t64
+      - name: Fetch Zig dependencies
+        working-directory: e2e
+        run: |
+          for attempt in 1 2 3; do
+            if zig build --fetch=all; then exit 0; fi
+            if test "$attempt" -eq 3; then exit 1; fi
+            sleep "$attempt"
+          done
       - name: Real-client acceptance
         working-directory: e2e
         env:
@@ -53,7 +63,7 @@ jobs:
           VERSION: ${{ matrix.version }}
           LIBGL_ALWAYS_SOFTWARE: '1'
         run: |
-          zig build --release=safe e2e -Dscenario="$SCENARIO" -Dclient-version="$VERSION" -Dio=uring
+          zig build --release=safe e2e -Dscenario="$SCENARIO" -Dclient-version="$VERSION"
       - name: Preserve evidence
         if: always()
         uses: actions/upload-artifact@v7
@@ -61,6 +71,7 @@ jobs:
           name: e2e-${{ matrix.scenario }}-${{ matrix.version }}
           path: |
             e2e/tests/*/artifacts/**/summary.json
+            e2e/tests/*/artifacts/**/upgrade.json
             e2e/tests/*/artifacts/**/*.metrics.json
             e2e/tests/*/artifacts/**/*.result
             e2e/tests/*/artifacts/**/*.log

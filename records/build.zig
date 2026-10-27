@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Verify cached records and persistent indexes");
     const fault = b.createModule(.{ .root_source_file = storage.path("src/fault_disk.zig"), .target = target, .optimize = optimize });
     const storage_testing = b.createModule(.{ .root_source_file = storage.path("src/testing.zig"), .target = target, .optimize = optimize });
-    for ([_][]const u8{ "src/cache_test.zig", "src/model_test.zig", "src/fault_test.zig" }) |source| {
+    for ([_][]const u8{ "src/cache_test.zig", "src/model_test.zig", "src/fault_test.zig", "src/blob_test.zig" }) |source| {
         const tests = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(source),
             .target = target,

@@ -106,7 +106,11 @@ pub const Corpus = struct {
         return null;
     }
 
-    pub fn read(self: *Corpus, section: chunks.Section, output: []u8) !usize {
+    pub fn read(self: *Corpus, io: std.Io, batch: chunks.Source.Batch) void {
+        for (batch.requests) |*request| request.result = self.readOne(io, request.section, request.output);
+    }
+
+    pub fn readOne(self: *Corpus, _: std.Io, section: chunks.Section, output: []u8) !usize {
         if (section.world != 0 or section.y < minimum_y or section.y >= minimum_y + section_count) return error.SectionOutsideCorpus;
         const id = self.find(section.x, section.z) orelse return error.SectionOutsideCorpus;
         const bytes = self.columns[id].sections[@intCast(section.y - minimum_y)];

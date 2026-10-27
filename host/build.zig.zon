@@ -1,0 +1,14 @@
+.{
+    .fingerprint = 0xbde4b2bd7e5a4f73,
+    .name = .lightning_rod_host,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .lightning_rod = .{ .path = ".." },
+        .storage = .{ .path = "../storage" },
+        .reload = .{ .path = "../reload" },
+        .reload_execve = .{ .path = "../reload_execve" },
+        .sessions = .{ .path = "../sessions" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

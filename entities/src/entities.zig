@@ -26,6 +26,7 @@ pub const Entities = struct {
     };
 
     pub const Dependencies = struct {
+        record_workspaces: *records.Workspaces,
         metrics: *metrics.Registry,
         storage: storage.Space,
     };
@@ -36,8 +37,10 @@ pub const Entities = struct {
     checkpointed_id: Id,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, configuration: Configuration, deps: Dependencies) !*Entities {
+        const self = try allocate(allocator, io, configuration, deps);
+        const table_resources = deps.record_workspaces.resources;
         var sequence: [8]u8 = undefined;
-        const length = try records.Table.init(deps.storage).get(&.{0}, &sequence);
+        const length = try records.Table.init(deps.storage, table_resources).get(&.{0}, &sequence);
         if (length != null and length.? != sequence.len)
             return error.Corrupt;
 
@@ -45,10 +48,17 @@ pub const Entities = struct {
         if (next_id == 0)
             return error.Corrupt;
 
+        self.next_id = next_id;
+        self.checkpointed_id = next_id;
+        return self;
+    }
+
+    pub fn allocate(allocator: std.mem.Allocator, io: std.Io, configuration: Configuration, deps: Dependencies) !*Entities {
+        const table_resources = deps.record_workspaces.resources;
         const self = try allocator.create(Entities);
         self.* = .{
             .deps = deps,
-            .cache = try records.Cache.init(allocator, io, records.Table.init(deps.storage), .{
+            .cache = try records.Cache.init(allocator, io, records.Table.init(deps.storage, table_resources), .{
                 .metrics = deps.metrics,
                 .metrics_namespace = "entities.cache",
                 .slots = configuration.cache_records,
@@ -56,31 +66,39 @@ pub const Entities = struct {
                 .value_bytes = encoded_bytes,
                 .scan_batch = 16,
             }),
-            .next_id = next_id,
-            .checkpointed_id = next_id,
+            .next_id = 1,
+            .checkpointed_id = 1,
         };
         return self;
     }
 
     pub fn create(self: *Entities, state: State) !Id {
-        if (self.next_id == std.math.maxInt(Id))
-            return error.IdExhausted;
+        var output: [1]Id = undefined;
+        try self.createMany(&.{state}, &output);
+        return output[0];
+    }
 
-        if (!valid(state))
-            return error.InvalidEntity;
-
-        const result = self.next_id;
-        const key = encodeKey(result);
-        const lease = try self.cache.acquire(&key);
-        defer lease.release();
-        if (lease.read() != null)
-            return error.Corrupt;
-
-        encode(state, lease.edit());
-        lease.commit(encoded_bytes);
-        self.next_id += 1;
-        assert(result != 0 and result < self.next_id);
-        return result;
+    pub fn createMany(self: *Entities, states: []const State, output: []Id) !void {
+        if (states.len != output.len or states.len > 128 or states.len > self.cache.entries.len) return error.WorkingSetTooLarge;
+        if (states.len > std.math.maxInt(Id) - self.next_id) return error.IdExhausted;
+        for (states) |state| if (!valid(state)) return error.InvalidEntity;
+        var keys: [128][9]u8 = undefined;
+        var slices: [128][]const u8 = undefined;
+        var leases: [128]records.Cache.Lease = undefined;
+        for (states, 0..) |_, index| {
+            keys[index] = encodeKey(self.next_id + index);
+            slices[index] = &keys[index];
+        }
+        try self.cache.acquireMany(slices[0..states.len], leases[0..states.len]);
+        defer for (leases[0..states.len]) |lease| lease.release();
+        for (leases[0..states.len]) |lease| if (lease.read() != null) return error.Corrupt;
+        for (states, output, leases[0..states.len], 0..) |state, *entity, lease, index| {
+            encode(state, lease.edit());
+            lease.commit(encoded_bytes);
+            entity.* = self.next_id + index;
+            assert(entity.* != 0);
+        }
+        self.next_id += states.len;
     }
 
     pub const Lease = struct {
@@ -145,30 +163,27 @@ pub const Entities = struct {
     /// Ordered by stable entity ID. Storage may be read synchronously in bounded batches. The
     /// returned values belong to this cursor.
     pub fn scan(self: *Entities, cursor: *Cursor) ![]const Row {
-        var entries: [16]records.ScanEntry = undefined;
-
-        for (&entries, &cursor.keys, &cursor.values) |*entry, *key, *value|
-            entry.* = .{ .key = key, .value = value };
+        var entries: [16]records.BorrowedEntry = undefined;
 
         var position: records.ScanCursor = .{
             .after = &cursor.after,
             .after_len = cursor.after_len,
         };
-        const batch = try self.cache.scan(&position, &entries);
+        const batch = try self.cache.scanBorrowed(&position, &entries);
         cursor.after_len = position.after_len;
         cursor.more = batch.more;
         var count: usize = 0;
 
         for (entries[0..batch.count]) |entry| {
-            if (entry.key_len == 1 and entry.key[0] == 0)
+            if (entry.key.len == 1 and entry.key[0] == 0)
                 continue;
 
-            if (entry.key_len != 9 or entry.key[0] != 1)
+            if (entry.key.len != 9 or entry.key[0] != 1)
                 return error.Corrupt;
 
             cursor.rows[count] = .{
                 .id = std.mem.readInt(Id, entry.key[1..9], .big),
-                .state = try decode(entry.value[0..entry.value_len]),
+                .state = try decode(entry.value),
             };
             count += 1;
         }
@@ -177,13 +192,14 @@ pub const Entities = struct {
     }
 
     pub fn checkpoint(self: *Entities, space: storage.Space) !void {
+        const table_resources = self.deps.record_workspaces.resources;
         try self.cache.flush();
         if (self.next_id == self.checkpointed_id)
             return;
 
         var sequence: [8]u8 = undefined;
         std.mem.writeInt(Id, &sequence, self.next_id, .little);
-        try records.Table.init(space).put(&.{0}, &sequence);
+        try records.Table.init(space, table_resources).put(&.{0}, &sequence);
         self.checkpointed_id = self.next_id;
     }
 };
@@ -197,8 +213,6 @@ pub const Cursor = struct {
     after: [9]u8 = undefined,
     after_len: usize = 0,
     more: bool = true,
-    keys: [16][9]u8 = undefined,
-    values: [16][encoded_bytes]u8 = undefined,
     rows: [16]Row = undefined,
 };
 

@@ -40,7 +40,9 @@ pub const Keepalive = struct {
                 if (self.configuration.interval_ns <= 0 or self.configuration.timeout_ns <= 0) return error.InvalidKeepalivePolicy;
                 state.* = .{ .due = now + self.configuration.interval_ns };
             },
-            .poll => |now| {
+            .poll => |poll| {
+                const now = poll.now;
+                defer poll.wakeAt(state.due);
                 if (now < state.due) return null;
                 if (state.expected != null) return error.KeepaliveTimeout;
                 const value: i64 = @intCast(@divTrunc(now, std.time.ns_per_ms));
@@ -58,3 +60,41 @@ pub const Keepalive = struct {
         return (try packet.keepAliveId(value)).finish();
     }
 };
+
+test "keepalive deadlines follow attachment, send, response, timeout, and parking" {
+    const interval = 10 * std.time.ns_per_s;
+    const timeout = 30 * std.time.ns_per_s;
+    var keepalive: Keepalive = .{ .configuration = .{ .interval_ns = interval, .timeout_ns = timeout } };
+    const profile: sessions.Profile = .{ .connection = .{ .index = 0, .generation = 1 }, .protocol = protocols.implementations[0].protocol_number, .uuid = 1, .name = "alice" };
+    var state: Keepalive.SessionPlayState = .{};
+    var output: [128]u8 = undefined;
+    try std.testing.expectEqual(null, try keepalive.onPlay(profile, &state, .{ .attached = 1 }, &output));
+
+    var poll: sessions.protocol.Poll = .{ .now = 1 };
+    try std.testing.expectEqual(null, try keepalive.onPlay(profile, &state, .{ .poll = &poll }, &output));
+    try std.testing.expectEqual(@as(?i96, 1 + interval), poll.deadline);
+
+    poll = .{ .now = state.due };
+    try std.testing.expect((try keepalive.onPlay(profile, &state, .{ .poll = &poll }, &output)) != null);
+    try std.testing.expectEqual(@as(?i96, poll.now + timeout), poll.deadline);
+    const expected = state.expected.?;
+
+    var response: [128]u8 = undefined;
+    const writer = try wire_1_21_5.play.toServer.write(&response).keep_alive();
+    const bytes = (try writer.keepAliveId(expected)).finish();
+    const header = try wire_1_21_5.play.toServer.readHeader(bytes);
+    const now = poll.now + std.time.ns_per_s;
+    const packet: wire_1_21_5.play.toServer.packet_keep_alive.Reader = .{ ._cursor = .{ .buffer = header.body, .rest = header.body } };
+    _ = try keepalive.onResponse(.{ .profile = profile, .io = std.testing.io, .now = now }, &state, packet, &output);
+    try std.testing.expectEqual(null, state.expected);
+    poll = .{ .now = now };
+    try std.testing.expectEqual(null, try keepalive.onPlay(profile, &state, .{ .poll = &poll }, &output));
+    try std.testing.expectEqual(@as(?i96, now + interval), poll.deadline);
+
+    poll = .{ .now = state.due };
+    try std.testing.expect((try keepalive.onPlay(profile, &state, .{ .poll = &poll }, &output)) != null);
+    poll = .{ .now = state.due };
+    try std.testing.expectError(error.KeepaliveTimeout, keepalive.onPlay(profile, &state, .{ .poll = &poll }, &output));
+    try std.testing.expectEqual(null, try keepalive.onPlay(profile, &state, .park, &output));
+    try std.testing.expectEqualDeep(Keepalive.SessionPlayState{}, state);
+}

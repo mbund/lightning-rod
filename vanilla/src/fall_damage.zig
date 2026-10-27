@@ -52,7 +52,9 @@ pub const FallDamage = struct {
     }
 
     pub fn tick(self: *FallDamage) void {
-        for (self.deps.players.records, self.falls) |*player, *fall| {
+        for (self.deps.players.activeSlots()) |index| {
+            const player = &self.deps.players.records[index];
+            const fall = &self.falls[index];
             const handle = player.handle orelse continue;
             if (fall.generation != handle.generation or fall.teleport_id != player.teleport_id) {
                 fall.* = .{ .generation = handle.generation, .teleport_id = player.teleport_id, .y = player.position.y };
@@ -63,7 +65,7 @@ pub const FallDamage = struct {
 
             if (player.stage != .ready or player.health == player.health_sent) continue;
 
-            if (self.deps.players.sendHealth(player.protocol, &.{handle}, player.health))
+            if (self.deps.players.sendHealth(player.protocol, handle, player.health))
                 player.health_sent = player.health;
         }
     }

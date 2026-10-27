@@ -325,7 +325,9 @@ pub const SurvivalInventory = struct {
     pub fn tick(self: *SurvivalInventory) !void {
         const menu = self.deps.inventory;
         const service = self.deps.sessions;
-        connections: for (self.deps.players.records, menu.states, 0..) |*player, *state, player_index| {
+        connections: for (self.deps.players.activeSlots()) |player_index| {
+            const player = &self.deps.players.records[player_index];
+            const state = &menu.states[player_index];
             const handle = player.handle orelse continue;
             if (player.gamemode == .creative or player.stage != .ready or !player.loaded) continue;
             if (state.presentation != self.deps.items.components.revision) {
@@ -334,22 +336,11 @@ pub const SurvivalInventory = struct {
             }
             if (state.close) try self.apply(player_index, .{ .inventory_close = 0 });
             if (state.dirty == 0 and state.generation == handle.generation and state.life == player.life and state.gamemode == player.gamemode) continue;
-            var slots: [47]inventories.Slot = undefined;
-            var contents: [47]inventories.Contents = undefined;
-            try menu.load(player_index, &slots, &contents);
-            if (state.dirty == 0) continue;
-
-            self.deps.packets.sendPacketRetrying(PlayerInventory.writeInventory, player.protocol, &.{handle}, .{
-                self.deps.items, state.revision, &contents, player.uuid,
-            }, service.config.page_bytes) catch |err| switch (err) {
-                error.EndOfStream, error.UnsupportedItem, error.UnsupportedComponent => {
-                    service.disconnect(handle);
-                    continue :connections;
-                },
+            menu.synchronize(player_index, self.deps.packets, service) catch |err| switch (err) {
+                error.EndOfStream, error.UnsupportedItem, error.UnsupportedComponent => service.disconnect(handle),
                 error.Backpressured, error.Closed => continue :connections,
                 else => return err,
             };
-            state.dirty = 0;
         }
     }
 };

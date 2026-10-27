@@ -1,3 +1,4 @@
+const SpatialIndex = @import("player_spatial.zig").Index;
 const persistent_records = @import("records");
 const std = @import("std");
 const wire_26_2 = @import("wire_26_2");
@@ -8,12 +9,12 @@ const sessions = @import("sessions");
 const minecraft = @import("minecraft_model");
 const minecraft_packets = @import("minecraft_packets");
 const lightning_rod = @import("lightning_rod");
+const IndexSet = lightning_rod.system.IndexSet;
 const Input = @import("input.zig").Input;
-const storage = lightning_rod.storage;
 
 pub const Players = struct {
     pub const id = "minecraft:players";
-    pub const maximum_players = 256;
+    const saved_size = 45;
 
     pub const Configuration = struct {
         maximum: usize = 32,
@@ -25,24 +26,28 @@ pub const Players = struct {
         spawn: minecraft.Position = .{ .x = 0.5, .y = 65, .z = 0.5 },
         spawn_for_player: ?*const fn (*const Player) minecraft.Position = null,
         dig_observers: usize = 16,
+        world_border: ?f64 = null,
     };
 
     pub const Stage = enum {
         login,
         brand,
         tab,
+        border,
         teleport,
         awaiting_teleport,
         health,
+        selection,
         ready,
         respawn,
     };
 
     pub const Dependencies = struct {
+        record_workspaces: *persistent_records.Workspaces,
         sessions: *sessions.Service,
         packets: *minecraft_packets.Packets,
         input: *Input,
-        storage: storage.Space,
+        storage: lightning_rod.storage.Space,
         worlds: *worlds.Worlds,
         vanilla_worlds: *default_worlds.VanillaWorlds,
     };
@@ -72,7 +77,7 @@ pub const Players = struct {
         health_sent: f32 = 20,
         life: u32 = 1,
         selected_slot: u4 = 0,
-        saved: [44]u8 = @splat(0),
+        saved: [saved_size]u8 = @splat(0),
 
         pub fn inWorld(self: Player) bool {
             return self.handle != null;
@@ -88,9 +93,8 @@ pub const Players = struct {
     spawn_world: u32,
     records: []Player,
     ticks: u64 = 0,
-    spatial: [maximum_players]u8 = undefined,
-    spatial_count: usize = 0,
-    spatial_keys: [maximum_players]SpatialKey = @splat(.{}),
+    connected: IndexSet = .{ .indices = &.{}, .positions = &.{} },
+    spatial: SpatialIndex = .{},
     movement_observer: ?MovementObserver = null,
 
     dig_handlers: []DigHandler,
@@ -107,66 +111,40 @@ pub const Players = struct {
         const VTable = struct { call: *const fn (*anyopaque, sessions.Handle, minecraft.Dig, std.mem.Allocator) anyerror!void };
     };
 
-    const SpatialKey = struct {
-        ready: bool = false,
-        world: u32 = 0,
-        column: f64 = 0,
-    };
-
-    /// Refresh once before a batch of nearby queries. Records are public, so compare
-    /// the sorting keys rather than relying on every writer to invalidate the index.
-    pub fn refreshSpatial(self: *Players) void {
-        var changed = false;
-        for (self.records, self.spatial_keys[0..self.records.len]) |player, *previous| {
-            const key: SpatialKey = if (player.inWorld())
-                .{ .ready = true, .world = player.world, .column = @floor(player.position.x / 16) }
-            else
-                .{};
-            changed = changed or !std.meta.eql(key, previous.*);
-            previous.* = key;
-        }
-        if (!changed) return;
-        self.spatial_count = 0;
-        for (self.records, 0..) |player, index| {
-            if (!player.inWorld()) continue;
-            self.spatial[self.spatial_count] = @intCast(index);
-            self.spatial_count += 1;
-        }
-        std.mem.sort(u8, self.spatial[0..self.spatial_count], self, struct {
-            fn less(players: *Players, a: u8, b: u8) bool {
-                const left = players.spatial_keys[a];
-                const right = players.spatial_keys[b];
-                if (left.world != right.world) return left.world < right.world;
-                return if (left.column != right.column) left.column < right.column else a < b;
-            }
-        }.less);
+    pub fn initIndexes(self: *Players, allocator: std.mem.Allocator) !void {
+        std.debug.assert(self.spatial.nodes.len == 0);
+        if (self.records.len != 0) self.connected = try IndexSet.init(allocator, self.records.len);
+        self.spatial = try SpatialIndex.init(allocator, self.records.len);
     }
 
-    /// Candidates in a chunk-column square, using the current spatial snapshot.
-    pub fn nearby(self: *Players, world: u32, position: minecraft.Position, radius: i32) u256 {
-        const x = @floor(position.x / 16);
-        const z = @floor(position.z / 16);
-        const distance: f64 = @floatFromInt(radius);
-        var low: usize = 0;
-        var high = self.spatial_count;
-        while (low < high) {
-            const middle = low + (high - low) / 2;
-            const player = self.records[self.spatial[middle]];
-            if (player.world < world or (player.world == world and @floor(player.position.x / 16) < x - distance)) low = middle + 1 else high = middle;
-        }
-        var found: u256 = 0;
-        for (self.spatial[low..self.spatial_count]) |index| {
-            const player = self.records[index];
-            if (player.world != world or @floor(player.position.x / 16) > x + distance) break;
-            if (@abs(@floor(player.position.z / 16) - z) <= distance) found |= @as(u256, 1) << index;
-        }
-        return found;
+    pub fn rebuildIndexes(self: *Players) void {
+        for (0..self.records.len) |index| self.updateIndexes(index);
+    }
+
+    fn updateIndexes(self: *Players, index: usize) void {
+        std.debug.assert(index < self.records.len);
+        self.track(index);
+        const player = self.records[index];
+        self.spatial.update(index, if (player.inWorld()) .{
+            .world = player.world,
+            .x = @intFromFloat(@floor(player.position.x / 16)),
+            .z = @intFromFloat(@floor(player.position.z / 16)),
+        } else null);
+    }
+
+    pub const Nearby = SpatialIndex.Query;
+
+    pub fn nearby(self: *const Players, world: u32, position: minecraft.Position, radius: i32) Nearby {
+        return self.spatial.query(.{ .world = world, .x = @intFromFloat(@floor(position.x / 16)), .z = @intFromFloat(@floor(position.z / 16)) }, radius);
     }
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Players {
-        if (config.maximum == 0 or config.maximum > maximum_players or config.render_distance < 2 or config.render_distance > 32 or config.simulation_distance < 1 or config.dig_observers == 0 or config.dig_observers > 256)
+        if (config.maximum == 0 or config.render_distance < 2 or config.render_distance > 32 or config.simulation_distance < 1 or config.dig_observers == 0 or config.dig_observers > 256)
             return error.InvalidConfiguration;
         if (config.brand.len == 0 or config.brand.len > 256) return error.InvalidConfiguration;
+        if (config.world_border) |diameter| {
+            if (!std.math.isFinite(diameter) or diameter < 1 or diameter > 60_000_000 or @abs(config.spawn.x) > diameter / 2 - 0.3 or @abs(config.spawn.z) > diameter / 2 - 0.3) return error.InvalidConfiguration;
+        }
 
         inline for (.{ config.spawn.x, config.spawn.y, config.spawn.z }) |coordinate| {
             if (!std.math.isFinite(coordinate) or @abs(coordinate) > 30_000_000) return error.InvalidConfiguration;
@@ -182,6 +160,8 @@ pub const Players = struct {
         for (records) |*player| player.* = .{};
 
         self.* = .{ .deps = deps, .config = config, .spawn_world = spawn_world, .records = records, .dig_handlers = try allocator.alloc(DigHandler, config.dig_observers) };
+        try self.initIndexes(allocator);
+        self.rebuildIndexes();
         try deps.input.onLifecycle(self, onLifecycle);
         try deps.input.on(.teleport_confirm, self, onTeleportConfirm);
         try deps.input.on(.client_command, self, onClientCommand);
@@ -198,8 +178,57 @@ pub const Players = struct {
         return self;
     }
 
-    fn onLifecycle(self: *Players, event: sessions.Event) !void {
-        const space = self.deps.storage;
+    pub const allocate = init;
+
+    fn onLifecycle(self: *Players, events: []const sessions.Event) !void {
+        const table = persistent_records.Table.init(self.deps.storage, self.deps.record_workspaces.resources);
+        var keys: [32][16]u8 = undefined;
+        var values: [32][saved_size]u8 = undefined;
+        var reads: [32]persistent_records.Get = undefined;
+        var writes: [32]persistent_records.Write = undefined;
+        var lengths: [32]?usize = undefined;
+        var begin: usize = 0;
+        while (begin < events.len) {
+            const kind = std.meta.activeTag(events[begin]);
+            std.debug.assert(kind != .input);
+            var end = begin;
+            while (end < events.len and end - begin < keys.len and std.meta.activeTag(events[end]) == kind) end += 1;
+            const batch = events[begin..end];
+            if (kind == .joined) {
+                for (batch, 0..) |event, index| {
+                    const joined = event.joined;
+                    std.debug.assert(joined.handle.index < self.records.len and self.records[joined.handle.index].handle == null);
+                    std.mem.writeInt(u128, &keys[index], joined.uuid, .little);
+                    reads[index] = .{ .key = &keys[index], .destination = &values[index] };
+                }
+                try table.getBatch(reads[0..batch.len], lengths[0..batch.len]);
+            }
+            if (kind == .left) {
+                var count: usize = 0;
+                for (batch) |event| {
+                    const handle = event.left;
+                    const player = &self.records[handle.index];
+                    std.debug.assert(std.meta.eql(player.handle, @as(?sessions.Handle, handle)));
+                    values[count] = encodePlayer(player);
+                    if (std.mem.eql(u8, &values[count], &player.saved)) continue;
+                    std.mem.writeInt(u128, &keys[count], player.uuid, .little);
+                    writes[count] = .{ .key = &keys[count], .value = &values[count] };
+                    count += 1;
+                }
+                try table.putBatch(writes[0..count]);
+            }
+            for (batch, 0..) |event, index| {
+                var saved: ?[]const u8 = null;
+                if (kind == .joined) if (lengths[index]) |length| {
+                    saved = values[index][0..length];
+                };
+                try self.applyLifecycle(event, saved);
+            }
+            begin = end;
+        }
+    }
+
+    fn applyLifecycle(self: *Players, event: sessions.Event, saved: ?[]const u8) !void {
         switch (event) {
             .joined => |joined| {
                 std.debug.assert(joined.handle.index < self.records.len);
@@ -216,14 +245,13 @@ pub const Players = struct {
                     .gamemode = self.config.gamemode,
                 };
                 player.world = self.spawn_world;
-                var key: [16]u8 = undefined;
-                std.mem.writeInt(u128, &key, player.uuid, .little);
-                if (try persistent_records.Table.init(space).get(&key, &player.saved)) |length| {
-                    if (length != 40 and length != 44) return error.CorruptPlayer;
+                if (saved) |bytes| {
+                    if (bytes.len != player.saved.len) return error.CorruptPlayer;
+                    @memcpy(&player.saved, bytes);
 
-                    var reader = std.Io.Reader.fixed(player.saved[0..length]);
+                    var reader = std.Io.Reader.fixed(&player.saved);
                     const version = try reader.takeByte();
-                    if ((version != 1 or length != 40) and (version != 2 or length != 44)) return error.CorruptPlayer;
+                    if (version != 3) return error.CorruptPlayer;
                     player.position = .{
                         .x = @bitCast(try reader.takeInt(u64, .little)),
                         .y = @bitCast(try reader.takeInt(u64, .little)),
@@ -244,14 +272,19 @@ pub const Players = struct {
 
                     player.on_ground = ground == 1;
 
-                    if (version == 2) player.world = try reader.takeInt(u32, .little);
+                    player.world = try reader.takeInt(u32, .little);
+                    const selected_slot = try reader.takeByte();
+                    if (selected_slot > 8) return error.CorruptPlayer;
+                    player.selected_slot = @intCast(selected_slot);
                     if (self.deps.worlds.get(player.world) == null) return error.UnknownWorld;
                 } else if (self.config.spawn_for_player) |spawn| {
                     player.position = spawn(player);
+                    if (!self.insideBorder(player.position)) return error.InvalidSpawnPosition;
                     inline for (.{ player.position.x, player.position.y, player.position.z }) |value| {
                         if (!std.math.isFinite(value) or @abs(value) > 30_000_000) return error.InvalidSpawnPosition;
                     }
                 }
+                self.updateIndexes(joined.handle.index);
             },
             .ready => |handle| {
                 const player = &self.records[handle.index];
@@ -263,13 +296,8 @@ pub const Players = struct {
             .left => |handle| {
                 const player = &self.records[handle.index];
                 std.debug.assert(player.handle != null and std.meta.eql(player.handle.?, handle));
-                const bytes = encodePlayer(player);
-                if (!std.mem.eql(u8, &bytes, &player.saved)) {
-                    var key: [16]u8 = undefined;
-                    std.mem.writeInt(u128, &key, player.uuid, .little);
-                    try persistent_records.Table.init(space).put(&key, &bytes);
-                }
                 player.* = .{};
+                self.updateIndexes(handle.index);
             },
             .input => {},
         }
@@ -347,6 +375,7 @@ pub const Players = struct {
         player.loaded = false;
         player.stage = .respawn;
         player.revision += 1;
+        self.updateIndexes(handle.index);
     }
 
     fn onPlayerLoaded(self: *Players, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_player_loaded.Reader) !void {
@@ -396,9 +425,13 @@ pub const Players = struct {
         var accepted = movement;
         if (movement.position) |position| {
             if (!std.math.isFinite(position.x) or !std.math.isFinite(position.y) or !std.math.isFinite(position.z) or @abs(position.x) > 30_000_000 or @abs(position.y) > 30_000_000 or @abs(position.z) > 30_000_000) return;
+            if (!self.insideBorder(position)) return;
         }
         if (movement.rotation) |rotation| accepted.rotation = normalizeRotation(rotation) catch return;
-        if (accepted.position) |position| player.position = position;
+        if (accepted.position) |position| {
+            player.position = position;
+            self.updateIndexes(handle.index);
+        }
         if (accepted.rotation) |rotation| player.rotation = rotation;
         player.on_ground = movement.on_ground;
         player.revision += 1;
@@ -441,10 +474,21 @@ pub const Players = struct {
         player.revision += 1;
     }
 
+    fn track(self: *Players, index: usize) void {
+        std.debug.assert(self.connected.positions.len == self.records.len);
+        if (self.records[index].inWorld()) {
+            self.connected.insert(index);
+        } else self.connected.remove(index);
+    }
+
+    pub fn activeSlots(self: *const Players) []const usize {
+        return self.connected.values();
+    }
+
     pub fn tick(self: *Players) !void {
         self.ticks += 1;
-
-        for (self.records, 0..) |*player, index| {
+        for (self.activeSlots()) |index| {
+            const player = &self.records[index];
             const handle = player.handle orelse continue;
             if (player.configuring) continue;
 
@@ -452,26 +496,40 @@ pub const Players = struct {
                 if (player.stage == .awaiting_teleport) break;
 
                 if (player.stage == .health) {
-                    if (!self.sendHealth(player.protocol, &.{handle}, player.health)) break;
+                    if (!self.sendHealth(player.protocol, handle, player.health)) break;
                     player.health_sent = player.health;
+                    player.stage = .selection;
+                    continue;
+                }
+
+                if (player.stage == .selection) {
+                    if (!self.sendPacket(writeSelectedSlot, player.protocol, handle, .{player.selected_slot})) break;
                     player.stage = .ready;
                     continue;
                 }
 
                 if (player.stage == .brand) {
-                    if (!self.sendPacket(writeBrand, player.protocol, &.{handle}, .{self.config.brand})) break;
+                    if (!self.sendPacket(writeBrand, player.protocol, handle, .{self.config.brand})) break;
                     player.stage = .tab;
                     continue;
                 }
 
                 if (player.stage == .tab) {
-                    if (!self.sendPlayerAdd(player.protocol, &.{handle}, player.uuid, player.name[0..player.name_len], player.gamemode)) break;
+                    if (!self.sendPlayerAdd(player.protocol, handle, player.uuid, player.name[0..player.name_len], player.gamemode)) break;
+                    player.stage = .border;
+                    continue;
+                }
+
+                if (player.stage == .border) {
+                    if (self.config.world_border) |diameter| {
+                        if (!self.sendPacket(writeBorder, player.protocol, handle, .{diameter})) break;
+                    }
                     player.stage = .teleport;
                     continue;
                 }
 
                 if (player.stage == .teleport) {
-                    if (!self.sendPacket(writeTeleport, player.protocol, &.{handle}, .{ player.teleport_id, player.position, player.rotation })) break;
+                    if (!self.sendPacket(writeTeleport, player.protocol, handle, .{ player.teleport_id, player.position, player.rotation })) break;
                     player.stage = .awaiting_teleport;
                     continue;
                 }
@@ -480,13 +538,22 @@ pub const Players = struct {
                 const selected = self.deps.packets.definition(player.protocol) catch unreachable;
 
                 if (player.stage == .respawn) {
-                    if (!self.sendPacket(writeRespawn, player.protocol, &.{handle}, .{ selected, world.dimension.name, world.name, @as(i8, @intFromEnum(player.gamemode)), @as(u8, if (player.keep_respawn_data) 3 else 0) })) break;
-                    player.stage = .teleport;
+                    const targets = [_]sessions.Service.Target{.{ .handle = handle, .protocol = player.protocol }};
+                    var delivered: [1]sessions.Service.Delivery = undefined;
+                    const respawn = .{ selected, world.dimension.name, world.name, @as(i8, @intFromEnum(player.gamemode)), @as(u8, if (player.keep_respawn_data) 3 else 0) };
+                    const position = .{ player.teleport_id, player.position, player.rotation };
+                    if (self.config.world_border) |diameter| {
+                        try self.deps.packets.fanoutGroup(.{ writeRespawn, writeBorder, writeTeleport }, &targets, .{ respawn, .{diameter}, position }, &.{ 2048, 128, 128 }, &delivered);
+                    } else {
+                        try self.deps.packets.fanoutGroup(.{ writeRespawn, writeTeleport }, &targets, .{ respawn, position }, &.{ 2048, 128 }, &delivered);
+                    }
+                    if (delivered[0] != .queued) break;
+                    player.stage = .awaiting_teleport;
                     continue;
                 }
 
                 std.debug.assert(player.stage == .login);
-                if (!self.sendPacket(writeLogin, player.protocol, &.{handle}, .{ selected, minecraft.Login{
+                if (!self.sendPacket(writeLogin, player.protocol, handle, .{ selected, minecraft.Login{
                     .entity_id = @intCast(index + 1),
                     .world_names = self.deps.worlds.names,
                     .dimension_type = world.dimension.name,
@@ -509,18 +576,22 @@ pub const Players = struct {
                 .spectator => 7,
                 .survival, .adventure => 0,
             };
-            if (player.abilities_sent != abilities) {
-                if (!self.sendPacket(writeAbilities, player.protocol, &.{handle}, .{abilities})) continue;
-                player.abilities_sent = abilities;
-            }
             if (player.gamemode_sent != player.gamemode) {
-                if (!self.sendPacket(writeGameMode, player.protocol, &.{handle}, .{player.gamemode})) continue;
+                const targets = [_]sessions.Service.Target{.{ .handle = handle, .protocol = player.protocol }};
+                var delivered: [1]sessions.Service.Delivery = undefined;
+                try self.deps.packets.fanoutGroup(.{ writeAbilities, writeGameMode }, &targets, .{ .{abilities}, .{player.gamemode} }, &.{ 32, 16 }, &delivered);
+                if (delivered[0] != .queued) continue;
+                player.abilities_sent = abilities;
                 player.gamemode_sent = player.gamemode;
+            } else if (player.abilities_sent != abilities) {
+                if (!self.sendPacket(writeAbilities, player.protocol, handle, .{abilities})) continue;
+                player.abilities_sent = abilities;
             }
         }
     }
 
-    pub fn checkpoint(self: *Players, space: storage.Space) !void {
+    pub fn checkpoint(self: *Players, space: lightning_rod.storage.Space) !void {
+        const table_resources = self.deps.record_workspaces.resources;
         var keys: [256][16]u8 = undefined;
         var writes: [256]persistent_records.Write = undefined;
         var count: usize = 0;
@@ -530,33 +601,42 @@ pub const Players = struct {
 
             const bytes = encodePlayer(player);
             if (std.mem.eql(u8, &bytes, &player.saved)) continue;
+            if (count == writes.len) {
+                try persistent_records.Table.init(space, table_resources).putBatch(writes[0..count]);
+                count = 0;
+            }
             player.saved = bytes;
             std.mem.writeInt(u128, &keys[count], player.uuid, .little);
             writes[count] = .{ .key = &keys[count], .value = &player.saved };
             count += 1;
         }
 
-        if (count != 0) try persistent_records.Table.init(space).putBatch(writes[0..count]);
+        if (count != 0) try persistent_records.Table.init(space, table_resources).putBatch(writes[0..count]);
     }
 
-    pub fn sendPacket(self: *Players, comptime encode_packet: anytype, protocol: i32, recipients: []const sessions.Handle, arguments: anytype) bool {
-        self.deps.packets.sendPacket(encode_packet, protocol, recipients, arguments, 2048) catch |err| switch (err) {
+    pub fn sendPacket(self: *Players, comptime encode_packet: anytype, protocol: i32, recipient: sessions.Handle, arguments: anytype) bool {
+        self.deps.packets.sendPacket(encode_packet, protocol, recipient, arguments, 2048) catch |err| switch (err) {
             error.Backpressured, error.Closed => return false,
             else => std.debug.panic("invalid server packet: {s}", .{@errorName(err)}),
         };
         return true;
     }
 
-    pub fn sendHealth(self: *Players, protocol: i32, recipients: []const sessions.Handle, health: f32) bool {
-        return self.sendPacket(writeHealth, protocol, recipients, .{health});
+    pub fn sendHealth(self: *Players, protocol: i32, recipient: sessions.Handle, health: f32) bool {
+        return self.sendPacket(writeHealth, protocol, recipient, .{health});
     }
 
-    pub fn sendBlockAck(self: *Players, protocol: i32, recipients: []const sessions.Handle, sequence: i32) bool {
-        return self.sendPacket(writeBlockAck, protocol, recipients, .{sequence});
+    pub fn sendBlockAck(self: *Players, protocol: i32, recipient: sessions.Handle, sequence: i32) bool {
+        return self.sendPacket(writeBlockAck, protocol, recipient, .{sequence});
     }
 
-    pub fn sendPlayerAdd(self: *Players, protocol: i32, recipients: []const sessions.Handle, uuid: u128, name: []const u8, mode: minecraft.GameMode) bool {
-        return self.sendPacket(writePlayerAdd, protocol, recipients, .{ uuid, name, @as(i32, @intFromEnum(mode)) });
+    pub fn sendPlayerAdd(self: *Players, protocol: i32, recipient: sessions.Handle, uuid: u128, name: []const u8, mode: minecraft.GameMode) bool {
+        return self.sendPacket(writePlayerAdd, protocol, recipient, .{ uuid, name, @as(i32, @intFromEnum(mode)) });
+    }
+
+    fn writeSelectedSlot(packet: wire_1_21_5.play.toClient.packet_held_item_slot.Writer, slot: u4) ![]u8 {
+        std.debug.assert(slot <= 8);
+        return (try packet.slot(slot)).finish();
     }
 
     fn writeHealth(packet: wire_1_21_5.play.toClient.packet_update_health.Writer, health: f32) ![]u8 {
@@ -595,7 +675,11 @@ pub const Players = struct {
         return done.finish();
     }
 
-    fn writePlayerAdd(packet: wire_1_21_5.play.toClient.packet_player_info.Writer, uuid: u128, name: []const u8, mode: i32) ![]u8 {
+    pub fn writePlayerAdd(packet: wire_1_21_5.play.toClient.packet_player_info.Writer, uuid: u128, name: []const u8, mode: i32) ![]u8 {
+        return writePlayerProfile(packet, uuid, name, mode, true);
+    }
+
+    pub fn writePlayerProfile(packet: wire_1_21_5.play.toClient.packet_player_info.Writer, uuid: u128, name: []const u8, mode: i32, is_listed: bool) ![]u8 {
         const action = try packet.action(.{
             .add_player = true,
             .initialize_chat = true,
@@ -619,7 +703,7 @@ pub const Players = struct {
         var gamemode = try chat.gamemode();
         const game = try gamemode.advance(try (try gamemode.begin()).case_true(mode));
         var listed = try game.listed();
-        const listing = try listed.advance(try (try listed.begin()).case_true(1));
+        const listing = try listed.advance(try (try listed.begin()).case_true(@intFromBool(is_listed)));
         var latency = try listing.latency();
         const latency_value = try latency.advance(try (try latency.begin()).case_true(0));
         var display = try latency_value.displayName();
@@ -731,6 +815,7 @@ pub const Players = struct {
 
         inline for (.{ position.x, position.y, position.z }) |value|
             if (!std.math.isFinite(value) or @abs(value) > 30_000_000) return error.InvalidPosition;
+        if (!self.insideBorder(position)) return error.InvalidPosition;
         const normalized = normalizeRotation(rotation) catch return error.InvalidPosition;
         player.stage = if (player.stage == .respawn or player.world != world) .respawn else .teleport;
         player.keep_respawn_data = true;
@@ -742,17 +827,35 @@ pub const Players = struct {
 
         player.world = world;
         player.position = position;
+        self.updateIndexes(player.handle.?.index);
         player.rotation = normalized;
         player.on_ground = false;
         player.revision += 1;
         player.teleport_id = if (player.teleport_id == std.math.maxInt(i32)) 1 else player.teleport_id + 1;
     }
+
+    pub fn insideBorder(self: *const Players, position: minecraft.Position) bool {
+        const diameter = self.config.world_border orelse return true;
+        return @abs(position.x) <= diameter / 2 - 0.3 and @abs(position.z) <= diameter / 2 - 0.3;
+    }
+
+    fn writeBorder(packet: wire_1_21_5.play.toClient.packet_initialize_world_border.Writer, diameter: f64) ![]u8 {
+        const x = try packet.x(0);
+        const z = try x.z(0);
+        const old = try z.oldDiameter(diameter);
+        const next = try old.newDiameter(diameter);
+        const speed = try next.speed(0);
+        const boundary = try speed.portalTeleportBoundary(29_999_984);
+        const blocks = try boundary.warningBlocks(5);
+        return (try blocks.warningTime(15)).finish();
+    }
 };
 
-fn encodePlayer(player: *const Players.Player) [44]u8 {
-    var bytes: [44]u8 = undefined;
+fn encodePlayer(player: *const Players.Player) [Players.saved_size]u8 {
+    std.debug.assert(player.selected_slot <= 8);
+    var bytes: [Players.saved_size]u8 = undefined;
     var writer = std.Io.Writer.fixed(&bytes);
-    writer.writeByte(2) catch unreachable;
+    writer.writeByte(3) catch unreachable;
     inline for (.{ player.position.x, player.position.y, player.position.z }) |value|
         writer.writeInt(u64, @bitCast(value), .little) catch unreachable;
     inline for (.{ player.rotation.yaw, player.rotation.pitch, player.health }) |value|
@@ -761,6 +864,7 @@ fn encodePlayer(player: *const Players.Player) [44]u8 {
     writer.writeByte(@bitCast(player.flags)) catch unreachable;
     writer.writeByte(@intFromBool(player.on_ground)) catch unreachable;
     writer.writeInt(u32, player.world, .little) catch unreachable;
+    writer.writeByte(player.selected_slot) catch unreachable;
     std.debug.assert(writer.end == bytes.len);
     return bytes;
 }
@@ -775,6 +879,11 @@ fn normalizeRotation(rotation: minecraft.Rotation) error{InvalidRotation}!minecr
 }
 
 test "disconnect stages player state until the next complete checkpoint" {
+    const record_workspaces = try persistent_records.Workspaces.init(std.testing.allocator, std.testing.io, .{});
+    defer {
+        record_workspaces.resources.deinit();
+        std.testing.allocator.destroy(record_workspaces);
+    }
     const Spawn = struct {
         fn select(player: *const Players.Player) minecraft.Position {
             return .{ .x = @floatFromInt(player.uuid), .y = 65, .z = -32 };
@@ -786,8 +895,8 @@ test "disconnect stages player state until the next complete checkpoint" {
         defer directory.cleanup();
         var path_bytes: [256]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_bytes, ".zig-cache/tmp/{s}/disconnect", .{directory.sub_path});
-        const options: storage.Store.Options = .{ .path = path };
-        var store = try storage.Store.init(std.testing.allocator, io, options);
+        const options: lightning_rod.storage.Store.Options = .{ .path = path };
+        var store = try lightning_rod.storage.Store.init(std.testing.allocator, io, options);
         var open = true;
         defer if (open) store.deinit();
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -798,15 +907,17 @@ test "disconnect stages player state until the next complete checkpoint" {
         const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
         var records: [1]Players.Player = @splat(.{});
         var players: Players = .{
-            .deps = .{ .sessions = undefined, .packets = undefined, .input = undefined, .storage = space, .worlds = dimensions, .vanilla_worlds = undefined },
+            .deps = .{ .sessions = undefined, .packets = undefined, .input = undefined, .storage = space, .worlds = dimensions, .vanilla_worlds = undefined, .record_workspaces = record_workspaces },
             .config = .{ .spawn_for_player = if (previous_save) Spawn.select else null },
             .spawn_world = world,
             .records = &records,
             .dig_handlers = &.{},
         };
+        try players.initIndexes(arena.allocator());
+        players.rebuildIndexes();
         const handle: sessions.Handle = .{ .index = 0, .generation = 1 };
         const joined: sessions.Event = .{ .joined = .{ .handle = handle, .uuid = 1, .protocol = 0, .name = @splat(0), .name_len = 1 } };
-        try players.onLifecycle(joined);
+        try players.onLifecycle(&.{joined});
         try std.testing.expectEqualDeep(if (previous_save) Spawn.select(&records[0]) else players.config.spawn, records[0].position);
         records[0].stage = .ready;
         if (previous_save) try players.checkpoint(space);
@@ -817,46 +928,52 @@ test "disconnect stages player state until the next complete checkpoint" {
         const rotation: minecraft.Rotation = .{ .yaw = 45, .pitch = 30 };
         players.applyMovement(handle, .{ .position = position, .rotation = rotation, .on_ground = true, .horizontal_collision = false });
         records[0].health = 7;
+        records[0].selected_slot = 8;
         records[0].gamemode = .survival;
-        try players.onLifecycle(.{ .left = handle });
+        try players.onLifecycle(&.{.{ .left = handle }});
         try std.testing.expect(records[0].handle == null);
         try std.testing.expectEqual(@as(u64, 1), store.lastTick());
         try std.testing.expectEqual(@as(u64, 1), store.durableTick());
-        try players.onLifecycle(joined);
+        try players.onLifecycle(&.{joined});
         try std.testing.expectEqualDeep(position, records[0].position);
         try std.testing.expectEqualDeep(rotation, records[0].rotation);
         try std.testing.expectEqual(@as(f32, 7), records[0].health);
         try std.testing.expectEqual(.survival, records[0].gamemode);
+        try std.testing.expectEqual(@as(u4, 8), records[0].selected_slot);
         try std.testing.expect(records[0].on_ground);
-        try players.onLifecycle(.{ .left = handle });
+        try players.onLifecycle(&.{.{ .left = handle }});
         try players.checkpoint(space);
         _ = try store.commit(2);
         try store.waitDurable(store.lastCommit());
 
         store.deinit();
         open = false;
-        store = try storage.Store.init(std.testing.allocator, io, options);
+        store = try lightning_rod.storage.Store.init(std.testing.allocator, io, options);
         open = true;
         try std.testing.expectEqual(@as(u64, 2), store.durableTick());
         const reading = store.transaction();
         defer reading.fail();
         players.deps.storage = try reading.openSpace(Players.id);
-        try players.onLifecycle(joined);
+        try players.onLifecycle(&.{joined});
         try std.testing.expectEqualDeep(position, records[0].position);
         try std.testing.expectEqualDeep(rotation, records[0].rotation);
         try std.testing.expectEqual(@as(f32, 7), records[0].health);
         try std.testing.expectEqual(.survival, records[0].gamemode);
+        try std.testing.expectEqual(@as(u4, 8), records[0].selected_slot);
         try std.testing.expect(records[0].on_ground);
     }
 }
 
 test "rotation validation precedes movement and normalizes movement teleports and saved players" {
+    const table_resources = try persistent_records.Resources.init(std.testing.allocator, std.testing.io, .{ .readers = 1, .writers = 1 });
+    defer table_resources.deinit();
+    var record_workspaces: persistent_records.Workspaces = .{ .resources = table_resources };
     const io = std.testing.io;
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
     var path_bytes: [256]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_bytes, ".zig-cache/tmp/{s}/rotation", .{directory.sub_path});
-    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
+    var store = try lightning_rod.storage.Store.init(std.testing.allocator, io, .{ .path = path });
     defer store.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -868,12 +985,14 @@ test "rotation validation precedes movement and normalizes movement teleports an
     const handle: sessions.Handle = .{ .index = 0, .generation = 1 };
     var records: [1]Players.Player = .{.{ .handle = handle, .uuid = 1, .world = world, .name = @splat(0), .stage = .ready }};
     var players: Players = .{
-        .deps = .{ .sessions = undefined, .packets = undefined, .input = undefined, .storage = space, .worlds = dimensions, .vanilla_worlds = undefined },
+        .deps = .{ .sessions = undefined, .packets = undefined, .input = undefined, .storage = space, .worlds = dimensions, .vanilla_worlds = undefined, .record_workspaces = &record_workspaces },
         .config = .{},
         .spawn_world = world,
         .records = &records,
         .dig_handlers = &.{},
     };
+    try players.initIndexes(arena.allocator());
+    players.rebuildIndexes();
     const Observer = struct {
         calls: usize = 0,
         last: minecraft.Movement = undefined,
@@ -907,17 +1026,207 @@ test "rotation validation precedes movement and normalizes movement teleports an
     try std.testing.expectError(error.InvalidPosition, players.teleport(&records[0], world, position, .{ .yaw = std.math.nan(f32), .pitch = 0 }));
     try std.testing.expectEqualDeep(teleported, records[0]);
     try players.checkpoint(space);
-    try players.onLifecycle(.{ .left = handle });
+    try players.onLifecycle(&.{.{ .left = handle }});
     const joined: sessions.Event = .{ .joined = .{ .handle = handle, .uuid = 1, .protocol = 0, .name = @splat(0), .name_len = 1 } };
-    try players.onLifecycle(joined);
+    try players.onLifecycle(&.{joined});
     try std.testing.expectEqualDeep(normalized, records[0].rotation);
 
     records[0].rotation = .{ .yaw = 40_000_000, .pitch = -1000 };
     const saved = encodePlayer(&records[0]);
     var key: [16]u8 = undefined;
     std.mem.writeInt(u128, &key, 1, .little);
-    try persistent_records.Table.init(space).put(&key, &saved);
+    try persistent_records.Table.init(space, table_resources).put(&key, &saved);
     records[0] = .{};
-    try players.onLifecycle(joined);
+    try players.onLifecycle(&.{joined});
     try std.testing.expectEqualDeep(normalized, records[0].rotation);
+
+    var invalid = saved;
+    invalid[invalid.len - 1] = 9;
+    try persistent_records.Table.init(space, table_resources).put(&key, &invalid);
+    records[0] = .{};
+    try std.testing.expectError(error.CorruptPlayer, players.onLifecycle(&.{joined}));
+}
+
+test "lifecycle batches preserve saved state and leave rejoin ordering" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/lifecycle-batch", .{temporary.sub_path});
+    var store = try lightning_rod.storage.Store.init(allocator, io, .{ .path = path, .io_mode = .standard });
+    defer store.deinit();
+    const resources = try persistent_records.Resources.init(allocator, io, .{ .readers = 1, .writers = 1 });
+    defer resources.deinit();
+    var workspaces: persistent_records.Workspaces = .{ .resources = resources };
+    const space = try store.openSpace(Players.id);
+    const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
+    const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
+    var rows: [3]Players.Player = @splat(.{});
+    var players: Players = .{
+        .deps = .{ .sessions = undefined, .packets = undefined, .input = undefined, .storage = space, .worlds = dimensions, .vanilla_worlds = undefined, .record_workspaces = &workspaces },
+        .config = .{},
+        .spawn_world = world,
+        .records = &rows,
+        .dig_handlers = &.{},
+    };
+    try players.initIndexes(arena.allocator());
+    players.rebuildIndexes();
+    var joins: [3]sessions.Event = undefined;
+    var departures: [3]sessions.Event = undefined;
+    for (&joins, &departures, 0..) |*join, *departure, index| {
+        const handle: sessions.Handle = .{ .index = @intCast(index), .generation = 1 };
+        join.* = .{ .joined = .{ .handle = handle, .uuid = index + 1, .protocol = 0, .name = @splat(0), .name_len = 1 } };
+        departure.* = .{ .left = handle };
+    }
+    try players.onLifecycle(&joins);
+    for (&rows, 0..) |*row, index| {
+        row.selected_slot = @intCast(index + 1);
+        row.position.x = @floatFromInt(index * 10);
+    }
+    try players.onLifecycle(&departures);
+    try players.onLifecycle(&joins);
+    for (rows, 0..) |row, index| {
+        try std.testing.expectEqual(index + 1, row.selected_slot);
+        try std.testing.expectEqual(@as(f64, @floatFromInt(index * 10)), row.position.x);
+    }
+    rows[0].selected_slot = 8;
+    rows[1].selected_slot = 7;
+    try players.onLifecycle(&.{ departures[0], joins[0], departures[1], joins[1] });
+    try std.testing.expectEqual(@as(u4, 8), rows[0].selected_slot);
+    try std.testing.expectEqual(@as(u4, 7), rows[1].selected_slot);
+}
+
+test "incremental player spatial updates match direct neighborhood queries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var records: [64]Players.Player = @splat(.{});
+    var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &records, .dig_handlers = &.{} };
+    try players.initIndexes(arena.allocator());
+    players.rebuildIndexes();
+    var random = std.Random.DefaultPrng.init(0);
+    for (0..2048) |_| {
+        const index = random.random().uintLessThan(usize, records.len);
+        records[index].handle = if (random.random().boolean()) .{ .index = @intCast(index), .generation = 1 } else null;
+        records[index].world = random.random().uintLessThan(u32, 3);
+        records[index].position = .{ .x = @as(f64, @floatFromInt(random.random().uintLessThan(u32, 64))) - 32, .y = 65, .z = @as(f64, @floatFromInt(random.random().uintLessThan(u32, 64))) - 32 };
+        players.updateIndexes(index);
+        const world = random.random().uintLessThan(u32, 3);
+        const position = records[random.random().uintLessThan(usize, records.len)].position;
+        var expected: [64]bool = @splat(false);
+        for (records, 0..) |player, at| {
+            if (!player.inWorld() or player.world != world) continue;
+            if (@abs(@floor(player.position.x / 16) - @floor(position.x / 16)) <= 1 and @abs(@floor(player.position.z / 16) - @floor(position.z / 16)) <= 1)
+                expected[at] = true;
+        }
+        var actual: [64]bool = @splat(false);
+        var nearby = players.nearby(world, position, 1);
+        while (nearby.next()) |at| {
+            try std.testing.expect(!actual[at]);
+            actual[at] = true;
+        }
+        try std.testing.expectEqualSlices(bool, &expected, &actual);
+        try std.testing.expectEqual(players.activeSlots().len, players.spatial.active.count);
+    }
+}
+
+test "nearby queries bound candidate work along either axis and retain inclusive boundaries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var rows: [513]Players.Player = undefined;
+    for (0..2) |axis| {
+        for (&rows, 0..) |*player, index| player.* = .{
+            .handle = .{ .index = @intCast(index), .generation = 1 },
+            .uuid = index + 1,
+            .position = .{ .x = if (axis == 0) @as(f64, @floatFromInt(index * 128)) else 0, .y = 65, .z = if (axis == 1) @as(f64, @floatFromInt(index * 128)) else 0 },
+        };
+        var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &rows, .dig_handlers = &.{} };
+        try players.initIndexes(arena.allocator());
+        players.rebuildIndexes();
+        var visited: usize = 0;
+        for (0..1024) |number| {
+            const index = number % rows.len;
+            var query = players.nearby(0, rows[index].position, 1);
+            try std.testing.expectEqual(index, query.next().?);
+            try std.testing.expectEqual(null, query.next());
+            visited += query.visited;
+        }
+        try std.testing.expect(visited <= 4096);
+        try expectNearby(players.nearby(1, rows[0].position, 32), &.{});
+        const boundary: minecraft.Position = .{ .x = if (axis == 0) -16 else 0, .y = 65, .z = if (axis == 1) -16 else 0 };
+        try expectNearby(players.nearby(0, boundary, 1), &.{0});
+        try expectNearby(players.nearby(0, boundary, 0), &.{});
+    }
+}
+
+test "full capacity spatial updates preserve neighborhoods through movement removal and rejoin" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var rows: [513]Players.Player = undefined;
+    for (&rows, 0..) |*row, index| row.* = .{
+        .handle = .{ .index = @intCast(index), .generation = 1 },
+        .uuid = index + 1,
+        .position = .{ .x = @as(f64, @floatFromInt(index)) * 16 + 15.9, .y = 65, .z = 8 },
+    };
+    var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &rows, .dig_handlers = &.{} };
+    try players.initIndexes(arena.allocator());
+    players.rebuildIndexes();
+    for (&rows, 0..) |*row, index| {
+        row.position.x += 0.2;
+        players.updateIndexes(index);
+    }
+    for (rows, 0..) |row, index| try expectNearby(players.nearby(row.world, row.position, 0), &.{index});
+    rows[255].handle = null;
+    players.updateIndexes(255);
+    rows[255].handle = .{ .index = 255, .generation = 2 };
+    players.updateIndexes(255);
+    var random = std.Random.DefaultPrng.init(20261025);
+    for (0..2048) |step| {
+        const index = random.random().uintLessThan(usize, rows.len);
+        rows[index].handle = if (random.random().boolean()) .{ .index = @intCast(index), .generation = 3 } else null;
+        rows[index].world = random.random().uintLessThan(u32, 3);
+        rows[index].position.x = @floatFromInt(random.random().intRangeAtMost(i32, -512, 512));
+        rows[index].position.z = @floatFromInt(random.random().intRangeAtMost(i32, -512, 512));
+        players.updateIndexes(index);
+        if (step % 16 == 0) {
+            var rebuilt: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &rows, .dig_handlers = &.{} };
+            try rebuilt.initIndexes(arena.allocator());
+            rebuilt.rebuildIndexes();
+            for (rows) |row| {
+                var expected: [513]bool = @splat(false);
+                var actual: [513]bool = @splat(false);
+                var before = rebuilt.nearby(row.world, row.position, 1);
+                var after = players.nearby(row.world, row.position, 1);
+                while (before.next()) |slot| expected[slot] = true;
+                while (after.next()) |slot| actual[slot] = true;
+                try std.testing.expectEqualSlices(bool, &expected, &actual);
+            }
+        }
+    }
+}
+
+fn expectNearby(query: Players.Nearby, expected: []const usize) !void {
+    var iterator = query;
+    for (expected) |index| try std.testing.expectEqual(index, iterator.next().?);
+    try std.testing.expectEqual(null, iterator.next());
+}
+
+test "player spatial indexes preserve slots beyond sixteen bits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const records = try allocator.alloc(Players.Player, 65_537);
+    @memset(records, .{});
+    records[65_536] = .{ .handle = .{ .index = 65_536, .generation = 1 }, .world = 4, .position = .{ .x = 8, .y = 65, .z = 8 } };
+    var players: Players = .{ .deps = undefined, .config = .{ .maximum = records.len }, .spawn_world = 4, .records = records, .dig_handlers = &.{} };
+    try players.initIndexes(allocator);
+    players.rebuildIndexes();
+    try expectNearby(players.nearby(4, records[65_536].position, 0), &.{65_536});
+    records[65_536].position.x = 1024;
+    players.updateIndexes(65_536);
+    try expectNearby(players.nearby(4, records[65_536].position, 0), &.{65_536});
+    records[65_536].handle = null;
+    players.updateIndexes(65_536);
+    try expectNearby(players.nearby(4, records[65_536].position, 0), &.{});
 }

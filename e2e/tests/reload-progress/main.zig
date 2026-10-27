@@ -1,17 +1,16 @@
 const records = @import("records");
 const std = @import("std");
-const lr = @import("lightning_rod");
+const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
 const e2e = @import("e2e");
 const sessions = @import("sessions");
-const bootstrap = e2e.server;
 
 pub fn main(init: std.process.Init) !void {
-    const plugins = lr.plugin.compose(.{
-        lr.plugin.replace(bootstrap.plugins(), .{lr.plugin.configured(vanilla.Players, .{ .maximum = 2, .render_distance = 2, .gamemode = .survival })}),
-        lr.plugin.configured(Probe, .{}),
+    const plugins = lightning_rod.plugin.compose(.{
+        lightning_rod.plugin.replace(e2e.profile.plugins(), .{lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 2, .render_distance = 2, .gamemode = .survival })}),
+        lightning_rod.plugin.configured(Probe, .{}),
     });
-    try bootstrap.run(init, plugins, .{ .reload_executable = "/proc/self/exe" });
+    try e2e.profile.run(init, plugins, .{ .reload_executable = "/proc/self/exe" });
 }
 
 const Probe = struct {
@@ -21,7 +20,7 @@ const Probe = struct {
         players: *vanilla.Players,
         control: *e2e.Control,
         reload: *vanilla.Reload,
-        storage: lr.storage.Space,
+        storage: lightning_rod.storage.Space,
     };
     const Phase = enum { waiting, restored, configuring, progressing, released };
     const Round = struct { health: f32, x: f64 };
@@ -70,7 +69,7 @@ const Probe = struct {
         return .handled;
     }
 
-    pub fn checkpoint(self: *Probe, space: lr.storage.Space) !void {
+    pub fn checkpoint(self: *Probe, space: lightning_rod.storage.Space) !void {
         try records.Value.init(space).write(&.{self.round});
     }
 

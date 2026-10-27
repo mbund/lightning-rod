@@ -15,8 +15,8 @@ fn length(tick: u64, id: usize) ?usize {
     };
 }
 
-fn change(store: *storage.Store, tick: u64) !void {
-    const table = records.Table.init(try store.openSpace("records"));
+fn change(store: *storage.Store, table_resources: *records.Resources, tick: u64) !void {
+    const table = records.Table.init(try store.openSpace("records"), table_resources);
     var keys: [count][2]u8 = undefined;
     var writes: [count]records.Write = undefined;
     const value: [8193]u8 = @splat(@intCast(tick));
@@ -28,26 +28,28 @@ fn change(store: *storage.Store, tick: u64) !void {
     _ = try store.commit(tick);
 }
 
-fn scenario(store: *storage.Store, acknowledged: *u64) !void {
-    try change(store, 2);
+fn scenario(store: *storage.Store, table_resources: *records.Resources, acknowledged: *u64) !void {
+    try change(store, table_resources, 2);
     try store.waitDurable(store.lastCommit());
     acknowledged.* = 2;
-    _ = try store.maintain(1);
-    while (store.phase == .copying) _ = try store.maintain(1);
-    try change(store, 3);
+    _ = try store.pollMaintenance(.{ .index_entries = 1, .pages = 1 });
+    while (store.phase != .database_sync) _ = try store.pollMaintenance(.{ .index_entries = 1, .pages = 1 });
+    try change(store, table_resources, 3);
 }
 
 test "power loss during tree balancing and overflow reuse preserves a complete save" {
+    const table_resources = try records.Resources.init(std.testing.allocator, std.testing.io, .{ .readers = 1, .writers = 1 });
+    defer table_resources.deinit();
     const io = std.testing.io;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/world", .{temporary.sub_path});
     defer std.testing.allocator.free(path);
-    const options: storage.Store.Options = .{ .path = path, .submission = .standard, .maximum_wal_pages = 1024, .checkpoint_bytes = 64 };
+    const options: storage.Store.Options = .{ .io_mode = .standard, .path = path, .maximum_wal_pages = 1024, .checkpoint_bytes = 64 };
     {
         var store = try storage.Store.init(std.testing.allocator, io, options);
         defer store.deinit();
-        try change(&store, 1);
+        try change(&store, table_resources, 1);
         try store.waitDurable(store.lastCommit());
     }
     for ([_]bool{ false, true }) |short| {
@@ -59,9 +61,9 @@ test "power loss during tree balancing and overflow reuse preserves a complete s
             const modeled = disk.interface();
             store.io = modeled;
             store.filesystem.io = modeled;
-            store.checkpoint_io.io = modeled;
+            store.maintenance_io.io = modeled;
             var acknowledged: u64 = 1;
-            try scenario(&store, &acknowledged);
+            try scenario(&store, table_resources, &acknowledged);
             events = disk.events;
             store.deinit();
             disk.detach();
@@ -76,9 +78,9 @@ test "power loss during tree balancing and overflow reuse preserves a complete s
                 const modeled = disk.interface();
                 store.io = modeled;
                 store.filesystem.io = modeled;
-                store.checkpoint_io.io = modeled;
+                store.maintenance_io.io = modeled;
                 var acknowledged: u64 = 1;
-                scenario(&store, &acknowledged) catch |err| switch (err) {
+                scenario(&store, table_resources, &acknowledged) catch |err| switch (err) {
                     error.IoFailure, error.FailedTransaction, error.NoSpace => {},
                     else => return err,
                 };
@@ -94,7 +96,7 @@ test "power loss during tree balancing and overflow reuse preserves a complete s
                 }
                 const tick = recovered.lastTick();
                 try std.testing.expect(tick >= acknowledged and tick <= 3);
-                const table = records.Table.init(try recovered.openSpace("records"));
+                const table = records.Table.init(try recovered.openSpace("records"), table_resources);
                 _ = try structure.inspect(table);
                 var value: [8193]u8 = undefined;
                 for (0..count) |id| {

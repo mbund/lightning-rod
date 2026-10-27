@@ -24,12 +24,12 @@ test "reload manifest is retained once in a stripped executable" {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = buffer[0..try std.process.executablePath(std.testing.io, &buffer)];
     const image = try reload.Image.open(std.testing.io, path);
-    defer image.close(std.testing.io);
+    image.close(std.testing.io);
     try std.testing.expectEqual(Endpoint.resume_manifest.len, image.protocols_bytes);
     for (protocols, formats) |protocol, format| {
-        try std.testing.expect(try image.supports(std.testing.io, protocol, null));
-        try std.testing.expect(try image.supports(std.testing.io, protocol, format));
-        try std.testing.expect(!try image.supports(std.testing.io, protocol, format ^ 1));
+        try std.testing.expect(image.supports(protocol, null));
+        try std.testing.expect(image.supports(protocol, format));
+        try std.testing.expect(!image.supports(protocol, format ^ 1));
     }
-    try std.testing.expect(!try image.supports(std.testing.io, protocols[1] + 1, null));
+    try std.testing.expect(!image.supports(protocols[1] + 1, null));
 }

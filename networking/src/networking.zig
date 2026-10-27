@@ -1,7 +1,9 @@
 const std = @import("std");
 
+pub const send_vectors_max = 128;
+
 pub const Handle = struct {
-    index: u16,
+    index: usize,
     generation: u32,
 };
 
@@ -12,10 +14,12 @@ pub const CloseReason = enum {
     capacity,
 };
 
-/// Each completion releases its buffer loan. A successful send may be partial.
+/// Receives release only their completed prefix while more is set. The final completion returns the remaining loan.
+/// Sends release their buffer and vector loans on completion and may be partial.
 pub const Result = struct {
     bytes: usize,
     errno: ?i32 = null,
+    more: bool = false,
 };
 
 pub const Completion = struct {
@@ -53,7 +57,7 @@ pub const Transport = struct {
 
     pub const VTable = struct {
         queue_receive: *const fn (*anyopaque, std.Io, Handle, []u8) QueueError!void,
-        queue_send: *const fn (*anyopaque, std.Io, Handle, []const u8) QueueError!void,
+        queue_send: *const fn (*anyopaque, std.Io, Handle, []const std.posix.iovec_const) QueueError!void,
         close: *const fn (*anyopaque, std.Io, Handle, CloseReason) void,
         release: *const fn (*anyopaque, std.Io, Handle) void,
         notify: *const fn (*anyopaque, std.Io) void,
@@ -74,7 +78,7 @@ pub const Transport = struct {
                     }
                 }.call,
                 .queue_send = struct {
-                    fn call(context: *anyopaque, io: std.Io, handle: Handle, bytes: []const u8) QueueError!void {
+                    fn call(context: *anyopaque, io: std.Io, handle: Handle, bytes: []const std.posix.iovec_const) QueueError!void {
                         return instance(context).queueSend(io, handle, bytes);
                     }
                 }.call,
@@ -111,7 +115,7 @@ pub const Transport = struct {
         return t.vtable.queue_receive(t.context, io, h, b);
     }
 
-    pub fn queueSend(t: Transport, io: std.Io, h: Handle, b: []const u8) QueueError!void {
+    pub fn queueSend(t: Transport, io: std.Io, h: Handle, b: []const std.posix.iovec_const) QueueError!void {
         return t.vtable.queue_send(t.context, io, h, b);
     }
 
@@ -191,6 +195,7 @@ pub const Inheritance = struct {
     pub fn descriptor(self: Inheritance, handle: Handle) i32 {
         return self.vtable.descriptor(self.context, handle);
     }
+    /// Adopt unique descriptor ownership. An already owned descriptor must be rejected.
     pub fn adopt(self: Inheritance, fd: i32) anyerror!Handle {
         return self.vtable.adopt(self.context, fd);
     }
@@ -198,8 +203,8 @@ pub const Inheritance = struct {
 
 pub fn validLimits(comptime x: Limits) void {
     comptime {
-        if (x.connections == 0 or x.connections > std.math.maxInt(u16))
-            @compileError("connections must fit Handle.index");
+        if (x.connections == 0)
+            @compileError("connections must be nonzero");
 
         if (x.operations == 0 or x.events < x.operations + 2 * x.connections)
             @compileError("events must hold every operation plus accepted and closed connection statuses");

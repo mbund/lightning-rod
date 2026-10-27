@@ -1,13 +1,11 @@
 const e2e_control = @import("e2e_control");
 const std = @import("std");
-const reload_execve = @import("reload_execve");
 const lightning_rod = @import("lightning_rod");
 const selected_protocol = @import("protocols");
-const profiles = @import("profiles");
-const networking = @import("network_stdio");
+const profile = @import("e2e_profile");
+const sessions = @import("sessions");
 const vanilla = @import("vanilla");
 const persistence = @import("storage");
-const reload = @import("reload");
 const ExtraNegotiation = @import("extra_negotiation.zig").ExtraNegotiation;
 
 const WorldProvider = struct {
@@ -17,7 +15,7 @@ const WorldProvider = struct {
         registry_identity: *vanilla.RegistryIdentity,
         worlds: *vanilla.Worlds,
     };
-    pub const Services = .{*vanilla.VanillaWorlds};
+    pub const Provides = .{*vanilla.VanillaWorlds};
 
     worlds: vanilla.VanillaWorlds,
 
@@ -33,17 +31,23 @@ const WorldProvider = struct {
         return self;
     }
 
-    pub fn service(self: *WorldProvider, comptime Contract: type) Contract {
+    pub fn provide(self: *WorldProvider, comptime Contract: type) Contract {
         return &self.worlds;
     }
 };
 
 pub fn main(init: std.process.Init) !void {
-    const startup = profiles.Startup.capture(init.io);
-    const allocator = init.gpa;
-    const address = init.environ_map.get("LIGHTNING_ROD_E2E_ADDRESS") orelse "127.0.0.1:25565";
+    const startup = profile.Startup.capture(init.io);
+    const metrics_output: lightning_rod.metrics.Exporter.Configuration = .{
+        .directory = init.environ_map.get("LIGHTNING_ROD_METRICS_DIRECTORY") orelse return error.MissingMetricsDirectory,
+        .stop_file = "metrics.stop",
+    };
+    var memory = lightning_rod.Memory.init(std.heap.page_allocator, init.io);
+    defer memory.deinit();
+    const allocator = memory.allocator("bootstrap");
+    const address = init.environ_map.get("LIGHTNING_ROD_E2E_ADDRESS") orelse return error.MissingServerAddress;
     const port = try std.fmt.parseInt(u16, address[(std.mem.lastIndexOfScalar(u8, address, ':') orelse return error.InvalidAddress) + 1 ..], 10);
-    const plugins = lightning_rod.plugin.compose(.{
+    const gameplay_plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(vanilla.plugins(), .{
             lightning_rod.plugin.configured(WorldProvider, WorldProvider.Configuration{}),
             lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .maximum = 2, .render_distance = 2 }),
@@ -68,23 +72,20 @@ pub fn main(init: std.process.Init) !void {
     });
     var store = try persistence.Store.init(allocator, init.io, .{ .path = "custom-store" });
     defer store.deinit();
-    const router = profiles.SingleSimulation{};
-    const Server = profiles.Server(@TypeOf(plugins), selected_protocol.Endpoint, networking.Transport(.{
-        .connections = 32,
-        .operations = 256,
-        .events = 320,
-    }), reload_execve, @TypeOf(session_plugins), @TypeOf(router));
-    try Server.run(allocator, init, .{
-        .metrics_export = if (init.environ_map.get("LIGHTNING_ROD_METRICS_DIRECTORY")) |directory| .{ .directory = directory, .stop_file = "metrics.stop" } else null,
-        .plugins = plugins,
-        .simulation = .{ .memory_bytes = 32 * 1024 * 1024, .temporary_bytes = 256 * 1024, .autosave = .{ .ticks = null } },
-        .session_plugins = session_plugins,
+    try profile.Server(@TypeOf(gameplay_plugins), selected_protocol.Endpoint, @TypeOf(session_plugins), sessions.SingleSimulation).run(&memory, init, .{
+        .plugins = gameplay_plugins,
+        .network = .{
+            .plugins = session_plugins,
+            .protocols = &selected,
+            .router = .{},
+            .endpoints = &.{.{ .id = 0 }},
+            .max_players = 2,
+            .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } },
+        },
+        .metrics_export = metrics_output,
+        .simulation = .{ .temporary_bytes = 256 * 1024, .autosave = .{ .ticks = null } },
         .startup = startup,
-        .router = router,
-        .max_players = 2,
-        .protocols = &selected,
         .persistence = &store,
-        .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } },
         .reload = .{ .executable = "/proc/self/exe" },
     }, .{});
 }

@@ -1,26 +1,23 @@
 const e2e = @import("e2e");
 const std = @import("std");
-const lr = @import("lightning_rod");
+const lightning_rod = @import("lightning_rod");
 const protocols = @import("protocols");
 const vanilla = @import("vanilla");
 const sessions = @import("sessions");
-const bootstrap = e2e.server;
 
 pub fn main(init: std.process.Init) !void {
-    const operators = bootstrap.aliceOperator();
-    const plugins = lr.plugin.compose(.{
-        lr.plugin.replace(bootstrap.plugins(), .{
-            lr.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = 2, .gamemode = .survival }),
-            lr.plugin.configured(vanilla.Worlds, .{ .maximum = 4 }),
-            lr.plugin.configured(vanilla.Operators, vanilla.Operators.Configuration{ .operators = &operators }),
+    const operators = e2e.profile.aliceOperator();
+    const plugins = lightning_rod.plugin.compose(.{
+        lightning_rod.plugin.replace(e2e.profile.plugins(), .{
+            lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = 2, .gamemode = .survival }),
+            lightning_rod.plugin.configured(vanilla.Worlds, .{ .maximum = 4 }),
+            lightning_rod.plugin.configured(vanilla.Operators, vanilla.Operators.Configuration{ .operators = &operators }),
         }),
-        lr.plugin.configured(e2e.Inventory, .{ .starting_bread = 17 }),
-        lr.plugin.configured(Probe, .{}),
+        lightning_rod.plugin.configured(e2e.Inventory, .{ .starting_bread = 17 }),
+        lightning_rod.plugin.configured(Probe, .{}),
     });
-    try bootstrap.run(init, plugins, .{});
+    try e2e.profile.run(init, plugins, .{});
 }
-
-const registry = protocols.registry;
 
 const Probe = struct {
     pub const id = "e2e:teleport";
@@ -83,10 +80,10 @@ const Probe = struct {
     fn world(self: *Probe, destination: World) !void {
         for (self.deps.players.records) |*player| if (player.handle != null and std.mem.eql(u8, player.name[0..player.name_len], "bob")) {
             const block: u16 = switch (destination) {
-                .overworld => registry.block_grass_block_default_state,
-                .nether => registry.block_netherrack_default_state,
-                .end => registry.block_end_stone_default_state,
-                .overworld_two => registry.block_stone_default_state,
+                .overworld => protocols.registry.block_grass_block_default_state,
+                .nether => protocols.registry.block_netherrack_default_state,
+                .end => protocols.registry.block_end_stone_default_state,
+                .overworld_two => protocols.registry.block_stone_default_state,
             };
             const worlds = self.deps.worlds;
             const defaults = self.deps.vanilla_worlds;
@@ -125,7 +122,7 @@ const Probe = struct {
 
         switch (phase) {
             .setup => {
-                try self.deps.chunks.setBlock(0, .{ .x = 10, .y = 64, .z = 11 }, registry.block_stone_default_state);
+                try self.deps.chunks.setBlock(0, .{ .x = 10, .y = 64, .z = 11 }, protocols.registry.block_stone_default_state);
                 try self.deps.players.teleport(alice, 0, .{ .x = 8.5, .y = 65, .z = 10.5 }, .{ .yaw = -90, .pitch = 30 });
                 try self.deps.players.teleport(other, 0, .{ .x = 10.5, .y = 65, .z = 10.5 }, .{ .yaw = 0, .pitch = 60 });
                 if (!try self.deps.menus.give(alice.handle.?.index, "minecraft:stone", 8)) return error.InventorySetup;
@@ -139,7 +136,7 @@ const Probe = struct {
                 try self.deps.dropped.put(self.isolated_item, metadata);
             },
             .verify => {
-                if (try self.deps.chunks.getBlock(0, .{ .x = 10, .y = 65, .z = 10 }) != registry.block_stone_default_state or try self.deps.chunks.getBlock(1, .{ .x = 10, .y = 65, .z = 10 }) != 0)
+                if (try self.deps.chunks.getBlock(0, .{ .x = 10, .y = 65, .z = 10 }) != protocols.registry.block_stone_default_state or try self.deps.chunks.getBlock(1, .{ .x = 10, .y = 65, .z = 10 }) != 0)
                     return error.CrossWorldPlacement;
 
                 var metadata = try self.deps.dropped.get(self.isolated_item);

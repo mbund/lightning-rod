@@ -4,19 +4,16 @@ const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
 const sessions = @import("sessions");
-const bootstrap = e2e.server;
 
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
-        lightning_rod.plugin.replace(bootstrap.plugins(), .{
+        lightning_rod.plugin.replace(e2e.profile.plugins(), .{
             lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 2, .render_distance = 2 }),
         }),
         lightning_rod.plugin.configured(Probe, .{}),
     });
-    try bootstrap.run(init, plugins, .{ .plaintext = true, .reload_executable = "/proc/self/exe" });
+    try e2e.profile.run(init, plugins, .{ .plaintext = true, .reload_executable = "/proc/self/exe" });
 }
-
-const storage = lightning_rod.storage;
 
 const Probe = struct {
     pub const id = "e2e:environment";
@@ -29,7 +26,7 @@ const Probe = struct {
         worlds: *vanilla.VanillaWorlds,
         control: *e2e.Control,
         reload: *vanilla.Reload,
-        storage: storage.Space,
+        storage: lightning_rod.storage.Space,
     };
 
     const Snapshot = extern struct {
@@ -119,7 +116,7 @@ const Probe = struct {
         }
     }
 
-    pub fn checkpoint(self: *Probe, space: storage.Space) !void {
+    pub fn checkpoint(self: *Probe, space: lightning_rod.storage.Space) !void {
         const value = self.snapshot();
         try records.Value.init(space).write(std.mem.asBytes(&value));
     }

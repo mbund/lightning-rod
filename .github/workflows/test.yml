@@ -35,6 +35,25 @@ jobs:
       - working-directory: protocol_codegen
         run: zig build check
 
+  examples:
+    name: Example (${{ matrix.example }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        example: [vanilla, embedded, vanilla-plus, skyblock]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Zig
+        run: bash .github/scripts/install-zig.sh
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+      - working-directory: examples/${{ matrix.example }}
+        run: zig build --release=safe
+
   distribution:
     name: Package distribution
     runs-on: ubuntu-24.04

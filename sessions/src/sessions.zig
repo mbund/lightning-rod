@@ -24,9 +24,11 @@ pub const Handle = networking.Handle;
 pub const Protocol = engine.Protocol;
 
 pub const SharedPages = shared.SharedPages;
+pub const OutputPool = shared.Pool;
 pub const shared_headroom = shared.headroom;
 pub const SharedConfiguration = shared.Configuration;
 pub const RawPacket = shared.RawPacket;
+pub const Recipients = shared.Recipients;
 pub const Frame = shared.Frame;
 pub const frame = shared.frame;
 pub const Engine = engine.Engine;
@@ -45,3 +47,9 @@ pub const ConfigurationInputEffect = input.ConfigurationEffect;
 pub const PlayInputEffect = input.PlayEffect;
 pub const Keepalive = protocol.Keepalive;
 pub const Disposition = engine.Disposition;
+
+pub const Threaded = @import("threaded.zig").Threaded;
+pub const Embedded = @import("embedded.zig").Embedded;
+pub const World = @import("plugin.zig").World;
+pub const Routing = @import("plugin.zig").Routing;
+pub const IoTransport = @import("transport.zig").Transport;

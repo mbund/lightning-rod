@@ -1,20 +1,18 @@
 const std = @import("std");
-const lr = @import("lightning_rod");
+const lightning_rod = @import("lightning_rod");
 const protocols = @import("protocols");
 const vanilla = @import("vanilla");
 const e2e = @import("e2e");
-const registry = protocols.registry;
 const sessions = @import("sessions");
-const bootstrap = e2e.server;
 
 pub fn main(init: std.process.Init) !void {
-    const plugins = lr.plugin.compose(.{
-        lr.plugin.replace(bootstrap.plugins(), .{
-            lr.plugin.configured(vanilla.BlockSynchronization, .{ .delta_sections = 2 }),
+    const plugins = lightning_rod.plugin.compose(.{
+        lightning_rod.plugin.replace(e2e.profile.plugins(), .{
+            lightning_rod.plugin.configured(vanilla.BlockSynchronization, .{ .delta_sections = 2 }),
         }),
-        lr.plugin.configured(Probe, .{}),
+        lightning_rod.plugin.configured(Probe, .{}),
     });
-    try bootstrap.run(init, plugins, .{});
+    try e2e.profile.run(init, plugins, .{});
 }
 
 const Probe = struct {
@@ -47,14 +45,14 @@ const Probe = struct {
         if (player.stage != .ready or !player.loaded) return .unhandled;
         if (std.mem.eql(u8, text, "blocks_clock")) {
             self.clock_left = clock_ticks;
-            self.clock_blocks = self.deps.synchronization.blocks;
-            self.clock_full = self.deps.synchronization.full_sections;
+            self.clock_blocks = self.deps.synchronization.blocks.load(.acquire);
+            self.clock_full = self.deps.synchronization.full_sections.load(.acquire);
             return .handled;
         }
 
         if (std.mem.eql(u8, text, "blocks_clock_check")) {
-            const sent = self.deps.synchronization.blocks - self.clock_blocks;
-            if (self.clock_left != 0 or sent < clock_ticks or sent > 2 * clock_ticks or self.deps.synchronization.full_sections != self.clock_full)
+            const sent = self.deps.synchronization.blocks.load(.acquire) - self.clock_blocks;
+            if (self.clock_left != 0 or sent < clock_ticks or sent > 2 * clock_ticks or self.deps.synchronization.full_sections.load(.acquire) != self.clock_full)
                 return error.BlockClockAmplification;
             std.log.info("event=block_clock_verified ticks={d} encoded_blocks={d}", .{ clock_ticks, sent });
             try self.deps.control.send(handle, "Block clock verified");
@@ -67,7 +65,7 @@ const Probe = struct {
 
             for (&edits, 0..) |*edit, local| edit.* = .{
                 .index = @intCast(local),
-                .state = if (local % 2 == 0) registry.block_stone_default_state else registry.block_dirt_default_state,
+                .state = if (local % 2 == 0) protocols.registry.block_stone_default_state else protocols.registry.block_dirt_default_state,
             };
 
             for (&sections, 0..) |*batch, section| batch.* = .{
@@ -80,25 +78,25 @@ const Probe = struct {
                 .edits = &edits,
             };
             try self.deps.chunks.setSections(&sections);
-            try self.deps.chunks.setBlock(0, .{ .x = -32, .y = 144, .z = -32 }, @intCast(registry.blockStateId("minecraft:gold_block").?));
+            try self.deps.chunks.setBlock(0, .{ .x = -32, .y = 144, .z = -32 }, @intCast(protocols.registry.blockStateId("minecraft:gold_block").?));
             return .handled;
         }
 
         if (std.mem.eql(u8, text, "blocks_single")) {
-            self.single_blocks = self.deps.synchronization.blocks;
-            self.single_full = self.deps.synchronization.full_sections;
-            try self.deps.chunks.setBlocks(.{ .world = 0, .x = std.math.maxInt(i32), .y = 4, .z = std.math.minInt(i32) }, &.{.{ .index = 0, .state = registry.block_stone_default_state }});
-            const gold: u16 = @intCast(registry.blockStateId("minecraft:gold_block").?);
+            self.single_blocks = self.deps.synchronization.blocks.load(.acquire);
+            self.single_full = self.deps.synchronization.full_sections.load(.acquire);
+            try self.deps.chunks.setBlocks(.{ .world = 0, .x = std.math.maxInt(i32), .y = 4, .z = std.math.minInt(i32) }, &.{.{ .index = 0, .state = protocols.registry.block_stone_default_state }});
+            const gold: u16 = @intCast(protocols.registry.blockStateId("minecraft:gold_block").?);
 
-            for (0..64) |step| try self.deps.chunks.setBlock(0, .{ .x = 33, .y = 208, .z = 33 }, if (step % 2 == 0) registry.block_dirt_default_state else gold);
+            for (0..64) |step| try self.deps.chunks.setBlock(0, .{ .x = 33, .y = 208, .z = 33 }, if (step % 2 == 0) protocols.registry.block_dirt_default_state else gold);
             return .handled;
         }
 
         if (std.mem.eql(u8, text, "blocks_check")) {
             const sync = self.deps.synchronization;
-            if (sync.evictions == 0 or sync.full_sections == 0 or sync.full_sections != self.single_full or sync.blocks - self.single_blocks > 2)
+            if (sync.evictions.load(.acquire) == 0 or sync.full_sections.load(.acquire) == 0 or sync.full_sections.load(.acquire) != self.single_full or sync.blocks.load(.acquire) - self.single_blocks > 2)
                 return error.BlockSynchronizationAccounting;
-            std.log.info("event=block_sync_verified evictions={d} full_sections={d} packets={d} blocks={d} final_edit_blocks={d} backpressured={d}", .{ sync.evictions, sync.full_sections, sync.packets, sync.blocks, sync.blocks - self.single_blocks, sync.backpressured });
+            std.log.info("event=block_sync_verified evictions={d} full_sections={d} packets={d} blocks={d} final_edit_blocks={d} backpressured={d}", .{ sync.evictions.load(.acquire), sync.full_sections.load(.acquire), sync.packets.load(.acquire), sync.blocks.load(.acquire), sync.blocks.load(.acquire) - self.single_blocks, sync.backpressured.load(.acquire) });
             try self.deps.control.send(handle, "Block synchronization verified");
             return .handled;
         }
@@ -107,18 +105,18 @@ const Probe = struct {
         const removed = std.mem.eql(u8, text, "blocks_remove");
         if (!added and !removed) return .unhandled;
         try self.deps.chunks.setBlocks(.{ .world = 0, .x = 0, .y = 4, .z = 0 }, &.{
-            .{ .index = 2, .state = if (added) registry.block_dirt_default_state else 0 },
-            .{ .index = 2, .state = if (added) registry.block_stone_default_state else 0 },
-            .{ .index = 18, .state = if (added) registry.block_dirt_default_state else 0 },
+            .{ .index = 2, .state = if (added) protocols.registry.block_dirt_default_state else 0 },
+            .{ .index = 2, .state = if (added) protocols.registry.block_stone_default_state else 0 },
+            .{ .index = 18, .state = if (added) protocols.registry.block_dirt_default_state else 0 },
         });
-        try self.deps.chunks.setBlock(0, .{ .x = -1, .y = 64, .z = -1 }, if (added) registry.block_stone_default_state else 0);
+        try self.deps.chunks.setBlock(0, .{ .x = -1, .y = 64, .z = -1 }, if (added) protocols.registry.block_stone_default_state else 0);
         return .handled;
     }
 
     pub fn tick(self: *Probe) !void {
         if (self.clock_left > 0) {
             self.clock_left -= 1;
-            try self.deps.chunks.setBlock(0, .{ .x = 32 + self.clock_left % 16, .y = 209, .z = 32 + self.clock_left / 16 }, @intCast(registry.blockStateId("minecraft:gold_block").?));
+            try self.deps.chunks.setBlock(0, .{ .x = 32 + self.clock_left % 16, .y = 209, .z = 32 + self.clock_left / 16 }, @intCast(protocols.registry.blockStateId("minecraft:gold_block").?));
             if (self.clock_left == 0) for (self.deps.players.records) |player| {
                 const handle = player.handle orelse continue;
                 try self.deps.control.send(handle, "Block clock completed");

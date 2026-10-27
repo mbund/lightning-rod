@@ -8,9 +8,9 @@ const components = @import("item_components.zig");
 const data = @import("item_data.zig");
 const Items = @import("items.zig").Items;
 
-pub const Incoming = struct { count: u16, definition: []const u8 };
+pub const Incoming = struct { count: u16, kind: u32, components: []const data.Component, encoded_bytes: usize };
 
-pub fn readStack(items: *Items, scratch: []u8, definition: []u8, bytes: []const u8, selected: *const sessions.Protocol, recipient: u128) !?Incoming {
+pub fn readStack(items: *Items, scratch: []u8, entries: []data.Component, bytes: []const u8, selected: *const sessions.Protocol, recipient: u128) !?Incoming {
     const packet = wire.UntrustedSlot.read(bytes);
     const count, const counted = try packet.itemCount();
     var choice = try counted.anon_1();
@@ -36,7 +36,7 @@ pub fn readStack(items: *Items, scratch: []u8, definition: []u8, bytes: []const 
     const added, const after_added = try identified.addedComponentCount();
     const removed, const counts = try after_added.removedComponentCount();
     if (added < 0 or removed < 0 or added > data.maximum_components or removed > data.maximum_components - added) return error.ItemTooLarge;
-    var entries: [data.maximum_components]data.Component = undefined;
+    if (entries.len < @as(usize, @intCast(added + removed))) return error.ItemTooLarge;
     var seen: [data.maximum_components]u64 = undefined;
     var seen_count: usize = 0;
     var output = scratch;
@@ -69,9 +69,9 @@ pub fn readStack(items: *Items, scratch: []u8, definition: []u8, bytes: []const 
         try removed_entries.advance(done);
     }
     try (try choice.advance(try contents.advance(try removed_entries.finish()))).finish();
-    const encoded = try data.encode(definition, kind orelse return error.UnsupportedProtocol, entries[0..index]);
-    if (count > try Items.maximum(try data.View.parse(encoded))) return error.InvalidItemCount;
-    return .{ .count = @intCast(count), .definition = encoded };
+    const canonical = kind orelse return error.UnsupportedProtocol;
+    if (count > try Items.maximumDefinition(canonical, entries[0..index])) return error.InvalidItemCount;
+    return .{ .count = @intCast(count), .kind = canonical, .components = entries[0..index], .encoded_bytes = 10 + index * 12 + scratch.len - output.len };
 }
 
 pub const SlotArguments = struct {
@@ -80,7 +80,7 @@ pub const SlotArguments = struct {
     stack: ?inventories.Stack,
     recipient: u128,
     /// Borrowed from a pinned definition for the duration of encoding.
-    view: ?data.View = null,
+    view: ?data.View,
 };
 
 pub const writeSlot: fn (destination: wire.Slot.Destination, args: SlotArguments) anyerror!wire.Slot.Completion = packets.nested(.{encodeSlot}).write;
@@ -90,51 +90,44 @@ fn encodeSlot(packet: wire.Slot.Writer, args: SlotArguments) !wire.Slot.Writer.D
     const items = args.items;
     const stack = args.stack;
     const recipient = args.recipient;
+    std.debug.assert((stack == null) == (args.view == null));
     const counted = try packet.itemCount(if (stack) |value| value.count else 0);
     var choice = try counted.anon_1();
     const branch = try choice.begin();
-    const value = stack orelse return choice.advance(try branch.case_0());
-    const prepared = if (args.view == null) try items.acquire(value) else null;
-    defer if (prepared) |held| held.release();
-    const view = args.view orelse prepared.?.view;
-    var emitted: [data.maximum_components]usize = undefined;
-    var added: usize = 0;
-    var removed: usize = 0;
-    var it = view.iterator();
-    while (it.next()) |component| {
-        if (items.components.dispatch.find(component.key) == null) return error.UnsupportedComponent;
-        removed += @intFromBool(component.value == null);
-    }
-    for (0..items.components.dispatch.count) |index| {
-        if (!items.components.present(index, view, recipient)) continue;
-        emitted[added] = index;
-        added += 1;
-        if (view.get(items.components.dispatch.entries[index].key)) |component| removed -= @intFromBool(component.value == null);
+    if (stack == null) return choice.advance(try branch.case_0());
+    const view = args.view.?;
+    std.debug.assert(items.components.dispatch.count <= data.maximum_components);
+    var offsets: [data.maximum_components]usize = undefined;
+    const count = items.components.dispatch.count;
+    try items.components.resolve(view, offsets[0..count]);
+    var emitted: std.StaticBitSet(data.maximum_components) = .initEmpty();
+    var removals: std.StaticBitSet(data.maximum_components) = .initEmpty();
+    for (offsets[0..count], 0..) |offset, index| {
+        const stored = if (offset == std.math.maxInt(usize)) null else view.at(offset);
+        if (items.components.present(index, view, recipient, stored)) {
+            emitted.set(index);
+        } else if (stored != null and stored.?.value == null) removals.set(index);
     }
     var contents = try branch.case_default();
     const identified = try (try contents.begin()).itemId(try registry.itemId(@intCast(view.kind)));
-    const counts = try (try identified.addedComponentCount(@intCast(added))).removedComponentCount(@intCast(removed));
+    const counts = try (try identified.addedComponentCount(@intCast(emitted.count()))).removedComponentCount(@intCast(removals.count()));
     var entries = try counts.components();
-    for (emitted[0..added]) |index| {
+    var writing = emitted.iterator(.{});
+    while (writing.next()) |index| {
         const entry = (try entries.next()).?;
-        const key = items.components.dispatch.entries[index].key;
-        try entries.advance(try items.components.dispatch.write(entry, key, components.WriteContext{
+        try entries.advance(try items.components.dispatch.writeAt(entry, index, components.WriteContext{
             .item = view,
-            .value = if (view.get(key)) |stored| stored.value else null,
+            .value = if (offsets[index] == std.math.maxInt(usize)) null else view.at(offsets[index]).value,
             .registry = registry,
             .protocol = packet._cursor.protocol_number,
             .recipient = recipient,
         }));
     }
-    var removals = try (try entries.finish()).removeComponents();
-    it = view.iterator();
-    while (it.next()) |component| {
-        if (component.value != null) continue;
-        var present = false;
-        for (emitted[0..added]) |index| present = present or items.components.dispatch.entries[index].key == component.key;
-        if (present) continue;
-        const entry = (try removals.next()).?;
-        try removals.advance(try entry.type(@intCast(try items.components.dispatch.tagForKey(packet._cursor.protocol_number, component.key))));
+    var removed_entries = try (try entries.finish()).removeComponents();
+    for (items.components.order[0..count]) |index| {
+        if (!removals.isSet(index)) continue;
+        const entry = (try removed_entries.next()).?;
+        try removed_entries.advance(try entry.type(@intCast(try items.components.dispatch.tagAt(packet._cursor.protocol_number, index))));
     }
-    return choice.advance(try contents.advance(try removals.finish()));
+    return choice.advance(try contents.advance(try removed_entries.finish()));
 }

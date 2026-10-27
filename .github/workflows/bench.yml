@@ -32,9 +32,13 @@ jobs:
           retention-days: 7
 
   chunk-benchmark:
-    name: Chunk workload benchmark
+    name: Chunk ${{ matrix.benchmark }} benchmark
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        benchmark: [workloads, formats]
     env:
       MINECRAFT_SERVER_SHA1: 823e2250d24b3ddac457a60c92a6a941943fcd6a
     steps:
@@ -47,6 +51,8 @@ jobs:
           path: |
             ${{ runner.temp }}/benchmark-world/corpus.bin
             ${{ runner.temp }}/benchmark-world/corpus.json
+            ${{ runner.temp }}/benchmark-world/anvil
+            ${{ runner.temp }}/benchmark-world/registry.json
           key: benchmark-corpus-${{ env.MINECRAFT_SERVER_SHA1 }}-${{ hashFiles('build.zig.zon', 'bench/chunks/src/prepare.zig', 'bench/chunks/src/anvil.zig', 'bench/chunks/src/corpus.zig', 'bench/chunks/src/common.zig', 'nbt/src/**') }}
       - uses: actions/setup-java@v6
         if: steps.corpus.outputs.cache-hit != 'true'
@@ -68,18 +74,26 @@ jobs:
             --server "$RUNNER_TEMP/benchmark-minecraft.jar" \
             --output "$RUNNER_TEMP/benchmark-world"
       - name: Run all chunk workloads
+        if: matrix.benchmark == 'workloads'
         working-directory: bench/chunks
         run: |
           zig build --release=safe bench -- \
+            --corpus "$RUNNER_TEMP/benchmark-world/corpus.bin"
+      - name: Compare Anvil SQLite and native terrain storage
+        if: matrix.benchmark == 'formats'
+        working-directory: bench/chunks
+        run: |
+          zig build --release=safe compare -- \
             --corpus "$RUNNER_TEMP/benchmark-world/corpus.bin"
       - name: Preserve chunk benchmark
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: chunk-benchmark
+          name: chunk-${{ matrix.benchmark }}-benchmark
           path: |
             bench/chunks/.zig-cache/world-bench/results/results.json
             bench/chunks/.zig-cache/world-bench/results/*.jsonl
+            bench/chunks/.zig-cache/storage-formats/results.json
             ${{ runner.temp }}/benchmark-world/corpus.json
             ${{ runner.temp }}/benchmark-world/generator/*.log
           include-hidden-files: true
@@ -123,3 +137,46 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  tick-benchmark:
+    name: Simulation tick scaling
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Zig
+        run: bash .github/scripts/install-zig.sh
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Measure steady-state tick workloads
+        working-directory: bench/tick
+        run: zig build --release=safe bench -- --ticks=1000 --samples=3 | tee results.txt
+      - name: Preserve tick benchmark
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tick-benchmark
+          path: bench/tick/results.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+  foundation-benchmark:
+    name: Simulation framework overhead
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Zig
+        run: bash .github/scripts/install-zig.sh
+      - name: Measure framework overhead
+        working-directory: bench/tick
+        run: zig build --release=safe bench-foundation -- --ticks=1000000 | tee foundation-results.txt
+      - name: Preserve framework benchmark
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: foundation-benchmark
+          path: bench/tick/foundation-results.txt
+          if-no-files-found: ignore
+          retention-days: 7

@@ -1,14 +1,12 @@
 const std = @import("std");
 const profile = @import("profile");
-const linux = std.os.linux;
 
 const Cache = enum { warm, cold };
 const Phases = struct {
-    initialize_ns: u64 = 0,
-    storage_ns: u64 = 0,
+    startup_ns: u64 = 0,
+    plugin_initialization_ns: u64 = 0,
+    storage_initialization_cpu_ns: u64 = 0,
     recovery_ns: u64 = 0,
-    sessions_ns: u64 = 0,
-    simulation_ns: u64 = 0,
     checkpoint_ns: u64 = 0,
     submit_ns: u64 = 0,
     close_hooks_ns: u64 = 0,
@@ -36,12 +34,12 @@ fn waitReadable(io: std.Io, fd: i32, milliseconds: u32) !void {
     while (true) {
         const left = deadline - std.Io.Clock.now(.awake, io).nanoseconds;
         if (left <= 0) return error.Timeout;
-        var descriptor: linux.pollfd = .{ .fd = fd, .events = linux.POLL.IN, .revents = 0 };
-        const result = linux.poll(@ptrCast(&descriptor), 1, @intCast(@divTrunc(left + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
-        switch (linux.errno(result)) {
+        var descriptor: std.os.linux.pollfd = .{ .fd = fd, .events = std.os.linux.POLL.IN, .revents = 0 };
+        const result = std.os.linux.poll(@ptrCast(&descriptor), 1, @intCast(@divTrunc(left + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+        switch (std.os.linux.errno(result)) {
             .SUCCESS => {
                 if (result == 0) return error.Timeout;
-                if (descriptor.revents & linux.POLL.NVAL != 0) return error.InvalidDescriptor;
+                if (descriptor.revents & std.os.linux.POLL.NVAL != 0) return error.InvalidDescriptor;
                 return;
             },
             .INTR => continue,
@@ -51,10 +49,13 @@ fn waitReadable(io: std.Io, fd: i32, milliseconds: u32) !void {
 }
 
 fn phasesRead(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Phases {
-    const Snapshot = struct { name: []const u8, count: u64, value: u64 };
+    const Snapshot = struct { name: []const u8, count: u64, value: u64, total: u64 };
     var directory = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
     defer directory.close(io);
     var result: Phases = .{};
+    var startup_seen = false;
+    var recovery_seen = false;
+    var plugins_seen = false;
     var iterator = directory.iterate();
     while (try iterator.next(io)) |entry| {
         if (!std.mem.endsWith(u8, entry.name, ".snapshot.jsonl")) continue;
@@ -71,11 +72,19 @@ fn phasesRead(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Phase
             defer parsed.deinit();
             const sample = parsed.value;
             if (sample.count == 0) continue;
-            if (std.mem.eql(u8, sample.name, "server.initialize")) result.initialize_ns = sample.value;
-            if (std.mem.eql(u8, sample.name, "server.initialize.storage")) result.storage_ns = sample.value;
-            if (std.mem.eql(u8, sample.name, "storage.initialize.recovery")) result.recovery_ns = sample.value;
-            if (std.mem.eql(u8, sample.name, "server.initialize.sessions")) result.sessions_ns = sample.value;
-            if (std.mem.eql(u8, sample.name, "server.initialize.simulation")) result.simulation_ns = sample.value;
+            if (std.mem.eql(u8, sample.name, "server.startup")) {
+                result.startup_ns = sample.value;
+                startup_seen = true;
+            }
+            if (std.mem.endsWith(u8, sample.name, ".initialize")) {
+                result.plugin_initialization_ns += sample.total;
+                plugins_seen = true;
+            }
+            if (std.mem.eql(u8, sample.name, "storage.initialize.cpu")) result.storage_initialization_cpu_ns = sample.value;
+            if (std.mem.eql(u8, sample.name, "storage.initialize.recovery")) {
+                result.recovery_ns = sample.value;
+                recovery_seen = true;
+            }
             if (std.mem.eql(u8, sample.name, "simulation.checkpoint")) result.checkpoint_ns = sample.value;
             if (std.mem.eql(u8, sample.name, "simulation.submit")) result.submit_ns = sample.value;
             if (std.mem.eql(u8, sample.name, "simulation.close.hooks")) result.close_hooks_ns = sample.value;
@@ -84,7 +93,7 @@ fn phasesRead(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Phase
             if (std.mem.eql(u8, sample.name, "storage.durability_wait.cpu")) result.durability_cpu_ns = sample.value;
         }
     }
-    if (result.initialize_ns == 0 or result.storage_ns == 0) return error.StartupMetricsMissing;
+    if (!startup_seen or !recovery_seen or !plugins_seen) return error.StartupMetricsMissing;
     return result;
 }
 
@@ -119,7 +128,7 @@ pub fn main(init: std.process.Init) !void {
     const source_path = try cwd.realPathFileAlloc(io, source orelse return error.MissingWorld, allocator);
     const source_file = try cwd.openFile(io, source_path, .{});
     defer source_file.close(io);
-    if (linux.errno(linux.flock(source_file.handle, std.posix.LOCK.SH | std.posix.LOCK.NB)) != .SUCCESS) return error.WorldInUse;
+    if (std.os.linux.errno(std.os.linux.flock(source_file.handle, std.posix.LOCK.SH | std.posix.LOCK.NB)) != .SUCCESS) return error.WorldInUse;
     const database_bytes = (try source_file.stat(io)).size;
     if (database_bytes == 0) return error.EmptyWorld;
     try cwd.createDirPath(io, output);
@@ -164,7 +173,7 @@ pub fn main(init: std.process.Init) !void {
                     if (count < buffer.len) break;
                 }
             }
-            if (cache == .cold and linux.errno(linux.fadvise(file.handle, 0, 0, linux.POSIX_FADV.DONTNEED)) != .SUCCESS) return error.CacheAdviceFailed;
+            if (cache == .cold and std.os.linux.errno(std.os.linux.fadvise(file.handle, 0, 0, std.os.linux.POSIX_FADV.DONTNEED)) != .SUCCESS) return error.CacheAdviceFailed;
         }
         const log_path = try std.fs.path.join(allocator, &.{ output, "server.log" });
         const log = try cwd.createFile(io, log_path, .{});
@@ -172,8 +181,8 @@ pub fn main(init: std.process.Init) !void {
         const launched = std.Io.Clock.now(.awake, io).nanoseconds;
         var child = try std.process.spawn(io, .{ .argv = &.{ server, "--startup-report", "--port=0", world_arg, metrics_arg }, .cwd = .{ .path = output }, .stdin = .ignore, .stdout = .pipe, .stderr = .{ .file = log } });
         defer child.kill(io);
-        const descriptor = linux.pidfd_open(child.id.?, 0);
-        if (linux.errno(descriptor) != .SUCCESS) return error.ProcessHandleFailed;
+        const descriptor = std.os.linux.pidfd_open(child.id.?, 0);
+        if (std.os.linux.errno(descriptor) != .SUCCESS) return error.ProcessHandleFailed;
         const pidfile: std.Io.File = .{ .handle = @intCast(descriptor), .flags = .{ .nonblocking = false } };
         defer pidfile.close(io);
         try waitReadable(io, child.stdout.?.handle, 30_000);
@@ -186,7 +195,7 @@ pub fn main(init: std.process.Init) !void {
         if (report.entered_ns < launched) return error.InvalidStartupReport;
         if (shutdown_delay_ms != 0) try std.Io.sleep(io, .fromMilliseconds(shutdown_delay_ms), .awake);
         const stopping = std.Io.Clock.now(.awake, io).nanoseconds;
-        const signal = linux.errno(linux.kill(child.id.?, .INT));
+        const signal = std.os.linux.errno(std.os.linux.kill(child.id.?, .INT));
         if (signal != .SUCCESS and signal != .SRCH) return error.ShutdownSignalFailed;
         try waitReadable(io, pidfile.handle, 10_000);
         const exited = std.Io.Clock.now(.awake, io).nanoseconds;

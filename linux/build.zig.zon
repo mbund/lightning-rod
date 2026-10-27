@@ -5,10 +5,12 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .lightning_rod = .{ .path = ".." },
+        .reload = .{ .path = "../reload" },
         .storage = .{ .path = "../storage" },
         .reload_execve = .{ .path = "../reload_execve" },
-        .profiles = .{ .path = "../profiles" },
-        .network_uring = .{ .path = "../network_uring" },
+        .host = .{ .path = "../host" },
+        .sessions = .{ .path = "../sessions" },
+        .vanilla = .{ .path = "../vanilla" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

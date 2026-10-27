@@ -1,7 +1,6 @@
 const std = @import("std");
 const sessions = @import("sessions");
 const JavaWire = @import("wire.zig").Wire;
-const api = sessions.protocol;
 const assert = std.debug.assert;
 
 const ResumePhase = enum(u8) {
@@ -21,7 +20,7 @@ pub fn Connection(comptime Protocol: type) type {
         login_started: bool = false,
         wire: Wire = .{},
 
-        pub fn init(intent: api.Handshake.Intent) Self {
+        pub fn init(intent: sessions.protocol.Handshake.Intent) Self {
             return .{ .phase = if (intent == .status) .status else .plugin_login };
         }
 
@@ -67,11 +66,15 @@ pub fn Connection(comptime Protocol: type) type {
             self.wire.send(bytes);
         }
 
+        pub fn encrypt(self: *Self, source: []const u8, destination: []u8) void {
+            self.wire.encrypt(source, destination);
+        }
+
         pub fn clear(self: *Self) void {
             self.wire.clear();
         }
 
-        pub fn frame(_: *const Self, bytes: []const u8, maximum: usize) !api.Frame {
+        pub fn frame(_: *const Self, bytes: []const u8, maximum: usize) !sessions.protocol.Frame {
             return Wire.frame(bytes, maximum);
         }
 
@@ -79,24 +82,28 @@ pub fn Connection(comptime Protocol: type) type {
             return self.wire.decode(bytes, destination, workspace, threshold);
         }
 
-        pub fn frameControl(self: *Self, packet: []const u8, scratch: []u8, output: []u8, workspace: *Wire.Workspace, threshold: ?usize) ![]const u8 {
-            return self.wire.control(packet, scratch, output, workspace, threshold);
+        pub fn frameControl(self: *Self, packet: sessions.protocol.Packet, output: []u8, workspace: *Wire.Workspace, threshold: ?usize) !sessions.protocol.Fragments {
+            return self.wire.control(packet, output, workspace, threshold);
         }
 
         pub fn playBorrowed(self: *const Self) bool {
             return !self.wire.compressed;
         }
 
-        pub fn advance(self: *Self, comptime Observer: type, event: api.Event, context: api.Context(Observer)) !?[]const u8 {
+        pub fn advance(self: *Self, comptime Observer: type, event: sessions.protocol.Event, context: sessions.protocol.Context(Observer)) !?[]const u8 {
             const state = context.state;
             const output = context.output;
-            const profile: api.Profile = .{
+            const profile: sessions.protocol.Profile = .{
                 .connection = context.connection,
                 .protocol = context.protocol.number,
                 .uuid = state.uuid,
                 .name = state.name[0..state.name_len],
             };
             switch (event) {
+                .verified => |secret| {
+                    if (self.phase != .plugin_login or self.wire.encrypted()) return error.InvalidEncryption;
+                    self.wire.install(secret);
+                },
                 .restore => {
                     if (self.wire.compressed != (context.compression_threshold != null)) return error.InvalidResume;
                     state.phase = .negotiating;
@@ -125,7 +132,7 @@ pub fn Connection(comptime Protocol: type) type {
                 .poll => {
                     switch (self.phase) {
                         .plugin_login => {
-                            const step: api.PhaseEvent = if (self.login_started) .poll else .begin;
+                            const step: sessions.protocol.PhaseEvent = if (self.login_started) .poll else .begin;
                             self.login_started = true;
                             return try self.runLogin(Observer, context, step);
                         },
@@ -136,7 +143,7 @@ pub fn Connection(comptime Protocol: type) type {
                         .plugin_configuration => {
                             return try self.configure(Observer, context, .poll);
                         },
-                        .play => return try context.observer.play(profile, .{ .poll = context.now }, output),
+                        .play => return try context.observer.play(profile, .{ .poll = context.poll }, output),
                         else => {},
                     }
                 },
@@ -150,6 +157,12 @@ pub fn Connection(comptime Protocol: type) type {
                         }
                         const effect = try context.observer.sessionInput(.login, profile, context.io, context.now, bytes, output);
                         switch (effect) {
+                            .verify => |verification| {
+                                const pending = context.verification orelse return error.MissingLoginWorker;
+                                assert(pending.* == null);
+                                pending.* = verification;
+                                return null;
+                            },
                             .none => {},
                             .send => |response| return response,
                             .name => |name| {
@@ -206,8 +219,8 @@ pub fn Connection(comptime Protocol: type) type {
             return null;
         }
 
-        fn runLogin(self: *Self, comptime Observer: type, context: api.Context(Observer), event: api.PhaseEvent) !?[]const u8 {
-            const step = try context.observer.login(context.connection, context.state, context.protocol.number, event, context.output);
+        fn runLogin(self: *Self, comptime Observer: type, context: sessions.protocol.Context(Observer), event: sessions.protocol.PhaseEvent) !?[]const u8 {
+            const step = try context.observer.login(context.io, context.connection, context.state, context.protocol.number, event, context.output);
             return switch (step) {
                 .send => |bytes| bytes,
                 .wait => null,
@@ -233,8 +246,8 @@ pub fn Connection(comptime Protocol: type) type {
             };
         }
 
-        fn configure(self: *Self, comptime Observer: type, context: api.Context(Observer), event: api.PhaseEvent) !?[]const u8 {
-            const step = try context.observer.configuration(context.connection, context.state, context.protocol.number, event, context.output);
+        fn configure(self: *Self, comptime Observer: type, context: sessions.protocol.Context(Observer), event: sessions.protocol.PhaseEvent) !?[]const u8 {
+            const step = try context.observer.configuration(context.io, context.connection, context.state, context.protocol.number, event, context.output);
             return switch (step) {
                 .send => |bytes| bytes,
                 .done => blk: {

@@ -2,6 +2,7 @@ const lightning_rod = @import("lightning_rod");
 const std = @import("std");
 const sessions = @import("sessions");
 const vanilla = @import("vanilla");
+const protocols = @import("protocols");
 
 pub const Control = struct {
     pub const id = "e2e:control";
@@ -24,22 +25,27 @@ pub const Control = struct {
     const Name = struct { bytes: [128]u8, len: u8 };
     const Fence = struct { name: Name, handle: sessions.Handle, remaining: u2 = 2, durable: ?u64 = null };
     const Cursor = struct { generation: u32 = 0, next: usize = 0 };
-    const maximum_players = vanilla.Players.maximum_players;
 
     deps: Dependencies,
     handlers: [8]Handler = undefined,
     handler_count: usize = 0,
     marks: [256]Name = undefined,
     mark_count: usize = 0,
-    cursors: [maximum_players]Cursor = @splat(.{}),
-    targets: [maximum_players]sessions.Service.Target = undefined,
-    delivered: [maximum_players]sessions.Service.Delivery = undefined,
+    cursors: []Cursor,
+    targets: []sessions.Service.Target,
+    delivered: []sessions.Service.Delivery,
     fences: [64]Fence = undefined,
     fence_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Control {
         const self = try allocator.create(Control);
-        self.* = .{ .deps = deps };
+        self.* = .{
+            .deps = deps,
+            .cursors = try allocator.alloc(Cursor, deps.players.records.len),
+            .targets = try allocator.alloc(sessions.Service.Target, deps.players.records.len),
+            .delivered = try allocator.alloc(sessions.Service.Delivery, deps.players.records.len),
+        };
+        @memset(self.cursors, .{});
         try deps.payloads.on(channel, self, receive);
         return self;
     }
@@ -188,7 +194,7 @@ test "custom messages must be claimed and handler errors must propagate" {
             return self.result;
         }
     };
-    var control: Control = .{ .deps = undefined };
+    var control: Control = .{ .deps = undefined, .cursors = &.{}, .targets = &.{}, .delivered = &.{} };
     const handle: sessions.Handle = .{ .index = 0, .generation = 1 };
     try std.testing.expectError(error.UnhandledFixtureMessage, control.receive(handle, "unknown", std.testing.allocator));
     var first: Probe = .{};
@@ -207,7 +213,7 @@ test "custom messages must be claimed and handler errors must propagate" {
 }
 
 test "markers catch up after readiness backpressure and connection reuse" {
-    const protocol: i32 = 772;
+    const protocol: i32 = protocols.implementations[0].protocol_number;
     const service = try sessions.Service.init(std.testing.allocator, std.testing.io, undefined, .{
         .connections = 2,
         .pages = 64,
@@ -234,7 +240,10 @@ test "markers catch up after readiness backpressure and connection reuse" {
     var players: vanilla.Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &records, .dig_handlers = &.{} };
     var packets: vanilla.Packets = .{ .deps = .{ .sessions = service } };
     var payloads: vanilla.PayloadChannels.Play = .{ .deps = .{ .input = undefined, .packets = &packets }, .subscriptions = &.{} };
-    var control: Control = .{ .deps = .{ .players = &players, .payloads = &payloads, .reload = undefined, .persistence = null, .checkpoint = undefined } };
+    var cursors: [2]Control.Cursor = @splat(.{});
+    var targets: [2]sessions.Service.Target = undefined;
+    var delivered: [2]sessions.Service.Delivery = undefined;
+    var control: Control = .{ .deps = .{ .players = &players, .payloads = &payloads, .reload = undefined, .persistence = null, .checkpoint = undefined }, .cursors = &cursors, .targets = &targets, .delivered = &delivered };
 
     try control.receive(bob, "sync", std.testing.allocator);
     try control.receive(alice, "mark alice.ready", std.testing.allocator);

@@ -13,7 +13,7 @@ pub const Economy = struct {
         initial_balance: u128 = 0,
     };
 
-    pub const Dependencies = struct { metrics: *metrics.Registry, storage: storage.Space };
+    pub const Dependencies = struct { metrics: *metrics.Registry, storage: storage.Space, record_workspaces: *records.Workspaces };
 
     config: Configuration,
     deps: Dependencies,
@@ -35,13 +35,14 @@ pub const Economy = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Configuration, deps: Dependencies) !*Economy {
+        const table_resources = deps.record_workspaces.resources;
         if (config.unit.len == 0 or config.unit.len > 32 or config.precision > 18 or config.cache_accounts < 2) return error.InvalidConfiguration;
 
         const self = try allocator.create(Economy);
         self.* = .{
             .config = config,
             .deps = deps,
-            .cache = try records.Cache.init(allocator, io, records.Table.init(deps.storage), .{ .metrics = deps.metrics, .metrics_namespace = "economy.cache", .slots = config.cache_accounts, .key_bytes = 16, .value_bytes = 34 }),
+            .cache = try records.Cache.init(allocator, io, records.Table.init(deps.storage, table_resources), .{ .metrics = deps.metrics, .metrics_namespace = "economy.cache", .slots = config.cache_accounts, .key_bytes = 16, .value_bytes = 34 }),
         };
         return self;
     }
@@ -52,6 +53,11 @@ pub const Economy = struct {
         std.mem.writeInt(u128, &key, uuid, .big);
         const lease = try self.cache.acquire(&key);
         errdefer lease.release();
+        return self.openAccount(lease, name);
+    }
+
+    fn openAccount(self: *Economy, lease: records.Cache.Lease, name: []const u8) !Account {
+        std.debug.assert(name.len > 0 and name.len <= 16);
         if (lease.read()) |bytes| {
             if (bytes.len != 34 or bytes[0] != 1 or bytes[17] == 0 or bytes[17] > 16) return error.Corrupt;
 
@@ -81,12 +87,16 @@ pub const Economy = struct {
     pub fn transfer(self: *Economy, from: u128, from_name: []const u8, to: u128, to_name: []const u8, amount: u128) !bool {
         if (amount == 0 or from == to) return false;
 
-        var source = try self.acquire(from, from_name);
-        defer source.release();
+        var keys: [2][16]u8 = undefined;
+        std.mem.writeInt(u128, &keys[0], from, .big);
+        std.mem.writeInt(u128, &keys[1], to, .big);
+        var leases: [2]records.Cache.Lease = undefined;
+        try self.cache.acquireMany(&.{ &keys[0], &keys[1] }, &leases);
+        defer for (leases) |lease| lease.release();
+        var source = try self.openAccount(leases[0], from_name);
         if (source.balance < amount) return false;
 
-        var destination = try self.acquire(to, to_name);
-        defer destination.release();
+        var destination = try self.openAccount(leases[1], to_name);
         const after = std.math.add(u128, destination.balance, amount) catch return false;
         source.set(source.balance - amount);
         destination.set(after);
