@@ -23,7 +23,7 @@ jobs:
           UPGRADE: ${{ inputs.upgrade }}
         run: |
           matrix=$(bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build e2e-matrix)
-          matrix=$(jq -c --argjson upgrade "$UPGRADE" '{include: [.include[] | select(.upgrade == $upgrade)] | group_by(.group) | map({group: .[0].group, tests: {include: .}})}' <<< "$matrix")
+          matrix=$(jq -c --argjson upgrade "$UPGRADE" '{include: [.include[] | select(.upgrade == $upgrade)] | group_by(.group) | map({group: .[0].group, tests: {include: sort_by(.priority)}}) | sort_by(.tests.include[0].priority)}' <<< "$matrix")
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   e2e:
