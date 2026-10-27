@@ -171,7 +171,7 @@ public final class Recorder {
             client.stop();
             return;
         }
-        if (completed) return;
+        if (completed || fixture.client.completing()) return;
         if (!connectionAttempted && server != null && tick >= connectTick && GuiApi.overlay(client) == null && fixture.canConnect()) {
             if (!ClientCompatibility.version().equals(System.getProperty("mcc.version"))) {
                 fail("unexpected_client_version");

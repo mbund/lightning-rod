@@ -33,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
         .metrics = .{ .enabled = false },
         .autosave = .{ .ticks = null },
     });
-    try simulation.initialize(plugins, .{ .metrics = &simulation.metrics, .persistence = &store });
+    try simulation.initialize(plugins, .{ .metrics = &simulation.metrics });
     const world = simulation.get(vanilla.VanillaWorlds).overworld;
     const sections = simulation.get(vanilla.Chunks);
     for (0..side) |x| for (0..side / columns_per_batch) |batch| {

@@ -6,6 +6,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.LinkedHashSet;
 import java.util.Set;
+import java.util.function.Consumer;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
@@ -29,12 +30,18 @@ final class TestClient {
     }
 
     private final Recorder recorder;
+    private final Consumer<Message> sender;
+    private String pendingPass;
     private final Map<String, Recorder.Capture> screenshots = new HashMap<>();
     private final Set<String> marks = new HashSet<>();
     private final Set<String> sentMarks = new HashSet<>();
     private final LinkedHashSet<String> messages = new LinkedHashSet<>();
 
-    TestClient(Recorder recorder) { this.recorder = recorder; }
+    TestClient(Recorder recorder) { this(recorder, ClientPlayNetworking::send); }
+    TestClient(Recorder recorder, Consumer<Message> sender) {
+        this.recorder = recorder;
+        this.sender = sender;
+    }
 
     static void register() {
         PayloadApi.register();
@@ -49,8 +56,10 @@ final class TestClient {
 
     void receive(String text) {
         recorder.event("fixture_received", "message", text);
-        if (text.startsWith("mark ")) rememberMark(text.substring(5));
-        else {
+        if (text.startsWith("mark ")) {
+            rememberMark(text.substring(5));
+            if (pendingPass != null) pass(pendingPass);
+        } else {
             if (messages.size() == 1024 && !messages.contains(text))
                 throw new IllegalStateException("fixture message capacity exceeded");
             messages.addLast(text);
@@ -58,8 +67,20 @@ final class TestClient {
         }
     }
 
-    void pass(String reason) { recorder.pass(reason); }
-    void fail(String reason) { recorder.fail(reason); }
+    void pass(String reason) {
+        if (recorder.completed) return;
+        if (!marks.containsAll(sentMarks)) {
+            pendingPass = reason;
+            return;
+        }
+        pendingPass = null;
+        recorder.pass(reason);
+    }
+    boolean completing() { return pendingPass != null; }
+    void fail(String reason) {
+        pendingPass = null;
+        recorder.fail(reason);
+    }
     void event(String name, Object... fields) { recorder.event(name, fields); }
     void marker(String name) { recorder.marker(name); }
     boolean hasMarker(String name) { return java.nio.file.Files.exists(recorder.artifacts.resolve(name)); }
@@ -79,7 +100,7 @@ final class TestClient {
         return capture;
     }
     void send(String message) {
-        ClientPlayNetworking.send(new Message(message));
+        sender.accept(new Message(message));
         recorder.event("fixture_sent", "message", message);
     }
     void reload() { send("reload"); }

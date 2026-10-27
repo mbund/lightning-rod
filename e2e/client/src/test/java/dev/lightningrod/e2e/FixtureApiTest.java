@@ -25,6 +25,7 @@ public final class FixtureApiTest {
         require(rejected, "new messages must respect capacity");
 
         checkpoints();
+        markerAcknowledgements();
         lateChatFailure(false);
         lateChatFailure(true);
         Recorder timing = new Recorder();
@@ -75,6 +76,37 @@ public final class FixtureApiTest {
                 }
             }
         }
+    }
+
+    private static void markerAcknowledgements() {
+        Recorder recorder = new Recorder();
+        var sent = new java.util.ArrayList<TestClient.Message>();
+        TestClient client = new TestClient(recorder, sent::add);
+        client.mark("first");
+        client.mark("second");
+        client.mark("first");
+        require(sent.size() == 2, "each marker must be sent once");
+        client.pass("markers_delivered");
+        require(!recorder.completed && recorder.pendingScreenshots.isEmpty(),
+            "sending a marker must not allow the client to finish before acknowledgement");
+        client.receive("mark other");
+        client.receive("mark second");
+        require(!recorder.completed, "every outgoing marker must be acknowledged");
+        client.receive("mark first");
+        require(recorder.completed && recorder.resultPassed && recorder.pendingScreenshots.size() == 1,
+            "the last acknowledgement must release pending success");
+        client.receive("mark first");
+        require(recorder.pendingScreenshots.size() == 1, "duplicate acknowledgements must not repeat completion");
+
+        Recorder failed = new Recorder();
+        TestClient failing = new TestClient(failed, sent::add);
+        failing.mark("pending");
+        failing.pass("pending_success");
+        require(failing.completing(), "pending acknowledgements must pause fixture work");
+        failing.fail("assertion_failed");
+        failing.receive("mark pending");
+        require(failed.completed && !failed.resultPassed && !failing.completing(),
+            "a delayed acknowledgement must not overturn failure");
     }
 
     private static void checkpoints() throws Exception {
