@@ -54,6 +54,8 @@ final class ReloadFixture extends Fixture {
     private volatile int rejectedMessages;
     private volatile boolean invalidFeedback;
     private int cursorStage = -1;
+    private int inventoryPrepared;
+    private int inventorySetupRequested = -1;
     private long inventoryMismatchTick = -1;
 
     ReloadFixture(Recorder r) { super(r); }
@@ -87,6 +89,17 @@ final class ReloadFixture extends Fixture {
             }
         }
         Case round = generation < ROUNDS.length ? ROUNDS[generation] : null;
+        boolean creative = game.player.hasInfiniteMaterials();
+        if (creative && round != null && r.joins == generation + 1 && inventoryPrepared != generation) {
+            String label = "reload-setup-" + generation;
+            if (inventorySetupRequested != generation) {
+                client.send("inventory_setup " + label + " 36/minecraft:bread/" + BREAD_COUNT);
+                client.fence(label);
+                inventorySetupRequested = generation;
+            }
+            if (!client.received("Inventory " + label + " ready") || !client.fenced(label)) return;
+            inventoryPrepared = generation;
+        }
         if (r.joins == generation + 2) {
             if (GuiApi.screen(game) != null) return;
             if (reloadRestoreRequested != generation) {
@@ -99,9 +112,11 @@ final class ReloadFixture extends Fixture {
         var cursor = game.player.containerMenu.getCarried();
         int bread = (stack.is(net.minecraft.world.item.Items.BREAD) ? stack.getCount() : 0)
             + (cursor.is(net.minecraft.world.item.Items.BREAD) ? cursor.getCount() : 0);
-        boolean deletedCursor = game.player.hasInfiniteMaterials() && round != null && round.cursor == Cursor.DELETED
+        boolean deletedCursor = creative && round != null && round.cursor == Cursor.DELETED
             && cursorStage == generation && r.joins == generation + 1;
-        if (bread != (deletedCursor ? 0 : BREAD_COUNT)) {
+        int restoredBread = creative && round != null && round.cursor != Cursor.CATALOG ? 0 : BREAD_COUNT;
+        int expectedBread = r.joins == generation + 2 ? restoredBread : deletedCursor ? 0 : BREAD_COUNT;
+        if (bread != expectedBread) {
             if (inventoryMismatchTick < 0) inventoryMismatchTick = r.tick;
             if (cursorStage >= 0 && r.tick - inventoryMismatchTick >= 40) {
                 client.event("reload_inventory_mismatch", "joins", r.joins, "stage", generation,
@@ -116,9 +131,9 @@ final class ReloadFixture extends Fixture {
                 client.fail("reload_selected_slot_not_restored");
                 return;
             }
-            if (stack.getCount() != BREAD_COUNT || !cursor.isEmpty()) {
+            if (stack.getCount() != restoredBread || !cursor.isEmpty()) {
                 client.event("reload_cursor_mismatch", "slot", stack.toString(), "cursor", cursor.toString());
-                client.fail("reload_cursor_not_returned_to_inventory");
+                client.fail("reload_inventory_state_incorrect");
                 return;
             }
             for (int slot = 1; slot < game.player.getInventory().getContainerSize(); slot++) {
@@ -142,6 +157,7 @@ final class ReloadFixture extends Fixture {
             round = generation < ROUNDS.length ? ROUNDS[generation] : null;
             reloadPositioned = false;
             client.event("reload_return", "generation", generation, "joins", r.joins);
+            if (creative) return;
         }
         if (r.joins != generation + 1) { client.fail("unexpected_reload_join_count"); return; }
         if (!reloadPositioned && GuiApi.screen(game) == null) {
