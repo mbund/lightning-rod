@@ -693,7 +693,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
         pub fn reserveOutput(self: *Self, handle: network.Handle, bytes: usize) error{Full}!void {
             const connection = &self.connections[handle.index];
             assert(bytes > 0 and bytes <= self.config.buffer_bytes);
-            assert(connection.codec.state.load(.acquire) == .idle);
+            if (connection.codec.state.load(.acquire) != .idle) return error.Full;
             const buffer = self.ringBuffer(handle.index);
             const used = connection.output_write -% connection.output_read;
             if (bytes <= buffer.len - used) return;

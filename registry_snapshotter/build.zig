@@ -3,6 +3,12 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const version = b.option([]const u8, "minecraft-version", "Minecraft release to extract") orelse @panic("missing -Dminecraft-version");
     const api = b.option([]const u8, "api", "Registry extractor API variant");
+    if (b.graph.environ_map.get("LIGHTNING_ROD_REGISTRIES")) |directory| {
+        const snapshot: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ directory, b.fmt("{s}.bin", .{version}) }) };
+        b.addNamedLazyPath("snapshot", snapshot);
+        _ = b.step("snapshot", "Use the prepared Minecraft registries");
+        return;
+    }
     const files = b.addWriteFiles();
     const directory = b.fmt("{s}-{s}", .{ version, api orelse "default" });
     for ([_][]const u8{ "build.gradle", "settings.gradle", "gradle.properties", "versions.json" }) |name|

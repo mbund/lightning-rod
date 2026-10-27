@@ -5,43 +5,38 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+  actions: read
+
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  prepare:
-    name: Prepare dependencies
+  prepare-zig:
+    name: Prepare Zig
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 2
-      - id: image
+      - id: previous
         run: |
-          echo "version=$ImageVersion" >> "$GITHUB_OUTPUT"
-          previous=$(git ls-tree -r HEAD^ | awk '$4 ~ /(^|\/)build.zig.zon$/ { print }' | sha256sum | cut -d ' ' -f 1)
-          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+          dependencies=$(git ls-tree -r HEAD^ | awk '$4 ~ /(^|\/)build.zig.zon$/ { print }' | sha256sum | cut -d ' ' -f 1)
+          echo "dependencies=$dependencies" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v5
         id: dependencies
         with:
           path: ${{ runner.temp }}/ci-dependencies
-          key: ci-dependencies-${{ runner.os }}-${{ steps.image.outputs.version }}-${{ steps.image.outputs.previous }}-${{ hashFiles('**/build.zig.zon', '**/*.gradle', '**/gradle.properties', '**/versions.json', '**/gradle/wrapper/*', '.github/workflows/ci.yml', '.github/scripts/install-zig.sh', '.github/scripts/prepare-dependencies.sh', 'bench/chunks/src/**', 'nbt/src/**') }}
+          key: ci-zig-${{ runner.os }}-${{ steps.previous.outputs.dependencies }}-${{ hashFiles('**/build.zig.zon', '.github/scripts/install-zig.sh', '.github/scripts/prepare-zig.sh') }}
       - name: Install Zig
         if: steps.dependencies.outputs.cache-hit != 'true'
         run: bash .github/scripts/install-zig.sh "$RUNNER_TEMP/ci-dependencies/zig"
-      - uses: actions/setup-java@v6
+      - name: Fetch Zig dependencies
         if: steps.dependencies.outputs.cache-hit != 'true'
-        with:
-          distribution: temurin
-          java-version: '25'
-      - name: Fetch dependencies and prepare the benchmark corpus
-        if: steps.dependencies.outputs.cache-hit != 'true'
-        run: |
-          bash .github/scripts/prepare-dependencies.sh
-          tar --zstd -cf "$RUNNER_TEMP/ci-dependencies/toolchain.tar.zst" -C "$RUNNER_TEMP/ci-dependencies" zig
-          rm -rf "$RUNNER_TEMP/ci-dependencies/zig"
+        run: bash .github/scripts/prepare-zig.sh
       - uses: actions/upload-artifact@v7
         with:
           name: ci-zig
@@ -51,15 +46,231 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 1
+
+  versions:
+    name: Discover Java versions
+    runs-on: ubuntu-24.04
+    outputs:
+      clients: ${{ steps.versions.outputs.clients }}
+      registries: ${{ steps.versions.outputs.registries }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: versions
+        run: |
+          echo "clients=$(jq -c '{include: .}' e2e/client/versions.json)" >> "$GITHUB_OUTPUT"
+          echo "registries=$(jq -c '{include: .}' registry_snapshotter/versions.json)" >> "$GITHUB_OUTPUT"
+
+  prepare-jdk:
+    name: Prepare JDK
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/cache@v5
+        id: jdk
+        with:
+          path: ${{ runner.temp }}/ci-dependencies/jdk.tar.zst
+          key: ci-jdk-25-${{ runner.os }}-v1
+      - uses: actions/setup-java@v6
+        if: steps.jdk.outputs.cache-hit != 'true'
+        with:
+          distribution: temurin
+          java-version: '25'
+      - if: steps.jdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci-dependencies"
+          tar --zstd -cf "$RUNNER_TEMP/ci-dependencies/jdk.tar.zst" -C "$JAVA_HOME" .
       - uses: actions/upload-artifact@v7
         with:
-          name: ci-java
-          path: |
-            ${{ runner.temp }}/ci-dependencies/jdk.tar.zst
-            ${{ runner.temp }}/ci-dependencies/gradle.tar.zst
+          name: ci-jdk
+          path: ${{ runner.temp }}/ci-dependencies/jdk.tar.zst
           compression-level: 0
           if-no-files-found: error
           retention-days: 1
+
+  prepare-clients:
+    name: Prepare client ${{ matrix.release }}
+    needs: [versions, prepare-jdk]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.versions.outputs.clients) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v5
+        id: client
+        with:
+          path: ${{ runner.temp }}/ci-prepared/client-${{ matrix.release }}.tar.zst
+          key: ci-client-${{ matrix.release }}-${{ runner.os }}-${{ hashFiles('e2e/client/**', 'e2e/src/client_bundle.zig', 'e2e/tests/*/test.json', 'e2e/tests/*/client/**') }}
+      - uses: ./.github/actions/dependencies
+        if: steps.client.outputs.cache-hit != 'true'
+        with:
+          zig: 'false'
+          jdk: 'true'
+      - name: Build client and verify fixture API
+        if: steps.client.outputs.cache-hit != 'true'
+        working-directory: e2e/client
+        env:
+          VERSION: ${{ matrix.release }}
+          API: ${{ matrix.api }}
+          FABRIC: ${{ matrix.fabric }}
+        run: |
+          ./gradlew --no-daemon "-Pminecraft_version=$VERSION" "-Pclient_api=$API" "-Pfabric_api_version=$FABRIC" exportRuntime testFixtureApi
+          mkdir -p "$RUNNER_TEMP/ci-prepared"
+          tar --zstd -cf "$RUNNER_TEMP/ci-prepared/client-$VERSION.tar.zst" -C build/runtime .
+          du -h "$RUNNER_TEMP/ci-prepared/client-$VERSION.tar.zst"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-client-${{ matrix.release }}
+          path: ${{ runner.temp }}/ci-prepared/client-${{ matrix.release }}.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  prepare-registries:
+    name: Prepare registries ${{ matrix.release }}
+    needs: [versions, prepare-jdk]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.versions.outputs.registries) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v5
+        id: registry
+        with:
+          path: ${{ runner.temp }}/ci-registries/${{ matrix.release }}.bin
+          key: ci-registry-${{ matrix.release }}-${{ runner.os }}-${{ hashFiles('registry_snapshotter/**') }}
+      - uses: ./.github/actions/dependencies
+        if: steps.registry.outputs.cache-hit != 'true'
+        with:
+          zig: 'false'
+          jdk: 'true'
+      - name: Extract registries
+        if: steps.registry.outputs.cache-hit != 'true'
+        working-directory: registry_snapshotter
+        env:
+          VERSION: ${{ matrix.release }}
+          API: ${{ matrix.api }}
+        run: ./gradlew --no-daemon "-Pminecraft_version=$VERSION" "-Pregistry_api=$API" "-PsnapshotOutput=$RUNNER_TEMP/ci-registries/$VERSION.bin" registrySnapshot
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-registry-${{ matrix.release }}
+          path: ${{ runner.temp }}/ci-registries/${{ matrix.release }}.bin
+          if-no-files-found: error
+          retention-days: 1
+
+  registries:
+    name: Collect registry snapshots
+    needs: prepare-registries
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: ci-registry-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/ci-registries
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-registries
+          path: ${{ runner.temp }}/ci-registries/*.bin
+          if-no-files-found: error
+          retention-days: 1
+
+  prepare-assets:
+    name: Prepare shared client assets
+    needs: prepare-jdk
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v5
+        id: assets
+        with:
+          path: ${{ runner.temp }}/ci-prepared/assets.tar.zst
+          key: ci-assets-${{ hashFiles('e2e/client/versions.json', 'e2e/client/src/test/java/dev/lightningrod/e2e/PrepareAssets.java') }}
+      - uses: ./.github/actions/dependencies
+        if: steps.assets.outputs.cache-hit != 'true'
+        with:
+          zig: 'false'
+          jdk: 'true'
+      - name: Download and verify shared assets
+        if: steps.assets.outputs.cache-hit != 'true'
+        working-directory: e2e/client
+        run: |
+          ./gradlew --no-daemon "-PassetOutput=$RUNNER_TEMP/ci-assets" exportAssets
+          mkdir -p "$RUNNER_TEMP/ci-prepared"
+          tar --zstd -cf "$RUNNER_TEMP/ci-prepared/assets.tar.zst" -C "$RUNNER_TEMP/ci-assets" .
+          du -h "$RUNNER_TEMP/ci-prepared/assets.tar.zst"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-assets
+          path: ${{ runner.temp }}/ci-prepared/assets.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  prepare-previous:
+    name: Prepare previous server
+    needs: [prepare-zig, prepare-jdk]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - id: previous
+        run: echo "sha=$(git rev-parse HEAD^)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v5
+        id: server
+        with:
+          path: ${{ runner.temp }}/ci-prepared/previous.tar.zst
+          key: ci-previous-safe-x86_64-baseline-${{ steps.previous.outputs.sha }}-${{ hashFiles('protocols/catalog.zig', 'build.zig.zon') }}
+      - uses: ./.github/actions/dependencies
+        if: steps.server.outputs.cache-hit != 'true'
+        with:
+          jdk: 'true'
+      - name: Build the previous commit without the latest protocol
+        if: steps.server.outputs.cache-hit != 'true'
+        env:
+          PREVIOUS: ${{ steps.previous.outputs.sha }}
+        run: |
+          releases=$(cd e2e && zig build upgrade-releases)
+          mkdir -p "$RUNNER_TEMP/previous-source" "$RUNNER_TEMP/previous-server/$PREVIOUS" "$RUNNER_TEMP/ci-prepared"
+          git archive "$PREVIOUS" | tar -xf - -C "$RUNNER_TEMP/previous-source"
+          (cd "$RUNNER_TEMP/previous-source/examples/vanilla" && zig build --release=safe -Dtarget=x86_64-linux -Dcpu=baseline "-Dreleases=$releases")
+          cp "$RUNNER_TEMP/previous-source/examples/vanilla/zig-out/bin/lightning_rod" "$RUNNER_TEMP/previous-server/$PREVIOUS/"
+          tar --zstd -cf "$RUNNER_TEMP/ci-prepared/previous.tar.zst" -C "$RUNNER_TEMP/previous-server" .
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-previous
+          path: ${{ runner.temp }}/ci-prepared/previous.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  prepare-native:
+    name: Prepare client native libraries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - id: image
+        run: echo "version=$ImageVersion" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v5
+        id: dependencies
+        with:
+          path: ${{ runner.temp }}/ci-dependencies
+          key: ci-native-${{ steps.image.outputs.version }}-${{ hashFiles('.github/workflows/ci.yml') }}
+      - name: Download native packages
+        if: steps.dependencies.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --download-only --reinstall -y --no-install-recommends \
+            xvfb libgl1-mesa-dri libglx-mesa0 libgl1 libxrandr2 libxinerama1 libxcursor1 libxi6 libasound2t64
+          mkdir -p "$RUNNER_TEMP/ci-dependencies"
+          tar --zstd --exclude=lock --exclude=partial -cf "$RUNNER_TEMP/ci-dependencies/native.tar.zst" \
+            -C /var/cache/apt/archives .
       - uses: actions/upload-artifact@v7
         with:
           name: ci-native
@@ -67,23 +278,21 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 1
-      - uses: actions/upload-artifact@v7
-        with:
-          name: ci-world
-          path: ${{ runner.temp }}/ci-dependencies/world.tar.zst
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 1
 
   tests:
-    needs: prepare
+    needs: [prepare-zig, prepare-jdk, prepare-clients, registries]
     uses: ./.github/workflows/test.yml
   fuzz:
-    needs: prepare
+    needs: prepare-zig
     uses: ./.github/workflows/fuzz.yml
   benchmarks:
-    needs: prepare
+    needs: [prepare-zig, prepare-jdk, registries]
     uses: ./.github/workflows/bench.yml
   e2e:
-    needs: prepare
+    needs: [prepare-zig, prepare-jdk, prepare-clients, registries, prepare-assets, prepare-native]
     uses: ./.github/workflows/e2e.yml
+  upgrade:
+    needs: [prepare-zig, prepare-jdk, prepare-clients, registries, prepare-assets, prepare-native, prepare-previous]
+    uses: ./.github/workflows/e2e.yml
+    with:
+      upgrade: true

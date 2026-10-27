@@ -1425,6 +1425,14 @@ test "encrypted groups reserve output capacity before opening and retain it betw
     connection.lifecycle = 0;
     connection.state.phase = .play;
     const group: framing.Group = .{ .protocol = catalog.values[0].number, .first = 3, .generation = 1, .count = 3, .bytes = 2000 };
+    inline for (.{ .queued, .complete }) |state| {
+        connection.codec.state.store(state, .release);
+        try std.testing.expectError(error.Full, owner.reserveOutput(handle, 1));
+        try std.testing.expectError(error.Full, owner.reserveGroupOutput(handle, group));
+        try std.testing.expect(connection.group == null and connection.output_burst == null);
+        try std.testing.expectEqual(@as(usize, 0), connection.output_write);
+    }
+    connection.codec.state.store(.idle, .release);
     const held = owner.output_bursts.acquire().?;
     try std.testing.expectError(error.Full, owner.reserveGroupOutput(handle, group));
     try std.testing.expect(connection.group == null and connection.output_burst == null);

@@ -101,13 +101,76 @@ tasks.register('testFixtureApi', JavaExec) {
     mainClass = 'dev.lightningrod.e2e.FixtureApiTest'
 }
 
-tasks.register('prepareDependencies') {
-    dependsOn tasks.named('configureClientLaunch')
+tasks.register('exportRuntime') {
+    dependsOn tasks.named('testClasses'), tasks.named('configureLaunch')
+    inputs.files(sourceSets.client.runtimeClasspath, sourceSets.test.runtimeClasspath)
+    inputs.property 'minecraft_version', minecraft_version
+    def destination = layout.buildDirectory.dir('runtime')
+    outputs.dir(destination)
     doLast {
-        [sourceSets.main, sourceSets.client, sourceSets.test].each {
-            it.compileClasspath.files
-            it.runtimeClasspath.files
-            it.annotationProcessorPath.files
+        def output = destination.get().asFile
+        delete(output)
+        output.mkdirs()
+        def run = tasks.named('runClient').get()
+        def replacements = new LinkedHashMap<String, String>()
+        def included = new LinkedHashMap<File, String>()
+        def include = { File source ->
+            if (!included.containsKey(source)) {
+                def target = "classpath/${included.size()}/${source.name}"
+                included[source] = target
+                replacements[source.absolutePath] = '@ROOT@/' + target
+                if (source.isDirectory()) copy { from source; into new File(output, target) }
+                else if (source.isFile()) copy { from source; into new File(output, target).parentFile }
+                else new File(output, target).mkdirs()
+            }
+            included[source]
         }
+        def classpath = run.classpath.files.collect { include(it) }
+        def testClasspath = sourceSets.test.runtimeClasspath.files.collect { include(it) }
+        def configs = new File(projectDir, '.gradle/loom-cache')
+        def templates = []
+        ['launch.cfg', 'remapClasspath.txt', 'log4j.xml'].each { name ->
+            def source = new File(configs, name)
+            if (source.exists() && (name == 'launch.cfg' || new File(configs, 'launch.cfg').text.contains(source.absolutePath))) {
+                replacements[source.absolutePath] = '@RUN@/' + name
+                templates.add([name: name, contents: source.text])
+            }
+        }
+        replacements[new File(gradle.gradleUserHomeDir, 'caches/fabric-loom/assets').absolutePath] = '@ASSETS@'
+        templates.each { template ->
+            def paths = template.name == 'remapClasspath.txt' ? [template.contents] :
+                template.name == 'launch.cfg' ? template.contents.readLines().findAll { it.contains('=') }.collect { it.split('=', 2)[1] } : []
+            paths.each { value ->
+                value.split(File.pathSeparator).each { path ->
+                    def source = new File(path)
+                    if (source.isAbsolute() && source.exists() && !replacements.containsKey(source.absolutePath)) include(source)
+                }
+            }
+        }
+        def relocate = { String value ->
+            replacements.entrySet().sort { -it.key.length() }.each { value = value.replace(it.key, it.value) }
+            value
+        }
+        templates.each { it.contents = relocate(it.contents) }
+        templates.each {
+            if (it.contents.contains(projectDir.absolutePath) || it.contents.contains(gradle.gradleUserHomeDir.absolutePath))
+                throw new GradleException("Unbundled runtime path in ${it.name}")
+        }
+        // Loom's argument file supplies the classpath that the bundle passes explicitly.
+        def jvm = run.allJvmArgs.findAll { !it.startsWith('@') }.collect { relocate(it) }
+        def args = (run.args + run.argumentProviders.collectMany { it.asArguments() }).collect { relocate(it) }
+        new File(output, 'runtime.json').text = groovy.json.JsonOutput.toJson([
+            version: minecraft_version, main: run.mainClass.get(), jvm: jvm, args: args,
+            classpath: classpath, test_classpath: testClasspath, templates: templates,
+        ])
+        println "Client runtime ${minecraft_version}: ${included.size()} classpath entries"
     }
+}
+
+tasks.register('exportAssets', JavaExec) {
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.lightningrod.e2e.PrepareAssets'
+    args new File(clientSource, 'versions.json').absolutePath,
+        providers.gradleProperty('assetOutput').getOrElse(layout.buildDirectory.dir('assets').get().asFile.absolutePath)
 }

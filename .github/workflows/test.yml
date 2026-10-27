@@ -12,7 +12,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/dependencies
         with:
-          java: 'true'
+          jdk: 'true'
+          registries: 'true'
+          clients: default
       - run: bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe test
 
   codegen:
@@ -37,7 +39,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/dependencies
         with:
-          java: 'true'
+          registries: 'true'
       - working-directory: examples/${{ matrix.example }}
         run: bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe
 
@@ -49,6 +51,6 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/dependencies
         with:
-          java: 'true'
+          registries: 'true'
       - run: bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig run test/distribution.zig
 

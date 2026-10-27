@@ -2,6 +2,10 @@ name: E2E
 
 on:
   workflow_call:
+    inputs:
+      upgrade:
+        type: boolean
+        default: false
 
 jobs:
   discover:
@@ -15,8 +19,11 @@ jobs:
       - id: tests
         shell: bash
         working-directory: e2e
+        env:
+          UPGRADE: ${{ inputs.upgrade }}
         run: |
           matrix=$(bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build e2e-matrix)
+          matrix=$(jq -c --argjson upgrade "$UPGRADE" '.include |= map(select(.upgrade == $upgrade))' <<< "$matrix")
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   e2e:
@@ -33,8 +40,12 @@ jobs:
           fetch-depth: 2
       - uses: ./.github/actions/dependencies
         with:
-          java: 'true'
+          jdk: 'true'
+          registries: 'true'
+          clients: ${{ matrix.clients }}
+          assets: 'true'
           native: 'true'
+          previous: ${{ matrix.upgrade }}
       - name: Real-client acceptance
         working-directory: e2e
         env:

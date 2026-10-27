@@ -4,6 +4,46 @@ on:
   workflow_call:
 
 jobs:
+  prepare-world:
+    name: Prepare chunk benchmark corpus
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      MINECRAFT_SERVER_SHA1: 823e2250d24b3ddac457a60c92a6a941943fcd6a
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v5
+        id: corpus
+        with:
+          path: ${{ runner.temp }}/ci-dependencies/world.tar.zst
+          key: ci-world-${{ env.MINECRAFT_SERVER_SHA1 }}-${{ hashFiles('bench/chunks/src/**', 'nbt/src/**') }}
+      - uses: ./.github/actions/dependencies
+        if: steps.corpus.outputs.cache-hit != 'true'
+        with:
+          jdk: 'true'
+      - name: Download benchmark server
+        if: steps.corpus.outputs.cache-hit != 'true'
+        run: |
+          curl --fail --silent --show-error --location \
+            "https://piston-data.mojang.com/v1/objects/$MINECRAFT_SERVER_SHA1/server.jar" \
+            -o "$RUNNER_TEMP/benchmark-minecraft.jar"
+          printf '%s  %s\n' "$MINECRAFT_SERVER_SHA1" "$RUNNER_TEMP/benchmark-minecraft.jar" | sha1sum --check --status
+      - name: Generate vanilla terrain corpus
+        if: steps.corpus.outputs.cache-hit != 'true'
+        working-directory: bench/chunks
+        run: |
+          bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe world -- \
+            --server "$RUNNER_TEMP/benchmark-minecraft.jar" --output "$RUNNER_TEMP/benchmark-world"
+          tar --zstd -cf "$RUNNER_TEMP/ci-dependencies/world.tar.zst" -C "$RUNNER_TEMP/benchmark-world" \
+            corpus.bin corpus.json anvil registry.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-world
+          path: ${{ runner.temp }}/ci-dependencies/world.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
   record-benchmark:
     name: Record storage comparison
     runs-on: ubuntu-24.04
@@ -26,6 +66,7 @@ jobs:
 
   chunk-benchmark:
     name: Chunk ${{ matrix.benchmark }} benchmark
+    needs: prepare-world
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
@@ -36,7 +77,6 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/dependencies
         with:
-          java: 'true'
           world: 'true'
       - name: Run all chunk workloads
         if: matrix.benchmark == 'workloads'
@@ -73,7 +113,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/dependencies
         with:
-          java: 'true'
+          registries: 'true'
       - name: Generate persisted server world
         working-directory: bench/startup-world
         run: |
@@ -107,7 +147,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/dependencies
         with:
-          java: 'true'
+          registries: 'true'
       - name: Measure steady-state tick workloads
         working-directory: bench/tick
         run: bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe bench -- --ticks=1000 --samples=3 | tee results.txt

@@ -133,12 +133,30 @@ pub fn build(b: *std.Build) void {
     artifacts_test.addArg("dev.lightningrod.e2e.ArtifactsTest");
     b.step("test-artifacts", "Verify atomic Java artifact publication").dependOn(&artifacts_test.step);
 
-    const client_test = b.addSystemCommand(&.{ "./gradlew", "--no-daemon", "testFixtureApi" });
-    client_test.setCwd(b.path("client"));
-    client_test.stdio = .inherit;
-    b.step("test-client", "Verify fixture messages and screenshot completion").dependOn(&client_test.step);
+    const client_test_step = b.step("test-client", "Verify fixture messages and screenshot completion");
+    if (b.graph.environ_map.get("LIGHTNING_ROD_E2E_CLIENTS") != null) {
+        const client_test = b.addRunArtifact(runner);
+        client_test.setCwd(b.path("."));
+        const properties = std.Io.Dir.cwd().readFileAlloc(b.graph.io, b.pathFromRoot("client/gradle.properties"), b.allocator, .limited(4096)) catch @panic("Cannot read client version");
+        var lines = std.mem.splitScalar(u8, properties, '\n');
+        var default_version: ?[]const u8 = null;
+        while (lines.next()) |line| if (std.mem.startsWith(u8, line, "minecraft_version=")) {
+            default_version = std.mem.trim(u8, line["minecraft_version=".len..], "\r ");
+            break;
+        };
+        client_test.addArgs(&.{ "--test-client", default_version orelse @panic("Missing default client version") });
+        client_test_step.dependOn(&client_test.step);
+    } else {
+        const client_test = b.addSystemCommand(&.{ "./gradlew", "--no-daemon", "testFixtureApi" });
+        client_test.setCwd(b.path("client"));
+        client_test.stdio = .inherit;
+        client_test_step.dependOn(&client_test.step);
+    }
 
     const list = b.addRunArtifact(runner);
+    const upgrade_versions = b.addRunArtifact(runner);
+    upgrade_versions.addArg("--upgrade-releases");
+    b.step("upgrade-releases", "List protocols supported by the previous upgrade fixture").dependOn(&upgrade_versions.step);
     list.setCwd(b.path("."));
     list.addArg("--list");
     list.addArgs(&.{ "--tests", b.pathFromRoot(tests_root) });

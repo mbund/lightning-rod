@@ -12,11 +12,7 @@ pub const Test = struct {
     replaced: bool = false,
     released: bool = false,
 
-    pub fn prepare(init: std.process.Init, current: []const u8, artifacts: []const u8, world: []const u8, revision: []const u8, process_group: *std.atomic.Value(std.posix.pid_t)) !Test {
-        const allocator = init.arena.allocator();
-        const root = std.mem.trim(u8, try command(init, &.{ "git", "rev-parse", "--show-toplevel" }, null), "\r\n");
-        const previous = std.mem.trim(u8, try command(init, &.{ "git", "rev-parse", "--verify", "--end-of-options", try std.fmt.allocPrint(allocator, "{s}^{{commit}}", .{revision}) }, root), "\r\n");
-        const head = std.mem.trim(u8, try command(init, &.{ "git", "rev-parse", "HEAD" }, root), "\r\n");
+    pub fn releases(allocator: std.mem.Allocator) ![]const u8 {
         var names: [protocols.versions.len - 1][]const u8 = undefined;
         var count: usize = 0;
         for (protocols.versions) |version| {
@@ -25,61 +21,74 @@ pub const Test = struct {
             count += 1;
         }
         std.debug.assert(count == names.len);
-        const releases = try std.mem.join(allocator, ",", &names);
-        const cache = try std.fs.path.join(allocator, &.{ root, "e2e/.zig-cache/upgrades", previous });
-        const checkout = try std.fs.path.join(allocator, &.{ cache, "source" });
+        return std.mem.join(allocator, ",", &names);
+    }
+
+    pub fn prepare(init: std.process.Init, current: []const u8, artifacts: []const u8, world: []const u8, revision: []const u8, process_group: *std.atomic.Value(std.posix.pid_t)) !Test {
+        const allocator = init.arena.allocator();
+        const root = std.mem.trim(u8, try command(init, &.{ "git", "rev-parse", "--show-toplevel" }, null), "\r\n");
+        const previous = std.mem.trim(u8, try command(init, &.{ "git", "rev-parse", "--verify", "--end-of-options", try std.fmt.allocPrint(allocator, "{s}^{{commit}}", .{revision}) }, root), "\r\n");
+        const head = std.mem.trim(u8, try command(init, &.{ "git", "rev-parse", "HEAD" }, root), "\r\n");
+        const selected_releases = try releases(allocator);
         const cwd = std.Io.Dir.cwd();
-        try cwd.createDirPath(init.io, cache);
-        const lock = try cwd.createFile(init.io, try std.fs.path.join(allocator, &.{ cache, "build.lock" }), .{ .truncate = false, .lock = .exclusive });
-        defer lock.close(init.io);
-        const complete = try std.fs.path.join(allocator, &.{ cache, "checkout.complete" });
-        const exists = if (cwd.access(init.io, complete, .{})) |_| true else |err| switch (err) {
-            error.FileNotFound => false,
-            else => return err,
+        const executable_source = if (init.environ_map.get("LIGHTNING_ROD_E2E_PREVIOUS")) |directory|
+            try std.fs.path.join(allocator, &.{ directory, previous, "lightning_rod" })
+        else source: {
+            const cache = try std.fs.path.join(allocator, &.{ root, "e2e/.zig-cache/upgrades", previous });
+            const checkout = try std.fs.path.join(allocator, &.{ cache, "source" });
+            try cwd.createDirPath(init.io, cache);
+            const lock = try cwd.createFile(init.io, try std.fs.path.join(allocator, &.{ cache, "build.lock" }), .{ .truncate = false, .lock = .exclusive });
+            defer lock.close(init.io);
+            const complete = try std.fs.path.join(allocator, &.{ cache, "checkout.complete" });
+            const exists = if (cwd.access(init.io, complete, .{})) |_| true else |err| switch (err) {
+                error.FileNotFound => false,
+                else => return err,
+            };
+            if (!exists) {
+                try cwd.deleteTree(init.io, checkout);
+                try cwd.createDir(init.io, checkout, .default_dir);
+                const archive = try std.fs.path.join(allocator, &.{ cache, "source.tar" });
+                _ = try command(init, &.{ "git", "archive", "--format=tar", "--output", archive, previous }, root);
+                _ = try command(init, &.{ "tar", "-xf", archive, "-C", checkout }, root);
+                try cwd.deleteFile(init.io, archive);
+                try cwd.writeFile(init.io, .{ .sub_path = complete, .data = previous });
+            }
+            const prefix = try std.fs.path.join(allocator, &.{ cache, protocols.latest.minecraft_version });
+            const log = try cwd.createFile(init.io, try std.fs.path.join(allocator, &.{ artifacts, "previous-build.log" }), .{});
+            defer log.close(init.io);
+            const zig = init.environ_map.get("LIGHTNING_ROD_E2E_ZIG") orelse "zig";
+            const argv: []const []const u8 = &.{ zig, "build", try std.fmt.allocPrint(allocator, "-Doptimize={s}", .{@tagName(builtin.mode)}), try std.fmt.allocPrint(allocator, "-Dreleases={s}", .{selected_releases}), "--prefix", prefix };
+            const build_directory = try std.fs.path.join(allocator, &.{ checkout, "examples/vanilla" });
+            const compiler = try std.process.spawn(init.io, .{
+                .argv = argv,
+                .cwd = .{ .path = build_directory },
+                .environ_map = init.environ_map,
+                .stdin = .ignore,
+                .stdout = .{ .file = log },
+                .stderr = .{ .file = log },
+                .pgid = 0,
+            });
+            var build: child.ManagedChild = .{ .child = compiler, .group = compiler.id orelse return error.ProcessIdUnavailable };
+            process_group.store(build.group, .release);
+            defer {
+                build.stop(init.io);
+                process_group.store(0, .release);
+            }
+            const result = try build.child.wait(init.io);
+            if (result != .exited or result.exited != 0) return error.PreviousServerBuildFailed;
+            break :source try std.fs.path.join(allocator, &.{ prefix, "bin/lightning_rod" });
         };
-        if (!exists) {
-            try cwd.deleteTree(init.io, checkout);
-            try cwd.createDir(init.io, checkout, .default_dir);
-            const archive = try std.fs.path.join(allocator, &.{ cache, "source.tar" });
-            _ = try command(init, &.{ "git", "archive", "--format=tar", "--output", archive, previous }, root);
-            _ = try command(init, &.{ "tar", "-xf", archive, "-C", checkout }, root);
-            try cwd.deleteFile(init.io, archive);
-            try cwd.writeFile(init.io, .{ .sub_path = complete, .data = previous });
-        }
-        const prefix = try std.fs.path.join(allocator, &.{ cache, protocols.latest.minecraft_version });
-        const log = try cwd.createFile(init.io, try std.fs.path.join(allocator, &.{ artifacts, "previous-build.log" }), .{});
-        defer log.close(init.io);
-        const zig = init.environ_map.get("LIGHTNING_ROD_E2E_ZIG") orelse "zig";
-        const argv: []const []const u8 = &.{ zig, "build", try std.fmt.allocPrint(allocator, "-Doptimize={s}", .{@tagName(builtin.mode)}), try std.fmt.allocPrint(allocator, "-Dreleases={s}", .{releases}), "--prefix", prefix };
-        const build_directory = try std.fs.path.join(allocator, &.{ checkout, "examples/vanilla" });
-        const compiler = try std.process.spawn(init.io, .{
-            .argv = argv,
-            .cwd = .{ .path = build_directory },
-            .environ_map = init.environ_map,
-            .stdin = .ignore,
-            .stdout = .{ .file = log },
-            .stderr = .{ .file = log },
-            .pgid = 0,
-        });
-        var build: child.ManagedChild = .{ .child = compiler, .group = compiler.id orelse return error.ProcessIdUnavailable };
-        process_group.store(build.group, .release);
-        defer {
-            build.stop(init.io);
-            process_group.store(0, .release);
-        }
-        const result = try build.child.wait(init.io);
-        if (result != .exited or result.exited != 0) return error.PreviousServerBuildFailed;
 
         const executable = try std.fs.path.join(allocator, &.{ world, "upgrade-server" });
         const replacement = try std.fs.path.join(allocator, &.{ world, "upgrade-next" });
-        try cwd.copyFile(try std.fs.path.join(allocator, &.{ prefix, "bin/lightning_rod" }), cwd, executable, init.io, .{});
+        try cwd.copyFile(executable_source, cwd, executable, init.io, .{});
         try cwd.copyFile(current, cwd, replacement, init.io, .{});
         const evidence = try std.json.Stringify.valueAlloc(allocator, .{
             .previous_revision = previous,
             .current_revision = head,
             .current_worktree_dirty = (try command(init, &.{ "git", "status", "--porcelain" }, root)).len != 0,
             .withheld_version = protocols.latest.minecraft_version,
-            .previous_releases = releases,
+            .previous_releases = selected_releases,
             .current_executable = current,
         }, .{});
         try cwd.writeFile(init.io, .{ .sub_path = try std.fs.path.join(allocator, &.{ artifacts, "upgrade.json" }), .data = evidence });

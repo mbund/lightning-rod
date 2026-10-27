@@ -11,6 +11,7 @@ const ReloadTest = @import("tests/reload/test.zig").Test;
 const UpgradeTest = @import("tests/upgrade/test.zig").Test;
 const ManagedChild = @import("src/child.zig").ManagedChild;
 const Listener = @import("src/listener.zig").Listener;
+const client_bundle = @import("src/client_bundle.zig");
 
 const max_processes = catalog.maximum_peers + 2;
 const scenario_timeout_s = 180;
@@ -24,7 +25,6 @@ const Arguments = struct {
     address: []const u8,
     client_version: []const u8,
     peer_versions: []const []const u8,
-    gradle: [5][]const u8,
     upgrade_from: []const u8,
 };
 
@@ -34,6 +34,20 @@ var interrupted = std.atomic.Value(bool).init(false);
 pub fn main(init: std.process.Init) !void {
     if (builtin.os.tag != .linux) return error.E2eRequiresLinux;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--upgrade-releases")) {
+        try std.Io.File.stdout().writeStreamingAll(init.io, try UpgradeTest.releases(init.arena.allocator()));
+        try std.Io.File.stdout().writeStreamingAll(init.io, "\n");
+        return;
+    }
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--test-client")) {
+        const bundle = try client_bundle.Bundle.open(init, "client", args[2]);
+        const run_directory = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", init.arena.allocator());
+        const command = try bundle.command(init, try std.fs.path.join(init.arena.allocator(), &.{ run_directory, ".zig-cache/client-api" }), &.{}, &.{}, true);
+        var child = try std.process.spawn(init.io, .{ .argv = command, .environ_map = init.environ_map });
+        const result = try child.wait(init.io);
+        if (result != .exited or result.exited != 0) return error.ClientApiTestFailed;
+        return;
+    }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--server-exec")) {
         try scheduling.enable();
         var watchdog: std.os.linux.rlimit = undefined;
@@ -108,12 +122,16 @@ fn run(init: std.process.Init, arguments: Arguments, cases: []const catalog.Case
         var duplicate = false;
         for (client_versions[0..index]) |previous| duplicate = duplicate or std.mem.eql(u8, previous, version);
         if (duplicate) continue;
-        const gradle = try clientArguments(init, client, version);
+        if (init.environ_map.get("LIGHTNING_ROD_E2E_CLIENTS") != null) {
+            _ = try client_bundle.Bundle.open(init, client, version);
+            continue;
+        }
+        const gradle = try buildClientArguments(init, client, version);
         const wrapper = try std.fs.path.join(init.gpa, &.{ client, "gradlew" });
         defer init.gpa.free(wrapper);
         const log = try std.fmt.allocPrint(init.gpa, "client-build-{s}.log", .{version});
         defer init.gpa.free(log);
-        var compile_client = try spawn(init, &.{ wrapper, "--no-daemon", "compileClientJava", gradle[0], gradle[1], gradle[2], gradle[3], gradle[4] }, artifacts, client, log, null);
+        var compile_client = try spawn(init, &.{ wrapper, "--no-daemon", "exportRuntime", gradle[0], gradle[1], gradle[2], gradle[3], gradle[4] }, artifacts, client, log, null);
         process_groups[0].store(compile_client.group, .release);
         defer {
             compile_client.stop(init.io);
@@ -131,7 +149,7 @@ fn run(init: std.process.Init, arguments: Arguments, cases: []const catalog.Case
         const preparation = try std.fs.path.join(init.gpa, &.{ artifacts, "prepare" });
         defer init.gpa.free(preparation);
         try cwd.createDir(init.io, preparation, .default_dir);
-        runScenario(init, catalog.find(cases, scenario).?, server, client, preparation, world, arguments.address, arguments.gradle, &.{}, arguments.realtime, arguments.upgrade_from) catch |err| {
+        runScenario(init, catalog.find(cases, scenario).?, server, client, preparation, world, arguments.address, arguments.client_version, &.{}, arguments.realtime, arguments.upgrade_from) catch |err| {
             try writeSummary(init, preparation, scenario, false, @errorName(err));
             if (err == error.PerformanceBudgetExceeded) preparation_performance_failed = true else {
                 try writeSummary(init, artifacts, arguments.scenario.name, false, @errorName(err));
@@ -140,7 +158,7 @@ fn run(init: std.process.Init, arguments: Arguments, cases: []const catalog.Case
         };
     }
 
-    runScenario(init, arguments.scenario, server, client, artifacts, world, arguments.address, arguments.gradle, arguments.peer_versions, arguments.realtime, arguments.upgrade_from) catch |err| {
+    runScenario(init, arguments.scenario, server, client, artifacts, world, arguments.address, arguments.client_version, arguments.peer_versions, arguments.realtime, arguments.upgrade_from) catch |err| {
         writeSummary(init, artifacts, arguments.scenario.name, false, @errorName(err)) catch {};
         std.log.err("event=e2e_failed reason={s} artifacts={s}", .{ @errorName(err), artifacts });
         return err;
@@ -152,7 +170,7 @@ fn run(init: std.process.Init, arguments: Arguments, cases: []const catalog.Case
     std.log.info("event=e2e_passed artifacts={s}", .{artifacts});
 }
 
-fn runScenario(init: std.process.Init, test_case: catalog.Case, server_path: []const u8, client_dir: []const u8, artifacts: []const u8, world: []const u8, requested_address: []const u8, gradle: [5][]const u8, peer_versions: []const []const u8, realtime: bool, upgrade_from: []const u8) !void {
+fn runScenario(init: std.process.Init, test_case: catalog.Case, server_path: []const u8, client_dir: []const u8, artifacts: []const u8, world: []const u8, requested_address: []const u8, primary_version: []const u8, peer_versions: []const []const u8, realtime: bool, upgrade_from: []const u8) !void {
     std.debug.assert(peer_versions.len == 0 or peer_versions.len == test_case.peers.len);
     var listener = try Listener.init(init.io, requested_address);
     defer listener.deinit(init.io);
@@ -227,8 +245,8 @@ fn runScenario(init: std.process.Init, test_case: catalog.Case, server_path: []c
 
     for (peers) |peer| {
         const connect_tick: usize = if (count + 1 == peers.len) test_case.last_peer_connect_tick else 40;
-        const peer_gradle = if (peer_versions.len == 0) gradle else try clientArguments(init, client_dir, peer_versions[count]);
-        clients[count] = try spawnClient(init, client_dir, artifacts, scenario, peer, peers, connect_tick, address, peer_gradle, display);
+        const peer_version = if (peer_versions.len == 0) primary_version else peer_versions[count];
+        clients[count] = try spawnClient(init, client_dir, artifacts, scenario, peer, peers, connect_tick, address, peer_version, display);
         process_groups[count + 2].store(clients[count].group, .release);
         count += 1;
         const startup_deadline = std.Io.Clock.Timestamp.now(init.io, .awake).raw.nanoseconds + 120 * std.time.ns_per_s;
@@ -320,9 +338,9 @@ fn waitForDisplay(init: std.process.Init, artifacts: []const u8) ![]const u8 {
     return error.DisplayStartupTimeout;
 }
 
-fn spawnClient(init: std.process.Init, client_dir: []const u8, artifacts: []const u8, scenario: []const u8, peer: []const u8, peers: []const []const u8, connect_tick: usize, address: []const u8, gradle: [5][]const u8, display: []const u8) !ManagedChild {
+fn spawnClient(init: std.process.Init, client_dir: []const u8, artifacts: []const u8, scenario: []const u8, peer: []const u8, peers: []const []const u8, connect_tick: usize, address: []const u8, client_version: []const u8, display: []const u8) !ManagedChild {
     const allocator = init.gpa;
-    const version = try std.fmt.allocPrint(allocator, "-Dmcc.version={s}", .{gradle[0]["-Pminecraft_version=".len..]});
+    const version = try std.fmt.allocPrint(allocator, "-Dmcc.version={s}", .{client_version});
     defer allocator.free(version);
     const address_arg = try std.fmt.allocPrint(allocator, "-Dmcc.server={s}", .{address});
     defer allocator.free(address_arg);
@@ -340,20 +358,21 @@ fn spawnClient(init: std.process.Init, client_dir: []const u8, artifacts: []cons
     defer allocator.free(scenario_arg);
     const connect_arg = try std.fmt.allocPrint(allocator, "-Dmcc.connectTick={d}", .{connect_tick});
     defer allocator.free(connect_arg);
-    const run_dir = try std.fmt.allocPrint(allocator, "-Dmcc.runDir={s}/run/{s}", .{ artifacts, peer });
+    const run_dir = try std.fmt.allocPrint(allocator, "{s}/run/{s}", .{ artifacts, peer });
     defer allocator.free(run_dir);
     var environment = try init.environ_map.clone(allocator);
     defer environment.deinit();
     try environment.put("DISPLAY", display);
     try environment.put("LP_NUM_THREADS", "2");
-    const wrapper = try std.fs.path.join(allocator, &.{ client_dir, "gradlew" });
-    defer allocator.free(wrapper);
+    const bundle = try client_bundle.Bundle.open(init, client_dir, client_version);
+    const command = try bundle.command(init, run_dir, &.{ version, address_arg, events, output, peer_arg, expected, scenario_arg, connect_arg }, &.{ "--username", peer, "--gameDir", run_dir }, false);
     const log_path = try std.fmt.allocPrint(allocator, "{s}/{s}.log", .{ artifacts, peer });
     defer allocator.free(log_path);
     const log = try std.Io.Dir.cwd().createFile(init.io, log_path, .{});
     defer log.close(init.io);
     const child = try std.process.spawn(init.io, .{
-        .argv = &.{ wrapper, "--no-daemon", "runClient", gradle[0], gradle[1], gradle[2], gradle[3], gradle[4], version, address_arg, events, output, peer_arg, expected, scenario_arg, connect_arg, run_dir },
+        .argv = command,
+        .cwd = .{ .path = run_dir },
         .environ_map = &environment,
         .stdin = .ignore,
         .stdout = .{ .file = log },
@@ -458,12 +477,11 @@ fn parse(init: std.process.Init, values: []const [:0]const u8, cases: []const ca
         .scenario = selected,
         .client_version = protocol_catalog.versions[protocol_catalog.releaseIndex(client_version).?].minecraft_version,
         .peer_versions = peer_versions,
-        .gradle = try clientArguments(init, client, peer_versions[0]),
         .upgrade_from = upgrade_from,
     };
 }
 
-fn clientArguments(init: std.process.Init, client: []const u8, version: []const u8) ![5][]const u8 {
+fn buildClientArguments(init: std.process.Init, client: []const u8, version: []const u8) ![5][]const u8 {
     const allocator = init.arena.allocator();
     const Version = struct { release: []const u8, api: []const u8, fabric: []const u8 };
     const path = try std.fs.path.join(allocator, &.{ client, "versions.json" });
