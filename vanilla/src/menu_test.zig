@@ -11,6 +11,7 @@ const InventoryFixture = @import("inventory_test_fixture.zig").InventoryFixture;
 const item_data = @import("item_data.zig");
 const ItemEntities = @import("item_entities.zig").ItemEntities;
 const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
+const InventoryCapacity = @import("inventory_capacity.zig").InventoryCapacity;
 const records = @import("records");
 const chunks = @import("chunks");
 const BlockActions = @import("block_actions.zig").BlockActions;
@@ -625,4 +626,30 @@ test "interrupted container saves recover a complete ownership snapshot" {
             try std.testing.expectEqualSlices(u64, &totals, &recovered);
         }
     }
+}
+
+test "inventory cache defaults follow player capacity and preserve explicit overrides" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/capacity", .{directory.sub_path});
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
+    defer store.deinit();
+    var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
+    defer registry.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    const fixture = try InventoryFixture.init(arena.allocator(), &store, &registry, &selected);
+    defer fixture.service.deinit();
+    const capacity = try InventoryCapacity.init(arena.allocator(), .{ .players = fixture.players });
+    var deps = fixture.ownership.deps;
+    deps.capacity = capacity.provide(inventories.SlotCapacity);
+    const automatic = try inventories.Inventories.init(arena.allocator(), std.testing.io, .{ .cache_items = 1, .max_item_bytes = 1024 }, deps);
+    try std.testing.expectEqual(92 * fixture.players.config.maximum, automatic.cache.entries.len);
+    const explicit = try inventories.Inventories.init(arena.allocator(), std.testing.io, .{ .cache_slots = 256, .cache_items = 1, .max_item_bytes = 1024 }, deps);
+    try std.testing.expectEqual(@as(usize, 256), explicit.cache.entries.len);
+    deps.capacity = null;
+    const standalone = try inventories.Inventories.init(arena.allocator(), std.testing.io, .{ .cache_items = 1, .max_item_bytes = 1024 }, deps);
+    try std.testing.expectEqual(@as(usize, 256), standalone.cache.entries.len);
 }

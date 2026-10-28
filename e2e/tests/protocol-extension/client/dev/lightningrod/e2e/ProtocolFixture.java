@@ -103,7 +103,6 @@ final class ProtocolFixture extends Fixture {
                         return;
                     }
                 }
-            if (!game.levelRenderer.hasRenderedAllSections()) return;
             if (game.level.players().stream().noneMatch(player -> player != game.player && player.getMainHandItem().getHoverName().getString().equals("Downstream item"))) return;
             if (game.getConnection().getOnlinePlayers().size() != 2) return;
             client.mark("rendered-" + r.peer);

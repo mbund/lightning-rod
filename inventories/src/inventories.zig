@@ -10,6 +10,7 @@ const SlotCache = records.CacheFor(Slots);
 const assert = std.debug.assert;
 
 pub const ItemId = [32]u8;
+pub const SlotCapacity = struct { slots: usize };
 
 pub const Slot = struct {
     owner: u128,
@@ -57,12 +58,13 @@ pub const Inventories = struct {
     pub const id = "lightning_rod:inventories";
 
     pub const Configuration = struct {
-        cache_slots: usize = 256,
+        cache_slots: ?usize = null,
         cache_items: usize = 8,
         max_item_bytes: usize = 64 * 1024,
     };
 
     pub const Dependencies = struct {
+        capacity: ?SlotCapacity = null,
         record_workspaces: *records.Workspaces,
         metrics: *metrics.Registry,
         storage: storage.Space,
@@ -159,8 +161,9 @@ pub const Inventories = struct {
 
     pub fn allocate(allocator: std.mem.Allocator, io: std.Io, config: Configuration, deps: Dependencies) !*Inventories {
         const table_resources = deps.record_workspaces.resources;
-        if (config.cache_slots < 2 or config.cache_items == 0 or config.max_item_bytes == 0) return error.InvalidArgument;
-        var slots = try Slots.init(allocator, .{ .space = deps.storage, .root_offset = 8, .resources = table_resources }, @min(config.cache_slots, Slots.write_batch_size));
+        const slot_capacity = config.cache_slots orelse if (deps.capacity) |capacity| capacity.slots else 256;
+        if (slot_capacity < 2 or config.cache_items == 0 or config.max_item_bytes == 0) return error.InvalidArgument;
+        var slots = try Slots.init(allocator, .{ .space = deps.storage, .root_offset = 8, .resources = table_resources }, @min(slot_capacity, Slots.write_batch_size));
         errdefer slots.deinit(allocator);
         const self = try allocator.create(Inventories);
         self.* = .{
@@ -170,7 +173,7 @@ pub const Inventories = struct {
             .cache = try SlotCache.init(allocator, io, slots, .{
                 .metrics = deps.metrics,
                 .metrics_namespace = "inventories.slots",
-                .slots = config.cache_slots,
+                .slots = slot_capacity,
                 .key_bytes = 18,
                 .value_bytes = encoded_bytes,
             }),

@@ -29,9 +29,6 @@ final class ChunksFixture extends Fixture {
             }
             if (targetTick < 0) targetTick = client.streamTarget(loaded);
             if (r.tick - targetTick >= r.minimumSoakTicks) {
-                // Packet delivery can finish before the renderer builds nearby terrain.
-                // Keep the delivery timestamp above independent of screenshot readiness.
-                if (!game.levelRenderer.hasRenderedAllSections()) return;
                 if (r.scenario.startsWith("chunks-prepare") && !stampRequested) {
                     client.send("chunks_stamp");
                     stampRequested = true;

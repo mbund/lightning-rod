@@ -46,6 +46,7 @@ pub const BlockEdit = @import("chunks").BlockEdit;
 pub const SectionEdits = @import("chunks").SectionEdits;
 pub const Entities = @import("entities").Entities;
 pub const Inventories = @import("inventories").Inventories;
+pub const InventoryCapacity = @import("inventory_capacity.zig").InventoryCapacity;
 pub const Items = @import("items.zig").Items;
 pub const ItemProperties = @import("item_properties.zig").ItemProperties;
 pub const Durability = @import("item_properties.zig").Durability;
@@ -110,6 +111,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Replication, Replication.Configuration{}),
     lightning_rod.plugin.configured(Chunks, Chunks.Configuration{}),
     lightning_rod.plugin.configured(Entities, Entities.Configuration{}),
+    lightning_rod.plugin.configured(InventoryCapacity, .{}),
     lightning_rod.plugin.configured(Inventories, Inventories.Configuration{}),
     lightning_rod.plugin.configured(Items, Items.Configuration{}),
     lightning_rod.plugin.configured(ItemProperties, ItemProperties.Configuration{}),

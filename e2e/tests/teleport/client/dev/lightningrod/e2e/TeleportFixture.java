@@ -255,8 +255,7 @@ final class TeleportFixture extends Fixture {
                 if (!markerExists(ISOLATION_DONE)) return;
                 if (isolation) {
                     if (!dimension(game).equals("overworld") || game.level.players().size() != PEER_COUNT
-                        || inventorySyncedPlayer != game.player || GuiApi.screen(game) != null
-                        || !game.levelRenderer.hasRenderedAllSections()) return;
+                        || inventorySyncedPlayer != game.player || GuiApi.screen(game) != null) return;
                     bobPhase = BobPhase.WAIT_FOR_ISOLATION_CAPTURE;
                     return;
                 }

@@ -55,6 +55,7 @@ pub const Key = struct {
 
 pub const Containers = struct {
     pub const id = "minecraft:containers";
+    pub const minimum_inventory_cache_slots = menu_click.maximum_slots;
     pub const Configuration = struct { active_furnaces: usize = 256 };
     pub const Dependencies = struct {
         players: *Players,
@@ -111,9 +112,10 @@ pub const Containers = struct {
     targets: []sessions.Service.Target,
     deliveries: []sessions.Service.Delivery,
 
-    pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Containers {
+    pub fn allocate(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Containers {
         if (config.active_furnaces == 0) return error.InvalidConfiguration;
-        if (deps.inventories.cache.entries.len < menu_click.maximum_slots) return error.InventoryCacheTooSmall;
+        assert(deps.inventories.cache.entries.len >= minimum_inventory_cache_slots);
+        if (deps.inventories.cache.entries.len < minimum_inventory_cache_slots) return error.InventoryCacheTooSmall;
         const self = try allocator.create(Containers);
         self.* = .{
             .deps = deps,
@@ -133,6 +135,15 @@ pub const Containers = struct {
         try self.lids.ensureTotalCapacity(allocator, try std.math.mul(usize, deps.players.records.len, 4));
         try self.watch_index.ensureTotalCapacity(allocator, @intCast(self.watches.len));
         try self.active_index.ensureTotalCapacity(allocator, @intCast(self.active.len));
+        for ([_]u16{ self.states.chests[0][0][0], self.states.furnaces[0][0], self.states.crafting }) |state| {
+            const block = game_data.registry.blocks[game_data.registry.block_state_to_block[state]];
+            try deps.actions.register(BlockActions.Handler.init(self, @intCast(block.min_state), @intCast(block.max_state), applyBlock));
+        }
+        return self;
+    }
+
+    pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Containers {
+        const self = try allocate(allocator, config, deps);
         var after: [16]u8 = undefined;
         var cursor: records.ScanCursor = .{ .after = &after };
         var keys: [16][16]u8 = undefined;
@@ -152,10 +163,6 @@ pub const Containers = struct {
                 self.saved_count += 1;
             }
             if (!batch.more) break;
-        }
-        for ([_]u16{ self.states.chests[0][0][0], self.states.furnaces[0][0], self.states.crafting }) |state| {
-            const block = game_data.registry.blocks[game_data.registry.block_state_to_block[state]];
-            try deps.actions.register(BlockActions.Handler.init(self, @intCast(block.min_state), @intCast(block.max_state), applyBlock));
         }
         return self;
     }

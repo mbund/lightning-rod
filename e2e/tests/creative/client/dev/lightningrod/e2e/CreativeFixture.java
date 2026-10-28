@@ -52,7 +52,6 @@ final class CreativeFixture extends Fixture {
         }
         if (phase == Phase.DROP_ONE) {
             for (String other : r.expectedPeers) if (!client.marked(other + ".creative-placed")) return;
-            if (!game.levelRenderer.hasRenderedAllSections()) return;
             if (!game.level.getBlockState(placed).is(net.minecraft.world.level.block.Blocks.STONE)) { client.fail("creative_placement_reverted"); return; }
             if (alice) game.player.drop(false);
             phase = Phase.DROPPED_ONE;

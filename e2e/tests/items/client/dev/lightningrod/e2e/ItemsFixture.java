@@ -105,7 +105,6 @@ final class ItemsFixture extends Fixture {
         }
         if (phase == Phase.PICKUP) {
             for (String other : r.expectedPeers) if (!client.marked(other + ".items-merged")) return;
-            if (!game.levelRenderer.hasRenderedAllSections()) return;
             if (r.peer.equals("alice")) {
                 game.player.setPos(4.5, 65, 0.5);
                 game.getConnection().send(new ServerboundMovePlayerPacket.Pos(4.5, 65, 0.5, true, false));
@@ -203,7 +202,6 @@ final class ItemsFixture extends Fixture {
             phase = Phase.PLACED;
         }
         if (phase == Phase.PLACED && game.level.getBlockState(placed).is(net.minecraft.world.level.block.Blocks.DIRT)) {
-            if (!game.levelRenderer.hasRenderedAllSections()) return;
             if (r.peer.equals("alice") && game.player.getInventory().countItem(net.minecraft.world.item.Items.DIRT) != 7) return;
             lookAt(game, placed);
             if (!client.screenshot("survival_block_placed").done()) return;
@@ -227,7 +225,6 @@ final class ItemsFixture extends Fixture {
                 aimedAfterReload = true;
                 lookAt(game, placed);
             }
-            if (!game.levelRenderer.hasRenderedAllSections()) return;
             if (!client.screenshot("survival_blocks_after_reload").done()) return;
             client.mark(r.peer + ".survival-restored");
             phase = Phase.COMPLETE;

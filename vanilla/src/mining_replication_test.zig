@@ -4,6 +4,7 @@ const storage = @import("storage");
 const records = @import("records");
 const metrics = @import("metrics");
 const inventories = @import("inventories");
+const entities = @import("entities");
 const worlds = @import("worlds");
 const chunks = @import("chunks");
 const sessions = @import("sessions");
@@ -14,6 +15,9 @@ const packets = @import("minecraft_packets");
 const minecraft = @import("minecraft_model");
 const Mining = @import("mining.zig").Mining;
 const Items = @import("items.zig").Items;
+const ItemEntities = @import("item_entities.zig").ItemEntities;
+const Durability = @import("item_properties.zig").Durability;
+const EquipmentSlots = @import("item_properties.zig").EquipmentSlots;
 const Players = @import("players.zig").Players;
 const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
 const Input = @import("input.zig").Input;
@@ -59,6 +63,7 @@ const Fixture = struct {
         const sink = try allocator.create(Sink);
         sink.* = .{};
         const service = try sessions.Service.init(allocator, std.testing.io, .{ .context = sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = count, .pages = @max(1024, count * 4), .page_bytes = 32768, .buffer_bytes = 128 * 1024, .protocols = &selected_protocols });
+        errdefer service.deinit();
         const input = try Input.init(allocator, .{ .sessions = service });
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
         const workspaces = try records.Workspaces.init(allocator, std.testing.io, .{});
@@ -71,10 +76,20 @@ const Fixture = struct {
         players.rebuildIndexes();
         const ownership = try inventories.Inventories.init(allocator, std.testing.io, .{ .cache_slots = 1024, .cache_items = 8, .max_item_bytes = 1024 }, .{ .metrics = registry, .storage = try store.openSpace("inventory"), .record_workspaces = workspaces });
         const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
-        const menus = try PlayerInventory.init(allocator, .{ .players = players, .inventories = ownership, .items = items, .equipment = undefined, .dropped = undefined });
+        const bodies = try entities.Entities.init(allocator, std.testing.io, .{ .cache_records = 16 }, .{ .metrics = registry, .storage = try store.openSpace("entities"), .record_workspaces = workspaces });
+        const dropped = try ItemEntities.init(allocator, std.testing.io, .{ .cache_records = 16, .maximum = 8 }, .{
+            .entities = bodies,
+            .inventories = ownership,
+            .items = items,
+            .worlds = dimensions,
+            .storage = try store.openSpace("drops"),
+            .metrics = registry,
+            .record_workspaces = workspaces,
+        });
+        const menus = try PlayerInventory.init(allocator, .{ .players = players, .inventories = ownership, .items = items, .equipment = try EquipmentSlots.init(allocator, .{ .items = items }), .dropped = dropped });
         const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 64, .demand_sections = 0, .cache_tiles = 8 }, .{ .metrics = registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
         const blocks = try Blocks.init(allocator, std.testing.io, .{ .metrics = registry, .chunks = terrain, .players = players, .streaming = undefined, .sessions = service, .packets = encoding, .worlds = dimensions }, .{ .delta_sections = 16, .queued_sections = 32 });
-        const mining = try Mining.allocate(allocator, .{}, .{ .visibility = try Visibility.init(allocator, .{}, .{ .players = players }), .metrics = registry, .storage = try store.openSpace("mining"), .players = players, .input = input, .inventories = ownership, .items = items, .durability = undefined, .worlds = dimensions, .chunks = terrain, .menus = menus, .loot = try BlockLoot.init(allocator), .dropped = undefined, .blocks = blocks, .actions = try BlockActions.init(allocator, .{}) });
+        const mining = try Mining.allocate(allocator, .{}, .{ .visibility = try Visibility.init(allocator, .{}, .{ .players = players }), .metrics = registry, .storage = try store.openSpace("mining"), .players = players, .input = input, .inventories = ownership, .items = items, .durability = try Durability.init(allocator, .{ .items = items, .inventories = ownership }), .worlds = dimensions, .chunks = terrain, .menus = menus, .loot = try BlockLoot.init(allocator), .dropped = dropped, .blocks = blocks, .actions = try BlockActions.init(allocator, .{}) });
         const tool: inventories.Stack = .{ .item = try items.define("minecraft:diamond_pickaxe"), .count = 1 };
         for (players.records) |player| try std.testing.expect(try ownership.set(.{ .owner = player.uuid, .index = 36 }, 0, tool));
         try terrain.setBlock(world, .{ .x = position.x, .y = position.y, .z = position.z }, game_data.registry.block_obsidian_default_state);
@@ -384,6 +399,32 @@ pub fn verifyReadWindow() !void {
         try std.testing.expectEqual(@as(i8, -1), state.stage);
     }
     try std.testing.expectEqual(@as(usize, 0), action.terrain.cache.pinned_entries);
+    const dropped = fixture.mining.deps.dropped;
+    try std.testing.expectEqual(dropped.residents.len, dropped.free_count);
+
+    const player = &fixture.mining.deps.players.records[0];
+    player.gamemode = .survival;
+    const ownership = fixture.mining.deps.inventories;
+    const slot: inventories.Slot = .{ .owner = player.uuid, .index = 36 };
+    const before = (try ownership.get(slot)).stack.?;
+    const at: chunks.Position = .{ .x = position.x, .y = position.y, .z = position.z };
+    try action.terrain.setBlock(player.world, at, game_data.registry.block_stone_default_state);
+    fixture.mining.states[0] = .{ .generation = player.handle.?.generation, .teleport_id = player.teleport_id, .active = true, .complete = true, .position = position };
+    _ = try fixture.tick();
+    try std.testing.expectEqual(@as(u16, 0), try action.terrain.getBlock(player.world, at));
+    try std.testing.expectEqual(@as(usize, 1), action.calls);
+    try std.testing.expectEqual(dropped.residents.len - 1, dropped.free_count);
+    const worn = (try ownership.get(slot)).stack.?;
+    try std.testing.expectEqual(@as(u16, 1), worn.count);
+    try std.testing.expect(!inventories.Stack.sameItem(before, worn));
+    var cursor: ItemEntities.Cursor = .{};
+    const rows = try dropped.scan(&cursor);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expect(rows[0].metadata.alive);
+    const body = (try dropped.deps.entities.get(rows[0].id)).?;
+    const loot = (try ownership.get(ItemEntities.slot(body))).stack.?;
+    try std.testing.expectEqual(@as(u16, 1), loot.count);
+    try std.testing.expectEqual(@as(u32, @intCast(game_data.registry.itemId("minecraft:cobblestone").?)), try fixture.mining.deps.items.kind(loot));
 }
 
 pub fn verifyNeighborhoods() !void {

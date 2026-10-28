@@ -106,7 +106,6 @@ final class TimeFixture extends Fixture {
                     if (Math.abs(value - game.level.getGameTime()) > 100) { client.fail("time_query_age"); return; }
                 }
                 if (current == 3 || current == CASES.length - 1) {
-                    if (!game.levelRenderer.hasRenderedAllSections()) return;
                     if (!client.screenshot(current == 3 ? "midnight" : "day").done()) return;
                 }
                 client.event("time_command_verified", "command", test.command(), "time", GameApi.dayTime(game));

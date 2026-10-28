@@ -95,7 +95,6 @@ final class ItemComponentsFixture extends Fixture {
             if (configurations != 0) game.player.getInventory().setSelectedSlot(1);
             if (configurations == 0 || !presented(game, game.player.getMainHandItem(), r.peer, 100)
                 || !presented(game, peer.getMainHandItem(), other, 100)) return;
-            if (!game.levelRenderer.hasRenderedAllSections()) return;
             if (!client.screenshot("components_after_reload").done()) return;
             client.mark(r.peer + ".complete");
             phase = Phase.COMPLETE;

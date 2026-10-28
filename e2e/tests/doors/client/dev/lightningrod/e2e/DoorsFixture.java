@@ -111,11 +111,6 @@ final class DoorsFixture extends Fixture {
                             return;
                         }
                     }
-                    if (!game.levelRenderer.hasRenderedAllSections()) {
-                        if (r.tick % 100 == 0) client.event("door_render_wait", "door", door, "stage", phase,
-                            "terrain_complete", game.levelRenderer.hasRenderedAllSections());
-                        return;
-                    }
                     String label = switch (phase) { case PLACED -> "placed"; case OPEN -> "open"; case CLOSED -> "closed"; default -> "saved"; };
                     if (!client.screenshot(prefix + label).done()) return;
                     client.event("door_verified", "door", door, "facing", facing.getSerializedName(), "hinge", hinge.getSerializedName(), "open", open, "stage", label);
@@ -188,7 +183,7 @@ final class DoorsFixture extends Fixture {
                     client.fence("doors-repositioned");
                     return;
                 }
-                if (missingChunks(game, 1) != 0 || !client.fenced("doors-repositioned") || !game.levelRenderer.hasRenderedAllSections()) return;
+                if (missingChunks(game, 1) != 0 || !client.fenced("doors-repositioned")) return;
                 if (!client.screenshot("doors_after_reload").done()) return;
                 client.mark(r.peer + ".doors-restored");
                 phase = Phase.BREAK_POSITION;
@@ -216,7 +211,6 @@ final class DoorsFixture extends Fixture {
                     if (r.tick % 100 == 0) client.event("door_break_wait", "door", broken, "lower", lower.toString(), "upper", upper.toString());
                     return;
                 }
-                if (!game.levelRenderer.hasRenderedAllSections()) return;
                 if (!client.screenshot("door_broken_" + (broken == 0 ? "lower" : "upper")).done()) return;
                 client.mark(r.peer + ".door-broken-" + broken);
                 phase = Phase.WAIT_BROKEN;

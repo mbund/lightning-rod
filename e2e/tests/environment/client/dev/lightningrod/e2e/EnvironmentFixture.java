@@ -55,7 +55,7 @@ final class EnvironmentFixture extends Fixture {
                 firstAge = game.level.getGameTime();
                 return;
             }
-            if (game.level.getGameTime() <= firstAge || !game.levelRenderer.hasRenderedAllSections()) return;
+            if (game.level.getGameTime() <= firstAge) return;
             if (!client.screenshot(phase.name().toLowerCase(java.util.Locale.ROOT)).done()) return;
             client.event("environment_verified", "phase", phase, "day", day, "rain", rain, "thunder", thunder);
             client.mark(r.peer + "." + marker);

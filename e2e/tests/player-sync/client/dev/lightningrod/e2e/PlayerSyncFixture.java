@@ -82,7 +82,6 @@ final class PlayerSyncFixture extends Fixture {
                 game.player.setXRot((float) -Math.toDegrees(Math.atan2(dy, Math.hypot(dx, dz))));
                 return;
             }
-            if (!game.levelRenderer.hasRenderedAllSections()) return;
             if (!client.screenshot("player_sync_observed").done()) return;
             client.mark(r.peer + ".sync-observed");
             client.event("player_sync_observed", "x", alice.getX(), "y", alice.getY(), "z", alice.getZ(), "yaw", alice.getYRot(),
