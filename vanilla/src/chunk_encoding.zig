@@ -13,6 +13,7 @@ const lightning_rod = @import("lightning_rod");
 const lighting = @import("lighting.zig");
 const worlds = @import("worlds");
 const assert = std.debug.assert;
+const container_blocks = @import("container_blocks.zig");
 
 pub const Workspace = struct {
     const Summary = struct {
@@ -21,6 +22,7 @@ pub const Workspace = struct {
             palette_len: u16 = 0,
             count: u16 = 0,
             fluid_count: u16 = 0,
+            block_entities: u16 = 0,
             direct: bool = false,
         };
 
@@ -69,6 +71,7 @@ pub const Workspace = struct {
                 summary.palette[0] = state;
                 summary.state.palette_len = 1;
                 summary.state.count = if (state != 0) 4096 else 0;
+                summary.state.block_entities = if (container_blocks.entityName(state) != null) 4096 else 0;
                 summary.state.fluid_count = if (game_data.registry.stateContainsFluid(state)) 4096 else 0;
                 @memset(&summary.heights, if (state != 0) 16 else 0);
             } else {
@@ -80,6 +83,7 @@ pub const Workspace = struct {
                         summary.state.count += 1;
                         summary.heights[i % 256] = @intCast(i / 256 + 1);
                     }
+                    summary.state.block_entities += @intFromBool(container_blocks.entityName(state) != null);
                     summary.state.fluid_count += @intFromBool(game_data.registry.stateContainsFluid(state));
                     if (summary.state.direct or self.palette_indices[state] != std.math.maxInt(u16)) continue;
                     if (summary.state.palette_len == summary.palette.len) {
@@ -237,7 +241,19 @@ fn encode(cursor: support.cursor.State(.write), registry: packets.Registry, chun
     output[length_offset] = @as(u8, @truncate(length & 127)) | 128;
     output[length_offset + 1] = @as(u8, @truncate((length >> 7) & 127)) | 128;
     output[length_offset + 2] = @intCast(length >> 14);
-    try varint(&writer, 0);
+    var entities: usize = 0;
+    for (workspace.summaries[0..sections.len]) |summary| entities += summary.state.block_entities;
+    try varint(&writer, @intCast(entities));
+    for (sections, 0..) |section, section_index| {
+        if (workspace.summaries[section_index].state.block_entities == 0) continue;
+        for (0..4096) |index| {
+            const name = container_blocks.entityName(section.view.get(@intCast(index))) orelse continue;
+            try writer.writeByte(@intCast(((index % 16) << 4) | ((index / 16) % 16)));
+            try writer.writeInt(i16, @intCast((chunk.minimum_section + @as(i32, @intCast(section_index))) * 16 + @as(i32, @intCast(index / 256))), .big);
+            try varint(&writer, try protocol.registryId("minecraft:block_entity_type", name));
+            try writer.writeAll(&.{ 10, 0 });
+        }
+    }
     try chunk.light.write(&writer);
     return output[0..writer.end];
 }

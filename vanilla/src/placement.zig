@@ -90,7 +90,7 @@ pub const Placement = struct {
         state.sequence = @max(state.sequence, place.sequence);
         if (place.hand < 0 or place.hand > 1 or place.face < 0 or place.face > 5) return;
         if (!std.math.isFinite(place.cursor[0]) or !std.math.isFinite(place.cursor[1]) or !std.math.isFinite(place.cursor[2])) return;
-        if (player.health <= 0 or (player.gamemode != .creative and player.gamemode != .survival)) return;
+        if (player.health <= 0) return;
 
         const dimension = self.deps.worlds.get(player.world).?.dimension;
         const minimum_y = dimension.minimumSection() * 16;
@@ -122,6 +122,7 @@ pub const Placement = struct {
             }
         }
 
+        if (player.gamemode != .creative and player.gamemode != .survival) return;
         var position = place.position;
         const offset = [_][3]i32{ .{ 0, -1, 0 }, .{ 0, 1, 0 }, .{ 0, 0, -1 }, .{ 0, 0, 1 }, .{ -1, 0, 0 }, .{ 1, 0, 0 } };
         position.x += offset[@intCast(place.face)][0];

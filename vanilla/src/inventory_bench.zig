@@ -31,7 +31,7 @@ const Lighting = @import("lighting.zig").Lighting;
 const Streaming = @import("streaming.zig").Streaming;
 const ItemEntities = @import("item_entities.zig").ItemEntities;
 const ItemReplication = @import("item_replication.zig").ItemReplication;
-const SurvivalInventory = @import("survival_inventory.zig").SurvivalInventory;
+const InventoryMenus = @import("inventory_menus.zig").InventoryMenus;
 
 const Sink = struct {
     pub fn notify(_: *Sink, _: std.Io) void {}
@@ -106,7 +106,7 @@ pub fn benchmark() !void {
             .equipment = undefined,
             .dropped = undefined,
         });
-        var survival: SurvivalInventory = .{ .deps = .{ .inventory = menu, .players = &players, .inventories = ownership, .items = items, .packets = encoding, .sessions = service, .input = undefined } };
+        var survival: InventoryMenus = .{ .deps = .{ .containers = undefined, .inventory = menu, .players = &players, .inventories = ownership, .items = items, .packets = encoding, .sessions = service, .input = undefined } };
         const Mode = enum { survival_dirty_one, survival_dirty_many, survival_cursor, survival_full, full_direct, single_slot_direct };
         for ([_]bool{ true, false }) |available| for (std.enums.values(Mode)) |mode| {
             const player = players_buffer[0];

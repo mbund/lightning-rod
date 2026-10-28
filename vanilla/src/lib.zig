@@ -34,7 +34,7 @@ pub const ReloadCommands = @import("reload_commands.zig").ReloadCommands;
 pub const CommandDispatch = @import("commands.zig").CommandDispatch;
 pub const FallDamage = @import("fall_damage.zig").FallDamage;
 pub const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
-pub const SurvivalInventory = @import("survival_inventory.zig").SurvivalInventory;
+pub const InventoryMenus = @import("inventory_menus.zig").InventoryMenus;
 pub const CreativeInventory = @import("creative_inventory.zig").CreativeInventory;
 pub const Visibility = @import("visibility.zig").Visibility;
 pub const Replication = @import("replication.zig").Replication;
@@ -64,6 +64,7 @@ pub const BlockLoot = @import("block_loot.zig").BlockLoot;
 pub const Mining = @import("mining.zig").Mining;
 pub const Placement = @import("placement.zig").Placement;
 pub const BlockActions = @import("block_actions.zig").BlockActions;
+pub const Containers = @import("containers.zig").Containers;
 pub const Doors = @import("doors.zig").Doors;
 pub const Equipment = @import("equipment.zig").Equipment;
 pub const item = @import("item.zig");
@@ -119,8 +120,10 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(BlockLoot, BlockLoot.Configuration{}),
     lightning_rod.plugin.configured(ItemPhysics, ItemPhysics.Configuration{}),
     lightning_rod.plugin.configured(ItemMerging, ItemMerging.Configuration{}),
+    lightning_rod.plugin.configured(BlockActions, BlockActions.Configuration{}),
     lightning_rod.plugin.configured(PlayerInventory, PlayerInventory.Configuration{}),
-    lightning_rod.plugin.configured(SurvivalInventory, SurvivalInventory.Configuration{}),
+    lightning_rod.plugin.configured(Containers, Containers.Configuration{}),
+    lightning_rod.plugin.configured(InventoryMenus, InventoryMenus.Configuration{}),
     lightning_rod.plugin.configured(CreativeInventory, CreativeInventory.Configuration{}),
     lightning_rod.plugin.configured(ItemPickup, ItemPickup.Configuration{}),
     lightning_rod.plugin.configured(ItemTick, ItemTick.Configuration{}),
@@ -128,7 +131,6 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Lighting, Lighting.Configuration{}),
     lightning_rod.plugin.configured(Streaming, Streaming.Configuration{}),
     lightning_rod.plugin.configured(BlockSynchronization, BlockSynchronization.Configuration{}),
-    lightning_rod.plugin.configured(BlockActions, BlockActions.Configuration{}),
     lightning_rod.plugin.configured(Doors, Doors.Configuration{}),
     lightning_rod.plugin.configured(Mining, Mining.Configuration{}),
     lightning_rod.plugin.configured(Placement, Placement.Configuration{}),

@@ -1,4 +1,5 @@
 const std = @import("std");
+const menu_click = @import("menu_click.zig");
 const entities = @import("entities");
 const wire_1_21_5 = @import("wire_1_21_5");
 const packets = @import("minecraft_packets");
@@ -33,24 +34,31 @@ pub const PlayerInventory = struct {
         revision: i32 = 0,
         presentation: u64 = 0,
         dirty: u64 = all_slots,
-        drag: u64 = 0,
-        drag_button: ?i8 = null,
+        drag: menu_click.Drag = .{},
         selected: u4 = 0,
         close: bool = true,
         synchronized: bool = false,
+        external: bool = false,
         gamemode: minecraft.GameMode = .survival,
     };
 
     pub const cursor = 46;
+    // Table inputs belong to the player so close and restart use the same recovery path.
+    pub const table_grid_first: u16 = 100;
+    pub const table_grid_count = 9;
     pub const all_slots = (@as(u64, 1) << 47) - 1;
 
     pub fn writeInventory(packet: wire_1_21_5.play.toClient.packet_window_items.Writer, registry: packets.Registry, store: *Items, revision: i32, contents: []const inventories.Contents, recipient: u128) ![]u8 {
         assert(contents.len == 47);
-        const body = try (try packet.windowId(0)).stateId(revision);
-        var items = try body.items(46);
+        return writeContents(packet, registry, store, 0, revision, contents[0..46], contents[46], recipient);
+    }
+
+    pub fn writeContents(packet: wire_1_21_5.play.toClient.packet_window_items.Writer, registry: packets.Registry, store: *Items, window: i32, revision: i32, contents: []const inventories.Contents, carried_stack: inventories.Contents, recipient: u128) ![]u8 {
+        const body = try (try packet.windowId(window)).stateId(revision);
+        var items = try body.items(@intCast(contents.len));
         var base: usize = 0;
-        while (base < 46) {
-            const count = @min(16, store.views.len, 46 - base);
+        while (base < contents.len) {
+            const count = @min(16, store.views.len, contents.len - base);
             var stacks: [16]inventories.Stack = undefined;
             var prepared: [16]Items.Prepared = undefined;
             var occupied: usize = 0;
@@ -75,14 +83,14 @@ pub const PlayerInventory = struct {
             }
             base += count;
         }
-        const prepared_cursor = if (contents[46].stack) |stack| try store.acquire(stack) else null;
+        const prepared_cursor = if (carried_stack.stack) |stack| try store.acquire(stack) else null;
         defer if (prepared_cursor) |prepared| prepared.release();
         const carried = try items.finish();
         var item = try carried.carriedItem();
         const done = try item_packets.writeSlot(try item.begin(), .{
             .registry = registry,
             .items = store,
-            .stack = contents[46].stack,
+            .stack = carried_stack.stack,
             .view = if (prepared_cursor) |prepared| prepared.view else null,
             .recipient = recipient,
         });
@@ -91,6 +99,7 @@ pub const PlayerInventory = struct {
 
     deps: Dependencies,
     states: []State,
+    recipes: *const game_data.recipe_data.Table,
     const maximum_drops = 128;
 
     pub fn fail(self: *PlayerInventory) void {
@@ -106,6 +115,7 @@ pub const PlayerInventory = struct {
         self.* = .{
             .deps = deps,
             .states = states,
+            .recipes = &game_data.recipes,
         };
         return self;
     }
@@ -124,10 +134,14 @@ pub const PlayerInventory = struct {
             .index = if (at == cursor) std.math.maxInt(u16) else @intCast(at),
         };
         try self.deps.inventories.getMany(slots, contents);
-        if (!state.close) return;
+        assert(contents[0].stack == null);
+        if (!state.close) {
+            try self.refreshOutput(contents);
+            return;
+        }
         var next: [47]?inventories.Stack = undefined;
         for (&next, contents) |*stack, entry| stack.* = entry.stack;
-        var drops: [5]inventories.Stack = undefined;
+        var drops: [14]inventories.Stack = undefined;
         var count: usize = 0;
         for ([_]usize{ cursor, 1, 2, 3, 4 }) |source| {
             if (try self.returnStack(state.selected, source, &next)) |overflow| {
@@ -135,15 +149,43 @@ pub const PlayerInventory = struct {
                 count += 1;
             }
         }
-        if (try self.apply(index, slots, contents, &next, drops[0..count])) state.close = false;
+        var table_slots: [table_grid_count]inventories.Slot = undefined;
+        var table_contents: [table_grid_count]inventories.Contents = undefined;
+        var table_edits: [table_grid_count]inventories.Edit = undefined;
+        var edited: usize = 0;
+        for (&table_slots, 0..) |*slot, at| slot.* = .{ .owner = player.uuid, .index = @intCast(table_grid_first + at) };
+        try self.deps.inventories.getMany(&table_slots, &table_contents);
+        for (table_slots, table_contents) |slot, value| if (value.stack) |stack| {
+            std.debug.assert(next[cursor] == null);
+            next[cursor] = stack;
+            if (try self.returnStack(state.selected, cursor, &next)) |overflow| {
+                drops[count] = overflow;
+                count += 1;
+            }
+            table_edits[edited] = .{ .slot = slot, .revision = value.revision, .stack = null };
+            edited += 1;
+        };
+        if (try self.applyWithExtras(index, slots, contents, &next, drops[0..count], table_edits[0..edited])) state.close = false;
+        try self.refreshOutput(contents);
+    }
+
+    fn refreshOutput(self: *PlayerInventory, contents: *[47]inventories.Contents) !void {
+        var kinds: [4]?u32 = @splat(null);
+        for (contents[1..5], &kinds) |value, *kind| if (value.stack) |stack| {
+            kind.* = try self.deps.items.kind(stack);
+        };
+        contents[0].stack = if (self.recipes.matches(&kinds, 2)) |craft| .{
+            .item = try self.deps.items.defineKind(craft.output),
+            .count = craft.amount,
+        } else null;
     }
 
     pub fn closeMenu(self: *PlayerInventory, index: usize) !void {
         const state = &self.states[index];
         state.close = true;
+        state.external = false;
         state.selected = self.deps.players.records[index].selected_slot;
-        state.drag = 0;
-        state.drag_button = null;
+        state.drag = .{};
         var slots: [47]inventories.Slot = undefined;
         var contents: [47]inventories.Contents = undefined;
         try self.load(index, &slots, &contents);
@@ -157,7 +199,7 @@ pub const PlayerInventory = struct {
         if (service.outputCredit(handle) == 0) return error.Backpressured;
         const full = if (player.gamemode == .creative) all_slots & ~(@as(u64, 1) << cursor) else all_slots;
         const initial = !state.synchronized or state.generation != handle.generation or state.life != player.life or state.gamemode != player.gamemode;
-        if (initial or (player.gamemode != .creative and state.dirty & full == full)) {
+        if (initial or (player.gamemode != .creative and (state.dirty & full == full or state.dirty & 1 != 0))) {
             var slots: [47]inventories.Slot = undefined;
             var contents: [47]inventories.Contents = undefined;
             try self.load(index, &slots, &contents);
@@ -221,8 +263,13 @@ pub const PlayerInventory = struct {
 
     pub fn writeSlot(packet: wire_1_21_5.play.toClient.packet_set_slot.Writer, registry: packets.Registry, store: *Items, revision: i32, slot: i16, stack: ?inventories.Stack, recipient: u128, view: ?Items.View) ![]u8 {
         assert(slot >= 0 and slot < 46);
+        return writeWindowSlot(packet, registry, store, 0, revision, slot, stack, recipient, view);
+    }
+
+    pub fn writeWindowSlot(packet: wire_1_21_5.play.toClient.packet_set_slot.Writer, registry: packets.Registry, store: *Items, window_id: i32, revision: i32, slot: i16, stack: ?inventories.Stack, recipient: u128, view: ?Items.View) ![]u8 {
+        assert(slot >= 0 and slot < 90);
         assert((stack == null) == (view == null));
-        const window = try packet.windowId(0);
+        const window = try packet.windowId(window_id);
         const state = try window.stateId(revision);
         const position = try state.slot(slot);
         var item = try position.item();
@@ -250,6 +297,11 @@ pub const PlayerInventory = struct {
     }
 
     pub fn apply(self: *PlayerInventory, index: usize, slots: *const [47]inventories.Slot, contents: *[47]inventories.Contents, next: *const [47]?inventories.Stack, drops: []const inventories.Stack) !bool {
+        return self.applyWithExtras(index, slots, contents, next, drops, &.{});
+    }
+
+    fn applyWithExtras(self: *PlayerInventory, index: usize, slots: *const [47]inventories.Slot, contents: *[47]inventories.Contents, next: *const [47]?inventories.Stack, drops: []const inventories.Stack, extras: []const inventories.Edit) !bool {
+        assert(extras.len <= table_grid_count);
         const state = &self.states[index];
         assert(state.generation == self.deps.players.records[index].handle.?.generation);
         assert(slots[cursor].index == std.math.maxInt(u16));
@@ -257,9 +309,13 @@ pub const PlayerInventory = struct {
         if (drops.len != 0 and !self.deps.dropped.canCreate(drops.len)) return false;
         errdefer self.fail();
         if (!try self.dropMany(self.deps.players.records[index], drops)) return false;
-        var edits: [47]inventories.Edit = undefined;
-        var count: usize = 0;
+        if (!std.meta.eql(contents[0].stack, next[0])) state.dirty |= 1;
+        var edits: [56]inventories.Edit = undefined;
+        @memcpy(edits[0..extras.len], extras);
+        var count: usize = extras.len;
         for (next, contents, slots, 0..) |stack, old, slot, at| {
+            // Result previews do not own persisted items.
+            if (at == 0) continue;
             if (std.meta.eql(stack, old.stack)) continue;
             edits[count] = .{ .slot = slot, .revision = old.revision, .stack = stack };
             count += 1;

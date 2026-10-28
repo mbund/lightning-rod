@@ -1,0 +1,21 @@
+{
+  "client": "ContainersFixture",
+  "variants": [
+    {
+      "name": "chests-multi",
+      "peers": [
+        "alice",
+        "bob"
+      ],
+      "fixture": "chests"
+    },
+    {
+      "name": "furnace",
+      "fixture": "furnace"
+    },
+    {
+      "name": "crafting",
+      "fixture": "crafting"
+    }
+  ]
+}

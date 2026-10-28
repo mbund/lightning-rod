@@ -49,12 +49,16 @@ pub fn build(b: *std.Build) void {
     const registry = generator.registry(.{ .data = data, .canonical = data, .canonical_snapshot = snapshot, .output = "registry.zig" });
     b.modules.put(b.allocator, "schema", schema) catch @panic("out of memory");
     b.modules.put(b.allocator, "registry", registry) catch @panic("out of memory");
+    const recipe_types = b.addModule("recipe_data", .{ .root_source_file = b.path("src/recipes.zig"), .target = target, .optimize = optimize });
+    const recipe_tables = recipes(b, target, optimize, registry, snapshotter.namedLazyPath("recipes"), recipe_types);
     const module = b.addModule("game_data", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "lighting", .module = b.dependency("lighting", .{ .target = target, .optimize = optimize }).module("lighting") },
+            .{ .name = "recipe_data", .module = recipe_types },
+            .{ .name = "recipes", .module = recipe_tables },
             .{ .name = "schema", .module = schema },
             .{ .name = "registry", .module = registry },
             .{ .name = "support", .module = support },
@@ -86,4 +90,26 @@ pub fn identity(b: *std.Build, registry: *std.Build.Module, version_name: []cons
     });
     executable.root_module.addOptions("canonical_version", version);
     return b.addRunArtifact(executable).addOutputFileArg("identity.bin");
+}
+
+pub fn recipes(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, registry: *std.Build.Module, snapshot: std.Build.LazyPath, types: *std.Build.Module) *std.Build.Module {
+    const tool = b.addExecutable(.{
+        .name = "prepare-recipes",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/prepare_recipes.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "registry", .module = b.createModule(.{ .root_source_file = registry.root_source_file }) },
+                .{ .name = "recipe_data", .module = b.createModule(.{ .root_source_file = b.path("src/recipes.zig") }) },
+            },
+        }),
+    });
+    tool.root_module.addAnonymousImport("vanilla_recipes", .{ .root_source_file = snapshot });
+    return b.createModule(.{
+        .root_source_file = b.addRunArtifact(tool).addOutputFileArg("recipes.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "recipe_data", .module = types }},
+    });
 }

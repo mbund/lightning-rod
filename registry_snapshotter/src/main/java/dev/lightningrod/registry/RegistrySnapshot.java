@@ -54,14 +54,17 @@ public final class RegistrySnapshot implements ModInitializer {
             var dynamic = RegistryLoader.load(resources, builtin);
             var combined = RegistryLayer.createRegistryAccess().replaceFrom(RegistryLayer.WORLDGEN, dynamic);
             var lookup = combined.compositeAccess();
+            var cooking = System.getProperty("mcc.recipeOutput");
+            if (cooking != null) RecipeSnapshot.write(Path.of(cooking), resources, lookup);
             var destination = Path.of(args[0]);
             Files.createDirectories(destination.toAbsolutePath().getParent());
             var temporary = destination.resolveSibling(destination.getFileName() + ".partial");
             try (var output = new DataOutputStream(Files.newOutputStream(temporary))) {
                 output.write("LRREG002".getBytes(StandardCharsets.US_ASCII));
                 string(output, System.getProperty("mcc.minecraftVersion"));
-                output.writeInt(RegistryDataLoader.SYNCHRONIZED_REGISTRIES.size() + 5);
+                output.writeInt(RegistryDataLoader.SYNCHRONIZED_REGISTRIES.size() + 6);
                 for (var registry : RegistryDataLoader.SYNCHRONIZED_REGISTRIES) write(output, lookup, registry);
+                writeStatic(output, BuiltInRegistries.MENU);
                 writeStatic(output, BuiltInRegistries.POTION);
                 writeStatic(output, BuiltInRegistries.DATA_COMPONENT_PREDICATE_TYPE);
                 writeStatic(output, BuiltInRegistries.VILLAGER_TYPE);

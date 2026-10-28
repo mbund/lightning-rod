@@ -43,7 +43,12 @@ pub const Items = struct {
 
     pub fn define(self: *Items, name: []const u8) !inventories.ItemId {
         const kind_id = game_data.registry.itemId(name) orelse return error.UnknownItem;
-        return data.define(self.deps.inventories, @intCast(kind_id), &.{});
+        return self.defineKind(@intCast(kind_id));
+    }
+
+    pub fn defineKind(self: *Items, kind_id: u32) !inventories.ItemId {
+        if (kind_id >= game_data.registry.items.len) return error.UnknownItem;
+        return data.define(self.deps.inventories, kind_id, &.{});
     }
 
     pub fn acquireMany(self: *Items, stacks: []const inventories.Stack, output: []Prepared) !void {

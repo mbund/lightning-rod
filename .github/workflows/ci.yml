@@ -156,6 +156,7 @@ jobs:
           ./gradlew --no-daemon "-Pminecraft_version=$VERSION" "-Pregistry_api=$API" \
             "-PsnapshotOutput=$RUNNER_TEMP/ci-registries/$VERSION.bin" \
             "-PlightingOutput=$RUNNER_TEMP/ci-registries/$VERSION-lighting.bin" \
+            "-PrecipeOutput=$RUNNER_TEMP/ci-registries/$VERSION-recipes.bin" \
             registrySnapshot lightingSnapshot
       - uses: actions/upload-artifact@v7
         with:

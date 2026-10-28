@@ -41,6 +41,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "registry", .module = canonical_registry },
         },
     });
+    canonical.addImport("recipes", game_data_build.recipes(game_data.builder, target, optimize, canonical_registry, snapshotter.namedLazyPath("recipes"), game_data.module("recipe_data")));
     canonical.addAnonymousImport("lighting_snapshot", .{ .root_source_file = snapshotter.namedLazyPath("lighting") });
     canonical.addAnonymousImport("registry_snapshot", .{ .root_source_file = snapshot });
     canonical.addAnonymousImport("canonical_identity", .{ .root_source_file = game_data_build.identity(game_data.builder, canonical_registry, "1.21.9") });

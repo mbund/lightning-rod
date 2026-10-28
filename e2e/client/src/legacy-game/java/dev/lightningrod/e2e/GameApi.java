@@ -6,7 +6,7 @@ import net.minecraft.resources.ResourceLocation;
 final class GameApi {
     static long dayTime(Minecraft client) { return client.level.getDayTime(); }
     static void inventoryClick(Minecraft client, int slot, int button, ClickType type) {
-        client.gameMode.handleInventoryMouseClick(0, slot, button, click(type), client.player);
+        client.gameMode.handleInventoryMouseClick(client.player.containerMenu.containerId, slot, button, click(type), client.player);
     }
     static ResourceLocation fixtureChannel() { return ResourceLocation.fromNamespaceAndPath("lightning_rod", "e2e"); }
     static ResourceLocation id(String path) { return ResourceLocation.withDefaultNamespace(path); }

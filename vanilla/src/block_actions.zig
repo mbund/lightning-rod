@@ -14,6 +14,8 @@ pub const BlockActions = struct {
         position: chunks.Position,
         state: u16,
         hit: ?minecraft.Place = null,
+        // Successful removal leaves capacity for these caller-owned drops.
+        following_drops: usize = 0,
     };
 
     pub const Result = enum { pass, applied, denied };
@@ -63,6 +65,7 @@ pub const BlockActions = struct {
     }
 
     pub fn apply(self: *BlockActions, request: Request) !Result {
+        std.debug.assert(request.action == .remove or request.following_drops == 0);
         for (self.handlers[0..self.count]) |handler| {
             if (request.state >= handler.minimum and request.state <= handler.maximum) return handler.vtable.apply(handler.context, request);
         }

@@ -32,6 +32,7 @@ pub const Doors = struct {
     }
 
     fn apply(self: *Doors, request: BlockActions.Request) !BlockActions.Result {
+        if (request.action == .use and request.player.gamemode == .spectator) return .denied;
         const world = request.player.world;
         const block = game_data.registry.blocks[game_data.registry.block_state_to_block[request.state]];
         const minimum: u16 = @intCast(block.min_state);

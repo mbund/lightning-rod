@@ -7,6 +7,7 @@ pub fn build(b: *std.Build) void {
         const snapshot: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ directory, b.fmt("{s}.bin", .{version}) }) };
         b.addNamedLazyPath("snapshot", snapshot);
         b.addNamedLazyPath("lighting", .{ .cwd_relative = b.pathJoin(&.{ directory, b.fmt("{s}-lighting.bin", .{version}) }) });
+        b.addNamedLazyPath("recipes", .{ .cwd_relative = b.pathJoin(&.{ directory, b.fmt("{s}-recipes.bin", .{version}) }) });
         _ = b.step("snapshot", "Use the prepared Minecraft registries");
         return;
     }
@@ -43,6 +44,7 @@ pub fn build(b: *std.Build) void {
     _ = command.addPrefixedOutputDirectoryArg("-PbuildRoot=", "gradle-build");
     command.addArg("lightingSnapshot");
     b.addNamedLazyPath("lighting", command.addPrefixedOutputFileArg("-PlightingOutput=", "lighting.bin"));
+    b.addNamedLazyPath("recipes", command.addPrefixedOutputFileArg("-PrecipeOutput=", "recipes.bin"));
     b.addNamedLazyPath("snapshot", output);
     b.step("snapshot", "Extract the selected Minecraft registries").dependOn(&command.step);
 }

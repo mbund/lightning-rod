@@ -281,6 +281,22 @@ pub const Mining = struct {
                     }
                     if (complete) {
                         terrain.deinit();
+                        const following_drops: usize = @intFromBool(player.gamemode != .creative and loot.drop != null);
+                        const removed = try self.deps.actions.apply(.{
+                            .following_drops = following_drops,
+                            .action = .remove,
+                            .player = &player,
+                            .position = position,
+                            .state = block,
+                        });
+                        if (removed == .denied) {
+                            self.deps.blocks.correct(player.world, position);
+                            state.active = false;
+                            state.finishing = false;
+                            state.complete = false;
+                            continue;
+                        }
+                        assert(self.deps.dropped.canCreate(following_drops));
                         var worn = held.stack;
 
                         if (player.gamemode != .creative) {
@@ -298,14 +314,6 @@ pub const Mining = struct {
                                 }, .{ random.float(f64) * 0.2 - 0.1, 0.2, random.float(f64) * 0.2 - 0.1 }, stack);
                             }
                         }
-
-                        const removed = try self.deps.actions.apply(.{
-                            .action = .remove,
-                            .player = &player,
-                            .position = position,
-                            .state = block,
-                        });
-                        assert(removed != .denied);
 
                         if (removed == .pass) try self.deps.chunks.setBlock(player.world, position, 0);
 

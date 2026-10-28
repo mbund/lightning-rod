@@ -5,7 +5,7 @@ const metrics = @import("metrics");
 const worlds = @import("worlds");
 const entities = @import("entities");
 const ItemEntities = @import("item_entities.zig").ItemEntities;
-const SurvivalInventory = @import("survival_inventory.zig").SurvivalInventory;
+const InventoryFixture = @import("inventory_test_fixture.zig").InventoryFixture;
 const protocols = @import("protocols");
 const wire_1_21_5 = @import("wire_1_21_5");
 const packets = @import("minecraft_packets");
@@ -75,7 +75,7 @@ pub const CreativeInventory = struct {
         const player = &self.deps.players.records[player_index];
         const state = &menu.states[player_index];
         if (player.handle == null) return;
-        if (player.stage != .ready or player.gamemode != .creative) return;
+        if (player.stage != .ready or player.gamemode != .creative or state.external) return;
         state.selected = player.selected_slot;
 
         var slots: [47]inventories.Slot = undefined;
@@ -157,6 +157,8 @@ pub const CreativeInventory = struct {
             const state = &menu.states[player_index];
             const handle = player.handle orelse continue;
             if (player.stage != .ready or !player.loaded or player.gamemode != .creative) continue;
+            if (state.external) continue;
+            if (state.close) try menu.closeMenu(player_index);
             if (state.presentation != self.deps.items.components.revision) {
                 state.presentation = self.deps.items.components.revision;
                 state.dirty = PlayerInventory.all_slots;
@@ -168,73 +170,6 @@ pub const CreativeInventory = struct {
                 else => return err,
             };
         }
-    }
-};
-
-const InventoryFixture = struct {
-    service: *sessions.Service,
-    input: *Input,
-    players: *Players,
-    ownership: *inventories.Inventories,
-    items: *Items,
-    menu: *PlayerInventory,
-    creative: *CreativeInventory,
-    bodies: *entities.Entities,
-    dropped: *ItemEntities,
-
-    fn init(allocator: std.mem.Allocator, store: *storage.Store, registry: *metrics.Registry, selected: []const sessions.Protocol) !InventoryFixture {
-        const io = std.testing.io;
-        const workspaces = try records.Workspaces.init(allocator, io, .{});
-        const service = try sessions.Service.init(allocator, io, undefined, .{ .connections = 1, .pages = 2, .page_bytes = 65536, .buffer_bytes = 128 * 1024, .protocols = selected });
-        errdefer service.deinit();
-        const input = try Input.init(allocator, .{ .sessions = service });
-        const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
-        const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
-        const players = try Players.init(allocator, .{ .maximum = 1, .world = world }, .{
-            .record_workspaces = workspaces,
-            .sessions = service,
-            .packets = undefined,
-            .input = input,
-            .storage = try store.openSpace("players"),
-            .worlds = dimensions,
-            .vanilla_worlds = undefined,
-        });
-        players.records[0] = .{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .loaded = true, .gamemode = .creative };
-        players.rebuildIndexes();
-        const ownership = try inventories.Inventories.init(allocator, io, .{ .cache_slots = 64, .cache_items = 8, .max_item_bytes = 1024 }, .{
-            .metrics = registry,
-            .storage = try store.openSpace("inventory"),
-            .record_workspaces = workspaces,
-        });
-        const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
-        const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 16 }, .{ .metrics = registry, .storage = try store.openSpace("entities"), .record_workspaces = workspaces });
-        const dropped = try ItemEntities.init(allocator, io, .{ .cache_records = 32, .maximum = 8 }, .{
-            .metrics = registry,
-            .storage = try store.openSpace("drops"),
-            .record_workspaces = workspaces,
-            .entities = bodies,
-            .inventories = ownership,
-            .items = items,
-            .worlds = dimensions,
-        });
-        const menu = try PlayerInventory.init(allocator, .{
-            .players = players,
-            .inventories = ownership,
-            .items = items,
-            .equipment = undefined,
-            .dropped = dropped,
-        });
-        const creative = try CreativeInventory.init(allocator, .{
-            .inventory = menu,
-            .input = input,
-            .players = players,
-            .sessions = service,
-            .packets = undefined,
-            .inventories = ownership,
-            .items = items,
-        });
-        _ = try SurvivalInventory.init(allocator, .{ .inventory = menu, .input = input, .players = players, .inventories = ownership, .items = items, .packets = undefined, .sessions = service });
-        return .{ .service = service, .input = input, .players = players, .ownership = ownership, .items = items, .menu = menu, .creative = creative, .bodies = bodies, .dropped = dropped };
     }
 };
 

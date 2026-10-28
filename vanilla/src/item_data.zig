@@ -79,6 +79,15 @@ pub const Iterator = struct {
 };
 
 /// Canonical ordering makes identity independent of client component ordering.
+pub fn defaultId(kind: u32) inventories.ItemId {
+    var bytes: [header_bytes]u8 = @splat(0);
+    @memcpy(bytes[0..4], "LRI2");
+    std.mem.writeInt(u32, bytes[4..8], kind, .little);
+    var id: inventories.ItemId = undefined;
+    std.crypto.hash.Blake3.hash(&bytes, &id, .{});
+    return id;
+}
+
 pub fn define(store: *inventories.Inventories, kind: u32, components: []const Component) !inventories.ItemId {
     if (components.len > maximum_components) return error.ItemTooLarge;
     var sorted: [maximum_components]Component = undefined;
