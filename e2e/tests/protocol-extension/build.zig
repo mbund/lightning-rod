@@ -66,7 +66,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = imports[0 .. names.len + 2],
     });
-    protocols.addAnonymousImport("wire_snapshot", .{ .root_source_file = game_data.namedLazyPath("snapshot") });
+    protocols.addAnonymousImport("wire_snapshot", .{ .root_source_file = b.dependency("registry_snapshotter", .{ .@"minecraft-version" = "1.21.8" }).namedLazyPath("snapshot") });
     imports[names.len + 2] = .{ .name = "protocols", .module = protocols };
     b.dependency("minecraft_packets", .{ .target = target, .optimize = optimize }).module("minecraft_packets").addImport("protocols", protocols);
     b.dependency("vanilla", .{ .target = target, .optimize = optimize }).module("lightning_rod_vanilla_1_21_6").addImport("protocols", protocols);

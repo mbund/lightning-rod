@@ -11,7 +11,7 @@ inputs:
     description: Restore generated Minecraft registries
     default: 'false'
   clients:
-    description: Comma-separated client versions, or default for fixture API tests
+    description: Comma-separated client versions, baseline for gameplay tools, or default for fixture API tests
     default: ''
   assets:
     description: Restore shared Minecraft assets
@@ -70,7 +70,9 @@ runs:
         GH_TOKEN: ${{ github.token }}
         CLIENTS: ${{ inputs.clients }}
       run: |
-        if test "$CLIENTS" = default; then
+        if test "$CLIENTS" = baseline; then
+          CLIENTS=$(cat game_data/baseline)
+        elif test "$CLIENTS" = default; then
           CLIENTS=$(sed -n 's/^minecraft_version=//p' e2e/client/gradle.properties)
         fi
         IFS=, read -r -a versions <<< "$CLIENTS"

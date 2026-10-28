@@ -43,3 +43,10 @@ pub fn build(b: *std.Build) void {
     b.addNamedLazyPath("snapshot", output);
     b.step("snapshot", "Extract the selected Minecraft registries").dependOn(&command.step);
 }
+
+pub fn apiForVersion(b: *std.Build, version: []const u8) []const u8 {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, b.pathFromRoot("versions.json"), b.allocator, .limited(64 * 1024)) catch @panic("cannot read registry API catalog");
+    const versions = std.json.parseFromSliceLeaky([]const struct { release: []const u8, api: []const u8 }, b.allocator, bytes, .{}) catch @panic("invalid registry API catalog");
+    for (versions) |entry| if (std.mem.eql(u8, entry.release, version)) return entry.api;
+    return "current";
+}

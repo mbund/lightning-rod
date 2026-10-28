@@ -52,10 +52,14 @@ pub const Codegen = struct {
         paths: std.json.ObjectMap,
 
         pub fn init(b: *std.Build, root: std.Build.LazyPath, version: []const u8) Data {
+            return find(b, root, version) orelse std.debug.panic("missing Minecraft data version: {s}", .{version});
+        }
+
+        pub fn find(b: *std.Build, root: std.Build.LazyPath, version: []const u8) ?Data {
             const filename = root.path(b, "data/dataPaths.json").getPath(b);
             const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, filename, b.allocator, .limited(1024 * 1024)) catch @panic("cannot read Minecraft data paths");
             const document = std.json.parseFromSliceLeaky(std.json.Value, b.allocator, bytes, .{}) catch @panic("invalid Minecraft data paths");
-            const paths = document.object.get("pc").?.object.get(version) orelse @panic("missing Minecraft data version");
+            const paths = document.object.get("pc").?.object.get(version) orelse return null;
             return .{ .root = root, .paths = paths.object };
         }
 

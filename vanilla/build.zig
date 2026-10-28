@@ -1,4 +1,5 @@
 const std = @import("std");
+const game_data = @import("game_data");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -36,7 +37,7 @@ pub fn build(b: *std.Build) void {
 
     // Standalone development needs a concrete selection. Consumers supply their own.
     if (b.dep_prefix.len == 0) {
-        const releases = b.option([]const u8, "releases", "Standalone development protocol releases") orelse "1.21.8";
+        const releases = b.option([]const u8, "releases", "Standalone development protocol releases") orelse game_data.minecraft_version;
         if (b.lazyDependency("protocols", .{ .target = target, .optimize = optimize, .releases = releases })) |protocols| {
             module.addImport("protocols", protocols.module("protocols"));
             b.dependency("minecraft_packets", .{ .target = target, .optimize = optimize }).module("minecraft_packets").addImport("protocols", protocols.module("protocols"));

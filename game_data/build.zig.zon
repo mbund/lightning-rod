@@ -7,10 +7,14 @@
         .protocol_codegen = .{ .path = "../protocol_codegen" },
         .registry_snapshotter = .{ .path = "../registry_snapshotter" },
         .encoding = .{ .path = "../protocol_encoding" },
+        .minecraft_data_current = .{
+            .url = "git+https://github.com/PrismarineJS/minecraft-data#68ea7b59e7aa318be86cf265be45ee1b79572528",
+            .hash = "N-V-__8AAArvDht45bV81w8QOe23megSo3SsY1FAzPZY7TTw",
+        },
         .minecraft_data = .{
             .url = "git+https://github.com/PrismarineJS/minecraft-data#f59168c3ce23158527ea7c3743ac16f18f96cf25",
             .hash = "N-V-__8AAFXUwxriGAbVVALGcyTN3vNwdm1KkaoBAUbzQZyB",
         },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "src" },
+    .paths = .{ "build.zig", "build.zig.zon", "baseline", "src" },
 }

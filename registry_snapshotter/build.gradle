@@ -4,7 +4,8 @@ plugins {
 }
 
 def versions = new groovy.json.JsonSlurper().parse(file('versions.json'))
-def release = versions.find { it.release == minecraft_version }
+def minecraftVersion = providers.gradleProperty('minecraft_version').getOrElse(versions.last().release)
+def release = versions.find { it.release == minecraftVersion }
 def api = providers.gradleProperty('registry_api').getOrElse(release == null ? 'current' : release.api)
 if (!['legacy', 'input', 'network', 'modern', 'current'].contains(api)) throw new GradleException("Unsupported registry API: ${api}")
 def modern = ['modern', 'current'].contains(api)
@@ -23,7 +24,7 @@ loom {
             // IDE imports configure runs without invoking the snapshot task.
             property 'mcc.snapshotOutput', providers.gradleProperty('snapshotOutput').getOrElse(
                 layout.buildDirectory.file('snapshot.json').get().asFile.absolutePath)
-            property 'mcc.minecraftVersion', minecraft_version
+            property 'mcc.minecraftVersion', minecraftVersion
         }
     }
 }
@@ -32,15 +33,15 @@ sourceSets.main.java.srcDir(modern ? 'src/modern-loader/java' : 'src/legacy-load
 sourceSets.main.java.srcDir(['legacy', 'input'].contains(api) ? 'src/legacy-registry/java' : 'src/current-registry/java')
 
 dependencies {
-    minecraft "com.mojang:minecraft:${minecraft_version}"
+    minecraft "com.mojang:minecraft:${minecraftVersion}"
     if (!modern) mappings loom.officialMojangMappings()
     add(modern ? 'implementation' : 'modImplementation', "net.fabricmc:fabric-loader:${loader_version}")
 }
 
 processResources {
     inputs.property 'version', project.version
-    inputs.property 'minecraft_version', project.minecraft_version
-    filesMatching('fabric.mod.json') { expand 'version': project.version, 'minecraft_version': project.minecraft_version }
+    inputs.property 'minecraft_version', minecraftVersion
+    filesMatching('fabric.mod.json') { expand 'version': project.version, 'minecraft_version': minecraftVersion }
 }
 
 tasks.withType(JavaCompile).configureEach { options.release = modern ? 25 : 21 }

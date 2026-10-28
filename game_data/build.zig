@@ -1,15 +1,19 @@
 const std = @import("std");
 const protocol_codegen = @import("protocol_codegen");
+const registry_snapshotter = @import("registry_snapshotter");
 
-pub const minecraft_version = "1.21.8";
+pub const minecraft_version = std.mem.trim(u8, @embedFile("baseline"), " \t\r\n");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const support = b.dependency("encoding", .{ .target = target, .optimize = optimize }).module("encoding");
-    const snapshot = b.dependency("registry_snapshotter", .{ .@"minecraft-version" = minecraft_version }).namedLazyPath("snapshot");
+    const snapshotter = b.dependency("registry_snapshotter", .{ .@"minecraft-version" = minecraft_version });
+    const snapshot = snapshotter.namedLazyPath("snapshot");
     b.addNamedLazyPath("snapshot", snapshot);
-    const data = protocol_codegen.Codegen.Data.init(b, b.dependency("minecraft_data", .{}).path(""), minecraft_version);
+    const data = protocol_codegen.Codegen.Data.find(b, b.dependency("minecraft_data", .{}).path(""), minecraft_version) orelse
+        protocol_codegen.Codegen.Data.find(b, b.dependency("minecraft_data_current", .{}).path(""), minecraft_version) orelse
+        std.debug.panic("missing gameplay baseline data: {s}", .{minecraft_version});
     b.addNamedLazyPath("data", data.root);
     const generator = protocol_codegen.Codegen.init(b, .{
         .tools = b.dependency("protocol_codegen", .{}),
@@ -22,12 +26,25 @@ pub fn build(b: *std.Build) void {
     const types = &document.document.object.getPtr("types").?.object;
     const matcher = types.get("DataComponentMatchers").?.array.items[1].array.items[1].object.get("type").?.array.items[1].object.getPtr("type").?;
     std.debug.assert(std.mem.eql(u8, matcher.string, "varint"));
-    const definition =
+    const current = std.mem.eql(u8, registry_snapshotter.apiForVersion(snapshotter.builder, minecraft_version), "current");
+    const definition = if (current)
+        \\["container", [{"name":"registered","type":"bool"}, {"name":"type","type":"varint"}, {"name":"data","type":"anonymousNbt"}]]
+    else
         \\["container", [{"name":"type","type":"varint"}, {"name":"data","type":"anonymousNbt"}]]
     ;
     const node = std.json.parseFromSliceLeaky(std.json.Value, b.allocator, definition, .{}) catch @panic("invalid matcher schema");
     types.put(b.allocator, "PartialComponentMatcher", node) catch @panic("out of memory");
     matcher.* = .{ .string = "PartialComponentMatcher" };
+    if (current) {
+        // Current holders omit the older outer hasHolder branch.
+        const components = &types.get("SlotComponent").?.array.items[1].array.items[1].object.get("type").?.array.items[1].object.getPtr("fields").?.object;
+        for ([_][]const u8{ "instrument", "jukebox_playable", "provides_trim_material" }) |name| {
+            const component = components.getPtr(name).?;
+            const fields = component.array.items[1].array.items;
+            std.debug.assert(std.mem.eql(u8, fields[0].object.get("name").?.string, "hasHolder"));
+            component.* = fields[1].object.get("type").?.array.items[1].object.get("fields").?.object.get("true").?;
+        }
+    }
     const schema = generator.schema(.{ .input = document.write(), .version = data.path(b, "version.json"), .output = "item_schema.zig" });
     const registry = generator.registry(.{ .data = data, .canonical = data, .canonical_snapshot = snapshot, .output = "registry.zig" });
     b.modules.put(b.allocator, "schema", schema) catch @panic("out of memory");
