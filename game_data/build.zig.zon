@@ -4,6 +4,7 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .lighting = .{ .path = "../lighting" },
         .protocol_codegen = .{ .path = "../protocol_codegen" },
         .registry_snapshotter = .{ .path = "../registry_snapshotter" },
         .encoding = .{ .path = "../protocol_encoding" },

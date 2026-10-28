@@ -15,6 +15,8 @@ pub const Store = struct {
     scratch: []u8,
     io: std.Io,
     mutex: std.Io.Mutex = .init,
+    // Table pages mutate in place. Cached tiles remain independent of this lock.
+    table_lock: std.Io.RwLock = .init,
     available: std.Io.Condition = .init,
     readers: usize = 0,
     writing: bool = false,
@@ -246,7 +248,11 @@ pub const Store = struct {
                 continue;
             }
             self.mutex.unlock(self.io);
-            const result = self.tiles.backend.getBatch(reads[0..loading], sizes[0..loading]);
+            const result = blk: {
+                self.table_lock.lockSharedUncancelable(self.io);
+                defer self.table_lock.unlockShared(self.io);
+                break :blk self.tiles.backend.getBatch(reads[0..loading], sizes[0..loading]);
+            };
             self.mutex.lockUncancelable(self.io);
             if (result) |_| {
                 for (fills[0..loading], sizes[0..loading]) |fill, length| fill.load(length);
@@ -268,7 +274,11 @@ pub const Store = struct {
             write.* = .{ .key = lease.key(), .value = lease.read() };
         }
         self.mutex.unlock(self.io);
-        const result = self.tiles.writeBack(writes[0..held.len]);
+        const result = blk: {
+            self.table_lock.lockUncancelable(self.io);
+            defer self.table_lock.unlock(self.io);
+            break :blk self.tiles.writeBack(writes[0..held.len]);
+        };
         self.mutex.lockUncancelable(self.io);
         for (held) |lease| {
             if (result) |_| {
@@ -411,6 +421,8 @@ pub const Store = struct {
             self.available.broadcast(self.io);
             self.mutex.unlock(self.io);
         }
+        self.table_lock.lockUncancelable(self.io);
+        defer self.table_lock.unlock(self.io);
         try self.tiles.flush();
     }
 

@@ -19,6 +19,7 @@ pub const Terrain = struct {
         try self.chunks.poll();
         _ = try self.streaming.poll(self.io);
         _ = try self.blocks.poll(self.io);
+        _ = try self.streaming.pollLight();
     }
 
     pub fn stop(self: *Terrain) void {

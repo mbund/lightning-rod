@@ -4,6 +4,51 @@ on:
   workflow_call:
 
 jobs:
+  lighting:
+    name: Lighting correctness and performance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/dependencies
+        with:
+          jdk: 'true'
+          clients: 'baseline'
+      - working-directory: bench/lighting
+        run: |
+          mkdir -p .zig-cache
+          bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe bench | tee .zig-cache/results.txt
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: lighting-benchmark
+          path: bench/lighting/.zig-cache/results.txt
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
+  lighting-pipeline:
+    name: Lighting streaming and update load
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/dependencies
+        with:
+          registries: 'true'
+      - working-directory: vanilla
+        run: |
+          mkdir -p .zig-cache
+          bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe bench-lighting | tee .zig-cache/lighting-results.txt
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: lighting-pipeline-benchmark
+          path: vanilla/.zig-cache/lighting-results.txt
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
   prepare-world:
     name: Prepare chunk benchmark corpus
     runs-on: ubuntu-24.04

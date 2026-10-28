@@ -3,7 +3,7 @@
     .name = .lightning_rod_vanilla_1_21_6,
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{ .storage = .{ .path = "../storage" },
+    .dependencies = .{ .lighting = .{ .path = "../lighting" }, .storage = .{ .path = "../storage" },
         .minecraft_java = .{ .path = "../minecraft_java" },
         .protocol_1_21_5 = .{ .path = "../protocol_versions/v1_21_5" },
         .protocol_1_21_6 = .{ .path = "../protocol_versions/v1_21_6" },

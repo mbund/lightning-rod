@@ -40,6 +40,7 @@ pub const Visibility = @import("visibility.zig").Visibility;
 pub const Replication = @import("replication.zig").Replication;
 pub const ChunkSource = @import("chunks").Source;
 pub const Chunks = @import("chunks").Chunks;
+pub const BlockPosition = @import("chunks").Position;
 pub const Section = @import("chunks").Section;
 pub const BlockEdit = @import("chunks").BlockEdit;
 pub const SectionEdits = @import("chunks").SectionEdits;
@@ -70,6 +71,8 @@ pub const Flat = @import("flat.zig").Flat;
 pub const Generation = @import("generation.zig").Generation;
 pub const Terrain = @import("terrain.zig").Terrain;
 pub const ThreadedTerrain = @import("terrain.zig").ThreadedTerrain;
+pub const Lighting = @import("lighting.zig").Lighting;
+pub const LightSample = @import("lighting.zig").Sample;
 pub const Streaming = @import("streaming.zig").Streaming;
 pub const BlockSynchronization = @import("block_sync.zig").BlockSynchronization;
 pub const RegistryIdentity = @import("registry_identity.zig").RegistryIdentity;
@@ -122,6 +125,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(ItemPickup, ItemPickup.Configuration{}),
     lightning_rod.plugin.configured(ItemTick, ItemTick.Configuration{}),
     lightning_rod.plugin.configured(Flat, Flat.Configuration{}),
+    lightning_rod.plugin.configured(Lighting, Lighting.Configuration{}),
     lightning_rod.plugin.configured(Streaming, Streaming.Configuration{}),
     lightning_rod.plugin.configured(BlockSynchronization, BlockSynchronization.Configuration{}),
     lightning_rod.plugin.configured(BlockActions, BlockActions.Configuration{}),

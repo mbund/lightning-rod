@@ -31,6 +31,7 @@ loom {
 
 sourceSets.main.java.srcDir(modern ? 'src/modern-loader/java' : 'src/legacy-loader/java')
 sourceSets.main.java.srcDir(['legacy', 'input'].contains(api) ? 'src/legacy-registry/java' : 'src/current-registry/java')
+sourceSets.main.java.srcDir(modern ? 'src/current-lighting/java' : 'src/legacy-lighting/java')
 
 dependencies {
     minecraft "com.mojang:minecraft:${minecraftVersion}"
@@ -46,3 +47,10 @@ processResources {
 
 tasks.withType(JavaCompile).configureEach { options.release = modern ? 25 : 21 }
 tasks.register('registrySnapshot') { dependsOn 'runRegistrySnapshot' }
+
+tasks.register('lightingSnapshot', JavaExec) {
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'dev.lightningrod.registry.LightingSnapshot'
+    args providers.gradleProperty('lightingOutput').getOrElse(
+        layout.buildDirectory.file('lighting.bin').get().asFile.absolutePath)
+}

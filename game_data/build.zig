@@ -54,6 +54,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "lighting", .module = b.dependency("lighting", .{ .target = target, .optimize = optimize }).module("lighting") },
             .{ .name = "schema", .module = schema },
             .{ .name = "registry", .module = registry },
             .{ .name = "support", .module = support },
@@ -63,6 +64,7 @@ pub fn build(b: *std.Build) void {
     version.addOption([]const u8, "value", minecraft_version);
     module.addOptions("canonical_version", version);
     module.addAnonymousImport("canonical_identity", .{ .root_source_file = identity(b, registry, minecraft_version) });
+    module.addAnonymousImport("lighting_snapshot", .{ .root_source_file = snapshotter.namedLazyPath("lighting") });
     module.addAnonymousImport("registry_snapshot", .{ .root_source_file = snapshot });
     b.step("check", "Check the generated gameplay data module").dependOn(&b.addLibrary(.{
         .name = "game_data",

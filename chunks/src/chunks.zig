@@ -51,6 +51,102 @@ pub const SectionEdits = struct {
     edits: []const BlockEdit,
 };
 
+/// Allocate with the chunk owner. Only the snapshot reader reconfigures the watched regions.
+pub const Watch = struct {
+    pub const Region = struct {
+        world: World,
+        minimum: Position,
+        maximum: Position,
+
+        fn contains(self: Region, section: Section) bool {
+            return section.world == self.world and
+                section.x >= self.minimum.x and section.x <= self.maximum.x and
+                section.y >= self.minimum.y and section.y <= self.maximum.y and
+                section.z >= self.minimum.z and section.z <= self.maximum.z;
+        }
+    };
+
+    owner: *Chunks,
+    next: ?*Watch = null,
+    region: Region = undefined,
+    width: usize = 0,
+    height: usize = 0,
+    versions: []std.atomic.Value(u64),
+    count: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator, owner: *Chunks, capacity: usize) !*Watch {
+        assert(capacity > 0);
+        const self = try allocator.create(Watch);
+        self.* = .{
+            .owner = owner,
+            .versions = try allocator.alloc(std.atomic.Value(u64), capacity),
+        };
+        for (self.versions) |*version| version.* = .init(0);
+        owner.mutex.lockUncancelable(owner.io);
+        defer owner.mutex.unlock(owner.io);
+        self.next = owner.watches;
+        owner.watches = self;
+        return self;
+    }
+
+    /// Capture the old section revisions at the same barrier that installs the new bounds.
+    pub fn configure(self: *Watch, region: Region, previous: []u64) void {
+        assert(previous.len == self.versions.len);
+        assert(region.minimum.x <= region.maximum.x and region.minimum.y <= region.maximum.y and region.minimum.z <= region.maximum.z);
+        const width: usize = @intCast(@as(i64, region.maximum.x) - region.minimum.x + 1);
+        const height: usize = @intCast(@as(i64, region.maximum.y) - region.minimum.y + 1);
+        const depth: usize = @intCast(@as(i64, region.maximum.z) - region.minimum.z + 1);
+        assert(width <= self.versions.len and height <= self.versions.len / width);
+        assert(depth <= self.versions.len / (width * height));
+        self.owner.mutex.lockUncancelable(self.owner.io);
+        defer self.owner.mutex.unlock(self.owner.io);
+        for (self.versions, previous) |*version, *old| {
+            old.* = version.load(.monotonic);
+            version.store(0, .release);
+        }
+        self.region = region;
+        self.width = width;
+        self.height = height;
+        self.count = width * height * depth;
+    }
+
+    /// Install a result's watch only if its source snapshot is still current.
+    pub fn capture(self: *Watch, source: *const Watch, expected: []const u64) bool {
+        assert(self != source and self.owner == source.owner);
+        self.owner.mutex.lockUncancelable(self.owner.io);
+        defer self.owner.mutex.unlock(self.owner.io);
+        assert(expected.len == source.count and self.versions.len >= source.count);
+        for (expected, 0..) |version, index| if (source.revision(index) != version) return false;
+        self.region = source.region;
+        self.width = source.width;
+        self.height = source.height;
+        self.count = source.count;
+        for (self.versions[0..self.count]) |*version| version.store(0, .release);
+        return true;
+    }
+
+    pub fn unchanged(self: *const Watch) bool {
+        for (0..self.count) |index| if (self.revision(index) != 0) return false;
+        return true;
+    }
+
+    pub fn revision(self: *const Watch, index: usize) u64 {
+        assert(index < self.count);
+        return self.versions[index].load(.acquire);
+    }
+
+    fn changed(self: *Watch, section: Section) void {
+        if (self.count == 0 or !self.region.contains(section)) return;
+        const x: usize = @intCast(@as(i64, section.x) - self.region.minimum.x);
+        const y: usize = @intCast(@as(i64, section.y) - self.region.minimum.y);
+        const z: usize = @intCast(@as(i64, section.z) - self.region.minimum.z);
+        const index = (z * self.width + x) * self.height + y;
+        assert(index < self.count);
+        const previous = self.versions[index].fetchAdd(1, .release);
+        assert(previous != std.math.maxInt(u64));
+    }
+};
+
 pub const Observer = struct {
     context: *anyopaque,
     vtable: *const VTable,
@@ -158,6 +254,7 @@ pub const Chunks = struct {
     writing_count: usize = 0,
     checkpoint_leases: []Cache.Lease,
     checkpointing: bool = false,
+    watches: ?*Watch = null,
     background_owner: std.atomic.Value(std.Thread.Id) = .init(0),
     work_ready: std.Io.Event = .unset,
     io: std.Io,
@@ -326,6 +423,11 @@ pub const Chunks = struct {
             for (section.edits) |edit|
                 std.mem.writeInt(u16, bytes[1 + @as(usize, edit.index) * 2 ..][0..2], edit.state, .little);
             lease.cached().commit(8193);
+            var watch = self.watches;
+            while (watch) |observer| {
+                observer.changed(section.section);
+                watch = observer.next;
+            }
         }
     }
 
@@ -432,6 +534,7 @@ pub const Chunks = struct {
             requests[count] = .{ .section = section, .destination = held[count].bytes[0..encoding.decoded_bytes], .token = lease.index };
             count += 1;
         }
+        if (count == 0) return;
         const accepted = self.generation.submit(requests[0..count], priority);
         for (held[0..count], 0..) |fill, index| {
             if (index < accepted) {
@@ -617,7 +720,6 @@ pub const Chunks = struct {
             for (held) |lease| if (self.generating[lease.index] != null or lease.read() == null) {
                 complete.* = false;
             };
-            if (!complete.* and self.generation.source != null) self.submitGenerated(request.sections, held, request.priority);
             if (self.generation.source == null) complete.* = true;
             if (complete.*) {
                 for (held, request.leases) |lease, *out| {
@@ -629,6 +731,19 @@ pub const Chunks = struct {
             begin += held.len;
         }
         assert(begin == count);
+        if (self.generation.source != null) {
+            var first: usize = 0;
+            var start: usize = 0;
+            while (first < requests.len) {
+                const priority = requests[first].priority;
+                var last = first;
+                var end = start;
+                while (last < requests.len and std.meta.eql(requests[last].priority, priority)) : (last += 1) end += requests[last].sections.len;
+                self.submitGenerated(sections[start..end], leases[start..end], priority);
+                first = last;
+                start = end;
+            }
+        }
     }
 
     fn waitGenerated(self: *Chunks) !void {

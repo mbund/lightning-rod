@@ -775,3 +775,54 @@ test "two-state sections preserve every packed byte and little endian palette va
     try std.testing.expectError(error.Corrupt, encoding.decodeTo(encoded[0 .. encoded.len - 1], &output));
     try std.testing.expectError(error.BufferTooSmall, encoding.decodeTo(&encoded, output[0 .. output.len - 1]));
 }
+
+test "snapshot watches invalidate only intersecting worlds and section bounds" {
+    const io = std.testing.io;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/watches", .{directory.sub_path});
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .enabled = false });
+    defer registry.deinit();
+    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
+    defer store.deinit();
+    const allocator = arena.allocator();
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 4, .demand_sections = 1 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = try records.Workspaces.init(allocator, io, .{}) });
+    const watch = try chunks.Watch.init(allocator, terrain, 2);
+    const other = try chunks.Watch.init(allocator, terrain, 2);
+    const first: chunks.Watch.Region = .{ .world = 0, .minimum = .{ .x = -1, .y = 4, .z = 0 }, .maximum = .{ .x = -1, .y = 5, .z = 0 } };
+    const second: chunks.Watch.Region = .{ .world = 1, .minimum = .{ .x = -1, .y = 4, .z = 0 }, .maximum = .{ .x = -1, .y = 5, .z = 0 } };
+    var previous: [2]u64 = undefined;
+    watch.configure(first, &previous);
+    other.configure(second, &previous);
+    try std.testing.expectEqual([2]u64{ 0, 0 }, previous);
+    try terrain.setBlock(0, .{ .x = 0, .y = 64, .z = 0 }, 1);
+    try terrain.setBlock(0, .{ .x = -1, .y = 96, .z = 0 }, 1);
+    try std.testing.expectEqual(@as(u64, 0), watch.revision(0));
+    try terrain.setBlock(0, .{ .x = -1, .y = 64, .z = 0 }, 1);
+    try std.testing.expectEqual(@as(u64, 1), watch.revision(0));
+    try terrain.setBlock(0, .{ .x = -1, .y = 64, .z = 0 }, 1);
+    try std.testing.expectEqual(@as(u64, 1), watch.revision(0));
+    try std.testing.expectEqual(@as(u64, 0), other.revision(0));
+    try terrain.setBlock(1, .{ .x = -1, .y = 95, .z = 0 }, 1);
+    try std.testing.expectEqual(@as(u64, 1), other.revision(1));
+    watch.configure(second, &previous);
+    try std.testing.expectEqual([2]u64{ 1, 0 }, previous);
+    other.configure(first, &previous);
+    try std.testing.expectEqual([2]u64{ 0, 1 }, previous);
+    try std.testing.expectEqual(@as(u64, 0), watch.revision(0));
+    try terrain.setBlock(0, .{ .x = -1, .y = 64, .z = 0 }, 0);
+    try std.testing.expectEqual(@as(u64, 0), watch.revision(0));
+    try std.testing.expectEqual(@as(u64, 1), other.revision(0));
+    const captured = try chunks.Watch.init(allocator, terrain, 2);
+    try std.testing.expect(!captured.capture(other, &.{ 0, 0 }));
+    try std.testing.expect(captured.capture(other, &.{ 1, 0 }));
+    try std.testing.expect(captured.unchanged());
+    try terrain.setBlock(0, .{ .x = -1, .y = 80, .z = 0 }, 1);
+    try std.testing.expect(!captured.unchanged());
+    try std.testing.expect(!captured.capture(other, &.{ 1, 0 }));
+    try std.testing.expect(captured.capture(other, &.{ 1, 1 }));
+    try std.testing.expect(captured.unchanged());
+}

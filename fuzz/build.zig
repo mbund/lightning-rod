@@ -7,6 +7,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const runner = fuzzRunner(b);
+    const lighting = b.dependency("lighting", .{ .target = target, .optimize = optimize }).module("lighting");
     const storage = b.dependency("storage", .{ .target = target, .optimize = optimize });
     const records = b.dependency("records", .{ .target = target, .optimize = optimize });
     const chunks = b.dependency("chunks", .{ .target = target, .optimize = optimize });
@@ -30,7 +31,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{ .{ .name = "records", .module = records.module("records") }, .{ .name = "storage", .module = storage.module("storage") } },
     });
     const test_step = b.step("test", "Run saved inputs for every fuzzer");
-    for ([_][]const u8{ "storage", "records", "chunks" }) |name| {
+    for ([_][]const u8{ "storage", "records", "chunks", "lighting" }) |name| {
         const tests = b.addTest(.{
             .name = b.fmt("{s}-fuzz", .{name}),
             // The native Debug backend does not emit the coverage tables required by fuzzing.
@@ -41,6 +42,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .imports = &.{
                     .{ .name = "storage", .module = storage.module("storage") },
+                    .{ .name = "lighting", .module = lighting },
                     .{ .name = "storage_testing", .module = storage_testing },
                     .{ .name = "model", .module = model },
                     .{ .name = "encoding", .module = encoding },

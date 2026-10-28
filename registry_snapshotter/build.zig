@@ -6,6 +6,7 @@ pub fn build(b: *std.Build) void {
     if (b.graph.environ_map.get("LIGHTNING_ROD_REGISTRIES")) |directory| {
         const snapshot: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ directory, b.fmt("{s}.bin", .{version}) }) };
         b.addNamedLazyPath("snapshot", snapshot);
+        b.addNamedLazyPath("lighting", .{ .cwd_relative = b.pathJoin(&.{ directory, b.fmt("{s}-lighting.bin", .{version}) }) });
         _ = b.step("snapshot", "Use the prepared Minecraft registries");
         return;
     }
@@ -40,6 +41,8 @@ pub fn build(b: *std.Build) void {
     if (api) |selected| command.addArg(b.fmt("-Pregistry_api={s}", .{selected}));
     const output = command.addPrefixedOutputFileArg("-PsnapshotOutput=", "registries.bin");
     _ = command.addPrefixedOutputDirectoryArg("-PbuildRoot=", "gradle-build");
+    command.addArg("lightingSnapshot");
+    b.addNamedLazyPath("lighting", command.addPrefixedOutputFileArg("-PlightingOutput=", "lighting.bin"));
     b.addNamedLazyPath("snapshot", output);
     b.step("snapshot", "Extract the selected Minecraft registries").dependOn(&command.step);
 }

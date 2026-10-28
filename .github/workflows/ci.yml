@@ -139,7 +139,7 @@ jobs:
       - uses: actions/cache@v5
         id: registry
         with:
-          path: ${{ runner.temp }}/ci-registries/${{ matrix.release }}.bin
+          path: ${{ runner.temp }}/ci-registries/${{ matrix.release }}*.bin
           key: ci-registry-${{ matrix.release }}-${{ runner.os }}-${{ hashFiles('registry_snapshotter/**') }}
       - uses: ./.github/actions/dependencies
         if: steps.registry.outputs.cache-hit != 'true'
@@ -152,11 +152,15 @@ jobs:
         env:
           VERSION: ${{ matrix.release }}
           API: ${{ matrix.api }}
-        run: ./gradlew --no-daemon "-Pminecraft_version=$VERSION" "-Pregistry_api=$API" "-PsnapshotOutput=$RUNNER_TEMP/ci-registries/$VERSION.bin" registrySnapshot
+        run: |
+          ./gradlew --no-daemon "-Pminecraft_version=$VERSION" "-Pregistry_api=$API" \
+            "-PsnapshotOutput=$RUNNER_TEMP/ci-registries/$VERSION.bin" \
+            "-PlightingOutput=$RUNNER_TEMP/ci-registries/$VERSION-lighting.bin" \
+            registrySnapshot lightingSnapshot
       - uses: actions/upload-artifact@v7
         with:
           name: ci-registry-${{ matrix.release }}
-          path: ${{ runner.temp }}/ci-registries/${{ matrix.release }}.bin
+          path: ${{ runner.temp }}/ci-registries/${{ matrix.release }}*.bin
           if-no-files-found: error
           retention-days: 1
 
@@ -286,7 +290,7 @@ jobs:
     needs: prepare-zig
     uses: ./.github/workflows/fuzz.yml
   benchmarks:
-    needs: [prepare-zig, prepare-jdk, registries]
+    needs: [prepare-zig, prepare-jdk, prepare-clients, registries]
     uses: ./.github/workflows/bench.yml
   e2e:
     needs: [prepare-zig, prepare-jdk, prepare-clients, registries, prepare-assets, prepare-native]

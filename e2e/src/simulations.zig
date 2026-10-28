@@ -164,7 +164,7 @@ pub fn run(init: std.process.Init, plugins: anytype, endpoints: []*sessions.Serv
         errdefer if (initialized <= index) registries[index].deinit();
         stores[index] = try .init(allocator, init.io, .{ .path = paths[index], .metrics = &registries[index] });
         errdefer if (initialized <= index) stores[index].deinit();
-        worlds[index] = try Simulation.init(allocator, init.io, &stores[index], .{ .memory_bytes = 16 * 1024 * 1024, .temporary_bytes = 256 * 1024, .metrics = .{ .capacity = 512, .parent = &registries[index] }, .autosave = config.autosave });
+        worlds[index] = try Simulation.init(allocator, init.io, &stores[index], .{ .temporary_bytes = 256 * 1024, .metrics = .{ .capacity = 512, .parent = &registries[index] }, .autosave = config.autosave });
         const world = worlds[index];
         errdefer if (initialized <= index) {
             world.close(host.timing.shutdownDeadline(init.io)) catch {};

@@ -4,6 +4,7 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .lighting = .{ .path = "../lighting" },
         .storage = .{ .path = "../storage" },
         .records = .{ .path = "../records" },
         .chunks = .{ .path = "../chunks" },

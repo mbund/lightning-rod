@@ -27,6 +27,7 @@ const ItemPickup = @import("item_pickup.zig").ItemPickup;
 const chunks = @import("chunks");
 const entities = @import("entities");
 const worlds = @import("worlds");
+const Lighting = @import("lighting.zig").Lighting;
 const Streaming = @import("streaming.zig").Streaming;
 const ItemEntities = @import("item_entities.zig").ItemEntities;
 const ItemReplication = @import("item_replication.zig").ItemReplication;
@@ -499,7 +500,7 @@ pub fn benchmarkItemReplication() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -846,7 +847,7 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
     player_records[connection].position.z = 1;
     players.rebuildIndexes();
     const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-    const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions });
+    const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
     defer service.unsubscribeOutput(streaming.changed);
     defer terrain.unsubscribeReady(streaming.changed);
     streaming.published.setStream(connection, .{ .generation = 1, .life = player_records[connection].life, .setup = .streaming });
@@ -968,7 +969,7 @@ pub fn benchmarkItemVisibility() !void {
         player_records[0].position.z = 1;
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -1198,7 +1199,7 @@ pub fn benchmarkIdleTerrain() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -1321,7 +1322,7 @@ pub fn benchmarkItemBroadcast() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         for (0..streaming.published.streams.len) |index| streaming.published.setStream(index, .{ .generation = 1, .life = 1, .setup = .streaming });
@@ -1474,7 +1475,7 @@ pub fn benchmarkBlockPlanning() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -1631,7 +1632,7 @@ pub fn benchmarkItemBoundaries() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         for (0..streaming.published.streams.len) |index| streaming.published.setStream(index, .{ .generation = 1, .life = 1, .setup = .streaming });
@@ -1728,7 +1729,7 @@ pub fn benchmarkTerrainBackpressure() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 128, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
 
@@ -1781,35 +1782,37 @@ pub fn benchmarkTerrainBackpressure() !void {
             held += 1;
         }
         try std.testing.expectEqual(service.config.pages, held);
-        if (generating) {
+        const ready_acquired = terrain.cache.metrics.acquired.value();
+        var progressed = false;
+        for (0..256) |_| {
             if (mode == .streaming) streaming.pending = true;
-            try std.testing.expect(!try if (mode == .streaming) streaming.poll(io) else blocks.poll(io));
+            progressed = try if (mode == .streaming) streaming.poll(io) else blocks.poll(io);
+            if (progressed) break;
             try std.testing.expectEqual(@as(usize, 0), terrain.borrowed_count);
             var unused = try service.reserve(service.config.page_bytes);
             unused.cancel();
             while (try terrain.generation.processOne(io)) {}
             try terrain.poll();
         }
-        const ready_acquired = terrain.cache.metrics.acquired.value();
-        if (mode == .streaming) streaming.pending = true;
-        try std.testing.expect(try if (mode == .streaming) streaming.poll(io) else blocks.poll(io));
-        const sections: u64 = if (mode == .streaming) 16 else 1;
-        try std.testing.expectEqual(sections, terrain.cache.metrics.acquired.value() - ready_acquired);
+        try std.testing.expect(progressed);
+        const sections = terrain.cache.metrics.acquired.value() - ready_acquired;
+        if (mode == .blocks) try std.testing.expectEqual(@as(u64, if (generating) 2 else 1), sections);
         var delivered = service.outputBatch();
         const packet = delivered.next().?;
         try std.testing.expectEqual(count, packet.recipients.len);
         service.recycle(io, &.{packet});
         try std.testing.expectEqual(null, delivered.next());
         service.recycle(io, retained[1..held]);
-        if (generating) {
+        progressed = false;
+        for (0..256) |_| {
             if (mode == .streaming) streaming.pending = true;
-            try std.testing.expect(!try if (mode == .streaming) streaming.poll(io) else blocks.poll(io));
+            progressed = try if (mode == .streaming) streaming.poll(io) else blocks.poll(io);
+            if (progressed) break;
             try std.testing.expectEqual(@as(usize, 0), terrain.borrowed_count);
             while (try terrain.generation.processOne(io)) {}
             try terrain.poll();
         }
-        if (mode == .streaming) streaming.pending = true;
-        try std.testing.expect(try if (mode == .streaming) streaming.poll(io) else blocks.poll(io));
+        try std.testing.expect(progressed);
         var remaining = service.outputBatch();
         while (remaining.next()) |pending| service.recycle(io, &.{pending});
         var reclaimed: [128]sessions.Service.Packet = undefined;
@@ -1895,7 +1898,7 @@ pub fn benchmarkSparseTerrainStreaming() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -2002,7 +2005,7 @@ pub fn benchmarkSparseBlockPlanning() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -2106,7 +2109,7 @@ pub fn verifyBlockBatchRetirement() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });

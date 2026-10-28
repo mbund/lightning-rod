@@ -9,3 +9,5 @@ pub const items: type = registry.item_ids;
 pub const encoding = base.encoding;
 
 pub const registry_snapshot = @embedFile("registry_snapshot");
+
+pub const lighting = base.lighting_data.Data(registry.block_state_names.len, @embedFile("lighting_snapshot"));

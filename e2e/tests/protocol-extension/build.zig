@@ -14,7 +14,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .support = b.dependency("encoding", .{ .target = target, .optimize = optimize }).module("encoding"),
     });
-    const snapshot = b.dependency("registry_snapshotter", .{ .@"minecraft-version" = "1.21.9" }).namedLazyPath("snapshot");
+    const snapshotter = b.dependency("registry_snapshotter", .{ .@"minecraft-version" = "1.21.9" });
+    const snapshot = snapshotter.namedLazyPath("snapshot");
     var canonical_schema = protocol_codegen.Json.read(b, canonical_data.path(b, "protocol.json"));
     var wire_schema = protocol_codegen.Json.read(b, data.path(b, "protocol.json"));
     for ([_]*protocol_codegen.Json{ &canonical_schema, &wire_schema }) |schema| {
@@ -40,6 +41,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "registry", .module = canonical_registry },
         },
     });
+    canonical.addAnonymousImport("lighting_snapshot", .{ .root_source_file = snapshotter.namedLazyPath("lighting") });
     canonical.addAnonymousImport("registry_snapshot", .{ .root_source_file = snapshot });
     canonical.addAnonymousImport("canonical_identity", .{ .root_source_file = game_data_build.identity(game_data.builder, canonical_registry, "1.21.9") });
     b.dependency("vanilla", .{ .target = target, .optimize = optimize }).module("lightning_rod_vanilla_1_21_6").addImport("game_data", canonical);

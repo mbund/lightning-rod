@@ -62,6 +62,7 @@ pub fn build(b: *std.Build) void {
         .{ .directory = "examples/skyblock" },
         .{ .directory = "records" },
         .{ .directory = "chunks" },
+        .{ .directory = "lighting" },
         .{ .directory = "bench/chunks" },
         .{ .directory = "fuzz" },
         .{ .directory = "sessions" },
