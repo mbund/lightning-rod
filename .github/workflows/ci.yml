@@ -157,6 +157,7 @@ jobs:
             "-PsnapshotOutput=$RUNNER_TEMP/ci-registries/$VERSION.bin" \
             "-PlightingOutput=$RUNNER_TEMP/ci-registries/$VERSION-lighting.bin" \
             "-PrecipeOutput=$RUNNER_TEMP/ci-registries/$VERSION-recipes.bin" \
+            "-PphysicsOutput=$RUNNER_TEMP/ci-registries/$VERSION-physics.bin" \
             registrySnapshot lightingSnapshot
       - uses: actions/upload-artifact@v7
         with:

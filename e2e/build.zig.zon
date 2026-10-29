@@ -4,6 +4,7 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .game_data = .{ .path = "../game_data" },
         .host = .{ .path = "../host" },
         .records = .{ .path = "../records" },
         .inventories = .{ .path = "../inventories" },

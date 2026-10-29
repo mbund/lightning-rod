@@ -60,6 +60,7 @@ pub fn build(b: *std.Build) void {
 
     const menu_module = b.createModule(.{ .root_source_file = b.path("src/menu_test.zig"), .target = target, .optimize = optimize });
     for (module.import_table.keys(), module.import_table.values()) |name, dependency| menu_module.addImport(name, dependency);
+    menu_module.addImport("fault_disk", b.createModule(.{ .root_source_file = b.dependency("storage", .{ .target = target, .optimize = optimize }).path("src/fault_disk.zig"), .target = target, .optimize = optimize }));
     const menu_tests = b.addRunArtifact(b.addTest(.{ .root_module = menu_module }));
     b.step("test-menus", "Verify crafting and container ownership across persistence").dependOn(&menu_tests.step);
     test_step.dependOn(&menu_tests.step);

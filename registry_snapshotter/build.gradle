@@ -27,6 +27,8 @@ loom {
             property 'mcc.minecraftVersion', minecraftVersion
             property 'mcc.recipeOutput', providers.gradleProperty('recipeOutput').getOrElse(
                 layout.buildDirectory.file('recipes.bin').get().asFile.absolutePath)
+            property 'mcc.physicsOutput', providers.gradleProperty('physicsOutput').getOrElse(
+                layout.buildDirectory.file('physics.bin').get().asFile.absolutePath)
         }
     }
 }
@@ -34,6 +36,7 @@ loom {
 sourceSets.main.java.srcDir(modern ? 'src/modern-loader/java' : 'src/legacy-loader/java')
 sourceSets.main.java.srcDir(['legacy', 'input'].contains(api) ? 'src/legacy-registry/java' : 'src/current-registry/java')
 sourceSets.main.java.srcDir(modern ? 'src/current-lighting/java' : 'src/legacy-lighting/java')
+sourceSets.main.java.srcDir(modern ? 'src/current-physics/java' : 'src/legacy-physics/java')
 sourceSets.main.java.srcDir(modern ? 'src/current-recipe/java' : 'src/legacy-recipe/java')
 
 dependencies {

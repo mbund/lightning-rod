@@ -25,6 +25,7 @@ const Durability = @import("item_properties.zig").Durability;
 const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
 const BlockLoot = @import("block_loot.zig").BlockLoot;
 const ItemEntities = @import("item_entities.zig").ItemEntities;
+const Experience = @import("experience.zig").Experience;
 
 const Chunks = chunks.Chunks;
 
@@ -49,6 +50,7 @@ pub const Mining = struct {
         menus: *PlayerInventory,
         loot: *BlockLoot,
         dropped: *ItemEntities,
+        experience: *Experience,
         blocks: *block_sync.BlockSynchronization,
         actions: *block_actions.BlockActions,
     };
@@ -222,6 +224,7 @@ pub const Mining = struct {
     }
 
     pub fn tick(self: *Mining) !void {
+        errdefer self.deps.storage.fail();
         const players = self.deps.players;
         for (players.activeSlots()) |index| self.actors.insert(index);
         var retiring: usize = 0;
@@ -235,7 +238,7 @@ pub const Mining = struct {
         for (self.actors.values()) |index| {
             const player = players.records[index];
             const state = &self.states[index];
-            if (player.handle == null or player.stage != .ready or player.health == 0) {
+            if (player.handle == null or player.stage != .ready or player.health == 0 or player.gamemode == .spectator or player.gamemode == .adventure) {
                 state.active = false;
                 state.stage = -1;
                 continue;
@@ -271,15 +274,17 @@ pub const Mining = struct {
                     const progress = if (info.hardness < 0) @as(f32, 0) else if (info.hardness == 0) @as(f32, 1) else loot.speed / info.hardness / @as(f32, if (loot.harvest) 30 else 100) / @as(f32, if (player.on_ground) 1 else 5) * @as(f32, @floatFromInt(players.ticks - state.started + 1));
                     complete = complete or (state.finishing and progress >= 1);
                     stage = @intFromFloat(@min(9, @floor(progress * 10)));
-                    if (complete and player.gamemode != .creative and loot.drop != null and !self.deps.dropped.canCreate(1)) {
-                        self.deps.blocks.correct(player.world, position);
-                        state.active = false;
-                        state.finishing = false;
-                        state.complete = false;
-                        complete = false;
-                        stage = -1;
-                    }
                     if (complete) {
+                        var experience_random = self.random.source;
+                        const experience = if (player.gamemode != .creative) loot.experience.sample(experience_random.random()) else 0;
+                        if (!self.deps.experience.canAward(experience) or (player.gamemode != .creative and loot.drop != null and !self.deps.dropped.canCreate(1))) {
+                            self.deps.blocks.correct(player.world, position);
+                            state.active = false;
+                            state.finishing = false;
+                            state.complete = false;
+                            state.stage = -1;
+                            continue;
+                        }
                         terrain.deinit();
                         const following_drops: usize = @intFromBool(player.gamemode != .creative and loot.drop != null);
                         const removed = try self.deps.actions.apply(.{
@@ -294,9 +299,11 @@ pub const Mining = struct {
                             state.active = false;
                             state.finishing = false;
                             state.complete = false;
+                            state.stage = -1;
                             continue;
                         }
                         assert(self.deps.dropped.canCreate(following_drops));
+                        self.random.source = experience_random;
                         var worn = held.stack;
 
                         if (player.gamemode != .creative) {
@@ -316,6 +323,7 @@ pub const Mining = struct {
                         }
 
                         if (removed == .pass) try self.deps.chunks.setBlock(player.world, position, 0);
+                        if (experience > 0) try self.deps.experience.award(player.world, .{ @as(f64, @floatFromInt(position.x)) + 0.5, @as(f64, @floatFromInt(position.y)) + 0.5, @as(f64, @floatFromInt(position.z)) + 0.5 }, experience);
 
                         if (!std.meta.eql(worn, held.stack)) {
                             const committed = try self.deps.inventories.set(slot, held.revision, worn);

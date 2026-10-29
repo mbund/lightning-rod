@@ -58,7 +58,10 @@ const Probe = struct {
                     const value = self.deps.containers.furnaceState(player.world, oven);
                     if (value.burn_left == 0 or value.burn_left > value.burn_total) return error.FurnaceDidNotResume;
                     const completed = std.mem.eql(u8, self.deps.reload.latest().?.token(), "e2e:furnace-taken");
-                    if (completed) try self.assertPlayerCount(handle.index, "minecraft:iron_ingot", 2);
+                    if (completed) {
+                        try self.assertPlayerCount(handle.index, "minecraft:iron_ingot", 2);
+                        if (player.experience.total < 1 or player.experience.total > 2) return error.FurnaceExperienceLost;
+                    }
                     try self.deps.control.send(handle, if (completed) "complete" else "reloaded");
                 } else try self.deps.control.send(handle, "reloaded");
                 return .handled;
@@ -98,6 +101,7 @@ const Probe = struct {
             if ((try self.deps.inventories.get(vanilla.Containers.slot(player.world, oven, 0))).stack != null) return error.FurnaceInputNotConsumed;
             try self.deps.control.send(handle, "cooked");
         } else if (std.mem.eql(u8, text, "taken")) {
+            if (player.experience.total < 1 or player.experience.total > 2) return error.FurnaceExperienceIncorrect;
             try self.assertPlayerCount(handle.index, "minecraft:iron_ingot", 2);
             if ((try self.deps.inventories.get(vanilla.Containers.slot(player.world, oven, 2))).stack != null) return error.FurnaceOutputDuplicated;
             try self.deps.reload.stage("e2e:furnace-taken");

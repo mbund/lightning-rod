@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const Recipe = struct {
+    index: u32 = 0,
     output: u32,
     count: u16,
     ticks: u32,
@@ -25,6 +26,7 @@ pub const Fuel = struct {
 
 pub const Table = struct {
     recipes: []const ?Recipe,
+    cooking_experience: []const f32 = &.{},
     fuels: []const Fuel,
     crafting: []const Craft,
     alternatives: []const u32,

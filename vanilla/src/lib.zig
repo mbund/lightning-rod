@@ -59,6 +59,9 @@ pub const ItemMerging = @import("item_merging.zig").ItemMerging;
 pub const ItemPickup = @import("item_pickup.zig").ItemPickup;
 pub const ItemEntities = @import("item_entities.zig").ItemEntities;
 pub const ItemPhysics = @import("item_physics.zig").ItemPhysics;
+pub const Enchantments = @import("enchantments.zig").Enchantments;
+pub const Experience = @import("experience.zig").Experience;
+pub const ExperienceReplication = @import("experience_replication.zig").ExperienceReplication;
 pub const ItemTick = @import("item_tick.zig").ItemTick;
 pub const ItemReplication = @import("item_replication.zig").ItemReplication;
 pub const BlockLoot = @import("block_loot.zig").BlockLoot;
@@ -117,6 +120,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(ItemProperties, ItemProperties.Configuration{}),
     lightning_rod.plugin.configured(Durability, Durability.Configuration{}),
     lightning_rod.plugin.configured(EquipmentSlots, EquipmentSlots.Configuration{}),
+    lightning_rod.plugin.configured(Enchantments, .{}),
     lightning_rod.plugin.configured(Lore, Lore.Configuration{}),
     lightning_rod.plugin.configured(ItemEntities, ItemEntities.Configuration{}),
     lightning_rod.plugin.configured(BlockLoot, BlockLoot.Configuration{}),
@@ -124,6 +128,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(ItemMerging, ItemMerging.Configuration{}),
     lightning_rod.plugin.configured(BlockActions, BlockActions.Configuration{}),
     lightning_rod.plugin.configured(PlayerInventory, PlayerInventory.Configuration{}),
+    lightning_rod.plugin.configured(Experience, .{}),
     lightning_rod.plugin.configured(Containers, Containers.Configuration{}),
     lightning_rod.plugin.configured(InventoryMenus, InventoryMenus.Configuration{}),
     lightning_rod.plugin.configured(CreativeInventory, CreativeInventory.Configuration{}),
@@ -132,6 +137,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Flat, Flat.Configuration{}),
     lightning_rod.plugin.configured(Lighting, Lighting.Configuration{}),
     lightning_rod.plugin.configured(Streaming, Streaming.Configuration{}),
+    lightning_rod.plugin.configured(ExperienceReplication, .{}),
     lightning_rod.plugin.configured(BlockSynchronization, BlockSynchronization.Configuration{}),
     lightning_rod.plugin.configured(Doors, Doors.Configuration{}),
     lightning_rod.plugin.configured(Mining, Mining.Configuration{}),

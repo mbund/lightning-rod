@@ -9,13 +9,24 @@ pub const Random = struct {
     pub fn init(seed: u64, space: storage.Space) !Random {
         var self: Random = .{ .source = .init(seed) };
         if (try records.Value.init(space).read(&self.saved)) |length| {
-            if (length != self.saved.len) return error.CorruptRandomState;
-            for (&self.source.s, 0..) |*word, index|
-                word.* = std.mem.readInt(u64, self.saved[index * 8 ..][0..8], .little);
-            if (self.source.s[0] | self.source.s[1] | self.source.s[2] | self.source.s[3] == 0)
-                return error.CorruptRandomState;
+            try self.restore(self.saved[0..length]);
         }
         return self;
+    }
+
+    pub fn restore(self: *Random, bytes: []const u8) !void {
+        if (bytes.len != self.saved.len) return error.CorruptRandomState;
+        for (&self.source.s, 0..) |*word, index|
+            word.* = std.mem.readInt(u64, bytes[index * 8 ..][0..8], .little);
+        if (self.source.s[0] | self.source.s[1] | self.source.s[2] | self.source.s[3] == 0)
+            return error.CorruptRandomState;
+    }
+
+    pub fn encode(self: *const Random) [32]u8 {
+        var bytes: [32]u8 = undefined;
+        for (self.source.s, 0..) |word, index|
+            std.mem.writeInt(u64, bytes[index * 8 ..][0..8], word, .little);
+        return bytes;
     }
 
     pub fn random(self: *Random) std.Random {
@@ -23,9 +34,7 @@ pub const Random = struct {
     }
 
     pub fn checkpoint(self: *Random, space: storage.Space) !void {
-        var bytes: [32]u8 = undefined;
-        for (self.source.s, 0..) |word, index|
-            std.mem.writeInt(u64, bytes[index * 8 ..][0..8], word, .little);
+        const bytes = self.encode();
         if (std.mem.eql(u8, &bytes, &self.saved)) return;
         try records.Value.init(space).write(&bytes);
         self.saved = bytes;

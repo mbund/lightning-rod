@@ -55,7 +55,7 @@ pub fn build(b: *std.Build) void {
     if (requested_version) |version| emit_matrix.addArg(version);
     b.step("e2e-matrix", "Print the GitHub Actions E2E matrix as JSON").dependOn(&emit_matrix.step);
 
-    const names = .{ "records", "inventories", "e2e_profile", "host", "lightning_rod", "vanilla", "minecraft_java", "minecraft_model", "sessions", "protocols", "tps", "economy", "shop", "economy_commands", "shop_commands", "e2e_control", "skyblock" };
+    const names = .{ "records", "inventories", "e2e_profile", "host", "lightning_rod", "vanilla", "game_data", "minecraft_java", "minecraft_model", "sessions", "protocols", "tps", "economy", "shop", "economy_commands", "shop_commands", "e2e_control", "skyblock" };
     b.dependency("minecraft_packets", .{ .target = target, .optimize = optimize }).module("minecraft_packets").addImport("protocols", protocols.module("protocols"));
     b.dependency("vanilla", .{ .target = target, .optimize = optimize }).module("lightning_rod_vanilla_1_21_6").addImport("protocols", protocols.module("protocols"));
     var imports: [names.len]std.Build.Module.Import = undefined;

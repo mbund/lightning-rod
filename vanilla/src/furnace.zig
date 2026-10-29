@@ -99,7 +99,7 @@ pub fn tick(self: *containers.Containers) !void {
             }
             var state = self.active[self.active_index.get(key).?].state;
             const old = contents[index * 3 ..][0..3];
-            const next = try advance(self, &state, old.*);
+            const next = try advance(self, key, &state, old.*);
             for (slots[index * 3 ..][0..3], old, next) |slot, previous, stack| {
                 if (std.meta.eql(previous.stack, stack)) continue;
                 edits[edited] = .{ .slot = slot, .revision = previous.revision, .stack = stack };
@@ -132,7 +132,7 @@ pub fn tick(self: *containers.Containers) !void {
     }
 }
 
-fn advance(self: *containers.Containers, state: *State, contents: [3]inventories.Contents) ![3]?inventories.Stack {
+fn advance(self: *containers.Containers, key: containers.Key, state: *State, contents: [3]inventories.Contents) ![3]?inventories.Stack {
     var next: [3]?inventories.Stack = undefined;
     for (contents, &next) |value, *stack| stack.* = value.stack;
     const source = next[0];
@@ -172,6 +172,7 @@ fn advance(self: *containers.Containers, state: *State, contents: [3]inventories
         state.cook += 1;
         if (state.cook == state.duration) {
             state.cook = 0;
+            try self.recordRecipe(key, recipe.?.index);
             const input = next[0].?;
             const output = result.?;
             const materialized = try self.deps.inventory.deps.items.defineKind(recipe.?.output);

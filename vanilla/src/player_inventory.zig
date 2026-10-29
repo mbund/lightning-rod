@@ -424,8 +424,14 @@ pub const PlayerInventory = struct {
     }
 
     pub fn changed(self: *PlayerInventory, player: usize) void {
+        self.changedSlots(player, all_slots);
+    }
+
+    pub fn changedSlots(self: *PlayerInventory, player: usize, mask: u64) void {
         assert(player < self.states.len);
-        self.states[player].dirty = all_slots;
+        assert(mask & ~all_slots == 0);
+        if (mask == 0) return;
+        self.states[player].dirty |= mask;
         self.states[player].revision = (self.states[player].revision + 1) & 32767;
     }
 };

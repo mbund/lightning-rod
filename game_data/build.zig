@@ -69,6 +69,7 @@ pub fn build(b: *std.Build) void {
     module.addOptions("canonical_version", version);
     module.addAnonymousImport("canonical_identity", .{ .root_source_file = identity(b, registry, minecraft_version) });
     module.addAnonymousImport("lighting_snapshot", .{ .root_source_file = snapshotter.namedLazyPath("lighting") });
+    module.addAnonymousImport("physics_snapshot", .{ .root_source_file = snapshotter.namedLazyPath("physics") });
     module.addAnonymousImport("registry_snapshot", .{ .root_source_file = snapshot });
     b.step("check", "Check the generated gameplay data module").dependOn(&b.addLibrary(.{
         .name = "game_data",

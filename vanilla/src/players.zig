@@ -10,6 +10,7 @@ const minecraft = @import("minecraft_model");
 const minecraft_packets = @import("minecraft_packets");
 const lightning_rod = @import("lightning_rod");
 const IndexSet = lightning_rod.system.IndexSet;
+const experience = @import("experience_state.zig");
 const Input = @import("input.zig").Input;
 
 pub const Players = struct {
@@ -77,7 +78,10 @@ pub const Players = struct {
         health_sent: f32 = 20,
         life: u32 = 1,
         selected_slot: u4 = 0,
+        experience: experience.State = .{},
+        experience_delay: u8 = 0,
         saved: [saved_size]u8 = @splat(0),
+        saved_experience: [experience.State.encoded_size]u8 = @splat(0),
 
         pub fn inWorld(self: Player) bool {
             return self.handle != null;
@@ -182,26 +186,28 @@ pub const Players = struct {
 
     fn onLifecycle(self: *Players, events: []const sessions.Event) !void {
         const table = persistent_records.Table.init(self.deps.storage, self.deps.record_workspaces.resources);
-        var keys: [32][16]u8 = undefined;
-        var values: [32][saved_size]u8 = undefined;
-        var reads: [32]persistent_records.Get = undefined;
-        var writes: [32]persistent_records.Write = undefined;
-        var lengths: [32]?usize = undefined;
+        var keys: [64][17]u8 = undefined;
+        var values: [64][saved_size]u8 = undefined;
+        var reads: [64]persistent_records.Get = undefined;
+        var writes: [64]persistent_records.Write = undefined;
+        var lengths: [64]?usize = undefined;
         var begin: usize = 0;
         while (begin < events.len) {
             const kind = std.meta.activeTag(events[begin]);
             std.debug.assert(kind != .input);
             var end = begin;
-            while (end < events.len and end - begin < keys.len and std.meta.activeTag(events[end]) == kind) end += 1;
+            while (end < events.len and end - begin < keys.len / 2 and std.meta.activeTag(events[end]) == kind) end += 1;
             const batch = events[begin..end];
             if (kind == .joined) {
                 for (batch, 0..) |event, index| {
                     const joined = event.joined;
                     std.debug.assert(joined.handle.index < self.records.len and self.records[joined.handle.index].handle == null);
-                    std.mem.writeInt(u128, &keys[index], joined.uuid, .little);
-                    reads[index] = .{ .key = &keys[index], .destination = &values[index] };
+                    std.mem.writeInt(u128, keys[index * 2][0..16], joined.uuid, .little);
+                    keys[index * 2 + 1] = experienceKey(joined.uuid);
+                    reads[index * 2] = .{ .key = keys[index * 2][0..16], .destination = &values[index * 2] };
+                    reads[index * 2 + 1] = .{ .key = &keys[index * 2 + 1], .destination = &values[index * 2 + 1] };
                 }
-                try table.getBatch(reads[0..batch.len], lengths[0..batch.len]);
+                try table.getBatch(reads[0 .. batch.len * 2], lengths[0 .. batch.len * 2]);
             }
             if (kind == .left) {
                 var count: usize = 0;
@@ -209,26 +215,37 @@ pub const Players = struct {
                     const handle = event.left;
                     const player = &self.records[handle.index];
                     std.debug.assert(std.meta.eql(player.handle, @as(?sessions.Handle, handle)));
-                    values[count] = encodePlayer(player);
-                    if (std.mem.eql(u8, &values[count], &player.saved)) continue;
-                    std.mem.writeInt(u128, &keys[count], player.uuid, .little);
-                    writes[count] = .{ .key = &keys[count], .value = &values[count] };
-                    count += 1;
+                    const body = encodePlayer(player);
+                    if (!std.mem.eql(u8, &body, &player.saved)) {
+                        values[count] = body;
+                        std.mem.writeInt(u128, keys[count][0..16], player.uuid, .little);
+                        writes[count] = .{ .key = keys[count][0..16], .value = &values[count] };
+                        count += 1;
+                    }
+                    const points = player.experience.encode();
+                    if (!std.mem.eql(u8, &points, &player.saved_experience)) {
+                        @memcpy(values[count][0..points.len], &points);
+                        keys[count] = experienceKey(player.uuid);
+                        writes[count] = .{ .key = &keys[count], .value = values[count][0..points.len] };
+                        count += 1;
+                    }
                 }
                 try table.putBatch(writes[0..count]);
             }
             for (batch, 0..) |event, index| {
                 var saved: ?[]const u8 = null;
-                if (kind == .joined) if (lengths[index]) |length| {
-                    saved = values[index][0..length];
-                };
-                try self.applyLifecycle(event, saved);
+                var points: ?[]const u8 = null;
+                if (kind == .joined) {
+                    if (lengths[index * 2]) |length| saved = values[index * 2][0..length];
+                    if (lengths[index * 2 + 1]) |length| points = values[index * 2 + 1][0..length];
+                }
+                try self.applyLifecycle(event, saved, points);
             }
             begin = end;
         }
     }
 
-    fn applyLifecycle(self: *Players, event: sessions.Event, saved: ?[]const u8) !void {
+    fn applyLifecycle(self: *Players, event: sessions.Event, saved: ?[]const u8, points: ?[]const u8) !void {
         switch (event) {
             .joined => |joined| {
                 std.debug.assert(joined.handle.index < self.records.len);
@@ -283,6 +300,10 @@ pub const Players = struct {
                     inline for (.{ player.position.x, player.position.y, player.position.z }) |value| {
                         if (!std.math.isFinite(value) or @abs(value) > 30_000_000) return error.InvalidSpawnPosition;
                     }
+                }
+                if (points) |bytes| {
+                    player.experience = try experience.State.decode(bytes);
+                    @memcpy(&player.saved_experience, bytes);
                 }
                 self.updateIndexes(joined.handle.index);
             },
@@ -591,27 +612,33 @@ pub const Players = struct {
     }
 
     pub fn checkpoint(self: *Players, space: lightning_rod.storage.Space) !void {
-        const table_resources = self.deps.record_workspaces.resources;
-        var keys: [256][16]u8 = undefined;
+        const table = persistent_records.Table.init(space, self.deps.record_workspaces.resources);
+        var keys: [256][17]u8 = undefined;
         var writes: [256]persistent_records.Write = undefined;
         var count: usize = 0;
-
-        for (self.records) |*player| {
-            if (player.handle == null) continue;
-
-            const bytes = encodePlayer(player);
-            if (std.mem.eql(u8, &bytes, &player.saved)) continue;
-            if (count == writes.len) {
-                try persistent_records.Table.init(space, table_resources).putBatch(writes[0..count]);
+        errdefer space.fail();
+        for (self.activeSlots()) |index| {
+            const player = &self.records[index];
+            if (writes.len - count < 2) {
+                try table.putBatch(writes[0..count]);
                 count = 0;
             }
-            player.saved = bytes;
-            std.mem.writeInt(u128, &keys[count], player.uuid, .little);
-            writes[count] = .{ .key = &keys[count], .value = &player.saved };
-            count += 1;
+            const bytes = encodePlayer(player);
+            if (!std.mem.eql(u8, &bytes, &player.saved)) {
+                player.saved = bytes;
+                std.mem.writeInt(u128, keys[count][0..16], player.uuid, .little);
+                writes[count] = .{ .key = keys[count][0..16], .value = &player.saved };
+                count += 1;
+            }
+            const points = player.experience.encode();
+            if (!std.mem.eql(u8, &points, &player.saved_experience)) {
+                player.saved_experience = points;
+                keys[count] = experienceKey(player.uuid);
+                writes[count] = .{ .key = &keys[count], .value = &player.saved_experience };
+                count += 1;
+            }
         }
-
-        if (count != 0) try persistent_records.Table.init(space, table_resources).putBatch(writes[0..count]);
+        if (count != 0) try table.putBatch(writes[0..count]);
     }
 
     pub fn sendPacket(self: *Players, comptime encode_packet: anytype, protocol: i32, recipient: sessions.Handle, arguments: anytype) bool {
@@ -929,6 +956,7 @@ test "disconnect stages player state until the next complete checkpoint" {
         players.applyMovement(handle, .{ .position = position, .rotation = rotation, .on_ground = true, .horizontal_collision = false });
         records[0].health = 7;
         records[0].selected_slot = 8;
+        records[0].experience = .{ .progress = 0.5, .level = 7, .total = 101, .score = 101 };
         records[0].gamemode = .survival;
         try players.onLifecycle(&.{.{ .left = handle }});
         try std.testing.expect(records[0].handle == null);
@@ -940,6 +968,7 @@ test "disconnect stages player state until the next complete checkpoint" {
         try std.testing.expectEqual(@as(f32, 7), records[0].health);
         try std.testing.expectEqual(.survival, records[0].gamemode);
         try std.testing.expectEqual(@as(u4, 8), records[0].selected_slot);
+        try std.testing.expectEqualDeep(experience.State{ .progress = 0.5, .level = 7, .total = 101, .score = 101 }, records[0].experience);
         try std.testing.expect(records[0].on_ground);
         try players.onLifecycle(&.{.{ .left = handle }});
         try players.checkpoint(space);
@@ -960,6 +989,7 @@ test "disconnect stages player state until the next complete checkpoint" {
         try std.testing.expectEqual(@as(f32, 7), records[0].health);
         try std.testing.expectEqual(.survival, records[0].gamemode);
         try std.testing.expectEqual(@as(u4, 8), records[0].selected_slot);
+        try std.testing.expectEqualDeep(experience.State{ .progress = 0.5, .level = 7, .total = 101, .score = 101 }, records[0].experience);
         try std.testing.expect(records[0].on_ground);
     }
 }
@@ -1229,4 +1259,11 @@ test "player spatial indexes preserve slots beyond sixteen bits" {
     records[65_536].handle = null;
     players.updateIndexes(65_536);
     try expectNearby(players.nearby(4, records[65_536].position, 0), &.{});
+}
+
+fn experienceKey(uuid: u128) [17]u8 {
+    var key: [17]u8 = undefined;
+    key[0] = 1;
+    std.mem.writeInt(u128, key[1..17], uuid, .little);
+    return key;
 }

@@ -23,7 +23,7 @@ pub fn load(allocator: std.mem.Allocator, snapshot: []const u8) !data.Table {
     @memset(self.recipes, null);
     @memset(self.fuels, .{});
     var reader = std.Io.Reader.fixed(snapshot);
-    if (!std.mem.eql(u8, try reader.take(8), "LRRCP001")) return error.InvalidRecipeSnapshot;
+    if (!std.mem.eql(u8, try reader.take(8), "LRRCP002")) return error.InvalidRecipeSnapshot;
     const items = try reader.takeInt(u32, .big);
     if (items != registry.items.len) return error.InvalidCookingRegistry;
     for (0..items) |_| {
@@ -36,15 +36,25 @@ pub fn load(allocator: std.mem.Allocator, snapshot: []const u8) !data.Table {
         };
     }
     const recipes = try reader.takeInt(u32, .big);
+    var highest_recipe: u32 = 0;
     for (0..recipes) |_| {
         const input = try itemKind(try string(&reader));
         const output = try itemKind(try string(&reader));
         const count = try reader.takeInt(u32, .big);
         const ticks = try reader.takeInt(u32, .big);
         const experience: f32 = @bitCast(try reader.takeInt(u32, .big));
+        const index = try reader.takeInt(u32, .big);
+        if (index >= recipes) return error.InvalidCookingRecipe;
+        highest_recipe = @max(highest_recipe, index);
         if (count == 0 or count > 99 or ticks == 0 or !std.math.isFinite(experience) or experience < 0) return error.InvalidCookingRecipe;
-        if (self.recipes[input] == null) self.recipes[input] = .{ .output = output, .count = @intCast(count), .ticks = ticks, .experience = experience };
+        if (self.recipes[input] == null) self.recipes[input] = .{ .index = index, .output = output, .count = @intCast(count), .ticks = ticks, .experience = experience };
     }
+    const cooking_experience = try allocator.alloc(f32, if (recipes == 0) 0 else highest_recipe + 1);
+    errdefer allocator.free(cooking_experience);
+    @memset(cooking_experience, 0);
+    for (self.recipes) |entry| if (entry) |recipe| {
+        cooking_experience[recipe.index] = recipe.experience;
+    };
     const crafting_count = try reader.takeInt(u32, .big);
     var measure = reader;
     var alternatives: usize = 0;
@@ -80,7 +90,7 @@ pub fn load(allocator: std.mem.Allocator, snapshot: []const u8) !data.Table {
     }
     std.debug.assert(offset == self.alternatives.len);
     if (reader.seek != snapshot.len) return error.InvalidRecipeSnapshot;
-    return .{ .recipes = self.recipes, .fuels = self.fuels, .crafting = self.crafting, .alternatives = self.alternatives };
+    return .{ .cooking_experience = cooking_experience, .recipes = self.recipes, .fuels = self.fuels, .crafting = self.crafting, .alternatives = self.alternatives };
 }
 
 fn itemKind(name: []const u8) !u32 {

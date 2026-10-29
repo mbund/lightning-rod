@@ -11,6 +11,8 @@ pub const encoding = base.encoding;
 pub const registry_snapshot = @embedFile("registry_snapshot");
 
 pub const lighting = base.lighting_data.Data(registry.block_state_names.len, @embedFile("lighting_snapshot"));
+pub const physics_data = base.physics_data;
+pub const physics = physics_data.Data(registry.block_state_names.len, registry.blocks.len, @embedFile("physics_snapshot"));
 
 pub const recipe_data = base.recipe_data;
 pub const recipes = @import("recipes").value;

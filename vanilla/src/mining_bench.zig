@@ -85,7 +85,7 @@ pub fn benchmark() !void {
         .{ .block = "minecraft:oak_slab[type=double,waterlogged=false]", .drop = "minecraft:oak_slab", .count = 2 },
         .{ .block = "minecraft:oak_slab[type=bottom,waterlogged=false]", .drop = "minecraft:oak_slab", .count = 1 },
     }) |case| {
-        const result = loot.evaluate(@intCast(game_data.registry.blockStateId(case.block).?), null);
+        const result = loot.evaluate(@intCast(game_data.registry.blockStateId(case.block).?), &.{});
         const definitions = ownership.items.metrics.acquired.value();
         const references = ownership.references.metrics.acquired.value();
         const stack = try result.drop.?.materialize(items);
@@ -94,18 +94,18 @@ pub fn benchmark() !void {
         try std.testing.expectEqual(case.count, stack.count);
         try std.testing.expectEqual(@as(u32, @intCast(game_data.registry.itemId(case.drop).?)), try items.kind(stack));
     }
-    const stone = loot.evaluate(@intCast(game_data.registry.blockStateId("minecraft:stone").?), null);
+    const stone = loot.evaluate(@intCast(game_data.registry.blockStateId("minecraft:stone").?), &.{});
     try std.testing.expect(!stone.harvest);
     try std.testing.expectEqual(null, stone.drop);
     var selected: BlockLoot.Tool = .{};
     const bedrock = loot.evaluate(@intCast(game_data.registry.blockStateId("minecraft:bedrock").?), try selected.resolve(items, tools[0]));
     try std.testing.expectEqual(null, bedrock.drop);
     const acquired = ownership.items.metrics.acquired.value();
-    try std.testing.expectEqual(selected.kind, try selected.resolve(items, .{ .item = tools[0].item, .count = 2 }));
+    try std.testing.expectEqual(selected.kind, (try selected.resolve(items, .{ .item = tools[0].item, .count = 2 })).kind);
     try std.testing.expectEqual(acquired, ownership.items.metrics.acquired.value());
-    try std.testing.expectEqual(@as(u32, @intCast(game_data.registry.itemId(cases[1].tool).?)), (try selected.resolve(items, tools[1])).?);
+    try std.testing.expectEqual(@as(u32, @intCast(game_data.registry.itemId(cases[1].tool).?)), (try selected.resolve(items, tools[1])).kind.?);
     try std.testing.expectEqual(acquired + 1, ownership.items.metrics.acquired.value());
-    try std.testing.expectEqual(null, try selected.resolve(items, null));
+    try std.testing.expectEqual(null, (try selected.resolve(items, null)).kind);
     try std.testing.expectEqual(null, selected.item);
     _ = try selected.resolve(items, tools[1]);
     try std.testing.expectEqual(acquired + 2, ownership.items.metrics.acquired.value());

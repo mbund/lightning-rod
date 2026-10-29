@@ -13,9 +13,11 @@ pub fn main(init: std.process.Init) !void {
     try writer.writeAll("const data = @import(\"recipe_data\");\npub const value: data.Table = .{\n.recipes = &.{\n");
     for (data.recipes) |entry| {
         if (entry) |recipe| {
-            try writer.print(".{{ .output = {d}, .count = {d}, .ticks = {d}, .experience = @bitCast(@as(u32, {d})) }},\n", .{ recipe.output, recipe.count, recipe.ticks, @as(u32, @bitCast(recipe.experience)) });
+            try writer.print(".{{ .index = {d}, .output = {d}, .count = {d}, .ticks = {d}, .experience = @bitCast(@as(u32, {d})) }},\n", .{ recipe.index, recipe.output, recipe.count, recipe.ticks, @as(u32, @bitCast(recipe.experience)) });
         } else try writer.writeAll("null,\n");
     }
+    try writer.writeAll("},\n.cooking_experience = &.{\n");
+    for (data.cooking_experience) |experience| try writer.print("@bitCast(@as(u32, {d})),\n", .{@as(u32, @bitCast(experience))});
     try writer.writeAll("},\n.fuels = &.{\n");
     for (data.fuels) |fuel| {
         try writer.print(".{{ .ticks = {d}, .remainder = ", .{fuel.ticks});

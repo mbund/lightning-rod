@@ -46,7 +46,7 @@ final class RecipeSnapshot {
             }
         }
         try (var out = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(path)))) {
-            out.write("LRRCP001".getBytes(StandardCharsets.US_ASCII));
+            out.write("LRRCP002".getBytes(StandardCharsets.US_ASCII));
             out.writeInt(BuiltInRegistries.ITEM.size());
             for (var item : BuiltInRegistries.ITEM) {
                 string(out, BuiltInRegistries.ITEM.getKey(item).toString());
@@ -55,6 +55,7 @@ final class RecipeSnapshot {
                 string(out, remainder.isEmpty() ? "" : BuiltInRegistries.ITEM.getKey(remainder.getItem()).toString());
             }
             out.writeInt(recipes.stream().mapToInt(r -> (int) r.input().items().count()).sum());
+            int recipeIndex = 0;
             for (var recipe : recipes) {
                 var result = RecipeApi.result(recipe, lookup);
                 for (var input : recipe.input().items().toList()) {
@@ -63,7 +64,9 @@ final class RecipeSnapshot {
                     out.writeInt(result.getCount());
                     out.writeInt(recipe.cookingTime());
                     out.writeFloat(recipe.experience());
+                    out.writeInt(recipeIndex);
                 }
+                recipeIndex++;
             }
             out.writeInt(crafting.size());
             for (var recipe : crafting) {

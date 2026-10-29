@@ -16,6 +16,8 @@ const ItemEntities = @import("item_entities.zig").ItemEntities;
 const menu_click = @import("menu_click.zig");
 const blocks = @import("container_blocks.zig");
 const furnace = @import("furnace.zig");
+const metrics = @import("metrics");
+const Experience = @import("experience.zig").Experience;
 
 const assert = std.debug.assert;
 
@@ -56,8 +58,10 @@ pub const Key = struct {
 pub const Containers = struct {
     pub const id = "minecraft:containers";
     pub const minimum_inventory_cache_slots = menu_click.maximum_slots;
-    pub const Configuration = struct { active_furnaces: usize = 256 };
+    pub const Configuration = struct { active_furnaces: usize = 256, reward_records: usize = 64 };
     pub const Dependencies = struct {
+        experience: *Experience,
+        metrics: *metrics.Registry,
         players: *Players,
         inventory: *PlayerInventory,
         inventories: *inventories.Inventories,
@@ -98,6 +102,7 @@ pub const Containers = struct {
     deps: Dependencies,
     states: blocks.States,
     table: records.Table,
+    rewards: records.Cache,
     active: []Resident,
     saved: []Key,
     saved_count: usize = 0,
@@ -112,15 +117,22 @@ pub const Containers = struct {
     targets: []sessions.Service.Target,
     deliveries: []sessions.Service.Delivery,
 
-    pub fn allocate(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Containers {
-        if (config.active_furnaces == 0) return error.InvalidConfiguration;
+    pub fn allocate(allocator: std.mem.Allocator, io: std.Io, config: Configuration, deps: Dependencies) !*Containers {
+        if (config.active_furnaces == 0 or config.reward_records == 0) return error.InvalidConfiguration;
         assert(deps.inventories.cache.entries.len >= minimum_inventory_cache_slots);
         if (deps.inventories.cache.entries.len < minimum_inventory_cache_slots) return error.InventoryCacheTooSmall;
         const self = try allocator.create(Containers);
         self.* = .{
             .deps = deps,
             .states = try .init(),
-            .table = records.Table.init(deps.storage, deps.record_workspaces.resources),
+            .table = .{ .space = deps.storage, .root_offset = 8, .resources = deps.record_workspaces.resources },
+            .rewards = try records.Cache.init(allocator, io, .{ .space = deps.storage, .root_offset = 16, .resources = deps.record_workspaces.resources }, .{
+                .slots = config.reward_records,
+                .key_bytes = 16,
+                .value_bytes = game_data.recipes.cooking_experience.len * 4,
+                .metrics = deps.metrics,
+                .metrics_namespace = "containers.rewards",
+            }),
             .active = try allocator.alloc(Resident, config.active_furnaces),
             .saved = try allocator.alloc(Key, config.active_furnaces),
             .views = try allocator.alloc(View, deps.players.records.len),
@@ -142,8 +154,22 @@ pub const Containers = struct {
         return self;
     }
 
-    pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Containers {
-        const self = try allocate(allocator, config, deps);
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Configuration, deps: Dependencies) !*Containers {
+        const self = try allocate(allocator, io, config, deps);
+        const root = try deps.storage.getRoot() orelse blk: {
+            var allocated: [1]storage.PageId = undefined;
+            try deps.storage.allocatePages(&allocated);
+            var page: storage.Page = @splat(0);
+            @memcpy(page[0..8], "LRCNTR01");
+            try deps.storage.writePages(&.{.{ .id = allocated[0], .source = &page }});
+            try deps.storage.setRoot(allocated[0]);
+            break :blk allocated[0];
+        };
+        var header: [8]u8 = undefined;
+        try deps.storage.readPages(&.{.{ .id = root, .destination = &header }});
+        if (!std.mem.eql(u8, &header, "LRCNTR01")) return error.CorruptFurnace;
+        self.table.directory = root;
+        self.rewards.backend.directory = root;
         var after: [16]u8 = undefined;
         var cursor: records.ScanCursor = .{ .after = &after };
         var keys: [16][16]u8 = undefined;
@@ -193,6 +219,51 @@ pub const Containers = struct {
             self.active[removed.value] = self.active[self.active_count];
             self.active_index.getPtr(self.active[removed.value].key).?.* = removed.value;
         }
+    }
+
+    pub const Reward = struct {
+        amounts: [game_data.recipes.cooking_experience.len]i32 = @splat(0),
+        random: std.Random.Xoshiro256,
+    };
+
+    pub fn recordRecipe(self: *Containers, key: Key, recipe: u32) !void {
+        assert(recipe < game_data.recipes.cooking_experience.len);
+        const lease = try self.rewards.acquire(&key.encode());
+        defer lease.release();
+        const previous = lease.read();
+        if (previous) |bytes| if (bytes.len != game_data.recipes.cooking_experience.len * 4) return error.CorruptFurnace;
+        const count = if (previous) |bytes| std.mem.readInt(u32, bytes[recipe * 4 ..][0..4], .little) else 0;
+        if (count == std.math.maxInt(i32)) return error.FurnaceRecipeCountExhausted;
+        const bytes = lease.edit();
+        if (previous == null) @memset(bytes, 0);
+        std.mem.writeInt(u32, bytes[recipe * 4 ..][0..4], count + 1, .little);
+        lease.commit(bytes.len);
+    }
+
+    fn reward(self: *Containers, key: Key) !Reward {
+        var plan: Reward = .{ .random = self.deps.experience.random.source };
+        const lease = try self.rewards.acquire(&key.encode());
+        defer lease.release();
+        const bytes = lease.read() orelse return plan;
+        if (bytes.len != game_data.recipes.cooking_experience.len * 4) return error.CorruptFurnace;
+        for (game_data.recipes.cooking_experience, &plan.amounts, 0..) |experience, *amount, index| {
+            const count = std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little);
+            const value = @as(f32, @floatFromInt(count)) * experience;
+            if (!std.math.isFinite(value) or value >= 2147483648) return error.FurnaceExperienceOverflow;
+            amount.* = @intFromFloat(@floor(value));
+            const fraction = value - @floor(value);
+            if (fraction != 0 and plan.random.random().float(f64) < fraction) amount.* += 1;
+        }
+        return plan;
+    }
+
+    fn claim(self: *Containers, key: Key, position: [3]f64, plan: Reward) !void {
+        assert(self.deps.experience.canAwardMany(&plan.amounts));
+        const lease = try self.rewards.acquire(&key.encode());
+        defer lease.release();
+        lease.remove();
+        self.deps.experience.random.source = plan.random;
+        for (plan.amounts) |amount| if (amount > 0) try self.deps.experience.award(key.world, position, amount);
     }
 
     fn watch(self: *Containers, owner: u128, player: bool, count: usize) usize {
@@ -295,6 +366,8 @@ pub const Containers = struct {
                 };
                 assert(request.following_drops <= self.deps.dropped.residents.len);
                 if (!self.deps.dropped.canCreate(drops + request.following_drops)) return .denied;
+                const reward_plan: ?Reward = if (kind == .furnace) try self.reward(key) else null;
+                if (reward_plan) |plan| if (!self.deps.experience.canAwardMany(&plan.amounts)) return .denied;
                 errdefer self.deps.storage.fail();
                 try self.closeAt(key);
                 if (drops != 0) {
@@ -312,6 +385,7 @@ pub const Containers = struct {
                     self.deactivate(key);
                 }
                 try self.deps.chunks.setBlock(key.world, key.position, 0);
+                if (reward_plan) |plan| try self.claim(key, .{ @as(f64, @floatFromInt(key.position.x)) + 0.5, @as(f64, @floatFromInt(key.position.y)) + 0.5, @as(f64, @floatFromInt(key.position.z)) + 0.5 }, plan);
                 return .applied;
             },
         }
@@ -469,6 +543,12 @@ pub const Containers = struct {
                 return;
             }
         }
+        const output_taken = view.kind == .furnace and contents[2].stack != null and (next[2] == null or next[2].?.count < contents[2].stack.?.count);
+        const reward_plan: ?Reward = if (output_taken) try self.reward(view.key) else null;
+        if (reward_plan) |plan| if (!self.deps.experience.canAwardMany(&plan.amounts)) {
+            view.drag = previous;
+            return;
+        };
         errdefer self.deps.storage.fail();
         const dropped = try self.deps.inventory.dropMany(player, result.drops[0..result.count]);
         assert(dropped);
@@ -482,6 +562,7 @@ pub const Containers = struct {
         const committed = try self.deps.inventories.editMany(edits[0..edited]);
         assert(committed);
         self.deps.inventory.changed(index);
+        if (reward_plan) |plan| try self.claim(view.key, .{ player.position.x, player.position.y, player.position.z }, plan);
         if (wake) {
             const activated = self.activate(view.key);
             assert(activated);
@@ -650,6 +731,7 @@ pub const Containers = struct {
     }
 
     pub fn checkpoint(self: *Containers, _: storage.Space) !void {
+        try self.rewards.flush();
         var keys: [records.Table.write_batch_size][16]u8 = undefined;
         var values: [records.Table.write_batch_size][furnace.encoded_bytes]u8 = undefined;
         var writes: [records.Table.write_batch_size]records.Write = undefined;

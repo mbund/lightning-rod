@@ -122,3 +122,7 @@ test "operation counts for shared mining neighborhoods preserve visibility and l
 test "operation counts for shared block delta retirement across delivery groups" {
     try inventory.verifyBlockBatchRetirement();
 }
+
+test "operation counts for mining experience preserve vanilla drops and atomic admission" {
+    try mining_replication.verifyExperience();
+}

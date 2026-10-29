@@ -56,6 +56,8 @@ public final class RegistrySnapshot implements ModInitializer {
             var lookup = combined.compositeAccess();
             var cooking = System.getProperty("mcc.recipeOutput");
             if (cooking != null) RecipeSnapshot.write(Path.of(cooking), resources, lookup);
+            var physics = System.getProperty("mcc.physicsOutput");
+            if (physics != null) PhysicsSnapshot.write(Path.of(physics));
             var destination = Path.of(args[0]);
             Files.createDirectories(destination.toAbsolutePath().getParent());
             var temporary = destination.resolveSibling(destination.getFileName() + ".partial");

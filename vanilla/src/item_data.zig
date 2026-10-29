@@ -122,6 +122,14 @@ pub fn define(store: *inventories.Inventories, kind: u32, components: []const Co
 }
 
 pub fn replace(store: *inventories.Inventories, stack: inventories.Stack, component: Component) !inventories.Stack {
+    return update(store, stack, component.key, component);
+}
+
+pub fn clearOverride(store: *inventories.Inventories, stack: inventories.Stack, component: u64) !inventories.Stack {
+    return update(store, stack, component, null);
+}
+
+fn update(store: *inventories.Inventories, stack: inventories.Stack, component_key: u64, replacement: ?Component) !inventories.Stack {
     const lease = try store.acquireItem(stack.item);
     defer lease.release();
     const view = try View.parse(lease.read().?);
@@ -129,12 +137,15 @@ pub fn replace(store: *inventories.Inventories, stack: inventories.Stack, compon
     var count: usize = 0;
     var it = view.iterator();
     while (it.next()) |entry| {
-        if (entry.key == component.key) continue;
+        if (entry.key == component_key) continue;
         if (count == entries.len) return error.ItemTooLarge;
         entries[count] = entry;
         count += 1;
     }
-    if (count == entries.len) return error.ItemTooLarge;
-    entries[count] = component;
-    return .{ .item = try define(store, view.kind, entries[0 .. count + 1]), .count = stack.count };
+    if (replacement) |component| {
+        if (count == entries.len) return error.ItemTooLarge;
+        entries[count] = component;
+        count += 1;
+    }
+    return .{ .item = try define(store, view.kind, entries[0..count]), .count = stack.count };
 }

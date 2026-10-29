@@ -1,5 +1,6 @@
 const std = @import("std");
 const storage = @import("storage");
+const fault = @import("fault_disk");
 const metrics = @import("metrics");
 const packets = @import("minecraft_packets");
 const sessions = @import("sessions");
@@ -11,6 +12,11 @@ const InventoryFixture = @import("inventory_test_fixture.zig").InventoryFixture;
 const item_data = @import("item_data.zig");
 const ItemEntities = @import("item_entities.zig").ItemEntities;
 const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
+const Experience = @import("experience.zig").Experience;
+const ExperienceState = @import("experience_state.zig").State;
+const Random = @import("random.zig").Random;
+const Enchantments = @import("enchantments.zig").Enchantments;
+const ItemPhysics = @import("item_physics.zig").ItemPhysics;
 const InventoryCapacity = @import("inventory_capacity.zig").InventoryCapacity;
 const records = @import("records");
 const chunks = @import("chunks");
@@ -26,6 +32,512 @@ test {
 
 fn kind(name: []const u8) u32 {
     return @intCast(game_data.registry.itemId(name).?);
+}
+
+test "experience pickup consumes one merged count every two ticks and ignores spectators" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/experience-pickup", .{directory.sub_path});
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
+    defer store.deinit();
+    var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
+    defer registry.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
+    const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    const fixture = try InventoryFixture.init(bounded.allocator(), &store, &registry, &selected);
+    defer fixture.service.deinit();
+    const containers = try blockContainers(bounded.allocator(), &store, &registry, fixture);
+    const experience = containers.deps.experience;
+    bounded.fail_index = bounded.alloc_index;
+    fixture.players.records[0].position = .{ .x = 0.5, .y = 8, .z = 0.5 };
+    fixture.players.records[0].gamemode = .spectator;
+    fixture.players.rebuildIndexes();
+    try experience.award(fixture.players.records[0].world, .{ 0.5, 8, 0.5 }, 7);
+    const index = experience.active.values()[0];
+    experience.orbs[index].count = 3;
+    try experience.tick();
+    try std.testing.expectEqual(@as(i32, 0), fixture.players.records[0].experience.total);
+    try std.testing.expectEqual(@as(i32, 3), experience.orbs[index].count);
+    fixture.players.records[0].gamemode = .survival;
+    for ([_]i32{ 7, 7, 14, 14, 21 }) |total| {
+        try experience.tick();
+        try std.testing.expectEqual(total, fixture.players.records[0].experience.total);
+    }
+    try std.testing.expect(!experience.orbs[index].alive);
+    try experience.tick();
+    try std.testing.expectEqual(@as(usize, 0), experience.active.values().len);
+    const player = &fixture.players.records[0];
+    player.health = 0;
+    player.experience = .{ .level = 30, .total = 1500 };
+    try experience.tick();
+    try std.testing.expectEqual(@as(i32, 0), player.experience.total);
+    try experience.tick();
+    var reward: i32 = 0;
+    for (experience.active.values()) |at| reward += experience.orbs[at].count * experience.orbs[at].value;
+    try std.testing.expectEqual(@as(i32, 100), reward);
+    player.life += 1;
+    player.experience = .{ .level = 1, .total = 7 };
+    experience.config.keep_inventory = true;
+    try experience.tick();
+    try std.testing.expectEqual(@as(i32, 7), player.experience.total);
+    experience.config.keep_inventory = false;
+    player.handle.?.generation += 1;
+    player.life = 1;
+    player.experience = .{ .level = 30, .total = 1500 };
+    try experience.tick();
+    try std.testing.expectEqual(@as(i32, 0), player.experience.total);
+    reward = 0;
+    for (experience.active.values()) |at| reward += experience.orbs[at].count * experience.orbs[at].value;
+    try std.testing.expectEqual(@as(i32, 200), reward);
+}
+
+test "mending repairs only equipped damaged items and preserves vanilla odd damage rounding" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/mending", .{directory.sub_path});
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
+    defer store.deinit();
+    var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
+    defer registry.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    const fixture = try InventoryFixture.init(arena.allocator(), &store, &registry, &selected);
+    defer fixture.service.deinit();
+    const containers = try blockContainers(arena.allocator(), &store, &registry, fixture);
+    var enchantment: [10]u8 = undefined;
+    var enchantments = [_]Enchantments.Entry{.{ .id = @intCast(game_data.registry.enchantmentId("minecraft:mending").?), .level = 1 }};
+    const enchanted = try Enchantments.encode(&enchantments, &enchantment);
+    const item = try item_data.define(fixture.ownership, kind("minecraft:diamond_pickaxe"), &.{
+        .{ .key = item_data.key(.enchantments), .value = enchanted },
+        .{ .key = item_data.key(.damage), .value = &.{5} },
+    });
+    const hand: inventories.Slot = .{ .owner = 1, .index = 36 };
+    const backpack: inventories.Slot = .{ .owner = 1, .index = 9 };
+    try std.testing.expect(try fixture.ownership.set(hand, 0, .{ .item = item, .count = 1 }));
+    try std.testing.expect(try fixture.ownership.set(backpack, 0, .{ .item = item, .count = 1 }));
+    try std.testing.expectEqual(@as(i32, 1), try containers.deps.experience.repair(0, 3));
+    const repaired = (try fixture.ownership.get(hand)).stack.?;
+    const lease = try fixture.ownership.acquireItem(repaired.item);
+    try std.testing.expect((try item_data.View.parse(lease.read().?)).get(item_data.key(.damage)) == null);
+    lease.release();
+    try std.testing.expectEqual(try item_data.define(fixture.ownership, kind("minecraft:diamond_pickaxe"), &.{.{ .key = item_data.key(.enchantments), .value = enchanted }}), repaired.item);
+    try std.testing.expectEqual(item, (try fixture.ownership.get(backpack)).stack.?.item);
+    try std.testing.expectEqual(@as(i32, 7), try containers.deps.experience.repair(0, 7));
+
+    const equipment = [_]u16{ 36, 45, 8, 7, 6, 5 };
+    for (0..32) |seed| {
+        containers.deps.experience.random.source = .init(seed);
+        for (equipment) |index| {
+            const slot: inventories.Slot = .{ .owner = 1, .index = index };
+            const previous = try fixture.ownership.get(slot);
+            try std.testing.expect(try fixture.ownership.set(slot, previous.revision, .{ .item = item, .count = 1 }));
+        }
+        try std.testing.expectEqual(@as(i32, 2), try containers.deps.experience.repair(0, 14));
+        for (equipment) |index| {
+            const stack = (try fixture.ownership.get(.{ .owner = 1, .index = index })).stack.?;
+            try std.testing.expectEqual(repaired.item, stack.item);
+        }
+        try std.testing.expectEqual(item, (try fixture.ownership.get(backpack)).stack.?.item);
+    }
+}
+
+test "competing experience collectors conserve every point under sustained bounded load" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/experience-competing", .{directory.sub_path});
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
+    defer store.deinit();
+    var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
+    defer registry.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
+    const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    const fixture = try InventoryFixture.init(bounded.allocator(), &store, &registry, &selected);
+    defer fixture.service.deinit();
+    const experience = (try blockContainers(bounded.allocator(), &store, &registry, fixture)).deps.experience;
+    fixture.players.records[1] = fixture.players.records[0];
+    fixture.players.records[1].handle = .{ .index = 1, .generation = 1 };
+    fixture.players.records[1].uuid = 2;
+    for (fixture.players.records) |*player| {
+        player.gamemode = .survival;
+        player.position = .{ .x = 0.5, .y = 8, .z = 0.5 };
+    }
+    fixture.players.rebuildIndexes();
+    bounded.fail_index = bounded.alloc_index;
+    var generated: i32 = 0;
+    for (0..64) |_| {
+        try experience.award(fixture.players.records[0].world, .{ 0.5, 8, 0.5 }, 73);
+        const index = experience.active.values()[0];
+        experience.orbs[index].count = 16;
+        generated += 73 * 16;
+        for (0..16) |_| {
+            if (experience.orbs[index].alive) {
+                experience.orbs[index].body.position = .{ 0.5, 8, 0.5 };
+                experience.orbs[index].body.velocity = .{ 0, 0, 0 };
+            }
+            try experience.tick();
+            var remaining: i32 = 0;
+            for (experience.active.values()) |at| if (experience.orbs[at].alive) {
+                remaining += experience.orbs[at].value * experience.orbs[at].count;
+            };
+            try std.testing.expectEqual(generated, remaining + fixture.players.records[0].experience.total + fixture.players.records[1].experience.total);
+        }
+        try std.testing.expectEqual(@as(usize, 0), experience.active.values().len);
+    }
+    for (fixture.players.records) |player| try std.testing.expectEqual(@divExact(generated, 2), player.experience.total);
+}
+
+test "spawn time orb merging uses the vanilla signed entity group and resets age" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/experience-spawn-merge", .{directory.sub_path});
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
+    defer store.deinit();
+    var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
+    defer registry.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    const fixture = try InventoryFixture.init(arena.allocator(), &store, &registry, &selected);
+    defer fixture.service.deinit();
+    const experience = (try blockContainers(arena.allocator(), &store, &registry, fixture)).deps.experience;
+    const world = fixture.players.records[0].world;
+    try experience.award(world, .{ 0.5, 8, 0.5 }, 3);
+    const index = experience.active.values()[0];
+    const entity = experience.residents[index].id;
+    try std.testing.expect(entity % 40 != 0 and entity % 40 != 20);
+    var matched = false;
+    for (0..4096) |seed| {
+        var random: Random = .{ .source = .init(seed) };
+        if (random.random().uintLessThan(u32, 40) != @mod(@as(i64, Experience.networkId(entity)), 40)) continue;
+        experience.random.source = .init(seed);
+        matched = true;
+        break;
+    }
+    try std.testing.expect(matched);
+    experience.orbs[index].age = 1234;
+    try experience.award(world, .{ 0.5, 8, 0.5 }, 3);
+    try std.testing.expectEqual(@as(usize, 1), experience.active.values().len);
+    try std.testing.expectEqual(@as(i32, 2), experience.orbs[index].count);
+    try std.testing.expectEqual(@as(u16, 0), experience.orbs[index].age);
+}
+
+test "experience pickup mending and remaining orbs commit atomically across interrupted checkpoints" {
+    for ([_]fault.Disk.Mode{ .discard, .torn, .torn_inverse }) |mode| try verifyAtomicExperience(mode);
+}
+
+fn verifyAtomicExperience(mode: fault.Disk.Mode) !void {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/experience-atomic", .{directory.sub_path});
+    var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
+    defer registry.deinit();
+    const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    var entity: u64 = undefined;
+    var repaired_item: inventories.ItemId = undefined;
+    const options: storage.Store.Options = .{ .path = path, .io_mode = .standard };
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, options);
+    var disk = fault.Disk.init(std.testing.allocator, std.testing.io, &.{ store.database, store.wal }, std.math.maxInt(usize), false) catch |err| {
+        store.deinit();
+        return err;
+    };
+    var opened = true;
+    defer {
+        if (opened) store.deinit();
+        disk.deinit();
+    }
+    store.bindIo(disk.interface());
+    for (0..4) |phase| {
+        if (phase > 0) {
+            store = try storage.Store.init(std.testing.allocator, disk.interface(), options);
+            opened = true;
+        }
+        defer {
+            store.deinit();
+            opened = false;
+            disk.detach();
+            if (phase > 0) disk.crash(mode);
+        }
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const fixture = try InventoryFixture.init(arena.allocator(), &store, &registry, &selected);
+        defer fixture.service.deinit();
+        const experience = (try blockContainers(arena.allocator(), &store, &registry, fixture)).deps.experience;
+        const player = &fixture.players.records[0];
+        player.position = .{ .x = 0.5, .y = 8, .z = 0.5 };
+        player.gamemode = .survival;
+        fixture.players.rebuildIndexes();
+        const hand: inventories.Slot = .{ .owner = player.uuid, .index = 36 };
+        if (phase == 0) {
+            var bytes: [10]u8 = undefined;
+            var entries = [_]Enchantments.Entry{.{ .id = @intCast(game_data.registry.enchantmentId("minecraft:mending").?), .level = 1 }};
+            const enchanted = try Enchantments.encode(&entries, &bytes);
+            repaired_item = try item_data.define(fixture.ownership, kind("minecraft:diamond_pickaxe"), &.{.{ .key = item_data.key(.enchantments), .value = enchanted }});
+            const damaged = try item_data.define(fixture.ownership, kind("minecraft:diamond_pickaxe"), &.{
+                .{ .key = item_data.key(.enchantments), .value = enchanted },
+                .{ .key = item_data.key(.damage), .value = &.{5} },
+            });
+            try std.testing.expect(try fixture.ownership.set(hand, 0, .{ .item = damaged, .count = 1 }));
+            try experience.award(player.world, .{ 0.5, 8, 0.5 }, 7);
+            const index = experience.active.values()[0];
+            entity = experience.residents[index].id;
+            experience.orbs[index].count = 3;
+        } else {
+            const table = records.Table.init(fixture.players.deps.storage, fixture.players.deps.record_workspaces.resources);
+            var key: [17]u8 = undefined;
+            key[0] = 1;
+            std.mem.writeInt(u128, key[1..17], player.uuid, .little);
+            var bytes: [ExperienceState.encoded_size]u8 = undefined;
+            const length = (try table.get(&key, &bytes)).?;
+            player.experience = try ExperienceState.decode(bytes[0..length]);
+            const expected: i32 = if (phase == 3) 12 else 5;
+            try std.testing.expectEqual(expected, player.experience.total);
+            try std.testing.expectEqual(expected, player.experience.score);
+            try std.testing.expectEqual(repaired_item, (try fixture.ownership.get(hand)).stack.?.item);
+            const index = experience.ids.get(entity).?;
+            try std.testing.expectEqual(@as(i32, if (phase == 3) 1 else 2), experience.orbs[index].count);
+            experience.orbs[index].body.position = .{ 0.5, 8, 0.5 };
+            experience.orbs[index].body.velocity = .{ 0, 0, 0 };
+            if (phase == 3) continue;
+        }
+        try experience.tick();
+        try std.testing.expectEqual(@as(i32, if (phase == 0) 5 else 12), player.experience.total);
+        try fixture.players.checkpoint(fixture.players.deps.storage);
+        try fixture.ownership.checkpoint(fixture.ownership.deps.storage);
+        try experience.checkpoint(experience.deps.storage);
+        if (phase != 1) try store.waitDurable(try store.commit(if (phase == 0) 1 else 2));
+    }
+}
+
+test "experience metadata bodies and random state survive reopen and discard interrupted saves" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/experience-save", .{directory.sub_path});
+    var expected_random: [32]u8 = undefined;
+    var entity: u64 = undefined;
+    const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    for (0..3) |pass| {
+        var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
+        defer store.deinit();
+        var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
+        defer registry.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const fixture = try InventoryFixture.init(arena.allocator(), &store, &registry, &selected);
+        defer fixture.service.deinit();
+        const containers = try blockContainers(arena.allocator(), &store, &registry, fixture);
+        const experience = containers.deps.experience;
+        if (pass == 0) {
+            try experience.award(fixture.players.records[0].world, .{ 8.5, 8, 0.5 }, 73);
+            const index = experience.active.values()[0];
+            entity = experience.residents[index].id;
+            experience.orbs[index].count = 5;
+            experience.orbs[index].age = 1234;
+            experience.orbs[index].fire = 80;
+            try std.testing.expect(try experience.damage(entity, 1.5));
+            expected_random = experience.random.encode();
+            try fixture.bodies.checkpoint(fixture.bodies.deps.storage);
+            try experience.checkpoint(experience.deps.storage);
+            try store.waitDurable(try store.commit(1));
+        } else {
+            const index = experience.ids.get(entity).?;
+            const orb = experience.orbs[index];
+            try std.testing.expectEqual(@as(i32, 73), orb.value);
+            try std.testing.expectEqual(@as(i32, 5), orb.count);
+            try std.testing.expectEqual(@as(u16, 1234), orb.age);
+            try std.testing.expectEqual(@as(i16, 3), orb.health);
+            try std.testing.expectEqual(@as(i16, 80), orb.fire);
+            try std.testing.expectEqualSlices(u8, &expected_random, &experience.random.encode());
+            try std.testing.expectEqual(@as(f64, 8.5), (try fixture.bodies.get(entity)).?.position[0]);
+            try std.testing.expect(try experience.damage(entity, 100));
+            try experience.checkpoint(experience.deps.storage);
+        }
+    }
+}
+
+test "orb merges preserve denomination counts and minimum age and expiry removes the body" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/experience-merge", .{directory.sub_path});
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
+    defer store.deinit();
+    var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
+    defer registry.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    const fixture = try InventoryFixture.init(arena.allocator(), &store, &registry, &selected);
+    defer fixture.service.deinit();
+    const containers = try blockContainers(arena.allocator(), &store, &registry, fixture);
+    const experience = containers.deps.experience;
+    fixture.players.records[0].position = .{ .x = 0, .y = 8, .z = 0 };
+    fixture.players.records[0].gamemode = .spectator;
+    fixture.players.rebuildIndexes();
+    const world = fixture.players.records[0].world;
+    try experience.award(world, .{ 8, 8, 0 }, 3);
+    fixture.bodies.next_id += 39;
+    try experience.award(world, .{ 10, 8, 0 }, 3);
+    try std.testing.expectEqual(@as(usize, 2), experience.active.values().len);
+    const first = experience.active.values()[0];
+    const second = experience.active.values()[1];
+    experience.orbs[first].age = 200;
+    experience.orbs[first].count = 2;
+    experience.orbs[second].age = 100;
+    experience.orbs[second].count = 5;
+    experience.orbs[second].body.position = experience.orbs[first].body.position;
+    try experience.tick();
+    try std.testing.expectEqual(@as(usize, 1), experience.active.values().len);
+    try std.testing.expectEqual(@as(i32, 3), experience.orbs[first].value);
+    try std.testing.expectEqual(@as(i32, 7), experience.orbs[first].count);
+    try std.testing.expectEqual(@as(u16, 101), experience.orbs[first].age);
+    const entity = experience.residents[first].id;
+    experience.orbs[first].age = 5999;
+    try experience.tick();
+    try std.testing.expect(!experience.orbs[first].alive);
+    try std.testing.expect((try fixture.bodies.get(entity)) == null);
+}
+
+test "orb placement fluid currents block effects and fire follow vanilla physics" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/experience-physics", .{directory.sub_path});
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
+    defer store.deinit();
+    var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
+    defer registry.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    const fixture = try InventoryFixture.init(arena.allocator(), &store, &registry, &selected);
+    defer fixture.service.deinit();
+    const containers = try blockContainers(arena.allocator(), &store, &registry, fixture);
+    const experience = containers.deps.experience;
+    const world = fixture.players.records[0].world;
+    fixture.players.records[0].gamemode = .spectator;
+    fixture.players.records[0].position = .{ .x = 8, .y = 8, .z = 8 };
+    fixture.players.rebuildIndexes();
+    try containers.deps.chunks.setBlock(world, .{ .x = 0, .y = 8, .z = 0 }, @intCast(game_data.registry.blockStateId("minecraft:stone").?));
+    try experience.award(world, .{ 1.1, 8, 0.5 }, 1);
+    const first = experience.active.values()[0];
+    try std.testing.expectEqual(@as(f64, 1.25), experience.orbs[first].body.position[0]);
+    try std.testing.expectEqual(@as(f64, 8), experience.orbs[first].body.position[1]);
+    const water: u16 = @intCast(game_data.registry.blockStateId("minecraft:water[level=0]").?);
+    try containers.deps.chunks.setBlock(world, .{ .x = 4, .y = 8, .z = 4 }, water);
+    try experience.award(world, .{ 4.5, 8, 4.5 }, 3);
+    const second = experience.active.values()[1];
+    experience.orbs[second].body.velocity = .{ 0.1, 0, 0.1 };
+    try experience.tick();
+    const body = experience.orbs[second].body;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.1) * @as(f64, @as(f32, 0.99)) * @as(f64, @as(f32, 0.98)), body.velocity[0], 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, @as(f32, 0.0005)) * @as(f64, @as(f32, 0.98)), body.velocity[1], 1e-12);
+    const stone: u16 = @intCast(game_data.registry.blockStateId("minecraft:stone").?);
+    for ([_]chunks.Position{ .{ .x = 3, .y = 8, .z = 4 }, .{ .x = 4, .y = 8, .z = 3 }, .{ .x = 4, .y = 8, .z = 5 } }) |position| try containers.deps.chunks.setBlock(world, position, stone);
+    try containers.deps.chunks.setBlock(world, .{ .x = 5, .y = 8, .z = 4 }, @intCast(game_data.registry.blockStateId("minecraft:water[level=4]").?));
+    experience.orbs[second].body.position = .{ 4.5, 8, 4.5 };
+    experience.orbs[second].body.velocity = .{ 0, 0, 0 };
+    try experience.tick();
+    try std.testing.expectApproxEqAbs(@as(f64, 0.014) * @as(f64, @as(f32, 0.99)) * @as(f64, @as(f32, 0.98)), experience.orbs[second].body.velocity[0], 1e-12);
+    try std.testing.expectEqual(@as(f64, 0), experience.orbs[second].body.velocity[2]);
+    const lava: u16 = @intCast(game_data.registry.blockStateId("minecraft:lava[level=0]").?);
+    try containers.deps.chunks.setBlock(world, .{ .x = 10, .y = 8, .z = 4 }, lava);
+    try experience.award(world, .{ 10.5, 8, 4.5 }, 7);
+    const burning = experience.active.values()[2];
+    experience.orbs[burning].body.velocity = .{ 0, 0, 0 };
+    try experience.tick();
+    try std.testing.expectEqual(@as(i16, 1), experience.orbs[burning].health);
+    try std.testing.expectEqual(@as(i16, 300), experience.orbs[burning].fire);
+    try experience.tick();
+    try std.testing.expect(!experience.orbs[burning].alive);
+    try containers.deps.chunks.setBlock(world, .{ .x = 12, .y = 8, .z = 4 }, @intCast(game_data.registry.blockStateId("minecraft:bubble_column[drag=false]").?));
+    try containers.deps.chunks.setBlock(world, .{ .x = 14, .y = 8, .z = 4 }, @intCast(game_data.registry.blockStateId("minecraft:cobweb").?));
+    var window = experience.deps.physics.readWindow();
+    defer window.deinit();
+    var moving = experience.orbs[second].body;
+    moving.position = .{ 12.5, 8, 4.5 };
+    moving.velocity = .{ 0, 0, 0 };
+    const lifted = try experience.deps.physics.advanceOrb(&window, 1, 1, moving, false, .{ 0, 0, 0 });
+    try std.testing.expectApproxEqAbs(@as(f64, 0.1) * @as(f64, @as(f32, 0.98)), lifted.body.velocity[1], 1e-12);
+    moving.position = .{ 14.5, 8.5, 4.5 };
+    moving.velocity = .{ 0.1, -0.03, 0.1 };
+    const stuck = try experience.deps.physics.advanceOrb(&window, 1, 1, moving, false, .{ 0.25, 0.05, 0.25 });
+    try std.testing.expectEqual(@as([3]f64, .{ 0.25, 0.05, 0.25 }), stuck.effects.stuck);
+    try std.testing.expectApproxEqAbs(@as(f64, 14.525), stuck.body.position[0], 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 8.4985), stuck.body.position[1], 1e-12);
+    try std.testing.expectEqual(@as([3]f64, .{ 0, 0, 0 }), stuck.body.velocity);
+    window.deinit();
+    try containers.deps.chunks.setBlock(world, .{ .x = 20, .y = 8, .z = 4 }, @intCast(game_data.registry.blockStateId("minecraft:honey_block").?));
+    window = experience.deps.physics.readWindow();
+    moving.position = .{ 21.2, 8.5, 4.5 };
+    moving.velocity = .{ 0, -0.3, 0.1 };
+    const sliding = try experience.deps.physics.advanceOrb(&window, 1, 1, moving, false, .{ 0, 0, 0 });
+    const drag = @as(f64, @as(f32, 0.98));
+    try std.testing.expect(sliding.effects.honey);
+    try std.testing.expectApproxEqAbs((-0.05 - 0.08) * drag * drag, sliding.body.velocity[1], 1e-12);
+}
+
+test "partial furnace extraction claims all stored recipe experience exactly once" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/furnace-experience", .{directory.sub_path});
+    const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    for (0..2) |pass| {
+        var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
+        defer store.deinit();
+        var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
+        defer registry.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const fixture = try InventoryFixture.init(arena.allocator(), &store, &registry, &selected);
+        defer fixture.service.deinit();
+        const containers = try blockContainers(arena.allocator(), &store, &registry, fixture);
+        const key: ContainerKey = .{ .world = fixture.players.records[0].world, .position = .{ .x = 2, .y = 1, .z = 0 } };
+        const state = containers.states.furnaces[0][0];
+        if (pass == 0) {
+            try containers.deps.chunks.setBlock(key.world, key.position, state);
+            const recipe = fixture.menu.recipes.recipes[kind("minecraft:raw_iron")].?;
+            for (0..7) |_| try containers.recordRecipe(key, recipe.index);
+            try std.testing.expect(try fixture.ownership.set(Containers.slot(key.world, key.position, 2), 0, .{ .item = try fixture.items.define("minecraft:iron_ingot"), .count = 2 }));
+            try containers.checkpoint(containers.deps.storage);
+            try fixture.ownership.checkpoint(fixture.ownership.deps.storage);
+            try containers.deps.chunks.checkpoint(try store.openSpace("chunks"));
+            try store.waitDurable(try store.commit(1));
+        } else {
+            const player = &fixture.players.records[0];
+            player.protocol = selected[0].number;
+            player.position = .{ .x = 2, .y = 1, .z = 3 };
+            try std.testing.expectEqual(BlockActions.Result.applied, try containers.deps.actions.apply(.{ .action = .use, .player = player, .position = key.position, .state = state }));
+            const view = &containers.views[0];
+            view.opened = true;
+            try containers.click(player.handle.?, .{ .window_id = view.window, .state_id = 0, .slot = 2, .button = 1, .mode = 0 });
+            try std.testing.expectEqual(@as(u16, 1), (try fixture.ownership.get(Containers.slot(key.world, key.position, 2))).stack.?.count);
+            var total: i32 = 0;
+            for (containers.deps.experience.active.values()) |index| {
+                const orb = containers.deps.experience.orbs[index];
+                total += orb.count * orb.value;
+            }
+            try std.testing.expect(total == 4 or total == 5);
+            try containers.click(player.handle.?, .{ .window_id = view.window, .state_id = 0, .slot = 2, .button = 0, .mode = 0 });
+            var after: i32 = 0;
+            for (containers.deps.experience.active.values()) |index| {
+                const orb = containers.deps.experience.orbs[index];
+                after += orb.count * orb.value;
+            }
+            try std.testing.expectEqual(total, after);
+        }
+    }
 }
 
 test "baseline recipes include fuels remainders shaped mirrored and shapeless matches" {
@@ -132,7 +644,18 @@ test "default item identity matches the serialized definition" {
 fn blockContainers(allocator: std.mem.Allocator, store: *storage.Store, registry: *metrics.Registry, fixture: InventoryFixture) !*Containers {
     const resources = try records.Workspaces.init(allocator, std.testing.io, .{});
     const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 16, .demand_sections = 4, .cache_tiles = 4 }, .{ .storage = try store.openSpace("chunks"), .metrics = registry, .record_workspaces = resources });
-    return Containers.init(allocator, .{ .active_furnaces = 8 }, .{
+    const experience = try Experience.init(allocator, .{ .maximum_orbs = 16 }, .{
+        .players = fixture.players,
+        .entities = fixture.bodies,
+        .physics = try ItemPhysics.init(allocator, .{ .chunks = terrain }),
+        .inventories = fixture.ownership,
+        .inventory = fixture.menu,
+        .storage = try store.openSpace("experience"),
+        .record_workspaces = resources,
+    });
+    return Containers.init(allocator, std.testing.io, .{ .active_furnaces = 8 }, .{
+        .experience = experience,
+        .metrics = registry,
         .players = fixture.players,
         .inventory = fixture.menu,
         .inventories = fixture.ownership,

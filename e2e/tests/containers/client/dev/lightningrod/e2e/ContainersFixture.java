@@ -29,6 +29,7 @@ final class ContainersFixture extends Fixture {
     private String phase = "waiting";
     private int readyJoin;
     private boolean reloaded;
+    private int furnaceExperience;
     private long started;
     private List<Click> script = List.of();
     private int action;
@@ -156,6 +157,7 @@ final class ContainersFixture extends Fixture {
                 phase = "waiting_reload";
             }
             case "cooking" -> {
+                if (game.player.totalExperience != 0) { client.fail("furnace_experience_before_extraction"); return; }
                 if (!stack(game, 2, Items.IRON_INGOT, 2)) return;
                 if (game.level.getBrightness(LightLayer.BLOCK, FURNACE) != 13) return;
                 if (!client.screenshot("smelted_after_reload").done()) return;
@@ -170,7 +172,9 @@ final class ContainersFixture extends Fixture {
                 phase = "output_closed";
             }
             case "output_closed" -> {
-                if (!client.fenced("output_closed")) return;
+                if (!client.fenced("output_closed") || game.player.totalExperience == 0) return;
+                furnaceExperience = game.player.totalExperience;
+                if (furnaceExperience < 1 || furnaceExperience > 2) { client.fail("furnace_experience_amount"); return; }
                 client.send("taken");
                 phase = "waiting_reload";
             }
@@ -221,6 +225,7 @@ final class ContainersFixture extends Fixture {
                 phase = "waiting_verified";
             }
             case "complete" -> {
+                if (game.player.totalExperience != furnaceExperience) return;
                 if (game.player.getInventory().countItem(Items.IRON_INGOT) != 2) return;
                 if (!client.screenshot("furnace_output_after_reload").done()) return;
                 client.pass("furnace_fuel_cooking_light_inventory_reload_verified");

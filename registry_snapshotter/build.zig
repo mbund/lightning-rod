@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) void {
         b.addNamedLazyPath("snapshot", snapshot);
         b.addNamedLazyPath("lighting", .{ .cwd_relative = b.pathJoin(&.{ directory, b.fmt("{s}-lighting.bin", .{version}) }) });
         b.addNamedLazyPath("recipes", .{ .cwd_relative = b.pathJoin(&.{ directory, b.fmt("{s}-recipes.bin", .{version}) }) });
+        b.addNamedLazyPath("physics", .{ .cwd_relative = b.pathJoin(&.{ directory, b.fmt("{s}-physics.bin", .{version}) }) });
         _ = b.step("snapshot", "Use the prepared Minecraft registries");
         return;
     }
@@ -45,6 +46,7 @@ pub fn build(b: *std.Build) void {
     command.addArg("lightingSnapshot");
     b.addNamedLazyPath("lighting", command.addPrefixedOutputFileArg("-PlightingOutput=", "lighting.bin"));
     b.addNamedLazyPath("recipes", command.addPrefixedOutputFileArg("-PrecipeOutput=", "recipes.bin"));
+    b.addNamedLazyPath("physics", command.addPrefixedOutputFileArg("-PphysicsOutput=", "physics.bin"));
     b.addNamedLazyPath("snapshot", output);
     b.step("snapshot", "Extract the selected Minecraft registries").dependOn(&command.step);
 }
