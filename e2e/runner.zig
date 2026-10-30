@@ -19,7 +19,7 @@ const scenario_timeout_s = 180;
 const Arguments = struct {
     realtime: bool = false,
     server: []const u8,
-    client: []const u8,
+    client_roots: []const []const u8,
     artifacts: ?[]const u8,
     scenario: catalog.Case,
     address: []const u8,
@@ -39,8 +39,8 @@ pub fn main(init: std.process.Init) !void {
         try std.Io.File.stdout().writeStreamingAll(init.io, "\n");
         return;
     }
-    if (args.len == 3 and std.mem.eql(u8, args[1], "--test-client")) {
-        const bundle = try client_bundle.Bundle.open(init, "client", args[2]);
+    if ((args.len == 3 or args.len == 4) and std.mem.eql(u8, args[1], "--test-client")) {
+        const bundle = try client_bundle.Bundle.open(init, args[2], if (args.len == 4) &.{args[3]} else &.{});
         const run_directory = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", init.arena.allocator());
         const command = try bundle.command(init, try std.fs.path.join(init.arena.allocator(), &.{ run_directory, ".zig-cache/client-api" }), &.{}, &.{}, true);
         var child = try std.process.spawn(init.io, .{ .argv = command, .environ_map = init.environ_map });
@@ -96,9 +96,6 @@ fn run(init: std.process.Init, arguments: Arguments, cases: []const catalog.Case
     defer init.gpa.free(working_directory);
     const server = try std.fs.path.resolve(init.gpa, &.{ working_directory, arguments.server });
     defer init.gpa.free(server);
-    const client = try cwd.realPathFileAlloc(init.io, arguments.client, init.gpa);
-    defer init.gpa.free(client);
-    try init.environ_map.put("LIGHTNING_ROD_E2E_CLIENT_SOURCE", client);
     const artifact_root = arguments.artifacts orelse try std.fs.path.join(init.arena.allocator(), &.{ arguments.scenario.directory, "artifacts" });
     try cwd.createDirPath(init.io, artifact_root);
     const root = try cwd.realPathFileAlloc(init.io, artifact_root, init.gpa);
@@ -117,29 +114,6 @@ fn run(init: std.process.Init, arguments: Arguments, cases: []const catalog.Case
     try cwd.deleteTree(init.io, artifacts);
     try cwd.createDir(init.io, artifacts, .default_dir);
     std.log.info("event=e2e_started scenario={s} artifacts={s}", .{ arguments.scenario.name, artifacts });
-    const client_versions = arguments.peer_versions;
-    for (client_versions, 0..) |version, index| {
-        var duplicate = false;
-        for (client_versions[0..index]) |previous| duplicate = duplicate or std.mem.eql(u8, previous, version);
-        if (duplicate) continue;
-        if (init.environ_map.get("LIGHTNING_ROD_E2E_CLIENTS") != null) {
-            _ = try client_bundle.Bundle.open(init, client, version);
-            continue;
-        }
-        const gradle = try buildClientArguments(init, client, version);
-        const wrapper = try std.fs.path.join(init.gpa, &.{ client, "gradlew" });
-        defer init.gpa.free(wrapper);
-        const log = try std.fmt.allocPrint(init.gpa, "client-build-{s}.log", .{version});
-        defer init.gpa.free(log);
-        var compile_client = try spawn(init, &.{ wrapper, "--no-daemon", "exportRuntime", gradle[0], gradle[1], gradle[2], gradle[3], gradle[4] }, artifacts, client, log, null);
-        process_groups[0].store(compile_client.group, .release);
-        defer {
-            compile_client.stop(init.io);
-            process_groups[0].store(0, .release);
-        }
-        const result = try compile_client.child.wait(init.io);
-        if (result != .exited or result.exited != 0) return error.ClientBuildFailed;
-    }
     const world = try std.fs.path.join(init.gpa, &.{ artifacts, "server" });
     defer init.gpa.free(world);
     try cwd.createDir(init.io, world, .default_dir);
@@ -149,7 +123,7 @@ fn run(init: std.process.Init, arguments: Arguments, cases: []const catalog.Case
         const preparation = try std.fs.path.join(init.gpa, &.{ artifacts, "prepare" });
         defer init.gpa.free(preparation);
         try cwd.createDir(init.io, preparation, .default_dir);
-        runScenario(init, catalog.find(cases, scenario).?, server, client, preparation, world, arguments.address, arguments.client_version, &.{}, arguments.realtime, arguments.upgrade_from) catch |err| {
+        runScenario(init, catalog.find(cases, scenario).?, server, preparation, world, arguments.address, arguments.client_version, &.{}, arguments.realtime, arguments.upgrade_from, arguments.client_roots) catch |err| {
             try writeSummary(init, preparation, scenario, false, @errorName(err));
             if (err == error.PerformanceBudgetExceeded) preparation_performance_failed = true else {
                 try writeSummary(init, artifacts, arguments.scenario.name, false, @errorName(err));
@@ -158,7 +132,7 @@ fn run(init: std.process.Init, arguments: Arguments, cases: []const catalog.Case
         };
     }
 
-    runScenario(init, arguments.scenario, server, client, artifacts, world, arguments.address, arguments.client_version, arguments.peer_versions, arguments.realtime, arguments.upgrade_from) catch |err| {
+    runScenario(init, arguments.scenario, server, artifacts, world, arguments.address, arguments.client_version, arguments.peer_versions, arguments.realtime, arguments.upgrade_from, arguments.client_roots) catch |err| {
         writeSummary(init, artifacts, arguments.scenario.name, false, @errorName(err)) catch {};
         std.log.err("event=e2e_failed reason={s} artifacts={s}", .{ @errorName(err), artifacts });
         return err;
@@ -170,7 +144,7 @@ fn run(init: std.process.Init, arguments: Arguments, cases: []const catalog.Case
     std.log.info("event=e2e_passed artifacts={s}", .{artifacts});
 }
 
-fn runScenario(init: std.process.Init, test_case: catalog.Case, server_path: []const u8, client_dir: []const u8, artifacts: []const u8, world: []const u8, requested_address: []const u8, primary_version: []const u8, peer_versions: []const []const u8, realtime: bool, upgrade_from: []const u8) !void {
+fn runScenario(init: std.process.Init, test_case: catalog.Case, server_path: []const u8, artifacts: []const u8, world: []const u8, requested_address: []const u8, primary_version: []const u8, peer_versions: []const []const u8, realtime: bool, upgrade_from: []const u8, client_roots: []const []const u8) !void {
     std.debug.assert(peer_versions.len == 0 or peer_versions.len == test_case.peers.len);
     var listener = try Listener.init(init.io, requested_address);
     defer listener.deinit(init.io);
@@ -246,7 +220,7 @@ fn runScenario(init: std.process.Init, test_case: catalog.Case, server_path: []c
     for (peers) |peer| {
         const connect_tick: usize = if (count + 1 == peers.len) test_case.last_peer_connect_tick else 40;
         const peer_version = if (peer_versions.len == 0) primary_version else peer_versions[count];
-        clients[count] = try spawnClient(init, client_dir, artifacts, scenario, peer, peers, connect_tick, address, peer_version, display);
+        clients[count] = try spawnClient(init, artifacts, scenario, peer, peers, connect_tick, address, peer_version, display, client_roots);
         process_groups[count + 2].store(clients[count].group, .release);
         count += 1;
         const startup_deadline = std.Io.Clock.Timestamp.now(init.io, .awake).raw.nanoseconds + 120 * std.time.ns_per_s;
@@ -338,7 +312,7 @@ fn waitForDisplay(init: std.process.Init, artifacts: []const u8) ![]const u8 {
     return error.DisplayStartupTimeout;
 }
 
-fn spawnClient(init: std.process.Init, client_dir: []const u8, artifacts: []const u8, scenario: []const u8, peer: []const u8, peers: []const []const u8, connect_tick: usize, address: []const u8, client_version: []const u8, display: []const u8) !ManagedChild {
+fn spawnClient(init: std.process.Init, artifacts: []const u8, scenario: []const u8, peer: []const u8, peers: []const []const u8, connect_tick: usize, address: []const u8, client_version: []const u8, display: []const u8, client_roots: []const []const u8) !ManagedChild {
     const allocator = init.gpa;
     const version = try std.fmt.allocPrint(allocator, "-Dmcc.version={s}", .{client_version});
     defer allocator.free(version);
@@ -364,7 +338,7 @@ fn spawnClient(init: std.process.Init, client_dir: []const u8, artifacts: []cons
     defer environment.deinit();
     try environment.put("DISPLAY", display);
     try environment.put("LP_NUM_THREADS", "2");
-    const bundle = try client_bundle.Bundle.open(init, client_dir, client_version);
+    const bundle = try client_bundle.Bundle.open(init, client_version, client_roots);
     const command = try bundle.command(init, run_dir, &.{ version, address_arg, events, output, peer_arg, expected, scenario_arg, connect_arg }, &.{ "--username", peer, "--gameDir", run_dir }, false);
     const log_path = try std.fmt.allocPrint(allocator, "{s}/{s}.log", .{ artifacts, peer });
     defer allocator.free(log_path);
@@ -446,11 +420,11 @@ fn parse(init: std.process.Init, values: []const [:0]const u8, cases: []const ca
     var realtime = false;
     var address: []const u8 = "127.0.0.1:0";
     var server: ?[]const u8 = null;
-    var client: []const u8 = "client";
     var artifacts: ?[]const u8 = null;
     var scenario: ?catalog.Case = null;
     var version: ?[]const u8 = null;
     var upgrade_from: []const u8 = "HEAD^";
+    var client_roots: std.ArrayList([]const u8) = .empty;
     var index: usize = 1;
 
     while (index < values.len) : (index += 2) {
@@ -459,10 +433,14 @@ fn parse(init: std.process.Init, values: []const [:0]const u8, cases: []const ca
         const key = values[index];
         const value = values[index + 1];
         if (std.mem.eql(u8, key, "--tests")) continue;
+        if (std.mem.eql(u8, key, "--clients")) {
+            try client_roots.append(init.arena.allocator(), value);
+            continue;
+        }
 
         if (std.mem.eql(u8, key, "--realtime")) {
             if (std.mem.eql(u8, value, "true")) realtime = true else if (std.mem.eql(u8, value, "false")) realtime = false else return error.InvalidRealtimeMode;
-        } else if (std.mem.eql(u8, key, "--upgrade-from")) upgrade_from = value else if (std.mem.eql(u8, key, "--client-version")) version = value else if (std.mem.eql(u8, key, "--server")) server = value else if (std.mem.eql(u8, key, "--address")) address = value else if (std.mem.eql(u8, key, "--client")) client = value else if (std.mem.eql(u8, key, "--artifacts")) artifacts = value else if (std.mem.eql(u8, key, "--scenario")) scenario = catalog.find(cases, value) orelse return error.UnknownScenario else return error.UnknownArgument;
+        } else if (std.mem.eql(u8, key, "--upgrade-from")) upgrade_from = value else if (std.mem.eql(u8, key, "--client-version")) version = value else if (std.mem.eql(u8, key, "--server")) server = value else if (std.mem.eql(u8, key, "--address")) address = value else if (std.mem.eql(u8, key, "--artifacts")) artifacts = value else if (std.mem.eql(u8, key, "--scenario")) scenario = catalog.find(cases, value) orelse return error.UnknownScenario else return error.UnknownArgument;
     }
 
     const client_version = version orelse return error.MissingClientVersion;
@@ -472,41 +450,12 @@ fn parse(init: std.process.Init, values: []const [:0]const u8, cases: []const ca
         .realtime = realtime,
         .address = address,
         .server = server orelse return error.MissingServerExecutable,
-        .client = client,
+        .client_roots = client_roots.items,
         .artifacts = artifacts,
         .scenario = selected,
         .client_version = protocol_catalog.versions[protocol_catalog.releaseIndex(client_version).?].minecraft_version,
         .peer_versions = peer_versions,
         .upgrade_from = upgrade_from,
-    };
-}
-
-fn buildClientArguments(init: std.process.Init, client: []const u8, version: []const u8) ![5][]const u8 {
-    const allocator = init.arena.allocator();
-    const Version = struct { release: []const u8, api: []const u8, fabric: []const u8 };
-    const path = try std.fs.path.join(allocator, &.{ client, "versions.json" });
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(64 * 1024));
-    const versions = try std.json.parseFromSliceLeaky([]const Version, allocator, bytes, .{});
-    var selected: ?Version = null;
-    for (versions) |entry| if (std.mem.eql(u8, entry.release, version)) {
-        if (selected != null) return error.DuplicateClientVersion;
-        selected = entry;
-    };
-    const entry = selected orelse return error.UnsupportedClientVersion;
-    const directory = try std.Io.Dir.cwd().realPathFileAlloc(init.io, client, allocator);
-    const project = try std.fs.path.join(allocator, &.{ directory, "build", "clients", entry.release });
-    try std.Io.Dir.cwd().createDirPath(init.io, project);
-    for ([_][]const u8{ "build.gradle", "settings.gradle", "gradle.properties" }) |name| {
-        const source = try std.fs.path.join(allocator, &.{ directory, name });
-        const destination = try std.fs.path.join(allocator, &.{ project, name });
-        try std.Io.Dir.cwd().copyFile(source, .cwd(), destination, init.io, .{});
-    }
-    return .{
-        try std.fmt.allocPrint(allocator, "-Pminecraft_version={s}", .{entry.release}),
-        try std.fmt.allocPrint(allocator, "-Pclient_api={s}", .{entry.api}),
-        try std.fmt.allocPrint(allocator, "-Pfabric_api_version={s}", .{entry.fabric}),
-        "-p",
-        project,
     };
 }
 

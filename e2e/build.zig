@@ -2,6 +2,7 @@ const protocol_definitions = @import("protocols");
 const std = @import("std");
 const catalog = @import("src/catalog.zig");
 const selection = @import("src/selection.zig");
+const client_build = @import("src/client_build.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -133,25 +134,24 @@ pub fn build(b: *std.Build) void {
     artifacts_test.addArg("dev.lightningrod.e2e.ArtifactsTest");
     b.step("test-artifacts", "Verify atomic Java artifact publication").dependOn(&artifacts_test.step);
 
-    const client_test_step = b.step("test-client", "Verify fixture messages and screenshot completion");
-    if (b.graph.environ_map.get("LIGHTNING_ROD_E2E_CLIENTS") != null) {
-        const client_test = b.addRunArtifact(runner);
-        client_test.setCwd(b.path("."));
-        const properties = std.Io.Dir.cwd().readFileAlloc(b.graph.io, b.pathFromRoot("client/gradle.properties"), b.allocator, .limited(4096)) catch @panic("Cannot read client version");
-        var lines = std.mem.splitScalar(u8, properties, '\n');
-        var default_version: ?[]const u8 = null;
-        while (lines.next()) |line| if (std.mem.startsWith(u8, line, "minecraft_version=")) {
-            default_version = std.mem.trim(u8, line["minecraft_version=".len..], "\r ");
-            break;
-        };
-        client_test.addArgs(&.{ "--test-client", default_version orelse @panic("Missing default client version") });
-        client_test_step.dependOn(&client_test.step);
-    } else {
-        const client_test = b.addSystemCommand(&.{ "./gradlew", "--no-daemon", "testFixtureApi" });
-        client_test.setCwd(b.path("client"));
-        client_test.stdio = .inherit;
-        client_test_step.dependOn(&client_test.step);
+    var clients = client_build.Clients.init(b, if (std.fs.path.isAbsolute(tests_root)) .{ .cwd_relative = tests_root } else b.path(tests_root));
+    const prepare_client = b.step("prepare-client", "Prepare the selected Minecraft client without running an E2E");
+    if (b.graph.environ_map.get("LIGHTNING_ROD_E2E_CLIENTS") == null) {
+        const bundle = clients.get(client_version);
+        bundle.addStepDependencies(prepare_client);
     }
+    const client_test_step = b.step("test-client", "Verify fixture messages and screenshot completion");
+    const client_test = b.addRunArtifact(runner);
+    client_test.setCwd(b.path("."));
+    const properties = std.Io.Dir.cwd().readFileAlloc(b.graph.io, b.pathFromRoot("client/gradle.properties"), b.allocator, .limited(4096)) catch @panic("Cannot read client version");
+    var lines = std.mem.splitScalar(u8, properties, '\n');
+    const default_version = while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "minecraft_version=")) break std.mem.trim(u8, line["minecraft_version=".len..], "\r ");
+    } else @panic("Missing default client version");
+    client_test.addArgs(&.{ "--test-client", default_version });
+    if (b.graph.environ_map.get("LIGHTNING_ROD_E2E_CLIENTS") == null) client_test.addDirectoryArg(clients.get(default_version));
+    client_test.has_side_effects = true;
+    client_test_step.dependOn(&client_test.step);
 
     const list = b.addRunArtifact(runner);
     const upgrade_versions = b.addRunArtifact(runner);
@@ -194,9 +194,19 @@ pub fn build(b: *std.Build) void {
         if (previous) |step| run.step.dependOn(step);
         previous = &run.step;
         run.setCwd(b.path("."));
+        if (scenario != null and b.graph.environ_map.get("LIGHTNING_ROD_E2E_CLIENTS") == null) {
+            const versions = selection.peerVersions(protocol_definitions.catalog, b.allocator, selected, client_version) catch @panic("Cannot select client versions");
+            for (versions, 0..) |version, index| {
+                if (for (versions[0..index]) |previous_version| {
+                    if (std.mem.eql(u8, version, previous_version)) break true;
+                } else false) continue;
+                run.addArg("--clients");
+                run.addDirectoryArg(clients.get(version));
+            }
+        }
         run.setEnvironmentVariable("LIGHTNING_ROD_E2E_KEY", b.dependency("minecraft_java", .{ .target = target, .optimize = optimize }).path("tests/fixtures/rsa-key.der").getPath(b));
         if (selected.upgrade) run.setEnvironmentVariable("LIGHTNING_ROD_E2E_ZIG", b.graph.zig_exe);
-        run.addArgs(&.{ "--scenario", selected.name, "--client", "client", "--realtime", if (realtime) "true" else "false" });
+        run.addArgs(&.{ "--scenario", selected.name, "--realtime", if (realtime) "true" else "false" });
         if (artifacts) |directory| run.addArgs(&.{ "--artifacts", directory });
         run.addArgs(&.{ "--address", address });
         run.addArgs(&.{ "--client-version", client_version });

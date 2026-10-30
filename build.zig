@@ -1,4 +1,5 @@
 const std = @import("std");
+const cache_clean = @import("src/cache_clean.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -33,6 +34,13 @@ pub fn build(b: *std.Build) void {
     }) }));
     test_step.dependOn(&allocation_tests.step);
     core_test_step.dependOn(&allocation_tests.step);
+    const cache_tests = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/cache_clean.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) }));
+    test_step.dependOn(&cache_tests.step);
+    core_test_step.dependOn(&cache_tests.step);
     const runtime_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/runtime/memset.zig"),
         .target = target,
@@ -50,6 +58,8 @@ pub fn build(b: *std.Build) void {
     core_test_step.dependOn(&simulation_tests_run.step);
 
     if (b.dep_prefix.len != 0) return;
+
+    cache_clean.add(b);
 
     const suites = [_]struct { directory: []const u8, targets: []const []const u8 = &.{"test"} }{
         .{ .directory = "reload" },
@@ -71,12 +81,15 @@ pub fn build(b: *std.Build) void {
         .{ .directory = "minecraft_java" },
         .{ .directory = "e2e", .targets = &.{ "test-performance", "test-harness", "test-artifacts", "test-client" } },
     };
+    const shared_cache = b.cache_root.handle.realPathFileAlloc(b.graph.io, ".", b.allocator) catch @panic("Cannot resolve build cache");
     const triple = target.query.zigTriple(b.allocator) catch @panic("OOM");
     const cpu = target.query.serializeCpuAlloc(b.allocator) catch @panic("OOM");
     for (suites) |suite| {
         const run = b.addSystemCommand(&.{
             b.graph.zig_exe,
             "build",
+            "--cache-dir",
+            shared_cache,
             b.fmt("-Doptimize={s}", .{@tagName(optimize)}),
             b.fmt("-Dtarget={s}", .{triple}),
             b.fmt("-Dcpu={s}", .{cpu}),

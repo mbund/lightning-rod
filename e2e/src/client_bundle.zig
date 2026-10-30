@@ -14,12 +14,21 @@ pub const Bundle = struct {
     root: []const u8,
     manifest: Manifest,
 
-    pub fn open(init: std.process.Init, client: []const u8, version: []const u8) !Bundle {
+    pub fn open(init: std.process.Init, version: []const u8, roots: []const []const u8) !Bundle {
         const allocator = init.arena.allocator();
-        const root = if (init.environ_map.get("LIGHTNING_ROD_E2E_CLIENTS")) |prepared|
-            try std.fs.path.join(allocator, &.{ prepared, version })
-        else
-            try std.fs.path.join(allocator, &.{ client, "build/clients", version, "build/runtime" });
+        const root = root: {
+            for (roots) |parent| {
+                const candidate = try std.fs.path.join(allocator, &.{ parent, version });
+                std.Io.Dir.cwd().access(init.io, candidate, .{}) catch |err| switch (err) {
+                    error.FileNotFound => continue,
+                    else => return err,
+                };
+                break :root candidate;
+            }
+            if (roots.len != 0) return error.ClientBundleUnavailable;
+            const prepared = init.environ_map.get("LIGHTNING_ROD_E2E_CLIENTS") orelse return error.ClientBundleUnavailable;
+            break :root try std.fs.path.join(allocator, &.{ prepared, version });
+        };
         const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, try std.fs.path.join(allocator, &.{ root, "runtime.json" }), allocator, .limited(4 * 1024 * 1024));
         const parsed = try std.json.parseFromSlice(Manifest, allocator, bytes, .{ .allocate = .alloc_always });
         if (!std.mem.eql(u8, parsed.value.version, version)) return error.ClientBundleVersionMismatch;

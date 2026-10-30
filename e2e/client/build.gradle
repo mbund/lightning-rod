@@ -105,10 +105,11 @@ tasks.register('exportRuntime') {
     dependsOn tasks.named('testClasses'), tasks.named('configureLaunch')
     inputs.files(sourceSets.client.runtimeClasspath, sourceSets.test.runtimeClasspath)
     inputs.property 'minecraft_version', minecraft_version
-    def destination = layout.buildDirectory.dir('runtime')
+    def destination = providers.gradleProperty('runtimeOutput').map { file(it) }
+        .orElse(layout.buildDirectory.dir('runtime').map { it.asFile })
     outputs.dir(destination)
     doLast {
-        def output = destination.get().asFile
+        def output = destination.get()
         delete(output)
         output.mkdirs()
         def run = tasks.named('runClient').get()
