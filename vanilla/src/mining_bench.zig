@@ -1,3 +1,4 @@
+const vanilla_content = @import("vanilla_content.zig");
 const std = @import("std");
 const storage = @import("storage");
 const records = @import("records");
@@ -6,6 +7,8 @@ const metrics = @import("metrics");
 const game_data = @import("game_data");
 const Items = @import("items.zig").Items;
 const RegistryIdentity = @import("registry_identity.zig").RegistryIdentity;
+const loot_tables = @import("loot.zig");
+const item_data = @import("item_data.zig");
 const BlockLoot = @import("block_loot.zig").BlockLoot;
 
 pub fn benchmark() !void {
@@ -28,8 +31,9 @@ pub fn benchmark() !void {
         .record_workspaces = workspaces,
     });
     const identity = try RegistryIdentity.init(allocator, .{ .storage = try store.openSpace("registry") });
-    const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = identity });
-    const loot = try BlockLoot.init(allocator);
+    const gameplay_definitions = try vanilla_content.prepare(allocator);
+    const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = identity });
+    const loot = try BlockLoot.init(allocator, .{ .loot = gameplay_definitions.loot });
     const Case = struct { block: []const u8, tool: []const u8, drop: []const u8, speed: f32 };
     const cases = [_]Case{
         .{ .block = "minecraft:stone", .tool = "minecraft:diamond_pickaxe", .drop = "minecraft:cobblestone", .speed = 8 },
@@ -63,11 +67,9 @@ pub fn benchmark() !void {
         const writes = ownership.items.metrics.writes.value();
         for (0..20) |_| for (0..miners) |index| {
             const at = index % cases.len;
-            const result = loot.evaluate(states[at], try resolved[index].resolve(items, tools[at]));
+            const result = gameplay_definitions.mining.evaluate(states[at], (try resolved[index].resolve(items, tools[at])).kind);
             try std.testing.expectEqual(cases[at].speed, result.speed);
             try std.testing.expect(result.harvest);
-            try std.testing.expectEqual(@as(u32, @intCast(game_data.registry.itemId(cases[at].drop).?)), result.drop.?.kind);
-            try std.testing.expectEqual(@as(u16, 1), result.drop.?.count);
         };
         const acquired = ownership.items.metrics.acquired.value() - definitions;
         const referenced = ownership.references.metrics.acquired.value() - references;
@@ -85,21 +87,27 @@ pub fn benchmark() !void {
         .{ .block = "minecraft:oak_slab[type=double,waterlogged=false]", .drop = "minecraft:oak_slab", .count = 2 },
         .{ .block = "minecraft:oak_slab[type=bottom,waterlogged=false]", .drop = "minecraft:oak_slab", .count = 1 },
     }) |case| {
-        const result = loot.evaluate(@intCast(game_data.registry.blockStateId(case.block).?), &.{});
+        const state: u16 = @intCast(game_data.registry.blockStateId(case.block).?);
+        var scratch_buffer: [16384]u8 = undefined;
+        var scratch: std.heap.FixedBufferAllocator = .init(&scratch_buffer);
+        var random: std.Random.DefaultPrng = .init(0);
+        var drop_buffer: [64]loot_tables.Drop = undefined;
+        const drops = try loot.table(state).?.evaluate(&.{ .items = gameplay_definitions.items, .state = state, .random = random.random(), .scratch = &scratch }, &drop_buffer);
+        try std.testing.expectEqual(@as(usize, 1), drops.len);
         const definitions = ownership.items.metrics.acquired.value();
         const references = ownership.references.metrics.acquired.value();
-        const stack = try result.drop.?.materialize(items);
+        const stack: inventories.Stack = .{ .item = try item_data.define(ownership, drops[0].kind, drops[0].components), .count = drops[0].count };
         try std.testing.expectEqual(definitions + 1, ownership.items.metrics.acquired.value());
         try std.testing.expectEqual(references + 1, ownership.references.metrics.acquired.value());
         try std.testing.expectEqual(case.count, stack.count);
         try std.testing.expectEqual(@as(u32, @intCast(game_data.registry.itemId(case.drop).?)), try items.kind(stack));
     }
-    const stone = loot.evaluate(@intCast(game_data.registry.blockStateId("minecraft:stone").?), &.{});
+    const stone = gameplay_definitions.mining.evaluate(@intCast(game_data.registry.blockStateId("minecraft:stone").?), null);
     try std.testing.expect(!stone.harvest);
-    try std.testing.expectEqual(null, stone.drop);
+
     var selected: BlockLoot.Tool = .{};
-    const bedrock = loot.evaluate(@intCast(game_data.registry.blockStateId("minecraft:bedrock").?), try selected.resolve(items, tools[0]));
-    try std.testing.expectEqual(null, bedrock.drop);
+    const bedrock = gameplay_definitions.mining.evaluate(@intCast(game_data.registry.blockStateId("minecraft:bedrock").?), (try selected.resolve(items, tools[0])).kind);
+    try std.testing.expectEqual(@as(f32, 1), bedrock.speed);
     const acquired = ownership.items.metrics.acquired.value();
     try std.testing.expectEqual(selected.kind, (try selected.resolve(items, .{ .item = tools[0].item, .count = 2 })).kind);
     try std.testing.expectEqual(acquired, ownership.items.metrics.acquired.value());

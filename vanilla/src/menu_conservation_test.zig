@@ -49,7 +49,7 @@ test "adversarial clicks conserve items across every survival menu layout" {
         var next: [menu_click.maximum_slots]?inventories.Stack = @splat(null);
         var drag: menu_click.Drag = .{};
         const length = if (layout.kind == .player) 47 else layout.slots + 38;
-        const menu: menu_click.Menu = .{ .inventory = fixture.menu, .kind = layout.kind, .container_slots = layout.slots, .stacks = next[0..length], .drag = &drag, .creative = false };
+        const menu: menu_click.Menu = .{ .inventory = fixture.menu, .player = fixture.players.records[0].uuid, .location = fixture.location(layout.kind), .kind = layout.kind, .container_slots = layout.slots, .stacks = next[0..length], .drag = &drag, .creative = false };
         for (menu.stacks, 0..) |*stack, index| {
             if (layout.kind == .player and index < 9) continue;
             if (layout.kind == .crafting and index == 0) continue;
@@ -106,7 +106,7 @@ test "crafting output clicks conserve ingredients including overflow drops" {
         var random = std.Random.DefaultPrng.init(seed);
         var next: [48]?inventories.Stack = @splat(null);
         var drag: menu_click.Drag = .{};
-        const menu: menu_click.Menu = .{ .inventory = fixture.menu, .kind = kind, .container_slots = if (kind == .player) 0 else 10, .stacks = next[0..if (kind == .player) 47 else 48], .drag = &drag, .creative = false };
+        const menu: menu_click.Menu = .{ .inventory = fixture.menu, .player = fixture.players.records[0].uuid, .location = fixture.location(kind), .kind = kind, .container_slots = if (kind == .player) 0 else 10, .stacks = next[0..if (kind == .player) 47 else 48], .drag = &drag, .creative = false };
         next[1] = .{ .item = items[0], .count = @intCast(seed + 1) };
         const begin: usize = if (kind == .player) 9 else 10;
         for (menu.stacks[begin..]) |*stack| if (random.random().boolean()) {

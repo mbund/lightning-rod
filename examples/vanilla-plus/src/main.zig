@@ -22,6 +22,7 @@ pub fn main(init: std.process.Init) !void {
                 .permission_policy = grants.policy(),
             }),
         }),
+        lightning_rod.plugin.configured(vanilla.Datapacks, .{ .sources = &.{.{ .collection = "datapacks" }} }),
         lightning_rod.plugin.configured(economy.Economy, economy.Economy.Configuration{
             .unit = "credit",
             .precision = 3,

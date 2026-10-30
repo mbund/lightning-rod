@@ -14,6 +14,8 @@
         .minecraft_model = .{ .path = "../minecraft_model" },
         .economy = .{ .path = "../examples/plugins/economy" },
         .shop = .{ .path = "../examples/plugins/shop" },
+        .silk_spawners = .{ .path = "../examples/plugins/silk_spawners" },
+        .storm_stick = .{ .path = "../examples/plugins/storm_stick" },
         .skyblock = .{ .path = "../examples/skyblock" },
         .economy_commands = .{ .path = "../examples/plugins/economy_commands" },
         .shop_commands = .{ .path = "../examples/plugins/shop_commands" },

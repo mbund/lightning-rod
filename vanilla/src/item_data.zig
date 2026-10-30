@@ -1,3 +1,4 @@
+const recipes = @import("recipes.zig");
 const std = @import("std");
 const inventories = @import("inventories");
 const support = @import("protocol_support");
@@ -7,7 +8,7 @@ const header_bytes = 10;
 const entry_bytes = 12;
 const removed = std.math.maxInt(u32);
 
-pub const Component = struct { key: u64, value: ?[]const u8 };
+pub const Component = recipes.Component;
 
 pub fn key(comptime tag: anytype) u64 {
     return support.cursor.layout.nameKey(@tagName(tag));
@@ -88,8 +89,19 @@ pub fn defaultId(kind: u32) inventories.ItemId {
     return id;
 }
 
-pub fn define(store: *inventories.Inventories, kind: u32, components: []const Component) !inventories.ItemId {
+pub fn encodedSize(components: []const Component) !usize {
     if (components.len > maximum_components) return error.ItemTooLarge;
+    var size = header_bytes + entry_bytes * components.len;
+    for (components) |component| if (component.value) |bytes| {
+        if (bytes.len >= removed) return error.ItemTooLarge;
+        size = try std.math.add(usize, size, bytes.len);
+    };
+    return size;
+}
+
+pub fn encode(output: []u8, kind: u32, components: []const Component) !View {
+    const size = try encodedSize(components);
+    if (output.len < size) return error.ItemTooLarge;
     var sorted: [maximum_components]Component = undefined;
     @memcpy(sorted[0..components.len], components);
     std.mem.sort(Component, sorted[0..components.len], {}, struct {
@@ -97,28 +109,75 @@ pub fn define(store: *inventories.Inventories, kind: u32, components: []const Co
             return a.key < b.key;
         }
     }.less);
-    var header: [header_bytes]u8 = undefined;
-    @memcpy(header[0..4], "LRI2");
-    std.mem.writeInt(u32, header[4..8], kind, .little);
-    std.mem.writeInt(u16, header[8..10], @intCast(components.len), .little);
-    var headers: [maximum_components][entry_bytes]u8 = undefined;
-    var parts: [1 + maximum_components * 2][]const u8 = undefined;
-    parts[0] = &header;
-    var count: usize = 1;
-    for (sorted[0..components.len], headers[0..components.len], 0..) |component, *entry, index| {
+    @memcpy(output[0..4], "LRI2");
+    std.mem.writeInt(u32, output[4..8], kind, .little);
+    std.mem.writeInt(u16, output[8..10], @intCast(components.len), .little);
+    var offset: usize = header_bytes;
+    for (sorted[0..components.len], 0..) |component, index| {
         if (index != 0 and sorted[index - 1].key == component.key) return error.DuplicateComponent;
-        const length = if (component.value) |bytes| bytes.len else 0;
-        if (length >= removed) return error.ItemTooLarge;
-        std.mem.writeInt(u64, entry[0..8], component.key, .little);
-        std.mem.writeInt(u32, entry[8..12], if (component.value != null) @intCast(length) else removed, .little);
-        parts[count] = entry;
-        count += 1;
-        if (component.value) |bytes| {
-            parts[count] = bytes;
-            count += 1;
+        std.mem.writeInt(u64, output[offset..][0..8], component.key, .little);
+        std.mem.writeInt(u32, output[offset + 8 ..][0..4], if (component.value) |value| @intCast(value.len) else removed, .little);
+        offset += entry_bytes;
+        if (component.value) |value| {
+            @memcpy(output[offset..][0..value.len], value);
+            offset += value.len;
         }
     }
-    return store.defineItem(parts[0..count]);
+    std.debug.assert(offset == size);
+    return View.parse(output[0..size]);
+}
+
+const Parts = struct {
+    header: [header_bytes]u8 = undefined,
+    headers: [maximum_components][entry_bytes]u8 = undefined,
+    parts: [1 + maximum_components * 2][]const u8 = undefined,
+    count: usize = 0,
+
+    fn init(self: *Parts, kind: u32, components: []const Component) !void {
+        if (components.len > maximum_components) return error.ItemTooLarge;
+        var sorted: [maximum_components]Component = undefined;
+        @memcpy(sorted[0..components.len], components);
+        std.mem.sort(Component, sorted[0..components.len], {}, struct {
+            fn less(_: void, a: Component, b: Component) bool {
+                return a.key < b.key;
+            }
+        }.less);
+        @memcpy(self.header[0..4], "LRI2");
+        std.mem.writeInt(u32, self.header[4..8], kind, .little);
+        std.mem.writeInt(u16, self.header[8..10], @intCast(components.len), .little);
+        self.parts[0] = &self.header;
+        self.count = 1;
+        for (sorted[0..components.len], self.headers[0..components.len], 0..) |component, *entry, index| {
+            if (index != 0 and sorted[index - 1].key == component.key) return error.DuplicateComponent;
+            const length = if (component.value) |bytes| bytes.len else 0;
+            if (length >= removed) return error.ItemTooLarge;
+            std.mem.writeInt(u64, entry[0..8], component.key, .little);
+            std.mem.writeInt(u32, entry[8..12], if (component.value != null) @intCast(length) else removed, .little);
+            self.parts[self.count] = entry;
+            self.count += 1;
+            if (component.value) |bytes| {
+                self.parts[self.count] = bytes;
+                self.count += 1;
+            }
+        }
+    }
+};
+
+pub fn identity(kind: u32, components: []const Component) !inventories.ItemId {
+    var parts: Parts = .{};
+    try parts.init(kind, components);
+    var hash = std.crypto.hash.Blake3.init(.{});
+    for (parts.parts[0..parts.count]) |part| hash.update(part);
+    var id: inventories.ItemId = undefined;
+    hash.final(&id);
+    return id;
+}
+
+pub fn define(store: *inventories.Inventories, kind: u32, components: []const Component) !inventories.ItemId {
+    if (try encodedSize(components) > store.config.max_item_bytes) return error.ItemTooLarge;
+    var parts: Parts = .{};
+    try parts.init(kind, components);
+    return store.defineItem(parts.parts[0..parts.count]);
 }
 
 pub fn replace(store: *inventories.Inventories, stack: inventories.Stack, component: Component) !inventories.Stack {

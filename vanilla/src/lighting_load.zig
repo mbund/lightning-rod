@@ -1,3 +1,4 @@
+const vanilla_content = @import("vanilla_content.zig");
 const std = @import("std");
 const chunks = @import("chunks");
 const storage = @import("storage");
@@ -102,7 +103,7 @@ test "lighting load scenarios" {
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 48, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = resources });
         var source: Scene = .{};
         terrain.setSource(chunks.Source.init(&source, Scene.read));
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         const blocks = try BlockSynchronization.init(allocator, io, .{ .metrics = &registry, .chunks = terrain, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .worlds = dimensions }, .{});

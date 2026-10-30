@@ -1,3 +1,5 @@
+const recipes = @import("recipes.zig");
+const recipe_placement = @import("recipe_placement.zig");
 const std = @import("std");
 const menu_click = @import("menu_click.zig");
 const Containers = @import("containers.zig").Containers;
@@ -67,6 +69,26 @@ pub const InventoryMenus = struct {
         if (!self.deps.inventory.states[handle.index].external) try self.apply(handle.index, .{ .inventory_click = click });
     }
 
+    pub fn placeRecipe(self: *InventoryMenus, handle: sessions.Handle, window: i32, table: *const recipes.BookTable, recipe: *const recipes.BookEntry, all: bool) !recipe_placement.Result {
+        if (window != 0) return self.deps.containers.placeRecipe(handle, window, table, recipe, all);
+        const index = handle.index;
+        const player = self.deps.players.records[index];
+        const state = &self.deps.inventory.states[index];
+        if (player.handle == null or !std.meta.eql(player.handle.?, handle) or player.stage != .ready or player.gamemode == .spectator or state.external or recipe.furnace) return .blocked;
+        var slots: [47]inventories.Slot = undefined;
+        var contents: [47]inventories.Contents = undefined;
+        try self.deps.inventory.load(index, &slots, &contents);
+        var next: [47]?inventories.Stack = undefined;
+        for (contents, &next) |value, *stack| stack.* = value.stack;
+        const result = try recipe_placement.place(self.deps.items, table, recipe, &next, &.{ 1, 2, 3, 4 }, 2, 9, all);
+        if (result == .blocked) return result;
+        const menu: menu_click.Menu = .{ .inventory = self.deps.inventory, .player = player.uuid, .location = .{ .player = .{ .world = player.world, .position = player.position } }, .kind = .player, .container_slots = 0, .stacks = &next, .drag = &state.drag, .creative = player.gamemode == .creative };
+        try menu.refresh();
+        if (!try self.deps.inventory.apply(index, &slots, &contents, &next, &.{})) return .blocked;
+        self.deps.inventory.changed(index);
+        return result;
+    }
+
     fn apply(self: *InventoryMenus, player_index: usize, event: Action) !void {
         const menu = self.deps.inventory;
         const player = &self.deps.players.records[player_index];
@@ -82,6 +104,7 @@ pub const InventoryMenus = struct {
         action: {
             var drops: [10]inventories.Stack = undefined;
             var drop_count: usize = 0;
+            var craft_batch: ?PlayerInventory.CraftBatch = null;
             var next: [47]?inventories.Stack = undefined;
 
             for (&next, contents) |*stack, value| stack.* = value.stack;
@@ -105,19 +128,26 @@ pub const InventoryMenus = struct {
                 .inventory_click => |click| {
                     if (click.mode != 5) state.dirty = all_slots;
                     if (click.window_id != 0 or player.gamemode == .spectator) break :action;
-                    const view: menu_click.Menu = .{ .inventory = menu, .kind = .player, .container_slots = 0, .stacks = &next, .drag = &state.drag, .creative = false };
+                    const view: menu_click.Menu = .{ .inventory = menu, .player = player.uuid, .location = .{ .player = .{ .world = player.world, .position = player.position } }, .kind = .player, .container_slots = 0, .stacks = &next, .drag = &state.drag, .creative = false };
                     const result = try view.apply(click);
+                    craft_batch = result.craft_batch;
                     @memcpy(drops[0..result.count], result.drops[0..result.count]);
                     drop_count = result.count;
                     try view.refresh();
                 },
             }
 
+            if (craft_batch) |batch| if (!menu.validateCraft(batch)) {
+                state.* = before;
+                state.dirty = all_slots;
+                break :action;
+            };
             if (!try menu.apply(player_index, &slots, &contents, &next, drops[0..drop_count])) {
                 state.* = before;
                 state.dirty = all_slots;
                 break :action;
             }
+            if (craft_batch) |batch| menu.completeCraft(batch);
         }
     }
 

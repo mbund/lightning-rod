@@ -1,3 +1,8 @@
+const fuel = @import("fuel.zig");
+const Blocks = @import("blocks.zig").Blocks;
+const Furnaces = @import("furnaces.zig").Furnaces;
+const recipes = @import("recipes.zig");
+const recipe_placement = @import("recipe_placement.zig");
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const storage = @import("storage");
@@ -60,6 +65,8 @@ pub const Containers = struct {
     pub const minimum_inventory_cache_slots = menu_click.maximum_slots;
     pub const Configuration = struct { active_furnaces: usize = 256, reward_records: usize = 64 };
     pub const Dependencies = struct {
+        definitions: *Blocks,
+        furnaces: *Furnaces,
         experience: *Experience,
         metrics: *metrics.Registry,
         players: *Players,
@@ -99,10 +106,16 @@ pub const Containers = struct {
 
     pub const Resident = struct { key: Key, state: furnace.State };
 
+    allocator: std.mem.Allocator,
+    content_memory: std.heap.ArenaAllocator,
     deps: Dependencies,
     states: blocks.States,
     table: records.Table,
     rewards: records.Cache,
+    reward_amounts: []i32,
+    reward_ids: [][32]u8,
+    reward_lookup: std.AutoHashMapUnmanaged([32]u8, usize) = .empty,
+    reward_epoch: u64 = 0,
     active: []Resident,
     saved: []Key,
     saved_count: usize = 0,
@@ -117,22 +130,56 @@ pub const Containers = struct {
     targets: []sessions.Service.Target,
     deliveries: []sessions.Service.Delivery,
 
+    fn fuelProperties(self: *Containers, key: Key, stacks: [3]?inventories.Stack) !fuel.Properties {
+        self.deps.inventory.scratch.reset();
+        return self.deps.furnaces.fuelProperties(self.deps.inventory.deps.items, .{
+            .phase = .burn,
+            .location = .{ .world = key.world, .position = .{ .x = key.position.x, .y = key.position.y, .z = key.position.z } },
+            .stacks = stacks,
+        }, &self.deps.inventory.scratch);
+    }
+
+    fn definitionsChanged(self: *Containers) !void {
+        var memory = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer memory.deinit();
+        const allocator = memory.allocator();
+        const amounts = try allocator.alloc(i32, self.deps.furnaces.table.cooking_names.len + 1);
+        const ids = try allocator.alloc([32]u8, self.deps.furnaces.table.cooking_names.len);
+        var lookup: @TypeOf(self.reward_lookup) = .empty;
+        try lookup.ensureTotalCapacity(allocator, @intCast(ids.len));
+        for (self.deps.furnaces.table.cooking_names, ids, 0..) |name, *identity, index| {
+            std.crypto.hash.Blake3.hash(name, identity, .{});
+            assert(!lookup.contains(identity.*));
+            lookup.putAssumeCapacityNoClobber(identity.*, index);
+        }
+        self.content_memory.deinit();
+        self.content_memory = memory;
+        self.reward_amounts = amounts;
+        self.reward_ids = ids;
+        self.reward_lookup = lookup;
+    }
+
     pub fn allocate(allocator: std.mem.Allocator, io: std.Io, config: Configuration, deps: Dependencies) !*Containers {
         if (config.active_furnaces == 0 or config.reward_records == 0) return error.InvalidConfiguration;
         assert(deps.inventories.cache.entries.len >= minimum_inventory_cache_slots);
         if (deps.inventories.cache.entries.len < minimum_inventory_cache_slots) return error.InventoryCacheTooSmall;
         const self = try allocator.create(Containers);
         self.* = .{
+            .allocator = allocator,
+            .content_memory = .init(allocator),
             .deps = deps,
             .states = try .init(),
             .table = .{ .space = deps.storage, .root_offset = 8, .resources = deps.record_workspaces.resources },
             .rewards = try records.Cache.init(allocator, io, .{ .space = deps.storage, .root_offset = 16, .resources = deps.record_workspaces.resources }, .{
                 .slots = config.reward_records,
-                .key_bytes = 16,
-                .value_bytes = game_data.recipes.cooking_experience.len * 4,
+                .key_bytes = 48,
+                .value_bytes = 16,
+                .scan_batch = 16,
                 .metrics = deps.metrics,
                 .metrics_namespace = "containers.rewards",
             }),
+            .reward_amounts = &.{},
+            .reward_ids = &.{},
             .active = try allocator.alloc(Resident, config.active_furnaces),
             .saved = try allocator.alloc(Key, config.active_furnaces),
             .views = try allocator.alloc(View, deps.players.records.len),
@@ -142,6 +189,8 @@ pub const Containers = struct {
             .deliveries = try allocator.alloc(sessions.Service.Delivery, deps.players.records.len),
             .observer = try deps.inventories.observe(allocator, try std.math.mul(usize, deps.players.records.len, 3)),
         };
+        try self.definitionsChanged();
+        try deps.furnaces.registry.onChange(self, definitionsChanged);
         @memset(self.views, .{});
         @memset(self.watches, .{});
         try self.lids.ensureTotalCapacity(allocator, try std.math.mul(usize, deps.players.records.len, 4));
@@ -160,14 +209,14 @@ pub const Containers = struct {
             var allocated: [1]storage.PageId = undefined;
             try deps.storage.allocatePages(&allocated);
             var page: storage.Page = @splat(0);
-            @memcpy(page[0..8], "LRCNTR01");
+            @memcpy(page[0..8], "LRCNTR03");
             try deps.storage.writePages(&.{.{ .id = allocated[0], .source = &page }});
             try deps.storage.setRoot(allocated[0]);
             break :blk allocated[0];
         };
         var header: [8]u8 = undefined;
         try deps.storage.readPages(&.{.{ .id = root, .destination = &header }});
-        if (!std.mem.eql(u8, &header, "LRCNTR01")) return error.CorruptFurnace;
+        if (!std.mem.eql(u8, &header, "LRCNTR03")) return error.CorruptFurnace;
         self.table.directory = root;
         self.rewards.backend.directory = root;
         var after: [16]u8 = undefined;
@@ -222,46 +271,97 @@ pub const Containers = struct {
     }
 
     pub const Reward = struct {
-        amounts: [game_data.recipes.cooking_experience.len]i32 = @splat(0),
+        amounts: []const i32,
         random: std.Random.Xoshiro256,
+        epoch: u64,
     };
 
     pub fn recordRecipe(self: *Containers, key: Key, recipe: u32) !void {
-        assert(recipe < game_data.recipes.cooking_experience.len);
-        const lease = try self.rewards.acquire(&key.encode());
+        try self.recordCooking(key, recipe, null);
+    }
+
+    pub fn recordCooking(self: *Containers, key: Key, recipe: u32, experience: ?f32) !void {
+        assert(recipe < self.reward_ids.len);
+        var encoded: [48]u8 = undefined;
+        @memcpy(encoded[0..16], &key.encode());
+        @memcpy(encoded[16..48], &self.reward_ids[recipe]);
+        const lease = try self.rewards.acquire(&encoded);
         defer lease.release();
         const previous = lease.read();
-        if (previous) |bytes| if (bytes.len != game_data.recipes.cooking_experience.len * 4) return error.CorruptFurnace;
-        const count = if (previous) |bytes| std.mem.readInt(u32, bytes[recipe * 4 ..][0..4], .little) else 0;
-        if (count == std.math.maxInt(i32)) return error.FurnaceRecipeCountExhausted;
+        if (previous) |bytes| if (bytes.len != 16) return error.CorruptFurnace;
+        const count = if (previous) |bytes| std.mem.readInt(u32, bytes[0..4], .little) else 0;
+        const declared = if (previous) |bytes| std.mem.readInt(u32, bytes[4..8], .little) else 0;
+        const earned: f64 = if (previous) |bytes| @bitCast(std.mem.readInt(u64, bytes[8..16], .little)) else 0;
+        if (count >= std.math.maxInt(i32) or declared > count or !std.math.isFinite(earned) or earned < 0) return error.FurnaceRecipeCountExhausted;
+        if (experience) |value| if (!std.math.isFinite(value) or value < 0) return error.InvalidSmeltingPlan;
+        const total = earned + @as(f64, experience orelse 0);
+        if (!std.math.isFinite(total) or total >= 2147483648) return error.FurnaceExperienceOverflow;
         const bytes = lease.edit();
-        if (previous == null) @memset(bytes, 0);
-        std.mem.writeInt(u32, bytes[recipe * 4 ..][0..4], count + 1, .little);
-        lease.commit(bytes.len);
+        std.mem.writeInt(u32, bytes[0..4], count + 1, .little);
+        std.mem.writeInt(u32, bytes[4..8], declared + @intFromBool(experience == null), .little);
+        std.mem.writeInt(u64, bytes[8..16], @bitCast(total), .little);
+        lease.commit(16);
     }
 
     fn reward(self: *Containers, key: Key) !Reward {
-        var plan: Reward = .{ .random = self.deps.experience.random.source };
-        const lease = try self.rewards.acquire(&key.encode());
-        defer lease.release();
-        const bytes = lease.read() orelse return plan;
-        if (bytes.len != game_data.recipes.cooking_experience.len * 4) return error.CorruptFurnace;
-        for (game_data.recipes.cooking_experience, &plan.amounts, 0..) |experience, *amount, index| {
-            const count = std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little);
-            const value = @as(f32, @floatFromInt(count)) * experience;
-            if (!std.math.isFinite(value) or value >= 2147483648) return error.FurnaceExperienceOverflow;
-            amount.* = @intFromFloat(@floor(value));
-            const fraction = value - @floor(value);
-            if (fraction != 0 and plan.random.random().float(f64) < fraction) amount.* += 1;
+        self.reward_epoch +%= 1;
+        @memset(self.reward_amounts, 0);
+        var plan: Reward = .{ .amounts = self.reward_amounts, .random = self.deps.experience.random.source, .epoch = self.reward_epoch };
+        const prefix = key.encode();
+        var after: [48]u8 = undefined;
+        @memcpy(after[0..16], &prefix);
+        var cursor: records.ScanCursor = .{ .after = &after, .after_len = 16 };
+        var keys: [16][48]u8 = undefined;
+        var values: [16][16]u8 = undefined;
+        var entries: [16]records.ScanEntry = undefined;
+        for (&entries, &keys, &values) |*entry, *name, *value| entry.* = .{ .key = name, .value = value };
+        scan: while (true) {
+            const batch = try self.rewards.scan(&cursor, &entries);
+            for (entries[0..batch.count]) |entry| {
+                if (entry.key_len != 48 or entry.value_len != 16) return error.CorruptFurnace;
+                if (!std.mem.eql(u8, entry.key[0..16], &prefix)) break :scan;
+                const selected = self.reward_lookup.get(entry.key[16..48].*);
+                const index = selected orelse self.reward_ids.len;
+                const total_count = std.mem.readInt(u32, entry.value[0..4], .little);
+                const count = std.mem.readInt(u32, entry.value[4..8], .little);
+                const earned: f64 = @bitCast(std.mem.readInt(u64, entry.value[8..16], .little));
+                if (count > total_count or !std.math.isFinite(earned) or earned < 0) return error.CorruptFurnace;
+                const declared: f32 = if (selected) |at| @as(f32, @floatFromInt(count)) * self.deps.furnaces.table.cooking_experience[at] else 0;
+                const value = @as(f64, declared) + earned;
+                if (!std.math.isFinite(value) or value >= 2147483648) return error.FurnaceExperienceOverflow;
+                var amount: i32 = @intFromFloat(@floor(value));
+                const fraction = value - @floor(value);
+                if (fraction != 0 and plan.random.random().float(f64) < fraction) amount += 1;
+                self.reward_amounts[index] = std.math.add(i32, self.reward_amounts[index], amount) catch return error.FurnaceExperienceOverflow;
+            }
+            if (!batch.more) break;
         }
         return plan;
     }
 
     fn claim(self: *Containers, key: Key, position: [3]f64, plan: Reward) !void {
-        assert(self.deps.experience.canAwardMany(&plan.amounts));
-        const lease = try self.rewards.acquire(&key.encode());
-        defer lease.release();
-        lease.remove();
+        assert(plan.epoch == self.reward_epoch and plan.amounts.ptr == self.reward_amounts.ptr);
+        assert(self.deps.experience.canAwardMany(plan.amounts));
+        errdefer self.deps.storage.fail();
+        const prefix = key.encode();
+        var after: [48]u8 = undefined;
+        @memcpy(after[0..16], &prefix);
+        var cursor: records.ScanCursor = .{ .after = &after, .after_len = 16 };
+        var keys: [16][48]u8 = undefined;
+        var values: [16][16]u8 = undefined;
+        var entries: [16]records.ScanEntry = undefined;
+        for (&entries, &keys, &values) |*entry, *name, *value| entry.* = .{ .key = name, .value = value };
+        scan: while (true) {
+            const batch = try self.rewards.scan(&cursor, &entries);
+            for (entries[0..batch.count]) |entry| {
+                if (entry.key_len != 48 or entry.value_len != 16) return error.CorruptFurnace;
+                if (!std.mem.eql(u8, entry.key[0..16], &prefix)) break :scan;
+                const lease = try self.rewards.acquire(entry.key[0..entry.key_len]);
+                lease.remove();
+                lease.release();
+            }
+            if (!batch.more) break;
+        }
         self.deps.experience.random.source = plan.random;
         for (plan.amounts) |amount| if (amount > 0) try self.deps.experience.award(key.world, position, amount);
     }
@@ -367,7 +467,7 @@ pub const Containers = struct {
                 assert(request.following_drops <= self.deps.dropped.residents.len);
                 if (!self.deps.dropped.canCreate(drops + request.following_drops)) return .denied;
                 const reward_plan: ?Reward = if (kind == .furnace) try self.reward(key) else null;
-                if (reward_plan) |plan| if (!self.deps.experience.canAwardMany(&plan.amounts)) return .denied;
+                if (reward_plan) |plan| if (!self.deps.experience.canAwardMany(plan.amounts)) return .denied;
                 errdefer self.deps.storage.fail();
                 try self.closeAt(key);
                 if (drops != 0) {
@@ -391,8 +491,8 @@ pub const Containers = struct {
         }
     }
 
-    fn blocksLid(_: *Containers, state: u16) bool {
-        if (game_data.registry.blocks[game_data.registry.block_state_to_block[state]].visually_transparent) return false;
+    fn blocksLid(self: *Containers, state: u16) bool {
+        if (self.deps.definitions.transparent[state]) return false;
         const shape = game_data.registry.block_state_collision_shape[state];
         const face = game_data.registry.collisionLightFace(shape, 2);
         return std.mem.allEqual(u64, &face, std.math.maxInt(u64));
@@ -496,7 +596,7 @@ pub const Containers = struct {
             var next: [menu_click.maximum_slots]?inventories.Stack = undefined;
             for (contents, next[0..contents.len]) |value, *stack| stack.* = value.stack;
             var drag: menu_click.Drag = .{};
-            const menu: menu_click.Menu = .{ .inventory = self.deps.inventory, .kind = .crafting, .container_slots = 10, .stacks = next[0..contents.len], .drag = &drag, .creative = player.gamemode == .creative };
+            const menu: menu_click.Menu = .{ .inventory = self.deps.inventory, .player = player.uuid, .location = .{ .block = .{ .world = view.key.world, .position = .{ .x = view.key.position.x, .y = view.key.position.y, .z = view.key.position.z } } }, .kind = .crafting, .container_slots = 10, .stacks = next[0..contents.len], .drag = &drag, .creative = player.gamemode == .creative };
             try menu.refresh();
             contents[0].stack = next[0];
         }
@@ -522,22 +622,43 @@ pub const Containers = struct {
         try self.load(index, slots[0..count], contents[0..count]);
         for (contents[0..count], next[0..count]) |value, *stack| stack.* = value.stack;
         const previous = view.drag;
-        const menu: menu_click.Menu = .{ .inventory = self.deps.inventory, .kind = switch (view.kind) {
+        const menu: menu_click.Menu = .{ .inventory = self.deps.inventory, .player = player.uuid, .location = .{ .block = .{ .world = view.key.world, .position = .{ .x = view.key.position.x, .y = view.key.position.y, .z = view.key.position.z } } }, .kind = switch (view.kind) {
             .chest => .chest,
             .furnace => .furnace,
             .crafting => .crafting,
         }, .container_slots = view.container_slots, .stacks = next[0..count], .drag = &view.drag, .creative = player.gamemode == .creative };
         const result = try menu.apply(action);
         try menu.refresh();
+        if (result.craft_batch) |batch| if (!self.deps.inventory.validateCraft(batch)) {
+            view.drag = previous;
+            return;
+        };
         if (!self.deps.dropped.canCreate(result.count)) {
             view.drag = previous;
             return;
         }
+        if (view.kind == .furnace) if (next[1]) |stack| {
+            const old = contents[1].stack;
+            const inserted = old == null or !inventories.Stack.sameItem(old.?, stack) or stack.count > old.?.count;
+            if (inserted) {
+                self.deps.inventory.scratch.reset();
+                const prepared = try self.deps.furnaces.insertFuel(self.deps.inventory.deps.items, .{
+                    .phase = .insertion,
+                    .player = player.uuid,
+                    .location = .{ .world = view.key.world, .position = .{ .x = view.key.position.x, .y = view.key.position.y, .z = view.key.position.z } },
+                    .stacks = next[0..3].*,
+                    .previous = old,
+                }, &self.deps.inventory.scratch) orelse {
+                    view.drag = previous;
+                    return;
+                };
+                next[1] = prepared.remaining;
+            }
+        };
         var wake = false;
         if (view.kind == .furnace and !self.active_index.contains(view.key) and next[0] != null and next[1] != null) {
             const source_kind = try self.deps.inventory.deps.items.kind(next[0].?);
-            const fuel_kind = try self.deps.inventory.deps.items.kind(next[1].?);
-            wake = self.deps.inventory.recipes.recipes[source_kind] != null and self.deps.inventory.recipes.fuels[fuel_kind].ticks != 0;
+            wake = self.deps.furnaces.table.recipes[source_kind] != null and (try self.fuelProperties(view.key, next[0..3].*)).ticks != 0;
             if (wake and self.active_count == self.active.len) {
                 view.drag = previous;
                 return;
@@ -545,7 +666,7 @@ pub const Containers = struct {
         }
         const output_taken = view.kind == .furnace and contents[2].stack != null and (next[2] == null or next[2].?.count < contents[2].stack.?.count);
         const reward_plan: ?Reward = if (output_taken) try self.reward(view.key) else null;
-        if (reward_plan) |plan| if (!self.deps.experience.canAwardMany(&plan.amounts)) {
+        if (reward_plan) |plan| if (!self.deps.experience.canAwardMany(plan.amounts)) {
             view.drag = previous;
             return;
         };
@@ -561,12 +682,51 @@ pub const Containers = struct {
         }
         const committed = try self.deps.inventories.editMany(edits[0..edited]);
         assert(committed);
+        if (result.craft_batch) |batch| self.deps.inventory.completeCraft(batch);
         self.deps.inventory.changed(index);
         if (reward_plan) |plan| try self.claim(view.key, .{ player.position.x, player.position.y, player.position.z }, plan);
         if (wake) {
             const activated = self.activate(view.key);
             assert(activated);
         }
+    }
+
+    pub fn placeRecipe(self: *Containers, handle: sessions.Handle, window: i32, table: *const recipes.BookTable, recipe: *const recipes.BookEntry, all: bool) !recipe_placement.Result {
+        const index = handle.index;
+        const view = &self.views[index];
+        const player = self.deps.players.records[index];
+        if (!view.opened or view.closing or view.window != window or !self.valid(index) or player.gamemode == .spectator or
+            (recipe.furnace and view.kind != .furnace) or (!recipe.furnace and view.kind != .crafting)) return .blocked;
+        const count = view.container_slots + 38;
+        var slots: [menu_click.maximum_slots]inventories.Slot = undefined;
+        var contents: [menu_click.maximum_slots]inventories.Contents = undefined;
+        var next: [menu_click.maximum_slots]?inventories.Stack = undefined;
+        try self.load(index, slots[0..count], contents[0..count]);
+        for (contents[0..count], next[0..count]) |value, *stack| stack.* = value.stack;
+        const grid: []const usize = if (recipe.furnace) &.{0} else &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+        const result = try recipe_placement.place(self.deps.inventory.deps.items, table, recipe, next[0..count], grid, if (recipe.furnace) 1 else 3, view.container_slots, all);
+        if (result == .blocked) return result;
+        var wake = false;
+        if (recipe.furnace and next[0] != null and next[1] != null and !self.active_index.contains(view.key)) {
+            const input = try self.deps.inventory.deps.items.kind(next[0].?);
+            wake = self.deps.furnaces.table.recipes[input] != null and (try self.fuelProperties(view.key, next[0..3].*)).ticks != 0;
+            if (wake and self.active_count == self.active.len) return .blocked;
+        }
+        var edits: [menu_click.maximum_slots]inventories.Edit = undefined;
+        var changed: usize = 0;
+        for (slots[0..count], contents[0..count], next[0..count], 0..) |destination, value, stack, at| {
+            if ((!recipe.furnace and at == 0) or std.meta.eql(value.stack, stack)) continue;
+            edits[changed] = .{ .slot = destination, .revision = value.revision, .stack = stack };
+            changed += 1;
+        }
+        if (!try self.deps.inventories.editMany(edits[0..changed])) return .blocked;
+        if (wake) {
+            const activated = self.activate(view.key);
+            assert(activated);
+        }
+        view.dirty = true;
+        self.deps.inventory.changed(index);
+        return result;
     }
 
     fn valid(self: *Containers, index: usize) bool {

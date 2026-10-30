@@ -42,7 +42,7 @@ pub fn RegistryPackets(comptime Wire: type) type {
                 if (!std.mem.eql(u8, try reader.take(try reader.takeInt(u16, .big)), version)) return error.WrongVersion;
 
                 const count = try reader.takeInt(u32, .big);
-                if (count == 0 or count > 64) return error.InvalidSnapshot;
+                if (count == 0 or count > 1024 or count > bytes.len / 8) return error.InvalidSnapshot;
 
                 const registries = try allocator.alloc(Registry, count);
                 var initialized: usize = 0;
@@ -221,10 +221,8 @@ pub fn RegistryPackets(comptime Wire: type) type {
 
                 for (registry.entries) |entry| {
                     if (entry.id.len == 0) return error.IncompleteRegistrySnapshot;
-                    if (registry.synchronized) {
-                        if (entry.nbt.len == 0) return error.IncompleteRegistrySnapshot;
-                        if ((try support.skip_anonymous_nbt_with_scratch(entry.nbt, &scratch)).len != 0) return error.InvalidSnapshot;
-                    } else if (entry.nbt.len != 0) return error.InvalidSnapshot;
+                    if (registry.synchronized and entry.nbt.len == 0) return error.IncompleteRegistrySnapshot;
+                    if (entry.nbt.len != 0 and (try support.skip_anonymous_nbt_with_scratch(entry.nbt, &scratch)).len != 0) return error.InvalidSnapshot;
                 }
             }
         }

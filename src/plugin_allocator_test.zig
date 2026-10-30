@@ -5,7 +5,7 @@ test "plugin allocations preserve alignment ownership and the reservation limit"
     var permanent = PluginAllocator.init(std.testing.allocator, 1024);
     defer permanent.deinit();
     var assigned: [2]u64 = undefined;
-    permanent.trackPlugins(&assigned);
+    try permanent.trackPlugins(&assigned);
     permanent.beginPlugin(0);
     const first = try permanent.allocator().alignedAlloc(u8, .fromByteUnits(128), 128);
     @memset(first, 11);
@@ -21,26 +21,25 @@ test "plugin allocations preserve alignment ownership and the reservation limit"
     var foreign: u64 = 0;
     try std.testing.expect(!permanent.ownsCurrentPluginAllocation(&foreign));
     permanent.endPlugin();
-    try std.testing.expectEqual(permanent.used(), assigned[0] + assigned[1]);
+    try std.testing.expect(permanent.used() > assigned[0] + assigned[1]);
     permanent.seal();
     try std.testing.expectEqual(@as(u8, 11), first[0]);
     try std.testing.expectEqual(@as(u64, 22), second.*);
 }
 
-test "initialization frees and resizes retain their reservation until teardown" {
+test "initialization frees reclaim their reservation" {
     var permanent = PluginAllocator.init(std.testing.allocator, 1024);
     defer permanent.deinit();
     const allocator = permanent.allocator();
     const bytes = try allocator.alloc(u8, 128);
-    const reserved = permanent.used();
     try std.testing.expect(allocator.resize(bytes, 64));
     const smaller: []u8 = bytes[0..64];
     try std.testing.expect(allocator.resize(smaller, 128));
     allocator.free(bytes);
     try std.testing.expect(!permanent.owns(bytes.ptr));
-    try std.testing.expectEqual(reserved, permanent.used());
+    try std.testing.expectEqual(@as(usize, 0), permanent.used());
     const next = try allocator.alloc(u8, 128);
-    try std.testing.expect(next.ptr != bytes.ptr);
+    try std.testing.expect(permanent.owns(next.ptr));
 }
 
 test "partial plugin initialization releases every backing allocation" {
@@ -52,4 +51,24 @@ test "partial plugin initialization releases every backing allocation" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Initialization.run, .{});
+}
+
+test "captured initialization allocators keep their owner when another plugin registers content" {
+    var permanent = PluginAllocator.init(std.testing.allocator, 4096);
+    defer permanent.deinit();
+    var assigned: [2]u64 = undefined;
+    try permanent.trackPlugins(&assigned);
+    const overhead = permanent.used();
+    permanent.beginPlugin(0);
+    const first = permanent.allocator();
+    permanent.endPlugin();
+    permanent.beginPlugin(1);
+    const bytes = try first.alloc(u8, 128);
+    try std.testing.expect(assigned[0] > 128);
+    try std.testing.expectEqual(@as(u64, 0), assigned[1]);
+    try std.testing.expectEqual(@as(usize, 0), permanent.currentPluginBytes());
+    first.free(bytes);
+    try std.testing.expectEqual(@as(u64, 0), assigned[0]);
+    try std.testing.expectEqual(overhead, permanent.used());
+    permanent.endPlugin();
 }

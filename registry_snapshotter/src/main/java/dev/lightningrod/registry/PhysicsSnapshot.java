@@ -12,7 +12,6 @@ import net.minecraft.util.valueproviders.ConstantInt;
 import net.minecraft.util.valueproviders.UniformInt;
 import net.minecraft.world.level.block.DropExperienceBlock;
 import net.minecraft.world.level.block.RedStoneOreBlock;
-import net.minecraft.world.level.block.SculkBlock;
 import net.minecraft.world.level.block.SculkCatalystBlock;
 import net.minecraft.world.level.block.SculkSensorBlock;
 import net.minecraft.world.level.block.SculkShriekerBlock;
@@ -28,7 +27,7 @@ final class PhysicsSnapshot {
     static void write(Path destination) throws Exception {
         Files.createDirectories(destination.toAbsolutePath().getParent());
         try (var output = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(destination)))) {
-            output.write("LRPHYS02".getBytes(StandardCharsets.US_ASCII));
+            output.write("LRPHYS03".getBytes(StandardCharsets.US_ASCII));
             output.writeInt(Block.BLOCK_STATE_REGISTRY.size());
             Direction[] faces = { Direction.WEST, Direction.EAST, Direction.NORTH, Direction.SOUTH, Direction.DOWN, Direction.UP };
             for (var state : Block.BLOCK_STATE_REGISTRY) {
@@ -70,9 +69,7 @@ final class PhysicsSnapshot {
                 output.writeByte(minimum);
                 output.writeByte(spawner ? 15 : maximum > minimum ? maximum - minimum + 1 : 0);
                 output.writeByte(spawner ? 2 : maximum > minimum ? 1 : 0);
-                boolean silkOnly = block instanceof SculkBlock || block instanceof SculkCatalystBlock || block instanceof SculkSensorBlock || block instanceof SculkShriekerBlock;
-                output.writeByte((range != null ? 1 : 0) | (silkOnly ? 2 : 0));
-                output.writeInt(Integer.reverseBytes(range == null ? -1 : BuiltInRegistries.ITEM.getId(block.asItem())));
+                output.writeByte(range != null ? 1 : 0);
             }
         }
     }

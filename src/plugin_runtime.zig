@@ -43,6 +43,7 @@ pub fn initialize(comptime reserve: bool, instances: anytype, selections: @TypeO
         instances.pointers[index] = instance;
         instances.initialized += 1;
     }
+    for (instruments, allocator.plugin_bytes) |instrument, bytes| instrument.persistent_bytes.set(bytes);
 }
 
 pub fn beginTick(instances: anytype) void {

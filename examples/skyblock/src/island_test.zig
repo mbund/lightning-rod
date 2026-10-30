@@ -92,6 +92,7 @@ test "bounded worker batches reuse scratch and retire worlds before admitting de
     var memory = lightning_rod.Memory.init(std.testing.allocator, std.testing.io);
     defer memory.deinit();
     const allocator = memory.allocator("test");
+    const content = try vanilla.prepareDefinitions(memory.allocator("definitions"));
     var selected = try protocols.Default.init(allocator);
     defer selected.deinit(allocator);
     var endpoints: [3]*sessions.Service = undefined;
@@ -136,6 +137,7 @@ test "bounded worker batches reuse scratch and retire worlds before admitting de
             .wakeup = &workers[0].ready,
             .routing = &routing,
             .catalog = &directory,
+            .content = content,
             .chat = &chat,
             .index = index,
             .worker = 0,

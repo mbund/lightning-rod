@@ -1,3 +1,4 @@
+const vanilla_content = @import("vanilla_content.zig");
 const std = @import("std");
 const storage = @import("storage");
 const records = @import("records");
@@ -40,7 +41,8 @@ test "pickup batches preserve player priority item order and partial collection"
                 .storage = try store.openSpace("inventory"),
                 .record_workspaces = workspaces,
             });
-            const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
+            const gameplay_definitions = try vanilla_content.prepare(allocator);
+            const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
             const bread = try items.define("minecraft:bread");
             const stone = try items.define("minecraft:stone");
             const apple = try items.define("minecraft:apple");
@@ -79,8 +81,10 @@ test "pickup batches preserve player priority item order and partial collection"
             var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
             try players.initIndexes(allocator);
             players.rebuildIndexes();
-            const menu = try PlayerInventory.init(allocator, .{
-                .players = &players,
+            const menu = try PlayerInventory.init(allocator, .{}, .{
+                .crafting = gameplay_definitions.crafting,
+                .furnaces = gameplay_definitions.furnaces,
+                    .players = &players,
                 .inventories = ownership,
                 .items = items,
                 .equipment = undefined,

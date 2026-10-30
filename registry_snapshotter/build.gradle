@@ -25,10 +25,12 @@ loom {
             property 'mcc.snapshotOutput', providers.gradleProperty('snapshotOutput').getOrElse(
                 layout.buildDirectory.file('snapshot.json').get().asFile.absolutePath)
             property 'mcc.minecraftVersion', minecraftVersion
-            property 'mcc.recipeOutput', providers.gradleProperty('recipeOutput').getOrElse(
-                layout.buildDirectory.file('recipes.bin').get().asFile.absolutePath)
+            property 'mcc.fuelOutput', providers.gradleProperty('fuelOutput').getOrElse(
+                layout.buildDirectory.file('fuels.bin').get().asFile.absolutePath)
             property 'mcc.physicsOutput', providers.gradleProperty('physicsOutput').getOrElse(
                 layout.buildDirectory.file('physics.bin').get().asFile.absolutePath)
+            property 'mcc.packOutput', providers.gradleProperty('packOutput').getOrElse(
+                layout.buildDirectory.file('pack.bin').get().asFile.absolutePath)
         }
     }
 }
@@ -37,7 +39,7 @@ sourceSets.main.java.srcDir(modern ? 'src/modern-loader/java' : 'src/legacy-load
 sourceSets.main.java.srcDir(['legacy', 'input'].contains(api) ? 'src/legacy-registry/java' : 'src/current-registry/java')
 sourceSets.main.java.srcDir(modern ? 'src/current-lighting/java' : 'src/legacy-lighting/java')
 sourceSets.main.java.srcDir(modern ? 'src/current-physics/java' : 'src/legacy-physics/java')
-sourceSets.main.java.srcDir(modern ? 'src/current-recipe/java' : 'src/legacy-recipe/java')
+sourceSets.main.java.srcDir(modern ? 'src/current-fuel/java' : 'src/legacy-fuel/java')
 
 dependencies {
     minecraft "com.mojang:minecraft:${minecraftVersion}"

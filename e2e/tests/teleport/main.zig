@@ -32,6 +32,7 @@ const Probe = struct {
         dropped: *vanilla.ItemEntities,
         worlds: *vanilla.Worlds,
         vanilla_worlds: *vanilla.VanillaWorlds,
+        dimensions: *vanilla.Dimensions,
         inventories: *vanilla.Inventories,
         entities: *vanilla.Entities,
     };
@@ -91,14 +92,14 @@ const Probe = struct {
                 .overworld => defaults.overworld,
                 .nether => defaults.nether,
                 .end => defaults.end,
-                .overworld_two => try worlds.create(.{ .name = "e2e:overworld_two", .dimension = vanilla.VanillaWorlds.dimensions.overworld }),
+                .overworld_two => try worlds.create(.{ .name = "e2e:overworld_two", .dimension = try self.deps.dimensions.dimension("minecraft:overworld") }),
             };
             if (destination == .overworld_two) {
-                if (world_id != try worlds.create(.{ .name = "e2e:overworld_two", .dimension = vanilla.VanillaWorlds.dimensions.overworld })) return error.UnstableWorldIdentity;
+                if (world_id != try worlds.create(.{ .name = "e2e:overworld_two", .dimension = try self.deps.dimensions.dimension("minecraft:overworld") })) return error.UnstableWorldIdentity;
 
-                if (worlds.create(.{ .name = "e2e:overworld_two", .dimension = vanilla.VanillaWorlds.dimensions.nether })) |_| return error.WorldIdentityReassigned else |err| if (err != error.WorldIdentityChanged) return err;
+                if (worlds.create(.{ .name = "e2e:overworld_two", .dimension = try self.deps.dimensions.dimension("minecraft:the_nether") })) |_| return error.WorldIdentityReassigned else |err| if (err != error.WorldIdentityChanged) return err;
 
-                if (worlds.create(.{ .name = "e2e:overflow", .dimension = vanilla.VanillaWorlds.dimensions.overworld })) |_| return error.WorldCapacityExceeded else |err| if (err != error.WorldCapacity) return err;
+                if (worlds.create(.{ .name = "e2e:overflow", .dimension = try self.deps.dimensions.dimension("minecraft:overworld") })) |_| return error.WorldCapacityExceeded else |err| if (err != error.WorldCapacity) return err;
                 if (worlds.find("e2e:overflow") != null or worlds.all().len != 4) return error.PartialWorldCreated;
                 std.log.info("event=runtime_world_verified id={d} name=e2e:overworld_two", .{world_id});
             }

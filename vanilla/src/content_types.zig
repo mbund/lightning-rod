@@ -1,0 +1,34 @@
+const PlacementDefinition = @import("placement_registry.zig").Definition;
+const MiningDefinition = @import("mining_registry.zig").Definition;
+const BlockState = @import("blocks.zig").State;
+const ItemDefinition = @import("item_registry.zig").Definition;
+const game_data = @import("game_data");
+const lighting = @import("lighting");
+const recipes = @import("recipes.zig");
+const tags = @import("content_tags.zig");
+const definitions = @import("content_definitions.zig");
+const registries = @import("content_registries.zig");
+const enchantments = @import("enchantment_effects.zig");
+const unlocks = @import("recipe_unlocks.zig");
+const loot = @import("loot.zig");
+
+pub const Definitions = struct {
+    items: []const ItemDefinition = &.{},
+    block_states: []const BlockState = &.{},
+    visibility: []const []const bool = &.{},
+    physics: []const []const game_data.physics_data.State = &.{},
+    lighting: []const lighting.Registry = &.{},
+    mining: []const MiningDefinition = &.{},
+    placement: []const PlacementDefinition = &.{},
+    recipes: []const recipes.Entry = &.{},
+    fuels: []const recipes.FuelDefinition = &.{},
+    remainders: []const recipes.RemainderDefinition = &.{},
+    fuel_conversions: []const recipes.FuelConversionDefinition = &.{},
+    tags: []const tags.Definition = &.{},
+    dimension_types: []const definitions.DimensionType = &.{},
+    registries: []const registries.Registries.Definition = &.{},
+    client_registries: []const registries.Registries.Presentation = &.{},
+    enchantments: []const enchantments.Effects.Entry = &.{},
+    loot_tables: []const loot.Definition = &.{},
+    recipe_unlocks: []const unlocks.Definition = &.{},
+};

@@ -27,7 +27,7 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
         pub const id = "lightning_rod:sessions";
         pub const Configuration = struct {
             plugins: Plugins,
-            protocols: *const Endpoint.Protocols,
+            protocols: *Endpoint.Protocols,
             router: Router,
             address: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 25565 } },
             /// Transfers the listening socket to this instance. Resume uses the handoff socket.

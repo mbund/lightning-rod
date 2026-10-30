@@ -373,3 +373,15 @@ test "configured reservation allocates capacity without restoring or checkpointi
         simulation.deinit(std.testing.allocator);
     }
 }
+
+test "framework metric capacity follows the composition without consuming the plugin budget" {
+    var database = try Database.init();
+    defer database.deinit();
+    const plugins = .{lightning_rod.plugin.configured(Probe, .{})};
+    const simulation = try lightning_rod.Simulation(@TypeOf(plugins)).init(std.testing.allocator, std.testing.io, &database.store, .{ .metrics = .{ .capacity = 0 } });
+    defer simulation.deinit(std.testing.allocator);
+    try simulation.initialize(plugins, .{});
+    defer simulation.unload(deadline()) catch unreachable;
+    try std.testing.expectEqual(simulation.metrics.records.len, simulation.metrics.count);
+    try std.testing.expect(simulation.metrics.count > 0);
+}

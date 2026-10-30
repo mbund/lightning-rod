@@ -1,5 +1,6 @@
+const fuel = @import("fuel.zig");
+const crafting = @import("crafting.zig");
 const std = @import("std");
-const game_data = @import("game_data");
 const inventories = @import("inventories");
 const minecraft = @import("minecraft_model");
 const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
@@ -7,10 +8,12 @@ const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
 pub const maximum_slots = 92;
 pub const Kind = enum { player, chest, furnace, crafting };
 pub const Drag = struct { slots: u128 = 0, button: ?i8 = null };
-pub const Result = struct { drops: [10]inventories.Stack = undefined, count: usize = 0 };
+pub const Result = struct { drops: [10]inventories.Stack = undefined, count: usize = 0, craft_batch: ?PlayerInventory.CraftBatch = null };
 
 pub const Menu = struct {
     inventory: *PlayerInventory,
+    player: u128,
+    location: crafting.Location,
     kind: Kind,
     container_slots: usize,
     stacks: []?inventories.Stack,
@@ -41,20 +44,40 @@ pub const Menu = struct {
         };
     }
 
+    fn fuelProperties(self: Menu, stack: inventories.Stack) !fuel.Properties {
+        std.debug.assert(self.kind == .furnace and self.location == .block);
+        self.inventory.scratch.reset();
+        return self.inventory.deps.furnaces.fuelProperties(self.inventory.deps.items, .{
+            .phase = .admission,
+            .player = self.player,
+            .location = .{ .world = self.location.block.world, .position = self.location.block.position },
+            .stacks = .{ self.stacks[0], stack, self.stacks[2] },
+            .previous = self.stacks[1],
+        }, &self.inventory.scratch);
+    }
+
     fn limit(self: Menu, at: usize, stack: inventories.Stack) !u16 {
         if (self.output() == at) return 0;
         if (self.kind == .player) return self.inventory.slotLimit(at, stack);
         if (self.kind == .furnace and at < 2) {
-            const kind = try self.inventory.deps.items.kind(stack);
-            if (at == 1 and self.inventory.recipes.fuels[kind].ticks == 0) {
-                return if (std.mem.eql(u8, game_data.registry.itemName(@intCast(kind)).?, "minecraft:bucket")) 1 else 0;
+            if (at == 1) {
+                const properties = try self.fuelProperties(stack);
+                if (properties.slot_limit) |maximum| return @min(maximum, try self.inventory.deps.items.stackLimit(stack));
+                if (properties.ticks == 0) return 0;
             }
         }
         return self.inventory.deps.items.stackLimit(stack);
     }
 
+    fn canTake(self: Menu, at: usize) !bool {
+        if (self.creative or self.kind != .player or at < 5 or at > 8) return true;
+        const stack = self.stacks[at] orelse return true;
+        return self.inventory.deps.equipment.removable(stack, @intCast(at - 3));
+    }
+
     fn transfer(self: Menu, source: usize, begin: usize, end: usize, reverse: bool) !void {
         std.debug.assert(source < self.stacks.len and begin <= end and end <= self.visible());
+        if (!try self.canTake(source)) return;
         const held = self.stacks[source] orelse return;
         var remaining = held.count;
         for (0..2) |pass| for (begin..end) |offset| {
@@ -76,21 +99,14 @@ pub const Menu = struct {
         return self.stacks[1..if (self.kind == .player) 5 else 10];
     }
 
-    fn recipe(self: Menu) !?*const game_data.recipe_data.Craft {
-        var kinds: [9]?u32 = @splat(null);
-        const inputs = self.grid();
-        for (inputs, 0..) |stack, at| if (stack) |held| {
-            kinds[at] = try self.inventory.deps.items.kind(held);
-        };
-        return self.inventory.recipes.matches(kinds[0..inputs.len], if (self.kind == .player) 2 else 3);
+    fn recipe(self: Menu) !?PlayerInventory.PreparedCraft {
+        std.debug.assert((self.kind == .player) == (self.location == .player));
+        return self.inventory.prepareCraft(self.player, self.location, self.grid(), if (self.kind == .player) 2 else 3);
     }
 
     pub fn refresh(self: Menu) !void {
         if (self.kind != .player and self.kind != .crafting) return;
-        self.stacks[0] = if (try self.recipe()) |craft| .{
-            .item = try self.inventory.deps.items.defineKind(craft.output),
-            .count = craft.amount,
-        } else null;
+        self.stacks[0] = if (try self.recipe()) |craft| craft.result else null;
     }
 
     fn takeCraft(self: Menu, click: minecraft.InventoryClick) !Result {
@@ -98,20 +114,23 @@ pub const Menu = struct {
         if (click.mode != 0 and click.mode != 1 and click.mode != 2 and click.mode != 4) return result;
         if ((click.mode == 0 or click.mode == 4) and click.button != 0 and click.button != 1) return result;
         if (click.mode == 2 and (click.button < 0 or (click.button > 8 and click.button != 40))) return result;
-        try self.refresh();
-        const initial = self.stacks[0] orelse return result;
+        var plan = try self.recipe() orelse {
+            self.stacks[0] = null;
+            return result;
+        };
+        self.stacks[0] = plan.result;
+        const initial = plan.result;
         var crafts: u16 = 0;
         while (crafts < 99) {
             const output_stack = self.stacks[0] orelse break;
             if (!inventories.Stack.sameItem(initial, output_stack)) break;
-            var repeats: u16 = if (click.mode == 1) 99 - crafts else 1;
-            var remainders: [9]?u32 = @splat(null);
-            for (self.grid(), 0..) |entry, at| if (entry) |stack| {
-                const kind = try self.inventory.deps.items.kind(stack);
-                remainders[at] = self.inventory.recipes.fuels[kind].remainder;
-                repeats = @min(repeats, stack.count);
-                if (remainders[at] != null) repeats = 1;
-            };
+            var repeats: u16 = if (click.mode == 1 and plan.repeatable) 99 - crafts else 1;
+            for (self.grid(), 0..) |entry, at| {
+                const consumed = plan.consume[at];
+                if (consumed > 0) repeats = @min(repeats, (entry orelse return error.InvalidRecipeConsumption).count / consumed);
+                if (plan.remainders[at] != null) repeats = 1;
+            }
+            if (repeats == 0) break;
             const maximum = try self.inventory.deps.items.stackLimit(output_stack);
             if (click.mode == 1) {
                 var capacity: usize = 0;
@@ -141,15 +160,17 @@ pub const Menu = struct {
                 self.stacks[destination] = .{ .item = output_stack.item, .count = previous + output_stack.count };
             }
             var changed = false;
-            for (self.grid(), 1..) |*entry, at| {
-                const stack = entry.* orelse continue;
-                std.debug.assert(stack.count >= repeats and repeats > 0);
-                changed = changed or stack.count == repeats;
-                entry.* = if (stack.count == repeats) null else .{ .item = stack.item, .count = stack.count - repeats };
-                if (remainders[at - 1]) |remainder| {
+            for (self.grid(), 0..) |*entry, at| {
+                const consumed = plan.consume[at] * repeats;
+                if (consumed > 0) {
+                    const stack = entry.* orelse return error.InvalidRecipeConsumption;
+                    std.debug.assert(stack.count >= consumed);
+                    changed = changed or stack.count == consumed;
+                    entry.* = if (stack.count == consumed) null else .{ .item = stack.item, .count = stack.count - consumed };
+                }
+                if (plan.remainders[at]) |returned| {
                     std.debug.assert(repeats == 1);
                     changed = true;
-                    const returned: inventories.Stack = .{ .item = try self.inventory.deps.items.defineKind(remainder), .count = 1 };
                     if (entry.* == null) {
                         entry.* = returned;
                     } else {
@@ -164,16 +185,24 @@ pub const Menu = struct {
                         self.stacks[0] = original;
                     }
                 }
-                std.debug.assert(at < self.stacks.len);
             }
+            self.inventory.recordCraft(plan.completion);
             crafts += repeats;
-            if (changed) try self.refresh() else self.stacks[0] = output_stack;
+            if (changed or !plan.repeatable) {
+                if (try self.recipe()) |next| {
+                    plan = next;
+                    self.stacks[0] = next.result;
+                } else self.stacks[0] = null;
+            } else self.stacks[0] = output_stack;
             if (click.mode != 1 or result.count > result.drops.len - 9) break;
         }
+        if (crafts > 0) result.craft_batch = self.inventory.craftBatch();
         return result;
     }
 
     pub fn apply(self: Menu, click: minecraft.InventoryClick) !Result {
+        self.inventory.beginCraft();
+        defer self.inventory.endCraft();
         std.debug.assert(self.stacks.len == self.visible() + (if (self.kind == .player) @as(usize, 1) else 2));
         std.debug.assert(self.stacks.len <= maximum_slots);
         std.debug.assert(switch (self.kind) {
@@ -232,6 +261,7 @@ pub const Menu = struct {
         }
         if (click.slot < 0 or click.slot >= self.visible()) return result;
         const at: usize = @intCast(click.slot);
+        if (click.mode != 3 and !try self.canTake(at)) return result;
         if ((self.kind == .player or self.kind == .crafting) and at == 0) return self.takeCraft(click);
         switch (click.mode) {
             0 => {
@@ -276,11 +306,11 @@ pub const Menu = struct {
                 } else {
                     if (self.kind == .furnace) {
                         const kind = try self.inventory.deps.items.kind(source);
-                        if (self.inventory.recipes.recipes[kind] != null) {
+                        if (self.inventory.deps.furnaces.table.recipes[kind] != null) {
                             try self.transfer(at, 0, 1, false);
                             return result;
                         }
-                        if (self.inventory.recipes.fuels[kind].ticks != 0) {
+                        if ((try self.fuelProperties(source)).ticks != 0) {
                             try self.transfer(at, 1, 2, false);
                             return result;
                         }
@@ -336,7 +366,7 @@ pub const Menu = struct {
                 const maximum = try self.inventory.deps.items.stackLimit(held);
                 for (0..2) |pass| for (0..self.visible()) |offset| {
                     const index = if (click.button == 0) offset else self.visible() - 1 - offset;
-                    if (index == self.output()) continue;
+                    if (index == self.output() or !try self.canTake(index)) continue;
                     const stack = self.stacks[index] orelse continue;
                     if (!inventories.Stack.sameItem(held, stack) or (pass == 0 and stack.count == maximum)) continue;
                     const amount = @min(stack.count, maximum -| self.stacks[carried].?.count);

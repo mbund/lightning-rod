@@ -107,7 +107,7 @@ pub const Players = struct {
     const MovementObserver = struct {
         context: *anyopaque,
         vtable: *const VTable,
-        const VTable = struct { call: *const fn (*anyopaque, sessions.Handle, minecraft.Movement) void };
+        const VTable = struct { call: *const fn (*anyopaque, sessions.Handle, minecraft.Movement) anyerror!void };
     };
     const DigHandler = struct {
         context: *anyopaque,
@@ -328,9 +328,9 @@ pub const Players = struct {
         if (self.movement_observer != null) return error.DuplicateMovementObserver;
         const Adapter = struct {
             const vtable: MovementObserver.VTable = .{ .call = @This().invoke };
-            fn invoke(raw: *anyopaque, handle: sessions.Handle, movement: minecraft.Movement) void {
+            fn invoke(raw: *anyopaque, handle: sessions.Handle, movement: minecraft.Movement) anyerror!void {
                 const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
-                handler(typed, handle, movement);
+                try handler(typed, handle, movement);
             }
         };
         self.movement_observer = .{ .context = context, .vtable = &Adapter.vtable };
@@ -412,7 +412,7 @@ pub const Players = struct {
         const z, const c = b.z() catch return error.InvalidPacket;
         const flags, const done = c.flags() catch return error.InvalidPacket;
         done.finish() catch return error.InvalidPacket;
-        self.applyMovement(handle, .{ .position = .{ .x = x, .y = y, .z = z }, .on_ground = flags.onGround, .horizontal_collision = flags.hasHorizontalCollision });
+        try self.applyMovement(handle, .{ .position = .{ .x = x, .y = y, .z = z }, .on_ground = flags.onGround, .horizontal_collision = flags.hasHorizontalCollision });
     }
 
     fn onPositionLook(self: *Players, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_position_look.Reader) !void {
@@ -423,7 +423,7 @@ pub const Players = struct {
         const pitch, const e = d.pitch() catch return error.InvalidPacket;
         const flags, const done = e.flags() catch return error.InvalidPacket;
         done.finish() catch return error.InvalidPacket;
-        self.applyMovement(handle, .{ .position = .{ .x = x, .y = y, .z = z }, .rotation = .{ .yaw = yaw, .pitch = pitch }, .on_ground = flags.onGround, .horizontal_collision = flags.hasHorizontalCollision });
+        try self.applyMovement(handle, .{ .position = .{ .x = x, .y = y, .z = z }, .rotation = .{ .yaw = yaw, .pitch = pitch }, .on_ground = flags.onGround, .horizontal_collision = flags.hasHorizontalCollision });
     }
 
     fn onLook(self: *Players, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_look.Reader) !void {
@@ -431,16 +431,16 @@ pub const Players = struct {
         const pitch, const b = a.pitch() catch return error.InvalidPacket;
         const flags, const done = b.flags() catch return error.InvalidPacket;
         done.finish() catch return error.InvalidPacket;
-        self.applyMovement(handle, .{ .rotation = .{ .yaw = yaw, .pitch = pitch }, .on_ground = flags.onGround, .horizontal_collision = flags.hasHorizontalCollision });
+        try self.applyMovement(handle, .{ .rotation = .{ .yaw = yaw, .pitch = pitch }, .on_ground = flags.onGround, .horizontal_collision = flags.hasHorizontalCollision });
     }
 
     fn onGround(self: *Players, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_flying.Reader) !void {
         const flags, const done = body.flags() catch return error.InvalidPacket;
         done.finish() catch return error.InvalidPacket;
-        self.applyMovement(handle, .{ .on_ground = flags.onGround, .horizontal_collision = flags.hasHorizontalCollision });
+        try self.applyMovement(handle, .{ .on_ground = flags.onGround, .horizontal_collision = flags.hasHorizontalCollision });
     }
 
-    fn applyMovement(self: *Players, handle: sessions.Handle, movement: minecraft.Movement) void {
+    fn applyMovement(self: *Players, handle: sessions.Handle, movement: minecraft.Movement) !void {
         const player = &self.records[handle.index];
         if (player.stage != .ready) return;
         var accepted = movement;
@@ -456,7 +456,7 @@ pub const Players = struct {
         if (accepted.rotation) |rotation| player.rotation = rotation;
         player.on_ground = movement.on_ground;
         player.revision += 1;
-        if (self.movement_observer) |observer| observer.vtable.call(observer.context, handle, accepted);
+        if (self.movement_observer) |observer| try observer.vtable.call(observer.context, handle, accepted);
     }
 
     fn onEntityAction(self: *Players, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_entity_action.Reader) !void {
@@ -953,7 +953,7 @@ test "disconnect stages player state until the next complete checkpoint" {
 
         const position: minecraft.Position = .{ .x = 100, .y = 70, .z = -32 };
         const rotation: minecraft.Rotation = .{ .yaw = 45, .pitch = 30 };
-        players.applyMovement(handle, .{ .position = position, .rotation = rotation, .on_ground = true, .horizontal_collision = false });
+        try players.applyMovement(handle, .{ .position = position, .rotation = rotation, .on_ground = true, .horizontal_collision = false });
         records[0].health = 7;
         records[0].selected_slot = 8;
         records[0].experience = .{ .progress = 0.5, .level = 7, .total = 101, .score = 101 };
@@ -1027,7 +1027,7 @@ test "rotation validation precedes movement and normalizes movement teleports an
         calls: usize = 0,
         last: minecraft.Movement = undefined,
 
-        fn moved(self: *@This(), _: sessions.Handle, movement: minecraft.Movement) void {
+        fn moved(self: *@This(), _: sessions.Handle, movement: minecraft.Movement) !void {
             self.calls += 1;
             self.last = movement;
         }
@@ -1037,13 +1037,13 @@ test "rotation validation precedes movement and normalizes movement teleports an
     const before = records[0];
     for ([_]f32{ std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32) }) |invalid| {
         for ([_]minecraft.Rotation{ .{ .yaw = invalid, .pitch = 0 }, .{ .yaw = 0, .pitch = invalid } }) |rotation| {
-            players.applyMovement(handle, .{ .position = .{ .x = 100, .y = 70, .z = -32 }, .rotation = rotation, .on_ground = true, .horizontal_collision = false });
+            try players.applyMovement(handle, .{ .position = .{ .x = 100, .y = 70, .z = -32 }, .rotation = rotation, .on_ground = true, .horizontal_collision = false });
             try std.testing.expectEqualDeep(before, records[0]);
             try std.testing.expectEqual(@as(usize, 0), observer.calls);
         }
     }
     for ([_]f32{ -std.math.floatMax(f32), -40_000_000, -540, -180, 0, 180, 540, 40_000_000, std.math.floatMax(f32) }) |yaw| {
-        players.applyMovement(handle, .{ .rotation = .{ .yaw = yaw, .pitch = 1000 }, .on_ground = true, .horizontal_collision = false });
+        try players.applyMovement(handle, .{ .rotation = .{ .yaw = yaw, .pitch = 1000 }, .on_ground = true, .horizontal_collision = false });
         try std.testing.expect(records[0].rotation.yaw >= -180 and records[0].rotation.yaw < 180);
         try std.testing.expectEqual(@as(f32, 90), records[0].rotation.pitch);
         try std.testing.expectEqualDeep(records[0].rotation, observer.last.rotation.?);

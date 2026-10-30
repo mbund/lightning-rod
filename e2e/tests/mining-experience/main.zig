@@ -76,8 +76,8 @@ const Probe = struct {
     fn prepare(self: *Probe, handle: sessions.Handle, phase: Phase) !void {
         const player = self.deps.players.records[handle.index];
         const kind: u32 = @intCast(game_data.registry.itemId(if (phase == .wrong) "minecraft:wooden_pickaxe" else "minecraft:diamond_pickaxe").?);
-        var bytes: [10]u8 = undefined;
-        var enchantments = [_]vanilla.Enchantments.Entry{.{ .id = @intCast(game_data.registry.enchantmentId("minecraft:silk_touch").?), .level = 1 }};
+        var bytes: [128]u8 = undefined;
+        var enchantments = [_]vanilla.Enchantments.Entry{.{ .name = "minecraft:silk_touch", .level = 1 }};
         const components: []const vanilla.Items.Component = if (phase == .silk) &.{.{ .key = vanilla.Items.key(.enchantments), .value = try vanilla.Enchantments.encode(&enchantments, &bytes) }} else &.{};
         const item = try vanilla.item_data.define(self.deps.inventories, kind, components);
         const slot: inventories.Slot = .{ .owner = player.uuid, .index = 36 };

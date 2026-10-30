@@ -39,6 +39,11 @@ const Economy = struct {
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Economy {
         const self = try allocator.create(Economy);
         self.* = .{ .deps = deps };
+        try deps.items.deps.definitions.addDefinitions(.{ .items = &.{
+            .{ .name = "minecraft:paper", .stack_size = 8 },
+            .{ .name = "minecraft:iron_pickaxe", .durability = 40 },
+            .{ .name = "minecraft:diamond_pickaxe", .durability = 0 },
+        } });
         deps.control.on(self, onMessage);
         return self;
     }
@@ -100,8 +105,8 @@ const PriceLore = struct {
         return self;
     }
 
-    fn present(_: *PriceLore, _: vanilla.Items.View, _: u128) bool {
-        return true;
+    fn present(_: *PriceLore, _: vanilla.Items.View, _: u128, _: ?vanilla.Items.Component) vanilla.item_components.Presentation {
+        return .added;
     }
 
     fn write(packet: Payload.Writer, self: *PriceLore, context: WriteContext) !Payload.Writer.Done {

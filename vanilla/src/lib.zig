@@ -1,7 +1,19 @@
+pub const smelting = @import("smelting.zig");
+pub const enchantment_effects = @import("enchantment_effects.zig");
+pub const placement_behavior = @import("placement_behavior.zig");
+pub const mining_behavior = @import("mining_behavior.zig");
+pub const fuel = @import("fuel.zig");
 const lightning_rod = @import("lightning_rod");
 const std = @import("std");
 const sessions = @import("sessions");
 const records = @import("records");
+pub const Datapacks = @import("datapacks.zig").Datapacks;
+pub const tags = @import("content_tags.zig");
+pub const recipes = @import("recipes.zig");
+pub const loot = @import("loot.zig");
+pub const crafting = @import("crafting.zig");
+pub const custom_data = @import("custom_data.zig");
+pub const entity_packets = @import("entity_packets.zig");
 pub const Packets = @import("minecraft_packets").Packets;
 pub const Status = @import("session_status.zig").Status;
 pub const PayloadChannels = @import("payload_channels.zig");
@@ -34,6 +46,18 @@ pub const ReloadCommands = @import("reload_commands.zig").ReloadCommands;
 pub const CommandDispatch = @import("commands.zig").CommandDispatch;
 pub const FallDamage = @import("fall_damage.zig").FallDamage;
 pub const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
+pub const definitions = @import("vanilla_content.zig").definitions;
+pub const prepareDefinitions = @import("vanilla_content.zig").prepare;
+pub const definition_provider = @import("definition_provider.zig");
+pub const Vanilla = @import("vanilla_content.zig").Vanilla;
+pub const Crafting = @import("crafting_registry.zig").Crafting;
+pub const Furnaces = @import("furnaces.zig").Furnaces;
+pub const Loot = @import("loot_registry.zig").Loot;
+pub const Dimensions = @import("dimensions.zig").Dimensions;
+pub const Blocks = @import("blocks.zig").Blocks;
+pub const ClientRegistries = @import("client_registries.zig").ClientRegistries;
+pub const RecipeCommands = @import("recipe_commands.zig").RecipeCommands;
+pub const RecipeBook = @import("recipe_book.zig").RecipeBook;
 pub const InventoryMenus = @import("inventory_menus.zig").InventoryMenus;
 pub const CreativeInventory = @import("creative_inventory.zig").CreativeInventory;
 pub const Visibility = @import("visibility.zig").Visibility;
@@ -45,11 +69,14 @@ pub const Section = @import("chunks").Section;
 pub const BlockEdit = @import("chunks").BlockEdit;
 pub const SectionEdits = @import("chunks").SectionEdits;
 pub const Entities = @import("entities").Entities;
+pub const EntityId = @import("entities").Id;
+pub const EntityState = @import("entities").State;
 pub const Inventories = @import("inventories").Inventories;
 pub const InventoryCapacity = @import("inventory_capacity.zig").InventoryCapacity;
 pub const Items = @import("items.zig").Items;
 pub const ItemProperties = @import("item_properties.zig").ItemProperties;
 pub const Durability = @import("item_properties.zig").Durability;
+pub const EquipmentAttributes = @import("equipment_attributes.zig").EquipmentAttributes;
 pub const EquipmentSlots = @import("item_properties.zig").EquipmentSlots;
 pub const Lore = @import("item_lore.zig").Lore;
 pub const item_lore = @import("item_lore.zig");
@@ -59,7 +86,12 @@ pub const ItemMerging = @import("item_merging.zig").ItemMerging;
 pub const ItemPickup = @import("item_pickup.zig").ItemPickup;
 pub const ItemEntities = @import("item_entities.zig").ItemEntities;
 pub const ItemPhysics = @import("item_physics.zig").ItemPhysics;
+pub const raycast = @import("raycast.zig");
+pub const ItemUse = @import("item_use.zig").ItemUse;
+pub const ItemActions = @import("item_actions.zig").ItemActions;
+pub const item_actions = @import("item_actions.zig");
 pub const Enchantments = @import("enchantments.zig").Enchantments;
+pub const ItemContent = @import("item_content.zig").ItemContent;
 pub const Experience = @import("experience.zig").Experience;
 pub const ExperienceReplication = @import("experience_replication.zig").ExperienceReplication;
 pub const ItemTick = @import("item_tick.zig").ItemTick;
@@ -85,6 +117,18 @@ pub const RegistryIdentity = @import("registry_identity.zig").RegistryIdentity;
 pub const RecordWorkspaces = records.Workspaces;
 
 const defaults = lightning_rod.plugin.compose(.{
+    lightning_rod.plugin.configured(Items.Registry, .{}),
+    lightning_rod.plugin.configured(Blocks, .{}),
+    lightning_rod.plugin.configured(Dimensions, .{}),
+    lightning_rod.plugin.configured(Enchantments.Registry, .{}),
+    lightning_rod.plugin.configured(ClientRegistries, .{}),
+    lightning_rod.plugin.configured(Crafting, .{}),
+    lightning_rod.plugin.configured(Furnaces, .{}),
+    lightning_rod.plugin.configured(Loot, .{}),
+    lightning_rod.plugin.configured(Mining.Registry, .{}),
+    lightning_rod.plugin.configured(Placement.Registry, .{}),
+    lightning_rod.plugin.configured(RecipeBook.Registry, .{}),
+    lightning_rod.plugin.configured(Vanilla, .{}),
     lightning_rod.plugin.configured(RecordWorkspaces, .{}),
     lightning_rod.plugin.configured(sessions.World, .{}),
     lightning_rod.plugin.configured(RegistryIdentity, RegistryIdentity.Configuration{}),
@@ -110,17 +154,20 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Reload, Reload.Configuration{}),
     lightning_rod.plugin.configured(ReloadCommands, ReloadCommands.Configuration{}),
     lightning_rod.plugin.configured(CommandDispatch, CommandDispatch.Configuration{}),
-    lightning_rod.plugin.configured(FallDamage, FallDamage.Configuration{}),
     lightning_rod.plugin.configured(Replication, Replication.Configuration{}),
     lightning_rod.plugin.configured(Chunks, Chunks.Configuration{}),
     lightning_rod.plugin.configured(Entities, Entities.Configuration{}),
     lightning_rod.plugin.configured(InventoryCapacity, .{}),
-    lightning_rod.plugin.configured(Inventories, Inventories.Configuration{}),
+    lightning_rod.plugin.configured(Inventories, Inventories.Configuration{ .cache_items = crafting.maximum_inputs + 1 }),
     lightning_rod.plugin.configured(Items, Items.Configuration{}),
     lightning_rod.plugin.configured(ItemProperties, ItemProperties.Configuration{}),
     lightning_rod.plugin.configured(Durability, Durability.Configuration{}),
     lightning_rod.plugin.configured(EquipmentSlots, EquipmentSlots.Configuration{}),
+    lightning_rod.plugin.configured(EquipmentAttributes, .{}),
+    lightning_rod.plugin.configured(ItemActions, .{}),
     lightning_rod.plugin.configured(Enchantments, .{}),
+    lightning_rod.plugin.configured(FallDamage, .{}),
+    lightning_rod.plugin.configured(ItemContent, .{}),
     lightning_rod.plugin.configured(Lore, Lore.Configuration{}),
     lightning_rod.plugin.configured(ItemEntities, ItemEntities.Configuration{}),
     lightning_rod.plugin.configured(BlockLoot, BlockLoot.Configuration{}),
@@ -131,6 +178,8 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Experience, .{}),
     lightning_rod.plugin.configured(Containers, Containers.Configuration{}),
     lightning_rod.plugin.configured(InventoryMenus, InventoryMenus.Configuration{}),
+    lightning_rod.plugin.configured(RecipeBook, .{}),
+    lightning_rod.plugin.configured(RecipeCommands, .{}),
     lightning_rod.plugin.configured(CreativeInventory, CreativeInventory.Configuration{}),
     lightning_rod.plugin.configured(ItemPickup, ItemPickup.Configuration{}),
     lightning_rod.plugin.configured(ItemTick, ItemTick.Configuration{}),
@@ -139,6 +188,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Streaming, Streaming.Configuration{}),
     lightning_rod.plugin.configured(ExperienceReplication, .{}),
     lightning_rod.plugin.configured(BlockSynchronization, BlockSynchronization.Configuration{}),
+    lightning_rod.plugin.configured(ItemUse, .{}),
     lightning_rod.plugin.configured(Doors, Doors.Configuration{}),
     lightning_rod.plugin.configured(Mining, Mining.Configuration{}),
     lightning_rod.plugin.configured(Placement, Placement.Configuration{}),

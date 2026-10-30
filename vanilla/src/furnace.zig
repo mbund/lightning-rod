@@ -1,12 +1,10 @@
 const std = @import("std");
 const inventories = @import("inventories");
-const game_data = @import("game_data");
 const item_data = @import("item_data.zig");
-const Items = @import("items.zig").Items;
 const containers = @import("containers.zig");
 const chunks = @import("chunks");
 
-pub const encoded_bytes = 21;
+pub const encoded_bytes = 85;
 pub const State = struct {
     burn_left: u32 = 0,
     burn_total: u32 = 0,
@@ -14,10 +12,12 @@ pub const State = struct {
     duration: u32 = 0,
     input: i32 = -1,
     active: bool = false,
+    source: [32]u8 = @splat(0),
+    recipe: [32]u8 = @splat(0),
 
     pub fn decode(raw: ?[]const u8) !State {
         const bytes = raw orelse return .{};
-        if (bytes.len != encoded_bytes or bytes[0] != 1) return error.CorruptFurnace;
+        if (bytes.len != encoded_bytes or bytes[0] != 2) return error.CorruptFurnace;
         const self: State = .{
             .burn_left = std.mem.readInt(u32, bytes[1..5], .little),
             .burn_total = std.mem.readInt(u32, bytes[5..9], .little),
@@ -25,6 +25,8 @@ pub const State = struct {
             .duration = std.mem.readInt(u32, bytes[13..17], .little),
             .input = std.mem.readInt(i32, bytes[17..21], .little),
             .active = true,
+            .source = bytes[21..53].*,
+            .recipe = bytes[53..85].*,
         };
         if (self.burn_left > self.burn_total or self.cook > self.duration) return error.CorruptFurnace;
         return self;
@@ -33,12 +35,14 @@ pub const State = struct {
     pub fn encode(self: State, bytes: []u8) void {
         std.debug.assert(bytes.len >= encoded_bytes and self.burn_left <= self.burn_total and self.cook <= self.duration);
         std.debug.assert(self.active);
-        bytes[0] = 1;
+        bytes[0] = 2;
         std.mem.writeInt(u32, bytes[1..5], self.burn_left, .little);
         std.mem.writeInt(u32, bytes[5..9], self.burn_total, .little);
         std.mem.writeInt(u32, bytes[9..13], self.cook, .little);
         std.mem.writeInt(u32, bytes[13..17], self.duration, .little);
         std.mem.writeInt(i32, bytes[17..21], self.input, .little);
+        @memcpy(bytes[21..53], &self.source);
+        @memcpy(bytes[53..85], &self.recipe);
     }
 };
 
@@ -135,54 +139,73 @@ pub fn tick(self: *containers.Containers) !void {
 fn advance(self: *containers.Containers, key: containers.Key, state: *State, contents: [3]inventories.Contents) ![3]?inventories.Stack {
     var next: [3]?inventories.Stack = undefined;
     for (contents, &next) |value, *stack| stack.* = value.stack;
-    const source = next[0];
-    const kind: ?u32 = if (source) |stack| try self.deps.inventory.deps.items.kind(stack) else null;
-    const recipe = if (kind) |input| self.deps.inventory.recipes.recipes[input] else null;
-    if (state.input != (if (kind) |input| @as(i32, @intCast(input)) else -1)) {
-        state.input = if (kind) |input| @intCast(input) else -1;
-        state.cook = 0;
-    }
-    state.duration = if (recipe) |value| value.ticks else 0;
-    const result: ?inventories.Stack = if (recipe) |value| .{
-        .item = item_data.defaultId(value.output),
-        .count = value.count,
-    } else null;
+    self.deps.inventory.scratch.reset();
+    const selected = try self.deps.furnaces.prepareSmelting(self.deps.inventory.deps.items, .{
+        .world = key.world,
+        .position = .{ .x = key.position.x, .y = key.position.y, .z = key.position.z },
+    }, next, &self.deps.inventory.scratch);
+    defer selected.release();
+    const kind = selected.input_kind;
+    const recipe = selected.recipe;
+    const input_kind: i32 = if (kind) |value| @intCast(value) else -1;
+    const recipe_id: [32]u8 = if (recipe) |value| self.reward_ids[value.index] else @splat(0);
+    const source_id: [32]u8 = if (recipe != null and recipe.?.dynamic) next[0].?.item else @splat(0);
+    const duration = if (recipe) |value| value.plan.ticks else 0;
+    if (state.input != input_kind or !std.mem.eql(u8, &state.recipe, &recipe_id) or !std.mem.eql(u8, &state.source, &source_id) or state.duration != duration) state.cook = 0;
+    state.input = input_kind;
+    state.recipe = recipe_id;
+    state.source = source_id;
+    state.duration = duration;
+    const result: ?inventories.Stack = if (recipe) |value| value.result else null;
     var can_cook = result != null;
     if (result) |output| {
-        const maximum = try Items.maximumDefinition(recipe.?.output, &.{});
+        const maximum = recipe.?.maximum;
+        std.debug.assert(output.count > 0 and output.count <= maximum);
         if (next[2]) |present| {
             can_cook = inventories.Stack.sameItem(output, present) and output.count <= maximum -| present.count;
         } else can_cook = output.count <= maximum;
     }
     const burning = state.burn_left > 0;
     if (burning) state.burn_left -= 1;
-    if (state.burn_left == 0 and can_cook) if (next[1]) |fuel| {
-        const fuel_kind = try self.deps.inventory.deps.items.kind(fuel);
-        const properties = self.deps.inventory.recipes.fuels[fuel_kind];
-        if (properties.ticks != 0) {
-            state.burn_left = properties.ticks;
-            state.burn_total = properties.ticks;
-            next[1] = if (fuel.count > 1) .{ .item = fuel.item, .count = fuel.count - 1 } else if (properties.remainder) |remainder| .{
-                .item = try self.deps.inventory.deps.items.defineKind(remainder),
-                .count = 1,
-            } else null;
+    if (state.burn_left == 0 and can_cook) if (next[1] != null) {
+        const prepared = try self.deps.furnaces.burnFuel(self.deps.inventory.deps.items, .{
+            .phase = .burn,
+            .location = .{ .world = key.world, .position = .{ .x = key.position.x, .y = key.position.y, .z = key.position.z } },
+            .stacks = next,
+        }, &self.deps.inventory.scratch);
+        if (prepared.properties.ticks != 0) {
+            state.burn_left = prepared.properties.ticks;
+            state.burn_total = prepared.properties.ticks;
+            next[1] = prepared.remaining;
         }
     };
     if (state.burn_left > 0 and can_cook) {
         state.cook += 1;
         if (state.cook == state.duration) {
             state.cook = 0;
-            try self.recordRecipe(key, recipe.?.index);
+            try self.recordCooking(key, recipe.?.index, if (recipe.?.dynamic) recipe.?.plan.experience else null);
             const input = next[0].?;
             const output = result.?;
-            const materialized = try self.deps.inventory.deps.items.defineKind(recipe.?.output);
+            const draft = recipe.?.plan.result;
+            const materialized = try item_data.define(self.deps.inventories, draft.kind, draft.components);
             std.debug.assert(std.mem.eql(u8, &materialized, &output.item));
-            next[0] = if (input.count == 1) null else .{ .item = input.item, .count = input.count - 1 };
+            switch (recipe.?.plan.input_replacement) {
+                .normal => next[0] = if (input.count == recipe.?.plan.consume) null else .{ .item = input.item, .count = input.count - recipe.?.plan.consume },
+                .clear => next[0] = null,
+                .stack => |replacement| {
+                    if (replacement.count > try self.deps.inventory.deps.items.maximumDefinition(replacement.kind, replacement.components)) return error.InvalidSmeltingPlan;
+                    next[0] = .{ .item = try item_data.define(self.deps.inventories, replacement.kind, replacement.components), .count = replacement.count };
+                },
+            }
             const previous_count = if (next[2]) |present| present.count else @as(u16, 0);
             next[2] = .{ .item = output.item, .count = output.count + previous_count };
-            if (std.mem.eql(u8, game_data.registry.itemName(@intCast(kind.?)).?, "minecraft:wet_sponge")) if (next[1]) |fuel| {
-                if (std.mem.eql(u8, game_data.registry.itemName(@intCast(try self.deps.inventory.deps.items.kind(fuel))).?, "minecraft:bucket"))
-                    next[1] = .{ .item = try self.deps.inventory.deps.items.define("minecraft:water_bucket"), .count = 1 };
+            if (next[1]) |fuel| for (0..self.deps.furnaces.table.fuel_conversions.len) |offset| {
+                const rules = self.deps.furnaces.table.fuel_conversions;
+                const rule = rules[rules.len - offset - 1];
+                if (rule.input != kind.?) continue;
+                if (rule.fuel != try self.deps.inventory.deps.items.kind(fuel)) continue;
+                if (rule.result) |replacement| next[1] = .{ .item = try self.deps.inventory.deps.items.defineKind(replacement), .count = 1 };
+                break;
             };
         }
     } else if (state.burn_left > 0) state.cook = 0 else state.cook -|= 2;
@@ -194,6 +217,6 @@ test "furnace persistence preserves every counter and rejects invalid state" {
     var bytes: [encoded_bytes]u8 = undefined;
     original.encode(&bytes);
     try std.testing.expectEqualDeep(original, try State.decode(&bytes));
-    bytes[0] = 2;
+    bytes[0] = 0xff;
     try std.testing.expectError(error.CorruptFurnace, State.decode(&bytes));
 }

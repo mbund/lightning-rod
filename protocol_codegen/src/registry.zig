@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
         "// Generated from Prismarine minecraft-data. Do not edit by hand.\n\n" ++
             "const std = @import(\"std\");\n\n" ++
             "pub const ItemInfo = struct { stack_size: u8, max_durability: u16, block_state: i32 };\n" ++
-            "pub const BlockInfo = struct { default_state: i32, min_state: i32, max_state: i32, hardness: f32, drop_item: i32, material_offset: u32, material_count: u8, harvest_offset: u32, harvest_count: u8, emitted_light: u4, filtered_light: u4, diggable: bool, visually_transparent: bool };\n" ++
+            "pub const BlockInfo = struct { default_state: i32, min_state: i32, max_state: i32, hardness: f32, material_offset: u32, material_count: u8, harvest_offset: u32, harvest_count: u8, emitted_light: u4, filtered_light: u4, diggable: bool, visually_transparent: bool };\n" ++
             "pub const ToolSpeed = struct { item_id: i32, multiplier: f32 };\n" ++
             "pub const CollisionBox = packed struct { min_x: i8, min_y: i8, min_z: i8, max_x: i8, max_y: i8, max_z: i8 };\n" ++
             "pub const CollisionShape = struct { offset: u32, count: u8 };\n\n" ++
@@ -318,12 +318,11 @@ pub fn main(init: std.process.Init) !void {
         const material_name = block.get("material").?.string;
         const material_range = try objectValueRange(materials.object, material_name);
         const harvest_count: usize = if (block.get("harvestTools")) |value| value.object.count() else 0;
-        try output.print("    .{{ .default_state = {}, .min_state = {}, .max_state = {}, .hardness = {d}, .drop_item = {}, .material_offset = {}, .material_count = {}, .harvest_offset = {}, .harvest_count = {}, .emitted_light = {}, .filtered_light = {}, .diggable = {}, .visually_transparent = {} }},\n", .{
-            try intField(block, "defaultState"),            try intField(block, "minStateId"),                 try intField(block, "maxStateId"),
-            try optionalNumberField(block, "hardness", -1), (try firstIntArrayField(block, "drops")) orelse 0, material_range.offset,
-            material_range.count,                           harvest_offset,                                    harvest_count,
-            try intField(block, "emitLight"),               try intField(block, "filterLight"),                try boolField(block, "diggable"),
-            try boolField(block, "transparent"),
+        try output.print("    .{{ .default_state = {}, .min_state = {}, .max_state = {}, .hardness = {d}, .material_offset = {}, .material_count = {}, .harvest_offset = {}, .harvest_count = {}, .emitted_light = {}, .filtered_light = {}, .diggable = {}, .visually_transparent = {} }},\n", .{
+            try intField(block, "defaultState"),            try intField(block, "minStateId"), try intField(block, "maxStateId"),
+            try optionalNumberField(block, "hardness", -1), material_range.offset,             material_range.count,
+            harvest_offset,                                 harvest_count,                     try intField(block, "emitLight"),
+            try intField(block, "filterLight"),             try boolField(block, "diggable"),  try boolField(block, "transparent"),
         });
         harvest_offset += @intCast(harvest_count);
     }
@@ -619,15 +618,6 @@ fn numberValue(value: std.json.Value) !f64 {
 
 fn optionalNumberField(object: std.json.ObjectMap, name: []const u8, default: f64) !f64 {
     return if (object.get(name)) |value| numberValue(value) else default;
-}
-
-fn firstIntArrayField(object: std.json.ObjectMap, name: []const u8) !?i64 {
-    const value = object.get(name) orelse return null;
-    if (value.array.items.len == 0) return null;
-    return switch (value.array.items[0]) {
-        .integer => |v| v,
-        else => error.FieldIsNotInteger,
-    };
 }
 
 fn collisionCoordinate(value: std.json.Value) !i8 {

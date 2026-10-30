@@ -4,7 +4,7 @@ const game_data = @import("game_data");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const names = .{ "lighting", "lightning_rod", "game_data", "minecraft_packets", "minecraft_java", "sessions", "chunks", "entities", "inventories", "metrics", "records", "commands", "reload", "worlds", "storage" };
+    const names = .{ "lighting", "lightning_rod", "game_data", "datapacks", "minecraft_packets", "minecraft_java", "sessions", "chunks", "entities", "inventories", "metrics", "records", "commands", "reload", "worlds", "storage" };
     var imports: [names.len + 2]std.Build.Module.Import = undefined;
 
     inline for (names, 0..) |name, i| {
@@ -44,19 +44,39 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    const generator_module = b.createModule(.{ .root_source_file = b.path("src/prepare_content.zig"), .target = b.graph.host, .optimize = .ReleaseFast });
+    for (module.import_table.keys(), module.import_table.values()) |name, dependency| generator_module.addImport(name, dependency);
+    const prepare_content = b.addExecutable(.{ .name = "prepare-vanilla-content", .root_module = generator_module });
+    const run_prepare = b.addRunArtifact(prepare_content);
+    module.addAnonymousImport("vanilla_definitions", .{ .root_source_file = run_prepare.addOutputFileArg("vanilla_content.zig") });
+
     const filter = b.option([]const u8, "test-filter", "Run matching tests");
     const lighting_tests = b.step("test-lighting", "Verify terrain lighting and chunk packet integration");
     const test_step = b.step("test", "Verify encoding and batched gameplay records");
-    for ([_][]const u8{ "src/chunk_encoding.zig", "src/lighting.zig", "src/container_blocks.zig", "src/furnace.zig", "src/block_sync.zig", "src/streaming.zig", "src/batch_test.zig", "src/pickup_test.zig", "src/merge_test.zig", "src/item_spatial_test.zig", "src/item_selection_test.zig", "src/placement_test.zig", "src/creative_inventory.zig", "src/command_dispatch_test.zig", "src/replication.zig", "src/visibility.zig", "src/visibility_replication_test.zig", "src/environment_test.zig", "src/configuration_test.zig", "src/session_keepalive.zig", "src/generation.zig", "src/random.zig" }) |source| {
+    for ([_][]const u8{ "src/chunk_encoding.zig", "src/lighting.zig", "src/container_blocks.zig", "src/furnace.zig", "src/block_sync.zig", "src/streaming.zig", "src/batch_test.zig", "src/pickup_test.zig", "src/merge_test.zig", "src/item_spatial_test.zig", "src/item_selection_test.zig", "src/placement_test.zig", "src/creative_inventory.zig", "src/command_dispatch_test.zig", "src/replication.zig", "src/visibility.zig", "src/visibility_replication_test.zig", "src/environment_test.zig", "src/configuration_test.zig", "src/session_keepalive.zig", "src/generation.zig", "src/random.zig", "src/raycast.zig" }) |source| {
         const test_module = b.createModule(.{ .root_source_file = b.path(source), .target = target, .optimize = optimize });
         for (module.import_table.keys(), module.import_table.values()) |name, dependency|
             test_module.addImport(name, dependency);
         const tests = b.addTest(.{ .root_module = test_module, .filters = if (filter) |value| &.{value} else &.{} });
         const run = b.addRunArtifact(tests);
         test_step.dependOn(&run.step);
+        if (std.mem.eql(u8, source, "src/placement_test.zig")) b.step("test-placement", "Verify placement and collision raycasts").dependOn(&run.step);
+        if (std.mem.eql(u8, source, "src/raycast.zig")) b.step("test-raycast", "Verify bounded voxel traversal").dependOn(&run.step);
         if (std.mem.eql(u8, source, "src/lighting.zig") or std.mem.eql(u8, source, "src/chunk_encoding.zig") or std.mem.eql(u8, source, "src/streaming.zig"))
             lighting_tests.dependOn(&run.step);
     }
+
+    const enchantment_module = b.createModule(.{ .root_source_file = b.path("src/enchantment_test.zig"), .target = target, .optimize = optimize });
+    for (module.import_table.keys(), module.import_table.values()) |name, dependency| enchantment_module.addImport(name, dependency);
+    const enchantment_tests = b.addRunArtifact(b.addTest(.{ .root_module = enchantment_module }));
+    b.step("test-enchantments", "Verify native and datapack enchantment behavior").dependOn(&enchantment_tests.step);
+    test_step.dependOn(&enchantment_tests.step);
+
+    const registry_module = b.createModule(.{ .root_source_file = b.path("src/registry_test.zig"), .target = target, .optimize = optimize });
+    for (module.import_table.keys(), module.import_table.values()) |name, dependency| registry_module.addImport(name, dependency);
+    const registry_tests = b.addRunArtifact(b.addTest(.{ .root_module = registry_module }));
+    b.step("test-registries", "Verify independently owned gameplay definitions").dependOn(&registry_tests.step);
+    test_step.dependOn(&registry_tests.step);
 
     const menu_module = b.createModule(.{ .root_source_file = b.path("src/menu_test.zig"), .target = target, .optimize = optimize });
     for (module.import_table.keys(), module.import_table.values()) |name, dependency| menu_module.addImport(name, dependency);
@@ -64,6 +84,37 @@ pub fn build(b: *std.Build) void {
     const menu_tests = b.addRunArtifact(b.addTest(.{ .root_module = menu_module }));
     b.step("test-menus", "Verify crafting and container ownership across persistence").dependOn(&menu_tests.step);
     test_step.dependOn(&menu_tests.step);
+    const book_module = b.createModule(.{ .root_source_file = b.path("src/recipe_book_test.zig"), .target = target, .optimize = optimize });
+    for (module.import_table.keys(), module.import_table.values()) |name, dependency| book_module.addImport(name, dependency);
+    const book_tests = b.addRunArtifact(b.addTest(.{ .root_module = book_module }));
+    b.step("test-recipe-book", "Verify recipe book displays placement and persistence").dependOn(&book_tests.step);
+    test_step.dependOn(&book_tests.step);
+    const recipe_module = b.createModule(.{ .root_source_file = b.path("src/recipes.zig"), .target = target, .optimize = optimize });
+    for (module.import_table.keys(), module.import_table.values()) |name, dependency| recipe_module.addImport(name, dependency);
+    const recipe_tests = b.addRunArtifact(b.addTest(.{ .root_module = recipe_module }));
+    b.step("test-recipes", "Verify typed and JSON recipe preparation").dependOn(&recipe_tests.step);
+    test_step.dependOn(&recipe_tests.step);
+    const content_module = b.createModule(.{ .root_source_file = b.path("src/definition_provider_test.zig"), .target = target, .optimize = optimize });
+    for (module.import_table.keys(), module.import_table.values()) |name, dependency| content_module.addImport(name, dependency);
+    _ = content_module.import_table.swapRemove("datapacks");
+    const content_tests = b.addRunArtifact(b.addTest(.{ .root_module = content_module }));
+    b.step("test-content", "Verify loaded content and client registry configuration").dependOn(&content_tests.step);
+    test_step.dependOn(&content_tests.step);
+    const native_content_module = b.createModule(.{ .root_source_file = b.path("src/native_content_test.zig"), .target = target, .optimize = optimize });
+    for (module.import_table.keys(), module.import_table.values()) |name, dependency| if (!std.mem.eql(u8, name, "datapacks")) native_content_module.addImport(name, dependency);
+    const native_content_tests = b.addRunArtifact(b.addTest(.{ .root_module = native_content_module }));
+    b.step("test-native-content", "Verify gameplay composition without the datapack package").dependOn(&native_content_tests.step);
+    test_step.dependOn(&native_content_tests.step);
+    const datapack_module = b.createModule(.{ .root_source_file = b.path("src/datapacks_test.zig"), .target = target, .optimize = optimize });
+    for (module.import_table.keys(), module.import_table.values()) |name, dependency| datapack_module.addImport(name, dependency);
+    const datapack_tests = b.addRunArtifact(b.addTest(.{ .root_module = datapack_module }));
+    b.step("test-datapacks", "Verify optional datapack adapters and native composition").dependOn(&datapack_tests.step);
+    test_step.dependOn(&datapack_tests.step);
+    const loot_module = b.createModule(.{ .root_source_file = b.path("src/loot.zig"), .target = target, .optimize = optimize });
+    for (module.import_table.keys(), module.import_table.values()) |name, dependency| loot_module.addImport(name, dependency);
+    const loot_tests = b.addRunArtifact(b.addTest(.{ .root_module = loot_module }));
+    b.step("test-loot", "Verify prepared block loot and pack overrides").dependOn(&loot_tests.step);
+    test_step.dependOn(&loot_tests.step);
 
     const pipeline_module = b.createModule(.{ .root_source_file = b.path("src/pipeline_bench.zig"), .target = target, .optimize = optimize });
     for (module.import_table.keys(), module.import_table.values()) |name, dependency|

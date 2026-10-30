@@ -72,6 +72,14 @@ pub const Entities = struct {
         return self;
     }
 
+    /// Reserves a contiguous ID range without creating persistent entity records.
+    pub fn reserveIds(self: *Entities, count: usize) !Id {
+        if (count > std.math.maxInt(Id) - self.next_id) return error.IdExhausted;
+        const first = self.next_id;
+        self.next_id += count;
+        return first;
+    }
+
     pub fn create(self: *Entities, state: State) !Id {
         var output: [1]Id = undefined;
         try self.createMany(&.{state}, &output);

@@ -22,6 +22,7 @@ pub const Configuration = struct {
     temporary_bytes: usize = 16 * 1024,
     /// Borrowed scratch must outlive this simulation and remain exclusive during ticks and lifecycle hooks.
     scratch: ?[]u8 = null,
+    /// Plugin metric capacity excludes the framework instruments counted from the composition.
     metrics: metrics.Registry.Configuration = .{ .capacity = 512 },
 };
 
@@ -68,6 +69,15 @@ pub fn Simulation(comptime Selections: type) type {
 
             const owned_scratch_bytes = if (configuration.scratch == null) configuration.temporary_bytes else 0;
             if (configuration.memory_bytes < @sizeOf(Self) or owned_scratch_bytes > configuration.memory_bytes - @sizeOf(Self)) return error.OutOfMemory;
+            const own_instruments = comptime blk: {
+                var total: usize = 0;
+                for (std.meta.fields(Self)) |field| if (field.type == metrics.Timer or field.type == metrics.Counter or field.type == metrics.Gauge) {
+                    total += 1;
+                };
+                break :blk total;
+            };
+            var metrics_configuration = configuration.metrics;
+            metrics_configuration.capacity = try std.math.add(usize, configuration.metrics.capacity, own_instruments + count * std.meta.fields(runtime.Instruments).len);
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
             const owned_scratch = if (configuration.scratch == null) try allocator.alignedAlloc(u8, .@"64", owned_scratch_bytes) else null;
@@ -80,7 +90,7 @@ pub fn Simulation(comptime Selections: type) type {
                 .owned_scratch = owned_scratch,
                 .permanent = PluginAllocator.init(allocator, configuration.memory_bytes - @sizeOf(Self) - owned_scratch_bytes),
                 .temporary = std.heap.FixedBufferAllocator.init(configuration.scratch orelse owned_scratch.?),
-                .metrics = try metrics.Registry.init(allocator, io, configuration.metrics),
+                .metrics = try metrics.Registry.init(allocator, io, metrics_configuration),
                 .storage = store,
                 .scope = configuration.scope,
                 .transaction = transaction,
@@ -89,7 +99,8 @@ pub fn Simulation(comptime Selections: type) type {
                 .autosave = configuration.autosave,
             };
             errdefer self.metrics.deinit();
-            self.permanent.trackPlugins(&self.plugin_bytes);
+            errdefer self.permanent.deinit();
+            try self.permanent.trackPlugins(&self.plugin_bytes);
             self.server_tick = try self.metrics.timer(.{ .name = "server.tick", .description = "Complete tick including session input and output publication" });
             self.server_work = try self.metrics.timer(.{ .name = "server.work", .description = "Between-tick storage progress and output publication" });
             self.tick_duration = try self.metrics.timer(.{ .name = "simulation.tick", .description = "Gameplay tick and storage submission" });

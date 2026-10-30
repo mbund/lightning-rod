@@ -5,14 +5,15 @@ const chunks = @import("chunks");
 const records = @import("records");
 
 const side = 64;
-const columns_per_batch = 8;
-const dimension = vanilla.VanillaWorlds.dimensions.overworld;
-const section_count: usize = dimension.section_count;
+const batch_sections = 192;
 
 pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
+    const content = try vanilla.prepareDefinitions(allocator);
+    const dimension = try content.dimensions.dimension("minecraft:overworld");
+    const section_count: usize = dimension.section_count;
     var args = try init.minimal.args.iterateAllocator(allocator);
     defer args.deinit();
     _ = args.skip();
@@ -21,11 +22,12 @@ pub fn main(init: std.process.Init) !void {
     var store = try lightning_rod.storage.Store.init(allocator, init.io, .{ .path = path });
     defer store.deinit();
     const plugins = lightning_rod.plugin.compose(.{
+        vanilla.definition_provider.selections(content),
         lightning_rod.plugin.configured(records.Workspaces, .{}),
         lightning_rod.plugin.configured(vanilla.RegistryIdentity, .{}),
         lightning_rod.plugin.configured(vanilla.Worlds, .{}),
         lightning_rod.plugin.configured(vanilla.VanillaWorlds, .{}),
-        lightning_rod.plugin.configured(vanilla.Chunks, .{ .demand_sections = 0, .cache_sections = columns_per_batch * section_count }),
+        lightning_rod.plugin.configured(vanilla.Chunks, .{ .demand_sections = 0, .cache_sections = batch_sections }),
         lightning_rod.plugin.configured(vanilla.Flat, .{}),
     });
     const simulation = try lightning_rod.Simulation(@TypeOf(plugins)).init(allocator, init.io, &store, .{
@@ -36,20 +38,22 @@ pub fn main(init: std.process.Init) !void {
     try simulation.initialize(plugins, .{ .metrics = &simulation.metrics });
     const world = simulation.get(vanilla.VanillaWorlds).overworld;
     const sections = simulation.get(vanilla.Chunks);
-    for (0..side) |x| for (0..side / columns_per_batch) |batch| {
-        var requests: [columns_per_batch * section_count]chunks.Section = undefined;
-        var leases: [requests.len]chunks.Lease = undefined;
-        for (0..columns_per_batch) |column| for (0..section_count) |y| {
-            requests[column * section_count + y] = .{
-                .world = world,
-                .x = @as(i32, @intCast(x)) - side / 2,
-                .z = @as(i32, @intCast(batch * columns_per_batch + column)) - side / 2,
-                .y = dimension.minimum_section + @as(i32, @intCast(y)),
-            };
+    var cursor: usize = 0;
+    const total_sections = side * side * section_count;
+    while (cursor < total_sections) {
+        var requests: [batch_sections]chunks.Section = undefined;
+        var leases: [batch_sections]chunks.Lease = undefined;
+        const count = @min(batch_sections, total_sections - cursor);
+        for (requests[0..count], cursor..) |*request, index| request.* = .{
+            .world = world,
+            .x = @as(i32, @intCast(index / section_count / side)) - side / 2,
+            .z = @as(i32, @intCast(index / section_count % side)) - side / 2,
+            .y = dimension.minimum_section + @as(i32, @intCast(index % section_count)),
         };
-        try sections.acquireMany(&requests, &leases);
-        for (leases) |lease| lease.release();
-    };
+        try sections.acquireMany(requests[0..count], leases[0..count]);
+        for (leases[0..count]) |lease| lease.release();
+        cursor += count;
+    }
     try simulation.tick();
     try simulation.close(.fromNow(init.io, .{ .clock = .awake, .raw = .fromSeconds(30) }));
     simulation.deinit(allocator);

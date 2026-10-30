@@ -1,3 +1,6 @@
+const placement_behavior = @import("placement_behavior.zig");
+const item_data = @import("item_data.zig");
+const PlacementRegistry = @import("placement_registry.zig").PlacementRegistry;
 const game_data = @import("game_data");
 const std = @import("std");
 const wire_1_21_5 = @import("wire_1_21_5");
@@ -11,16 +14,19 @@ const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
 const Players = @import("players.zig").Players;
 const Input = @import("input.zig").Input;
 const Items = @import("items.zig").Items;
+const ItemActions = @import("item_actions.zig").ItemActions;
 const BlockSynchronization = @import("block_sync.zig").BlockSynchronization;
 
 const Chunks = chunks.Chunks;
 
 pub const Placement = struct {
+    pub const Registry = PlacementRegistry;
     pub const id = "minecraft:placement";
 
     pub const Configuration = struct {};
 
     pub const Dependencies = struct {
+        definitions: *Registry,
         menus: *PlayerInventory,
         players: *Players,
         input: *Input,
@@ -30,6 +36,7 @@ pub const Placement = struct {
         chunks: *Chunks,
         blocks: *BlockSynchronization,
         actions: *block_actions.BlockActions,
+        item_actions: *ItemActions,
     };
 
     const State = struct {
@@ -122,6 +129,7 @@ pub const Placement = struct {
             }
         }
 
+        if (try self.deps.item_actions.apply(&player, place.hand, place) != .pass) return;
         if (player.gamemode != .creative and player.gamemode != .survival) return;
         var position = place.position;
         const offset = [_][3]i32{ .{ 0, -1, 0 }, .{ 0, 1, 0 }, .{ 0, 0, -1 }, .{ 0, 0, 1 }, .{ -1, 0, 0 }, .{ 1, 0, 0 } };
@@ -139,10 +147,38 @@ pub const Placement = struct {
         const pos: chunks.Position = .{ .x = position.x, .y = position.y, .z = position.z };
         const previous = try self.deps.chunks.getBlock(player.world, pos);
         var block: u16 = 0;
-
+        var remaining = held.stack;
         if (held.stack) |stack| {
-            const kind = try self.deps.items.kind(stack);
-            block = @intCast(game_data.registry.items[kind].block_state);
+            const pinned = try self.deps.items.acquire(stack);
+            defer pinned.release();
+            var plan: placement_behavior.Plan = .{ .state = self.deps.definitions.states[pinned.view.kind] };
+            if (self.deps.definitions.callbacks[pinned.view.kind]) |callback| {
+                self.deps.menus.scratch.reset();
+                const context: placement_behavior.Context = .{
+                    .player = player.uuid,
+                    .actor = &player,
+                    .world = player.world,
+                    .position = position,
+                    .previous = previous,
+                    .hit = place,
+                    .item = .{ .stack = stack, .view = pinned.view },
+                    .standard = plan,
+                    .scratch = &self.deps.menus.scratch,
+                };
+                plan = try callback.call(&context) orelse .{ .state = 0 };
+                try placement_behavior.validate(plan, stack.count);
+            }
+            block = plan.state;
+            switch (plan.replacement) {
+                .normal => if (player.gamemode != .creative) {
+                    remaining = if (stack.count == plan.consume) null else .{ .item = stack.item, .count = stack.count - plan.consume };
+                },
+                .clear => remaining = null,
+                .stack => |draft| {
+                    if (draft.count > try self.deps.items.maximumDefinition(draft.kind, draft.components)) return error.InvalidPlacementPlan;
+                    remaining = .{ .item = try item_data.define(self.deps.inventories, draft.kind, draft.components), .count = draft.count };
+                },
+            }
         }
 
         var allowed = block != 0 and previous == 0 and player.health > 0 and (player.gamemode == .creative or player.gamemode == .survival);
@@ -180,9 +216,7 @@ pub const Placement = struct {
 
         if (custom == .pass) try self.deps.chunks.setBlock(player.world, pos, block);
 
-        if (player.gamemode != .creative) {
-            const stack = held.stack.?;
-            const remaining: ?inventories.Stack = if (stack.count == 1) null else .{ .item = stack.item, .count = stack.count - 1 };
+        if (!std.meta.eql(held.stack, remaining)) {
             const changed = try self.deps.inventories.set(slot, held.revision, remaining);
             std.debug.assert(changed);
             self.deps.menus.changed(index);

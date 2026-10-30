@@ -76,8 +76,11 @@ pub fn run(init: std.process.Init, config: Configuration) !void {
     try signals.install();
     defer signals.restore();
     const protocol_allocator = memory.allocator("protocols");
+    const content = try vanilla.prepareDefinitions(memory.allocator("definitions"));
+    _ = try vanilla.Datapacks.init(memory.allocator("datapacks"), init.io, .{ .sources = &.{.{ .collection = "datapacks" }} }, content);
     var selected = try protocols.Default.init(protocol_allocator);
     defer selected.deinit(protocol_allocator);
+    try vanilla.definition_provider.configureProtocols(content, protocols.Default, protocol_allocator, &selected);
     const session_plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.configured(protocols.Handshake, .{}),
         vanilla.session_plugins(&selected),
@@ -155,6 +158,7 @@ pub fn run(init: std.process.Init, config: Configuration) !void {
             .wakeup = &workers[index % pool_size].background_ready,
             .routing = &routing_table,
             .catalog = &catalog,
+            .content = content,
             .chat = chat,
             .index = index,
             .worker = index % pool_size,

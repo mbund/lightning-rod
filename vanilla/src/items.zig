@@ -1,3 +1,4 @@
+const ItemRegistry = @import("item_registry.zig").ItemRegistry;
 const RegistryIdentity = @import("registry_identity.zig").RegistryIdentity;
 const std = @import("std");
 const inventories = @import("inventories");
@@ -7,9 +8,10 @@ const data = @import("item_data.zig");
 const components = @import("item_components.zig");
 
 pub const Items = struct {
+    pub const Registry = ItemRegistry;
     pub const id = "minecraft:items";
     pub const Configuration = struct { maximum_components: usize = 32 };
-    pub const Dependencies = struct { registry_identity: *RegistryIdentity, inventories: *inventories.Inventories };
+    pub const Dependencies = struct { definitions: *Registry, registry_identity: *RegistryIdentity, inventories: *inventories.Inventories };
     pub const View = data.View;
     pub const Component = data.Component;
     pub const key = data.key;
@@ -94,7 +96,7 @@ pub const Items = struct {
     pub fn stackLimit(self: *Items, stack: inventories.Stack) !u16 {
         const prepared = try self.acquire(stack);
         defer prepared.release();
-        return maximum(prepared.view);
+        return self.maximum(prepared.view);
     }
 
     pub fn stackLimits(self: *Items, stacks: []const inventories.Stack, limits: []u16) !void {
@@ -126,25 +128,25 @@ pub const Items = struct {
             defer for (prepared[0..count]) |value| value.release();
             var at = begin;
             for (prepared[0..count], ends[0..count]) |value, end| {
-                const limit = try maximum(value.view);
+                const limit = try self.maximum(value.view);
                 for (order[at..end]) |index| limits[index] = limit;
                 at = end;
             }
         }
     }
 
-    pub fn maximum(view: View) !u16 {
-        return maximumComponent(view.kind, view.get(key(.max_stack_size)));
+    pub fn maximum(self: *const Items, view: View) !u16 {
+        return self.maximumComponent(view.kind, view.get(key(.max_stack_size)));
     }
 
-    pub fn maximumDefinition(kind_id: u32, entries: []const Component) !u16 {
-        for (entries) |component| if (component.key == key(.max_stack_size)) return maximumComponent(kind_id, component);
-        return maximumComponent(kind_id, null);
+    pub fn maximumDefinition(self: *const Items, kind_id: u32, entries: []const Component) !u16 {
+        for (entries) |component| if (component.key == key(.max_stack_size)) return self.maximumComponent(kind_id, component);
+        return self.maximumComponent(kind_id, null);
     }
 
-    fn maximumComponent(kind_id: u32, component: ?Component) !u16 {
+    fn maximumComponent(self: *const Items, kind_id: u32, component: ?Component) !u16 {
         if (kind_id >= game_data.registry.items.len) return error.UnknownItem;
-        const limit = component orelse return game_data.registry.items[kind_id].stack_size;
+        const limit = component orelse return self.deps.definitions.properties[kind_id].stack_size;
         const bytes = limit.value orelse return error.InvalidStackLimit;
         const count, const rest = try game_data.encoding.read_varint(bytes);
         if (rest.len != 0 or count <= 0 or count > 99) return error.InvalidStackLimit;

@@ -19,6 +19,7 @@ pub fn Server(comptime Plugins: type, comptime Endpoint: type, comptime SessionP
             defer process.deinit();
             const simulation = process.simulation;
             const network = process.network;
+            try vanilla.definition_provider.configureProtocols(vanilla.definition_provider.from(@TypeOf(simulation.*), simulation), Endpoint.Protocols, memory.allocator("content_protocols"), options.network.protocols);
             const request = &process.reloading.request;
             const generation = try vanilla.Generation.init(memory.allocator("generation"), init.io, simulation.get(vanilla.Chunks).generation, 0);
             defer generation.deinit();

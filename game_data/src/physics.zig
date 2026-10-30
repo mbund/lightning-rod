@@ -21,9 +21,7 @@ pub const Experience = struct {
     minimum: u8 = 0,
     bound: u8 = 0,
     rolls: u8 = 0,
-    silk_touch: bool = false,
-    silk_only: bool = false,
-    silk_drop: i32 = -1,
+    enchantments: bool = false,
 
     pub fn maximum(self: Experience) i32 {
         std.debug.assert(self.rolls == 0 or self.bound > 0);
@@ -40,15 +38,15 @@ pub const Experience = struct {
 };
 
 pub fn Data(comptime expected_states: usize, comptime expected_blocks: usize, comptime bytes: []const u8) type {
-    std.debug.assert(bytes.len == 16 + expected_states * 12 + expected_blocks * 8);
-    std.debug.assert(std.mem.eql(u8, bytes[0..8], "LRPHYS02"));
+    std.debug.assert(bytes.len == 16 + expected_states * 12 + expected_blocks * 4);
+    std.debug.assert(std.mem.eql(u8, bytes[0..8], "LRPHYS03"));
     std.debug.assert(std.mem.readInt(u32, bytes[8..12], .big) == expected_states);
     std.debug.assert(std.mem.readInt(u32, bytes[12 + expected_states * 12 ..][0..4], .big) == expected_blocks);
     return struct {
         pub fn experience(block: u16) Experience {
             std.debug.assert(block < expected_blocks);
-            const entry = bytes[16 + expected_states * 12 + @as(usize, block) * 8 ..][0..8];
-            return .{ .minimum = entry[0], .bound = entry[1], .rolls = entry[2], .silk_touch = entry[3] & 1 != 0, .silk_only = entry[3] & 2 != 0, .silk_drop = std.mem.readInt(i32, entry[4..8], .little) };
+            const entry = bytes[16 + expected_states * 12 + @as(usize, block) * 4 ..][0..4];
+            return .{ .minimum = entry[0], .bound = entry[1], .rolls = entry[2], .enchantments = entry[3] & 1 != 0 };
         }
 
         pub fn get(state: u16) State {

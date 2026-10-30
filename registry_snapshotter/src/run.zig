@@ -11,7 +11,16 @@ pub fn main(init: std.process.Init) !void {
     defer log.close(init.io);
     var child = try std.process.spawn(init.io, .{ .argv = args[3..], .stdout = .{ .file = log }, .stderr = .{ .file = log } });
     const result = try child.wait(init.io);
-    if (result == .exited and result.exited == 0) return;
+    var complete = result == .exited and result.exited == 0;
+    for (args[3..]) |arg| {
+        inline for (.{ "snapshot", "lighting", "fuel", "physics", "pack" }) |name| {
+            const prefix = "-P" ++ name ++ "Output=";
+            if (std.mem.startsWith(u8, arg, prefix)) cwd.access(init.io, arg[prefix.len..], .{}) catch {
+                complete = false;
+            };
+        }
+    }
+    if (complete) return;
     var read_buffer: [4096]u8 = undefined;
     var write_buffer: [4096]u8 = undefined;
     var reader = log.reader(init.io, &read_buffer);
@@ -19,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
     _ = try reader.interface.streamRemaining(&writer.interface);
     try writer.interface.flush();
     switch (result) {
-        .exited => |code| std.process.exit(code),
+        .exited => |code| std.process.exit(if (code == 0) 1 else code),
         else => return error.RegistrySnapshotFailed,
     }
 }

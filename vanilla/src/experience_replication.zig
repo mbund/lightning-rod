@@ -7,7 +7,7 @@ const minecraft = @import("minecraft_model");
 const entities = @import("entities");
 const game_data = @import("game_data");
 const wire = @import("wire_1_21_5");
-const packed_wire = @import("wire_1_21_9");
+const entity_packets = @import("entity_packets.zig");
 const Experience = @import("experience.zig").Experience;
 const State = @import("experience_state.zig").State;
 const Players = @import("players.zig").Players;
@@ -245,7 +245,7 @@ pub const ExperienceReplication = struct {
         if (count == 0) return;
         const entity = Experience.networkId(self.deps.experience.residents[index].id);
         switch (phase) {
-            .spawn => try self.deps.packets.fanoutGroup(.{ .{ writeSpawnLegacy, writeSpawnPacked }, writeValue }, self.targets[0..count], .{ .{ entity, body }, .{ entity, self.deps.experience.orbs[index].value, self.deps.experience.orbs[index].fire > 0 } }, &.{ 128, 32 }, self.deliveries[0..count]),
+            .spawn => try self.deps.packets.fanoutGroup(.{ entity_packets.spawn, writeValue }, self.targets[0..count], .{ .{ entity, body }, .{ entity, self.deps.experience.orbs[index].value, self.deps.experience.orbs[index].fire > 0 } }, &.{ 128, 32 }, self.deliveries[0..count]),
             .position => try self.deps.packets.fanout(writePosition, self.targets[0..count], .{ entity, body, self.deps.experience.orbs[index].on_ground }, 128, self.deliveries[0..count]),
             .metadata => try self.deps.packets.fanout(writeValue, self.targets[0..count], .{ entity, self.deps.experience.orbs[index].value, self.deps.experience.orbs[index].fire > 0 }, 32, self.deliveries[0..count]),
             .remove => try self.deps.packets.fanout(writeRemove, self.targets[0..count], .{entity}, 32, self.deliveries[0..count]),
@@ -274,20 +274,6 @@ pub const ExperienceReplication = struct {
 
 fn writeExperience(packet: wire.play.toClient.packet_experience.Writer, value: State) ![]u8 {
     return (try (try (try packet.experienceBar(value.progress)).level(value.level)).totalExperience(value.total)).finish();
-}
-fn writeSpawnLegacy(packet: wire.play.toClient.packet_spawn_entity.Writer, registry: packets.Registry, id: i32, body: entities.State) ![]u8 {
-    const positioned = try (try (try (try (try (try packet.entityId(id)).objectUUID(body.uuid)).type(try registry.entityId(@intCast(body.kind)))).x(body.position[0])).y(body.position[1])).z(body.position[2]);
-    const data = try (try (try (try positioned.pitch(angle(body.pitch))).yaw(angle(body.yaw))).headPitch(0)).objectData(0);
-    var velocity = try data.velocity();
-    return (try velocity.advance(try packets.nested(.{writeVelocity}).write(try velocity.begin(), body.velocity))).finish();
-}
-fn writeVelocity(packet: wire.vec3i16.Writer, motion: [3]f64) !wire.vec3i16.Writer.Done {
-    return (try (try packet.x(@intFromFloat(std.math.clamp(motion[0], -3.9, 3.9) * 8000))).y(@intFromFloat(std.math.clamp(motion[1], -3.9, 3.9) * 8000))).z(@intFromFloat(std.math.clamp(motion[2], -3.9, 3.9) * 8000));
-}
-fn writeSpawnPacked(packet: packed_wire.play.toClient.packet_spawn_entity.Writer, registry: packets.Registry, id: i32, body: entities.State) ![]u8 {
-    const positioned = try (try (try (try (try (try packet.entityId(id)).objectUUID(body.uuid)).type(try registry.entityId(@intCast(body.kind)))).x(body.position[0])).y(body.position[1])).z(body.position[2]);
-    const rotated = try (try (try (try positioned.velocity(.{ .x = body.velocity[0], .y = body.velocity[1], .z = body.velocity[2] })).pitch(angle(body.pitch))).yaw(angle(body.yaw))).headPitch(0);
-    return (try rotated.objectData(0)).finish();
 }
 fn writeValue(packet: wire.play.toClient.packet_entity_metadata.Writer, id: i32, value: i32, burning: bool) ![]u8 {
     var metadata = try (try packet.entityId(id)).metadata();
@@ -337,8 +323,4 @@ fn writeSoundHolder(packet: wire.ItemSoundHolder.Writer, _: void) !wire.ItemSoun
 fn writeSoundEvent(packet: wire.ItemSoundEvent.Writer, _: void) !wire.ItemSoundEvent.Writer.Done {
     var range = try (try packet.soundName("minecraft:entity.player.levelup")).fixedRange();
     return range.advance(try (try range.begin()).none());
-}
-
-fn angle(degrees: f32) i8 {
-    return @bitCast(@as(u8, @intFromFloat(@mod(@floor(degrees * 256 / 360), 256))));
 }

@@ -1,3 +1,4 @@
+const Blocks = @import("blocks.zig").Blocks;
 const game_data = @import("game_data");
 const std = @import("std");
 const chunks = @import("chunks");
@@ -10,7 +11,7 @@ pub const ItemPhysics = struct {
 
     pub const Configuration = struct {};
 
-    pub const Dependencies = struct { chunks: *chunks.Chunks };
+    pub const Dependencies = struct { blocks: *Blocks, chunks: *chunks.Chunks };
 
     pub const Window = chunks.ReadWindow(8);
 
@@ -56,9 +57,9 @@ pub const ItemPhysics = struct {
                 while (@as(f64, @floatFromInt(x)) < high[0]) : (x += 1) {
                     const state = try self.blockState(window, body.world, .{ .x = x, .y = y, .z = z });
                     const name = game_data.registry.blockStateName(state).?;
-                    const properties = game_data.physics.get(state);
+                    const properties = self.deps.blocks.get(state);
                     if (properties.fluid != .none) {
-                        const above = game_data.physics.get(try self.blockState(window, body.world, .{ .x = x, .y = y + 1, .z = z }));
+                        const above = self.deps.blocks.get(try self.blockState(window, body.world, .{ .x = x, .y = y + 1, .z = z }));
                         const height = if (above.fluid == properties.fluid) @as(f64, 1) else properties.height();
                         if (low[1] < @as(f64, @floatFromInt(y)) + height) {
                             result.extinguish = result.extinguish or properties.fluid == .water;
@@ -89,9 +90,9 @@ pub const ItemPhysics = struct {
     pub fn orbEnvironment(self: *ItemPhysics, window: *Window, body: entities.State) !OrbEnvironment {
         const eye = body.position[1] + @as(f64, @as(f32, 0.425));
         const position: chunks.Position = .{ .x = @intFromFloat(@floor(body.position[0])), .y = @intFromFloat(@floor(eye)), .z = @intFromFloat(@floor(body.position[2])) };
-        const water = game_data.physics.get(try self.blockState(window, body.world, position));
-        const above = game_data.physics.get(try self.blockState(window, body.world, .{ .x = position.x, .y = position.y + 1, .z = position.z }));
-        const base = game_data.physics.get(try self.blockState(window, body.world, .{ .x = position.x, .y = @intFromFloat(@floor(body.position[1])), .z = position.z }));
+        const water = self.deps.blocks.get(try self.blockState(window, body.world, position));
+        const above = self.deps.blocks.get(try self.blockState(window, body.world, .{ .x = position.x, .y = position.y + 1, .z = position.z }));
+        const base = self.deps.blocks.get(try self.blockState(window, body.world, .{ .x = position.x, .y = @intFromFloat(@floor(body.position[1])), .z = position.z }));
         return .{ .solid = try self.orbCollides(window, body), .water = water.fluid == .water and eye < @as(f64, @as(f32, @floatFromInt(position.y)) + (if (above.fluid == .water) @as(f32, 1) else water.height())), .lava = base.fluid == .lava };
     }
 
@@ -118,9 +119,9 @@ pub const ItemPhysics = struct {
                     var z: i32 = @intFromFloat(@floor(low[2]));
                     while (@as(f64, @floatFromInt(z)) < high[2]) : (z += 1) {
                         const position: chunks.Position = .{ .x = x, .y = y, .z = z };
-                        const state = game_data.physics.get(try self.blockState(window, body.world, position));
+                        const state = self.deps.blocks.get(try self.blockState(window, body.world, position));
                         if (state.fluid != kind) continue;
-                        const above = game_data.physics.get(try self.blockState(window, body.world, .{ .x = x, .y = y + 1, .z = z }));
+                        const above = self.deps.blocks.get(try self.blockState(window, body.world, .{ .x = x, .y = y + 1, .z = z }));
                         const height = @as(f64, @as(f32, @floatFromInt(y)) + (if (above.fluid == kind) @as(f32, 1) else state.height()));
                         if (height < low[1]) continue;
                         depth = @max(depth, height - low[1]);
@@ -150,12 +151,12 @@ pub const ItemPhysics = struct {
         var falling_wall = false;
         for (directions, 0..) |direction, face| {
             const neighbor: chunks.Position = .{ .x = position.x + direction[0], .y = position.y, .z = position.z + direction[1] };
-            const other = game_data.physics.get(try self.blockState(window, world, neighbor));
+            const other = self.deps.blocks.get(try self.blockState(window, world, neighbor));
             if (other.fluid == state.fluid or other.fluid == .none) {
                 var difference: f32 = 0;
                 if (other.height() == 0) {
                     if (!other.blocks_motion) {
-                        const below = game_data.physics.get(try self.blockState(window, world, .{ .x = neighbor.x, .y = neighbor.y - 1, .z = neighbor.z }));
+                        const below = self.deps.blocks.get(try self.blockState(window, world, .{ .x = neighbor.x, .y = neighbor.y - 1, .z = neighbor.z }));
                         if (below.fluid == state.fluid and below.height() > 0) difference = state.height() - (below.height() - @as(f32, 0.8888889));
                     }
                 } else difference = state.height() - other.height();
@@ -163,7 +164,7 @@ pub const ItemPhysics = struct {
                 velocity[2] += @as(f32, @floatFromInt(direction[1])) * difference;
             }
             if (state.falling) {
-                const above = game_data.physics.get(try self.blockState(window, world, .{ .x = neighbor.x, .y = neighbor.y + 1, .z = neighbor.z }));
+                const above = self.deps.blocks.get(try self.blockState(window, world, .{ .x = neighbor.x, .y = neighbor.y + 1, .z = neighbor.z }));
                 const mask = @as(u8, 1) << @intCast(face);
                 falling_wall = falling_wall or (other.fluid != state.fluid and !other.ice and other.sturdy & mask != 0) or (above.fluid != state.fluid and !above.ice and above.sturdy & mask != 0);
             }
@@ -416,11 +417,11 @@ pub const ItemPhysics = struct {
             var below: ?u16 = null;
             const below_position: chunks.Position = .{ .x = @intFromFloat(@floor(next.position[0])), .y = @intFromFloat(@floor(next.position[1] - @as(f64, @as(f32, 0.999999)))), .z = @intFromFloat(@floor(next.position[2])) };
             if (orb) {
-                const base = game_data.physics.get(try self.blockState(neighborhood, body.world, .{ .x = @intFromFloat(@floor(next.position[0])), .y = @intFromFloat(@floor(next.position[1])), .z = @intFromFloat(@floor(next.position[2])) }));
+                const base = self.deps.blocks.get(try self.blockState(neighborhood, body.world, .{ .x = @intFromFloat(@floor(next.position[0])), .y = @intFromFloat(@floor(next.position[1])), .z = @intFromFloat(@floor(next.position[2])) }));
                 var speed = base.speed;
                 if (speed == 1 and !base.water_block) {
                     below = try self.blockState(neighborhood, body.world, below_position);
-                    speed = game_data.physics.get(below.?).speed;
+                    speed = self.deps.blocks.get(below.?).speed;
                 }
                 next.velocity[0] *= speed;
                 next.velocity[2] *= speed;
@@ -444,7 +445,7 @@ pub const ItemPhysics = struct {
             var friction: f32 = 0.98;
             if (grounded) {
                 const state = below orelse try self.blockState(neighborhood, body.world, below_position);
-                friction *= game_data.physics.get(state).friction;
+                friction *= self.deps.blocks.get(state).friction;
             }
 
             next.velocity[0] *= friction;

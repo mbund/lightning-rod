@@ -1,0 +1,6 @@
+{
+  "required": true,
+  "package": "dev.lightningrod.registry.mixin",
+  "mixins": ["FuelBuilderMixin"],
+  "injectors": {"defaultRequire": 1}
+}

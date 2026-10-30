@@ -1,3 +1,4 @@
+const vanilla_content = @import("vanilla_content.zig");
 const audience_storage = @import("audience.zig");
 const bit_sets = @import("lightning_rod").system.bit_sets;
 const Visibility = @import("visibility.zig").Visibility;
@@ -78,7 +79,8 @@ pub fn benchmark() !void {
             .storage = try store.openSpace("inventory"),
             .record_workspaces = workspaces,
         });
-        const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
+        const gameplay_definitions = try vanilla_content.prepare(allocator);
+        const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         _ = try ItemProperties.init(allocator, .{ .items = items });
         var name: [515]u8 = @splat('x');
         name[0] = 8;
@@ -99,7 +101,9 @@ pub fn benchmark() !void {
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &players_buffer, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        const menu = try PlayerInventory.init(allocator, .{
+        const menu = try PlayerInventory.init(allocator, .{}, .{
+            .crafting = gameplay_definitions.crafting,
+            .furnaces = gameplay_definitions.furnaces,
             .players = &players,
             .inventories = ownership,
             .items = items,
@@ -197,7 +201,8 @@ pub fn benchmarkEquipment() !void {
             .storage = try store.openSpace("inventory"),
             .record_workspaces = workspaces,
         });
-        const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
+        const gameplay_definitions = try vanilla_content.prepare(allocator);
+        const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         var stacks: [6]inventories.Stack = undefined;
         for (&stacks, [_][]const u8{ "minecraft:bread", "minecraft:bread", "minecraft:diamond_boots", "minecraft:diamond_leggings", "minecraft:diamond_chestplate", "minecraft:diamond_helmet" }) |*stack, name| {
             stack.* = .{ .item = try items.define(name), .count = 1 };
@@ -370,13 +375,16 @@ pub fn benchmarkPickup() !void {
             .storage = try store.openSpace("inventory"),
             .record_workspaces = workspaces,
         });
-        const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
+        const gameplay_definitions = try vanilla_content.prepare(allocator);
+        const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const stack: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 1 };
         var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .stage = .ready, .loaded = true, .gamemode = .survival }};
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        const menu = try PlayerInventory.init(allocator, .{
+        const menu = try PlayerInventory.init(allocator, .{}, .{
+            .crafting = gameplay_definitions.crafting,
+            .furnaces = gameplay_definitions.furnaces,
             .players = &players,
             .inventories = ownership,
             .items = items,
@@ -472,7 +480,8 @@ pub fn benchmarkItemReplication() !void {
             .storage = try store.openSpace("inventory"),
             .record_workspaces = workspaces,
         });
-        const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
+        const gameplay_definitions = try vanilla_content.prepare(allocator);
+        const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const stack: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 1 };
         const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 128 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
@@ -500,7 +509,7 @@ pub fn benchmarkItemReplication() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -728,7 +737,8 @@ pub fn benchmarkDrops() !void {
             .storage = try store.openSpace("inventory"),
             .record_workspaces = workspaces,
         });
-        const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
+        const gameplay_definitions = try vanilla_content.prepare(allocator);
+        const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const stack: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 1 };
         const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 128 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
@@ -747,7 +757,9 @@ pub fn benchmarkDrops() !void {
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        const menu = try PlayerInventory.init(allocator, .{
+        const menu = try PlayerInventory.init(allocator, .{}, .{
+            .crafting = gameplay_definitions.crafting,
+            .furnaces = gameplay_definitions.furnaces,
             .players = &players,
             .inventories = ownership,
             .items = items,
@@ -814,7 +826,8 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
         .storage = try store.openSpace("inventory"),
         .record_workspaces = workspaces,
     });
-    const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
+    const gameplay_definitions = try vanilla_content.prepare(allocator);
+    const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
     const stack: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 64 };
     const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 256 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
     const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
@@ -847,7 +860,7 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
     player_records[connection].position.z = 1;
     players.rebuildIndexes();
     const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-    const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
+    const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
     defer service.unsubscribeOutput(streaming.changed);
     defer terrain.unsubscribeReady(streaming.changed);
     streaming.published.setStream(connection, .{ .generation = 1, .life = player_records[connection].life, .setup = .streaming });
@@ -939,7 +952,8 @@ pub fn benchmarkItemVisibility() !void {
             .storage = try store.openSpace("inventory"),
             .record_workspaces = workspaces,
         });
-        const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
+        const gameplay_definitions = try vanilla_content.prepare(allocator);
+        const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const stack: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 64 };
         const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 256 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
@@ -969,7 +983,7 @@ pub fn benchmarkItemVisibility() !void {
         player_records[0].position.z = 1;
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -1054,14 +1068,17 @@ pub fn benchmarkPickupAdmission() !void {
             .storage = try store.openSpace("inventory"),
             .record_workspaces = workspaces,
         });
-        const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
+        const gameplay_definitions = try vanilla_content.prepare(allocator);
+        const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const stack: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 1 };
         var player_records: [32]Players.Player = undefined;
         for (player_records[0..player_count], 0..) |*player, index| player.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 }, .uuid = index + 1, .stage = .ready, .loaded = true, .gamemode = .survival };
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = player_records[0..player_count], .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        const menu = try PlayerInventory.init(allocator, .{
+        const menu = try PlayerInventory.init(allocator, .{}, .{
+            .crafting = gameplay_definitions.crafting,
+            .furnaces = gameplay_definitions.furnaces,
             .players = &players,
             .inventories = ownership,
             .items = items,
@@ -1199,7 +1216,7 @@ pub fn benchmarkIdleTerrain() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -1285,7 +1302,8 @@ pub fn benchmarkItemBroadcast() !void {
             .storage = try store.openSpace("inventory"),
             .record_workspaces = workspaces,
         });
-        const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
+        const gameplay_definitions = try vanilla_content.prepare(allocator);
+        const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const stack: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 1 };
         const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 512 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
@@ -1322,7 +1340,7 @@ pub fn benchmarkItemBroadcast() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         for (0..streaming.published.streams.len) |index| streaming.published.setStream(index, .{ .generation = 1, .life = 1, .setup = .streaming });
@@ -1475,7 +1493,7 @@ pub fn benchmarkBlockPlanning() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -1603,7 +1621,8 @@ pub fn benchmarkItemBoundaries() !void {
             .storage = try store.openSpace("inventory"),
             .record_workspaces = workspaces,
         });
-        const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
+        const gameplay_definitions = try vanilla_content.prepare(allocator);
+        const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const stack: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 64 };
         const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 256 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
@@ -1632,7 +1651,7 @@ pub fn benchmarkItemBoundaries() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         for (0..streaming.published.streams.len) |index| streaming.published.setStream(index, .{ .generation = 1, .life = 1, .setup = .streaming });
@@ -1729,7 +1748,7 @@ pub fn benchmarkTerrainBackpressure() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 128, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
 
@@ -1898,7 +1917,7 @@ pub fn benchmarkSparseTerrainStreaming() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -2005,7 +2024,7 @@ pub fn benchmarkSparseBlockPlanning() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -2109,7 +2128,7 @@ pub fn verifyBlockBatchRetirement() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions }) });
+        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });

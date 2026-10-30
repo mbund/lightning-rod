@@ -1,3 +1,8 @@
+const fuel = @import("fuel.zig");
+const custom_data = @import("custom_data.zig");
+const vanilla_content = @import("vanilla_content.zig");
+const recipe_placement = @import("recipe_placement.zig");
+const FuelConversionDefinition = @import("recipes.zig").FuelConversionDefinition;
 const std = @import("std");
 const storage = @import("storage");
 const fault = @import("fault_disk");
@@ -6,6 +11,8 @@ const packets = @import("minecraft_packets");
 const sessions = @import("sessions");
 const protocols = @import("protocols");
 const game_data = @import("game_data");
+const provider = @import("definition_provider.zig");
+const Crafting = @import("crafting_registry.zig").Crafting;
 const inventories = @import("inventories");
 const menu_click = @import("menu_click.zig");
 const InventoryFixture = @import("inventory_test_fixture.zig").InventoryFixture;
@@ -109,8 +116,8 @@ test "mending repairs only equipped damaged items and preserves vanilla odd dama
     const fixture = try InventoryFixture.init(arena.allocator(), &store, &registry, &selected);
     defer fixture.service.deinit();
     const containers = try blockContainers(arena.allocator(), &store, &registry, fixture);
-    var enchantment: [10]u8 = undefined;
-    var enchantments = [_]Enchantments.Entry{.{ .id = @intCast(game_data.registry.enchantmentId("minecraft:mending").?), .level = 1 }};
+    var enchantment: [128]u8 = undefined;
+    var enchantments = [_]Enchantments.Entry{ .{ .name = "minecraft:mending", .level = 1 }, .{ .name = "removed:enchantment", .level = 1 } };
     const enchanted = try Enchantments.encode(&enchantments, &enchantment);
     const item = try item_data.define(fixture.ownership, kind("minecraft:diamond_pickaxe"), &.{
         .{ .key = item_data.key(.enchantments), .value = enchanted },
@@ -278,8 +285,8 @@ fn verifyAtomicExperience(mode: fault.Disk.Mode) !void {
         fixture.players.rebuildIndexes();
         const hand: inventories.Slot = .{ .owner = player.uuid, .index = 36 };
         if (phase == 0) {
-            var bytes: [10]u8 = undefined;
-            var entries = [_]Enchantments.Entry{.{ .id = @intCast(game_data.registry.enchantmentId("minecraft:mending").?), .level = 1 }};
+            var bytes: [128]u8 = undefined;
+            var entries = [_]Enchantments.Entry{.{ .name = "minecraft:mending", .level = 1 }};
             const enchanted = try Enchantments.encode(&entries, &bytes);
             repaired_item = try item_data.define(fixture.ownership, kind("minecraft:diamond_pickaxe"), &.{.{ .key = item_data.key(.enchantments), .value = enchanted }});
             const damaged = try item_data.define(fixture.ownership, kind("minecraft:diamond_pickaxe"), &.{
@@ -487,12 +494,13 @@ test "orb placement fluid currents block effects and fire follow vanilla physics
     try std.testing.expectApproxEqAbs((-0.05 - 0.08) * drag * drag, sliding.body.velocity[1], 1e-12);
 }
 
-test "partial furnace extraction claims all stored recipe experience exactly once" {
+test "furnace recipe rewards survive reordered content and claim exactly once" {
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
     var path_buffer: [256]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/furnace-experience", .{directory.sub_path});
     const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    var saved_recipe: u32 = undefined;
     for (0..2) |pass| {
         var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
         defer store.deinit();
@@ -503,11 +511,17 @@ test "partial furnace extraction claims all stored recipe experience exactly onc
         const fixture = try InventoryFixture.init(arena.allocator(), &store, &registry, &selected);
         defer fixture.service.deinit();
         const containers = try blockContainers(arena.allocator(), &store, &registry, fixture);
+        if (pass == 1) {
+            _ = try provider.register(fixture.definitions, arena.allocator(), .{ .recipes = &.{.{ .name = "aaa:inserted", .definition = .{ .smelting = .{ .input = .{ .item = "minecraft:dirt" }, .result = .{ .item = "minecraft:diamond" }, .experience = 100 } } }} }, null);
+            try std.testing.expectEqual(fixture.definitions.furnaces.table.cooking_names.len, containers.reward_ids.len);
+            try std.testing.expectEqual(saved_recipe + 1, fixture.definitions.furnaces.table.recipes[kind("minecraft:raw_iron")].?.index);
+        }
         const key: ContainerKey = .{ .world = fixture.players.records[0].world, .position = .{ .x = 2, .y = 1, .z = 0 } };
         const state = containers.states.furnaces[0][0];
         if (pass == 0) {
             try containers.deps.chunks.setBlock(key.world, key.position, state);
-            const recipe = fixture.menu.recipes.recipes[kind("minecraft:raw_iron")].?;
+            const recipe = fixture.definitions.furnaces.table.recipes[kind("minecraft:raw_iron")].?;
+            saved_recipe = recipe.index;
             for (0..7) |_| try containers.recordRecipe(key, recipe.index);
             try std.testing.expect(try fixture.ownership.set(Containers.slot(key.world, key.position, 2), 0, .{ .item = try fixture.items.define("minecraft:iron_ingot"), .count = 2 }));
             try containers.checkpoint(containers.deps.storage);
@@ -541,11 +555,15 @@ test "partial furnace extraction claims all stored recipe experience exactly onc
 }
 
 test "baseline recipes include fuels remainders shaped mirrored and shapeless matches" {
-    const recipes = &game_data.recipes;
-    try std.testing.expectEqual(@as(u32, 1600), recipes.fuels[kind("minecraft:coal")].ticks);
-    try std.testing.expectEqual(@as(u32, 20000), recipes.fuels[kind("minecraft:lava_bucket")].ticks);
-    try std.testing.expectEqual(kind("minecraft:bucket"), recipes.fuels[kind("minecraft:lava_bucket")].remainder.?);
-    const iron = recipes.recipes[kind("minecraft:raw_iron")].?;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const content = try vanilla_content.prepare(arena.allocator());
+    const recipes = &content.crafting.table;
+    const furnace_recipes = &content.furnaces.table;
+    try std.testing.expectEqual(@as(u32, 1600), furnace_recipes.fuels[kind("minecraft:coal")].ticks);
+    try std.testing.expectEqual(@as(u32, 20000), furnace_recipes.fuels[kind("minecraft:lava_bucket")].ticks);
+    try std.testing.expectEqual(kind("minecraft:bucket"), recipes.remainders[kind("minecraft:lava_bucket")].?);
+    const iron = furnace_recipes.recipes[kind("minecraft:raw_iron")].?;
     try std.testing.expectEqual(kind("minecraft:iron_ingot"), iron.output);
     try std.testing.expectEqual(@as(u32, 200), iron.ticks);
     var grid: [9]?u32 = @splat(null);
@@ -594,7 +612,7 @@ test "crafting consumes inputs once and cursor ownership survives durable restar
             var next: [47]?inventories.Stack = undefined;
             for (contents, &next) |value, *stack| stack.* = value.stack;
             var drag: menu_click.Drag = .{};
-            const menu: menu_click.Menu = .{ .inventory = fixture.menu, .kind = .player, .container_slots = 0, .stacks = &next, .drag = &drag, .creative = false };
+            const menu: menu_click.Menu = .{ .inventory = fixture.menu, .player = fixture.players.records[0].uuid, .location = fixture.location(.player), .kind = .player, .container_slots = 0, .stacks = &next, .drag = &drag, .creative = false };
             const result = try menu.apply(.{ .window_id = 0, .state_id = 0, .slot = 0, .button = 0, .mode = 0 });
             try std.testing.expectEqual(@as(u16, 1), next[1].?.count);
             try std.testing.expectEqual(@as(u16, 4), next[46].?.count);
@@ -645,15 +663,19 @@ fn blockContainers(allocator: std.mem.Allocator, store: *storage.Store, registry
     const resources = try records.Workspaces.init(allocator, std.testing.io, .{});
     const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 16, .demand_sections = 4, .cache_tiles = 4 }, .{ .storage = try store.openSpace("chunks"), .metrics = registry, .record_workspaces = resources });
     const experience = try Experience.init(allocator, .{ .maximum_orbs = 16 }, .{
+        .enchantments = fixture.definitions.enchantments,
+        .dimensions = fixture.definitions.dimensions,
         .players = fixture.players,
         .entities = fixture.bodies,
-        .physics = try ItemPhysics.init(allocator, .{ .chunks = terrain }),
+        .physics = try ItemPhysics.init(allocator, .{ .blocks = fixture.definitions.blocks, .chunks = terrain }),
         .inventories = fixture.ownership,
         .inventory = fixture.menu,
         .storage = try store.openSpace("experience"),
         .record_workspaces = resources,
     });
     return Containers.init(allocator, std.testing.io, .{ .active_furnaces = 8 }, .{
+        .definitions = fixture.definitions.blocks,
+        .furnaces = fixture.definitions.furnaces,
         .experience = experience,
         .metrics = registry,
         .players = fixture.players,
@@ -767,7 +789,7 @@ test "container clicks enforce output fuel stack and recipe remainder rules" {
     {
         var next: [41]?inventories.Stack = @splat(null);
         var drag: menu_click.Drag = .{};
-        const menu: menu_click.Menu = .{ .inventory = fixture.menu, .kind = .furnace, .container_slots = 3, .stacks = &next, .drag = &drag, .creative = false };
+        const menu: menu_click.Menu = .{ .inventory = fixture.menu, .player = fixture.players.records[0].uuid, .location = fixture.location(.furnace), .kind = .furnace, .container_slots = 3, .stacks = &next, .drag = &drag, .creative = false };
         next[39] = bread;
         _ = try menu.apply(.{ .window_id = 1, .state_id = 0, .slot = 1, .button = 0, .mode = 0 });
         try std.testing.expect(next[1] == null);
@@ -785,7 +807,7 @@ test "container clicks enforce output fuel stack and recipe remainder rules" {
     {
         var next: [48]?inventories.Stack = @splat(null);
         var drag: menu_click.Drag = .{};
-        const menu: menu_click.Menu = .{ .inventory = fixture.menu, .kind = .crafting, .container_slots = 10, .stacks = &next, .drag = &drag, .creative = false };
+        const menu: menu_click.Menu = .{ .inventory = fixture.menu, .player = fixture.players.records[0].uuid, .location = fixture.location(.crafting), .kind = .crafting, .container_slots = 10, .stacks = &next, .drag = &drag, .creative = false };
         const milk: inventories.Stack = .{ .item = try fixture.items.define("minecraft:milk_bucket"), .count = 1 };
         const sugar: inventories.Stack = .{ .item = try fixture.items.define("minecraft:sugar"), .count = 1 };
         const wheat: inventories.Stack = .{ .item = try fixture.items.define("minecraft:wheat"), .count = 1 };
@@ -807,7 +829,7 @@ test "container clicks enforce output fuel stack and recipe remainder rules" {
     {
         var next: [47]?inventories.Stack = @splat(null);
         var drag: menu_click.Drag = .{};
-        const menu: menu_click.Menu = .{ .inventory = fixture.menu, .kind = .player, .container_slots = 0, .stacks = &next, .drag = &drag, .creative = false };
+        const menu: menu_click.Menu = .{ .inventory = fixture.menu, .player = fixture.players.records[0].uuid, .location = fixture.location(.player), .kind = .player, .container_slots = 0, .stacks = &next, .drag = &drag, .creative = false };
         const planks = try fixture.items.define("minecraft:oak_planks");
         next[1] = .{ .item = try fixture.items.define("minecraft:oak_log"), .count = 1 };
         for (next[9..45]) |*stack| stack.* = .{ .item = planks, .count = 64 };
@@ -1175,4 +1197,534 @@ test "inventory cache defaults follow player capacity and preserve explicit over
     deps.capacity = null;
     const standalone = try inventories.Inventories.init(arena.allocator(), std.testing.io, .{ .cache_items = 1, .max_item_bytes = 1024 }, deps);
     try std.testing.expectEqual(@as(usize, 256), standalone.cache.entries.len);
+}
+
+const crafting = @import("crafting.zig");
+
+const ChargedRecipe = struct {
+    pub const id = "test:charged";
+    pub const minimum_inputs = 1;
+    pub const maximum_inputs = 1;
+    pub const Parameters = struct { increment: i32 };
+    pub const Completion = struct { cost: u32, player: u128 };
+    const Implementation = crafting.Implementation(ChargedRecipe);
+    allowed_player: u128 = 1,
+    expected_location: ?crafting.Location = null,
+    credits: u32 = 2,
+    commits: usize = 0,
+
+    pub fn prepare(self: *ChargedRecipe, parameters: *const Parameters, context: *const crafting.Context) !?Implementation.Prepared {
+        if (self.expected_location) |expected| std.debug.assert(std.meta.eql(expected, context.location));
+        if (context.player != self.allowed_player) return null;
+        var reserved: u32 = 0;
+        var pending = Implementation.pending(self, context);
+        while (pending.next()) |completion| reserved += completion.cost;
+        if (reserved >= self.credits) return null;
+        for (context.input, 0..) |entry, index| {
+            const input = entry orelse continue;
+            const data = try input.customData() orelse return null;
+            const charge = try data.getInt("charge") orelse return null;
+            var editor = try data.edit(context.scratch.allocator());
+            try editor.setInt("charge", try std.math.add(i32, charge, parameters.increment));
+            var result = try context.result(kind("minecraft:diamond"), 1);
+            try result.copyComponents(input.view);
+            try result.set(.custom_data, try editor.finish());
+            var plan: crafting.Plan = .{ .result = result.finish() };
+            plan.consume[index] = 1;
+            return .{ .plan = plan, .completion = .{ .cost = 1, .player = context.player } };
+        }
+        return null;
+    }
+
+    pub fn validate(self: *ChargedRecipe, completions: []const Completion) bool {
+        var total: u32 = 0;
+        for (completions) |completion| {
+            if (completion.player != self.allowed_player) return false;
+            total += completion.cost;
+        }
+        return total <= self.credits;
+    }
+
+    pub fn complete(self: *ChargedRecipe, completions: []const Completion) void {
+        std.debug.assert(self.validate(completions));
+        for (completions) |completion| self.credits -= completion.cost;
+        self.commits += 1;
+    }
+};
+
+test "algorithmic crafting derives NBT and commits effects only with the inventory batch" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/algorithmic", .{directory.sub_path});
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
+    defer store.deinit();
+    var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
+    defer registry.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
+    const allocator = bounded.allocator();
+    const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    const fixture = try InventoryFixture.init(allocator, &store, &registry, &selected);
+    defer fixture.service.deinit();
+    var owner: ChargedRecipe = .{};
+    const implementation = try ChargedRecipe.Implementation.define(allocator, &owner, .{ .increment = 5 });
+    const content = try Crafting.init(allocator, .{ .definitions = .{ .recipes = &.{.{ .name = "test:charged", .definition = .{ .algorithmic = implementation } }} } }, .{ .items = fixture.definitions.items });
+    fixture.players.records[0].gamemode = .survival;
+    fixture.menu.states[0] = .{ .generation = 1, .life = fixture.players.records[0].life, .close = false, .gamemode = .survival };
+    fixture.menu.recipes = &content.table;
+    fixture.menu.deps.crafting = content;
+    var data: custom_data.Editor = .{ .allocator = allocator };
+    try data.setInt("charge", 7);
+    try data.setString("owner", "test:player");
+    const item = try item_data.define(fixture.ownership, kind("minecraft:paper"), &.{.{ .key = item_data.key(.custom_data), .value = try data.finish() }});
+    const input_slot: inventories.Slot = .{ .owner = 1, .index = 1 };
+    try std.testing.expect(try fixture.ownership.set(input_slot, 0, .{ .item = item, .count = 3 }));
+    bounded.fail_index = bounded.alloc_index;
+    const allowed_player: u128 = 0x123456789abcdef0_fedcba9876543210;
+    owner.allowed_player = allowed_player;
+    for ([_]menu_click.Kind{ .player, .crafting }) |menu_kind| {
+        var next: [48]?inventories.Stack = @splat(null);
+        next[1] = .{ .item = item, .count = 3 };
+        var drag: menu_click.Drag = .{};
+        var menu: menu_click.Menu = .{
+            .inventory = fixture.menu,
+            .player = allowed_player + 1,
+            .location = fixture.location(menu_kind),
+            .kind = menu_kind,
+            .container_slots = if (menu_kind == .player) 0 else 10,
+            .stacks = next[0..if (menu_kind == .player) 47 else 48],
+            .drag = &drag,
+            .creative = false,
+        };
+        owner.expected_location = menu.location;
+        try menu.refresh();
+        try std.testing.expect(next[0] == null);
+        menu.player = allowed_player;
+        try menu.refresh();
+        try std.testing.expect(next[0] != null);
+        owner.allowed_player = allowed_player + 1;
+        const rejected = try menu.apply(.{ .window_id = 0, .state_id = 0, .slot = 0, .button = 0, .mode = 1 });
+        try std.testing.expect(next[0] == null);
+        try std.testing.expectEqual(@as(u16, 3), next[1].?.count);
+        try std.testing.expect(menu.stacks[menu.cursor()] == null);
+        try std.testing.expectEqual(@as(usize, 0), rejected.count);
+        for (next[2..]) |stack| try std.testing.expect(stack == null);
+        try std.testing.expectEqual(@as(usize, 0), owner.commits);
+        try std.testing.expectEqual(@as(u32, 2), owner.credits);
+        owner.allowed_player = allowed_player;
+    }
+    owner.allowed_player = fixture.players.records[0].uuid;
+    owner.expected_location = fixture.location(.player);
+    var slots: [47]inventories.Slot = undefined;
+    var contents: [47]inventories.Contents = undefined;
+    try fixture.menu.load(0, &slots, &contents);
+    var next: [47]?inventories.Stack = undefined;
+    for (&next, contents) |*stack, value| stack.* = value.stack;
+    var drag: menu_click.Drag = .{};
+    const menu: menu_click.Menu = .{ .inventory = fixture.menu, .player = fixture.players.records[0].uuid, .location = fixture.location(.player), .kind = .player, .container_slots = 0, .stacks = &next, .drag = &drag, .creative = false };
+    const result = try menu.apply(.{ .window_id = 0, .state_id = 0, .slot = 0, .button = 0, .mode = 1 });
+    try std.testing.expectEqual(@as(u16, 1), next[1].?.count);
+    const output = next[44].?;
+    try std.testing.expectEqual(@as(u16, 2), output.count);
+    const lease = try fixture.ownership.acquireItem(output.item);
+    const view = try item_data.View.parse(lease.read().?);
+    const derived = (try (crafting.Input{ .stack = output, .view = view }).customData()).?;
+    try std.testing.expectEqual(@as(i32, 12), (try derived.getInt("charge")).?);
+    try std.testing.expectEqualStrings("test:player", (try derived.getString("owner", allocator)).?);
+    lease.release();
+    try std.testing.expectEqual(@as(u32, 2), owner.credits);
+    const batch = result.craft_batch.?;
+    owner.allowed_player = 2;
+    try std.testing.expect(!fixture.menu.validateCraft(batch));
+    try std.testing.expectEqual(@as(u16, 3), (try fixture.ownership.get(input_slot)).stack.?.count);
+    owner.allowed_player = fixture.players.records[0].uuid;
+    owner.credits = 1;
+    try std.testing.expect(!fixture.menu.validateCraft(batch));
+    try std.testing.expectEqual(@as(u16, 3), (try fixture.ownership.get(input_slot)).stack.?.count);
+    try std.testing.expectEqual(@as(usize, 0), owner.commits);
+    owner.credits = 2;
+    try std.testing.expect(fixture.menu.validateCraft(batch));
+    try std.testing.expect(try fixture.menu.apply(0, &slots, &contents, &next, result.drops[0..result.count]));
+    fixture.menu.completeCraft(batch);
+    try std.testing.expectEqual(@as(u32, 0), owner.credits);
+    try std.testing.expectEqual(@as(usize, 1), owner.commits);
+    try std.testing.expectEqual(@as(u16, 1), (try fixture.ownership.get(input_slot)).stack.?.count);
+    const original = try fixture.ownership.acquireItem(item);
+    defer original.release();
+    const original_data = (try (crafting.Input{ .stack = .{ .item = item, .count = 1 }, .view = try item_data.View.parse(original.read().?) }).customData()).?;
+    try std.testing.expectEqual(@as(i32, 7), (try original_data.getInt("charge")).?);
+}
+
+test "recipe book placement validates real crafting table and furnace views before atomic edits" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    for (0..2) |station| {
+        var path_buffer: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/book-{d}", .{ directory.sub_path, station });
+        var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
+        defer store.deinit();
+        var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
+        defer registry.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
+        const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+        const fixture = try InventoryFixture.init(bounded.allocator(), &store, &registry, &selected);
+        defer fixture.service.deinit();
+        const containers = try blockContainers(bounded.allocator(), &store, &registry, fixture);
+        const player = &fixture.players.records[0];
+        player.position = .{ .x = 0.5, .y = 2, .z = 0.5 };
+        player.gamemode = .survival;
+        const key: ContainerKey = .{ .world = player.world, .position = .{ .x = 2, .y = 1, .z = 0 } };
+        const source: inventories.Slot = .{ .owner = player.uuid, .index = 9 };
+        const item = try fixture.items.define(if (station == 0) "minecraft:oak_planks" else "minecraft:iron_ore");
+        try std.testing.expect(try fixture.ownership.set(source, 0, .{ .item = item, .count = 12 }));
+        if (station == 1) {
+            const coal = try fixture.items.define("minecraft:coal");
+            try std.testing.expect(try fixture.ownership.set(Containers.slot(key.world, key.position, 1), 0, .{ .item = coal, .count = 8 }));
+        }
+        const name = if (station == 0) "minecraft:crafting_table" else "minecraft:iron_ingot_from_smelting_iron_ore";
+        const recipe = for (fixture.definitions.book.table.book) |*entry| {
+            if (std.mem.eql(u8, name, entry.name)) break entry;
+        } else unreachable;
+        containers.views[0] = .{
+            .opened = true,
+            .generation = 1,
+            .life = player.life,
+            .key = key,
+            .owners = .{ key.owner(), 0 },
+            .kind = if (station == 0) .crafting else .furnace,
+            .container_slots = if (station == 0) 10 else 3,
+            .window = 4,
+        };
+        bounded.fail_index = bounded.alloc_index;
+        try std.testing.expectEqual(recipe_placement.Result.blocked, try containers.placeRecipe(player.handle.?, 3, &fixture.definitions.book.table, recipe, true));
+        try std.testing.expectEqual(@as(u16, 12), (try fixture.ownership.get(source)).stack.?.count);
+        player.position.x = 100;
+        try std.testing.expectEqual(recipe_placement.Result.blocked, try containers.placeRecipe(player.handle.?, 4, &fixture.definitions.book.table, recipe, true));
+        try std.testing.expectEqual(@as(u16, 12), (try fixture.ownership.get(source)).stack.?.count);
+        player.position.x = 0.5;
+        try std.testing.expectEqual(recipe_placement.Result.placed, try containers.placeRecipe(player.handle.?, 4, &fixture.definitions.book.table, recipe, true));
+        try std.testing.expect((try fixture.ownership.get(source)).stack == null);
+        if (station == 0) {
+            for ([_]u16{ 0, 1, 3, 4 }) |index| {
+                const stack = (try fixture.ownership.get(.{ .owner = player.uuid, .index = PlayerInventory.table_grid_first + index })).stack.?;
+                try std.testing.expectEqual(item, stack.item);
+                try std.testing.expectEqual(@as(u16, 3), stack.count);
+            }
+        } else {
+            const stack = (try fixture.ownership.get(Containers.slot(key.world, key.position, 0))).stack.?;
+            try std.testing.expectEqual(item, stack.item);
+            try std.testing.expectEqual(@as(u16, 12), stack.count);
+            try std.testing.expectEqual(@as(u16, 8), (try fixture.ownership.get(Containers.slot(key.world, key.position, 1))).stack.?.count);
+            try std.testing.expectEqual(@as(usize, 1), containers.active_count);
+        }
+    }
+}
+
+test "component smelting preserves identity stack limits and blocked inventories across durable restart" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/component-furnace", .{directory.sub_path});
+    var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
+    defer registry.deinit();
+    const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    for (0..3) |phase| {
+        var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
+        defer store.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
+        const allocator = bounded.allocator();
+        const fixture = try InventoryFixture.init(allocator, &store, &registry, &selected);
+        defer fixture.service.deinit();
+        var data: custom_data.Editor = .{ .allocator = allocator };
+        try data.setInt("charge", 7);
+        const components = [_]item_data.Component{
+            .{ .key = item_data.key(.custom_data), .value = try data.finish() },
+            .{ .key = item_data.key(.max_stack_size), .value = &.{3} },
+        };
+        _ = try provider.register(fixture.definitions, allocator, .{ .recipes = &.{.{
+            .name = "minecraft:iron_ingot_from_smelting_raw_iron",
+            .definition = .{ .smelting = .{
+                .input = .{ .item = "minecraft:raw_iron" },
+                .result = .{ .item = "minecraft:iron_ingot", .count = 2, .components = &components },
+                .ticks = 3,
+            } },
+        }} }, null);
+        const installed = fixture.definitions.furnaces.table.recipes.ptr;
+        try std.testing.expectError(error.InvalidRecipeResult, provider.register(fixture.definitions, allocator, .{ .recipes = &.{.{
+            .name = "test:oversized_smelting",
+            .definition = .{ .smelting = .{
+                .input = .{ .item = "minecraft:raw_iron" },
+                .result = .{ .item = "minecraft:iron_ingot", .count = 4, .components = &components },
+            } },
+        }} }, null));
+        try std.testing.expectEqual(installed, fixture.definitions.furnaces.table.recipes.ptr);
+        const containers = try blockContainers(allocator, &store, &registry, fixture);
+        const recipe = fixture.definitions.furnaces.table.recipes[kind("minecraft:raw_iron")].?;
+        try std.testing.expectEqual(@as(u16, 3), recipe.stack_limit);
+        const custom = recipe.item_id;
+        const plain = item_data.defaultId(kind("minecraft:iron_ingot"));
+        try std.testing.expect(!std.mem.eql(u8, &custom, &plain));
+        var keys: [5]ContainerKey = undefined;
+        for (&keys, 0..) |*key, index| key.* = .{ .world = fixture.players.records[0].world, .position = .{ .x = @intCast(index + 2), .y = 1, .z = 0 } };
+        if (phase == 0) {
+            const raw = try fixture.items.define("minecraft:raw_iron");
+            const coal = try fixture.items.define("minecraft:coal");
+            try std.testing.expectEqual(custom, try item_data.define(fixture.ownership, kind("minecraft:iron_ingot"), &components));
+            try std.testing.expectEqual(plain, try fixture.items.define("minecraft:iron_ingot"));
+            var different_data: custom_data.Editor = .{ .allocator = allocator };
+            try different_data.setInt("charge", 8);
+            var different_components = components;
+            different_components[0].value = try different_data.finish();
+            const different = try item_data.define(fixture.ownership, kind("minecraft:iron_ingot"), &different_components);
+            const outputs: [5]?inventories.Stack = .{
+                null,
+                .{ .item = custom, .count = 1 },
+                .{ .item = plain, .count = 1 },
+                .{ .item = different, .count = 1 },
+                .{ .item = custom, .count = 3 },
+            };
+            const inputs = [_]u16{ 3, 2, 1, 1, 1 };
+            var edits: [15]inventories.Edit = undefined;
+            for (keys, outputs, inputs, 0..) |key, output, input, index| {
+                try containers.deps.chunks.setBlock(key.world, key.position, containers.states.furnaces[0][0]);
+                edits[index * 3] = .{ .slot = Containers.slot(key.world, key.position, 0), .revision = 0, .stack = .{ .item = raw, .count = input } };
+                edits[index * 3 + 1] = .{ .slot = Containers.slot(key.world, key.position, 1), .revision = 0, .stack = .{ .item = coal, .count = 1 } };
+                edits[index * 3 + 2] = .{ .slot = Containers.slot(key.world, key.position, 2), .revision = 0, .stack = output };
+            }
+            try std.testing.expect(try fixture.ownership.editMany(&edits));
+            for (keys) |key| try std.testing.expect(containers.activate(key));
+        }
+        bounded.fail_index = bounded.alloc_index;
+        if (phase == 0) {
+            try furnace.tick(containers);
+            for (keys[0..2]) |key| try std.testing.expectEqual(@as(u32, 1), containers.furnaceState(key.world, key.position).cook);
+        } else {
+            if (phase == 1) {
+                for (keys[0..2]) |key| try std.testing.expectEqual(@as(u32, 1), containers.furnaceState(key.world, key.position).cook);
+                for (0..10) |_| try furnace.tick(containers);
+            }
+            for (keys[0..2], 0..) |key, index| {
+                const output = (try fixture.ownership.get(Containers.slot(key.world, key.position, 2))).stack.?;
+                try std.testing.expectEqual(custom, output.item);
+                try std.testing.expectEqual(@as(u16, @intCast(2 + index)), output.count);
+                try std.testing.expectEqual(@as(u16, @intCast(2 - index)), (try fixture.ownership.get(Containers.slot(key.world, key.position, 0))).stack.?.count);
+                const prepared = try fixture.items.acquire(output);
+                defer prepared.release();
+                const saved = try custom_data.Compound.init(prepared.view.value(.custom_data).?);
+                try std.testing.expectEqual(@as(?i32, 7), try saved.getInt("charge"));
+            }
+        }
+        for (keys[2..], 0..) |key, index| {
+            try std.testing.expectEqual(@as(u16, 1), (try fixture.ownership.get(Containers.slot(key.world, key.position, 0))).stack.?.count);
+            try std.testing.expectEqual(@as(u16, 1), (try fixture.ownership.get(Containers.slot(key.world, key.position, 1))).stack.?.count);
+            const output = (try fixture.ownership.get(Containers.slot(key.world, key.position, 2))).stack.?;
+            try std.testing.expectEqual(@as(u16, if (index == 2) 3 else 1), output.count);
+            if (index == 0) try std.testing.expectEqual(plain, output.item);
+            if (index == 1) {
+                const prepared = try fixture.items.acquire(output);
+                defer prepared.release();
+                const saved = try custom_data.Compound.init(prepared.view.value(.custom_data).?);
+                try std.testing.expectEqual(@as(?i32, 8), try saved.getInt("charge"));
+            }
+            try std.testing.expectEqual(@as(u32, 0), containers.furnaceState(key.world, key.position).burn_left);
+        }
+        if (phase < 2) {
+            try containers.checkpoint(containers.deps.storage);
+            try fixture.ownership.checkpoint(fixture.ownership.deps.storage);
+            try containers.deps.chunks.checkpoint(try store.openSpace("chunks"));
+            try store.waitDurable(try store.commit(phase + 1));
+        }
+    }
+}
+
+test "furnace mechanics use configured fuels remainders and completion rules" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    const cooking_ticks = 2;
+    for ([_]bool{ false, true }) |disable_conversion| {
+        var path_buffer: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/configured-furnace-{d}", .{ directory.sub_path, @intFromBool(disable_conversion) });
+        var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
+        defer store.deinit();
+        var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
+        defer registry.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
+        const allocator = bounded.allocator();
+        const fixture = try InventoryFixture.init(allocator, &store, &registry, &selected);
+        defer fixture.service.deinit();
+        const conversions = [_]FuelConversionDefinition{
+            .{ .input = "minecraft:dirt", .fuel = "minecraft:glass_bottle", .result = "minecraft:emerald" },
+            .{ .input = "minecraft:wet_sponge", .fuel = "minecraft:bucket", .result = null },
+        };
+        _ = try provider.register(fixture.definitions, allocator, .{
+            .fuels = &.{.{ .input = .{ .item = "minecraft:charcoal" }, .ticks = cooking_ticks }},
+            .remainders = &.{.{ .input = .{ .item = "minecraft:charcoal" }, .item = "minecraft:glass_bottle" }},
+            .fuel_conversions = conversions[0..if (disable_conversion) 2 else 1],
+            .recipes = &.{
+                .{ .name = "aaa:dirt", .definition = .{ .smelting = .{ .input = .{ .item = "minecraft:dirt" }, .result = .{ .item = "minecraft:diamond" }, .ticks = cooking_ticks } } },
+                .{ .name = "aaa:sponge", .definition = .{ .smelting = .{ .input = .{ .item = "minecraft:wet_sponge" }, .result = .{ .item = "minecraft:sponge" }, .ticks = cooking_ticks } } },
+            },
+        }, null);
+        const containers = try blockContainers(allocator, &store, &registry, fixture);
+        const keys = [_]ContainerKey{
+            .{ .world = fixture.players.records[0].world, .position = .{ .x = 2, .y = 1, .z = 0 } },
+            .{ .world = fixture.players.records[0].world, .position = .{ .x = 3, .y = 1, .z = 0 } },
+        };
+        const inputs = [_][]const u8{ "minecraft:dirt", "minecraft:wet_sponge" };
+        const fuels = [_][]const u8{ "minecraft:charcoal", "minecraft:lava_bucket" };
+        var edits: [4]inventories.Edit = undefined;
+        for (keys, inputs, fuels, 0..) |key, input, fuel_name, index| {
+            try containers.deps.chunks.setBlock(key.world, key.position, containers.states.furnaces[0][0]);
+            edits[index * 2] = .{ .slot = Containers.slot(key.world, key.position, 0), .revision = 0, .stack = .{ .item = try fixture.items.define(input), .count = if (index == 0) 2 else 1 } };
+            edits[index * 2 + 1] = .{ .slot = Containers.slot(key.world, key.position, 1), .revision = 0, .stack = .{ .item = try fixture.items.define(fuel_name), .count = 1 } };
+        }
+        try std.testing.expect(try fixture.ownership.editMany(&edits));
+        for (keys) |key| try std.testing.expect(containers.activate(key));
+        bounded.fail_index = bounded.alloc_index;
+        for (0..cooking_ticks * 2) |_| try furnace.tick(containers);
+        const custom_fuel = (try fixture.ownership.get(Containers.slot(keys[0].world, keys[0].position, 1))).stack.?;
+        try std.testing.expectEqual(kind("minecraft:emerald"), try fixture.items.kind(custom_fuel));
+        try std.testing.expectEqual(@as(u16, 1), (try fixture.ownership.get(Containers.slot(keys[0].world, keys[0].position, 0))).stack.?.count);
+        const custom_output = (try fixture.ownership.get(Containers.slot(keys[0].world, keys[0].position, 2))).stack.?;
+        try std.testing.expectEqual(kind("minecraft:diamond"), try fixture.items.kind(custom_output));
+        try std.testing.expectEqual(@as(u16, 1), custom_output.count);
+        try std.testing.expectEqual(@as(u32, 0), containers.furnaceState(keys[0].world, keys[0].position).burn_left);
+        const sponge_fuel = (try fixture.ownership.get(Containers.slot(keys[1].world, keys[1].position, 1))).stack.?;
+        try std.testing.expectEqual(if (disable_conversion) kind("minecraft:bucket") else kind("minecraft:water_bucket"), try fixture.items.kind(sponge_fuel));
+        const sponge_output = (try fixture.ownership.get(Containers.slot(keys[1].world, keys[1].position, 2))).stack.?;
+        try std.testing.expectEqual(kind("minecraft:sponge"), try fixture.items.kind(sponge_output));
+    }
+}
+
+const ContextualFuel = struct {
+    pub const Parameters = struct { label: []const u8, player: u128, x: i32 };
+
+    pub fn prepare(_: *ContextualFuel, parameters: *const Parameters, context: *const fuel.Context) !?fuel.Plan {
+        if (!std.mem.eql(u8, parameters.label, "owned")) return error.BorrowedFuelParameters;
+        if (context.location.position.x != parameters.x) return null;
+        const data = try context.fuel.customData() orelse return null;
+        if ((try data.getInt("charge") orelse return null) != 7) return null;
+        const properties: fuel.Properties = .{ .ticks = 2, .slot_limit = 4 };
+        if (context.phase != .burn and context.player != parameters.player) return null;
+        if (context.phase == .admission) return .{ .properties = properties };
+        var editor = try data.edit(context.scratch.allocator());
+        var text: [32]u8 = undefined;
+        const identity = try std.fmt.bufPrint(&text, "{x:0>32}", .{parameters.player});
+        if (context.phase == .insertion) {
+            try editor.setString("actor", identity);
+        } else {
+            if (context.player != null) return error.InventedFuelActor;
+            const source = context.input orelse return error.MissingFuelInput;
+            if (source.view.kind != kind("minecraft:dirt")) return error.WrongFuelInput;
+            const saved = try data.getString("actor", context.scratch.allocator()) orelse return null;
+            if (!std.mem.eql(u8, saved, identity)) return null;
+            try editor.setInt("charge", 12);
+        }
+        var replacement = try context.result(if (context.phase == .insertion) context.fuel.view.kind else kind("minecraft:diamond"), context.fuel.stack.count);
+        try replacement.copyComponents(context.fuel.view);
+        try replacement.set(.custom_data, try editor.finish());
+        return .{ .properties = properties, .replacement = .{ .stack = replacement.finish() } };
+    }
+};
+
+test "fuel callbacks receive actor position and NBT and preserve plugin provenance across restart" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/callback-fuel", .{directory.sub_path});
+    var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
+    defer registry.deinit();
+    const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    for (0..2) |pass| {
+        var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
+        defer store.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
+        const allocator = bounded.allocator();
+        const fixture = try InventoryFixture.init(allocator, &store, &registry, &selected);
+        defer fixture.service.deinit();
+        var policy: ContextualFuel = .{};
+        var label = "owned".*;
+        try fixture.definitions.furnaces.addDefinitions(.{
+            .fuels = &.{.{ .input = .{ .item = "minecraft:paper" }, .callback = try fuel.Handler(ContextualFuel, ContextualFuel.Parameters, ContextualFuel.prepare).define(allocator, &policy, .{ .label = &label, .player = 1, .x = 2 }) }},
+            .recipes = &.{.{ .name = "test:fuel_input", .definition = .{ .smelting = .{ .input = .{ .item = "minecraft:dirt" }, .result = .{ .item = "minecraft:iron_ingot" }, .ticks = 2 } } }},
+        });
+        @memset(&label, 'x');
+        const containers = try blockContainers(allocator, &store, &registry, fixture);
+        const player = &fixture.players.records[0];
+        player.protocol = selected[0].number;
+        player.position = .{ .x = 2, .y = 1, .z = 3 };
+        player.gamemode = .survival;
+        const key: ContainerKey = .{ .world = player.world, .position = .{ .x = 2, .y = 1, .z = 0 } };
+        bounded.fail_index = bounded.alloc_index;
+        if (pass == 0) {
+            const nbt = &[_]u8{ 10, 3, 0, 6, 'c', 'h', 'a', 'r', 'g', 'e', 0, 0, 0, 7, 0 };
+            const item = try item_data.define(fixture.ownership, kind("minecraft:paper"), &.{.{ .key = item_data.key(.custom_data), .value = nbt }});
+            var wrong = nbt.*;
+            wrong[wrong.len - 2] = 6;
+            const wrong_item = try item_data.define(fixture.ownership, kind("minecraft:paper"), &.{.{ .key = item_data.key(.custom_data), .value = &wrong }});
+            for (0..4) |attempt| {
+                var stacks: [41]?inventories.Stack = @splat(null);
+                stacks[3] = .{ .item = if (attempt == 2) wrong_item else item, .count = 1 };
+                var drag: menu_click.Drag = .{};
+                const menu: menu_click.Menu = .{
+                    .inventory = fixture.menu,
+                    .player = if (attempt == 1) 2 else 1,
+                    .location = .{ .block = .{ .world = key.world, .position = .{ .x = if (attempt == 3) 3 else 2, .y = 1, .z = 0 } } },
+                    .kind = .furnace,
+                    .container_slots = 3,
+                    .stacks = &stacks,
+                    .drag = &drag,
+                    .creative = false,
+                };
+                _ = try menu.apply(.{ .window_id = 1, .state_id = 0, .slot = 3, .button = 0, .mode = 1 });
+                try std.testing.expectEqual(attempt == 0, stacks[1] != null);
+                var remaining: u16 = 0;
+                for (stacks[3..39]) |stack| if (stack) |value| {
+                    try std.testing.expectEqual(if (attempt == 2) wrong_item else item, value.item);
+                    remaining += value.count;
+                };
+                try std.testing.expectEqual(@as(u16, @intFromBool(attempt != 0)), remaining);
+            }
+            try containers.deps.chunks.setBlock(key.world, key.position, containers.states.furnaces[0][0]);
+            try std.testing.expect(try fixture.ownership.set(.{ .owner = player.uuid, .index = 9 }, 0, .{ .item = item, .count = 1 }));
+            try std.testing.expect(try fixture.ownership.set(Containers.slot(key.world, key.position, 0), 0, .{ .item = try fixture.items.define("minecraft:dirt"), .count = 2 }));
+            try std.testing.expectEqual(BlockActions.Result.applied, try containers.deps.actions.apply(.{ .action = .use, .player = player, .position = key.position, .state = containers.states.furnaces[0][0] }));
+            containers.views[0].opened = true;
+            try containers.click(player.handle.?, .{ .window_id = containers.views[0].window, .state_id = 0, .slot = 3, .button = 0, .mode = 1 });
+            try std.testing.expect((try fixture.ownership.get(.{ .owner = player.uuid, .index = 9 })).stack == null);
+            try std.testing.expectEqual(@as(usize, 1), containers.active_count);
+            const stamped = (try fixture.ownership.get(Containers.slot(key.world, key.position, 1))).stack.?;
+            try std.testing.expect(!std.mem.eql(u8, &stamped.item, &item));
+            try containers.checkpoint(containers.deps.storage);
+            try fixture.ownership.checkpoint(fixture.ownership.deps.storage);
+            try containers.deps.chunks.checkpoint(try store.openSpace("chunks"));
+            try store.waitDurable(try store.commit(1));
+        } else {
+            player.uuid = 2;
+            for (0..2) |_| try furnace.tick(containers);
+            try std.testing.expectEqual(@as(u32, 2), containers.furnaceState(key.world, key.position).burn_total);
+            const output = (try fixture.ownership.get(Containers.slot(key.world, key.position, 2))).stack.?;
+            try std.testing.expectEqual(kind("minecraft:iron_ingot"), try fixture.items.kind(output));
+            const transformed = (try fixture.ownership.get(Containers.slot(key.world, key.position, 1))).stack.?;
+            const pinned = try fixture.items.acquire(transformed);
+            defer pinned.release();
+            try std.testing.expectEqual(kind("minecraft:diamond"), pinned.view.kind);
+            const data = try custom_data.Compound.init(pinned.view.value(.custom_data).?);
+            try std.testing.expectEqual(@as(?i32, 12), try data.getInt("charge"));
+            var bytes: [64]u8 = undefined;
+            var scratch = std.heap.FixedBufferAllocator.init(&bytes);
+            try std.testing.expectEqualStrings("00000000000000000000000000000001", (try data.getString("actor", scratch.allocator())).?);
+        }
+    }
 }

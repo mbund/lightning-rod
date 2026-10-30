@@ -65,8 +65,8 @@ const Probe = struct {
                 for (self.deps.players.activeSlots()) |index| {
                     const alice = self.deps.players.records[index];
                     if (!std.mem.eql(u8, alice.name[0..alice.name_len], "alice")) continue;
-                    var enchantment: [10]u8 = undefined;
-                    var entries = [_]vanilla.Enchantments.Entry{.{ .id = @intCast(game_data.registry.enchantmentId("minecraft:mending").?), .level = 1 }};
+                    var enchantment: [128]u8 = undefined;
+                    var entries = [_]vanilla.Enchantments.Entry{.{ .name = "minecraft:mending", .level = 1 }};
                     const enchanted = try vanilla.Enchantments.encode(&entries, &enchantment);
                     const item = try vanilla.item_data.define(self.deps.inventories, @intCast(game_data.registry.itemId("minecraft:diamond_pickaxe").?), &.{
                         .{ .key = vanilla.Items.key(.enchantments), .value = enchanted },

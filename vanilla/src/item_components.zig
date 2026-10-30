@@ -15,6 +15,14 @@ const schemas = block: {
     break :block values;
 };
 
+pub const Presentation = enum { absent, added, removed };
+
+pub const RetentionContext = struct {
+    kind: u32,
+    recipient: u128,
+    component: data.Component,
+};
+
 pub const ReadContext = struct {
     /// Write the plugin's canonical payload here. It becomes immutable item data.
     output: *[]u8,
@@ -41,7 +49,10 @@ pub const Components = struct {
     pub const Provider = struct {
         context: *anyopaque,
         vtable: *const VTable,
-        const VTable = struct { present: ?*const fn (*anyopaque, data.View, u128) bool };
+        const VTable = struct {
+            present: ?*const fn (*anyopaque, data.View, u128, ?data.Component) Presentation,
+            retain: ?*const fn (*anyopaque, RetentionContext) anyerror!bool,
+        };
     };
 
     dispatch: Dispatch,
@@ -49,6 +60,7 @@ pub const Components = struct {
     order: []usize,
     personalized: bool = false,
     has_presentation: bool = false,
+    has_retention: bool = false,
     revision: u64 = 0,
     extra_bytes: usize = 0,
 
@@ -74,12 +86,21 @@ pub const Components = struct {
         self.order[position] = index;
         self.extra_bytes = total;
         self.has_presentation = self.has_presentation or @hasField(@TypeOf(callbacks), "present");
+        self.has_retention = self.has_retention or @hasField(@TypeOf(callbacks), "retain");
         const Adapter = struct {
-            const vtable: Provider.VTable = .{ .present = if (@hasField(@TypeOf(callbacks), "present")) invoke else null };
+            const vtable: Provider.VTable = .{
+                .present = if (@hasField(@TypeOf(callbacks), "present")) invoke else null,
+                .retain = if (@hasField(@TypeOf(callbacks), "retain")) retainComponent else null,
+            };
 
-            fn invoke(raw: *anyopaque, view: data.View, recipient: u128) bool {
+            fn retainComponent(raw: *anyopaque, context: RetentionContext) !bool {
                 const typed: @TypeOf(owner) = @ptrCast(@alignCast(raw));
-                return callbacks.present(typed, view, recipient);
+                return callbacks.retain(typed, context);
+            }
+
+            fn invoke(raw: *anyopaque, view: data.View, recipient: u128, stored: ?data.Component) Presentation {
+                const typed: @TypeOf(owner) = @ptrCast(@alignCast(raw));
+                return callbacks.present(typed, view, recipient, stored);
             }
         };
         self.providers[index] = .{ .context = owner, .vtable = &Adapter.vtable };
@@ -113,11 +134,28 @@ pub const Components = struct {
         if (next != null) return error.UnsupportedComponent;
     }
 
-    pub fn present(self: *const Components, index: usize, view: data.View, recipient: u128, stored: ?data.Component) bool {
+    pub fn retain(self: *const Components, context: RetentionContext) !bool {
+        if (!self.has_retention) return true;
+        var low: usize = 0;
+        var high = self.dispatch.count;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const index = self.order[middle];
+            if (self.dispatch.entries[index].key < context.component.key) low = middle + 1 else high = middle;
+        }
+        if (low == self.dispatch.count) return error.UnsupportedComponent;
+        const index = self.order[low];
+        if (self.dispatch.entries[index].key != context.component.key) return error.UnsupportedComponent;
+        const provider = self.providers[index];
+        if (provider.vtable.retain) |call| return call(provider.context, context);
+        return true;
+    }
+
+    pub fn present(self: *const Components, index: usize, view: data.View, recipient: u128, stored: ?data.Component) Presentation {
         std.debug.assert(index < self.dispatch.count);
         if (stored) |component| std.debug.assert(component.key == self.dispatch.entries[index].key);
         const provider = self.providers[index];
-        if (provider.vtable.present) |call| return call(provider.context, view, recipient);
-        return if (stored) |component| component.value != null else false;
+        if (provider.vtable.present) |call| return call(provider.context, view, recipient, stored);
+        return if (stored) |component| if (component.value != null) .added else .removed else .absent;
     }
 };

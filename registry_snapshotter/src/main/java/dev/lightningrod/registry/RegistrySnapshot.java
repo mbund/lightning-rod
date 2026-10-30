@@ -16,6 +16,9 @@ import net.minecraft.core.Registry;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.world.entity.ai.attributes.RangedAttribute;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.resources.RegistryDataLoader;
@@ -54,8 +57,10 @@ public final class RegistrySnapshot implements ModInitializer {
             var dynamic = RegistryLoader.load(resources, builtin);
             var combined = RegistryLayer.createRegistryAccess().replaceFrom(RegistryLayer.WORLDGEN, dynamic);
             var lookup = combined.compositeAccess();
-            var cooking = System.getProperty("mcc.recipeOutput");
-            if (cooking != null) RecipeSnapshot.write(Path.of(cooking), resources, lookup);
+            var pack = System.getProperty("mcc.packOutput");
+            if (pack != null) PackSnapshot.write(Path.of(pack), resources);
+            var cooking = System.getProperty("mcc.fuelOutput");
+            if (cooking != null) FuelSnapshot.write(Path.of(cooking), lookup);
             var physics = System.getProperty("mcc.physicsOutput");
             if (physics != null) PhysicsSnapshot.write(Path.of(physics));
             var destination = Path.of(args[0]);
@@ -64,14 +69,9 @@ public final class RegistrySnapshot implements ModInitializer {
             try (var output = new DataOutputStream(Files.newOutputStream(temporary))) {
                 output.write("LRREG002".getBytes(StandardCharsets.US_ASCII));
                 string(output, System.getProperty("mcc.minecraftVersion"));
-                output.writeInt(RegistryDataLoader.SYNCHRONIZED_REGISTRIES.size() + 6);
+                output.writeInt(RegistryDataLoader.SYNCHRONIZED_REGISTRIES.size() + BuiltInRegistries.REGISTRY.size());
                 for (var registry : RegistryDataLoader.SYNCHRONIZED_REGISTRIES) write(output, lookup, registry);
-                writeStatic(output, BuiltInRegistries.MENU);
-                writeStatic(output, BuiltInRegistries.POTION);
-                writeStatic(output, BuiltInRegistries.DATA_COMPONENT_PREDICATE_TYPE);
-                writeStatic(output, BuiltInRegistries.VILLAGER_TYPE);
-                writeStatic(output, BuiltInRegistries.ENTITY_TYPE);
-                writeStatic(output, BuiltInRegistries.BLOCK_ENTITY_TYPE);
+                for (var registry : BuiltInRegistries.REGISTRY) writeStatic(output, registry);
                 var tags = new FriendlyByteBuf(Unpooled.buffer());
                 try {
                     var groups = new TreeMap<String, TagNetworkSerialization.NetworkPayload>();
@@ -128,7 +128,20 @@ public final class RegistrySnapshot implements ModInitializer {
         output.writeInt(registry.size());
         for (int id = 0; id < registry.size(); id++) {
             string(output, registry.getKey(registry.byId(id)).toString());
-            output.writeInt(0);
+            if (registry == BuiltInRegistries.ATTRIBUTE) {
+                var attribute = BuiltInRegistries.ATTRIBUTE.byId(id);
+                var holder = BuiltInRegistries.ATTRIBUTE.wrapAsHolder(attribute);
+                var player = Player.createAttributes().build();
+                var value = new CompoundTag();
+                value.putDouble("player_base", player.hasAttribute(holder) ? player.getBaseValue(holder) : attribute.getDefaultValue());
+                var range = (RangedAttribute)attribute;
+                value.putDouble("minimum", range.getMinValue());
+                value.putDouble("maximum", range.getMaxValue());
+                var bytes = new ByteArrayOutputStream();
+                NbtIo.writeAnyTag(value, new DataOutputStream(bytes));
+                output.writeInt(bytes.size());
+                bytes.writeTo(output);
+            } else output.writeInt(0);
         }
     }
 

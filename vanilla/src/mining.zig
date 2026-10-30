@@ -1,3 +1,7 @@
+const EnchantmentRegistry = @import("enchantment_registry.zig").EnchantmentRegistry;
+const MiningRegistry = @import("mining_registry.zig").MiningRegistry;
+const loot_tables = @import("loot.zig");
+const item_data = @import("item_data.zig");
 const sparse_sets = @import("lightning_rod").system.sparse_sets;
 const SpatialIndex = @import("player_spatial.zig").Index;
 const SpatialGroups = @import("player_spatial.zig").Groups;
@@ -11,6 +15,7 @@ const wire_1_21_5 = @import("wire_1_21_5");
 const packets = @import("minecraft_packets");
 const block_sync = @import("block_sync.zig");
 const block_actions = @import("block_actions.zig");
+const entities = @import("entities");
 const chunks = @import("chunks");
 const minecraft = @import("minecraft_model");
 const inventories = @import("inventories");
@@ -29,14 +34,22 @@ const Experience = @import("experience.zig").Experience;
 
 const Chunks = chunks.Chunks;
 
+const Blocks = @import("blocks.zig").Blocks;
+const EquipmentAttributes = @import("equipment_attributes.zig").EquipmentAttributes;
+
 const assert = std.debug.assert;
 
 pub const Mining = struct {
+    pub const Registry = MiningRegistry;
     pub const id = "minecraft:mining";
 
-    pub const Configuration = struct { seed: u64 = 0, audience_words: usize = 4096 };
+    pub const Configuration = struct { seed: u64 = 0, audience_words: usize = 4096, loot_scratch_bytes: usize = 64 * 1024 };
 
     pub const Dependencies = struct {
+        enchantments: *EnchantmentRegistry,
+        attributes: *EquipmentAttributes,
+        block_definitions: *Blocks,
+        definitions: *Registry,
         visibility: *Visibility,
         metrics: *metrics.Registry,
         storage: storage.Space,
@@ -100,6 +113,7 @@ pub const Mining = struct {
     pair_checks: metrics.Counter,
     audience_checks: metrics.Counter,
     random: Random,
+    loot_scratch: std.heap.FixedBufferAllocator,
     selections: audience_storage.Matrix,
     scratch: sparse_sets.Workspace,
     targets: []sessions.Service.Target,
@@ -142,10 +156,42 @@ pub const Mining = struct {
             .pair_checks = try deps.metrics.counter(.{ .name = "mining.replication.pairs", .description = "Pending mining recipient states examined" }),
             .audience_checks = try deps.metrics.counter(.{ .name = "mining.replication.audience", .description = "Spatial candidates examined for mining audience changes" }),
             .random = .{ .source = .init(configuration.seed) },
+            .loot_scratch = .init(try allocator.alloc(u8, configuration.loot_scratch_bytes)),
         };
         try deps.players.observeDig(self, onDig);
         try deps.input.on(.arm_animation, self, onSwing);
         return self;
+    }
+
+    fn lootNeighbors(self: *Mining, world: u32, position: chunks.Position, offsets: []const loot_tables.Offset, output: []loot_tables.Neighbor) !void {
+        assert(offsets.len == output.len and offsets.len <= 16);
+        var window = chunks.ReadWindow(8).init(self.deps.chunks);
+        defer window.deinit();
+        var cursor: usize = 0;
+        while (cursor < offsets.len) {
+            var positions: [8]chunks.Position = undefined;
+            var sections: [8]chunks.Section = undefined;
+            var indices: [8]usize = undefined;
+            var count: usize = 0;
+            const end = @min(offsets.len, cursor + @min(8, self.deps.chunks.cache.entries.len));
+            for (cursor..end) |index| {
+                const offset = offsets[index];
+                output[index] = .{ .offset = offset, .state = 0 };
+                const at: chunks.Position = .{
+                    .x = std.math.add(i32, position.x, offset.x) catch continue,
+                    .y = std.math.add(i32, position.y, offset.y) catch continue,
+                    .z = std.math.add(i32, position.z, offset.z) catch continue,
+                };
+                indices[count] = index;
+                positions[count] = at;
+                sections[count] = chunks.sectionAt(world, at);
+                count += 1;
+            }
+            var views: [8]chunks.View = undefined;
+            try window.readMany(sections[0..count], views[0..count]);
+            for (views[0..count], positions[0..count], indices[0..count]) |view, at, index| output[index].state = view.get(chunks.localIndex(at));
+            cursor = end;
+        }
     }
 
     pub fn checkpoint(self: *Mining, space: storage.Space) !void {
@@ -172,6 +218,30 @@ pub const Mining = struct {
         }
         players.deps.packets.fanout(writeAnimation, targets[0..count], .{ @as(i32, @intCast(handle.index + 1)), @as(u8, if (hand == 0) 0 else 3) }, 2048, deliveries[0..count]) catch |err|
             std.debug.panic("invalid server packet: {s}", .{@errorName(err)});
+    }
+
+    fn evaluateBlock(self: *Mining, player: *const Players.Player, state: *State, block: u16, position: minecraft.BlockPosition, tool: ?inventories.Stack) !Registry.Result {
+        self.loot_scratch.reset();
+        var result = try self.deps.definitions.evaluateContext(self.deps.items, .{
+            .actor = player,
+            .world = player.world,
+            .position = position,
+            .state = block,
+            .tool = tool,
+            .tick = self.deps.players.ticks,
+        }, (try state.tool.resolve(self.deps.items, tool)).kind, &self.loot_scratch);
+        const player_index = player.handle.?.index;
+        if (result.speed > 1) result.speed += @floatCast(try self.deps.attributes.value(player_index, "minecraft:mining_efficiency"));
+        result.speed *= @floatCast(try self.deps.attributes.value(player_index, "minecraft:block_break_speed"));
+        const eye_y = player.position.y + if (player.flags.sneaking) @as(f64, 1.27) else @as(f64, 1.62);
+        const eye: chunks.Position = .{ .x = @intFromFloat(@floor(player.position.x)), .y = @intFromFloat(@floor(eye_y)), .z = @intFromFloat(@floor(player.position.z)) };
+        const fluid = self.deps.block_definitions.properties[try self.deps.chunks.getBlock(player.world, eye)];
+        if (fluid.fluid == .water) {
+            const above = self.deps.block_definitions.properties[try self.deps.chunks.getBlock(player.world, .{ .x = eye.x, .y = eye.y + 1, .z = eye.z })];
+            const height: f64 = if (above.fluid == .water) 1 else fluid.height();
+            if (eye_y < @as(f64, @floatFromInt(eye.y)) + height) result.speed *= @floatCast(try self.deps.attributes.value(player_index, "minecraft:submerged_mining_speed"));
+        }
+        return result;
     }
 
     fn onDig(self: *Mining, handle: sessions.Handle, dig: minecraft.Dig) !void {
@@ -204,12 +274,11 @@ pub const Mining = struct {
         if (dx * dx + dy * dy + dz * dz > 36) return;
         const block = try self.deps.chunks.getBlock(player.world, .{ .x = position.x, .y = position.y, .z = position.z });
         if (block == 0 or block >= game_data.registry.block_state_to_block.len) return;
-        const info = game_data.registry.blocks[game_data.registry.block_state_to_block[block]];
-        if (!info.diggable or info.hardness < 0) return;
         const slot: inventories.Slot = .{ .owner = player.uuid, .index = 36 + @as(u16, player.selected_slot) };
         const held = try self.deps.inventories.get(slot);
-        const loot = self.deps.loot.evaluate(block, try state.tool.resolve(self.deps.items, held.stack));
-        const delta = if (info.hardness == 0) std.math.inf(f32) else loot.speed / info.hardness / @as(f32, if (loot.harvest) 30 else 100) / @as(f32, if (player.on_ground) 1 else 5);
+        const evaluation = try self.evaluateBlock(&player, state, block, position, held.stack);
+        if (!evaluation.diggable or evaluation.hardness < 0) return;
+        const delta = if (evaluation.hardness == 0) std.math.inf(f32) else evaluation.speed / evaluation.hardness / @as(f32, if (evaluation.harvest) 30 else 100) / @as(f32, if (player.on_ground) 1 else 5);
         const current_tick = players.ticks + 1;
         if (action == .start) {
             state.position = .{ .x = position.x, .y = position.y, .z = position.z };
@@ -269,15 +338,52 @@ pub const Mining = struct {
                 const block = views[0].get(chunks.localIndex(position));
 
                 if (block == 0) state.active = false else {
-                    const info = game_data.registry.blocks[game_data.registry.block_state_to_block[block]];
-                    const loot = self.deps.loot.evaluate(block, try state.tool.resolve(self.deps.items, held.stack));
-                    const progress = if (info.hardness < 0) @as(f32, 0) else if (info.hardness == 0) @as(f32, 1) else loot.speed / info.hardness / @as(f32, if (loot.harvest) 30 else 100) / @as(f32, if (player.on_ground) 1 else 5) * @as(f32, @floatFromInt(players.ticks - state.started + 1));
+                    const evaluation = try self.evaluateBlock(&player, state, block, state.position, held.stack);
+                    if (!evaluation.diggable or evaluation.hardness < 0) {
+                        state.active = false;
+                        complete = false;
+                    }
+                    const progress = if (!evaluation.diggable or evaluation.hardness < 0) @as(f32, 0) else if (evaluation.hardness == 0) @as(f32, 1) else evaluation.speed / evaluation.hardness / @as(f32, if (evaluation.harvest) 30 else 100) / @as(f32, if (player.on_ground) 1 else 5) * @as(f32, @floatFromInt(players.ticks - state.started + 1));
                     complete = complete or (state.finishing and progress >= 1);
-                    stage = @intFromFloat(@min(9, @floor(progress * 10)));
+                    stage = if (state.active) @intFromFloat(@min(9, @floor(progress * 10))) else -1;
                     if (complete) {
+                        terrain.deinit();
+                        self.loot_scratch.reset();
                         var experience_random = self.random.source;
-                        const experience = if (player.gamemode != .creative) loot.experience.sample(experience_random.random()) else 0;
-                        if (!self.deps.experience.canAward(experience) or (player.gamemode != .creative and loot.drop != null and !self.deps.dropped.canCreate(1))) {
+                        var experience = if (player.gamemode != .creative) evaluation.experience.sample(experience_random.random()) else 0;
+                        var drop_buffer: [loot_tables.maximum_drops]loot_tables.Drop = undefined;
+                        var drops: []const loot_tables.Drop = &.{};
+                        var admitted = true;
+                        if (player.gamemode != .creative) {
+                            const tool = if (held.stack) |stack| try self.deps.items.acquire(stack) else null;
+                            defer if (tool) |prepared| prepared.release();
+                            if (state.tool.enchanted and evaluation.experience.enchantments) {
+                                experience = @max(0, try self.deps.enchantments.effects.modify(.{
+                                    .item = tool.?.view,
+                                    .slot = 0,
+                                    .amount = @floatFromInt(experience),
+                                    .channel = .block_experience,
+                                    .random = experience_random.random(),
+                                    .player = player.uuid,
+                                    .actor = &player,
+                                    .location = .{ .world = player.world, .position = .{ .x = @floatFromInt(position.x), .y = @floatFromInt(position.y), .z = @floatFromInt(position.z) } },
+                                    .scratch = &self.loot_scratch,
+                                }));
+                            }
+                            if (evaluation.harvest and evaluation.diggable) if (self.deps.loot.table(block)) |table| {
+                                var neighbors: [16]loot_tables.Neighbor = undefined;
+                                try self.lootNeighbors(player.world, position, table.offsets, neighbors[0..table.offsets.len]);
+                                const context: loot_tables.Context = .{ .items = self.deps.items.deps.definitions, .state = block, .player = player.uuid, .location = .{ .world = player.world, .x = @floatFromInt(position.x), .y = @floatFromInt(position.y), .z = @floatFromInt(position.z) }, .tool = if (tool) |prepared| prepared.view else null, .neighbors = neighbors[0..table.offsets.len], .random = experience_random.random(), .scratch = &self.loot_scratch };
+                                drops = table.evaluate(&context, &drop_buffer) catch |err| switch (err) {
+                                    error.OutOfMemory, error.LootCapacity => exhausted: {
+                                        admitted = false;
+                                        break :exhausted &.{};
+                                    },
+                                    else => return err,
+                                };
+                            };
+                        }
+                        if (!admitted or !self.deps.experience.canAward(experience) or !self.deps.dropped.canCreate(drops.len)) {
                             self.deps.blocks.correct(player.world, position);
                             state.active = false;
                             state.finishing = false;
@@ -286,7 +392,9 @@ pub const Mining = struct {
                             continue;
                         }
                         terrain.deinit();
-                        const following_drops: usize = @intFromBool(player.gamemode != .creative and loot.drop != null);
+                        const following_drops = drops.len;
+                        var drop_stacks: [loot_tables.maximum_drops]inventories.Stack = undefined;
+                        for (drops, drop_stacks[0..drops.len]) |drop, *stack| stack.* = .{ .item = try item_data.define(self.deps.inventories, drop.kind, drop.components), .count = drop.count };
                         const removed = try self.deps.actions.apply(.{
                             .following_drops = following_drops,
                             .action = .remove,
@@ -308,21 +416,32 @@ pub const Mining = struct {
 
                         if (player.gamemode != .creative) {
                             if (held.stack) |tool| {
-                                if (info.hardness != 0) worn = try self.deps.durability.wear(tool, 1);
+                                if (evaluation.hardness != 0 and evaluation.tool_damage > 0) worn = try self.deps.durability.wear(tool, .{
+                                    .amount = @intCast(evaluation.tool_damage),
+                                    .slot = 0,
+                                    .actor = &player,
+                                    .random = self.random.random(),
+                                    .scratch = &self.loot_scratch,
+                                });
                             }
 
-                            if (loot.drop) |drop| {
-                                const stack = try drop.materialize(self.deps.items);
-                                const random = self.random.random();
-                                _ = try self.deps.dropped.create(player.world, .{
+                            var requests: [loot_tables.maximum_drops]ItemEntities.Spawn = undefined;
+                            var spawned: [loot_tables.maximum_drops]entities.Id = undefined;
+                            const random = self.random.random();
+                            for (drop_stacks[0..drops.len], requests[0..drops.len]) |stack, *request| request.* = .{
+                                .world = player.world,
+                                .position = .{
                                     @as(f64, @floatFromInt(position.x)) + 0.25 + random.float(f64) * 0.5,
                                     @as(f64, @floatFromInt(position.y)) + 0.25 + random.float(f64) * 0.5 - 0.125,
                                     @as(f64, @floatFromInt(position.z)) + 0.25 + random.float(f64) * 0.5,
-                                }, .{ random.float(f64) * 0.2 - 0.1, 0.2, random.float(f64) * 0.2 - 0.1 }, stack);
-                            }
+                                },
+                                .velocity = .{ random.float(f64) * 0.2 - 0.1, 0.2, random.float(f64) * 0.2 - 0.1 },
+                                .stack = stack,
+                            };
+                            try self.deps.dropped.createMany(requests[0..drops.len], spawned[0..drops.len]);
                         }
 
-                        if (removed == .pass) try self.deps.chunks.setBlock(player.world, position, 0);
+                        if (removed == .pass or evaluation.replacement != 0) try self.deps.chunks.setBlock(player.world, position, evaluation.replacement);
                         if (experience > 0) try self.deps.experience.award(player.world, .{ @as(f64, @floatFromInt(position.x)) + 0.5, @as(f64, @floatFromInt(position.y)) + 0.5, @as(f64, @floatFromInt(position.z)) + 0.5 }, experience);
 
                         if (!std.meta.eql(worn, held.stack)) {

@@ -1,3 +1,5 @@
+const EnchantmentRegistry = @import("enchantment_registry.zig").EnchantmentRegistry;
+const Dimensions = @import("dimensions.zig").Dimensions;
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const storage = @import("storage");
@@ -12,7 +14,6 @@ const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
 const ItemPhysics = @import("item_physics.zig").ItemPhysics;
 const spatial = @import("item_spatial.zig");
 const Random = @import("random.zig").Random;
-const Enchantments = @import("enchantments.zig").Enchantments;
 const item_data = @import("item_data.zig");
 const encoding = @import("protocol_support");
 const xp = @import("experience_state.zig");
@@ -22,6 +23,8 @@ pub const Experience = struct {
     pub const id = "minecraft:experience";
     pub const Configuration = struct { maximum_orbs: usize = 1024, seed: u64 = 0x657870657269656e, keep_inventory: bool = false };
     pub const Dependencies = struct {
+        enchantments: *EnchantmentRegistry,
+        dimensions: *Dimensions,
         players: *Players,
         entities: *entities.Entities,
         physics: *ItemPhysics,
@@ -332,7 +335,7 @@ pub const Experience = struct {
                 continue;
             }
             orb.ticks +%= 1;
-            try self.deps.physics.pushOrb(&window, &body, std.mem.eql(u8, world.dimension.name, "minecraft:the_nether"));
+            try self.deps.physics.pushOrb(&window, &body, if (self.deps.dimensions.get(world.dimension.name)) |dimension| dimension.ultrawarm else false);
             const environment = try self.deps.physics.orbEnvironment(&window, body);
             if (orb.fire > 0) {
                 if (@mod(orb.fire, 20) == 0 and (try self.deps.physics.orbEffects(&window, body)).lava == 0) {
@@ -475,7 +478,8 @@ pub const Experience = struct {
         var damages: [6]i32 = @splat(0);
         var default_damage: [6]bool = @splat(false);
         var repaired: [6]?inventories.Stack = undefined;
-        const mending = game_data.registry.enchantmentId("minecraft:mending").?;
+        const effects = &self.deps.enchantments.effects;
+        const equipment_slots = [_]u3{ 0, 1, 5, 4, 3, 2 };
         for (contents, &repaired, 0..) |entry, *stack, index| {
             stack.* = entry.stack;
             const held = entry.stack orelse continue;
@@ -483,8 +487,8 @@ pub const Experience = struct {
             defer lease.release();
             const view = try item_data.View.parse(lease.read().?);
             if (view.kind >= game_data.registry.items.len) return error.Corrupt;
-            if (view.value(.unbreakable) != null or try Enchantments.level(view, @intCast(mending)) == 0) continue;
-            var maximum: i32 = game_data.registry.items[view.kind].max_durability;
+            if (view.value(.unbreakable) != null or !try effects.hasRepair(view, equipment_slots[index])) continue;
+            var maximum: i32 = @intCast(self.deps.inventory.deps.items.deps.definitions.properties[view.kind].durability);
             default_damage[index] = maximum > 0;
             if (view.get(item_data.key(.max_damage))) |value| maximum = if (value.value) |bytes| (try encoding.read_varint(bytes))[0] else 0;
             if (maximum <= 0) continue;
@@ -500,7 +504,27 @@ pub const Experience = struct {
             };
             if (count == 0) break;
             const index = candidates[self.random.random().uintLessThan(usize, count)];
-            const durability = @min(@as(i64, left) * 2, damages[index]);
+            const repairable = blk: {
+                const lease = try self.deps.inventories.acquireItem(repaired[index].?.item);
+                defer lease.release();
+                self.deps.inventory.scratch.reset();
+                break :blk @max(0, try effects.modify(.{
+                    .item = try item_data.View.parse(lease.read().?),
+                    .slot = equipment_slots[index],
+                    .amount = @floatFromInt(left),
+                    .channel = .repair,
+                    .random = self.random.random(),
+                    .player = player.uuid,
+                    .actor = &player,
+                    .location = .{ .world = player.world, .position = player.position },
+                    .scratch = &self.deps.inventory.scratch,
+                }));
+            };
+            if (repairable == 0) {
+                left = 0;
+                break;
+            }
+            const durability = @min(@as(i64, repairable), damages[index]);
             damages[index] -= @intCast(durability);
             if (damages[index] == 0 and default_damage[index]) {
                 repaired[index] = try item_data.clearOverride(self.deps.inventories, repaired[index].?, item_data.key(.damage));
@@ -509,7 +533,7 @@ pub const Experience = struct {
                 const rest = try encoding.write_varint(&bytes, damages[index]);
                 repaired[index] = try item_data.replace(self.deps.inventories, repaired[index].?, .{ .key = item_data.key(.damage), .value = bytes[0 .. bytes.len - rest.len] });
             }
-            left -= @intCast(@divTrunc(durability * left, @as(i64, left) * 2));
+            left -= @intCast(@divTrunc(durability * left, repairable));
         }
         var edits: [6]inventories.Edit = undefined;
         var count: usize = 0;

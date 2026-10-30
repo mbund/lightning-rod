@@ -1,3 +1,4 @@
+const vanilla_content = @import("vanilla_content.zig");
 const storage = @import("storage");
 const persistent_records = @import("records");
 const metrics = @import("metrics");
@@ -44,7 +45,7 @@ fn itemPhysicsProbe(output: *std.Io.Writer) !void {
     const section: chunks.Section = .{ .world = 0, .x = 0, .y = 4, .z = 0 };
     const warm = try terrain.acquire(section);
     warm.release();
-    var physics: ItemPhysics = .{ .deps = .{ .chunks = terrain } };
+    var physics: ItemPhysics = .{ .deps = .{ .blocks = try vanilla_content.blocks(arena.allocator()), .chunks = terrain } };
     const body: entities.State = .{ .uuid = 1, .kind = 1, .world = 0, .position = .{ 8, 70, 8 }, .velocity = .{ 0.1, 0, 0.1 } };
     try output.writeAll("moving items | section acquisitions | storage reads | generated sections\n");
     for ([_]usize{ 1, 64, 1024 }) |count| {
@@ -192,7 +193,8 @@ test "prepared definitions survive cache reuse and revalidate changed bytes" {
     const transaction = store.transaction();
     defer transaction.fail();
     const ownership = try inventories.Inventories.init(arena.allocator(), io, .{ .cache_items = 2, .max_item_bytes = 1024 }, .{ .metrics = &metric_registry, .storage = try transaction.openSpace("inventory"), .record_workspaces = try persistent_records.Workspaces.init(arena.allocator(), io, .{}) });
-    const items = try Items.init(arena.allocator(), .{}, .{ .inventories = ownership, .registry_identity = undefined });
+    const gameplay_definitions = try vanilla_content.prepare(arena.allocator());
+    const items = try Items.init(arena.allocator(), .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
     const bread: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 1 };
     const stone: inventories.Stack = .{ .item = try items.define("minecraft:stone"), .count = 1 };
     const apple: inventories.Stack = .{ .item = try items.define("minecraft:apple"), .count = 1 };
@@ -242,7 +244,8 @@ test "pinned item batches observe earlier mutations and retirement" {
         const transaction = store.transaction();
         defer transaction.fail();
         const ownership = try inventories.Inventories.init(allocator, io, .{ .cache_items = 2, .cache_slots = 8, .max_item_bytes = 1024 }, .{ .metrics = &metric_registry, .storage = try transaction.openSpace("inventory"), .record_workspaces = workspaces });
-        const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
+        const gameplay_definitions = try vanilla_content.prepare(allocator);
+        const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = cache_records / 2 }, .{ .metrics = &metric_registry, .storage = try transaction.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try transaction.openSpace("worlds") });
         const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
@@ -350,7 +353,8 @@ pub fn benchmarkItemQueries() !void {
             .storage = try store.openSpace("inventory"),
             .record_workspaces = workspaces,
         });
-        const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
+        const gameplay_definitions = try vanilla_content.prepare(allocator);
+        const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const bodies = try entities.Entities.allocate(allocator, io, .{ .cache_records = 2 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.allocate(allocator, .{ .maximum = 1 });
         const dropped = try ItemEntities.allocate(allocator, io, .{ .cache_records = 4, .maximum = count }, .{
@@ -435,7 +439,7 @@ pub fn benchmarkItemPhysicsWindow() !void {
     });
     var source: Source = .{};
     terrain.setSource(chunks.Source.init(&source, Source.read));
-    var physics: ItemPhysics = .{ .deps = .{ .chunks = terrain } };
+    var physics: ItemPhysics = .{ .deps = .{ .blocks = try vanilla_content.blocks(arena.allocator()), .chunks = terrain } };
     const body: entities.State = .{ .uuid = 1, .kind = 1, .world = 0, .position = .{ 15.875, 65, 8 }, .velocity = .{ 0.1, 0, 0.1 } };
     {
         var window = physics.readWindow();

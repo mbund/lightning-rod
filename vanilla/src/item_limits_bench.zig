@@ -1,3 +1,4 @@
+const vanilla_content = @import("vanilla_content.zig");
 const game_data = @import("game_data");
 const std = @import("std");
 const storage = @import("storage");
@@ -36,7 +37,8 @@ pub fn benchmark() !void {
             .storage = try store.openSpace("inventory"),
             .record_workspaces = workspaces,
         });
-        const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
+        const gameplay_definitions = try vanilla_content.prepare(allocator);
+        const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
 
         const names = [_][]const u8{ "minecraft:bread", "minecraft:stone", "minecraft:dirt", "minecraft:apple", "minecraft:cobblestone", "minecraft:sand", "minecraft:gravel", "minecraft:oak_log", "minecraft:oak_planks", "minecraft:iron_ingot", "minecraft:gold_ingot", "minecraft:coal", "minecraft:redstone", "minecraft:diamond", "minecraft:emerald", "minecraft:stick" };
         var stacks: [names.len]inventories.Stack = undefined;
@@ -82,7 +84,7 @@ pub fn benchmark() !void {
         var source: Source = .{};
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 0, .cache_tiles = 2 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
         terrain.setSource(chunks.Source.init(&source, Source.read));
-        const physics = try ItemPhysics.init(allocator, .{ .chunks = terrain });
+        const physics = try ItemPhysics.init(allocator, .{ .blocks = gameplay_definitions.blocks, .chunks = terrain });
         const merging = try ItemMerging.init(allocator);
         var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .position = .{ .x = 32, .y = 65, .z = 32 } }};
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };

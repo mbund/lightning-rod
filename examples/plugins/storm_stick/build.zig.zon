@@ -1,0 +1,13 @@
+.{
+    .fingerprint = 0xf9a27f82fa0ac374,
+    .name = .lightning_rod_storm_stick,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .vanilla = .{ .path = "../../../vanilla" },
+        .game_data = .{ .path = "../../../game_data" },
+        .sessions = .{ .path = "../../../sessions" },
+        .protocol_1_21_5 = .{ .path = "../../../protocol_versions/v1_21_5" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

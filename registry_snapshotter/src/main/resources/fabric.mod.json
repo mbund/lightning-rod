@@ -4,5 +4,6 @@
   "version": "${version}",
   "environment": "*",
   "entrypoints": { "main": ["dev.lightningrod.registry.RegistrySnapshot"] },
+  "mixins": ["fuel.mixins.json"],
   "depends": { "fabricloader": ">=0.19.3", "minecraft": "${minecraft_version}", "java": ">=21" }
 }

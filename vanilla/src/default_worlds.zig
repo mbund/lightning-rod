@@ -1,20 +1,16 @@
 const RegistryIdentity = @import("registry_identity.zig").RegistryIdentity;
 const std = @import("std");
 const Worlds = @import("worlds").Worlds;
+const Dimensions = @import("dimensions.zig").Dimensions;
 
 pub const VanillaWorlds = struct {
     pub const id = "minecraft:vanilla_worlds";
 
     pub const Configuration = struct {};
 
-    pub const Dependencies = struct { registry_identity: *RegistryIdentity, worlds: *Worlds };
+    pub const Dependencies = struct { registry_identity: *RegistryIdentity, worlds: *Worlds, dimensions: *Dimensions };
 
-    pub const dimensions = struct {
-        pub const overworld: Worlds.Dimension = .{ .name = "minecraft:overworld", .minimum_section = -4, .section_count = 24, .skylight = true };
-        pub const nether: Worlds.Dimension = .{ .name = "minecraft:the_nether", .minimum_section = 0, .section_count = 16 };
-        pub const end: Worlds.Dimension = .{ .name = "minecraft:the_end", .minimum_section = 0, .section_count = 16 };
-    };
-
+    deps: Dependencies,
     overworld: u32,
     nether: u32,
     end: u32,
@@ -22,10 +18,42 @@ pub const VanillaWorlds = struct {
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*VanillaWorlds {
         const self = try allocator.create(VanillaWorlds);
         self.* = .{
-            .overworld = try deps.worlds.create(.{ .name = "minecraft:overworld", .dimension = dimensions.overworld }),
-            .nether = try deps.worlds.create(.{ .name = "minecraft:the_nether", .dimension = dimensions.nether }),
-            .end = try deps.worlds.create(.{ .name = "minecraft:the_end", .dimension = dimensions.end }),
+            .deps = deps,
+            .overworld = try findOrCreate(deps, "minecraft:overworld"),
+            .nether = try findOrCreate(deps, "minecraft:the_nether"),
+            .end = try findOrCreate(deps, "minecraft:the_end"),
         };
+        try deps.dimensions.registry.onChange(self, definitionsChanged);
+        try deps.dimensions.registry.checkWith(self, validate);
         return self;
+    }
+
+    fn findOrCreate(deps: Dependencies, name: []const u8) !u32 {
+        if (deps.worlds.find(name)) |world| return world.id;
+        return deps.worlds.create(.{ .name = name, .dimension = try deps.dimensions.dimension(name) });
+    }
+
+    fn definitionsChanged(self: *VanillaWorlds) !void {
+        const worlds = self.deps.worlds;
+        const dimensions = self.deps.dimensions;
+        for (worlds.entries[worlds.checkpointed..worlds.count]) |*world| {
+            const dimension = dimensions.dimension(world.dimension.name) catch |err| switch (err) {
+                error.UnknownDimension => continue,
+            };
+            world.dimension.minimum_section = dimension.minimum_section;
+            world.dimension.section_count = dimension.section_count;
+            world.dimension.skylight = dimension.skylight;
+        }
+    }
+
+    fn validate(self: *VanillaWorlds) !void {
+        const worlds = self.deps.worlds;
+        const dimensions = self.deps.dimensions;
+        for (worlds.all()) |world| {
+            const dimension = dimensions.dimension(world.dimension.name) catch |err| switch (err) {
+                error.UnknownDimension => continue,
+            };
+            if (!world.dimension.eql(dimension)) return error.DimensionIdentityChanged;
+        }
     }
 };

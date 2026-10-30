@@ -65,6 +65,7 @@ pub fn build(b: *std.Build) void {
         .{ .directory = "reload" },
         .{ .directory = "reload_execve" },
         .{ .directory = "nbt" },
+        .{ .directory = "datapacks" },
         .{ .directory = "system" },
         .{ .directory = "storage" },
         .{ .directory = "inventories" },

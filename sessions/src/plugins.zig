@@ -38,7 +38,7 @@ pub fn Runtime(comptime Endpoint: type, comptime Selections: type) type {
             @memset(self.connections, .{});
             self.inputs.init();
             self.phases = try sessions.Phases.init(self.fixed.allocator(), count);
-            self.fixed.trackPlugins(&self.plugin_bytes);
+            try self.fixed.trackPlugins(&self.plugin_bytes);
             const environment_with_input = lightning_rod.plugin.environment(environment, .{ .input = &self.inputs, .handshake = &self.inputs.handshake, .phases = &self.phases });
 
             inline for (0..count) |index| {

@@ -1,3 +1,4 @@
+const vanilla_content = @import("vanilla_content.zig");
 const Visibility = @import("visibility.zig").Visibility;
 const std = @import("std");
 const storage = @import("storage");
@@ -17,6 +18,7 @@ const Experience = @import("experience.zig").Experience;
 const ItemPhysics = @import("item_physics.zig").ItemPhysics;
 const Enchantments = @import("enchantments.zig").Enchantments;
 const item_data = @import("item_data.zig");
+const EquipmentAttributes = @import("equipment_attributes.zig").EquipmentAttributes;
 const Mining = @import("mining.zig").Mining;
 const Items = @import("items.zig").Items;
 const ItemEntities = @import("item_entities.zig").ItemEntities;
@@ -79,7 +81,8 @@ const Fixture = struct {
         for (players.records, 0..) |*player, at| player.* = .{ .handle = .{ .index = @intCast(at), .generation = 1 }, .uuid = at + 1, .world = world, .stage = .ready, .gamemode = .survival, .protocol = selected_protocols[0].number, .position = .{ .x = 8, .y = 65, .z = 6.5 }, .on_ground = true };
         players.rebuildIndexes();
         const ownership = try inventories.Inventories.init(allocator, std.testing.io, .{ .cache_slots = 1024, .cache_items = 8, .max_item_bytes = 1024 }, .{ .metrics = registry, .storage = try store.openSpace("inventory"), .record_workspaces = workspaces });
-        const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
+        const gameplay_definitions = try vanilla_content.prepare(allocator);
+        const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const bodies = try entities.Entities.init(allocator, std.testing.io, .{ .cache_records = 16 }, .{ .metrics = registry, .storage = try store.openSpace("entities"), .record_workspaces = workspaces });
         const dropped = try ItemEntities.init(allocator, std.testing.io, .{ .cache_records = 16, .maximum = 8 }, .{
             .entities = bodies,
@@ -90,11 +93,11 @@ const Fixture = struct {
             .metrics = registry,
             .record_workspaces = workspaces,
         });
-        const menus = try PlayerInventory.init(allocator, .{ .players = players, .inventories = ownership, .items = items, .equipment = try EquipmentSlots.init(allocator, .{ .items = items }), .dropped = dropped });
+        const menus = try PlayerInventory.init(allocator, .{}, .{ .crafting = gameplay_definitions.crafting, .furnaces = gameplay_definitions.furnaces, .players = players, .inventories = ownership, .items = items, .equipment = try EquipmentSlots.init(allocator, .{ .items = items, .enchantments = gameplay_definitions.enchantments }), .dropped = dropped });
         const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 64, .demand_sections = 0, .cache_tiles = 8 }, .{ .metrics = registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
         const blocks = try Blocks.init(allocator, std.testing.io, .{ .metrics = registry, .chunks = terrain, .players = players, .streaming = undefined, .sessions = service, .packets = encoding, .worlds = dimensions }, .{ .delta_sections = 16, .queued_sections = 32 });
-        const experience = try Experience.init(allocator, .{ .maximum_orbs = 64 }, .{ .players = players, .entities = bodies, .physics = try ItemPhysics.init(allocator, .{ .chunks = terrain }), .inventories = ownership, .inventory = menus, .storage = try store.openSpace("experience"), .record_workspaces = workspaces });
-        const mining = try Mining.allocate(allocator, .{}, .{ .visibility = try Visibility.init(allocator, .{}, .{ .players = players }), .metrics = registry, .storage = try store.openSpace("mining"), .players = players, .input = input, .inventories = ownership, .items = items, .durability = try Durability.init(allocator, .{ .items = items, .inventories = ownership }), .worlds = dimensions, .chunks = terrain, .menus = menus, .loot = try BlockLoot.init(allocator), .experience = experience, .dropped = dropped, .blocks = blocks, .actions = try BlockActions.init(allocator, .{}) });
+        const experience = try Experience.init(allocator, .{ .maximum_orbs = 64 }, .{ .enchantments = gameplay_definitions.enchantments, .dimensions = gameplay_definitions.dimensions, .players = players, .entities = bodies, .physics = try ItemPhysics.init(allocator, .{ .blocks = gameplay_definitions.blocks, .chunks = terrain }), .inventories = ownership, .inventory = menus, .storage = try store.openSpace("experience"), .record_workspaces = workspaces });
+        const mining = try Mining.allocate(allocator, .{}, .{ .enchantments = gameplay_definitions.enchantments, .block_definitions = gameplay_definitions.blocks, .attributes = try EquipmentAttributes.init(allocator, .{}, .{ .players = players, .items = items, .enchantments = gameplay_definitions.enchantments, .client = gameplay_definitions.client }), .definitions = gameplay_definitions.mining, .visibility = try Visibility.init(allocator, .{}, .{ .players = players }), .metrics = registry, .storage = try store.openSpace("mining"), .players = players, .input = input, .inventories = ownership, .items = items, .durability = try Durability.init(allocator, .{ .items = items, .inventories = ownership, .enchantments = gameplay_definitions.enchantments }), .worlds = dimensions, .chunks = terrain, .menus = menus, .loot = try BlockLoot.init(allocator, .{ .loot = gameplay_definitions.loot }), .experience = experience, .dropped = dropped, .blocks = blocks, .actions = try BlockActions.init(allocator, .{}) });
         const tool: inventories.Stack = .{ .item = try items.define("minecraft:diamond_pickaxe"), .count = 1 };
         for (players.records) |player| try std.testing.expect(try ownership.set(.{ .owner = player.uuid, .index = 36 }, 0, tool));
         try terrain.setBlock(world, .{ .x = position.x, .y = position.y, .z = position.z }, game_data.registry.block_obsidian_default_state);
@@ -254,7 +257,7 @@ pub fn verifyDelivery() !void {
     try std.testing.expectEqual(@as(i8, 0), fixture.clients[count].stage);
     try std.testing.expectEqual(@as(i8, 0), fixture.clients[2 * count].stage);
     const block = game_data.registry.blocks[game_data.registry.block_state_to_block[game_data.registry.block_obsidian_default_state]];
-    const loot = fixture.mining.deps.loot.evaluate(game_data.registry.block_obsidian_default_state, &fixture.mining.states[0].tool);
+    const loot = fixture.mining.deps.definitions.evaluate(game_data.registry.block_obsidian_default_state, fixture.mining.states[0].tool.kind);
     const stage_ticks: u64 = @intFromFloat(@ceil(block.hardness * @as(f32, if (loot.harvest) 30 else 100) / loot.speed / 10));
     players.ticks = stage_ticks;
     _ = try fixture.tick();
@@ -496,6 +499,9 @@ pub fn verifyNeighborhoods() !void {
 }
 
 pub fn verifyExperience() !void {
+    var definitions_memory = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer definitions_memory.deinit();
+    const definitions = try vanilla_content.prepare(definitions_memory.allocator());
     const Case = struct { block: []const u8, minimum: i32, maximum: i32 };
     for ([_]Case{
         .{ .block = "minecraft:coal_ore", .minimum = 0, .maximum = 2 },
@@ -534,13 +540,10 @@ pub fn verifyExperience() !void {
         const reward = game_data.physics.experience(game_data.registry.block_state_to_block[@intCast(state)]);
         try std.testing.expectEqual(expected, reward.minimum);
         try std.testing.expectEqual(expected, reward.maximum());
-        try std.testing.expect(reward.silk_touch);
-        const evaluator: BlockLoot = .{};
-        const ordinary = evaluator.evaluate(@intCast(state), &.{});
-        try std.testing.expect(ordinary.harvest and ordinary.drop == null);
-        const silk = evaluator.evaluate(@intCast(state), &.{ .silk_touch = true });
-        try std.testing.expectEqual(@as(i32, 0), silk.experience.maximum());
-        try std.testing.expectEqual(@as(u32, @intCast(reward.silk_drop)), silk.drop.?.kind);
+        try std.testing.expect(reward.enchantments);
+        const ordinary = definitions.mining.evaluate(@intCast(state), null);
+        try std.testing.expect(ordinary.harvest);
+        try std.testing.expectEqual(expected, ordinary.experience.maximum());
     }
     var normal_experience: i32 = 0;
     const Break = struct { tool: ?[]const u8 = "minecraft:diamond_pickaxe", enchantment: ?[]const u8 = null, block: []const u8 = "minecraft:diamond_ore", mode: minecraft.GameMode = .survival, minimum: i32 = 0, maximum: i32 = 0, exhausted: bool = false, denied: bool = false, break_tool: bool = false };
@@ -587,9 +590,9 @@ pub fn verifyExperience() !void {
         const item_kind: u32 = if (case.tool) |name| @intCast(game_data.registry.itemId(name).?) else 0;
         var components: [2]item_data.Component = undefined;
         var component_count: usize = 0;
-        var enchantment_bytes: [10]u8 = undefined;
+        var enchantment_bytes: [128]u8 = undefined;
         if (case.enchantment) |name| {
-            var entries = [_]Enchantments.Entry{.{ .id = @intCast(game_data.registry.enchantmentId(name).?), .level = 1 }};
+            var entries = [_]Enchantments.Entry{.{ .name = name, .level = 1 }};
             components[component_count] = .{ .key = item_data.key(.enchantments), .value = try Enchantments.encode(&entries, &enchantment_bytes) };
             component_count += 1;
         }
@@ -637,14 +640,14 @@ pub fn verifyExperience() !void {
             try std.testing.expectEqualSlices(u8, &random_before, &fixture.mining.random.encode());
         }
         if (case.break_tool) try std.testing.expect((try fixture.mining.deps.inventories.get(slot)).stack == null);
-        const loot = fixture.mining.deps.loot.evaluate(state, &fixture.mining.states[0].tool);
+        const loot = fixture.mining.deps.definitions.evaluate(state, fixture.mining.states[0].tool.kind);
         const dropped = fixture.mining.deps.dropped;
-        const should_drop = !refused and case.mode != .creative and loot.drop != null;
+        const should_drop = !refused and case.mode != .creative and loot.harvest and !std.mem.eql(u8, case.block, "minecraft:spawner");
         try std.testing.expectEqual(@as(usize, @intFromBool(should_drop)), dropped.residents.len - dropped.free_count);
         for (dropped.residents) |resident| if (resident.alive) {
             const body = (try dropped.deps.entities.get(resident.id)).?;
             const stack = (try fixture.mining.deps.inventories.get(ItemEntities.slot(body))).stack.?;
-            try std.testing.expectEqual(loot.drop.?.kind, try fixture.mining.deps.items.kind(stack));
+            try std.testing.expectEqual(@as(u32, @intCast(game_data.registry.itemId(if (case.enchantment != null and std.mem.eql(u8, case.enchantment.?, "minecraft:silk_touch")) "minecraft:diamond_ore" else "minecraft:diamond").?)), try fixture.mining.deps.items.kind(stack));
         };
         const completed_random = fixture.mining.random.encode();
         try fixture.dig(0, 2, position);

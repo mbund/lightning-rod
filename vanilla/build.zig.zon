@@ -20,6 +20,7 @@
         .metrics = .{ .path = "../metrics" },
         .lightning_rod = .{ .path = ".." },
         .game_data = .{ .path = "../game_data" },
+        .datapacks = .{ .path = "../datapacks" },
         .minecraft_packets = .{ .path = "../minecraft_packets" },
         .minecraft_model = .{ .path = "../minecraft_model" },
         .sessions = .{ .path = "../sessions" },

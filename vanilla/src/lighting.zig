@@ -1,3 +1,5 @@
+const vanilla_definitions = @import("vanilla_content.zig");
+const Blocks = @import("blocks.zig").Blocks;
 const std = @import("std");
 const builtin = @import("builtin");
 const lighting = @import("lighting");
@@ -60,11 +62,7 @@ pub const Workspace = struct {
     uniforms: [9 * maximum_sections]?u16 = @splat(null),
     section_views: [maximum_sections]Section = undefined,
 
-    pub fn init(allocator: std.mem.Allocator, terrain: *chunks.Chunks) !*Workspace {
-        return initRegistry(allocator, terrain, try game_data.lighting.init(allocator));
-    }
-
-    fn initRegistry(allocator: std.mem.Allocator, terrain: *chunks.Chunks, registry: lighting.Registry) !*Workspace {
+    pub fn init(allocator: std.mem.Allocator, terrain: *chunks.Chunks, registry: lighting.Registry) !*Workspace {
         const self = try allocator.create(Workspace);
         self.* = .{
             .watch = try chunks.Watch.init(allocator, terrain, 9 * maximum_sections),
@@ -322,7 +320,7 @@ pub const Sample = packed struct(u8) { block: u4, sky: u4 };
 pub const Lighting = struct {
     pub const id = "minecraft:lighting";
     pub const Configuration = struct { cache_columns: usize = 16 };
-    pub const Dependencies = struct { chunks: *chunks.Chunks, worlds: *worlds.Worlds };
+    pub const Dependencies = struct { blocks: *Blocks, chunks: *chunks.Chunks, worlds: *worlds.Worlds };
     const batch_max = 256;
     const Key = struct { x: i32, z: i32 };
     const Entry = struct {
@@ -344,17 +342,31 @@ pub const Lighting = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Lighting {
         if (config.cache_columns == 0) return error.InvalidLightingCapacity;
-        const registry = try game_data.lighting.init(allocator);
+        const registry = deps.blocks.light;
         const self = try allocator.create(Lighting);
         self.* = .{
             .deps = deps,
-            .background = try Workspace.initRegistry(allocator, deps.chunks, registry),
-            .simulation = try Workspace.initRegistry(allocator, deps.chunks, registry),
+            .background = try Workspace.init(allocator, deps.chunks, registry),
+            .simulation = try Workspace.init(allocator, deps.chunks, registry),
             .entries = try allocator.alloc(Entry, config.cache_columns),
         };
         for (self.entries) |*entry| entry.* = .{ .watch = try chunks.Watch.init(allocator, deps.chunks, 9 * maximum_sections) };
         try self.groups.ensureTotalCapacity(allocator, batch_max);
+        try deps.blocks.registry.onChange(self, definitionsChanged);
         return self;
+    }
+
+    fn definitionsChanged(self: *Lighting) !void {
+        for ([_]*Workspace{ self.background, self.simulation }) |workspace| {
+            workspace.engine.registry = self.deps.blocks.light;
+            workspace.region = null;
+            workspace.pending = null;
+            @memset(&workspace.copied, false);
+        }
+        for (self.entries) |*entry| {
+            entry.region = null;
+            entry.building = false;
+        }
     }
 
     pub fn prepare(self: *Lighting, world: u32, x: i32, z: i32, dimension: worlds.Worlds.Dimension, player: usize) !bool {
@@ -546,7 +558,7 @@ test "terrain lighting crosses chunk boundaries and reconstructs after persisten
     defer store.deinit();
     const resources = try records.Workspaces.init(allocator, io, .{});
     const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 4, .demand_sections = 1 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = resources });
-    const workspace = try Workspace.init(allocator, terrain);
+    const workspace = try Workspace.init(allocator, terrain, try game_data.lighting.init(allocator));
     const dimension: worlds.Worlds.Dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 1 };
     const glowstone: u16 = @intCast(game_data.registry.blockStateId("minecraft:glowstone").?);
     const stone: u16 = @intCast(game_data.registry.blockStateId("minecraft:stone").?);
@@ -569,7 +581,7 @@ test "terrain lighting crosses chunk boundaries and reconstructs after persisten
     try terrain.checkpoint(try store.openSpace("chunks"));
     try store.waitDurable(try store.commit(1));
     const restored = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 4, .demand_sections = 1 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = resources });
-    const reloaded = try Workspace.init(allocator, restored);
+    const reloaded = try Workspace.init(allocator, restored, try game_data.lighting.init(allocator));
     try settle(reloaded, restored, dimension);
     reloaded.engine.packSection(.block, .{ 1, 1, 1 }, &after);
     try std.testing.expectEqualSlices(u8, &before, &after);
@@ -589,7 +601,7 @@ test "terrain lighting crosses chunk boundaries and reconstructs after persisten
     var failing = std.testing.FailingAllocator.init(allocator, .{});
     const bounded = failing.allocator();
     const asynchronous = try chunks.Chunks.init(bounded, io, .{ .cache_sections = 4, .demand_sections = 1 }, .{ .metrics = &registry, .storage = try store.openSpace("asynchronous"), .record_workspaces = resources });
-    const pending = try Workspace.init(bounded, asynchronous);
+    const pending = try Workspace.init(bounded, asynchronous, try game_data.lighting.init(bounded));
     var source: Source = .{};
     asynchronous.setSource(chunks.Source.init(&source, Source.read));
     failing.fail_index = failing.alloc_index;
@@ -633,7 +645,7 @@ test "simulation light queries share worker results and observe same tick edits"
     const dimensions = try worlds.Worlds.allocate(allocator, .{});
     const world = try dimensions.create(.{ .name = "test:light", .dimension = .{ .name = "test:dimension", .minimum_section = -1, .section_count = 2, .skylight = true } });
     const world_id = world;
-    const service = try Lighting.init(allocator, .{ .cache_columns = 1 }, .{ .chunks = terrain, .worlds = dimensions });
+    const service = try Lighting.init(allocator, .{ .cache_columns = 1 }, .{ .blocks = try vanilla_definitions.blocks(allocator), .chunks = terrain, .worlds = dimensions });
     const Source = struct {
         fn read(_: *@This(), _: std.Io, batch: chunks.Source.Batch) void {
             for (batch.requests) |*request| request.result = chunks.uniform(0, request.output);
@@ -736,7 +748,7 @@ const ConcurrentLighting = struct {
             const world = try self.dimensions.create(.{ .name = name, .dimension = .{ .name = name, .minimum_section = 0, .section_count = 1, .skylight = index == 0 } });
             assert(world == index);
         }
-        self.service = try Lighting.init(allocator, .{ .cache_columns = 1 }, .{ .chunks = self.terrain, .worlds = self.dimensions });
+        self.service = try Lighting.init(allocator, .{ .cache_columns = 1 }, .{ .blocks = try vanilla_definitions.blocks(allocator), .chunks = self.terrain, .worlds = self.dimensions });
         self.terrain.setSource(chunks.Source.init(&self.source, Source.read));
         self.generation = try Generation.init(allocator, io, self.terrain.generation, 1);
         self.bounded.fail_index = self.bounded.alloc_index;

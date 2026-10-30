@@ -14,6 +14,7 @@ const WorldProvider = struct {
     pub const Dependencies = struct {
         registry_identity: *vanilla.RegistryIdentity,
         worlds: *vanilla.Worlds,
+        dimensions: *vanilla.Dimensions,
     };
     pub const Provides = .{*vanilla.VanillaWorlds};
 
@@ -21,12 +22,12 @@ const WorldProvider = struct {
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*WorldProvider {
         const self = try allocator.create(WorldProvider);
-        var dimension = vanilla.VanillaWorlds.dimensions.overworld;
+        var dimension = try deps.dimensions.dimension("minecraft:overworld");
         dimension.name = "example:bright";
         self.* = .{ .worlds = .{
             .overworld = try deps.worlds.create(.{ .name = "example:world", .dimension = dimension }),
-            .nether = try deps.worlds.create(.{ .name = "minecraft:the_nether", .dimension = vanilla.VanillaWorlds.dimensions.nether }),
-            .end = try deps.worlds.create(.{ .name = "minecraft:the_end", .dimension = vanilla.VanillaWorlds.dimensions.end }),
+            .nether = try deps.worlds.create(.{ .name = "minecraft:the_nether", .dimension = try deps.dimensions.dimension("minecraft:the_nether") }),
+            .end = try deps.worlds.create(.{ .name = "minecraft:the_end", .dimension = try deps.dimensions.dimension("minecraft:the_end") }),
         } };
         return self;
     }

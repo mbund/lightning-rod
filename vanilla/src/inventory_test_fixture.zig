@@ -1,3 +1,7 @@
+const definition_provider = @import("definition_provider.zig");
+const vanilla_content = @import("vanilla_content.zig");
+const crafting = @import("crafting.zig");
+const menu_click = @import("menu_click.zig");
 const std = @import("std");
 const storage = @import("storage");
 const records = @import("records");
@@ -16,15 +20,25 @@ const Items = @import("items.zig").Items;
 const EquipmentSlots = @import("item_properties.zig").EquipmentSlots;
 
 pub const InventoryFixture = struct {
+    definitions: definition_provider.Dependencies,
     service: *sessions.Service,
     input: *Input,
     players: *Players,
     ownership: *inventories.Inventories,
     items: *Items,
     menu: *PlayerInventory,
+    menus: *InventoryMenus,
     creative: *CreativeInventory,
     bodies: *entities.Entities,
     dropped: *ItemEntities,
+
+    pub fn location(self: InventoryFixture, kind: menu_click.Kind) crafting.Location {
+        const player = self.players.records[0];
+        return if (kind == .player)
+            .{ .player = .{ .world = player.world, .position = player.position } }
+        else
+            .{ .block = .{ .world = player.world, .position = .{ .x = -33, .y = 64, .z = 18 } } };
+    }
 
     pub fn init(allocator: std.mem.Allocator, store: *storage.Store, registry: *metrics.Registry, selected: []const sessions.Protocol) !InventoryFixture {
         const io = std.testing.io;
@@ -50,7 +64,8 @@ pub const InventoryFixture = struct {
             .storage = try store.openSpace("inventory"),
             .record_workspaces = workspaces,
         });
-        const items = try Items.init(allocator, .{}, .{ .inventories = ownership, .registry_identity = undefined });
+        const gameplay_definitions = try vanilla_content.prepare(allocator);
+        const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 16 }, .{ .metrics = registry, .storage = try store.openSpace("entities"), .record_workspaces = workspaces });
         const dropped = try ItemEntities.init(allocator, io, .{ .cache_records = 32, .maximum = 8 }, .{
             .metrics = registry,
@@ -61,11 +76,13 @@ pub const InventoryFixture = struct {
             .items = items,
             .worlds = dimensions,
         });
-        const menu = try PlayerInventory.init(allocator, .{
+        const menu = try PlayerInventory.init(allocator, .{}, .{
+            .crafting = gameplay_definitions.crafting,
+            .furnaces = gameplay_definitions.furnaces,
             .players = players,
             .inventories = ownership,
             .items = items,
-            .equipment = try EquipmentSlots.init(allocator, .{ .items = items }),
+            .equipment = try EquipmentSlots.init(allocator, .{ .items = items, .enchantments = gameplay_definitions.enchantments }),
             .dropped = dropped,
         });
         const creative = try CreativeInventory.init(allocator, .{
@@ -77,7 +94,7 @@ pub const InventoryFixture = struct {
             .inventories = ownership,
             .items = items,
         });
-        _ = try InventoryMenus.init(allocator, .{ .containers = undefined, .inventory = menu, .input = input, .players = players, .inventories = ownership, .items = items, .packets = undefined, .sessions = service });
-        return .{ .service = service, .input = input, .players = players, .ownership = ownership, .items = items, .menu = menu, .creative = creative, .bodies = bodies, .dropped = dropped };
+        const menus = try InventoryMenus.init(allocator, .{ .containers = undefined, .inventory = menu, .input = input, .players = players, .inventories = ownership, .items = items, .packets = undefined, .sessions = service });
+        return .{ .definitions = gameplay_definitions, .service = service, .input = input, .players = players, .ownership = ownership, .items = items, .menu = menu, .menus = menus, .creative = creative, .bodies = bodies, .dropped = dropped };
     }
 };

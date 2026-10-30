@@ -13,7 +13,7 @@ pub fn main(init: std.process.Init) !void {
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
             lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = if (mode == .chests) 2 else 1, .render_distance = 2, .gamemode = .survival }),
         }),
-        lightning_rod.plugin.configured(Probe, .{ .mode = mode }),
+        lightning_rod.plugin.configured(Probe, .{ .mode = mode, .fuel_callback = std.mem.eql(u8, args.fixture, "furnace-callback") }),
     });
     try e2e.profile.run(init, plugins, .{ .reload_executable = "/proc/self/exe" });
 }
@@ -25,10 +25,12 @@ const bread_count = 17;
 
 const Probe = struct {
     pub const id = "e2e:containers";
-    pub const Configuration = struct { mode: Mode };
+    pub const Configuration = struct { mode: Mode, fuel_callback: bool = false };
+    pub const Parameters = struct {};
     pub const Dependencies = struct {
         players: *vanilla.Players,
         menus: *vanilla.PlayerInventory,
+        furnaces: *vanilla.Furnaces,
         inventories: *vanilla.Inventories,
         items: *vanilla.Items,
         chunks: *vanilla.Chunks,
@@ -44,8 +46,55 @@ const Probe = struct {
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Probe {
         const self = try allocator.create(Probe);
         self.* = .{ .deps = deps, .config = config, .resumed = if (deps.reload.latest()) |request| request.sequence > 0 else false };
+        if (config.fuel_callback) try deps.furnaces.addFuels(&.{.{
+            .input = .{ .item = "minecraft:coal" },
+            .callback = try vanilla.fuel.Handler(Probe, Probe.Parameters, Probe.prepare).define(allocator, self, .{}),
+        }});
         deps.control.on(self, message);
         return self;
+    }
+
+    pub fn prepare(self: *Probe, _: *const Parameters, context: *const vanilla.fuel.Context) !?vanilla.fuel.Plan {
+        const position = context.location.position;
+        if (position.x != oven.x or position.y != oven.y or position.z != oven.z) return null;
+        const data = try context.fuel.customData() orelse return null;
+        if ((try data.getInt("charge") orelse return null) != 7) return null;
+        const properties: vanilla.fuel.Properties = .{ .ticks = context.standard.ticks * 2 };
+        if (context.phase == .admission) {
+            if (context.player != self.deps.players.records[0].uuid) return null;
+            return .{ .properties = properties };
+        }
+        var editor = try data.edit(context.scratch.allocator());
+        var identity: [32]u8 = undefined;
+        const player = try std.fmt.bufPrint(&identity, "{x:0>32}", .{self.deps.players.records[0].uuid});
+        if (context.phase == .insertion) {
+            if (context.player != self.deps.players.records[0].uuid) return null;
+            try editor.setString("actor", player);
+        } else {
+            if (context.player != null) return error.InventedFuelActor;
+            const stored = try data.getString("actor", context.scratch.allocator()) orelse return null;
+            if (!std.mem.eql(u8, stored, player)) return null;
+            try editor.setInt("charge", 0);
+        }
+        var result = try context.result(context.fuel.view.kind, context.fuel.stack.count);
+        try result.copyComponents(context.fuel.view);
+        try result.set(.custom_data, try editor.finish());
+        return .{ .properties = properties, .replacement = .{ .stack = result.finish() } };
+    }
+
+    fn checkFuel(self: *Probe, player: *const vanilla.Players.Player) !void {
+        if (!self.config.fuel_callback) return;
+        const value = self.deps.containers.furnaceState(player.world, oven);
+        if (value.burn_total != self.deps.furnaces.table.fuels[itemKind("minecraft:coal")].ticks * 2) return error.CustomFuelDuration;
+        const stack = (try self.deps.inventories.get(vanilla.Containers.slot(player.world, oven, 1))).stack orelse return error.CustomFuelMissing;
+        const pinned = try self.deps.items.acquire(stack);
+        defer pinned.release();
+        const data = try vanilla.custom_data.Compound.init(pinned.view.value(.custom_data) orelse return error.CustomFuelDataMissing);
+        if ((try data.getInt("charge")) != 0) return error.CustomFuelNotConsumed;
+        var bytes: [128]u8 = undefined;
+        var scratch = std.heap.FixedBufferAllocator.init(&bytes);
+        const actor = try data.getString("actor", scratch.allocator()) orelse return error.FuelProvenanceMissing;
+        if ((try std.fmt.parseInt(u128, actor, 16)) != player.uuid) return error.FuelProvenanceChanged;
     }
 
     fn message(self: *Probe, handle: sessions.Handle, text: []const u8) !e2e.Control.Result {
@@ -57,6 +106,7 @@ const Probe = struct {
                 if (self.config.mode == .furnace) {
                     const value = self.deps.containers.furnaceState(player.world, oven);
                     if (value.burn_left == 0 or value.burn_left > value.burn_total) return error.FurnaceDidNotResume;
+                    try self.checkFuel(&player);
                     const completed = std.mem.eql(u8, self.deps.reload.latest().?.token(), "e2e:furnace-taken");
                     if (completed) {
                         try self.assertPlayerCount(handle.index, "minecraft:iron_ingot", 2);
@@ -93,7 +143,8 @@ const Probe = struct {
         } else if (std.mem.eql(u8, text, "started")) {
             const value = self.deps.containers.furnaceState(player.world, oven);
             const input = protocols.registry.itemId("minecraft:raw_iron").?;
-            if (value.burn_left == 0 or value.duration != self.deps.menus.recipes.recipes[@intCast(input)].?.ticks or value.cook == 0) return error.FurnaceTiming;
+            if (value.burn_left == 0 or value.duration != self.deps.furnaces.table.recipes[@intCast(input)].?.ticks or value.cook == 0) return error.FurnaceTiming;
+            try self.checkFuel(&player);
             try self.deps.reload.stage("e2e:furnace-started");
         } else if (std.mem.eql(u8, text, "cooked")) {
             const value = (try self.deps.inventories.get(vanilla.Containers.slot(player.world, oven, 2))).stack orelse return error.FurnaceOutputMissing;
@@ -133,7 +184,11 @@ const Probe = struct {
             };
             for (specs) |spec| {
                 const value = try self.deps.inventories.get(.{ .owner = player.uuid, .index = spec.slot });
-                const committed = try self.deps.inventories.set(.{ .owner = player.uuid, .index = spec.slot }, value.revision, .{ .item = try self.deps.items.define(spec.name), .count = spec.count });
+                const item = if (self.config.fuel_callback and std.mem.eql(u8, spec.name, "minecraft:coal"))
+                    try vanilla.item_data.define(self.deps.inventories, itemKind(spec.name), &.{.{ .key = vanilla.item_data.key(.custom_data), .value = &.{ 10, 3, 0, 6, 'c', 'h', 'a', 'r', 'g', 'e', 0, 0, 0, 7, 0 } }})
+                else
+                    try self.deps.items.define(spec.name);
+                const committed = try self.deps.inventories.set(.{ .owner = player.uuid, .index = spec.slot }, value.revision, .{ .item = item, .count = spec.count });
                 std.debug.assert(committed);
             }
             self.deps.menus.changed(index);

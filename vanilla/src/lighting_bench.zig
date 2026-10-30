@@ -1,3 +1,4 @@
+const vanilla_content = @import("vanilla_content.zig");
 const std = @import("std");
 const chunks = @import("chunks");
 const storage = @import("storage");
@@ -37,7 +38,7 @@ test "lighting pipeline makes progress under sustained edits" {
         defer store.deinit();
         const resources = try records.Workspaces.init(allocator, io, .{});
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 4, .demand_sections = 1 }, .{ .metrics = &registry, .storage = try store.openSpace("terrain"), .record_workspaces = resources });
-        const workspace = try lighting.Workspace.init(allocator, terrain);
+        const workspace = try lighting.Workspace.init(allocator, terrain, try game_data.lighting.init(allocator));
         var source: Source = .{};
         terrain.setSource(chunks.Source.init(&source, Source.read));
         bounded.fail_index = bounded.alloc_index;
@@ -83,7 +84,7 @@ test "lighting pipeline retains overlapping neighborhoods in every direction" {
     defer store.deinit();
     const resources = try records.Workspaces.init(allocator, io, .{});
     const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 48, .demand_sections = 24 }, .{ .metrics = &registry, .storage = try store.openSpace("terrain"), .record_workspaces = resources });
-    const workspace = try lighting.Workspace.init(allocator, terrain);
+    const workspace = try lighting.Workspace.init(allocator, terrain, try game_data.lighting.init(allocator));
     var source: Scene = .{};
     terrain.setSource(chunks.Source.init(&source, Scene.read));
     const dimension: worlds.Worlds.Dimension = .{ .name = "test:dimension", .minimum_section = 4, .section_count = 1, .skylight = true };
@@ -147,7 +148,7 @@ test "lighting pipeline simulation queries group points and reuse cached light" 
     const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 48, .demand_sections = 24 }, .{ .metrics = &registry, .storage = try store.openSpace("terrain"), .record_workspaces = resources });
     const dimensions = try worlds.Worlds.allocate(allocator, .{});
     const world = try dimensions.create(.{ .name = "test:queries", .dimension = .{ .name = "test:dimension", .minimum_section = -4, .section_count = 24, .skylight = true } });
-    const service = try lighting.Lighting.init(allocator, .{}, .{ .chunks = terrain, .worlds = dimensions });
+    const service = try lighting.Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions });
     var source: Scene = .{};
     terrain.setSource(chunks.Source.init(&source, Scene.read));
     const positions: [256]chunks.Position = @splat(.{ .x = 17, .y = 66, .z = 2 });

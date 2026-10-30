@@ -26,12 +26,23 @@ final class ItemComponentsFixture extends Fixture {
     }
 
     private boolean presented(Minecraft game, ItemStack stack, String owner, int price) {
-        if (!stack.getHoverName().getString().equals(owner + "'s paper")) return false;
+        if (stack.getMaxStackSize() != 8 || !stack.getHoverName().getString().equals(owner + "'s paper")) return false;
         var lore = stack.get(DataComponents.LORE);
         if (lore == null || lore.lines().size() != 2) return false;
         String recipient = game.player.getUUID().toString().replace("-", "").replaceFirst("^0+", "");
         return lore.lines().get(0).getString().equals("Original lore")
             && lore.lines().get(1).getString().equals("Price: " + price + " credits. Customer: " + recipient);
+    }
+
+    private boolean defaults(Minecraft game) {
+        var iron = game.player.getInventory().getItem(3);
+        var diamond = game.player.getInventory().getItem(4);
+        var customIron = game.player.getInventory().getItem(5);
+        var customPaper = game.player.getInventory().getItem(6);
+        return iron.is(Items.IRON_PICKAXE) && iron.getMaxDamage() == 40
+            && diamond.is(Items.DIAMOND_PICKAXE) && !diamond.has(DataComponents.MAX_DAMAGE)
+            && customIron.is(Items.IRON_PICKAXE) && customIron.getMaxDamage() == 72
+            && customPaper.is(Items.PAPER) && customPaper.getMaxStackSize() == 16;
     }
 
     @Override public void tick(Minecraft game, int loaded, int missing) {
@@ -52,8 +63,23 @@ final class ItemComponentsFixture extends Fixture {
             var stack = original(r.peer);
             game.player.getInventory().setItem(0, stack);
             game.gameMode.handleCreativeModeItemAdd(stack, 36);
+            var iron = new ItemStack(Items.IRON_PICKAXE);
+            var diamond = new ItemStack(Items.DIAMOND_PICKAXE);
+            game.player.getInventory().setItem(3, iron);
+            game.player.getInventory().setItem(4, diamond);
+            game.gameMode.handleCreativeModeItemAdd(iron, 39);
+            game.gameMode.handleCreativeModeItemAdd(diamond, 40);
+            var customIron = new ItemStack(Items.IRON_PICKAXE);
+            customIron.set(DataComponents.MAX_DAMAGE, 72);
+            var customPaper = new ItemStack(Items.PAPER);
+            customPaper.set(DataComponents.MAX_STACK_SIZE, 16);
+            game.player.getInventory().setItem(5, customIron);
+            game.player.getInventory().setItem(6, customPaper);
+            game.gameMode.handleCreativeModeItemAdd(customIron, 41);
+            game.gameMode.handleCreativeModeItemAdd(customPaper, 42);
             phase = Phase.INITIAL;
         } else if (phase == Phase.INITIAL) {
+            if (!defaults(game)) return;
             if (!presented(game, game.player.getMainHandItem(), r.peer, 100)
                 || !presented(game, peer.getMainHandItem(), other, 100)) return;
             if (!client.screenshot("personalized_equipment").done()) return;
@@ -95,6 +121,7 @@ final class ItemComponentsFixture extends Fixture {
             if (configurations != 0) game.player.getInventory().setSelectedSlot(1);
             if (configurations == 0 || !presented(game, game.player.getMainHandItem(), r.peer, 100)
                 || !presented(game, peer.getMainHandItem(), other, 100)) return;
+            if (!defaults(game)) return;
             if (!client.screenshot("components_after_reload").done()) return;
             client.mark(r.peer + ".complete");
             phase = Phase.COMPLETE;
