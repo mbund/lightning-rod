@@ -50,7 +50,7 @@ pub fn Endpoint(comptime implementations: anytype, comptime bootstrap: type, com
             break :block @Union(.auto, Tag, &names, &types, &@splat(.{}));
         };
         /// One workspace per type. Operations run sequentially on the owning session thread.
-        pub const Workspaces = std.meta.Tuple(&workspace_layout.types);
+        pub const Workspaces = @Tuple(&workspace_layout.types);
 
         pub fn initWorkspaces(allocator: std.mem.Allocator) !Workspaces {
             var result: Workspaces = undefined;
@@ -84,14 +84,14 @@ pub fn Endpoint(comptime implementations: anytype, comptime bootstrap: type, com
 
         pub fn decode(connection: *Connection, workspaces: *Workspaces, bytes: []const u8, destination: []u8, threshold: ?usize) ![]const u8 {
             return switch (connection.*) {
-                inline else => |*state, tag| state.decode(bytes, destination, &workspaces[workspace_layout.indices[@intFromEnum(tag)]], threshold),
+                inline else => |*state, tag| state.decode(bytes, destination, &workspaces[workspace_layout.indices[@backingInt(tag)]], threshold),
             };
         }
 
         /// Framing settings belong to the packet, before subsequent protocol polling changes them.
         pub fn control(connection: *Connection, workspaces: *Workspaces, packet: protocol.Packet, output: []u8, threshold: ?usize) !protocol.Fragments {
             return switch (connection.*) {
-                inline else => |*state, tag| state.frameControl(packet, output, &workspaces[workspace_layout.indices[@intFromEnum(tag)]], threshold),
+                inline else => |*state, tag| state.frameControl(packet, output, &workspaces[workspace_layout.indices[@backingInt(tag)]], threshold),
             };
         }
 

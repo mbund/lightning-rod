@@ -35,10 +35,10 @@ pub fn build(b: *std.Build) void {
     for (executable.root_module.import_table.keys(), executable.root_module.import_table.values()) |name, dependency|
         module.addImport(name, dependency);
     b.installArtifact(executable);
-    const run = b.addSystemCommand(&.{b.getInstallPath(.bin, executable.out_filename)});
+    const run = b.addRunFile(b.graph.path(.install_bin, executable.out_filename));
     run.step.dependOn(b.getInstallStep());
     run.setCwd(b.path("."));
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Run independent islands on a bounded worker pool").dependOn(&run.step);
     const integration = b.addExecutable(.{
         .name = "skyblock-reload-test",

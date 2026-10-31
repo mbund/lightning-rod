@@ -33,7 +33,9 @@ jobs:
           key: ci-zig-${{ runner.os }}-${{ steps.previous.outputs.dependencies }}-${{ hashFiles('**/build.zig.zon', '.github/scripts/install-zig.sh', '.github/scripts/prepare-zig.sh') }}
       - name: Install Zig
         if: steps.dependencies.outputs.cache-hit != 'true'
-        run: bash .github/scripts/install-zig.sh "$RUNNER_TEMP/ci-dependencies/zig"
+        run: |
+          bash .github/scripts/install-zig.sh "$RUNNER_TEMP/ci-dependencies/zig"
+          echo "$RUNNER_TEMP/ci-dependencies/zig" >> "$GITHUB_PATH"
       - name: Fetch Zig dependencies
         if: steps.dependencies.outputs.cache-hit != 'true'
         run: bash .github/scripts/prepare-zig.sh
@@ -245,43 +247,14 @@ jobs:
           releases=$(cd e2e && zig build upgrade-releases)
           mkdir -p "$RUNNER_TEMP/previous-source" "$RUNNER_TEMP/previous-server/$PREVIOUS" "$RUNNER_TEMP/ci-prepared"
           git archive "$PREVIOUS" | tar -xf - -C "$RUNNER_TEMP/previous-source"
-          (cd "$RUNNER_TEMP/previous-source/examples/vanilla" && zig build --release=safe -Dtarget=x86_64-linux -Dcpu=baseline "-Dreleases=$releases")
+          (cd "$RUNNER_TEMP/previous-source" && bash "$GITHUB_WORKSPACE/.github/scripts/install-zig.sh" "$RUNNER_TEMP/previous-zig")
+          (cd "$RUNNER_TEMP/previous-source/examples/vanilla" && "$RUNNER_TEMP/previous-zig/zig" build --release=safe -Dtarget=x86_64-linux -Dcpu=baseline "-Dreleases=$releases")
           cp "$RUNNER_TEMP/previous-source/examples/vanilla/zig-out/bin/lightning_rod" "$RUNNER_TEMP/previous-server/$PREVIOUS/"
           tar --zstd -cf "$RUNNER_TEMP/ci-prepared/previous.tar.zst" -C "$RUNNER_TEMP/previous-server" .
       - uses: actions/upload-artifact@v7
         with:
           name: ci-previous
           path: ${{ runner.temp }}/ci-prepared/previous.tar.zst
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 1
-
-  prepare-native:
-    name: Prepare client native libraries
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-      - id: image
-        run: echo "version=$ImageVersion" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v5
-        id: dependencies
-        with:
-          path: ${{ runner.temp }}/ci-dependencies
-          key: ci-native-${{ steps.image.outputs.version }}-${{ hashFiles('.github/workflows/ci.yml') }}
-      - name: Download native packages
-        if: steps.dependencies.outputs.cache-hit != 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --download-only --reinstall -y --no-install-recommends \
-            xvfb libgl1-mesa-dri libglx-mesa0 libgl1 libxrandr2 libxinerama1 libxcursor1 libxi6 libasound2t64
-          mkdir -p "$RUNNER_TEMP/ci-dependencies"
-          tar --zstd --exclude=lock --exclude=partial -cf "$RUNNER_TEMP/ci-dependencies/native.tar.zst" \
-            -C /var/cache/apt/archives .
-      - uses: actions/upload-artifact@v7
-        with:
-          name: ci-native
-          path: ${{ runner.temp }}/ci-dependencies/native.tar.zst
           compression-level: 0
           if-no-files-found: error
           retention-days: 1
@@ -296,10 +269,10 @@ jobs:
     needs: [prepare-zig, prepare-jdk, prepare-clients, registries]
     uses: ./.github/workflows/bench.yml
   e2e:
-    needs: [prepare-zig, prepare-jdk, prepare-clients, registries, prepare-assets, prepare-native]
+    needs: [prepare-zig, prepare-jdk, prepare-clients, registries, prepare-assets]
     uses: ./.github/workflows/e2e.yml
   upgrade:
-    needs: [prepare-zig, prepare-jdk, prepare-clients, registries, prepare-assets, prepare-native, prepare-previous]
+    needs: [prepare-zig, prepare-jdk, prepare-clients, registries, prepare-assets, prepare-previous]
     uses: ./.github/workflows/e2e.yml
     with:
       upgrade: true

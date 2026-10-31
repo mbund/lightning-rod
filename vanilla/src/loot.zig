@@ -490,7 +490,7 @@ pub const Tables = struct {
             names[count] = name.*;
             count += 1;
         }
-        std.mem.sort([]const u8, names, {}, struct {
+        std.mem.sortUnstable([]const u8, names, {}, struct {
             fn less(_: void, a: []const u8, b: []const u8) bool {
                 return std.mem.lessThan(u8, a, b);
             }

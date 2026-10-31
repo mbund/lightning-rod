@@ -17,6 +17,7 @@ const InventoryMenus = @import("inventory_menus.zig").InventoryMenus;
 const book_packets = @import("recipe_book_packets.zig");
 const unlocks = @import("recipe_unlocks.zig");
 const assert = std.debug.assert;
+const absent = std.math.maxInt(usize);
 
 pub const RecipeBook = struct {
     pub const Registry = RecipeBookRegistry;
@@ -36,6 +37,14 @@ pub const RecipeBook = struct {
     };
     pub const Kind = enum(u2) { crafting, furnace, blast_furnace, smoker };
     pub const Setting = struct { open: bool = false, craftable: bool = false };
+    const BlockSample = struct {
+        section: chunks.Section,
+        index: u12,
+        valid: bool = false,
+        previous: usize = absent,
+        next: usize = absent,
+    };
+    const BlockQueries = lightning_rod.system.BatchIndex(chunks.Section, usize, std.hash_map.AutoContext(chunks.Section));
     const State = struct {
         uuid: u128 = 0,
         loaded: bool = false,
@@ -48,7 +57,9 @@ pub const RecipeBook = struct {
         inventory_dirty: u64 = 0,
         settings: u8 = 0,
         phase: u8 = 0,
-        block_pending: bool = true,
+        block_pending: bool = false,
+        block_sample: ?BlockSample = null,
+        block_next: usize = absent,
     };
     const held_slots: [41]u16 = block: {
         var values: [41]u16 = undefined;
@@ -69,6 +80,9 @@ pub const RecipeBook = struct {
     awarded: []bool,
     candidate: []bool,
     active: lightning_rod.system.IndexSet,
+    block_watches: std.AutoArrayHashMapUnmanaged(chunks.Section, usize) = .empty,
+    block_queries: BlockQueries,
+    block_leases: []chunks.Lease,
     observer: *inventories.Inventories.Observer,
     table: records.Table,
     state_bytes: []u8,
@@ -98,6 +112,8 @@ pub const RecipeBook = struct {
             .awarded = &.{},
             .candidate = &.{},
             .active = try .init(allocator, players),
+            .block_queries = try .init(allocator, players),
+            .block_leases = try allocator.alloc(chunks.Lease, @min(players, deps.chunks.cache.entries.len)),
             .observer = try deps.inventories.observe(allocator, players),
             .table = records.Table.init(deps.storage, deps.record_workspaces.resources),
             .state_bytes = try allocator.alloc(u8, config.state_bytes),
@@ -106,6 +122,8 @@ pub const RecipeBook = struct {
             .available = @splat(&.{}),
         };
         @memset(self.states, .{});
+        try self.block_watches.ensureTotalCapacity(allocator, players);
+        try deps.chunks.observe(.init(self, blocksChanged));
         try self.definitionsChanged();
         try deps.definitions.registry.onChange(self, definitionsChanged);
         try deps.definitions.registry.checkWith(self, validate);
@@ -235,14 +253,14 @@ pub const RecipeBook = struct {
 
     pub fn setting(self: *RecipeBook, player: usize, kind: Kind) !Setting {
         try self.bind(player);
-        const value = self.states[player].settings >> (@as(u3, @intFromEnum(kind)) * 2);
+        const value = self.states[player].settings >> (@as(u3, @backingInt(kind)) * 2);
         return .{ .open = value & 1 != 0, .craftable = value & 2 != 0 };
     }
 
     pub fn configure(self: *RecipeBook, player: usize, kind: Kind, value: Setting) !void {
         try self.bind(player);
         const state = &self.states[player];
-        const shift: u3 = @as(u3, @intFromEnum(kind)) * 2;
+        const shift: u3 = @as(u3, @backingInt(kind)) * 2;
         const encoded: u8 = @intFromBool(value.open) | (@as(u8, @intFromBool(value.craftable)) << 1);
         const next = (state.settings & ~(@as(u8, 3) << shift)) | (encoded << shift);
         if (next == state.settings) return;
@@ -279,6 +297,7 @@ pub const RecipeBook = struct {
         if (!state.loaded or state.uuid != profile.uuid) {
             if (state.loaded and state.dirty) try self.save(player);
             if (state.watching) self.observer.unwatch(state.uuid);
+            self.unwatchBlock(state);
             state.* = .{ .uuid = profile.uuid, .loaded = true };
             @memset(self.row(player), 0);
             @memset(self.criteria(player), false);
@@ -314,6 +333,10 @@ pub const RecipeBook = struct {
                 state.dirty = true;
                 for (self.deps.definitions.table.book, 0..) |recipe, index| if (recipe.initially_unlocked) self.grant(player, index, false);
             }
+            const progress = self.criteria(player);
+            state.block_pending = for (self.deps.definitions.unlocks.blocks) |criterion| {
+                if (!progress[criterion]) break true;
+            } else false;
         }
         if (!state.watching) {
             self.observer.watch(state.uuid, &held_slots, .{ .dirty = &state.inventory_dirty });
@@ -376,7 +399,7 @@ pub const RecipeBook = struct {
         const filter, const done = try b.filterActive();
         try done.finish();
         if (book < 0 or book > 3) return error.InvalidPacket;
-        try self.configure(handle.index, @enumFromInt(book), .{ .open = open, .craftable = filter });
+        try self.configure(handle.index, @fromBackingInt(@intCast(book)), .{ .open = open, .craftable = filter });
     }
     fn onDisplayed(self: *RecipeBook, handle: sessions.Handle, packet: wire.play.toServer.packet_displayed_recipe.Reader) !void {
         if (!self.validHandle(handle)) return;
@@ -424,6 +447,7 @@ pub const RecipeBook = struct {
                     self.observer.unwatch(state.uuid);
                     state.watching = false;
                 }
+                self.unwatchBlock(state);
                 self.active.remove(index);
                 continue;
             }
@@ -437,25 +461,125 @@ pub const RecipeBook = struct {
                 state.progress_dirty = true;
             };
             if (state.inventory_dirty != 0) try self.inventoryChanged(index);
-            const position: chunks.Position = .{ .x = @intFromFloat(@floor(player.position.x)), .y = @intFromFloat(@floor(player.position.y)), .z = @intFromFloat(@floor(player.position.z)) };
-            if (state.block_pending and player.loaded) {
-                state.block_pending = for (rules.blocks) |criterion| {
-                    if (!progress[criterion]) break true;
-                } else false;
-                if (state.block_pending and player.loaded) {
-                    const block = game_data.registry.block_state_to_block[try self.deps.chunks.getBlock(player.world, position)];
-                    for (rules.blocks) |criterion| if (!progress[criterion] and rules.criteria[criterion].trigger.block == block) {
-                        progress[criterion] = true;
-                        state.dirty = true;
-                        state.progress_dirty = true;
-                    };
-                }
-            }
+        }
+        try self.updateBlocks();
+        for (self.active.values()) |index| {
+            if (self.deps.players.records[index].stage != .ready) continue;
             self.propagate(index);
             self.send(index) catch |err| switch (err) {
                 error.Backpressured, error.Closed => {},
                 else => return err,
             };
+        }
+    }
+
+    fn blocksChanged(self: *RecipeBook, section: chunks.Section, edits: []const chunks.BlockEdit) void {
+        var index = self.block_watches.get(section) orelse return;
+        assert(index != absent);
+        var changed: std.StaticBitSet(4096) = .empty;
+        for (edits) |edit| changed.set(edit.index);
+        // Keep samples indexed until the next tick so edits during a teleport are not missed.
+        var previous: usize = absent;
+        while (index != absent) {
+            const sample = &self.states[index].block_sample.?;
+            assert(std.meta.eql(sample.section, section) and sample.previous == previous);
+            if (changed.isSet(sample.index)) sample.valid = false;
+            previous = index;
+            index = sample.next;
+        }
+    }
+
+    fn unwatchBlock(self: *RecipeBook, state: *State) void {
+        const sample = state.block_sample orelse return;
+        if (sample.previous != absent) {
+            const previous = &self.states[sample.previous].block_sample.?;
+            assert(previous.next != absent and &self.states[previous.next] == state);
+            previous.next = sample.next;
+        } else {
+            const head = self.block_watches.getPtr(sample.section).?;
+            assert(head.* != absent and &self.states[head.*] == state);
+            if (sample.next != absent) {
+                head.* = sample.next;
+            } else {
+                const removed = self.block_watches.swapRemove(sample.section);
+                assert(removed);
+            }
+        }
+        if (sample.next != absent) {
+            const next = &self.states[sample.next].block_sample.?;
+            assert(next.previous != absent and &self.states[next.previous] == state);
+            next.previous = sample.previous;
+        }
+        state.block_sample = null;
+    }
+
+    fn updateBlocks(self: *RecipeBook) !void {
+        self.block_queries.clear();
+        for (self.active.values()) |index| {
+            const player = &self.deps.players.records[index];
+            const state = &self.states[index];
+            if (player.stage != .ready or !player.loaded or !state.block_pending) {
+                self.unwatchBlock(state);
+                continue;
+            }
+            const position: chunks.Position = .{ .x = @intFromFloat(@floor(player.position.x)), .y = @intFromFloat(@floor(player.position.y)), .z = @intFromFloat(@floor(player.position.z)) };
+            const section = chunks.sectionAt(player.world, position);
+            const at = chunks.localIndex(position);
+            if (state.block_sample) |sample| if (!std.meta.eql(sample.section, section)) self.unwatchBlock(state);
+            if (state.block_sample == null) {
+                const watch = self.block_watches.getOrPutAssumeCapacity(section);
+                if (!watch.found_existing) watch.value_ptr.* = absent;
+                const head = watch.value_ptr.*;
+                state.block_sample = .{ .section = section, .index = at, .next = head };
+                if (head != absent) {
+                    assert(head != index and self.states[head].block_sample.?.previous == absent);
+                    self.states[head].block_sample.?.previous = index;
+                }
+                watch.value_ptr.* = index;
+            }
+            const sample = &state.block_sample.?;
+            if (sample.valid and sample.index == at) continue;
+            sample.index = at;
+            sample.valid = false;
+            const query = self.block_queries.getOrPut(section);
+            if (!query.found_existing) query.value_ptr.* = absent;
+            assert(state.block_next == absent);
+            state.block_next = query.value_ptr.*;
+            query.value_ptr.* = index;
+        }
+        var offset: usize = 0;
+        while (offset < self.block_queries.count()) {
+            const count = @min(self.block_leases.len, self.deps.chunks.cache.entries.len, self.block_queries.count() - offset);
+            assert(count > 0);
+            const sections = self.block_queries.keys[offset..][0..count];
+            const leases = self.block_leases[0..count];
+            try self.deps.chunks.acquireMany(sections, leases);
+            defer self.deps.chunks.releaseMany(leases);
+            for (sections, leases, self.block_queries.values()[offset..][0..count]) |section, lease, head| {
+                var index = head;
+                while (index != absent) {
+                    const state = &self.states[index];
+                    const sample = &state.block_sample.?;
+                    assert(std.meta.eql(sample.section, section) and !sample.valid);
+                    const block = game_data.registry.block_state_to_block[lease.get(sample.index)];
+                    sample.valid = true;
+                    state.block_pending = false;
+                    const progress = self.criteria(index);
+                    for (self.deps.definitions.unlocks.blocks) |criterion| {
+                        if (!progress[criterion] and self.deps.definitions.unlocks.criteria[criterion].trigger.block == block) {
+                            progress[criterion] = true;
+                            state.dirty = true;
+                            state.progress_dirty = true;
+                        }
+                        state.block_pending = state.block_pending or !progress[criterion];
+                    }
+                    if (!state.block_pending) self.unwatchBlock(state);
+                    const next = state.block_next;
+                    state.block_next = absent;
+                    index = next;
+                }
+            }
+            offset += count;
         }
     }
 

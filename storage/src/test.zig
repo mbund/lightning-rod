@@ -400,7 +400,7 @@ test "ranged reads validate the entire page before copying into caller buffers" 
     }
     try space.readPages(&.{.{ .id = ids[0], .destination = &.{}, .offset = storage.page_size }});
     store.resources.cache_index.clearRetainingCapacity();
-    const location = store.locations.get(@intFromEnum(ids[0])).?;
+    const location = store.locations.get(@backingInt(ids[0])).?;
     try store.wal.writePositionalAll(io, &.{page[2000] ^ 255}, location.current + 32 + 32 + 2000);
     try std.testing.expectError(error.Corrupt, space.readPages(&.{.{ .id = ids[0], .destination = output[1..16] }}));
     try std.testing.expectEqual(@as(u8, 255), output[0]);
@@ -614,7 +614,7 @@ test "transaction checksum rejects a complete stale frame from an earlier write"
     const space = try store.openSpace("test");
     const root = (try space.getRoot()).?;
     var pages: [2]storage.Page = undefined;
-    try space.readPages(&.{ .{ .id = root, .destination = &pages[0] }, .{ .id = @enumFromInt(@intFromEnum(root) + 1), .destination = &pages[1] } });
+    try space.readPages(&.{ .{ .id = root, .destination = &pages[0] }, .{ .id = @fromBackingInt(@intCast(@backingInt(root) + 1)), .destination = &pages[1] } });
     const expected: storage.Page = @splat(1);
     for (&pages) |*page| try std.testing.expectEqualSlices(u8, &expected, page);
 }
@@ -866,7 +866,7 @@ test "WAL replacement preserves a copied slot reused as an unwritten zero page" 
             if (steps == store.limits.maximum_wal_pages * 16) return error.MaintenanceDidNotFinish;
             _ = try store.pollMaintenance(.{ .index_entries = 1, .pages = 1 });
         }
-        while (store.locations.get(@intFromEnum(ids[0])).?.replacement == 0) {
+        while (store.locations.get(@backingInt(ids[0])).?.replacement == 0) {
             _ = try store.pollMaintenance(.{ .index_entries = 1, .pages = 1 });
         }
         const b = try store.openSpace("b");
@@ -1018,7 +1018,7 @@ test "power loss during WAL replacement preserves both possible directory outcom
                 try space.setRoot(ids[0]);
                 try owner.waitDurable(try owner.commit(1));
                 const old_inode = (try owner.wal.stat(io)).inode;
-                const wal_name = try std.testing.allocator.dupeZ(u8, owner.wal_name);
+                const wal_name = try std.testing.allocator.dupeSentinel(u8, owner.wal_name, 0);
                 defer std.testing.allocator.free(wal_name);
                 try std.testing.expectEqual(.SUCCESS, std.os.linux.errno(std.os.linux.linkat(owner.directory.handle, wal_name, owner.directory.handle, "previous.wal", 0)));
                 const staging = try owner.directory.createFile(io, owner.temporary_name, .{ .read = true });
@@ -1616,7 +1616,7 @@ test "a paused read preserves its WAL image while foreground work and rotation p
         }
         var warm: storage.Page = undefined;
         try space.readPages(&.{.{ .id = ids[1], .destination = &warm }});
-        const offset = store.locations.get(@intFromEnum(ids[0])).?.current;
+        const offset = store.locations.get(@backingInt(ids[0])).?.current;
         var gate: fault.Disk.IoGate = .{ .file = store.wal, .offset = offset + 32 };
         disk.read_gate = &gate;
         defer disk.read_gate = null;
@@ -1650,7 +1650,7 @@ test "a paused read preserves its WAL image while foreground work and rotation p
         worker.join();
         worker_joined = true;
         try foreground.result;
-        if (!rotate) try std.testing.expect(store.locations.get(@intFromEnum(ids[0])).?.current != offset);
+        if (!rotate) try std.testing.expect(store.locations.get(@backingInt(ids[0])).?.current != offset);
         if (rotate) {
             try std.testing.expectEqual(@as(u64, 1), store.durableTick());
             const deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(10) });
@@ -1728,7 +1728,7 @@ test "a paused page overwrite blocks only its cold dependents and not unrelated 
     }
     var warm: storage.Page = undefined;
     try space.readPages(&.{.{ .id = ids[1], .destination = &warm }});
-    const offset = store.locations.get(@intFromEnum(ids[0])).?.current;
+    const offset = store.locations.get(@backingInt(ids[0])).?.current;
     var disk = try fault.Disk.init(std.testing.allocator, io, &.{ store.database, store.wal }, std.math.maxInt(usize), false);
     defer disk.deinit();
     const modeled = disk.interface();
@@ -1801,12 +1801,12 @@ test "page ownership checks submit a batch and free groups survive partial alloc
     try restored.allocatePages(&rest);
     var seen: [65]bool = @splat(false);
     for (first) |id| {
-        try std.testing.expect(!seen[@intFromEnum(id)]);
-        seen[@intFromEnum(id)] = true;
+        try std.testing.expect(!seen[@backingInt(id)]);
+        seen[@backingInt(id)] = true;
     }
     for (rest) |id| {
-        try std.testing.expect(!seen[@intFromEnum(id)]);
-        seen[@intFromEnum(id)] = true;
+        try std.testing.expect(!seen[@backingInt(id)]);
+        seen[@backingInt(id)] = true;
     }
     try std.testing.expect(std.mem.allEqual(bool, seen[1..], true));
     try std.testing.expectEqual(@as(u64, 65), store.metadata.pages);
@@ -1843,7 +1843,7 @@ test "native maintenance completes from I/O notifications without simulation pol
         while (true) {
             try maintenance.check();
             const status = store.maintenanceStatus();
-            if (!status.pending and @intFromEnum(status.checkpointed) == tick) break;
+            if (!status.pending and @backingInt(status.checkpointed) == tick) break;
             if (std.Io.Clock.now(.awake, io).nanoseconds >= deadline) return error.MaintenanceStalled;
             std.Thread.yield() catch {};
         }
@@ -1896,7 +1896,7 @@ test "cache misses and read completions each notify a blocked maintenance owner"
     const bytes: storage.Page = @splat(41);
     try space.writePages(&.{.{ .id = ids[0], .source = &bytes }});
     try store.waitDurable(try store.commit(1));
-    const offset = store.locations.get(@intFromEnum(ids[0])).?.current + 32;
+    const offset = store.locations.get(@backingInt(ids[0])).?.current + 32;
     var disk = try fault.Disk.init(std.testing.allocator, io, &.{ store.database, store.wal }, std.math.maxInt(usize), false);
     defer disk.deinit();
     defer disk.detach();
@@ -2051,7 +2051,7 @@ test "concurrent cache publication preserves both leases and indexes the current
     defer disk.deinit();
     store.bindIo(disk.interface());
     defer disk.detach();
-    const offset = store.locations.get(@intFromEnum(ids[0])).?.current;
+    const offset = store.locations.get(@backingInt(ids[0])).?.current;
     var gate: fault.Disk.IoGate = .{ .file = store.wal, .offset = offset + 32 };
     disk.read_gate = &gate;
     defer disk.read_gate = null;

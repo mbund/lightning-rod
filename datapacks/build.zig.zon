@@ -2,6 +2,6 @@
     .name = .datapacks,
     .fingerprint = 0x5f94dbdea6f4bc9d,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

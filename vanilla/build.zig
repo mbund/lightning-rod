@@ -44,15 +44,26 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    const generator_module = b.createModule(.{ .root_source_file = b.path("src/prepare_content.zig"), .target = b.graph.host, .optimize = .ReleaseFast });
-    for (module.import_table.keys(), module.import_table.values()) |name, dependency| generator_module.addImport(name, dependency);
-    const prepare_content = b.addExecutable(.{ .name = "prepare-vanilla-content", .root_module = generator_module });
+    const prepare_content = contentGenerator(b, b.dependency("game_data", .{ .target = b.graph.host, .optimize = .debug }).module("game_data"));
+    const generator_module = prepare_content.root_module;
     const run_prepare = b.addRunArtifact(prepare_content);
-    module.addAnonymousImport("vanilla_definitions", .{ .root_source_file = run_prepare.addOutputFileArg("vanilla_content.zig") });
+    const prepared_definitions = run_prepare.addOutputFileArg("vanilla_content.zig");
+    module.addAnonymousImport("vanilla_definitions", .{ .root_source_file = prepared_definitions });
+    b.step("prepare-content", "Generate vanilla gameplay definitions").dependOn(&run_prepare.step);
 
     const filter = b.option([]const u8, "test-filter", "Run matching tests");
     const lighting_tests = b.step("test-lighting", "Verify terrain lighting and chunk packet integration");
     const test_step = b.step("test", "Verify encoding and batched gameplay records");
+    const prepared_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/vanilla_content_test.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+    }) });
+    for (generator_module.import_table.keys(), generator_module.import_table.values()) |name, dependency| prepared_tests.root_module.addImport(name, dependency);
+    prepared_tests.root_module.addAnonymousImport("vanilla_definitions", .{ .root_source_file = prepared_definitions });
+    const test_content = b.addRunArtifact(prepared_tests);
+    test_step.dependOn(&test_content.step);
+    b.step("test-prepared-content", "Verify compiled vanilla gameplay definitions").dependOn(&test_content.step);
     for ([_][]const u8{ "src/chunk_encoding.zig", "src/lighting.zig", "src/container_blocks.zig", "src/furnace.zig", "src/block_sync.zig", "src/streaming.zig", "src/batch_test.zig", "src/pickup_test.zig", "src/merge_test.zig", "src/item_spatial_test.zig", "src/item_selection_test.zig", "src/placement_test.zig", "src/creative_inventory.zig", "src/command_dispatch_test.zig", "src/replication.zig", "src/visibility.zig", "src/visibility_replication_test.zig", "src/environment_test.zig", "src/configuration_test.zig", "src/session_keepalive.zig", "src/generation.zig", "src/random.zig", "src/raycast.zig" }) |source| {
         const test_module = b.createModule(.{ .root_source_file = b.path(source), .target = target, .optimize = optimize });
         for (module.import_table.keys(), module.import_table.values()) |name, dependency|
@@ -145,4 +156,14 @@ pub fn build(b: *std.Build) void {
     benchmark_lighting.dependOn(&lighting_load_run.step);
     const check = b.addLibrary(.{ .name = "vanilla", .root_module = module });
     b.step("check", "Check the Vanilla module").dependOn(&check.step);
+}
+
+pub fn contentGenerator(b: *std.Build, gameplay: *std.Build.Module) *std.Build.Step.Compile {
+    const module = b.createModule(.{ .root_source_file = b.path("src/prepare_content.zig"), .target = b.graph.host, .optimize = .debug });
+    module.addImport("game_data", gameplay);
+    inline for (.{ "datapacks", "lighting", "minecraft_model", "inventories", "sessions" }) |name| {
+        module.addImport(name, b.dependency(name, .{ .target = b.graph.host, .optimize = .debug }).module(name));
+    }
+    module.addImport("protocol_support", b.dependency("protocol_support", .{ .target = b.graph.host, .optimize = .debug }).module("encoding"));
+    return b.addExecutable(.{ .name = "prepare-vanilla-content", .root_module = module });
 }

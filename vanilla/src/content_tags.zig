@@ -13,8 +13,8 @@ pub const Tags = struct {
     }
 
     pub fn members(self: *const Tags, id: Id) []const u32 {
-        assert(@intFromEnum(id) < self.entries.len);
-        return self.entries[@intFromEnum(id)].values;
+        assert(@backingInt(id) < self.entries.len);
+        return self.entries[@backingInt(id)].values;
     }
 
     pub fn contains(self: *const Tags, id: Id, value: u32) bool {
@@ -40,7 +40,7 @@ pub const Tags = struct {
             definitions[index] = .{ .name = name.* };
             index += 1;
         }
-        std.mem.sort(Pending, definitions, {}, struct {
+        std.mem.sortUnstable(Pending, definitions, {}, struct {
             fn less(_: void, a: Pending, b: Pending) bool {
                 return std.mem.lessThan(u8, a.name, b.name);
             }
@@ -48,7 +48,7 @@ pub const Tags = struct {
         builder.definitions = definitions;
         builder.entries = try allocator.alloc(Entry, definitions.len);
         try builder.tags.ensureTotalCapacity(allocator, @intCast(definitions.len));
-        for (definitions, 0..) |definition, at| builder.tags.putAssumeCapacityNoClobber(definition.name, @enumFromInt(at));
+        for (definitions, 0..) |definition, at| builder.tags.putAssumeCapacityNoClobber(definition.name, @fromBackingInt(@intCast(at)));
         try builder.values.ensureTotalCapacity(temporary, @intCast(value_names.len));
         for (value_names, 0..) |name, at| builder.values.putAssumeCapacityNoClobber(name, @intCast(at));
         for (0..definitions.len) |at| try builder.resolve(at, 0);
@@ -101,8 +101,8 @@ const Preparation = struct {
                     if (reference.required) return error.UnknownTag;
                     continue;
                 };
-                try self.resolve(@intFromEnum(target), depth + 1);
-                for (self.entries[@intFromEnum(target)].values) |value| members.set(value);
+                try self.resolve(@backingInt(target), depth + 1);
+                for (self.entries[@backingInt(target)].values) |value| members.set(value);
             } else {
                 const value = self.values.get(reference.name) orelse {
                     if (reference.required) return error.UnknownTagValue;

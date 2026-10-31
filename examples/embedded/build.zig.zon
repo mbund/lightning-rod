@@ -2,7 +2,7 @@
     .fingerprint = 0xb71bc80306133582,
     .name = .lightning_rod_embedded,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .lightning_rod = .{ .path = "../.." },
         .embedded = .{ .path = "../../embedded" },

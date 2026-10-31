@@ -217,7 +217,6 @@ pub fn benchmarkEquipment() !void {
         const player_records = try allocator.alloc(Players.Player, count);
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
         players.deps.sessions = service;
         for (player_records, service.credit, 0..) |*player, *credit, index| {
             player.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 }, .uuid = index + 1, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number };
@@ -226,6 +225,7 @@ pub fn benchmarkEquipment() !void {
             for (&edits, stacks, [_]u16{ 36, 45, 8, 7, 6, 5 }) |*edit, stack, slot| edit.* = .{ .slot = .{ .owner = player.uuid, .index = slot }, .revision = 0, .stack = stack };
             try std.testing.expect(try ownership.editMany(&edits));
         }
+        players.rebuildIndexes();
         const replication = try Replication.init(allocator, .{}, .{ .players = &players, .visibility = try Visibility.init(allocator, .{}, .{ .players = &players }) });
         const equipment = try Equipment.init(allocator, .{}, .{
             .replication = replication,

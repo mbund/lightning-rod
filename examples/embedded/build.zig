@@ -30,7 +30,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(executable);
     const run = b.addRunArtifact(executable);
     run.setCwd(b.path("."));
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Run all server services on one thread").dependOn(&run.step);
     b.addNamedLazyPath("server", executable.getEmittedBin());
 }

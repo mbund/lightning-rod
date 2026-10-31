@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub fn add(b: *std.Build, generator: *std.Build.Step.Compile) void {
     const check = b.step("check", "Check generated restricted-writer contracts and encoding");
-    const support = b.dependency("encoding", .{ .target = b.graph.host, .optimize = .Debug }).module("encoding");
+    const support = b.dependency("encoding", .{ .target = b.graph.host, .optimize = .debug }).module("encoding");
     const files = b.addWriteFiles();
     const source = schema(b, generator, support, files, "source", 1, "i32", "u8", "number", false);
     const cases = .{
@@ -26,7 +26,7 @@ pub fn add(b: *std.Build, generator: *std.Build.Step.Compile) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/contracts.zig"),
                 .target = b.graph.host,
-                .optimize = .Debug,
+                .optimize = .debug,
                 .imports = &.{
                     .{ .name = "source", .module = source },
                     .{ .name = "target", .module = target },
@@ -72,7 +72,7 @@ fn schema(b: *std.Build, generator: *std.Build.Step.Compile, support: *std.Build
     command.addFileArg(files.add(b.fmt("{s}.json", .{name}), json));
     const output = command.addOutputFileArg("schema.zig");
     command.addFileArg(files.add(b.fmt("{s}-version.json", .{name}), b.fmt("{{\"version\":{d}}}", .{version})));
-    return b.createModule(.{ .root_source_file = output, .target = b.graph.host, .optimize = .Debug, .imports = &.{.{ .name = "protocol_support", .module = support }} });
+    return b.createModule(.{ .root_source_file = output, .target = b.graph.host, .optimize = .debug, .imports = &.{.{ .name = "protocol_support", .module = support }} });
 }
 
 const empty_phase = "{\"toServer\":{\"types\":{}},\"toClient\":{\"types\":{}}}";

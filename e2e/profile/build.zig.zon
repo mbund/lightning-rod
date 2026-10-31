@@ -2,7 +2,7 @@
     .fingerprint = 0x5903c44df8826e34,
     .name = .lightning_rod_e2e_profile,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .linux = .{ .path = "../../linux" },
         .embedded = .{ .path = "../../embedded" },

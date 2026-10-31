@@ -1,8 +1,6 @@
 const std = @import("std");
 const native = @import("native.zig");
-const c = @cImport({
-    @cInclude("sqlite3.h");
-});
+const c = @import("sqlite_c");
 
 pub fn version() []const u8 {
     return std.mem.span(c.sqlite3_libversion());
@@ -59,7 +57,7 @@ fn fileSizes(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![2]u64
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, path: []const u8, trace: []const u8, page_size: u32, without_rowid: bool) !native.Result {
     var db_optional: ?*c.sqlite3 = null;
-    const opened = c.sqlite3_open(try allocator.dupeZ(u8, path), &db_optional);
+    const opened = c.sqlite3_open(try allocator.dupeSentinel(u8, path, 0), &db_optional);
     defer if (db_optional) |db| {
         const closed = c.sqlite3_close(db);
         std.debug.assert(closed == c.SQLITE_OK);

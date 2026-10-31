@@ -87,7 +87,16 @@ pub fn configure(registries: *const Registries, presentations: []const Registrie
                     const effects = try definition.getString("effects", scratch) orelse return error.MissingDimensionEffects;
                     template = for (registry.entries) |candidate| {
                         if (std.mem.eql(u8, candidate.id, effects)) break candidate.nbt;
-                    } else return error.UnknownDimensionEffects;
+                    } else null;
+                    if (template == null) for (registry.entries) |candidate| {
+                        const metadata = try custom_data.Compound.init(candidate.nbt);
+                        const rendering = try metadata.getString("effects", scratch) orelse continue;
+                        if (std.mem.eql(u8, rendering, effects)) {
+                            template = candidate.nbt;
+                            break;
+                        }
+                    };
+                    if (template == null) return error.UnknownDimensionEffects;
                 }
                 const nbt = presentation orelse try project(scratch, reference, template, entry.nbt);
                 const replaced = for (entries.items) |*previous| {
@@ -144,7 +153,7 @@ pub fn configure(registries: *const Registries, presentations: []const Registrie
         const prepared = if (changed)
             try Builder.build(allocator, Version.protocol_number, snapshot)
         else
-            try Builder.readEmbedded(allocator, Version);
+            try Version.RegistryProvider.init(allocator);
         catalog.prepared[version_index].deinit(allocator);
         catalog.prepared[version_index] = prepared;
         catalog.values[version_index] = prepared.configurationData();

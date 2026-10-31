@@ -37,12 +37,12 @@ pub const Input = struct {
         inline for (protocols.implementations, 0..) |Version, index| {
             const Packet = Version.Protocol.play.toServer;
             var maximum: usize = 0;
-            inline for (@typeInfo(Packet.PacketName).@"enum".fields) |field|
-                maximum = @max(maximum, @as(usize, @intCast(Packet.packetId(@field(Packet.PacketName, field.name)))));
+            inline for (@typeInfo(Packet.PacketName).@"enum".field_names) |field|
+                maximum = @max(maximum, @as(usize, @intCast(Packet.packetId(@field(Packet.PacketName, field)))));
             self.tables[index] = try allocator.alloc(Slot, maximum + 1);
             @memset(self.tables[index], .{});
-            inline for (@typeInfo(Packet.PacketName).@"enum".fields) |field| {
-                const number: usize = @intCast(Packet.packetId(@field(Packet.PacketName, field.name)));
+            inline for (@typeInfo(Packet.PacketName).@"enum".field_names) |field| {
+                const number: usize = @intCast(Packet.packetId(@field(Packet.PacketName, field)));
                 self.tables[index][number].valid = true;
             }
         }
@@ -81,9 +81,9 @@ pub const Input = struct {
                 const Reader = sessions.packet_api.Cursor(callback);
                 comptime sessions.packet_api.validateReader(Reader, "play", name);
                 const reader: Reader = .{ ._cursor = .{ .buffer = body, .rest = body, .protocol_number = Version.protocol_number } };
-                comptime if (@typeInfo(@TypeOf(callback)).@"fn".params.len != 3 and @typeInfo(@TypeOf(callback)).@"fn".params.len != 4)
+                comptime if (@typeInfo(@TypeOf(callback)).@"fn".param_types.len != 3 and @typeInfo(@TypeOf(callback)).@"fn".param_types.len != 4)
                     @compileError("packet handler takes context, handle, Reader, and optionally temporary allocator");
-                if (comptime @typeInfo(@TypeOf(callback)).@"fn".params.len == 3)
+                if (comptime @typeInfo(@TypeOf(callback)).@"fn".param_types.len == 3)
                     try @call(.auto, callback, .{ typed, handle, reader })
                 else
                     try @call(.auto, callback, .{ typed, handle, reader, temporary });

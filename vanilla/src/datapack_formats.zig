@@ -7,7 +7,7 @@ const Components = @import("content_components.zig").Components;
 pub const supported = block: {
     const formats = std.enums.values(Format);
     var result: [formats.len]datapacks.Version = undefined;
-    for (formats, &result) |format, *version| version.* = .{ .major = @intFromEnum(format) };
+    for (formats, &result) |format, *version| version.* = .{ .major = @backingInt(format) };
     break :block result;
 };
 
@@ -15,6 +15,7 @@ pub const Format = enum(u32) {
     v1_21 = 48,
     v1_21_5 = 71,
     v1_21_8 = 81,
+    v1_21_9 = 88,
 
     pub fn select(version: ?datapacks.Version) !Format {
         const value = version orelse return error.MissingPackFormat;

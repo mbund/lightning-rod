@@ -2,7 +2,7 @@
     .fingerprint = 0xc1364550b35a1b66,
     .name = .lightning_rod_vanilla_plus,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .sessions = .{ .path = "../../sessions" },
         .minecraft_packets = .{ .path = "../../minecraft_packets" },

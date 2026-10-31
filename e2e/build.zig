@@ -15,7 +15,16 @@ pub fn build(b: *std.Build) void {
     const requested_version = b.option([]const u8, "client-version", "Minecraft client release");
     const scenario = b.option([]const u8, "scenario", "Run one E2E scenario (default: all)");
     const upgrade_from = b.option([]const u8, "upgrade-from", "Previous revision for the upgrade E2E") orelse "HEAD^";
-    const cases = catalog.load(b.allocator, b.graph.io, b.pathFromRoot(tests_root)) catch |err| std.debug.panic("Cannot discover E2E tests: {s}", .{@errorName(err)});
+    const tests_path = if (std.fs.path.isAbsolute(tests_root)) tests_root else b.root.joinString(b.allocator, tests_root) catch @panic("OOM");
+    b.dependOnDirectoryContents(.{ .cwd_relative = tests_path });
+    const tests_directory = std.Io.Dir.cwd().openDir(b.graph.io, tests_path, .{ .iterate = true }) catch @panic("Cannot open E2E tests");
+    defer tests_directory.close(b.graph.io);
+    var entries = tests_directory.iterate();
+    while (entries.next(b.graph.io) catch @panic("Cannot discover E2E test directories")) |entry| {
+        if (entry.kind == .directory) b.dependOnDirectoryContents(.{ .cwd_relative = b.pathJoin(&.{ tests_path, entry.name }) });
+    }
+    const cases = catalog.load(b.allocator, b.graph.io, tests_path) catch |err| std.debug.panic("Cannot discover E2E tests: {s}", .{@errorName(err)});
+    for (cases) |selected| b.dependOnFileContents(.{ .cwd_relative = b.pathJoin(&.{ selected.directory, "test.json" }) });
     const selected_case = if (scenario) |name| catalog.find(cases, name) orelse
         std.debug.panic("Unknown E2E test '{s}'; use zig build list-tests", .{name}) else null;
     const client_version = requested_version orelse (if (selected_case) |selected| selected.version else null) orelse protocol_definitions.catalog.latest.minecraft_version;
@@ -43,7 +52,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/matrix.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .imports = &.{.{
                 .name = "protocol_catalog",
                 .module = protocol_catalog_module,
@@ -52,7 +61,7 @@ pub fn build(b: *std.Build) void {
     });
     const emit_matrix = b.addRunArtifact(matrix);
     emit_matrix.setCwd(b.path("."));
-    emit_matrix.addArg(b.pathFromRoot(tests_root));
+    emit_matrix.addArg(tests_path);
     if (requested_version) |version| emit_matrix.addArg(version);
     b.step("e2e-matrix", "Print the GitHub Actions E2E matrix as JSON").dependOn(&emit_matrix.step);
 
@@ -134,7 +143,7 @@ pub fn build(b: *std.Build) void {
     artifacts_test.addArg("dev.lightningrod.e2e.ArtifactsTest");
     b.step("test-artifacts", "Verify atomic Java artifact publication").dependOn(&artifacts_test.step);
 
-    var clients = client_build.Clients.init(b, if (std.fs.path.isAbsolute(tests_root)) .{ .cwd_relative = tests_root } else b.path(tests_root));
+    var clients = client_build.Clients.init(b, tests_path);
     const prepare_client = b.step("prepare-client", "Prepare the selected Minecraft client without running an E2E");
     if (b.graph.environ_map.get("LIGHTNING_ROD_E2E_CLIENTS") == null) {
         const bundle = clients.get(client_version);
@@ -143,7 +152,8 @@ pub fn build(b: *std.Build) void {
     const client_test_step = b.step("test-client", "Verify fixture messages and screenshot completion");
     const client_test = b.addRunArtifact(runner);
     client_test.setCwd(b.path("."));
-    const properties = std.Io.Dir.cwd().readFileAlloc(b.graph.io, b.pathFromRoot("client/gradle.properties"), b.allocator, .limited(4096)) catch @panic("Cannot read client version");
+    b.dependOnFileContents(b.path("client/gradle.properties"));
+    const properties = std.Io.Dir.cwd().readFileAlloc(b.graph.io, (b.root.joinString(b.allocator, "client/gradle.properties") catch @panic("OOM")), b.allocator, .limited(4096)) catch @panic("Cannot read client version");
     var lines = std.mem.splitScalar(u8, properties, '\n');
     const default_version = while (lines.next()) |line| {
         if (std.mem.startsWith(u8, line, "minecraft_version=")) break std.mem.trim(u8, line["minecraft_version=".len..], "\r ");
@@ -159,7 +169,7 @@ pub fn build(b: *std.Build) void {
     b.step("upgrade-releases", "List protocols supported by the previous upgrade fixture").dependOn(&upgrade_versions.step);
     list.setCwd(b.path("."));
     list.addArg("--list");
-    list.addArgs(&.{ "--tests", b.pathFromRoot(tests_root) });
+    list.addArgs(&.{ "--tests", tests_path });
     b.step("list-tests", "List automatically discovered E2E tests and their directories").dependOn(&list.step);
 
     const server = b.option([]const u8, "server", "Override the test's server executable");
@@ -204,20 +214,21 @@ pub fn build(b: *std.Build) void {
                 run.addDirectoryArg(clients.get(version));
             }
         }
-        run.setEnvironmentVariable("LIGHTNING_ROD_E2E_KEY", b.dependency("minecraft_java", .{ .target = target, .optimize = optimize }).path("tests/fixtures/rsa-key.der").getPath(b));
-        if (selected.upgrade) run.setEnvironmentVariable("LIGHTNING_ROD_E2E_ZIG", b.graph.zig_exe);
+        const key_path = b.dependency("minecraft_java", .{ .target = target, .optimize = optimize }).builder.root.joinString(b.allocator, "tests/fixtures/rsa-key.der") catch @panic("OOM");
+        const key = std.Io.Dir.cwd().realPathFileAlloc(b.graph.io, key_path, b.allocator) catch @panic("Cannot resolve the fixture encryption key");
+        run.setEnvironmentVariable("LIGHTNING_ROD_E2E_KEY", key);
         run.addArgs(&.{ "--scenario", selected.name, "--realtime", if (realtime) "true" else "false" });
         if (artifacts) |directory| run.addArgs(&.{ "--artifacts", directory });
         run.addArgs(&.{ "--address", address });
         run.addArgs(&.{ "--client-version", client_version });
         if (selected.upgrade) run.addArgs(&.{ "--upgrade-from", upgrade_from });
-        run.addArgs(&.{ "--tests", b.pathFromRoot(tests_root) });
+        run.addArgs(&.{ "--tests", tests_path });
 
         if (server) |path| {
             run.addArgs(&.{ "--server", path });
         } else if (selected.standalone) {
             const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "build", b.fmt("-Doptimize={s}", .{@tagName(optimize)}) });
-            if (b.graph.max_jobs) |jobs| compile.addArg(b.fmt("-j{d}", .{jobs}));
+
             compile.addArg("--prefix");
             compile.has_side_effects = true;
             compile.setCwd(.{ .cwd_relative = selected.directory });
@@ -259,7 +270,7 @@ pub fn build(b: *std.Build) void {
                 std.debug.panic("E2E fixture {s} needs a main.zig in {s}", .{ selected.name, selected.directory });
             } else {
                 const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "build", b.fmt("-Doptimize={s}", .{@tagName(optimize)}) });
-                if (b.graph.max_jobs) |jobs| compile.addArg(b.fmt("-j{d}", .{jobs}));
+
                 if (selected_releases.len != 0)
                     compile.addArg(b.fmt("-Dreleases={s}", .{selected_releases}));
                 compile.addArg("--prefix");
@@ -278,7 +289,7 @@ pub fn build(b: *std.Build) void {
     } else {
         const suite_matrix = b.addRunArtifact(matrix);
         suite_matrix.setCwd(b.path("."));
-        suite_matrix.addArg(b.pathFromRoot(tests_root));
+        suite_matrix.addArg(tests_path);
         if (requested_version) |version| suite_matrix.addArg(version);
         const suite_runner = b.addExecutable(.{ .name = "e2e-suite", .root_module = b.createModule(.{
             .root_source_file = b.path("src/suite.zig"),
@@ -288,7 +299,7 @@ pub fn build(b: *std.Build) void {
         const run_suite = b.addRunArtifact(suite_runner);
         run_suite.addFileArg(suite_matrix.captureStdOut(.{}));
         run_suite.addArgs(&.{ b.graph.zig_exe, b.fmt("-Doptimize={s}", .{@tagName(optimize)}), b.fmt("-Dtests={s}", .{tests_root}), b.fmt("-Daddress={s}", .{address}) });
-        if (b.graph.max_jobs) |jobs| run_suite.addArg(b.fmt("-j{d}", .{jobs}));
+
         run_suite.addArg(b.fmt("-Drealtime={s}", .{if (realtime) "true" else "false"}));
         run_suite.addArg(b.fmt("-Dsingle-threaded={s}", .{if (single_threaded) "true" else "false"}));
         if (!target.query.isNative()) {

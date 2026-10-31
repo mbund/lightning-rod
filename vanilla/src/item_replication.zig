@@ -404,18 +404,18 @@ pub const ItemReplication = struct {
                     }
 
                     const entity_id = ItemEntities.networkId(row.id);
-                    var queued = std.EnumSet(Phase).initEmpty();
+                    var queued = std.EnumSet(Phase).empty;
                     for (std.enums.values(Phase)) |phase| {
                         // Later phases use the actual admission result of spawn, stack, and collection updates.
                         const dependencies = switch (phase) {
                             .stack => std.EnumSet(Phase).initOne(.spawn),
                             .position => std.EnumSet(Phase).initMany(&.{ .spawn, .stack }),
                             .remove => std.EnumSet(Phase).initOne(.collect),
-                            else => std.EnumSet(Phase).initEmpty(),
+                            else => std.EnumSet(Phase).empty,
                         };
                         if (queued.intersectWith(dependencies).count() != 0) {
                             outgoing.flush();
-                            queued = .initEmpty();
+                            queued = .empty;
                         }
                         const wanted = self.selections.row(6);
                         switch (phase) {

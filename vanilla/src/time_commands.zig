@@ -81,8 +81,8 @@ pub const TimeCommands = struct {
     }
 
     fn parseSet(self: *TimeCommands, context: commands.Context, text: []const u8) commands.ParseError!i32 {
-        inline for (std.meta.fields(@TypeOf(presets))) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @field(presets, field.name);
+        inline for (@typeInfo(@TypeOf(presets)).@"struct".field_names) |field| {
+            if (std.mem.eql(u8, text, field)) return @field(presets, field);
         }
         return parseTime(self, context, text);
     }
@@ -103,8 +103,8 @@ pub const TimeCommands = struct {
     }
 
     fn suggestSet(self: *TimeCommands, context: commands.CompletionContext, output: *commands.Suggestions) void {
-        inline for (std.meta.fields(@TypeOf(presets))) |field| {
-            if (std.mem.startsWith(u8, field.name, context.prefix)) output.add(.{ .text = field.name }) catch return;
+        inline for (@typeInfo(@TypeOf(presets)).@"struct".field_names) |field| {
+            if (std.mem.startsWith(u8, field, context.prefix)) output.add(.{ .text = field }) catch return;
         }
         suggestTime(self, context, output);
     }

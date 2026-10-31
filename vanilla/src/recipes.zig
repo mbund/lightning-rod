@@ -442,7 +442,7 @@ pub const Preparation = struct {
         const start = self.alternatives.items.len;
         try self.expand(input, 0);
         const values = self.alternatives.items[start..];
-        std.mem.sort(u32, values, {}, std.sort.asc(u32));
+        std.mem.sortUnstable(u32, values, {}, std.sort.asc(u32));
         var count: usize = 0;
         for (values) |value| {
             if (count > 0 and values[count - 1] == value) continue;
@@ -498,7 +498,7 @@ pub fn prepare(allocator: std.mem.Allocator, temporary: std.mem.Allocator, tags:
         names[count] = name.*;
         count += 1;
     }
-    std.mem.sort([]const u8, names, {}, struct {
+    std.mem.sortUnstable([]const u8, names, {}, struct {
         fn less(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.lessThan(u8, a, b);
         }

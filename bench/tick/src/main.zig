@@ -76,10 +76,13 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     if (maximum < count or maximum == 0) return error.InvalidCapacity;
     const service = try sessions.Service.init(backing, io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = maximum, .pages = options.pages, .page_bytes = 32768, .buffer_bytes = 128 * 1024, .protocols = selected });
     defer service.deinit();
+    const chunk_defaults: vanilla.Chunks.Configuration = .{};
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(vanilla.plugins(), .{
             lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = maximum, .render_distance = 8 }),
+            lightning_rod.plugin.configured(vanilla.Chunks, .{ .cache_sections = @max(chunk_defaults.cache_sections, count) }),
             lightning_rod.plugin.configured(sessions.World, .{ .endpoint = service }),
+            lightning_rod.plugin.configured(vanilla.RecipeBook, .{ .packet_bytes = service.config.page_bytes }),
         }),
         lightning_rod.plugin.configured(tps.Tps, .{}),
         lightning_rod.plugin.configured(Policy, .{}),
@@ -112,8 +115,8 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     const visibility = simulation.get(vanilla.Visibility);
     const layer = simulation.get(Policy).layer;
     if (mode == .hidden) try layer.updateMany(&.{.{ .subjects = handles[0..count], .channels = &.{visibility.player_entity}, .excluded = true }});
-    const stages = try backing.alloc(lightning_rod.metrics.Snapshot, 512);
-    const before = try backing.alloc(lightning_rod.metrics.Snapshot, 512);
+    const stages = try backing.alloc(lightning_rod.metrics.Snapshot, simulation.metrics.count);
+    const before = try backing.alloc(lightning_rod.metrics.Snapshot, simulation.metrics.count);
     const cpus = try backing.alloc(u64, options.samples);
     const walls = try backing.alloc(u64, options.samples);
     if (options.detail) {

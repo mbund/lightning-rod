@@ -2,7 +2,7 @@
     .name = .bench_chunks,
     .fingerprint = 0x94e3c066d9e1c036,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .chunks = .{ .path = "../../chunks" },
         .records = .{ .path = "../../records" },

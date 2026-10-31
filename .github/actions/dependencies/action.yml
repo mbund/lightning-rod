@@ -16,9 +16,6 @@ inputs:
   assets:
     description: Restore shared Minecraft assets
     default: 'false'
-  native:
-    description: Install the Minecraft client's native libraries
-    default: 'false'
   previous:
     description: Restore the previous commit's server for the upgrade E2E
     default: 'false'
@@ -96,18 +93,6 @@ runs:
         tar --zstd -xf "$RUNNER_TEMP/ci-dependencies/assets.tar.zst" -C "$RUNNER_TEMP/ci-assets"
         rm "$RUNNER_TEMP/ci-dependencies/assets.tar.zst"
         echo "LIGHTNING_ROD_E2E_ASSETS=$RUNNER_TEMP/ci-assets" >> "$GITHUB_ENV"
-    - uses: actions/download-artifact@v8
-      if: inputs.native == 'true'
-      with:
-        name: ci-native
-        path: ${{ runner.temp }}/ci-dependencies
-    - if: inputs.native == 'true'
-      shell: bash
-      run: |
-        mkdir -p "$RUNNER_TEMP/ci-native"
-        tar --zstd -xf "$RUNNER_TEMP/ci-dependencies/native.tar.zst" -C "$RUNNER_TEMP/ci-native"
-        sudo dpkg -i "$RUNNER_TEMP"/ci-native/*.deb
-        rm -rf "$RUNNER_TEMP/ci-native" "$RUNNER_TEMP/ci-dependencies/native.tar.zst"
     - uses: actions/download-artifact@v8
       if: inputs.previous == 'true'
       with:

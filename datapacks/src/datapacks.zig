@@ -201,7 +201,7 @@ pub const Builder = struct {
             if (files.items.len == self.limits.resources) return error.ResourceCapacity;
             try files.append(self.temporary, try self.temporary.dupe(u8, entry.path));
         }
-        std.mem.sort([]const u8, files.items, {}, lessName);
+        std.mem.sortUnstable([]const u8, files.items, {}, lessName);
         for (roots) |root| {
             self.layer_start = self.entries.items.len;
             for (files.items) |file| {
@@ -271,7 +271,7 @@ pub const Builder = struct {
             if (packs.items.len == self.limits.packs) return error.PackCapacity;
             try packs.append(self.temporary, .{ .path = try std.fs.path.join(self.temporary, &.{ path, entry.name }), .zip = entry.kind == .file });
         }
-        std.mem.sort(Pack, packs.items, {}, struct {
+        std.mem.sortUnstable(Pack, packs.items, {}, struct {
             fn less(_: void, a: Pack, b: Pack) bool {
                 return std.mem.lessThan(u8, a.path, b.path);
             }
@@ -308,7 +308,7 @@ pub const Builder = struct {
         const descriptor = try pack_metadata.Metadata.parse(self.temporary, header_bytes);
         const selected = self.target orelse if (self.formats.len > 0) try descriptor.select(self.formats) else descriptor.defaultVersion();
         const roots = try descriptor.roots(self.temporary, selected);
-        std.mem.sort(Entry, entries.items, {}, struct {
+        std.mem.sortUnstable(Entry, entries.items, {}, struct {
             fn less(_: void, a: Entry, b: Entry) bool {
                 return std.mem.lessThan(u8, a.name, b.name);
             }
@@ -381,7 +381,7 @@ pub const Builder = struct {
             selected[count] = value.*;
             count += 1;
         }
-        std.mem.sort(usize, selected, self.entries.items, struct {
+        std.mem.sortUnstable(usize, selected, self.entries.items, struct {
             fn less(entries: []const Resource, a: usize, b: usize) bool {
                 return std.mem.lessThan(u8, entries[a].name, entries[b].name);
             }
@@ -408,7 +408,7 @@ pub const Builder = struct {
             excluded[excluded_count] = name.*;
             excluded_count += 1;
         }
-        std.mem.sort([]const u8, excluded, {}, lessName);
+        std.mem.sortUnstable([]const u8, excluded, {}, lessName);
         return .{ .entries = self.entries.items, .packs = self.packs.items, .index = self.index, .directories = directories, .excluded = excluded };
     }
 };

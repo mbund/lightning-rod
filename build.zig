@@ -82,23 +82,21 @@ pub fn build(b: *std.Build) void {
         .{ .directory = "minecraft_java" },
         .{ .directory = "e2e", .targets = &.{ "test-performance", "test-harness", "test-artifacts", "test-client" } },
     };
-    const shared_cache = b.cache_root.handle.realPathFileAlloc(b.graph.io, ".", b.allocator) catch @panic("Cannot resolve build cache");
     const triple = target.query.zigTriple(b.allocator) catch @panic("OOM");
     const cpu = target.query.serializeCpuAlloc(b.allocator) catch @panic("OOM");
     for (suites) |suite| {
         const run = b.addSystemCommand(&.{
             b.graph.zig_exe,
             "build",
-            "--cache-dir",
-            shared_cache,
             b.fmt("-Doptimize={s}", .{@tagName(optimize)}),
             b.fmt("-Dtarget={s}", .{triple}),
             b.fmt("-Dcpu={s}", .{cpu}),
         });
+        run.addArg("--cache-dir");
+        run.addDirectoryArg(.cache_root);
         run.setName(b.fmt("test {s}", .{suite.directory}));
         run.setCwd(b.path(suite.directory));
         run.addArgs(suite.targets);
-        if (b.graph.max_jobs) |jobs| run.addArg(b.fmt("-j{d}", .{jobs}));
         // Inherited stdio serializes nested builds so each can use the full job budget.
         run.stdio = .inherit;
         test_step.dependOn(&run.step);

@@ -1,6 +1,6 @@
 const behavior = @import("behavior.zig");
 const minecraft = @import("minecraft_model");
-const Players = @import("players.zig").Players;
+const Player = @import("player_state.zig").Player;
 const std = @import("std");
 const Registries = @import("content_registries.zig").Registries;
 const Enchantments = @import("enchantments.zig").Enchantments;
@@ -69,7 +69,7 @@ pub const Request = struct {
     channel: Channel,
     random: std.Random,
     player: ?u128 = null,
-    actor: ?*const Players.Player = null,
+    actor: ?*const Player = null,
     location: ?Location = null,
     scratch: *std.heap.FixedBufferAllocator,
     item_tags: ?*const Tags = null,
@@ -84,7 +84,7 @@ pub const Context = struct {
     channel: Channel,
     random: std.Random,
     player: ?u128,
-    actor: ?*const Players.Player,
+    actor: ?*const Player,
     location: ?Location,
     scratch: *std.heap.FixedBufferAllocator,
     damage_tags: []const []const u8,

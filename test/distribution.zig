@@ -26,7 +26,7 @@ const Packager = struct {
         try self.packages.put(source, .{ .path = destination });
         const manifest_path = try std.fs.path.join(self.allocator, &.{ source, "build.zig.zon" });
         const bytes = try std.Io.Dir.cwd().readFileAlloc(self.init.io, manifest_path, self.allocator, .limited(1024 * 1024));
-        const sentinel = try self.allocator.dupeZ(u8, bytes);
+        const sentinel = try self.allocator.dupeSentinel(u8, bytes, 0);
         var tokenizer = std.zig.Tokenizer.init(sentinel);
         var tokens: std.ArrayList(std.zig.Token) = .empty;
         while (true) {

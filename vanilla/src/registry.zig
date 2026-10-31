@@ -56,7 +56,7 @@ pub fn Registry(comptime Owner: type) type {
             const self = &owner.registry;
             if (configuration.prepared) |prepared| {
                 assert(!prepared.registry.failed and !prepared.registry.staged);
-                inline for (@typeInfo(Definitions).@"struct".fields) |field| if (@field(configuration.definitions, field.name).len != 0) return error.PreparedRegistryCannotRegister;
+                inline for (@typeInfo(Definitions).@"struct".field_names) |field| if (@field(configuration.definitions, field).len != 0) return error.PreparedRegistryCannotRegister;
                 const previous = prepared.registry.version;
                 const users = previous.users.fetchAdd(1, .monotonic);
                 assert(users > 0 and users < std.math.maxInt(usize));
@@ -86,26 +86,27 @@ pub fn Registry(comptime Owner: type) type {
             defer scratch.deinit();
             const temporary = scratch.allocator();
             var combined: Definitions = .{};
-            inline for (@typeInfo(Definitions).@"struct".fields) |field| {
-                const T = @typeInfo(field.type).pointer.child;
+            const info = @typeInfo(Definitions).@"struct";
+            inline for (info.field_names, info.field_types) |field, Field| {
+                const T = @typeInfo(Field).pointer.child;
                 var count: usize = 0;
                 var filtered = false;
                 for (sources) |source| {
-                    count = try std.math.add(usize, count, @field(source.definitions, field.name).len);
+                    count = try std.math.add(usize, count, @field(source.definitions, field).len);
                     for (source.exclusions) |exclusion| {
-                        filtered = filtered or exclusion.field == @field(std.meta.FieldEnum(Definitions), field.name);
+                        filtered = filtered or exclusion.field == @field(std.meta.FieldEnum(Definitions), field);
                     }
                 }
                 if (!filtered) {
                     const entries = try allocator.alloc(T, count);
                     var written: usize = 0;
                     for (sources) |source| {
-                        const part = @field(source.definitions, field.name);
+                        const part = @field(source.definitions, field);
                         @memcpy(entries[written..][0..part.len], part);
                         written += part.len;
                     }
                     assert(written == entries.len);
-                    @field(combined, field.name) = entries;
+                    @field(combined, field) = entries;
                 } else {
                     var entries: std.ArrayList(T) = .empty;
                     var excluded: std.HashMapUnmanaged(Key, void, KeyContext, 80) = .empty;
@@ -113,7 +114,7 @@ pub fn Registry(comptime Owner: type) type {
                     while (index > 0) {
                         index -= 1;
                         const source = sources[index];
-                        const part = @field(source.definitions, field.name);
+                        const part = @field(source.definitions, field);
                         var at = part.len;
                         while (at > 0) {
                             at -= 1;
@@ -124,13 +125,13 @@ pub fn Registry(comptime Owner: type) type {
                             try entries.append(temporary, part[at]);
                         }
                         for (source.exclusions) |exclusion| {
-                            if (exclusion.field != @field(std.meta.FieldEnum(Definitions), field.name)) continue;
+                            if (exclusion.field != @field(std.meta.FieldEnum(Definitions), field)) continue;
                             assert(comptime @typeInfo(T) == .@"struct" and @hasField(T, "name"));
                             try excluded.put(temporary, .{ .name = exclusion.name, .registry = exclusion.registry }, {});
                         }
                     }
                     std.mem.reverse(T, entries.items);
-                    @field(combined, field.name) = try allocator.dupe(T, entries.items);
+                    @field(combined, field) = try allocator.dupe(T, entries.items);
                 }
             }
             version.definitions = combined;
@@ -139,7 +140,7 @@ pub fn Registry(comptime Owner: type) type {
         }
 
         fn install(self: *Self, data: Data) void {
-            inline for (@typeInfo(Data).@"struct".fields) |field| @field(self.owner, field.name) = @field(data, field.name);
+            inline for (@typeInfo(Data).@"struct".field_names) |field| @field(self.owner, field) = @field(data, field);
         }
 
         pub const Source = struct {

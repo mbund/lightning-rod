@@ -2,7 +2,7 @@
     .fingerprint = 0xc74dc4b58ef951ec,
     .name = .chunks,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .metrics = .{ .path = "../metrics" },
         .records = .{ .path = "../records" },

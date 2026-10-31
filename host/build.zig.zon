@@ -2,7 +2,7 @@
     .fingerprint = 0xbde4b2bd7e5a4f73,
     .name = .lightning_rod_host,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .lightning_rod = .{ .path = ".." },
         .storage = .{ .path = "../storage" },

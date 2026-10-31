@@ -2,7 +2,7 @@
     .fingerprint = 0xe4bfc57e75007690,
     .name = .lightning_rod_linux,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .lightning_rod = .{ .path = ".." },
         .reload = .{ .path = "../reload" },

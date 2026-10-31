@@ -47,6 +47,7 @@ pub const EquipmentAttributes = struct {
     registry: *const Registries.Registry,
     ranges: []Range,
     states: []State,
+    owners: std.AutoArrayHashMapUnmanaged(u128, usize) = .empty,
     desired: []f64,
     sent: []f64,
     sums: []Sum,
@@ -72,6 +73,7 @@ pub const EquipmentAttributes = struct {
             .actors = try .init(allocator, deps.players.records.len),
             .observer = try deps.items.deps.inventories.observe(allocator, deps.players.records.len),
         };
+        try self.owners.ensureTotalCapacity(allocator, self.states.len);
         @memset(self.states, .{});
         @memset(self.sent, std.math.nan(f64));
         for (registry.entries, self.ranges) |entry, *range| {
@@ -110,8 +112,13 @@ pub const EquipmentAttributes = struct {
         const desired = self.desired[index * self.ranges.len ..][0..self.ranges.len];
         const sent = self.sent[index * self.ranges.len ..][0..self.ranges.len];
         if (state.owner != player.uuid or state.generation != handle.generation or state.life != player.life) {
-            if (state.owner) |owner| self.observer.unwatch(owner);
+            if (state.owner != null) self.retire(index);
+            if (self.owners.get(player.uuid)) |previous| {
+                std.debug.assert(previous != index);
+                self.retire(previous);
+            }
             state.* = .{ .owner = player.uuid, .generation = handle.generation, .life = player.life, .selected = player.selected_slot, .slots = .{ 36 + @as(u16, player.selected_slot), 45, 5, 6, 7, 8 } };
+            self.owners.putAssumeCapacityNoClobber(player.uuid, index);
             self.observer.watch(player.uuid, &state.slots, .{ .dirty = &state.invalid });
             self.actors.insert(index);
             @memset(sent, std.math.nan(f64));
@@ -208,11 +215,18 @@ pub const EquipmentAttributes = struct {
                 at += 1;
                 continue;
             }
-            const state = &self.states[index];
-            self.observer.unwatch(state.owner.?);
-            state.* = .{};
-            self.actors.remove(index);
+            self.retire(index);
         }
+    }
+
+    fn retire(self: *EquipmentAttributes, index: usize) void {
+        const state = &self.states[index];
+        const owner = state.owner.?;
+        const removed = self.owners.fetchSwapRemove(owner).?;
+        std.debug.assert(removed.value == index and self.actors.contains(index));
+        self.observer.unwatch(owner);
+        self.actors.remove(index);
+        state.* = .{};
     }
 
     fn write(packet: wire.play.toClient.packet_entity_update_attributes.Writer, registry: packets.Registry, entity: i32, properties: []const Property) ![]u8 {

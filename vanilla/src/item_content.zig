@@ -60,7 +60,7 @@ pub const ItemContent = struct {
             }
             try properties.advance(done);
         }
-        std.mem.sort(Property, values[0..count], {}, struct {
+        std.mem.sortUnstable(Property, values[0..count], {}, struct {
             fn less(_: void, a: Property, b: Property) bool {
                 return std.mem.lessThan(u8, a.name, b.name);
             }

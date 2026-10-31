@@ -2,14 +2,14 @@ plugins {
     id 'fabric-loom' version "${loom_version}" apply false
     id 'net.fabricmc.fabric-loom' version "${loom_version}" apply false
 }
+def clientSource = file(providers.gradleProperty('clientSource').getOrElse(System.getenv('LIGHTNING_ROD_E2E_CLIENT_SOURCE') ?: '.'))
 def clientApi = providers.gradleProperty('client_api').getOrElse(
-    new groovy.json.JsonSlurper().parse(file(System.getenv('LIGHTNING_ROD_E2E_CLIENT_SOURCE') ?: '.').toPath().resolve('versions.json').toFile())
+    new groovy.json.JsonSlurper().parse(new File(clientSource, 'versions.json'))
         .find { it.release == minecraft_version }.api)
 def unobfuscated = ['modern', 'current'].contains(clientApi)
 apply plugin: unobfuscated ? 'net.fabricmc.fabric-loom' : 'fabric-loom'
 version = project.mod_version
 group = project.maven_group
-def clientSource = file(System.getenv('LIGHTNING_ROD_E2E_CLIENT_SOURCE') ?: '.')
 loom {
     enableModProvidedJavadoc = false
     splitEnvironmentSourceSets()
@@ -41,7 +41,7 @@ processResources {
     filesMatching("fabric.mod.json") { expand "version": project.version, "minecraft_version": project.minecraft_version }
 }
 tasks.withType(JavaCompile).configureEach { options.release = unobfuscated ? 25 : 21 }
-def testsDirectory = file(System.getenv('LIGHTNING_ROD_E2E_TEST_ROOT') ?: new File(clientSource, '../tests'))
+def testsDirectory = file(providers.gradleProperty('testRoot').getOrElse(System.getenv('LIGHTNING_ROD_E2E_TEST_ROOT') ?: new File(clientSource, '../tests').absolutePath))
 def testManifests = fileTree(testsDirectory).matching { include '*/test.json' }.files.sort()
 def generatedTests = layout.buildDirectory.dir('generated/e2e')
 // Keep fixtures with their scenarios while giving each one a package-correct

@@ -40,12 +40,13 @@ pub fn exclusions(deps: provider.Dependencies, allocator: std.mem.Allocator, blo
     var names: std.StringHashMapUnmanaged(void) = .empty;
     for (blocked) |name| try names.put(allocator, name, {});
     var result: provider.Exclusions = .{};
-    inline for (@typeInfo(provider.Exclusions).@"struct".fields) |owner| {
-        const T = @typeInfo(owner.type).pointer.child;
+    const info = @typeInfo(provider.Exclusions).@"struct";
+    inline for (info.field_names, info.field_types) |owner, Field| {
+        const T = @typeInfo(Field).pointer.child;
         var entries: std.ArrayList(T) = .empty;
         inline for (fields) |field| {
-            if (comptime std.mem.eql(u8, field[0], owner.name)) {
-                const registry = &@field(deps, owner.name).registry;
+            if (comptime std.mem.eql(u8, field[0], owner)) {
+                const registry = &@field(deps, owner).registry;
                 for (registry.contributions()) |source| {
                     for (@field(source.definitions, field[1])) |entry| {
                         if (!names.contains(try resourceName(@TypeOf(entry), allocator, field[2], entry))) continue;
@@ -58,7 +59,7 @@ pub fn exclusions(deps: provider.Dependencies, allocator: std.mem.Allocator, blo
                 }
             }
         }
-        @field(result, owner.name) = entries.items;
+        @field(result, owner) = entries.items;
     }
     return result;
 }

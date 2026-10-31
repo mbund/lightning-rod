@@ -212,7 +212,7 @@ pub const Compiler = struct {
                     if (property != .string) return error.InvalidLootFunction;
                     name.* = property.string;
                 }
-                std.mem.sort([]const u8, property_names, {}, struct {
+                std.mem.sortUnstable([]const u8, property_names, {}, struct {
                     fn less(_: void, a: []const u8, b: []const u8) bool {
                         return std.mem.lessThan(u8, a, b);
                     }

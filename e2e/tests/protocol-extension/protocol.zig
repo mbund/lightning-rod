@@ -172,12 +172,13 @@ pub const Crypt = struct {
 };
 
 const CustomRegistry = struct {
+    pub const Builder = Custom.Registries.Builder;
     pub const PreparedRegistries = Custom.Registries.PreparedRegistries;
 
-    pub fn init(allocator: std.mem.Allocator) !PreparedRegistries {
-        const snapshot = try Custom.Registries.snapshot(allocator);
-        defer snapshot.deinit(allocator);
-        for (snapshot.registries) |table| {
+    pub fn snapshot(allocator: std.mem.Allocator) !Builder.Snapshot {
+        const result = try Custom.Registries.snapshot(allocator);
+        errdefer result.deinit(allocator);
+        for (result.registries) |table| {
             if (table.synchronized) std.mem.reverse(Custom.Registries.Builder.RegistryEntry, @constCast(table.entries));
             if (!std.mem.eql(u8, table.id, "minecraft:dimension_type")) continue;
             const entries = @constCast(table.entries);
@@ -185,12 +186,20 @@ const CustomRegistry = struct {
                 if (std.mem.eql(u8, entry.id, "minecraft:overworld")) entry.id = "example:bright";
             }
         }
-        return Custom.Registries.Builder.build(allocator, Custom.protocol_number, snapshot);
+        return result;
+    }
+
+    pub fn init(allocator: std.mem.Allocator) !PreparedRegistries {
+        const source = try snapshot(allocator);
+        defer source.deinit(allocator);
+        return Builder.build(allocator, Custom.protocol_number, source);
     }
 };
 
 const CryptRegistry = struct {
+    pub const Builder = CustomRegistry.Builder;
     pub const PreparedRegistries = CustomRegistry.PreparedRegistries;
+    pub const snapshot = CustomRegistry.snapshot;
 
     pub fn init(allocator: std.mem.Allocator) !PreparedRegistries {
         var prepared = try CustomRegistry.init(allocator);

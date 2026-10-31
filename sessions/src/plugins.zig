@@ -17,7 +17,7 @@ pub fn Runtime(comptime Endpoint: type, comptime Selections: type) type {
             active: bool = false,
             index: usize = 0,
             play_index: usize = 0,
-            values: std.meta.Tuple(&states) = undefined,
+            values: @Tuple(&states) = undefined,
         };
 
         allocator: std.mem.Allocator,
@@ -243,8 +243,9 @@ pub fn Runtime(comptime Endpoint: type, comptime Selections: type) type {
 
         fn dependencies(self: *Self, comptime T: type, environment: anytype, comptime current_index: usize) T {
             var result: T = undefined;
-            inline for (@typeInfo(T).@"struct".fields) |field| {
-                @field(result, field.name) = lightning_rod.plugin.dependency(field.name, field.type, &self.instances, environment, current_index);
+            const info = @typeInfo(T).@"struct";
+            inline for (info.field_names, info.field_types) |field, Field| {
+                @field(result, field) = lightning_rod.plugin.dependency(field, Field, &self.instances, environment, current_index);
             }
             return result;
         }

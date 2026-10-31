@@ -112,7 +112,7 @@ test "RSA rejects malformed PKCS1 padding without modifying output" {
     const boundary = try encryptBlock(&key, &minimum_padding);
     try key.decrypt(&boundary, &maximum_message);
     try std.testing.expectEqualSlices(u8, minimum_padding[11..], &maximum_message);
-    const short_padding = try encryptBlock(&key, &(.{ 0, 2 } ++ [_]u8{0x55} ** 7 ++ .{0} ++ [_]u8{0x55} ** (PrivateKey.ciphertext_bytes - 10)));
+    const short_padding = try encryptBlock(&key, &(.{ 0, 2 } ++ @as([7]u8, @splat(0x55)) ++ .{0} ++ @as([PrivateKey.ciphertext_bytes - 10]u8, @splat(0x55))));
     try std.testing.expectError(error.InvalidCiphertext, key.decrypt(&short_padding, &output));
 }
 

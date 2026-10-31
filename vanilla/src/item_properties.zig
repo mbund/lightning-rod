@@ -37,7 +37,7 @@ pub const ItemProperties = struct {
 };
 
 fn stackLimitPresentation(self: *ItemProperties, view: data.View, _: u128, stored: ?data.Component) components.Presentation {
-    if (stored) |entry| return if (entry.value != null) .added else .removed;
+    if (stored != null) return .stored;
     return if (self.deps.items.deps.definitions.properties[view.kind].stack_size != game_data.registry.items[view.kind].stack_size) .added else .absent;
 }
 
@@ -98,7 +98,7 @@ pub const Durability = struct {
     }
 
     fn maximumPresentation(self: *Durability, view: data.View, _: u128, stored: ?data.Component) components.Presentation {
-        if (stored) |entry| return if (entry.value != null) .added else .removed;
+        if (stored != null) return .stored;
         const maximum = self.deps.items.deps.definitions.properties[view.kind].durability;
         if (maximum == game_data.registry.items[view.kind].max_durability) return .absent;
         return if (maximum == 0) .removed else .added;

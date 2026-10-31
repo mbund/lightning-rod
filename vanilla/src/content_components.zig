@@ -71,7 +71,7 @@ pub const Components = struct {
             result[index] = .{ .key = try componentKey(name["minecraft:".len..]), .value = output.written() };
             index += 1;
         }
-        std.mem.sort(data.Component, result, {}, struct {
+        std.mem.sortUnstable(data.Component, result, {}, struct {
             fn less(_: void, a: data.Component, b: data.Component) bool {
                 return a.key < b.key;
             }
@@ -139,7 +139,7 @@ fn nbtPayload(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: std.j
         .object => {
             const keys = try allocator.alloc([]const u8, value.object.count());
             @memcpy(keys, value.object.keys());
-            std.mem.sort([]const u8, keys, {}, struct {
+            std.mem.sortUnstable([]const u8, keys, {}, struct {
                 fn less(_: void, a: []const u8, b: []const u8) bool {
                     return std.mem.lessThan(u8, a, b);
                 }

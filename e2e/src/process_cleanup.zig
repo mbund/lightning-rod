@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub fn enable() !void {
-    if (std.os.linux.errno(std.os.linux.prctl(@intFromEnum(std.os.linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)) != .SUCCESS)
+    if (std.os.linux.errno(std.os.linux.prctl(@backingInt(std.os.linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)) != .SUCCESS)
         return error.SubreaperUnavailable;
 }
 
@@ -32,7 +32,7 @@ pub fn finish(io: std.Io) !usize {
                 const result = std.os.linux.kill(pid, .KILL);
 
                 if (std.os.linux.errno(result) == .SUCCESS) killed += 1;
-                var status: u32 = 0;
+                var status: i32 = 0;
                 _ = std.os.linux.waitpid(pid, &status, std.os.linux.W.NOHANG);
             }
         }

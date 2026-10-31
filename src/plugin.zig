@@ -9,8 +9,8 @@ pub fn initialize(comptime Plugin: type, allocator: std.mem.Allocator, io: std.I
 /// Persistent plugins share their allocation path with init and defer storage access to init.
 pub fn reserve(comptime Plugin: type, allocator: std.mem.Allocator, io: std.Io, configuration: Plugin.Configuration, dependencies: anytype, source: anytype) !*Plugin {
     if (@hasDecl(Plugin, "Dependencies")) {
-        inline for (std.meta.fields(Plugin.Dependencies)) |field| {
-            if (field.type == storage.Space and !@hasDecl(Plugin, "allocate"))
+        inline for (@typeInfo(Plugin.Dependencies).@"struct".field_types) |field| {
+            if (field == storage.Space and !@hasDecl(Plugin, "allocate"))
                 @compileError("persistent plugin must provide allocation without storage access: " ++ Plugin.id);
         }
     }
@@ -20,8 +20,8 @@ pub fn reserve(comptime Plugin: type, allocator: std.mem.Allocator, io: std.Io, 
 fn construct(comptime Plugin: type, comptime constructor: anytype, allocator: std.mem.Allocator, io: std.Io, configuration: Plugin.Configuration, dependencies: anytype, source: anytype) !*Plugin {
     var args: std.meta.ArgsTuple(@TypeOf(constructor)) = undefined;
 
-    inline for (@typeInfo(@TypeOf(constructor)).@"fn".params, 0..) |parameter, argument| {
-        const T = parameter.type.?;
+    inline for (@typeInfo(@TypeOf(constructor)).@"fn".param_types, 0..) |parameter, argument| {
+        const T = parameter.?;
         args[argument] = if (T == std.mem.Allocator) allocator else if (T == std.Io) io else if (T == Plugin.Configuration) configuration else if (@hasDecl(Plugin, "Dependencies") and T == Plugin.Dependencies) dependencies else if (@hasDecl(Plugin, "Meta") and T == Plugin.Meta) metadata(T, source) else @compileError("unsupported init parameter in plugin " ++ Plugin.id);
     }
 
@@ -33,8 +33,8 @@ pub fn close(comptime Plugin: type, instance: *Plugin, io: std.Io, closing: *lif
     var args: std.meta.ArgsTuple(@TypeOf(Plugin.close)) = undefined;
     args[0] = instance;
 
-    inline for (@typeInfo(@TypeOf(Plugin.close)).@"fn".params[1..], 1..) |parameter, argument| {
-        args[argument] = if (parameter.type == std.Io) io else if (parameter.type == *lifecycle.Closing) closing else @compileError("unsupported close parameter in plugin " ++ Plugin.id);
+    inline for (@typeInfo(@TypeOf(Plugin.close)).@"fn".param_types[1..], 1..) |parameter, argument| {
+        args[argument] = if (parameter == std.Io) io else if (parameter == *lifecycle.Closing) closing else @compileError("unsupported close parameter in plugin " ++ Plugin.id);
     }
 
     @call(.never_inline, Plugin.close, args);
@@ -63,7 +63,7 @@ pub fn Instances(comptime Selections: type) type {
 
     return struct {
         pub const selections = Selections;
-        pointers: std.meta.Tuple(&types) = undefined,
+        pointers: @Tuple(&types) = undefined,
         initialized: usize = 0,
 
         pub fn get(self: *const @This(), comptime Plugin: type) *Plugin {
@@ -91,33 +91,26 @@ fn pointerTypes(comptime Selections: type) [selectedCount(Selections)]type {
 
 pub fn environment(base: anytype, extra: anytype) Environment(@TypeOf(base), @TypeOf(extra)) {
     var result: Environment(@TypeOf(base), @TypeOf(extra)) = undefined;
-
-    inline for (std.meta.fields(@TypeOf(base))) |field| if (!field.is_comptime) {
-        @field(result, field.name) = @field(base, field.name);
+    const a = @typeInfo(@TypeOf(base)).@"struct";
+    const b = @typeInfo(@TypeOf(extra)).@"struct";
+    inline for (a.field_names, a.field_attrs) |name, attrs| if (!attrs.@"comptime") {
+        @field(result, name) = @field(base, name);
     };
-
-    inline for (std.meta.fields(@TypeOf(extra))) |field| if (!field.is_comptime) {
-        @field(result, field.name) = @field(extra, field.name);
+    inline for (b.field_names, b.field_attrs) |name, attrs| if (!attrs.@"comptime") {
+        @field(result, name) = @field(extra, name);
     };
-
     return result;
 }
 
 fn Environment(comptime Base: type, comptime Extra: type) type {
-    const a = std.meta.fields(Base);
-    const b = std.meta.fields(Extra);
-    comptime var names: [a.len + b.len][]const u8 = undefined;
-    comptime var types: [names.len]type = undefined;
-    comptime var attributes: [names.len]std.builtin.Type.StructField.Attributes = undefined;
-
-    inline for (a ++ b, 0..) |field, index| {
-        inline for (names[0..index]) |name| if (std.mem.eql(u8, name, field.name)) @compileError("duplicate environment binding: " ++ name);
-        names[index] = field.name;
-        types[index] = field.type;
-        attributes[index] = .{ .@"comptime" = field.is_comptime, .default_value_ptr = field.default_value_ptr, .@"align" = field.alignment };
+    const a = @typeInfo(Base).@"struct";
+    const b = @typeInfo(Extra).@"struct";
+    const names = a.field_names ++ b.field_names;
+    inline for (names, 0..) |name, index| {
+        inline for (names[0..index]) |previous| if (std.mem.eql(u8, name, previous))
+            @compileError("duplicate environment binding: " ++ name);
     }
-
-    return @Struct(.auto, null, &names, &types, &attributes);
+    return @Struct(.auto, null, names, a.field_types ++ b.field_types, a.field_attrs ++ b.field_attrs);
 }
 
 pub fn configured(comptime Plugin: type, configuration: Plugin.Configuration) Selection(Plugin) {
@@ -132,15 +125,15 @@ pub fn Selection(comptime Plugin: type) type {
 }
 
 pub fn selectedCount(comptime Selections: type) usize {
-    return (comptime tupleFields(Selections)).len;
+    return (comptime tupleTypes(Selections)).len;
 }
 
 pub fn minimumTickScratchBytes(comptime Selections: type) usize {
     return comptime total: {
         var bytes: usize = 0;
 
-        for (tupleFields(Selections)) |field| {
-            const Plugin = selectedPlugin(field.type);
+        for (tupleTypes(Selections)) |field| {
+            const Plugin = selectedPlugin(field);
 
             if (@hasDecl(Plugin, "tick_scratch_bytes")) bytes += Plugin.tick_scratch_bytes;
         }
@@ -152,8 +145,8 @@ pub fn minimumTickScratchBytes(comptime Selections: type) usize {
 pub fn closeTokenCount(comptime Selections: type) usize {
     var count: usize = 0;
 
-    inline for (comptime tupleFields(Selections)) |field| {
-        const Plugin = selectedPlugin(field.type);
+    inline for (comptime tupleTypes(Selections)) |field| {
+        const Plugin = selectedPlugin(field);
 
         if (@hasDecl(Plugin, "close")) count += 1;
     }
@@ -162,10 +155,10 @@ pub fn closeTokenCount(comptime Selections: type) usize {
 }
 
 pub fn selectedType(comptime Selections: type, comptime index: usize) type {
-    const fields = comptime tupleFields(Selections);
+    const fields = comptime tupleTypes(Selections);
 
     if (index >= fields.len) @compileError("plugin selection index is out of bounds");
-    return fields[index].type;
+    return fields[index];
 }
 
 pub fn selectedPlugin(comptime Selected: type) type {
@@ -177,27 +170,27 @@ pub fn selectedPlugin(comptime Selected: type) type {
 pub fn indexOfId(comptime Selections: type, comptime id: []const u8) ?usize {
     @setEvalBranchQuota(20_000_000);
 
-    inline for (comptime tupleFields(Selections), 0..) |field, index| {
-        if (comptime std.mem.eql(u8, selectedPlugin(field.type).id, id)) return index;
+    inline for (comptime tupleTypes(Selections), 0..) |field, index| {
+        if (comptime std.mem.eql(u8, selectedPlugin(field).id, id)) return index;
     }
 
     return null;
 }
 
 pub fn compose(parts: anytype) Compose(@TypeOf(parts)) {
-    const fields = comptime tupleFields(@TypeOf(parts));
+    const fields = comptime tupleTypes(@TypeOf(parts));
     var result: Compose(@TypeOf(parts)) = undefined;
     comptime var cursor: usize = 0;
 
-    inline for (fields) |field| {
-        const value = @field(parts, field.name);
+    inline for (fields, 0..) |field, part_index| {
+        const value = parts[part_index];
 
-        if (comptime isSelection(field.type)) {
+        if (comptime isSelection(field)) {
             result[cursor] = value;
             cursor += 1;
         } else {
-            inline for (comptime tupleFields(field.type)) |nested| {
-                result[cursor] = @field(value, nested.name);
+            inline for (comptime tupleTypes(field), 0..) |_, nested_index| {
+                result[cursor] = value[nested_index];
                 cursor += 1;
             }
         }
@@ -222,8 +215,8 @@ pub fn replace(selections: anytype, replacements: anytype) Replace(@TypeOf(selec
     comptime validateReplacements(@TypeOf(selections), @TypeOf(replacements));
     var result: Replace(@TypeOf(selections), @TypeOf(replacements)) = undefined;
 
-    inline for (comptime tupleFields(@TypeOf(selections)), 0..) |field, index| {
-        const id = selectedPlugin(field.type).id;
+    inline for (comptime tupleTypes(@TypeOf(selections)), 0..) |field, index| {
+        const id = selectedPlugin(field).id;
 
         if (comptime replacementIndex(@TypeOf(replacements), id)) |replacement|
             result[index] = replacements[replacement]
@@ -248,110 +241,110 @@ pub fn insertAfter(selections: anytype, comptime Anchor: type, inserted: anytype
 
 pub fn Compose(comptime Parts: type) type {
     @setEvalBranchQuota(20_000_000);
-    const fields = comptime tupleFields(Parts);
+    const fields = comptime tupleTypes(Parts);
     comptime var count: usize = 0;
 
-    inline for (fields) |field| count += partCount(field.type);
+    inline for (fields) |field| count += partCount(field);
     comptime var result: [count]type = undefined;
     comptime var cursor: usize = 0;
 
     inline for (fields) |field| {
-        if (isSelection(field.type)) {
-            result[cursor] = field.type;
+        if (isSelection(field)) {
+            result[cursor] = field;
             cursor += 1;
         } else {
-            inline for (tupleFields(field.type)) |nested| {
-                result[cursor] = nested.type;
+            inline for (tupleTypes(field)) |nested| {
+                result[cursor] = nested;
                 cursor += 1;
             }
         }
     }
 
-    return std.meta.Tuple(&result);
+    return @Tuple(&result);
 }
 
 pub fn Remove(comptime Selections: type, comptime Plugin: type) type {
-    const fields = comptime tupleFields(Selections);
+    const fields = comptime tupleTypes(Selections);
     const removed = comptime indexOfPlugin(Selections, Plugin) orelse @compileError("plugin is not selected: " ++ Plugin.id);
     comptime var result: [fields.len - 1]type = undefined;
 
-    inline for (0..removed) |index| result[index] = fields[index].type;
+    inline for (0..removed) |index| result[index] = fields[index];
 
-    inline for (removed + 1..fields.len) |index| result[index - 1] = fields[index].type;
-    return std.meta.Tuple(&result);
+    inline for (removed + 1..fields.len) |index| result[index - 1] = fields[index];
+    return @Tuple(&result);
 }
 
 pub fn Replace(comptime Selections: type, comptime Replacements: type) type {
-    const fields = comptime tupleFields(Selections);
+    const fields = comptime tupleTypes(Selections);
     comptime validateReplacements(Selections, Replacements);
     comptime var result: [fields.len]type = undefined;
 
     inline for (fields, 0..) |field, index| {
-        const id = selectedPlugin(field.type).id;
+        const id = selectedPlugin(field).id;
         result[index] = if (replacementIndex(Replacements, id)) |replacement|
-            tupleFields(Replacements)[replacement].type
+            tupleTypes(Replacements)[replacement]
         else
-            field.type;
+            field;
     }
 
-    return std.meta.Tuple(&result);
+    return @Tuple(&result);
 }
 
 fn validateReplacements(comptime Selections: type, comptime Replacements: type) void {
-    const fields = tupleFields(Replacements);
+    const fields = tupleTypes(Replacements);
 
     if (fields.len == 0) @compileError("plugin.replace requires at least one replacement");
 
     inline for (fields, 0..) |field, index| {
-        if (!isSelection(field.type)) @compileError("plugin.replace accepts plugin selections");
-        const Replacement = selectedPlugin(field.type);
+        if (!isSelection(field)) @compileError("plugin.replace accepts plugin selections");
+        const Replacement = selectedPlugin(field);
 
         if (indexOfId(Selections, Replacement.id) == null)
             @compileError("cannot replace a plugin that is not selected: " ++ Replacement.id);
 
         inline for (fields[0..index]) |previous| {
-            if (std.mem.eql(u8, Replacement.id, selectedPlugin(previous.type).id))
+            if (std.mem.eql(u8, Replacement.id, selectedPlugin(previous).id))
                 @compileError("duplicate plugin replacement: " ++ Replacement.id);
         }
     }
 }
 
 fn replacementIndex(comptime Replacements: type, comptime id: []const u8) ?usize {
-    inline for (tupleFields(Replacements), 0..) |field, index|
-        if (std.mem.eql(u8, id, selectedPlugin(field.type).id)) return index;
+    inline for (tupleTypes(Replacements), 0..) |field, index|
+        if (std.mem.eql(u8, id, selectedPlugin(field).id)) return index;
     return null;
 }
 
 pub fn InsertAfter(comptime Selections: type, comptime Anchor: type, comptime Inserted: type) type {
-    const fields = comptime tupleFields(Selections);
+    const fields = comptime tupleTypes(Selections);
     const index = comptime indexOfPlugin(Selections, Anchor) orelse @compileError("plugin is not selected: " ++ Anchor.id);
     comptime var result: [fields.len + 1]type = undefined;
 
-    inline for (0..index + 1) |source| result[source] = fields[source].type;
+    inline for (0..index + 1) |source| result[source] = fields[source];
     result[index + 1] = Inserted;
 
-    inline for (index + 1..fields.len) |source| result[source + 1] = fields[source].type;
-    return std.meta.Tuple(&result);
+    inline for (index + 1..fields.len) |source| result[source + 1] = fields[source];
+    return @Tuple(&result);
 }
 
 fn indexOfPlugin(comptime Selections: type, comptime Plugin: type) ?usize {
-    inline for (comptime tupleFields(Selections), 0..) |field, index| {
-        if (comptime selectedPlugin(field.type) == Plugin) return index;
+    inline for (comptime tupleTypes(Selections), 0..) |field, index| {
+        if (comptime selectedPlugin(field) == Plugin) return index;
     }
 
     return null;
 }
 
 pub fn validate(comptime Selections: type) void {
-    const fields = comptime tupleFields(Selections);
+    const fields = comptime tupleTypes(Selections);
     @setEvalBranchQuota(1_000 + fields.len * fields.len * 32);
 
     inline for (fields, 0..) |field, index| {
-        const Plugin = selectedPlugin(field.type);
+        const Plugin = selectedPlugin(field);
         validatePlugin(Plugin);
 
         inline for (fields[0..index]) |previous| {
-            if (comptime std.mem.eql(u8, Plugin.id, selectedPlugin(previous.type).id))
+            if (comptime std.mem.eql(u8, Plugin.id, selectedPlugin(previous).id))
                 @compileError("duplicate plugin id: " ++ Plugin.id);
         }
 
@@ -383,8 +376,8 @@ fn validateDependenciesType(comptime Plugin: type) void {
     if (@typeInfo(Plugin.Dependencies) != .@"struct")
         @compileError(Plugin.id ++ ".Dependencies must be a struct");
 
-    inline for (@typeInfo(Plugin.Dependencies).@"struct".fields) |field| {
-        const Dependency = dependencyPlugin(field.type) orelse continue;
+    inline for (@typeInfo(Plugin.Dependencies).@"struct".field_types) |field| {
+        const Dependency = dependencyPlugin(field) orelse continue;
 
         if (@typeInfo(Dependency) != .@"struct" or !@hasDecl(Dependency, "id") or Dependency.id.len == 0)
             @compileError(Plugin.id ++ " dependency must point to a plugin struct with an id");
@@ -395,8 +388,8 @@ fn validateInit(comptime Plugin: type) void {
     const info = @typeInfo(@TypeOf(Plugin.init)).@"fn";
     var seen: u8 = 0;
 
-    for (info.params) |parameter| {
-        const T = parameter.type orelse @compileError(Plugin.id ++ ".init requires typed parameters");
+    for (info.param_types) |parameter| {
+        const T = parameter orelse @compileError(Plugin.id ++ ".init requires typed parameters");
         const bit: u8 = if (T == std.mem.Allocator) 1 else if (T == std.Io) 2 else if (T == Plugin.Configuration) 4 else if (@hasDecl(Plugin, "Dependencies") and T == Plugin.Dependencies) 8 else if (@hasDecl(Plugin, "Meta") and T == Plugin.Meta) 16 else @compileError(Plugin.id ++ ".init has an unsupported parameter");
 
         if (seen & bit != 0) @compileError(Plugin.id ++ ".init has a duplicate injected parameter");
@@ -422,9 +415,9 @@ fn validateLifecycle(comptime Plugin: type) void {
 
 fn validateBoundary(comptime Plugin: type, comptime name: []const u8, comptime success: bool) void {
     const info = @typeInfo(@TypeOf(@field(Plugin, name))).@"fn";
-    if (info.params.len != (if (success) @as(usize, 2) else 1) or info.params[0].type != *Plugin or info.return_type != void)
+    if (info.param_types.len != (if (success) @as(usize, 2) else 1) or info.param_types[0] != *Plugin or info.return_type != void)
         @compileError(Plugin.id ++ "." ++ name ++ " has an invalid lifecycle signature");
-    if (success and info.params[1].type != bool) @compileError(Plugin.id ++ ".endTick requires a success bool");
+    if (success and info.param_types[1] != bool) @compileError(Plugin.id ++ ".endTick requires a success bool");
 }
 
 fn validateTick(comptime Plugin: type) void {
@@ -433,12 +426,12 @@ fn validateTick(comptime Plugin: type) void {
     if (result != void and (@typeInfo(result) != .error_union or @typeInfo(result).error_union.payload != void))
         @compileError(Plugin.id ++ ".tick must return void or !void");
 
-    if (info.params.len < 1 or info.params.len > 4 or info.params[0].type != *Plugin)
+    if (info.param_types.len < 1 or info.param_types.len > 4 or info.param_types[0] != *Plugin)
         @compileError(Plugin.id ++ ".tick must take *Self and optional Allocator, std.Io, storage.Space");
     var seen: u8 = 0;
 
-    for (info.params[1..]) |parameter| {
-        const bit: u8 = if (parameter.type == std.mem.Allocator) 1 else if (parameter.type == std.Io) 2 else if (parameter.type == storage.Space) 4 else @compileError(Plugin.id ++ ".tick accepts only Allocator, std.Io and storage.Space after *Self");
+    for (info.param_types[1..]) |parameter| {
+        const bit: u8 = if (parameter == std.mem.Allocator) 1 else if (parameter == std.Io) 2 else if (parameter == storage.Space) 4 else @compileError(Plugin.id ++ ".tick accepts only Allocator, std.Io and storage.Space after *Self");
 
         if (seen & bit != 0) @compileError(Plugin.id ++ ".tick has a duplicate injected parameter");
         seen |= bit;
@@ -450,14 +443,14 @@ fn validateCheckpoint(comptime Plugin: type) void {
     const result = info.return_type orelse
         @compileError(Plugin.id ++ ".checkpoint must return !void");
 
-    if (info.params.len < 2 or info.params.len > 4 or info.params[0].type != *Plugin or
+    if (info.param_types.len < 2 or info.param_types.len > 4 or info.param_types[0] != *Plugin or
         @typeInfo(result) != .error_union or
         @typeInfo(result).error_union.payload != void)
         @compileError(Plugin.id ++ ".checkpoint requires *Self, storage.Space, optional Allocator and std.Io, and an error union void result");
     var seen: u8 = 0;
 
-    for (info.params[1..]) |parameter| {
-        const bit: u8 = if (parameter.type == storage.Space) 1 else if (parameter.type == std.Io) 2 else if (parameter.type == std.mem.Allocator) 4 else @compileError(Plugin.id ++ ".checkpoint accepts only storage.Space, std.Io and Allocator after *Self");
+    for (info.param_types[1..]) |parameter| {
+        const bit: u8 = if (parameter == storage.Space) 1 else if (parameter == std.Io) 2 else if (parameter == std.mem.Allocator) 4 else @compileError(Plugin.id ++ ".checkpoint accepts only storage.Space, std.Io and Allocator after *Self");
 
         if (seen & bit != 0) @compileError(Plugin.id ++ ".checkpoint has a duplicate injected parameter");
         seen |= bit;
@@ -469,12 +462,12 @@ fn validateCheckpoint(comptime Plugin: type) void {
 fn validateClose(comptime Plugin: type) void {
     const info = @typeInfo(@TypeOf(Plugin.close)).@"fn";
 
-    if (info.params.len < 2 or info.params.len > 3 or info.params[0].type != *Plugin or info.return_type != void)
+    if (info.param_types.len < 2 or info.param_types.len > 3 or info.param_types[0] != *Plugin or info.return_type != void)
         @compileError(Plugin.id ++ ".close requires *Self, *Closing, optional std.Io and a void result");
     var seen: u8 = 0;
 
-    for (info.params[1..]) |parameter| {
-        const bit: u8 = if (parameter.type == *lifecycle.Closing) 1 else if (parameter.type == std.Io) 2 else @compileError(Plugin.id ++ ".close accepts only *Closing and std.Io after *Self");
+    for (info.param_types[1..]) |parameter| {
+        const bit: u8 = if (parameter == *lifecycle.Closing) 1 else if (parameter == std.Io) 2 else @compileError(Plugin.id ++ ".close accepts only *Closing and std.Io after *Self");
 
         if (seen & bit != 0) @compileError(Plugin.id ++ ".close has a duplicate injected parameter");
         seen |= bit;
@@ -484,12 +477,13 @@ fn validateClose(comptime Plugin: type) void {
 }
 
 fn validateDependencies(comptime Selections: type, comptime Plugin: type, comptime plugin_index: usize) void {
-    inline for (@typeInfo(dependenciesType(Plugin)).@"struct".fields) |field| {
-        if (comptime provider(Selections, field.type)) |index| {
-            if (index >= plugin_index) @compileError("dependency provider must appear before " ++ Plugin.id ++ "." ++ field.name);
+    const info = @typeInfo(dependenciesType(Plugin)).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
+        if (comptime provider(Selections, T)) |index| {
+            if (index >= plugin_index) @compileError("dependency provider must appear before " ++ Plugin.id ++ "." ++ name);
             continue;
         }
-        const Dependency = dependencyPlugin(field.type) orelse continue;
+        const Dependency = dependencyPlugin(T) orelse continue;
         const found = comptime indexOfId(Selections, Dependency.id);
 
         if (found) |index| if (index >= plugin_index)
@@ -502,8 +496,8 @@ fn validateDependencies(comptime Selections: type, comptime Plugin: type, compti
 pub fn provider(comptime Selections: type, comptime T: type) ?usize {
     const Required = if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
     var found: ?usize = null;
-    inline for (comptime tupleFields(Selections), 0..) |field, index| {
-        const Provider = selectedPlugin(field.type);
+    inline for (comptime tupleTypes(Selections), 0..) |field, index| {
+        const Provider = selectedPlugin(field);
         if (!@hasDecl(Provider, "Provides")) continue;
         inline for (Provider.Provides) |Contract| {
             if (Contract != Required) continue;
@@ -533,19 +527,19 @@ fn isPlugin(comptime T: type) bool {
 
 fn partCount(comptime Part: type) usize {
     if (isSelection(Part)) return 1;
-    return tupleFields(Part).len;
+    return tupleTypes(Part).len;
 }
 
 fn isSelection(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "plugin");
 }
 
-fn tupleFields(comptime Selections: type) []const std.builtin.Type.StructField {
+fn tupleTypes(comptime Selections: type) []const type {
     const info = @typeInfo(Selections);
 
     if (info != .@"struct" or !info.@"struct".is_tuple)
         @compileError("plugin selections must be a tuple");
-    return info.@"struct".fields;
+    return info.@"struct".field_types;
 }
 pub fn environmental(comptime name: []const u8, comptime T: type, values: anytype) T {
     if (@hasField(@TypeOf(values), name)) {
@@ -560,11 +554,12 @@ pub fn environmental(comptime name: []const u8, comptime T: type, values: anytyp
 
     comptime var match: ?[]const u8 = null;
 
-    inline for (@typeInfo(@TypeOf(values)).@"struct".fields) |field| {
-        if (comptime !compatible(T, field.type)) continue;
+    const info = @typeInfo(@TypeOf(values)).@"struct";
+    inline for (info.field_names, info.field_types) |field_name, Field| {
+        if (comptime !compatible(T, Field)) continue;
 
         if (match != null) @compileError("ambiguous environment dependency: " ++ name);
-        match = field.name;
+        match = field_name;
     }
 
     if (match) |field| return @field(values, field);
@@ -579,13 +574,14 @@ fn compatible(comptime Expected: type, comptime Actual: type) bool {
 pub fn metadata(comptime T: type, source: anytype) T {
     var result: T = undefined;
 
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        if (@hasField(@TypeOf(source), field.name)) {
-            @field(result, field.name) = @field(source, field.name);
-        } else if (@typeInfo(field.type) == .optional) {
-            @field(result, field.name) = null;
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types) |name, Field| {
+        if (@hasField(@TypeOf(source), name)) {
+            @field(result, name) = @field(source, name);
+        } else if (@typeInfo(Field) == .optional) {
+            @field(result, name) = null;
         } else {
-            @compileError("missing required plugin metadata: " ++ field.name);
+            @compileError("missing required plugin metadata: " ++ name);
         }
     }
 

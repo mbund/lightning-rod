@@ -349,3 +349,38 @@ test "attribute synchronization sends configured bases updates changes and skips
     try std.testing.expectEqual(@as(usize, 1), drain(fixture.service));
     try std.testing.expectEqual(@as(f64, 5), try attributes.value(0, "minecraft:mining_efficiency"));
 }
+
+test "equipment watches follow player identities when connection slots are reassigned" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
+    var context = try Test.init(bounded.allocator());
+    defer context.deinit();
+    const fixture = context.fixture;
+    const attributes = try EquipmentAttributes.init(bounded.allocator(), .{}, .{ .players = fixture.players, .items = fixture.items, .enchantments = fixture.definitions.enchantments, .client = fixture.definitions.client });
+    fixture.players.records[1] = fixture.players.records[0];
+    fixture.players.records[1].uuid = 2;
+    fixture.players.records[1].handle = .{ .index = 1, .generation = 1 };
+    fixture.players.rebuildIndexes();
+    bounded.fail_index = bounded.alloc_index;
+    _ = try attributes.value(0, "minecraft:mining_efficiency");
+    _ = try attributes.value(1, "minecraft:mining_efficiency");
+    for (0..3) |_| {
+        std.mem.swap(@TypeOf(fixture.players.records[0]), &fixture.players.records[0], &fixture.players.records[1]);
+        for (fixture.players.records, 0..) |*player, index| {
+            player.handle.?.index = index;
+            player.handle.?.generation += 1;
+            _ = try attributes.value(index, "minecraft:mining_efficiency");
+        }
+        for (fixture.players.records, 0..) |player, index| {
+            try std.testing.expectEqual(index, attributes.owners.get(player.uuid).?);
+            try std.testing.expectEqual(&attributes.states[index].invalid, attributes.observer.owners.get(player.uuid).?.target.dirty);
+        }
+        try std.testing.expectEqual(@as(usize, 2), attributes.owners.count());
+    }
+    for (fixture.players.records) |*player| player.handle = null;
+    fixture.players.rebuildIndexes();
+    try attributes.tick();
+    try std.testing.expectEqual(@as(usize, 0), attributes.owners.count());
+    try std.testing.expectEqual(@as(usize, 0), attributes.observer.owners.count());
+}

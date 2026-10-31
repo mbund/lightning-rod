@@ -70,7 +70,7 @@ pub const Arguments = struct {
             allocator.free(argv);
         }
         for (arguments, argv) |argument, *destination| {
-            destination.* = (try allocator.dupeZ(u8, argument)).ptr;
+            destination.* = (try allocator.dupeSentinel(u8, argument, 0)).ptr;
             copied += 1;
         }
         const keys = process.environ_map.keys();
@@ -112,7 +112,7 @@ pub const Image = struct {
         const file = try std.Io.Dir.cwd().openFile(io, path, .{});
         errdefer file.close(io);
         const stat = try file.stat(io);
-        if (@intFromEnum(stat.permissions) & 0o111 == 0) return error.NotExecutable;
+        if (@backingInt(stat.permissions) & 0o111 == 0) return error.NotExecutable;
 
         var header: [64]u8 = undefined;
         if (try file.readPositionalAll(io, &header, 0) != header.len or !std.mem.eql(u8, header[0..4], "\x7fELF") or header[4] != 2 or header[5] != 1)

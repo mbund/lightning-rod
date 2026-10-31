@@ -13,7 +13,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/" ++ name ++ ".zig"),
                 .target = b.graph.host,
-                .optimize = .Debug,
+                .optimize = .debug,
             }),
         });
         b.installArtifact(tool);

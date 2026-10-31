@@ -2,8 +2,8 @@
 //! Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors.
 //! Distributed under the MIT license in LICENSE.
 //!
-//! Zig 0.16 disables loop vectorization. Remove this override when compiler_rt
-//! supplies an efficient memset. See Ghostty's src/quirks_memset.zig.
+//! Avoids short-fill dispatch overhead during compiler-generated initialization.
+//! Remove this override when compiler_rt matches its short-fill performance.
 
 const std = @import("std");
 const builtin = @import("builtin");

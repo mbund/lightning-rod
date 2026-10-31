@@ -2,7 +2,7 @@
     .fingerprint = 0x64dd5e0eae2aae06,
     .name = .protocol_extension_example,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .e2e_control = .{ .path = "../../control" },
         .protocol_codegen = .{ .path = "../../../protocol_codegen" },

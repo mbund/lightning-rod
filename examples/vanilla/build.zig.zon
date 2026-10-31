@@ -2,7 +2,7 @@
     .fingerprint = 0xc68b43046bd70677,
     .name = .lightning_rod_vanilla,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .sessions = .{ .path = "../../sessions" },
         .minecraft_java = .{ .path = "../../minecraft_java" },
@@ -12,6 +12,9 @@
         .lightning_rod_linux = .{ .path = "../../linux" },
         .lightning_rod_vanilla_1_21_6 = .{ .path = "../../vanilla" },
         .tps = .{ .path = "../plugins/tps" },
+        .storm_stick = .{ .path = "../plugins/storm_stick" },
+        .inventories = .{ .path = "../../inventories" },
+        .game_data = .{ .path = "../../game_data" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

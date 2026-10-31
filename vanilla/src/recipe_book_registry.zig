@@ -43,7 +43,7 @@ pub const RecipeBookRegistry = struct {
             for (ingredients) |*ingredient| ingredient.ingredient.offset += @intCast(crafting.alternatives.len);
             entry.ingredients = ingredients;
         }
-        std.mem.sort(recipes.BookEntry, entries, {}, struct {
+        std.mem.sortUnstable(recipes.BookEntry, entries, {}, struct {
             fn less(_: void, a: recipes.BookEntry, b: recipes.BookEntry) bool {
                 return std.mem.lessThan(u8, a.name, b.name);
             }

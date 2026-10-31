@@ -1,7 +1,7 @@
 const std = @import("std");
 const minecraft = @import("minecraft_model");
 const inventories = @import("inventories");
-const Players = @import("players.zig").Players;
+const Player = @import("player_state.zig").Player;
 const Items = @import("items.zig").Items;
 const item_data = @import("item_data.zig");
 const behavior = @import("behavior.zig");
@@ -9,7 +9,7 @@ const behavior = @import("behavior.zig");
 /// The first non-pass result consumes the action. Passing handlers leave gameplay unchanged.
 pub const Result = enum { pass, applied, denied };
 pub const Context = struct {
-    player: *const Players.Player,
+    player: *const Player,
     item: item_data.View,
     stack: inventories.Stack,
     hand: enum { main, off },
@@ -48,7 +48,7 @@ pub const ItemActions = struct {
         self.count += 1;
     }
 
-    pub fn apply(self: *ItemActions, player: *const Players.Player, hand: i32, hit: ?minecraft.Place) !Result {
+    pub fn apply(self: *ItemActions, player: *const Player, hand: i32, hit: ?minecraft.Place) !Result {
         self.sealed = true;
         if (hand < 0 or hand > 1 or player.stage != .ready or player.health <= 0 or player.gamemode == .spectator) return .denied;
         if (self.count == 0) return .pass;

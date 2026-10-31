@@ -15,6 +15,7 @@ const metrics = @import("metrics");
 const sessions = @import("sessions");
 const RecipeBook = @import("recipe_book.zig").RecipeBook;
 const protocols = @import("protocols");
+const chunks = @import("chunks");
 const packets = @import("minecraft_packets");
 const RecipeBookRegistry = @import("recipe_book_registry.zig").RecipeBookRegistry;
 const ItemContent = @import("item_content.zig").ItemContent;
@@ -76,7 +77,11 @@ test "recipe book packets encode loaded recipes for every selected protocol" {
         .inventory = fixture.menus,
         .inventories = fixture.ownership,
         .items = fixture.items,
-        .chunks = undefined,
+        .chunks = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 1, .demand_sections = 0, .cache_tiles = 1 }, .{
+            .metrics = &registry,
+            .storage = try store.openSpace("recipe_chunks"),
+            .record_workspaces = fixture.players.deps.record_workspaces,
+        }),
         .input = fixture.input,
         .packets = sender,
         .storage = try store.openSpace("recipe_book"),
@@ -139,7 +144,11 @@ test "recipe unlocks settings and revocation persist by name across recipe inser
             .inventory = fixture.menus,
             .inventories = fixture.ownership,
             .items = fixture.items,
-            .chunks = undefined,
+            .chunks = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 1, .demand_sections = 0, .cache_tiles = 1 }, .{
+                .metrics = &registry,
+                .storage = try store.openSpace("recipe_chunks"),
+                .record_workspaces = fixture.players.deps.record_workspaces,
+            }),
             .input = fixture.input,
             .packets = sender,
             .storage = try store.openSpace("recipe_book"),
@@ -297,7 +306,11 @@ test "inventory discovery unlocks recipes without retaining definition leases or
         .inventory = fixture.menus,
         .inventories = fixture.ownership,
         .items = fixture.items,
-        .chunks = undefined,
+        .chunks = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 1, .demand_sections = 0, .cache_tiles = 1 }, .{
+            .metrics = &registry,
+            .storage = try store.openSpace("recipe_chunks"),
+            .record_workspaces = fixture.players.deps.record_workspaces,
+        }),
         .input = fixture.input,
         .packets = sender,
         .storage = try store.openSpace("recipe_book"),
@@ -449,4 +462,155 @@ test "native item defaults reach every client while explicit components take pre
             try std.testing.expectEqual(@as(usize, 0), reader.bufferedLen());
         }
     }
+}
+
+test "block discovery batches samples and invalidates only occupied edits without allocation" {
+    const Source = struct {
+        generated: usize = 0,
+        fn read(self: *@This(), _: std.Io, batch: chunks.Source.Batch) void {
+            for (batch.requests) |*request| {
+                self.generated += 1;
+                request.result = chunks.uniform(game_data.registry.block_air_default_state, request.output);
+            }
+        }
+    };
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/block-discovery", .{directory.sub_path});
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
+    defer store.deinit();
+    var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .capacity = 1024 });
+    defer registry.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
+    const allocator = bounded.allocator();
+    var catalog = try protocols.Default.init(allocator);
+    defer catalog.deinit(allocator);
+    const fixture = try InventoryFixture.init(allocator, &store, &registry, &catalog.values);
+    defer fixture.service.deinit();
+    fixture.players.records[0].protocol = catalog.values[0].number;
+    fixture.players.records[0].position = .{ .x = 0.25, .y = 0, .z = 0.25 };
+    fixture.players.records[1] = fixture.players.records[0];
+    fixture.players.records[1].uuid = 2;
+    fixture.players.records[1].handle = .{ .index = 1, .generation = 1 };
+    fixture.players.rebuildIndexes();
+    const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 1, .demand_sections = 0, .cache_tiles = 1 }, .{
+        .metrics = &registry,
+        .storage = try store.openSpace("recipe_chunks"),
+        .record_workspaces = fixture.players.deps.record_workspaces,
+    });
+    var source: Source = .{};
+    terrain.setSource(chunks.Source.init(&source, Source.read));
+    const content = try RecipeBookRegistry.init(allocator, .{}, fixture.definitions.book.deps);
+    try content.addDefinitions(&.{
+        .{ .name = "test:stone", .criteria = &.{.{ .name = "entered", .trigger = .{ .block = game_data.registry.block_state_to_block[game_data.registry.block_stone_default_state] } }}, .requirements = &.{&.{0}}, .recipes = &.{"minecraft:oak_planks"} },
+        .{ .name = "test:honey", .criteria = &.{.{ .name = "entered", .trigger = .{ .block = game_data.registry.block_state_to_block[game_data.registry.block_honey_block_default_state] } }}, .requirements = &.{&.{0}}, .recipes = &.{"minecraft:iron_pickaxe"} },
+    });
+    const book = try RecipeBook.init(allocator, .{ .packet_bytes = fixture.service.config.page_bytes }, .{
+        .definitions = content,
+        .players = fixture.players,
+        .inventory = fixture.menus,
+        .inventories = fixture.ownership,
+        .items = fixture.items,
+        .chunks = terrain,
+        .input = fixture.input,
+        .packets = try packets.Packets.init(allocator, .{ .sessions = fixture.service }),
+        .storage = try store.openSpace("recipe_book"),
+        .record_workspaces = fixture.players.deps.record_workspaces,
+    });
+    const planks = book.recipeId("minecraft:oak_planks").?;
+    const pickaxe = book.recipeId("minecraft:iron_pickaxe").?;
+    const initial = terrain.cache.metrics.acquired.value();
+    bounded.fail_index = bounded.alloc_index;
+    try book.tick();
+    try std.testing.expectEqual(initial + 1, terrain.cache.metrics.acquired.value());
+    const stable = terrain.cache.metrics.acquired.value();
+    for (0..8) |_| try book.tick();
+    fixture.players.records[0].position.x = 0.75;
+    try book.tick();
+    try std.testing.expectEqual(stable, terrain.cache.metrics.acquired.value());
+    const generated = source.generated;
+    fixture.players.records[0].position.x = 32.25;
+    fixture.players.records[1].position.x = 64.25;
+    try book.tick();
+    try std.testing.expectEqual(generated + 2, source.generated);
+    const separated = terrain.cache.metrics.acquired.value();
+    try book.tick();
+    try std.testing.expectEqual(separated, terrain.cache.metrics.acquired.value());
+    fixture.players.records[0].position.x = 0.25;
+    fixture.players.records[1].position.x = 0.25;
+    try book.tick();
+    const reunited = terrain.cache.metrics.acquired.value();
+    try book.tick();
+    try std.testing.expectEqual(reunited, terrain.cache.metrics.acquired.value());
+    try terrain.setBlock(fixture.players.records[0].world, .{ .x = 1, .y = 0, .z = 0 }, game_data.registry.block_stone_default_state);
+    const unrelated = terrain.cache.metrics.acquired.value();
+    try book.tick();
+    try std.testing.expectEqual(unrelated, terrain.cache.metrics.acquired.value());
+    try std.testing.expect(!try book.knows(0, planks));
+    fixture.players.records[0].position.x = 1.25;
+    try book.tick();
+    try std.testing.expectEqual(unrelated + 1, terrain.cache.metrics.acquired.value());
+    try std.testing.expect(try book.knows(0, planks));
+    try std.testing.expect(!try book.knows(1, planks));
+    fixture.players.records[1].position.x = 128.25;
+    fixture.players.rebuildIndexes();
+    try terrain.setBlock(fixture.players.records[1].world, .{ .x = 0, .y = 0, .z = 0 }, game_data.registry.block_stone_default_state);
+    fixture.players.records[1].position.x = 0.25;
+    fixture.players.rebuildIndexes();
+    const occupied = terrain.cache.metrics.acquired.value();
+    try book.tick();
+    try std.testing.expectEqual(occupied + 1, terrain.cache.metrics.acquired.value());
+    try std.testing.expect(try book.knows(1, planks));
+    try terrain.setBlock(111, .{ .x = 1, .y = 0, .z = 0 }, game_data.registry.block_honey_block_default_state);
+    const other_world = terrain.cache.metrics.acquired.value();
+    try book.tick();
+    try std.testing.expectEqual(other_world, terrain.cache.metrics.acquired.value());
+    try std.testing.expect(!try book.knows(0, pickaxe));
+    fixture.players.records[0].world = 111;
+    try book.tick();
+    try std.testing.expectEqual(other_world + 1, terrain.cache.metrics.acquired.value());
+    try std.testing.expect(try book.knows(0, pickaxe));
+    fixture.players.records[1].position.x = -0.5;
+    try book.tick();
+    try std.testing.expect(!try book.knows(1, pickaxe));
+    fixture.players.records[1].handle = null;
+    fixture.players.rebuildIndexes();
+    try book.tick();
+    try std.testing.expectEqual(@as(usize, 0), book.block_watches.count());
+    fixture.players.records[1].handle = .{ .index = 1, .generation = 2 };
+    fixture.players.rebuildIndexes();
+    const reconnect = terrain.cache.metrics.acquired.value();
+    try book.tick();
+    try std.testing.expectEqual(reconnect + 1, terrain.cache.metrics.acquired.value());
+    try terrain.setBlock(fixture.players.records[1].world, .{ .x = -1, .y = 0, .z = 0 }, game_data.registry.block_honey_block_default_state);
+    const negative = terrain.cache.metrics.acquired.value();
+    try book.tick();
+    try std.testing.expectEqual(negative + 1, terrain.cache.metrics.acquired.value());
+    try std.testing.expect(try book.knows(1, pickaxe));
+    try std.testing.expectEqual(@as(usize, 0), book.block_watches.count());
+    try std.testing.expectEqual(@as(usize, 0), terrain.borrowed_count);
+    try book.tick();
+    try std.testing.expectEqual(negative + 1, terrain.cache.metrics.acquired.value());
+    fixture.players.records[1].uuid = 3;
+    fixture.players.rebuildIndexes();
+    try book.tick();
+    try std.testing.expect(!try book.knows(1, planks));
+    try std.testing.expect(try book.knows(1, pickaxe));
+    try std.testing.expectEqual(@as(usize, 1), book.block_watches.count());
+    fixture.players.records[1].uuid = 2;
+    fixture.players.rebuildIndexes();
+    const restored = terrain.cache.metrics.acquired.value();
+    try book.tick();
+    try std.testing.expect(try book.knows(1, planks));
+    try std.testing.expect(try book.knows(1, pickaxe));
+    try std.testing.expectEqual(restored, terrain.cache.metrics.acquired.value());
+    try std.testing.expectEqual(@as(usize, 0), book.block_watches.count());
+    for (fixture.players.records) |*player| player.handle = null;
+    fixture.players.rebuildIndexes();
+    try book.tick();
+    try std.testing.expectEqual(@as(usize, 0), book.block_watches.count());
+    try std.testing.expectEqual(bounded.fail_index, bounded.alloc_index);
 }

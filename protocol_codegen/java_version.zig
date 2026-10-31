@@ -50,12 +50,12 @@ pub const JavaVersion = struct {
         });
         b.modules.put(b.allocator, "wire", schema) catch @panic("out of memory");
         module.addAnonymousImport("registry_snapshot", .{ .root_source_file = snapshot });
-        const host_support = b.dependency("encoding", .{ .target = b.graph.host, .optimize = .Debug }).module("encoding");
-        const host_sessions = java.builder.dependency("sessions", .{ .target = b.graph.host, .optimize = .Debug }).module("sessions");
+        const host_support = b.dependency("encoding", .{ .target = b.graph.host, .optimize = .debug }).module("encoding");
+        const host_sessions = java.builder.dependency("sessions", .{ .target = b.graph.host, .optimize = .debug }).module("sessions");
         const host_wire = b.createModule(.{
             .root_source_file = schema.root_source_file,
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .imports = &.{.{ .name = "protocol_support", .module = host_support }},
         });
         const prepare = b.addExecutable(.{
@@ -63,7 +63,7 @@ pub const JavaVersion = struct {
             .root_module = b.createModule(.{
                 .root_source_file = java.path("src/prepare_registries.zig"),
                 .target = b.graph.host,
-                .optimize = .Debug,
+                .optimize = .debug,
                 .imports = &.{
                     .{ .name = "wire", .module = host_wire },
                     .{ .name = "support", .module = host_support },

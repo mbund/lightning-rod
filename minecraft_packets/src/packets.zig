@@ -16,8 +16,8 @@ fn Writer(comptime callbacks: anytype) type {
             const candidates = comptime sessions.packet_api.candidates(callbacks);
             const index = comptime sessions.packet_api.select(Version, callbacks);
             const handler = candidates[index];
-            const parameters = @typeInfo(@TypeOf(handler)).@"fn".params;
-            if (comptime parameters.len > 1 and parameters[1].type == Registry) {
+            const parameters = @typeInfo(@TypeOf(handler)).@"fn".param_types;
+            if (comptime parameters.len > 1 and parameters[1] == Registry) {
                 const selected: Registry = .{
                     .entities = Version.Registry.canonical_entity_to_wire,
                     .items = Version.Registry.canonical_item_to_wire,
@@ -136,7 +136,7 @@ pub const Packets = struct {
         const count = callbacks.len + offset * 2;
         comptime {
             std.debug.assert(callbacks.len > 0 and count <= sessions.Service.batch_max);
-            std.debug.assert(@typeInfo(@TypeOf(arguments)).@"struct".fields.len == callbacks.len);
+            std.debug.assert(@typeInfo(@TypeOf(arguments)).@"struct".field_names.len == callbacks.len);
         }
         std.debug.assert(maximum_bytes.len == callbacks.len);
         var capacities: [count]usize = undefined;

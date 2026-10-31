@@ -164,7 +164,8 @@ pub fn configureProtocols(deps: Dependencies, comptime Catalog: type, allocator:
 
 pub fn from(comptime Simulation: type, simulation: *Simulation) Dependencies {
     var result: Dependencies = undefined;
-    inline for (@typeInfo(Dependencies).@"struct".fields) |field| @field(result, field.name) = simulation.get(@typeInfo(field.type).pointer.child);
+    const info = @typeInfo(Dependencies).@"struct";
+    inline for (info.field_names, info.field_types) |name, Field| @field(result, name) = simulation.get(@typeInfo(Field).pointer.child);
     return result;
 }
 
@@ -187,7 +188,7 @@ pub fn prepare(allocator: std.mem.Allocator) !Dependencies {
     };
 }
 
-pub const Selections = lightning_rod.plugin.Compose(std.meta.Tuple(&.{
+pub const Selections = lightning_rod.plugin.Compose(@Tuple(&.{
     lightning_rod.plugin.Selection(ItemRegistry),
     lightning_rod.plugin.Selection(Blocks),
     lightning_rod.plugin.Selection(Dimensions),

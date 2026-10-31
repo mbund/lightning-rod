@@ -18,22 +18,23 @@ const WorldProvider = struct {
     };
     pub const Provides = .{*vanilla.VanillaWorlds};
 
-    worlds: vanilla.VanillaWorlds,
+    worlds: *vanilla.VanillaWorlds,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*WorldProvider {
         const self = try allocator.create(WorldProvider);
+        self.* = .{ .worlds = try vanilla.VanillaWorlds.init(allocator, .{
+            .registry_identity = deps.registry_identity,
+            .worlds = deps.worlds,
+            .dimensions = deps.dimensions,
+        }) };
         var dimension = try deps.dimensions.dimension("minecraft:overworld");
         dimension.name = "example:bright";
-        self.* = .{ .worlds = .{
-            .overworld = try deps.worlds.create(.{ .name = "example:world", .dimension = dimension }),
-            .nether = try deps.worlds.create(.{ .name = "minecraft:the_nether", .dimension = try deps.dimensions.dimension("minecraft:the_nether") }),
-            .end = try deps.worlds.create(.{ .name = "minecraft:the_end", .dimension = try deps.dimensions.dimension("minecraft:the_end") }),
-        } };
+        self.worlds.overworld = try deps.worlds.create(.{ .name = "example:world", .dimension = dimension });
         return self;
     }
 
     pub fn provide(self: *WorldProvider, comptime Contract: type) Contract {
-        return &self.worlds;
+        return self.worlds;
     }
 };
 

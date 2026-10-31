@@ -2,7 +2,7 @@
     .fingerprint = 0x6b9b8f7df655db67,
     .name = .lightning_rod_protocol_1_21_9,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .protocol_codegen = .{ .path = "../../protocol_codegen" },
         .game_data = .{ .path = "../../game_data" },

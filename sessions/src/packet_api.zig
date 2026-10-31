@@ -5,14 +5,14 @@ pub fn candidates(comptime callbacks: anytype) Candidates(@TypeOf(callbacks)) {
 }
 
 fn Candidates(comptime T: type) type {
-    return if (@typeInfo(T) == .@"struct") T else std.meta.Tuple(&.{T});
+    return if (@typeInfo(T) == .@"struct") T else @Tuple(&.{T});
 }
 
 pub fn Cursor(comptime callback: anytype) type {
     const function = @typeInfo(@TypeOf(callback)).@"fn";
     var found: ?type = null;
-    for (function.params) |parameter| {
-        const T = parameter.type orelse continue;
+    for (function.param_types) |parameter| {
+        const T = parameter orelse continue;
         if (@typeInfo(T) != .@"struct" or !@hasDecl(T, "layout_fingerprint")) continue;
         if (found != null) @compileError("packet callback must take exactly one initial packet cursor");
         found = T;
@@ -65,7 +65,7 @@ pub fn encode(comptime Version: type, comptime callbacks: anytype, buffer: []u8,
     comptime {
         if (!std.mem.eql(u8, Source.cursor_mode, "write") or !std.mem.eql(u8, Source.direction, "toClient"))
             @compileError("outbound packet callback must take a clientbound Writer");
-        if (@typeInfo(@TypeOf(handler)).@"fn".params[0].type != Source)
+        if (@typeInfo(@TypeOf(handler)).@"fn".param_types[0] != Source)
             @compileError("outbound packet callback must take its Writer as the first argument");
     }
     const Packets = @field(@field(Version.Protocol, Source.phase), Source.direction);

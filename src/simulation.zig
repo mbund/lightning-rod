@@ -71,13 +71,13 @@ pub fn Simulation(comptime Selections: type) type {
             if (configuration.memory_bytes < @sizeOf(Self) or owned_scratch_bytes > configuration.memory_bytes - @sizeOf(Self)) return error.OutOfMemory;
             const own_instruments = comptime blk: {
                 var total: usize = 0;
-                for (std.meta.fields(Self)) |field| if (field.type == metrics.Timer or field.type == metrics.Counter or field.type == metrics.Gauge) {
+                for (@typeInfo(Self).@"struct".field_types) |field| if (field == metrics.Timer or field == metrics.Counter or field == metrics.Gauge) {
                     total += 1;
                 };
                 break :blk total;
             };
             var metrics_configuration = configuration.metrics;
-            metrics_configuration.capacity = try std.math.add(usize, configuration.metrics.capacity, own_instruments + count * std.meta.fields(runtime.Instruments).len);
+            metrics_configuration.capacity = try std.math.add(usize, configuration.metrics.capacity, own_instruments + count * @typeInfo(runtime.Instruments).@"struct".field_names.len);
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
             const owned_scratch = if (configuration.scratch == null) try allocator.alignedAlloc(u8, .@"64", owned_scratch_bytes) else null;

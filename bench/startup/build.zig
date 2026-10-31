@@ -16,6 +16,6 @@ pub fn build(b: *std.Build) void {
     });
     const run = b.addRunArtifact(executable);
     run.addFileArg(server.namedLazyPath("server"));
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("bench", "Measure server startup and graceful shutdown against an existing world").dependOn(&run.step);
 }

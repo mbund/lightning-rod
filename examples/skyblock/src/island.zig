@@ -20,7 +20,7 @@ const operators = blk: {
 };
 
 const defaults = lightning_rod.plugin.remove(lightning_rod.plugin.replace(lightning_rod.plugin.remove(lightning_rod.plugin.remove(vanilla.plugins(), vanilla.ChatInput), vanilla.JoinLeaveMessages), .{lightning_rod.plugin.configured(Terrain, .{ .kind = .island })}), vanilla.Vanilla);
-const Selections = lightning_rod.plugin.Compose(std.meta.Tuple(&.{ @TypeOf(defaults), lightning_rod.plugin.Selection(IslandCommands), lightning_rod.plugin.Selection(global_chat.GlobalChat) }));
+const Selections = lightning_rod.plugin.Compose(@Tuple(&.{ @TypeOf(defaults), lightning_rod.plugin.Selection(IslandCommands), lightning_rod.plugin.Selection(global_chat.GlobalChat) }));
 const Simulation = lightning_rod.Simulation(Selections);
 
 fn selections(content: vanilla.definition_provider.Dependencies, config: IslandCommands.Configuration, chat: *global_chat.Channel, resources: *records.Resources, wakeup: *std.Io.Event, request: *reload.Request) !Selections {
@@ -33,7 +33,7 @@ fn selections(content: vanilla.definition_provider.Dependencies, config: IslandC
             lightning_rod.plugin.configured(Terrain, .{ .kind = if (config.index == 0) .hub else .island }),
             lightning_rod.plugin.configured(vanilla.Reload, .{ .request = request }),
             lightning_rod.plugin.configured(vanilla.Chunks, .{ .wakeup = wakeup, .cache_sections = column_sections * 2, .demand_sections = column_sections, .cache_tiles = 4 }),
-            lightning_rod.plugin.configured(vanilla.Inventories, .{ .cache_items = 4 }),
+            lightning_rod.plugin.configured(vanilla.Inventories, .{ .cache_items = 6 }),
             lightning_rod.plugin.configured(vanilla.BlockSynchronization, .{ .delta_sections = 32, .queued_sections = 32 }),
             lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = if (config.index == 0) catalog.maximum_players else catalog.island_connections, .render_distance = 4, .world_border = 512 }),
         }),
@@ -96,7 +96,7 @@ pub const Island = struct {
                     .routing = self.routing,
                 });
                 const definitions = vanilla.definition_provider.from(@TypeOf(simulation.*), simulation);
-                inline for (@typeInfo(vanilla.definition_provider.Dependencies).@"struct".fields) |field| try @field(definitions, field.name).registry.validate();
+                inline for (@typeInfo(vanilla.definition_provider.Dependencies).@"struct".field_names) |field| try @field(definitions, field).registry.validate();
                 self.terrain = .{ .chunks = simulation.get(vanilla.Chunks), .streaming = simulation.get(vanilla.Streaming), .blocks = simulation.get(vanilla.BlockSynchronization), .io = self.io };
             },
             .retire => {

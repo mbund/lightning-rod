@@ -56,8 +56,16 @@ pub const Test = struct {
             const prefix = try std.fs.path.join(allocator, &.{ cache, protocols.latest.minecraft_version });
             const log = try cwd.createFile(init.io, try std.fs.path.join(allocator, &.{ artifacts, "previous-build.log" }), .{});
             defer log.close(init.io);
-            const zig = init.environ_map.get("LIGHTNING_ROD_E2E_ZIG") orelse "zig";
-            const argv: []const []const u8 = &.{ zig, "build", try std.fmt.allocPrint(allocator, "-Doptimize={s}", .{@tagName(builtin.mode)}), try std.fmt.allocPrint(allocator, "-Dreleases={s}", .{selected_releases}), "--prefix", prefix };
+            const toolchain = try std.fs.path.join(allocator, &.{ cache, "zig" });
+            _ = try command(init, &.{ "bash", try std.fs.path.join(allocator, &.{ root, ".github/scripts/install-zig.sh" }), toolchain }, checkout);
+            const zig = try std.fs.path.join(allocator, &.{ toolchain, "zig" });
+            const optimization = switch (builtin.mode) {
+                .debug => "--release=off",
+                .safe => "--release=safe",
+                .fast => "--release=fast",
+                .small => "--release=small",
+            };
+            const argv: []const []const u8 = &.{ zig, "build", optimization, try std.fmt.allocPrint(allocator, "-Dreleases={s}", .{selected_releases}), "--prefix", prefix };
             const build_directory = try std.fs.path.join(allocator, &.{ checkout, "examples/vanilla" });
             const compiler = try std.process.spawn(init.io, .{
                 .argv = argv,

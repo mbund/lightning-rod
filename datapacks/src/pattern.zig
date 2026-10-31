@@ -169,10 +169,10 @@ const Parser = struct {
         }
         if (self.take('^')) return self.create(.beginning);
         if (self.take('$')) return self.create(.end);
-        if (self.take('.')) return self.create(.{ .character = Mask.initFull() });
+        if (self.take('.')) return self.create(.{ .character = Mask.full });
         if (self.take('[')) {
             const inverted = self.take('^');
-            var mask = Mask.initEmpty();
+            var mask = Mask.empty;
             var count_value: usize = 0;
             while (self.cursor < self.expression.len and self.expression[self.cursor] != ']') {
                 const first = try self.character();
@@ -198,7 +198,7 @@ const Parser = struct {
         if (self.cursor == self.expression.len) return error.InvalidPattern;
         var byte = self.expression[self.cursor];
         self.cursor += 1;
-        var mask = Mask.initEmpty();
+        var mask = Mask.empty;
         if (byte == '\\') {
             if (self.cursor == self.expression.len) return error.InvalidPattern;
             byte = self.expression[self.cursor];

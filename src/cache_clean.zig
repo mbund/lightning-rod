@@ -1,14 +1,23 @@
 const std = @import("std");
 
 pub fn add(b: *std.Build) void {
-    b.step("clean", "Remove generated Zig caches and package directories").makeFn = make;
+    const executable = b.addExecutable(.{
+        .name = "clean-cache",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/cache_clean.zig"), .target = b.graph.host, .optimize = .debug }),
+    });
+    const run = b.addRunArtifact(executable);
+    run.addDirectoryArg(b.path("."));
+    run.has_side_effects = true;
+    b.step("clean", "Remove generated Zig caches and package directories").dependOn(&run.step);
 }
 
-fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) !void {
-    const b = step.owner;
-    const directory = try b.build_root.handle.openDir(b.graph.io, ".", .{ .iterate = true });
-    defer directory.close(b.graph.io);
-    try clean(b.graph.io, directory);
+pub fn main(init: std.process.Init) !void {
+    var args = init.minimal.args.iterate();
+    _ = args.next();
+    const root = args.next() orelse return error.MissingRoot;
+    const directory = try std.Io.Dir.cwd().openDir(init.io, root, .{ .iterate = true });
+    defer directory.close(init.io);
+    try clean(init.io, directory);
 }
 
 fn clean(io: std.Io, directory: std.Io.Dir) anyerror!void {

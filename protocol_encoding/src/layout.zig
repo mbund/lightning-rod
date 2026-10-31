@@ -16,21 +16,24 @@ pub const Tag = struct { key: u64, value: i128 };
 
 /// Stable across compiler versions. Registration rejects duplicate identifiers.
 pub fn nameKey(comptime name: []const u8) u64 {
-    return comptime identifier: {
-        @setEvalBranchQuota(10_000);
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(name, &digest, .{});
-        break :identifier std.mem.readInt(u64, digest[0..8], .little);
-    };
+    // The declaration caches the digest for every use of this name.
+    return struct {
+        const value = identifier: {
+            @setEvalBranchQuota(10_000);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(name, &digest, .{});
+            break :identifier std.mem.readInt(u64, digest[0..8], .little);
+        };
+    }.value;
 }
 
-pub fn candidates(comptime callbacks: anytype) if (@typeInfo(@TypeOf(callbacks)) == .@"struct") @TypeOf(callbacks) else std.meta.Tuple(&.{@TypeOf(callbacks)}) {
+pub fn candidates(comptime callbacks: anytype) if (@typeInfo(@TypeOf(callbacks)) == .@"struct") @TypeOf(callbacks) else @Tuple(&.{@TypeOf(callbacks)}) {
     return if (@typeInfo(@TypeOf(callbacks)) == .@"struct") callbacks else .{callbacks};
 }
 
 pub fn callbackCursor(comptime callback: anytype) type {
     const function = @typeInfo(@TypeOf(callback)).@"fn";
-    return function.params[0].type orelse @compileError("nested writer must take a concrete cursor as its first argument");
+    return function.param_types[0] orelse @compileError("nested writer must take a concrete cursor as its first argument");
 }
 
 pub fn sameCase(a: ?Case, b: ?Case) bool {
@@ -64,7 +67,7 @@ fn check(comptime Source: type, comptime actual: []const Node, comptime root: u3
             if (std.mem.eql(u8, &Source.layout_fingerprint, &fingerprint)) return;
     }
     var pending: []const Pair = &.{.{ .source = Source.schema_id, .target = root }};
-    var seen = [_]?usize{null} ** Source.schema_nodes.len;
+    var seen: [Source.schema_nodes.len]?usize = @splat(null);
     seen[Source.schema_id] = 0;
     var index: usize = 0;
     while (index < pending.len) : (index += 1) {
@@ -117,7 +120,7 @@ fn check(comptime Source: type, comptime actual: []const Node, comptime root: u3
 pub fn samePlainEncoding(comptime a: []const Node, comptime ai: u32, comptime b: []const Node, comptime bi: u32) bool {
     if (a[ai].fingerprint == null or b[bi].fingerprint == null or
         !std.mem.eql(u8, &a[ai].fingerprint.?, &b[bi].fingerprint.?)) return false;
-    var seen = [_]bool{false} ** a.len;
+    var seen: [a.len]bool = @splat(false);
     var pending: [a.len]u32 = undefined;
     pending[0] = ai;
     seen[ai] = true;
@@ -139,8 +142,8 @@ pub fn samePlainEncoding(comptime a: []const Node, comptime ai: u32, comptime b:
 pub fn destinationWriter(comptime Wire: type, comptime Source: type) ?type {
     @setEvalBranchQuota(100_000);
     if (Wire.namedWriter(Source.wire_type_name)) |Writer| return Writer;
-    for (@typeInfo(Wire.NamedWriters).@"struct".decls) |decl| {
-        const Writer = @field(Wire.NamedWriters, decl.name);
+    for (@typeInfo(Wire.NamedWriters).@"struct".decl_names) |decl| {
+        const Writer = @field(Wire.NamedWriters, decl);
         if (samePlainEncoding(Source.schema_nodes, Source.schema_id, Writer.schema_nodes, Writer.schema_id)) return Writer;
     }
     return null;

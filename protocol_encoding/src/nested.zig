@@ -9,16 +9,16 @@ pub fn Encoder(comptime schemas: anytype, comptime callbacks: anytype) type {
     if (handlers.len == 0) @compileError("nested encoding requires at least one handler");
     const First = layout.callbackCursor(handlers[0]);
     const name = First.wire_type_name;
-    const Parameters = @typeInfo(@TypeOf(handlers[0])).@"fn".params;
+    const Parameters = @typeInfo(@TypeOf(handlers[0])).@"fn".param_types;
     if (Parameters.len != 2) @compileError("nested writers take a concrete cursor and one concrete argument type");
-    const Arguments = Parameters[1].type orelse @compileError("nested arguments must have a concrete type");
+    const Arguments = Parameters[1] orelse @compileError("nested arguments must have a concrete type");
     const Output = cursor.Destination(name);
     const selected = comptime selection: {
         var indices: [schemas.len]?usize = @splat(null);
         for (handlers, 0..) |handler, index| {
             const Source = layout.callbackCursor(handler);
             const Function = @typeInfo(@TypeOf(handler)).@"fn";
-            if (Function.params.len != 2 or Function.params[1].type != Arguments)
+            if (Function.param_types.len != 2 or Function.param_types[1] != Arguments)
                 @compileError("nested writers must use the same concrete arguments");
             if (!std.mem.eql(u8, Source.wire_type_name, name) or !std.mem.eql(u8, Source.cursor_mode, "write") or
                 Source.requires_parent_context or !layout.sameCase(Source.restricted_case, First.restricted_case))

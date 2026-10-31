@@ -4,7 +4,7 @@ const crafting = @import("crafting.zig");
 const inventories = @import("inventories");
 const minecraft = @import("minecraft_model");
 const game_data = @import("game_data");
-const Players = @import("players.zig").Players;
+const Player = @import("player_state.zig").Player;
 
 pub const Plan = struct {
     hardness: f32 = -1,
@@ -16,7 +16,7 @@ pub const Plan = struct {
     replacement: u16 = 0,
 };
 pub const Request = struct {
-    actor: ?*const Players.Player = null,
+    actor: ?*const Player = null,
     world: u32,
     position: minecraft.BlockPosition,
     state: u16,
@@ -25,7 +25,7 @@ pub const Request = struct {
 };
 pub const Context = struct {
     player: ?u128,
-    actor: ?*const Players.Player,
+    actor: ?*const Player,
     world: u32,
     position: minecraft.BlockPosition,
     state: u16,

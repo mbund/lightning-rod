@@ -201,7 +201,7 @@ pub fn plugins() @TypeOf(defaults) {
 }
 
 pub fn SessionPlugins(comptime Catalog: type) type {
-    return std.meta.Tuple(&.{
+    return @Tuple(&.{
         lightning_rod.plugin.Selection(LoginStart),
         lightning_rod.plugin.Selection(LoginEncryption),
         lightning_rod.plugin.Selection(Disconnect),

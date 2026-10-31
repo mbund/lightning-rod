@@ -56,12 +56,13 @@ pub const Exporter = struct {
         }
 
         fn completeOutput(self: *State) !bool {
-            errdefer |err| {
-                self.failure = err;
-                self.failed.store(true, .release);
-            }
             if (self.output) |*output| if (output.active) {
-                if (!try output.poll()) return false;
+                const complete = output.poll() catch |err| {
+                    self.failure = err;
+                    self.failed.store(true, .release);
+                    return err;
+                };
+                if (!complete) return false;
                 if (self.checking_stop) {
                     self.checking_stop = false;
                     if (self.stop_requested) {
@@ -74,12 +75,12 @@ pub const Exporter = struct {
         }
 
         fn waitOutput(self: *State) !void {
-            errdefer |err| {
-                self.failure = err;
-                self.failed.store(true, .release);
-            }
             if (self.output) |*output| if (output.active) {
-                try output.wait(null);
+                output.wait(null) catch |err| {
+                    self.failure = err;
+                    self.failed.store(true, .release);
+                    return err;
+                };
                 if (self.checking_stop and self.stop_requested) self.stream.freeze.store(true, .release);
                 self.checking_stop = false;
             };

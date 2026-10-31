@@ -248,10 +248,10 @@ fn requireValue(comptime Value: type) void {
         .void, .bool, .int, .float, .@"enum" => {},
         .array => |array| requireValue(array.child),
         .optional => |optional| requireValue(optional.child),
-        .@"struct" => |structure| for (structure.fields) |field| requireValue(field.type),
+        .@"struct" => |structure| for (structure.field_types) |Field| requireValue(Field),
         .@"union" => |value| {
             if (value.tag_type == null) @compileError("recipe completion unions must be tagged");
-            for (value.fields) |field| requireValue(field.type);
+            for (value.field_types) |Field| requireValue(Field);
         },
         else => @compileError("recipe completion values cannot borrow pointers or slices"),
     }

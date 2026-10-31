@@ -19,7 +19,7 @@ pub fn RegistryCatalog(comptime implementations: anytype) type {
                     if (Implementation.protocol_number == implementations[previous].protocol_number) @compileError("duplicate protocol number");
                 types[index] = Implementation.RegistryProvider.PreparedRegistries;
             }
-            break :block std.meta.Tuple(&types);
+            break :block @Tuple(&types);
         };
 
         prepared: Prepared,

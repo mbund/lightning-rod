@@ -20,13 +20,13 @@
             zls
             gradle
             jdk25
-            (jdt-language-server.override { jdk = pkgs.jdk25; })
+            (jdt-language-server.override { jdk25 = pkgs.jdk25; })
             jq
             curl
             xorg-server
             mesa
             libglvnd
-          ];
+          ] ++ lib.optionals stdenv.isLinux [ util-linux ];
 
           shellHook = ''
             # VS Code's Java extension and Gradle must use the same JDK as JDT LS.

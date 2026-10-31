@@ -13,6 +13,7 @@ const inventories = @import("inventories");
 const sessions = @import("sessions");
 const minecraft = @import("minecraft_model");
 const item_data = @import("item_data.zig");
+const ItemProperties = @import("item_properties.zig").ItemProperties;
 const item_packets = @import("item_packets.zig");
 const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
 const Items = @import("items.zig").Items;
@@ -123,6 +124,11 @@ pub const CreativeInventory = struct {
                 }
                 next[target] = stack;
                 accepted |= @as(u64, 1) << @intCast(target);
+                if (stack) |value| {
+                    const prepared = try self.deps.items.acquire(value);
+                    defer prepared.release();
+                    if (try self.deps.items.components.requiresCorrection(prepared.view, player.uuid)) accepted &= ~(@as(u64, 1) << @intCast(target));
+                }
             },
             .dig => |dig| dig_action: {
                 if (player.health == 0) break :dig_action;
@@ -145,8 +151,7 @@ pub const CreativeInventory = struct {
             state.dirty = PlayerInventory.all_slots;
             return;
         }
-        // A computed presentation differs from the client's accepted proposal.
-        if (!self.deps.items.components.has_presentation) state.dirty &= ~accepted;
+        state.dirty &= ~accepted;
     }
 
     pub fn tick(self: *CreativeInventory) !void {
@@ -331,4 +336,40 @@ test "survival cursor placements drops and close preserve ownership across resta
             try std.testing.expectEqual(@as(u32, 17), total);
         }
     }
+}
+
+test "creative proposals only echo computed corrections" {
+    const io = std.testing.io;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/creative", .{directory.sub_path});
+    var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .enabled = false });
+    defer registry.deinit();
+    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    const fixture = try InventoryFixture.init(arena.allocator(), &store, &registry, &selected);
+    defer fixture.service.deinit();
+    _ = try ItemProperties.init(arena.allocator(), .{ .items = fixture.items });
+    const diamond = try fixture.items.kind(.{ .item = try fixture.items.define("minecraft:diamond"), .count = 1 });
+    var slots: [47]inventories.Slot = undefined;
+    var contents: [47]inventories.Contents = undefined;
+    try fixture.menu.load(0, &slots, &contents);
+    const mask = @as(u64, 1) << 9;
+    for ([_]?item_packets.Incoming{
+        .{ .count = 13, .kind = diamond, .components = &.{}, .encoded_bytes = 10 },
+        null,
+        .{ .count = 1, .kind = diamond, .components = &.{.{ .key = item_data.key(.max_stack_size), .value = &.{3} }}, .encoded_bytes = 12 },
+    }) |proposal| {
+        fixture.menu.states[0].dirty = 0;
+        try fixture.creative.apply(0, .{ .creative_slot = .{ .slot = 9, .item = proposal } });
+        try std.testing.expectEqual(@as(u64, 0), fixture.menu.states[0].dirty & mask);
+    }
+    try fixture.definitions.items.addDefinitions(.{ .items = &.{.{ .name = "minecraft:diamond", .stack_size = 32 }} });
+    fixture.menu.states[0].dirty = 0;
+    try fixture.creative.apply(0, .{ .creative_slot = .{ .slot = 9, .item = .{ .count = 1, .kind = diamond, .components = &.{}, .encoded_bytes = 10 } } });
+    try std.testing.expectEqual(mask, fixture.menu.states[0].dirty & mask);
 }

@@ -254,7 +254,7 @@ pub const ItemPhysics = struct {
         }
         // Collision boxes and the expanded orb bounds share the registry's 1/64 grid.
         // Each free cell is convex. Its closest point is sufficient for the global minimum.
-        var occupied: std.StaticBitSet(33 * 33 * 33) = .initEmpty();
+        var occupied: std.StaticBitSet(33 * 33 * 33) = .empty;
         var y: i32 = @intFromFloat(@floor(minimum[1] - 0.25) - 1);
         while (@as(f64, @floatFromInt(y)) <= @floor(maximum[1] + 0.25) + 1) : (y += 1) {
             var z: i32 = @intFromFloat(@floor(minimum[2] - 0.25) - 1);

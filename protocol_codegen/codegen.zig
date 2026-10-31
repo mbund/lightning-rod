@@ -5,7 +5,8 @@ pub const Json = struct {
     document: std.json.Value,
 
     pub fn read(b: *std.Build, source: std.Build.LazyPath) Json {
-        const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, source.getPath(b), b.allocator, .unlimited) catch @panic("cannot read JSON");
+        b.dependOnFileContents(source);
+        const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, (sourcePath(b, source).toString(b.allocator) catch @panic("OOM")), b.allocator, .unlimited) catch @panic("cannot read JSON");
         return .{
             .builder = b,
             .document = std.json.parseFromSliceLeaky(std.json.Value, b.allocator, bytes, .{}) catch @panic("invalid JSON"),
@@ -21,7 +22,7 @@ pub const Json = struct {
 pub const Codegen = struct {
     builder: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     support: *std.Build.Module,
     packets: *std.Build.Step.Compile,
     registries: *std.Build.Step.Compile,
@@ -29,7 +30,7 @@ pub const Codegen = struct {
     pub const Configuration = struct {
         tools: *std.Build.Dependency,
         target: std.Build.ResolvedTarget,
-        optimize: std.builtin.OptimizeMode,
+        optimize: std.lang.Optimize,
         support: *std.Build.Module,
     };
 
@@ -56,7 +57,9 @@ pub const Codegen = struct {
         }
 
         pub fn find(b: *std.Build, root: std.Build.LazyPath, version: []const u8) ?Data {
-            const filename = root.path(b, "data/dataPaths.json").getPath(b);
+            const input = root.path(b, "data/dataPaths.json");
+            b.dependOnFileContents(input);
+            const filename = sourcePath(b, input).toString(b.allocator) catch @panic("OOM");
             const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, filename, b.allocator, .limited(1024 * 1024)) catch @panic("cannot read Minecraft data paths");
             const document = std.json.parseFromSliceLeaky(std.json.Value, b.allocator, bytes, .{}) catch @panic("invalid Minecraft data paths");
             const paths = document.object.get("pc").?.object.get(version) orelse return null;
@@ -111,3 +114,13 @@ pub const Codegen = struct {
         });
     }
 };
+
+pub fn sourcePath(b: *std.Build, source: std.Build.LazyPath) std.Build.Cache.Path {
+    return switch (source) {
+        .src_path => |path| path.owner.root.join(b.allocator, path.sub_path) catch @panic("OOM"),
+        .dependency => |path| path.dependency.builder.root.join(b.allocator, path.sub_path) catch @panic("OOM"),
+        .cwd_relative => |path| .initCwd(path),
+        .relative => |path| if (path.base == .cwd) .initCwd(path.sub_path) else @panic("Build configuration requires a source path"),
+        .generated => @panic("Generated files are unavailable during build configuration"),
+    };
+}

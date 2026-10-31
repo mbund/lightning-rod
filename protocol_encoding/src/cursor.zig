@@ -80,8 +80,8 @@ pub fn State(comptime mode: Mode) type {
 pub fn context(comptime Target: type, source: anytype) Target {
     var result: Target = .{};
 
-    inline for (@typeInfo(Target).@"struct".fields) |field| {
-        if (@hasField(@TypeOf(source), field.name)) @field(result, field.name) = @field(source, field.name);
+    inline for (@typeInfo(Target).@"struct".field_names) |field| {
+        if (@hasField(@TypeOf(source), field)) @field(result, field) = @field(source, field);
     }
 
     return result;

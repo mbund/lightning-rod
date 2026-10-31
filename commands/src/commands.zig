@@ -209,13 +209,14 @@ pub fn Argument(comptime Owner: type, comptime T: type) type {
 }
 
 pub fn Arguments(comptime Owner: type, comptime Args: type) type {
-    const fields = std.meta.fields(Args);
+    const info = @typeInfo(Args).@"struct";
+    const fields = info.field_types;
     comptime var types: [fields.len]type = undefined;
 
-    inline for (fields, 0..) |field, index|
-        types[index] = Argument(Owner, Value(field.type));
+    inline for (fields, 0..) |Field, index|
+        types[index] = Argument(Owner, Value(Field));
 
-    return @Struct(.auto, null, std.meta.fieldNames(Args), &types, &@splat(.{}));
+    return @Struct(.auto, null, @typeInfo(Args).@"struct".field_names, &types, &@splat(.{}));
 }
 
 pub fn Leaf(comptime Owner: type, comptime Args: type) type {
@@ -229,7 +230,8 @@ pub fn Leaf(comptime Owner: type, comptime Args: type) type {
 }
 
 pub fn leaf(comptime Owner: type, comptime Args: type, comptime definition: Leaf(Owner, Args)) Definition {
-    const fields = std.meta.fields(Args);
+    const info = @typeInfo(Args).@"struct";
+    const fields = info.field_types;
 
     if (fields.len > max_arguments)
         @compileError("too many command arguments");
@@ -245,21 +247,21 @@ pub fn leaf(comptime Owner: type, comptime Args: type, comptime definition: Leaf
             assert(values.len <= fields.len);
             var args: Args = undefined;
 
-            inline for (fields, 0..) |field, index| {
-                const spec = @field(definition.arguments, field.name);
+            inline for (fields, 0..) |Field, index| {
+                const spec = @field(definition.arguments, info.field_names[index]);
 
                 if (index < values.len) {
-                    const parse = spec.parse orelse Parser(Owner, Value(field.type)).parse;
+                    const parse = spec.parse orelse Parser(Owner, Value(Field)).parse;
                     const value = try parse(owner, context, values[index]);
 
-                    if (comptime @typeInfo(Value(field.type)) == .int) {
+                    if (comptime @typeInfo(Value(Field)) == .int) {
                         if (spec.minimum) |minimum| if (value < minimum) return error.InvalidArgument;
                         if (spec.maximum) |maximum| if (value > maximum) return error.InvalidArgument;
                     }
 
-                    @field(args, field.name) = value;
-                } else if (comptime @typeInfo(field.type) == .optional) {
-                    @field(args, field.name) = null;
+                    @field(args, info.field_names[index]) = value;
+                } else if (comptime @typeInfo(Field) == .optional) {
+                    @field(args, info.field_names[index]) = null;
                 } else return error.InvalidArgument;
             }
 
@@ -270,11 +272,11 @@ pub fn leaf(comptime Owner: type, comptime Args: type, comptime definition: Leaf
         var output: [fields.len]ArgumentInfo = undefined;
         var optional = false;
 
-        for (fields, 0..) |field, index| {
-            const T = Value(field.type);
-            const spec = @field(definition.arguments, field.name);
+        for (fields, 0..) |Field, index| {
+            const T = Value(Field);
+            const spec = @field(definition.arguments, info.field_names[index]);
 
-            if (field.name.len > 64)
+            if (info.field_names[index].len > 64)
                 @compileError("command argument name is too long");
 
             if (spec.minimum != null and spec.maximum != null and spec.minimum.? > spec.maximum.?)
@@ -283,10 +285,10 @@ pub fn leaf(comptime Owner: type, comptime Args: type, comptime definition: Leaf
             if ((spec.minimum != null or spec.maximum != null) and @typeInfo(T) != .int)
                 @compileError("bounds require an integer argument");
 
-            if (optional and @typeInfo(field.type) != .optional)
+            if (optional and @typeInfo(Field) != .optional)
                 @compileError("optional arguments must be trailing");
 
-            optional = @typeInfo(field.type) == .optional;
+            optional = @typeInfo(Field) == .optional;
 
             if (spec.greedy and index + 1 != fields.len)
                 @compileError("greedy argument must be last");
@@ -302,8 +304,8 @@ pub fn leaf(comptime Owner: type, comptime Args: type, comptime definition: Leaf
                     if (spec.suggest) |callback|
                         return callback(owner, context, suggestions);
 
-                    if (comptime @typeInfo(T) == .@"enum") inline for (std.meta.fields(T)) |tag| {
-                        if (std.mem.startsWith(u8, tag.name, context.prefix)) suggestions.add(.{ .text = tag.name }) catch return;
+                    if (comptime @typeInfo(T) == .@"enum") inline for (@typeInfo(T).@"enum".field_names) |tag| {
+                        if (std.mem.startsWith(u8, tag, context.prefix)) suggestions.add(.{ .text = tag }) catch return;
                     };
                 }
             };
@@ -354,7 +356,7 @@ pub fn leaf(comptime Owner: type, comptime Args: type, comptime definition: Leaf
         .name = definition.name,
         .description = definition.description,
         .permission = definition.permission,
-        .argument_names = std.meta.fieldNames(Args),
+        .argument_names = @typeInfo(Args).@"struct".field_names,
         .arguments = &arguments,
         .vtable = &Adapter.vtable,
     };

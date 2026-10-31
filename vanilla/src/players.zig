@@ -1,3 +1,4 @@
+const player_state = @import("player_state.zig");
 const SpatialIndex = @import("player_spatial.zig").Index;
 const persistent_records = @import("records");
 const std = @import("std");
@@ -15,7 +16,7 @@ const Input = @import("input.zig").Input;
 
 pub const Players = struct {
     pub const id = "minecraft:players";
-    const saved_size = 45;
+    const saved_size = player_state.encoded_size;
 
     pub const Configuration = struct {
         maximum: usize = 32,
@@ -30,18 +31,7 @@ pub const Players = struct {
         world_border: ?f64 = null,
     };
 
-    pub const Stage = enum {
-        login,
-        brand,
-        tab,
-        border,
-        teleport,
-        awaiting_teleport,
-        health,
-        selection,
-        ready,
-        respawn,
-    };
+    pub const Stage = player_state.Stage;
 
     pub const Dependencies = struct {
         record_workspaces: *persistent_records.Workspaces,
@@ -53,44 +43,7 @@ pub const Players = struct {
         vanilla_worlds: *default_worlds.VanillaWorlds,
     };
 
-    pub const Player = struct {
-        handle: ?sessions.Handle = null,
-        uuid: u128 = 0,
-        world: u32 = 0,
-        teleport_id: i32 = 1,
-        keep_respawn_data: bool = false,
-        protocol: i32 = 0,
-        name: [16]u8 = undefined,
-        name_len: u8 = 0,
-        position: minecraft.Position = .{ .x = 0.5, .y = 65, .z = 0.5 },
-        rotation: minecraft.Rotation = .{ .yaw = 0, .pitch = 0 },
-        stage: Stage = .login,
-        configuring: bool = false,
-        loaded: bool = false,
-        on_ground: bool = false,
-        flags: minecraft.EntityFlags = .{},
-        revision: u64 = 0,
-        gamemode: minecraft.GameMode = .creative,
-        health: f32 = 20,
-        gamemode_sent: ?minecraft.GameMode = null,
-        abilities_sent: ?u8 = null,
-        flying: bool = false,
-        health_sent: f32 = 20,
-        life: u32 = 1,
-        selected_slot: u4 = 0,
-        experience: experience.State = .{},
-        experience_delay: u8 = 0,
-        saved: [saved_size]u8 = @splat(0),
-        saved_experience: [experience.State.encoded_size]u8 = @splat(0),
-
-        pub fn inWorld(self: Player) bool {
-            return self.handle != null;
-        }
-
-        pub fn inPlay(self: Player) bool {
-            return self.handle != null and !self.configuring and self.stage != .login and self.stage != .brand and self.stage != .tab;
-        }
-    };
+    pub const Player = player_state.Player;
 
     deps: Dependencies,
     config: Configuration,
@@ -342,9 +295,9 @@ pub const Players = struct {
             const vtable: DigHandler.VTable = .{ .call = @This().invoke };
             fn invoke(raw: *anyopaque, handle: sessions.Handle, dig: minecraft.Dig, temporary: std.mem.Allocator) anyerror!void {
                 const typed: @TypeOf(context) = @ptrCast(@alignCast(raw));
-                comptime if (@typeInfo(@TypeOf(handler)).@"fn".params.len != 3 and @typeInfo(@TypeOf(handler)).@"fn".params.len != 4)
+                comptime if (@typeInfo(@TypeOf(handler)).@"fn".param_types.len != 3 and @typeInfo(@TypeOf(handler)).@"fn".param_types.len != 4)
                     @compileError("dig observer takes context, handle, Dig, and optionally temporary allocator");
-                if (comptime @typeInfo(@TypeOf(handler)).@"fn".params.len == 3)
+                if (comptime @typeInfo(@TypeOf(handler)).@"fn".param_types.len == 3)
                     try @call(.auto, handler, .{ typed, handle, dig })
                 else
                     try @call(.auto, handler, .{ typed, handle, dig, temporary });
@@ -561,7 +514,7 @@ pub const Players = struct {
                 if (player.stage == .respawn) {
                     const targets = [_]sessions.Service.Target{.{ .handle = handle, .protocol = player.protocol }};
                     var delivered: [1]sessions.Service.Delivery = undefined;
-                    const respawn = .{ selected, world.dimension.name, world.name, @as(i8, @intFromEnum(player.gamemode)), @as(u8, if (player.keep_respawn_data) 3 else 0) };
+                    const respawn = .{ selected, world.dimension.name, world.name, @as(i8, @backingInt(player.gamemode)), @as(u8, if (player.keep_respawn_data) 3 else 0) };
                     const position = .{ player.teleport_id, player.position, player.rotation };
                     if (self.config.world_border) |diameter| {
                         try self.deps.packets.fanoutGroup(.{ writeRespawn, writeBorder, writeTeleport }, &targets, .{ respawn, .{diameter}, position }, &.{ 2048, 128, 128 }, &delivered);
@@ -583,7 +536,7 @@ pub const Players = struct {
                     .view_distance = self.config.render_distance,
                     .simulation_distance = self.config.simulation_distance,
                     .hashed_seed = 0,
-                    .gamemode = @intFromEnum(player.gamemode),
+                    .gamemode = @backingInt(player.gamemode),
                     .sea_level = 63,
                 } })) break;
                 player.stage = .brand;
@@ -658,7 +611,7 @@ pub const Players = struct {
     }
 
     pub fn sendPlayerAdd(self: *Players, protocol: i32, recipient: sessions.Handle, uuid: u128, name: []const u8, mode: minecraft.GameMode) bool {
-        return self.sendPacket(writePlayerAdd, protocol, recipient, .{ uuid, name, @as(i32, @intFromEnum(mode)) });
+        return self.sendPacket(writePlayerAdd, protocol, recipient, .{ uuid, name, @as(i32, @backingInt(mode)) });
     }
 
     fn writeSelectedSlot(packet: wire_1_21_5.play.toClient.packet_held_item_slot.Writer, slot: u4) ![]u8 {
@@ -684,7 +637,7 @@ pub const Players = struct {
 
     fn writeGameMode(packet: wire_1_21_5.play.toClient.packet_game_state_change.Writer, mode: minecraft.GameMode) ![]u8 {
         const reason = try packet.reason(3);
-        return (try reason.gameMode(@floatFromInt(@intFromEnum(mode)))).finish();
+        return (try reason.gameMode(@floatFromInt(@backingInt(mode)))).finish();
     }
 
     fn writeBrand(packet: wire_1_21_5.play.toClient.packet_custom_payload.Writer, brand: []const u8) ![]u8 {
@@ -887,7 +840,7 @@ fn encodePlayer(player: *const Players.Player) [Players.saved_size]u8 {
         writer.writeInt(u64, @bitCast(value), .little) catch unreachable;
     inline for (.{ player.rotation.yaw, player.rotation.pitch, player.health }) |value|
         writer.writeInt(u32, @bitCast(value), .little) catch unreachable;
-    writer.writeByte(@intCast(@intFromEnum(player.gamemode))) catch unreachable;
+    writer.writeByte(@intCast(@backingInt(player.gamemode))) catch unreachable;
     writer.writeByte(@bitCast(player.flags)) catch unreachable;
     writer.writeByte(@intFromBool(player.on_ground)) catch unreachable;
     writer.writeInt(u32, player.world, .little) catch unreachable;

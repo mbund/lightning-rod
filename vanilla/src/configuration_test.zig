@@ -97,7 +97,8 @@ fn pendingOutput(comptime Version: type) !void {
     }
     const lease = old.configurations.acquire().?;
     connection.control_burst = lease;
-    connection.control_output = .{ .items = lease.bytes[0 .. 32 * 1024], .capacity = lease.bytes.len };
+    connection.control_output = .initBuffer(lease.bytes);
+    connection.control_output.items = lease.bytes[0 .. 32 * 1024];
     @memset(connection.control_output.items, 23);
     Endpoint.send(&connection.lifecycle.?, connection.control_output.items);
     const accepted = 123;
@@ -187,7 +188,7 @@ test "handoff phase tags have fixed encodings independent of internal enum order
 }
 
 test "frozen Minecraft handoff retains compression and independent cipher feedback" {
-    const frozen = "\x02\x01\x01" ++ "\x11" ** 16 ++ "\x22" ** 16 ++ "\x33" ** 16;
+    const frozen = "\x02\x01\x01" ++ @as([16]u8, @splat(0x11)) ++ @as([16]u8, @splat(0x22)) ++ @as([16]u8, @splat(0x33));
     inline for (protocols.implementations) |Version| {
         var connection = Version.Connection.init(.login);
         connection.phase = .restart_finish_ack;

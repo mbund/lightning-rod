@@ -2,7 +2,7 @@
     .fingerprint = 0x2d293959bfa00ced,
     .name = .minecraft_packets,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .sessions = .{ .path = "../sessions" },
         .protocol_support = .{ .path = "../protocol_encoding" },

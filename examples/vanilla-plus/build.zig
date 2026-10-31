@@ -40,10 +40,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(executable);
-    const run = b.addSystemCommand(&.{b.getInstallPath(.bin, executable.out_filename)});
+    const run = b.addRunFile(b.graph.path(.install_bin, executable.out_filename));
     run.setCwd(b.path("."));
     run.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Run the Vanilla+ server").dependOn(&run.step);
 }

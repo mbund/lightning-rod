@@ -228,7 +228,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             const control_storage = try allocator.alloc(u8, try std.math.mul(usize, config.connections, small));
             errdefer allocator.free(control_storage);
 
-            for (connections, 0..) |*connection, index| connection.* = .{ .control_output = .{ .items = control_storage[index * small ..][0..0], .capacity = small } };
+            for (connections, 0..) |*connection, index| connection.* = .{ .control_output = .initBuffer(control_storage[index * small ..][0..small]) };
 
             self.* = .{
                 .allocator = allocator,
@@ -801,7 +801,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 if (event == .accepted) {
                     assert(connection.handle == null and !connection.active);
                     connection.* = .{
-                        .control_output = .{ .items = connection.control_output.items.ptr[0..0], .capacity = self.smallBytes() },
+                        .control_output = .initBuffer(connection.control_output.items.ptr[0..self.smallBytes()]),
                         .admission_deadline = std.Io.Clock.now(.awake, io).nanoseconds + 30 * std.time.ns_per_s,
                     };
                     self.setHandle(handle.index, handle);
@@ -814,8 +814,8 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                             assert(connection.receiving);
                             connection.receiving = result.result.more;
 
-                            if (!result.result.more and result.result.errno == @intFromEnum(std.posix.E.NOBUFS)) continue;
-                            if (self.reloading and result.result.errno == @intFromEnum(std.posix.E.CANCELED)) continue;
+                            if (!result.result.more and result.result.errno == @backingInt(std.posix.E.NOBUFS)) continue;
+                            if (self.reloading and result.result.errno == @backingInt(std.posix.E.CANCELED)) continue;
                             if (result.result.errno != null or result.result.bytes == 0 or result.result.bytes > self.inputBuffer(handle.index).len - connection.input_end - connection.received) {
                                 connection.closing = true;
                             } else {
@@ -835,7 +835,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                             assert(connection.sending);
                             connection.sending = false;
 
-                            if (self.reloading and result.result.errno == @intFromEnum(std.posix.E.CANCELED)) continue;
+                            if (self.reloading and result.result.errno == @backingInt(std.posix.E.CANCELED)) continue;
                             if (result.result.errno != null or result.result.bytes == 0 or result.result.bytes > connection.sending_bytes) {
                                 connection.closing = true;
                             } else {
@@ -1009,7 +1009,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             connection.control_write = 0;
             connection.control_wire = 0;
             const stride = self.smallBytes();
-            connection.control_output = .{ .items = self.control_storage[index * stride ..][0..0], .capacity = stride };
+            connection.control_output = .initBuffer(self.control_storage[index * stride ..][0..stride]);
         }
 
         pub fn releaseBuffers(self: *Self, index: usize) void {
@@ -1052,7 +1052,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             };
             assert(connection.control_output.items.len == 0);
             connection.control_burst = lease;
-            connection.control_output = .{ .items = lease.bytes[0..0], .capacity = lease.bytes.len };
+            connection.control_output = .initBuffer(lease.bytes);
             return true;
         }
 
@@ -1226,7 +1226,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             self.transport_waiting.remove(index);
             const connection = &self.connections[index];
             const kind = connection.waiting orelse return;
-            const queue = &self.waiting[@intFromEnum(kind)];
+            const queue = &self.waiting[@backingInt(kind)];
             assert(queue.count > 0);
             if (connection.wait_previous != absent) self.connections[connection.wait_previous].wait_next = connection.wait_next else {
                 assert(queue.head == index);
@@ -1253,7 +1253,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             }
             if (connection.waiting == kind) return;
             self.removeWait(index);
-            const queue = &self.waiting[@intFromEnum(kind)];
+            const queue = &self.waiting[@backingInt(kind)];
             connection.waiting = kind;
             connection.wait_previous = queue.tail;
             if (queue.tail != absent) self.connections[queue.tail].wait_next = index else queue.head = index;
@@ -1264,7 +1264,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
         }
 
         fn wakeWaiters(self: *Self, kind: Wait, capacity: usize) void {
-            const queue = &self.waiting[@intFromEnum(kind)];
+            const queue = &self.waiting[@backingInt(kind)];
             const count = @min(capacity, queue.count);
             for (0..count) |_| {
                 const index = queue.head;
@@ -1282,11 +1282,11 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             const configuration = self.configurations.takeReleased();
             if (!(self.resources_ready or decoded or input or control_released or configuration)) return;
             self.resources_ready = false;
-            if (self.waiting[@intFromEnum(Wait.decoded)].count != 0) self.wakeWaiters(.decoded, self.decoded.availableCountWithin(self.decoded.slots.len));
-            if (self.waiting[@intFromEnum(Wait.input)].count != 0) self.wakeWaiters(.input, self.input_bursts.availableCountWithin(self.input_bursts.slots.len));
-            if (self.waiting[@intFromEnum(Wait.control)].count != 0) self.wakeWaiters(.control, self.control_raw.availableCountWithin(self.control_raw.slots.len));
-            const admitted = &self.waiting[@intFromEnum(Wait.configuration_admitted)];
-            const other = &self.waiting[@intFromEnum(Wait.configuration)];
+            if (self.waiting[@backingInt(Wait.decoded)].count != 0) self.wakeWaiters(.decoded, self.decoded.availableCountWithin(self.decoded.slots.len));
+            if (self.waiting[@backingInt(Wait.input)].count != 0) self.wakeWaiters(.input, self.input_bursts.availableCountWithin(self.input_bursts.slots.len));
+            if (self.waiting[@backingInt(Wait.control)].count != 0) self.wakeWaiters(.control, self.control_raw.availableCountWithin(self.control_raw.slots.len));
+            const admitted = &self.waiting[@backingInt(Wait.configuration_admitted)];
+            const other = &self.waiting[@backingInt(Wait.configuration)];
             if (admitted.count != 0 or other.count != 0) {
                 const capacity = self.configurations.availableCountWithin(self.configurations.slots.len);
                 const limit = self.configurations.slots.len - @intFromBool(self.configurations.slots.len > 1);
@@ -1319,7 +1319,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 }
             }
             // Admit waiting peers before the peers that just returned their decode buffers.
-            if (returned and self.waiting[@intFromEnum(Wait.decoded)].count != 0) {
+            if (returned and self.waiting[@backingInt(Wait.decoded)].count != 0) {
                 for (ready) |index| self.readiness.signal(index).notify();
                 self.wakeResources();
                 ready = self.readiness.take(now);

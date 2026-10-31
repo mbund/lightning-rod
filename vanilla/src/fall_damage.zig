@@ -39,11 +39,17 @@ pub const FallDamage = struct {
     scratch: std.heap.FixedBufferAllocator,
 
     pub fn init(allocator: std.mem.Allocator, configuration: Configuration, deps: Dependencies) !*FallDamage {
+        const self = try allocate(allocator, configuration, deps);
+        self.random = try .init(configuration.seed, deps.storage);
+        return self;
+    }
+
+    pub fn allocate(allocator: std.mem.Allocator, configuration: Configuration, deps: Dependencies) !*FallDamage {
         if (configuration.scratch_bytes == 0) return error.InvalidConfiguration;
         const self = try allocator.create(FallDamage);
         const falls = try allocator.alloc(Fall, deps.players.records.len);
         @memset(falls, .{});
-        self.* = .{ .deps = deps, .falls = falls, .random = try Random.init(configuration.seed, deps.storage), .scratch = .init(try allocator.alloc(u8, configuration.scratch_bytes)) };
+        self.* = .{ .deps = deps, .falls = falls, .random = .{ .source = .init(configuration.seed) }, .scratch = .init(try allocator.alloc(u8, configuration.scratch_bytes)) };
         try deps.players.observeMovement(self, onMovement);
         return self;
     }

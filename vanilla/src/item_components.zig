@@ -15,7 +15,13 @@ const schemas = block: {
     break :block values;
 };
 
-pub const Presentation = enum { absent, added, removed };
+pub const Presentation = enum {
+    absent,
+    /// The stored addition or removal is presented unchanged.
+    stored,
+    added,
+    removed,
+};
 
 pub const RetentionContext = struct {
     kind: u32,
@@ -151,11 +157,30 @@ pub const Components = struct {
         return true;
     }
 
+    pub fn requiresCorrection(self: *const Components, view: data.View, recipient: u128) !bool {
+        if (!self.has_presentation) return false;
+        var offsets: [data.maximum_components]usize = undefined;
+        const count = self.dispatch.count;
+        std.debug.assert(count <= offsets.len);
+        try self.resolve(view, offsets[0..count]);
+        for (offsets[0..count], 0..) |offset, index| {
+            if (self.providers[index].vtable.present == null) continue;
+            const stored = if (offset == std.math.maxInt(usize)) null else view.at(offset);
+            switch (self.present(index, view, recipient, stored)) {
+                .added, .removed => return true,
+                .absent => if (stored != null) return true,
+                .stored => {},
+            }
+        }
+        return false;
+    }
+
     pub fn present(self: *const Components, index: usize, view: data.View, recipient: u128, stored: ?data.Component) Presentation {
         std.debug.assert(index < self.dispatch.count);
         if (stored) |component| std.debug.assert(component.key == self.dispatch.entries[index].key);
         const provider = self.providers[index];
-        if (provider.vtable.present) |call| return call(provider.context, view, recipient, stored);
-        return if (stored) |component| if (component.value != null) .added else .removed else .absent;
+        const result = if (provider.vtable.present) |call| call(provider.context, view, recipient, stored) else if (stored != null) Presentation.stored else Presentation.absent;
+        std.debug.assert(result != .stored or stored != null);
+        return result;
     }
 };

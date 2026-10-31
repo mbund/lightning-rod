@@ -2,6 +2,6 @@
     .name = .lighting,
     .version = "0.1.0",
     .fingerprint = 0xcb0815734b7a6fde,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

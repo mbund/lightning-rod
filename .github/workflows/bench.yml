@@ -3,6 +3,10 @@ name: Benchmarks
 on:
   workflow_call:
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   lighting:
     name: Lighting correctness and performance

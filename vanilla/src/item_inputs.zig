@@ -14,7 +14,7 @@ pub const Resolver = struct {
     pub fn resolve(self: *const Resolver, input: recipes.Input) ![]const u32 {
         var entries: std.ArrayList(u32) = .empty;
         try self.expand(input, &entries, 0);
-        std.mem.sort(u32, entries.items, {}, std.sort.asc(u32));
+        std.mem.sortUnstable(u32, entries.items, {}, std.sort.asc(u32));
         var count: usize = 0;
         for (entries.items) |entry| {
             if (count > 0 and entries.items[count - 1] == entry) continue;

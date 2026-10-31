@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
     executable.root_module.addObjectFile(b.dependency("lightning_rod", .{ .target = target, .optimize = optimize }).namedLazyPath("runtime"));
     b.installArtifact(executable);
     const run = b.addRunArtifact(executable);
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("bench", "Measure vanilla simulation ticks across player counts and audiences").dependOn(&run.step);
 
     const foundation = b.addExecutable(.{
@@ -44,6 +44,6 @@ pub fn build(b: *std.Build) void {
     foundation.root_module.addObjectFile(b.dependency("lightning_rod", .{ .target = target, .optimize = optimize }).namedLazyPath("runtime"));
     b.installArtifact(foundation);
     const run_foundation = b.addRunArtifact(foundation);
-    if (b.args) |args| run_foundation.addArgs(args);
+    run_foundation.addPassthruArgs();
     b.step("bench-foundation", "Measure plugin dispatch, instrumentation, and idle storage overhead").dependOn(&run_foundation.step);
 }

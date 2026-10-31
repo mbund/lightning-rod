@@ -85,8 +85,8 @@ pub fn tick(instances: anytype, temporary: *std.heap.FixedBufferAllocator, instr
             var args: std.meta.ArgsTuple(@TypeOf(Plugin.tick)) = undefined;
             args[0] = instances.get(Plugin);
 
-            inline for (@typeInfo(@TypeOf(Plugin.tick)).@"fn".params[1..], 1..) |parameter, argument| {
-                args[argument] = if (parameter.type == std.Io) io else if (parameter.type == storage.Space) try transaction.openSpace(Plugin.id) else if (parameter.type == std.mem.Allocator) temporary.allocator() else @compileError("unsupported tick parameter in plugin " ++ Plugin.id);
+            inline for (@typeInfo(@TypeOf(Plugin.tick)).@"fn".param_types[1..], 1..) |parameter, argument| {
+                args[argument] = if (parameter == std.Io) io else if (parameter == storage.Space) try transaction.openSpace(Plugin.id) else if (parameter == std.mem.Allocator) temporary.allocator() else @compileError("unsupported tick parameter in plugin " ++ Plugin.id);
             }
 
             const result = @call(.never_inline, Plugin.tick, args);
@@ -112,8 +112,8 @@ pub fn checkpoint(instances: anytype, temporary: *std.heap.FixedBufferAllocator,
             var args: std.meta.ArgsTuple(@TypeOf(Plugin.checkpoint)) = undefined;
             args[0] = instances.get(Plugin);
 
-            inline for (@typeInfo(@TypeOf(Plugin.checkpoint)).@"fn".params[1..], 1..) |parameter, argument| {
-                args[argument] = if (parameter.type == std.Io) io else if (parameter.type == storage.Space) try transaction.openSpace(Plugin.id) else if (parameter.type == std.mem.Allocator) temporary.allocator() else @compileError("unsupported checkpoint parameter in plugin " ++ Plugin.id);
+            inline for (@typeInfo(@TypeOf(Plugin.checkpoint)).@"fn".param_types[1..], 1..) |parameter, argument| {
+                args[argument] = if (parameter == std.Io) io else if (parameter == storage.Space) try transaction.openSpace(Plugin.id) else if (parameter == std.mem.Allocator) temporary.allocator() else @compileError("unsupported checkpoint parameter in plugin " ++ Plugin.id);
             }
 
             const result = @call(.never_inline, Plugin.checkpoint, args);
@@ -142,13 +142,14 @@ pub fn close(instances: anytype, io: std.Io, closing: *lifecycle.Closing) void {
 fn dependencies(comptime T: type, comptime requester: []const u8, instances: anytype, transaction: storage.Transaction, environment: anytype) !T {
     var result: T = undefined;
 
-    inline for (@typeInfo(T).@"struct".fields) |field| {
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types) |name, Field| {
         const Selections = @TypeOf(instances.*).selections;
-        if (field.type == storage.Space) {
-            @field(result, field.name) = try transaction.openSpace(requester);
+        if (Field == storage.Space) {
+            @field(result, name) = try transaction.openSpace(requester);
         } else {
             const before = comptime selection.indexOfId(Selections, requester).?;
-            @field(result, field.name) = selection.dependency(field.name, field.type, instances, environment, before);
+            @field(result, name) = selection.dependency(name, Field, instances, environment, before);
         }
     }
 

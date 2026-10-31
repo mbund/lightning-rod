@@ -24,8 +24,8 @@ pub fn clone(allocator: std.mem.Allocator, value: anytype, depth: usize) anyerro
         },
         .@"struct" => |info| result: {
             var copied: T = undefined;
-            inline for (info.fields) |field| if (!field.is_comptime) {
-                @field(copied, field.name) = try clone(allocator, @field(value, field.name), depth + 1);
+            inline for (info.field_names, info.field_attrs) |name, attrs| if (!attrs.@"comptime") {
+                @field(copied, name) = try clone(allocator, @field(value, name), depth + 1);
             };
             break :result copied;
         },

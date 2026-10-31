@@ -154,7 +154,7 @@ test "format adapters reject ingredients from a different schema and empty alter
     , .{});
     try std.testing.expect((try decode(allocator, legacy, .v1_21)).? == .shapeless);
     try std.testing.expectError(error.InvalidRecipe, decode(allocator, modern, .v1_21));
-    for ([_]Format{ .v1_21_5, .v1_21_8 }) |format| {
+    for ([_]Format{ .v1_21_5, .v1_21_8, .v1_21_9 }) |format| {
         try std.testing.expect((try decode(allocator, modern, format)).? == .shapeless);
         try std.testing.expectError(error.InvalidRecipe, decode(allocator, legacy, format));
         for ([_][]const u8{ "[]", "[\"#minecraft:logs\"]", "\"minecraft:air\"", "\"#\"", "\"\"" }) |invalid| {

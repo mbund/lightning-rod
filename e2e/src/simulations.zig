@@ -65,7 +65,7 @@ const IslandRouter = struct {
     routes: []const InitialRoute,
 
     pub fn route(self: *IslandRouter, player: sessions.Profile) sessions.Route(Destination) {
-        for (self.routes) |route_to| if (std.mem.eql(u8, player.name, route_to.player)) return .{ .destination = @enumFromInt(route_to.destination) };
+        for (self.routes) |route_to| if (std.mem.eql(u8, player.name, route_to.player)) return .{ .destination = @fromBackingInt(@intCast(route_to.destination)) };
         return .reject;
     }
 };
@@ -98,7 +98,7 @@ pub fn run(init: std.process.Init, plugins: anytype, endpoints: []*sessions.Serv
         lightning_rod.plugin.configured(vanilla.Entities, vanilla.Entities.Configuration{ .cache_records = 16 }),
         lightning_rod.plugin.configured(vanilla.ItemEntities, vanilla.ItemEntities.Configuration{ .cache_records = 16, .maximum = 64 }),
         lightning_rod.plugin.configured(vanilla.ItemReplication, vanilla.ItemReplication.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.Inventories, vanilla.Inventories.Configuration{ .cache_items = 2 }),
+        lightning_rod.plugin.configured(vanilla.Inventories, vanilla.Inventories.Configuration{ .cache_items = vanilla.crafting.maximum_inputs + 1 }),
         lightning_rod.plugin.configured(vanilla.Chat, vanilla.Chat.Configuration{ .pending_messages = 8 }),
     };
     const selected = lightning_rod.plugin.replace(lightning_rod.plugin.insertAfter(plugins[0], vanilla.Reload, lightning_rod.plugin.configured(control.Control, .{})), limits);
@@ -115,7 +115,7 @@ pub fn run(init: std.process.Init, plugins: anytype, endpoints: []*sessions.Serv
     else
         sessions.Threaded(protocol_set.Endpoint, @TypeOf(routing), IslandRouter);
     var endpoint_configurations: [plugins.len]Network.EndpointConfiguration = undefined;
-    for (&endpoint_configurations, 0..) |*endpoint, index| endpoint.* = .{ .id = @enumFromInt(index), .connections = config.connections, .page_bytes = 128 * 1024, .output = &endpoints[index] };
+    for (&endpoint_configurations, 0..) |*endpoint, index| endpoint.* = .{ .id = @fromBackingInt(@intCast(index)), .connections = config.connections, .page_bytes = 128 * 1024, .output = &endpoints[index] };
     var network_registry = try lightning_rod.metrics.Registry.init(allocator, init.io, .{});
     defer network_registry.deinit();
     const network = try Network.init(allocator, init.io, .{

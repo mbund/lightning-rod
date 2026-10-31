@@ -52,7 +52,7 @@ pub const Enchantments = struct {
     /// Sorts the caller's scratch entries into canonical order.
     pub fn encode(entries: []Entry, output: []u8) ![]const u8 {
         if (entries.len > 256) return error.InvalidComponent;
-        std.mem.sort(Entry, entries, {}, struct {
+        std.mem.sortUnstable(Entry, entries, {}, struct {
             fn less(_: void, a: Entry, b: Entry) bool {
                 return std.mem.lessThan(u8, a.name, b.name);
             }

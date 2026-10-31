@@ -104,7 +104,7 @@ pub fn encode(output: []u8, kind: u32, components: []const Component) !View {
     if (output.len < size) return error.ItemTooLarge;
     var sorted: [maximum_components]Component = undefined;
     @memcpy(sorted[0..components.len], components);
-    std.mem.sort(Component, sorted[0..components.len], {}, struct {
+    std.mem.sortUnstable(Component, sorted[0..components.len], {}, struct {
         fn less(_: void, a: Component, b: Component) bool {
             return a.key < b.key;
         }
@@ -137,7 +137,7 @@ const Parts = struct {
         if (components.len > maximum_components) return error.ItemTooLarge;
         var sorted: [maximum_components]Component = undefined;
         @memcpy(sorted[0..components.len], components);
-        std.mem.sort(Component, sorted[0..components.len], {}, struct {
+        std.mem.sortUnstable(Component, sorted[0..components.len], {}, struct {
             fn less(_: void, a: Component, b: Component) bool {
                 return a.key < b.key;
             }

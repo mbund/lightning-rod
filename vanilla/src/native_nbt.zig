@@ -52,7 +52,7 @@ fn payload(writer: *std.Io.Writer, value: anytype) anyerror!void {
             } else try custom_data.writeString(writer, value);
         },
         .@"struct" => |info| {
-            inline for (info.fields) |member| try field(writer, member.name, @field(value, member.name));
+            inline for (info.field_names) |name| try field(writer, name, @field(value, name));
             try writer.writeByte(0);
         },
         .@"union" => {

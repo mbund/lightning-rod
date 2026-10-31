@@ -83,7 +83,7 @@ pub fn identity(b: *std.Build, registry: *std.Build.Module, version_name: []cons
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/identity.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseFast,
+            .optimize = .debug,
             .imports = &.{.{ .name = "registry", .module = b.createModule(.{ .root_source_file = registry.root_source_file }) }},
         }),
     });

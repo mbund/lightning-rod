@@ -2,7 +2,7 @@
     .fingerprint = 0x936c863d0ffda1b9,
     .name = .inventories,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .metrics = .{ .path = "../metrics" },
         .records = .{ .path = "../records" },

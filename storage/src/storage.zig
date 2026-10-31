@@ -73,13 +73,13 @@ pub const Space = struct {
             const source: Space = .{ .store = self.store, .id = reference.space, .store_is_new = self.store_is_new };
             try source.readPages(&.{.{ .id = reference.page, .offset = reference.offset, .destination = &bytes }});
             const root = std.mem.readInt(u64, &bytes, .little);
-            return if (root == 0) null else @enumFromInt(root);
+            return if (root == 0) null else @fromBackingInt(@intCast(root));
         }
         const operation = self.store.enter(.read);
         defer operation.end();
         try self.store.check();
-        const root = self.store.metadata.spaces[@intFromEnum(self.id) - 1].root;
-        return if (root == 0) null else @enumFromInt(root);
+        const root = self.store.metadata.spaces[@backingInt(self.id) - 1].root;
+        return if (root == 0) null else @fromBackingInt(@intCast(root));
     }
     pub fn setRoot(self: Space, root: ?PageId) Error!void {
         const operation = self.store.enter(.pages);
@@ -89,16 +89,16 @@ pub const Space = struct {
         try self.store.check();
         if (root) |id| {
             var block: format.Block = undefined;
-            try self.store.readBlock(@intFromEnum(id), @intFromEnum(self.id), &block);
+            try self.store.readBlock(@backingInt(id), @backingInt(self.id), &block);
         }
-        const value = if (root) |id| @intFromEnum(id) else 0;
+        const value = if (root) |id| @backingInt(id) else 0;
         if (self.root) |reference| {
             var block: format.Block = undefined;
-            try self.store.readBlock(@intFromEnum(reference.page), @intFromEnum(reference.space), &block);
+            try self.store.readBlock(@backingInt(reference.page), @backingInt(reference.space), &block);
             const page: *Page = block[32..];
             format.put(u64, page, reference.offset, value);
             try self.store.writePages(reference.space, &.{.{ .id = reference.page, .source = page }});
-        } else self.store.metadata.spaces[@intFromEnum(self.id) - 1].root = value;
+        } else self.store.metadata.spaces[@backingInt(self.id) - 1].root = value;
     }
     pub fn allocatePages(self: Space, ids: []PageId) Error!void {
         const operation = self.store.enter(.pages);
@@ -151,7 +151,7 @@ pub const Transaction = struct {
         var space = try self.store.openSpace(name);
         if (self.scope) |scope| {
             assert(scope.space.store == self.store);
-            space.root = .{ .space = scope.space.id, .page = scope.page, .offset = @intCast(Scope.roots_offset + (@as(usize, @intFromEnum(space.id)) - 1) * 8) };
+            space.root = .{ .space = scope.space.id, .page = scope.page, .offset = @intCast(Scope.roots_offset + (@as(usize, @backingInt(space.id)) - 1) * 8) };
             space.store_is_new = scope.fresh;
         }
         return space;
@@ -236,7 +236,7 @@ pub const Resources = struct {
     readers: []Reader,
     readers_available: std.Io.Condition = .init,
     io_mode: backend.Mode,
-    frames: []format.Frame,
+    frames: []align(64) format.Frame,
     buffers_mutex: std.Io.Mutex = .init,
     buffer_owner: u64 = 0,
     maintenance_available: std.Io.Condition = .init,
@@ -823,7 +823,7 @@ pub const Store = struct {
     pub fn maintenanceStatus(self: *Store) MaintenanceStatus {
         const operation = self.enter(.read);
         defer operation.end();
-        return .{ .checkpointed = @enumFromInt(self.checkpointed_sequence), .pending = self.phase != .idle or self.maintenance_io.active };
+        return .{ .checkpointed = @fromBackingInt(@intCast(self.checkpointed_sequence)), .pending = self.phase != .idle or self.maintenance_io.active };
     }
 
     pub fn hasWrites(self: *Store) bool {
@@ -832,7 +832,7 @@ pub const Store = struct {
         return self.dirty_count != 0 or !std.meta.eql(self.metadata, self.saved);
     }
     pub fn lastCommit(self: *const Store) CommitId {
-        return @enumFromInt(self.published_commit.load(.acquire));
+        return @fromBackingInt(@intCast(self.published_commit.load(.acquire)));
     }
     pub fn transaction(self: *Store) Transaction {
         return .{ .store = self };
@@ -963,13 +963,13 @@ pub const Store = struct {
         if (name.len == 0 or name.len > format.maximum_name) return error.InvalidArgument;
         var empty: ?usize = null;
         for (self.metadata.spaces, 0..) |space, index| {
-            if (space.length == name.len and std.mem.eql(u8, space.name[0..space.length], name)) return .{ .store = self, .id = @enumFromInt(index + 1), .store_is_new = self.saved.sequence == 0 };
+            if (space.length == name.len and std.mem.eql(u8, space.name[0..space.length], name)) return .{ .store = self, .id = @fromBackingInt(@intCast(index + 1)), .store_is_new = self.saved.sequence == 0 };
             if (empty == null and space.length == 0) empty = index;
         }
         const index = empty orelse return error.NoSpace;
         self.metadata.spaces[index].length = @intCast(name.len);
         @memcpy(self.metadata.spaces[index].name[0..name.len], name);
-        return .{ .store = self, .id = @enumFromInt(index + 1), .store_is_new = self.saved.sequence == 0 };
+        return .{ .store = self, .id = @fromBackingInt(@intCast(index + 1)), .store_is_new = self.saved.sequence == 0 };
     }
 
     fn locationPtr(self: *Store, id: u64) ?*wal_index.Location {
@@ -1070,15 +1070,15 @@ pub const Store = struct {
         errdefer self.failed = true;
         var slots: [batch_size]usize = undefined;
         for (reads, slots[0..reads.len]) |read, *slot| {
-            const id = @intFromEnum(read.id);
+            const id = @backingInt(read.id);
             if (id == 0 or id >= self.metadata.pages or read.offset > page_size or read.destination.len > page_size - read.offset) return error.InvalidArgument;
             slot.* = self.resources.cache_index.get(.{ .token = self.cache_token, .id = id }) orelse return false;
             assert(self.cache[slot.*].loaded and self.cache[slot.*].id == id and self.cache[slot.*].token == self.cache_token);
-            if (format.get(u32, self.cache[slot.*].block(), 4) != @intFromEnum(space)) return error.Corrupt;
+            if (format.get(u32, self.cache[slot.*].block(), 4) != @backingInt(space)) return error.Corrupt;
         }
         for (reads, slots[0..reads.len], 0..) |read, slot, index| {
             const entry = &self.cache[slot];
-            assert(entry.loaded and entry.id == @intFromEnum(read.id));
+            assert(entry.loaded and entry.id == @backingInt(read.id));
             assert(format.get(u64, entry.block(), 8) == entry.id);
             self.resources.makeAvailable(slot);
             if (borrowed) |output| {
@@ -1112,7 +1112,7 @@ pub const Store = struct {
             defer operation.end();
             while (true) {
                 var pending = false;
-                for (reads[begin..][0..count]) |read| pending = pending or std.mem.indexOfScalar(u64, self.writing_pages, @intFromEnum(read.id)) != null;
+                for (reads[begin..][0..count]) |read| pending = pending or std.mem.indexOfScalar(u64, self.writing_pages, @backingInt(read.id)) != null;
                 if (!pending) break;
                 self.owner.store(0, .release);
                 self.page_written.waitUncancelable(self.io, &self.mutex);
@@ -1122,7 +1122,8 @@ pub const Store = struct {
             const protection = self.resources.acquire(self.io);
             defer protection.end();
             try self.check();
-            errdefer |err| if (err != error.CachePinned) {
+            var cache_pinned = false;
+            errdefer if (!cache_pinned) {
                 self.failed = true;
             };
             var requests: [batch_size]backend.Io.Read = undefined;
@@ -1141,7 +1142,7 @@ pub const Store = struct {
             const epoch = self.wal_epoch;
             const mutation = self.mutation;
             for (reads[begin..][0..count], 0..) |read, index| {
-                const id = @intFromEnum(read.id);
+                const id = @backingInt(read.id);
                 if (id == 0 or id >= self.metadata.pages or read.offset > page_size or read.destination.len > page_size - read.offset) return error.InvalidArgument;
                 const duplicate = for (reads[begin..][0..index], 0..) |previous, prior| {
                     if (previous.id == read.id) break prior;
@@ -1168,7 +1169,10 @@ pub const Store = struct {
                     }
                     self.resources.setReading(at, true);
                 } else {
-                    if (borrowed != null) return error.CachePinned;
+                    if (borrowed != null) {
+                        cache_pinned = true;
+                        return error.CachePinned;
+                    }
                     blocks[index] = &reader.blocks[index];
                 }
                 const block = blocks[index];
@@ -1206,8 +1210,8 @@ pub const Store = struct {
                 self.read_bytes.add(reading * format.block_size);
             }
             for (reads[begin..][0..count], blocks[0..count], verified[0..count]) |read, block, valid| {
-                if (!valid) try format.validate(block, @intFromEnum(read.id), @intFromEnum(space));
-                if (format.get(u32, block, 4) != @intFromEnum(space)) return error.Corrupt;
+                if (!valid) try format.validate(block, @backingInt(read.id), @backingInt(space));
+                if (format.get(u32, block, 4) != @backingInt(space)) return error.Corrupt;
             }
             for (slots[0..held]) |slot| {
                 const entry = &self.cache[slot.index];
@@ -1239,9 +1243,7 @@ pub const Store = struct {
 
     fn readPages(self: *Store, space: SpaceId, reads: []const Read) Error!void {
         try self.check();
-        errdefer |err| {
-            if (err != error.CachePinned) self.failed = true;
-        }
+        errdefer self.failed = true;
         var requests: [batch_size]backend.Io.Read = undefined;
         var slots: [batch_size]usize = undefined;
         var held: usize = 0;
@@ -1255,7 +1257,7 @@ pub const Store = struct {
             const count = @min(batch_size, reads.len - start);
             var reading: usize = 0;
             for (reads[start..][0..count], blocks[0..count], verified[0..count], 0..) |read, *destination, *valid, index| {
-                const id = @intFromEnum(read.id);
+                const id = @backingInt(read.id);
                 if (id == 0 or id >= self.metadata.pages or read.offset > page_size or read.destination.len > page_size - read.offset) return error.InvalidArgument;
                 if (self.cached(id)) |hit| {
                     assert(self.cache[hit].loaded);
@@ -1300,8 +1302,8 @@ pub const Store = struct {
             if (reading != 0) self.read_batches.add(1);
             self.read_pages.add(reading);
             for (reads[start..][0..count], blocks[0..count], verified[0..count]) |read, block, valid| {
-                if (!valid) try format.validate(block, @intFromEnum(read.id), @intFromEnum(space));
-                if (format.get(u32, block, 4) != @intFromEnum(space)) return error.Corrupt;
+                if (!valid) try format.validate(block, @backingInt(read.id), @backingInt(space));
+                if (format.get(u32, block, 4) != @backingInt(space)) return error.Corrupt;
                 @memcpy(read.destination, block[32 + @as(usize, read.offset) ..][0..read.destination.len]);
             }
             self.read_bytes.add(reading * format.block_size);
@@ -1411,7 +1413,7 @@ pub const Store = struct {
         try self.check();
         errdefer self.failed = true;
         var ids: [batch_size]u64 = undefined;
-        const owners: [batch_size]u32 = @splat(@intFromEnum(space));
+        const owners: [batch_size]u32 = @splat(@backingInt(space));
         var pages: [batch_size][]const u8 = undefined;
         var checks: [batch_size]Read = undefined;
         var start: usize = 0;
@@ -1419,11 +1421,11 @@ pub const Store = struct {
             const count = @min(batch_size, writes.len - start);
             var checking: usize = 0;
             for (writes[start..][0..count], ids[0..count], pages[0..count]) |write, *id, *page| {
-                id.* = @intFromEnum(write.id);
+                id.* = @backingInt(write.id);
                 if (id.* == 0 or id.* >= self.metadata.pages) return error.InvalidArgument;
                 if (write.source.len > page_size) return error.InvalidArgument;
                 if (self.locations.get(id.*)) |entry| {
-                    if (entry.owner != @intFromEnum(space)) return error.InvalidArgument;
+                    if (entry.owner != @backingInt(space)) return error.InvalidArgument;
                 } else {
                     checks[checking] = .{ .id = write.id, .destination = &.{} };
                     checking += 1;
@@ -1452,7 +1454,7 @@ pub const Store = struct {
                 self.metadata.free_pages -= count;
                 for (ids[at..][0..count]) |*id| {
                     self.metadata.free_count -= 1;
-                    id.* = @enumFromInt(if (self.metadata.free_count == 0) head else group.ids[self.metadata.free_count - 1]);
+                    id.* = @fromBackingInt(@intCast(if (self.metadata.free_count == 0) head else group.ids[self.metadata.free_count - 1]));
                 }
                 if (self.metadata.free_count == 0) {
                     self.metadata.free = group.next;
@@ -1461,18 +1463,18 @@ pub const Store = struct {
             } else {
                 count = @min(ids.len - at, self.limits.maximum_pages - self.metadata.pages);
                 if (count == 0) return error.NoSpace;
-                for (ids[at..][0..count], 0..) |*id, index| id.* = @enumFromInt(self.metadata.pages + index);
+                for (ids[at..][0..count], 0..) |*id, index| id.* = @fromBackingInt(@intCast(self.metadata.pages + index));
                 self.metadata.pages += count;
             }
             for (ids[at..][0..count]) |id| {
-                const number = @intFromEnum(id);
+                const number = @backingInt(id);
                 if (!self.locations.contains(number) and self.locations.count() == self.limits.maximum_wal_pages) return error.NoSpace;
                 const result = self.locations.getOrPutAssumeCapacity(number);
-                if (!result.found_existing) result.value_ptr.* = .{ .epoch = self.wal_epoch, .current = 0, .owner = @intFromEnum(space) };
+                if (!result.found_existing) result.value_ptr.* = .{ .epoch = self.wal_epoch, .current = 0, .owner = @backingInt(space) };
                 const location = self.locationPtr(number).?;
                 location.current = 0;
                 location.replacement_dirty = true;
-                location.owner = @intFromEnum(space);
+                location.owner = @backingInt(space);
                 if (self.resources.cache_index.get(.{ .token = self.cache_token, .id = number })) |slot| self.resources.invalidate(slot);
                 if (!location.dirty) {
                     self.dirty[self.dirty_count] = number;
@@ -1497,14 +1499,14 @@ pub const Store = struct {
         while (start < ids.len) {
             const count = @min(batch_size, ids.len - start);
             for (ids[start..][0..count], reads[0..count], 0..) |id, *read, index| {
-                if (@intFromEnum(id) == 0) return error.InvalidArgument;
+                if (@backingInt(id) == 0) return error.InvalidArgument;
                 for (ids[start..][0..index]) |previous| if (previous == id) return error.InvalidArgument;
                 read.* = .{ .id = id, .destination = &.{} };
             }
             try self.readPages(space, reads[0..count]);
             var group: format.FreePages = .{ .next = self.metadata.free, .next_count = self.metadata.free_count, .count = @intCast(count) };
             for (ids[start..][0..count], pointers[0..count], numbers[0..count], 0..) |id, *pointer, *number, index| {
-                number.* = @intFromEnum(id);
+                number.* = @backingInt(id);
                 if (index < count - 1) group.ids[index] = number.*;
                 pointer.* = &.{};
             }
@@ -1582,14 +1584,14 @@ pub const Store = struct {
         self.commits.add(1);
         publishing.end();
         if (self.resources.background.load(.acquire)) |worker| worker.notify();
-        return @enumFromInt(self.saved.sequence);
+        return @fromBackingInt(@intCast(self.saved.sequence));
     }
 
     /// A failed transaction may still make an earlier complete commit durable.
     pub fn submitSync(self: *Store, through: CommitId) Error!void {
         const operation = self.enter(.metadata);
         defer operation.end();
-        const sequence = @intFromEnum(through);
+        const sequence = @backingInt(through);
         if (sequence > self.saved.sequence) return error.InvalidArgument;
         self.requested_sequence = @max(self.requested_sequence, sequence);
         try self.progress();
@@ -1641,7 +1643,7 @@ pub const Store = struct {
             try result;
         }
         try self.submitSync(through);
-        while (self.rotation_pending or self.durable_sequence < @intFromEnum(through)) {
+        while (self.rotation_pending or self.durable_sequence < @backingInt(through)) {
             while (self.retired_reads != 0) {
                 self.reads_released.reset();
                 self.owner.store(0, .release);

@@ -3,7 +3,7 @@ const behavior = @import("behavior.zig");
 const crafting = @import("crafting.zig");
 const minecraft = @import("minecraft_model");
 const game_data = @import("game_data");
-const Players = @import("players.zig").Players;
+const Player = @import("player_state.zig").Player;
 
 pub const Plan = struct {
     state: u16,
@@ -12,7 +12,7 @@ pub const Plan = struct {
 };
 pub const Context = struct {
     player: u128,
-    actor: *const Players.Player,
+    actor: *const Player,
     world: u32,
     position: minecraft.BlockPosition,
     previous: u16,

@@ -28,15 +28,18 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "sessions", .module = b.dependency("sessions", .{ .target = target, .optimize = optimize }).module("sessions") },
                 .{ .name = "lightning_rod_vanilla_1_21_6", .module = vanilla.module("lightning_rod_vanilla_1_21_6") },
                 .{ .name = "tps", .module = b.dependency("tps", .{ .target = target, .optimize = optimize }).module("tps") },
+                .{ .name = "storm_stick", .module = b.dependency("storm_stick", .{ .target = target, .optimize = optimize }).module("storm_stick") },
+                .{ .name = "inventories", .module = b.dependency("inventories", .{ .target = target, .optimize = optimize }).module("inventories") },
+                .{ .name = "game_data", .module = b.dependency("game_data", .{ .target = target, .optimize = optimize }).module("game_data") },
             },
         }),
     });
     b.installArtifact(executable);
-    const run = b.addSystemCommand(&.{b.getInstallPath(.bin, executable.out_filename)});
+    const run = b.addRunFile(b.graph.path(.install_bin, executable.out_filename));
     run.setCwd(b.path("."));
     run.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Run the Vanilla server").dependOn(&run.step);
 
     b.addNamedLazyPath("server", executable.getEmittedBin());

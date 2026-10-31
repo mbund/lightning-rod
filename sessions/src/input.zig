@@ -185,8 +185,8 @@ pub fn Input(comptime Version: type, comptime phase: Phase) type {
     const maximum = comptime block: {
         @setEvalBranchQuota(100_000);
         var value: usize = 0;
-        for (@typeInfo(Server.PacketName).@"enum".fields) |field| {
-            const packet = @field(Server.PacketName, field.name);
+        for (@typeInfo(Server.PacketName).@"enum".field_names) |field| {
+            const packet = @field(Server.PacketName, field);
             value = @max(value, @as(usize, @intCast(Server.packetId(packet))));
         }
         break :block value;
@@ -246,8 +246,8 @@ pub fn StatusInput(comptime Version: type) type {
     const Server = Version.Protocol.status.toServer;
     const maximum = comptime block: {
         var value: usize = 0;
-        for (@typeInfo(Server.PacketName).@"enum".fields) |field| {
-            const packet = @field(Server.PacketName, field.name);
+        for (@typeInfo(Server.PacketName).@"enum".field_names) |field| {
+            const packet = @field(Server.PacketName, field);
             value = @max(value, @as(usize, @intCast(Server.packetId(packet))));
         }
         break :block value;
@@ -351,7 +351,7 @@ fn Set(comptime versions: anytype, comptime phase: enum { status, login, configu
 
     return struct {
         const Self = @This();
-        tables: std.meta.Tuple(&types),
+        tables: @Tuple(&types),
 
         pub fn on(self: *Self, comptime packet: anytype, context: anytype, comptime handler: anytype) !void {
             inline for (versions) |Version|

@@ -6,6 +6,7 @@ const profile = @import("profile");
 const sessions = @import("sessions");
 const vanilla = @import("lightning_rod_vanilla_1_21_6");
 const tps = @import("tps");
+const storm_stick = @import("storm_stick");
 
 pub const std_options: std.Options = .{ .log_level = .debug };
 
@@ -59,6 +60,7 @@ pub fn main(init: std.process.Init) !void {
         }),
         lightning_rod.plugin.configured(vanilla.Datapacks, .{ .sources = &.{.{ .collection = "datapacks" }} }),
         lightning_rod.plugin.configured(tps.Tps, .{}),
+        lightning_rod.plugin.configured(storm_stick.StormStick, .{}),
     });
     var protocols = try protocol_set.Default.init(allocator);
     defer protocols.deinit(allocator);

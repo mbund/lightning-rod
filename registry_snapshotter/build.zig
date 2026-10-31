@@ -19,18 +19,14 @@ pub fn build(b: *std.Build) void {
         _ = files.addCopyFile(b.path(name), b.fmt("{s}/{s}", .{ directory, name }));
     _ = files.addCopyDirectory(b.path("src"), b.fmt("{s}/src", .{directory}), .{});
 
-    const launcher = b.addExecutable(.{
-        .name = "registry-snapshotter",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/run.zig"),
-            .target = b.graph.host,
-        }),
-    });
-    const command = b.addRunArtifact(launcher);
-    _ = command.addOutputFileArg("gradle.log");
-    const cache = b.graph.global_cache_root.handle.realPathFileAlloc(b.graph.io, ".", b.allocator) catch |err|
-        std.debug.panic("Cannot resolve the compiler cache: {s}", .{@errorName(err)});
-    command.addArg(b.pathJoin(&.{ cache, "registry-snapshotter.lock" }));
+    const command = std.Build.Step.Run.create(b, b.fmt("extract Minecraft {s} registries", .{version}));
+    command.rename_step_with_output_arg = false;
+    _ = command.captureStdOut(.{ .basename = "gradle.log" });
+    _ = command.captureStdErr(.{ .basename = "gradle-stderr.log" });
+    if (b.graph.host.result.os.tag == .linux) {
+        command.addArgs(&.{ "flock", "--exclusive" });
+        command.addDirectoryArg(b.graph.path(.global_cache, "registry-snapshotter.lock"));
+    }
     if (b.graph.host.result.os.tag == .windows) command.addArgs(&.{ "cmd", "/c" });
     command.addFileArg(b.path(if (b.graph.host.result.os.tag == .windows) "gradlew.bat" else "gradlew"));
     command.addFileInput(b.path("gradle/wrapper/gradle-wrapper.jar"));
@@ -54,7 +50,9 @@ pub fn build(b: *std.Build) void {
 }
 
 pub fn apiForVersion(b: *std.Build, version: []const u8) []const u8 {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, b.pathFromRoot("versions.json"), b.allocator, .limited(64 * 1024)) catch @panic("cannot read registry API catalog");
+    b.dependOnFileContents(b.path("versions.json"));
+    const filename = b.root.joinString(b.allocator, "versions.json") catch @panic("OOM");
+    const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, filename, b.allocator, .limited(64 * 1024)) catch @panic("cannot read registry API catalog");
     const versions = std.json.parseFromSliceLeaky([]const struct { release: []const u8, api: []const u8 }, b.allocator, bytes, .{}) catch @panic("invalid registry API catalog");
     for (versions) |entry| if (std.mem.eql(u8, entry.release, version)) return entry.api;
     return "current";

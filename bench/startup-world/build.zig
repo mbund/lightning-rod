@@ -19,6 +19,6 @@ pub fn build(b: *std.Build) void {
     });
     const run = b.addRunArtifact(executable);
     b.installArtifact(executable);
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Generate a persisted superflat world for startup benchmarks").dependOn(&run.step);
 }

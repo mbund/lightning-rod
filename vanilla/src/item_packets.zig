@@ -118,11 +118,12 @@ fn encodeComponents(comptime Writer: type, comptime Done: type, packet: Writer, 
     var offsets: [data.maximum_components]usize = undefined;
     const count = items.components.dispatch.count;
     try items.components.resolve(view, offsets[0..count]);
-    var emitted: std.StaticBitSet(data.maximum_components) = .initEmpty();
-    var removals: std.StaticBitSet(data.maximum_components) = .initEmpty();
+    var emitted: std.StaticBitSet(data.maximum_components) = .empty;
+    var removals: std.StaticBitSet(data.maximum_components) = .empty;
     for (offsets[0..count], 0..) |offset, index| {
         const stored = if (offset == std.math.maxInt(usize)) null else view.at(offset);
         switch (items.components.present(index, view, recipient, stored)) {
+            .stored => if (stored.?.value != null) emitted.set(index) else removals.set(index),
             .added => emitted.set(index),
             .removed => removals.set(index),
             .absent => {},

@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
     }) });
     const run_prepare = b.addRunArtifact(prepare);
     prepare.root_module.addImport("records", records);
-    if (b.args) |args| run_prepare.addArgs(args);
+    run_prepare.addPassthruArgs();
     b.step("world", "Pregenerate or import vanilla terrain into a frozen corpus").dependOn(&run_prepare.step);
     const benchmark = b.addExecutable(.{ .name = "chunks-bench", .root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -26,7 +26,7 @@ pub fn build(b: *std.Build) void {
     }) });
     const run_benchmark = b.addRunArtifact(benchmark);
     benchmark.root_module.addImport("records", records);
-    if (b.args) |args| run_benchmark.addArgs(args);
+    run_benchmark.addPassthruArgs();
     b.step("bench", "Measure terrain encoding and deterministic player access patterns").dependOn(&run_benchmark.step);
     const comparison = b.addExecutable(.{ .name = "storage-comparison", .root_module = b.createModule(.{
         .root_source_file = b.path("src/compare.zig"),
@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) void {
     }) });
     const run_comparison = b.addRunArtifact(comparison);
     comparison.root_module.addImport("records", records);
-    if (b.args) |args| run_comparison.addArgs(args);
+    run_comparison.addPassthruArgs();
     b.step("compare", "Compare Anvil, SQLite, and native storage for the same terrain").dependOn(&run_comparison.step);
     const tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/test.zig"),

@@ -25,7 +25,6 @@ jobs:
           registries: 'true'
           clients: ${{ matrix.clients }}
           assets: 'true'
-          native: 'true'
           previous: ${{ matrix.upgrade }}
       - name: Real-client acceptance
         working-directory: e2e
