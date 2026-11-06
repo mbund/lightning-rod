@@ -54,13 +54,13 @@ pub fn main(init: std.process.Init) !void {
 
     const gameplay_plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(vanilla.plugins(), .{
+            lightning_rod.plugin.configured(vanilla.Streaming, .{ .prefetch = 3 }),
             lightning_rod.plugin.configured(vanilla.Operators, vanilla.Operators.Configuration{
                 .operators = &operators,
             }),
         }),
-        lightning_rod.plugin.configured(vanilla.Datapacks, .{ .sources = &.{.{ .collection = "datapacks" }} }),
         lightning_rod.plugin.configured(tps.Tps, .{}),
-        lightning_rod.plugin.configured(storm_stick.StormStick, .{}),
+        lightning_rod.plugin.configured(vanilla.RegionDebug, .{}),
     });
     var protocols = try protocol_set.Default.init(allocator);
     defer protocols.deinit(allocator);

@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "metrics", .module = metrics },
+            .{ .name = "zstandard", .module = b.dependency("zstandard", .{ .target = target, .optimize = optimize }).module("zstandard") },
             .{ .name = "records", .module = records.module("records") },
             .{ .name = "storage", .module = storage.module("storage") },
         },

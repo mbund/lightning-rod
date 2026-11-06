@@ -30,7 +30,9 @@ test "independent blob indexes and payloads share bounded submissions" {
     store.deinit();
     store = try storage.Store.init(allocator, io, options);
     space = try store.openSpace("blobs");
-    var reading: blob.ReadBatch = .{ .space = space };
+    const indices = try allocator.alloc(blob.Index, storage.batch_size);
+    defer allocator.free(indices);
+    var reading: blob.ReadBatch = .{ .space = space, .indices = indices };
     const before = store.read_batches.value();
     for (&values, 0..) |*value, index| {
         @memset(value, 0xff);

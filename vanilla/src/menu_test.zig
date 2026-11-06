@@ -661,7 +661,7 @@ test "default item identity matches the serialized definition" {
 
 fn blockContainers(allocator: std.mem.Allocator, store: *storage.Store, registry: *metrics.Registry, fixture: InventoryFixture) !*Containers {
     const resources = try records.Workspaces.init(allocator, std.testing.io, .{});
-    const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 16, .demand_sections = 4, .cache_tiles = 4 }, .{ .storage = try store.openSpace("chunks"), .metrics = registry, .record_workspaces = resources });
+    const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 16, .demand_sections = 4, .cache_groups = 4 }, .{ .storage = try store.openSpace("chunks"), .metrics = registry, .record_workspaces = resources });
     const experience = try Experience.init(allocator, .{ .maximum_orbs = 16 }, .{
         .enchantments = fixture.definitions.enchantments,
         .dimensions = fixture.definitions.dimensions,

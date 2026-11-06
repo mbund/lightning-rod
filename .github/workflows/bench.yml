@@ -8,6 +8,26 @@ defaults:
     shell: bash
 
 jobs:
+  sections:
+    name: Shared section visibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/dependencies
+      - working-directory: vanilla
+        run: |
+          mkdir -p .zig-cache
+          bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe bench-sections | tee .zig-cache/section-results.txt
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: section-benchmark
+          path: vanilla/.zig-cache/section-results.txt
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
   lighting:
     name: Lighting correctness and performance
     runs-on: ubuntu-24.04
@@ -53,38 +73,84 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  visibility:
+    name: Visibility correctness and quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/dependencies
+        with:
+          registries: 'true'
+      - working-directory: bench/visibility
+        run: |
+          mkdir -p .zig-cache
+          bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe test bench | tee .zig-cache/results.txt
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: visibility-benchmark
+          path: |
+            bench/visibility/.zig-cache/results.txt
+            bench/visibility/.zig-cache/visibility.jsonl
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
   prepare-world:
     name: Prepare chunk benchmark corpus
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    env:
-      MINECRAFT_SERVER_SHA1: 823e2250d24b3ddac457a60c92a6a941943fcd6a
     steps:
       - uses: actions/checkout@v7
       - uses: actions/cache@v5
         id: corpus
         with:
           path: ${{ runner.temp }}/ci-dependencies/world.tar.zst
-          key: ci-world-${{ env.MINECRAFT_SERVER_SHA1 }}-${{ hashFiles('bench/chunks/src/**', 'nbt/src/**') }}
+          key: ci-world-${{ hashFiles('game_data/baseline', 'bench/chunks/src/**', 'nbt/src/**', 'tools/world-import/src/**', 'chunks/src/**', 'records/src/**', 'storage/src/**', 'worlds/src/**') }}
       - uses: ./.github/actions/dependencies
         if: steps.corpus.outputs.cache-hit != 'true'
         with:
           jdk: 'true'
-      - name: Download benchmark server
+          registries: 'true'
+      - name: Download gameplay baseline server
         if: steps.corpus.outputs.cache-hit != 'true'
         run: |
+          minecraft_baseline=$(cat game_data/baseline)
           curl --fail --silent --show-error --location \
-            "https://piston-data.mojang.com/v1/objects/$MINECRAFT_SERVER_SHA1/server.jar" \
+            https://piston-meta.mojang.com/mc/game/version_manifest_v2.json \
+            -o "$RUNNER_TEMP/minecraft-versions.json"
+          minecraft_metadata=$(jq -er --arg version "$minecraft_baseline" \
+            '.versions[] | select(.id == $version) | .url' "$RUNNER_TEMP/minecraft-versions.json")
+          curl --fail --silent --show-error --location "$minecraft_metadata" \
+            -o "$RUNNER_TEMP/benchmark-version.json"
+          server_url=$(jq -er '.downloads.server.url' "$RUNNER_TEMP/benchmark-version.json")
+          server_sha1=$(jq -er '.downloads.server.sha1' "$RUNNER_TEMP/benchmark-version.json")
+          curl --fail --silent --show-error --location \
+            "$server_url" \
             -o "$RUNNER_TEMP/benchmark-minecraft.jar"
-          printf '%s  %s\n' "$MINECRAFT_SERVER_SHA1" "$RUNNER_TEMP/benchmark-minecraft.jar" | sha1sum --check --status
+          printf '%s  %s\n' "$server_sha1" "$RUNNER_TEMP/benchmark-minecraft.jar" | sha1sum --check --status
+          minecraft_data_version=$(unzip -p "$RUNNER_TEMP/benchmark-minecraft.jar" version.json | jq -er '.world_version')
+          echo "MINECRAFT_DATA_VERSION=$minecraft_data_version" >> "$GITHUB_ENV"
       - name: Generate vanilla terrain corpus
         if: steps.corpus.outputs.cache-hit != 'true'
         working-directory: bench/chunks
         run: |
           bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe world -- \
-            --server "$RUNNER_TEMP/benchmark-minecraft.jar" --output "$RUNNER_TEMP/benchmark-world"
+            --server "$RUNNER_TEMP/benchmark-minecraft.jar" --output "$RUNNER_TEMP/benchmark-world" \
+            --data-version "$MINECRAFT_DATA_VERSION"
+      - name: Import visibility benchmark terrain
+        if: steps.corpus.outputs.cache-hit != 'true'
+        working-directory: tools/world-import
+        run: |
+          bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe run -- \
+            --input "$RUNNER_TEMP/benchmark-world/generator/world" \
+            --output "$RUNNER_TEMP/benchmark-world/native" --no-lighting --skip-unsupported
+      - name: Archive benchmark worlds
+        if: steps.corpus.outputs.cache-hit != 'true'
+        run: |
           tar --zstd -cf "$RUNNER_TEMP/ci-dependencies/world.tar.zst" -C "$RUNNER_TEMP/benchmark-world" \
-            corpus.bin corpus.json anvil registry.json
+            corpus.bin corpus.json anvil registry.json native
       - uses: actions/upload-artifact@v7
         with:
           name: ci-world
@@ -92,6 +158,36 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 1
+
+  visibility-caves:
+    name: Imported cave visibility correctness and quality
+    needs: prepare-world
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/dependencies
+        with:
+          registries: 'true'
+          world: 'true'
+      - working-directory: bench/visibility
+        run: |
+          mkdir -p .zig-cache
+          bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe test-caves caves -- \
+            --world "$RUNNER_TEMP/benchmark-world/native/world" --position 256 64 256 \
+            | tee .zig-cache/cave-results.txt
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: imported-cave-visibility
+          path: |
+            bench/visibility/.zig-cache/cave-results.txt
+            bench/visibility/.zig-cache/visibility-caves.jsonl
+            ${{ runner.temp }}/benchmark-world/native/import.json
+            ${{ runner.temp }}/benchmark-world/corpus.json
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
 
   record-benchmark:
     name: Record storage comparison

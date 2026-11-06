@@ -2,14 +2,84 @@ package dev.lightningrod.e2e;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
+import net.minecraft.network.protocol.game.ClientboundBlockChangedAckPacket;
+import net.minecraft.network.protocol.game.ClientboundBlockUpdatePacket;
+import net.minecraft.network.protocol.game.ClientboundBundlePacket;
+import net.minecraft.network.protocol.game.ClientboundSectionBlocksUpdatePacket;
+import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
+import net.minecraft.network.protocol.game.ServerboundUseItemOnPacket;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import dev.lightningrod.e2e.mixin.ClientConnectionAccessor;
+import io.netty.channel.ChannelDuplexHandler;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelPromise;
 
 final class CreativeFixture extends Fixture {
     private enum Phase { POSITION, GIVE, HELD, PLACE, PLACED, DROP_ONE, DROPPED_ONE, DROP_STACK, DROPPED_STACK, DROP_CATALOG, DROPPED_CATALOG, BREAK, BROKEN, COMPLETE }
     private Phase phase = Phase.POSITION;
+    private static final BlockPos PLACED = new BlockPos(3, 65, 1);
+    private volatile String predictionFailure;
+    private volatile boolean placementAcknowledged;
+    private volatile boolean breakingAcknowledged;
 
     CreativeFixture(Recorder r) { super(r); }
+    @Override boolean encrypted() { return true; }
+
+    @Override void connected(Minecraft game) {
+        if (!r.peer.equals("alice")) return;
+        var channel = ((ClientConnectionAccessor) game.getConnection().getConnection()).lightningRod$channel();
+        if (channel.pipeline().get("creative-prediction") != null) return;
+        channel.pipeline().addBefore("packet_handler", "creative-prediction", new ChannelDuplexHandler() {
+            private int placementSequence = -1;
+            private int breakingSequence = -1;
+            private boolean placementVerified;
+            private boolean breakingVerified;
+
+            @Override public void write(ChannelHandlerContext context, Object message, ChannelPromise promise) throws Exception {
+                if (message instanceof ServerboundUseItemOnPacket packet && packet.getHitResult().getBlockPos().equals(PLACED.below())) {
+                    placementSequence = packet.getSequence();
+                    placementVerified = false;
+                }
+                if (message instanceof ServerboundPlayerActionPacket packet && packet.getPos().equals(PLACED)
+                        && packet.getAction() == ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK) {
+                    breakingSequence = packet.getSequence();
+                    breakingVerified = false;
+                }
+                super.write(context, message, promise);
+            }
+
+            private void update(BlockPos position, BlockState state) {
+                if (!position.equals(PLACED)) return;
+                if (placementSequence >= 0 && state.is(Blocks.STONE)) placementVerified = true;
+                if (breakingSequence >= 0 && state.isAir()) breakingVerified = true;
+            }
+
+            private void observe(Object message) {
+                if (message instanceof ClientboundBundlePacket bundle) for (var packet : bundle.subPackets()) observe(packet);
+                if (message instanceof ClientboundSectionBlocksUpdatePacket packet) packet.runUpdates(this::update);
+                if (message instanceof ClientboundBlockUpdatePacket packet) update(packet.getPos(), packet.getBlockState());
+                if (message instanceof ClientboundBlockChangedAckPacket packet) {
+                    if (placementSequence >= 0 && packet.sequence() >= placementSequence && !placementAcknowledged) {
+                        if (!placementVerified) predictionFailure = "placement_acknowledged_before_authoritative_block";
+                        placementAcknowledged = true;
+                    }
+                    if (breakingSequence >= 0 && packet.sequence() >= breakingSequence && !breakingAcknowledged) {
+                        if (!breakingVerified) predictionFailure = "breaking_acknowledged_before_authoritative_block";
+                        breakingAcknowledged = true;
+                    }
+                }
+            }
+
+            @Override public void channelRead(ChannelHandlerContext context, Object message) throws Exception {
+                observe(message);
+                super.channelRead(context, message);
+            }
+        });
+    }
 
     public void tick(Minecraft game, int loaded, int missing) {
+        if (predictionFailure != null) { client.fail(predictionFailure); return; }
         if (r.terrainTick < 0 || missingChunks(game, 2) != 0) return;
         if (r.tick - r.terrainTick > 400) { client.fail("creative_timeout_stage_" + phase); return; }
         boolean alice = r.peer.equals("alice");
@@ -38,14 +108,14 @@ final class CreativeFixture extends Fixture {
             client.mark(r.peer + ".creative-held");
             phase = Phase.PLACE;
         }
-        BlockPos placed = new BlockPos(3, 65, 1);
+        BlockPos placed = PLACED;
         if (phase == Phase.PLACE) {
             for (String other : r.expectedPeers) if (!client.marked(other + ".creative-held")) return;
             if (alice) game.gameMode.useItemOn(game.player, net.minecraft.world.InteractionHand.MAIN_HAND,
                 new net.minecraft.world.phys.BlockHitResult(new net.minecraft.world.phys.Vec3(3.5, 65, 1.5), net.minecraft.core.Direction.UP, placed.below(), false));
             phase = Phase.PLACED;
         }
-        if (phase == Phase.PLACED && game.level.getBlockState(placed).is(net.minecraft.world.level.block.Blocks.STONE)) {
+        if (phase == Phase.PLACED && game.level.getBlockState(placed).is(Blocks.STONE) && (!alice || placementAcknowledged)) {
             if (!client.screenshot("creative_block").done()) return;
             client.mark(r.peer + ".creative-placed");
             phase = Phase.DROP_ONE;
@@ -91,7 +161,7 @@ final class CreativeFixture extends Fixture {
             if (alice) game.gameMode.startDestroyBlock(placed, net.minecraft.core.Direction.UP);
             phase = Phase.BROKEN;
         }
-        if (phase == Phase.BROKEN && game.level.getBlockState(placed).isAir()) {
+        if (phase == Phase.BROKEN && game.level.getBlockState(placed).isAir() && (!alice || breakingAcknowledged)) {
             client.mark(r.peer + ".creative-broken");
             phase = Phase.COMPLETE;
         }

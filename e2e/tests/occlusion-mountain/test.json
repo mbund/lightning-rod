@@ -1,0 +1,4 @@
+{
+  "client": "OcclusionMountainFixture",
+  "variants": [{ "name": "occlusion-mountain" }]
+}

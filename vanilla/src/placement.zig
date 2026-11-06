@@ -39,39 +39,13 @@ pub const Placement = struct {
         item_actions: *ItemActions,
     };
 
-    const State = struct {
-        generation: u32 = 0,
-        teleport_id: i32 = 0,
-        sequence: i32 = -1,
-        selected: u4 = 0,
-    };
-
     deps: Dependencies,
-    states: []State,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Placement {
         const self = try allocator.create(Placement);
-        const states = try allocator.alloc(State, deps.players.records.len);
-        @memset(states, .{});
-        self.* = .{ .deps = deps, .states = states };
+        self.* = .{ .deps = deps };
         try deps.input.on(.block_place, self, onPlace);
         return self;
-    }
-
-    pub fn tick(self: *Placement) !void {
-        const players = self.deps.players;
-
-        for (players.activeSlots()) |index| {
-            const player = players.records[index];
-            const state = &self.states[index];
-            const handle = player.handle orelse continue;
-
-            if (state.generation != handle.generation or state.teleport_id != player.teleport_id)
-                state.* = .{ .generation = handle.generation, .teleport_id = player.teleport_id, .selected = player.selected_slot };
-
-            if (state.sequence >= 0 and self.deps.blocks.observers[index].pending == 0 and players.sendBlockAck(player.protocol, handle, state.sequence))
-                state.sequence = -1;
-        }
     }
 
     fn onPlace(self: *Placement, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_block_place.Reader) !void {
@@ -89,12 +63,8 @@ pub const Placement = struct {
         const players = self.deps.players;
         const index = handle.index;
         const player = players.records[index];
-        const state = &self.states[index];
-        if (state.generation != handle.generation or state.teleport_id != player.teleport_id)
-            state.* = .{ .generation = handle.generation, .teleport_id = player.teleport_id };
-        state.selected = player.selected_slot;
         if (player.stage != .ready) return;
-        state.sequence = @max(state.sequence, place.sequence);
+        self.deps.blocks.acknowledge(&player, place.sequence);
         if (place.hand < 0 or place.hand > 1 or place.face < 0 or place.face > 5) return;
         if (!std.math.isFinite(place.cursor[0]) or !std.math.isFinite(place.cursor[1]) or !std.math.isFinite(place.cursor[2])) return;
         if (player.health <= 0) return;
@@ -108,12 +78,12 @@ pub const Placement = struct {
         const hit_dz = @as(f64, @floatFromInt(place.position.z)) + 0.5 - player.position.z;
         if (hit_dx * hit_dx + hit_dy * hit_dy + hit_dz * hit_dz > 36) return;
 
-        const slot: inventories.Slot = .{ .owner = player.uuid, .index = if (place.hand == 1) 45 else 36 + @as(u16, state.selected) };
+        const slot: inventories.Slot = .{ .owner = player.uuid, .index = if (place.hand == 1) 45 else 36 + @as(u16, player.selected_slot) };
         const held = try self.deps.inventories.get(slot);
         const clicked: chunks.Position = .{ .x = place.position.x, .y = place.position.y, .z = place.position.z };
         const secondary = if (player.flags.sneaking and held.stack == null) (try self.deps.inventories.get(.{
             .owner = player.uuid,
-            .index = if (place.hand == 0) 45 else 36 + @as(u16, state.selected),
+            .index = if (place.hand == 0) 45 else 36 + @as(u16, player.selected_slot),
         })).stack else null;
         if (!player.flags.sneaking or (held.stack == null and secondary == null)) {
             const used = try self.deps.actions.apply(.{

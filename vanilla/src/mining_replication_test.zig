@@ -1,5 +1,7 @@
 const vanilla_content = @import("vanilla_content.zig");
 const Visibility = @import("visibility.zig").Visibility;
+const Streaming = @import("streaming.zig").Streaming;
+const Lighting = @import("lighting.zig").Lighting;
 const std = @import("std");
 const storage = @import("storage");
 const records = @import("records");
@@ -94,8 +96,10 @@ const Fixture = struct {
             .record_workspaces = workspaces,
         });
         const menus = try PlayerInventory.init(allocator, .{}, .{ .crafting = gameplay_definitions.crafting, .furnaces = gameplay_definitions.furnaces, .players = players, .inventories = ownership, .items = items, .equipment = try EquipmentSlots.init(allocator, .{ .items = items, .enchantments = gameplay_definitions.enchantments }), .dropped = dropped });
-        const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 64, .demand_sections = 0, .cache_tiles = 8 }, .{ .metrics = registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const blocks = try Blocks.init(allocator, std.testing.io, .{ .metrics = registry, .chunks = terrain, .players = players, .streaming = undefined, .sessions = service, .packets = encoding, .worlds = dimensions }, .{ .delta_sections = 16, .queued_sections = 32 });
+        const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 64, .demand_sections = 0, .cache_groups = 8 }, .{ .metrics = registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
+        const light = try Lighting.init(allocator, .{ .cache_columns = 1 }, .{ .metrics = registry, .blocks = gameplay_definitions.blocks, .chunks = terrain, .worlds = dimensions });
+        const streaming = try Streaming.init(allocator, std.testing.io, .{ .occlusion = false }, .{ .metrics = registry, .players = players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = light });
+        const blocks = try Blocks.init(allocator, std.testing.io, .{ .metrics = registry, .chunks = terrain, .players = players, .streaming = streaming, .sessions = service, .packets = encoding, .worlds = dimensions }, .{ .delta_sections = 16, .queued_sections = 32 });
         const experience = try Experience.init(allocator, .{ .maximum_orbs = 64 }, .{ .enchantments = gameplay_definitions.enchantments, .dimensions = gameplay_definitions.dimensions, .players = players, .entities = bodies, .physics = try ItemPhysics.init(allocator, .{ .blocks = gameplay_definitions.blocks, .chunks = terrain }), .inventories = ownership, .inventory = menus, .storage = try store.openSpace("experience"), .record_workspaces = workspaces });
         const mining = try Mining.allocate(allocator, .{}, .{ .enchantments = gameplay_definitions.enchantments, .block_definitions = gameplay_definitions.blocks, .attributes = try EquipmentAttributes.init(allocator, .{}, .{ .players = players, .items = items, .enchantments = gameplay_definitions.enchantments, .client = gameplay_definitions.client }), .definitions = gameplay_definitions.mining, .visibility = try Visibility.init(allocator, .{}, .{ .players = players }), .metrics = registry, .storage = try store.openSpace("mining"), .players = players, .input = input, .inventories = ownership, .items = items, .durability = try Durability.init(allocator, .{ .items = items, .inventories = ownership, .enchantments = gameplay_definitions.enchantments }), .worlds = dimensions, .chunks = terrain, .menus = menus, .loot = try BlockLoot.init(allocator, .{ .loot = gameplay_definitions.loot }), .experience = experience, .dropped = dropped, .blocks = blocks, .actions = try BlockActions.init(allocator, .{}) });
         const tool: inventories.Stack = .{ .item = try items.define("minecraft:diamond_pickaxe"), .count = 1 };
@@ -112,6 +116,13 @@ const Fixture = struct {
     fn grant(self: *Fixture, index: usize, bytes: usize) void {
         const handle = self.mining.deps.players.records[index].handle.?;
         self.service.credit[index].store((@as(u64, handle.generation) << 32) | sessions.Service.active | bytes, .release);
+    }
+
+    fn deinit(self: *Fixture) void {
+        const streaming = self.mining.deps.blocks.deps.streaming;
+        self.service.unsubscribeOutput(streaming.changed);
+        self.mining.deps.chunks.unsubscribeReady(streaming.changed);
+        self.service.deinit();
     }
 
     fn grantAll(self: *Fixture) void {
@@ -198,7 +209,7 @@ pub fn benchmarkReplication() !void {
         var registry = try metrics.Registry.init(allocator, std.testing.io, .{ .capacity = 128 });
         defer registry.deinit();
         var fixture = try Fixture.init(allocator, &store, &registry, count);
-        defer fixture.service.deinit();
+        defer fixture.deinit();
         failing.fail_index = failing.alloc_index;
         fixture.service.beginTick();
         for (0..count) |index| try fixture.dig(index, 0, position);
@@ -238,7 +249,7 @@ pub fn verifyDelivery() !void {
     var registry = try metrics.Registry.init(allocator, std.testing.io, .{ .capacity = 128 });
     defer registry.deinit();
     var fixture = try Fixture.init(allocator, &store, &registry, count);
-    defer fixture.service.deinit();
+    defer fixture.deinit();
     const exclusion = try fixture.mining.deps.visibility.createLayer();
     failing.fail_index = failing.alloc_index;
     const players = fixture.mining.deps.players;
@@ -380,7 +391,7 @@ pub fn verifyReadWindow() !void {
     var registry = try metrics.Registry.init(allocator, std.testing.io, .{ .capacity = 128 });
     defer registry.deinit();
     var fixture = try Fixture.init(allocator, &store, &registry, 2);
-    defer fixture.service.deinit();
+    defer fixture.deinit();
     const Action = struct {
         terrain: *chunks.Chunks,
         calls: usize = 0,
@@ -449,7 +460,7 @@ pub fn verifyNeighborhoods() !void {
         var registry = try metrics.Registry.init(allocator, std.testing.io, .{ .capacity = 128 });
         defer registry.deinit();
         var fixture = try Fixture.init(allocator, &store, &registry, count);
-        defer fixture.service.deinit();
+        defer fixture.deinit();
         const players = fixture.mining.deps.players;
         const terrain = fixture.mining.deps.chunks;
         const target: minecraft.BlockPosition = .{ .x = 16, .y = position.y, .z = position.z };
@@ -580,7 +591,7 @@ pub fn verifyExperience() !void {
         var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .capacity = 256 });
         defer registry.deinit();
         var fixture = try Fixture.init(allocator, &store, &registry, 1);
-        defer fixture.service.deinit();
+        defer fixture.deinit();
         const player = &fixture.mining.deps.players.records[0];
         player.gamemode = case.mode;
         const world = player.world;

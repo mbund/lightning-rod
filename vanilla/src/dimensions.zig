@@ -9,7 +9,7 @@ const nbt = @import("native_nbt.zig");
 pub const Dimensions = struct {
     pub const id = "minecraft:dimensions";
     pub const Definitions = struct { dimensions: []const types.DimensionType = &.{}, tags: []const types.Tag = &.{} };
-    pub const Entry = struct { dimension: Worlds.Dimension, ultrawarm: bool };
+    pub const Entry = struct { dimension: Worlds.Dimension, ultrawarm: bool, ceiling: bool = false };
     pub const Data = struct { entries: []const ?Entry, client: Registries };
     pub const Configuration = registry.Registry(Dimensions).Configuration;
     registry: registry.Registry(Dimensions),
@@ -36,6 +36,7 @@ pub const Dimensions = struct {
         for (definitions.dimensions) |entry| entries[values.id(entry.name).?] = .{
             .dimension = .{ .name = values.get(entry.name).?.name, .minimum_section = @divExact(entry.definition.min_y, 16), .section_count = @intCast(@divExact(entry.definition.height, 16)), .skylight = entry.definition.has_skylight },
             .ultrawarm = entry.definition.ultrawarm,
+            .ceiling = entry.definition.has_ceiling,
         };
         return .{ .entries = entries, .client = client };
     }

@@ -35,7 +35,7 @@ fn itemPhysicsProbe(output: *std.Io.Writer) !void {
     defer arena.deinit();
     var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .capacity = 128 });
     defer registry.deinit();
-    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .cache_sections = 8, .demand_sections = 0, .cache_tiles = 2 }, .{
+    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .cache_sections = 8, .demand_sections = 0, .cache_groups = 2 }, .{
         .metrics = &registry,
         .storage = try store.openSpace(chunks.Chunks.id),
         .record_workspaces = try persistent_records.Workspaces.init(arena.allocator(), io, .{}),
@@ -432,7 +432,7 @@ pub fn benchmarkItemPhysicsWindow() !void {
     defer arena.deinit();
     var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .capacity = 128 });
     defer registry.deinit();
-    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .cache_sections = 8, .demand_sections = 0, .cache_tiles = 2 }, .{
+    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .cache_sections = 8, .demand_sections = 0, .cache_groups = 2 }, .{
         .metrics = &registry,
         .storage = try store.openSpace(chunks.Chunks.id),
         .record_workspaces = try persistent_records.Workspaces.init(arena.allocator(), io, .{}),

@@ -1,0 +1,4 @@
+{
+  "client": "RegionDebugFixture",
+  "variants": [{ "name": "region-debug-multi", "peers": ["alice", "bob"] }]
+}

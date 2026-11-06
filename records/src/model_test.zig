@@ -274,7 +274,7 @@ test "structural inspection rejects lost pages and scanning rejects cyclic leaf 
     const root = (try table.space.getRoot()).?;
     var page: storage.Page = undefined;
     try table.space.readPages(&.{.{ .id = root, .destination = &page }});
-    std.mem.writeInt(u64, page[8..16], @intFromEnum(root), .little);
+    std.mem.writeInt(u64, page[8..16], @backingInt(root), .little);
     try table.space.writePages(&.{.{ .id = root, .source = &page }});
     try std.testing.expectError(error.Corrupt, structure.inspect(table));
     var after: [16]u8 = undefined;
@@ -883,7 +883,7 @@ test "independent lookups and mutations progress around a paused read on small s
     try first.put("key", &large);
     try second.put("key", &small);
     const root = (try a.getRoot()).?;
-    const offset = store.locations.get(@intFromEnum(root)).?.current;
+    const offset = store.locations.get(@backingInt(root)).?.current;
     var disk = try fault.Disk.init(allocator, io, &.{ store.database, store.wal }, std.math.maxInt(usize), false);
     defer disk.deinit();
     const modeled = disk.interface();
@@ -1037,4 +1037,85 @@ test "borrowed node navigation invalidates after page rewrite and detects new co
     std.mem.writeInt(u16, page[16..18], 0, .little);
     try space.writePages(&.{.{ .id = (try space.getRoot()).?, .source = &page }});
     try std.testing.expectError(error.Corrupt, table.get("key", &value));
+}
+
+test "compound record changes exclude concurrent commits" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_bytes: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_bytes, ".zig-cache/tmp/{s}/compound", .{temporary.sub_path});
+    const io = std.testing.io;
+    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path, .io_mode = .standard, .maximum_wal_pages = 128 });
+    var closed = false;
+    defer if (!closed) store.deinit();
+    const resources = try records.Resources.init(std.testing.allocator, io, .{ .readers = 1 });
+    defer resources.deinit();
+    const space = try store.openSpace("test");
+    const table = records.Table.init(space, resources);
+    const Commit = struct {
+        store: *storage.Store,
+        started: std.Io.Event = .unset,
+        result: anyerror!void = error.CommitNotRun,
+        fn run(self: *@This()) void {
+            self.started.set(self.store.io);
+            self.result = blk: {
+                _ = self.store.commit(1) catch |err| break :blk err;
+                break :blk {};
+            };
+        }
+    };
+    var commit: Commit = .{ .store = &store };
+    var thread: ?std.Thread = null;
+    defer if (thread) |active| active.join();
+    {
+        const mutation = space.mutate();
+        defer mutation.end();
+        try table.putBatch(&.{.{ .key = "block", .value = "moved" }});
+        thread = try std.Thread.spawn(.{}, Commit.run, .{&commit});
+        commit.started.waitUncancelable(io);
+        try table.putBatch(&.{.{ .key = "inventory", .value = "moved" }});
+    }
+    thread.?.join();
+    thread = null;
+    try commit.result;
+    try store.waitDurable(store.lastCommit());
+    try std.testing.expectEqual(@as(u64, 1), store.lastTick());
+    store.deinit();
+    closed = true;
+    var reopened = try storage.Store.init(std.testing.allocator, io, .{ .path = path, .io_mode = .standard, .maximum_wal_pages = 128 });
+    defer reopened.deinit();
+    const persisted = records.Table.init(try reopened.openSpace("test"), resources);
+    var block: [16]u8 = undefined;
+    var inventory: [16]u8 = undefined;
+    var lengths: [2]?usize = undefined;
+    try persisted.getBatch(&.{ .{ .key = "block", .destination = &block }, .{ .key = "inventory", .destination = &inventory } }, &lengths);
+    try std.testing.expectEqualStrings("moved", block[0..lengths[0].?]);
+    try std.testing.expectEqualStrings("moved", inventory[0..lengths[1].?]);
+}
+
+test "key scans paginate without requiring value buffers" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/keys", .{directory.sub_path});
+    const io = std.testing.io;
+    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path, .io_mode = .standard });
+    defer store.deinit();
+    const resources = try records.Resources.init(std.testing.allocator, io, .{ .readers = 1, .writers = 1 });
+    defer resources.deinit();
+    const table = records.Table.init(try store.openSpace("keys"), resources);
+    const large: [32 * 1024]u8 = @splat(9);
+    try table.putBatch(&.{ .{ .key = "a", .value = &large }, .{ .key = "b", .value = &large } });
+    var after: [16]u8 = undefined;
+    var cursor: records.ScanCursor = .{ .after = &after };
+    var key: [16]u8 = undefined;
+    var rows: [1]records.ScanKey = .{.{ .key = &key }};
+    const first = try table.scanKeys(&cursor, &rows);
+    try std.testing.expectEqual(@as(usize, 1), first.count);
+    try std.testing.expect(first.more);
+    try std.testing.expectEqualStrings("a", key[0..rows[0].key_len]);
+    const second = try table.scanKeys(&cursor, &rows);
+    try std.testing.expectEqual(@as(usize, 1), second.count);
+    try std.testing.expect(!second.more);
+    try std.testing.expectEqualStrings("b", key[0..rows[0].key_len]);
 }

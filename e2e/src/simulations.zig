@@ -93,7 +93,7 @@ pub fn run(init: std.process.Init, plugins: anytype, endpoints: []*sessions.Serv
     std.debug.assert(plugins.len == endpoints.len);
     std.debug.assert(plugins.len == 2 or plugins.len == 3);
     const limits = .{
-        lightning_rod.plugin.configured(vanilla.Chunks, vanilla.Chunks.Configuration{ .cache_sections = 48, .demand_sections = 24, .cache_tiles = 6 }),
+        lightning_rod.plugin.configured(vanilla.Chunks, vanilla.Chunks.Configuration{ .cache_sections = 48, .demand_sections = 24, .cache_groups = 6 }),
         lightning_rod.plugin.configured(vanilla.BlockSynchronization, vanilla.BlockSynchronization.Configuration{ .delta_sections = 8, .queued_sections = 8 }),
         lightning_rod.plugin.configured(vanilla.Entities, vanilla.Entities.Configuration{ .cache_records = 16 }),
         lightning_rod.plugin.configured(vanilla.ItemEntities, vanilla.ItemEntities.Configuration{ .cache_records = 16, .maximum = 64 }),

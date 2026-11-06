@@ -28,6 +28,7 @@ pub const Terrain = struct {
 };
 
 pub const ThreadedTerrain = struct {
+    pub const stack_size = 256 * 1024;
     terrain: Terrain,
     io: std.Io,
     thread: ?std.Thread = null,
@@ -38,7 +39,7 @@ pub const ThreadedTerrain = struct {
     failure: ?anyerror = null,
 
     pub fn start(self: *ThreadedTerrain) !void {
-        self.thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, execute, .{self});
+        self.thread = try std.Thread.spawn(.{ .stack_size = stack_size }, execute, .{self});
         self.initialized.waitUncancelable(self.io);
     }
 

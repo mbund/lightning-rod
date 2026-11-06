@@ -21,7 +21,7 @@ const Plugins = struct {
     fn init(allocator: std.mem.Allocator, store: *storage.Store, registry: *metrics.Registry) !Plugins {
         const workspaces = try records.Workspaces.init(allocator, store.io, .{});
         return .{
-            .world = try chunks.Chunks.init(allocator, store.io, .{ .demand_sections = 0, .cache_sections = 2, .cache_tiles = 1 }, .{ .metrics = registry, .storage = try store.openSpace(chunks.Chunks.id), .record_workspaces = workspaces }),
+            .world = try chunks.Chunks.init(allocator, store.io, .{ .demand_sections = 0, .cache_sections = 2, .cache_groups = 1 }, .{ .metrics = registry, .storage = try store.openSpace(chunks.Chunks.id), .record_workspaces = workspaces }),
             .inventory = try inventories.Inventories.init(allocator, store.io, .{ .cache_slots = 2, .cache_items = 2 }, .{ .metrics = registry, .storage = try store.openSpace(inventories.Inventories.id), .record_workspaces = workspaces }),
         };
     }

@@ -15,7 +15,7 @@ const progress_ticks = 10;
 
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
-        lightning_rod.plugin.replace(vanilla.plugins(), .{lightning_rod.plugin.configured(vanilla.Players, .{ .render_distance = render_distance })}),
+        lightning_rod.plugin.replace(e2e.profile.plugins(), .{lightning_rod.plugin.configured(vanilla.Players, .{ .render_distance = render_distance })}),
         lightning_rod.plugin.configured(Probe, .{}),
     });
     try e2e.profile.run(init, plugins, .{ .reload_executable = "/proc/self/exe" });

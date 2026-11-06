@@ -1,0 +1,20 @@
+.{
+    .name = .world_import,
+    .fingerprint = 0x0d70b35ee8a40e61,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .entities = .{ .path = "../../entities" },
+        .chunks = .{ .path = "../../chunks" },
+        .anvil = .{ .path = "../../anvil" },
+        .lightning_rod = .{ .path = "../.." },
+        .vanilla = .{ .path = "../../vanilla" },
+        .game_data = .{ .path = "../../game_data" },
+        .records = .{ .path = "../../records" },
+        .inventories = .{ .path = "../../inventories" },
+        .protocols = .{ .path = "../../protocols" },
+        .minecraft_packets = .{ .path = "../../minecraft_packets" },
+        .nbt = .{ .path = "../../nbt" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

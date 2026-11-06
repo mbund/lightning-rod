@@ -77,7 +77,7 @@ test "recipe book packets encode loaded recipes for every selected protocol" {
         .inventory = fixture.menus,
         .inventories = fixture.ownership,
         .items = fixture.items,
-        .chunks = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 1, .demand_sections = 0, .cache_tiles = 1 }, .{
+        .chunks = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 1, .demand_sections = 0, .cache_groups = 1 }, .{
             .metrics = &registry,
             .storage = try store.openSpace("recipe_chunks"),
             .record_workspaces = fixture.players.deps.record_workspaces,
@@ -144,7 +144,7 @@ test "recipe unlocks settings and revocation persist by name across recipe inser
             .inventory = fixture.menus,
             .inventories = fixture.ownership,
             .items = fixture.items,
-            .chunks = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 1, .demand_sections = 0, .cache_tiles = 1 }, .{
+            .chunks = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 1, .demand_sections = 0, .cache_groups = 1 }, .{
                 .metrics = &registry,
                 .storage = try store.openSpace("recipe_chunks"),
                 .record_workspaces = fixture.players.deps.record_workspaces,
@@ -306,7 +306,7 @@ test "inventory discovery unlocks recipes without retaining definition leases or
         .inventory = fixture.menus,
         .inventories = fixture.ownership,
         .items = fixture.items,
-        .chunks = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 1, .demand_sections = 0, .cache_tiles = 1 }, .{
+        .chunks = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 1, .demand_sections = 0, .cache_groups = 1 }, .{
             .metrics = &registry,
             .storage = try store.openSpace("recipe_chunks"),
             .record_workspaces = fixture.players.deps.record_workspaces,
@@ -496,7 +496,7 @@ test "block discovery batches samples and invalidates only occupied edits withou
     fixture.players.records[1].uuid = 2;
     fixture.players.records[1].handle = .{ .index = 1, .generation = 1 };
     fixture.players.rebuildIndexes();
-    const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 1, .demand_sections = 0, .cache_tiles = 1 }, .{
+    const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 1, .demand_sections = 0, .cache_groups = 1 }, .{
         .metrics = &registry,
         .storage = try store.openSpace("recipe_chunks"),
         .record_workspaces = fixture.players.deps.record_workspaces,

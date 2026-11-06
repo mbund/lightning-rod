@@ -195,13 +195,13 @@ const ValueReads = struct {
             var offset = layout.prefix;
             for (0..layout.pages) |at| {
                 const length = @min(storage.page_size, cell.length - offset);
-                try self.data.append(@enumFromInt(std.mem.readInt(u64, cell.value[at * 8 ..][0..8], .little)), destination[offset..][0..length]);
+                try self.data.append(@fromBackingInt(@intCast(std.mem.readInt(u64, cell.value[at * 8 ..][0..8], .little))), destination[offset..][0..length]);
                 offset += length;
             }
             assert(offset == cell.length);
             return cell.length;
         }
-        return self.data.appendBlob(@enumFromInt(cell.reference), cell.length, destination);
+        return self.data.appendBlob(@fromBackingInt(@intCast(cell.reference)), cell.length, destination);
     }
 };
 
@@ -209,6 +209,7 @@ pub const Get = struct { key: []const u8, destination: []u8 };
 pub const Write = struct { key: []const u8, value: ?[]const u8 };
 pub const ScanCursor = struct { after: []u8, after_len: usize = 0 };
 pub const ScanEntry = struct { key: []u8, value: []u8, key_len: usize = 0, value_len: usize = 0 };
+pub const ScanKey = struct { key: []u8, key_len: usize = 0 };
 pub const ScanResult = struct { count: usize, more: bool };
 
 const Cell = struct {
@@ -232,6 +233,7 @@ const Cell = struct {
 };
 
 const UpdateWorkspace = struct {
+    blob_indices: [storage.batch_size]blob.Index = undefined,
     path: [maximum_depth]storage.Page = undefined,
     cells: [working_cells]Cell = undefined,
     parent_cells: [maximum_cells]Cell = undefined,
@@ -307,13 +309,14 @@ fn WorkspacePool(comptime Workspace: type) type {
 
 pub const Resources = struct {
     pub const Configuration = struct { readers: usize = 2, writers: usize = 1, navigation_pages: usize = 64 };
-    const ReadWorkspace = struct { pages: [storage.batch_size]storage.Page, cells: [maximum_cells]Cell, navigation: []Navigation, fallback: Navigation };
+    const ReadWorkspace = struct { pages: [storage.batch_size]storage.Page, cells: [maximum_cells]Cell, navigation: []Navigation, fallback: Navigation, borrowed: [storage.batch_size]storage.PageLease, blob_indices: [storage.batch_size]blob.Index };
     const WriteWorkspace = struct {
         update: UpdateWorkspace,
         ids: [storage.batch_size]storage.PageId,
         pages: [storage.batch_size]storage.Page,
         order: [maximum_sorted_batch]u16,
         sorted: [maximum_batch]Write,
+        borrowed: [storage.batch_size]storage.PageLease,
     };
     const Readers = WorkspacePool(ReadWorkspace);
     const Writers = WorkspacePool(WriteWorkspace);
@@ -471,6 +474,7 @@ pub const Table = struct {
     resources: *Resources,
     directory: ?storage.PageId = null,
     root_offset: u16 = 0,
+    value_cache: storage.Read.Cache = .retain,
 
     fn identity(self: Table) TableIdentity {
         return .{ .store = self.space.store, .space = self.space.id, .root = self.space.root, .directory = self.directory, .offset = self.root_offset };
@@ -488,13 +492,13 @@ pub const Table = struct {
         var bytes: [8]u8 = undefined;
         try self.space.readPages(&.{.{ .id = directory, .offset = self.root_offset, .destination = &bytes }});
         const id = std.mem.readInt(u64, &bytes, .little);
-        return if (id == 0) null else @enumFromInt(id);
+        return if (id == 0) null else @fromBackingInt(@intCast(id));
     }
     fn setRoot(self: Table, root: ?storage.PageId) storage.Error!void {
         const directory = self.directory orelse return self.space.setRoot(root);
         var page: storage.Page = undefined;
         try self.space.readPages(&.{.{ .id = directory, .destination = &page }});
-        std.mem.writeInt(u64, page[self.root_offset..][0..8], if (root) |id| @intFromEnum(id) else 0, .little);
+        std.mem.writeInt(u64, page[self.root_offset..][0..8], if (root) |id| @backingInt(id) else 0, .little);
         try self.space.writePages(&.{.{ .id = directory, .source = &page }});
     }
     pub fn fail(self: Table) void {
@@ -513,7 +517,7 @@ pub const Table = struct {
         @memset(lengths, null);
         for (requests) |request| if (request.key.len == 0 or request.key.len > maximum_key) return error.InvalidArgument;
         const root = try self.getRoot() orelse return;
-        var values: ValueReads = .{ .data = .{ .space = self.space } };
+        var values: ValueReads = .{ .data = .{ .space = self.space, .indices = &lease.workspace.blob_indices, .cache = self.value_cache } };
         const pages = &lease.workspace.pages;
         var begin: usize = 0;
         while (begin < requests.len) {
@@ -524,7 +528,7 @@ pub const Table = struct {
             var tails: [storage.batch_size]usize = undefined;
             var next: [storage.batch_size]usize = undefined;
             var unique: [storage.batch_size]storage.PageId = undefined;
-            var borrowed: [storage.batch_size]storage.PageLease = undefined;
+            const borrowed = &lease.workspace.borrowed;
             var depth: usize = 0;
             while (true) : (depth += 1) {
                 var reading: usize = 0;
@@ -580,7 +584,7 @@ pub const Table = struct {
                             const request = requests[begin + index];
                             const position = node.lowerBound(request.key);
                             if (navigation.branch) {
-                                ids[index] = @enumFromInt(node.cell(@min(position, navigation.count - 1)).reference);
+                                ids[index] = @fromBackingInt(@intCast(node.cell(@min(position, navigation.count - 1)).reference));
                             } else {
                                 active[index] = false;
                                 if (position < navigation.count) {
@@ -626,7 +630,7 @@ pub const Table = struct {
                     var ids: [storage.batch_size]storage.PageId = undefined;
                     try self.space.allocatePages(ids[0..count]);
                     for (ids[0..count], 0..) |id, at| {
-                        std.mem.writeInt(u64, descriptor[(begin + at) * 8 ..][0..8], @intFromEnum(id), .little);
+                        std.mem.writeInt(u64, descriptor[(begin + at) * 8 ..][0..8], @backingInt(id), .little);
                         const length = @min(value.len - offset, storage.page_size);
                         try data.append(id, value[offset..][0..length]);
                         offset += length;
@@ -636,7 +640,7 @@ pub const Table = struct {
                 assert(offset == value.len);
             } else {
                 cell.flags = 1;
-                cell.reference = @intFromEnum(try data.write(value));
+                cell.reference = @backingInt(try data.write(value));
             }
         }
         return cell;
@@ -647,6 +651,8 @@ pub const Table = struct {
     }
     pub fn putBatch(self: Table, writes: []const Write) storage.Error!void {
         if (writes.len == 0) return;
+        const mutation = self.space.mutate();
+        defer mutation.end();
         errdefer self.fail();
         const lease = self.resources.acquireWrite(self.identity());
         defer lease.end();
@@ -682,8 +688,8 @@ pub const Table = struct {
                 const window = @min(storage.batch_size, @max(1, self.space.borrowCapacity() / 2));
                 while (applied < unique) {
                     const limit = applied + @min(window, unique - applied);
-                    var held: [storage.batch_size]storage.PageLease = undefined;
-                    const kept = try self.prefetch(sorted[applied..limit], &nodes, &workspace.update.cells, &held);
+                    const held = &workspace.borrowed;
+                    const kept = try self.prefetch(sorted[applied..limit], &nodes, &workspace.update.cells, held);
                     assert(kept <= limit - applied);
                     defer storage.PageLease.releaseMany(held[0..kept]);
                     while (applied < limit) {
@@ -748,7 +754,7 @@ pub const Table = struct {
                     if (!active[index] or mapping[index] != page_index) continue;
                     if (node.branch) {
                         const position = node.lowerBound(write.key);
-                        ids[index] = @enumFromInt(node.cells[@min(position, node.count - 1)].reference);
+                        ids[index] = @fromBackingInt(@intCast(node.cells[@min(position, node.count - 1)].reference));
                     } else active[index] = false;
                 }
             }
@@ -795,7 +801,7 @@ pub const Table = struct {
             positions[depth] = @min(positions[depth], node.count - 1);
             if (positions[depth] + 1 != node.count) rightmost = false;
             if (depth + 1 == maximum_depth) return error.NoSpace;
-            ids[depth + 1] = @enumFromInt(node.cells[positions[depth]].reference);
+            ids[depth + 1] = @fromBackingInt(@intCast(node.cells[positions[depth]].reference));
             depth += 1;
         }
         var height = depth + 1;
@@ -806,16 +812,16 @@ pub const Table = struct {
         var data: blob.WriteBatch = .{ .space = self.space, .writes = &workspace.writes };
         var accounted: usize = 0;
         var leaf_bytes: usize = 0;
-        var freeing: blob.FreeBatch = .{ .space = self.space };
+        var freeing: blob.FreeBatch = .{ .space = self.space, .indices = &workspace.blob_indices };
         for (writes) |write| {
             if (!rightmost and upper != null and std.mem.order(u8, write.key, upper.?.keySlice()) == .gt) break;
             const at = node.lowerBound(write.key);
             if (at == node.count or !std.mem.eql(u8, node.cells[at].keySlice(), write.key)) continue;
             const cell = &node.cells[at];
-            if (cell.flags == 1) try freeing.appendBlob(@enumFromInt(cell.reference), cell.length);
+            if (cell.flags == 1) try freeing.appendBlob(@fromBackingInt(@intCast(cell.reference)), cell.length);
             if (cell.flags == 3) {
                 const layout = Direct.layout(cell.length, cell.prefix);
-                for (0..layout.pages) |index| try freeing.appendPage(@enumFromInt(std.mem.readInt(u64, cell.value[index * 8 ..][0..8], .little)));
+                for (0..layout.pages) |index| try freeing.appendPage(@fromBackingInt(@intCast(std.mem.readInt(u64, cell.value[index * 8 ..][0..8], .little))));
             }
         }
         try freeing.flush();
@@ -847,7 +853,7 @@ pub const Table = struct {
         const children = &workspace.children;
         while (true) {
             if (depth == 0 and node.branch and node.count == 1) {
-                const child: storage.PageId = @enumFromInt(node.cells[0].reference);
+                const child: storage.PageId = @fromBackingInt(@intCast(node.cells[0].reference));
                 try self.setRoot(child);
                 nodes.discard(ids[0]);
                 try self.space.freePages(&.{ids[0]});
@@ -872,7 +878,7 @@ pub const Table = struct {
                 var reads: [2]storage.Read = undefined;
                 for (old_ids[0..replaced], 0..) |*id, index| {
                     const position = first_peer + index;
-                    id.* = @enumFromInt(parent.cells[position].reference);
+                    id.* = @fromBackingInt(@intCast(parent.cells[position].reference));
                     if (position == at) continue;
                     reads[reading] = .{ .id = id.*, .destination = &peer_pages[reading] };
                     reading += 1;
@@ -887,7 +893,7 @@ pub const Table = struct {
                         reading += 1;
                         if (peer.branch != node.branch or peer.count == 0) return error.Corrupt;
                     }
-                    if (!node.branch and index != 0 and peers[index - 1].next != @intFromEnum(old_ids[index])) return error.Corrupt;
+                    if (!node.branch and index != 0 and peers[index - 1].next != @backingInt(old_ids[index])) return error.Corrupt;
                 }
                 var selected_begin: usize = 0;
                 var selected_end: usize = replaced;
@@ -942,20 +948,20 @@ pub const Table = struct {
                         level -= 1;
                         if (positions[level] == 0) continue;
                         const parent = try Node.decode(&path[level], parent_cells);
-                        var predecessor: storage.PageId = @enumFromInt(parent.cells[positions[level] - 1].reference);
+                        var predecessor: storage.PageId = @fromBackingInt(@intCast(parent.cells[positions[level] - 1].reference));
                         var preceding_page: storage.Page = undefined;
                         var steps: usize = 0;
                         while (true) {
                             try nodes.read(predecessor, &preceding_page);
                             var preceding = try Node.decode(&preceding_page, &peer_cells[0]);
                             if (!preceding.branch) {
-                                if (preceding.next != @intFromEnum(ids[depth])) return error.Corrupt;
+                                if (preceding.next != @backingInt(ids[depth])) return error.Corrupt;
                                 preceding.encode(try nodes.reserve(predecessor), 0, preceding.count, node.next);
                                 break;
                             }
                             if (steps == maximum_depth) return error.Corrupt;
                             steps += 1;
-                            predecessor = @enumFromInt(preceding.cells[preceding.count - 1].reference);
+                            predecessor = @fromBackingInt(@intCast(preceding.cells[preceding.count - 1].reference));
                         }
                         break;
                     }
@@ -1021,13 +1027,13 @@ pub const Table = struct {
                     const count = @min(storage.batch_size, child_count - begin);
                     for (0..count) |offset| {
                         const at = begin + offset;
-                        const next = if (node.branch) 0 else if (at + 1 < child_count) @intFromEnum(output_ids[at + 1]) else node.next;
+                        const next = if (node.branch) 0 else if (at + 1 < child_count) @backingInt(output_ids[at + 1]) else node.next;
                         node.encode(try nodes.reserve(output_ids[at]), boundaries[at], boundaries[at + 1], next);
                         children[at] = node.cells[boundaries[at + 1] - 1];
                         children[at].flags = 2;
                         children[at].length = 0;
                         children[at].value = &.{};
-                        children[at].reference = @intFromEnum(output_ids[at]);
+                        children[at].reference = @backingInt(output_ids[at]);
                         children[at].prefix = 0;
                     }
                     begin += count;
@@ -1057,6 +1063,15 @@ pub const Table = struct {
     }
 
     pub fn scan(self: Table, cursor: *ScanCursor, output: []ScanEntry) storage.Error!ScanResult {
+        return self.scanBatch(cursor, true, output);
+    }
+
+    pub fn scanKeys(self: Table, cursor: *ScanCursor, output: []ScanKey) storage.Error!ScanResult {
+        if (output.len > maximum_batch) return error.InvalidArgument;
+        return self.scanBatch(cursor, false, output);
+    }
+
+    fn scanBatch(self: Table, cursor: *ScanCursor, comptime include_values: bool, output: [](if (include_values) ScanEntry else ScanKey)) storage.Error!ScanResult {
         if (output.len == 0 or cursor.after_len > cursor.after.len or cursor.after_len > maximum_key) return error.InvalidArgument;
         const lease = self.resources.acquireRead(self.identity());
         defer lease.end();
@@ -1072,7 +1087,7 @@ pub const Table = struct {
         var depth: usize = 0;
         var page: storage.Page = undefined;
         const cells = &lease.workspace.cells;
-        var values: ValueReads = .{ .data = .{ .space = self.space } };
+        var values: if (include_values) ValueReads else void = if (include_values) .{ .data = .{ .space = self.space, .indices = &lease.workspace.blob_indices, .cache = self.value_cache } } else {};
         var node: Node = undefined;
         while (true) {
             if (depth == maximum_depth) return error.Corrupt;
@@ -1081,7 +1096,7 @@ pub const Table = struct {
             if (!node.branch) break;
             depth += 1;
             const at = @min(node.lowerBound(cursor.after[0..cursor.after_len]), node.count - 1);
-            id = @enumFromInt(node.cells[at].reference);
+            id = @fromBackingInt(@intCast(node.cells[at].reference));
         }
         var at = node.lowerBound(cursor.after[0..cursor.after_len]);
         if (node.count == 0) return error.Corrupt;
@@ -1093,17 +1108,17 @@ pub const Table = struct {
                 if (row.key.len < cell.key_len or cursor.after.len < cell.key_len) return error.BufferTooSmall;
                 @memcpy(row.key[0..cell.key_len], cell.keySlice());
                 row.key_len = cell.key_len;
-                row.value_len = try values.append(cell.view(), row.value);
+                if (include_values) row.value_len = try values.append(cell.view(), row.value);
                 @memcpy(cursor.after[0..cell.key_len], cell.keySlice());
                 cursor.after_len = cell.key_len;
                 count += 1;
             }
             if (count == output.len or node.next == 0) {
-                try values.flush();
+                if (include_values) try values.flush();
                 return .{ .count = count, .more = at < node.count or node.next != 0 };
             }
             const last = node.cells[node.count - 1];
-            id = @enumFromInt(node.next);
+            id = @fromBackingInt(@intCast(node.next));
             try self.space.readPages(&.{.{ .id = id, .destination = &page }});
             node = try Node.decode(&page, cells);
             if (node.branch or node.count == 0 or std.mem.order(u8, last.keySlice(), node.cells[0].keySlice()) != .lt) return error.Corrupt;

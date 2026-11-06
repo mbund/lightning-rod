@@ -11,12 +11,19 @@ pub fn main(init: std.process.Init) !void {
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
             lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = 2, .gamemode = .survival }),
             lightning_rod.plugin.configured(vanilla.Worlds, .{ .maximum = 4 }),
+            lightning_rod.plugin.configured(vanilla.Flat, .{ .biomes = biomePattern }),
             lightning_rod.plugin.configured(vanilla.Operators, vanilla.Operators.Configuration{ .operators = &operators }),
         }),
         lightning_rod.plugin.configured(e2e.Inventory, .{ .starting_bread = 17 }),
         lightning_rod.plugin.configured(Probe, .{}),
     });
     try e2e.profile.run(init, plugins, .{});
+}
+
+fn biomePattern(section: vanilla.Section, values: *[64]u16) void {
+    const names = [_][]const u8{ "minecraft:plains", "minecraft:nether_wastes", "minecraft:the_end", "minecraft:basalt_deltas" };
+    std.debug.assert(section.world < names.len);
+    @memset(values, @intCast(protocols.registry.biomeId(names[section.world]).?));
 }
 
 const Probe = struct {

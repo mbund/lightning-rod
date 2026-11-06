@@ -1,0 +1,4 @@
+{
+  "client": "OcclusionBiomesFixture",
+  "variants": [{ "name": "occlusion-biomes" }]
+}

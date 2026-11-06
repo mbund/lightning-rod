@@ -1114,6 +1114,54 @@ test "committed output progresses while the same connection waits for the codec"
     try std.testing.expectEqual(@as(u8, 7), connection.lifecycle.?);
 }
 
+test "codec idle handoffs drain every submitted task before shutdown" {
+    const Codec = packet_codec.Codec(Endpoint);
+    const io = std.testing.io;
+    var native: Native = .{};
+    const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
+    const codec = try Codec.init(std.testing.allocator, io, transport, 32, null);
+    defer codec.deinit();
+    var connection: Endpoint.Connection = 0;
+    var tasks: [32]Codec.Task = @splat(.{});
+    var bytes: [32]u8 = @splat(0);
+    try codec.start();
+    defer codec.stop();
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(5) });
+    var completed: usize = 0;
+    for (0..10000) |iteration| {
+        const window: usize = if (iteration < 5000) 1 else tasks.len;
+        const slot = iteration % window;
+        const task = &tasks[slot];
+        if (task.state.load(.acquire) != .idle) {
+            var result = Codec.take(task);
+            while (result == null) : (result = Codec.take(task)) {
+                if (std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds >= deadline.raw.nanoseconds) {
+                    std.log.err("codec stalled read={d} write={d} ready={s}", .{ codec.read.load(.acquire), codec.write.load(.acquire), @tagName(@atomicLoad(std.Io.Event, &codec.ready, .acquire)) });
+                    return error.Timeout;
+                }
+                try std.Thread.yield();
+            }
+            try std.testing.expectEqual(@as(usize, 1), (try result.?).received);
+            completed += 1;
+        }
+        codec.submit(task, .{ .receive = .{ .connection = &connection, .bytes = bytes[slot..][0..1] } });
+    }
+    for (&tasks) |*task| {
+        if (task.state.load(.acquire) == .idle) continue;
+        while (true) {
+            if (Codec.take(task)) |result| {
+                try std.testing.expectEqual(@as(usize, 1), (try result).received);
+                completed += 1;
+                break;
+            }
+            if (std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds >= deadline.raw.nanoseconds) return error.Timeout;
+            try std.Thread.yield();
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 10000), completed);
+    try std.testing.expectEqual(codec.write.load(.acquire), codec.read.load(.acquire));
+}
+
 test "completed codec tasks notify before the rest of their batch finishes" {
     const Codec = packet_codec.Codec(Endpoint);
     const io = std.testing.io;

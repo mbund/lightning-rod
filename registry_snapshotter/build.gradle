@@ -39,6 +39,7 @@ sourceSets.main.java.srcDir(modern ? 'src/modern-loader/java' : 'src/legacy-load
 sourceSets.main.java.srcDir(['legacy', 'input'].contains(api) ? 'src/legacy-registry/java' : 'src/current-registry/java')
 sourceSets.main.java.srcDir(modern ? 'src/current-lighting/java' : 'src/legacy-lighting/java')
 sourceSets.main.java.srcDir(modern ? 'src/current-physics/java' : 'src/legacy-physics/java')
+sourceSets.main.java.srcDir(api == 'legacy' ? 'src/legacy-collision/java' : 'src/current-collision/java')
 sourceSets.main.java.srcDir(modern ? 'src/current-fuel/java' : 'src/legacy-fuel/java')
 
 dependencies {

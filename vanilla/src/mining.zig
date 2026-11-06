@@ -31,6 +31,7 @@ const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
 const BlockLoot = @import("block_loot.zig").BlockLoot;
 const ItemEntities = @import("item_entities.zig").ItemEntities;
 const Experience = @import("experience.zig").Experience;
+const Streaming = @import("streaming.zig").Streaming;
 
 const Chunks = chunks.Chunks;
 
@@ -51,6 +52,7 @@ pub const Mining = struct {
         block_definitions: *Blocks,
         definitions: *Registry,
         visibility: *Visibility,
+        streaming: ?*Streaming = null,
         metrics: *metrics.Registry,
         storage: storage.Space,
         players: *Players,
@@ -77,7 +79,6 @@ pub const Mining = struct {
         finishing: bool = false,
         complete: bool = false,
         stage: i8 = -1,
-        sequence: i32 = -1,
         selected_slot: u4 = 0,
         tool: BlockLoot.Tool = .{},
     };
@@ -198,6 +199,16 @@ pub const Mining = struct {
         try self.random.checkpoint(space);
     }
 
+    fn disclosed(self: *const Mining, source: usize, recipient: usize) bool {
+        const streaming = self.deps.streaming orelse return true;
+        const subject = &self.deps.players.records[source];
+        const observer = &self.deps.players.records[recipient];
+        return streaming.snapshotVisibility().boundsVisible(recipient, observer, subject.world, .{
+            .minimum = .{ @intFromFloat(@floor(subject.position.x - 0.3)), @intFromFloat(@floor(subject.position.y)), @intFromFloat(@floor(subject.position.z - 0.3)) },
+            .maximum = .{ @intFromFloat(@ceil(subject.position.x + 0.3)), @intFromFloat(@ceil(subject.position.y + 1.8)), @intFromFloat(@ceil(subject.position.z + 0.3)) },
+        });
+    }
+
     fn onSwing(self: *Mining, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_arm_animation.Reader) !void {
         const hand, const done = body.hand() catch return error.InvalidPacket;
         done.finish() catch return error.InvalidPacket;
@@ -213,6 +224,7 @@ pub const Mining = struct {
             const observer = players.records[other];
             const recipient = observer.handle orelse continue;
             if (other == handle.index or observer.world != player.world or observer.stage != .ready) continue;
+            if (!self.disclosed(handle.index, other)) continue;
             targets[count] = .{ .handle = recipient, .protocol = observer.protocol };
             count += 1;
         }
@@ -255,7 +267,7 @@ pub const Mining = struct {
         if (state.generation != handle.generation or state.teleport_id != player.teleport_id)
             state.* = .{ .generation = handle.generation, .teleport_id = player.teleport_id, .selected_slot = player.selected_slot };
         state.selected_slot = player.selected_slot;
-        state.sequence = @max(state.sequence, sequence);
+        self.deps.blocks.acknowledge(&player, sequence);
         if (action == .cancel) {
             state.active = false;
             state.finishing = false;
@@ -322,8 +334,6 @@ pub const Mining = struct {
                     .selected_slot = player.selected_slot,
                 };
 
-            if (state.sequence >= 0 and self.deps.blocks.observers[index].pending == 0 and players.sendBlockAck(player.protocol, handle, state.sequence))
-                state.sequence = -1;
             state.selected_slot = player.selected_slot;
             if (!state.active and state.stage == -1) continue;
             const slot: inventories.Slot = .{ .owner = player.uuid, .index = 36 + @as(u16, state.selected_slot) };
@@ -459,6 +469,10 @@ pub const Mining = struct {
                             const observer = players.records[other];
                             const recipient = observer.handle orelse continue;
                             if (other == index or observer.world != player.world or observer.stage != .ready) continue;
+                            if (!self.disclosed(index, other)) continue;
+                            if (self.deps.streaming) |streaming| {
+                                if (!streaming.snapshotVisibility().blockVisible(other, &observer, player.world, .{ position.x, position.y, position.z })) continue;
+                            }
                             targets[count] = .{ .handle = recipient, .protocol = observer.protocol };
                             count += 1;
                         }
@@ -491,7 +505,8 @@ pub const Mining = struct {
         const available = self.scratch.row(5);
         available.clear();
         while (self.spatial_changes.active.count != 0) self.spatial_changes.update(self.spatial_changes.active.indices[self.spatial_changes.active.count - 1], null);
-        var regroup = false;
+        const disclosure_changed = if (self.deps.streaming) |streaming| streaming.snapshotVisibility().changed_words.count != 0 or streaming.snapshotVisibility().reset.count != 0 else false;
+        var regroup = disclosure_changed;
         for (self.actors.values()) |index| {
             const player = players.records[index];
             const previous = &self.observers[index];
@@ -560,7 +575,7 @@ pub const Mining = struct {
                 }
             }
             if (subject.handle) |handle| {
-                if (!view.valid or distance_changed or affected or view.visibility_revision != visibility_revision) {
+                if (!view.valid or distance_changed or affected or disclosure_changed or self.deps.streaming != null or view.visibility_revision != visibility_revision) {
                     const nearby = self.scratch.row(11);
                     if (!captured) {
                         nearby.clear();
@@ -573,6 +588,14 @@ pub const Mining = struct {
                     view.valid = true;
                 }
                 _ = self.deps.visibility.player_entity.filter(handle, interested.view(), interested);
+                if (self.deps.streaming) |streaming| {
+                    const snapshot = streaming.snapshotVisibility();
+                    var recipients = interested.view().iterator();
+                    while (recipients.next()) |other| {
+                        const position = state.position;
+                        if (!self.disclosed(index, other) or !snapshot.blockVisible(other, &players.records[other], subject.world, .{ position.x, position.y, position.z })) interested.remove(other);
+                    }
+                }
             } else interested.clear();
             view.visibility_revision = visibility_revision;
             const altered = self.scratch.row(7);

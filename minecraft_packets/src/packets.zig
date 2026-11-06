@@ -96,6 +96,14 @@ pub const Packets = struct {
         return error.UnsupportedProtocol;
     }
 
+    pub fn writeGroup(self: *Packets, comptime callbacks: anytype, protocol: i32, buffers: []const []u8, lengths: []usize, arguments: anytype) !void {
+        _ = try self.definition(protocol);
+        inline for (protocols.implementations) |Version| {
+            if (protocol == Version.protocol_number) return GroupWriter(callbacks).writeGroup(Version, buffers, lengths, arguments);
+        }
+        return error.UnsupportedProtocol;
+    }
+
     pub fn sendPacket(self: *Packets, comptime encode_packet: anytype, protocol: i32, recipient: sessions.Handle, arguments: anytype, maximum_bytes: usize) !void {
         try self.deps.sessions.send(protocols.implementations, Writer(encode_packet), protocol, recipient, arguments, maximum_bytes);
     }

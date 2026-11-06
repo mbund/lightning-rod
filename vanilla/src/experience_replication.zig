@@ -210,6 +210,10 @@ pub const ExperienceReplication = struct {
             while (nearby.next()) |at| {
                 const recipient = self.deps.players.records[at];
                 if (recipient.stage != .ready or recipient.handle == null) continue;
+                if (at != source and !visibility.boundsVisible(at, &recipient, player.world, .{
+                    .minimum = .{ @intFromFloat(@floor(player.position.x - 0.3)), @intFromFloat(@floor(player.position.y)), @intFromFloat(@floor(player.position.z - 0.3)) },
+                    .maximum = .{ @intFromFloat(@ceil(player.position.x + 0.3)), @intFromFloat(@ceil(player.position.y + 1.8)), @intFromFloat(@ceil(player.position.z + 0.3)) },
+                })) continue;
                 const dx = recipient.position.x - player.position.x;
                 const dy = recipient.position.y - player.position.y;
                 const dz = recipient.position.z - player.position.z;
@@ -222,7 +226,7 @@ pub const ExperienceReplication = struct {
         }
     }
 
-    fn interest(self: *ExperienceReplication, index: usize, body: entities.State, visibility: *const Streaming.Visibility) audience.Row {
+    fn interest(self: *ExperienceReplication, _: usize, body: entities.State, visibility: *const Streaming.Visibility) audience.Row {
         const desired = self.scratch.row(0);
         desired.clear();
         var nearby = self.deps.players.nearby(body.world, .{ .x = body.position[0], .y = body.position[1], .z = body.position[2] }, 6);
@@ -230,7 +234,10 @@ pub const ExperienceReplication = struct {
             const player = self.deps.players.records[at];
             if (player.handle == null or player.stage != .ready) continue;
             if (@abs(player.position.x - body.position[0]) > 96 or @abs(player.position.z - body.position[2]) > 96) continue;
-            if (visibility.visible(at, &player, body.world, self.deps.experience.residents[index].x, self.deps.experience.residents[index].z)) desired.insert(at);
+            if (visibility.boundsVisible(at, &player, body.world, .{
+                .minimum = .{ @intFromFloat(@floor(body.position[0] - 1)), @intFromFloat(@floor(body.position[1] - 1)), @intFromFloat(@floor(body.position[2] - 1)) },
+                .maximum = .{ @intFromFloat(@ceil(body.position[0] + 1)), @intFromFloat(@ceil(body.position[1] + 1)), @intFromFloat(@ceil(body.position[2] + 1)) },
+            })) desired.insert(at);
         }
         return desired;
     }

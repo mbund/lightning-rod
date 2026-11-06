@@ -1,9 +1,22 @@
 const std = @import("std");
+const generator_commands = @import("generator_commands.zig");
 const corpus = @import("corpus.zig");
 const trace = @import("trace.zig");
-const anvil = @import("anvil.zig");
 const common = @import("common.zig");
-const nbt = @import("nbt");
+
+test "world generation uses the random tick rule from its own command report" {
+    for ([_][]const u8{ "randomTickSpeed", "random_tick_speed", "minecraft:random_tick_speed" }) |name| {
+        const bytes = try std.fmt.allocPrint(std.testing.allocator, "{{\"children\":{{\"gamerule\":{{\"children\":{{\"{s}\":{{}},\"doDaylightCycle\":{{}}}}}}}}}}", .{name});
+        defer std.testing.allocator.free(bytes);
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(name, try generator_commands.randomTickRule(parsed.value));
+    }
+    const missing = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"children\":{\"gamerule\":{\"children\":{}}}}", .{});
+    defer missing.deinit();
+    try std.testing.expectError(error.MissingRandomTickRule, generator_commands.randomTickRule(missing.value));
+    try std.testing.expectError(error.InvalidCommandReport, generator_commands.randomTickRule(.null));
+}
 
 fn fixture(allocator: std.mem.Allocator) !corpus.Corpus {
     var bytes: std.Io.Writer.Allocating = .init(allocator);
@@ -139,20 +152,6 @@ test "walking traces stay within their region when neighboring regions touch" {
     }
 }
 
-test "block state registry keys normalize property order without losing values" {
-    var first = [_]anvil.Property{ .{ .name = "waterlogged", .value = "false" }, .{ .name = "axis", .value = "y" } };
-    var second = [_]anvil.Property{ first[1], first[0] };
-    const a = try anvil.stateKey(std.testing.allocator, "minecraft:oak_log", &first);
-    defer std.testing.allocator.free(a);
-    const b = try anvil.stateKey(std.testing.allocator, "minecraft:oak_log", &second);
-    defer std.testing.allocator.free(b);
-    try std.testing.expectEqualSlices(u8, a, b);
-    second[0].value = "x";
-    const c = try anvil.stateKey(std.testing.allocator, "minecraft:oak_log", &second);
-    defer std.testing.allocator.free(c);
-    try std.testing.expect(!std.mem.eql(u8, a, c));
-}
-
 test "tail percentiles retain the maximum for short benchmark samples" {
     var samples = [_]u64{ 16, 1, 15, 2, 14, 3, 13, 4, 12, 5, 11, 6, 10, 7, 9, 8 };
     const distribution = common.Distribution.summarize(&samples);
@@ -160,61 +159,4 @@ test "tail percentiles retain the maximum for short benchmark samples" {
     try std.testing.expectEqual(@as(u64, 8), distribution.p50_ns);
     try std.testing.expectEqual(@as(u64, 16), distribution.p95_ns);
     try std.testing.expectEqual(@as(u64, 16), distribution.p99_ns);
-}
-
-fn named(writer: *std.Io.Writer, kind: u8, name: []const u8) !void {
-    try writer.writeByte(kind);
-    try writer.writeInt(u16, @intCast(name.len), .big);
-    try writer.writeAll(name);
-}
-
-test "Anvil import preserves global states across Java padded palette words" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    var registry: anvil.Registry = .{ .states = std.StringHashMap(u16).init(allocator), .hash = @splat(0) };
-    try registry.states.put("minecraft:air\x00", 0);
-    for ([_]u16{ 1, 2, 17, 33, 257 }) |count| {
-        var bytes: std.Io.Writer.Allocating = .init(allocator);
-        const writer = &bytes.writer;
-        try named(writer, 10, "");
-        try named(writer, 10, "block_states");
-        try named(writer, 9, "palette");
-        try writer.writeByte(10);
-        try writer.writeInt(u32, count, .big);
-        for (0..count) |id| {
-            const name = try std.fmt.allocPrint(allocator, "minecraft:test_{d}", .{id});
-            const key = try anvil.stateKey(allocator, name, &.{});
-            try registry.states.put(key, @intCast(40000 + id));
-            try named(writer, 8, "Name");
-            try writer.writeInt(u16, @intCast(name.len), .big);
-            try writer.writeAll(name);
-            try writer.writeByte(0);
-        }
-        if (count > 1) {
-            const bits: u6 = @intCast(@max(4, std.math.log2_int_ceil(u16, count)));
-            const per_word: usize = 64 / @as(usize, bits);
-            const words = (4096 + per_word - 1) / per_word;
-            try named(writer, 12, "data");
-            try writer.writeInt(u32, @intCast(words), .big);
-            for (0..words) |word_index| {
-                var word: u64 = 0;
-                for (0..per_word) |offset| {
-                    const index = word_index * per_word + offset;
-                    if (index < 4096) word |= @as(u64, index % count) << @as(u6, @intCast(offset * bits));
-                }
-                try writer.writeInt(u64, word, .big);
-            }
-        }
-        try writer.writeAll(&.{ 0, 0 });
-        const nodes = try allocator.alloc(nbt.Node, 1024);
-        var frames: [64]nbt.Frame = undefined;
-        const doc = try nbt.scan_named(bytes.written(), nodes, &frames);
-        var decoded: [corpus.section_bytes]u8 = undefined;
-        const section = try anvil.section(allocator, &registry, doc, doc.root_node(), &decoded);
-        for (0..4096) |index| {
-            const state = std.mem.readInt(u16, section[if (section[0] == 0) 1 else 1 + index * 2..][0..2], .little);
-            try std.testing.expectEqual(@as(u16, @intCast(40000 + index % count)), state);
-        }
-    }
 }

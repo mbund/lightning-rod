@@ -8,12 +8,14 @@ pub fn build(b: *std.Build) void {
     const storage = b.dependency("storage", .{ .target = target, .optimize = optimize }).module("storage");
     const metrics = b.dependency("metrics", .{ .target = target, .optimize = optimize }).module("metrics");
     const nbt = b.dependency("nbt", .{ .target = target, .optimize = optimize }).module("nbt");
+    const anvil = b.dependency("anvil", .{ .target = target, .optimize = optimize }).module("anvil");
     const prepare = b.addExecutable(.{ .name = "chunks-world", .root_module = b.createModule(.{
         .root_source_file = b.path("src/prepare.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{ .{ .name = "chunks", .module = chunks }, .{ .name = "storage", .module = storage }, .{ .name = "nbt", .module = nbt } },
     }) });
+    prepare.root_module.addImport("anvil", anvil);
     const run_prepare = b.addRunArtifact(prepare);
     prepare.root_module.addImport("records", records);
     run_prepare.addPassthruArgs();
@@ -41,6 +43,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sqlite", .module = b.dependency("comparison", .{ .target = target, .optimize = optimize }).module("sqlite") },
         },
     }) });
+    comparison.root_module.addImport("anvil", anvil);
     const run_comparison = b.addRunArtifact(comparison);
     comparison.root_module.addImport("records", records);
     run_comparison.addPassthruArgs();
@@ -51,5 +54,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{ .{ .name = "chunks", .module = chunks }, .{ .name = "storage", .module = storage }, .{ .name = "nbt", .module = nbt } },
     }) });
+    tests.root_module.addImport("anvil", anvil);
     b.step("test", "Verify corpus framing and reproducible access traces").dependOn(&b.addRunArtifact(tests).step);
 }

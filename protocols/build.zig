@@ -74,5 +74,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "nbt", .module = nbt },
         },
     });
+    b.step("test", "Verify registry translations across the selected protocols").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
     b.getInstallStep().dependOn(&b.addLibrary(.{ .name = "protocols", .root_module = module }).step);
 }

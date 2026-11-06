@@ -1,3 +1,4 @@
+const Progress = @import("recipe_book_progress.zig").Progress;
 const protocols = @import("protocols");
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
@@ -20,6 +21,7 @@ const assert = std.debug.assert;
 const absent = std.math.maxInt(usize);
 
 pub const RecipeBook = struct {
+    pub const SavedProgress = Progress;
     pub const Registry = RecipeBookRegistry;
     pub const id = "minecraft:recipe_book";
     pub const Configuration = struct { packet_bytes: usize = 64 * 1024, state_bytes: usize = 256 * 1024 };
@@ -66,8 +68,8 @@ pub const RecipeBook = struct {
         for (&values, 0..) |*value, index| value.* = @intCast(index + 5);
         break :block values;
     };
-    const learned: u8 = 1;
-    const highlighted: u8 = 2;
+    const learned: u8 = Progress.learned;
+    const highlighted: u8 = Progress.highlighted;
     const sent: u8 = 4;
     const notification: u8 = 8;
     allocator: std.mem.Allocator,
@@ -355,27 +357,16 @@ pub const RecipeBook = struct {
         const state = &self.states[player];
         assert(state.loaded);
         var writer = std.Io.Writer.fixed(self.state_bytes);
-        try writer.writeAll("LRBOOK01");
-        try writer.writeByte(state.settings);
-        var count: u32 = 0;
-        for (self.row(player)) |flags| count += @intFromBool(flags & learned != 0);
-        try writer.writeInt(u32, count, .big);
-        for (self.row(player), self.identities) |flags, *identity| if (flags & learned != 0) {
-            try writer.writeAll(identity);
-            try writer.writeByte(flags & (learned | highlighted));
+        const progress: Progress = .{
+            .settings = state.settings,
+            .flags = self.row(player),
+            .identities = self.identities,
+            .criteria = self.criteria(player),
+            .criterion_definitions = self.deps.definitions.unlocks.criteria,
+            .awards = self.rewards(player),
+            .rule_definitions = self.deps.definitions.unlocks.rules,
         };
-        count = 0;
-        for (self.criteria(player)) |value| count += @intFromBool(value);
-        try writer.writeInt(u32, count, .big);
-        for (self.criteria(player), self.deps.definitions.unlocks.criteria) |value, criterion| if (value) {
-            try writer.writeAll(&criterion.identity);
-        };
-        count = 0;
-        for (self.rewards(player)) |value| count += @intFromBool(value);
-        try writer.writeInt(u32, count, .big);
-        for (self.rewards(player), self.deps.definitions.unlocks.rules) |value, rule| if (value) {
-            try writer.writeAll(&rule.identity);
-        };
+        try progress.write(&writer);
         var key: [16]u8 = undefined;
         std.mem.writeInt(u128, &key, state.uuid, .big);
         try self.table.put(&key, writer.buffered());

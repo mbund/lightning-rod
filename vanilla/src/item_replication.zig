@@ -318,7 +318,10 @@ pub const ItemReplication = struct {
                         const player = &self.deps.players.records[player_index];
                         if (player.handle == null or player.stage != .ready or body.world != player.world) continue;
                         if (@abs(body.position[0] - player.position.x) > tracking_distance or @abs(body.position[2] - player.position.z) > tracking_distance) continue;
-                        if (visibility.visible(player_index, player, body.world, @intFromFloat(@floor(body.position[0] / 16)), @intFromFloat(@floor(body.position[2] / 16)))) interests[index].insert(player_index);
+                        if (visibility.boundsVisible(player_index, player, body.world, .{
+                            .minimum = .{ @intFromFloat(@floor(body.position[0] - 1)), @intFromFloat(@floor(body.position[1] - 1)), @intFromFloat(@floor(body.position[2] - 1)) },
+                            .maximum = .{ @intFromFloat(@ceil(body.position[0] + 1)), @intFromFloat(@ceil(body.position[1] + 1)), @intFromFloat(@ceil(body.position[2] + 1)) },
+                        })) interests[index].insert(player_index);
                     }
                     const view = &self.views[dropped.ids.get(record.id).?];
                     const slot = ItemEntities.slot(body);

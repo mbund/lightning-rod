@@ -5,6 +5,8 @@ const Lifecycle = @import("lifecycle.zig").Lifecycle;
 const bit_sets = @import("lightning_rod").system.bit_sets;
 const IndexSet = @import("lightning_rod").system.IndexSet;
 const Visibility = @import("visibility.zig").Visibility;
+const Streaming = @import("streaming.zig").Streaming;
+const geometry_bounds = @import("bounds.zig");
 const std = @import("std");
 const protocols = @import("protocols");
 const sessions = @import("sessions");
@@ -25,7 +27,7 @@ pub const Replication = struct {
 
     pub const Configuration = struct { lifecycle_exceptions: usize = 4096, audience_words: usize = 4096 };
 
-    pub const Dependencies = struct { players: *Players, visibility: *Visibility };
+    pub const Dependencies = struct { players: *Players, visibility: *Visibility, streaming: ?*Streaming = null };
 
     const Spawn = struct {
         entity_id: i32,
@@ -225,22 +227,22 @@ pub const Replication = struct {
     }
 
     const Work = enum { updates, interested, audience };
-    const Scratch = enum { changed, movement_changed, head_changed, flags_changed, connected, spatial_changed, ready_observers, selected, nearby, difference, listed, lifecycle_remove_entity, lifecycle_remove_player, lifecycle_add_player, lifecycle_mode, lifecycle_spawn, spawned, eligible, retry, previous, members, force, candidates, outstanding, group, delivered, failed, displaced, filtered, entity_audience };
+    const Scratch = enum { changed, movement_changed, head_changed, flags_changed, connected, spatial_changed, ready_observers, selected, nearby, difference, listed, lifecycle_remove_entity, lifecycle_remove_player, lifecycle_add_player, lifecycle_mode, lifecycle_spawn, spawned, eligible, retry, previous, members, force, candidates, outstanding, group, delivered, failed, displaced, filtered, entity_audience, terrain_changed };
 
     fn workMask(self: *const Replication, index: usize, comptime kind: Work) bit_sets.Set {
         assert(index < self.subjects.len);
-        return self.work_masks.row(index * 3 + @intFromEnum(kind)).view();
+        return self.work_masks.row(index * 3 + @backingInt(kind)).view();
     }
 
     fn editWorkMask(self: *Replication, index: usize, comptime kind: Work) audience_storage.Row {
         assert(index < self.subjects.len);
-        const row = index * 3 + @intFromEnum(kind);
+        const row = index * 3 + @backingInt(kind);
         self.dirty_work.insert(row);
         return self.work_masks.row(row);
     }
 
     fn temp(self: *const Replication, comptime kind: Scratch) sparse_sets.Workspace.RowView {
-        return self.scratch.row(@intFromEnum(kind));
+        return self.scratch.row(@backingInt(kind));
     }
 
     fn queueUpdates(self: *Replication, subject: usize, audience: bit_sets.Set) void {
@@ -267,6 +269,13 @@ pub const Replication = struct {
 
     pub fn tick(self: *Replication) void {
         const players = self.deps.players;
+        const terrain = if (self.deps.streaming) |streaming| streaming.snapshotVisibility() else null;
+        const terrain_changed = self.temp(.terrain_changed);
+        terrain_changed.clear();
+        if (terrain) |snapshot| {
+            for (snapshot.reset.values()) |index| terrain_changed.insert(index);
+            for (snapshot.changed_words.values()) |word| terrain_changed.insert(word / snapshot.words_per_player);
+        }
         for (players.activeSlots()) |index| self.actors.insert(index);
         const changed = self.temp(.changed);
         changed.clear();
@@ -315,12 +324,14 @@ pub const Replication = struct {
             };
             if (generation != 0) connected.insert(index);
             if (generation != subject.generation or next.gamemode != subject.gamemode or next.entity_visibility != subject.entity_visibility or next.tab_visibility != subject.tab_visibility) changed.insert(index);
+            const moved = !std.meta.eql(next.position, subject.position);
+            if (terrain != null and moved and !std.meta.eql(terrainSections(next.position), terrainSections(subject.position))) changed.insert(index);
             if (generation != subject.generation or next.world != subject.world or !std.meta.eql(next.cell, subject.cell)) {
                 spatial_changed.insert(index);
                 if (subject.generation != 0) self.spatial_changes.update(index * 2, spatialPosition(subject.*));
                 self.spatial_changes.update(index * 2 + 1, spatialPosition(next));
             }
-            if (!std.meta.eql(next.position, subject.position) or next.yaw != subject.yaw or next.pitch != subject.pitch or next.on_ground != subject.on_ground) movement_changed.insert(index);
+            if (moved or next.yaw != subject.yaw or next.pitch != subject.pitch or next.on_ground != subject.on_ground) movement_changed.insert(index);
             if (next.yaw != subject.yaw) head_changed.insert(index);
             if (!std.meta.eql(next.flags, subject.flags)) flags_changed.insert(index);
             subject.* = next;
@@ -359,6 +370,11 @@ pub const Replication = struct {
             if (generation == 0) continue;
             if (lifecycle_changed) {
                 watching.pending.unite(watching.pending.view(), changed.view());
+                watching.pending_dirty = true;
+            }
+            if (terrain_changed.view().contains(other)) {
+                watching.pending.unite(watching.pending.view(), watching.nearby.view());
+                watching.pending.unite(watching.pending.view(), watching.spawned.view());
                 watching.pending_dirty = true;
             }
             if (observer.stage != .ready) {
@@ -423,7 +439,7 @@ pub const Replication = struct {
         }
         for (self.actors.values()) |index| {
             const subject = players.records[index];
-            if (!self.dirty_work.contains(index * 3 + @intFromEnum(Work.audience))) continue;
+            if (!self.dirty_work.contains(index * 3 + @backingInt(Work.audience))) continue;
             const audience = self.workMask(index, .audience);
             if (!audience.any()) continue;
             while (!self.lifecycle.begin(index, audience)) self.evictObserver(ready_observers);
@@ -438,6 +454,13 @@ pub const Replication = struct {
                 const filtered = self.temp(.entity_audience);
                 _ = self.deps.visibility.player_entity.filter(handle, entity_row.view(), filtered);
                 entity_row.copy(filtered.view());
+                if (terrain) |snapshot| {
+                    const bounds = terrainBounds(self.subjects[index].position);
+                    var observers = entity_row.view().iterator();
+                    while (observers.next()) |other| {
+                        if (!snapshot.boundsVisible(other, &players.records[other], subject.world, bounds)) entity_row.remove(other);
+                    }
+                }
                 _ = self.deps.visibility.tab_list.filter(handle, ready_observers.view(), listed_row);
             } else {
                 entity_row.clear();
@@ -459,24 +482,24 @@ pub const Replication = struct {
                     seen.listed = true;
                 }
                 const stale = seen.generation != generation;
-                if (seen.spawned and (stale or !wants_spawn)) needed[@intFromEnum(Action.remove_entity)].insert(other);
+                if (seen.spawned and (stale or !wants_spawn)) needed[@backingInt(Action.remove_entity)].insert(other);
                 if (seen.known and (stale or !wants_known)) {
-                    if (!seen.spawned) needed[@intFromEnum(Action.remove_player)].insert(other);
+                    if (!seen.spawned) needed[@backingInt(Action.remove_player)].insert(other);
                     continue;
                 }
                 if (!wants_known) continue;
                 if (!seen.known) {
-                    needed[@intFromEnum(Action.add_player)].insert(other);
+                    needed[@backingInt(Action.add_player)].insert(other);
                     continue;
                 }
-                if (seen.gamemode != subject.gamemode or seen.listed != (listed_audience.contains(other))) needed[@intFromEnum(Action.mode)].insert(other);
-                if (!seen.spawned and wants_spawn) needed[@intFromEnum(Action.spawn)].insert(other);
+                if (seen.gamemode != subject.gamemode or seen.listed != (listed_audience.contains(other))) needed[@backingInt(Action.mode)].insert(other);
+                if (!seen.spawned and wants_spawn) needed[@backingInt(Action.spawn)].insert(other);
             }
             const yaw = self.subjects[index].yaw;
             const pitch = self.subjects[index].pitch;
             const entity_id: i32 = @intCast(index + 1);
             inline for (std.enums.values(Action)) |phase| {
-                const remaining = needed[@intFromEnum(phase)];
+                const remaining = needed[@backingInt(phase)];
                 while (remaining.view().any()) {
                     const first = remaining.view().firstFrom(0).?;
                     const old_uuid = self.lifecycle.get(index, first).uuid;
@@ -496,7 +519,7 @@ pub const Replication = struct {
                     const result = switch (phase) {
                         .remove_entity => players.deps.packets.fanout(writeRemove, targets[0..count], .{entity_id}, 2048, deliveries[0..count]),
                         .remove_player => players.deps.packets.fanout(writePlayerRemove, targets[0..count], .{old_uuid}, 2048, deliveries[0..count]),
-                        .add_player => players.deps.packets.fanout(Players.writePlayerProfile, targets[0..count], .{ subject.uuid, subject.name[0..subject.name_len], @as(i32, @intFromEnum(subject.gamemode)), listed_audience.contains(first) }, 2048, deliveries[0..count]),
+                        .add_player => players.deps.packets.fanout(Players.writePlayerProfile, targets[0..count], .{ subject.uuid, subject.name[0..subject.name_len], @as(i32, @backingInt(subject.gamemode)), listed_audience.contains(first) }, 2048, deliveries[0..count]),
                         .mode => players.deps.packets.fanout(writeInfo, targets[0..count], .{ subject.uuid, subject.gamemode, listed_audience.contains(first) }, 2048, deliveries[0..count]),
                         .spawn => players.deps.packets.fanoutGroup(.{ .{ writeSpawnLegacy, writeSpawnPacked }, writeFlags, writeHeadRotation }, targets[0..count], .{
                             .{Spawn{ .entity_id = entity_id, .uuid = subject.uuid, .position = subject.position, .pitch = pitch, .yaw = yaw, .head_yaw = yaw }},
@@ -518,19 +541,19 @@ pub const Replication = struct {
                             .remove_entity => {
                                 self.detach(index, other);
                                 seen.spawned = false;
-                                if (seen.generation != generation or (other != index and !listed_audience.contains(other) and !entity_audience.contains(other))) needed[@intFromEnum(Action.remove_player)].insert(other);
+                                if (seen.generation != generation or (other != index and !listed_audience.contains(other) and !entity_audience.contains(other))) needed[@backingInt(Action.remove_player)].insert(other);
                             },
                             .remove_player => {
                                 self.detach(index, other);
                                 seen.* = .{ .generation = generation, .uuid = subject.uuid };
-                                if (generation != 0 and (other == index or listed_audience.contains(other) or entity_audience.contains(other))) needed[@intFromEnum(Action.add_player)].insert(other);
+                                if (generation != 0 and (other == index or listed_audience.contains(other) or entity_audience.contains(other))) needed[@backingInt(Action.add_player)].insert(other);
                             },
                             .add_player => {
                                 seen.known = true;
                                 seen.listed = listed_audience.contains(other);
                                 seen.spawned = false;
                                 seen.gamemode = subject.gamemode;
-                                if (self.workMask(index, .interested).contains(other) and subject.inWorld()) needed[@intFromEnum(Action.spawn)].insert(other);
+                                if (self.workMask(index, .interested).contains(other) and subject.inWorld()) needed[@backingInt(Action.spawn)].insert(other);
                             },
                             .mode => {
                                 seen.gamemode = subject.gamemode;
@@ -579,7 +602,7 @@ pub const Replication = struct {
         var group_count: usize = 0;
         for (self.actors.values()) |index| {
             const subject = players.records[index];
-            if (!self.dirty_work.contains(index * 3 + @intFromEnum(Work.updates))) continue;
+            if (!self.dirty_work.contains(index * 3 + @backingInt(Work.updates))) continue;
             const watching = self.workMask(index, .updates);
             if (!watching.any()) continue;
             const previous_pending = self.temp(.previous);
@@ -640,7 +663,7 @@ pub const Replication = struct {
                     const seen = self.observed(index, other);
                     assert(seen.state.spawned and seen.state.generation == self.subjects[index].generation);
                     assert(observer.stage == .ready and observer.world == subject.world);
-                    const known = seen.known & (@as(u3, 1) << @intFromEnum(phase)) != 0;
+                    const known = seen.known & (@as(u3, 1) << @backingInt(phase)) != 0;
                     const needed = !known or switch (phase) {
                         .movement => !std.meta.eql(position, seen.value.position) or yaw != seen.value.yaw or pitch != seen.value.pitch or subject.on_ground != seen.value.on_ground,
                         .head => seen.value.head == null or seen.value.head.? != yaw,
@@ -746,7 +769,7 @@ pub const Replication = struct {
                             .head => players.deps.packets.broadcast(&self.broadcast, writeHeadRotation, excluded, required, .{ entity_id, yaw }, 16),
                             .flags => players.deps.packets.broadcast(&self.broadcast, writeFlags, excluded, required, .{ entity_id, subject.flags }, 32),
                         } catch |err| std.debug.panic("invalid server packet: {s}", .{@errorName(err)});
-                        receipts[index][@intFromEnum(phase)] = receipt;
+                        receipts[index][@backingInt(phase)] = receipt;
                         required = receipt;
                     }
                 }
@@ -757,7 +780,7 @@ pub const Replication = struct {
                 const eligible = self.temp(.eligible);
                 eligible.intersect(self.workMask(index, .updates), self.viewer_masks.row(index).view());
                 inline for (std.enums.values(Phase)) |phase| {
-                    if (receipts[index][@intFromEnum(phase)]) |receipt| {
+                    if (receipts[index][@backingInt(phase)]) |receipt| {
                         const accepted = self.broadcast.accepted(receipt);
                         self.advance(index, phase, accepted);
                         const failed = self.temp(.failed);
@@ -841,8 +864,8 @@ pub const Replication = struct {
         var cached: ?*const CachedBaseline = null;
         var checked_cache = false;
         inline for (std.enums.values(Phase)) |phase| {
-            const flag = @as(u3, 1) << @intFromEnum(phase);
-            if (common.members[@intFromEnum(phase)].view().contains(observer)) {
+            const flag = @as(u3, 1) << @backingInt(phase);
+            if (common.members[@backingInt(phase)].view().contains(observer)) {
                 assign(&result.value, common.value, phase);
                 result.known |= flag;
             } else {
@@ -868,13 +891,13 @@ pub const Replication = struct {
         const entry = &self.baselines[self.baselineSlot(key)];
         if (!std.meta.eql(key, entry.key)) entry.* = .{ .key = key };
         assign(&entry.value, value, phase);
-        entry.known |= @as(u3, 1) << @intFromEnum(phase);
+        entry.known |= @as(u3, 1) << @backingInt(phase);
     }
 
     fn detach(self: *Replication, subject: usize, observer: usize) void {
         const observed_state = self.observed(subject, observer);
         inline for (std.enums.values(Phase)) |phase| {
-            if (observed_state.known & (@as(u3, 1) << @intFromEnum(phase)) != 0) self.remember(subject, observer, observed_state.value, phase);
+            if (observed_state.known & (@as(u3, 1) << @backingInt(phase)) != 0) self.remember(subject, observer, observed_state.value, phase);
         }
         for (self.common[subject].members) |members| members.remove(observer);
     }
@@ -890,16 +913,16 @@ pub const Replication = struct {
         assign(&after, next, phase);
         if (!std.meta.eql(before, after)) {
             const displaced = self.temp(.displaced);
-            displaced.subtract(common.members[@intFromEnum(phase)].view(), accepted);
+            displaced.subtract(common.members[@backingInt(phase)].view(), accepted);
             var previous = displaced.view().iterator();
             while (previous.next()) |observer| {
                 self.remember(index, observer, common.value, phase);
             }
-            common.members[@intFromEnum(phase)].clear();
+            common.members[@backingInt(phase)].clear();
             assign(&common.value, next, phase);
         }
-        common.members[@intFromEnum(phase)].unite(common.members[@intFromEnum(phase)].view(), accepted);
-        assert(common.members[@intFromEnum(phase)].view().includes(accepted));
+        common.members[@backingInt(phase)].unite(common.members[@backingInt(phase)].view(), accepted);
+        assert(common.members[@backingInt(phase)].view().includes(accepted));
     }
 
     /// The view expires at the next viewers call or tick.
@@ -984,7 +1007,7 @@ pub const Replication = struct {
         var chat = try absent_player.chatSession();
         const absent_chat = try chat.advance(try (try chat.begin()).case_default());
         var gamemode = try absent_chat.gamemode();
-        const selected = try gamemode.advance(try (try gamemode.begin()).case_true(@intFromEnum(mode)));
+        const selected = try gamemode.advance(try (try gamemode.begin()).case_true(@backingInt(mode)));
         var listed = try selected.listed();
         const absent_listed = try listed.advance(try (try listed.begin()).case_true(@intFromBool(is_listed)));
         var latency = try absent_listed.latency();
@@ -1051,6 +1074,25 @@ fn relative(position: [3]i64, baseline: [3]i64) bool {
     const dy = position[1] - baseline[1];
     const dz = position[2] - baseline[2];
     return dx >= -32768 and dx <= 32767 and dy >= -32768 and dy <= 32767 and dz >= -32768 and dz <= 32767;
+}
+
+fn terrainBounds(position: [3]i64) geometry_bounds.Box {
+    var bounds: geometry_bounds.Box = undefined;
+    for (0..3) |axis| {
+        const coordinate: i32 = @intCast(@divFloor(position[axis], 4096));
+        bounds.minimum[axis] = coordinate - 1;
+        bounds.maximum[axis] = coordinate + (if (axis == 1) @as(i32, 3) else 2);
+    }
+    return bounds;
+}
+
+fn terrainSections(position: [3]i64) geometry_bounds.Box {
+    var bounds = terrainBounds(position);
+    for (0..3) |axis| {
+        bounds.minimum[axis] = @divFloor(bounds.minimum[axis], 16);
+        bounds.maximum[axis] = @divFloor(bounds.maximum[axis] - 1, 16) + 1;
+    }
+    return bounds;
 }
 
 fn fixed(value: f64) i64 {

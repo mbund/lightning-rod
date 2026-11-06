@@ -33,6 +33,27 @@ pub const ItemEntities = struct {
     };
 
     pub const Metadata = struct {
+        pub const encoded_size = 54;
+        pub fn encode(value: Metadata, output: []u8) void {
+            assert(output.len == encoded_size);
+            assert(value.pickup_delay <= 32767);
+            var writer = std.Io.Writer.fixed(output);
+            writer.writeByte(1) catch unreachable;
+            writer.writeInt(u32, value.ticks, .little) catch unreachable;
+            writer.writeInt(i32, value.age, .little) catch unreachable;
+            writer.writeInt(u16, value.pickup_delay, .little) catch unreachable;
+            writer.writeInt(i16, value.health, .little) catch unreachable;
+            writer.writeByte(@intFromBool(value.on_ground)) catch unreachable;
+            writer.writeByte(@intFromBool(value.owner != null)) catch unreachable;
+            writer.writeInt(u128, value.owner orelse 0, .little) catch unreachable;
+            writer.writeInt(u64, value.revision, .little) catch unreachable;
+            writer.writeByte(@intFromBool(value.alive)) catch unreachable;
+            writer.writeInt(i32, value.collector, .little) catch unreachable;
+            writer.writeInt(u16, value.collected, .little) catch unreachable;
+            writer.writeInt(u64, value.collection, .little) catch unreachable;
+            assert(writer.end == output.len);
+        }
+
         ticks: u32 = 0,
         age: i32 = 0,
         pickup_delay: u16 = 10,
@@ -175,7 +196,7 @@ pub const ItemEntities = struct {
                 .metrics_namespace = "items.cache",
                 .slots = config.cache_records,
                 .key_bytes = 9,
-                .value_bytes = 54,
+                .value_bytes = Metadata.encoded_size,
                 .scan_batch = 16,
             }),
         };
@@ -245,8 +266,8 @@ pub const ItemEntities = struct {
             defer for (metadata[0..count]) |lease| lease.release();
             for (metadata[0..count]) |lease| if (lease.read() != null) return error.Corrupt;
             for (batch, ids, bodies[0..count], metadata[0..count], limits[begin..][0..count]) |request, entity, body, lease, limit| {
-                encode(request.metadata, lease.edit());
-                lease.commit(54);
+                request.metadata.encode(lease.edit());
+                lease.commit(Metadata.encoded_size);
                 try self.track(entity, body);
                 const properties = &self.stack_properties[self.ids.get(entity).?];
                 properties.item = request.stack.item;
@@ -275,8 +296,8 @@ pub const ItemEntities = struct {
                     previous.collector != metadata.collector or previous.collected != metadata.collected or previous.collection != metadata.collection;
             } else true;
             if (changed) self.owner.changes.insert(self.index);
-            encode(metadata, self.record.edit());
-            self.record.commit(54);
+            metadata.encode(self.record.edit());
+            self.record.commit(Metadata.encoded_size);
         }
 
         pub fn release(self: MetadataLease) void {
@@ -402,8 +423,8 @@ pub const ItemEntities = struct {
         const lease = try self.cache.acquire(&key);
         defer lease.release();
         self.changes.insert(self.ids.get(entity) orelse return error.UnknownItemEntity);
-        encode(metadata, lease.edit());
-        lease.commit(54);
+        metadata.encode(lease.edit());
+        lease.commit(Metadata.encoded_size);
     }
 
     pub fn move(self: *ItemEntities, record: Record, before: entities.State, after: entities.State) !void {
@@ -692,28 +713,8 @@ fn keyFor(entity: entities.Id) [9]u8 {
     return key;
 }
 
-fn encode(value: ItemEntities.Metadata, output: []u8) void {
-    assert(output.len == 54);
-    assert(value.pickup_delay <= 32767);
-    var writer = std.Io.Writer.fixed(output);
-    writer.writeByte(1) catch unreachable;
-    writer.writeInt(u32, value.ticks, .little) catch unreachable;
-    writer.writeInt(i32, value.age, .little) catch unreachable;
-    writer.writeInt(u16, value.pickup_delay, .little) catch unreachable;
-    writer.writeInt(i16, value.health, .little) catch unreachable;
-    writer.writeByte(@intFromBool(value.on_ground)) catch unreachable;
-    writer.writeByte(@intFromBool(value.owner != null)) catch unreachable;
-    writer.writeInt(u128, value.owner orelse 0, .little) catch unreachable;
-    writer.writeInt(u64, value.revision, .little) catch unreachable;
-    writer.writeByte(@intFromBool(value.alive)) catch unreachable;
-    writer.writeInt(i32, value.collector, .little) catch unreachable;
-    writer.writeInt(u16, value.collected, .little) catch unreachable;
-    writer.writeInt(u64, value.collection, .little) catch unreachable;
-    assert(writer.end == output.len);
-}
-
 fn decode(bytes: []const u8) !ItemEntities.Metadata {
-    if (bytes.len != 54 or bytes[0] != 1 or bytes[13] > 1 or bytes[14] > 1 or bytes[39] > 1) return error.Corrupt;
+    if (bytes.len != ItemEntities.Metadata.encoded_size or bytes[0] != 1 or bytes[13] > 1 or bytes[14] > 1 or bytes[39] > 1) return error.Corrupt;
 
     const value: ItemEntities.Metadata = .{
         .ticks = std.mem.readInt(u32, bytes[1..5], .little),

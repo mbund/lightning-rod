@@ -17,26 +17,23 @@ const Options = struct {
 const Row = struct {
     format: []const u8,
     files: u64,
-    payload: u64,
     file_count: usize,
     submitted_bytes: u64,
 };
 const Entry = struct { key: [16]u8, value: []const u8 };
-const Trace = struct { bytes: []const u8, digest: [64]u8, payload: u64 };
+const Trace = struct { bytes: []const u8, digest: [64]u8 };
 const SqliteCase = struct { page_size: u32, without_rowid: bool, row: Row };
 
 fn trace(allocator: std.mem.Allocator, source: *const corpus.Corpus) !Trace {
     const entries = try allocator.alloc(Entry, source.columns.len * corpus.section_count);
     defer allocator.free(entries);
     var encoded: [corpus.section_bytes]u8 = undefined;
-    var payload: u64 = 0;
     for (source.columns, 0..) |column, index| for (column.sections, 0..) |section, y| {
         const bytes = try chunks.encoding.encode(section, &encoded);
         entries[index * corpus.section_count + y] = .{
             .key = chunks.encodeKey(.{ .world = 0, .x = column.x, .z = column.z, .y = @as(i32, @intCast(y)) + corpus.minimum_y }),
             .value = try allocator.dupe(u8, bytes),
         };
-        payload += bytes.len;
     };
     defer for (entries) |entry| allocator.free(entry.value);
     var output: std.Io.Writer.Allocating = .init(allocator);
@@ -70,7 +67,7 @@ fn trace(allocator: std.mem.Allocator, source: *const corpus.Corpus) !Trace {
     }
     var hash: [32]u8 = undefined;
     digest.final(&hash);
-    return .{ .bytes = try output.toOwnedSlice(), .digest = std.fmt.bytesToHex(hash, .lower), .payload = payload };
+    return .{ .bytes = try output.toOwnedSlice(), .digest = std.fmt.bytesToHex(hash, .lower) };
 }
 
 fn verifyNative(init: std.process.Init, source: *const corpus.Corpus, path: []const u8) !u64 {
@@ -122,7 +119,7 @@ fn verifyAnvil(init: std.process.Init, source: *const corpus.Corpus, directory: 
     var region = try std.Io.Dir.cwd().openDir(init.io, reader.region, .{ .iterate = true });
     defer region.close(init.io);
     var iterator = region.iterate();
-    var result: Row = .{ .format = "Anvil (NBT + zlib)", .files = 0, .payload = 0, .file_count = 0, .submitted_bytes = manifest.value.anvil_submitted_bytes };
+    var result: Row = .{ .format = "Anvil (NBT + zlib)", .files = 0, .file_count = 0, .submitted_bytes = manifest.value.anvil_submitted_bytes };
     var columns: usize = 0;
     while (try iterator.next(init.io)) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".mca")) return error.UnexpectedRegionFile;
@@ -139,7 +136,6 @@ fn verifyAnvil(init: std.process.Init, source: *const corpus.Corpus, directory: 
             if (try file.readPositionalAll(init.io, &length, @as(u64, location >> 8) * 4096) != length.len) return error.TruncatedRegion;
             const size = std.mem.readInt(u32, &length, .big);
             if (size < 1) return error.InvalidRegionLength;
-            result.payload += size - 1;
             columns += 1;
         }
     }
@@ -183,7 +179,7 @@ fn run(init: std.process.Init) !void {
         case.* = .{
             .page_size = page_size,
             .without_rowid = without_rowid,
-            .row = .{ .format = "SQLite (packed sections)", .files = result.after_checkpoint.database + result.after_checkpoint.wal, .payload = result.payload, .file_count = 1, .submitted_bytes = result.submitted_bytes },
+            .row = .{ .format = "SQLite (packed sections)", .files = result.after_checkpoint.database + result.after_checkpoint.wal, .file_count = 1, .submitted_bytes = result.submitted_bytes },
         };
         if (case.row.files < sqlite_cases[smallest].row.files) smallest = layout;
     }
@@ -194,7 +190,7 @@ fn run(init: std.process.Init) !void {
     const rows = [_]Row{
         vanilla,
         sql.row,
-        .{ .format = "Native (packed tiles)", .files = native_bytes, .payload = writes.payload, .file_count = 2, .submitted_bytes = native_writes.wal_bytes + native_writes.maintenance_bytes },
+        .{ .format = "Native (packed tiles)", .files = native_bytes, .file_count = 2, .submitted_bytes = native_writes.wal_bytes + native_writes.maintenance_bytes },
     };
     var raw: u64 = 0;
     for (source.columns) |column| for (column.sections) |section| {
@@ -217,16 +213,15 @@ fn run(init: std.process.Init) !void {
     var output = std.Io.File.stdout().writer(init.io, &buffer);
     const writer = &output.interface;
     try writer.print("\nTerrain storage comparison: {d} chunks, {d} sections, {d:.3} MiB decoded\n\n", .{ source.columns.len, source.columns.len * corpus.section_count, @as(f64, @floatFromInt(raw)) / 1048576 });
-    try writer.print("{s: <28} {s: >10} {s: >12} {s: >12} {s: >12}\n", .{ "Format", "File MiB", "Payload MiB", "Overhead %", "Write MiB" });
-    try writer.writeAll("--------------------------------------------------------------------------------\n");
-    for (rows) |row| try writer.print("{s: <28} {d: >10.3} {d: >12.3} {d: >12.2} {d: >12.3}\n", .{
+    try writer.print("{s: <28} {s: >10} {s: >12} {s: >12}\n", .{ "Format", "File MiB", "Decoded/file", "Write MiB" });
+    try writer.writeAll("-------------------------------------------------------------------\n");
+    for (rows) |row| try writer.print("{s: <28} {d: >10.3} {d: >11.2}x {d: >12.3}\n", .{
         row.format,
         @as(f64, @floatFromInt(row.files)) / 1048576,
-        @as(f64, @floatFromInt(row.payload)) / 1048576,
-        @as(f64, @floatFromInt(row.files - row.payload)) * 100 / @as(f64, @floatFromInt(row.payload)),
+        @as(f64, @floatFromInt(raw)) / @as(f64, @floatFromInt(row.files)),
         @as(f64, @floatFromInt(row.submitted_bytes)) / 1048576,
     });
-    try writer.writeAll("\nBlock states only. All terrain was read back and verified. Lower file size is better.\nFiles include indexes, free space, and retained WAL headers after maintenance.\nOverhead is (file - encoded payload) / encoded payload. Native tile headers count.\nWrites count submitted bytes including WAL, checkpoints, and region header updates.\nAnvil has no atomic multi-chunk commit. SQLite and native use durable WAL commits.\n");
+    try writer.writeAll("\nBlock states only. All terrain was read back and verified. Lower file size is better.\nFiles include indexes, free space, and retained WAL headers after maintenance.\nDecoded/file divides the same decoded block-state byte count by each format's total file size.\nWrites count submitted bytes including WAL, checkpoints, and region header updates.\nAnvil has no atomic multi-chunk commit. SQLite and native use durable WAL commits.\n");
     try writer.print("SQLite shows the smallest of four layouts: {d}-byte pages, {s}.\n", .{ sql.page_size, if (sql.without_rowid) "WITHOUT ROWID" else "rowid" });
     try writer.print("Detailed results: {s}\n", .{result_path});
     try writer.flush();

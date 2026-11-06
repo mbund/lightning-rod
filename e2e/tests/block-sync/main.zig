@@ -9,6 +9,7 @@ pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
             lightning_rod.plugin.configured(vanilla.BlockSynchronization, .{ .delta_sections = 2 }),
+            lightning_rod.plugin.configured(vanilla.Streaming, .{ .occlusion = false }),
         }),
         lightning_rod.plugin.configured(Probe, .{}),
     });

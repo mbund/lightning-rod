@@ -8,6 +8,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import net.minecraft.client.Minecraft;
+import net.minecraft.network.protocol.game.ClientboundAddEntityPacket;
 import net.minecraft.client.gui.screens.ConnectScreen;
 import net.minecraft.client.gui.screens.DisconnectedScreen;
 import net.minecraft.client.gui.screens.TitleScreen;
@@ -121,7 +122,12 @@ public final class Recorder {
             throw new IllegalStateException("cannot initialize e2e probe", error);
         }
     }
+    public synchronized void viewCenter(int x, int z) {
+        event("view_center", "x", x, "z", z);
+        if (fixture != null) fixture.viewCenter(x, z);
+    }
     public synchronized void chunkData(int x, int z, int skySetCount, int blockSetCount, int skyArrays, int blockArrays) {
+        if (fixture != null) fixture.chunkData(Minecraft.getInstance(), x, z);
         if (observedChunkPackets++ >= 64 && observedChunkPackets % 64 != 0) return;
         event("chunk_data", "x", x, "z", z, "sky_set_count", skySetCount, "block_set_count", blockSetCount,
             "sky_arrays", skyArrays, "block_arrays", blockArrays);
@@ -367,7 +373,14 @@ public final class Recorder {
         return capture;
     }
 
-    public synchronized void rendered(Minecraft client) {
+    public void rendered(Minecraft client) {
+        Fixture current;
+        synchronized (this) { current = enabled && !written && !completed ? fixture : null; }
+        if (current != null && client.player != null && client.level != null) current.frame(client);
+        captureFrame(client);
+    }
+
+    private synchronized void captureFrame(Minecraft client) {
         if (!enabled || written || pendingScreenshots.isEmpty() || GuiApi.target(client) == null ||
             GuiApi.overlay(client) != null && (!completed || resultPassed)) return;
         List<Capture> captures = new ArrayList<>(pendingScreenshots);
@@ -412,6 +425,9 @@ public final class Recorder {
     }
 
     public synchronized void blockBreaking(BlockPos position, int stage) { if (fixture != null) fixture.blockBreaking(position, stage); }
+    public synchronized void entitySpawned(ClientboundAddEntityPacket packet) { if (fixture != null) fixture.entitySpawned(packet); }
+    public synchronized void particles(net.minecraft.network.protocol.game.ClientboundLevelParticlesPacket packet) { if (fixture != null) fixture.particles(packet); }
+    public synchronized void overlay(String text) { if (fixture != null) fixture.overlay(text); }
     public synchronized void inventorySynced(int containerId) {
         if (containerId == 0 && fixture != null) fixture.inventorySynced(Minecraft.getInstance());
     }

@@ -4,7 +4,7 @@ const storage = @import("storage");
 const metrics = @import("metrics");
 
 const assert = std.debug.assert;
-const section_bytes = 8193;
+const section_bytes = chunks.encoding.maximum_decoded_bytes;
 
 pub const Priority = struct {
     urgency: enum { required, occupied, streaming } = .streaming,
@@ -211,7 +211,7 @@ pub const Generation = struct {
             if (self.index.get(section)) |index| {
                 const slot = &self.slots[index];
                 assert(slot.destination.ptr == request.destination.ptr and slot.token == request.token);
-                if (slot.obsolete or @intFromEnum(priority.urgency) < @intFromEnum(slot.priority.urgency) or (priority.urgency == slot.priority.urgency and priority.distance < slot.priority.distance)) self.prioritize(index, priority);
+                if (slot.obsolete or @backingInt(priority.urgency) < @backingInt(slot.priority.urgency) or (priority.urgency == slot.priority.urgency and priority.distance < slot.priority.distance)) self.prioritize(index, priority);
                 slot.obsolete = false;
                 submitted += 1;
                 continue;
@@ -254,7 +254,7 @@ pub const Generation = struct {
     fn reclaimLess(self: *const Generation, a: usize, b: usize) bool {
         const first = &self.slots[a];
         const second = &self.slots[b];
-        if (first.priority.urgency != second.priority.urgency) return @intFromEnum(first.priority.urgency) < @intFromEnum(second.priority.urgency);
+        if (first.priority.urgency != second.priority.urgency) return @backingInt(first.priority.urgency) < @backingInt(second.priority.urgency);
         if (first.priority.distance != second.priority.distance) return first.priority.distance < second.priority.distance;
         return first.sequence < second.sequence;
     }
@@ -476,7 +476,7 @@ pub const Generation = struct {
     }
 
     fn ordered(a: *const Slot, b: *const Slot) bool {
-        if (a.priority.urgency != b.priority.urgency) return @intFromEnum(a.priority.urgency) < @intFromEnum(b.priority.urgency);
+        if (a.priority.urgency != b.priority.urgency) return @backingInt(a.priority.urgency) < @backingInt(b.priority.urgency);
         if (a.priority.player != b.priority.player) return a.priority.player < b.priority.player;
         if (a.priority.distance != b.priority.distance) return a.priority.distance < b.priority.distance;
         return a.sequence < b.sequence;
@@ -490,7 +490,7 @@ pub const Generation = struct {
         var candidate: ?usize = null;
         while (current) |index| {
             const priority = self.slots[index].priority;
-            if (@intFromEnum(priority.urgency) < @intFromEnum(urgency) or (priority.urgency == urgency and priority.player <= self.last_player)) {
+            if (@backingInt(priority.urgency) < @backingInt(urgency) or (priority.urgency == urgency and priority.player <= self.last_player)) {
                 current = self.slots[index].children[1];
             } else {
                 if (priority.urgency == urgency) candidate = index;
@@ -597,11 +597,11 @@ pub const Generation = struct {
             self.append(&self.finished, index);
             _ = self.ready_count.fetchAdd(1, .release);
             if (request.result) |length| {
-                if (length != 3 and length != section_bytes) {
+                if (length > slot.destination.len or !chunks.encoding.valid(slot.destination[0..length])) {
                     slot.result = error.InvalidSection;
                 } else {
-                    const kind = slot.destination[0];
-                    if ((kind == 0 and length != 3) or (kind == 1 and length != section_bytes) or kind > 1) slot.result = error.InvalidSection;
+                    const offset = chunks.encoding.blockOffset(slot.destination[0..length]);
+                    if (slot.destination[offset] > 1) slot.result = error.InvalidSection;
                 }
             } else |err| {
                 assert(err != error.GenerationIncomplete);
@@ -965,7 +965,7 @@ const ScheduleModel = struct {
             if (worst) |previous| {
                 const other = queue.slots[previous];
                 if (slot.priority.urgency != other.priority.urgency) {
-                    if (@intFromEnum(slot.priority.urgency) < @intFromEnum(other.priority.urgency)) continue;
+                    if (@backingInt(slot.priority.urgency) < @backingInt(other.priority.urgency)) continue;
                 } else if (slot.priority.distance != other.priority.distance) {
                     if (slot.priority.distance < other.priority.distance) continue;
                 } else if (slot.sequence < other.sequence) continue;
@@ -976,7 +976,7 @@ const ScheduleModel = struct {
     }
 
     fn before(a: Generation.Slot, b: Generation.Slot, last_player: usize) bool {
-        if (a.priority.urgency != b.priority.urgency) return @intFromEnum(a.priority.urgency) < @intFromEnum(b.priority.urgency);
+        if (a.priority.urgency != b.priority.urgency) return @backingInt(a.priority.urgency) < @backingInt(b.priority.urgency);
         if (a.priority.player != b.priority.player) {
             const a_wrap = a.priority.player <= last_player;
             const b_wrap = b.priority.player <= last_player;
@@ -1047,7 +1047,7 @@ test "indexed scheduling matches linear priority and fairness through updates ca
             0, 1 => if (queue.free_count != 0) {
                 const slot = queue.free[queue.free_count - 1];
                 const player = random.random().uintLessThan(usize, 13);
-                const priority: Priority = .{ .player = player, .distance = random.random().uintLessThan(u32, 65), .urgency = @enumFromInt(random.random().uintLessThan(u8, 3)) };
+                const priority: Priority = .{ .player = player, .distance = random.random().uintLessThan(u32, 65), .urgency = @fromBackingInt(@intCast(random.random().uintLessThan(u8, 3))) };
                 try std.testing.expectEqual(@as(usize, 1), queue.submit(&.{.{ .section = testSection(@intCast(step)), .destination = &destinations[slot], .token = slot }}, priority));
             },
             2 => {

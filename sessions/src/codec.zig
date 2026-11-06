@@ -148,7 +148,8 @@ pub fn Codec(comptime Endpoint: type) type {
             while (true) {
                 const read = self.read.load(.monotonic);
                 if (read == self.write.load(.acquire)) {
-                    self.ready.reset();
+                    // Acquire a concurrent publish before checking the queue again.
+                    _ = @atomicRmw(std.Io.Event, &self.ready, .Xchg, .unset, .acq_rel);
                     const stopping = self.stopping.load(.acquire);
                     if (read != self.write.load(.acquire)) continue;
                     if (stopping) return;

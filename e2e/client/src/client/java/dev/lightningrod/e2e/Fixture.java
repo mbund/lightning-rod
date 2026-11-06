@@ -3,6 +3,7 @@ package dev.lightningrod.e2e;
 import net.minecraft.client.Minecraft;
 import io.netty.buffer.ByteBuf;
 import net.minecraft.core.BlockPos;
+import net.minecraft.network.protocol.game.ClientboundAddEntityPacket;
 import net.minecraft.util.Mth;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 
@@ -17,6 +18,9 @@ abstract class Fixture {
     }
 
     void poll(Minecraft game) {}
+    void frame(Minecraft game) {}
+    void viewCenter(int x, int z) {}
+    void chunkData(Minecraft game, int x, int z) {}
     void connected(Minecraft game) {}
     boolean encrypted() { return false; }
     boolean canConnect() { return true; }
@@ -28,6 +32,9 @@ abstract class Fixture {
     void chat(String text) { r.receivedChat.add(text); }
     void chatAction(String text, String command, String hover) {}
     void blockBreaking(BlockPos position, int stage) {}
+    void entitySpawned(ClientboundAddEntityPacket packet) {}
+    void particles(net.minecraft.network.protocol.game.ClientboundLevelParticlesPacket packet) {}
+    void overlay(String text) {}
     void inventorySynced(Minecraft game) {}
     void reconfigurationEncoded() {}
     void encryptionResponseEncoded(ByteBuf encoded) {}

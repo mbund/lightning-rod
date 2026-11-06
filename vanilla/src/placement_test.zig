@@ -20,6 +20,8 @@ const raycast = @import("raycast.zig");
 const ItemActions = @import("item_actions.zig").ItemActions;
 const BlockActions = @import("block_actions.zig").BlockActions;
 const BlockSynchronization = @import("block_sync.zig").BlockSynchronization;
+const Streaming = @import("streaming.zig").Streaming;
+const Lighting = @import("lighting.zig").Lighting;
 const Doors = @import("doors.zig").Doors;
 const selected_protocols = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
 
@@ -28,6 +30,7 @@ const Fixture = struct {
     input: *Input,
     players: *Players,
     terrain: *chunks.Chunks,
+    streaming: *Streaming,
     inventories: *inventories.Inventories,
     items: *Items,
     other_world: u32,
@@ -74,16 +77,25 @@ const Fixture = struct {
             .equipment = undefined,
             .dropped = undefined,
         });
-        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 0, .cache_tiles = 8 }, .{
+        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 0, .cache_groups = 8 }, .{
             .metrics = registry,
             .storage = try store.openSpace("chunks"),
             .record_workspaces = workspaces,
+        });
+        const streaming = try Streaming.init(allocator, io, .{}, .{
+            .metrics = registry,
+            .chunks = terrain,
+            .players = players,
+            .sessions = service,
+            .packets = encoding,
+            .worlds = dimensions,
+            .lighting = try Lighting.init(allocator, .{}, .{ .metrics = registry, .blocks = gameplay_definitions.blocks, .chunks = terrain, .worlds = dimensions }),
         });
         const blocks = try BlockSynchronization.init(allocator, io, .{
             .metrics = registry,
             .chunks = terrain,
             .players = players,
-            .streaming = undefined,
+            .streaming = streaming,
             .sessions = service,
             .packets = encoding,
             .worlds = dimensions,
@@ -103,7 +115,13 @@ const Fixture = struct {
             .blocks = blocks,
             .actions = actions,
         });
-        return .{ .service = service, .input = input, .players = players, .terrain = terrain, .inventories = ownership, .items = items, .other_world = other_world };
+        return .{ .service = service, .input = input, .players = players, .terrain = terrain, .streaming = streaming, .inventories = ownership, .items = items, .other_world = other_world };
+    }
+
+    fn deinit(self: *Fixture) void {
+        self.service.unsubscribeOutput(self.streaming.changed);
+        self.terrain.unsubscribeReady(self.streaming.changed);
+        self.service.deinit();
     }
 
     fn place(self: *Fixture, position: chunks.Position, item: inventories.ItemId) !u16 {
@@ -149,7 +167,7 @@ test "block and door placement retain collision boundaries across chunk edges" {
     var registry = try metrics.Registry.init(allocator, std.testing.io, .{ .capacity = 128 });
     defer registry.deinit();
     var fixture = try Fixture.init(allocator, &store, &registry);
-    defer fixture.service.deinit();
+    defer fixture.deinit();
     const stone = try fixture.items.define("minecraft:stone");
     const door = try fixture.items.define("minecraft:oak_door");
     failing.fail_index = failing.alloc_index;
@@ -217,7 +235,7 @@ test "raycasts test collision shapes across sections without allocating during t
     var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
     defer registry.deinit();
     const fixture = try Fixture.init(allocator, &store, &registry);
-    defer fixture.service.deinit();
+    defer fixture.deinit();
     const world = fixture.players.records[0].world;
     const stone: u16 = @intCast(game_data.registry.blockStateId("minecraft:stone").?);
     const slab: u16 = @intCast(game_data.registry.blockStateId("minecraft:stone_slab[type=bottom,waterlogged=false]").?);

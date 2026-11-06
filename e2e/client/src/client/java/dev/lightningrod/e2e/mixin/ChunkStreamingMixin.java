@@ -2,11 +2,13 @@ package dev.lightningrod.e2e.mixin;
 
 import dev.lightningrod.e2e.Recorder;
 import net.minecraft.client.multiplayer.ClientPacketListener;
+import net.minecraft.network.protocol.game.ClientboundAddEntityPacket;
 import net.minecraft.network.protocol.game.ClientboundChunkBatchFinishedPacket;
 import net.minecraft.network.protocol.game.ClientboundChunkBatchStartPacket;
 import net.minecraft.network.protocol.game.ClientboundGameEventPacket;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
 import net.minecraft.network.protocol.game.ClientboundLoginPacket;
+import net.minecraft.network.protocol.game.ClientboundSetChunkCacheCenterPacket;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -14,6 +16,26 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(ClientPacketListener.class)
 abstract class ChunkStreamingMixin {
+    @Inject(method = "handleParticleEvent", at = @At("TAIL"))
+    private void particles(net.minecraft.network.protocol.game.ClientboundLevelParticlesPacket packet, CallbackInfo info) {
+        Recorder.instance().particles(packet);
+    }
+
+    @Inject(method = "handleSystemChat", at = @At("TAIL"))
+    private void overlay(net.minecraft.network.protocol.game.ClientboundSystemChatPacket packet, CallbackInfo info) {
+        if (packet.overlay()) Recorder.instance().overlay(packet.content().getString());
+    }
+
+    @Inject(method = "handleSetChunkCacheCenter", at = @At("TAIL"))
+    private void viewCenter(ClientboundSetChunkCacheCenterPacket packet, CallbackInfo info) {
+        Recorder.instance().viewCenter(packet.getX(), packet.getZ());
+    }
+
+    @Inject(method = "handleAddEntity", at = @At("RETURN"))
+    private void entitySpawned(ClientboundAddEntityPacket packet, CallbackInfo info) {
+        Recorder.instance().entitySpawned(packet);
+    }
+
     @Inject(method = "handleContainerContent", at = @At("TAIL"))
     private void inventory(net.minecraft.network.protocol.game.ClientboundContainerSetContentPacket packet, CallbackInfo info) {
         Recorder.instance().inventorySynced(packet.containerId());

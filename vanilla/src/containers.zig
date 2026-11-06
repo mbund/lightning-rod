@@ -205,20 +205,9 @@ pub const Containers = struct {
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Configuration, deps: Dependencies) !*Containers {
         const self = try allocate(allocator, io, config, deps);
-        const root = try deps.storage.getRoot() orelse blk: {
-            var allocated: [1]storage.PageId = undefined;
-            try deps.storage.allocatePages(&allocated);
-            var page: storage.Page = @splat(0);
-            @memcpy(page[0..8], "LRCNTR03");
-            try deps.storage.writePages(&.{.{ .id = allocated[0], .source = &page }});
-            try deps.storage.setRoot(allocated[0]);
-            break :blk allocated[0];
-        };
-        var header: [8]u8 = undefined;
-        try deps.storage.readPages(&.{.{ .id = root, .destination = &header }});
-        if (!std.mem.eql(u8, &header, "LRCNTR03")) return error.CorruptFurnace;
-        self.table.directory = root;
-        self.rewards.backend.directory = root;
+        const persisted = try Persistence.init(deps.storage, deps.record_workspaces);
+        self.table.directory = persisted.states.directory;
+        self.rewards.backend.directory = persisted.rewards.directory;
         var after: [16]u8 = undefined;
         var cursor: records.ScanCursor = .{ .after = &after };
         var keys: [16][16]u8 = undefined;
@@ -400,7 +389,7 @@ pub const Containers = struct {
             .place => {
                 if (kind == .crafting) return .pass;
                 const face = blocks.placedFacing(request.player.rotation.yaw);
-                var state = if (kind == .chest) self.states.chests[@intFromEnum(face)][0][0] else self.states.furnaces[@intFromEnum(face)][0];
+                var state = if (kind == .chest) self.states.chests[@backingInt(face)][0][0] else self.states.furnaces[@backingInt(face)][0];
                 var neighbor_position: ?chunks.Position = null;
                 var neighbor_state: u16 = 0;
                 if (kind == .chest and !request.player.flags.sneaking) {
@@ -946,3 +935,27 @@ fn writeClose(packet: wire.play.toClient.packet_close_window.Writer, window: i32
 fn writeProperty(packet: wire.play.toClient.packet_craft_progress_bar.Writer, window: i32, property: i16, value: i16) ![]u8 {
     return (try (try (try packet.windowId(window)).property(property)).value(value)).finish();
 }
+
+pub const Persistence = struct {
+    states: records.Table,
+    rewards: records.Table,
+
+    pub fn init(space: storage.Space, workspaces: *records.Workspaces) !Persistence {
+        const root = try space.getRoot() orelse blk: {
+            var allocated: [1]storage.PageId = undefined;
+            try space.allocatePages(&allocated);
+            var page: storage.Page = @splat(0);
+            @memcpy(page[0..8], "LRCNTR03");
+            try space.writePages(&.{.{ .id = allocated[0], .source = &page }});
+            try space.setRoot(allocated[0]);
+            break :blk allocated[0];
+        };
+        var header: [8]u8 = undefined;
+        try space.readPages(&.{.{ .id = root, .destination = &header }});
+        if (!std.mem.eql(u8, &header, "LRCNTR03")) return error.CorruptFurnace;
+        return .{
+            .states = .{ .space = space, .directory = root, .root_offset = 8, .resources = workspaces.resources },
+            .rewards = .{ .space = space, .directory = root, .root_offset = 16, .resources = workspaces.resources },
+        };
+    }
+};

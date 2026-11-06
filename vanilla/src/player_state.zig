@@ -1,3 +1,4 @@
+const std = @import("std");
 const sessions = @import("sessions");
 const minecraft = @import("minecraft_model");
 const experience = @import("experience_state.zig");
@@ -46,6 +47,24 @@ pub const Player = struct {
     experience_delay: u8 = 0,
     saved: [encoded_size]u8 = @splat(0),
     saved_experience: [experience.State.encoded_size]u8 = @splat(0),
+
+    pub fn encode(player: *const Player) [encoded_size]u8 {
+        std.debug.assert(player.selected_slot <= 8);
+        var bytes: [encoded_size]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&bytes);
+        writer.writeByte(3) catch unreachable;
+        inline for (.{ player.position.x, player.position.y, player.position.z }) |value|
+            writer.writeInt(u64, @bitCast(value), .little) catch unreachable;
+        inline for (.{ player.rotation.yaw, player.rotation.pitch, player.health }) |value|
+            writer.writeInt(u32, @bitCast(value), .little) catch unreachable;
+        writer.writeByte(@intCast(@backingInt(player.gamemode))) catch unreachable;
+        writer.writeByte(@bitCast(player.flags)) catch unreachable;
+        writer.writeByte(@intFromBool(player.on_ground)) catch unreachable;
+        writer.writeInt(u32, player.world, .little) catch unreachable;
+        writer.writeByte(player.selected_slot) catch unreachable;
+        std.debug.assert(writer.end == bytes.len);
+        return bytes;
+    }
 
     pub fn inWorld(self: Player) bool {
         return self.handle != null;

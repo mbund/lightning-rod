@@ -107,7 +107,9 @@ test "lighting pipeline retains overlapping neighborhoods in every direction" {
         const before = workspace.work;
         var complete = false;
         for (0..18) |_| {
+            const batches = workspace.work.acquisition_batches;
             complete = try workspace.prepare(terrain, 0, position.x, position.z, dimension, 0);
+            try std.testing.expectEqual(@as(u64, 1), workspace.work.acquisition_batches - batches);
             if (complete) break;
             while (try terrain.generation.processOne(io)) {}
             try terrain.poll();
@@ -148,7 +150,7 @@ test "lighting pipeline simulation queries group points and reuse cached light" 
     const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 48, .demand_sections = 24 }, .{ .metrics = &registry, .storage = try store.openSpace("terrain"), .record_workspaces = resources });
     const dimensions = try worlds.Worlds.allocate(allocator, .{});
     const world = try dimensions.create(.{ .name = "test:queries", .dimension = .{ .name = "test:dimension", .minimum_section = -4, .section_count = 24, .skylight = true } });
-    const service = try lighting.Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions });
+    const service = try lighting.Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions });
     var source: Scene = .{};
     terrain.setSource(chunks.Source.init(&source, Scene.read));
     const positions: [256]chunks.Position = @splat(.{ .x = 17, .y = 66, .z = 2 });

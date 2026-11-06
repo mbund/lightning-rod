@@ -5,6 +5,15 @@
       "name": "chunks"
     },
     {
+      "name": "chunks-registry",
+      "fixture": "registry",
+      "peers": [
+        "alice",
+        "bob"
+      ],
+      "mixed_versions": true
+    },
+    {
       "name": "chunks-disk",
       "prepare": "chunks-prepare",
       "fixture": "disk"

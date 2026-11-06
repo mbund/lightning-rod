@@ -391,16 +391,16 @@ pub const Service = struct {
 
     pub const Publication = struct { packet: *Packet, length: usize, recipients: []network.Handle };
 
-    const GroupPacket = struct { packet: *Packet, length: usize };
+    pub const GroupPacket = struct { packet: *Packet, length: usize };
 
-    const GroupPublication = struct {
+    pub const GroupPublication = struct {
         packets: []const GroupPacket,
         protocol: i32,
         targets: []const Target,
         delivered: []Delivery,
     };
 
-    fn publishGroups(self: *Service, groups: []const GroupPublication) void {
+    pub fn publishGroups(self: *Service, groups: []const GroupPublication) void {
         self.publication.lockUncancelable(self.output.producer_io);
         defer self.publication.unlock(self.output.producer_io);
         var pending: [batch_max]shared.SharedPages.Publication = undefined;
@@ -412,6 +412,7 @@ pub const Service = struct {
             var charge: usize = 0;
             var stale = false;
             for (packets) |entry| {
+                assert(entry.packet.epoch == packets[0].packet.epoch);
                 assert(entry.packet.owner == self and entry.length > 0 and entry.length <= entry.packet.bytes.len);
                 if (entry.packet.epoch) |epoch| stale = stale or epoch & 1 != 0 or self.epoch.load(.acquire) != epoch;
                 charge += self.framedBound(entry.length);
@@ -469,7 +470,7 @@ pub const Service = struct {
         _ = self.published_since_flush.fetchAdd(published, .release);
     }
 
-    fn cancelPackets(self: *Service, packets: []Packet) void {
+    pub fn cancelPackets(self: *Service, packets: []Packet) void {
         assert(packets.len <= batch_max);
         var reservations: [batch_max]shared.Reservation = undefined;
         var count: usize = 0;

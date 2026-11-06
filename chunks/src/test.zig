@@ -30,7 +30,7 @@ fn demandCancellationProbe(output: *std.Io.Writer) !void {
         defer arena.deinit();
         var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .enabled = false });
         defer registry.deinit();
-        const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .cache_sections = prefetched + case.reserve, .demand_sections = case.reserve, .cache_tiles = 2 }, .{
+        const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .cache_sections = prefetched + case.reserve, .demand_sections = case.reserve, .cache_groups = 2 }, .{
             .metrics = &registry,
             .storage = try store.openSpace(chunks.Chunks.id),
             .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}),
@@ -68,7 +68,7 @@ fn demandCancellationProbe(output: *std.Io.Writer) !void {
 
 pub fn benchmarkDemandCancellation() !void {
     var buffer: [1024]u8 = undefined;
-    var output = std.Io.File.stdout().writer(std.testing.io, &buffer);
+    var output = std.Io.File.stdout().writerStreaming(std.testing.io, &buffer);
     try demandCancellationProbe(&output.interface);
     try output.interface.flush();
 }
@@ -81,6 +81,7 @@ test "demand reclaims only the missing capacity while retaining useful prefetch"
 
 test {
     _ = @import("store_test.zig");
+    _ = @import("patch_test.zig");
 }
 
 test "read windows reuse duplicate and retained views within cache capacity" {
@@ -100,7 +101,7 @@ test "read windows reuse duplicate and retained views within cache capacity" {
         defer arena.deinit();
         var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
         defer registry.deinit();
-        const terrain = try chunks.Chunks.init(arena.allocator(), std.testing.io, .{ .cache_sections = capacity, .demand_sections = 0, .cache_tiles = 2 }, .{
+        const terrain = try chunks.Chunks.init(arena.allocator(), std.testing.io, .{ .cache_sections = capacity, .demand_sections = 0, .cache_groups = 2 }, .{
             .metrics = &registry,
             .storage = try store.openSpace(chunks.Chunks.id),
             .record_workspaces = try records.Workspaces.init(arena.allocator(), std.testing.io, .{}),
@@ -134,21 +135,21 @@ test "read windows reuse duplicate and retained views within cache capacity" {
 
 test "section palettes round trip every bit width and fall back before expanding" {
     for ([_]u16{ 1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33, 64, 65, 128, 129, 256, 257, 512, 513, 1024, 1025, 1278, 1279, 1280, 2048, 4096 }) |count| {
-        var dense: [encoding.decoded_bytes]u8 = undefined;
+        var dense: [encoding.dense_block_bytes]u8 = undefined;
         dense[0] = 1;
         for (0..encoding.blocks) |i| {
             const state = @as(u16, @intCast(i % count)) *% 40503 +% 65535;
             std.mem.writeInt(u16, dense[1 + i * 2 ..][0..2], state, .little);
         }
-        var encoded: [encoding.decoded_bytes]u8 = undefined;
+        var encoded: [encoding.dense_block_bytes]u8 = undefined;
         const bytes = try encoding.encode(&dense, &encoded);
-        const expected = if (count == 1) 3 else @min(encoding.decoded_bytes, 3 + @as(usize, count) * 2 + 512 * @as(usize, std.math.log2_int_ceil(u16, count)));
+        const expected = if (count == 1) 3 else @min(encoding.dense_block_bytes, 3 + @as(usize, count) * 2 + 512 * @as(usize, std.math.log2_int_ceil(u16, count)));
         try std.testing.expectEqual(expected, bytes.len);
         if (count >= 1279) try std.testing.expectEqual(dense[0..].ptr, bytes.ptr);
-        var decoded: [encoding.decoded_bytes]u8 = undefined;
+        var decoded: [encoding.dense_block_bytes]u8 = undefined;
         @memcpy(decoded[0..bytes.len], bytes);
         const length = try encoding.decode(&decoded, bytes.len);
-        var direct: [encoding.decoded_bytes]u8 = undefined;
+        var direct: [encoding.dense_block_bytes]u8 = undefined;
         try std.testing.expectEqual(length, try encoding.decodeTo(bytes, &direct));
         try std.testing.expectEqualSlices(u8, decoded[0..length], direct[0..length]);
         if (count == 1) {
@@ -162,7 +163,7 @@ test "section palettes round trip every bit width and fall back before expanding
 }
 
 test "section decoder rejects malformed lengths palettes and indices" {
-    var bytes: [encoding.decoded_bytes]u8 = @splat(0);
+    var bytes: [encoding.dense_block_bytes]u8 = @splat(0);
     try std.testing.expectError(error.Corrupt, encoding.decode(&bytes, 0));
     try std.testing.expectError(error.Corrupt, encoding.decode(&bytes, bytes.len + 1));
     for ([_]u8{ 0, 1, 2, 3, 255 }) |tag| {
@@ -175,9 +176,11 @@ test "section decoder rejects malformed lengths palettes and indices" {
         try std.testing.expectError(error.Corrupt, encoding.decode(&bytes, bytes.len));
     }
     std.mem.writeInt(u16, bytes[1..3], 3, .little);
-    bytes[9] = 3;
+    bytes[9] = 1;
+    bytes[9 + 512] = 1;
     try std.testing.expectError(error.Corrupt, encoding.decode(&bytes, 1033));
     bytes[9] = 0;
+    bytes[9 + 512] = 0;
     try std.testing.expectError(error.Corrupt, encoding.decode(&bytes, 1032));
     try std.testing.expectError(error.Corrupt, encoding.decode(&bytes, 1034));
     try std.testing.expectError(error.BufferTooSmall, encoding.decode(bytes[0..1033], 1033));
@@ -264,7 +267,7 @@ test "encoded cache batches retain their bytes across flushes and decode scans" 
     const tx = store.transaction();
     defer tx.fail();
     const space = try tx.openSpace(chunks.Chunks.id);
-    var cache = try records.Cache.init(arena.allocator(), io, records.Table.init(space, table_resources), .{ .slots = 40, .key_bytes = 1, .value_bytes = encoding.decoded_bytes, .codec = encoding.codec, .scan_batch = 2 });
+    var cache = try records.Cache.init(arena.allocator(), io, records.Table.init(space, table_resources), .{ .slots = 40, .key_bytes = 1, .value_bytes = encoding.dense_block_bytes, .codec = encoding.codec, .scan_batch = 2 });
     var keys: [40][1]u8 = undefined;
     var key_slices: [40][]const u8 = undefined;
     var leases: [40]records.Cache.Lease = undefined;
@@ -277,15 +280,15 @@ test "encoded cache batches retain their bytes across flushes and decode scans" 
         const value = lease.edit();
         value[0] = 1;
         for (0..encoding.blocks) |i| std.mem.writeInt(u16, value[1 + i * 2 ..][0..2], @intCast(section * 64 + i % 64), .little);
-        lease.commit(encoding.decoded_bytes);
+        lease.commit(encoding.dense_block_bytes);
         lease.release();
     }
     try cache.flush();
-    var scan = try records.Cache.init(arena.allocator(), io, records.Table.init(space, table_resources), .{ .slots = 1, .key_bytes = 1, .value_bytes = encoding.decoded_bytes, .codec = encoding.codec, .scan_batch = 2 });
+    var scan = try records.Cache.init(arena.allocator(), io, records.Table.init(space, table_resources), .{ .slots = 1, .key_bytes = 1, .value_bytes = encoding.dense_block_bytes, .codec = encoding.codec, .scan_batch = 2 });
     var cursor_key: [1]u8 = undefined;
     var cursor: records.ScanCursor = .{ .after = &cursor_key };
     var scan_keys: [2][1]u8 = undefined;
-    var scan_values: [2][encoding.decoded_bytes]u8 = undefined;
+    var scan_values: [2][encoding.dense_block_bytes]u8 = undefined;
     var entries: [2]records.ScanEntry = undefined;
     for (&entries, &scan_keys, &scan_values) |*entry, *key, *value| entry.* = .{ .key = key, .value = value };
     var read: usize = 0;
@@ -293,14 +296,14 @@ test "encoded cache batches retain their bytes across flushes and decode scans" 
         const result = try scan.scan(&cursor, &entries);
         for (entries[0..result.count]) |entry| {
             try std.testing.expectEqual(read, entry.key[0]);
-            try std.testing.expectEqual(encoding.decoded_bytes, entry.value_len);
+            try std.testing.expectEqual(encoding.dense_block_bytes, entry.value_len);
             for (0..encoding.blocks) |i| try std.testing.expectEqual(@as(u16, @intCast(read * 64 + i % 64)), std.mem.readInt(u16, entry.value[1 + i * 2 ..][0..2], .little));
             read += 1;
         }
         if (!result.more) break;
     }
     try std.testing.expectEqual(keys.len, read);
-    var value: [encoding.decoded_bytes]u8 = undefined;
+    var value: [encoding.dense_block_bytes]u8 = undefined;
     for (keys) |key| try std.testing.expectEqual(@as(?usize, 3203), try records.Table.init(space, table_resources).get(&key, &value));
 }
 
@@ -368,7 +371,7 @@ test "simulation reads and edits progress without the attached background thread
     var registry = try metrics.Registry.init(allocator, io, .{});
     defer registry.deinit();
     const space = try store.openSpace(chunks.Chunks.id);
-    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .demand_sections = 0, .cache_sections = 2, .cache_tiles = 2 }, .{ .metrics = &registry, .storage = space, .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}) });
+    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .demand_sections = 0, .cache_sections = 2, .cache_groups = 2 }, .{ .metrics = &registry, .storage = space, .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}) });
     var source: Source = .{ .caller = std.Thread.getCurrentId() };
     terrain.setSource(chunks.Source.init(&source, Source.read));
     var worker: Worker = .{ .terrain = terrain };
@@ -490,6 +493,212 @@ test "repeated sections in an edit batch observe preceding edits without extra b
     try std.testing.expectEqual(@as(u16, 19), lease.get(1));
 }
 
+test "palette property projections agree with scalar voxels and reject invalid palette indices" {
+    var properties: [4096]u8 = undefined;
+    var raw: [encoding.maximum_decoded_bytes]u8 = undefined;
+    var encoded: [encoding.maximum_decoded_bytes]u8 = undefined;
+    for (0..3) |mode| {
+        for (&properties, 0..) |*value, state| value.* = switch (mode) {
+            0 => 7,
+            1 => @as(u8, 1) << @intCast(state % 2) | 8,
+            else => @as(u8, 1) << @intCast(state % 8),
+        };
+        for ([_]usize{ 1, 2, 3, 4, 7, 16, 31, 255, 256, 511, 1024, 2047 }) |count| {
+            for ([_]usize{ 0, encoding.biome_header_bytes }) |offset| {
+                @memset(raw[0..offset], 0);
+                if (offset != 0) raw[0] = 3;
+                raw[offset] = 1;
+                var expected: u8 = 255;
+                for (0..4096) |index| {
+                    const state: u16 = @intCast(index % count);
+                    std.mem.writeInt(u16, raw[offset + 1 + index * 2 ..][0..2], state, .little);
+                    expected &= properties[state];
+                }
+                const input = raw[0 .. offset + encoding.dense_block_bytes];
+                const representation = try encoding.encode(input, &encoded);
+                const borrowed = try encoding.Packed.init(representation);
+                for (0..256) |row| {
+                    const states = borrowed.row(@intCast(row));
+                    for (states, 0..) |state, lane| {
+                        const index = row * 16 + lane;
+                        const expected_state = std.mem.readInt(u16, raw[offset + 1 + index * 2 ..][0..2], .little);
+                        try std.testing.expectEqual(expected_state, state);
+                        try std.testing.expectEqual(expected_state, borrowed.get(@intCast(index)));
+                    }
+                }
+                for ([_]u8{ 1, 2, 128 }) |flag| {
+                    var selected: [64]u64 = @splat(0);
+                    for (0..4096) |index| {
+                        const state = std.mem.readInt(u16, raw[offset + 1 + index * 2 ..][0..2], .little);
+                        if (properties[state] & flag != 0) selected[index / 64] |= @as(u64, 1) << @intCast(index % 64);
+                    }
+                    const dense = try encoding.classify(input, &properties, flag, .complete);
+                    const packed_section = try encoding.classify(representation, &properties, flag, .complete);
+                    try std.testing.expectEqual(expected, dense.known.common);
+                    try std.testing.expectEqual(expected, packed_section.known.common);
+                    try std.testing.expectEqualSlices(u64, &selected, &dense.known.selected);
+                    try std.testing.expectEqualSlices(u64, &selected, &packed_section.known.selected);
+                }
+            }
+        }
+    }
+    var invalid: [3 + 6 + 1024]u8 = @splat(0);
+    invalid[0] = 2;
+    std.mem.writeInt(u16, invalid[1..3], 3, .little);
+    std.mem.writeInt(u16, invalid[5..7], 1, .little);
+    std.mem.writeInt(u16, invalid[7..9], 2, .little);
+    @memset(&properties, 7);
+    try std.testing.expectEqual(@as(u8, 7), (try encoding.classify(&invalid, &properties, 1, .complete)).known.common);
+    invalid[9] = 1;
+    invalid[9 + 512] = 1;
+    try std.testing.expect(encoding.valid(&invalid));
+    try std.testing.expectError(error.Corrupt, encoding.classify(&invalid, &properties, 1, .complete));
+    invalid[9] = 0;
+    invalid[9 + 512] = 0;
+    properties[1] = 2;
+    try std.testing.expectEqual(@as(u8, 2), (try encoding.classify(&invalid, &properties, 1, .complete)).known.common);
+    try std.testing.expectError(error.Corrupt, encoding.classify(&.{ 0, 255, 255 }, &properties, 1, .complete));
+}
+
+test "mixed property requests share one compressed group read without allocating" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/mixed-properties", .{temporary.sub_path});
+    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path, .io_mode = .standard });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
+    const allocator = bounded.allocator();
+    var registry = try metrics.Registry.init(std.testing.allocator, io, .{});
+    defer registry.deinit();
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .demand_sections = 0, .cache_sections = 8, .cache_groups = 1, .storage_group_side = 2 }, .{
+        .metrics = &registry,
+        .storage = try store.openSpace(chunks.Chunks.id),
+        .record_workspaces = try records.Workspaces.init(allocator, io, .{}),
+    });
+    const sections = [_]chunks.Section{ .{ .world = 0, .x = 0, .y = 0, .z = 0 }, .{ .world = 0, .x = 1, .y = 0, .z = 0 }, .{ .world = 0, .x = 0, .y = 1, .z = 0 } };
+    const first = chunks.encodeKey(sections[0]);
+    const second = chunks.encodeKey(sections[1]);
+    var dense: [encoding.dense_block_bytes]u8 = undefined;
+    dense[0] = 1;
+    for (0..4096) |index| std.mem.writeInt(u16, dense[1 + index * 2 ..][0..2], if (index == 4095) 99 else 7, .little);
+    try terrain.cache.backend.store.putBatch(&.{ .{ .key = &first, .value = &.{ 0, 7, 0 } }, .{ .key = &second, .value = &dense } });
+    try terrain.cache.backend.store.flush();
+    terrain.cache.backend.store.bases.invalidate(&first);
+    terrain.attach();
+    defer terrain.stop();
+    bounded.fail_index = bounded.alloc_index;
+    bounded.resize_fail_index = bounded.resize_index;
+    var properties: [256]u8 = @splat(1);
+    properties[99] = 2;
+    var results: [5]encoding.Classification = undefined;
+    const requests = [_]chunks.Chunks.ClassificationRequest{
+        .{ .section = sections[0], .result = &results[0], .mode = .homogeneous },
+        .{ .section = sections[1], .result = &results[1], .mode = .homogeneous },
+        .{ .section = sections[1], .result = &results[2] },
+        .{ .section = sections[2], .result = &results[3] },
+        .{ .section = sections[0], .result = &results[4] },
+    };
+    const reads = terrain.cache.backend.store.bases.metrics.reads.value();
+    try terrain.classify(&requests, &properties, 1);
+    try std.testing.expectEqual(reads + 1, terrain.cache.backend.store.bases.metrics.reads.value());
+    try std.testing.expectEqual(@as(u8, 1), results[0].known.common);
+    try std.testing.expect(results[1] == .unavailable and results[3] == .unavailable);
+    try std.testing.expectEqual(@as(u8, 0), results[2].known.common);
+    try std.testing.expectEqual(std.math.maxInt(u64) >> 1, results[2].known.selected[63]);
+    try std.testing.expectEqualDeep(results[0], results[4]);
+    try std.testing.expectEqual(@as(usize, 0), terrain.cache.lookup.count());
+    try std.testing.expectEqual(@as(usize, 0), terrain.generation.queued_count);
+    try std.testing.expect(!bounded.has_induced_failure);
+}
+
+test "property reads preserve pending edits without generating or admitting decoded sections" {
+    const Generator = struct {
+        fn read(_: *@This(), _: std.Io, batch: chunks.Source.Batch) void {
+            for (batch.requests) |*request| request.result = chunks.uniform(19, request.output);
+        }
+    };
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/properties", .{temporary.sub_path});
+    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
+    const allocator = bounded.allocator();
+    var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .enabled = false });
+    defer registry.deinit();
+    const space = try store.openSpace(chunks.Chunks.id);
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .demand_sections = 1, .cache_sections = 8, .storage_group_side = 2 }, .{
+        .metrics = &registry,
+        .storage = space,
+        .record_workspaces = try records.Workspaces.init(allocator, io, .{}),
+    });
+    const sections = [_]chunks.Section{ .{ .world = 0, .x = 0, .y = 0, .z = 0 }, .{ .world = 0, .x = 1, .y = 0, .z = 0 } };
+    const watch = try chunks.Watch.init(allocator, terrain, 2);
+    const region: chunks.Watch.Region = .{ .world = 0, .minimum = .{ .x = 0, .y = 0, .z = 0 }, .maximum = .{ .x = 1, .y = 0, .z = 0 } };
+    var revisions: [2]u64 = undefined;
+    watch.configure(region, &revisions);
+    const key = chunks.encodeKey(sections[0]);
+    try terrain.cache.backend.store.putBatch(&.{.{ .key = &key, .value = &.{ 0, 7, 0 } }});
+    try terrain.cache.backend.store.flush();
+    var generator: Generator = .{};
+    terrain.setSource(chunks.Source.init(&generator, Generator.read));
+    terrain.attach();
+    defer terrain.stop();
+    bounded.fail_index = bounded.alloc_index;
+    var properties: [256]u8 = @splat(1);
+    properties[99] = 2;
+    var values: [2]encoding.Classification = undefined;
+    const requests = [_]chunks.Chunks.ClassificationRequest{
+        .{ .section = sections[0], .result = &values[0] },
+        .{ .section = sections[1], .result = &values[1] },
+    };
+    try terrain.classify(&requests, &properties, 1);
+    try std.testing.expectEqual(@as(u8, 1), values[0].known.common);
+    for (values[0].known.selected) |word| try std.testing.expectEqual(std.math.maxInt(u64), word);
+    try std.testing.expect(values[1] == .unavailable);
+    try std.testing.expectEqual(@as(usize, 0), terrain.cache.lookup.count());
+    try std.testing.expectEqual(@as(usize, 0), terrain.generation.queued_count);
+    var borrowed: [2]chunks.Chunks.PackedSection = undefined;
+    try std.testing.expect(try terrain.tryBorrowPacked(&sections, &borrowed, watch) == null);
+    try std.testing.expectEqual(@as(usize, 0), terrain.cache.backend.store.readers);
+    const window = (try terrain.tryBorrowPacked(sections[0..1], borrowed[0..1], watch)).?;
+    try std.testing.expectEqual(@as(u16, 7), borrowed[0].view.get(4095));
+    try terrain.classify(&requests, &properties, 1);
+    try std.testing.expectEqual(@as(usize, 0), terrain.cache.lookup.count());
+    window.release();
+    try std.testing.expectEqual(@as(usize, 0), terrain.cache.backend.store.readers);
+    const group = terrain.storageGroup(.{ .world = 3, .x = -1, .y = -3, .z = 4 });
+    try std.testing.expectEqual(@as(u8, 2), group.side);
+    try std.testing.expectEqual(chunks.Section{ .world = 3, .x = -2, .y = -4, .z = 4 }, group.minimum);
+    try terrain.setBlock(0, .{ .x = 0, .y = 0, .z = 0 }, 99);
+    try std.testing.expect(!watch.unchanged());
+    try std.testing.expect(try terrain.tryBorrowPacked(sections[0..1], borrowed[0..1], watch) == null);
+    watch.configure(region, &revisions);
+    try std.testing.expect(try terrain.tryBorrowPacked(sections[0..1], borrowed[0..1], watch) == null);
+    try terrain.classify(&requests, &properties, 1);
+    try std.testing.expectEqual(@as(u8, 0), values[0].known.common);
+    try std.testing.expectEqual(std.math.maxInt(u64) - 1, values[0].known.selected[0]);
+    try std.testing.expect(values[1] == .unavailable);
+    try terrain.checkpoint(space);
+    terrain.cache.invalidate(&key);
+    try terrain.classify(&requests, &properties, 1);
+    for (values) |value| try std.testing.expect(value == .unavailable);
+    watch.configure(region, &revisions);
+    try std.testing.expect(try terrain.tryBorrowPacked(sections[0..1], borrowed[0..1], watch) == null);
+    try std.testing.expectEqual(@as(usize, 0), terrain.cache.backend.store.readers);
+    try std.testing.expectEqual(@as(usize, 0), terrain.generation.queued_count);
+    try std.testing.expectEqual(@as(usize, 0), terrain.borrowed_count);
+    try std.testing.expect(!bounded.has_induced_failure);
+}
+
 test "column preparation returns ready columns while independently queuing missing sections" {
     const Generator = struct {
         sections: usize = 0,
@@ -587,7 +796,7 @@ test "checkpoint releases its dirty snapshot across multiple batches and failure
         var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .capacity = 64 });
         defer registry.deinit();
         const space = try store.openSpace("chunks");
-        const terrain = try chunks.Chunks.init(arena.allocator(), std.testing.io, .{ .cache_sections = 193, .demand_sections = 0, .cache_tiles = 8 }, .{
+        const terrain = try chunks.Chunks.init(arena.allocator(), std.testing.io, .{ .cache_sections = 193, .demand_sections = 0, .cache_groups = 8 }, .{
             .storage = space,
             .metrics = &registry,
             .record_workspaces = try records.Workspaces.init(arena.allocator(), std.testing.io, .{}),
@@ -600,7 +809,7 @@ test "checkpoint releases its dirty snapshot across multiple batches and failure
         try terrain.acquireMany(&sections, &leases);
         terrain.releaseMany(&leases);
         if (fail) {
-            terrain.cache.backend.store.tiles.failed = true;
+            terrain.cache.backend.store.bases.failed = true;
             try std.testing.expectError(error.FailedTransaction, terrain.checkpoint(space));
         } else {
             try terrain.checkpoint(space);
@@ -634,7 +843,7 @@ pub fn benchmarkDemandBatches() !void {
         }
     };
     var output_buffer: [1024]u8 = undefined;
-    var output = std.Io.File.stdout().writer(std.testing.io, &output_buffer);
+    var output = std.Io.File.stdout().writerStreaming(std.testing.io, &output_buffer);
     try output.interface.writeAll("required sections | source calls | maximum source batch | retained prefetch\n");
     for ([_]usize{ 8, 24, 96 }) |count| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -647,7 +856,7 @@ pub fn benchmarkDemandBatches() !void {
         defer registry.deinit();
         var store = try storage.Store.init(allocator, std.testing.io, .{ .path = path });
         defer store.deinit();
-        const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 192, .demand_sections = 0, .cache_tiles = 32 }, .{
+        const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 192, .demand_sections = 0, .cache_groups = 32 }, .{
             .metrics = &registry,
             .storage = try store.openSpace("chunks"),
             .record_workspaces = try records.Workspaces.init(allocator, std.testing.io, .{}),
@@ -703,7 +912,7 @@ test "read windows release optional leases under external pressure and preserve 
         const allocator = failing.allocator();
         var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .capacity = 128 });
         defer registry.deinit();
-        const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = capacity, .demand_sections = 0, .cache_tiles = 2 }, .{
+        const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = capacity, .demand_sections = 0, .cache_groups = 2 }, .{
             .metrics = &registry,
             .storage = try store.openSpace(chunks.Chunks.id),
             .record_workspaces = try records.Workspaces.init(allocator, std.testing.io, .{}),
@@ -758,20 +967,20 @@ test "two-state sections preserve every packed byte and little endian palette va
         std.mem.writeInt(u16, encoded[5..7], palette[1], .little);
         for (0..256) |pattern| {
             @memset(encoded[7..], @intCast(pattern));
-            var decoded: [encoding.decoded_bytes]u8 = undefined;
+            var decoded: [encoding.dense_block_bytes]u8 = undefined;
             try std.testing.expectEqual(decoded.len, try encoding.decodeTo(&encoded, &decoded));
             try std.testing.expectEqual(@as(u8, 1), decoded[0]);
             for (0..encoding.blocks) |index| {
                 const selected = pattern >> @intCast(index % 8) & 1;
                 try std.testing.expectEqual(palette[selected], std.mem.readInt(u16, decoded[1 + index * 2 ..][0..2], .little));
             }
-            var inplace: [encoding.decoded_bytes]u8 = undefined;
+            var inplace: [encoding.dense_block_bytes]u8 = undefined;
             @memcpy(inplace[0..encoded.len], &encoded);
             try std.testing.expectEqual(inplace.len, try encoding.decode(&inplace, encoded.len));
             try std.testing.expectEqualSlices(u8, &decoded, &inplace);
         }
     }
-    var output: [encoding.decoded_bytes]u8 = undefined;
+    var output: [encoding.dense_block_bytes]u8 = undefined;
     try std.testing.expectError(error.Corrupt, encoding.decodeTo(encoded[0 .. encoded.len - 1], &output));
     try std.testing.expectError(error.BufferTooSmall, encoding.decodeTo(&encoded, output[0 .. output.len - 1]));
 }

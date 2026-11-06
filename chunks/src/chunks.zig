@@ -4,8 +4,10 @@ const std = @import("std");
 const records = @import("records");
 const storage = @import("storage");
 pub const encoding = @import("encoding.zig");
+pub const patch = @import("patch.zig");
 pub const Generation = @import("generation.zig").Generation;
 pub const GenerationPriority = @import("generation.zig").Priority;
+pub const Light = @import("light.zig");
 pub const ReadWindow = @import("read_window.zig").ReadWindow;
 
 const Cache = records.CacheFor(Backend);
@@ -232,7 +234,9 @@ pub const Chunks = struct {
         cache_sections: usize = 192,
         /// Background fills leave this capacity available for synchronous demand.
         demand_sections: usize = 24,
-        cache_tiles: usize = 32,
+        cache_groups: usize = 8,
+        /// Side length of each persisted base group, measured in sections.
+        storage_group_side: u8 = 4,
         observers: usize = 8,
     };
 
@@ -242,6 +246,30 @@ pub const Chunks = struct {
         storage: storage.Space,
     };
 
+    const ReadWorkspace = struct {
+        busy: bool = false,
+        requests: []records.Get,
+        fills: []Cache.Fill,
+        lengths: []?usize,
+
+        fn init(allocator: std.mem.Allocator, readers: usize, capacity: usize) ![]ReadWorkspace {
+            assert(readers > 0 and capacity > 0 and capacity <= 192);
+            const workspaces = try allocator.alloc(ReadWorkspace, readers);
+            errdefer allocator.free(workspaces);
+            const requests = try allocator.alloc(records.Get, readers * capacity);
+            errdefer allocator.free(requests);
+            const fills = try allocator.alloc(Cache.Fill, readers * capacity);
+            errdefer allocator.free(fills);
+            const lengths = try allocator.alloc(?usize, readers * capacity);
+            for (workspaces, 0..) |*workspace, index| workspace.* = .{
+                .requests = requests[index * capacity ..][0..capacity],
+                .fills = fills[index * capacity ..][0..capacity],
+                .lengths = lengths[index * capacity ..][0..capacity],
+            };
+            return workspaces;
+        }
+    };
+    read_workspaces: []ReadWorkspace,
     generating: []?Cache.Fill,
     generating_count: usize = 0,
     borrowed_count: usize = 0,
@@ -280,12 +308,12 @@ pub const Chunks = struct {
             .io = io,
             .wakeup = configuration.wakeup,
             .demand_sections = configuration.demand_sections,
-            .cache = try Cache.init(allocator, io, .{ .store = try ChunkStore.allocate(allocator, io, deps.storage, configuration.cache_tiles, deps.metrics, deps.record_workspaces.resources) }, .{
+            .cache = try Cache.init(allocator, io, .{ .store = try ChunkStore.allocate(allocator, io, deps.storage, configuration.cache_groups, deps.metrics, deps.record_workspaces.resources, .{ .side = configuration.storage_group_side }) }, .{
                 .metrics = deps.metrics,
                 .metrics_namespace = "chunks.cache",
                 .slots = configuration.cache_sections,
                 .key_bytes = 16,
-                .value_bytes = std.mem.alignForward(usize, encoding.decoded_bytes, 64),
+                .value_bytes = std.mem.alignForward(usize, encoding.maximum_decoded_bytes, 64),
                 .codec = .{ .encode = encoding.encode },
             }),
             .observers = try allocator.alloc(Observer, configuration.observers),
@@ -294,6 +322,7 @@ pub const Chunks = struct {
             .generating = try allocator.alloc(?Cache.Fill, configuration.cache_sections),
             .writing = try allocator.alloc(bool, configuration.cache_sections),
             .checkpoint_leases = try allocator.alloc(Cache.Lease, configuration.cache_sections),
+            .read_workspaces = try ReadWorkspace.init(allocator, deps.record_workspaces.resources.readers.slots.len, @min(192, configuration.cache_sections)),
         };
         @memset(self.generating, null);
         @memset(self.writing, false);
@@ -346,6 +375,45 @@ pub const Chunks = struct {
         const lease = try self.acquire(sectionAt(world, pos));
         defer lease.release();
         return lease.get(localIndex(pos));
+    }
+
+    pub fn lightSnapshot(self: *Chunks, column: Light.Column, minimum: i32, count: usize, destination: ?[]u8) !Light.Snapshot {
+        var snapshots: [1]Light.Snapshot = undefined;
+        try self.lightSnapshots(&.{.{ .column = column, .minimum = minimum, .count = count, .destination = destination }}, &snapshots);
+        return snapshots[0];
+    }
+
+    pub fn lightSnapshots(self: *Chunks, input: []const Light.Request, snapshots: []Light.Snapshot) !void {
+        assert(input.len == snapshots.len and input.len <= Light.batch_max);
+        // A flush can clear dirtiness after reading older revisions. Observe dirtiness first.
+        // The caller's watch detects subsequent edits.
+        self.mutex.lockUncancelable(self.io);
+        for (input, snapshots) |entry, *snapshot| snapshot.clean = self.lightCleanLocked(entry.column, entry.minimum, entry.count);
+        self.mutex.unlock(self.io);
+        try self.cache.backend.store.lightSnapshots(input, snapshots);
+    }
+
+    pub fn lightClean(self: *Chunks, column: Light.Column, minimum: i32, count: usize) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.lightCleanLocked(column, minimum, count);
+    }
+
+    fn lightCleanLocked(self: *Chunks, column: Light.Column, minimum: i32, count: usize) bool {
+        for (self.cache.dirty_entries.values()) |index| {
+            const key = self.cache.keys[index * self.cache.key_bytes ..][0..16];
+            if (column.contains(key, minimum, count)) return false;
+        }
+        if (self.generating_count != 0) for (self.generating, 0..) |fill, index| {
+            if (fill == null) continue;
+            const key = self.cache.keys[index * self.cache.key_bytes ..][0..16];
+            if (column.contains(key, minimum, count)) return false;
+        };
+        return true;
+    }
+
+    pub fn putLight(self: *Chunks, column: Light.Column, frame: []const u8) !void {
+        try self.cache.backend.store.putLight(column, frame);
     }
 
     pub fn setBlock(self: *Chunks, world: World, pos: Position, state: u16) !void {
@@ -416,13 +484,14 @@ pub const Chunks = struct {
             did_change.* = false;
             for (section.edits) |edit| did_change.* = did_change.* or view.get(edit.index) != edit.state;
             if (!did_change.*) continue;
+            const offset = if (lease.cached().read()) |stored| encoding.blockOffset(stored) else 0;
             const bytes = lease.cached().edit();
             if (view == .uniform) for (0..4096) |index|
-                std.mem.writeInt(u16, bytes[1 + index * 2 ..][0..2], view.uniform, .little);
-            bytes[0] = 1;
+                std.mem.writeInt(u16, bytes[offset + 1 + index * 2 ..][0..2], view.uniform, .little);
+            bytes[offset] = 1;
             for (section.edits) |edit|
-                std.mem.writeInt(u16, bytes[1 + @as(usize, edit.index) * 2 ..][0..2], edit.state, .little);
-            lease.cached().commit(8193);
+                std.mem.writeInt(u16, bytes[offset + 1 + @as(usize, edit.index) * 2 ..][0..2], edit.state, .little);
+            lease.cached().commit(offset + encoding.dense_block_bytes);
             var watch = self.watches;
             while (watch) |observer| {
                 observer.changed(section.section);
@@ -531,7 +600,7 @@ pub const Chunks = struct {
             if (self.generating[lease.index] != null or lease.read() != null) continue;
             held[count] = lease.reserve();
             self.generating[lease.index] = held[count];
-            requests[count] = .{ .section = section, .destination = held[count].bytes[0..encoding.decoded_bytes], .token = lease.index };
+            requests[count] = .{ .section = section, .destination = held[count].bytes[0..encoding.maximum_decoded_bytes], .token = lease.index };
             count += 1;
         }
         if (count == 0) return;
@@ -553,27 +622,42 @@ pub const Chunks = struct {
     fn loadLocked(self: *Chunks, leases: []const Cache.Lease) !void {
         while (true) {
             if (self.cache.failed) return error.FailedTransaction;
-            var requests: [192]records.Get = undefined;
-            var fills: [192]Cache.Fill = undefined;
-            var lengths: [192]?usize = undefined;
-            var count: usize = 0;
             var waiting = false;
-            for (leases) |lease| {
+            const missing = for (leases) |lease| {
                 const entry = &self.cache.entries[lease.index];
                 if (entry.loaded) continue;
-                if (entry.filling) {
-                    waiting = true;
-                    continue;
-                }
-                fills[count] = lease.reserve();
-                requests[count] = .{ .key = lease.key(), .destination = fills[count].bytes };
-                count += 1;
-            }
-            if (count == 0) {
+                waiting = true;
+                if (!entry.filling) break true;
+            } else false;
+            if (!missing) {
                 if (!waiting) return;
                 self.waitAvailableLocked();
                 continue;
             }
+            const workspace = for (self.read_workspaces) |*workspace| {
+                if (!workspace.busy) break workspace;
+            } else {
+                self.waitAvailableLocked();
+                continue;
+            };
+            assert(leases.len <= workspace.requests.len);
+            workspace.busy = true;
+            defer {
+                workspace.busy = false;
+                self.available.broadcast(self.io);
+            }
+            const requests = workspace.requests;
+            const fills = workspace.fills;
+            const lengths = workspace.lengths;
+            var count: usize = 0;
+            for (leases) |lease| {
+                const entry = &self.cache.entries[lease.index];
+                if (entry.loaded or entry.filling) continue;
+                fills[count] = lease.reserve();
+                requests[count] = .{ .key = lease.key(), .destination = fills[count].bytes };
+                count += 1;
+            }
+            assert(count > 0);
             self.mutex.unlock(self.io);
             const result: anyerror!void = blk: {
                 const reading = self.cache.metrics.storage.start();
@@ -591,10 +675,8 @@ pub const Chunks = struct {
             } else |err| {
                 for (fills[0..count]) |fill| fill.cancel();
                 self.cache.failed = true;
-                self.available.broadcast(self.io);
                 return err;
             }
-            self.available.broadcast(self.io);
         }
     }
 
@@ -669,7 +751,86 @@ pub const Chunks = struct {
         }
     }
 
-    pub const Preparation = struct { sections: []const Section, leases: []Lease, priority: GenerationPriority };
+    pub const Preparation = struct {
+        sections: []const Section,
+        leases: []Lease,
+        priority: GenerationPriority,
+    };
+
+    pub const StorageGroup = struct { minimum: Section, side: u8 };
+    pub const PackedWindow = ChunkStore.PackedWindow;
+    pub const PackedSection = ChunkStore.PackedSection;
+
+    pub fn tryBorrowPacked(self: *Chunks, sections: []const Section, output: []PackedSection, watch: *const Watch) !?PackedWindow {
+        assert(self.ownsCurrentThread() and sections.len == output.len and sections.len <= 192);
+        assert(watch.owner == self and watch.count != 0);
+        if (!watch.unchanged()) return null;
+        var keys: [192][16]u8 = undefined;
+        var reads: [192][]const u8 = undefined;
+        var pending = false;
+        self.mutex.lockUncancelable(self.io);
+        for (sections, 0..) |section, index| {
+            assert(watch.region.contains(section));
+            keys[index] = encodeKey(section);
+            reads[index] = &keys[index];
+            if (self.cache.lookup.get(&keys[index])) |slot| pending = pending or !self.cache.entries[slot].loaded or self.cache.entries[slot].dirty or self.generating[slot] != null or self.writing[slot];
+        }
+        self.mutex.unlock(self.io);
+        if (pending) return null;
+        const window = self.cache.backend.store.tryBorrowPacked(reads[0..sections.len], output) catch |err| switch (err) {
+            error.WritebackRequired, error.WorkingSetTooLarge => null,
+            else => return err,
+        };
+        if (!watch.unchanged()) {
+            if (window) |held| held.release();
+            return null;
+        }
+        return window;
+    }
+
+    pub fn storageGroup(self: *const Chunks, section: Section) StorageGroup {
+        const side = self.cache.backend.store.side;
+        return .{ .side = side, .minimum = .{
+            .world = section.world,
+            .x = @divFloor(section.x, @as(i32, side)) * side,
+            .y = @divFloor(section.y, @as(i32, side)) * side,
+            .z = @divFloor(section.z, @as(i32, side)) * side,
+        } };
+    }
+
+    pub const ClassificationRequest = struct { section: Section, result: *encoding.Classification, mode: encoding.ClassificationMode = .complete };
+
+    /// Reads never generate terrain or fill the decoded cache.
+    pub fn classify(self: *Chunks, requests: []const ClassificationRequest, properties: []const u8, selected: u8) !void {
+        assert(self.ownsCurrentThread() and requests.len <= 192);
+        assert(std.math.isPowerOfTwo(selected));
+        for (requests) |request| request.result.* = .unavailable;
+        var keys: [192][16]u8 = undefined;
+        var reads: [192]ChunkStore.ClassificationRead = undefined;
+        var count: usize = 0;
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            try self.collectGenerated();
+            // Check live records before storage. An eviction can publish their pending edits.
+            for (requests) |request| {
+                const key = encodeKey(request.section);
+                if (self.cache.lookup.get(&key)) |slot| {
+                    if (!self.cache.entries[slot].loaded or self.generating[slot] != null) continue;
+                    const lease = self.cache.pin(slot);
+                    defer lease.release();
+                    if (lease.read()) |bytes| {
+                        request.result.* = try encoding.classify(bytes, properties, selected, request.mode);
+                    }
+                    continue;
+                }
+                keys[count] = key;
+                reads[count] = .{ .key = &keys[count], .result = request.result, .mode = request.mode };
+                count += 1;
+            }
+        }
+        try self.cache.backend.store.classify(reads[0..count], properties, selected);
+    }
 
     pub fn backgroundCapacity(self: *const Chunks) usize {
         return self.cache.entries.len - self.demand_sections;
@@ -777,6 +938,10 @@ pub const Chunks = struct {
                 };
                 assert(bytes.ptr == fill.bytes.ptr);
                 fill.publish(bytes.len);
+                const key = self.cache.keys[completion.token * self.cache.key_bytes ..][0..16];
+                const section: Section = .{ .world = std.mem.readInt(u32, key[0..4], .big), .x = std.mem.readInt(i32, key[4..8], .big), .z = std.mem.readInt(i32, key[8..12], .big), .y = std.mem.readInt(i32, key[12..16], .big) };
+                var watch = self.watches;
+                while (watch) |current| : (watch = current.next) current.changed(section);
                 changed = true;
             }
             if (failure) |err| return err;
@@ -856,6 +1021,7 @@ pub const Chunks = struct {
         };
         self.mutex.lockUncancelable(self.io);
         try result;
+        self.ready().set(self.io);
     }
 
     pub fn attach(self: *Chunks) void {
@@ -875,8 +1041,15 @@ pub const Chunks = struct {
 
     pub fn poll(self: *Chunks) !void {
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.collectGenerated();
+        const collected = self.collectGenerated();
+        self.mutex.unlock(self.io);
+        try collected;
+        var progressed = try self.cache.backend.store.prepareMerge();
+        if (self.writeback_mutex.tryLock()) {
+            defer self.writeback_mutex.unlock(self.io);
+            progressed = try self.cache.backend.store.publishPrepared() != 0 or progressed;
+        }
+        if (progressed) self.ready().set(self.io);
     }
 };
 
@@ -908,6 +1081,11 @@ pub const Lease = struct {
         return View.fromBytes(self.record.read());
     }
 
+    pub fn biomes(self: Lease) ?BiomeView {
+        const bytes = self.record.read() orelse return null;
+        return if (bytes[0] == 3) .{ .bytes = bytes[1..129] } else null;
+    }
+
     pub fn get(self: Lease, index: u12) u16 {
         return self.view().get(index);
     }
@@ -918,12 +1096,22 @@ pub const Lease = struct {
 };
 
 /// Borrows the section until its lease is released.
+pub const BiomeView = struct {
+    bytes: *const [128]u8,
+
+    pub fn get(self: BiomeView, index: u6) u16 {
+        return std.mem.readInt(u16, self.bytes[@as(usize, index) * 2 ..][0..2], .little);
+    }
+};
+
+/// Borrows the section until its lease is released.
 pub const View = union(enum) {
     uniform: u16,
     dense: *const [8192]u8,
 
     fn fromBytes(value: ?[]const u8) View {
-        const bytes = value orelse return .{ .uniform = 0 };
+        const stored = value orelse return .{ .uniform = 0 };
+        const bytes = stored[encoding.blockOffset(stored)..];
         assert((bytes[0] == 0 and bytes.len == 3) or (bytes[0] == 1 and bytes.len == 8193));
         return if (bytes[0] == 0) .{ .uniform = std.mem.readInt(u16, bytes[1..3], .little) } else .{ .dense = bytes[1..8193] };
     }

@@ -15,7 +15,15 @@ pub const SpaceId = format.SpaceId;
 pub const CommitId = format.CommitId;
 pub const page_size = format.page_size;
 pub const batch_size = backend.maximum_batch;
-pub const Read = struct { id: PageId, destination: []u8, offset: u16 = 0 };
+pub const Read = struct {
+    pub const Cache = enum { retain, stream };
+
+    id: PageId,
+    destination: []u8,
+    offset: u16 = 0,
+    /// Streaming reads use existing cached pages without admitting misses.
+    cache: Cache = .retain,
+};
 pub const Write = struct { id: PageId, source: []const u8 };
 pub const MaintenanceBudget = struct { index_entries: usize, pages: usize };
 pub const MaintenanceResult = enum { idle, progressed, pending };
@@ -66,6 +74,15 @@ pub const Space = struct {
     id: SpaceId,
     store_is_new: bool,
     root: ?struct { space: SpaceId, page: PageId, offset: u16 } = null,
+
+    /// Keep a compound page mutation inside one commit boundary.
+    pub fn mutate(self: Space) Store.Mutation {
+        return self.store.beginMutation();
+    }
+
+    pub fn tryMutate(self: Space) ?Store.Mutation {
+        return self.store.tryBeginMutation();
+    }
 
     pub fn getRoot(self: Space) Error!?PageId {
         if (self.root) |reference| {
@@ -400,6 +417,35 @@ pub const Resources = struct {
 
 /// A single owner submits page batches. Spaces borrow the store's stable address.
 pub const Store = struct {
+    pub const Mutation = struct {
+        store: *Store,
+        owns: bool,
+
+        pub fn end(self: Mutation) void {
+            if (!self.owns) return;
+            assert(self.store.compound_owner.load(.monotonic) == std.Thread.getCurrentId());
+            self.store.compound_owner.store(0, .release);
+            self.store.compound_mutex.unlock(self.store.io);
+        }
+    };
+
+    fn beginMutation(self: *Store) Mutation {
+        const thread = std.Thread.getCurrentId();
+        if (self.compound_owner.load(.acquire) == thread) return .{ .store = self, .owns = false };
+        self.compound_mutex.lockUncancelable(self.io);
+        assert(self.compound_owner.load(.monotonic) == 0);
+        self.compound_owner.store(thread, .release);
+        return .{ .store = self, .owns = true };
+    }
+
+    fn tryBeginMutation(self: *Store) ?Mutation {
+        const thread = std.Thread.getCurrentId();
+        if (self.compound_owner.load(.acquire) == thread) return .{ .store = self, .owns = false };
+        if (!self.compound_mutex.tryLock()) return null;
+        assert(self.compound_owner.load(.monotonic) == 0);
+        self.compound_owner.store(thread, .release);
+        return .{ .store = self, .owns = true };
+    }
     pub const service_name = "lightning_rod:persistence";
     pub const Options = struct {
         path: []const u8,
@@ -470,6 +516,8 @@ pub const Store = struct {
         }
     };
 
+    compound_mutex: std.Io.Mutex = .init,
+    compound_owner: std.atomic.Value(std.Thread.Id) = .init(0),
     allocator: std.mem.Allocator,
     resources: *Resources,
     owns_resources: bool,
@@ -1154,7 +1202,7 @@ pub const Store = struct {
                     continue;
                 }
                 const cached_slot = self.cached(id);
-                const slot = cached_slot orelse self.cacheSlot(id);
+                const slot = cached_slot orelse if (read.cache == .retain) self.cacheSlot(id) else null;
                 mapping[index] = slot;
                 if (slot) |at| {
                     const entry = &self.cache[at];
@@ -1276,7 +1324,7 @@ pub const Store = struct {
                     valid.* = verified[prior];
                     continue;
                 }
-                const slot = self.cacheSlot(id);
+                const slot = if (read.cache == .retain) self.cacheSlot(id) else null;
                 if (slot) |cached_slot| {
                     assert(self.cache[cached_slot].pins.load(.monotonic) == 0 and !self.cache[cached_slot].reading);
                     assert(self.cache[cached_slot].id == id);
@@ -1522,6 +1570,9 @@ pub const Store = struct {
     }
 
     pub fn commit(self: *Store, tick: u64) Error!CommitId {
+        assert(self.compound_owner.load(.acquire) != std.Thread.getCurrentId());
+        const mutation = self.beginMutation();
+        defer mutation.end();
         const operation = self.enter(.pages);
         defer operation.end();
         const lease = self.resources.acquireBuffers(self.cache_token);
@@ -1705,7 +1756,8 @@ pub const Store = struct {
         const buffers = self.maintenance_buffers;
         switch (self.phase) {
             .idle => {
-                if (budget.pages == 0 or budget.index_entries == 0 or self.end == format.header_size or self.saved.sequence == self.checkpointed_sequence or self.end < self.limits.checkpoint_bytes) return .idle;
+                const pressured = self.locations.count() + batch_size + 1 >= self.limits.maximum_wal_pages;
+                if (budget.pages == 0 or budget.index_entries == 0 or self.end == format.header_size or self.saved.sequence == self.checkpointed_sequence or (!pressured and self.end < self.limits.checkpoint_bytes)) return .idle;
                 if (self.durable_sequence < self.saved.sequence) return .pending;
                 self.checkpoint_metadata = self.saved;
                 self.checkpoint_count = 0;

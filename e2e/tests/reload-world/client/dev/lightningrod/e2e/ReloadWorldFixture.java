@@ -11,6 +11,7 @@ import io.netty.channel.ChannelPromise;
 import io.netty.util.ReferenceCountUtil;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
+import net.minecraft.network.protocol.game.ServerboundPlayerLoadedPacket;
 import net.minecraft.world.level.block.Blocks;
 import dev.lightningrod.e2e.mixin.ClientConnectionAccessor;
 
@@ -23,6 +24,8 @@ final class ReloadWorldFixture extends Fixture {
     private static final float BOB_RESUMED_HEALTH = 14;
     private static final long ONE_WAY_LATENCY_MS = 500;
     private boolean installed;
+    private final RenderReadiness renderReadiness = new RenderReadiness();
+    private boolean readinessReleased;
     private int readyJoin;
     private boolean progressed;
     private boolean observedSlowPlayer;
@@ -35,14 +38,18 @@ final class ReloadWorldFixture extends Fixture {
     @Override boolean encrypted() { return true; }
 
     @Override void connected(Minecraft game) {
-        if (!r.peer.equals("bob") || installed) return;
+        if (installed) return;
         var channel = ((ClientConnectionAccessor) game.getConnection().getConnection()).lightningRod$channel();
-        channel.pipeline().addFirst("e2e-latency", new Latency());
+        channel.pipeline().addLast("e2e-render-readiness", renderReadiness);
+        if (r.peer.equals("bob")) {
+            channel.pipeline().addFirst("e2e-latency", new Latency());
+            client.event("network_latency", "one_way_ms", ONE_WAY_LATENCY_MS);
+        }
         installed = true;
-        client.event("network_latency", "one_way_ms", ONE_WAY_LATENCY_MS);
     }
 
     @Override void reconfigurationEncoded() {
+        renderReadiness.allow = false;
         if (r.peer.equals("bob")) acknowledgmentNs = System.nanoTime();
     }
 
@@ -70,6 +77,10 @@ final class ReloadWorldFixture extends Fixture {
         }
         boolean resumed = r.joins == 2;
         if (r.joins > 2) { client.fail("unexpected_additional_reload"); return; }
+        if (resumed && ((game.player.getBlockX() >> 4) != 0 || (game.player.getBlockZ() >> 4) != 0)) {
+            client.fail("reload_streaming_required_chunk_boundary_crossing");
+            return;
+        }
         if (resumed && r.peer.equals("bob") && rejoinedNs == 0) {
             rejoinedNs = System.nanoTime();
             if (acknowledgmentNs == 0 || rejoinedNs - acknowledgmentNs < 2 * ONE_WAY_LATENCY_MS * 1_000_000L) {
@@ -82,6 +93,11 @@ final class ReloadWorldFixture extends Fixture {
         if (bob.isEmpty() || !close(bob.get().getX(), resumed ? BOB_RESUMED_X : BOB_INITIAL_X, 0.05)) return;
         if (r.peer.equals("alice") && progressed) observedSlowPlayer = true;
         if (loaded < EXPECTED_CHUNKS || missing != 0) return;
+        if (resumed && !readinessReleased) {
+            renderReadiness.release();
+            readinessReleased = true;
+            client.event("streamed_before_render_acknowledgment", "loaded", loaded);
+        }
         if (!game.level.getBlockState(new BlockPos(3, 65, 3)).is(Blocks.GOLD_BLOCK)
                 || !game.level.getBlockState(new BlockPos(4, 65, 3)).is(Blocks.DIAMOND_BLOCK)) {
             client.fail("world_edits_missing");
@@ -92,6 +108,43 @@ final class ReloadWorldFixture extends Fixture {
             readyJoin = r.joins;
             client.event("terrain_complete", "join", readyJoin, "loaded", loaded, "missing", missing);
             client.send("terrain_ready");
+        }
+    }
+
+    private static final class RenderReadiness extends ChannelDuplexHandler {
+        private ChannelHandlerContext context;
+        private ServerboundPlayerLoadedPacket pending;
+        private ChannelPromise promise;
+        private boolean allow = true;
+
+        @Override public void handlerAdded(ChannelHandlerContext ctx) { context = ctx; }
+
+        @Override public void write(ChannelHandlerContext ctx, Object message, ChannelPromise completion) {
+            // Rendering readiness must not gate the remaining chunk deliveries.
+            if (!allow && message instanceof ServerboundPlayerLoadedPacket packet) {
+                if (pending != null) throw new IllegalStateException("duplicate player loaded acknowledgment");
+                pending = packet;
+                promise = completion;
+            } else ctx.write(message, completion);
+        }
+
+        void release() {
+            context.executor().execute(() -> {
+                allow = true;
+                if (pending == null) return;
+                context.writeAndFlush(pending, promise);
+                pending = null;
+                promise = null;
+            });
+        }
+
+        @Override public void channelInactive(ChannelHandlerContext ctx) {
+            if (pending != null) {
+                promise.tryFailure(new ClosedChannelException());
+                pending = null;
+                promise = null;
+            }
+            ctx.fireChannelInactive();
         }
     }
 

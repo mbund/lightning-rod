@@ -6,7 +6,66 @@ const reference = testing.reference;
 pub const lanes = 16;
 pub const Levels = @Vector(lanes, u8);
 pub const Layer = enum { block, sky };
-pub const Blocks = union(enum) { uniform: u16, dense: []const u16 };
+pub const Blocks = union(enum) {
+    uniform: u16,
+    dense: []const u16,
+    ring: Ring,
+
+    pub const Ring = struct {
+        /// Uniform sections never read their backing rows. Null entries require complete dense rows.
+        pub const Sections = struct {
+            uniforms: []const ?u16,
+            first: usize,
+            count: usize,
+            stride: usize,
+        };
+        states: []const u16,
+        sections: ?Sections = null,
+        /// Horizontal origin in sixteen-cell X rows and single-cell Z rows.
+        origin: [2]usize,
+        /// Rows below this height are outside the solve. Exact queries need a fifteen-cell halo.
+        minimum_y: usize = 0,
+
+        fn row(self: Ring, index: usize, stride: usize, depth: usize) @Vector(lanes, u16) {
+            const plane = stride * depth;
+            if (self.sections) |sections| {
+                const section = index / plane / 16;
+                if (section < sections.first or section - sections.first >= sections.count) return @splat(0);
+                const column = index % plane / stride / 16 * stride + index % stride;
+                if (sections.uniforms[column * sections.stride + section - sections.first]) |state| return @splat(state);
+            }
+            const physical = index / plane * plane +
+                (index % plane / stride + self.origin[1]) % depth * stride +
+                (index % stride + self.origin[0]) % stride;
+            return self.states[physical * lanes ..][0..lanes].*;
+        }
+
+        fn materialEnd(self: Ring, stride: usize, depth: usize) usize {
+            const minimum = self.minimum_y * stride * depth * lanes;
+            if (self.sections) |sections| {
+                assert(depth % 16 == 0 and sections.count <= sections.stride);
+                assert(sections.uniforms.len >= stride * (depth / 16) * sections.stride);
+                assert((sections.first + sections.count) * 16 * stride * depth * lanes <= self.states.len);
+                var section = sections.count;
+                while (section != 0) {
+                    section -= 1;
+                    for (0..stride * (depth / 16)) |column| {
+                        if (sections.uniforms[column * sections.stride + section] != 0)
+                            return @max(minimum, (sections.first + section + 1) * 16 * stride * depth * lanes);
+                    }
+                }
+                return minimum;
+            }
+            var remaining = self.states.len;
+            while (remaining >= minimum + 64) : (remaining -= 64) {
+                const values: @Vector(64, u16) = self.states[remaining - 64 ..][0..64].*;
+                if (@reduce(.Or, values != @as(@Vector(64, u16), @splat(0)))) break;
+            }
+            while (remaining > minimum and self.states[remaining - 1] == 0) remaining -= 1;
+            return remaining;
+        }
+    };
+};
 pub const Direction = enum(u3) { west, east, north, south, down, up };
 
 pub const Properties = struct {
@@ -21,7 +80,7 @@ pub const Registry = struct {
     occlusion: []const u8,
 
     pub fn blocked(self: Registry, from: u16, to: u16, direction: Direction) bool {
-        const face = @intFromEnum(direction);
+        const face = @backingInt(direction);
         const a = self.states[from].faces[face];
         const b = self.states[to].faces[face ^ 1];
         return self.occlusion[@as(usize, a) * self.faces + b] != 0;
@@ -49,6 +108,9 @@ pub const Work = struct {
     removed_cells: u64 = 0,
     cancelled_rows: u64 = 0,
     source_rows: u64 = 0,
+    loaded_rows: u64 = 0,
+    retained_rows: u64 = 0,
+    reset_rows: u64 = 0,
 };
 
 pub const Edit = struct { index: usize, state: u16 };
@@ -67,7 +129,7 @@ const Row = struct {
     blocked_horizontal: [2]u16 = .{ 0, 0 },
     edges_dirty: bool = false,
     boundary: u6,
-    restore_queued: bool,
+    restore_queued: bool = false,
 };
 
 comptime {
@@ -85,6 +147,7 @@ const Material = packed struct(u16) { opacity: u4, emission: u4, shaped: bool, r
 const Change = struct { index: usize, block: bool, sky: bool, block_decrease: bool };
 const SourceBounds = struct { highest: u32 = none, lowest: u32 = none };
 const PreparedEdits = struct { count: usize, indirect: bool };
+const WindowColumn = struct { index: u32, logical: u32 };
 
 fn editLess(edits: []const Edit, a: EditIndex, b: EditIndex) bool {
     return edits[a].index < edits[b].index;
@@ -133,6 +196,9 @@ pub const Engine = struct {
     blocks: []BlockRow,
     stride: u32,
     plane: u32,
+    origin: [2]usize = .{ 0, 0 },
+    horizontal: []u6,
+    window_columns: []WindowColumn,
     links: []Link,
     decreases: []Levels,
     decrease_queue: []u32,
@@ -154,6 +220,7 @@ pub const Engine = struct {
     block_zero: bool = false,
     sky_start: usize = 0,
     air_start: usize = 0,
+    minimum: usize = 0,
     emitter_count: usize = 0,
     work: Work = .{},
     changes: [batch_max]Change = undefined,
@@ -195,6 +262,10 @@ pub const Engine = struct {
         const source_bounds = try allocator.alloc(SourceBounds, plane);
         errdefer allocator.free(source_bounds);
         const restore_rows = try allocator.alloc(u32, count);
+        errdefer allocator.free(restore_rows);
+        const horizontal = try allocator.alloc(u6, plane);
+        errdefer allocator.free(horizontal);
+        const window_columns = try allocator.alloc(WindowColumn, plane);
         @memset(decreases, @splat(0));
         @memset(decrease_queued, false);
         @memset(links, .{});
@@ -211,12 +282,16 @@ pub const Engine = struct {
                 index + plane >= count,
             };
             row.boundary = @bitCast(boundary);
+            row.edges_dirty = false;
             row.restore_queued = false;
+            if (index < plane) horizontal[index] = @as(u6, @truncate(row.boundary)) & 15;
         }
-        return .{ .allocator = allocator, .dimensions = dimensions, .registry = registry, .materials = materials, .rows = rows, .blocks = blocks, .stride = @intCast(stride), .plane = @intCast(plane), .links = links, .decreases = decreases, .decrease_queue = decrease_queue, .decrease_queued = decrease_queued, .restore_rows = restore_rows, .source_bounds = source_bounds };
+        return .{ .allocator = allocator, .dimensions = dimensions, .registry = registry, .materials = materials, .rows = rows, .blocks = blocks, .stride = @intCast(stride), .plane = @intCast(plane), .horizontal = horizontal, .window_columns = window_columns, .links = links, .decreases = decreases, .decrease_queue = decrease_queue, .decrease_queued = decrease_queued, .restore_rows = restore_rows, .source_bounds = source_bounds };
     }
 
     pub fn deinit(self: *Engine) void {
+        self.allocator.free(self.horizontal);
+        self.allocator.free(self.window_columns);
         self.allocator.free(self.links);
         self.allocator.free(self.restore_rows);
         self.allocator.free(self.decrease_queued);
@@ -231,67 +306,49 @@ pub const Engine = struct {
 
     /// Blocks are in YZX order. The engine owns its decoded rows after this returns.
     pub fn load(self: *Engine, input: Blocks) !void {
+        self.origin = .{ 0, 0 };
         self.loaded = false;
         self.lit = false;
+        const minimum_y = if (input == .ring) input.ring.minimum_y else 0;
+        assert(minimum_y < self.dimensions.y and minimum_y % 16 == 0);
+        self.minimum = minimum_y * self.plane;
         var remaining = self.dimensions.volume();
         switch (input) {
             .uniform => |state| {
                 if (state >= self.materials.len) return error.InvalidState;
                 if (state == 0) remaining = 0;
             },
-            .dense => |blocks| {
-                if (blocks.len != remaining) return error.InvalidBlockCount;
-                const scan_lanes = 64;
-                while (remaining >= scan_lanes) : (remaining -= scan_lanes) {
-                    const values: @Vector(scan_lanes, u16) = blocks[remaining - scan_lanes ..][0..scan_lanes].*;
-                    if (@reduce(.Or, values != @as(@Vector(scan_lanes, u16), @splat(0)))) break;
+            .dense, .ring => {
+                const blocks = if (input == .dense) input.dense else input.ring.states;
+                if (input == .ring) {
+                    assert(input.ring.origin[0] < self.stride and input.ring.origin[1] < self.dimensions.z);
+                    assert(input.ring.origin[1] % 16 == 0);
                 }
-                while (remaining != 0 and blocks[remaining - 1] == 0) remaining -= 1;
+                if (blocks.len != remaining) return error.InvalidBlockCount;
+                remaining = if (input == .ring) input.ring.materialEnd(self.stride, self.dimensions.z) else (Blocks.Ring{ .states = blocks, .origin = .{ 0, 0 }, .minimum_y = minimum_y }).materialEnd(self.stride, self.dimensions.z);
             },
         }
-        self.uniform_air = remaining == 0;
+        self.uniform_air = remaining <= self.minimum * lanes;
         // Above the last material, sixteen air layers also contain every block light ray.
         const plane_cells = @as(usize, self.plane) * lanes;
-        self.air_start = if (self.uniform_air) 0 else @min(self.dimensions.y, (remaining - 1) / plane_cells + 17) * self.plane;
+        self.air_start = if (self.uniform_air) self.minimum else @min(self.dimensions.y, (remaining - 1) / plane_cells + 17) * self.plane;
         self.emitter_count = 0;
-        self.sky_start = 0;
+        self.sky_start = self.minimum;
+        for (self.horizontal, 0..) |*column, index| column.* = self.rows[index].boundary & 15;
         if (self.uniform_air) {
             self.loaded = true;
             return;
         }
         var opaque_plane = true;
-        var plane_end: usize = self.plane;
-        for (self.rows[0..self.air_start], self.blocks[0..self.air_start], 0..) |*row, *block, r| {
+        var plane_end: usize = self.minimum + self.plane;
+        for (self.rows[self.minimum..self.air_start], self.minimum..) |*row, r| {
             const states: @Vector(lanes, u16) = switch (input) {
                 .uniform => |state| @splat(state),
                 .dense => |blocks| blocks[r * lanes ..][0..lanes].*,
+                .ring => |blocks| blocks.row(r, self.stride, self.dimensions.z),
             };
-            block.state = states;
-            var row_opaque: bool = undefined;
-            if (@reduce(.And, states == @as(@Vector(lanes, u16), @splat(states[0])))) {
-                if (states[0] >= self.materials.len) return error.InvalidState;
-                const material = self.materials[states[0]];
-                row.attenuation = @splat(@max(@as(u8, material.opacity), 1));
-                block.emission = @splat(material.emission);
-                row.emitters = if (material.emission != 0) std.math.maxInt(u16) else 0;
-                row.transparent = if (material.opacity == 0) std.math.maxInt(u16) else 0;
-                row.shaped = if (material.shaped) std.math.maxInt(u16) else 0;
-                row_opaque = material.opacity == 15;
-            } else {
-                var materials: [lanes]u16 = undefined;
-                for (block.state, &materials) |state, *material| {
-                    if (state >= self.materials.len) return error.InvalidState;
-                    material.* = @bitCast(self.materials[state]);
-                }
-                const values: @Vector(lanes, u16) = materials;
-                const opacity: Levels = @intCast(values & @as(@Vector(lanes, u16), @splat(15)));
-                row.attenuation = @max(@as(Levels, @splat(1)), opacity);
-                block.emission = @intCast((values >> @splat(4)) & @as(@Vector(lanes, u16), @splat(15)));
-                row.emitters = @bitCast(block.emission > @as(Levels, @splat(0)));
-                row.transparent = @bitCast(opacity == @as(Levels, @splat(0)));
-                row.shaped = @bitCast((values & @as(@Vector(lanes, u16), @splat(256))) != @as(@Vector(lanes, u16), @splat(0)));
-                row_opaque = @reduce(.And, opacity == @as(Levels, @splat(15)));
-            }
+            try self.loadRow(r, states);
+            const row_opaque = @reduce(.And, row.attenuation == @as(Levels, @splat(15)));
             if (row.emitters != 0) self.emitter_count += @popCount(row.emitters);
             opaque_plane = opaque_plane and row_opaque;
             if (r + 1 == plane_end) {
@@ -299,9 +356,38 @@ pub const Engine = struct {
                 opaque_plane = true;
                 plane_end += self.plane;
             }
-            self.prepareEdges(r);
         }
         self.loaded = true;
+    }
+
+    fn loadRow(self: *Engine, r: usize, states: @Vector(lanes, u16)) !void {
+        self.work.loaded_rows += 1;
+        const row = &self.rows[r];
+        const block = &self.blocks[r];
+        block.state = states;
+        if (@reduce(.And, states == @as(@Vector(lanes, u16), @splat(states[0])))) {
+            if (states[0] >= self.materials.len) return error.InvalidState;
+            const material = self.materials[states[0]];
+            row.attenuation = @splat(@max(@as(u8, material.opacity), 1));
+            block.emission = @splat(material.emission);
+            row.emitters = if (material.emission != 0) std.math.maxInt(u16) else 0;
+            row.transparent = if (material.opacity == 0) std.math.maxInt(u16) else 0;
+            row.shaped = if (material.shaped) std.math.maxInt(u16) else 0;
+        } else {
+            var materials: [lanes]u16 = undefined;
+            for (block.state, &materials) |state, *material| {
+                if (state >= self.materials.len) return error.InvalidState;
+                material.* = @bitCast(self.materials[state]);
+            }
+            const values: @Vector(lanes, u16) = materials;
+            const opacity: Levels = @intCast(values & @as(@Vector(lanes, u16), @splat(15)));
+            row.attenuation = @max(@as(Levels, @splat(1)), opacity);
+            block.emission = @intCast((values >> @splat(4)) & @as(@Vector(lanes, u16), @splat(15)));
+            row.emitters = @bitCast(block.emission > @as(Levels, @splat(0)));
+            row.transparent = @bitCast(opacity == @as(Levels, @splat(0)));
+            row.shaped = @bitCast((values & @as(@Vector(lanes, u16), @splat(256))) != @as(@Vector(lanes, u16), @splat(0)));
+        }
+        self.prepareEdges(r);
     }
 
     /// Horizontal boundaries are opaque. All columns above the top boundary see the sky.
@@ -310,13 +396,13 @@ pub const Engine = struct {
         assert(self.decrease_count == 0 and self.restore_count == 0);
         self.skylight = skylight;
         self.lit = true;
-        self.work = .{};
+        self.work = .{ .loaded_rows = self.air_start - self.minimum };
         self.block_zero = self.emitter_count == 0;
         if (self.uniform_air) return;
         // The empty decrease queue holds emitting rows until skylight propagation finishes.
         var sources: usize = 0;
         var at = self.air_start;
-        const bottom = if (self.block_zero) (if (skylight) self.sky_start else self.air_start) else 0;
+        const bottom = if (self.block_zero) (if (skylight) self.sky_start else self.air_start) else self.minimum;
         while (at != bottom) {
             at -= 1;
             const row = &self.rows[at];
@@ -366,9 +452,189 @@ pub const Engine = struct {
         self.propagate(.block);
     }
 
+    /// Scrolls chunk-aligned strips. Every overlapping block must remain unchanged.
+    pub fn scroll(self: *Engine, offset: [2]i32, input: Blocks.Ring) !void {
+        assert(self.loaded and self.lit and self.highest == 0 and self.source_count == 0);
+        assert(self.decrease_count == 0 and self.restore_count == 0);
+        assert(offset[0] != 0 or offset[1] != 0);
+        assert(@mod(offset[0], lanes) == 0 and @mod(offset[1], 16) == 0 and self.dimensions.z % 16 == 0);
+        assert(@abs(offset[0]) < self.dimensions.x and @abs(offset[1]) < self.dimensions.z);
+        const blocks = input.states;
+        if (blocks.len != self.dimensions.volume()) return error.InvalidBlockCount;
+        assert(input.origin[0] < self.stride and input.origin[1] < self.dimensions.z);
+        assert(input.origin[1] % 16 == 0);
+        assert(input.minimum_y * self.plane == self.minimum);
+        const old_air = if (self.uniform_air) self.minimum else self.air_start;
+        const old_sky = self.sky_start;
+        const old_zero = self.block_zero;
+        const remaining = input.materialEnd(self.stride, self.dimensions.z);
+        if (remaining == self.minimum * lanes) {
+            try self.load(.{ .ring = input });
+            self.relight(self.skylight);
+            return;
+        }
+        self.work = .{};
+        const count = @min(self.dimensions.y, (remaining - 1) / (self.plane * lanes) + 17) * self.plane;
+        const dx = @divExact(offset[0], lanes);
+        const dz = offset[1];
+        self.origin = .{
+            @intCast(@mod(@as(i64, @intCast(self.origin[0])) + dx, self.stride)),
+            @intCast(@mod(@as(i64, @intCast(self.origin[1])) + dz, @as(i64, @intCast(self.dimensions.z)))),
+        };
+        var incoming_count: usize = 0;
+        var pz = self.origin[1];
+        for (0..self.dimensions.z) |z| {
+            var px = self.origin[0];
+            for (0..self.stride) |x| {
+                const column = pz * self.stride + px;
+                const sx = @as(i64, @intCast(x)) + dx;
+                const sz = @as(i64, @intCast(z)) + dz;
+                const incoming = sx < 0 or sx >= self.stride or sz < 0 or sz >= self.dimensions.z;
+                const ghost = (dx > 0 and x == 0) or (dx < 0 and x + 1 == self.stride) or
+                    (dz > 0 and z < 16) or (dz < 0 and z + 16 >= self.dimensions.z);
+                const boundary: @Vector(4, bool) = .{ x == 0, x + 1 == self.stride, z == 0, z + 1 == self.dimensions.z };
+                self.horizontal[column] = @as(u4, @bitCast(boundary)) | (@as(u6, @intFromBool(incoming)) << 4) | (@as(u6, @intFromBool(ghost)) << 5);
+                if (incoming) {
+                    self.window_columns[incoming_count] = .{ .index = @intCast(column), .logical = @intCast(z * self.stride + x) };
+                    incoming_count += 1;
+                }
+                px = if (px + 1 == self.stride) 0 else px + 1;
+            }
+            pz = if (pz + 1 == self.dimensions.z) 0 else pz + 1;
+        }
+        if (count < old_air) for (self.rows[count..old_air]) |row| {
+            self.emitter_count -= @popCount(row.emitters);
+        };
+        self.air_start = count;
+        self.uniform_air = false;
+        self.sky_start = self.minimum;
+        // Newly materialized heights were implicit air in the previous window.
+        var at = old_air;
+        while (at < count) : (at += 1) {
+            if (self.horizontal[at % self.plane] & 16 != 0) continue;
+            try self.loadRow(at, @splat(0));
+            self.rows[at].light = .{ @splat(0), @splat(if (self.skylight) 15 else 0) };
+            self.rows[at].sky_source = if (self.skylight) std.math.maxInt(u16) else 0;
+        }
+        var end = count;
+        while (end != self.minimum) {
+            end -= self.plane;
+            for (self.window_columns[0..incoming_count]) |column| {
+                const index = end + column.index;
+                const logical = end + column.logical;
+                if (index < old_air) self.emitter_count -= @popCount(self.rows[index].emitters);
+                try self.loadRow(index, input.row(logical, self.stride, self.dimensions.z));
+                const row = &self.rows[index];
+                self.emitter_count += @popCount(row.emitters);
+                const above = index + self.plane;
+                const upstream = if (self.skylight) self.directSource(index, if (above < count) self.rows[above].sky_source else std.math.maxInt(u16)) else 0;
+                row.sky_source = upstream;
+                row.light = .{ self.blocks[index].emission, @select(u8, @as(@Vector(lanes, bool), @bitCast(upstream)), @as(Levels, @splat(15)), @as(Levels, @splat(0))) };
+            }
+        }
+        self.work.retained_rows = count - self.minimum - self.work.loaded_rows;
+        var plane_end = count;
+        while (plane_end != self.minimum) {
+            const begin = plane_end - self.plane;
+            const opaque_plane = for (self.rows[begin..plane_end]) |row| {
+                if (!@reduce(.And, row.attenuation == @as(Levels, @splat(15)))) break false;
+            } else true;
+            if (opaque_plane) {
+                self.sky_start = begin;
+                break;
+            }
+            plane_end = begin;
+        }
+        self.block_zero = self.emitter_count == 0;
+        if (old_zero and !self.block_zero) for (self.rows[self.minimum..count], self.minimum..) |*row, index| {
+            if (self.horizontal[index % self.plane] & 16 == 0) row.light[0] = @splat(0);
+        };
+        if (self.sky_start < old_sky) {
+            for (self.rows[self.sky_start..@min(old_sky, count)], self.sky_start..) |*row, index| {
+                if (self.horizontal[index % self.plane] & 16 != 0) continue;
+                row.light[1] = @splat(0);
+                row.sky_source = 0;
+            }
+        }
+        // Sources outside the new window cannot reach beyond the discarded-side band.
+        for (self.horizontal, 0..) |column, index| {
+            if (column & 48 != 32) continue;
+            var base = self.minimum;
+            if (old_zero and self.block_zero) base = if (self.skylight) @min(old_sky, self.sky_start) else count;
+            while (base < count) : (base += self.plane) {
+                const r = base + index;
+                const row = &self.rows[r];
+                const source = if (!self.skylight or r < old_sky) 0 else row.sky_source;
+                const sky: Levels = if (self.skylight and r >= self.sky_start) @select(u8, @as(@Vector(lanes, bool), @bitCast(source)), @as(Levels, @splat(15)), @as(Levels, @splat(0))) else @splat(0);
+                const old_light: Levels = if (!self.skylight or r < old_sky) @splat(0) else row.light[1];
+                const block = self.blocks[r].emission;
+                if ((old_zero or @reduce(.And, row.light[0] == block)) and @reduce(.And, old_light == sky)) continue;
+                row.light = .{ block, sky };
+                row.sky_source = source;
+                self.restore_rows[self.restore_count] = @intCast(r);
+                self.restore_count += 1;
+                self.work.reset_rows += 1;
+            }
+        }
+        inline for (.{ Layer.sky, Layer.block }) |layer| {
+            if ((layer == .sky and self.skylight) or (layer == .block and !self.block_zero)) {
+                var base = if (layer == .sky) self.sky_start else self.minimum;
+                while (base < count) : (base += self.plane) {
+                    for (self.window_columns[0..incoming_count]) |column| {
+                        const index = base + column.index;
+                        const row = &self.rows[index];
+                        const adjacent = self.neighbours(index);
+                        if (layer == .block and row.emitters != 0) self.seedRow(layer, index);
+                        if (layer == .sky) {
+                            if (row.sky_source != 0 and row.sky_source != std.math.maxInt(u16)) self.seedRow(layer, index);
+                            if (index + self.plane >= count) self.skyBoundary(index);
+                        }
+                        inline for (0..6) |direction| edge: {
+                            const next = adjacent[direction];
+                            if (next == none) break :edge;
+                            if (self.horizontal[next % self.plane] & 16 == 0) {
+                                self.seedPair(layer, index, next, @fromBackingInt(@intCast(direction)));
+                            } else if (layer == .sky and direction & 1 != 0) {
+                                self.seedSky(index, next, row.sky_source);
+                                self.seedSky(next, index, self.rows[next].sky_source);
+                            }
+                        }
+                    }
+                }
+                for (self.restore_rows[0..self.restore_count]) |index| {
+                    self.seedRow(layer, index);
+                    const adjacent = self.neighbours(index);
+                    inline for (0..6) |direction| {
+                        if (adjacent[direction] != none) self.seedPair(layer, index, adjacent[direction], @fromBackingInt(@intCast(direction)));
+                    }
+                }
+                self.propagate(layer);
+            }
+        }
+        self.restore_count = 0;
+        assert(self.highest == 0 and self.decrease_count == 0);
+    }
+
+    inline fn seedPair(self: *Engine, comptime layer: Layer, from: usize, to: usize, comptime direction: Direction) void {
+        if (layer == .sky and (from < self.sky_start or to < self.sky_start)) return;
+        const a = &self.rows[from];
+        const b = &self.rows[to];
+        const forward = a.light[@backingInt(layer)];
+        const backward = b.light[@backingInt(layer)];
+        if (direction == .west or direction == .east) {
+            const x = if (direction == .east) lanes - 1 else 0;
+            const next_x = lanes - 1 - x;
+            if (forward[x] -| b.attenuation[next_x] > backward[next_x]) self.seedRow(layer, from);
+            if (backward[next_x] -| a.attenuation[x] > forward[x]) self.seedRow(layer, to);
+        } else {
+            if (@reduce(.Or, forward -| b.attenuation > backward)) self.seedRow(layer, from);
+            if (@reduce(.Or, backward -| a.attenuation > forward)) self.seedRow(layer, to);
+        }
+    }
+
     fn materialize(self: *Engine) void {
-        if (!self.uniform_air and !self.block_zero and self.sky_start == 0 and self.air_start == self.rows.len) return;
-        for (self.rows, self.blocks, 0..) |*row, *block, index| {
+        if (!self.uniform_air and !self.block_zero and self.sky_start == self.minimum and self.air_start == self.rows.len) return;
+        for (self.rows[self.minimum..], self.blocks[self.minimum..], self.minimum..) |*row, *block, index| {
             if (self.uniform_air or index >= self.air_start) {
                 block.state = @splat(0);
                 block.emission = @splat(0);
@@ -388,7 +654,7 @@ pub const Engine = struct {
         }
         self.uniform_air = false;
         self.block_zero = false;
-        self.sky_start = 0;
+        self.sky_start = self.minimum;
         self.air_start = self.rows.len;
     }
 
@@ -456,7 +722,7 @@ pub const Engine = struct {
                 row.light[1] = @max(row.light[1], @select(u8, @as(@Vector(lanes, bool), @bitCast(source)), @as(Levels, @splat(15)), @as(Levels, @splat(0))));
                 self.enqueue(@intCast(at), 15, added);
             }
-            if (at < plane) break;
+            if (at < self.minimum + plane) break;
             at -= plane;
         }
     }
@@ -464,11 +730,22 @@ pub const Engine = struct {
     /// Applies the final state of each cell against a settled light field.
     /// The batch is bounded by batch_max. No allocation or IO occurs.
     pub fn update(self: *Engine, edits: []const Edit) !void {
+        if (self.origin[0] == 0 and self.origin[1] == 0) return self.updatePhysical(edits);
+        if (edits.len > batch_max) return error.BatchTooLarge;
+        var translated: [batch_max]Edit = undefined;
+        for (edits, translated[0..edits.len]) |edit, *value| {
+            if (edit.index >= self.dimensions.volume()) return error.InvalidEdit;
+            value.* = .{ .index = self.physicalRow(edit.index / lanes) * lanes + edit.index % lanes, .state = edit.state };
+        }
+        return self.updatePhysical(translated[0..edits.len]);
+    }
+
+    fn updatePhysical(self: *Engine, edits: []const Edit) !void {
         assert(self.lit and self.highest == 0 and self.source_count == 0 and self.restore_count == 0);
         if (edits.len > batch_max) return error.BatchTooLarge;
         if (edits.len <= 1) {
             for (edits) |edit| {
-                if (edit.index >= self.dimensions.volume() or edit.state >= self.registry.states.len) return error.InvalidEdit;
+                if (edit.index >= self.dimensions.volume() or edit.index / lanes < self.minimum or edit.state >= self.registry.states.len) return error.InvalidEdit;
             }
         }
         const prepared: PreparedEdits = if (edits.len > 1) try self.prepareEdits(edits) else .{ .count = edits.len, .indirect = false };
@@ -500,7 +777,7 @@ pub const Engine = struct {
             const geometry = old.opacity != next.opacity or faces_changed;
             const old_cost = @max(1, old.opacity);
             const next_cost = @max(1, next.opacity);
-            const light = self.get(.block, edit.index);
+            const light = self.getPhysical(.block, edit.index);
             const emission_changed = old.emission != next.emission;
             // Darkening restores the updated emission if another edit removes its stronger support.
             const affects_emission = emission_changed and (next.emission > light or (next.emission < old.emission and old.emission >= light));
@@ -588,7 +865,7 @@ pub const Engine = struct {
         var ordered = true;
         var repeated = false;
         for (edits, 0..) |edit, i| {
-            if (edit.index >= self.dimensions.volume() or edit.state >= self.registry.states.len) return error.InvalidEdit;
+            if (edit.index >= self.dimensions.volume() or edit.index / lanes < self.minimum or edit.state >= self.registry.states.len) return error.InvalidEdit;
             variation |= edit.index ^ edits[0].index;
             if (i != 0) {
                 if (edit.index < edits[i - 1].index) ordered = false;
@@ -644,19 +921,19 @@ pub const Engine = struct {
 
     inline fn neighbours(self: *const Engine, index: usize) [6]u32 {
         const at: u32 = @intCast(index);
-        const boundary = self.rows[index].boundary;
+        const boundary = if (self.origin[0] == 0 and self.origin[1] == 0) self.rows[index].boundary else (self.rows[index].boundary & 48) | (self.horizontal[index % self.plane] & 15);
         return .{
-            if (boundary & 1 == 0) at - 1 else none,
-            if (boundary & 2 == 0) at + 1 else none,
-            if (boundary & 4 == 0) at - self.stride else none,
-            if (boundary & 8 == 0) at + self.stride else none,
-            if (boundary & 16 == 0) at - self.plane else none,
+            if (boundary & 1 != 0) none else if (self.rows[index].boundary & 1 != 0) at + self.stride - 1 else at - 1,
+            if (boundary & 2 != 0) none else if (self.rows[index].boundary & 2 != 0) at + 1 - self.stride else at + 1,
+            if (boundary & 4 != 0) none else if (self.rows[index].boundary & 4 != 0) at + self.plane - self.stride else at - self.stride,
+            if (boundary & 8 != 0) none else if (self.rows[index].boundary & 8 != 0) at + self.stride - self.plane else at + self.stride,
+            if (at >= self.minimum + self.plane) at - self.plane else none,
             if (boundary & 32 == 0 and at + self.plane < self.air_start) at + self.plane else none,
         };
     }
 
     fn seedRow(self: *Engine, comptime layer: Layer, row: usize) void {
-        const value = self.rows[row].light[@intFromEnum(layer)];
+        const value = self.rows[row].light[@backingInt(layer)];
         const maximum = @reduce(.Max, value);
         if (maximum > 1) self.enqueue(@intCast(row), maximum, @bitCast(value > @as(Levels, @splat(1))));
     }
@@ -672,7 +949,7 @@ pub const Engine = struct {
 
     inline fn removeMask(self: *Engine, comptime layer: Layer, at: usize, mask: u16) void {
         const row = &self.rows[at];
-        const value = row.light[@intFromEnum(layer)];
+        const value = row.light[@backingInt(layer)];
         const nonzero: u16 = @bitCast(value > @as(Levels, @splat(0)));
         const affected = mask & nonzero;
         if (affected == 0) return;
@@ -684,7 +961,7 @@ pub const Engine = struct {
         const row = &self.rows[at];
         const selected: @Vector(lanes, bool) = @bitCast(affected);
         self.decreases[at] = @max(self.decreases[at], @select(u8, selected, value, @as(Levels, @splat(0))));
-        row.light[@intFromEnum(layer)] = @select(u8, selected, @as(Levels, @splat(0)), value);
+        row.light[@backingInt(layer)] = @select(u8, selected, @as(Levels, @splat(0)), value);
         const restore = if (layer == .block) row.emitters != 0 else row.boundary & 32 != 0;
         if (restore and !row.restore_queued) {
             assert(self.restore_count < self.restore_rows.len);
@@ -719,7 +996,7 @@ pub const Engine = struct {
             self.decrease_count -= 1;
             self.work.darkened_rows += 1;
             const row = &self.rows[at];
-            const reached = horizontalRemoval(self.decreases[at], row.light[@intFromEnum(layer)]);
+            const reached = horizontalRemoval(self.decreases[at], row.light[@backingInt(layer)]);
             self.removeMask(layer, at, reached);
             // Queue survivors while this row is hot. Increases wait for all decreases.
             self.seedRow(layer, at);
@@ -743,7 +1020,7 @@ pub const Engine = struct {
     }
 
     fn decreaseTo(self: *Engine, comptime layer: Layer, at: usize, source: Levels) void {
-        const value = self.rows[at].light[@intFromEnum(layer)];
+        const value = self.rows[at].light[@backingInt(layer)];
         self.removeMask(layer, at, @bitCast(value < source));
         const boundary = (value >= source) & (source > @as(Levels, @splat(0))) & (value > @as(Levels, @splat(1)));
         const mask: u16 = @bitCast(boundary);
@@ -758,7 +1035,7 @@ pub const Engine = struct {
         assert(row.restore_queued);
         assert(if (layer == .block) row.emitters != 0 else row.boundary & 32 != 0);
         const source = if (layer == .block) self.blocks[at].emission else @select(u8, @as(@Vector(lanes, bool), @bitCast(row.sky_source)), @as(Levels, @splat(15)), @as(Levels, @splat(0)));
-        row.light[@intFromEnum(layer)] = @max(row.light[@intFromEnum(layer)], source);
+        row.light[@backingInt(layer)] = @max(row.light[@backingInt(layer)], source);
         if (layer == .sky and row.boundary & 32 != 0) self.skyBoundary(at);
         self.seedRow(layer, at);
     }
@@ -771,10 +1048,10 @@ pub const Engine = struct {
         const plane = self.dimensions.x * self.dimensions.z;
         if (layer == .sky and self.skylight and index >= self.dimensions.volume() - plane and !self.registry.blocked(0, state, .down))
             source = @max(source, 15 -| @max(1, self.registry.states[state].opacity));
-        var light: [lanes]u8 = row.light[@intFromEnum(layer)];
+        var light: [lanes]u8 = row.light[@backingInt(layer)];
         if (light[x] >= source) return;
         light[x] = @max(light[x], source);
-        row.light[@intFromEnum(layer)] = light;
+        row.light[@backingInt(layer)] = light;
         self.seedRow(layer, index / lanes);
     }
 
@@ -816,17 +1093,17 @@ pub const Engine = struct {
             if (link.next != none) self.links[link.next].previous = none;
             const mask = link.mask;
             link.* = .{};
-            const live = mask & @as(u16, @bitCast(self.rows[index].light[@intFromEnum(layer)] > @as(Levels, @splat(1))));
+            const live = mask & @as(u16, @bitCast(self.rows[index].light[@backingInt(layer)] > @as(Levels, @splat(1))));
             if (live == 0) continue;
             self.work.propagated_rows += 1;
             const at: usize = index;
             const adjacent = self.neighbours(at);
             const row = &self.rows[at];
-            const old = row.light[@intFromEnum(layer)];
+            const old = row.light[@backingInt(layer)];
             const value = horizontalIncrease(old, row.attenuation, row.blocked_horizontal);
             const changed: u16 = @bitCast(value > old);
             self.work.changed_cells += @popCount(changed);
-            row.light[@intFromEnum(layer)] = value;
+            row.light[@backingInt(layer)] = value;
             const light = @select(u8, @as(@Vector(lanes, bool), @bitCast(live | changed)), value, @as(Levels, @splat(0)));
             if (adjacent[0] != none and light[0] > 1) {
                 var edge: Levels = @splat(0);
@@ -839,7 +1116,7 @@ pub const Engine = struct {
                 self.spread(layer, at, adjacent[1], .east, edge);
             }
             inline for (2..6) |direction| if (adjacent[direction] != none)
-                self.spread(layer, at, adjacent[direction], @enumFromInt(direction), light);
+                self.spread(layer, at, adjacent[direction], @fromBackingInt(@intCast(direction)), light);
         }
         assert(std.mem.allEqual(u32, &self.heads, none));
     }
@@ -866,18 +1143,18 @@ pub const Engine = struct {
             const x = if (direction == .west) lanes - 1 else 0;
             const source_x = lanes - 1 - x;
             const next = source[x] -| target.attenuation[x];
-            if (next <= target.light[@intFromEnum(layer)][x]) return;
+            if (next <= target.light[@backingInt(layer)][x]) return;
             const mask = @as(u16, 1) << x;
             if ((self.rows[from].shaped & (@as(u16, 1) << source_x)) != 0 or (target.shaped & mask) != 0) {
                 self.work.shape_checks += 1;
                 if (self.registry.blocked(self.blocks[from].state[source_x], self.blocks[to].state[x], direction)) return;
             }
             self.work.changed_cells += 1;
-            target.light[@intFromEnum(layer)][x] = next;
+            target.light[@backingInt(layer)][x] = next;
             if (next > 1) self.enqueue(@intCast(to), next, mask);
             return;
         }
-        const old = target.light[@intFromEnum(layer)];
+        const old = target.light[@backingInt(layer)];
         const next = source -| target.attenuation;
         var improved: u16 = @bitCast(next > old);
         if (improved == 0) return;
@@ -893,39 +1170,52 @@ pub const Engine = struct {
         if (improved == 0) return;
         self.work.changed_cells += @popCount(improved);
         const admitted = @select(u8, @as(@Vector(lanes, bool), @bitCast(improved)), next, @as(Levels, @splat(0)));
-        target.light[@intFromEnum(layer)] = @max(admitted, old);
+        target.light[@backingInt(layer)] = @max(admitted, old);
         const maximum = @reduce(.Max, admitted);
         if (maximum > 1) self.enqueue(@intCast(to), maximum, improved);
     }
 
     pub fn get(self: *const Engine, layer: Layer, index: usize) u4 {
-        assert(self.lit and index < self.dimensions.volume());
+        assert(index < self.dimensions.volume());
+        return self.getPhysical(layer, self.physicalRow(index / lanes) * lanes + index % lanes);
+    }
+
+    fn physicalRow(self: *const Engine, index: usize) usize {
+        if (self.origin[0] == 0 and self.origin[1] == 0) return index;
+        return index / self.plane * self.plane +
+            (index % self.plane / self.stride + self.origin[1]) % self.dimensions.z * self.stride +
+            (index % self.stride + self.origin[0]) % self.stride;
+    }
+
+    fn getPhysical(self: *const Engine, layer: Layer, index: usize) u4 {
+        assert(self.lit and index < self.dimensions.volume() and index / lanes >= self.minimum);
         if (layer == .block and self.block_zero) return 0;
         if (layer == .sky and (!self.skylight or index / lanes < self.sky_start)) return 0;
         if (self.uniform_air or index / lanes >= self.air_start) return if (layer == .sky and self.skylight) 15 else 0;
-        const values: [lanes]u8 = self.rows[index / lanes].light[@intFromEnum(layer)];
+        const values: [lanes]u8 = self.rows[index / lanes].light[@backingInt(layer)];
         return @intCast(values[index % lanes]);
     }
 
     pub fn blockState(self: *const Engine, index: usize) u16 {
-        assert(self.loaded and index < self.dimensions.volume());
+        assert(self.loaded and index < self.dimensions.volume() and index / lanes >= self.minimum);
         if (self.uniform_air or index / lanes >= self.air_start) return 0;
-        return self.blocks[index / lanes].state[index % lanes];
+        return self.blocks[self.physicalRow(index / lanes)].state[index % lanes];
     }
 
     pub fn pack(self: *const Engine, layer: Layer, output: []u8) void {
         assert(self.lit and output.len == self.dimensions.volume() / 2);
         if (self.uniform_air or (layer == .block and self.block_zero) or (layer == .sky and !self.skylight)) {
             @memset(output, if (self.uniform_air and layer == .sky and self.skylight) 255 else 0);
+            @memset(output[0 .. self.minimum * 8], 0);
             return;
         }
         const even = [8]i32{ 0, 2, 4, 6, 8, 10, 12, 14 };
         const odd = [8]i32{ 1, 3, 5, 7, 9, 11, 13, 15 };
-        const begin = if (layer == .sky) self.sky_start else 0;
+        const begin = if (layer == .sky) self.sky_start else self.minimum;
         @memset(output[0 .. begin * 8], 0);
         @memset(output[self.air_start * 8 ..], if (layer == .sky) 255 else 0);
-        for (self.rows[begin..self.air_start], begin..) |*row, index| {
-            const value = row.light[@intFromEnum(layer)];
+        for (begin..self.air_start) |index| {
+            const value = self.rows[self.physicalRow(index)].light[@backingInt(layer)];
             const low = @shuffle(u8, value, undefined, even);
             const high = @shuffle(u8, value, undefined, odd);
             output[index * 8 ..][0..8].* = low | (high << @splat(4));
@@ -935,6 +1225,7 @@ pub const Engine = struct {
     pub fn sectionNonempty(self: *const Engine, layer: Layer, section: [3]usize) bool {
         assert(self.lit);
         assert(section[0] < self.dimensions.x / 16 and section[1] < self.dimensions.y / 16 and section[2] < self.dimensions.z / 16);
+        if (section[1] * 16 * self.plane < self.minimum) return false;
         if (layer == .block and self.block_zero) return false;
         if (layer == .sky and !self.skylight) return false;
         if (self.uniform_air) return layer == .sky and self.skylight;
@@ -942,14 +1233,16 @@ pub const Engine = struct {
         if (layer == .sky and (section[1] + 1) * 16 * self.plane <= self.sky_start) return false;
         const stride = self.dimensions.x / lanes;
         const plane = stride * self.dimensions.z;
+        const column_x = (section[0] + self.origin[0]) % stride;
+        const column_z = (section[2] * 16 + self.origin[1]) % self.dimensions.z;
         for (0..16) |y| for (0..16) |z| {
-            const index = (section[1] * 16 + y) * plane + (section[2] * 16 + z) * stride + section[0];
+            const index = (section[1] * 16 + y) * plane + (column_z + z) * stride + column_x;
             if (layer == .sky and index < self.sky_start) continue;
             if (index >= self.air_start) {
                 if (layer == .sky) return true;
                 continue;
             }
-            if (@reduce(.Or, self.rows[index].light[@intFromEnum(layer)] != @as(Levels, @splat(0)))) return true;
+            if (@reduce(.Or, self.rows[index].light[@backingInt(layer)] != @as(Levels, @splat(0)))) return true;
         };
         return false;
     }
@@ -957,6 +1250,10 @@ pub const Engine = struct {
     pub fn packSection(self: *const Engine, layer: Layer, section: [3]usize, output: *[2048]u8) void {
         assert(self.lit);
         assert(section[0] < self.dimensions.x / 16 and section[1] < self.dimensions.y / 16 and section[2] < self.dimensions.z / 16);
+        if (section[1] * 16 * self.plane < self.minimum) {
+            @memset(output, 0);
+            return;
+        }
         if (self.uniform_air or (layer == .block and self.block_zero) or (layer == .sky and !self.skylight)) {
             @memset(output, if (self.uniform_air and layer == .sky and self.skylight) 255 else 0);
             return;
@@ -973,13 +1270,188 @@ pub const Engine = struct {
         const plane = stride * self.dimensions.z;
         const even = [8]i32{ 0, 2, 4, 6, 8, 10, 12, 14 };
         const odd = [8]i32{ 1, 3, 5, 7, 9, 11, 13, 15 };
+        const column_x = (section[0] + self.origin[0]) % stride;
+        const column_z = (section[2] * 16 + self.origin[1]) % self.dimensions.z;
         for (0..16) |y| for (0..16) |z| {
-            const index = (section[1] * 16 + y) * plane + (section[2] * 16 + z) * stride + section[0];
-            const value = if (layer == .sky and index < self.sky_start) @as(Levels, @splat(0)) else if (index >= self.air_start) @as(Levels, @splat(if (layer == .sky) 15 else 0)) else self.rows[index].light[@intFromEnum(layer)];
+            const index = (section[1] * 16 + y) * plane + (column_z + z) * stride + column_x;
+            const value = if (layer == .sky and index < self.sky_start) @as(Levels, @splat(0)) else if (index >= self.air_start) @as(Levels, @splat(if (layer == .sky) 15 else 0)) else self.rows[index].light[@backingInt(layer)];
             output[(y * 16 + z) * 8 ..][0..8].* = @shuffle(u8, value, undefined, even) | (@shuffle(u8, value, undefined, odd) << @splat(4));
         };
     }
 };
+
+test "scrolling settled light agrees with fresh solves through reversals and diagonal movement" {
+    const states = [_]Properties{
+        .{ .opacity = 0, .emission = 0, .faces = @splat(0) },
+        .{ .opacity = 15, .emission = 0, .faces = @splat(0) },
+        .{ .opacity = 1, .emission = 0, .faces = @splat(0) },
+        .{ .opacity = 0, .emission = 0, .faces = .{ 1, 0, 1, 0, 1, 0 } },
+        .{ .opacity = 0, .emission = 15, .faces = @splat(0) },
+    };
+    const registry: Registry = .{ .states = &states, .faces = 2, .occlusion = &.{ 0, 0, 0, 1 } };
+    const dimensions: Dimensions = .{ .x = 48, .y = 48, .z = 48 };
+    const Scene = struct {
+        fn fill(blocks: []u16, origin: [2]i32, mode: usize) void {
+            for (blocks, 0..) |*state, index| {
+                const x = origin[0] + @as(i32, @intCast(index % 48));
+                const y = index / (48 * 48);
+                const z = origin[1] + @as(i32, @intCast(index / 48 % 48));
+                state.* = switch (mode) {
+                    0 => 0,
+                    1 => if (y == 15 and @mod(x, 23) == 0 and @mod(z, 19) == 0) 4 else 0,
+                    2 => if (y == 15 and @mod(x, 23) == 0 and @mod(z, 19) == 0) 4 else if (y < 8 or (y == 24 and @mod(x, 17) != 0)) 1 else if (y < 24 and @mod(x * 31 + z * 17, 13) < 3) 1 else if (y == 25 and @mod(x + z, 11) == 0) 2 else if (y == 8 and @mod(x - z, 7) == 0) 3 else 0,
+                    3 => if (x == 8 and z == 8 and y == 40) 4 else if (y < 3 or (x < 16 and y < 32)) 1 else 0,
+                    4 => if (x == 8 and z == 8 and y == 6) 2 else if (x == 8 and z == 8 and y == 7) 3 else 0,
+                    5 => if (y < @as(usize, if (x < 32) 8 else 24)) 1 else 0,
+                    else => unreachable,
+                };
+            }
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var engine = try Engine.init(allocator, dimensions, registry);
+    var fresh = try Engine.init(allocator, dimensions, registry);
+    const blocks = try allocator.alloc(u16, dimensions.volume());
+    const ring_blocks = try allocator.alloc(u16, blocks.len);
+    const expected = try allocator.alloc(u8, blocks.len);
+    const packed_actual = try allocator.alloc(u8, blocks.len / 2);
+    const packed_expected = try allocator.alloc(u8, blocks.len / 2);
+    var section_actual: [2048]u8 = undefined;
+    var section_expected: [2048]u8 = undefined;
+    for (0..6) |mode| for ([_]bool{ false, true }) |skylight| {
+        for (engine.rows) |*row| {
+            row.light = .{ @splat(170), @splat(170) };
+            row.sky_source = 0xaaaa;
+        }
+        var origin: [2]i32 = .{ 0, 0 };
+        Scene.fill(blocks, origin, mode);
+        try engine.load(.{ .dense = blocks });
+        engine.relight(skylight);
+        for ([_][2]i32{ .{ 16, 0 }, .{ 0, 16 }, .{ -16, 0 }, .{ 0, -16 }, .{ 16, 16 }, .{ -16, -16 }, .{ 32, 0 }, .{ -32, 0 }, .{ 0, 32 }, .{ 0, -32 } }, 0..) |offset, step| {
+            origin[0] += offset[0];
+            origin[1] += offset[1];
+            Scene.fill(blocks, origin, mode);
+            const ring_origin = [2]usize{ (step + 1) % 3, (step % 3) * 16 };
+            for (blocks, 0..) |state, index| {
+                const x = (index % 48 + ring_origin[0] * 16) % 48;
+                const z = (index / 48 % 48 + ring_origin[1]) % 48;
+                ring_blocks[index / (48 * 48) * 48 * 48 + z * 48 + x] = state;
+            }
+            const input: Blocks.Ring = if (step % 2 == 0) .{ .states = ring_blocks, .origin = ring_origin } else .{ .states = blocks, .origin = .{ 0, 0 } };
+            try engine.scroll(offset, input);
+            try fresh.load(.{ .dense = blocks });
+            fresh.relight(skylight);
+            for ([_]Layer{ .block, .sky }) |layer| {
+                engine.pack(layer, packed_actual);
+                fresh.pack(layer, packed_expected);
+                try std.testing.expectEqualSlices(u8, packed_expected, packed_actual);
+                for (0..27) |section| {
+                    const at = [3]usize{ section % 3, section / 9, section / 3 % 3 };
+                    engine.packSection(layer, at, &section_actual);
+                    fresh.packSection(layer, at, &section_expected);
+                    try std.testing.expectEqualSlices(u8, &section_expected, &section_actual);
+                    try std.testing.expectEqual(fresh.sectionNonempty(layer, at), engine.sectionNonempty(layer, at));
+                }
+                if (step == 2) reference(dimensions, registry, blocks, layer, skylight, expected);
+                for (blocks, 0..) |_, index| {
+                    const actual = engine.get(layer, index);
+                    if (layer == .block) try std.testing.expectEqual(blocks[index], engine.blockState(index));
+                    const wanted = fresh.get(layer, index);
+                    if (actual != wanted) {
+                        std.debug.print("scroll mode={d} sky={} step={d} layer={s} index={d} actual={d} expected={d}\n", .{ mode, skylight, step, @tagName(layer), index, actual, wanted });
+                        return error.TestUnexpectedResult;
+                    }
+                    if (step == 2) try std.testing.expectEqual(expected[index], actual);
+                }
+            }
+            if (step == 3) {
+                const cell = (47 * 48 + 16) * 48 + 16;
+                const original = blocks[cell];
+                for ([_]u16{ 4, original }) |state| {
+                    try engine.update(&.{.{ .index = cell, .state = state }});
+                    blocks[cell] = state;
+                    try fresh.load(.{ .dense = blocks });
+                    fresh.relight(skylight);
+                    for ([_]Layer{ .block, .sky }) |layer| {
+                        engine.pack(layer, packed_actual);
+                        fresh.pack(layer, packed_expected);
+                        try std.testing.expectEqualSlices(u8, packed_expected, packed_actual);
+                    }
+                }
+            }
+            if (step == 5) {
+                try engine.load(.{ .ring = .{ .states = ring_blocks, .origin = ring_origin } });
+                engine.relight(skylight);
+                for ([_]Layer{ .block, .sky }) |layer| {
+                    engine.pack(layer, packed_actual);
+                    fresh.pack(layer, packed_expected);
+                    try std.testing.expectEqualSlices(u8, packed_expected, packed_actual);
+                }
+            }
+        }
+    };
+}
+
+test "bounded lighting preserves visible values with hidden emitters and skylight above" {
+    const states = [_]Properties{
+        .{ .opacity = 0, .emission = 0, .faces = @splat(0) },
+        .{ .opacity = 15, .emission = 0, .faces = @splat(0) },
+        .{ .opacity = 1, .emission = 0, .faces = @splat(0) },
+        .{ .opacity = 0, .emission = 0, .faces = .{ 1, 0, 1, 0, 1, 0 } },
+        .{ .opacity = 0, .emission = 15, .faces = @splat(0) },
+    };
+    const registry: Registry = .{ .states = &states, .faces = 2, .occlusion = &.{ 0, 0, 0, 1 } };
+    const dimensions: Dimensions = .{ .x = 48, .y = 96, .z = 48 };
+    const Scene = struct {
+        fn fill(blocks: []u16, offset: i32) void {
+            for (blocks, 0..) |*state, index| {
+                const x = offset + @as(i32, @intCast(index % 48));
+                const z = index / 48 % 48;
+                const y = index / (48 * 48);
+                state.* = if (y % 16 == 14 and @mod(x, 19) == 0 and z % 7 == 0) 4 else if (y < 4 or (y == 72 and @mod(x, 13) != 0)) 1 else if (y < 60 and @mod(x, 17) < 3 and z % 11 < 3) 1 else if (y == 73 and @mod(x, 7) == 0) 2 else if (y % 16 == 4 and @mod(x, 11) == 0) 3 else 0;
+            }
+        }
+    };
+    const blocks = try std.testing.allocator.alloc(u16, dimensions.volume());
+    defer std.testing.allocator.free(blocks);
+    var full = try Engine.init(std.testing.allocator, dimensions, registry);
+    defer full.deinit();
+    var partial = try Engine.init(std.testing.allocator, dimensions, registry);
+    defer partial.deinit();
+    var actual: [2048]u8 = undefined;
+    var expected: [2048]u8 = undefined;
+    for ([_]bool{ false, true }) |sky| for (0..5) |floor| {
+        for ([_]i32{ 0, 16, 32, 16, 0 }, 0..) |offset, step| {
+            Scene.fill(blocks, offset);
+            const input: Blocks.Ring = .{ .states = blocks, .origin = .{ 0, 0 }, .minimum_y = floor * 16 };
+            if (step == 0) {
+                try partial.load(.{ .ring = input });
+                partial.relight(sky);
+            } else try partial.scroll(.{ if (step < 3) 16 else -16, 0 }, input);
+            try full.load(.{ .dense = blocks });
+            full.relight(sky);
+            for ([_]Layer{ .block, .sky }) |layer| for (floor + 1..6) |section| {
+                partial.packSection(layer, .{ 1, section, 1 }, &actual);
+                full.packSection(layer, .{ 1, section, 1 }, &expected);
+                try std.testing.expectEqualSlices(u8, &expected, &actual);
+            };
+            const cell = ((floor * 16 + 18) * 48 + 24) * 48 + 24;
+            const original = blocks[cell];
+            for ([_]u16{ 4, original }) |state| {
+                const edits = [_]Edit{.{ .index = cell, .state = state }};
+                try partial.update(&edits);
+                try full.update(&edits);
+                for ([_]Layer{ .block, .sky }) |layer| for (floor + 1..6) |section| {
+                    partial.packSection(layer, .{ 1, section, 1 }, &actual);
+                    full.packSection(layer, .{ 1, section, 1 }, &expected);
+                    try std.testing.expectEqualSlices(u8, &expected, &actual);
+                };
+            }
+        }
+    };
+}
 
 test "a maximum batch preserves its last writes and ignores cancelled intermediate edits" {
     const allocator = std.testing.allocator;
@@ -1325,4 +1797,50 @@ test "implicit air and opaque planes materialize correctly before the first edit
             }
         }
     }
+}
+
+test "section descriptors match dense lighting without reading uniform backing storage" {
+    const states = [_]Properties{
+        .{ .opacity = 0, .emission = 0, .faces = @splat(0) },
+        .{ .opacity = 15, .emission = 0, .faces = @splat(0) },
+        .{ .opacity = 0, .emission = 15, .faces = @splat(0) },
+    };
+    const registry: Registry = .{ .states = &states, .faces = 1, .occlusion = &.{0} };
+    const dimensions: Dimensions = .{ .x = 32, .y = 64, .z = 32 };
+    const dense = try std.testing.allocator.alloc(u16, dimensions.volume());
+    defer std.testing.allocator.free(dense);
+    const sparse = try std.testing.allocator.alloc(u16, dimensions.volume());
+    defer std.testing.allocator.free(sparse);
+    var actual = try Engine.init(std.testing.allocator, dimensions, registry);
+    defer actual.deinit();
+    var expected = try Engine.init(std.testing.allocator, dimensions, registry);
+    defer expected.deinit();
+    const mixed: [8]?u16 = .{ 1, null, 0, 2, null, 0, 1, 2 };
+    for ([_]bool{ false, true }) |air| for ([_]bool{ false, true }) |sky| for ([_]usize{ 0, 16, 48 }) |minimum| for ([_][2]usize{ .{ 0, 0 }, .{ 1, 16 } }) |origin| {
+        const uniforms: [8]?u16 = if (air) @splat(0) else mixed;
+        @memset(sparse, std.math.maxInt(u16));
+        for (dense, 0..) |*state, index| {
+            const x = index % 32;
+            const z = index / 32 % 32;
+            const y = index / (32 * 32);
+            const section = y / 16;
+            if (section < 1 or section >= 3) {
+                state.* = 0;
+                continue;
+            }
+            const uniform = uniforms[(z / 16 * 2 + x / 16) * 2 + section - 1];
+            state.* = uniform orelse @intCast((x + y + z) % 3);
+            if (uniform == null) sparse[(y * 32 + (z + origin[1]) % 32) * 32 + (x + origin[0] * 16) % 32] = state.*;
+        }
+        try actual.load(.{ .ring = .{ .states = sparse, .origin = origin, .minimum_y = minimum, .sections = .{ .uniforms = &uniforms, .first = 1, .count = 2, .stride = 2 } } });
+        actual.relight(sky);
+        try expected.load(.{ .ring = .{ .states = dense, .origin = .{ 0, 0 }, .minimum_y = minimum } });
+        expected.relight(sky);
+        try std.testing.expectEqual(expected.uniform_air, actual.uniform_air);
+        for (minimum * 32 * 32..dimensions.volume()) |index| {
+            try std.testing.expectEqual(expected.blockState(index), actual.blockState(index));
+            try std.testing.expectEqual(expected.get(.block, index), actual.get(.block, index));
+            try std.testing.expectEqual(expected.get(.sky, index), actual.get(.sky, index));
+        }
+    };
 }

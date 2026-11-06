@@ -1,0 +1,4 @@
+{
+  "client": "OcclusionTransitionFixture",
+  "variants": [{ "name": "occlusion-transition" }]
+}

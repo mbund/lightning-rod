@@ -213,6 +213,17 @@ final class TeleportFixture extends Fixture {
                     || !game.player.onGround() || inventorySyncedPlayer != game.player) return;
                 if (!assertTeleportState(game)) return;
                 if (!game.level.getBlockState(SUPPORT_BLOCK).is(hop.destinationBlock())) return;
+                var biome = switch (hop.dimension()) {
+                    case "the_nether" -> net.minecraft.world.level.biome.Biomes.NETHER_WASTES;
+                    case "the_end" -> net.minecraft.world.level.biome.Biomes.THE_END;
+                    case "overworld_two" -> net.minecraft.world.level.biome.Biomes.BASALT_DELTAS;
+                    default -> net.minecraft.world.level.biome.Biomes.PLAINS;
+                };
+                if (!game.level.getBiome(SUPPORT_BLOCK).is(biome)
+                        || !game.level.getBiome(new BlockPos(10, 0, 10)).is(biome)) {
+                    client.fail("dimension_biome_incorrect_" + hop.dimension());
+                    return;
+                }
                 game.options.setCameraType(CameraType.THIRD_PERSON_BACK);
                 client.mark("alice-joined-" + hop.dimension());
                 alicePhase = AlicePhase.WAIT_FOR_BOB_ACK;

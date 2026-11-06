@@ -2,6 +2,7 @@ package dev.lightningrod.e2e;
 
 import java.nio.file.Files;
 import net.minecraft.client.Minecraft;
+import net.minecraft.world.level.biome.Biomes;
 import dev.lightningrod.e2e.mixin.ClientConnectionAccessor;
 
 final class ChunksFixture extends Fixture {
@@ -12,7 +13,7 @@ final class ChunksFixture extends Fixture {
 
     ChunksFixture(Recorder r) { super(r); }
     @Override boolean encrypted() { return r.scenario.contains("encrypted"); }
-    @Override int renderDistance() { return 32; }
+    @Override int renderDistance() { return r.scenario.equals("chunks-registry") ? 2 : 32; }
 
     @Override public void tick(Minecraft game, int loaded, int missing) {
         if (loaded >= r.targetChunks && missing == 0 && r.terrainTick >= 0) {
@@ -25,6 +26,31 @@ final class ChunksFixture extends Fixture {
                 if (r.peer.equals("alice") ? !stack.is(net.minecraft.world.item.Items.BREAD) || stack.getCount() != 17 : !stack.isEmpty()) {
                     client.fail("simulation_inventory_leaked");
                     return;
+                }
+            }
+            if (!r.scenario.equals("chunks-simulations-multi")) {
+                var expectedBiomes = java.util.List.of(Biomes.PLAINS, Biomes.DESERT, Biomes.FOREST);
+                for (int y = 0; y < 4; y++) for (int z = 0; z < 4; z++) for (int x = 0; x < 4; x++) {
+                    var at = new net.minecraft.core.BlockPos(game.player.getBlockX() + x * 4, 64 + y * 4, game.player.getBlockZ() + z * 4);
+                    var section = game.level.getChunkAt(at).getSection(game.level.getSectionIndex(at.getY()));
+                    if (!section.getBiomes().get(x, y, z).is(expectedBiomes.get((y * 16 + z * 4 + x) % 3))) {
+                        client.fail("section_biome_incorrect");
+                        return;
+                    }
+                }
+                for (int i = 0; i < 6; i++) {
+                    var at = new net.minecraft.core.BlockPos(game.player.getBlockX() + 2 + i, 65, game.player.getBlockZ() + 3);
+                    var state = game.level.getBlockState(at);
+                    var name = state.getBlock().getDescriptionId();
+                    var axis = state.getBlock().getStateDefinition().getProperty("axis");
+                    var waterlogged = state.getBlock().getStateDefinition().getProperty("waterlogged");
+                    if ((!name.equals("block.minecraft.chain") && !name.equals("block.minecraft.iron_chain"))
+                        || axis == null || waterlogged == null
+                        || !state.getValue(axis).toString().equals(new String[]{"x", "y", "z"}[i / 2])
+                        || !state.getValue(waterlogged).toString().equals(i % 2 == 0 ? "true" : "false")) {
+                        client.fail("chain_block_state_incorrect");
+                        return;
+                    }
                 }
             }
             if (targetTick < 0) targetTick = client.streamTarget(loaded);

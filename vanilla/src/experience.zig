@@ -34,6 +34,18 @@ pub const Experience = struct {
         record_workspaces: *records.Workspaces,
     };
     pub const Orb = struct {
+        pub fn encode(orb: Orb) [16]u8 {
+            var bytes: [16]u8 = @splat(0);
+            bytes[0] = 1;
+            std.mem.writeInt(i32, bytes[1..5], orb.value, .little);
+            std.mem.writeInt(i32, bytes[5..9], orb.count, .little);
+            std.mem.writeInt(u16, bytes[9..11], orb.age, .little);
+            std.mem.writeInt(i16, bytes[11..13], orb.health, .little);
+            bytes[13] = @intFromBool(orb.on_ground);
+            std.mem.writeInt(i16, bytes[14..16], orb.fire, .little);
+            return bytes;
+        }
+
         value: i32 = 0,
         count: i32 = 1,
         age: u16 = 0,
@@ -616,14 +628,7 @@ pub const Experience = struct {
             if (!orb.alive) continue;
             keys[count][0] = 1;
             std.mem.writeInt(u64, keys[count][1..9], self.residents[index].id, .big);
-            values[count] = @splat(0);
-            values[count][0] = 1;
-            std.mem.writeInt(i32, values[count][1..5], orb.value, .little);
-            std.mem.writeInt(i32, values[count][5..9], orb.count, .little);
-            std.mem.writeInt(u16, values[count][9..11], orb.age, .little);
-            std.mem.writeInt(i16, values[count][11..13], orb.health, .little);
-            values[count][13] = @intFromBool(orb.on_ground);
-            std.mem.writeInt(i16, values[count][14..16], orb.fire, .little);
+            values[count] = orb.encode();
             writes[count] = .{ .key = &keys[count], .value = &values[count] };
             count += 1;
             if (count == writes.len) {

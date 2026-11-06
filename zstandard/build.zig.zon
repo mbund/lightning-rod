@@ -1,0 +1,13 @@
+.{
+    .name = .zstandard,
+    .fingerprint = 0xf651550b19a4f23c,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .source = .{
+            .url = "https://github.com/facebook/zstd/archive/refs/tags/v1.5.7.tar.gz",
+            .hash = "N-V-__8AAPZ7fwBg4JoCzM_0o2A8wxH2hsUUeiU1iuZv53L5",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

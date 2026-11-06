@@ -24,6 +24,7 @@ pub const Arguments = struct { fixture: []const u8 = "", port: u16 = 0 };
 pub fn plugins() @TypeOf(vanilla.plugins()) {
     return lightning_rod.plugin.replace(vanilla.plugins(), .{
         lightning_rod.plugin.configured(vanilla.Players, .{ .render_distance = 2 }),
+        lightning_rod.plugin.configured(vanilla.Spawn, .{ .radius = 0 }),
     });
 }
 

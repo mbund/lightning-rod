@@ -508,8 +508,8 @@ pub fn benchmarkItemReplication() !void {
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 2 }, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
+        const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -859,8 +859,8 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
     player_records[connection].position.x = 1;
     player_records[connection].position.z = 1;
     players.rebuildIndexes();
-    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-    const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
+    const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
     defer service.unsubscribeOutput(streaming.changed);
     defer terrain.unsubscribeReady(streaming.changed);
     streaming.published.setStream(connection, .{ .generation = 1, .life = player_records[connection].life, .setup = .streaming });
@@ -982,8 +982,8 @@ pub fn benchmarkItemVisibility() !void {
         player_records[0].position.x = 1;
         player_records[0].position.z = 1;
         players.rebuildIndexes();
-        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
+        const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -1215,8 +1215,8 @@ pub fn benchmarkIdleTerrain() !void {
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 8 }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
+        const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -1339,8 +1339,8 @@ pub fn benchmarkItemBroadcast() !void {
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 2 }, .spawn_world = world, .records = player_records[0..viewers], .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
+        const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         for (0..streaming.published.streams.len) |index| streaming.published.setStream(index, .{ .generation = 1, .life = 1, .setup = .streaming });
@@ -1492,8 +1492,8 @@ pub fn benchmarkBlockPlanning() !void {
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = radius }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
+        const streaming = try Streaming.init(allocator, io, .{ .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -1506,16 +1506,19 @@ pub fn benchmarkBlockPlanning() !void {
         defer background.stop();
         const side: usize = @intCast(players.config.render_distance * 2 + 1);
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
-            stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .cursor = side * side, .delivered = side * side };
+            stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .cursor = side * side, .delivered = side * side, .minimum_section = 0, .section_count = 16 };
             streaming.published.setStream(index, stream.*);
             service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
         }
         @memset(streaming.sent, std.math.maxInt(u64));
+        @memset(streaming.occluded, 0);
+        @memset(streaming.disclosed, std.math.maxInt(u32));
         for (0..3) |pass| {
             service.beginTick();
             try terrain.setBlock(world, .{ .x = 0, .y = 65, .z = 0 }, @intCast(pass + 1));
             blocks.endTick(true);
             service.endTick(true);
+            streaming.epoch = service.backgroundEpoch();
             const before = blocks.planning_words.value();
             try std.testing.expect(try blocks.poll(io));
             const examined = blocks.planning_words.value() - before;
@@ -1538,8 +1541,12 @@ pub fn benchmarkBlockPlanning() !void {
         }
         service.beginTick();
         blocks.correct(world, .{ .x = 0, .y = 65, .z = 0 });
+        blocks.acknowledge(&player_records[0], 40);
+        blocks.acknowledge(&player_records[0], 42);
         blocks.endTick(true);
         service.endTick(true);
+        streaming.epoch = service.backgroundEpoch();
+        @memcpy(streaming.refresh_bits, streaming.sent);
         for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active, .release);
         try std.testing.expect(!try blocks.poll(io));
         for (blocks.observers) |observer| try std.testing.expectEqual(@as(usize, 1), observer.pending);
@@ -1550,6 +1557,16 @@ pub fn benchmarkBlockPlanning() !void {
         try std.testing.expectEqual(@as(usize, 1), packet.recipients.len);
         try std.testing.expectEqual(@as(u16, 0), packet.recipients.first().?.index);
         service.recycle(io, &.{packet});
+        const acknowledgment = retry.next().?;
+        const Protocol = protocols.implementations[0].Protocol;
+        const header = try Protocol.play.toClient.readHeader(acknowledgment.bytes);
+        try std.testing.expectEqual(Protocol.play.toClient.packetId(.acknowledge_player_digging), header.id);
+        const sequence, const done = try Protocol.play.toClient.packet_acknowledge_player_digging.read(header.body).sequenceId();
+        try done.finish();
+        try std.testing.expectEqual(@as(i32, 42), sequence);
+        try std.testing.expectEqual(@as(usize, 1), acknowledgment.recipients.len);
+        try std.testing.expectEqual(@as(usize, 0), acknowledgment.recipients.first().?.index);
+        service.recycle(io, &.{acknowledgment});
         try std.testing.expectEqual(null, retry.next());
         for (blocks.observers, 0..) |observer, index| try std.testing.expectEqual(@as(usize, @intFromBool(index != 0)), observer.pending);
         for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
@@ -1564,6 +1581,37 @@ pub fn benchmarkBlockPlanning() !void {
             try std.testing.expectEqual(null, rest.next());
         }
         for (blocks.observers) |observer| try std.testing.expectEqual(@as(usize, 0), observer.pending);
+        @memset(streaming.refresh_bits, 0);
+
+        if (count > 8) {
+            service.beginTick();
+            for (player_records) |*player| blocks.acknowledge(player, 43);
+            blocks.endTick(true);
+            service.endTick(true);
+            streaming.epoch = service.backgroundEpoch();
+            blocks.next_acknowledgment = 0;
+            for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active, .release);
+            service.credit[count - 1].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+            for (0..std.math.divCeil(usize, count, 8) catch unreachable) |_| _ = try blocks.poll(io);
+            var independent = service.outputBatch();
+            const last = independent.next().?;
+            const last_header = try Protocol.play.toClient.readHeader(last.bytes);
+            try std.testing.expectEqual(Protocol.play.toClient.packetId(.acknowledge_player_digging), last_header.id);
+            try std.testing.expectEqual(@as(usize, 1), last.recipients.len);
+            try std.testing.expectEqual(count - 1, last.recipients.first().?.index);
+            service.recycle(io, &.{last});
+            try std.testing.expectEqual(null, independent.next());
+            try std.testing.expectEqual(@as(i32, -1), blocks.observers[count - 1].sequence);
+            for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+            var attempts: usize = 0;
+            while (blocks.pending_acknowledgments.count != 0) {
+                try std.testing.expect(attempts < count);
+                try std.testing.expect(try blocks.poll(io));
+                var pending = service.outputBatch();
+                while (pending.next()) |ack| service.recycle(io, &.{ack});
+                attempts += 1;
+            }
+        }
 
         service.beginTick();
         const evictions_before = blocks.evictions.load(.monotonic);
@@ -1571,6 +1619,7 @@ pub fn benchmarkBlockPlanning() !void {
         for (0..8) |section| try terrain.setBlock(world, .{ .x = @as(i32, @intCast(section)) * 16, .y = 65, .z = 0 }, 4);
         blocks.endTick(true);
         service.endTick(true);
+        streaming.epoch = service.backgroundEpoch();
         const before = blocks.planning_words.value();
         try std.testing.expect(try blocks.poll(io));
         try std.testing.expect(blocks.planning_words.value() - before <= 64);
@@ -1650,8 +1699,8 @@ pub fn benchmarkItemBoundaries() !void {
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 8 }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
+        const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         for (0..streaming.published.streams.len) |index| streaming.published.setStream(index, .{ .generation = 1, .life = 1, .setup = .streaming });
@@ -1747,8 +1796,8 @@ pub fn benchmarkTerrainBackpressure() !void {
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 8 }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 128, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 128, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
+        const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
 
@@ -1760,11 +1809,15 @@ pub fn benchmarkTerrainBackpressure() !void {
         defer terrain.stop();
         const side: usize = @intCast(players.config.render_distance * 2 + 1);
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
-            stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .cursor = if (mode == .blocks) side * side else 0 };
+            stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .cursor = if (mode == .blocks) side * side else 0, .delivered = if (mode == .blocks) side * side else 0 };
             streaming.published.setStream(index, stream.*);
             service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
         }
         @memset(streaming.sent, if (mode == .blocks) std.math.maxInt(u64) else 0);
+        if (mode == .blocks) {
+            @memset(streaming.occluded, 0);
+            @memset(streaming.disclosed, std.math.maxInt(u32));
+        }
         @memcpy(streaming.published.sent, streaming.sent);
         if (mode == .blocks) {
             service.beginTick();
@@ -1774,6 +1827,7 @@ pub fn benchmarkTerrainBackpressure() !void {
             }
             blocks.endTick(true);
             service.endTick(true);
+            streaming.epoch = service.backgroundEpoch();
         }
         failing.fail_index = failing.alloc_index;
         const handle = player_records[0].handle.?;
@@ -1838,6 +1892,14 @@ pub fn benchmarkTerrainBackpressure() !void {
         for (&reclaimed) |*reservation| reservation.* = try service.reserve(service.config.page_bytes);
         try std.testing.expectError(error.Backpressured, service.reserve(service.config.page_bytes));
         for (&reclaimed) |*reservation| reservation.cancel();
+        service.stop();
+        if (mode == .streaming) {
+            @memset(streaming.stale, std.math.maxInt(u32));
+            for (streaming.refresh_bits, streaming.sent) |*bits, sent| bits.* |= sent;
+            for (streaming.streams) |*stream| stream.cursor = 0;
+            streaming.pending = true;
+            try std.testing.expect(!try streaming.poll(io));
+        }
         try output.interface.print("terrain mode={s} players={d} blocked_passes=64 section_acquisitions=0 backend_reads=0 partial_capacity_sections={d}\n", .{ @tagName(mode), count, sections });
     };
     try output.interface.flush();
@@ -1916,8 +1978,8 @@ pub fn benchmarkSparseTerrainStreaming() !void {
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 8 }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
+        const streaming = try Streaming.init(allocator, io, .{ .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -1941,14 +2003,17 @@ pub fn benchmarkSparseTerrainStreaming() !void {
         streaming.endTick(true);
         service.endTick(true);
         streaming.publish();
-        try background.poll();
         var packets_sent: usize = 0;
-        var batch = service.outputBatch();
-        while (batch.next()) |packet| {
-            packets_sent += 1;
-            try std.testing.expectEqual(@as(usize, 1), packet.recipients.len);
-            try std.testing.expectEqual(@as(usize, 0), packet.recipients.first().?.index);
-            service.recycle(io, &.{packet});
+        for (0..256) |_| {
+            try background.poll();
+            var batch = service.outputBatch();
+            while (batch.next()) |packet| {
+                packets_sent += 1;
+                try std.testing.expectEqual(@as(usize, 1), packet.recipients.len);
+                try std.testing.expectEqual(@as(usize, 0), packet.recipients.first().?.index);
+                service.recycle(io, &.{packet});
+            }
+            if (packets_sent != 0) break;
         }
         try std.testing.expectEqual(@as(usize, 1), packets_sent);
         try std.testing.expectEqual(side * side, streaming.streams[0].cursor);
@@ -2023,8 +2088,8 @@ pub fn benchmarkSparseBlockPlanning() !void {
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = radius }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
+        const streaming = try Streaming.init(allocator, io, .{ .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -2037,16 +2102,19 @@ pub fn benchmarkSparseBlockPlanning() !void {
         defer background.stop();
         const side: usize = @intCast(players.config.render_distance * 2 + 1);
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
-            stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .cursor = side * side, .delivered = side * side, .center = .{ .x = @intCast(index * 64), .z = 0 }, .target = .{ .x = @intCast(index * 64), .z = 0 } };
+            stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .minimum_section = 0, .section_count = 16, .cursor = side * side, .delivered = side * side, .center = .{ .x = @intCast(index * 64), .z = 0 }, .target = .{ .x = @intCast(index * 64), .z = 0 } };
             streaming.published.setStream(index, stream.*);
             service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
         }
         @memset(streaming.sent, std.math.maxInt(u64));
+        @memset(streaming.occluded, 0);
+        @memset(streaming.disclosed, std.math.maxInt(u32));
 
         service.beginTick();
         try terrain.setBlock(world, .{ .x = 0, .y = 65, .z = 0 }, 1);
         blocks.endTick(true);
         service.endTick(true);
+        streaming.epoch = service.backgroundEpoch();
         for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active, .release);
         try std.testing.expect(!try blocks.poll(io));
         for (0..64) |_| {
@@ -2070,6 +2138,7 @@ pub fn benchmarkSparseBlockPlanning() !void {
         blocks.correct(world, .{ .x = 0, .y = 65, .z = 0 });
         blocks.endTick(true);
         service.endTick(true);
+        streaming.epoch = service.backgroundEpoch();
         service.credit[0].store((@as(u64, 1) << 32) | sessions.Service.active, .release);
         try std.testing.expect(!try blocks.poll(io));
         player_records[0].handle = null;
@@ -2077,6 +2146,7 @@ pub fn benchmarkSparseBlockPlanning() !void {
         service.beginTick();
         blocks.endTick(true);
         service.endTick(true);
+        streaming.epoch = service.backgroundEpoch();
         try std.testing.expect(!try blocks.poll(io));
         try std.testing.expect(!blocks.selections.row(0).view().any());
         try std.testing.expectEqual(@as(usize, 0), blocks.observers[0].pending);
@@ -2086,6 +2156,7 @@ pub fn benchmarkSparseBlockPlanning() !void {
         blocks.correct(world, .{ .x = 0, .y = 65, .z = 0 });
         blocks.endTick(true);
         service.endTick(true);
+        streaming.epoch = service.backgroundEpoch();
         try std.testing.expect(!try blocks.poll(io));
         try std.testing.expect(!blocks.selections.row(0).view().any());
         try std.testing.expectEqual(@as(u32, 2), blocks.observers[0].generation);
@@ -2127,8 +2198,8 @@ pub fn verifyBlockBatchRetirement() !void {
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = radius }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_tiles = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
+        const streaming = try Streaming.init(allocator, io, .{ .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -2141,11 +2212,13 @@ pub fn verifyBlockBatchRetirement() !void {
         defer background.stop();
         const side: usize = @intCast(players.config.render_distance * 2 + 1);
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
-            stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .cursor = side * side, .delivered = side * side };
+            stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .minimum_section = 0, .section_count = 16, .cursor = side * side, .delivered = side * side };
             streaming.published.setStream(index, stream.*);
             service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
         }
         @memset(streaming.sent, std.math.maxInt(u64));
+        @memset(streaming.occluded, 0);
+        @memset(streaming.disclosed, std.math.maxInt(u32));
 
         const section = chunks.sectionAt(world, .{ .x = 0, .y = 65, .z = 0 });
         for (0..3) |round| {
@@ -2154,6 +2227,7 @@ pub fn verifyBlockBatchRetirement() !void {
             try terrain.setBlock(world, .{ .x = 0, .y = 65, .z = 0 }, @intCast(round + 1));
             blocks.endTick(true);
             service.endTick(true);
+            streaming.epoch = service.backgroundEpoch();
             try std.testing.expect(!try blocks.poll(io));
             try std.testing.expectEqual(@as(usize, 1), blocks.delta_index.count());
             const slot = blocks.delta_index.get(section).?;

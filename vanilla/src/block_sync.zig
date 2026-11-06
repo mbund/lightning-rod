@@ -32,6 +32,7 @@ pub const BlockSynchronization = struct {
         life: u32 = 0,
         world: u32 = 0,
         pending: usize = 0,
+        sequence: i32 = -1,
         cursor: usize = 0,
         pending_bits: []u64 = &.{},
         full_bits: []u64 = &.{},
@@ -75,12 +76,15 @@ pub const BlockSynchronization = struct {
 
     const Changes = struct {
         const State = struct { generation: u32 = 0, life: u32 = 0, world: u32 = 0 };
+        const Acknowledgment = struct { state: State, sequence: i32 };
         entries: []Delta,
         masks: [][64]u64,
         index: std.AutoHashMapUnmanaged(chunks.Section, usize),
         count: usize = 0,
         full_players: bit_sets.Matrix,
         full_states: []State,
+        acknowledgments: []Acknowledgment,
+        acknowledging: lightning_rod.system.IndexSet,
         full_bits: []u64,
         dirty_words: std.DynamicBitSetUnmanaged,
         words: usize,
@@ -96,12 +100,13 @@ pub const BlockSynchronization = struct {
             const full_bits = try allocator.alloc(u64, players * words);
             @memset(full_bits, 0);
             const dirty_words = try std.DynamicBitSetUnmanaged.initEmpty(allocator, full_bits.len);
-            return .{ .full_players = try bit_sets.Matrix.init(allocator, 1, players), .entries = entries, .masks = masks, .index = index, .full_states = full_states, .full_bits = full_bits, .dirty_words = dirty_words, .words = words };
+            return .{ .full_players = try bit_sets.Matrix.init(allocator, 1, players), .acknowledging = try lightning_rod.system.IndexSet.init(allocator, players), .entries = entries, .masks = masks, .index = index, .full_states = full_states, .acknowledgments = try allocator.alloc(Acknowledgment, players), .full_bits = full_bits, .dirty_words = dirty_words, .words = words };
         }
 
         fn clear(self: *Changes) void {
             if (self.count != 0) self.index.clearRetainingCapacity();
             self.count = 0;
+            self.acknowledging.clear();
             if (!self.full_players.row(0).view().any()) return;
             var dirty = self.dirty_words.iterator(.{});
             while (dirty.next()) |word| self.full_bits[word] = 0;
@@ -123,6 +128,15 @@ pub const BlockSynchronization = struct {
             self.count += 1;
             assert(self.index.count() == self.count);
             return true;
+        }
+
+        fn acknowledge(self: *Changes, player: usize, value: Acknowledgment) void {
+            assert(player < self.acknowledgments.len and value.state.generation != 0 and value.sequence >= 0);
+            const previous = &self.acknowledgments[player];
+            if (self.acknowledging.contains(player) and std.meta.eql(previous.state, value.state)) {
+                previous.sequence = @max(previous.sequence, value.sequence);
+            } else previous.* = value;
+            self.acknowledging.insert(player);
         }
 
         fn row(self: *Changes, player: usize, state: State) void {
@@ -147,7 +161,7 @@ pub const BlockSynchronization = struct {
 
         fn overflow(self: *Changes, section: chunks.Section, players: *const Players, side: i32) void {
             if (section.y < -4 or section.y >= 20) return;
-            const radius = players.config.render_distance;
+            const radius = @divTrunc(side - 1, 2);
             var nearby = players.nearby(section.world, .{ .x = @as(f64, @floatFromInt(section.x)) * 16, .y = 0, .z = @as(f64, @floatFromInt(section.z)) * 16 }, radius);
             while (nearby.next()) |index| {
                 const player = players.records[index];
@@ -167,6 +181,7 @@ pub const BlockSynchronization = struct {
                 self.full_bits[word] |= other.full_bits[word];
                 self.dirty_words.set(word);
             }
+            for (other.acknowledging.values()) |index| self.acknowledge(index, other.acknowledgments[index]);
         }
     };
     const Published = struct {
@@ -200,6 +215,8 @@ pub const BlockSynchronization = struct {
     selections: bit_sets.Matrix,
     remaining: []usize,
     covered: []u8,
+    pending_acknowledgments: lightning_rod.system.IndexSet,
+    next_acknowledgment: usize = 0,
     next_delta: usize = 0,
     next_player: usize = 0,
     packets: std.atomic.Value(u64) = .init(0),
@@ -219,7 +236,7 @@ pub const BlockSynchronization = struct {
 
         const self = try allocator.create(BlockSynchronization);
         const observers = try allocator.alloc(Observer, deps.players.records.len);
-        const side = deps.players.config.render_distance * 2 + 1;
+        const side = deps.streaming.deliveryRadius() * 2 + 1;
         const words = (@as(usize, @intCast(side * side)) * 24 + 63) / 64;
         for (observers, deps.players.records) |*observer, player| observer.* = .{ .life = player.life, .nonempty = try .initEmpty(allocator, words) };
         const pending = try allocator.alloc(u64, words * observers.len);
@@ -239,6 +256,7 @@ pub const BlockSynchronization = struct {
         self.* = .{
             .io = io,
             .selections = try bit_sets.Matrix.init(allocator, 3, observers.len),
+            .pending_acknowledgments = try lightning_rod.system.IndexSet.init(allocator, observers.len),
             .remaining = try allocator.alloc(usize, observers.len),
             .covered = try allocator.alloc(u8, observers.len),
             .native_io = io,
@@ -271,6 +289,12 @@ pub const BlockSynchronization = struct {
 
     pub fn correct(self: *BlockSynchronization, world: u32, position: chunks.Position) void {
         changed(self, chunks.sectionAt(world, position), &.{.{ .index = chunks.localIndex(position), .state = 0 }});
+    }
+
+    pub fn acknowledge(self: *BlockSynchronization, player: *const Players.Player, sequence: i32) void {
+        if (sequence < 0) return;
+        const handle = player.handle.?;
+        self.staged.acknowledge(handle.index, .{ .state = .{ .generation = handle.generation, .life = player.life, .world = player.world }, .sequence = sequence });
     }
 
     fn changed(self: *BlockSynchronization, section: chunks.Section, edits: []const chunks.BlockEdit) void {
@@ -359,8 +383,8 @@ pub const BlockSynchronization = struct {
         const published = self.published;
         published.mutex.lockUncancelable(self.native_io);
         defer published.mutex.unlock(self.native_io);
-        var updated = self.staged.count != 0 or self.staged.full_players.row(0).view().any();
-        if (published.changes.count == 0 and !published.changes.full_players.row(0).view().any()) {
+        var updated = self.staged.count != 0 or self.staged.full_players.row(0).view().any() or self.staged.acknowledging.count != 0;
+        if (published.changes.count == 0 and !published.changes.full_players.row(0).view().any() and published.changes.acknowledging.count == 0) {
             std.mem.swap(Changes, &self.staged, &published.changes);
         } else {
             for (self.staged.entries[0..self.staged.count], self.staged.masks[0..self.staged.count]) |entry, *mask|
@@ -398,7 +422,7 @@ pub const BlockSynchronization = struct {
         {
             published.mutex.lockUncancelable(self.native_io);
             defer published.mutex.unlock(self.native_io);
-            if (published.epoch != self.deps.sessions.backgroundEpoch() or published.epoch & 1 != 0) return false;
+            if (published.epoch != self.deps.sessions.backgroundEpoch() or published.epoch != self.deps.streaming.epoch or published.epoch & 1 != 0) return false;
             if (self.epoch != published.epoch) std.mem.swap([]Streaming.View, &self.views, &published.views);
             self.epoch = published.epoch;
             std.mem.swap(lightning_rod.system.IndexSet, &self.changed_views, &published.changed_views);
@@ -420,9 +444,10 @@ pub const BlockSynchronization = struct {
         if (!self.deps.chunks.ownsCurrentThread()) return error.InvalidChunkOwner;
         defer self.deps.sessions.retryBackground(self.epoch);
         const progressed = try self.sendBatch(io, 8);
+        const acknowledged = try self.sendAcknowledgments();
         self.deps.sessions.flush();
-        if (progressed) self.changed_event.set(io);
-        return progressed;
+        if (progressed or acknowledged) self.changed_event.set(io);
+        return progressed or acknowledged;
     }
 
     fn sendBatch(self: *BlockSynchronization, _: std.Io, maximum_items: usize) !bool {
@@ -450,13 +475,20 @@ pub const BlockSynchronization = struct {
             observer.full_bits[word] |= bits;
             if (observer.pending != 0) self.selections.row(0).insert(index);
         }
+        for (self.incoming.acknowledging.values()) |index| {
+            const view = self.views[index];
+            const handle = view.handle orelse continue;
+            const acknowledgment = self.incoming.acknowledgments[index];
+            if (acknowledgment.state.generation != handle.generation or acknowledgment.state.life != view.life or acknowledgment.state.world != view.world) continue;
+            self.observers[index].sequence = @max(self.observers[index].sequence, acknowledgment.sequence);
+            self.pending_acknowledgments.insert(index);
+        }
         if (!self.selections.row(0).view().any()) return false;
-        const players = self.deps.players;
         const service = self.deps.sessions;
         assert(maximum_items > 0 and maximum_items <= 8);
         var advanced = false;
         var completed: usize = 0;
-        const Plan = struct { section: chunks.Section, protocol: i32, full: bool, slot: ?usize, bit: usize, changed: i32, mask: *const [64]u64, recipients: []sessions.Handle };
+        const Plan = struct { section: chunks.Section, protocol: i32, full: bool, slot: ?usize, bit: usize, changed: i32, mask: *const [64]u64, recipients: []sessions.Handle, owner: usize };
         var plans: [8]Plan = undefined;
         var capacities: [8]usize = undefined;
         var planned: usize = 0;
@@ -507,7 +539,7 @@ pub const BlockSynchronization = struct {
             observer.cursor = (at + 1) % (@as(usize, @intCast(self.side * self.side)) * 24);
             const flag = @as(u64, 1) << @intCast(at % 64);
             const center = self.deps.streaming.streams[selected].center;
-            const radius = players.config.render_distance;
+            const radius = @divTrunc(self.side - 1, 2);
             const x = center.x - radius;
             const z = center.z - radius;
             const cell: i32 = @intCast(at / 24);
@@ -518,7 +550,14 @@ pub const BlockSynchronization = struct {
                 .z = z + @mod(@divTrunc(cell, self.side) - @mod(z, self.side), self.side),
             };
             assert(sectionBit(self.side, section) == at);
-            if (!self.deps.streaming.visibleView(selected, player, section.world, section.x, section.z)) {
+            const visible = self.deps.streaming.visibleView(selected, player, section.world, section.x, section.z);
+            const column: Streaming.Position = .{ .x = section.x, .z = section.z };
+            if (visible and !self.deps.streaming.visibilityReady(selected, column)) {
+                candidates.remove(selected);
+                continue;
+            }
+            if (!visible or !self.deps.streaming.sectionVisible(selected, section)) {
+                if (visible) self.deps.streaming.invalidateSection(selected, section);
                 observer.pending_bits[at / 64] &= ~flag;
                 if (observer.pending_bits[at / 64] == 0) observer.nonempty.unset(at / 64);
                 observer.full_bits[at / 64] &= ~flag;
@@ -545,6 +584,8 @@ pub const BlockSynchronization = struct {
 
             var watchers = self.deps.streaming.visibleObservers(self.views, section.world, section.x, section.z);
             while (watchers.next()) |index| {
+                if (!self.deps.streaming.sectionVisible(index, section)) continue;
+                if (!self.deps.streaming.visibilityReady(index, column)) continue;
                 const recipient = self.views[index];
                 const handle = recipient.handle.?;
                 assert(recipient.world == section.world);
@@ -588,7 +629,7 @@ pub const BlockSynchronization = struct {
                 if (remaining[index] == 0) candidates.remove(index);
             }
 
-            plans[planned] = .{ .section = section, .protocol = player.protocol, .full = full, .slot = slot, .bit = at, .changed = changed_count, .mask = mask, .recipients = recipients[0..ready] };
+            plans[planned] = .{ .section = section, .protocol = player.protocol, .full = full, .slot = slot, .bit = at, .changed = changed_count, .mask = mask, .recipients = recipients[0..ready], .owner = selected };
             capacities[planned] = capacity;
             planned += 1;
             completed += 1;
@@ -630,11 +671,37 @@ pub const BlockSynchronization = struct {
         if (reserved == 0) return advanced;
         var publications: [8]sessions.Service.Publication = undefined;
         var admitted: [8]usize = undefined;
-        for (plans[0..reserved], leases[0..reserved], output[0..reserved], publications[0..reserved]) |plan, lease, *packet, *publication| {
-            const bytes = try self.deps.packets.writePacket(writeChanges, plan.protocol, packet.bytes, .{ plan.section, lease.view(), plan.mask });
-            publication.* = .{ .packet = packet, .length = bytes.len, .recipients = plan.recipients };
+        var filtered: [8][64]u64 = undefined;
+        var send: [8]sessions.Service.Publication = undefined;
+        var send_indices: [8]usize = undefined;
+        var send_count: usize = 0;
+        for (plans[0..reserved], leases[0..reserved], output[0..reserved], publications[0..reserved], 0..) |*plan, lease, *packet, *publication, index| {
+            admitted[index] = 0;
+            publication.* = .{ .packet = packet, .length = 0, .recipients = plan.recipients };
+            if (!self.deps.streaming.sectionMaskForChanges(plan.owner, plan.section, &filtered[index])) {
+                packet.cancel();
+                continue;
+            }
+            var changed_count: i32 = 0;
+            for (&filtered[index], plan.mask) |*visible, changed_bits| {
+                visible.* &= changed_bits;
+                changed_count += @popCount(visible.*);
+            }
+            plan.changed = changed_count;
+            if (changed_count == 0) {
+                packet.cancel();
+                admitted[index] = plan.recipients.len;
+                continue;
+            }
+            const bytes = try self.deps.packets.writePacket(writeChanges, plan.protocol, packet.bytes, .{ plan.section, lease.view(), &filtered[index] });
+            publication.length = bytes.len;
+            send[send_count] = publication.*;
+            send_indices[send_count] = index;
+            send_count += 1;
         }
-        service.publishManyReady(publications[0..reserved], admitted[0..reserved]);
+        var sent: [8]usize = undefined;
+        service.publishManyReady(send[0..send_count], sent[0..send_count]);
+        for (send_indices[0..send_count], sent[0..send_count]) |index, count| admitted[index] = count;
         const Retirement = struct { slot: usize, section: chunks.Section, bit: usize, delta_delivered: bool = false };
         var retirements: [8]Retirement = undefined;
         var retiring: usize = 0;
@@ -658,8 +725,8 @@ pub const BlockSynchronization = struct {
             }
 
             if (accepted.len > 0) {
-                _ = self.packets.fetchAdd(1, .monotonic);
-                _ = self.full_sections.fetchAdd(@intFromBool(full), .monotonic);
+                _ = self.packets.fetchAdd(@intFromBool(changed_count != 0), .monotonic);
+                _ = self.full_sections.fetchAdd(@intFromBool(full and changed_count != 0), .monotonic);
                 _ = self.blocks.fetchAdd(@intCast(changed_count), .monotonic);
                 advanced = true;
             }
@@ -709,8 +776,68 @@ pub const BlockSynchronization = struct {
         return advanced;
     }
 
+    fn sendAcknowledgments(self: *BlockSynchronization) !bool {
+        const service = self.deps.sessions;
+        if (self.epoch & 1 != 0 or self.epoch != service.backgroundEpoch()) return false;
+        var indices: [8]usize = undefined;
+        var recipients: [8][1]sessions.Handle = undefined;
+        var count: usize = 0;
+        var remaining = self.pending_acknowledgments.count;
+        while (remaining != 0) {
+            remaining -= 1;
+            self.next_acknowledgment %= self.pending_acknowledgments.count;
+            const index = self.pending_acknowledgments.indices[self.next_acknowledgment];
+            const view = self.views[index];
+            const observer = &self.observers[index];
+            if (view.handle == null or !view.ready or observer.generation != view.handle.?.generation or observer.life != view.life or observer.world != view.world) {
+                self.pending_acknowledgments.remove(index);
+                observer.sequence = -1;
+                continue;
+            }
+            self.next_acknowledgment += 1;
+            assert(observer.sequence >= 0);
+            if (observer.pending != 0) continue;
+            indices[count] = index;
+            recipients[count] = .{view.handle.?};
+            count += 1;
+            if (count == indices.len) break;
+        }
+        if (count == 0) return false;
+        var output: [8]sessions.Service.Packet = undefined;
+        const capacities: [8]usize = @splat(16);
+        const reserved = service.reserveBatch(capacities[0..count], output[0..count]) catch |err| switch (err) {
+            error.Closed => return false,
+            else => return err,
+        };
+        defer for (output[0..reserved]) |*packet| packet.cancel();
+        var publications: [8]sessions.Service.Publication = undefined;
+        var accepted: [8]usize = undefined;
+        for (indices[0..reserved], output[0..reserved], 0..) |index, *packet, i| {
+            packet.epoch = self.epoch;
+            const bytes = try self.deps.packets.writePacket(writeAcknowledgment, self.views[index].protocol, packet.bytes, .{self.observers[index].sequence});
+            publications[i] = .{ .packet = packet, .length = bytes.len, .recipients = &recipients[i] };
+        }
+        service.publishManyReady(publications[0..reserved], accepted[0..reserved]);
+        var progressed = false;
+        for (indices[0..reserved], accepted[0..reserved]) |index, admitted| {
+            assert(admitted <= 1);
+            if (admitted == 0) continue;
+            assert(self.observers[index].pending == 0);
+            self.observers[index].sequence = -1;
+            self.pending_acknowledgments.remove(index);
+            progressed = true;
+        }
+        return progressed;
+    }
+
+    fn writeAcknowledgment(packet: wire_1_21_5.play.toClient.packet_acknowledge_player_digging.Writer, sequence: i32) ![]u8 {
+        assert(sequence >= 0);
+        return (try packet.sequenceId(sequence)).finish();
+    }
+
     fn resetObserver(self: *BlockSynchronization, index: usize, generation: u32, life: u32, world: u32) void {
         self.selections.row(0).remove(index);
+        self.pending_acknowledgments.remove(index);
         const count = if (generation == 0) 0 else self.words;
         const pending = self.pending[index * self.words ..][0..count];
         const full = self.full[index * self.words ..][0..count];
@@ -750,6 +877,29 @@ pub const BlockSynchronization = struct {
 fn sectionBit(side: i32, section: chunks.Section) usize {
     assert(section.y >= -4 and section.y < 20);
     return @as(usize, @intCast(@mod(section.z, side) * side + @mod(section.x, side))) * 24 + @as(usize, @intCast(section.y + 4));
+}
+
+test "block acknowledgments coalesce within a player lifetime and discard aborted publications" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var changes = try BlockSynchronization.Changes.init(arena.allocator(), 1, 2, 1);
+    var following = try BlockSynchronization.Changes.init(arena.allocator(), 1, 2, 1);
+    const state: BlockSynchronization.Changes.State = .{ .generation = 1, .life = 2, .world = 3 };
+    changes.acknowledge(0, .{ .state = state, .sequence = 4 });
+    changes.acknowledge(0, .{ .state = state, .sequence = 2 });
+    try std.testing.expectEqual(@as(i32, 4), changes.acknowledgments[0].sequence);
+    following.acknowledge(0, .{ .state = state, .sequence = 6 });
+    changes.merge(&following);
+    try std.testing.expectEqual(@as(i32, 6), changes.acknowledgments[0].sequence);
+    try std.testing.expect(!changes.full_players.row(0).view().any());
+    following.clear();
+    try std.testing.expect(following.acknowledging.count == 0);
+    following.acknowledge(0, .{ .state = .{ .generation = 2 }, .sequence = 1 });
+    changes.merge(&following);
+    try std.testing.expectEqual(@as(i32, 1), changes.acknowledgments[0].sequence);
+    try std.testing.expectEqual(@as(u32, 2), changes.acknowledgments[0].state.generation);
+    changes.clear();
+    try std.testing.expect(changes.acknowledging.count == 0);
 }
 
 test "pending section selection wraps and excludes planned work across sparse words" {
@@ -845,4 +995,38 @@ test "a saturated block queue marks only the changed section for matching viewer
     try std.testing.expectEqual(@as(usize, 1), changes.full_players.row(0).view().count());
     try std.testing.expect(changes.full_players.row(0).view().contains(0));
     try std.testing.expectEqual(@as(usize, 2), changes.count);
+}
+
+test "block publication waits for visibility from the same completed tick" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var service: sessions.Service = undefined;
+    service.epoch = .init(2);
+    var streaming: Streaming = undefined;
+    streaming.epoch = 0;
+    var published: BlockSynchronization.Published = .{
+        .changes = try BlockSynchronization.Changes.init(allocator, 1, 1, 1),
+        .views = &.{},
+        .changed_views = try lightning_rod.system.IndexSet.init(allocator, 1),
+        .epoch = 2,
+    };
+    const changed: chunks.Section = .{ .world = 0, .x = 1, .y = 3, .z = 1 };
+    try std.testing.expect(published.changes.append(changed, &all_blocks));
+    var blocks: BlockSynchronization = undefined;
+    blocks.native_io = std.testing.io;
+    blocks.published = &published;
+    blocks.changed_views = try lightning_rod.system.IndexSet.init(allocator, 1);
+    blocks.incoming = try BlockSynchronization.Changes.init(allocator, 1, 1, 1);
+    blocks.views = &.{};
+    blocks.epoch = 0;
+    blocks.deps = .{ .metrics = undefined, .chunks = undefined, .players = undefined, .streaming = &streaming, .sessions = &service, .packets = undefined, .worlds = undefined };
+    try std.testing.expect(!blocks.receive());
+    try std.testing.expectEqual(@as(usize, 1), published.changes.count);
+    try std.testing.expectEqual(@as(usize, 0), blocks.incoming.count);
+    streaming.epoch = 2;
+    try std.testing.expect(blocks.receive());
+    try std.testing.expectEqual(@as(usize, 0), published.changes.count);
+    try std.testing.expectEqual(@as(usize, 1), blocks.incoming.count);
+    try std.testing.expectEqual(changed, blocks.incoming.entries[0].section);
 }

@@ -3,6 +3,7 @@ const nbt = @import("nbt");
 const anvil = @import("anvil.zig");
 const corpus = @import("corpus.zig");
 const common = @import("common.zig");
+const generator_commands = @import("generator_commands.zig");
 
 const origins = corpus.origins;
 const password = "lightning-rod-benchmark";
@@ -80,7 +81,16 @@ fn generate(init: std.process.Init, options: Options, work: []const u8, world: [
     defer control.stream.close(init.io);
     try control.command(init.io, 3, password);
     try control.command(init.io, 2, "forceload remove all");
-    try control.command(init.io, 2, "gamerule random_tick_speed 0");
+    {
+        const report_path = try std.fs.path.join(init.arena.allocator(), &.{ work, "generated/reports/commands.json" });
+        const report = try common.readFile(init.gpa, init.io, report_path, 32 * 1024 * 1024);
+        defer init.gpa.free(report);
+        const parsed = try std.json.parseFromSlice(std.json.Value, init.gpa, report, .{});
+        defer parsed.deinit();
+        const rule = try generator_commands.randomTickRule(parsed.value);
+        var command: [256]u8 = undefined;
+        try control.command(init.io, 2, try std.fmt.bufPrint(&command, "gamerule {s} 0", .{rule}));
+    }
     var reader = try anvil.Reader.init(init.gpa, init.io, world, options.data_version);
     defer {
         init.gpa.free(reader.region);
@@ -237,7 +247,7 @@ pub fn main(init: std.process.Init) !void {
     const registry = if (options.registry) |path| try std.fs.path.resolve(allocator, &.{path}) else try std.fs.path.join(allocator, &.{ work, "generated/reports/blocks.json" });
     if (options.server) |path| {
         const server = try std.fs.path.resolve(allocator, &.{path});
-        if (options.registry == null) try checkedRun(init, &.{ "java", "-DbundlerMainClass=net.minecraft.data.Main", "-jar", server, "--reports", "--output", "generated" }, work, try std.fs.path.join(allocator, &.{ work, "reports.log" }));
+        if (options.registry == null or options.world == null) try checkedRun(init, &.{ "java", "-DbundlerMainClass=net.minecraft.data.Main", "-jar", server, "--reports", "--output", "generated" }, work, try std.fs.path.join(allocator, &.{ work, "reports.log" }));
         if (options.world == null) try generate(init, options, work, world, server);
     } else if (options.world == null or options.registry == null) {
         std.debug.print("Use --server /absolute/path/server.jar to pregenerate, or --world PATH --registry blocks.json to import.\n", .{});

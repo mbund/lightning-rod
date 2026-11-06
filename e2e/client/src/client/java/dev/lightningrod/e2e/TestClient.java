@@ -99,6 +99,11 @@ final class TestClient {
         screenshots.put(name, capture);
         return capture;
     }
+    void snapshot(String name) {
+        if (screenshots.containsKey(name)) return;
+        if (screenshots.size() == 256) throw new IllegalStateException("screenshot capacity exceeded");
+        screenshots.put(name, recorder.screenshot(name));
+    }
     void send(String message) {
         sender.accept(new Message(message));
         recorder.event("fixture_sent", "message", message);

@@ -1939,6 +1939,51 @@ test "cache misses and read completions each notify a blocked maintenance owner"
     store.resources.mutex.unlock(io);
 }
 
+test "streaming payload reads preserve hot pages and observe current WAL images" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/streaming-cache", .{temporary.sub_path});
+    var memory = storage.system.Memory.init(std.testing.allocator, io);
+    defer memory.deinit();
+    const allocator = memory.allocator("storage");
+    const resources = try storage.Resources.init(allocator, io, .{ .cache_pages = 1, .io_mode = .standard });
+    defer resources.deinit();
+    var store = try storage.Store.init(allocator, io, .{ .path = path, .resources = resources, .io_mode = .standard, .maximum_wal_pages = 128 });
+    defer store.deinit();
+    const space = try store.openSpace("pages");
+    var ids: [8]storage.PageId = undefined;
+    try space.allocatePages(&ids);
+    for (ids, 0..) |id, index| try space.writePages(&.{.{ .id = id, .source = &.{@intCast(index)} }});
+    try store.waitDurable(try store.commit(1));
+    memory.seal();
+
+    var hot: [1]u8 = undefined;
+    try space.readPages(&.{.{ .id = ids[0], .destination = &hot }});
+    const version = resources.cache[0].generation;
+    var outputs: [8][1]u8 = undefined;
+    var reads: [8]storage.Read = undefined;
+    for (ids, &outputs, &reads) |id, *output, *read| read.* = .{ .id = id, .destination = output, .cache = .stream };
+    for (0..4) |_| {
+        try space.readPages(&reads);
+        for (outputs, 0..) |output, index| try std.testing.expectEqual(@as(u8, @intCast(index)), output[0]);
+        try std.testing.expectEqual(version, resources.cache[0].generation);
+        try std.testing.expectEqual(@backingInt(ids[0]), resources.cache[0].id);
+        try std.testing.expect(resources.cache[0].loaded);
+        try std.testing.expectEqual(@as(usize, 1), resources.cache_index.count());
+    }
+
+    try space.writePages(&.{.{ .id = ids[0], .source = &.{99} }});
+    try space.readPages(&reads);
+    try std.testing.expectEqual(@as(u8, 99), outputs[0][0]);
+    try space.writePages(&.{.{ .id = ids[1], .source = &.{88} }});
+    try space.readPages(&reads);
+    try std.testing.expectEqual(@as(u8, 99), outputs[0][0]);
+    try std.testing.expectEqual(@as(u8, 88), outputs[1][0]);
+    for (outputs[2..], 2..) |output, index| try std.testing.expectEqual(@as(u8, @intCast(index)), output[0]);
+}
+
 test "cache indexing preserves database identity and pinned versions under sealed churn" {
     const io = std.testing.io;
     for ([_]usize{ 1, 2, 7 }) |capacity| {
@@ -2083,4 +2128,29 @@ test "concurrent cache publication preserves both leases and indexes the current
     try std.testing.expectEqualSlices(u8, &second, &actual);
     try std.testing.expectEqualSlices(u8, &first, foreground[0].bytes());
     try std.testing.expectEqualSlices(u8, &first, reader.leases[0].bytes());
+}
+
+test "WAL index pressure recycles small committed transactions before the byte threshold" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/index-pressure", .{directory.sub_path});
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var store = try storage.Store.init(failing.allocator(), std.testing.io, .{ .path = path, .io_mode = .standard, .maximum_wal_pages = 128 });
+    defer store.deinit();
+    const space = try store.openSpace("pressure");
+    failing.fail_index = failing.alloc_index;
+    const page: storage.Page = @splat(7);
+    for (1..200) |tick| {
+        var ids: [1]storage.PageId = undefined;
+        try space.allocatePages(&ids);
+        try space.writePages(&.{.{ .id = ids[0], .source = &page }});
+        try store.waitDurable(try store.commit(tick));
+        for (0..128) |_| {
+            const result = try store.pollMaintenance(.{ .pages = storage.batch_size, .index_entries = 4096 });
+            if (result == .idle) break;
+        } else return error.MaintenanceStalled;
+    }
+    try std.testing.expectEqual(@as(u64, 199), store.lastTick());
+    try std.testing.expectEqual(failing.fail_index, failing.alloc_index);
 }

@@ -5,7 +5,8 @@ const reload = @import("reload");
 const assert = std.debug.assert;
 
 const section_name = ".lightning_rod.resume";
-pub const manifest = reload.handoff.manifest;
+// Executable compatibility also covers persisted state, independently of the frozen handoff codec.
+pub const manifest: [16]u8 = reload.handoff.manifest[0..12].* ++ [_]u8{ 2, 0, 0, 0 };
 
 pub const Service = struct {
     request: reload.Request,

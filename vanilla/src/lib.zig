@@ -1,3 +1,4 @@
+const game_data = @import("game_data");
 pub const smelting = @import("smelting.zig");
 pub const enchantment_effects = @import("enchantment_effects.zig");
 pub const placement_behavior = @import("placement_behavior.zig");
@@ -27,6 +28,7 @@ pub const LoginCompression = @import("session_compression.zig").LoginCompression
 pub const Disconnect = @import("session_disconnect.zig").Disconnect;
 pub const Bossbars = @import("bossbars.zig").Bossbars;
 pub const Players = @import("players.zig").Players;
+pub const Spawn = @import("spawn.zig").Spawn;
 pub const Time = @import("time.zig").Time;
 pub const TimeCommands = @import("time_commands.zig").TimeCommands;
 pub const Weather = @import("weather.zig").Weather;
@@ -36,6 +38,7 @@ pub const VanillaWorlds = @import("default_worlds.zig").VanillaWorlds;
 pub const Operators = @import("operators.zig").Operators;
 pub const TeleportCommands = @import("teleport_commands.zig").TeleportCommands;
 pub const GamemodeCommands = @import("gamemode_commands.zig").GamemodeCommands;
+pub const RegionDebug = @import("region_debug.zig").RegionDebug;
 pub const Input = @import("input.zig").Input;
 pub const Chat = @import("chat.zig").Chat;
 pub const ChatInput = @import("chat_input.zig").ChatInput;
@@ -100,6 +103,9 @@ pub const BlockLoot = @import("block_loot.zig").BlockLoot;
 pub const Mining = @import("mining.zig").Mining;
 pub const Placement = @import("placement.zig").Placement;
 pub const BlockActions = @import("block_actions.zig").BlockActions;
+pub const container_storage = @import("containers.zig");
+pub const furnace_state = @import("furnace.zig");
+pub const content_components = @import("content_components.zig");
 pub const Containers = @import("containers.zig").Containers;
 pub const Doors = @import("doors.zig").Doors;
 pub const Equipment = @import("equipment.zig").Equipment;
@@ -137,6 +143,8 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(PayloadChannels.Play, PayloadChannels.Play.Configuration{}),
     lightning_rod.plugin.configured(Worlds, Worlds.Configuration{}),
     lightning_rod.plugin.configured(VanillaWorlds, VanillaWorlds.Configuration{}),
+    lightning_rod.plugin.configured(Chunks, Chunks.Configuration{}),
+    lightning_rod.plugin.configured(Spawn, Spawn.Configuration{}),
     lightning_rod.plugin.configured(Players, Players.Configuration{}),
     lightning_rod.plugin.configured(Visibility, Visibility.Configuration{}),
     lightning_rod.plugin.configured(Bossbars, Bossbars.Configuration{}),
@@ -154,8 +162,6 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Reload, Reload.Configuration{}),
     lightning_rod.plugin.configured(ReloadCommands, ReloadCommands.Configuration{}),
     lightning_rod.plugin.configured(CommandDispatch, CommandDispatch.Configuration{}),
-    lightning_rod.plugin.configured(Replication, Replication.Configuration{}),
-    lightning_rod.plugin.configured(Chunks, Chunks.Configuration{}),
     lightning_rod.plugin.configured(Entities, Entities.Configuration{}),
     lightning_rod.plugin.configured(InventoryCapacity, .{}),
     lightning_rod.plugin.configured(Inventories, Inventories.Configuration{ .cache_items = crafting.maximum_inputs + 1 }),
@@ -186,6 +192,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Flat, Flat.Configuration{}),
     lightning_rod.plugin.configured(Lighting, Lighting.Configuration{}),
     lightning_rod.plugin.configured(Streaming, Streaming.Configuration{}),
+    lightning_rod.plugin.configured(Replication, Replication.Configuration{}),
     lightning_rod.plugin.configured(ExperienceReplication, .{}),
     lightning_rod.plugin.configured(BlockSynchronization, BlockSynchronization.Configuration{}),
     lightning_rod.plugin.configured(ItemUse, .{}),

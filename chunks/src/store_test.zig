@@ -1,4 +1,5 @@
 const std = @import("std");
+const light = @import("light.zig");
 const storage = @import("storage");
 const records = @import("records");
 const metrics = @import("metrics");
@@ -6,6 +7,76 @@ const fault = @import("fault_disk");
 const chunks = @import("chunks.zig");
 const encoding = @import("encoding.zig");
 const ChunkStore = @import("store.zig").Store;
+
+fn lightSnapshot(store: *ChunkStore, column: light.Column, destination: ?[]u8, revisions: *[9]u64) !?usize {
+    var snapshots: [1]light.Snapshot = .{.{ .length = null, .revisions = undefined, .clean = true }};
+    try store.lightSnapshots(&.{.{ .column = column, .minimum = 0, .count = 1, .destination = destination }}, &snapshots);
+    revisions.* = snapshots[0].revisions;
+    return snapshots[0].length;
+}
+
+test "lighting dependencies recover with terrain and distinguish neighboring from distant writes" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/light-recovery", .{temporary.sub_path});
+    const column: light.Column = .{ .world = 0, .x = 0, .z = 0 };
+    var expected: [9]u64 = undefined;
+    for (0..4) |phase| {
+        var database = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
+        defer database.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .capacity = 16 });
+        defer registry.deinit();
+        var store = try ChunkStore.init(arena.allocator(), io, try database.openSpace(chunks.Chunks.id), 2, &registry, try records.Resources.init(arena.allocator(), io, .{ .readers = 1, .writers = 1 }), .{ .side = 2 });
+        var revisions: [9]u64 = undefined;
+        var frame: [32]u8 = undefined;
+        const center = chunks.encodeKey(.{ .world = 0, .x = 0, .y = 0, .z = 0 });
+        const neighbor = chunks.encodeKey(.{ .world = 0, .x = 1, .y = 0, .z = 0 });
+        const distant = chunks.encodeKey(.{ .world = 0, .x = 8, .y = 0, .z = 8 });
+        if (phase == 0) {
+            try store.putBatch(&.{.{ .key = &center, .value = &.{ 0, 1, 0 } }});
+            try store.flush();
+            _ = try lightSnapshot(&store, column, null, &expected);
+            try std.testing.expect(expected[4] != 0 and expected[5] == 0);
+            try store.putLight(column, "saved-light");
+            const missing: light.Column = .{ .world = 0, .x = 4, .z = 7 };
+            var snapshots: [3]light.Snapshot = @splat(.{ .length = null, .revisions = undefined, .clean = true });
+            var second: [32]u8 = undefined;
+            try store.lightSnapshots(&.{
+                .{ .column = column, .minimum = 0, .count = 1, .destination = &frame },
+                .{ .column = missing, .minimum = 0, .count = 1, .destination = &second },
+                .{ .column = column, .minimum = 0, .count = 1, .destination = null },
+            }, &snapshots);
+            try std.testing.expectEqualStrings("saved-light", frame[0..snapshots[0].length.?]);
+            try std.testing.expectEqualSlices(u64, &expected, &snapshots[0].revisions);
+            try std.testing.expectEqualSlices(u64, &expected, &snapshots[2].revisions);
+            try std.testing.expect(snapshots[1].length == null and snapshots[2].length == null);
+            try std.testing.expectEqualSlices(u64, &@as([9]u64, @splat(0)), &snapshots[1].revisions);
+            try database.waitDurable(try database.commit(1));
+        } else {
+            const length = (try lightSnapshot(&store, column, &frame, &revisions)).?;
+            try std.testing.expectEqualStrings("saved-light", frame[0..length]);
+            if (phase < 3) {
+                try std.testing.expectEqualSlices(u64, &expected, &revisions);
+                try store.putBatch(&.{.{ .key = &neighbor, .value = &.{ 0, 2, 0 } }});
+                try store.flush();
+                if (phase == 2) try database.waitDurable(try database.commit(2));
+            } else {
+                try std.testing.expectEqual(expected[4], revisions[4]);
+                try std.testing.expect(revisions[5] != expected[5]);
+                expected = revisions;
+                try store.putBatch(&.{.{ .key = &distant, .value = &.{ 0, 3, 0 } }});
+                try store.flush();
+                _ = try lightSnapshot(&store, column, &frame, &revisions);
+                try std.testing.expectEqualSlices(u64, &expected, &revisions);
+                try database.waitDurable(try database.commit(3));
+            }
+        }
+    }
+}
 
 const count = 12;
 
@@ -34,7 +105,7 @@ fn change(store: *storage.Store, tick: u64) !void {
     defer arena.deinit();
     var registry = try metrics.Registry.init(std.testing.allocator, store.io, .{ .capacity = 16 });
     defer registry.deinit();
-    var chunks_store = try ChunkStore.init(arena.allocator(), store.io, try store.openSpace(chunks.Chunks.id), 2, &registry, try records.Resources.init(arena.allocator(), store.io, .{ .readers = 1, .writers = 1 }));
+    var chunks_store = try ChunkStore.init(arena.allocator(), store.io, try store.openSpace(chunks.Chunks.id), 2, &registry, try records.Resources.init(arena.allocator(), store.io, .{ .readers = 1, .writers = 1 }), .{ .side = 2 });
     var keys: [count][16]u8 = undefined;
     var values: [count][8193]u8 = undefined;
     var writes: [count]records.Write = undefined;
@@ -52,7 +123,7 @@ fn verify(store: *storage.Store, tick: u64) !void {
     defer arena.deinit();
     var registry = try metrics.Registry.init(std.testing.allocator, store.io, .{ .capacity = 16 });
     defer registry.deinit();
-    var chunks_store = try ChunkStore.init(arena.allocator(), store.io, try store.openSpace(chunks.Chunks.id), 1, &registry, try records.Resources.init(arena.allocator(), store.io, .{ .readers = 1, .writers = 1 }));
+    var chunks_store = try ChunkStore.init(arena.allocator(), store.io, try store.openSpace(chunks.Chunks.id), 1, &registry, try records.Resources.init(arena.allocator(), store.io, .{ .readers = 1, .writers = 1 }), .{ .side = 2 });
     var keys: [count][16]u8 = undefined;
     var values: [count][8193]u8 = undefined;
     var requests: [count]records.Get = undefined;
@@ -96,6 +167,15 @@ fn scenario(store: *storage.Store, acknowledged: *u64) !void {
     try change(store, 2);
     try store.waitDurable(store.lastCommit());
     acknowledged.* = 2;
+    {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var registry = try metrics.Registry.init(std.testing.allocator, store.io, .{ .capacity = 16 });
+        defer registry.deinit();
+        var chunks_store = try ChunkStore.init(arena.allocator(), store.io, try store.openSpace(chunks.Chunks.id), 2, &registry, try records.Resources.init(arena.allocator(), store.io, .{ .readers = 1, .writers = 1 }), .{ .side = 2 });
+        while (try chunks_store.prepareMerge()) {}
+        _ = try chunks_store.publishPrepared();
+    }
     try change(store, 3);
 }
 
@@ -159,7 +239,7 @@ test "power loss while repacking spatial records recovers an atomic save" {
     }
 }
 
-test "unrelated tile reads progress during cold reads and mutations" {
+test "unrelated base group reads progress during cold reads and mutations" {
     const Actor = struct {
         store: *ChunkStore,
         key: [16]u8,
@@ -201,16 +281,16 @@ test "unrelated tile reads progress during cold reads and mutations" {
         const resources = try records.Resources.init(allocator, io, .{ .readers = 2, .writers = 1 });
         defer resources.deinit();
         const space = try store.openSpace("chunks");
-        var initial = try ChunkStore.init(allocator, io, space, 2, &registry, resources);
+        var initial = try ChunkStore.init(allocator, io, space, 2, &registry, resources, .{ .side = 2 });
         var keys = [_][16]u8{ keyFor(0), keyFor(8) };
         const value = [_]u8{ 0, 7, 0 };
         try initial.putBatch(&.{ .{ .key = &keys[0], .value = &value }, .{ .key = &keys[1], .value = &value } });
         try initial.flush();
-        var reader = try ChunkStore.init(allocator, io, space, 2, &registry, resources);
+        var reader = try ChunkStore.init(allocator, io, space, 2, &registry, resources, .{ .side = 2 });
         var warm: Actor = .{ .store = &reader, .key = keys[1] };
         if (mutation) try warm.read();
         const root = (try space.getRoot()).?;
-        const offset = store.locations.get(@intFromEnum(root)).?.current;
+        const offset = store.locations.get(@backingInt(root)).?.current;
         var disk = try fault.Disk.init(allocator, io, &.{ store.database, store.wal }, std.math.maxInt(usize), false);
         defer disk.deinit();
         const modeled = disk.interface();
@@ -237,7 +317,7 @@ test "unrelated tile reads progress during cold reads and mutations" {
     }
 }
 
-test "interleaved duplicate tile writes preserve the final caller value across cache windows" {
+test "interleaved duplicate base group writes preserve the final caller value across cache windows" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     for ([_]usize{ 1, 2 }) |capacity| {
@@ -249,7 +329,7 @@ test "interleaved duplicate tile writes preserve the final caller value across c
         defer disk.deinit();
         var registry = try metrics.Registry.init(allocator, std.testing.io, .{ .enabled = false });
         defer registry.deinit();
-        var store = try ChunkStore.init(allocator, std.testing.io, try disk.openSpace("chunks"), capacity, &registry, try records.Resources.init(allocator, std.testing.io, .{ .readers = 1, .writers = 1 }));
+        var store = try ChunkStore.init(allocator, std.testing.io, try disk.openSpace("chunks"), capacity, &registry, try records.Resources.init(allocator, std.testing.io, .{ .readers = 1, .writers = 1 }), .{ .side = 2 });
         const a = keyFor(0);
         const b = keyFor(4);
         try store.putBatch(&.{
@@ -272,4 +352,323 @@ test "interleaved duplicate tile writes preserve the final caller value across c
         try std.testing.expectEqualSlices(u8, &.{ 0, 4, 0 }, &values[1]);
         try std.testing.expectEqualSlices(u8, &.{ 0, 4, 0 }, &values[2]);
     }
+}
+
+test "prepared consolidation skips pinned bases and rejects edits after its snapshot" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/prepared", .{temporary.sub_path});
+    var disk = try storage.Store.init(allocator, io, .{ .path = path, .io_mode = .standard, .maximum_wal_pages = 1024 });
+    defer disk.deinit();
+    var registry = try metrics.Registry.init(allocator, io, .{ .capacity = 16 });
+    defer registry.deinit();
+    var store = try ChunkStore.init(allocator, io, try disk.openSpace("chunks"), 1, &registry, try records.Resources.init(allocator, io, .{ .readers = 1 }), .{ .side = 2 });
+    const key = keyFor(0);
+    var initial: [8193]u8 = undefined;
+    initial[0] = 1;
+    for (0..4096) |index| std.mem.writeInt(u16, initial[1 + index * 2 ..][0..2], @intCast(index % 17), .little);
+    try store.putBatch(&.{.{ .key = &key, .value = &initial }});
+    try store.flush();
+    try disk.waitDurable(try disk.commit(1));
+    const next: [3]u8 = .{ 0, 17, 0 };
+    try store.putBatch(&.{.{ .key = &key, .value = &next }});
+    try store.flush();
+    try disk.waitDurable(try disk.commit(2));
+    while (try store.prepareMerge()) {}
+    const group = try store.groupKey(&key);
+    const held = try store.bases.acquire(&group);
+    try std.testing.expectEqual(@as(usize, 0), try store.publishPrepared());
+    held.release();
+    try std.testing.expectEqual(@as(usize, 1), try store.publishPrepared());
+    try disk.waitDurable(try disk.commit(3));
+    const changed: [3]u8 = .{ 0, 33, 0 };
+    try store.putBatch(&.{.{ .key = &key, .value = &changed }});
+    try store.flush();
+    while (try store.prepareMerge()) {}
+    const newer: [3]u8 = .{ 0, 49, 0 };
+    try store.putBatch(&.{.{ .key = &key, .value = &newer }});
+    try std.testing.expectEqual(@as(usize, 0), try store.publishPrepared());
+    try store.flush();
+    try disk.waitDurable(try disk.commit(4));
+    var output: [8193]u8 = undefined;
+    var lengths: [1]?usize = undefined;
+    try store.decodeBatch(&.{.{ .key = &key, .destination = &output }}, &lengths);
+    const view: chunks.View = if (output[0] == 0) .{ .uniform = std.mem.readInt(u16, output[1..3], .little) } else .{ .dense = output[1..8193] };
+    for (0..4096) |index| try std.testing.expectEqual(@as(u16, 49), view.get(@intCast(index)));
+}
+
+test "biomes survive block overlays eviction consolidation and reopening" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/biomes", .{temporary.sub_path});
+    const options: storage.Store.Options = .{ .path = path, .io_mode = .standard, .maximum_wal_pages = 1024 };
+    const key = keyFor(0);
+    var section: [encoding.maximum_decoded_bytes]u8 = undefined;
+    section[0] = 3;
+    for (0..64) |index| std.mem.writeInt(u16, section[1 + index * 2 ..][0..2], @intCast(index), .little);
+    section[encoding.biome_header_bytes] = 1;
+    for (0..4096) |index| std.mem.writeInt(u16, section[encoding.biome_header_bytes + 1 + index * 2 ..][0..2], @intCast(index % 7), .little);
+    {
+        var disk = try storage.Store.init(allocator, io, options);
+        defer disk.deinit();
+        var registry = try metrics.Registry.init(allocator, io, .{ .capacity = 16 });
+        defer registry.deinit();
+        var store = try ChunkStore.init(allocator, io, try disk.openSpace("chunks"), 1, &registry, try records.Resources.init(allocator, io, .{ .readers = 1 }), .{ .side = 4 });
+        try store.putBatch(&.{.{ .key = &key, .value = &section }});
+        try store.flush();
+        try disk.waitDurable(try disk.commit(1));
+        std.mem.writeInt(u16, section[1..3], 41, .little);
+        for (0..4096) |index| std.mem.writeInt(u16, section[encoding.biome_header_bytes + 1 + index * 2 ..][0..2], 65535, .little);
+        try store.putBatch(&.{.{ .key = &key, .value = &section }});
+        try store.flush();
+        while (try store.prepareMerge()) {}
+        try std.testing.expectEqual(@as(usize, 1), try store.publishPrepared());
+        try disk.waitDurable(try disk.commit(2));
+    }
+    var disk = try storage.Store.init(allocator, io, options);
+    defer disk.deinit();
+    var registry = try metrics.Registry.init(allocator, io, .{ .capacity = 16 });
+    defer registry.deinit();
+    var store = try ChunkStore.init(allocator, io, try disk.openSpace("chunks"), 1, &registry, try records.Resources.init(allocator, io, .{ .readers = 1 }), .{ .side = 4 });
+    var output: [encoding.maximum_decoded_bytes]u8 = undefined;
+    var lengths: [1]?usize = undefined;
+    try store.decodeBatch(&.{.{ .key = &key, .destination = &output }}, &lengths);
+    var expanded: [encoding.maximum_decoded_bytes]u8 = undefined;
+    const length = lengths[0].?;
+    if (length == section.len) {
+        try std.testing.expectEqualSlices(u8, &section, output[0..length]);
+    } else {
+        @memcpy(expanded[0..encoding.biome_header_bytes], output[0..encoding.biome_header_bytes]);
+        expanded[encoding.biome_header_bytes] = 1;
+        for (0..4096) |index| std.mem.writeInt(u16, expanded[encoding.biome_header_bytes + 1 + index * 2 ..][0..2], std.mem.readInt(u16, output[encoding.biome_header_bytes + 1 ..][0..2], .little), .little);
+        try std.testing.expectEqualSlices(u8, &section, &expanded);
+    }
+}
+
+test "chunk format and persisted group size reject incompatible configuration" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/format", .{temporary.sub_path});
+    var disk = try storage.Store.init(allocator, io, .{ .path = path, .io_mode = .standard });
+    defer disk.deinit();
+    const space = try disk.openSpace("chunks");
+    const resources = try records.Resources.init(allocator, io, .{ .readers = 1 });
+    var registry = try metrics.Registry.init(allocator, io, .{ .capacity = 16 });
+    defer registry.deinit();
+    var store = try ChunkStore.init(allocator, io, space, 1, &registry, resources, .{ .side = 2 });
+    store.side = 4;
+    try std.testing.expectError(error.UnsupportedFormat, store.open());
+    store.side = 2;
+    try store.open();
+    const root = (try space.getRoot()).?;
+    var page: storage.Page = undefined;
+    try space.readPages(&.{.{ .id = root, .destination = &page }});
+    @memcpy(page[0..8], "LRCHNK03");
+    try space.writePages(&.{.{ .id = root, .source = &page }});
+    try std.testing.expectError(error.UnsupportedFormat, store.open());
+}
+
+test "chunk compression and consolidation allocate only during initialization" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var failing = std.testing.FailingAllocator.init(arena.allocator(), .{});
+    const allocator = failing.allocator();
+    const io = std.testing.io;
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/sealed", .{temporary.sub_path});
+    var disk = try storage.Store.init(allocator, io, .{ .path = path, .io_mode = .standard, .maximum_wal_pages = 1024 });
+    defer disk.deinit();
+    var registry = try metrics.Registry.init(allocator, io, .{ .capacity = 16 });
+    defer registry.deinit();
+    var store = try ChunkStore.init(allocator, io, try disk.openSpace("chunks"), 1, &registry, try records.Resources.init(allocator, io, .{ .readers = 1 }), .{ .side = 4 });
+    failing.fail_index = failing.alloc_index;
+    const key = keyFor(0);
+    var initial: [8193]u8 = undefined;
+    initial[0] = 1;
+    for (0..4096) |index| std.mem.writeInt(u16, initial[1 + index * 2 ..][0..2], @as(u16, @intCast(index)) *% 40503, .little);
+    try store.putBatch(&.{.{ .key = &key, .value = &initial }});
+    try store.flush();
+    try disk.waitDurable(try disk.commit(1));
+    var section: [8193]u8 = undefined;
+    section[0] = 1;
+    for (0..4096) |index| std.mem.writeInt(u16, section[1 + index * 2 ..][0..2], @intCast(index % 31), .little);
+    try store.putBatch(&.{.{ .key = &key, .value = &section }});
+    try store.flush();
+    while (try store.prepareMerge()) {}
+    try std.testing.expectEqual(@as(usize, 1), try store.publishPrepared());
+    try disk.waitDurable(try disk.commit(2));
+    var output: [8193]u8 = undefined;
+    var lengths: [1]?usize = undefined;
+    try store.decodeBatch(&.{.{ .key = &key, .destination = &output }}, &lengths);
+    try std.testing.expectEqualSlices(u8, &section, output[0..lengths[0].?]);
+    try std.testing.expectEqual(failing.fail_index, failing.alloc_index);
+}
+
+test "incompressible overlay snapshots retain dense bytes across consolidation" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/dense", .{temporary.sub_path});
+    var disk = try storage.Store.init(allocator, io, .{ .path = path, .io_mode = .standard, .maximum_wal_pages = 1024 });
+    defer disk.deinit();
+    var registry = try metrics.Registry.init(allocator, io, .{ .capacity = 16 });
+    defer registry.deinit();
+    var store = try ChunkStore.init(allocator, io, try disk.openSpace("chunks"), 1, &registry, try records.Resources.init(allocator, io, .{ .readers = 1 }), .{ .side = 1 });
+    const key = keyFor(0);
+    const initial: [3]u8 = .{ 0, 1, 0 };
+    try store.putBatch(&.{.{ .key = &key, .value = &initial }});
+    try store.flush();
+    try disk.waitDurable(try disk.commit(1));
+    var section: [8193]u8 = undefined;
+    section[0] = 1;
+    var random = std.Random.DefaultPrng.init(20261031);
+    random.random().bytes(section[1..]);
+    try store.putBatch(&.{.{ .key = &key, .value = &section }});
+    try store.flush();
+    var output: [8193]u8 = undefined;
+    var lengths: [1]?usize = undefined;
+    try store.getBatch(&.{.{ .key = &key, .destination = &output }}, &lengths);
+    try std.testing.expectEqualSlices(u8, &section, output[0..lengths[0].?]);
+    while (try store.prepareMerge()) {}
+    _ = try store.publishPrepared();
+    try disk.waitDurable(try disk.commit(2));
+    try store.decodeBatch(&.{.{ .key = &key, .destination = &output }}, &lengths);
+    try std.testing.expectEqualSlices(u8, &section, output[0..lengths[0].?]);
+}
+
+test "consolidation preserves unrelated frames and publishes one group per call" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/group-publication", .{directory.sub_path});
+    var disk = try storage.Store.init(allocator, io, .{ .path = path, .io_mode = .standard });
+    defer disk.deinit();
+    var registry = try metrics.Registry.init(allocator, io, .{ .capacity = 32 });
+    defer registry.deinit();
+    var store = try ChunkStore.init(allocator, io, try disk.openSpace("chunks"), 2, &registry, try records.Resources.init(allocator, io, .{ .readers = 1 }), .{ .side = 4 });
+    const a = chunks.encodeKey(.{ .world = 0, .x = 0, .z = 0, .y = 0 });
+    const b = chunks.encodeKey(.{ .world = 0, .x = 8, .z = 0, .y = 0 });
+    var initial: [8193]u8 = undefined;
+    initial[0] = 1;
+    for (0..4096) |index| std.mem.writeInt(u16, initial[1 + index * 2 ..][0..2], @intCast(index % 17), .little);
+    try store.putBatch(&.{ .{ .key = &a, .value = &initial }, .{ .key = &b, .value = &initial } });
+    try store.flush();
+    try disk.waitDurable(try disk.commit(1));
+    try store.putBatch(&.{.{ .key = &a, .value = &.{ 0, 17, 0 } }});
+    try store.flush();
+    while (try store.prepareMerge()) {}
+    try std.testing.expectEqual(@as(u64, 1), store.prepared.value());
+    try store.putBatch(&.{.{ .key = &b, .value = &.{ 0, 29, 0 } }});
+    try store.flush();
+    try std.testing.expectEqual(@as(u64, 0), store.merged.value());
+    while (try store.prepareMerge()) {}
+    try std.testing.expectEqual(@as(u64, 2), store.prepared.value());
+    try std.testing.expectEqual(@as(usize, 1), try store.publishPrepared());
+    try std.testing.expectEqual(@as(usize, 1), try store.publishPrepared());
+    try std.testing.expectEqual(@as(usize, 0), try store.publishPrepared());
+    try std.testing.expectEqual(@as(u64, 2), store.merged.value());
+    try disk.waitDurable(try disk.commit(2));
+    var output: [2][8193]u8 = undefined;
+    var lengths: [2]?usize = undefined;
+    try store.decodeBatch(&.{ .{ .key = &a, .destination = &output[0] }, .{ .key = &b, .destination = &output[1] } }, &lengths);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 17, 0 }, output[0][0..lengths[0].?]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 29, 0 }, output[1][0..lengths[1].?]);
+}
+
+test "dense group consolidation scans keys once without runtime allocation" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var failing = std.testing.FailingAllocator.init(arena.allocator(), .{});
+    const allocator = failing.allocator();
+    const io = std.testing.io;
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/key-discovery", .{directory.sub_path});
+    var disk = try storage.Store.init(allocator, io, .{ .path = path, .io_mode = .standard });
+    defer disk.deinit();
+    var registry = try metrics.Registry.init(allocator, io, .{ .capacity = 32 });
+    defer registry.deinit();
+    var store = try ChunkStore.init(allocator, io, try disk.openSpace("chunks"), 1, &registry, try records.Resources.init(allocator, io, .{ .readers = 1 }), .{ .side = 4 });
+    const group = chunks.encodeKey(.{ .world = 0, .x = 0, .z = 0, .y = 0 });
+    var keys: [64][16]u8 = undefined;
+    store.sectionKeys(&group, &keys);
+    var initial: [8193]u8 = undefined;
+    initial[0] = 1;
+    for (0..4096) |index| std.mem.writeInt(u16, initial[1 + index * 2 ..][0..2], @intCast(index % 17), .little);
+    var writes: [64]records.Write = undefined;
+    failing.fail_index = failing.alloc_index;
+    for (&keys, &writes) |*key, *write| write.* = .{ .key = key, .value = &initial };
+    try store.putBatch(&writes);
+    try store.flush();
+    try disk.waitDurable(try disk.commit(1));
+    for (&writes) |*write| write.value = &.{ 0, 17, 0 };
+    try store.putBatch(&writes);
+    try store.flush();
+    while (try store.prepareMerge()) {}
+    try std.testing.expectEqual(@as(u64, 1), store.discovery_scans.value());
+    try std.testing.expectEqual(@as(u64, 1), store.prepared.value());
+    try store.flush();
+    try std.testing.expectEqual(@as(u64, 0), store.merged.value());
+    try std.testing.expectEqual(@as(usize, 1), try store.publishPrepared());
+    try disk.waitDurable(try disk.commit(2));
+    var output: [8193]u8 = undefined;
+    var lengths: [1]?usize = undefined;
+    for (&keys) |*key| {
+        try store.decodeBatch(&.{.{ .key = key, .destination = &output }}, &lengths);
+        try std.testing.expectEqualSlices(u8, &.{ 0, 17, 0 }, output[0..lengths[0].?]);
+    }
+    try std.testing.expectEqual(failing.fail_index, failing.alloc_index);
+}
+
+test "consolidation retries invalidated groups without waiting for another edit" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/retry-group", .{directory.sub_path});
+    var disk = try storage.Store.init(allocator, io, .{ .path = path, .io_mode = .standard });
+    defer disk.deinit();
+    var registry = try metrics.Registry.init(allocator, io, .{ .capacity = 32 });
+    defer registry.deinit();
+    var store = try ChunkStore.init(allocator, io, try disk.openSpace("chunks"), 1, &registry, try records.Resources.init(allocator, io, .{ .readers = 1 }), .{ .side = 4 });
+    const key = keyFor(0);
+    var initial: [8193]u8 = undefined;
+    initial[0] = 1;
+    for (0..4096) |index| std.mem.writeInt(u16, initial[1 + index * 2 ..][0..2], @intCast(index % 17), .little);
+    try store.putBatch(&.{.{ .key = &key, .value = &initial }});
+    try store.putBatch(&.{.{ .key = &key, .value = &.{ 0, 17, 0 } }});
+    while (try store.prepareMerge()) {}
+    try std.testing.expectEqual(@as(u64, 0), store.prepared.value());
+    try store.flush();
+    while (try store.prepareMerge()) {}
+    try std.testing.expectEqual(@as(u64, 1), store.prepared.value());
+    try store.putBatch(&.{.{ .key = &key, .value = &.{ 0, 29, 0 } }});
+    while (try store.prepareMerge()) {}
+    try std.testing.expectEqual(@as(u64, 2), store.prepared.value());
+    try std.testing.expectEqual(@as(usize, 1), try store.publishPrepared());
+    var output: [8193]u8 = undefined;
+    var lengths: [1]?usize = undefined;
+    try store.decodeBatch(&.{.{ .key = &key, .destination = &output }}, &lengths);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 29, 0 }, output[0..lengths[0].?]);
 }

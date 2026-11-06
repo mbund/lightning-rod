@@ -6,10 +6,14 @@ const e2e = @import("e2e");
 const sessions = @import("sessions");
 const minecraft = @import("minecraft_model");
 
+const spawn_offset = 4096;
+
 pub fn main(init: std.process.Init) !void {
     const args = try e2e.profile.arguments(init);
+    const distance: i32 = if (std.mem.eql(u8, args.fixture, "registry")) 2 else 32;
     const terrain_plugins = lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-        lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = 32, .spawn_for_player = spawn }),
+        lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = distance, .spawn_for_player = spawn }),
+        lightning_rod.plugin.configured(vanilla.Flat, .{ .biomes = biomePattern }),
     });
     if (std.mem.eql(u8, args.fixture, "simulations")) {
         var endpoints: [2]*sessions.Service = undefined;
@@ -32,8 +36,13 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn spawn(player: *const vanilla.Players.Player) minecraft.Position {
-    const coordinate: f64 = if (std.mem.eql(u8, player.name[0..player.name_len], "alice")) -4095.5 else 4096.5;
+    const coordinate: f64 = if (std.mem.eql(u8, player.name[0..player.name_len], "alice")) -spawn_offset + 0.5 else spawn_offset + 0.5;
     return .{ .x = coordinate, .y = 65, .z = coordinate };
+}
+
+fn biomePattern(_: vanilla.Section, values: *[64]u16) void {
+    const names = [_][]const u8{ "minecraft:plains", "minecraft:desert", "minecraft:forest" };
+    for (values, 0..) |*biome, index| biome.* = @intCast(protocols.registry.biomeId(names[index % names.len]).?);
 }
 
 // Disk scenarios must resolve every section from storage, including unchanged air sections.
@@ -65,6 +74,7 @@ const Probe = struct {
         control: *e2e.Control,
         players: *vanilla.Players,
         chunks: *vanilla.Chunks,
+        vanilla_worlds: *vanilla.VanillaWorlds,
     };
     disk: bool,
     deps: Dependencies,
@@ -73,6 +83,18 @@ const Probe = struct {
         const self = try allocator.create(Probe);
         self.* = .{ .disk = config.disk, .deps = deps };
         deps.control.on(self, message);
+        if (!config.disk) {
+            const name = if (protocols.registry.itemId("minecraft:chain") != null) "minecraft:chain" else "minecraft:iron_chain";
+            for ([_]i32{ -spawn_offset, spawn_offset }) |coordinate| {
+                var edits: [6]vanilla.BlockEdit = undefined;
+                for (&edits, 0..) |*edit, index| {
+                    var buffer: [128]u8 = undefined;
+                    const state_name = try std.fmt.bufPrint(&buffer, "{s}[axis={s},waterlogged={s}]", .{ name, ([_][]const u8{ "x", "y", "z" })[index / 2], if (index % 2 == 0) "true" else "false" });
+                    edit.* = .{ .index = @intCast(256 + 3 * 16 + 2 + index), .state = @intCast(protocols.registry.blockStateId(state_name).?) };
+                }
+                try deps.chunks.setBlocks(.{ .world = deps.vanilla_worlds.overworld, .x = @divExact(coordinate, 16), .z = @divExact(coordinate, 16), .y = 4 }, &edits);
+            }
+        }
         return self;
     }
 

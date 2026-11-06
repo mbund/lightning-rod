@@ -2,12 +2,15 @@ const std = @import("std");
 const storage = @import("storage");
 
 const index_bytes = 24 + storage.batch_size * 8;
+pub const Index = [index_bytes]u8;
 
-/// Destinations remain borrowed until flush returns.
+/// Destinations and index scratch remain borrowed until flush returns.
 pub const ReadBatch = struct {
     const Blob = struct { id: u64, destination: []u8, offset: usize = 0 };
 
     space: storage.Space,
+    indices: []Index,
+    cache: storage.Read.Cache = .retain,
     reads: [storage.batch_size]storage.Read = undefined,
     count: usize = 0,
     blobs: [storage.batch_size]Blob = undefined,
@@ -20,18 +23,19 @@ pub const ReadBatch = struct {
     }
 
     pub fn flush(self: *ReadBatch) storage.Error!void {
-        var indices: [storage.batch_size][index_bytes]u8 = undefined;
+        std.debug.assert(self.indices.len > 0 and self.indices.len <= self.blobs.len);
+        const indices = self.indices;
         var selected: [storage.batch_size]usize = undefined;
         var cursor: usize = 0;
         while (true) {
             var count: usize = 0;
             for (0..self.blob_count) |step| {
-                if (self.count == self.reads.len) break;
+                if (self.count == self.reads.len or count == indices.len) break;
                 const at = (cursor + step) % self.blob_count;
                 const value = self.blobs[at];
                 if (value.offset == value.destination.len) continue;
                 selected[count] = at;
-                self.reads[self.count] = .{ .id = @enumFromInt(value.id), .destination = &indices[count] };
+                self.reads[self.count] = .{ .id = @fromBackingInt(@intCast(value.id)), .destination = &indices[count] };
                 self.count += 1;
                 count += 1;
             }
@@ -45,7 +49,7 @@ pub const ReadBatch = struct {
                 if (pages == 0 or pages > storage.batch_size or pages > std.math.divCeil(usize, value.destination.len - value.offset, storage.page_size) catch return error.Corrupt) return error.Corrupt;
                 for (0..pages) |page| {
                     const length = @min(value.destination.len - value.offset, storage.page_size);
-                    try self.append(@enumFromInt(std.mem.readInt(u64, index[24 + page * 8 ..][0..8], .little)), value.destination[value.offset..][0..length]);
+                    try self.append(@fromBackingInt(@intCast(std.mem.readInt(u64, index[24 + page * 8 ..][0..8], .little))), value.destination[value.offset..][0..length]);
                     value.offset += length;
                 }
                 value.id = std.mem.readInt(u64, index[8..16], .little);
@@ -58,23 +62,24 @@ pub const ReadBatch = struct {
     pub fn append(self: *ReadBatch, id: storage.PageId, destination: []u8) storage.Error!void {
         std.debug.assert(destination.len <= storage.page_size);
         if (self.count == self.reads.len) try self.flushPages();
-        self.reads[self.count] = .{ .id = id, .destination = destination };
+        self.reads[self.count] = .{ .id = id, .destination = destination, .cache = self.cache };
         self.count += 1;
     }
 
     pub fn appendBlob(self: *ReadBatch, root: storage.PageId, length: usize, destination: []u8) storage.Error!usize {
         if (destination.len < length) return error.BufferTooSmall;
-        if ((length == 0) != (@intFromEnum(root) == 0)) return error.Corrupt;
+        if ((length == 0) != (@backingInt(root) == 0)) return error.Corrupt;
         if (length == 0) return 0;
-        if (self.blob_count == self.blobs.len) try self.flush();
-        self.blobs[self.blob_count] = .{ .id = @intFromEnum(root), .destination = destination[0..length] };
+        if (self.blob_count == self.indices.len) try self.flush();
+        self.blobs[self.blob_count] = .{ .id = @backingInt(root), .destination = destination[0..length] };
         self.blob_count += 1;
         return length;
     }
 };
 
 pub fn read(space: storage.Space, root: storage.PageId, length: usize, destination: []u8) storage.Error!usize {
-    var batch: ReadBatch = .{ .space = space };
+    var indices: [1]Index = undefined;
+    var batch: ReadBatch = .{ .space = space, .indices = &indices };
     const size = try batch.appendBlob(root, length, destination);
     try batch.flush();
     return size;
@@ -84,6 +89,7 @@ pub fn read(space: storage.Space, root: storage.PageId, length: usize, destinati
 pub const FreeBatch = struct {
     const Blob = struct { id: storage.PageId, remaining: usize };
     space: storage.Space,
+    indices: []Index,
     pages: [storage.batch_size]storage.PageId = undefined,
     count: usize = 0,
     blobs: [storage.batch_size]Blob = undefined,
@@ -96,9 +102,9 @@ pub const FreeBatch = struct {
     }
 
     pub fn appendBlob(self: *FreeBatch, root: storage.PageId, length: usize) storage.Error!void {
-        if ((length == 0) != (@intFromEnum(root) == 0)) return error.Corrupt;
+        if ((length == 0) != (@backingInt(root) == 0)) return error.Corrupt;
         if (length == 0) return;
-        if (self.blob_count == self.blobs.len) try self.flush();
+        if (self.blob_count == self.indices.len) try self.flush();
         self.blobs[self.blob_count] = .{ .id = root, .remaining = length };
         self.blob_count += 1;
     }
@@ -110,8 +116,9 @@ pub const FreeBatch = struct {
     }
 
     pub fn flush(self: *FreeBatch) storage.Error!void {
+        std.debug.assert(self.indices.len > 0 and self.indices.len <= self.blobs.len);
         while (true) {
-            var indices: [storage.batch_size][index_bytes]u8 = undefined;
+            const indices = self.indices;
             var requests: [storage.batch_size]storage.Read = undefined;
             var selected: [storage.batch_size]usize = undefined;
             var count: usize = 0;
@@ -128,11 +135,11 @@ pub const FreeBatch = struct {
                 if (!std.mem.eql(u8, index[0..8], "LRBLOB01")) return error.Corrupt;
                 const pages = std.mem.readInt(u32, index[16..20], .little);
                 if (pages == 0 or pages > storage.batch_size or pages > std.math.divCeil(usize, value.remaining, storage.page_size) catch return error.Corrupt) return error.Corrupt;
-                for (0..pages) |page| try self.appendPage(@enumFromInt(std.mem.readInt(u64, index[24 + page * 8 ..][0..8], .little)));
+                for (0..pages) |page| try self.appendPage(@fromBackingInt(@intCast(std.mem.readInt(u64, index[24 + page * 8 ..][0..8], .little))));
                 try self.appendPage(value.id);
                 value.remaining -= @min(value.remaining, @as(usize, pages) * storage.page_size);
-                value.id = @enumFromInt(std.mem.readInt(u64, index[8..16], .little));
-                if ((value.remaining == 0) != (@intFromEnum(value.id) == 0)) return error.Corrupt;
+                value.id = @fromBackingInt(@intCast(std.mem.readInt(u64, index[8..16], .little)));
+                if ((value.remaining == 0) != (@backingInt(value.id) == 0)) return error.Corrupt;
             }
         }
         self.blob_count = 0;
@@ -141,7 +148,8 @@ pub const FreeBatch = struct {
 };
 
 pub fn free(space: storage.Space, root: storage.PageId, length: usize) storage.Error!void {
-    var batch: FreeBatch = .{ .space = space };
+    var indices: [1]Index = undefined;
+    var batch: FreeBatch = .{ .space = space, .indices = &indices };
     try batch.appendBlob(root, length);
     try batch.flush();
 }
@@ -190,12 +198,12 @@ pub const WriteBatch = struct {
             @memcpy(index[0..8], "LRBLOB01");
             std.mem.writeInt(u64, index[8..16], previous, .little);
             std.mem.writeInt(u32, index[16..20], @intCast(count), .little);
-            for (ids[0..count], 0..) |id, at| std.mem.writeInt(u64, index[24 + at * 8 ..][0..8], @intFromEnum(id), .little);
+            for (ids[0..count], 0..) |id, at| std.mem.writeInt(u64, index[24 + at * 8 ..][0..8], @backingInt(id), .little);
             try self.append(ids[count], index);
-            previous = @intFromEnum(ids[count]);
+            previous = @backingInt(ids[count]);
             end = begin;
         }
-        return @enumFromInt(previous);
+        return @fromBackingInt(@intCast(previous));
     }
 };
 

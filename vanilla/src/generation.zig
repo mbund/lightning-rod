@@ -120,7 +120,7 @@ test "generation workers execute concurrently and retain completed results acros
         .{ .world = 0, .x = 1, .y = 0, .z = 0 },
         .{ .world = 0, .x = 2, .y = 0, .z = 0 },
     };
-    var buffers: [2][8193]u8 = undefined;
+    var buffers: [2][chunks.encoding.maximum_decoded_bytes]u8 = undefined;
     const requests = [_]chunks.Generation.Request{
         .{ .section = sections[0], .destination = &buffers[0], .token = 0 },
         .{ .section = sections[1], .destination = &buffers[1], .token = 1 },
@@ -173,7 +173,7 @@ test "canceling a running generation retains its destination until the worker re
     try pool.start();
     defer pool.stop();
     defer source.release.set(io);
-    var destination: [8193]u8 = undefined;
+    var destination: [chunks.encoding.maximum_decoded_bytes]u8 = undefined;
     const request: chunks.Generation.Request = .{ .section = .{ .world = 0, .x = 0, .y = 0, .z = 0 }, .destination = &destination, .token = 42 };
     try std.testing.expectEqual(@as(usize, 1), queue.submit(&.{request}, .{}));
     try source.entered.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });

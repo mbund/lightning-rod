@@ -7,6 +7,7 @@ pub const Workspaces = table.Workspaces;
 pub const Get = table.Get;
 pub const Write = table.Write;
 pub const ScanEntry = table.ScanEntry;
+pub const ScanKey = table.ScanKey;
 pub const ScanCursor = table.ScanCursor;
 pub const ScanResult = table.ScanResult;
 pub const BorrowedEntry = struct { key: []const u8, value: []const u8 };

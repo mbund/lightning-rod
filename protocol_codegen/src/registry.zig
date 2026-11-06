@@ -432,7 +432,12 @@ fn writeCanonicalTranslations(
         for (0..max_state - min_state + 1) |offset| {
             name_buffer.clearRetainingCapacity();
             try writeBlockStateName(&name_buffer, block, offset);
-            const wire_id = block_ids.get(name_buffer.items) orelse -1;
+            const wire_id = block_ids.get(name_buffer.items) orelse renamed: {
+                const name = blockAlias(block.get("name").?.string) orelse break :renamed -1;
+                name_buffer.clearRetainingCapacity();
+                try writeBlockStateNameAs(&name_buffer, block, offset, name);
+                break :renamed block_ids.get(name_buffer.items) orelse -1;
+            };
 
             if (wire_id != @as(i32, @intCast(min_state + offset))) identity = false;
             try output.print("    {},\n", .{wire_id});
@@ -465,7 +470,12 @@ fn writeIdTranslations(output: *std.array_list.Managed(u8), allocator: std.mem.A
     for (canonical, 0..) |entry, index| {
         const id: i64 = if (entry.object.get("id")) |value| value.integer else @intCast(index + offset);
         if (id != index + offset) return error.NonDenseNamedRegistry;
-        const mapped = target_ids.get(entry.object.get("name").?.string) orelse -1;
+        const name = entry.object.get("name").?.string;
+        const mapped = target_ids.get(name) orelse renamed: {
+            if (comptime !std.mem.eql(u8, prefix, "block") and !std.mem.eql(u8, prefix, "item")) break :renamed -1;
+            const alias = blockAlias(name) orelse break :renamed -1;
+            break :renamed target_ids.get(alias) orelse -1;
+        };
         if (mapped >= 0) reverse[@intCast(mapped)] = @intCast(id);
         identity = identity and mapped == id;
         try output.print("    {},\n", .{mapped});
@@ -524,8 +534,18 @@ fn parseFile(io: std.Io, cwd: std.Io.Dir, allocator: std.mem.Allocator, path: []
 }
 
 fn writeBlockStateName(output: *std.array_list.Managed(u8), block: std.json.ObjectMap, offset: usize) !void {
+    return writeBlockStateNameAs(output, block, offset, block.get("name").?.string);
+}
+
+fn blockAlias(name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "chain")) return "iron_chain";
+    if (std.mem.eql(u8, name, "iron_chain")) return "chain";
+    return null;
+}
+
+fn writeBlockStateNameAs(output: *std.array_list.Managed(u8), block: std.json.ObjectMap, offset: usize, name: []const u8) !void {
     try output.appendSlice("minecraft:");
-    try output.appendSlice(block.get("name").?.string);
+    try output.appendSlice(name);
     const states = block.get("states").?.array.items;
     if (states.len == 0) return;
     try output.append('[');
