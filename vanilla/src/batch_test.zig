@@ -98,7 +98,7 @@ fn itemPhysicsProbe(output: *std.Io.Writer) !void {
         try terrain.setBlocks(dense_section, &edits);
         const uniform = try terrain.acquire(uniform_section);
         const dense = try terrain.acquire(dense_section);
-        try std.testing.expect(uniform.view() == .uniform and dense.view() == .dense);
+        try std.testing.expect(uniform.view() == .uniform and dense.view() == .uniform);
         uniform.release();
         dense.release();
 

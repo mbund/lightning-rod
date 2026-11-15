@@ -23,6 +23,37 @@ pub const Read = struct {
     offset: u16 = 0,
     /// Streaming reads use existing cached pages without admitting misses.
     cache: Cache = .retain,
+
+    fn assertIndependent(reads: []const Read) void {
+        assert(reads.len <= batch_size);
+        var previous: usize = 0;
+        var ordered = true;
+        for (reads) |read| {
+            if (read.destination.len == 0) continue;
+            const begin = @intFromPtr(read.destination.ptr);
+            ordered = ordered and previous <= begin;
+            previous = begin + read.destination.len;
+        }
+        if (ordered) return;
+        const Range = struct {
+            begin: usize,
+            end: usize,
+
+            fn less(_: void, a: @This(), b: @This()) bool {
+                return a.begin < b.begin;
+            }
+        };
+        var ranges: [batch_size]Range = undefined;
+        var count: usize = 0;
+        for (reads) |read| {
+            if (read.destination.len == 0) continue;
+            ranges[count] = .{ .begin = @intFromPtr(read.destination.ptr), .end = @intFromPtr(read.destination.ptr) + read.destination.len };
+            count += 1;
+        }
+        if (count < 2) return;
+        std.mem.sortUnstable(Range, ranges[0..count], {}, Range.less);
+        for (1..count) |index| assert(ranges[index - 1].end <= ranges[index].begin);
+    }
 };
 pub const Write = struct { id: PageId, source: []const u8 };
 pub const MaintenanceBudget = struct { index_entries: usize, pages: usize };
@@ -36,12 +67,15 @@ pub const PageLease = struct {
     generation: u64,
     frame: *const format.Frame,
 
-    pub const Version = struct { resources: *Resources, index: usize, generation: u64, checksum: u64 };
+    pub const Content = struct { resources: *Resources, token: u64, page: PageId, checksum: u64 };
 
-    /// Derived page metadata expires when the version changes. It never owns the page bytes.
-    pub fn version(self: PageLease) Version {
+    /// Identifies a validated page image independently of its cache slot.
+    pub fn content(self: PageLease) Content {
         _ = self.bytes();
-        return .{ .resources = self.resources, .index = self.index, .generation = self.generation, .checksum = std.mem.readInt(u64, self.frame[16..24], .little) };
+        const entry = &self.resources.cache[self.index];
+        const block: *const format.Block = self.frame[32..];
+        assert(entry.id == format.get(u64, block, 8));
+        return .{ .resources = self.resources, .token = entry.token, .page = @fromBackingInt(@intCast(entry.id)), .checksum = format.get(u64, block, 24) };
     }
 
     pub fn bytes(self: PageLease) *const Page {
@@ -84,6 +118,16 @@ pub const Space = struct {
         return self.store.tryBeginMutation();
     }
 
+    pub const Revision = struct { resources: *Resources, token: u64, identity: [16]u8, commit: u64, mutation: u64 };
+
+    /// Invalidates derived lookup state. It does not retain a read snapshot.
+    pub fn revision(self: Space) Error!Revision {
+        const operation = self.store.enter(.read);
+        defer operation.end();
+        try self.store.check();
+        return .{ .resources = self.store.resources, .token = self.store.cache_token, .identity = self.store.metadata.identity, .commit = self.store.saved.sequence, .mutation = self.store.mutation };
+    }
+
     pub fn getRoot(self: Space) Error!?PageId {
         if (self.root) |reference| {
             var bytes: [8]u8 = undefined;
@@ -115,7 +159,11 @@ pub const Space = struct {
             const page: *Page = block[32..];
             format.put(u64, page, reference.offset, value);
             try self.store.writePages(reference.space, &.{.{ .id = reference.page, .source = page }});
-        } else self.store.metadata.spaces[@backingInt(self.id) - 1].root = value;
+        } else {
+            const saved = &self.store.metadata.spaces[@backingInt(self.id) - 1].root;
+            if (saved.* != value) self.store.mutation += 1;
+            saved.* = value;
+        }
     }
     pub fn allocatePages(self: Space, ids: []PageId) Error!void {
         const operation = self.store.enter(.pages);
@@ -131,7 +179,8 @@ pub const Space = struct {
         defer lease.end();
         try self.store.freePages(self.id, ids);
     }
-    /// Each window captures its page images together. Only reads of physical overwrites wait for that writer.
+    /// Each window captures its page images together. Physical overwrites wait for
+    /// their writer. Destinations are exclusively borrowed until return and must not overlap.
     pub fn readPages(self: Space, reads: []const Read) Error!void {
         try self.store.readConcurrent(self.id, reads, null);
     }
@@ -231,6 +280,13 @@ pub const Resources = struct {
         filesystem: backend.Io,
         controlled: backend.Io,
         blocks: [batch_size]format.Block = undefined,
+        requests: [batch_size]backend.Io.Read = undefined,
+        block_views: [batch_size]*format.Block = undefined,
+        verified: [batch_size]bool = undefined,
+        direct: [batch_size]bool = undefined,
+        read_indices: [batch_size]usize = undefined,
+        mapping: [batch_size]?usize = undefined,
+        slots: [batch_size]struct { index: usize, loading: bool } = undefined,
         used: bool = false,
     };
     const Lease = struct {
@@ -247,7 +303,7 @@ pub const Resources = struct {
     buffers: *Store.Buffers,
     maintenance: *Store.MaintenanceBuffers,
     cache: []Store.CachedPage,
-    cache_index: std.AutoHashMapUnmanaged(CacheKey, usize) = .empty,
+    cache_index: std.AutoArrayHashMapUnmanaged(CacheKey, usize) = .empty,
     oldest: ?usize = null,
     newest: ?usize = null,
     readers: []Reader,
@@ -273,7 +329,7 @@ pub const Resources = struct {
         errdefer allocator.destroy(maintenance);
         const cache = try allocator.alloc(Store.CachedPage, config.cache_pages);
         errdefer allocator.free(cache);
-        var cache_index: std.AutoHashMapUnmanaged(CacheKey, usize) = .empty;
+        var cache_index: std.AutoArrayHashMapUnmanaged(CacheKey, usize) = .empty;
         errdefer cache_index.deinit(allocator);
         try cache_index.ensureTotalCapacity(allocator, std.math.cast(u32, config.cache_pages) orelse return error.InvalidArgument);
         const frames = try allocator.alignedAlloc(format.Frame, .@"64", config.cache_pages + batch_size);
@@ -323,7 +379,13 @@ pub const Resources = struct {
     }
 
     pub fn memoryBytes(self: *const Resources) usize {
-        return self.readers.len * @sizeOf(Reader) + @sizeOf(Resources) + @sizeOf(Store.Buffers) + @sizeOf(Store.MaintenanceBuffers) + self.cache.len * @sizeOf(Store.CachedPage) + self.frames.len * @sizeOf(format.Frame) + self.cache_index.capacity() * (@sizeOf(CacheKey) + @sizeOf(usize) + @sizeOf(u8));
+        const Entries = @TypeOf(self.cache_index.entries);
+        var index_bytes = Entries.capacityInBytes(self.cache_index.entries.capacity);
+        if (self.cache_index.index_header) |header| {
+            const word_bytes: usize = if (header.bit_index <= 8) 1 else if (header.bit_index <= 16) 2 else 4;
+            index_bytes += @sizeOf(@TypeOf(header.*)) + (@as(usize, 1) << @intCast(header.bit_index)) * 2 * word_bytes;
+        }
+        return self.readers.len * @sizeOf(Reader) + @sizeOf(Resources) + @sizeOf(Store.Buffers) + @sizeOf(Store.MaintenanceBuffers) + self.cache.len * @sizeOf(Store.CachedPage) + self.frames.len * @sizeOf(format.Frame) + index_bytes;
     }
 
     fn removeAvailable(self: *Resources, index: usize) void {
@@ -365,7 +427,7 @@ pub const Resources = struct {
         const key: CacheKey = .{ .token = entry.token, .id = entry.id };
         if (self.cache_index.get(key)) |mapped| {
             if (mapped == index) {
-                const removed = self.cache_index.remove(key);
+                const removed = self.cache_index.swapRemove(key);
                 assert(removed);
             }
         }
@@ -415,6 +477,188 @@ pub const Resources = struct {
     }
 };
 
+/// Rebuildable pages shared by every store that opened this file. A failed or interrupted
+/// write may leave damage anywhere in it, so damage is answered by emptying the whole file.
+pub const DiskCache = struct {
+    pub const State = enum(u8) { ready, damaged, discarded };
+    /// A cache that keeps failing is not worth emptying again.
+    pub const resets_max = 4;
+
+    store: Store,
+    next: ?*DiskCache = null,
+    /// Held shared by every use of the pages and exclusively to empty them.
+    users: std.Io.RwLock = .init,
+    state: std.atomic.Value(State) = .init(.ready),
+    /// Counts resets. Roots and page IDs issued under an earlier generation are invalid.
+    generation: std.atomic.Value(u32) = .init(0),
+
+    /// Keeps the file from being emptied while its pages are read or written.
+    pub const Use = struct {
+        cache: *DiskCache,
+        generation: u32,
+
+        pub fn end(self: Use) void {
+            self.cache.users.unlockShared(self.cache.store.io);
+        }
+
+        /// False when the pages must be treated as absent.
+        pub fn ready(self: Use) bool {
+            return self.cache.state.load(.acquire) == .ready;
+        }
+
+        /// Marks the file damaged for every user. Returns whether this call was the first to say so.
+        pub fn damage(self: Use) bool {
+            return self.cache.state.cmpxchgStrong(.ready, .damaged, .acq_rel, .acquire) == null;
+        }
+    };
+
+    pub fn use(self: *DiskCache) Use {
+        self.users.lockSharedUncancelable(self.store.io);
+        return .{ .cache = self, .generation = self.generation.load(.acquire) };
+    }
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, options: Store.Options) !DiskCache {
+        var self: DiskCache = .{ .store = undefined };
+        try self.store.initialize(allocator, io, options, true);
+        self.store.bindIo(io);
+        errdefer self.store.deinit();
+        var reads: [batch_size]backend.Io.Read = undefined;
+        var ids: [batch_size]u64 = undefined;
+        var owners: [batch_size]u32 = undefined;
+        var count: usize = 0;
+        for (self.store.metadata.spaces, 0..) |space, index| {
+            if (space.root == 0) continue;
+            const block: *format.Block = self.store.buffers.frames[count][32..];
+            reads[count] = .{ .file = self.store.database, .offset = space.root * format.block_size, .bytes = block };
+            ids[count] = space.root;
+            owners[count] = @intCast(index + 1);
+            count += 1;
+            if (count == batch_size) {
+                try self.store.filesystem.read(reads[0..count]);
+                for (ids[0..count], owners[0..count], 0..) |id, owner, slot| try format.validate(self.store.buffers.frames[slot][32..], id, owner);
+                count = 0;
+            }
+        }
+        if (count != 0) {
+            try self.store.filesystem.read(reads[0..count]);
+            for (ids[0..count], owners[0..count], 0..) |id, owner, slot| try format.validate(self.store.buffers.frames[slot][32..], id, owner);
+        }
+
+        return self;
+    }
+
+    pub fn openSpace(self: *DiskCache, name: []const u8) Error!Space {
+        return self.store.openSpace(name);
+    }
+
+    /// Stops serving this cache for the rest of the process and removes it from the next
+    /// one's inputs. Returns whether this call was the first to do so.
+    pub fn discard(self: *DiskCache) !bool {
+        if (self.state.swap(.discarded, .acq_rel) == .discarded) return false;
+        self.store.fail();
+        self.store.directory.deleteFile(self.store.io, self.store.name) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        try self.store.database.setLength(self.store.io, 0);
+        return true;
+    }
+
+    /// Empties a damaged cache in place and serves it again. Waits for every use to end.
+    /// Registered spaces keep their names and lose their roots. Returns false when another
+    /// user emptied the file first or it was discarded. An error means the file could not
+    /// be emptied and was discarded instead.
+    pub fn reset(self: *DiskCache) !bool {
+        const io = self.store.io;
+        self.users.lockUncancelable(io);
+        defer self.users.unlock(io);
+        if (self.state.load(.acquire) != .damaged) return false;
+        const generation = self.generation.load(.acquire);
+        // The failure that stopped the reset is the one worth reporting.
+        errdefer _ = self.discard() catch false;
+        if (generation == resets_max) return error.RepeatedDamage;
+        try self.empty();
+        self.generation.store(generation + 1, .release);
+        self.state.store(.ready, .release);
+        return true;
+    }
+
+    /// An error leaves the store failed.
+    fn empty(self: *DiskCache) !void {
+        const store = &self.store;
+        assert(store.disposable);
+        const mutation = store.beginMutation();
+        defer mutation.end();
+        const operation = store.enter(.pages);
+        defer operation.end();
+        const lease = store.resources.acquireBuffers(store.cache_token);
+        defer lease.end();
+        // Every read and write happens inside a use, and none is open.
+        assert(store.inflight_reads == 0 and store.writing_pages.len == 0);
+        store.failed = true;
+        // A new identity makes every lookup derived from the old pages stale.
+        var metadata: format.Metadata = .{ .identity = undefined };
+        try store.io.randomSecure(&metadata.identity);
+        for (&metadata.spaces, store.metadata.spaces) |*fresh, space| {
+            fresh.name = space.name;
+            fresh.length = space.length;
+        }
+        // The next process treats an empty file as a new cache, so a crash here loses nothing more.
+        try store.database.setLength(store.io, 0);
+        const block: *format.Block = store.buffers.frames[0][32..];
+        const page = metadata.encode();
+        format.seal(block, 0, 0, 0, &page);
+        try store.database.writePositionalAll(store.io, block, 0);
+        // A page still pinned by a borrower stays valid for that borrower and is never found again.
+        for (store.cache, 0..) |*entry, index| {
+            if (entry.token != store.cache_token) continue;
+            assert(!entry.reading);
+            store.resources.invalidate(index);
+        }
+        store.locations.clear();
+        store.metadata = metadata;
+        store.saved = metadata;
+        store.mutation += 1;
+        store.failed = false;
+        // A write that failed latched the file as unusable. The file is a new one now, and
+        // without this every write after the reset would fail on the old latch.
+        store.filesystem.failed = false;
+    }
+
+    /// Complete all page writes before publishing allocation and namespace metadata.
+    /// Existing pages are written in place. No WAL or durability request is issued.
+    pub fn publish(self: *DiskCache) Error!void {
+        const store = &self.store;
+        assert(store.disposable);
+        errdefer store.failed = true;
+        const mutation = store.beginMutation();
+        defer mutation.end();
+        const operation = store.enter(.pages);
+        defer operation.end();
+        const lease = store.resources.acquireBuffers(store.cache_token);
+        defer lease.end();
+        try store.check();
+        while (store.locations.count() != 0) {
+            var ids: [batch_size]u64 = undefined;
+            var owners: [batch_size]u32 = undefined;
+            const bytes: [batch_size][]const u8 = @splat(&.{});
+            var iterator = store.locations.iterator();
+            var count: usize = 0;
+            while (count < batch_size) : (count += 1) {
+                const entry = iterator.next() orelse break;
+                assert(entry.value_ptr.current == 0);
+                ids[count] = entry.key_ptr.*;
+                owners[count] = entry.value_ptr.owner;
+            }
+            try store.writeDisposable(ids[0..count], owners[0..count], bytes[0..count]);
+        }
+        if (std.meta.eql(store.metadata, store.saved)) return;
+        const page = store.metadata.encode();
+        try store.writeDisposable(&.{0}, &.{0}, &.{&page});
+        store.saved = store.metadata;
+    }
+};
+
 /// A single owner submits page batches. Spaces borrow the store's stable address.
 pub const Store = struct {
     pub const Mutation = struct {
@@ -447,6 +691,10 @@ pub const Store = struct {
         return .{ .store = self, .owns = true };
     }
     pub const service_name = "lightning_rod:persistence";
+    pub const default_maintenance_work: system.work.Limits = .{
+        .guaranteed = .{ .operations = 128, .bytes = page_size },
+        .burst = .{ .operations = 4096 - 128, .bytes = (batch_size - 1) * page_size },
+    };
     pub const Options = struct {
         path: []const u8,
         io_mode: backend.Mode = .uring,
@@ -456,6 +704,7 @@ pub const Store = struct {
         maximum_wal_pages: u32 = 65536,
         maximum_pages: u64 = 1 << 32,
         checkpoint_bytes: u64 = 64 * 1024 * 1024,
+        maintenance_work: system.work.Limits = default_maintenance_work,
         /// Deferred recovery leaves complete commits unacknowledged until an explicit durability wait.
         recovery: enum { durable, deferred } = .durable,
     };
@@ -522,6 +771,8 @@ pub const Store = struct {
     resources: *Resources,
     owns_resources: bool,
     cache_token: u64,
+    caches: ?*DiskCache = null,
+    disposable: bool = false,
     mutex: std.Io.Mutex = .init,
     owner: std.atomic.Value(std.Thread.Id) = .init(0),
     writer: std.Thread.Id = 0,
@@ -551,6 +802,7 @@ pub const Store = struct {
     wal_name: [:0]u8,
     temporary_name: [:0]u8,
     limits: struct { maximum_wal_pages: u32, maximum_pages: u64, checkpoint_bytes: u64 },
+    maintenance_work: system.work.Limits = default_maintenance_work,
     metadata: format.Metadata,
     saved: format.Metadata,
     locations: wal_index.Index,
@@ -586,6 +838,8 @@ pub const Store = struct {
     failed: bool = false,
     wal_bytes: metrics.Counter = .{},
     read_bytes: metrics.Counter = .{},
+    read_cpu: metrics.Timer = .{},
+    read_direct_bytes: metrics.Counter = .{},
     read_batches: metrics.Counter = .{},
     read_pages: metrics.Counter = .{},
     checkpoint_bytes: metrics.Counter = .{},
@@ -596,13 +850,56 @@ pub const Store = struct {
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !Store {
         var self: Store = undefined;
-        try self.initialize(allocator, io, options);
+        try self.initialize(allocator, io, options, false);
         self.bindIo(io);
         return self;
     }
 
-    fn initialize(self: *Store, allocator: std.mem.Allocator, io: std.Io, options: Options) !void {
+    /// Open disposable pages during initialization. Their lifetime follows this store.
+    /// A cache has no durability barrier and never participates in world transactions.
+    pub fn openCache(self: *Store, suffix: []const u8, options: struct { maximum_pages: u64 = 1 << 24 }) !*DiskCache {
+        assert(!self.disposable);
+        if (suffix.len == 0 or std.mem.indexOfAny(u8, suffix, "/\\") != null) return error.InvalidArgument;
+        var name_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "{s}{s}", .{ self.name, suffix });
+        var existing = self.caches;
+        while (existing) |entry| : (existing = entry.next) if (std.mem.eql(u8, entry.store.name, name)) return entry;
+        var directory_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const directory = directory_buffer[0..try self.directory.realPath(self.io, &directory_buffer)];
+        const path = try std.fs.path.join(self.allocator, &.{ directory, name });
+        defer self.allocator.free(path);
+        const child = try self.allocator.create(DiskCache);
+        errdefer self.allocator.destroy(child);
+        // Two threads read a chunk cache at once: one delivers terrain, the other ticks.
+        const configuration: Options = .{ .path = path, .io_mode = self.io_mode, .readers = 2, .maximum_wal_pages = 256, .maximum_pages = options.maximum_pages };
+        child.* = DiskCache.init(self.allocator, self.io, configuration) catch |err| reset: {
+            switch (err) {
+                error.Corrupt, error.UnsupportedFormat, error.NoSpace => {},
+                else => return err,
+            }
+            // Everything in it can be derived again, at the cost of a cold start. An
+            // operator who sees one should know why.
+            std.log.warn("event=disk_cache_replaced reason={t} file={s}", .{ err, name });
+            var sibling: [std.fs.max_path_bytes]u8 = undefined;
+            for ([_][]const u8{ "", ".wal", ".wal.next" }) |extension| {
+                const file = try std.fmt.bufPrint(&sibling, "{s}{s}", .{ name, extension });
+                self.directory.deleteFile(self.io, file) catch |failure| switch (failure) {
+                    error.FileNotFound => {},
+                    else => return failure,
+                };
+            }
+            break :reset try DiskCache.init(self.allocator, self.io, configuration);
+        };
+        child.next = self.caches;
+        self.caches = child;
+        return child;
+    }
+
+    fn initialize(self: *Store, allocator: std.mem.Allocator, io: std.Io, options: Options, disposable: bool) !void {
         if (options.path.len == 0 or options.maximum_wal_pages < batch_size or options.maximum_wal_pages > 1 << 24 or options.maximum_pages < 2 or options.maximum_pages > @as(u64, std.math.maxInt(i64)) / format.block_size or options.checkpoint_bytes < format.header_size) return error.InvalidArgument;
+        try options.maintenance_work.validate(1, .{ .operations = 1, .bytes = page_size });
+        const maintenance = try options.maintenance_work.maximum(1);
+        if (options.maintenance_work.guaranteed.bytes < page_size or maintenance.bytes % page_size != 0 or maintenance.bytes / page_size > batch_size) return error.InvalidMaintenanceBudget;
         const directory_timer = try initializationTimer(options.metrics, "directory", "Open the database directory and publish new ancestors");
         const paths_timer = try initializationTimer(options.metrics, "paths", "Allocate database and WAL filenames");
         const database_timer = try initializationTimer(options.metrics, "database", "Open and lock the database file");
@@ -663,8 +960,10 @@ pub const Store = struct {
             const page = metadata.encode();
             format.seal(&block, 0, 0, 0, &page);
             try database.writePositionalAll(io, &block, 0);
-            try database.sync(io);
-            try syncDirectory(io, directory);
+            if (!disposable) {
+                try database.sync(io);
+                try syncDirectory(io, directory);
+            }
         } else {
             var block: format.Block = undefined;
             if (try database.readPositionalAll(io, &block, 0) != block.len) return error.Corrupt;
@@ -678,7 +977,7 @@ pub const Store = struct {
         }
         header_started.end();
         const wal_started = wal_timer.start();
-        const wal = directory.openFile(io, wal_name, .{ .mode = .read_write }) catch |err| blk: {
+        const wal = if (disposable) database else directory.openFile(io, wal_name, .{ .mode = .read_write }) catch |err| blk: {
             if (err != error.FileNotFound or (!new and (!valid_database or metadata.sequence != 0))) return err;
             const file = try directory.createFile(io, wal_name, .{ .read = true, .exclusive = true });
             errdefer file.close(io);
@@ -688,7 +987,7 @@ pub const Store = struct {
             try syncDirectory(io, directory);
             break :blk file;
         };
-        errdefer wal.close(io);
+        errdefer if (!disposable) wal.close(io);
         wal_started.end();
         const buffers_started = buffers_timer.start();
         const dirty_started = dirty_timer.start();
@@ -714,7 +1013,7 @@ pub const Store = struct {
         buffers_started.end();
         var filesystem = try backend.Io.init(io, options.io_mode);
         errdefer filesystem.deinit();
-        var maintenance_io = try system.FileBatch.init(io, options.io_mode);
+        var maintenance_io = try system.FileBatch.init(io, if (disposable) .standard else options.io_mode);
         errdefer maintenance_io.deinit();
         const index_started = index_timer.start();
         const index_cpu_started = index_cpu.start();
@@ -724,18 +1023,23 @@ pub const Store = struct {
         const replacement_checksums = std.mem.bytesAsSlice([8]u8, workspace[checkpoint_length + checksum_length ..][0..checksum_length]);
         index_cpu_started.end();
         index_started.end();
-        self.* = .{ .allocator = allocator, .resources = resources, .owns_resources = options.resources == null, .cache_token = cache_token, .io = io, .filesystem = filesystem, .io_mode = options.io_mode, .maintenance_io = maintenance_io, .directory = directory, .database = database, .wal = wal, .name = name, .wal_name = wal_name, .temporary_name = temporary_name, .limits = .{ .maximum_wal_pages = options.maximum_wal_pages, .maximum_pages = options.maximum_pages, .checkpoint_bytes = options.checkpoint_bytes }, .metadata = metadata, .saved = metadata, .locations = locations, .checksums = checksums, .replacement_checksums = replacement_checksums, .dirty = dirty, .checkpoint_pages = checkpoint_pages, .workspace = workspace, .cache = resources.cache, .buffers = resources.buffers, .maintenance_buffers = resources.maintenance, .sync_wait = sync_wait, .sync_wait_cpu = sync_wait_cpu };
+        self.* = .{ .disposable = disposable, .allocator = allocator, .resources = resources, .owns_resources = options.resources == null, .cache_token = cache_token, .io = io, .filesystem = filesystem, .io_mode = options.io_mode, .maintenance_io = maintenance_io, .directory = directory, .database = database, .wal = wal, .name = name, .wal_name = wal_name, .temporary_name = temporary_name, .limits = .{ .maximum_wal_pages = options.maximum_wal_pages, .maximum_pages = options.maximum_pages, .checkpoint_bytes = options.checkpoint_bytes }, .maintenance_work = options.maintenance_work, .metadata = metadata, .saved = metadata, .locations = locations, .checksums = checksums, .replacement_checksums = replacement_checksums, .dirty = dirty, .checkpoint_pages = checkpoint_pages, .workspace = workspace, .cache = resources.cache, .buffers = resources.buffers, .maintenance_buffers = resources.maintenance, .sync_wait = sync_wait, .sync_wait_cpu = sync_wait_cpu };
         self.commit_metrics = try CommitMetrics.init(options.metrics);
         const recovery_started = recovery_timer.start();
         while (resources.maintenance_owner.load(.acquire) != 0) resources.maintenance_available.waitUncancelable(io, &resources.mutex);
         resources.maintenance_owner.store(cache_token, .release);
         defer self.releaseMaintenanceBuffers();
-        try self.recover(valid_database, options.metrics, options.recovery == .durable);
+        if (disposable) {
+            if (!valid_database or self.metadata.sequence != 0 or self.metadata.pages > options.maximum_pages) return error.Corrupt;
+            if ((try database.stat(io)).size != self.metadata.pages * format.block_size) return error.Corrupt;
+        } else try self.recover(valid_database, options.metrics, options.recovery == .durable);
         recovery_started.end();
         if (options.metrics) |registry| {
             self.wal_bytes = try registry.counter(.{ .namespace = "storage", .name = "wal_bytes", .description = "Page images and transaction markers submitted to the WAL", .unit = .bytes });
             self.cache_hits = try registry.counter(.{ .namespace = "storage", .name = "page_cache_hits", .description = "Page reads served from validated memory" });
             self.read_bytes = try registry.counter(.{ .namespace = "storage", .name = "read_bytes", .description = "Page bytes read", .unit = .bytes });
+            self.read_cpu = try registry.timer(.{ .namespace = "storage", .name = "read.cpu", .description = "CPU used submitting and completing file read batches", .clock = .thread_cpu, .detailed = true });
+            self.read_direct_bytes = try registry.counter(.{ .namespace = "storage", .name = "read_direct_bytes", .description = "Verified payload bytes read directly into caller buffers", .unit = .bytes });
             self.read_batches = try registry.counter(.{ .namespace = "storage", .name = "read_batches", .description = "Application page read batches submitted" });
             self.read_pages = try registry.counter(.{ .namespace = "storage", .name = "read_pages", .description = "Application pages fetched through batched reads" });
             self.checkpoint_bytes = try registry.counter(.{ .namespace = "storage", .name = "checkpoint_bytes", .description = "Committed page bytes copied into the database", .unit = .bytes });
@@ -777,7 +1081,7 @@ pub const Store = struct {
         var pending_count: usize = 0;
         var pending_overflow = false;
         var header: [format.header_size]u8 = undefined;
-        if (try self.wal.readPositionalAll(self.io, &header, 0) != header.len or !std.mem.eql(u8, header[0..8], "LRWAL002") or format.get(u64, &header, 56) != format.checksum(header[0..56])) return error.Corrupt;
+        if (try self.wal.readPositionalAll(self.io, &header, 0) != header.len or !std.mem.eql(u8, header[0..8], "LRWAL003") or format.get(u64, &header, 56) != format.checksum(header[0..56])) return error.Corrupt;
         const identity = header[8..24].*;
         const base = format.get(u64, &header, 24);
         if (valid_database and (!std.mem.eql(u8, &identity, &self.metadata.identity) or base > self.metadata.sequence)) return error.Corrupt;
@@ -892,7 +1196,10 @@ pub const Store = struct {
         return self.published_durable.load(.acquire);
     }
     pub fn memoryBytes(self: *const Store) usize {
-        return (if (self.owns_resources) self.resources.memoryBytes() else 0) + self.dirty.len * @sizeOf(u64) + self.workspace.len + self.locations.memoryBytes();
+        var bytes = (if (self.owns_resources) self.resources.memoryBytes() else 0) + self.dirty.len * @sizeOf(u64) + self.workspace.len + self.locations.memoryBytes();
+        var child = self.caches;
+        while (child) |entry| : (child = entry.next) bytes += @sizeOf(DiskCache) + entry.store.memoryBytes();
+        return bytes;
     }
 
     pub fn bindIo(self: *Store, io: std.Io) void {
@@ -978,7 +1285,11 @@ pub const Store = struct {
         self.resources.mutex.unlock(self.resources.io);
         self.owner.store(0, .release);
         self.mutex.unlock(self.io);
-        const result = self.filesystem.read(requests);
+        const result = read: {
+            const cpu = self.read_cpu.start();
+            defer cpu.end();
+            break :read self.filesystem.read(requests);
+        };
         self.mutex.lockUncancelable(self.io);
         self.owner.store(std.Thread.getCurrentId(), .release);
         self.resources.mutex.lockUncancelable(self.resources.io);
@@ -1147,6 +1458,7 @@ pub const Store = struct {
         var begin: usize = 0;
         while (begin < reads.len) {
             const count = @min(batch_size, reads.len - begin);
+            Read.assertIndependent(reads[begin..][0..count]);
             const window_leases = if (borrowed) |leases| leases[begin..][0..count] else null;
             if (try self.readCached(space, reads[begin..][0..count], window_leases)) {
                 begin += count;
@@ -1174,11 +1486,15 @@ pub const Store = struct {
             errdefer if (!cache_pinned) {
                 self.failed = true;
             };
-            var requests: [batch_size]backend.Io.Read = undefined;
-            var blocks: [batch_size]*format.Block = undefined;
-            var verified: [batch_size]bool = @splat(false);
-            var mapping: [batch_size]?usize = undefined;
-            var slots: [batch_size]struct { index: usize, loading: bool } = undefined;
+            const requests = &reader.requests;
+            const blocks = &reader.block_views;
+            const verified = &reader.verified;
+            const direct = &reader.direct;
+            const read_indices = &reader.read_indices;
+            const mapping = &reader.mapping;
+            const slots = &reader.slots;
+            @memset(verified[0..count], false);
+            @memset(direct[0..count], false);
             var held: usize = 0;
             defer for (slots[0..held]) |slot| {
                 const entry = &self.cache[slot.index];
@@ -1196,6 +1512,14 @@ pub const Store = struct {
                     if (previous.id == read.id) break prior;
                 } else null;
                 if (duplicate) |prior| {
+                    if (direct[prior]) {
+                        assert(read_indices[prior] < reading);
+                        const request = &requests[read_indices[prior]];
+                        request.prefix = &.{};
+                        request.bytes = blocks[prior];
+                        request.suffix = &.{};
+                        direct[prior] = false;
+                    }
                     blocks[index] = blocks[prior];
                     mapping[index] = mapping[prior];
                     verified[index] = verified[prior];
@@ -1230,7 +1554,15 @@ pub const Store = struct {
                     format.seal(block, id, value.owner, self.saved.sequence + 1, block[32..]);
                     continue;
                 };
-                requests[reading] = .{ .file = if (location != null) self.wal else self.database, .offset = if (location) |value| value.current + 32 else id * format.block_size, .bytes = block };
+                direct[index] = borrowed == null and read.cache == .stream and self.io_mode == .uring;
+                read_indices[index] = reading;
+                requests[reading] = .{
+                    .file = if (location != null) self.wal else self.database,
+                    .offset = if (location) |value| value.current + 32 else id * format.block_size,
+                    .prefix = if (direct[index]) block[0 .. 32 + @as(usize, read.offset)] else &.{},
+                    .bytes = if (direct[index]) read.destination else block,
+                    .suffix = if (direct[index]) block[32 + @as(usize, read.offset) + read.destination.len ..] else &.{},
+                };
                 reading += 1;
             }
             if (reading != 0) {
@@ -1240,7 +1572,11 @@ pub const Store = struct {
                 self.resources.mutex.unlock(self.resources.io);
                 self.owner.store(0, .release);
                 self.mutex.unlock(self.io);
-                const result = filesystem.read(requests[0..reading]);
+                const result = read: {
+                    const cpu = self.read_cpu.start();
+                    defer cpu.end();
+                    break :read filesystem.read(requests[0..reading]);
+                };
                 self.mutex.lockUncancelable(self.io);
                 assert(self.owner.load(.monotonic) == 0);
                 self.owner.store(std.Thread.getCurrentId(), .release);
@@ -1257,8 +1593,14 @@ pub const Store = struct {
                 self.read_pages.add(reading);
                 self.read_bytes.add(reading * format.block_size);
             }
-            for (reads[begin..][0..count], blocks[0..count], verified[0..count]) |read, block, valid| {
-                if (!valid) try format.validate(block, @backingInt(read.id), @backingInt(space));
+            for (reads[begin..][0..count], blocks[0..count], verified[0..count], direct[0..count]) |read, block, valid, scattered| {
+                if (!valid) {
+                    if (scattered) {
+                        const prefix = block[0 .. 32 + @as(usize, read.offset)];
+                        const suffix = block[prefix.len + read.destination.len ..];
+                        try format.validateParts(prefix, read.destination, suffix, @backingInt(read.id), @backingInt(space));
+                    } else try format.validate(block, @backingInt(read.id), @backingInt(space));
+                }
                 if (format.get(u32, block, 4) != @backingInt(space)) return error.Corrupt;
             }
             for (slots[0..held]) |slot| {
@@ -1274,14 +1616,19 @@ pub const Store = struct {
                 }
                 if (slot.loading) self.resources.setReading(slot.index, false);
             }
+            var direct_bytes: usize = 0;
             for (reads[begin..][0..count], blocks[0..count], mapping[0..count], 0..) |read, block, slot, index| {
                 if (borrowed) |output| {
                     const at = slot.?;
                     const entry = &self.cache[at];
                     self.resources.setPins(at, entry.pins.load(.monotonic) + 1);
                     output[index] = .{ .resources = self.resources, .index = at, .generation = entry.generation, .frame = entry.frame };
+                } else if (direct[index]) {
+                    assert(read.cache == .stream and slot == null);
+                    direct_bytes += read.destination.len;
                 } else @memcpy(read.destination, block[32 + @as(usize, read.offset) ..][0..read.destination.len]);
             }
+            if (direct_bytes != 0) self.read_direct_bytes.add(direct_bytes);
             reader.used = false;
             owns_reader = false;
             self.resources.readers_available.broadcast(self.resources.io);
@@ -1367,6 +1714,10 @@ pub const Store = struct {
 
     fn append(self: *Store, ids: []const u64, owners: []const u32, pages: []const []const u8, digest: ?u64) Error!void {
         assert(ids.len == owners.len and ids.len == pages.len and ids.len <= batch_size);
+        if (self.disposable) {
+            assert(digest == null);
+            return self.writeDisposable(ids, owners, pages);
+        }
         const committing = digest != null;
         assert(!committing or (ids.len == 1 and ids[0] == 0));
         try self.check();
@@ -1457,6 +1808,31 @@ pub const Store = struct {
         self.wal_bytes.add(count * @sizeOf(format.Frame));
     }
 
+    fn writeDisposable(self: *Store, ids: []const u64, owners: []const u32, pages: []const []const u8) Error!void {
+        assert(self.disposable and ids.len <= batch_size);
+        var requests: [batch_size]backend.Io.Write = undefined;
+        var numbers: [batch_size]u64 = undefined;
+        var count: usize = 0;
+        for (ids, owners, pages, 0..) |id, owner, page, index| {
+            if (std.mem.indexOfScalar(u64, ids[index + 1 ..], id) != null) continue;
+            const block: *format.Block = self.buffers.frames[count][32..];
+            format.seal(block, id, owner, 0, page);
+            requests[count] = .{ .file = self.database, .offset = id * format.block_size, .bytes = block };
+            numbers[count] = id;
+            count += 1;
+        }
+        try self.waitWrite(numbers[0..count], requests[0..count]);
+        for (numbers[0..count], 0..) |id, frame| {
+            _ = self.locations.remove(id);
+            if (self.resources.cache_index.get(.{ .token = self.cache_token, .id = id })) |slot| self.resources.invalidate(slot);
+            if (self.cacheSlot(id)) |slot| {
+                std.mem.swap(*format.Frame, &self.cache[slot].frame, &self.buffers.frames[frame]);
+                self.publishCache(slot);
+            }
+        }
+        self.mutation += 1;
+    }
+
     fn writePages(self: *Store, space: SpaceId, writes: []const Write) Error!void {
         try self.check();
         errdefer self.failed = true;
@@ -1524,7 +1900,7 @@ pub const Store = struct {
                 location.replacement_dirty = true;
                 location.owner = @backingInt(space);
                 if (self.resources.cache_index.get(.{ .token = self.cache_token, .id = number })) |slot| self.resources.invalidate(slot);
-                if (!location.dirty) {
+                if (!self.disposable and !location.dirty) {
                     self.dirty[self.dirty_count] = number;
                     self.dirty_count += 1;
                     location.dirty = true;
@@ -1570,6 +1946,7 @@ pub const Store = struct {
     }
 
     pub fn commit(self: *Store, tick: u64) Error!CommitId {
+        assert(!self.disposable);
         assert(self.compound_owner.load(.acquire) != std.Thread.getCurrentId());
         const mutation = self.beginMutation();
         defer mutation.end();
@@ -1620,8 +1997,10 @@ pub const Store = struct {
             const location = self.locationPtr(id).?;
             if (self.phase == .collecting) {
                 const position = self.locations.position(id);
-                if (position >= self.maintenance_at and position < self.checkpoint_limit and location.checkpoint == null)
+                if (position >= self.maintenance_at and position < self.checkpoint_limit and !location.checkpoint_captured) {
                     location.checkpoint = location.committed;
+                    location.checkpoint_captured = true;
+                }
             }
             location.committed = location.current;
             location.uncommitted = 0;
@@ -1640,6 +2019,7 @@ pub const Store = struct {
 
     /// A failed transaction may still make an earlier complete commit durable.
     pub fn submitSync(self: *Store, through: CommitId) Error!void {
+        assert(!self.disposable);
         const operation = self.enter(.metadata);
         defer operation.end();
         const sequence = @backingInt(through);
@@ -1678,6 +2058,7 @@ pub const Store = struct {
     }
 
     fn flushUntilInternal(self: *Store, through: CommitId, deadline: ?std.Io.Clock.Timestamp) Error!void {
+        assert(!self.disposable);
         const operation = self.enter(.metadata);
         defer operation.end();
         const waiting = self.sync_wait.start();
@@ -1743,6 +2124,11 @@ pub const Store = struct {
         }
     }
 
+    pub fn maintenanceBudget(self: *const Store) MaintenanceBudget {
+        const maximum = self.maintenance_work.maximum(1) catch unreachable;
+        return .{ .index_entries = maximum.operations, .pages = maximum.bytes / page_size };
+    }
+
     /// Never wait for an I/O completion or a contended lock. Every index visit consumes budget.
     pub fn pollMaintenance(self: *Store, budget: MaintenanceBudget) Error!MaintenanceResult {
         const guard = self.tryEnter() orelse return .pending;
@@ -1773,8 +2159,8 @@ pub const Store = struct {
                 const end = @min(self.checkpoint_limit, iterator.at +| budget.index_entries);
                 while (iterator.at < end) {
                     const entry = iterator.next().?;
-                    const committed = entry.value_ptr.checkpoint orelse entry.value_ptr.committed;
-                    entry.value_ptr.checkpoint = null;
+                    const committed = if (entry.value_ptr.checkpoint_captured) entry.value_ptr.checkpoint else entry.value_ptr.committed;
+                    entry.value_ptr.checkpoint_captured = false;
                     if (committed == 0 or committed == entry.value_ptr.materialized) continue;
                     self.checkpoint_pages[self.checkpoint_count] = .{ .id = entry.key_ptr.*, .offset = committed };
                     self.checkpoint_count += 1;
@@ -2002,6 +2388,11 @@ pub const Store = struct {
     }
 
     pub fn deinit(self: *Store) void {
+        while (self.caches) |child| {
+            self.caches = child.next;
+            child.store.deinit();
+            self.allocator.destroy(child);
+        }
         if (self.resources.background.load(.acquire)) |worker| assert(worker.store != self);
         assert(self.inflight_reads == 0 and self.retired_reads == 0 and self.writer == 0 and self.owner.load(.acquire) == 0);
         {
@@ -2014,7 +2405,7 @@ pub const Store = struct {
         if (self.phase == .replacement_open) if (self.maintenance_io.opened) |file| file.close(self.io);
         if (self.retired_wal) |file| file.close(self.io);
         if (self.replacement) |file| file.close(self.io);
-        self.wal.close(self.io);
+        if (!self.disposable) self.wal.close(self.io);
         closeDatabase(self.io, self.database);
         self.directory.close(self.io);
         self.locations.deinit(self.allocator);

@@ -3,6 +3,7 @@ const oracle = @import("oracle");
 const topology = @import("topology");
 const caves = @import("visibility_caves.zig");
 const production = @import("section_visibility_world.zig");
+const chunk_horizon = @import("chunk_horizon.zig");
 const lighting = @import("lighting.zig");
 const light_engine = @import("lighting");
 const chunk_encoding = @import("chunk_encoding.zig");
@@ -17,7 +18,7 @@ const sessions = @import("sessions");
 const packets = @import("minecraft_packets");
 const minecraft_java = @import("minecraft_java");
 
-const Options = struct {
+pub const Options = struct {
     world: ?[]const u8 = null,
     scene: ?[]const u8 = null,
     radius: i32 = 1,
@@ -33,15 +34,19 @@ const Options = struct {
     samples: usize = 1,
     output: ?[]const u8 = null,
     targets: []const [3]i32 = &.{},
+    f5_witnesses: bool = false,
 };
 
-const Scene = struct {
+// Set once from the command line before any solve; the benchmark is single threaded.
+var eye_precision: production.Source.Precision = .head;
+
+pub const Scene = struct {
     grid: topology.Grid,
     blocks: []u16,
     biomes: [][64]u16,
     eye: oracle.Eye,
 
-    fn init(allocator: std.mem.Allocator, radius: i32, minimum: i32, height: usize, feet: [3]i64) !Scene {
+    pub fn init(allocator: std.mem.Allocator, radius: i32, minimum: i32, height: usize, feet: [3]i64) !Scene {
         const side: usize = @intCast(radius * 2 + 1);
         const grid: topology.Grid = .{ .minimum = .{ @as(i32, @intCast(@divFloor(feet[0], 16 * oracle.Eye.scale))) - radius, minimum, @as(i32, @intCast(@divFloor(feet[2], 16 * oracle.Eye.scale))) - radius }, .side = side, .height = height };
         var result: Scene = .{ .grid = grid, .blocks = try allocator.alloc(u16, grid.count() * 4096), .biomes = try allocator.alloc([64]u16, grid.count()), .eye = .{ .coordinates = feet } };
@@ -51,20 +56,21 @@ const Scene = struct {
         return result;
     }
 
-    fn at(self: Scene, position: [3]i32) ?u16 {
+    pub fn at(self: Scene, position: [3]i32) ?u16 {
         const section = self.grid.index(.{ @divFloor(position[0], 16), @divFloor(position[1], 16), @divFloor(position[2], 16) }) orelse return null;
         const local: usize = @intCast(@mod(position[1], 16) * 256 + @mod(position[2], 16) * 16 + @mod(position[0], 16));
         return self.blocks[section * 4096 + local];
     }
 
-    fn synthetic(allocator: std.mem.Allocator, radius: i32, kind: []const u8) !Scene {
+    pub fn synthetic(allocator: std.mem.Allocator, radius: i32, kind: []const u8) !Scene {
         const geode = std.mem.startsWith(u8, kind, "geode");
+        const terraces = std.mem.eql(u8, kind, "sky-terraces");
         const stacked = std.mem.eql(u8, kind, "stacked-caves");
         const cave = std.mem.eql(u8, kind, "bent-cave");
         const straight = std.mem.eql(u8, kind, "straight-tunnel");
         const winding = std.mem.eql(u8, kind, "winding-tunnel");
-        const feet: [3]i64 = .{ 8500, if (stacked) 20000 else if (geode or cave or straight or winding) 24000 else 32000, 8500 };
-        const scene = try Scene.init(allocator, radius, 0, 4, feet);
+        const feet: [3]i64 = .{ 8500, if (terraces) 96000 else if (stacked) 20000 else if (geode or cave or straight or winding) 24000 else 32000, 8500 };
+        const scene = try Scene.init(allocator, radius, 0, if (terraces) 8 else 4, feet);
         const stone: u16 = @intCast(game_data.registry.block_stone_default_state);
         for (0..scene.grid.count()) |section| {
             const position = scene.grid.position(section);
@@ -73,6 +79,11 @@ const Scene = struct {
                 const y = position[1] * 16 + @as(i32, @intCast(local / 256));
                 const z = position[2] * 16 + @as(i32, @intCast(local / 16 % 16));
                 state.* = if (y < (if (geode or cave or stacked) @as(i32, 40) else 32)) stone else 0;
+                if (terraces) {
+                    const surface = 32 + 16 * @mod(@divFloor(x, 16) + @divFloor(z, 16), 3);
+                    const wall = x >= 32 and x < 34 and z >= -24 and z < 24 and y >= 64 and y < 128;
+                    state.* = if (y < surface or wall) stone else 0;
+                }
                 if (stacked and x >= 4 and z >= 4 and z < 12 and
                     ((y >= 20 and y < 24) or (y >= 28 and y < 32) or (x >= 32 and x < 40 and y >= 28))) state.* = 0;
                 if (geode) {
@@ -119,7 +130,7 @@ const Neighborhood = struct {
             if (id) |index| for (0..16) |row_y| for (0..16) |row_z| {
                 @memcpy(self.states[offset + (row_y * 48 + row_z) * 48 ..][0..16], scene.blocks[index * 4096 + (row_y * 16 + row_z) * 16 ..][0..16]);
             };
-            self.sections[column * height + y] = .{ .stamp = .{ .generation = if (id) |index| index + 1 else 0 }, .view = .{ .rows = self.states[offset..] }, .biomes = if (id) |index| &scene.biomes[index] else null };
+            self.sections[column * height + y] = .{ .stamp = .{ .generation = if (id) |index| index + 1 else 0 }, .view = .{ .rows = self.states[offset..] }, .biomes = if (id) |index| .{ .values = &scene.biomes[index] } else null };
         };
         return .{ .world = 0, .x = x, .z = z, .minimum = scene.grid.minimum[1], .count = height, .sections = self.sections };
     }
@@ -133,7 +144,7 @@ const Neighborhood = struct {
     }
 };
 
-fn loadWorld(init: std.process.Init, allocator: std.mem.Allocator, options: Options) !Scene {
+pub fn loadWorld(init: std.process.Init, allocator: std.mem.Allocator, options: Options) !Scene {
     try std.Io.Dir.cwd().access(init.io, options.world.?, .{});
     var registry = try metrics.Registry.init(allocator, init.io, .{ .capacity = 128 });
     defer registry.deinit();
@@ -178,7 +189,7 @@ fn loadWorld(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
     return scene;
 }
 
-const Wire = struct {
+pub const Wire = struct {
     engine: light_engine.Engine,
     workspace: *chunk_encoding.Workspace,
     catalog: protocols.Default,
@@ -186,8 +197,9 @@ const Wire = struct {
     bytes: []u8,
     compressed: []u8,
 
-    fn init(allocator: std.mem.Allocator, height: usize) !Wire {
-        return .{ .engine = try light_engine.Engine.init(allocator, .{ .x = 48, .y = (height + 2) * 16, .z = 48 }, try game_data.lighting.init(allocator)), .workspace = try chunk_encoding.Workspace.init(allocator), .catalog = try protocols.Default.init(allocator), .compression = try minecraft_java.Wire.Workspace.init(allocator), .bytes = try allocator.alloc(u8, 1 << 21), .compressed = try allocator.alloc(u8, (1 << 21) + sessions.shared_headroom) };
+    pub fn init(allocator: std.mem.Allocator, height: usize) !Wire {
+        const catalog = try protocols.Default.init(allocator);
+        return .{ .engine = try light_engine.Engine.init(allocator, .{ .x = 48, .y = (height + 2) * 16, .z = 48 }, try game_data.lighting.init(allocator)), .workspace = try chunk_encoding.Workspace.init(allocator, (1 << 21) - 1, &catalog.values), .catalog = catalog, .compression = try minecraft_java.Wire.Workspace.init(allocator), .bytes = try allocator.alloc(u8, 1 << 21), .compressed = try allocator.alloc(u8, (1 << 21) + sessions.shared_headroom) };
     }
 
     fn size(self: *Wire, scene: Scene, column: usize, neighborhood: Neighborhood, mask: u32) !usize {
@@ -199,14 +211,15 @@ const Wire = struct {
             if (self.engine.sectionNonempty(.block, .{ 1, section, 1 })) masks[0] |= @as(u32, 1) << @intCast(section);
             if (self.engine.sectionNonempty(.sky, .{ 1, section, 1 })) masks[1] |= @as(u32, 1) << @intCast(section);
         }
-        const chunk: chunk_encoding.Chunk = .{ .x = position[0], .z = position[2], .minimum_section = position[1], .sections = neighborhood.sections[4 * scene.grid.height ..][0..scene.grid.height], .workspace = self.workspace, .biome = game_data.registry.biomeId("minecraft:plains").?, .light = .{ .source = .{ .computed = &self.engine }, .count = scene.grid.height + 2, .masks = masks }, .disclosure = mask, .concealment = 0 };
-        const encoded = try sessions.packet_api.encode(Version, chunk_encoding.write, self.bytes, .{ mapping, chunk, &self.catalog.values[0] });
+        const chunk: chunk_encoding.Chunk = .{ .x = position[0], .z = position[2], .minimum_section = position[1], .sections = .{ .loaded = neighborhood.sections[4 * scene.grid.height ..][0..scene.grid.height] }, .workspace = self.workspace, .biome = game_data.registry.biomeId("minecraft:plains").?, .light = .{ .source = .{ .computed = &self.engine }, .count = scene.grid.height + 2, .masks = masks }, .disclosure = mask, .concealment = 0 };
+        const prepared = try self.workspace.prepare(chunk);
+        const encoded = try sessions.packet_api.encode(Version, chunk_encoding.write, self.bytes, .{ mapping, &prepared, &self.catalog.values[0] });
         if (encoded.len >= 256) return (try self.compression.compress(encoded, self.compressed)).len;
         return encoded.len + 1 + @as(usize, if (encoded.len + 1 < 128) 1 else 2);
     }
 };
 
-fn oracleSections(allocator: std.mem.Allocator, scene: Scene) ![]oracle.Section {
+pub fn oracleSections(allocator: std.mem.Allocator, scene: Scene) ![]oracle.Section {
     const sections = try allocator.alloc(oracle.Section, scene.grid.count());
     for (sections, 0..) |*section, index| {
         section.* = .{ .position = scene.grid.position(index) };
@@ -219,7 +232,7 @@ fn oracleSections(allocator: std.mem.Allocator, scene: Scene) ![]oracle.Section 
 
 const Solution = struct {
     world: *production.World,
-    query: production.Handle,
+    view_index: usize,
     cpu_ns: i96,
     reads: usize,
     visits: u64,
@@ -232,10 +245,10 @@ fn learnSection(world: *production.World, scene: Scene, index: usize) void {
     world.learnSection(.{ .world = 0, .x = at[0], .z = at[2], .minimum = scene.grid.minimum[1] }, scene.grid.height, @intCast(at[1] - scene.grid.minimum[1]), .{ .dense = states });
 }
 
-fn solve(io: std.Io, allocator: std.mem.Allocator, scene: Scene, warm: bool) !Solution {
+pub fn solve(io: std.Io, allocator: std.mem.Allocator, scene: Scene, warm: bool) !Solution {
     const world = try allocator.create(production.World);
     const radius: i32 = @intCast((scene.grid.side - 1) / 2);
-    world.* = try .init(allocator, .{ .columns = (scene.grid.side + 2) * (scene.grid.side + 2), .sources = 1, .radius = radius });
+    world.* = try .init(allocator, .{ .columns = (scene.grid.side + 2) * (scene.grid.side + 2), .views = 1, .radius = radius });
     if (warm) for (0..scene.grid.count()) |index| learnSection(world, scene, index);
     return calculate(io, world, scene);
 }
@@ -251,19 +264,20 @@ fn calculate(io: std.Io, world: *production.World, scene: Scene) !Solution {
         learnSection(world, scene, index);
     }
     var source_storage: production.Source = undefined;
-    const source = world.source(0, scene.grid.minimum[1], scene.grid.height, head, &source_storage) orelse return error.MissingSource;
-    world.beginPoll();
-    const query = world.query(source, scene.grid.minimum[1], scene.grid.height, radius);
+    // A fixed head is a slow head, so it gets the same precision as in streaming.
+    const source = world.narrowSource(0, scene.grid.minimum[1], scene.grid.height, head, eye_precision, &source_storage) orelse return error.MissingSource;
+    const view_index = @as(usize, 0);
+    world.begin(view_index, source, scene.grid.minimum[1], scene.grid.height, radius);
     var reads: usize = 0;
     var iterations: usize = 0;
-    while (!world.ready(query)) {
+    while (!world.ready(view_index)) {
         if (iterations > scene.grid.count() * 2) return error.VisibilityDidNotComplete;
         const missing = world.advance().requests;
-        for (missing) |position| {
-            const index = scene.grid.index(.{ position.x, position.y, position.z }) orelse return error.RequestOutsideScene;
+        for (missing) |column| for (0..column.count) |offset| {
+            const index = scene.grid.index(.{ column.x, column.minimum + @as(i32, @intCast(offset)), column.z }) orelse return error.RequestOutsideScene;
             learnSection(world, scene, index);
             reads += 1;
-        }
+        };
         iterations += 1;
     }
     const elapsed = std.Io.Clock.now(.cpu_thread, io).nanoseconds - started;
@@ -271,10 +285,10 @@ fn calculate(io: std.Io, world: *production.World, scene: Scene) !Solution {
     for (0..scene.grid.side * scene.grid.side) |column| {
         const at = scene.grid.position(column * scene.grid.height);
         var bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &bytes, world.mask(query, at[0], at[2]), .little);
+        std.mem.writeInt(u32, &bytes, world.mask(view_index, at[0], at[2]), .little);
         hash.update(&bytes);
     }
-    return .{ .world = world, .query = query, .cpu_ns = elapsed, .reads = reads, .visits = world.visits - visits, .mask_sha256 = std.fmt.bytesToHex(hash.finalResult(), .lower) };
+    return .{ .world = world, .view_index = view_index, .cpu_ns = elapsed, .reads = reads, .visits = world.visits - visits, .mask_sha256 = std.fmt.bytesToHex(hash.finalResult(), .lower) };
 }
 
 fn measure(io: std.Io, allocator: std.mem.Allocator, scene: Scene, warm: bool, samples: usize) !Solution {
@@ -297,7 +311,46 @@ fn measure(io: std.Io, allocator: std.mem.Allocator, scene: Scene, warm: bool, s
     return solution;
 }
 
-fn cameraEyes(allocator: std.mem.Allocator, scene: Scene, samples: usize) ![]const oracle.Eye {
+/// Third-person cameras as vanilla places them: up to four blocks from the eye along any
+/// look direction, pulled in where a block stops the camera.
+fn f5Eyes(allocator: std.mem.Allocator, scene: Scene) ![]const oracle.Eye {
+    const distance = 4.0;
+    const step = 0.05;
+    const directions = 64;
+    var result: std.ArrayList(oracle.Eye) = .empty;
+    errdefer result.deinit(allocator);
+    var origin: [3]f64 = undefined;
+    for (&origin, scene.eye.coordinates) |*value, milli| value.* = @as(f64, @floatFromInt(milli)) / oracle.Eye.scale;
+    for (0..directions) |index| {
+        // Fibonacci sphere: evenly spread look directions, both behind and in front of the player.
+        const fraction = (@as(f64, @floatFromInt(index)) + 0.5) / directions;
+        const y = 1 - 2 * fraction;
+        const ring = @sqrt(1 - y * y);
+        const angle = std.math.pi * (3 - @sqrt(5.0)) * @as(f64, @floatFromInt(index));
+        const direction = [3]f64{ ring * @cos(angle), y, ring * @sin(angle) };
+        var camera = origin;
+        var travelled: f64 = step;
+        while (travelled <= distance) : (travelled += step) {
+            var next: [3]f64 = undefined;
+            var block: [3]i32 = undefined;
+            for (&next, &block, origin, direction) |*value, *cell, start, delta| {
+                value.* = start + delta * travelled;
+                cell.* = @intFromFloat(@floor(value.*));
+            }
+            const state = scene.at(block) orelse break;
+            if (game_data.physics.rendering(state).occluder) break;
+            camera = next;
+        }
+        var eye: oracle.Eye = undefined;
+        for (&eye.coordinates, camera) |*value, position| value.* = @intFromFloat(@round(position * oracle.Eye.scale));
+        var duplicate = false;
+        for (result.items) |previous| duplicate = duplicate or std.meta.eql(previous, eye);
+        if (!duplicate) try result.append(allocator, eye);
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+pub fn cameraEyes(allocator: std.mem.Allocator, scene: Scene, samples: usize) ![]const oracle.Eye {
     std.debug.assert(samples <= 256);
     const side = 16 + 2 * production.camera_margin;
     const head = scene.eye.block();
@@ -410,9 +463,10 @@ fn runTargets(io: std.Io, allocator: std.mem.Allocator, scene: Scene, options: O
     defer coverage.deinit();
     const cold = try measure(io, allocator, scene, false, options.samples);
     const warm = try measure(io, allocator, scene, true, options.samples);
+    const eyes = if (options.camera_witnesses) try cameraEyes(allocator, scene, options.camera_samples) else &.{};
     for (0..scene.grid.side * scene.grid.side) |column| {
         const at = scene.grid.position(column * scene.grid.height);
-        if (cold.world.mask(cold.query, at[0], at[2]) != warm.world.mask(warm.query, at[0], at[2])) return error.CacheDependentVisibility;
+        if (cold.world.mask(cold.view_index, at[0], at[2]) != warm.world.mask(warm.view_index, at[0], at[2])) return error.CacheDependentVisibility;
     }
     var wrong: usize = 0;
     for (options.targets) |point| {
@@ -421,9 +475,17 @@ fn runTargets(io: std.Io, allocator: std.mem.Allocator, scene: Scene, options: O
         try coverage.restrict(sections[index].bounds(), scene.eye);
         try oracle.classify(allocator, &coverage, sections, scene.eye, reference);
         const bit = @as(u32, 1) << @as(u5, @intCast(section[1] - scene.grid.minimum[1]));
-        const disclosed = cold.world.mask(cold.query, section[0], section[2]) & bit != 0;
+        const disclosed = cold.world.mask(cold.view_index, section[0], section[2]) & bit != 0;
         wrong += @intFromBool(reference[index] and !disclosed);
-        const result = .{ .target = point, .section = section, .reference_visible = reference[index], .disclosed = disclosed, .cold_warm_identical = true, .samples = options.samples, .mask_sha256 = warm.mask_sha256, .cold_cpu_ns = cold.cpu_ns, .warm_cpu_ns = warm.cpu_ns, .visits = cold.visits, .metadata_reads = cold.reads, .reference_nodes = coverage.used };
+        const reference_visible = reference[index];
+        var camera_visible: usize = 0;
+        for (eyes) |eye| {
+            try coverage.restrict(sections[index].bounds(), eye);
+            try oracle.classify(allocator, &coverage, sections, eye, reference);
+            camera_visible += @intFromBool(reference[index]);
+            wrong += @intFromBool(reference[index] and !disclosed);
+        }
+        const result = .{ .target = point, .section = section, .reference_visible = reference_visible, .disclosed = disclosed, .camera_samples = eyes.len, .camera_visible = camera_visible, .cold_warm_identical = true, .samples = options.samples, .mask_sha256 = warm.mask_sha256, .cold_cpu_ns = cold.cpu_ns, .warm_cpu_ns = warm.cpu_ns, .visits = cold.visits, .metadata_reads = cold.reads, .reference_nodes = coverage.used };
         try std.json.Stringify.value(result, .{}, output);
         try output.writeByte('\n');
         try output.flush();
@@ -437,6 +499,8 @@ fn runTargets(io: std.Io, allocator: std.mem.Allocator, scene: Scene, options: O
 fn run(init: std.process.Init, allocator: std.mem.Allocator, scene: Scene, name: []const u8, options: Options, output: *std.Io.Writer, details: *std.Io.Writer) !usize {
     const count = scene.grid.count();
     const head = scene.eye.block();
+    const center: chunk_horizon.Position = .{ .x = @divFloor(head[0], 16), .z = @divFloor(head[2], 16) };
+    const radius: i32 = @intCast((scene.grid.side - 1) / 2);
     const observer_index = scene.grid.index(.{ @divFloor(head[0], 16), @divFloor(head[1], 16), @divFloor(head[2], 16) }) orelse return error.ObserverOutsideScene;
     const sections = try oracleSections(allocator, scene);
     const reference = try allocator.alloc(bool, count);
@@ -458,6 +522,19 @@ fn run(init: std.process.Init, allocator: std.mem.Allocator, scene: Scene, name:
             };
         }
     }
+    // Sections some vanilla third-person camera can see, beyond what the head sees.
+    const f5_visible = try allocator.alloc(bool, count);
+    @memset(f5_visible, false);
+    var f5_cameras: usize = 0;
+    if (options.f5_witnesses) {
+        const scratch = try allocator.alloc(bool, count);
+        const cameras = try f5Eyes(allocator, scene);
+        f5_cameras = cameras.len;
+        for (cameras) |camera| {
+            try oracle.classify(allocator, &coverage, sections, camera, scratch);
+            for (scratch, f5_visible) |visible, *flag| flag.* = flag.* or visible;
+        }
+    }
     var topology_check = try topology.Analysis.init(allocator, count);
     defer topology_check.deinit();
     const neighborhood = try Neighborhood.init(allocator, scene.grid.height);
@@ -476,12 +553,14 @@ fn run(init: std.process.Init, allocator: std.mem.Allocator, scene: Scene, name:
         var camera_wrong: usize = 0;
         for (0..scene.grid.side * scene.grid.side) |column| {
             const at = scene.grid.position(column * scene.grid.height);
-            const mask = solution.world.mask(solution.query, at[0], at[2]);
+            const mask = solution.world.mask(solution.view_index, at[0], at[2]);
             if (warm and mask != expected[column]) return error.CacheDependentVisibility;
             expected[column] = mask;
             for (0..scene.grid.height) |y| disclosed[column * scene.grid.height + y] = mask & (@as(u32, 1) << @as(u5, @intCast(y))) != 0;
         }
         for (reference, disclosed, 0..) |actual, sent, index| {
+            const at = scene.grid.position(index);
+            if (!chunk_horizon.contains(radius, center, .{ .x = at[0], .z = at[2] })) continue;
             visible += @intFromBool(actual);
             extra += @intFromBool(!actual and sent);
             wrong += @intFromBool(actual and !sent);
@@ -493,6 +572,17 @@ fn run(init: std.process.Init, allocator: std.mem.Allocator, scene: Scene, name:
             }
         }
         total_wrong += wrong + camera_wrong;
+        if (options.f5_witnesses) {
+            var f5_only: usize = 0;
+            var f5_hidden: usize = 0;
+            for (reference, f5_visible, disclosed, 0..) |head_visible, camera_visible, sent, index| {
+                const at = scene.grid.position(index);
+                if (!chunk_horizon.contains(radius, center, .{ .x = at[0], .z = at[2] })) continue;
+                f5_only += @intFromBool(camera_visible and !head_visible);
+                f5_hidden += @intFromBool(camera_visible and !sent);
+            }
+            try output.print("  f5 cameras={d} visible_only_from_f5={d} hidden_from_f5={d}\n", .{ f5_cameras, f5_only, f5_hidden });
+        }
         topology_check.run(scene.grid, disclosed, observer_index);
         var disconnected: usize = 0;
         for (topology_check.components.items) |component| if (!component.contains_observer) {
@@ -501,6 +591,8 @@ fn run(init: std.process.Init, allocator: std.mem.Allocator, scene: Scene, name:
         if (topology_check.isolated.items.len != 0 or disconnected != 0) return error.DisconnectedDisclosure;
         var sizes: [3]usize = @splat(0);
         for (0..scene.grid.side * scene.grid.side) |column| {
+            const at = scene.grid.position(column * scene.grid.height);
+            if (!chunk_horizon.contains(radius, center, .{ .x = at[0], .z = at[2] })) continue;
             _ = neighborhood.load(scene, scene.grid.position(column * scene.grid.height)[0], scene.grid.position(column * scene.grid.height)[2]);
             try wire.engine.load(.{ .dense = neighborhood.states });
             wire.engine.relight(true);
@@ -583,7 +675,7 @@ pub fn main(init: std.process.Init) !void {
     defer targets.deinit(init.arena.allocator());
     while (args.next()) |argument| {
         if (std.mem.eql(u8, argument, "--help")) {
-            try output.interface.writeAll("zig build bench -Doptimize=ReleaseSafe -- [options]\n--scene flat|forest|overhang|geode|geode-opening|bent-cave|stacked-caves|straight-tunnel|winding-tunnel\n--world PATH           Native world copy instead of synthetic scenes\n--position X Y Z       Player feet, exact decimals with at most three fractional digits\n--target X Y Z       Check one target section exactly, repeatable with --world\n--radius 1..35         Render distance, default 1\n--samples 1..64       CPU samples per cache state, default 1\n--nodes N --depth N    Exact reference capacity, default 262144 and 1024\n--output PATH          Full JSONL diagnostics, default .zig-cache/visibility.jsonl\n");
+            try output.interface.writeAll("zig build bench -Doptimize=ReleaseSafe -- [options]\n--scene flat|forest|overhang|sky-terraces|geode|geode-opening|bent-cave|stacked-caves|straight-tunnel|winding-tunnel\n--world PATH           Native world copy instead of synthetic scenes\n--position X Y Z       Player feet, exact decimals with at most three fractional digits\n--target X Y Z       Check one target section exactly, repeatable with --world\n--radius 1..35         Render distance, default 1\n--samples 1..64       CPU samples per cache state, default 1\n--nodes N --depth N    Exact reference capacity, default 262144 and 1024\n--output PATH          Full JSONL diagnostics, default .zig-cache/visibility.jsonl\n");
             try output.interface.writeAll("--caves               Discover tight, large, and tall caves in --world and check each against the exact oracle\n--search-radius N     Imported search window, default 8 chunks around --position X,Z\nCave suites default to --radius 2 and --output .zig-cache/visibility-caves.jsonl.\nCave viewpoints depend only on terrain and are printed with reproducible input hashes.\n");
             try output.interface.writeAll("--camera-witnesses     Check additional permitted camera positions with the exact oracle\n");
             try output.interface.writeAll("--camera-samples N     Additional deterministic interior camera samples, default 64\n--cave tight|chamber|tall  Run one imported cave case\n");
@@ -595,11 +687,19 @@ pub fn main(init: std.process.Init) !void {
             options.caves = true;
             continue;
         }
+        if (std.mem.eql(u8, argument, "--f5-witnesses")) {
+            options.f5_witnesses = true;
+            continue;
+        }
         if (std.mem.eql(u8, argument, "--camera-witnesses")) {
             options.camera_witnesses = true;
             continue;
         }
         const value = args.next() orelse return error.MissingArgument;
+        if (std.mem.eql(u8, argument, "--precision")) {
+            eye_precision = std.meta.stringToEnum(production.Source.Precision, value) orelse return error.InvalidPrecision;
+            continue;
+        }
         if (std.mem.eql(u8, argument, "--samples")) {
             options.samples = try std.fmt.parseInt(usize, value, 10);
             continue;
@@ -643,7 +743,7 @@ pub fn main(init: std.process.Init) !void {
     if (options.cave != null and !options.caves) return error.MissingCaveSuite;
     if (options.camera_samples > 256) return error.InvalidCameraSamples;
     if (options.repeat_queries > 1000000) return error.InvalidQueryRepetitions;
-    if ((options.camera_witnesses or options.repeat_queries != 0) and options.targets.len != 0) return error.ConflictingTargets;
+    if (options.repeat_queries != 0 and options.targets.len != 0) return error.ConflictingTargets;
     const output_path = options.output orelse if (options.caves) ".zig-cache/visibility-caves.jsonl" else ".zig-cache/visibility.jsonl";
     if (std.fs.path.dirname(output_path)) |directory| try std.Io.Dir.cwd().createDirPath(init.io, directory);
     const file = try std.Io.Dir.cwd().createFile(init.io, output_path, .{});
@@ -666,7 +766,7 @@ pub fn main(init: std.process.Init) !void {
         }
     } else {
         var matched = false;
-        for ([_][]const u8{ "flat", "forest", "overhang", "geode", "geode-opening", "bent-cave", "stacked-caves", "straight-tunnel", "winding-tunnel" }) |name| {
+        for ([_][]const u8{ "flat", "forest", "overhang", "sky-terraces", "geode", "geode-opening", "bent-cave", "stacked-caves", "straight-tunnel", "winding-tunnel" }) |name| {
             if (options.scene) |selected| if (!std.mem.eql(u8, selected, name)) continue;
             matched = true;
             var arena = std.heap.ArenaAllocator.init(init.gpa);
@@ -681,7 +781,7 @@ pub fn main(init: std.process.Init) !void {
     if (wrong != 0) return error.IncorrectConcealment;
 }
 
-fn coordinate(text: []const u8) !i64 {
+pub fn coordinate(text: []const u8) !i64 {
     if (text.len == 0) return error.InvalidPosition;
     const negative = text[0] == '-';
     const magnitude = if (negative or text[0] == '+') text[1..] else text;
@@ -696,4 +796,117 @@ fn coordinate(text: []const u8) !i64 {
     if (parts.next() != null or whole > 30_000_000 or (whole == 30_000_000 and fraction != 0)) return error.InvalidPosition;
     const value = @as(i64, whole) * oracle.Eye.scale + fraction;
     return if (negative) -value else value;
+}
+
+fn verifyIncrementalScene(init: std.process.Init, allocator: std.mem.Allocator, scene: Scene, name: []const u8, output: *std.Io.Writer) !void {
+    const radius: i32 = @intCast((scene.grid.side - 1) / 2);
+    const count = scene.grid.count();
+    const sections = try oracleSections(allocator, scene);
+    const exact = try allocator.alloc(bool, count);
+    var coverage = try oracle.Coverage.init(allocator, 262144, 1024);
+    defer coverage.deinit();
+    try oracle.classify(allocator, &coverage, sections, scene.eye, exact);
+    const live = try solve(init.io, allocator, scene, true);
+    const head = scene.eye.block();
+    var origin: production.Source = undefined;
+    const source = live.world.source(0, scene.grid.minimum[1], scene.grid.height, head, &origin).?;
+    const actual = try allocator.dupe(u32, live.world.views[0].masks);
+    var wrong: usize = 0;
+    var extra: usize = 0;
+    for (exact, 0..) |visible, index| {
+        const disclosed = actual[index / scene.grid.height] & (@as(u32, 1) << @intCast(index % scene.grid.height)) != 0;
+        const at = scene.grid.position(index);
+        if (!chunk_horizon.contains(radius, .{ .x = source.section.x, .z = source.section.z }, .{ .x = at[0], .z = at[2] })) continue;
+        wrong += @intFromBool(visible and !disclosed);
+        extra += @intFromBool(!visible and disclosed);
+    }
+    if (wrong != 0) return error.IncorrectlyHiddenSection;
+    var poses: usize = 1;
+    for ([_]usize{ 0, 2 }) |axis| {
+        var moved = scene;
+        moved.eye.coordinates[axis] += oracle.Eye.scale;
+        if (!source.supports(0, moved.eye.block())) continue;
+        _ = try calculate(init.io, live.world, moved);
+        if (!std.mem.eql(u32, actual, live.world.views[0].masks)) return error.SourceComponentChangedVisibility;
+        try oracle.classify(allocator, &coverage, sections, moved.eye, exact);
+        for (exact, 0..) |visible, index| {
+            const at = scene.grid.position(index);
+            if (!chunk_horizon.contains(radius, .{ .x = source.section.x, .z = source.section.z }, .{ .x = at[0], .z = at[2] })) continue;
+            if (visible and actual[index / scene.grid.height] & (@as(u32, 1) << @intCast(index % scene.grid.height)) == 0) return error.IncorrectlyHiddenSection;
+        }
+        poses += 1;
+    }
+    try output.print("{s:<17} sections={d:>4} extra={d:>4} wrong={d} poses={d}\n", .{ name, count, extra, wrong, poses });
+    try output.flush();
+}
+
+pub fn verifyIncremental(init: std.process.Init, output: *std.Io.Writer) !void {
+    try output.writeAll("Visibility oracle: incremental results compared with exact voxel visibility and fresh proofs\n");
+    const cases = [_][]const u8{ "flat", "forest", "overhang", "sky-terraces", "geode", "geode-opening", "bent-cave", "stacked-caves", "straight-tunnel", "winding-tunnel" };
+    for (cases) |name| {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const radius: i32 = if (std.mem.endsWith(u8, name, "tunnel")) 6 else 3;
+        const scene = try Scene.synthetic(allocator, radius, name);
+        try verifyIncrementalScene(init, allocator, scene, name, output);
+    }
+    // A closed passage and a single-block opening exercise stale negative visibility.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const scene = try Scene.synthetic(allocator, 6, "straight-tunnel");
+    const live = try solve(init.io, allocator, scene, true);
+    const previous = try allocator.dupe(u32, live.world.views[0].masks);
+    for (0..2) |phase| {
+        const section = scene.grid.index(.{ 2, 1, 0 }).?;
+        if (phase == 0) {
+            for (24..27) |y| for (7..9) |z| {
+                scene.blocks[section * 4096 + (y - 16) * 256 + z * 16] = game_data.registry.block_stone_default_state;
+            };
+        } else scene.blocks[section * 4096 + 9 * 256 + 8 * 16] = 0;
+        live.world.changed(0, 0, .{ .minimum = .{ 32, 24, 7 }, .maximum = .{ 33, 27, 9 } }, false);
+        learnSection(live.world, scene, section);
+        _ = try calculate(init.io, live.world, scene);
+        const current = live.world.views[0].masks;
+        const fresh = try solve(init.io, allocator, scene, true);
+        if (!std.mem.eql(u32, current, fresh.world.views[0].masks)) return error.IncrementalMismatch;
+        var changed: usize = 0;
+        for (current, previous) |a, b| changed += @popCount(a ^ b);
+        if (changed == 0) return error.EditDidNotChangeVisibility;
+        const exact = try allocator.alloc(bool, scene.grid.count());
+        var coverage = try oracle.Coverage.init(allocator, 262144, 1024);
+        defer coverage.deinit();
+        try oracle.classify(allocator, &coverage, try oracleSections(allocator, scene), scene.eye, exact);
+        for (exact, 0..) |visible, index| {
+            const at = scene.grid.position(index);
+            if (!chunk_horizon.contains(6, .{ .x = 0, .z = 0 }, .{ .x = at[0], .z = at[2] })) continue;
+            if (visible and current[index / scene.grid.height] & (@as(u32, 1) << @intCast(index % scene.grid.height)) == 0) return error.IncorrectlyHiddenSection;
+        }
+        @memcpy(previous, current);
+        try output.print("{s:<17} changed_sections={d} wrong=0\n", .{ if (phase == 0) "close-door" else "open-one-block", changed });
+        try output.flush();
+    }
+}
+
+pub fn verifyImportedIncremental(init: std.process.Init, path: []const u8, output: *std.Io.Writer) !void {
+    var search = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer search.deinit();
+    const source = try loadWorld(init, search.allocator(), .{ .world = path, .radius = 8 });
+    const sites = try caves.select(.{ .grid = source.grid, .blocks = source.blocks }, 3);
+    for (sites) |site| {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const scene = try Scene.init(arena.allocator(), 3, source.grid.minimum[1], source.grid.height, site.feet());
+        for (0..scene.grid.count()) |index| {
+            const from = source.grid.index(scene.grid.position(index)) orelse return error.CaveWindowOutsideImport;
+            @memcpy(scene.blocks[index * 4096 ..][0..4096], source.blocks[from * 4096 ..][0..4096]);
+            scene.biomes[index] = source.biomes[from];
+        }
+        try verifyIncrementalScene(init, arena.allocator(), scene, switch (site.kind) {
+            .tight => "imported-tight",
+            .chamber => "imported-chamber",
+            .tall => "imported-tall",
+        }, output);
+    }
 }

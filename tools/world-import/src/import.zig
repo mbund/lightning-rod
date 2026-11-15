@@ -12,6 +12,9 @@ const item_import = @import("items.zig");
 const player_import = @import("players.zig");
 const entity_import = @import("entities.zig");
 const block_import = @import("blocks.zig");
+const delivery = @import("delivery.zig");
+const protocols = @import("protocols");
+const assert = std.debug.assert;
 
 const chunk_configuration: chunks.Chunks.Configuration = .{ .cache_sections = 192, .demand_sections = 0 };
 
@@ -33,7 +36,7 @@ pub const Options = struct {
     output: []const u8,
     skip_unsupported: bool = false,
     players: []const Mapping = &.{},
-    lighting: bool = true,
+    lighting: bool = false,
 };
 pub const Counts = struct {
     columns: usize = 0,
@@ -47,6 +50,9 @@ pub const Counts = struct {
     incomplete_chunks: usize = 0,
     lit_columns: usize = 0,
     deferred_lighting: usize = 0,
+    /// Lit columns whose whole neighbourhood has no biome data. Delivery falls back to the
+    /// configured biome, so no record is compiled for them.
+    uncompiled_columns: usize = 0,
 };
 
 pub const Import = struct {
@@ -95,6 +101,8 @@ pub const Import = struct {
         const ownership = try inventories.Inventories.init(allocator, io, .{ .cache_slots = 256, .cache_items = 16 }, .{ .record_workspaces = workspace, .metrics = metrics, .storage = try store.openSpace(inventories.Inventories.id) });
         const terrain = try vanilla.Chunks.init(allocator, io, chunk_configuration, .{ .record_workspaces = workspace, .metrics = metrics, .storage = try store.openSpace(vanilla.Chunks.id) });
         const spawn = try vanilla.Spawn.init(allocator, .{}, .{ .record_workspaces = workspace, .storage = try store.openSpace(vanilla.Spawn.id), .worlds = worlds, .chunks = terrain, .blocks = content.blocks, .dimensions = content.dimensions });
+        const lighting = try vanilla.Lighting.init(allocator, .{}, .{ .metrics = metrics, .blocks = content.blocks, .chunks = terrain, .worlds = worlds });
+        if (options.lighting) lighting.includeClassification(try vanilla.Streaming.prepareMetadata(allocator, terrain));
         return .{
             .allocator = allocator,
             .io = io,
@@ -106,7 +114,7 @@ pub const Import = struct {
             .inventories = ownership,
             .chunks = terrain,
             .spawn = spawn,
-            .lighting = try vanilla.Lighting.init(allocator, .{}, .{ .metrics = metrics, .blocks = content.blocks, .chunks = terrain, .worlds = worlds }),
+            .lighting = lighting,
             .columns = .empty,
             .items = try vanilla.Items.init(allocator, .{}, .{ .definitions = content.items, .registry_identity = identity, .inventories = ownership }),
             .entities = try vanilla.Entities.init(allocator, io, .{}, .{ .record_workspaces = workspace, .metrics = metrics, .storage = try store.openSpace(vanilla.Entities.id) }),
@@ -184,28 +192,130 @@ pub const Import = struct {
         if (self.options.lighting) try self.bakeLighting();
     }
 
-    fn bakeLighting(self: *Import) !void {
-        const before = (try self.store.database.stat(self.io)).size + (try self.store.wal.stat(self.io)).size;
+    /// Bakes caches for a database imported without them. Columns are discovered from stored
+    /// terrain groups, and a column counts only when every section of its dimension is stored.
+    pub fn prewarmExisting(self: *Import) !void {
+        assert(self.options.lighting and self.columns.count() == 0);
+        const index = self.lighting.classification.?;
+        const store = self.chunks.cache.backend.store;
+        const side: i32 = store.side;
+        var footprints: std.AutoArrayHashMapUnmanaged([12]u8, void) = .empty;
+        defer footprints.deinit(self.allocator);
+        var after: [64]u8 = undefined;
+        var cursor: records.ScanCursor = .{ .after = &after };
+        while (true) {
+            var keys: [records.Table.read_batch_size][64]u8 = undefined;
+            var entries: [records.Table.read_batch_size]records.ScanKey = undefined;
+            for (&keys, &entries) |*key, *entry| entry.* = .{ .key = key };
+            const result = try store.bases.backend.table.scanKeys(&cursor, &entries);
+            for (entries[0..result.count]) |entry| {
+                if (entry.key_len != 16) return error.UnexpectedTerrainKey;
+                try footprints.put(self.allocator, entry.key[0..12].*, {});
+            }
+            if (!result.more) break;
+        }
+        const partial = try self.discoverStored(footprints.keys(), side, index);
+        // Row order lets each bake scroll the lighting neighbourhood by one column.
+        const Order = struct {
+            keys: []const chunks.Light.Column,
+            pub fn lessThan(order: @This(), a: usize, b: usize) bool {
+                const left = order.keys[a];
+                const right = order.keys[b];
+                if (left.world != right.world) return left.world < right.world;
+                if (left.z != right.z) return left.z < right.z;
+                return left.x < right.x;
+            }
+        };
+        self.columns.sort(Order{ .keys = self.columns.keys() });
+        std.log.info("event=prewarm_discovered footprints={d} columns={d} partial={d}", .{ footprints.count(), self.columns.count(), partial });
+        try self.bakeLighting();
+    }
+
+    /// Summaries record which sections are stored. Returns how many columns were partial.
+    fn discoverStored(self: *Import, footprints: []const [12]u8, side: i32, index: *const chunks.classification.Index) !usize {
         self.chunks.attach();
         defer self.chunks.stop();
-        std.log.info("event=lighting_bake_started columns={d} world_bytes={d}", .{ self.columns.count(), before });
-        for (self.columns.keys()) |column_key| {
-            const neighbors = try column_key.neighbors();
-            var complete = true;
-            for (neighbors) |neighbor| complete = complete and self.columns.contains(neighbor);
-            if (!complete) {
-                self.counts.deferred_lighting += 1;
+        var partial: usize = 0;
+        var candidates: [chunks.classification.column_batch_max]chunks.classification.Column = undefined;
+        var summaries: [chunks.classification.column_batch_max]chunks.classification.ColumnSummary = undefined;
+        var pending: usize = 0;
+        for (footprints) |key| {
+            const world = std.mem.readInt(u32, key[0..4], .big);
+            const dimension = (self.worlds.get(world) orelse return error.UnknownWorld).dimension;
+            const base_x = std.mem.readInt(i32, key[4..8], .big) * side;
+            const base_z = std.mem.readInt(i32, key[8..12], .big) * side;
+            for (0..@intCast(side * side)) |offset| {
+                candidates[pending] = .{ .world = world, .x = base_x + @as(i32, @intCast(offset % @as(usize, @intCast(side)))), .z = base_z + @as(i32, @intCast(offset / @as(usize, @intCast(side)))), .minimum = dimension.minimumSection(), .count = @intCast(dimension.sectionCount()) };
+                pending += 1;
+                if (pending == candidates.len) {
+                    partial += try self.keepStored(candidates[0..pending], summaries[0..pending], index);
+                    pending = 0;
+                }
+            }
+        }
+        if (pending != 0) partial += try self.keepStored(candidates[0..pending], summaries[0..pending], index);
+        return partial;
+    }
+
+    /// Returns how many candidates had only some of their sections stored.
+    fn keepStored(self: *Import, candidates: []const chunks.classification.Column, summaries: []chunks.classification.ColumnSummary, index: *const chunks.classification.Index) !usize {
+        assert(candidates.len == summaries.len);
+        try self.chunks.summarize(candidates, summaries, index.properties, index.selected);
+        var partial: usize = 0;
+        for (candidates, summaries) |candidate, summary| {
+            const all: u32 = @truncate((@as(u64, 1) << @intCast(candidate.count)) - 1);
+            // A section is stored only once classified. An unclassified absent section is not
+            // yet marked missing, which once admitted columns the import never wrote.
+            if (summary.known & all == 0) continue;
+            if (summary.missing & all != 0 or summary.known & all != all) {
+                partial += 1;
                 continue;
             }
-            const dimension = self.worlds.get(column_key.world).?.dimension;
-            if (!try self.lighting.bake(column_key.world, column_key.x, column_key.z, dimension)) return error.LightingBakeIncomplete;
-            self.counts.lit_columns += 1;
-            self.columns_since_save += 1;
-            if (self.columns_since_save == 64) try self.save();
+            try self.columns.put(self.allocator, .{ .world = candidate.world, .x = candidate.x, .z = candidate.z }, {});
         }
-        try self.save();
-        const after = (try self.store.database.stat(self.io)).size + (try self.store.wal.stat(self.io)).size;
-        std.log.info("event=lighting_bake_finished columns={d} deferred={d} before_bytes={d} after_bytes={d}", .{ self.counts.lit_columns, self.counts.deferred_lighting, before, after });
+        return partial;
+    }
+
+    fn bakeLighting(self: *Import) !void {
+        const cache = self.chunks.cache.backend.store.derived;
+        const before = (try cache.store.database.stat(self.io)).size;
+        const generation = cache.generation.load(.acquire);
+        self.chunks.attach();
+        defer self.chunks.stop();
+        std.log.info("event=lighting_bake_started columns={d} cache_bytes={d}", .{ self.columns.count(), before });
+        var selected = try protocols.Default.init(self.allocator);
+        defer selected.deinit(self.allocator);
+        var compiler = try delivery.Compiler.init(self.allocator, &selected);
+        defer compiler.workspace.cancel();
+        const columns = self.columns.keys();
+        var offset: usize = 0;
+        while (offset < columns.len) {
+            const batch = columns[offset..@min(columns.len, offset + compiler.capacity())];
+            try compiler.begin(batch);
+            for (batch) |column_key| {
+                const neighbors = try column_key.neighbors();
+                var complete = true;
+                for (neighbors) |neighbor| complete = complete and self.columns.contains(neighbor);
+                if (!complete) {
+                    self.counts.deferred_lighting += 1;
+                    continue;
+                }
+                const dimension = self.worlds.get(column_key.world).?.dimension;
+                const frame = try self.lighting.bakeFrame(column_key.world, column_key.x, column_key.z, dimension) orelse return error.LightingBakeIncomplete;
+                compiler.compile(self.chunks, column_key, &frame) catch |err| switch (err) {
+                    error.MissingBiomeData => self.counts.uncompiled_columns += 1,
+                    else => return err,
+                };
+                self.counts.lit_columns += 1;
+            }
+            try compiler.finish(self.chunks);
+            offset += batch.len;
+            if (offset / 16384 != (offset - batch.len) / 16384) std.log.info("event=lighting_bake_progress columns={d}/{d}", .{ offset, columns.len });
+        }
+        // A cache emptied or dropped along the way holds only part of the bake.
+        if (cache.state.load(.acquire) != .ready or cache.generation.load(.acquire) != generation) return error.PrewarmLost;
+        const after = (try cache.store.database.stat(self.io)).size;
+        std.log.info("event=lighting_bake_finished columns={d} deferred={d} uncompiled={d} before_bytes={d} after_bytes={d}", .{ self.counts.lit_columns, self.counts.deferred_lighting, self.counts.uncompiled_columns, before, after });
     }
 
     fn checkDimensions(self: *Import) !void {

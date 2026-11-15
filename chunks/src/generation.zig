@@ -2,6 +2,7 @@ const std = @import("std");
 const chunks = @import("chunks.zig");
 const storage = @import("storage");
 const metrics = @import("metrics");
+const work = storage.system.work;
 
 const assert = std.debug.assert;
 const section_bytes = chunks.encoding.maximum_decoded_bytes;
@@ -16,6 +17,10 @@ pub const Interest = struct { world: chunks.World, x: i32, z: i32, radius: u32 }
 
 pub const Generation = struct {
     const batch_max = chunks.Source.batch_max;
+    pub const default_work: work.Limits = .{
+        .guaranteed = .{ .operations = 1, .bytes = section_bytes },
+        .burst = .{ .operations = batch_max - 1, .bytes = (batch_max - 1) * section_bytes },
+    };
     const State = enum { free, queued, running, ready, consuming };
     const Slot = struct {
         state: State = .free,
@@ -62,6 +67,7 @@ pub const Generation = struct {
     owners: std.AutoHashMapUnmanaged(usize, List) = .empty,
     sequence: u64 = 0,
     last_player: usize = std.math.maxInt(usize),
+    work_limits: work.Limits = default_work,
     next_worker: usize = 0,
     ready_count: std.atomic.Value(usize) = .init(0),
     source: ?chunks.Source = null,
@@ -116,6 +122,13 @@ pub const Generation = struct {
     pub fn setSource(self: *Generation, source: chunks.Source) void {
         assert(self.owner.load(.acquire) == 0 and self.source == null);
         self.source = source;
+    }
+
+    pub fn configureWork(self: *Generation, limits: work.Limits) !void {
+        assert(self.owner.load(.acquire) == 0 and self.queued_count == 0);
+        try limits.validate(self.slots.len, .{ .operations = 1, .bytes = section_bytes });
+        if (limits.guaranteed.bytes < section_bytes) return error.InvalidWorkLimits;
+        self.work_limits = limits;
     }
 
     pub fn promote(self: *Generation, sections: []const chunks.Section) void {
@@ -486,20 +499,29 @@ pub const Generation = struct {
         const first = self.minimum(self.waiting orelse return null);
         const urgency = self.slots[first].priority.urgency;
         if (required_only and urgency != .required) return null;
-        var current = self.waiting;
-        var candidate: ?usize = null;
-        while (current) |index| {
-            const priority = self.slots[index].priority;
-            if (@backingInt(priority.urgency) < @backingInt(urgency) or (priority.urgency == urgency and priority.player <= self.last_player)) {
-                current = self.slots[index].children[1];
-            } else {
-                if (priority.urgency == urgency) candidate = index;
-                current = self.slots[index].children[0];
+        if (urgency == .required) return first;
+        for ([_]bool{ true, false }) |after| {
+            var selected: ?usize = null;
+            for ([_]@FieldType(Priority, "urgency"){ .occupied, .streaming }) |kind| {
+                var current = self.waiting;
+                var candidate: ?usize = null;
+                while (current) |index| {
+                    const priority = self.slots[index].priority;
+                    if (@backingInt(priority.urgency) < @backingInt(kind) or (priority.urgency == kind and after and priority.player <= self.last_player)) current = self.slots[index].children[1] else {
+                        if (priority.urgency == kind) candidate = index;
+                        current = self.slots[index].children[0];
+                    }
+                }
+                if (candidate) |index| if (selected == null or self.slots[index].priority.player < self.slots[selected.?].priority.player) {
+                    selected = index;
+                };
+            }
+            if (selected) |index| {
+                assert(self.slots[index].state == .queued);
+                return index;
             }
         }
-        const selected = candidate orelse first;
-        assert(self.slots[selected].state == .queued and self.slots[selected].priority.urgency == urgency);
-        return selected;
+        unreachable;
     }
 
     fn releaseLocked(self: *Generation, index: usize) void {
@@ -545,7 +567,8 @@ pub const Generation = struct {
         var workers: usize = 0;
         for (self.work_events) |event| workers += @intFromBool(event != null);
         const share = std.math.divCeil(usize, self.queued_count, @max(workers, 1)) catch unreachable;
-        const limit = @min(maximum, share);
+        const allowance = self.work_limits.maximum(self.owners.count()) catch unreachable;
+        const limit = @min(maximum, share, allowance.operations, allowance.bytes / section_bytes);
         if (limit == 0) return 0;
         var requests: [batch_max]chunks.Source.Request = undefined;
         while (count < limit and self.queued_count != 0) {
@@ -743,6 +766,28 @@ fn testSection(x: i32) chunks.Section {
     return .{ .world = 0, .x = x, .y = 0, .z = 0 };
 }
 
+test "generation burst arrivals cannot starve another owner's guaranteed work" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
+    defer registry.deinit();
+    var notified: std.Io.Event = .unset;
+    const queue = try Generation.init(arena.allocator(), std.testing.io, 4, &notified, &registry);
+    var source: TestSource = .{};
+    queue.setSource(chunks.Source.init(&source, TestSource.read));
+    var destinations: [3][section_bytes]u8 = undefined;
+    var requests: [3]Generation.Request = undefined;
+    for (&requests, &destinations, 0..) |*request, *destination, index| request.* = .{ .section = testSection(@intCast(index)), .destination = destination, .token = index };
+    _ = queue.submit(requests[0..1], .{ .player = 0 });
+    _ = queue.submit(requests[1..2], .{ .urgency = .occupied, .player = 1 });
+    queue.last_player = 0;
+    try std.testing.expect(try queue.processOne(std.testing.io));
+    _ = queue.submit(requests[2..3], .{ .urgency = .occupied, .player = 1 });
+    try std.testing.expect(try queue.processOne(std.testing.io));
+    try std.testing.expectEqualSlices(i32, &.{ 1, 0 }, source.order[0..source.count]);
+    while (queue.next()) |completion| queue.release(completion);
+}
+
 test "generation writes into caller slots and serves priorities fairly" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -761,7 +806,7 @@ test "generation writes into caller slots and serves priorities fairly" {
     _ = queue.submit(requests[5..6], .{ .urgency = .occupied, .player = 3 });
     _ = queue.submit(requests[6..7], .{ .urgency = .required });
     while (try queue.processOne(std.testing.io)) {}
-    try std.testing.expectEqualSlices(i32, &.{ 6, 5, 0, 2, 1, 3, 4 }, source.order[0..source.count]);
+    try std.testing.expectEqualSlices(i32, &.{ 6, 2, 5, 0, 3, 1, 4 }, source.order[0..source.count]);
     var completions: [8]Generation.Completion = undefined;
     const count = queue.nextMany(&completions);
     try std.testing.expectEqual(@as(usize, 7), count);
@@ -976,13 +1021,15 @@ const ScheduleModel = struct {
     }
 
     fn before(a: Generation.Slot, b: Generation.Slot, last_player: usize) bool {
-        if (a.priority.urgency != b.priority.urgency) return @backingInt(a.priority.urgency) < @backingInt(b.priority.urgency);
+        if ((a.priority.urgency == .required) != (b.priority.urgency == .required)) return a.priority.urgency == .required;
+        if (a.priority.urgency == .required and b.priority.urgency == .required) return Generation.ordered(&a, &b);
         if (a.priority.player != b.priority.player) {
             const a_wrap = a.priority.player <= last_player;
             const b_wrap = b.priority.player <= last_player;
             if (a_wrap != b_wrap) return !a_wrap;
             return a.priority.player < b.priority.player;
         }
+        if (a.priority.urgency != b.priority.urgency) return @backingInt(a.priority.urgency) < @backingInt(b.priority.urgency);
         if (a.priority.distance != b.priority.distance) return a.priority.distance < b.priority.distance;
         return a.sequence < b.sequence;
     }

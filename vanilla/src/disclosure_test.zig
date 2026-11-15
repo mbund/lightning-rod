@@ -16,7 +16,7 @@ const Fixture = struct {
     fn init(allocator: std.mem.Allocator) !*Fixture {
         const self = try allocator.create(Fixture);
         self.* = .{
-            .world = try .init(allocator, .{ .columns = 9, .sources = 1, .radius = 1 }),
+            .world = try .init(allocator, .{ .columns = 9, .views = 1, .radius = 1 }),
             .states = try allocator.alloc(u16, count * 16 * 48 * 48),
         };
         for (0..9) |neighbor| for (0..count) |y| {
@@ -55,11 +55,11 @@ const Fixture = struct {
 
     fn disclose(self: *Fixture, eye: [3]i32) !void {
         var source_storage: production.Source = undefined;
-        const source = self.world.source(self.column.world, self.column.minimum, count, eye, &source_storage).?;
-        self.world.beginPoll();
-        const query = self.world.query(source, self.column.minimum, count, 1);
-        while (!self.world.ready(query)) try std.testing.expectEqual(@as(usize, 0), self.world.advance().requests.len);
-        self.disclosed = self.world.mask(query, self.column.x, self.column.z);
+        const source = self.world.narrowSource(self.column.world, self.column.minimum, count, eye, .head, &source_storage).?;
+        const view_index = @as(usize, 0);
+        self.world.begin(view_index, source, self.column.minimum, count, 1);
+        while (!self.world.ready(view_index)) try std.testing.expectEqual(@as(usize, 0), self.world.advance().requests.len);
+        self.disclosed = self.world.mask(view_index, self.column.x, self.column.z);
     }
 
     fn visible(self: *const Fixture, point: [3]i32) bool {
@@ -153,12 +153,12 @@ test "opening and closing a shaft invalidates section disclosure certificates" {
     try fixture.disclose(eye);
     try std.testing.expect(!fixture.visible(.{ 4, -20, 4 }));
     fixture.set(.{ 4, 8, 4 }, 0);
-    fixture.world.changed(3, fixture.column.minimum, .{ .minimum = .{ 4, 8, 4 }, .maximum = .{ 5, 9, 5 } });
+    fixture.world.changed(3, fixture.column.minimum, .{ .minimum = .{ 4, 8, 4 }, .maximum = .{ 5, 9, 5 } }, false);
     fixture.world.learn(fixture.column, fixture.sections[4 * Fixture.count ..][0..Fixture.count]);
     try fixture.disclose(eye);
     try std.testing.expect(fixture.visible(.{ 4, -20, 4 }));
     fixture.set(.{ 4, 8, 4 }, Fixture.stone);
-    fixture.world.changed(3, fixture.column.minimum, .{ .minimum = .{ 4, 8, 4 }, .maximum = .{ 5, 9, 5 } });
+    fixture.world.changed(3, fixture.column.minimum, .{ .minimum = .{ 4, 8, 4 }, .maximum = .{ 5, 9, 5 } }, false);
     fixture.world.learn(fixture.column, fixture.sections[4 * Fixture.count ..][0..Fixture.count]);
     try fixture.disclose(eye);
     try std.testing.expect(!fixture.visible(.{ 4, -20, 4 }));

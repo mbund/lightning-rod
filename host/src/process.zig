@@ -131,7 +131,7 @@ pub fn Process(comptime Plugins: type, comptime Network: type) type {
             if (network_configuration.inherited_listener == null) network_configuration.inherited_listener = try host.inheritedListener(process_init);
             self.network = try Network.init(allocator, process_init.io, network_configuration, .{ .memory = memory, .metrics = registry, .handoff = if (handoff) |*value| value else null });
             errdefer self.network.deinit();
-            self.descriptors = try allocator.alloc(i32, options.network.max_players + 9);
+            self.descriptors = try allocator.alloc(i32, self.network.core.worker.engine.connections.len + 1);
             errdefer allocator.free(self.descriptors);
             var configuration = options.simulation;
             configuration.metrics.parent = registry;
@@ -166,6 +166,7 @@ pub fn Process(comptime Plugins: type, comptime Network: type) type {
         }
 
         pub fn ready(self: *Self) !void {
+            if (self.owned_registry) |*registry| registry.seal();
             self.memory.seal();
             const captured = timing.Startup.capture(self.io);
             self.startup_total.observe(@intCast(captured.wall_ns - self.startup.wall_ns));

@@ -4,7 +4,7 @@ const game_data = @import("game_data");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const names = .{ "lighting", "lightning_rod", "game_data", "datapacks", "minecraft_packets", "minecraft_java", "sessions", "chunks", "entities", "inventories", "metrics", "records", "commands", "reload", "worlds", "storage" };
+    const names = .{ "lighting", "deflate", "zstandard", "lightning_rod", "game_data", "datapacks", "minecraft_packets", "minecraft_java", "sessions", "chunks", "entities", "inventories", "metrics", "records", "commands", "reload", "worlds", "storage" };
     var imports: [names.len + 2]std.Build.Module.Import = undefined;
 
     inline for (names, 0..) |name, i| {
@@ -35,10 +35,17 @@ pub fn build(b: *std.Build) void {
     module.addImport("wire_26_2", b.dependency("protocol_26_2", .{ .target = target, .optimize = optimize }).module("wire"));
     module.addImport("wire_1_21_9", b.dependency("protocol_1_21_9", .{ .target = target, .optimize = optimize }).module("wire"));
 
-    // Standalone development needs a concrete selection. Consumers supply their own.
+    // Standalone development selects every supported release, as a server does by default,
+    // so encodings that differ between releases are always compiled and tested. Consumers
+    // supply their own selection.
     if (b.dep_prefix.len == 0) {
-        const releases = b.option([]const u8, "releases", "Standalone development protocol releases") orelse game_data.minecraft_version;
-        if (b.lazyDependency("protocols", .{ .target = target, .optimize = optimize, .releases = releases })) |protocols| {
+        const single = b.option(bool, "single-release", "Select only the gameplay baseline release, the smallest catalog a server can run") orelse false;
+        const releases = b.option([]const u8, "releases", "Comma-separated protocol releases, every supported one by default") orelse if (single) game_data.minecraft_version else "";
+        const selected = if (releases.len == 0)
+            b.lazyDependency("protocols", .{ .target = target, .optimize = optimize })
+        else
+            b.lazyDependency("protocols", .{ .target = target, .optimize = optimize, .releases = releases });
+        if (selected) |protocols| {
             module.addImport("protocols", protocols.module("protocols"));
             b.dependency("minecraft_packets", .{ .target = target, .optimize = optimize }).module("minecraft_packets").addImport("protocols", protocols.module("protocols"));
         }
@@ -89,7 +96,7 @@ pub fn build(b: *std.Build) void {
     const visibility_run = std.Build.Step.Run.create(b, "shared section visibility workloads");
     visibility_run.addArtifactArg(visibility_bench);
     b.step("bench-sections", "Measure section traversal and sealed-source bounds").dependOn(&visibility_run.step);
-    for ([_][]const u8{ "src/chunk_encoding.zig", "src/lighting.zig", "src/container_blocks.zig", "src/furnace.zig", "src/block_sync.zig", "src/streaming.zig", "src/batch_test.zig", "src/pickup_test.zig", "src/merge_test.zig", "src/item_spatial_test.zig", "src/item_selection_test.zig", "src/placement_test.zig", "src/creative_inventory.zig", "src/command_dispatch_test.zig", "src/replication.zig", "src/visibility.zig", "src/visibility_replication_test.zig", "src/environment_test.zig", "src/configuration_test.zig", "src/session_keepalive.zig", "src/generation.zig", "src/random.zig", "src/raycast.zig", "src/spawn.zig", "src/spawn_test.zig" }) |source| {
+    for ([_][]const u8{ "src/chunk_encoding.zig", "src/lighting.zig", "src/container_blocks.zig", "src/furnace.zig", "src/block_sync.zig", "src/streaming.zig", "src/batch_test.zig", "src/pickup_test.zig", "src/merge_test.zig", "src/item_spatial_test.zig", "src/item_selection_test.zig", "src/placement_test.zig", "src/creative_inventory.zig", "src/command_dispatch_test.zig", "src/replication.zig", "src/visibility.zig", "src/visibility_replication_test.zig", "src/environment_test.zig", "src/configuration_test.zig", "src/session_keepalive.zig", "src/generation.zig", "src/random.zig", "src/raycast.zig", "src/spawn.zig", "src/spawn_test.zig", "src/section_hull.zig" }) |source| {
         const test_module = b.createModule(.{ .root_source_file = b.path(source), .target = target, .optimize = optimize });
         for (module.import_table.keys(), module.import_table.values()) |name, dependency|
             test_module.addImport(name, dependency);
@@ -99,7 +106,12 @@ pub fn build(b: *std.Build) void {
         if (std.mem.eql(u8, source, "src/streaming.zig")) debug_step.dependOn(&run.step);
         if (std.mem.eql(u8, source, "src/replication.zig") or std.mem.eql(u8, source, "src/visibility_replication_test.zig")) replication_tests.dependOn(&run.step);
         if (std.mem.eql(u8, source, "src/placement_test.zig")) b.step("test-placement", "Verify placement and collision raycasts").dependOn(&run.step);
+        if (std.mem.eql(u8, source, "src/merge_test.zig")) b.step("test-item-merging", "Verify bounded item merging and ownership").dependOn(&run.step);
         if (std.mem.eql(u8, source, "src/block_sync.zig")) b.step("test-block-sync", "Verify block publication and visibility ordering").dependOn(&run.step);
+        if (std.mem.eql(u8, source, "src/lighting.zig")) b.step("test-lighting-state", "Verify lighting samples snapshots and delivery receipts").dependOn(&run.step);
+        if (std.mem.eql(u8, source, "src/section_hull.zig")) b.step("test-hull", "Verify hidden block replacement").dependOn(&run.step);
+        if (std.mem.eql(u8, source, "src/chunk_encoding.zig")) b.step("test-chunk-encoding", "Verify terrain packet encoding and biome disclosure").dependOn(&run.step);
+        if (std.mem.eql(u8, source, "src/streaming.zig")) b.step("test-streaming-state", "Verify disclosure refresh and chunk delivery state").dependOn(&run.step);
         if (std.mem.eql(u8, source, "src/spawn.zig") or std.mem.eql(u8, source, "src/spawn_test.zig")) spawn_tests.dependOn(&run.step);
         if (std.mem.eql(u8, source, "src/raycast.zig")) b.step("test-raycast", "Verify bounded voxel traversal").dependOn(&run.step);
         if (std.mem.eql(u8, source, "src/lighting.zig") or std.mem.eql(u8, source, "src/chunk_encoding.zig") or std.mem.eql(u8, source, "src/streaming.zig"))
@@ -178,22 +190,34 @@ pub fn build(b: *std.Build) void {
     for (lighting_bench_module.import_table.keys(), lighting_bench_module.import_table.values()) |name, dependency|
         lighting_load_module.addImport(name, dependency);
     const streaming_options = b.addOptions();
+    streaming_options.addOption(usize, "compression_samples", b.option(usize, "compression-samples", "Samples per DEFLATE level in the streaming comparison") orelse 3);
     streaming_options.addOption(usize, "radius", b.option(usize, "streaming-radius", "Render distance for the imported world benchmark") orelse 32);
+    streaming_options.addOption(u2, "prefetch", b.option(u2, "streaming-prefetch", "Additional delivery distance beyond the measured render horizon") orelse 0);
     streaming_options.addOption(usize, "players", b.option(usize, "streaming-players", "Concurrent observers in the imported world benchmark") orelse 1);
+    streaming_options.addOption([]const u8, "horizon_players", b.option([]const u8, "streaming-horizon-players", "Comma separated player counts for moving horizon comparisons") orelse "1,8,32");
+    streaming_options.addOption(usize, "flight_ticks", b.option(usize, "streaming-flight-ticks", "Flight duration in ticks, zero measures initial loading only") orelse 600);
     streaming_options.addOption(usize, "spacing", b.option(usize, "streaming-spacing", "Chunk spacing between surface observers, zero shares the same source") orelse 0);
     streaming_options.addOption(bool, "encryption", b.option(bool, "streaming-encryption", "Encrypt each recipient's stream with the production cipher") orelse false);
+    streaming_options.addOption(?[]const u8, "codec_workers", b.option([]const u8, "streaming-codec-workers", "Comma separated production codec worker counts, zero runs inline"));
+    streaming_options.addOption(bool, "validate_output", b.option(bool, "streaming-validate-output", "Decode production output and compare final terrain between worker counts") orelse false);
+    streaming_options.addOption(bool, "detailed_timers", b.option(bool, "streaming-detailed-timers", "Collect per-stage CPU timings instead of measuring normal production throughput") orelse false);
     streaming_options.addOption(bool, "stored_lighting", b.option(bool, "streaming-stored-lighting", "Use lighting baked into the chunk store") orelse true);
     streaming_options.addOption(?bool, "occlusion", b.option(bool, "streaming-occlusion", "Run only the selected occlusion mode"));
     streaming_options.addOption(?[]const u8, "corpus", b.option([]const u8, "streaming-corpus", "Export encoded packets and frames for isolated component benchmarks"));
     streaming_options.addOption(bool, "movement", b.option(bool, "streaming-movement", "Measure sustained flight after initial streaming") orelse false);
     streaming_options.addOption([]const u8, "flight_speeds", b.option([]const u8, "streaming-flight-speeds", "Comma separated flight speeds in blocks per second") orelse "80");
     streaming_options.addOption(bool, "flight_settle", b.option(bool, "streaming-flight-settle", "Complete every flight position for deterministic workload and bandwidth comparisons") orelse false);
+    streaming_options.addOption(bool, "flight_straight", b.option(bool, "streaming-flight-straight", "Fly straight through fresh terrain instead of turning within each observer area") orelse false);
     streaming_options.addOption(bool, "lighting_comparison", b.option(bool, "streaming-lighting-comparison", "Compare fresh and retained lighting with identical encoded packets") orelse false);
     streaming_options.addOption(?[]const u8, "world", b.option([]const u8, "streaming-world", "Native world copy for the streaming benchmark"));
     streaming_options.addOption(?[]const u8, "position", b.option([]const u8, "streaming-position", "Observer feet as X,Y,Z instead of automatic surface and cave positions"));
     streaming_options.addOption(?[]const u8, "hidden", b.option([]const u8, "streaming-hidden", "Semicolon separated X,Y,Z block positions that must remain concealed"));
     lighting_load_module.addOptions("streaming_benchmark_options", streaming_options);
     const streaming_bench = b.addTest(.{ .root_module = lighting_load_module, .filters = &.{"imported world streaming"} });
+    const compression_bench = b.addTest(.{ .root_module = lighting_load_module, .filters = &.{"imported world DEFLATE levels"} });
+    const compression_levels = std.Build.Step.Run.create(b, "imported world DEFLATE levels");
+    compression_levels.addArtifactArg(compression_bench);
+    b.step("bench-streaming-compression", "Rebuild a world copy's delivery cache and compare DEFLATE levels").dependOn(&compression_levels.step);
     const streaming_fixture = b.addRunArtifact(b.addTest(.{ .root_module = lighting_load_module, .filters = &.{"imported world fixture"} }));
     b.step("verify-streaming-world", "Verify complete and distinct terrain for streaming observers").dependOn(&streaming_fixture.step);
     const movement_tests = b.addRunArtifact(b.addTest(.{ .root_module = lighting_load_module, .filters = &.{"streaming movement"} }));
@@ -204,7 +228,12 @@ pub fn build(b: *std.Build) void {
     b.step("test-streaming-cold", "Verify cold lighting progress with separated observers and constrained caches").dependOn(&cold_tests.step);
     lighting_tests.dependOn(&cold_tests.step);
     test_step.dependOn(&cold_tests.step);
+    const edit_tests = b.addRunArtifact(b.addTest(.{ .root_module = lighting_load_module, .filters = &.{"edited light"} }));
+    b.step("test-streaming-edits", "Verify light updates after block edits against a client model").dependOn(&edit_tests.step);
+    lighting_tests.dependOn(&edit_tests.step);
+    test_step.dependOn(&edit_tests.step);
     const streaming_run = std.Build.Step.Run.create(b, "imported world streaming");
+    b.step("build-streaming", "Compile the imported world streaming benchmark").dependOn(&streaming_bench.step);
     streaming_run.addArtifactArg(streaming_bench);
     streaming_run.step.dependOn(&streaming_fixture.step);
     b.step("bench-streaming", "Measure real world chunk streaming without client rendering").dependOn(&streaming_run.step);
@@ -212,6 +241,11 @@ pub fn build(b: *std.Build) void {
     const scaling_run = std.Build.Step.Run.create(b, "imported world player scaling");
     scaling_run.addArtifactArg(scaling_bench);
     b.step("bench-streaming-scaling", "Measure shared and independent player streams with sealed allocation").dependOn(&scaling_run.step);
+    const horizon_bench = b.addTest(.{ .root_module = lighting_load_module, .filters = &.{"imported world horizon scaling"} });
+    b.step("build-horizon", "Compile the moving horizon benchmark").dependOn(&b.addInstallArtifact(horizon_bench, .{ .dest_sub_path = "chunk-horizon" }).step);
+    const horizon_run = std.Build.Step.Run.create(b, "imported world moving horizons");
+    horizon_run.addArtifactArg(horizon_bench);
+    b.step("bench-streaming-horizon", "Measure moving horizons with compression encryption and immediately completed output").dependOn(&horizon_run.step);
     const lighting_load = b.addTest(.{ .root_module = lighting_load_module, .filters = &.{"lighting load"} });
     const lighting_load_run = std.Build.Step.Run.create(b, "lighting streaming load");
     lighting_load_run.addArtifactArg(lighting_load);

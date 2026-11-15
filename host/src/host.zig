@@ -19,3 +19,7 @@ pub fn inheritedListener(init: std.process.Init) !?i32 {
     if (fd < 3) return error.InvalidListener;
     return fd;
 }
+
+test {
+    _ = timing;
+}

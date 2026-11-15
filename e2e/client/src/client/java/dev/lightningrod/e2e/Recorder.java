@@ -111,7 +111,7 @@ public final class Recorder {
         fixture = Fixture.create(this, scenario);
         int distance = fixture.renderDistance();
         minimumRadius = integer("mcc.minimumRadius", distance);
-        targetChunks = integer("mcc.targetChunks", (2 * distance + 1) * (2 * distance + 1));
+        targetChunks = integer("mcc.targetChunks", Fixture.horizonColumns(distance));
         try {
             Files.createDirectories(eventsPath.getParent());
             Files.createDirectories(artifacts.resolve("screenshots"));

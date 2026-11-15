@@ -10,7 +10,7 @@ import net.minecraft.world.phys.Vec3;
 final class OcclusionMountainFixture extends Fixture {
     private static final int DISTANCE = 32;
     private static final int CACHE_DISTANCE = DISTANCE + 3;
-    private static final int COLUMNS = (CACHE_DISTANCE * 2 + 1) * (CACHE_DISTANCE * 2 + 1);
+    private static final int COLUMNS = horizonColumns(CACHE_DISTANCE);
     private static final double RADIUS = 224;
     private static final double STEP = 4;
     private static final int FLIGHT_TICKS = (int) Math.ceil(2 * Math.PI * RADIUS / STEP);

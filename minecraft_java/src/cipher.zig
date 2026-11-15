@@ -5,6 +5,92 @@ pub const Cipher = struct {
     feedback: [16]u8,
     secret: [16]u8,
 
+    pub const Encryption = struct { cipher: *Cipher, first: []u8, second: []u8 = &.{} };
+    pub const batch_size = if (std.crypto.core.aes.has_hardware_support)
+        std.math.ceilPowerOfTwo(usize, std.crypto.core.aes.Block.parallel.optimal_parallel_blocks) catch unreachable
+    else
+        1;
+
+    /// Destinations are exclusive and disjoint from the shared plaintext. Each cipher occurs once.
+    pub fn encryptBatch(source: []const u8, targets: []const Encryption) void {
+        std.debug.assert(targets.len <= batch_size);
+        for (targets, 0..) |target, index| {
+            std.debug.assert(target.first.len + target.second.len == source.len);
+            assertDisjoint(target.first, target.second);
+            for ([_][]u8{ target.first, target.second }) |destination| {
+                assertDisjoint(source, destination);
+                for (targets[0..index]) |previous| {
+                    assertDisjoint(previous.first, destination);
+                    assertDisjoint(previous.second, destination);
+                }
+            }
+            for (targets[0..index]) |previous| std.debug.assert(previous.cipher != target.cipher);
+        }
+        if (source.len == 0 or targets.len == 0) return;
+        if (comptime std.crypto.core.aes.has_hardware_support) {
+            inline for (1..batch_size + 1) |count| {
+                if (targets.len == count) {
+                    encryptParallel(count, source, targets[0..count].*);
+                    return;
+                }
+            }
+            unreachable;
+        }
+        for (targets) |target| {
+            target.cipher.transform(.encrypt, source[0..target.first.len], target.first);
+            target.cipher.transform(.encrypt, source[target.first.len..], target.second);
+        }
+    }
+
+    fn assertDisjoint(a: []const u8, b: []const u8) void {
+        std.debug.assert(a.len == 0 or b.len == 0 or @intFromPtr(a.ptr) + a.len <= @intFromPtr(b.ptr) or @intFromPtr(b.ptr) + b.len <= @intFromPtr(a.ptr));
+    }
+
+    fn encryptParallel(comptime count: usize, source: []const u8, targets: [count]Encryption) void {
+        const lanes = comptime std.math.ceilPowerOfTwo(usize, count) catch unreachable;
+        const Blocks = std.crypto.core.aes.BlockVec(lanes);
+        var keys: [std.crypto.core.aes.Aes128.rounds + 1]Blocks = undefined;
+        inline for (0..keys.len) |round| {
+            var bytes: [lanes * 16]u8 = undefined;
+            // Inactive SIMD lanes repeat the first stream without writing output or cipher state.
+            inline for (0..lanes) |lane| bytes[lane * 16 ..][0..16].* = targets[if (lane < count) lane else 0].cipher.key.key_schedule.round_keys[round].toBytes();
+            keys[round] = Blocks.fromBytes(&bytes);
+        }
+        var registers: [lanes * 16]u8 = undefined;
+        inline for (0..lanes) |lane| registers[lane * 16 ..][0..16].* = targets[if (lane < count) lane else 0].cipher.feedback;
+        var feedback: @Vector(lanes * 16, u8) = registers;
+        const shift = comptime shift: {
+            var indices: [lanes * 16]i32 = undefined;
+            for (&indices, 0..) |*index, at| index.* = if (at % 16 == 15) ~@as(i32, @intCast(at - 15)) else @intCast(at + 1);
+            break :shift indices;
+        };
+        var offset: usize = 0;
+        while (offset < source.len) {
+            var end = source.len;
+            var output: [count][]u8 = undefined;
+            inline for (targets, 0..) |target, lane| {
+                output[lane] = if (offset < target.first.len) target.first[offset..] else target.second[offset - target.first.len ..];
+                end = @min(end, offset + output[lane].len);
+            }
+            std.debug.assert(end > offset);
+            for (source[offset..end], 0..) |byte, index| {
+                const bytes: [lanes * 16]u8 = feedback;
+                var blocks = Blocks.fromBytes(&bytes).xorBlocks(keys[0]);
+                // Independent connections overlap AES latency without changing either CFB8 stream.
+                inline for (1..std.crypto.core.aes.Aes128.rounds) |round| {
+                    blocks = blocks.encrypt(keys[round]);
+                }
+                const mask: @Vector(lanes * 16, u8) = blocks.encryptLast(keys[std.crypto.core.aes.Aes128.rounds]).toBytes();
+                const encrypted = mask ^ @as(@Vector(lanes * 16, u8), @splat(byte));
+                feedback = @shuffle(u8, feedback, encrypted, shift);
+                inline for (0..count) |lane| output[lane][index] = encrypted[lane * 16];
+            }
+            offset = end;
+        }
+        const result: [lanes * 16]u8 = feedback;
+        inline for (targets, 0..) |target, lane| target.cipher.feedback = result[lane * 16 ..][0..16].*;
+    }
+
     pub fn init(secret: [16]u8) Cipher {
         return .{ .key = std.crypto.core.aes.Aes128.initEnc(secret), .feedback = secret, .secret = secret };
     }
@@ -13,9 +99,13 @@ pub const Cipher = struct {
     /// transport boundaries do not reset either stream.
     pub fn transform(self: *Cipher, comptime direction: enum { encrypt, decrypt }, input: []const u8, output: []u8) void {
         std.debug.assert(input.len == output.len);
+        if (input.len == 0) return;
 
-        if (input.len != 0 and input.ptr != output.ptr) {
-            std.debug.assert(@intFromPtr(input.ptr) + input.len <= @intFromPtr(output.ptr) or @intFromPtr(output.ptr) + output.len <= @intFromPtr(input.ptr));
+        if (input.ptr != output.ptr) assertDisjoint(input, output);
+
+        if (comptime direction == .encrypt and std.crypto.core.aes.has_hardware_support) {
+            encryptParallel(1, input, .{.{ .cipher = self, .first = output }});
+            return;
         }
 
         var offset: usize = 0;

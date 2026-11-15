@@ -61,7 +61,7 @@ pub fn build(b: *std.Build) void {
 
     cache_clean.add(b);
 
-    const suites = [_]struct { directory: []const u8, targets: []const []const u8 = &.{"test"} }{
+    const suites = [_]struct { directory: []const u8, targets: []const []const u8 = &.{"test"}, arguments: []const []const u8 = &.{} }{
         .{ .directory = "reload" },
         .{ .directory = "reload_execve" },
         .{ .directory = "nbt" },
@@ -76,6 +76,7 @@ pub fn build(b: *std.Build) void {
         .{ .directory = "records" },
         .{ .directory = "chunks" },
         .{ .directory = "zstandard" },
+        .{ .directory = "deflate" },
         .{ .directory = "lighting" },
         .{ .directory = "bench/chunks" },
         .{ .directory = "bench/visibility" },
@@ -83,7 +84,11 @@ pub fn build(b: *std.Build) void {
         .{ .directory = "sessions" },
         .{ .directory = "protocols" },
         .{ .directory = "metrics" },
+        .{ .directory = "host" },
+        // Every supported release by default. The suites that depend on the protocol
+        // catalog run again with the one release a minimal server selects.
         .{ .directory = "vanilla" },
+        .{ .directory = "vanilla", .targets = &.{ "test-chunk-encoding", "test-streaming-state", "test-lighting" }, .arguments = &.{"-Dsingle-release=true"} },
         .{ .directory = "minecraft_java" },
         .{ .directory = "e2e", .targets = &.{ "test-performance", "test-harness", "test-artifacts", "test-client" } },
     };
@@ -99,9 +104,10 @@ pub fn build(b: *std.Build) void {
         });
         run.addArg("--cache-dir");
         run.addDirectoryArg(.cache_root);
-        run.setName(b.fmt("test {s}", .{suite.directory}));
+        run.setName(if (suite.arguments.len == 0) b.fmt("test {s}", .{suite.directory}) else b.fmt("test {s} {s}", .{ suite.directory, suite.arguments[0] }));
         run.setCwd(b.path(suite.directory));
         run.addArgs(suite.targets);
+        run.addArgs(suite.arguments);
         // Inherited stdio serializes nested builds so each can use the full job budget.
         run.stdio = .inherit;
         test_step.dependOn(&run.step);

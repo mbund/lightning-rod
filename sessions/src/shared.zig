@@ -7,6 +7,7 @@ pub const PageId = u16;
 pub const Configuration = struct {
     pages: usize,
     page_bytes: usize,
+    unit_bytes: usize = 16 * 1024,
     recipients_per_page: usize,
     pool: ?*Pool = null,
 };
@@ -46,6 +47,7 @@ pub fn readVarint(bytes: []const u8) error{ Incomplete, Malformed }!struct { i32
 }
 
 pub const Reservation = struct {
+    decoded_length: usize = 0,
     page: PageId,
     generation: u64,
     bytes: []u8,
@@ -117,6 +119,8 @@ pub const Recipients = struct {
 };
 
 pub const RawPacket = struct {
+    decoded_length: usize = 0,
+
     page: PageId,
     units: usize,
     generation: u64,
@@ -125,6 +129,10 @@ pub const RawPacket = struct {
     group: Group = .{},
     // Mask storage belongs to this packet's page until it is recycled.
     selection: ?struct { pool: *const Pool, audience: usize, generation: u64, mask: []const usize } = null,
+
+    pub fn boundLength(self: RawPacket) usize {
+        return @max(self.bytes.len, self.decoded_length);
+    }
 
     pub fn sameAudience(a: RawPacket, b: RawPacket) bool {
         if (a.selection) |left| if (b.selection) |right|
@@ -198,6 +206,8 @@ pub const Pool = struct {
     bytes: []align(64) u8,
     pages: []SharedPages.Page,
     free_units: std.DynamicBitSetUnmanaged,
+    /// A copy of the free units on which `fit` tries reservations without making them.
+    trial_units: std.DynamicBitSetUnmanaged,
     recipients: []networking.Handle,
     audiences: []AudienceSlot,
     audience_handles: []networking.Handle,
@@ -205,6 +215,15 @@ pub const Pool = struct {
     free_audiences: std.DynamicBitSetUnmanaged,
     next_owner: u32 = 0,
     cursor: usize = 0,
+    /// Where the next reservation of one unit is looked for in the small region.
+    small_cursor: usize = 0,
+    /// Reservations of one unit that are held.
+    small_units: usize = 0,
+    active_units: usize = 0,
+    peak_units: usize = 0,
+    largest_reservation: usize = 0,
+    payload_bytes: usize = 0,
+    peak_payload_bytes: usize = 0,
 
     const AudienceSlot = struct {
         references: std.atomic.Value(usize) = .init(0),
@@ -213,8 +232,8 @@ pub const Pool = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration) !Pool {
-        if (config.pages == 0 or config.page_bytes == 0 or config.recipients_per_page == 0) return error.InvalidConfiguration;
-        const unit_bytes = @min(config.page_bytes, 64 * 1024) + headroom;
+        if (config.pages == 0 or config.page_bytes == 0 or config.unit_bytes == 0 or config.recipients_per_page == 0) return error.InvalidConfiguration;
+        const unit_bytes = try std.math.add(usize, @min(config.page_bytes, config.unit_bytes), headroom);
         const packet_bytes = try std.math.add(usize, config.page_bytes, headroom);
         const per_packet = try std.math.divCeil(usize, packet_bytes, unit_bytes);
         const units = try std.math.mul(usize, config.pages, per_packet);
@@ -234,13 +253,36 @@ pub const Pool = struct {
         errdefer allocator.free(recipient_masks);
         var free_audiences = try std.DynamicBitSetUnmanaged.initFull(allocator, units);
         errdefer free_audiences.deinit(allocator);
-        const free_units = try std.DynamicBitSetUnmanaged.initFull(allocator, units);
+        var free_units = try std.DynamicBitSetUnmanaged.initFull(allocator, units);
+        errdefer free_units.deinit(allocator);
+        const trial_units = try std.DynamicBitSetUnmanaged.initFull(allocator, units);
         for (audiences) |*slot| slot.* = .{};
         for (pages) |*page| page.* = .{};
-        return .{ .allocator = allocator, .unit_bytes = unit_bytes, .recipients_per_page = config.recipients_per_page, .bytes = bytes, .pages = pages, .recipients = recipients, .free_units = free_units, .audiences = audiences, .audience_handles = audience_handles, .recipient_masks = recipient_masks, .free_audiences = free_audiences };
+        return .{ .allocator = allocator, .unit_bytes = unit_bytes, .recipients_per_page = config.recipients_per_page, .bytes = bytes, .pages = pages, .recipients = recipients, .free_units = free_units, .trial_units = trial_units, .audiences = audiences, .audience_handles = audience_handles, .recipient_masks = recipient_masks, .free_audiences = free_audiences };
     }
 
     fn findRun(self: *const Pool, start: usize, end: usize, units: usize) ?usize {
+        return self.findRunIn(&self.free_units, start, end, units);
+    }
+
+    /// The highest free unit in `[start, end)`.
+    fn lastFreeIn(self: *const Pool, free_units: *const std.DynamicBitSetUnmanaged, start: usize, end: usize) ?usize {
+        std.debug.assert(start <= end and end <= self.pages.len);
+        const width = @bitSizeOf(std.DynamicBitSetUnmanaged.MaskInt);
+        var at = end;
+        while (at > start) {
+            const word = (at - 1) / width;
+            const low = @max(start, word * width);
+            var bits = free_units.masks[word] >> @intCast(low - word * width);
+            const span = at - low;
+            if (span < width) bits &= (@as(std.DynamicBitSetUnmanaged.MaskInt, 1) << @intCast(span)) - 1;
+            if (bits != 0) return low + (width - 1 - @clz(bits));
+            at = low;
+        }
+        return null;
+    }
+
+    fn findRunIn(self: *const Pool, free_units: *const std.DynamicBitSetUnmanaged, start: usize, end: usize, units: usize) ?usize {
         std.debug.assert(start <= end and end <= self.pages.len and units > 0);
         const Mask = std.DynamicBitSetUnmanaged.MaskInt;
         const Shift = std.DynamicBitSetUnmanaged.ShiftInt;
@@ -250,7 +292,7 @@ pub const Pool = struct {
         var free: usize = 0;
         while (at < end) {
             const word = at / width;
-            const bits = self.free_units.masks[word] & (~@as(Mask, 0) << @as(Shift, @intCast(at % width)));
+            const bits = free_units.masks[word] & (~@as(Mask, 0) << @as(Shift, @intCast(at % width)));
             if (bits == 0) {
                 free = 0;
                 at = @min(end, (word + 1) * width);
@@ -287,7 +329,8 @@ pub const Pool = struct {
     }
 
     pub fn deinit(self: *Pool) void {
-        for (self.pages) |*page| std.debug.assert(page.status.load(.acquire) & 255 == @intFromEnum(SharedPages.State.free));
+        std.debug.assert(self.active_units == 0 and self.payload_bytes == 0);
+        for (self.pages) |*page| std.debug.assert(page.status.load(.acquire) & 255 == @backingInt(SharedPages.State.free));
         for (self.audiences) |*slot| std.debug.assert(slot.references.load(.acquire) == 0);
         self.free_audiences.deinit(self.allocator);
         self.allocator.free(self.recipient_masks);
@@ -295,6 +338,7 @@ pub const Pool = struct {
         self.allocator.free(self.audiences);
         self.allocator.free(self.recipients);
         self.free_units.deinit(self.allocator);
+        self.trial_units.deinit(self.allocator);
         self.allocator.free(self.pages);
         self.allocator.free(self.bytes);
         self.* = undefined;
@@ -328,15 +372,18 @@ pub const SharedPages = struct {
         status: std.atomic.Value(u64) = .init(0),
         units: usize = 0,
         len: usize = 0,
+        decoded_length: usize = 0,
         recipient_count: usize = 0,
         owner: u32 = 0,
         group: Group = .{},
         audience: ?Audience = null,
+        /// The reservation was one unit when it was made, and counts toward the cap on those.
+        small: bool = false,
     };
 
     fn status(state: State, generation: u64) u64 {
         std.debug.assert(generation <= std.math.maxInt(u56));
-        return (generation << 8) | @intFromEnum(state);
+        return (generation << 8) | @backingInt(state);
     }
 
     const Ring = struct {
@@ -399,7 +446,7 @@ pub const SharedPages = struct {
 
     pub fn deinit(s: *SharedPages) void {
         s.producer.lockUncancelable(s.producer_io);
-        for (s.pages) |*page| if (page.owner == s.owner) std.debug.assert(page.status.load(.acquire) & 255 == @intFromEnum(State.free));
+        for (s.pages) |*page| if (page.owner == s.owner) std.debug.assert(page.status.load(.acquire) & 255 == @backingInt(State.free));
         s.producer.unlock(s.producer_io);
         s.allocator.free(s.ready.slots);
         if (s.owns_pool) {
@@ -430,6 +477,31 @@ pub const SharedPages = struct {
         return count;
     }
 
+    /// How many of these reservations, taken in order, the pool has room for now. Nothing
+    /// is reserved. Free units alone do not answer this, since a reservation needs its
+    /// units in one run.
+    pub fn fit(s: *SharedPages, lengths: []const usize) usize {
+        s.producer.lockUncancelable(s.producer_io);
+        defer s.producer.unlock(s.producer_io);
+        const trial = &s.pool.trial_units;
+        const width = @bitSizeOf(std.DynamicBitSetUnmanaged.MaskInt);
+        const masks = (trial.bit_length + width - 1) / width;
+        std.debug.assert(trial.bit_length == s.pool.free_units.bit_length);
+        @memcpy(trial.masks[0..masks], s.pool.free_units.masks[0..masks]);
+        var cursors: Cursors = .{ .large = s.pool.cursor, .small = s.pool.small_cursor };
+        var small = s.pool.small_units;
+        var count: usize = 0;
+        for (lengths) |len| {
+            if (len == 0 or len > s.page_bytes) break;
+            const units = std.math.divCeil(usize, len + headroom, s.unit_bytes) catch unreachable;
+            const first = s.place(trial, &cursors, units, small) orelse break;
+            trial.setRangeValue(.{ .start = first, .end = first + units }, false);
+            small += @intFromBool(units == 1);
+            count += 1;
+        }
+        return count;
+    }
+
     pub fn reserveBatch(s: *SharedPages, lengths: []const usize, reservations: []Reservation) usize {
         std.debug.assert(lengths.len == reservations.len);
         s.producer.lockUncancelable(s.producer_io);
@@ -449,26 +521,73 @@ pub const SharedPages = struct {
         return s.recipients[base..][0..s.recipients_per_page];
     }
 
+    const Cursors = struct { large: usize, small: usize };
+
+    /// Small packets, such as entity movement in a crowd, are kept from breaking up the
+    /// runs that larger ones, such as terrain, need. Reservations of one unit start at
+    /// this unit, on a page boundary, and spill below it from the top down. Larger ones
+    /// start at the bottom. A small pool, or one whose every packet fits one unit, keeps
+    /// a single region.
+    fn smallStart(s: *const SharedPages) usize {
+        const per_page = std.math.divCeil(usize, s.page_bytes + headroom, s.unit_bytes) catch unreachable;
+        if (s.pages.len < 64 or per_page == 1) return s.pages.len;
+        return s.pages.len / per_page / 2 * per_page;
+    }
+
+    /// Reservations of one unit may hold no more of the pool than this, so that a flood
+    /// of them always leaves room for a full page.
+    fn smallCap(s: *const SharedPages) usize {
+        return s.pages.len - s.pages.len / 4;
+    }
+
+    /// Where a reservation of `units` goes in `free`.
+    fn place(s: *const SharedPages, free: *const std.DynamicBitSetUnmanaged, cursors: *Cursors, units: usize, small_held: usize) ?usize {
+        const total = s.pages.len;
+        const split = s.smallStart();
+        if (units == 1 and split < total) {
+            if (small_held >= s.smallCap()) return null;
+            const at = @max(cursors.small, split);
+            if (s.pool.findRunIn(free, at, total, 1) orelse s.pool.findRunIn(free, split, at, 1)) |first| {
+                cursors.small = if (first + 1 == total) split else first + 1;
+                return first;
+            }
+            return s.pool.lastFreeIn(free, 0, split);
+        }
+        const end = split;
+        const cursor = if (cursors.large < end) cursors.large else 0;
+        const overlap_end = cursor + @min(units - 1, end - cursor);
+        if (s.pool.findRunIn(free, cursor, end, units) orelse s.pool.findRunIn(free, 0, overlap_end, units)) |first| {
+            cursors.large = (first + units) % end;
+            return first;
+        }
+        if (units == 1 or split == total) return null;
+        return s.pool.findRunIn(free, split, total, units);
+    }
+
     fn reserveLocked(s: *SharedPages, len: usize) ?Reservation {
         if (len == 0 or len > s.page_bytes) return null;
         const units = std.math.divCeil(usize, len + headroom, s.unit_bytes) catch unreachable;
-        const cursor = s.pool.cursor;
-        std.debug.assert(cursor < s.pages.len);
-        const overlap_end = cursor + @min(units - 1, s.pages.len - cursor);
-        const first = s.pool.findRun(cursor, s.pages.len, units) orelse
-            s.pool.findRun(0, overlap_end, units) orelse return null;
-        s.pool.cursor = (first + units) % s.pages.len;
+        var cursors: Cursors = .{ .large = s.pool.cursor, .small = s.pool.small_cursor };
+        const first = s.place(&s.pool.free_units, &cursors, units, s.pool.small_units) orelse return null;
+        s.pool.cursor = cursors.large;
+        s.pool.small_cursor = cursors.small;
         s.pool.free_units.setRangeValue(.{ .start = first, .end = first + units }, false);
+        s.pool.active_units += units;
+        s.pool.peak_units = @max(s.pool.peak_units, s.pool.active_units);
+        s.pool.largest_reservation = @max(s.pool.largest_reservation, len);
+        std.debug.assert(s.pool.active_units <= s.pool.pages.len);
 
         for (s.pages[first..][0..units]) |*part| {
             const old = part.status.load(.monotonic);
-            std.debug.assert(old & 255 == @intFromEnum(State.free));
+            std.debug.assert(old & 255 == @backingInt(State.free));
             part.status.store(status(.reserved, (old >> 8) + 1), .release);
             part.owner = s.owner;
         }
 
         const first_page = &s.pages[first];
         first_page.units = units;
+        first_page.small = units == 1;
+        s.pool.small_units += @intFromBool(units == 1);
         first_page.len = 0;
         first_page.recipient_count = 0;
         return .{
@@ -541,6 +660,9 @@ pub const SharedPages = struct {
         std.debug.assert(group.count == 1 or (group.protocol != null and group.bytes > 0));
         p.group = group;
         p.len = r.bytes.len;
+        p.decoded_length = r.decoded_length;
+        s.pool.payload_bytes += p.len;
+        s.pool.peak_payload_bytes = @max(s.pool.peak_payload_bytes, s.pool.payload_bytes);
         p.recipient_count = recipient_count;
         p.status.store(status(.published, r.generation), .release);
         const queued = s.ready.push(r.page);
@@ -561,6 +683,7 @@ pub const SharedPages = struct {
     fn cancelLocked(s: *SharedPages, r: Reservation) void {
         if (r.page >= s.pages.len or s.pages[r.page].owner != s.owner or s.pages[r.page].status.load(.acquire) != status(.reserved, r.generation)) return;
         if (r.bytes.ptr != s.pagePayload(r.page).ptr or r.bytes.len > s.page_bytes) return;
+        s.endSmall(r.page);
         s.freeRange(r.page, s.pages[r.page].units);
     }
 
@@ -572,7 +695,7 @@ pub const SharedPages = struct {
         const previous = p.status.cmpxchgStrong(status(.published, generation), status(.taken, generation), .acq_rel, .acquire);
         std.debug.assert(previous == null);
         const base = @as(usize, id) * s.recipients_per_page;
-        var result: RawPacket = .{ .page = id, .units = p.units, .generation = generation, .bytes = s.pagePayload(id)[0..p.len], .recipients = Recipients.all(s.recipients[base..][0..p.recipient_count]), .group = p.group };
+        var result: RawPacket = .{ .page = id, .units = p.units, .generation = generation, .bytes = s.pagePayload(id)[0..p.len], .decoded_length = p.decoded_length, .recipients = Recipients.all(s.recipients[base..][0..p.recipient_count]), .group = p.group };
         if (p.audience) |audience| {
             const slot = &s.pool.audiences[audience.index];
             std.debug.assert(slot.generation == audience.generation);
@@ -606,6 +729,8 @@ pub const SharedPages = struct {
     fn releaseLocked(s: *SharedPages, id: PageId, generation: u64) bool {
         if (id >= s.pages.len or generation > std.math.maxInt(u56)) return false;
         if (s.pages[id].owner != s.owner or s.pages[id].status.load(.acquire) != status(.taken, generation)) return false;
+        std.debug.assert(s.pages[id].len <= s.pool.payload_bytes);
+        s.pool.payload_bytes -= s.pages[id].len;
         if (s.pages[id].audience) |audience| {
             const slot = &s.pool.audiences[audience.index];
             std.debug.assert(slot.generation == audience.generation);
@@ -617,17 +742,31 @@ pub const SharedPages = struct {
             }
             s.pages[id].audience = null;
         }
+        s.endSmall(id);
         s.freeRange(id, s.pages[id].units);
         return true;
     }
 
+    fn endSmall(s: *SharedPages, id: usize) void {
+        if (!s.pages[id].small) return;
+        std.debug.assert(s.pool.small_units > 0);
+        s.pool.small_units -= 1;
+        s.pages[id].small = false;
+    }
+
     fn freeRange(s: *SharedPages, first: usize, units: usize) void {
+        std.debug.assert(units <= s.pool.active_units);
+        s.pool.active_units -= units;
         for (s.pages[first..][0..units]) |*p| {
             const old = p.status.load(.monotonic);
-            std.debug.assert(old & 255 == @intFromEnum(State.reserved) or old & 255 == @intFromEnum(State.taken));
+            std.debug.assert(old & 255 == @backingInt(State.reserved) or old & 255 == @backingInt(State.taken));
             p.status.store(status(.free, old >> 8), .release);
         }
         s.pool.free_units.setRangeValue(.{ .start = first, .end = first + units }, true);
+        if (s.pool.active_units == 0) {
+            s.pool.cursor = 0;
+            s.pool.small_cursor = 0;
+        }
     }
 
     pub fn framingHeadroom(s: *SharedPages, id: PageId) []u8 {
@@ -649,6 +788,70 @@ pub const SharedPages = struct {
     }
 };
 
+test "draining packet extents restores the configured maximum packet capacity" {
+    var pool = try SharedPages.init(std.testing.allocator, std.testing.io, .{ .pages = 8, .page_bytes = 32768, .recipients_per_page = 1 });
+    defer pool.deinit();
+    for ([_]usize{ 1, 16384, 16385, 32768 }) |length| {
+        const transient = pool.reserve(length).?;
+        pool.cancel(transient);
+        try std.testing.expectEqual(@as(usize, 0), pool.pool.active_units);
+        var reservations: [8]Reservation = undefined;
+        const count = pool.reserveMany(32768, &reservations);
+        defer pool.cancelMany(reservations[0..count]);
+        try std.testing.expectEqual(reservations.len, count);
+        try std.testing.expectEqual(null, pool.reserve(1));
+    }
+}
+
+test "a trial of reservations answers what the pool would take without taking it" {
+    var pool = try SharedPages.init(std.testing.allocator, std.testing.io, .{ .pages = 4, .page_bytes = 131072, .recipients_per_page = 1 });
+    defer pool.deinit();
+    const total = pool.pool.pages.len;
+    const page_units = total / 4;
+    try std.testing.expect(page_units > 2);
+    // Small packets take one unit each and a full page takes several.
+    const ones: [64]usize = @splat(1);
+    const pages: [8]usize = @splat(131072);
+    try std.testing.expectEqual(total, pool.fit(ones[0..total]));
+    try std.testing.expectEqual(total, pool.fit(ones[0 .. total + 1]));
+    try std.testing.expectEqual(@as(usize, 4), pool.fit(&pages));
+    // A length the pool can never hold ends the trial where it stands.
+    try std.testing.expectEqual(@as(usize, 1), pool.fit(&.{ 1, 131073, 1 }));
+    try std.testing.expectEqual(@as(usize, 0), pool.pool.active_units);
+
+    // One unit held in the middle of each page leaves most units free and no run long
+    // enough for a page. Counting free units would promise room that is not there.
+    var held: [4]Reservation = undefined;
+    var filler: [64]Reservation = undefined;
+    var filled: usize = 0;
+    for (&held) |*middle| {
+        for (0..page_units / 2) |_| {
+            filler[filled] = pool.reserve(1).?;
+            filled += 1;
+        }
+        middle.* = pool.reserve(1).?;
+        for (0..page_units - page_units / 2 - 1) |_| {
+            filler[filled] = pool.reserve(1).?;
+            filled += 1;
+        }
+    }
+    pool.cancelMany(filler[0..filled]);
+    try std.testing.expectEqual(total - 4, total - pool.pool.active_units);
+    try std.testing.expectEqual(@as(usize, 0), pool.fit(&pages));
+    try std.testing.expectEqual(null, pool.reserve(131072));
+    // The trial takes what the reservations themselves then take, no more and no fewer.
+    const mixed = [_]usize{ 1, 1, 30000, 1, 60000, 1, 1, 90000, 1, 1, 1, 120000, 1, 1 };
+    const promised = pool.fit(&mixed);
+    var reservations: [mixed.len]Reservation = undefined;
+    const taken = pool.reserveBatch(&mixed, &reservations);
+    try std.testing.expectEqual(promised, taken);
+    try std.testing.expect(taken != 0 and taken != mixed.len);
+    pool.cancelMany(reservations[0..taken]);
+    pool.cancelMany(&held);
+    try std.testing.expectEqual(@as(usize, 0), pool.pool.active_units);
+    try std.testing.expectEqual(@as(usize, 4), pool.fit(&pages));
+}
+
 test "packet extents shrink without reusing outstanding consumer bytes" {
     var pool = try SharedPages.init(std.testing.allocator, std.testing.io, .{ .pages = 2, .page_bytes = 192 * 1024, .recipients_per_page = 1 });
     defer pool.deinit();
@@ -663,7 +866,8 @@ test "packet extents shrink without reusing outstanding consumer bytes" {
         packets[i] = pool.takeReady() orelse return error.TestUnexpectedResult;
     }
 
-    try std.testing.expect(pool.reserve(1) == null);
+    try std.testing.expect(pool.reserve(192 * 1024) == null);
+    try std.testing.expectEqual(@as(usize, 262 * 1024 + 1), pool.pool.peak_payload_bytes);
 
     for (packets, 0..) |packet, i| {
         try std.testing.expectEqual(lengths[i], packet.bytes.len);
@@ -672,9 +876,31 @@ test "packet extents shrink without reusing outstanding consumer bytes" {
     }
 
     for ([_]usize{ 1, 0, 2 }) |i| try std.testing.expect(pool.releaseReady(packets[i].page, packets[i].generation));
+    try std.testing.expectEqual(@as(usize, 0), pool.pool.payload_bytes);
+    try std.testing.expectEqual(@as(usize, 0), pool.pool.active_units);
     const replacement = pool.reserve(192 * 1024) orelse return error.TestUnexpectedResult;
     try std.testing.expect(!pool.releaseReady(packets[0].page, packets[0].generation));
     pool.cancel(replacement);
+    try std.testing.expectEqual(@as(usize, 0), pool.pool.active_units);
+}
+
+test "small packets retain burst capacity after maximum sized reservations shrink" {
+    var pool = try SharedPages.init(std.testing.allocator, std.testing.io, .{ .pages = 2, .page_bytes = 192 * 1024, .recipients_per_page = 1 });
+    defer pool.deinit();
+    var packets: [8]RawPacket = undefined;
+    for (&packets, 0..) |*packet, index| {
+        var reservation = pool.reserve(192 * 1024) orelse return error.TestUnexpectedResult;
+        reservation.bytes = reservation.bytes[0..32];
+        @memset(reservation.bytes, @intCast(index));
+        try std.testing.expect(pool.publish(reservation, &.{.{ .index = 0, .generation = 1 }}));
+        packet.* = pool.takeReady().?;
+        try std.testing.expectEqual(reservation.bytes.ptr, packet.bytes.ptr);
+    }
+    for (packets, 0..) |packet, index| {
+        try std.testing.expect(std.mem.allEqual(u8, packet.bytes, @intCast(index)));
+        try std.testing.expect(pool.releaseReady(packet.page, packet.generation));
+    }
+    try std.testing.expectEqual(@as(usize, 0), pool.pool.active_units);
 }
 
 test "endpoints share output capacity without sharing ownership or delayed reclamation" {
@@ -788,4 +1014,50 @@ test "audience reservations cancel and freeze without retaining writable views" 
     try std.testing.expectEqual(@as(usize, 1), output.pool.audiences[audience.index].length);
     audience.release(std.testing.io);
     try std.testing.expectEqual(output.pool.audiences.len, output.pool.free_audiences.count());
+}
+
+test "a flood of small packets leaves room for a full page" {
+    var pool = try SharedPages.init(std.testing.allocator, std.testing.io, .{ .pages = 8, .page_bytes = 128 * 1024, .recipients_per_page = 1 });
+    defer pool.deinit();
+    const total = pool.pool.pages.len;
+    try std.testing.expect(total >= 64 and pool.smallStart() < total);
+    var small: [256]Reservation = undefined;
+    var count: usize = 0;
+    while (count < small.len) : (count += 1) small[count] = pool.reserve(1) orelse break;
+    // Small packets stopped where a full page still fits.
+    try std.testing.expectEqual(pool.smallCap(), count);
+    // A full page still finds its run of units.
+    const page = pool.reserve(128 * 1024).?;
+    try std.testing.expectEqual(@as(usize, 0), pool.fit(&.{1}));
+    pool.cancel(page);
+    pool.cancelMany(small[0..count]);
+    try std.testing.expectEqual(@as(usize, 0), pool.pool.active_units);
+    // Without the flood, the whole pool takes full pages.
+    var pages: [16]Reservation = undefined;
+    var full: usize = 0;
+    while (full < pages.len) : (full += 1) pages[full] = pool.reserve(128 * 1024) orelse break;
+    try std.testing.expectEqual(@as(usize, 8), full);
+    pool.cancelMany(pages[0..full]);
+}
+
+test "small packets take a page freed among full ones and the split keeps whole pages" {
+    // An odd number of pages: each region holds whole pages and none is lost.
+    var pool = try SharedPages.init(std.testing.allocator, std.testing.io, .{ .pages = 9, .page_bytes = 128 * 1024, .recipients_per_page = 1 });
+    defer pool.deinit();
+    const per_page = pool.pool.pages.len / 9;
+    try std.testing.expectEqual(@as(usize, 0), pool.smallStart() % per_page);
+    var pages: [9]Reservation = undefined;
+    for (&pages) |*page| page.* = pool.reserve(128 * 1024).?;
+    try std.testing.expectEqual(@as(?Reservation, null), pool.reserve(1));
+    // A freed page in the lower region takes small packets once the upper one is full.
+    pool.cancel(pages[0]);
+    try std.testing.expectEqual(@as(usize, 1), pool.fit(&.{1}));
+    const small = pool.reserve(1).?;
+    try std.testing.expect(small.page < pool.smallStart());
+    // It came from the top of what was freed, so the rest of that run stays whole.
+    try std.testing.expectEqual(pages[0].page + per_page - 1, small.page);
+    pool.cancel(small);
+    for (pages[1..]) |page| pool.cancel(page);
+    try std.testing.expectEqual(@as(usize, 0), pool.pool.active_units);
+    try std.testing.expectEqual(@as(usize, 0), pool.pool.small_units);
 }

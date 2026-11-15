@@ -164,7 +164,7 @@ test "block and door placement retain collision boundaries across chunk edges" {
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/placement", .{temporary.sub_path});
     var store = try storage.Store.init(allocator, std.testing.io, .{ .path = path });
     defer store.deinit();
-    var registry = try metrics.Registry.init(allocator, std.testing.io, .{ .capacity = 128 });
+    var registry = try metrics.Registry.init(allocator, std.testing.io, .{});
     defer registry.deinit();
     var fixture = try Fixture.init(allocator, &store, &registry);
     defer fixture.deinit();
@@ -234,7 +234,7 @@ test "raycasts test collision shapes across sections without allocating during t
     defer store.deinit();
     var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
     defer registry.deinit();
-    const fixture = try Fixture.init(allocator, &store, &registry);
+    var fixture = try Fixture.init(allocator, &store, &registry);
     defer fixture.deinit();
     const world = fixture.players.records[0].world;
     const stone: u16 = @intCast(game_data.registry.blockStateId("minecraft:stone").?);

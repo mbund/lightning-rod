@@ -529,7 +529,7 @@ pub const ItemReplication = struct {
 
     fn selectVisibility(self: *ItemReplication, visibility: *const Streaming.Visibility) void {
         for (visibility.changed_words.values()) |word| {
-            const player_index = word / visibility.words_per_player;
+            const player_index = word / visibility.grid.words;
             if (visibility.reset.contains(player_index)) continue;
             const player = self.deps.players.records[player_index];
             if (player.handle == null or player.stage != .ready) continue;
@@ -538,12 +538,13 @@ pub const ItemReplication = struct {
             const z = center.z - visibility.radius;
             var bits = visibility.changed[word];
             while (bits != 0) {
-                const cell: i32 = @intCast((word % visibility.words_per_player) * 64 + @ctz(bits));
+                const cell: i32 = @intCast((word % visibility.grid.words) * 64 + @ctz(bits));
                 bits &= bits - 1;
-                if (cell >= visibility.side * visibility.side) continue;
+                if (cell >= visibility.grid.columns) continue;
+                const side: i32 = @intCast(visibility.grid.width);
                 const column: [2]i32 = .{
-                    x + @mod(@mod(cell, visibility.side) - @mod(x, visibility.side), visibility.side),
-                    z + @mod(@divTrunc(cell, visibility.side) - @mod(z, visibility.side), visibility.side),
+                    x + @mod(@mod(cell, side) - @mod(x, side), side),
+                    z + @mod(@divTrunc(cell, side) - @mod(z, side), side),
                 };
                 self.deps.dropped.selectColumns(player.world, column, column, &self.work);
             }

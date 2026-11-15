@@ -82,7 +82,7 @@ pub const Maintenance = struct {
             self.notified.store(false, .release);
             while (!self.stopping.load(.acquire)) {
                 self.blocked.store(true, .release);
-                const result = try self.store.pollMaintenance(.{ .index_entries = 4096, .pages = storage.batch_size });
+                const result = try self.store.pollMaintenance(self.store.maintenanceBudget());
                 if (result != .pending) self.blocked.store(false, .release);
                 if (result != .progressed) break;
             }

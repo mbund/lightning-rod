@@ -50,7 +50,7 @@ pub fn aliceOperator() [1]u128 {
 
 pub fn run(init: std.process.Init, selections: anytype, config: Configuration) !void {
     const startup = profile.Startup.capture(init.io);
-    var memory = lightning_rod.Memory.init(std.heap.page_allocator, init.io);
+    var memory = lightning_rod.Memory.init(lightning_rod.system.huge_page_allocator, init.io);
     defer memory.deinit();
     const allocator = memory.allocator("bootstrap");
     const started = std.Io.Clock.now(.awake, init.io);

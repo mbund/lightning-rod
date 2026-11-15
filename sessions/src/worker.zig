@@ -52,11 +52,12 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             max_players: usize = 32,
             buffer_bytes: usize = 512 * 1024,
             connection_bytes: usize = 8 * 1024,
-            input_burst_slots: usize = 8,
+            input_burst_slots: usize = 2,
             output_burst_slots: usize = 8,
             configuration_slots: usize = 8,
-            decode_slots: usize = 8,
+            decode_slots: usize = 2,
             framing_slots: usize = 8,
+            codec_workers: usize = 1,
             max_pending_wire_bytes: usize = 4 * 1024 * 1024,
             protocols: *const Endpoint.Protocols,
             compression_threshold: ?usize = 256,
@@ -172,7 +173,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
 
         pub fn initCodec(self: *Self, io: std.Io, registry: ?*metrics.Registry) !void {
             assert(self.engine.codec == null);
-            const codec = try Codec.init(self.allocator, io, self.engine.networking, self.config.connections + self.frames.len, registry);
+            const codec = try Codec.init(self.allocator, io, self.engine.networking, .{ .tasks = self.config.connections + self.frames.len, .frames = self.frames.len, .workers = self.config.codec_workers, .metrics = registry });
             errdefer codec.deinit();
             try self.engine.attachCodec(codec);
         }
@@ -425,7 +426,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
 
         /// Producers, packet work, and kernel operations must be stopped before abandoning loans.
         pub fn abort(self: *Self, io: std.Io) void {
-            if (self.engine.codec) |codec| assert(codec.thread == null);
+            if (self.engine.codec) |codec| assert(codec.stopped());
             for (self.endpoints) |endpoint| assert(!endpoint.tick_active);
             self.discardInputs();
             for (self.engine.connections, 0..) |*connection, index| {
@@ -515,7 +516,6 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
         }
 
         fn prepareSequence(self: *Self, origin: usize, pending: *Pending) !bool {
-            const codec = self.engine.codec orelse return false;
             const group = pending.packet.group;
             if (group.index != 0 or group.count > self.frames.len) return false;
             var frames: [Service.batch_max]*Frame = undefined;
@@ -539,7 +539,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                     if (entry.packet.group.count != 1 or entry.packet.group.protocol != group.protocol) break;
                 }
                 if (entry.frame != null) break;
-                const bound = pending.source.?.framedBound(entry.packet.bytes.len);
+                const bound = pending.source.?.framedBound(entry.packet.boundLength());
                 if (bound > self.config.buffer_bytes - charge) break;
                 charge += bound;
                 members[count] = entry;
@@ -574,7 +574,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                     const bit = @as(u32, 1) << @intCast(position);
                     assert(candidate.packets & bit == 0);
                     candidate.packets |= bit;
-                    candidate.required += endpoint.framedBound(member.packet.bytes.len);
+                    candidate.required += endpoint.framedBound(member.packet.boundLength());
                     self.sequence_slots[candidate.slot * stride + position] = recipient;
                 }
             }
@@ -619,15 +619,19 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                 frame.sequence_count = if (index == 0) count else 1;
                 frame.sequence_next = if (index + 1 < count) frames[index + 1] else null;
                 frame.completion_owner = if (index == 0) .network else .sequence;
-                frame.sequence = .{ .task = &frame.task, .protocol = frame.protocol, .storage = endpoint.output.framingStorage(member.packet), .length = member.packet.bytes.len, .threshold = if (compressed.?) self.config.compression_threshold else null, .output = frame.bytes };
+                frame.sequence = .{ .task = &frame.task, .protocol = frame.protocol, .storage = endpoint.output.framingStorage(member.packet), .length = member.packet.bytes.len, .decoded_length = member.packet.decoded_length, .threshold = if (compressed.?) self.config.compression_threshold else null, .output = frame.bytes };
                 if (index != 0) {
-                    assert(frame.task.state.load(.acquire) == .idle);
-                    frame.task.operation = .{ .frame = .{ .protocol = frame.protocol, .storage = frame.sequence.?.storage, .length = frame.sequence.?.length, .threshold = frame.sequence.?.threshold, .output = frame.bytes } };
-                    frame.task.state.store(.queued, .release);
+                    frame.task.begin(.{ .frame = .{ .protocol = frame.protocol, .storage = frame.sequence.?.storage, .length = frame.sequence.?.length, .threshold = frame.sequence.?.threshold, .output = frame.bytes } });
                     frames[index - 1].sequence.?.next = &frame.sequence.?;
                 }
             }
-            codec.submit(&frames[0].task, .{ .frame_sequence = .{ .first = &frames[0].sequence.?, .targets = targets.? } });
+            const operation: Codec.Operation = .{ .frame_sequence = .{ .first = &frames[0].sequence.?, .targets = targets.? } };
+            if (self.engine.codec) |codec| {
+                codec.submit(&frames[0].task, operation);
+            } else {
+                frames[0].task.begin(operation);
+                Codec.execute(&self.engine.workspaces, &frames[0].task);
+            }
             return true;
         }
 
@@ -680,7 +684,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
         }
 
         pub fn discardInputs(self: *Self) void {
-            for (self.endpoints) |endpoint| while (endpoint.next()) |event| if (event == .input) endpoint.release(event.input.handle);
+            for (self.endpoints) |endpoint| endpoint.discardInputs();
         }
 
         fn deliver(self: *Self, io: std.Io) !void {
@@ -805,7 +809,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                     const endpoint = pending.source.?;
                     assert(endpoint == self.endpoints[index]);
                     const packet = pending.packet;
-                    const charge = endpoint.framedBound(packet.bytes.len);
+                    const charge = endpoint.framedBound(packet.boundLength());
                     var checking = pending.remaining.iterator(.{});
                     if (pending.frame == null or pending.frame.?.ready) {
                         while (checking.next()) |recipient| {
@@ -855,9 +859,13 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                                     if (self.blocked.isSet(native.index) or connection.codec.state.load(.acquire) != .idle or connection.received != 0) continue;
                                     if (connection.protocol.?.number != selected.number or Endpoint.compressed(&connection.lifecycle.?) != compressed) continue;
                                     if (pending.sizes[group] != 0 and !self.engine.canSendFramed(native, pending.sizes[group], .{ .sockets = &self.socket_budget })) continue;
-                                    if (self.engine.codec != null and Endpoint.encrypted(&connection.lifecycle.?)) {
+                                    if (Endpoint.encrypted(&connection.lifecycle.?)) {
                                         if (self.target_free_count == 0) continue;
                                         self.engine.reserveGroupOutput(native, packet.group) catch {
+                                            self.block(native.index);
+                                            continue;
+                                        };
+                                        self.engine.reserveOutput(native, if (pending.sizes[group] != 0) pending.sizes[group] else charge) catch {
                                             self.block(native.index);
                                             continue;
                                         };
@@ -898,15 +906,12 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                                 frame.compressed = compressed;
                                 pending.frame = frame;
                                 pending.group = if (known_protocol != null) (group + 1) % 2 else (group + 1) % groups;
+                                const operation: Codec.Operation = .{ .frame = .{ .protocol = selected.number, .storage = endpoint.output.framingStorage(packet), .length = packet.bytes.len, .decoded_length = packet.decoded_length, .threshold = if (compressed) self.config.compression_threshold else null, .output = frame.bytes, .targets = frame.targets } };
                                 if (self.engine.codec) |codec| {
-                                    codec.submit(&frame.task, .{ .frame = .{ .protocol = selected.number, .storage = endpoint.output.framingStorage(packet), .length = packet.bytes.len, .threshold = if (compressed) self.config.compression_threshold else null, .output = frame.bytes, .targets = frame.targets } });
+                                    codec.submit(&frame.task, operation);
                                 } else {
-                                    assert(frame.loan.references == 0 and frame.loan.sockets == 0);
-                                    frame.loan = Engine.Loan.framed(try Endpoint.sharedFrame(selected.number, &self.engine.workspaces, endpoint.output.framingStorage(packet), packet.bytes.len, if (compressed) self.config.compression_threshold else null, frame.bytes), packet.bytes);
-                                    frame.ready = true;
-                                    self.instruments.encoded_packets.add(1);
-                                    self.instruments.encoded_bytes.add(packet.bytes.len);
-                                    self.instruments.framed_bytes.add(frame.loan.length());
+                                    frame.task.begin(operation);
+                                    Codec.execute(&self.engine.workspaces, &frame.task);
                                 }
                                 break;
                             }
@@ -923,6 +928,11 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                                     const native = endpoint.routes[recipient_index].?;
                                     const connection = &self.engine.connections[native.index];
                                     assert(connection.frame_targets > 0);
+                                    if (self.engine.codec == null) {
+                                        const completion = try (Codec.take(target.task) orelse unreachable);
+                                        assert(target.task.operation == .send);
+                                        try self.engine.commitSend(io, native, completion.consumed, completion.burst);
+                                    }
                                     if (target.sent) {
                                         if (frame.sequence != null) {
                                             var member: ?*Frame = frame;
@@ -939,7 +949,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                                                 entry.complete(recipient);
                                                 self.delivery_ready = true;
                                                 self.engine.completeGroupPacket(native, index, entry.packet.group);
-                                                endpoint.refund(handle, endpoint.framedBound(entry.packet.bytes.len) - encoded.len);
+                                                endpoint.refund(handle, endpoint.framedBound(entry.packet.boundLength()) - encoded.len);
                                                 self.instruments.fanout_bytes.add(encoded.len);
                                             }
                                             assert(member == null);
@@ -1486,6 +1496,19 @@ const TestEndpoint = struct {
     pub const versions = .{};
     pub const Protocols = struct { values: [2]session_protocol.Protocol = .{ .{ .number = 1 }, .{ .number = 2 } } };
     pub const Connection = usize;
+    pub const Encryption = session_protocol.Encryption(Connection);
+    pub const maximum_encryption_batch_size = 8;
+    pub fn encryptionBatchSize(number: i32) usize {
+        return if (number == 2) 8 else 4;
+    }
+
+    pub fn encryptBatch(number: i32, source: []const u8, targets: []const Encryption) void {
+        std.debug.assert(targets.len <= encryptionBatchSize(number));
+        for (targets) |target| {
+            encrypt(target.connection, source[0..target.first.len], target.first);
+            encrypt(target.connection, source[target.first.len..], target.second);
+        }
+    }
     pub const Workspaces = struct { headers: bool = false };
     pub fn initWorkspaces(_: std.mem.Allocator) !Workspaces {
         return .{};
@@ -1622,8 +1645,8 @@ test "framing and burst exhaustion preserve ordering and isolate slow recipients
     try fourth.publish(10, handles[0..1]);
     endpoint.flush();
     try owner.deliver(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 3), endpoint.preparing.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 1000), owner.engine.connections[0].lifecycle.?);
+    try std.testing.expectEqual(@as(usize, 2), endpoint.preparing.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1010), owner.engine.connections[0].lifecycle.?);
     try std.testing.expectEqual(@as(usize, 0), owner.engine.connections[1].lifecycle.?);
     try std.testing.expectEqual(@as(usize, 10), owner.engine.connections[2].lifecycle.?);
     for (0..2) |_| {
@@ -1797,7 +1820,7 @@ test "framing and burst exhaustion preserve ordering and isolate slow recipients
     try owner.initCodec(std.testing.io, null);
     const codec = owner.engine.codec.?;
     defer {
-        codec.read.store(codec.write.load(.acquire), .release);
+        codec.workers[0].read.store(codec.workers[0].write.load(.acquire), .release);
         for (owner.frames) |*frame| if (frame.task.state.load(.acquire) == .queued) {
             frame.task.result = error.TestStopped;
             frame.task.state.store(.complete, .release);
@@ -1824,7 +1847,7 @@ test "framing and burst exhaustion preserve ordering and isolate slow recipients
     }
     endpoint.flush();
     try owner.deliver(std.testing.io);
-    try std.testing.expectEqual(@as(u64, 1), codec.write.load(.acquire) - codec.read.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), codec.workers[0].write.load(.acquire) - codec.workers[0].read.load(.acquire));
     const sequence = owner.queues[0].head.?;
     try std.testing.expectEqual(@as(usize, 2), sequence.frame.?.sequence_count);
     try std.testing.expectEqual(@as(u8, 1), sequence.packet.group.count);
@@ -1983,7 +2006,7 @@ test "queued codec work does not revisit borrowed recipient tables" {
     try owner.initCodec(std.testing.io, null);
     const codec = owner.engine.codec.?;
     defer {
-        codec.read.store(codec.write.load(.acquire), .release);
+        codec.workers[0].read.store(codec.workers[0].write.load(.acquire), .release);
         for (owner.frames) |*frame| if (frame.task.state.load(.acquire) == .queued) {
             frame.task.result = error.TestStopped;
             frame.task.state.store(.complete, .release);
@@ -2008,7 +2031,7 @@ test "queued codec work does not revisit borrowed recipient tables" {
     }
     endpoint.flush();
     try owner.deliver(std.testing.io);
-    const queued = codec.write.load(.acquire) - codec.read.load(.acquire);
+    const queued = codec.workers[0].write.load(.acquire) - codec.workers[0].read.load(.acquire);
     try std.testing.expect(queued > 0);
 
     for (owner.frames) |*frame| try std.testing.expect(frame.packet != null and frame.task.state.load(.acquire) == .queued);
@@ -2020,7 +2043,7 @@ test "queued codec work does not revisit borrowed recipient tables" {
         pending.packet.recipients = shared.Recipients.all(handles);
     };
     for (0..64) |_| try owner.deliverFrames(std.testing.io);
-    try std.testing.expectEqual(queued, codec.write.load(.acquire) - codec.read.load(.acquire));
+    try std.testing.expectEqual(queued, codec.workers[0].write.load(.acquire) - codec.workers[0].read.load(.acquire));
     for (owner.engine.connections) |connection| try std.testing.expectEqual(@as(usize, 0), connection.output_write);
 }
 
@@ -2089,117 +2112,118 @@ test "capacity released by a later endpoint wakes an earlier waiting endpoint" {
 }
 
 test "encrypted sequences batch rotating exclusions and retain closing recipients until completion" {
-    for ([_]bool{ false, true }) |compact| {
-        for ([_]bool{ false, true }) |exclude_self| {
-            const Owner = Worker(TestEndpoint, TestHooks, SingleSimulation);
-            const audience = 32;
-            const packet_count = 8;
-            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-            defer arena.deinit();
-            const allocator = arena.allocator();
-            var hooks: TestHooks = .{};
-            var router: SingleSimulation = .{};
-            var protocols: TestEndpoint.Protocols = .{};
-            const transport: network.Transport = .{ .context = &hooks, .vtable = network.Transport.adapter(TestHooks) };
-            const endpoint = try Service.init(allocator, std.testing.io, transport, .{ .connections = audience, .buffer_bytes = 512 * 1024, .pages = packet_count, .page_bytes = 1500, .protocols = &protocols.values });
-            defer endpoint.deinit();
-            const owner = try Owner.init(allocator, transport, .{ .connections = audience, .max_players = audience, .buffer_bytes = 512 * 1024, .connection_bytes = 8192, .framing_slots = 8, .max_pending_wire_bytes = 1024 * 1024, .compression_threshold = null, .protocols = &protocols, .hooks = &hooks, .router = &router, .destinations = &.{0} }, &.{endpoint});
-            defer {
-                owner.abort(std.testing.io);
-                owner.deinit();
-            }
-            try owner.initCodec(std.testing.io, null);
-            const codec = owner.engine.codec.?;
-            defer {
-                codec.read.store(codec.write.load(.acquire), .release);
-                for (owner.frames) |*frame| if (frame.task.state.load(.acquire) == .queued) {
-                    frame.task.result = error.TestStopped;
-                    frame.task.state.store(.complete, .release);
+    for ([_]usize{ 0, 1, 4 }) |codec_workers| {
+        const threaded = codec_workers != 0;
+        for ([_]bool{ false, true }) |compact| {
+            for ([_]bool{ false, true }) |exclude_self| {
+                const Owner = Worker(TestEndpoint, TestHooks, SingleSimulation);
+                const audience = 32;
+                const packet_count = 8;
+                var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer arena.deinit();
+                const allocator = arena.allocator();
+                var hooks: TestHooks = .{};
+                var router: SingleSimulation = .{};
+                var protocols: TestEndpoint.Protocols = .{};
+                const transport: network.Transport = .{ .context = &hooks, .vtable = network.Transport.adapter(TestHooks) };
+                const endpoint = try Service.init(allocator, std.testing.io, transport, .{ .connections = audience, .buffer_bytes = 512 * 1024, .pages = packet_count, .page_bytes = 1500, .protocols = &protocols.values });
+                defer endpoint.deinit();
+                const owner = try Owner.init(allocator, transport, .{ .connections = audience, .max_players = audience, .buffer_bytes = 512 * 1024, .connection_bytes = 8192, .framing_slots = 8, .codec_workers = @max(1, codec_workers), .max_pending_wire_bytes = 1024 * 1024, .compression_threshold = null, .protocols = &protocols, .hooks = &hooks, .router = &router, .destinations = &.{0} }, &.{endpoint});
+                defer {
+                    owner.abort(std.testing.io);
+                    owner.deinit();
+                }
+                if (threaded) try owner.initCodec(std.testing.io, null);
+                defer if (owner.engine.codec) |codec| codec.stop();
+                const handles = try allocator.alloc(network.Handle, audience);
+                for (handles, 0..) |*handle, i| {
+                    handle.* = .{ .index = @intCast(i), .generation = 1 };
+                    endpoint.routes[i] = handle.*;
+                    endpoint.credit[i].store((@as(u64, 1) << 32) | Service.active | endpoint.config.buffer_bytes, .release);
+                    owner.engine.setHandle(i, handle.*);
+                    const connection = &owner.engine.connections[i];
+                    connection.protocol = &protocols.values[0];
+                    connection.lifecycle = 0;
+                    connection.state.phase = .play;
+                }
+                const Version = struct {
+                    pub const protocol_number = 1;
                 };
-                for (owner.engine.connections) |*connection| if (connection.codec.state.load(.acquire) == .queued) connection.codec.complete(error.TestStopped);
-            }
-            const handles = try allocator.alloc(network.Handle, audience);
-            for (handles, 0..) |*handle, i| {
-                handle.* = .{ .index = @intCast(i), .generation = 1 };
-                endpoint.routes[i] = handle.*;
-                endpoint.credit[i].store((@as(u64, 1) << 32) | Service.active | endpoint.config.buffer_bytes, .release);
-                owner.engine.setHandle(i, handle.*);
-                const connection = &owner.engine.connections[i];
-                connection.protocol = &protocols.values[0];
-                connection.lifecycle = 0;
-                connection.state.phase = .play;
-            }
-            const Version = struct {
-                pub const protocol_number = 1;
-            };
-            const Encoder = struct {
-                pub fn writeGroup(comptime _: type, buffers: []const []u8, lengths: []usize, value: u8) !void {
-                    for (buffers, lengths) |buffer, *length| {
-                        @memset(buffer[0..10], value);
-                        length.* = 10;
+                const Encoder = struct {
+                    pub fn writeGroup(comptime _: type, buffers: []const []u8, lengths: []usize, value: u8) !void {
+                        for (buffers, lengths) |buffer, *length| {
+                            @memset(buffer[0..10], value);
+                            length.* = 10;
+                        }
                     }
-                }
-            };
-            var broadcast = try Service.Broadcast.init(allocator, endpoint, packet_count);
-            defer broadcast.deinit();
-            const targets = try allocator.alloc(Service.Target, audience);
-            for (handles, targets) |handle, *target| target.* = .{ .handle = handle, .protocol = 1 };
-            if (compact) {
-                var delivered: [audience]Service.Delivery = undefined;
-                for (0..packet_count) |packet_index| {
-                    var selected: usize = 0;
-                    for (0..audience) |offset| {
-                        const index = (offset + packet_index) % audience;
-                        if (exclude_self and index == packet_index) continue;
-                        targets[selected] = .{ .handle = handles[index], .protocol = 1 };
-                        selected += 1;
+                };
+                var broadcast = try Service.Broadcast.init(allocator, endpoint, packet_count);
+                defer broadcast.deinit();
+                const targets = try allocator.alloc(Service.Target, audience);
+                for (handles, targets) |handle, *target| target.* = .{ .handle = handle, .protocol = 1 };
+                if (compact) {
+                    var delivered: [audience]Service.Delivery = undefined;
+                    for (0..packet_count) |packet_index| {
+                        var selected: usize = 0;
+                        for (0..audience) |offset| {
+                            const index = (offset + packet_index) % audience;
+                            if (exclude_self and index == packet_index) continue;
+                            targets[selected] = .{ .handle = handles[index], .protocol = 1 };
+                            selected += 1;
+                        }
+                        try endpoint.fanout(.{Version}, Encoder, targets[0..selected], @as(u8, @intCast(packet_index)), &.{10}, delivered[0..selected]);
+                        for (delivered[0..selected]) |delivery| try std.testing.expectEqual(Service.Delivery.queued, delivery);
                     }
-                    try endpoint.fanout(.{Version}, Encoder, targets[0..selected], @as(u8, @intCast(packet_index)), &.{10}, delivered[0..selected]);
-                    for (delivered[0..selected]) |delivery| try std.testing.expectEqual(Service.Delivery.queued, delivery);
+                } else {
+                    try broadcast.begin(targets);
+                    for (0..packet_count) |packet_index| {
+                        _ = try broadcast.write(.{Version}, Encoder, if (exclude_self) handles[packet_index % audience] else null, null, @as(u8, @intCast(packet_index)), 10);
+                    }
+                    broadcast.finish();
                 }
-            } else {
-                try broadcast.begin(targets);
-                for (0..packet_count) |packet_index| {
-                    _ = try broadcast.write(.{Version}, Encoder, if (exclude_self) handles[packet_index % audience] else null, null, @as(u8, @intCast(packet_index)), 10);
+                endpoint.flush();
+                try owner.deliver(std.testing.io);
+                if (owner.engine.codec) |codec| {
+                    const queued = codec.workers[0].write.load(.acquire) - codec.workers[0].read.load(.acquire);
+                    var framed: usize = 0;
+                    for (owner.frames) |frame| framed += @intFromBool(frame.packet != null);
+                    try std.testing.expectEqual(@as(u64, 1), queued);
+                    try std.testing.expectEqual(owner.frames.len, framed);
+                    const first = owner.queues[0].head.?.frame.?;
+                    try std.testing.expectEqual(owner.frames.len, first.sequence_count);
+                    var target = first.targets;
+                    while (target) |destination| : (target = destination.next) {
+                        const count = @popCount(destination.packets);
+                        try std.testing.expectEqual(owner.frames.len - @intFromBool(exclude_self and destination.recipient < owner.frames.len), count);
+                    }
+                    try codec.start();
+                    codec.stop();
+                    owner.engine.connections[0].closing = true;
+                    try std.testing.expectEqual(@as(usize, 1), owner.engine.connections[0].frame_targets);
+                    try std.testing.expect(!owner.detached(handles[0]));
                 }
-                broadcast.finish();
-            }
-            endpoint.flush();
-            try owner.deliver(std.testing.io);
-            const queued = codec.write.load(.acquire) - codec.read.load(.acquire);
-
-            var framed: usize = 0;
-            for (owner.frames) |frame| framed += @intFromBool(frame.packet != null);
-            try std.testing.expectEqual(@as(u64, 1), queued);
-            try std.testing.expectEqual(owner.frames.len, framed);
-            const first = owner.queues[0].head.?.frame.?;
-            try std.testing.expectEqual(owner.frames.len, first.sequence_count);
-            var target = first.targets;
-            while (target) |destination| : (target = destination.next) {
-                const count = @popCount(destination.packets);
-                try std.testing.expectEqual(owner.frames.len - @intFromBool(exclude_self and destination.recipient < owner.frames.len), count);
-            }
-            try codec.start();
-            codec.stop();
-            owner.engine.connections[0].closing = true;
-            try std.testing.expectEqual(@as(usize, 1), owner.engine.connections[0].frame_targets);
-            try std.testing.expect(!owner.detached(handles[0]));
-            for (owner.engine.connections, 0..) |*connection, recipient| {
-                const result = try (Owner.Codec.take(&connection.codec) orelse return error.MissingSendCompletion);
-                var offset: usize = 0;
-                const bytes = owner.engine.output[recipient * owner.config.connection_bytes ..][0..owner.config.connection_bytes];
-                for (0..packet_count) |packet_index| {
-                    if (exclude_self and recipient == packet_index) continue;
-                    try std.testing.expect(std.mem.allEqual(u8, bytes[offset..][0..10], @intCast(packet_index)));
-                    offset += 10;
+                for (owner.engine.connections, 0..) |*connection, recipient| {
+                    const consumed = if (threaded)
+                        (try (Owner.Codec.take(&connection.codec) orelse return error.MissingSendCompletion)).consumed
+                    else
+                        connection.output_write;
+                    var offset: usize = 0;
+                    const bytes = owner.engine.output[recipient * owner.config.connection_bytes ..][0..owner.config.connection_bytes];
+                    for (0..packet_count) |packet_index| {
+                        if (exclude_self and recipient == packet_index) continue;
+                        try std.testing.expect(std.mem.allEqual(u8, bytes[offset..][0..10], @intCast(packet_index)));
+                        offset += 10;
+                    }
+                    try std.testing.expectEqual(offset, consumed);
+                    try std.testing.expectEqual(@as(usize, offset), connection.lifecycle.?);
+                    try std.testing.expectEqual(.idle, connection.codec.state.load(.acquire));
                 }
-                try std.testing.expectEqual(offset, result.consumed);
+                try owner.deliver(std.testing.io);
+                try owner.deliver(std.testing.io);
+                try std.testing.expectEqual(@as(usize, 0), endpoint.preparing.load(.acquire));
+                try std.testing.expect(owner.queues[0].head == null);
+                for (owner.engine.connections) |connection| try std.testing.expectEqual(@as(usize, 0), connection.frame_targets);
             }
-            try owner.deliver(std.testing.io);
-            try owner.deliver(std.testing.io);
-            try std.testing.expectEqual(@as(usize, 0), endpoint.preparing.load(.acquire));
-            try std.testing.expect(owner.queues[0].head == null);
-            for (owner.engine.connections) |connection| try std.testing.expectEqual(@as(usize, 0), connection.frame_targets);
         }
     }
 }

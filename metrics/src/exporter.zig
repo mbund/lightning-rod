@@ -186,7 +186,7 @@ pub const Exporter = struct {
             if (snapshot.kind != .timer) return error.InvalidSubscription;
             for (names[0..i]) |previous| if (std.mem.eql(u8, previous, name)) return error.InvalidSubscription;
         }
-        errdefer for (registry.records[0..registry.count]) |*record| {
+        errdefer for (registry.records[0..registry.count]) |record| {
             if (record.stream == &state.stream) record.stream = null;
         };
         for (names) |name| try registry.subscribe(name, &state.stream);
@@ -345,7 +345,7 @@ pub const Exporter = struct {
         if (state.output) |*output| output.deinit();
         state.stopping = true;
         state.run(io);
-        for (registry.records[0..registry.count]) |*record| {
+        for (registry.records[0..registry.count]) |record| {
             if (record.stream == &state.stream) record.stream = null;
         }
         const failure = state.failure;
@@ -366,7 +366,7 @@ pub const Exporter = struct {
 
     /// Snapshot reads require quiescent ownership, just like Registry.snapshot.
     pub fn writeSnapshot(registry: *const metrics.Registry, writer: *std.Io.Writer) !void {
-        for (registry.records[0..registry.count]) |*record| {
+        for (registry.records[0..registry.count]) |record| {
             const snapshot = record.read();
             try writeRecord(snapshot, writer);
         }

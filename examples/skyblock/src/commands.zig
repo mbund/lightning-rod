@@ -30,6 +30,7 @@ pub const IslandCommands = struct {
     }
 
     pub fn allocate(allocator: std.mem.Allocator, deps: Dependencies, config: Configuration) !*IslandCommands {
+        if (deps.players.config.spawn == null) return error.MissingIslandSpawn;
         const self = try allocator.create(IslandCommands);
         self.* = .{ .deps = deps, .config = config, .saved = .{} };
         inline for (.{ "island", "is" }) |name| {
@@ -216,7 +217,7 @@ pub const IslandCommands = struct {
             const target = update.destination orelse continue;
             if (target == self.config.index) {
                 directory.moved(player.uuid, self.config.index, target);
-                try self.deps.players.teleport(&self.deps.players.records[handle.index], self.deps.players.spawn_world, self.deps.players.config.spawn, .{ .yaw = 0, .pitch = 0 });
+                try self.deps.players.teleport(&self.deps.players.records[handle.index], self.deps.players.spawn_world, self.deps.players.config.spawn.?, .{ .yaw = 0, .pitch = 0 });
                 continue;
             }
             self.deps.sessions.transfer(handle, self.config.routing.endpoints[target]) catch |err| switch (err) {

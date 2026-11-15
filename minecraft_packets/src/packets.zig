@@ -18,16 +18,7 @@ fn Writer(comptime callbacks: anytype) type {
             const handler = candidates[index];
             const parameters = @typeInfo(@TypeOf(handler)).@"fn".param_types;
             if (comptime parameters.len > 1 and parameters[1] == Registry) {
-                const selected: Registry = .{
-                    .entities = Version.Registry.canonical_entity_to_wire,
-                    .items = Version.Registry.canonical_item_to_wire,
-                    .blocks = Version.Registry.canonical_block_to_wire,
-                    .block_states = Version.Registry.canonical_block_state_to_wire,
-                    .block_state_bits = Version.Registry.block_state_bits,
-                    .sounds = Version.Registry.canonical_sound_to_wire,
-                    .effects = Version.Registry.canonical_effect_to_wire,
-                    .attributes = Version.Registry.canonical_attribute_to_wire,
-                };
+                const selected = Registry.forVersion(Version);
                 const encoded = try sessions.packet_api.encode(Version, callbacks, bytes, .{selected} ++ arguments);
                 std.debug.assert(encoded.ptr == bytes.ptr and encoded.len <= bytes.len);
                 return encoded;

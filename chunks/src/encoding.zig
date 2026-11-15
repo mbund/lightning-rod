@@ -15,8 +15,13 @@ const palette_capacity = 2048;
 const table_capacity = 4096;
 const empty = std.math.maxInt(u16);
 
+pub const BlockEdit = struct {
+    index: u12,
+    state: u16,
+};
+
 // Tags 0 and 1 match the decoded uniform and dense representations.
-// Tag 2 stores a frequency-ordered palette followed by LSB-first bitplanes.
+// Tag 2 stores a palette followed by LSB-first bitplanes.
 // Tag 3 prefixes a block representation with 64 little-endian biome IDs.
 pub fn encode(input: []const u8, output: []u8) storage.Error![]const u8 {
     if (input.len >= biome_header_bytes + 3 and input[0] == 3) {
@@ -28,6 +33,10 @@ pub fn encode(input: []const u8, output: []u8) storage.Error![]const u8 {
         return output[0 .. biome_header_bytes + encoded.len];
     }
     if (input.len == 3 and input[0] == 0) return input;
+    if (input.len >= 3 and input[0] == 2) {
+        _ = try Packed.init(input);
+        return input;
+    }
     if (input.len != dense_block_bytes or input[0] != 1) return error.Corrupt;
     var table: [table_capacity]u16 = @splat(empty);
     var palette: [palette_capacity]u16 = undefined;
@@ -77,6 +86,80 @@ pub fn encode(input: []const u8, output: []u8) storage.Error![]const u8 {
     bitplanes.encode(blocks, &indices, count, &writer) catch return error.BufferTooSmall;
     std.debug.assert(writer.end == writer.buffer.len);
     return output[0..length];
+}
+
+/// The caller exclusively owns buffer. Scratch is reused between section batches.
+pub fn edit(buffer: []u8, length: usize, edits: []const BlockEdit, scratch: []u8) storage.Error!usize {
+    std.debug.assert(length <= buffer.len and valid(buffer[0..length]));
+    std.debug.assert(buffer.len >= maximum_decoded_bytes and scratch.len >= maximum_decoded_bytes);
+    std.debug.assert(edits.len <= blocks);
+    std.debug.assert(@intFromPtr(buffer.ptr) + buffer.len <= @intFromPtr(scratch.ptr) or @intFromPtr(scratch.ptr) + scratch.len <= @intFromPtr(buffer.ptr));
+    const offset = blockOffset(buffer[0..length]);
+    const block = buffer[offset..length];
+    if (block[0] != 1) {
+        const previous = if (block[0] == 0) @as(u16, 1) else std.mem.readInt(u16, block[1..3], .little);
+        const previous_bits: usize = std.math.log2_int_ceil(usize, previous);
+        var count = previous;
+        // Bound palette searches by one section traversal before choosing a rebuild.
+        if (edits.len <= blocks / (previous + edits.len)) reuse: {
+            for (edits, 0..) |change, index| {
+                const rank = for (0..count) |rank| {
+                    const state = if (rank >= previous)
+                        std.mem.readInt(u16, scratch[edits.len * 2 + (rank - previous) * 2 ..][0..2], .little)
+                    else if (block[0] == 0)
+                        std.mem.readInt(u16, block[1..3], .little)
+                    else
+                        std.mem.readInt(u16, block[3 + rank * 2 ..][0..2], .little);
+                    if (state == change.state) break rank;
+                } else add: {
+                    if (encodedBytes(count + 1) >= dense_block_bytes) break :reuse;
+                    std.mem.writeInt(u16, scratch[edits.len * 2 + @as(usize, count - previous) * 2 ..][0..2], change.state, .little);
+                    count += 1;
+                    break :add count - 1;
+                };
+                std.mem.writeInt(u16, scratch[index * 2 ..][0..2], @intCast(rank), .little);
+            }
+            if (count == 1) return length;
+            const bits: usize = std.math.log2_int_ceil(usize, count);
+            const planes = buffer[offset + 3 + @as(usize, count) * 2 ..][0 .. bits * (blocks / 8)];
+            if (count != previous) {
+                const first = std.mem.readInt(u16, block[1..3], .little);
+                if (previous_bits != 0) std.mem.copyBackwards(u8, planes[0 .. previous_bits * (blocks / 8)], block[3 + @as(usize, previous) * 2 ..]);
+                @memset(planes[previous_bits * (blocks / 8) ..], 0);
+                if (previous == 1) std.mem.writeInt(u16, buffer[offset + 3 ..][0..2], first, .little);
+                @memcpy(buffer[offset + 3 + @as(usize, previous) * 2 ..][0 .. @as(usize, count - previous) * 2], scratch[edits.len * 2 ..][0 .. @as(usize, count - previous) * 2]);
+                buffer[offset] = 2;
+                std.mem.writeInt(u16, buffer[offset + 1 ..][0..2], count, .little);
+            }
+            for (edits, 0..) |change, index| {
+                const rank = std.mem.readInt(u16, scratch[index * 2 ..][0..2], .little);
+                const shift: u3 = @truncate(change.index);
+                const mask = @as(u8, 1) << shift;
+                for (0..bits) |bit| {
+                    const byte = &planes[bit * (blocks / 8) + change.index / 8];
+                    byte.* = (byte.* & ~mask) | (@as(u8, @intCast((rank >> @intCast(bit)) & 1)) << shift);
+                }
+            }
+            const result = offset + encodedBytes(count);
+            std.debug.assert(valid(buffer[0..result]));
+            return result;
+        }
+    }
+    const dense = if (block[0] == 1) buffer else scratch;
+    const output = if (block[0] == 1) scratch else buffer;
+    if (block[0] != 1) {
+        _ = try decodeTo(buffer[0..length], dense);
+        if (block[0] == 0) {
+            const state = std.mem.readInt(u16, block[1..3], .little);
+            dense[offset] = 1;
+            for (0..blocks) |index| std.mem.writeInt(u16, dense[offset + 1 + index * 2 ..][0..2], state, .little);
+        }
+    }
+    for (edits) |change| std.mem.writeInt(u16, dense[offset + 1 + @as(usize, change.index) * 2 ..][0..2], change.state, .little);
+    const encoded = try encode(dense[0 .. offset + dense_block_bytes], output);
+    if (encoded.ptr != buffer.ptr) @memcpy(buffer[0..encoded.len], encoded);
+    std.debug.assert(valid(buffer[0..encoded.len]));
+    return encoded.len;
 }
 
 pub fn decode(buffer: []u8, length: usize) storage.Error!usize {
@@ -180,9 +263,10 @@ fn validateIndices(bytes: []const u8, count: u16) storage.Error!void {
 
 pub const Classification = union(enum) {
     unavailable,
-    known: struct { common: u8, property: u8, selected: [64]u64 },
+    summary: struct { common: u8, property: u8, prefix: [16]u8 = @splat(0), prefix_len: u8 = 0 },
+    known: Known,
+    pub const Known = struct { common: u8, property: u8, selected: [64]u64 };
 };
-pub const ClassificationMode = enum { homogeneous, complete };
 
 pub const Packed = struct {
     bytes: []const u8,
@@ -192,6 +276,10 @@ pub const Packed = struct {
         const blocks_bytes = bytes[blockOffset(bytes)..];
         if (blocks_bytes[0] == 2) try validateIndices(blocks_bytes, std.mem.readInt(u16, blocks_bytes[1..3], .little));
         return .{ .bytes = blocks_bytes };
+    }
+
+    pub fn classify(self: Packed, properties: []const u8, selected: u8) storage.Error!Classification.Known {
+        return classifyPacked(self.bytes, properties, selected, true);
     }
 
     pub fn paletteCount(self: Packed) usize {
@@ -253,10 +341,48 @@ pub const Packed = struct {
         return self.state(rank);
     }
 
+    /// Decodes two consecutive rows into place with one pass over the bit planes. Terrain
+    /// repeats one state across most row pairs, which then cost a single palette lookup.
+    pub fn pair(self: Packed, group: u7, first: *[16]u16, second: *[16]u16) void {
+        if (self.bytes[0] == 0) {
+            first.* = @splat(self.state(0));
+            second.* = first.*;
+            return;
+        }
+        if (self.bytes[0] == 1) {
+            inline for (.{ first, second }, 0..) |row_, half| {
+                const values: @Vector(16, u16) = std.mem.bytesAsValue([16]u16, self.bytes[1 + @as(usize, group) * 64 + half * 32 ..][0..32]).*;
+                row_.* = if (builtin.cpu.arch.endian() == .little) values else @byteSwap(values);
+            }
+            return;
+        }
+        const count = self.paletteCount();
+        const bits = std.math.log2_int_ceil(usize, count);
+        const palette = self.bytes[3..][0 .. count * 2];
+        const planes = self.bytes[3 + count * 2 ..];
+        var values: @Vector(32, u16) = @splat(0);
+        var varied: u32 = 0;
+        for (0..bits) |bit| {
+            const word = std.mem.readInt(u32, planes[bit * 512 + @as(usize, group) * 4 ..][0..4], .little);
+            // A plane of all zeros or all ones gives every cell the same bit.
+            varied |= word ^ (0 -% (word & 1));
+            const present: @Vector(32, bool) = @bitCast(word);
+            values |= @select(u16, present, @as(@Vector(32, u16), @splat(@as(u16, 1) << @intCast(bit))), @as(@Vector(32, u16), @splat(0)));
+        }
+        const ranks_: [32]u16 = values;
+        if (varied == 0) {
+            first.* = @splat(std.mem.readInt(u16, palette[@as(usize, ranks_[0]) * 2 ..][0..2], .little));
+            second.* = first.*;
+            return;
+        }
+        for (first, ranks_[0..16]) |*value, rank| value.* = std.mem.readInt(u16, palette[@as(usize, rank) * 2 ..][0..2], .little);
+        for (second, ranks_[16..32]) |*value, rank| value.* = std.mem.readInt(u16, palette[@as(usize, rank) * 2 ..][0..2], .little);
+    }
+
     pub fn row(self: Packed, index: u8) [16]u16 {
         if (self.bytes[0] == 0) return @splat(self.state(0));
         if (self.bytes[0] == 1) {
-            const values: @Vector(16, u16) = @bitCast(self.bytes[1 + @as(usize, index) * 32 ..][0..32].*);
+            const values: @Vector(16, u16) = std.mem.bytesAsValue([16]u16, self.bytes[1 + @as(usize, index) * 32 ..][0..32]).*;
             return if (builtin.cpu.arch.endian() == .little) values else @byteSwap(values);
         }
         const values = self.ranks(@intCast(index / 2));
@@ -267,12 +393,15 @@ pub const Packed = struct {
 };
 
 /// Project a registry property directly from storage bitplanes without expanding block states.
-pub fn classify(input: []const u8, properties: []const u8, selected: u8, mode: ClassificationMode) storage.Error!Classification {
-    std.debug.assert(std.math.isPowerOfTwo(selected));
+pub fn classify(input: []const u8, properties: []const u8, selected: u8) storage.Error!Classification.Known {
     if (!valid(input)) return error.Corrupt;
-    const bytes = input[blockOffset(input)..];
-    var result: Classification = .{ .known = .{ .common = 255, .property = selected, .selected = @splat(0) } };
-    const output = &result.known;
+    return classifyPacked(input[blockOffset(input)..], properties, selected, false);
+}
+
+fn classifyPacked(bytes: []const u8, properties: []const u8, selected: u8, comptime validated: bool) storage.Error!Classification.Known {
+    std.debug.assert(std.math.isPowerOfTwo(selected));
+    var result: Classification.Known = .{ .common = 255, .property = selected, .selected = @splat(0) };
+    const output = &result;
     if (bytes[0] == 0) {
         const state = std.mem.readInt(u16, bytes[1..3], .little);
         if (state >= properties.len) return error.Corrupt;
@@ -281,18 +410,12 @@ pub fn classify(input: []const u8, properties: []const u8, selected: u8, mode: C
         return result;
     }
     if (bytes[0] == 1) {
-        var first: ?bool = null;
         for (0..blocks) |index| {
             const state = std.mem.readInt(u16, bytes[1 + index * 2 ..][0..2], .little);
             if (state >= properties.len) return error.Corrupt;
             output.common &= properties[state];
             const matches = properties[state] & selected != 0;
-            if (mode == .homogeneous) {
-                if (first) |before| {
-                    if (before != matches) return .unavailable;
-                } else first = matches;
-            }
-            if (properties[state] & selected != 0) output.selected[index / 64] |= @as(u64, 1) << @intCast(index % 64);
+            if (matches) output.selected[index / 64] |= @as(u64, 1) << @intCast(index % 64);
         }
         return result;
     }
@@ -305,9 +428,8 @@ pub fn classify(input: []const u8, properties: []const u8, selected: u8, mode: C
         flag.* = properties[state];
         output.common &= flag.*;
         occupied += @intFromBool(flag.* & selected != 0);
-        if (mode == .homogeneous and occupied != 0 and occupied != index + 1) return .unavailable;
     }
-    try validateIndices(bytes, count);
+    if (!validated) try validateIndices(bytes, count);
     if (occupied == 0 or occupied == count) {
         if (occupied != 0) output.selected = @splat(std.math.maxInt(u64));
         return result;
@@ -323,7 +445,7 @@ pub fn classify(input: []const u8, properties: []const u8, selected: u8, mode: C
         while (word < 64) : (word += 4) {
             var equal: Wide = @splat(std.math.maxInt(u64));
             for (0..bits) |bit| {
-                const raw: Wide = @bitCast(planes[bit * 512 + word * 8 ..][0..32].*);
+                const raw: Wide = std.mem.bytesAsValue([4]u64, planes[bit * 512 + word * 8 ..][0..32]).*;
                 const values = if (builtin.cpu.arch.endian() == .little) raw else @byteSwap(raw);
                 equal &= if (rank & (@as(usize, 1) << @intCast(bit)) != 0) values else ~values;
             }

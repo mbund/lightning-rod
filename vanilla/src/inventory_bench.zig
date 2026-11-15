@@ -514,6 +514,7 @@ pub fn benchmarkItemReplication() !void {
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
         @memset(streaming.published.sent, std.math.maxInt(u64));
+        @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
         const replication = try ItemReplication.init(allocator, .{}, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
         const Mode = enum { blocked_spawn, spawn, unchanged, single_move, unchanged_after_single_move, single_stack, unchanged_after_single_stack, age_only, blocked_change, change, mutation, unchanged_after_mutation, blocked_mutation, resumed_mutation, blocked_retirement, retirement, reuse, unchanged_after_reuse, leave_view, return_view, viewer_reset };
@@ -586,6 +587,7 @@ pub fn benchmarkItemReplication() !void {
             const slots_before = ownership.cache.metrics.acquired.value();
             const definitions_before = ownership.items.metrics.acquired.value();
             service.beginTick();
+            streaming.tick();
             try replication.tick();
             service.endTick(true);
             service.flush();
@@ -865,6 +867,7 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
     defer terrain.unsubscribeReady(streaming.changed);
     streaming.published.setStream(connection, .{ .generation = 1, .life = player_records[connection].life, .setup = .streaming });
     @memset(streaming.published.sent, std.math.maxInt(u64));
+    @memset(streaming.published.occluded, 0);
     streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
     const replication = try ItemReplication.init(allocator, .{}, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
 
@@ -901,6 +904,7 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
         const reads_before = dropped.cache.metrics.reads.value() + bodies.cache.metrics.reads.value();
         service.credit[connection].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
         service.beginTick();
+        streaming.tick();
         try replication.tick();
         service.endTick(true);
         service.flush();
@@ -968,7 +972,7 @@ pub fn benchmarkItemVisibility() !void {
             .storage = try store.openSpace("metadata"),
         });
         var ids: [1024]entities.Id = undefined;
-        for (ids[0..count]) |*id| id.* = try dropped.create(world, .{ 0.5, 65, 0.5 }, @splat(0), stack);
+        for (ids[0..count]) |*id| id.* = try dropped.create(world, .{ 8.5, 65, 8.5 }, @splat(0), stack);
         var catalog = try protocols.Default.init(allocator);
         defer catalog.deinit(allocator);
         var sink: Sink = .{};
@@ -989,12 +993,13 @@ pub fn benchmarkItemVisibility() !void {
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
         streaming.published.setStream(1, .{ .generation = 1, .life = player_records[1].life, .setup = .streaming, .center = .{ .x = 625, .z = 625 } });
         @memset(streaming.published.sent, std.math.maxInt(u64));
+        @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
         const replication = try ItemReplication.init(allocator, .{}, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
 
         for (0..9) |mode| {
             if (mode == 2) {
-                const word = streaming.words_per_player;
+                const word = streaming.grid.words;
                 streaming.published.sent[word] ^= 1;
                 streaming.published.dirty_words.set(word);
             }
@@ -1022,6 +1027,7 @@ pub fn benchmarkItemVisibility() !void {
             const reads_before = dropped.cache.metrics.reads.value() + bodies.cache.metrics.reads.value();
             for (0..2) |i| service.credit[i].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
             service.beginTick();
+            streaming.tick();
             try replication.tick();
             service.endTick(true);
             service.flush();
@@ -1216,11 +1222,12 @@ pub fn benchmarkIdleTerrain() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const streaming = try Streaming.init(allocator, io, .{ .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
         @memset(streaming.published.sent, std.math.maxInt(u64));
+        @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
 
         const blocks = try block_synchronization.BlockSynchronization.init(allocator, io, .{ .metrics = &registry, .chunks = terrain, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .worlds = dimensions }, .{});
@@ -1230,10 +1237,13 @@ pub fn benchmarkIdleTerrain() !void {
         const side: usize = @intCast(players.config.render_distance * 2 + 1);
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
             stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .cursor = side * side, .delivered = side * side };
-            streaming.published.setStream(index, stream.*);
+            streaming.published.setStream(index, stream.snapshot());
             service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
         }
         @memset(streaming.sent, std.math.maxInt(u64));
+        @memset(streaming.occluded, 0);
+        @memset(streaming.disclosed, std.math.maxInt(u32));
+        @memset(streaming.biome_disclosed, std.math.maxInt(u32));
         terrain.ready().reset();
         try background.poll();
         terrain.ready().reset();
@@ -1343,8 +1353,9 @@ pub fn benchmarkItemBroadcast() !void {
         const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
-        for (0..streaming.published.streams.len) |index| streaming.published.setStream(index, .{ .generation = 1, .life = 1, .setup = .streaming });
+        for (players.records, 0..) |player, index| streaming.published.setStream(index, .{ .generation = player.handle.?.generation, .life = player.life, .setup = .streaming });
         @memset(streaming.published.sent, std.math.maxInt(u64));
+        @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
         const replication = try ItemReplication.init(allocator, .{}, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
 
@@ -1352,6 +1363,7 @@ pub fn benchmarkItemBroadcast() !void {
         for (0..2) |_| {
             for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
             service.beginTick();
+            streaming.tick();
             try replication.tick();
             service.endTick(true);
             service.flush();
@@ -1383,6 +1395,7 @@ pub fn benchmarkItemBroadcast() !void {
             }
             const reservations = service.instruments.broadcast_reservations.value();
             service.beginTick();
+            streaming.tick();
             try replication.tick();
             service.endTick(true);
             service.flush();
@@ -1437,6 +1450,7 @@ pub fn benchmarkItemBroadcast() !void {
             if (limited) {
                 for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
                 service.beginTick();
+                streaming.tick();
                 try replication.tick();
                 service.endTick(true);
                 service.flush();
@@ -1498,6 +1512,7 @@ pub fn benchmarkBlockPlanning() !void {
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
         @memset(streaming.published.sent, std.math.maxInt(u64));
+        @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
 
         const blocks = try block_synchronization.BlockSynchronization.init(allocator, io, .{ .metrics = &registry, .chunks = terrain, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .worlds = dimensions }, .{ .delta_sections = if (count == 1) 1 else (block_synchronization.BlockSynchronization.Configuration{}).delta_sections });
@@ -1507,7 +1522,7 @@ pub fn benchmarkBlockPlanning() !void {
         const side: usize = @intCast(players.config.render_distance * 2 + 1);
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
             stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .cursor = side * side, .delivered = side * side, .minimum_section = 0, .section_count = 16 };
-            streaming.published.setStream(index, stream.*);
+            streaming.published.setStream(index, stream.snapshot());
             service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
         }
         @memset(streaming.sent, std.math.maxInt(u64));
@@ -1703,8 +1718,9 @@ pub fn benchmarkItemBoundaries() !void {
         const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
-        for (0..streaming.published.streams.len) |index| streaming.published.setStream(index, .{ .generation = 1, .life = 1, .setup = .streaming });
+        for (players.records, 0..) |player, index| streaming.published.setStream(index, .{ .generation = player.handle.?.generation, .life = player.life, .setup = .streaming });
         @memset(streaming.published.sent, std.math.maxInt(u64));
+        @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
         const replication = try ItemReplication.init(allocator, .{}, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
 
@@ -1725,6 +1741,7 @@ pub fn benchmarkItemBoundaries() !void {
             const reads_before = dropped.cache.metrics.reads.value() + bodies.cache.metrics.reads.value();
             for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
             service.beginTick();
+            streaming.tick();
             try replication.tick();
             service.endTick(true);
             service.flush();
@@ -1810,7 +1827,7 @@ pub fn benchmarkTerrainBackpressure() !void {
         const side: usize = @intCast(players.config.render_distance * 2 + 1);
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
             stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .cursor = if (mode == .blocks) side * side else 0, .delivered = if (mode == .blocks) side * side else 0 };
-            streaming.published.setStream(index, stream.*);
+            streaming.published.setStream(index, stream.snapshot());
             service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
         }
         @memset(streaming.sent, if (mode == .blocks) std.math.maxInt(u64) else 0);
@@ -1848,6 +1865,7 @@ pub fn benchmarkTerrainBackpressure() !void {
         try std.testing.expectEqual(reads, terrain.cache.metrics.reads.value());
         var retained: [128]sessions.RawPacket = undefined;
         var held: usize = 0;
+        defer if (held > 1) service.recycle(io, retained[1..held]);
         var batch = service.outputBatch();
         while (batch.next()) |packet| {
             if (held == 0) service.recycle(io, &.{packet});
@@ -1857,7 +1875,9 @@ pub fn benchmarkTerrainBackpressure() !void {
         try std.testing.expectEqual(service.config.pages, held);
         const ready_acquired = terrain.cache.metrics.acquired.value();
         var progressed = false;
+        var attempts: usize = 0;
         for (0..256) |_| {
+            attempts += 1;
             if (mode == .streaming) streaming.pending = true;
             progressed = try if (mode == .streaming) streaming.poll(io) else blocks.poll(io);
             if (progressed) break;
@@ -1869,13 +1889,20 @@ pub fn benchmarkTerrainBackpressure() !void {
         }
         try std.testing.expect(progressed);
         const sections = terrain.cache.metrics.acquired.value() - ready_acquired;
-        if (mode == .blocks) try std.testing.expectEqual(@as(u64, if (generating) 2 else 1), sections);
+        if (mode == .blocks) {
+            try std.testing.expect(sections > 0 and sections <= attempts * blocks.batch_limit);
+        }
         var delivered = service.outputBatch();
-        const packet = delivered.next().?;
-        try std.testing.expectEqual(count, packet.recipients.len);
-        service.recycle(io, &.{packet});
-        try std.testing.expectEqual(null, delivered.next());
+        var partial_packets: usize = 0;
+        while (delivered.next()) |packet| {
+            defer service.recycle(io, &.{packet});
+            try std.testing.expectEqual(count, packet.recipients.len);
+            partial_packets += 1;
+        }
+        try std.testing.expect(partial_packets > 0);
+        if (mode == .blocks) try std.testing.expectEqual(partial_packets * @as(u64, if (generating) 2 else 1), sections);
         service.recycle(io, retained[1..held]);
+        held = 1;
         progressed = false;
         for (0..256) |_| {
             if (mode == .streaming) streaming.pending = true;
@@ -1889,9 +1916,15 @@ pub fn benchmarkTerrainBackpressure() !void {
         var remaining = service.outputBatch();
         while (remaining.next()) |pending| service.recycle(io, &.{pending});
         var reclaimed: [128]sessions.Service.Packet = undefined;
-        for (&reclaimed) |*reservation| reservation.* = try service.reserve(service.config.page_bytes);
+        var reclaimed_count: usize = 0;
+        defer service.cancelPackets(reclaimed[0..reclaimed_count]);
+        for (&reclaimed) |*reservation| {
+            reservation.* = try service.reserve(service.config.page_bytes);
+            reclaimed_count += 1;
+        }
         try std.testing.expectError(error.Backpressured, service.reserve(service.config.page_bytes));
         for (&reclaimed) |*reservation| reservation.cancel();
+        reclaimed_count = 0;
         service.stop();
         if (mode == .streaming) {
             @memset(streaming.stale, std.math.maxInt(u32));
@@ -1984,6 +2017,7 @@ pub fn benchmarkSparseTerrainStreaming() !void {
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
         @memset(streaming.published.sent, std.math.maxInt(u64));
+        @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
 
         const blocks = try block_synchronization.BlockSynchronization.init(allocator, io, .{ .metrics = &registry, .chunks = terrain, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .worlds = dimensions }, .{});
@@ -1993,7 +2027,7 @@ pub fn benchmarkSparseTerrainStreaming() !void {
         const side: usize = @intCast(players.config.render_distance * 2 + 1);
         if (populated) for (streaming.streams, 0..) |*stream, index| {
             stream.* = .{ .generation = 1, .life = player_records[index].life, .setup = .streaming, .cursor = side * side, .delivered = side * side, .center = .{ .x = @intCast(index * 64), .z = 0 }, .target = .{ .x = @intCast(index * 64), .z = 0 } };
-            streaming.published.setStream(index, stream.*);
+            streaming.published.setStream(index, stream.snapshot());
         };
         streaming.streams[0] = .{ .generation = 1, .life = player_records[0].life, .setup = .streaming, .cursor = 0, .delivered = side * side - 1 };
         @memset(streaming.sent, std.math.maxInt(u64));
@@ -2094,6 +2128,7 @@ pub fn benchmarkSparseBlockPlanning() !void {
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
         @memset(streaming.published.sent, std.math.maxInt(u64));
+        @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
 
         const blocks = try block_synchronization.BlockSynchronization.init(allocator, io, .{ .metrics = &registry, .chunks = terrain, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .worlds = dimensions }, .{});
@@ -2103,7 +2138,7 @@ pub fn benchmarkSparseBlockPlanning() !void {
         const side: usize = @intCast(players.config.render_distance * 2 + 1);
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
             stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .minimum_section = 0, .section_count = 16, .cursor = side * side, .delivered = side * side, .center = .{ .x = @intCast(index * 64), .z = 0 }, .target = .{ .x = @intCast(index * 64), .z = 0 } };
-            streaming.published.setStream(index, stream.*);
+            streaming.published.setStream(index, stream.snapshot());
             service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
         }
         @memset(streaming.sent, std.math.maxInt(u64));
@@ -2204,6 +2239,7 @@ pub fn verifyBlockBatchRetirement() !void {
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
         @memset(streaming.published.sent, std.math.maxInt(u64));
+        @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
 
         const blocks = try block_synchronization.BlockSynchronization.init(allocator, io, .{ .metrics = &registry, .chunks = terrain, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .worlds = dimensions }, .{ .delta_sections = 1 });
@@ -2213,7 +2249,7 @@ pub fn verifyBlockBatchRetirement() !void {
         const side: usize = @intCast(players.config.render_distance * 2 + 1);
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
             stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .minimum_section = 0, .section_count = 16, .cursor = side * side, .delivered = side * side };
-            streaming.published.setStream(index, stream.*);
+            streaming.published.setStream(index, stream.snapshot());
             service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
         }
         @memset(streaming.sent, std.math.maxInt(u64));

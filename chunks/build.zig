@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "deflate", .module = b.dependency("deflate", .{ .target = target, .optimize = optimize }).module("deflate") },
             .{ .name = "metrics", .module = metrics },
             .{ .name = "zstandard", .module = b.dependency("zstandard", .{ .target = target, .optimize = optimize }).module("zstandard") },
             .{ .name = "records", .module = records.module("records") },

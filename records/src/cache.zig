@@ -5,6 +5,8 @@ pub const Table = table.Table;
 pub const Resources = table.Resources;
 pub const Workspaces = table.Workspaces;
 pub const Get = table.Get;
+pub const PackedRead = table.PackedRead;
+pub const PackedBatch = table.PackedBatch;
 pub const Write = table.Write;
 pub const ScanEntry = table.ScanEntry;
 pub const ScanKey = table.ScanKey;
@@ -17,6 +19,8 @@ const storage = @import("storage");
 
 const assert = std.debug.assert;
 const IndexSet = storage.system.IndexSet;
+const value_pool = @import("value_pool.zig");
+pub const PooledValues = value_pool.Pool;
 
 pub const Instrumentation = struct {
     acquisition: metrics.Timer = .{},
@@ -53,6 +57,7 @@ pub const Instrumentation = struct {
 
 pub const Configuration = struct {
     slots: usize,
+    reserved_slots: usize = 0,
     key_bytes: usize = 32,
     value_bytes: usize,
     metrics: ?*metrics.Registry = null,
@@ -70,6 +75,10 @@ pub const Codec = struct {
 pub const Cache = CacheFor(Table);
 
 pub fn CacheFor(comptime Backend: type) type {
+    return CacheWithValues(Backend, value_pool.Fixed);
+}
+
+pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
     return struct {
         const Self = @This();
         pub const write_batch_size = Backend.write_batch_size;
@@ -82,6 +91,9 @@ pub fn CacheFor(comptime Backend: type) type {
         entries: []Entry,
         keys: []u8,
         values: []u8,
+        value_storage: Values,
+        capacity: usize,
+        physical_capacity: usize,
         key_bytes: usize,
         value_bytes: usize,
         replacement: usize = 0,
@@ -117,23 +129,28 @@ pub fn CacheFor(comptime Backend: type) type {
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, backend: Backend, configuration: Configuration) !Self {
             _ = io;
-            if (configuration.slots == 0 or configuration.slots > std.math.maxInt(u32) or configuration.key_bytes == 0 or configuration.value_bytes == 0)
+            if (configuration.slots == 0) return error.InvalidArgument;
+            const physical = std.math.add(usize, configuration.slots, configuration.reserved_slots) catch return error.InvalidArgument;
+            const slots = Values.slots(physical) catch return error.InvalidArgument;
+            if (slots == 0 or slots > std.math.maxInt(u32) or configuration.key_bytes == 0 or configuration.value_bytes == 0)
                 return error.InvalidArgument;
 
             const instrumentation = try Instrumentation.init(configuration.metrics, configuration.metrics_namespace);
-            const entries = try allocator.alignedAlloc(Entry, .@"64", configuration.slots);
+            const entries = try allocator.alignedAlloc(Entry, .@"64", slots);
             errdefer allocator.free(entries);
             @memset(entries, .{});
-            const keys = try allocator.alloc(u8, try std.math.mul(usize, configuration.slots, configuration.key_bytes));
+            const keys = try allocator.alloc(u8, try std.math.mul(usize, slots, configuration.key_bytes));
             errdefer allocator.free(keys);
-            const values = try allocator.alignedAlloc(u8, .@"64", try std.math.mul(usize, configuration.slots, configuration.value_bytes));
+            const values = try allocator.alignedAlloc(u8, .@"64", try Values.bytes(physical, configuration.value_bytes));
             errdefer allocator.free(values);
-            const order = try allocator.alignedAlloc(usize, .@"64", configuration.slots);
+            var value_storage = try Values.init(allocator, physical, configuration.value_bytes);
+            errdefer value_storage.deinit(allocator);
+            const order = try allocator.alignedAlloc(usize, .@"64", slots);
             errdefer allocator.free(order);
             var lookup: std.StringArrayHashMapUnmanaged(usize) = .empty;
-            try lookup.ensureTotalCapacity(allocator, @intCast(configuration.slots));
+            try lookup.ensureTotalCapacity(allocator, @intCast(slots));
             errdefer lookup.deinit(allocator);
-            const index = try allocator.alignedAlloc(usize, .@"64", configuration.slots);
+            const index = try allocator.alignedAlloc(usize, .@"64", slots);
             errdefer allocator.free(index);
             const scan_entries = try allocator.alloc(ScanEntry, configuration.scan_batch);
             errdefer allocator.free(scan_entries);
@@ -141,7 +158,7 @@ pub fn CacheFor(comptime Backend: type) type {
             const scan_capacity = try std.math.add(usize, try std.math.mul(usize, configuration.scan_batch, stride), if (configuration.scan_batch == 0) 0 else configuration.key_bytes);
             const scan_bytes = try allocator.alloc(u8, scan_capacity);
             errdefer allocator.free(scan_bytes);
-            var dirty_entries = try IndexSet.init(allocator, configuration.slots);
+            var dirty_entries = try IndexSet.init(allocator, slots);
             errdefer dirty_entries.deinit(allocator);
             const encoded = try allocator.alloc(u8, if (configuration.codec == null) 0 else @max(64 * 1024, configuration.value_bytes));
 
@@ -165,9 +182,56 @@ pub fn CacheFor(comptime Backend: type) type {
                 .entries = entries,
                 .keys = keys,
                 .values = values,
+                .value_storage = value_storage,
+                .capacity = configuration.slots,
+                .physical_capacity = physical,
                 .key_bytes = configuration.key_bytes,
                 .value_bytes = configuration.value_bytes,
             };
+        }
+
+        /// Initialization only. Outstanding pipeline pins leave the normal working set available.
+        pub fn reservePinned(self: *Self, allocator: std.mem.Allocator, io: std.Io, slots: usize) !void {
+            assert(self.pinned_entries == 0 and !self.failed);
+            if (slots <= self.physical_capacity - self.capacity) return;
+            var replacement = try Self.init(allocator, io, self.backend, .{
+                .slots = self.capacity,
+                .reserved_slots = slots,
+                .key_bytes = self.key_bytes,
+                .value_bytes = self.value_bytes,
+                .scan_batch = self.scan_entries.len,
+                .codec = self.codec,
+            });
+            errdefer replacement.freeBuffers(allocator);
+            for (self.entries, 0..) |entry, index| {
+                assert(entry.pins == 0 and !entry.editing and !entry.filling);
+                if (!entry.occupied) continue;
+                assert(replacement.value_storage.reserve(index, entry.value_len));
+                @memcpy(replacement.value(index)[0..entry.value_len], self.value(index)[0..entry.value_len]);
+                @memcpy(replacement.keyBytes(index)[0..entry.key_len], self.keyBytes(index)[0..entry.key_len]);
+                replacement.entries[index] = entry;
+                replacement.entries[index].ordered = false;
+                if (entry.indexed) replacement.lookup.putAssumeCapacity(replacement.keyBytes(index)[0..entry.key_len], index);
+                if (entry.dirty) replacement.dirty_entries.insert(index);
+            }
+            replacement.metrics = self.metrics;
+            replacement.index_dirty = true;
+            self.freeBuffers(allocator);
+            self.* = replacement;
+        }
+
+        fn freeBuffers(self: *Self, allocator: std.mem.Allocator) void {
+            allocator.free(self.entries);
+            allocator.free(self.keys);
+            allocator.free(self.values);
+            self.value_storage.deinit(allocator);
+            allocator.free(self.order);
+            allocator.free(self.index);
+            self.lookup.deinit(allocator);
+            self.dirty_entries.deinit(allocator);
+            allocator.free(self.scan_entries);
+            allocator.free(self.scan_bytes);
+            allocator.free(self.encoded);
         }
 
         fn addPin(self: *Self, index: usize) void {
@@ -200,7 +264,7 @@ pub fn CacheFor(comptime Backend: type) type {
         }
 
         pub fn acquireMany(self: *Self, keys: []const []const u8, leases: []Lease) !void {
-            const result = try self.acquireBatch(keys, leases, false, null, self.entries.len);
+            const result = try self.acquireBatch(keys, leases, false, null, self.capacity);
             assert(result == .ready);
         }
 
@@ -288,6 +352,7 @@ pub fn CacheFor(comptime Backend: type) type {
                 errdefer {
                     for (missing[0..missing_count]) |slot| {
                         self.unindex(slot);
+                        self.value_storage.release(slot);
                         self.entries[slot].occupied = false;
                     }
                 }
@@ -440,6 +505,7 @@ pub fn CacheFor(comptime Backend: type) type {
 
                         self.unindex(slot);
                         self.metrics.evictions.add(@intFromBool(entry.occupied));
+                        self.value_storage.release(slot);
                         self.metrics.misses.add(1);
                         entry.* = .{ .generation = entry.generation + 1, .key_len = batch[request].len, .occupied = true };
                         self.addPin(slot);
@@ -450,7 +516,7 @@ pub fn CacheFor(comptime Backend: type) type {
                         self.index_dirty = true;
                         hits[request] = slot;
                         missing[missing_count] = slot;
-                        requests[missing_count] = .{ .key = self.keyBytes(slot)[0..entry.key_len], .destination = self.value(slot) };
+                        requests[missing_count] = .{ .key = self.keyBytes(slot)[0..entry.key_len], .destination = if (reserve_only) &.{} else self.value(slot) };
                         missing_count += 1;
                         previous = request;
                     }
@@ -466,6 +532,24 @@ pub fn CacheFor(comptime Backend: type) type {
 
                 hits_owned = false;
                 if (!reserve_only and missing_count != 0) {
+                    for (missing[0..missing_count], requests[0..missing_count]) |slot, *request| {
+                        var victims: [192]Lease = undefined;
+                        const lease: Lease = .{ .cache = self, .index = slot, .generation = self.entries[slot].generation };
+                        while (true) {
+                            switch (try self.reserveValue(lease, self.value_bytes, &victims)) {
+                                .ready => break,
+                                .blocked => return error.CachePinned,
+                                .writeback => |dirty| {
+                                    defer for (dirty) |victim| victim.release();
+                                    var writes: [192]Write = undefined;
+                                    for (dirty, writes[0..dirty.len]) |victim, *write| write.* = .{ .key = victim.key(), .value = victim.read() };
+                                    try self.writeBack(writes[0..dirty.len]);
+                                    for (dirty) |victim| victim.markWritten();
+                                },
+                            }
+                        }
+                        request.destination = self.value(slot);
+                    }
                     const reading = self.metrics.storage.start();
                     defer reading.end();
                     self.backend.getBatch(requests[0..missing_count], lengths[0..missing_count]) catch |err| {
@@ -478,6 +562,7 @@ pub fn CacheFor(comptime Backend: type) type {
                         self.entries[slot].present = length != null;
                         self.entries[slot].value_len = if (length) |size| try self.decode(self.value(slot), size) else 0;
                         self.entries[slot].loaded = true;
+                        self.value_storage.shrink(slot, self.entries[slot].value_len);
                     }
 
                     self.metrics.reads.add(missing_count);
@@ -766,13 +851,62 @@ pub fn CacheFor(comptime Backend: type) type {
         }
 
         fn value(self: *Self, index: usize) []u8 {
-            return self.values[index * self.value_bytes ..][0..self.value_bytes];
+            return self.value_storage.buffer(self.values, self.value_bytes, index);
+        }
+
+        /// Preserve previous bytes before growing a value. Other pinned buffers never move.
+        pub fn reserveValue(self: *Self, lease: Lease, length: usize, victims: []Lease) !Reservation {
+            const entry = &self.entries[lease.index];
+            assert(entry.generation == lease.generation and entry.pins > 0);
+            assert(length <= self.value_bytes and victims.len > 0);
+            assert(!entry.present or length <= self.value(lease.index).len or entry.pins == 1);
+            while (!self.value_storage.reserve(lease.index, length)) {
+                var dirty: usize = 0;
+                var reclaimed = false;
+                // Two revolutions give referenced entries a second chance before reclaiming them.
+                for (0..self.entries.len * 2) |_| {
+                    const slot = self.replacement;
+                    self.replacement = (slot + 1) % self.entries.len;
+                    const candidate = &self.entries[slot];
+                    if (candidate.pins != 0 or !candidate.occupied or self.value(slot).len == 0) continue;
+                    if (candidate.referenced) {
+                        candidate.referenced = false;
+                        continue;
+                    }
+                    if (candidate.dirty) {
+                        self.addPin(slot);
+                        victims[dirty] = .{ .cache = self, .index = slot, .generation = candidate.generation };
+                        dirty += 1;
+                        if (dirty == victims.len) break;
+                        continue;
+                    }
+                    self.unindex(slot);
+                    self.value_storage.release(slot);
+                    candidate.occupied = false;
+                    candidate.loaded = false;
+                    candidate.present = false;
+                    candidate.value_len = 0;
+                    self.metrics.evictions.add(1);
+                    reclaimed = true;
+                    break;
+                }
+                if (dirty != 0) return .{ .writeback = victims[0..dirty] };
+                if (!reclaimed) return .{ .blocked = 1 };
+            }
+            return .ready;
         }
 
         /// Retains a pin. Publish or cancel only after the writer has stopped.
         pub const Fill = struct {
             lease: Lease,
             bytes: []u8,
+
+            pub fn prepare(self: *Fill, length: usize, victims: []Lease) !Reservation {
+                assert(self.lease.cache.entries[self.lease.index].filling);
+                const result = try self.lease.cache.reserveValue(self.lease, length, victims);
+                if (result == .ready) self.bytes = self.lease.cache.value(self.lease.index);
+                return result;
+            }
 
             pub fn load(self: Fill, length: ?usize) void {
                 const entry = &self.lease.cache.entries[self.lease.index];
@@ -783,6 +917,7 @@ pub fn CacheFor(comptime Backend: type) type {
                 entry.loaded = true;
                 entry.present = length != null;
                 entry.value_len = length orelse 0;
+                self.lease.cache.value_storage.shrink(self.lease.index, entry.value_len);
                 entry.revision += 1;
                 self.lease.release();
             }
@@ -864,6 +999,7 @@ pub fn CacheFor(comptime Backend: type) type {
                 assert(entry.pins > 0);
                 assert(entry.editing);
                 assert(length <= self.cache.value_bytes);
+                assert(length <= self.cache.value(self.index).len);
                 entry.revision += 1;
                 entry.value_len = length;
                 entry.present = true;
@@ -871,6 +1007,7 @@ pub fn CacheFor(comptime Backend: type) type {
                 entry.dirty = true;
                 self.cache.dirty_entries.insert(self.index);
                 entry.editing = false;
+                self.cache.value_storage.shrink(self.index, length);
                 assert(entry.present and entry.dirty);
             }
 

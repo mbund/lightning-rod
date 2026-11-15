@@ -53,7 +53,7 @@ pub fn put(comptime T: type, bytes: []u8, offset: usize, value: T) void {
     std.mem.writeInt(T, bytes[offset..][0..@sizeOf(T)], value, .little);
 }
 pub fn checksum(bytes: []const u8) u64 {
-    return std.hash.XxHash64.hash(checksum_seed, bytes);
+    return std.hash.Wyhash.hash(checksum_seed, bytes);
 }
 pub fn seal(block: *Block, id: u64, owner: u32, sequence: u64, page: []const u8) void {
     @memcpy(block[0..4], "LRPG");
@@ -75,8 +75,22 @@ pub fn validate(block: *Block, id: u64, owner: ?u32) Error!void {
     put(u64, block, 24, saved);
     if (saved != actual) return error.Corrupt;
 }
-pub fn transaction(previous: u64) std.hash.XxHash64 {
-    var hash = std.hash.XxHash64.init(checksum_seed);
+
+pub fn validateParts(prefix: []u8, payload: []const u8, suffix: []const u8, id: u64, owner: ?u32) Error!void {
+    std.debug.assert(prefix.len >= 32 and prefix.len + payload.len + suffix.len == block_size);
+    if (!std.mem.eql(u8, prefix[0..4], "LRPG") or get(u64, prefix, 8) != id) return error.Corrupt;
+    if (owner) |expected| if (get(u32, prefix, 4) != expected) return error.Corrupt;
+    const saved = get(u64, prefix, 24);
+    put(u64, prefix, 24, 0);
+    var hash = std.hash.Wyhash.init(checksum_seed);
+    hash.update(prefix);
+    hash.update(payload);
+    hash.update(suffix);
+    put(u64, prefix, 24, saved);
+    if (saved != hash.final()) return error.Corrupt;
+}
+pub fn transaction(previous: u64) std.hash.Wyhash {
+    var hash = std.hash.Wyhash.init(checksum_seed);
     var bytes: [8]u8 = undefined;
     put(u64, &bytes, 0, previous);
     hash.update(&bytes);
@@ -118,7 +132,7 @@ pub const Metadata = struct {
 
     pub fn encode(self: *const Metadata) Page {
         var bytes: Page = @splat(0);
-        @memcpy(bytes[0..8], "LRMETA02");
+        @memcpy(bytes[0..8], "LRMETA03");
         @memcpy(bytes[8..24], &self.identity);
         put(u64, &bytes, 24, self.sequence);
         put(u64, &bytes, 32, self.tick);
@@ -136,7 +150,7 @@ pub const Metadata = struct {
     }
 
     pub fn decode(bytes: *const Page) Error!Metadata {
-        if (!std.mem.eql(u8, bytes[0..8], "LRMETA02")) return error.UnsupportedFormat;
+        if (!std.mem.eql(u8, bytes[0..8], "LRMETA03")) return error.UnsupportedFormat;
         var self: Metadata = .{ .identity = bytes[8..24].*, .sequence = get(u64, bytes, 24), .tick = get(u64, bytes, 32), .pages = get(u64, bytes, 40), .free = get(u64, bytes, 48), .free_pages = get(u64, bytes, 56), .free_count = get(u16, bytes, 64) };
         if (self.pages == 0 or self.free >= self.pages or self.free_pages >= self.pages or self.free_count > free_batch or self.free_count > self.free_pages or
             (self.free == 0) != (self.free_count == 0) or (self.free == 0) != (self.free_pages == 0)) return error.Corrupt;
@@ -154,7 +168,7 @@ pub const Metadata = struct {
 
 pub fn walHeader(identity: [16]u8, sequence: u64) [header_size]u8 {
     var bytes: [header_size]u8 = @splat(0);
-    @memcpy(bytes[0..8], "LRWAL002");
+    @memcpy(bytes[0..8], "LRWAL003");
     @memcpy(bytes[8..24], &identity);
     put(u64, &bytes, 24, sequence);
     put(u64, &bytes, 56, checksum(bytes[0..56]));

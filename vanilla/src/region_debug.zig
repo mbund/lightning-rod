@@ -17,9 +17,9 @@ pub const RegionDebug = struct {
     pub const Dependencies = struct { commands: *commands.Commands, players: *Players, streaming: *Streaming, packets: *packets.Packets, entities: *entities.Entities };
     pub const permission: commands.Permission = .{ .name = "debug.regions", .description = "Inspect terrain disclosure" };
 
-    const Action = enum { bounds, visibility, freeze, live, off };
+    const Action = enum { bounds, visibility, frontier, freeze, live, off };
     const Arguments = struct { action: ?Action };
-    const Mode = enum { bounds, visibility };
+    const Mode = enum { bounds, visibility, frontier };
     const Viewer = struct {
         handle: ?sessions.Handle = null,
         world: u32 = 0,
@@ -52,7 +52,7 @@ pub const RegionDebug = struct {
         self.* = .{ .deps = deps, .config = config, .command = 0, .viewers = viewers, .first_entity = @intCast(first) };
         self.command = (try deps.commands.register(self, commands.leaf(RegionDebug, Arguments, .{
             .name = "regions",
-            .description = "Inspect shared world regions and section disclosure",
+            .description = "Inspect section disclosure and stopping frontiers",
             .permission = &permission,
             .handler = execute,
             .arguments = .{ .action = .{} },
@@ -65,6 +65,7 @@ pub const RegionDebug = struct {
         const player = self.deps.players.find(context.sender) orelse return error.InvalidArgument;
         const handle = player.handle orelse return error.InvalidArgument;
         const action = args.action orelse .bounds;
+        if (action == .off and !self.deps.streaming.debugFrontier(handle, false)) return error.InvalidArgument;
         var selected: ?usize = null;
         var empty: ?usize = null;
         for (self.viewers, 0..) |viewer, index| {
@@ -89,17 +90,23 @@ pub const RegionDebug = struct {
         switch (action) {
             .bounds => viewer.mode = .bounds,
             .visibility => viewer.mode = .visibility,
+            .frontier => viewer.mode = .frontier,
             .freeze => viewer.frozen = !viewer.frozen,
             .live => viewer.frozen = false,
             .off => unreachable,
         }
         viewer.next_tick = 0;
         viewer.stopping = false;
+        if (!self.deps.streaming.debugFrontier(handle, viewer.mode == .frontier)) return error.InvalidArgument;
+        if (viewer.mode == .frontier) {
+            context.reply("Frontier sections are pink terracotta. Concealed sections are air. /regions off to restore terrain");
+            return;
+        }
         if (!viewer.frozen) self.deps.streaming.requestDebug(index, handle, player.world, player.life);
         context.reply(if (viewer.frozen) "Debug snapshot frozen. /regions live to follow again" else if (viewer.mode == .bounds)
-            "Cyan: source section bounds. /regions visibility, freeze, live, off"
+            "Cyan: source section bounds. /regions visibility, frontier, freeze, live, off"
         else
-            "Green: authorized. Gold: retained. Red: concealed. Gray: pending. /regions freeze, live, off");
+            "Green: authorized. Gold: retained. Red: concealed. Gray: pending. /regions frontier, freeze, live, off");
     }
 
     pub fn tick(self: *RegionDebug) !void {
@@ -122,6 +129,10 @@ pub const RegionDebug = struct {
                 continue;
             }
             if (player.stage != .ready or tick_number < viewer.next_tick) continue;
+            if (viewer.mode == .frontier) {
+                if (viewer.captured and try self.clear(viewer, player.protocol)) viewer.captured = false;
+                continue;
+            }
             viewer.next_tick = tick_number + self.config.refresh_ticks;
             if (!viewer.frozen) {
                 viewer.captured = self.deps.streaming.readDebug(index, handle, player.world, player.life, &viewer.snapshot);
@@ -133,6 +144,7 @@ pub const RegionDebug = struct {
     }
 
     fn remove(self: *RegionDebug, index: usize) void {
+        if (self.viewers[index].handle) |handle| _ = self.deps.streaming.debugFrontier(handle, false);
         self.deps.streaming.clearDebug(index);
         self.viewers[index] = .{};
     }

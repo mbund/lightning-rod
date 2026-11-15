@@ -8,13 +8,14 @@ const ItemMerging = @import("item_merging.zig").ItemMerging;
 const ItemPickup = @import("item_pickup.zig").ItemPickup;
 const Players = @import("players.zig").Players;
 const Items = @import("items.zig").Items;
+const work = @import("lightning_rod").system.work;
 
 const assert = std.debug.assert;
 
 pub const ItemTick = struct {
     pub const id = "minecraft:item_tick";
 
-    pub const Configuration = struct { merge_candidates: usize = 4096 };
+    pub const Configuration = struct { merge_work: work.Limits = .{ .guaranteed = .{ .operations = 1 }, .burst = .{ .operations = 4096 } } };
 
     pub const Dependencies = struct {
         dropped: *ItemEntities,
@@ -31,20 +32,21 @@ pub const ItemTick = struct {
     deps: Dependencies,
     stepped: u64 = 0,
     merged: u64 = 0,
-    merge_candidates: usize,
+    merge_work: work.Limits,
     merge_after: entities.Id = 0,
     query: ItemEntities.Query,
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*ItemTick {
+        try config.merge_work.validate(deps.dropped.residents.len, .{ .operations = 1 });
+        if ((try config.merge_work.maximum(1)).bytes != 0) return error.InvalidWorkLimits;
         const self = try allocator.create(ItemTick);
-        if (config.merge_candidates == 0) return error.InvalidConfiguration;
-        self.* = .{ .deps = deps, .merge_candidates = config.merge_candidates, .query = try ItemEntities.Query.init(allocator, deps.dropped, deps.players) };
+        self.* = .{ .deps = deps, .merge_work = config.merge_work, .query = try ItemEntities.Query.init(allocator, deps.dropped, deps.players) };
         return self;
     }
 
     pub fn tick(self: *ItemTick) !void {
         const dropped = self.deps.dropped;
-        var merge_remaining = self.merge_candidates;
+        var burst = self.merge_work.burst;
         const active = self.query.read(self.deps.players.config.simulation_distance);
         var start_low: usize = 0;
         var start_high = active.len;
@@ -77,6 +79,9 @@ pub const ItemTick = struct {
             }
 
             self.stepped += 1;
+            var guaranteed = self.merge_work.guaranteed;
+            const allowance: work.Allowance = .{ .guaranteed = &guaranteed, .burst = &burst };
+            var merge_remaining = guaranteed.operations + burst.operations;
             const interval: u32 = if (advanced.crossed_block) 2 else 40;
             if (merge_remaining != 0 and metadata.ticks % interval == 0 and metadata.age != -32768 and metadata.age < 6000 and metadata.pickup_delay != 32767) {
                 if (!dropped.fullStack(record)) {
@@ -98,8 +103,11 @@ pub const ItemTick = struct {
                                     assert(capacity > 0);
                                     const batch = dropped.inSection(.{ .world = body.world, .x = x, .y = y, .z = z }, &after, candidate_ids[0..capacity]);
                                     if (batch.len == 0) break;
-                                    merge_remaining -= batch.len;
-                                    self.merge_after = entity;
+                                    const shared = burst.operations;
+                                    const admitted = allowance.take(.{ .operations = batch.len });
+                                    assert(admitted);
+                                    merge_remaining = guaranteed.operations + burst.operations;
+                                    if (burst.operations != shared) self.merge_after = entity;
                                     var count: usize = 0;
                                     for (batch) |candidate_id| {
                                         if (candidate_id == entity) continue;

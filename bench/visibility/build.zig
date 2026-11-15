@@ -12,6 +12,11 @@ pub fn build(b: *std.Build) void {
     executable.root_module.addImport("protocols", protocols);
     module.import_table.get("minecraft_packets").?.addImport("protocols", protocols);
     for ([_][]const u8{ "oracle", "topology" }) |name| executable.root_module.addAnonymousImport(name, .{ .root_source_file = b.path(b.fmt("src/{s}.zig", .{name})) });
+    const incremental_executable = b.addExecutable(.{ .name = "visibility-incremental-bench", .root_module = b.createModule(.{ .root_source_file = vanilla.builder.path("src/visibility_incremental_bench.zig"), .target = target, .optimize = optimize }) });
+    for (executable.root_module.import_table.keys(), executable.root_module.import_table.values()) |name, dependency| incremental_executable.root_module.addImport(name, dependency);
+    const incremental_run = b.addRunArtifact(incremental_executable);
+    incremental_run.addPassthruArgs();
+    b.step("incremental", "Measure cached visibility against fresh proofs").dependOn(&incremental_run.step);
     b.installArtifact(executable);
     const run = b.addRunArtifact(executable);
     run.addPassthruArgs();
@@ -30,6 +35,9 @@ pub fn build(b: *std.Build) void {
     const safety_run = b.addRunArtifact(b.addTest(.{ .root_module = safety }));
     test_step.dependOn(&safety_run.step);
     b.step("test-disclosure", "Verify production disclosure against independent ray witnesses").dependOn(&safety_run.step);
+    const incremental = b.createModule(.{ .root_source_file = vanilla.builder.path("src/section_visibility_world.zig"), .target = target, .optimize = optimize });
+    for (executable.root_module.import_table.keys(), executable.root_module.import_table.values()) |name, dependency| incremental.addImport(name, dependency);
+    b.step("test-incremental", "Verify incremental visibility against fresh solves").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = incremental, .filters = &.{"incremental edits"} })).step);
     const cave_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = vanilla.builder.path("src/visibility_caves.zig"), .target = target, .optimize = optimize }) });
     cave_tests.root_module.addImport("game_data", module.import_table.get("game_data").?);
     cave_tests.root_module.addAnonymousImport("topology", .{ .root_source_file = b.path("src/topology.zig") });

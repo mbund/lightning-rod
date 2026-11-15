@@ -2,9 +2,37 @@ const std = @import("std");
 const network = @import("networking");
 const framing = @import("shared.zig");
 
+pub fn Encryption(comptime Connection: type) type {
+    return struct { connection: *Connection, first: []u8, second: []u8 = &.{} };
+}
+
 pub const Packets = union(enum) {
     framed: []const u8,
     packets: []const []const u8,
+
+    pub fn empty(self: Packets) bool {
+        return switch (self) {
+            .framed => |bytes| bytes.len == 0,
+            .packets => |values| values.len == 0,
+        };
+    }
+
+    pub fn before(self: Packets, rest: Packets) Packets {
+        return switch (self) {
+            .framed => |bytes| prefix: {
+                std.debug.assert(rest == .framed and rest.framed.len <= bytes.len);
+                const count = bytes.len - rest.framed.len;
+                std.debug.assert(rest.framed.ptr == bytes.ptr + count);
+                break :prefix .{ .framed = bytes[0..count] };
+            },
+            .packets => |values| prefix: {
+                std.debug.assert(rest == .packets and rest.packets.len <= values.len);
+                const count = values.len - rest.packets.len;
+                std.debug.assert(rest.packets.ptr == values.ptr + count);
+                break :prefix .{ .packets = values[0..count] };
+            },
+        };
+    }
 
     pub fn next(self: *Packets) !?[]const u8 {
         switch (self.*) {

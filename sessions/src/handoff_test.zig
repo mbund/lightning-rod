@@ -14,6 +14,18 @@ const Gate = struct {
     release: std.Io.Event = .unset,
 };
 
+fn waitSignal(event: *std.Io.Event) !void {
+    const io = std.testing.io;
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(5) });
+    while (!event.isSet()) {
+        if (std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds >= deadline.raw.nanoseconds) return error.Timeout;
+        event.waitTimeout(io, .{ .deadline = deadline }) catch |err| switch (err) {
+            error.Timeout => {},
+            else => return err,
+        };
+    }
+}
+
 const frozen_connection = "\x01\x00\x00\x00" ++
     "\x64\x00\x00\x00\x01\x00\x00\x00\x3f\x00\x00\x00" ++
     "\x04\x03\x00\x00\x08\x07\x06\x05\x04\x03\x02\x01\x01\x00\x00\x00\xcc" ++
@@ -23,8 +35,20 @@ const frozen_connection = "\x01\x00\x00\x00" ++
 
 const Endpoint = struct {
     pub const Connection = u8;
+    pub const Encryption = protocol.Encryption(Connection);
+    pub const maximum_encryption_batch_size = 4;
+    pub fn encryptionBatchSize(_: i32) usize {
+        return maximum_encryption_batch_size;
+    }
+
+    pub fn encryptBatch(_: i32, source: []const u8, targets: []const Encryption) void {
+        for (targets) |target| {
+            encrypt(target.connection, source[0..target.first.len], target.first);
+            encrypt(target.connection, source[target.first.len..], target.second);
+        }
+    }
     pub const Protocols = struct { values: [1]protocol.Protocol = .{.{ .number = 772 }} };
-    pub const Workspaces = struct { gate: ?*Gate = null, gate_byte: ?u8 = null, framed_length: ?usize = null };
+    pub const Workspaces = struct { failure: ?anyerror = null, gate: ?*Gate = null, gate_byte: ?u8 = null, framed_length: ?usize = null };
     pub fn initWorkspaces(_: std.mem.Allocator) !Workspaces {
         return .{};
     }
@@ -32,8 +56,9 @@ const Endpoint = struct {
     pub fn needsDecoded(threshold: ?usize) bool {
         return threshold != null;
     }
-    pub fn init(_: i32, _: protocol.Handshake.Intent) !Connection {
-        return error.UnexpectedHandshake;
+    pub fn init(number: i32, intent: protocol.Handshake.Intent) !Connection {
+        if (number != 772 or intent != .login) return error.UnexpectedHandshake;
+        return 0xff;
     }
     pub fn save(value: *const Connection, bytes: []u8) ![]const u8 {
         bytes[0] = value.*;
@@ -80,6 +105,7 @@ const Endpoint = struct {
         return bytes;
     }
     pub fn sharedFrame(_: i32, workspaces: *Workspaces, storage: []u8, length: usize, _: ?usize, _: []u8) ![]const u8 {
+        if (workspaces.failure) |failure| return failure;
         if (workspaces.gate) |gate| {
             if (workspaces.gate_byte == null or storage[framing.headroom] == workspaces.gate_byte.?) {
                 gate.started.set(std.testing.io);
@@ -130,6 +156,7 @@ const Endpoint = struct {
 };
 
 const Observer = struct {
+    handshakes: bool = false,
     configuration_remaining: usize = 0,
     polls: usize = 0,
     due: ?i96 = null,
@@ -138,8 +165,9 @@ const Observer = struct {
     disconnects: usize = 0,
     payloads: [2][]const u8 = @splat(&.{}),
     pub fn closed(_: *Observer, _: network.Handle) void {}
-    pub fn handshake(_: *Observer, _: []const u8) !protocol.Handshake {
-        return error.UnexpectedHandshake;
+    pub fn handshake(self: *Observer, _: []const u8) !protocol.Handshake {
+        if (!self.handshakes) return error.UnexpectedHandshake;
+        return .{ .protocol = 772, .intent = .login };
     }
     pub fn input(self: *Observer, handle: network.Handle, _: i32, packets: protocol.Packets) engine.Disposition {
         self.payloads[handle.index] = switch (packets) {
@@ -235,7 +263,7 @@ test "closed play connections cannot enqueue disconnect work during shutdown" {
         var catalog: Endpoint.Protocols = .{};
         const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
         defer owner.deinit();
-        const codec = try Codec.init(std.testing.allocator, io, transport, 1, null);
+        const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 1, .frames = 1 });
         defer codec.deinit();
         try owner.attachCodec(codec);
         owner.setHandle(0, .{ .index = 0, .generation = 1 });
@@ -252,7 +280,7 @@ test "closed play connections cannot enqueue disconnect work during shutdown" {
         owner.progress(io);
         try std.testing.expectEqual(@as(usize, 0), observer.disconnects);
         try std.testing.expectEqual(@as(usize, 1), native.released);
-        try std.testing.expectEqual(@as(usize, 0), codec.write.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), codec.workers[0].write.load(.acquire));
         try std.testing.expect(owner.drained());
     }
 }
@@ -408,7 +436,7 @@ fn configurationCounts(packets: usize, queued: bool) !ConfigurationCounts {
         owner.codec = null;
         owner.deinit();
     }
-    const codec = try Codec.init(std.testing.allocator, io, transport, 2, null);
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2, .frames = 1 });
     defer codec.deinit();
     if (queued) try owner.attachCodec(codec);
     const connection = &owner.connections[0];
@@ -423,11 +451,11 @@ fn configurationCounts(packets: usize, queued: bool) !ConfigurationCounts {
         owner.progress(io);
         passes += 1;
         if (connection.codec.state.load(.acquire) == .queued) {
-            const read = codec.read.load(.monotonic);
+            const read = codec.workers[0].read.load(.monotonic);
             const task = codec.tasks[read % codec.tasks.len];
             try std.testing.expect(task == &connection.codec);
-            try Codec.controlBatch(&codec.workspaces, task.operation.control_batch);
-            codec.read.store(read + 1, .release);
+            try Codec.controlBatch(&codec.workers[0].workspaces, task.operation.control_batch);
+            codec.workers[0].read.store(read + 1, .release);
             task.complete(.{});
             rounds += 1;
         }
@@ -436,7 +464,7 @@ fn configurationCounts(packets: usize, queued: bool) !ConfigurationCounts {
     try std.testing.expectEqual(@as(usize, 0), observer.configuration_remaining);
     try std.testing.expectEqual(packets, connection.control_wire);
     for (connection.control_packets[0..connection.control_write], 0..) |bytes, index| try std.testing.expectEqualSlices(u8, &.{@intCast(packets - index - 1)}, bytes);
-    return .{ .submissions = codec.write.load(.acquire), .rounds = rounds, .passes = passes, .bytes = connection.control_wire };
+    return .{ .submissions = codec.workers[0].write.load(.acquire), .rounds = rounds, .passes = passes, .bytes = connection.control_wire };
 }
 
 pub fn benchmarkConfiguration() !void {
@@ -484,10 +512,10 @@ test "status replies progress while the packet worker and shared buffers are occ
         defer decoded.release();
         const control = owner.configurations.acquire().?;
         defer control.release();
-        const codec = try Codec.init(std.testing.allocator, io, transport, 2, null);
+        const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2, .frames = 1 });
         defer codec.deinit();
         var gate: Gate = .{};
-        codec.workspaces.gate = &gate;
+        codec.workers[0].workspaces.gate = &gate;
         try codec.start();
         defer codec.stop();
         defer gate.release.set(io);
@@ -544,7 +572,7 @@ test "framing continues into recipient encryption without a networking reply" {
     const io = std.testing.io;
     var native: Native = .{};
     const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
-    const codec = try Codec.init(std.testing.allocator, io, transport, 1, null);
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 1, .frames = 1 });
     defer codec.deinit();
     var connections = [_]Endpoint.Connection{ 17, 33 };
     var destinations: [2][5]u8 = undefined;
@@ -590,7 +618,7 @@ test "asynchronous control retains its output loan and advances the cipher once"
         owner.codec = null;
         owner.deinit();
     }
-    const codec = try Codec.init(std.testing.allocator, io, transport, 2, null);
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2, .frames = 1 });
     defer codec.deinit();
     try codec.start();
     defer codec.stop();
@@ -875,7 +903,7 @@ test "plaintext fanout lends the original bytes through partial sends cancellati
     }
     try std.testing.expectEqual(@as(usize, 3), first.references);
     native.events[0] = .{ .sent = .{ .handle = owner.connections[0].handle.?, .result = .{ .bytes = 7 } } };
-    native.events[1] = .{ .sent = .{ .handle = owner.connections[1].handle.?, .result = .{ .bytes = 0, .errno = @intFromEnum(std.posix.E.CANCELED) } } };
+    native.events[1] = .{ .sent = .{ .handle = owner.connections[1].handle.?, .result = .{ .bytes = 0, .errno = @backingInt(std.posix.E.CANCELED) } } };
     native.count = 2;
     owner.reloading = true;
     try owner.receive(io);
@@ -972,10 +1000,10 @@ test "codec uses actual framed size and defers exhausted destinations without ad
     const io = std.testing.io;
     var native: Native = .{};
     const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
-    const codec = try Codec.init(std.testing.allocator, io, transport, 1, null);
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 1, .frames = 1 });
     defer codec.deinit();
-    codec.workspaces.framed_length = 5;
-    var pool = try Buffers.init(std.testing.allocator, 1, 64);
+    codec.workers[0].workspaces.framed_length = 5;
+    var pool = try Buffers.init(std.testing.allocator, .{ .slots = 1, .bytes = 64 });
     defer pool.deinit(std.testing.allocator);
     var connections = [_]Endpoint.Connection{ 17, 33, 49, 65 };
     var destinations: [4][8]u8 = @splat(@splat(0));
@@ -1049,10 +1077,10 @@ test "engine commits codec destinations using actual output size" {
             owner.codec = null;
             owner.deinit();
         }
-        const codec = try Codec.init(std.testing.allocator, io, transport, 1, null);
+        const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 1, .frames = 1 });
         defer codec.deinit();
         try owner.attachCodec(codec);
-        codec.workspaces.framed_length = length;
+        codec.workers[0].workspaces.framed_length = length;
         const connection = &owner.connections[0];
         const handle: network.Handle = .{ .index = 0, .generation = 1 };
         owner.setHandle(handle.index, handle);
@@ -1096,7 +1124,7 @@ test "committed output progresses while the same connection waits for the codec"
         owner.codec = null;
         owner.deinit();
     }
-    const codec = try Codec.init(std.testing.allocator, io, transport, 1, null);
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 1, .frames = 1 });
     defer codec.deinit();
     try owner.attachCodec(codec);
     const connection = &owner.connections[0];
@@ -1117,49 +1145,43 @@ test "committed output progresses while the same connection waits for the codec"
 test "codec idle handoffs drain every submitted task before shutdown" {
     const Codec = packet_codec.Codec(Endpoint);
     const io = std.testing.io;
-    var native: Native = .{};
+    var wake: std.Io.Event = .unset;
+    var native: Native = .{ .wake = &wake };
     const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
-    const codec = try Codec.init(std.testing.allocator, io, transport, 32, null);
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 32, .frames = 1 });
     defer codec.deinit();
     var connection: Endpoint.Connection = 0;
     var tasks: [32]Codec.Task = @splat(.{});
     var bytes: [32]u8 = @splat(0);
     try codec.start();
     defer codec.stop();
-    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(5) });
     var completed: usize = 0;
     for (0..10000) |iteration| {
         const window: usize = if (iteration < 5000) 1 else tasks.len;
         const slot = iteration % window;
         const task = &tasks[slot];
         if (task.state.load(.acquire) != .idle) {
-            var result = Codec.take(task);
-            while (result == null) : (result = Codec.take(task)) {
-                if (std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds >= deadline.raw.nanoseconds) {
-                    std.log.err("codec stalled read={d} write={d} ready={s}", .{ codec.read.load(.acquire), codec.write.load(.acquire), @tagName(@atomicLoad(std.Io.Event, &codec.ready, .acquire)) });
-                    return error.Timeout;
+            while (true) {
+                _ = @atomicRmw(std.Io.Event, &wake, .Xchg, .unset, .acq_rel);
+                if (Codec.take(task)) |result| {
+                    try std.testing.expectEqual(@as(usize, 1), (try result).received);
+                    completed += 1;
+                    break;
                 }
-                try std.Thread.yield();
+                try waitSignal(&wake);
             }
-            try std.testing.expectEqual(@as(usize, 1), (try result.?).received);
-            completed += 1;
         }
         codec.submit(task, .{ .receive = .{ .connection = &connection, .bytes = bytes[slot..][0..1] } });
     }
+    codec.stop();
     for (&tasks) |*task| {
         if (task.state.load(.acquire) == .idle) continue;
-        while (true) {
-            if (Codec.take(task)) |result| {
-                try std.testing.expectEqual(@as(usize, 1), (try result).received);
-                completed += 1;
-                break;
-            }
-            if (std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds >= deadline.raw.nanoseconds) return error.Timeout;
-            try std.Thread.yield();
-        }
+        const result = try Codec.take(task).?;
+        try std.testing.expectEqual(@as(usize, 1), result.received);
+        completed += 1;
     }
     try std.testing.expectEqual(@as(usize, 10000), completed);
-    try std.testing.expectEqual(codec.write.load(.acquire), codec.read.load(.acquire));
+    try std.testing.expectEqual(codec.workers[0].write.load(.acquire), codec.workers[0].read.load(.acquire));
 }
 
 test "completed codec tasks notify before the rest of their batch finishes" {
@@ -1168,10 +1190,10 @@ test "completed codec tasks notify before the rest of their batch finishes" {
     var wake: std.Io.Event = .unset;
     var native: Native = .{ .wake = &wake };
     const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
-    const codec = try Codec.init(std.testing.allocator, io, transport, 2, null);
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2, .frames = 1 });
     defer codec.deinit();
     var gate: Gate = .{};
-    codec.workspaces = .{ .gate = &gate, .gate_byte = 1 };
+    codec.workers[0].workspaces = .{ .gate = &gate, .gate_byte = 1 };
     var storage: [2][framing.headroom + 1]u8 = @splat(@splat(0));
     storage[1][framing.headroom] = 1;
     var output: [2][64]u8 = undefined;
@@ -1497,7 +1519,7 @@ test "one codec submission frames and encrypts a whole sequence into wrapped rec
     const Codec = packet_codec.Codec(Endpoint);
     for ([_]bool{ false, true }) |masked| {
         var native: Native = .{};
-        const codec = try Codec.init(std.testing.allocator, std.testing.io, .{ .context = &native, .vtable = network.Transport.adapter(Native) }, 8, null);
+        const codec = try Codec.init(std.testing.allocator, std.testing.io, .{ .context = &native, .vtable = network.Transport.adapter(Native) }, .{ .tasks = 8, .frames = 1 });
         defer codec.deinit();
         var storage: [3][framing.headroom + 3]u8 = undefined;
         const payloads = [_][]const u8{ "ab", "cde", "f" };
@@ -1522,7 +1544,7 @@ test "one codec submission frames and encrypts a whole sequence into wrapped rec
             if (index != 0) targets[index - 1].next = target;
         }
         codec.submit(&tasks[0], .{ .frame_sequence = .{ .first = &frames[0], .targets = &targets[0] } });
-        try std.testing.expectEqual(@as(usize, 1), codec.write.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), codec.workers[0].write.load(.acquire));
         try codec.start();
         codec.stop();
         for (&tasks, payloads) |*task, payload| {
@@ -1625,12 +1647,12 @@ test "multishot ciphertext arriving during a codec loan is consumed exactly once
     const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
     const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
     defer owner.deinit();
-    const codec = try Codec.init(std.testing.allocator, io, transport, 2, null);
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2, .frames = 1 });
     defer codec.deinit();
     try owner.attachCodec(codec);
     const connection = &owner.connections[0];
     defer {
-        codec.read.store(codec.write.load(.acquire), .release);
+        codec.workers[0].read.store(codec.workers[0].write.load(.acquire), .release);
         if (connection.codec.state.load(.acquire) == .queued) connection.codec.complete(error.TestStopped);
         if (Codec.take(&connection.codec)) |result| _ = result catch .{};
         connection.receiving = false;
@@ -1652,12 +1674,12 @@ test "multishot ciphertext arriving during a codec loan is consumed exactly once
     try owner.receive(io);
     try std.testing.expectEqual(@as(usize, 3), connection.received);
     for (0..2) |round| {
-        const read = codec.read.load(.monotonic);
+        const read = codec.workers[0].read.load(.monotonic);
         const task = codec.tasks[read % codec.tasks.len];
         const job = task.operation.receive;
         try std.testing.expectEqual(@as(usize, if (round == 0) 2 else 1), job.bytes.len);
         Endpoint.receive(job.connection, job.bytes);
-        codec.read.store(read + 1, .release);
+        codec.workers[0].read.store(read + 1, .release);
         task.complete(.{ .received = job.bytes.len });
         owner.progress(io);
     }
@@ -1668,11 +1690,11 @@ test "multishot ciphertext arriving during a codec loan is consumed exactly once
     native.feedMore(0, "\x58\x5b\x71", true);
     try owner.receive(io);
     owner.progress(io);
-    const read = codec.read.load(.monotonic);
+    const read = codec.workers[0].read.load(.monotonic);
     const task = codec.tasks[read % codec.tasks.len];
     const job = task.operation.receive;
     Endpoint.receive(job.connection, job.bytes);
-    codec.read.store(read + 1, .release);
+    codec.workers[0].read.store(read + 1, .release);
     task.complete(.{ .received = job.bytes.len });
     owner.progress(io);
     try std.testing.expectEqualSlices(u8, "\x02\x01\x2a", borrowed);
@@ -1682,7 +1704,7 @@ test "multishot ciphertext arriving during a codec loan is consumed exactly once
     try std.testing.expectEqualSlices(u8, "\x02\x01\x2b", observer.payloads[0]);
     try std.testing.expect(connection.receiving);
     try std.testing.expectEqual(@as(usize, 0), connection.received);
-    try std.testing.expectEqual(codec.write.load(.acquire), codec.read.load(.acquire));
+    try std.testing.expectEqual(codec.workers[0].write.load(.acquire), codec.workers[0].read.load(.acquire));
 }
 
 test "returned decode loans go to waiting peers before a busy peer can reacquire them" {
@@ -1695,11 +1717,11 @@ test "returned decode loans go to waiting peers before a busy peer can reacquire
     const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
     const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 2, .decode_slots = 1, .compression_threshold = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
     defer owner.deinit();
-    const codec = try Codec.init(std.testing.allocator, io, transport, 2, null);
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2, .frames = 1 });
     defer codec.deinit();
     try owner.attachCodec(codec);
     defer {
-        codec.read.store(codec.write.load(.acquire), .release);
+        codec.workers[0].read.store(codec.workers[0].write.load(.acquire), .release);
         for (owner.connections, 0..) |*connection, index| {
             if (connection.codec.state.load(.acquire) == .queued) connection.codec.complete(error.TestStopped);
             if (Codec.take(&connection.codec)) |result| _ = result catch .{};
@@ -1723,8 +1745,8 @@ test "returned decode loans go to waiting peers before a busy peer can reacquire
     const first = codec.tasks[0];
     const holder: u16 = if (first == &owner.connections[0].codec) 0 else 1;
     const waiter: u16 = 1 - holder;
-    const result = try Codec.decodeBatch(&codec.workspaces, first.operation.decode_batch);
-    codec.read.store(1, .release);
+    const result = try Codec.decodeBatch(&codec.workers[0].workspaces, first.operation.decode_batch);
+    codec.workers[0].read.store(1, .release);
     first.complete(result);
     owner.progress(io);
     try std.testing.expect(owner.connections[holder].loan.load(.acquire));
@@ -1735,8 +1757,8 @@ test "returned decode loans go to waiting peers before a busy peer can reacquire
     owner.progress(io);
     const next = codec.tasks[1];
     try std.testing.expect(next == &owner.connections[waiter].codec);
-    const next_result = try Codec.decodeBatch(&codec.workspaces, next.operation.decode_batch);
-    codec.read.store(2, .release);
+    const next_result = try Codec.decodeBatch(&codec.workers[0].workspaces, next.operation.decode_batch);
+    codec.workers[0].read.store(2, .release);
     next.complete(next_result);
     owner.progress(io);
     try std.testing.expect(observer.payloads[waiter].len != 0);
@@ -1754,14 +1776,14 @@ test "reload drains ciphertext without waiting for a gameplay decode buffer" {
     const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
     const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 1, .decode_slots = 1, .compression_threshold = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
     defer owner.deinit();
-    const codec = try Codec.init(std.testing.allocator, io, transport, 2, null);
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2, .frames = 1 });
     defer codec.deinit();
     try owner.attachCodec(codec);
     const held = owner.decoded.acquire().?;
     defer held.release();
     const connection = &owner.connections[0];
     defer {
-        codec.read.store(codec.write.load(.acquire), .release);
+        codec.workers[0].read.store(codec.workers[0].write.load(.acquire), .release);
         if (connection.codec.state.load(.acquire) == .queued) connection.codec.complete(error.TestStopped);
         if (Codec.take(&connection.codec)) |result| _ = result catch .{};
         connection.receiving = false;
@@ -1773,6 +1795,7 @@ test "reload drains ciphertext without waiting for a gameplay decode buffer" {
     connection.protocol = &catalog.values[0];
     connection.lifecycle = 0xfe;
     connection.state.phase = .play;
+    connection.decode_large = true;
     owner.progress(io);
     native.feedMore(0, "\x58\x5b\x70", true);
     try owner.receive(io);
@@ -1788,7 +1811,7 @@ test "reload drains ciphertext without waiting for a gameplay decode buffer" {
     const task = codec.tasks[0];
     const job = task.operation.receive;
     Endpoint.receive(job.connection, job.bytes);
-    codec.read.store(1, .release);
+    codec.workers[0].read.store(1, .release);
     task.complete(.{ .received = job.bytes.len });
     owner.progress(io);
     try std.testing.expectEqual(@as(usize, 0), connection.received);
@@ -1873,11 +1896,11 @@ test "exhausted decode pools retain waiters and wake only available capacity" {
     const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
     const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 64, .decode_slots = 1, .compression_threshold = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
     defer owner.deinit();
-    const codec = try Codec.init(std.testing.allocator, io, transport, 64, null);
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 64, .frames = 1 });
     defer codec.deinit();
     try owner.attachCodec(codec);
     defer {
-        codec.read.store(codec.write.load(.acquire), .release);
+        codec.workers[0].read.store(codec.workers[0].write.load(.acquire), .release);
         for (owner.connections, 0..) |*connection, index| {
             if (connection.codec.state.load(.acquire) == .queued) connection.codec.complete(error.TestStopped);
             if (Codec.take(&connection.codec)) |result| _ = result catch .{};
@@ -1894,18 +1917,19 @@ test "exhausted decode pools retain waiters and wake only available capacity" {
         connection.protocol = &catalog.values[0];
         connection.lifecycle = 0xfe;
         connection.state.phase = .play;
+        connection.decode_large = true;
         connection.received = 1;
     }
     for (0..64) |_| owner.progress(io);
-    try std.testing.expectEqual(@as(u64, 0), codec.write.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), codec.workers[0].write.load(.acquire));
     for (owner.connections) |connection| try std.testing.expect(connection.waiting == .decoded);
     held.?.release();
     held = null;
     owner.progress(io);
-    try std.testing.expectEqual(@as(u64, 1), codec.write.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), codec.workers[0].write.load(.acquire));
     try std.testing.expect(codec.tasks[0] == &owner.connections[0].codec);
     for (0..64) |_| owner.progress(io);
-    try std.testing.expectEqual(@as(u64, 1), codec.write.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), codec.workers[0].write.load(.acquire));
     for (owner.connections[1..]) |connection| try std.testing.expect(connection.waiting == .decoded);
 }
 
@@ -1919,7 +1943,7 @@ test "transport capacity wakes outbound delivery while inbound decoding stays bl
     const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
     const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 1, .decode_slots = 1, .compression_threshold = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
     defer owner.deinit();
-    const codec = try Codec.init(std.testing.allocator, io, transport, 1, null);
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 1, .frames = 1 });
     defer codec.deinit();
     try owner.attachCodec(codec);
     defer {
@@ -1935,6 +1959,7 @@ test "transport capacity wakes outbound delivery while inbound decoding stays bl
     connection.protocol = &catalog.values[0];
     connection.lifecycle = 0xfe;
     connection.state.phase = .play;
+    connection.decode_large = true;
     connection.received = 1;
     connection.output_write = 10;
     @memset(owner.output[0..10], 17);
@@ -1949,5 +1974,349 @@ test "transport capacity wakes outbound delivery while inbound decoding stays bl
     owner.progress(io);
     try std.testing.expectEqual(@as(usize, 2), native.send_calls);
     try std.testing.expect(connection.sending and connection.waiting == .decoded);
-    try std.testing.expectEqual(@as(u64, 0), codec.write.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), codec.workers[0].write.load(.acquire));
+}
+
+test "resident decode capacity remains available when every shared decode buffer is held" {
+    const Engine = engine.Engine(Endpoint, Observer);
+    const Codec = Engine.Codec;
+    const io = std.testing.io;
+    var native: Native = .{};
+    var observer: Observer = .{};
+    var catalog: Endpoint.Protocols = .{};
+    const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
+    const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 2, .decode_slots = 1, .compression_threshold = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
+    defer owner.deinit();
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2, .frames = 1 });
+    defer codec.deinit();
+    try owner.attachCodec(codec);
+    defer {
+        codec.workers[0].read.store(codec.workers[0].write.load(.acquire), .release);
+        for (owner.connections, 0..) |*connection, index| {
+            if (connection.codec.state.load(.acquire) == .queued) connection.codec.complete(error.TestStopped);
+            if (Codec.take(&connection.codec)) |result| _ = result catch .{};
+            connection.receiving = false;
+            connection.sending = false;
+            owner.releaseBuffers(index);
+            owner.setHandle(index, null);
+        }
+    }
+    const held = owner.decoded.acquire().?;
+    defer held.release();
+    for (owner.connections, 0..) |*connection, index| {
+        owner.setHandle(index, .{ .index = index, .generation = 1 });
+        connection.protocol = &catalog.values[0];
+        connection.lifecycle = 0xfe;
+        connection.state.phase = .play;
+        connection.received = 1;
+    }
+    owner.progress(io);
+    try std.testing.expectEqual(@as(u64, 2), codec.workers[0].write.load(.acquire));
+    for (owner.connections, 0..) |connection, index| {
+        try std.testing.expect(connection.decoded == null);
+        try std.testing.expectEqual(owner.decoded_storage[index * 512 ..].ptr, connection.codec.operation.decode_batch.output.ptr);
+    }
+}
+
+test "decode retry preserves decrypted input without decrypting it twice" {
+    const Decoder = struct {
+        pub const Connection = usize;
+        pub const Workspaces = struct {};
+        pub fn receive(connection: *Connection, bytes: []u8) void {
+            connection.* += 1;
+            for (bytes) |*byte| byte.* ^= 0x55;
+        }
+        pub fn frame(_: *Connection, bytes: []const u8, maximum: usize) !protocol.Frame {
+            const value = try framing.frame(bytes, maximum);
+            return .{ .body = value.body, .length = value.length };
+        }
+        pub fn decode(_: *Connection, _: *Workspaces, bytes: []const u8, output: []u8, _: ?usize) ![]const u8 {
+            if (bytes.len > output.len) return error.BufferTooSmall;
+            @memcpy(output[0..bytes.len], bytes);
+            return output[0..bytes.len];
+        }
+    };
+    const Codec = packet_codec.Codec(Decoder);
+    var connection: Decoder.Connection = 0;
+    var workspace: Decoder.Workspaces = .{};
+    var bytes = [_]u8{ 3 ^ 0x55, 'a' ^ 0x55, 'b' ^ 0x55, 'c' ^ 0x55 };
+    var small: [1]u8 = undefined;
+    var large: [3]u8 = undefined;
+    var packets: [1][]const u8 = undefined;
+    const pending = try Codec.decodeBatch(&workspace, .{ .connection = &connection, .encrypted_tail = &bytes, .received = bytes.len, .bytes = &bytes, .output = &small, .packets = &packets, .threshold = null, .maximum = 512 });
+    try std.testing.expect(pending.needs_output and pending.consumed == 0 and pending.received == bytes.len);
+    const complete = try Codec.decodeBatch(&workspace, .{ .connection = &connection, .bytes = &bytes, .output = &large, .packets = &packets, .threshold = null, .maximum = 512 });
+    try std.testing.expect(!complete.needs_output);
+    try std.testing.expectEqual(@as(usize, 1), connection);
+    try std.testing.expectEqual(@as(usize, 4), complete.consumed);
+    try std.testing.expectEqualStrings("abc", complete.input.?.packets[0]);
+    const pending_single = try Codec.decode(&workspace, .{ .connection = &connection, .bytes = "abc", .output = &small, .threshold = null });
+    try std.testing.expect(pending_single.needs_output);
+    const complete_single = try Codec.decode(&workspace, .{ .connection = &connection, .bytes = "abc", .output = &large, .threshold = null });
+    try std.testing.expect(!complete_single.needs_output);
+    try std.testing.expectEqualStrings("abc", complete_single.bytes);
+    try std.testing.expectEqual(@as(usize, 1), connection);
+}
+
+test "coalesced handshake and login wait for both control leases before consuming login" {
+    const Engine = engine.Engine(Endpoint, Observer);
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |hold_raw| {
+        var native: Native = .{};
+        var observer: Observer = .{ .handshakes = true };
+        var catalog: Endpoint.Protocols = .{};
+        const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
+        const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 1, .configuration_slots = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
+        defer owner.deinit();
+        defer {
+            owner.connections[0].receiving = false;
+            owner.connections[0].sending = false;
+            owner.releaseBuffers(0);
+            owner.setHandle(0, null);
+        }
+        const held = if (hold_raw) owner.control_raw.acquire().? else owner.configurations.acquire().?;
+        var released = false;
+        defer if (!released) held.release();
+        owner.setHandle(0, .{ .index = 0, .generation = 1 });
+        const connection = &owner.connections[0];
+        connection.receiving = true;
+        connection.admission_deadline = std.math.maxInt(i96);
+        @memcpy(owner.input[0..4], "\x01h\x01a");
+        connection.input_end = 4;
+        owner.progress(io);
+        try std.testing.expectEqual(.negotiating, connection.state.phase);
+        try std.testing.expectEqual(@as(usize, 2), connection.input_start);
+        try std.testing.expectEqual(@as(usize, 0), observer.polls);
+        try std.testing.expect(!connection.closing and connection.control_burst == null);
+        try std.testing.expect(connection.control_raw == null);
+        held.release();
+        released = true;
+        owner.progress(io);
+        try std.testing.expect(observer.polls != 0);
+        try std.testing.expectEqual(connection.input_end, connection.input_start);
+        try std.testing.expect(connection.sending and !connection.closing);
+    }
+}
+
+test "stopping before codec startup returns every queued sequence loan" {
+    const Codec = packet_codec.Codec(Endpoint);
+    for ([_]usize{ 1, 4 }) |workers| {
+        var native: Native = .{};
+        const codec = try Codec.init(std.testing.allocator, std.testing.io, .{ .context = &native, .vtable = network.Transport.adapter(Native) }, .{ .tasks = 4, .frames = 1, .workers = workers });
+        defer codec.deinit();
+        var connection: Endpoint.Connection = 17;
+        var recipient: Codec.Task = .{};
+        recipient.state.store(.queued, .release);
+        var output: [8]u8 = @splat(0);
+        var target: Codec.SendTarget = .{ .task = &recipient, .connection = &connection, .bytes = &output, .used = 0, .offset = 0 };
+        var tasks: [2]Codec.Task = @splat(.{});
+        var storage: [2][framing.headroom + 1]u8 = @splat(@splat(0));
+        var frames: [2]Codec.Frame = undefined;
+        for (&frames, &tasks, &storage, 0..) |*frame, *task, *bytes, index| {
+            frame.* = .{ .task = task, .protocol = 772, .storage = bytes, .length = 1, .threshold = null, .output = &output, .next = if (index == 0) &frames[1] else null };
+            if (index != 0) task.begin(.{ .frame = .{ .protocol = 772, .storage = bytes, .length = 1, .threshold = null, .output = &output } });
+        }
+        codec.submit(&tasks[0], .{ .frame_sequence = .{ .first = &frames[0], .targets = &target } });
+        codec.stop();
+        for (&tasks) |*task| try std.testing.expectError(error.Canceled, Codec.take(task).?);
+        try std.testing.expectError(error.Canceled, Codec.take(&recipient).?);
+        try std.testing.expectEqual(@as(u8, 17), connection);
+        try std.testing.expectEqualSlices(u8, &@as([8]u8, @splat(0)), &output);
+    }
+}
+
+test "independent codec workers progress while every other workspace is blocked" {
+    const Codec = packet_codec.Codec(Endpoint);
+    const io = std.testing.io;
+    for ([_]usize{ 1, 2, 4, 8 }) |count| {
+        var native: Native = .{};
+        var bounded = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const codec = try Codec.init(bounded.allocator(), io, .{ .context = &native, .vtable = network.Transport.adapter(Native) }, .{ .tasks = count, .frames = count, .workers = count });
+        defer codec.deinit();
+        bounded.fail_index = bounded.alloc_index;
+        bounded.resize_fail_index = bounded.resize_index;
+        var gates: [8]Gate = @splat(.{});
+        var tasks: [8]Codec.Task = @splat(.{});
+        var storage: [8][framing.headroom + 1]u8 = @splat(@splat(0));
+        var output: [8][64]u8 = undefined;
+        for (codec.workers, gates[0..count]) |*worker, *gate| worker.workspaces.gate = gate;
+        for (tasks[0..count], storage[0..count], output[0..count]) |*task, *bytes, *destination| codec.submit(task, .{ .frame = .{ .protocol = 772, .storage = bytes, .length = 1, .threshold = null, .output = destination } });
+        try codec.start();
+        defer codec.stop();
+        defer for (gates[0..count]) |*gate| gate.release.set(io);
+        for (gates[0..count]) |*gate| try waitSignal(&gate.started);
+        for (tasks[0..count]) |*task| try std.testing.expectEqual(.queued, task.state.load(.acquire));
+        for (gates[0..count]) |*gate| gate.release.set(io);
+        codec.stop();
+        for (tasks[0..count], storage[0..count]) |*task, *bytes| {
+            const result = try Codec.take(task).?;
+            try std.testing.expect(result.bytes.ptr == bytes[framing.headroom..].ptr);
+            try std.testing.expectEqual(@as(usize, 1), result.bytes.len);
+        }
+        try std.testing.expectEqual(bounded.fail_index, bounded.alloc_index);
+    }
+}
+
+test "parallel frame sequences preserve each cipher stream and reuse bounded fanout reservations" {
+    const Codec = packet_codec.Codec(Endpoint);
+    const io = std.testing.io;
+    for ([_]usize{ 2, 4, 8 }) |workers| {
+        var wake: std.Io.Event = .unset;
+        var native: Native = .{ .wake = &wake };
+        var bounded = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const codec = try Codec.init(bounded.allocator(), io, .{ .context = &native, .vtable = network.Transport.adapter(Native) }, .{ .tasks = 36, .frames = 1, .workers = workers });
+        defer codec.deinit();
+        bounded.fail_index = bounded.alloc_index;
+        bounded.resize_fail_index = bounded.resize_index;
+        try codec.start();
+        defer codec.stop();
+        var connections: [32]Endpoint.Connection = undefined;
+        var tasks: [32]Codec.Task = @splat(.{});
+        var targets: [32]Codec.SendTarget = undefined;
+        var output: [32][16]u8 = undefined;
+        var expected: [32][16]u8 = undefined;
+        var storage: [4][framing.headroom + 3]u8 = @splat(@splat(0));
+        var frames: [4]Codec.Frame = undefined;
+        var frame_tasks: [4]Codec.Task = @splat(.{});
+        var framed_output: [4][32]u8 = undefined;
+        for (&connections, 0..) |*connection, index| connection.* = @intCast(index * 7);
+        for (0..32) |_| {
+            @memset(&output, @splat(0xcc));
+            expected = output;
+            for (&storage, 0..) |*bytes, index| @memset(bytes[framing.headroom..], @intCast(index + 1));
+            for (&targets, &tasks, &connections, &output, 0..) |*target, *task, *connection, *bytes, index| {
+                task.state.store(.queued, .release);
+                const selected: u32 = @intCast(index % 15 + 1);
+                target.* = .{ .connection = connection, .task = task, .bytes = bytes, .used = 0, .offset = 7, .packets = selected, .next = if (index + 1 < targets.len) &targets[index + 1] else null };
+                var value = connection.*;
+                var at: usize = 7;
+                for (0..frames.len) |packet| {
+                    if (selected & (@as(u32, 1) << @intCast(packet)) == 0) continue;
+                    for (0..3) |_| {
+                        expected[index][at % bytes.len] = @as(u8, @intCast(packet + 1)) ^ value;
+                        value +%= 1;
+                        at += 1;
+                    }
+                }
+            }
+            for (&frames, &frame_tasks, &storage, &framed_output, 0..) |*frame, *task, *bytes, *destination, index| {
+                frame.* = .{ .task = task, .protocol = 772, .storage = bytes, .length = 3, .threshold = null, .output = destination, .next = if (index + 1 < frames.len) &frames[index + 1] else null };
+                if (index != 0) task.begin(.{ .frame = .{ .protocol = 772, .storage = bytes, .length = 3, .threshold = null, .output = destination } });
+            }
+            codec.submit(&frame_tasks[0], .{ .frame_sequence = .{ .first = &frames[0], .targets = &targets[0] } });
+            while (true) {
+                _ = @atomicRmw(std.Io.Event, &wake, .Xchg, .unset, .acq_rel);
+                if (frame_tasks[0].state.load(.acquire) == .complete) break;
+                try waitSignal(&wake);
+            }
+            for (&frame_tasks) |*task| {
+                try std.testing.expectEqual(.complete, task.state.load(.acquire));
+                _ = try Codec.take(task).?;
+            }
+            for (&targets, &tasks, &output, &expected) |target, *task, *actual, *wanted| {
+                const sent = try Codec.take(task).?;
+                try std.testing.expectEqual(@as(usize, @popCount(target.packets) * 3), sent.consumed);
+                try std.testing.expectEqualSlices(u8, wanted, actual);
+            }
+        }
+        try std.testing.expectEqual(bounded.fail_index, bounded.alloc_index);
+    }
+}
+
+test "parallel compression failure returns every loan without advancing ciphers" {
+    const Codec = packet_codec.Codec(Endpoint);
+    const io = std.testing.io;
+    var wake: std.Io.Event = .unset;
+    var native: Native = .{ .wake = &wake };
+    const codec = try Codec.init(std.testing.allocator, io, .{ .context = &native, .vtable = network.Transport.adapter(Native) }, .{ .tasks = 6, .frames = 1, .workers = 4 });
+    defer codec.deinit();
+    try codec.start();
+    defer codec.stop();
+    var connections: [2]Endpoint.Connection = .{ 3, 7 };
+    var tasks: [2]Codec.Task = @splat(.{});
+    var targets: [2]Codec.SendTarget = undefined;
+    var storage: [4][framing.headroom + 1]u8 = @splat(@splat(1));
+    var output: [2][8]u8 = undefined;
+    var frame_output: [4][8]u8 = undefined;
+    var frames: [4]Codec.Frame = undefined;
+    var frame_tasks: [4]Codec.Task = @splat(.{});
+    for ([_]bool{ true, false }) |fail| {
+        for (codec.workers) |*worker| worker.workspaces.failure = if (fail) error.InjectedCompressionFailure else null;
+        @memset(&output, @splat(0xcc));
+        for (&targets, &tasks, &connections, &output, 0..) |*target, *task, *connection, *bytes, index| {
+            task.state.store(.queued, .release);
+            target.* = .{ .connection = connection, .task = task, .bytes = bytes, .used = 0, .offset = 0, .next = if (index == 0) &targets[1] else null };
+        }
+        for (&frames, &frame_tasks, &storage, &frame_output, 0..) |*frame, *task, *bytes, *destination, index| {
+            frame.* = .{ .task = task, .protocol = 772, .storage = bytes, .length = 1, .threshold = null, .output = destination, .next = if (index + 1 < frames.len) &frames[index + 1] else null };
+            if (index != 0) task.begin(.{ .frame = .{ .protocol = 772, .storage = bytes, .length = 1, .threshold = null, .output = destination } });
+        }
+        codec.submit(&frame_tasks[0], .{ .frame_sequence = .{ .first = &frames[0], .targets = &targets[0] } });
+        while (true) {
+            _ = @atomicRmw(std.Io.Event, &wake, .Xchg, .unset, .acq_rel);
+            var complete = true;
+            for (&frame_tasks) |*task| complete = complete and task.state.load(.acquire) == .complete;
+            if (complete) break;
+            try waitSignal(&wake);
+        }
+        for (&frame_tasks) |*task| {
+            const result = Codec.take(task).?;
+            if (fail) try std.testing.expectError(error.InjectedCompressionFailure, result) else _ = try result;
+        }
+        for (&tasks) |*task| {
+            const result = Codec.take(task).?;
+            if (fail) try std.testing.expectError(error.InjectedCompressionFailure, result) else try std.testing.expectEqual(@as(usize, frames.len), (try result).consumed);
+        }
+        try std.testing.expectEqualSlices(u8, if (fail) &.{ 3, 7 } else &.{ 7, 11 }, &connections);
+        if (fail) try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&output), 0xcc));
+    }
+}
+
+test "a recipient completes while an unrelated frame is still compressing" {
+    const Codec = packet_codec.Codec(Endpoint);
+    const io = std.testing.io;
+    var wake: std.Io.Event = .unset;
+    var native: Native = .{ .wake = &wake };
+    const codec = try Codec.init(std.testing.allocator, io, .{ .context = &native, .vtable = network.Transport.adapter(Native) }, .{ .tasks = 4, .frames = 1, .workers = 2 });
+    defer codec.deinit();
+    var gate: Gate = .{};
+    codec.workers[1].workspaces = .{ .gate = &gate, .gate_byte = 1 };
+    try codec.start();
+    defer codec.stop();
+    defer gate.release.set(io);
+    var connections: [2]Endpoint.Connection = @splat(0);
+    var tasks: [2]Codec.Task = @splat(.{});
+    var targets: [2]Codec.SendTarget = undefined;
+    var storage: [2][framing.headroom + 1]u8 = @splat(@splat(0));
+    storage[1][framing.headroom] = 1;
+    var output: [2][8]u8 = undefined;
+    var frame_output: [2][8]u8 = undefined;
+    var frames: [2]Codec.Frame = undefined;
+    var frame_tasks: [2]Codec.Task = @splat(.{});
+    for (&targets, &tasks, &connections, &output, 0..) |*target, *task, *connection, *bytes, index| {
+        task.state.store(.queued, .release);
+        target.* = .{ .connection = connection, .task = task, .bytes = bytes, .used = 0, .offset = 0, .packets = @as(u32, 1) << @intCast(index), .next = if (index == 0) &targets[1] else null };
+    }
+    for (&frames, &frame_tasks, &storage, &frame_output, 0..) |*frame, *task, *bytes, *destination, index| {
+        frame.* = .{ .task = task, .protocol = 772, .storage = bytes, .length = 1, .threshold = null, .output = destination, .next = if (index == 0) &frames[1] else null };
+        if (index != 0) task.begin(.{ .frame = .{ .protocol = 772, .storage = bytes, .length = 1, .threshold = null, .output = destination } });
+    }
+    codec.submit(&frame_tasks[0], .{ .frame_sequence = .{ .first = &frames[0], .targets = &targets[0] } });
+    try waitSignal(&gate.started);
+    while (true) {
+        _ = @atomicRmw(std.Io.Event, &wake, .Xchg, .unset, .acq_rel);
+        if (tasks[0].state.load(.acquire) == .complete) break;
+        try waitSignal(&wake);
+    }
+    try std.testing.expectEqual(@as(usize, 1), (try Codec.take(&tasks[0]).?).consumed);
+    try std.testing.expectEqual(.queued, tasks[1].state.load(.acquire));
+    try std.testing.expectEqual(.queued, frame_tasks[0].state.load(.acquire));
+    gate.release.set(io);
+    while (true) {
+        _ = @atomicRmw(std.Io.Event, &wake, .Xchg, .unset, .acq_rel);
+        if (frame_tasks[0].state.load(.acquire) == .complete and frame_tasks[1].state.load(.acquire) == .complete) break;
+        try waitSignal(&wake);
+    }
+    for (&frame_tasks) |*task| _ = try Codec.take(task).?;
+    try std.testing.expectEqual(@as(usize, 1), (try Codec.take(&tasks[1]).?).consumed);
 }

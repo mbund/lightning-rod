@@ -47,7 +47,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 pub fn run(init: std.process.Init, config: Configuration) !void {
-    var memory = lightning_rod.Memory.init(std.heap.page_allocator, init.io);
+    var memory = lightning_rod.Memory.init(lightning_rod.system.huge_page_allocator, init.io);
     defer memory.deinit();
     const allocator = memory.allocator("bootstrap");
     var registry = try lightning_rod.metrics.Registry.init(memory.allocator("metrics"), init.io, .{ .capacity = 512 });
@@ -142,6 +142,7 @@ pub fn run(init: std.process.Init, config: Configuration) !void {
         worker.* = .{
             .io = init.io,
             .record_resources = try records.Resources.init(memory.allocator("records"), init.io, .{ .readers = 2, .writers = 2 }),
+            .delivery = try vanilla.chunk_delivery.Workspace.init(memory.allocator("delivery"), selected.values.len),
             .index = index,
         };
         workers_initialized += 1;
@@ -154,6 +155,7 @@ pub fn run(init: std.process.Init, config: Configuration) !void {
             .id = id,
             .worlds = &world_storage,
             .record_resources = workers[index % pool_size].record_resources,
+            .delivery = workers[index % pool_size].delivery,
             .io = init.io,
             .wakeup = &workers[index % pool_size].background_ready,
             .routing = &routing_table,

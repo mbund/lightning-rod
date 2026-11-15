@@ -65,7 +65,7 @@ pub fn Server(comptime Plugins: type, comptime Endpoint: type, comptime SessionP
                     deadline = std.Io.Clock.now(.awake, init.io).nanoseconds;
                     continue;
                 }
-                _ = try process.store.pollMaintenance(.{ .index_entries = 8, .pages = 8 });
+                _ = try process.store.pollMaintenance(process.store.maintenanceBudget());
                 try simulation.poll();
                 if (process.exporter) |*value| try value.poll(init.io);
                 deadline = host.timing.nextTick(deadline, std.Io.Clock.now(.awake, init.io).nanoseconds);

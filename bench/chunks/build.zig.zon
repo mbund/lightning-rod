@@ -6,6 +6,8 @@
     .dependencies = .{
         .anvil = .{ .path = "../../anvil" },
         .chunks = .{ .path = "../../chunks" },
+        .protocols = .{ .path = "../../protocols" },
+        .minecraft_java = .{ .path = "../../minecraft_java" },
         .records = .{ .path = "../../records" },
         .storage = .{ .path = "../../storage" },
         .metrics = .{ .path = "../../metrics" },

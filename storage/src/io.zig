@@ -6,7 +6,17 @@ const format = @import("format.zig");
 pub const Mode = system.FileBatch.Mode;
 pub const maximum_batch = 32;
 const Ring = std.os.linux.IoUring;
-const IoRead = system.FileBatch.Read;
+const IoRead = struct {
+    file: std.Io.File,
+    offset: u64,
+    prefix: []u8 = &.{},
+    bytes: []u8,
+    suffix: []u8 = &.{},
+
+    fn length(self: IoRead) usize {
+        return self.prefix.len + self.bytes.len + self.suffix.len;
+    }
+};
 const IoWrite = system.FileBatch.Write;
 pub const Io = if (builtin.os.tag == .linux) LinuxIo else StandardIo;
 
@@ -37,23 +47,32 @@ const LinuxIo = struct {
     pub fn read(self: *LinuxIo, reads: []const Read) format.Error!void {
         if (reads.len > maximum_batch) return error.InvalidArgument;
         if (self.failed) return error.IoFailure;
+        if (reads.len == 0) return;
+        for (reads) |request| if (request.length() == 0) return error.InvalidArgument;
         if (self.ring) |*ring| {
-            var vectors: [maximum_batch]std.posix.iovec = undefined;
+            var vectors: [maximum_batch * 3]std.posix.iovec = undefined;
             var lengths: [maximum_batch]usize = undefined;
+            var vector_count: usize = 0;
             var left: usize = 0;
             var index: usize = 0;
             while (index < reads.len) {
                 const first = index;
                 const request = reads[first];
+                const vector_begin = vector_count;
                 var length: usize = 0;
                 while (index < reads.len) : (index += 1) {
                     const next = reads[index];
                     if (next.file.handle != request.file.handle or next.offset != request.offset + length) break;
-                    vectors[index] = .{ .base = next.bytes.ptr, .len = next.bytes.len };
-                    length += next.bytes.len;
+                    for ([_][]u8{ next.prefix, next.bytes, next.suffix }) |bytes| {
+                        if (bytes.len == 0) continue;
+                        std.debug.assert(vector_count < vectors.len);
+                        vectors[vector_count] = .{ .base = bytes.ptr, .len = bytes.len };
+                        vector_count += 1;
+                    }
+                    length += next.length();
                 }
                 lengths[first] = length;
-                const buffer: Ring.ReadBuffer = if (index == first + 1) .{ .buffer = request.bytes } else .{ .iovecs = vectors[first..index] };
+                const buffer: Ring.ReadBuffer = if (vector_count == vector_begin + 1) .{ .buffer = vectors[vector_begin].base[0..vectors[vector_begin].len] } else .{ .iovecs = vectors[vector_begin..vector_count] };
                 _ = ring.read(first, request.file.handle, buffer, request.offset) catch unreachable;
                 left += 1;
             }
@@ -72,9 +91,7 @@ const LinuxIo = struct {
                 }
             }
             if (self.failed) return error.IoFailure;
-        } else for (reads) |request| {
-            if ((request.file.readPositionalAll(self.io, request.bytes, request.offset) catch return error.IoFailure) != request.bytes.len) return error.Corrupt;
-        }
+        } else try readStandard(self.io, reads);
     }
 
     pub fn write(self: *LinuxIo, file: std.Io.File, bytes: []const u8, start: u64) format.Error!void {
@@ -120,6 +137,8 @@ const LinuxIo = struct {
             var vectors: [maximum_batch]std.posix.iovec_const = undefined;
             var lengths: [maximum_batch]usize = undefined;
             var completions: [maximum_batch + 2]std.os.linux.io_uring_cqe = undefined;
+            // A full device is told apart from damage, as the single write path does.
+            var failure: format.Error = error.IoFailure;
             while (true) {
                 var pending: usize = 0;
                 var index: usize = 0;
@@ -158,6 +177,7 @@ const LinuxIo = struct {
                         var at: usize = @intCast(cqe.user_data);
                         if (cqe.res <= 0 or cqe.res > lengths[at]) {
                             self.failed = true;
+                            if (cqe.res < 0 and self.writeError(cqe.res) == error.NoSpace) failure = error.NoSpace;
                         } else {
                             var completed: usize = @intCast(cqe.res);
                             while (completed != 0) : (at += 1) {
@@ -169,13 +189,13 @@ const LinuxIo = struct {
                         pending -= 1;
                     }
                 }
-                if (self.failed) return error.IoFailure;
+                if (self.failed) return failure;
             }
         } else for (writes) |request| try self.write(request.file, request.bytes, request.offset);
     }
 
     fn writeError(_: *LinuxIo, result: i32) format.Error {
-        return switch (@as(std.os.linux.E, @enumFromInt(-result))) {
+        return switch (@as(std.os.linux.E, @fromBackingInt(@intCast(-result)))) {
             .NOSPC, .DQUOT, .FBIG => error.NoSpace,
             else => error.IoFailure,
         };
@@ -295,9 +315,8 @@ const StandardIo = struct {
     pub fn read(self: *StandardIo, reads: []const Read) format.Error!void {
         if (reads.len > maximum_batch) return error.InvalidArgument;
         if (self.failed) return error.IoFailure;
-        for (reads) |request| {
-            if ((request.file.readPositionalAll(self.io, request.bytes, request.offset) catch return error.IoFailure) != request.bytes.len) return error.Corrupt;
-        }
+        for (reads) |request| if (request.length() == 0) return error.InvalidArgument;
+        try readStandard(self.io, reads);
     }
     pub fn write(self: *StandardIo, file: std.Io.File, bytes: []const u8, offset: u64) format.Error!void {
         if (self.failed) return error.IoFailure;
@@ -327,3 +346,14 @@ const StandardIo = struct {
         try self.poll();
     }
 };
+
+fn readStandard(io: std.Io, reads: []const IoRead) format.Error!void {
+    for (reads) |request| {
+        var offset = request.offset;
+        for ([_][]u8{ request.prefix, request.bytes, request.suffix }) |bytes| {
+            if (bytes.len == 0) continue;
+            if ((request.file.readPositionalAll(io, bytes, offset) catch return error.IoFailure) != bytes.len) return error.Corrupt;
+            offset += bytes.len;
+        }
+    }
+}

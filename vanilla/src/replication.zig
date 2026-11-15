@@ -25,7 +25,15 @@ const assert = std.debug.assert;
 pub const Replication = struct {
     pub const id = "minecraft:player_replication";
 
-    pub const Configuration = struct { lifecycle_exceptions: usize = 4096, audience_words: usize = 4096 };
+    pub const Configuration = struct {
+        /// Pairs of players whose view of each other differs from what most pairs of
+        /// their row share. Null lets every player differ with up to 255 others, which
+        /// is every pair there is up to 256 players. A fixed count ran out when more
+        /// than 64 players met in one place, and the player with the most in view was
+        /// disconnected to make room.
+        lifecycle_exceptions: ?usize = null,
+        audience_words: usize = 4096,
+    };
 
     pub const Dependencies = struct { players: *Players, visibility: *Visibility, streaming: ?*Streaming = null };
 
@@ -168,7 +176,8 @@ pub const Replication = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Replication {
         const self = try allocator.create(Replication);
-        const lifecycle = try Lifecycle.init(allocator, deps.players.records.len, config.lifecycle_exceptions);
+        const slots = deps.players.records.len;
+        const lifecycle = try Lifecycle.init(allocator, slots, config.lifecycle_exceptions orelse slots * @min(slots -| 1, 255));
         const rejected = try allocator.alloc(u32, deps.players.records.len);
         @memset(rejected, 0);
         const baselines = try allocator.alloc(CachedBaseline, deps.players.records.len);
@@ -274,7 +283,7 @@ pub const Replication = struct {
         terrain_changed.clear();
         if (terrain) |snapshot| {
             for (snapshot.reset.values()) |index| terrain_changed.insert(index);
-            for (snapshot.changed_words.values()) |word| terrain_changed.insert(word / snapshot.words_per_player);
+            for (snapshot.changed_words.values()) |word| terrain_changed.insert(word / snapshot.grid.words);
         }
         for (players.activeSlots()) |index| self.actors.insert(index);
         const changed = self.temp(.changed);

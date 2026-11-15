@@ -33,15 +33,15 @@ const Inspector = struct {
     fn data(self: *Inspector, id: u64) !void {
         try self.claim(id);
         var page: storage.Page = undefined;
-        try self.space.readPages(&.{.{ .id = @enumFromInt(id), .destination = &page }});
+        try self.space.readPages(&.{.{ .id = @fromBackingInt(@intCast(id)), .destination = &page }});
     }
 
     fn tree(self: *Inspector, id: u64, depth: usize) !Key {
         if (depth >= 16) return error.Corrupt;
         try self.claim(id);
         var page: storage.Page = undefined;
-        try self.space.readPages(&.{.{ .id = @enumFromInt(id), .destination = &page }});
-        if (!std.mem.eql(u8, page[0..4], "LRBT") or page[4] > 1 or page[5] != 1) return error.Corrupt;
+        try self.space.readPages(&.{.{ .id = @fromBackingInt(@intCast(id)), .destination = &page }});
+        if (!std.mem.eql(u8, page[0..4], "LRBT") or page[4] > 1 or page[5] != 2) return error.Corrupt;
         const branch = page[4] != 0;
         const count = std.mem.readInt(u16, page[6..8], .little);
         const next = std.mem.readInt(u64, page[8..16], .little);
@@ -63,7 +63,7 @@ const Inspector = struct {
             const flags = representation & 3;
             const prefix = representation >> 2;
             const length = std.mem.readInt(u32, page[at + 4 ..][0..4], .little);
-            if (flags != 3 and prefix != 0) return error.Corrupt;
+            if ((flags == 0 or flags == 2) and prefix != 0) return error.Corrupt;
             at += 8;
             if (key_len == 0 or key_len > 64 or key_len > page.len - at or flags > 3) return error.Corrupt;
             var key: Key = .{ .length = key_len };
@@ -87,13 +87,13 @@ const Inspector = struct {
                     at += length;
                 },
                 1 => {
-                    if (length == 0 or at + 8 > page.len) return error.Corrupt;
+                    if (prefix >= length or at + 8 + prefix > page.len) return error.Corrupt;
                     var index = std.mem.readInt(u64, page[at..][0..8], .little);
-                    var remaining: usize = length;
+                    var remaining: usize = length - prefix;
                     while (remaining != 0) {
                         try self.claim(index);
                         var descriptor: storage.Page = undefined;
-                        try self.space.readPages(&.{.{ .id = @enumFromInt(index), .destination = &descriptor }});
+                        try self.space.readPages(&.{.{ .id = @fromBackingInt(@intCast(index)), .destination = &descriptor }});
                         if (!std.mem.eql(u8, descriptor[0..8], "LRBLOB01")) return error.Corrupt;
                         const pages = std.mem.readInt(u32, descriptor[16..20], .little);
                         if (pages == 0 or pages > storage.batch_size or pages > (remaining + storage.page_size - 1) / storage.page_size) return error.Corrupt;
@@ -102,11 +102,11 @@ const Inspector = struct {
                         index = std.mem.readInt(u64, descriptor[8..16], .little);
                     }
                     if (index != 0) return error.Corrupt;
-                    at += 8;
+                    at += 8 + prefix;
                 },
                 3 => {
                     const limit = storage.page_size - 16 - 8 - 64;
-                    if (prefix > length or (prefix != 0 and prefix != length % storage.page_size)) return error.Corrupt;
+                    if (prefix >= length) return error.Corrupt;
                     const remaining = length - prefix;
                     const pages = remaining / storage.page_size + @intFromBool(remaining % storage.page_size != 0);
                     if (pages == 0) return error.Corrupt;
@@ -130,7 +130,7 @@ pub fn inspect(table: records.Table) !Shape {
     defer std.testing.allocator.free(seen);
     @memset(seen, false);
     var inspector: Inspector = .{ .space = table.space, .seen = seen };
-    if (try table.space.getRoot()) |root| _ = try inspector.tree(@intFromEnum(root), 0);
+    if (try table.space.getRoot()) |root| _ = try inspector.tree(@backingInt(root), 0);
     if (inspector.next_leaf != 0) return error.Corrupt;
     var free = store.metadata.free;
     var free_count = store.metadata.free_count;
@@ -154,7 +154,7 @@ pub fn inspect(table: records.Table) !Shape {
     for (1..seen.len) |id| {
         const block = try readBlock(store, id);
         const owner = std.mem.readInt(u32, block[4..8], .little);
-        if ((owner == @intFromEnum(table.space.id) or owner == std.math.maxInt(u32)) and !seen[id]) return error.Corrupt;
+        if ((owner == @backingInt(table.space.id) or owner == std.math.maxInt(u32)) and !seen[id]) return error.Corrupt;
     }
     return inspector.shape;
 }
@@ -168,7 +168,7 @@ fn readBlock(store: *storage.Store, id: u64) ![4096]u8 {
     if (!std.mem.eql(u8, block[0..4], "LRPG") or std.mem.readInt(u64, block[8..16], .little) != id) return error.Corrupt;
     const saved = std.mem.readInt(u64, block[24..32], .little);
     std.mem.writeInt(u64, block[24..32], 0, .little);
-    const checksum = std.hash.XxHash64.hash(0x4c52504147455231, &block);
+    const checksum = std.hash.Wyhash.hash(0x4c52504147455231, &block);
     std.mem.writeInt(u64, block[24..32], saved, .little);
     if (saved != checksum) return error.Corrupt;
     return block;

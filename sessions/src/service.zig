@@ -13,6 +13,10 @@ pub const Instrumentation = struct {
     reserve_failures: metrics.Counter = .{},
     broadcast_reservations: metrics.Counter = .{},
     broadcast_exceptions: metrics.Counter = .{},
+    input_packets: metrics.Counter = .{},
+    input_bytes: metrics.Counter = .{},
+    input_deferred: metrics.Counter = .{},
+    input_pending: metrics.Gauge = .{},
 
     pub fn init(registry: ?*metrics.Registry, namespace: []const u8) !Instrumentation {
         const owner = registry orelse return .{};
@@ -20,6 +24,10 @@ pub const Instrumentation = struct {
             .reserve_failures = try owner.counter(.{ .namespace = namespace, .name = "reserve_failures", .description = "Output reservations denied" }),
             .broadcast_reservations = try owner.counter(.{ .namespace = namespace, .name = "broadcast_reservations", .description = "Recipient credit reservations for broadcast batches" }),
             .broadcast_exceptions = try owner.counter(.{ .namespace = namespace, .name = "broadcast_exceptions", .description = "Broadcast recipients requiring individual packet admission" }),
+            .input_packets = try owner.counter(.{ .namespace = namespace, .name = "input_packets", .description = "Packets admitted to simulation ticks" }),
+            .input_bytes = try owner.counter(.{ .namespace = namespace, .name = "input_bytes", .description = "Packet bytes admitted to simulation ticks", .unit = .bytes }),
+            .input_deferred = try owner.counter(.{ .namespace = namespace, .name = "input_deferred", .description = "Input loans deferred by per-tick work limits" }),
+            .input_pending = try owner.gauge(.{ .namespace = namespace, .name = "input_pending", .description = "Input loans retained for later ticks" }),
         };
     }
 };
@@ -30,6 +38,8 @@ pub const Configuration = struct {
     pages: usize = 32,
     page_bytes: usize = 384 * 1024,
     output_pool: ?*shared.Pool = null,
+    max_input_bytes: usize = 512 * 1024 - 3,
+    input_work: system.work.Limits = Service.default_input_work,
     protocols: []const engine.Protocol,
     metrics: ?*metrics.Registry = null,
 };
@@ -112,12 +122,33 @@ pub const Service = struct {
     committed_moves: []std.atomic.Value(usize),
     activity: []std.atomic.Value(usize),
     instruments: Instrumentation,
+    pending_inputs: []PendingInput,
+    input_head: ?usize = null,
+    input_tail: ?usize = null,
+    pending_input_count: usize = 0,
 
     pub const active: u64 = 1 << 31;
+    pub const default_input_work: system.work.Limits = .{
+        .guaranteed = .{ .operations = 8, .bytes = 8 * 1024 },
+        .burst = .{ .operations = 128, .bytes = 512 * 1024 },
+    };
+
+    const PendingInput = struct {
+        handle: ?network.Handle = null,
+        protocol: i32 = 0,
+        original: protocol_api.Packets = .{ .packets = &.{} },
+        remaining: protocol_api.Packets = .{ .packets = &.{} },
+        allowance: system.work.Cost = .{},
+        selected: usize = 0,
+        previous: ?usize = null,
+        next: ?usize = null,
+    };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, transport: network.Transport, config: Configuration) !*Service {
         if (config.page_bytes == 0 or config.protocols.len == 0 or config.buffer_bytes < frameBound(config.protocols, config.page_bytes) or config.buffer_bytes >= active or config.connections == 0)
             return error.InvalidConfiguration;
+        if (config.max_input_bytes == 0) return error.InvalidConfiguration;
+        try config.input_work.validate(config.connections, .{ .operations = 1, .bytes = config.max_input_bytes });
 
         const instrumentation = try Instrumentation.init(config.metrics, "session.producer");
         const self = try allocator.create(Service);
@@ -134,8 +165,11 @@ pub const Service = struct {
         const recipient_marks = try allocator.alloc(u64, config.connections);
         errdefer allocator.free(recipient_marks);
         @memset(recipient_marks, 0);
-        const batch = try allocator.alloc(Event, events.len);
+        const batch = try allocator.alloc(Event, try std.math.add(usize, events.len, config.connections));
         errdefer allocator.free(batch);
+        const pending_inputs = try allocator.alloc(PendingInput, config.connections);
+        errdefer allocator.free(pending_inputs);
+        @memset(pending_inputs, .{});
         const credit = try allocator.alloc(std.atomic.Value(u64), config.connections);
         errdefer allocator.free(credit);
 
@@ -179,6 +213,7 @@ pub const Service = struct {
             .events = events,
             .recipient_marks = recipient_marks,
             .batch = batch,
+            .pending_inputs = pending_inputs,
             .credit = credit,
             .disconnects = disconnects,
             .releases = releases,
@@ -194,6 +229,7 @@ pub const Service = struct {
     }
 
     pub fn deinit(self: *Service) void {
+        assert(self.pending_input_count == 0 and self.input_head == null and self.input_tail == null);
         for (self.output_notifications) |event| assert(event == null);
         assert(!self.tick_active and self.staged_move == null and self.preparing.load(.acquire) == 0);
         assert(self.owner == null and self.readiness == null);
@@ -218,6 +254,7 @@ pub const Service = struct {
         self.allocator.free(self.events);
         self.allocator.free(self.recipient_marks);
         self.allocator.free(self.batch);
+        self.allocator.free(self.pending_inputs);
         self.allocator.destroy(self);
     }
 
@@ -225,7 +262,7 @@ pub const Service = struct {
 
     pub fn memoryBytes(self: *const Service) usize {
         return @sizeOf(Service) - @sizeOf(shared.SharedPages) + self.output.memoryBytes() +
-            (self.events.len + self.batch.len) * @sizeOf(Event) +
+            (self.events.len + self.batch.len) * @sizeOf(Event) + self.pending_inputs.len * @sizeOf(PendingInput) +
             self.recipient_marks.len * @sizeOf(u64) +
             self.credit.len * @sizeOf(std.atomic.Value(u64)) + (self.disconnects.len + self.releases.len + self.departed.len) * @sizeOf(std.atomic.Value(u32)) +
             self.routes.len * @sizeOf(?network.Handle) + self.occupied.len * @sizeOf(std.atomic.Value(bool)) + self.moves.len * @sizeOf(Move) + (self.committed_moves.len + self.activity.len) * @sizeOf(std.atomic.Value(usize));
@@ -300,8 +337,29 @@ pub const Service = struct {
         reservation: ?shared.Reservation,
         bytes: []u8,
         epoch: ?u64 = null,
+        credit: ?struct { handle: network.Handle, bytes: usize } = null,
+
+        pub fn limit(self: *Packet, maximum: usize) void {
+            assert(self.reservation != null and self.credit == null);
+            assert(maximum > 0 and maximum <= self.bytes.len);
+            self.bytes = self.bytes[0..maximum];
+            self.reservation.?.bytes = self.bytes;
+        }
+
+        /// Prepared bytes belong to the selected protocol. Reserve for their decoded bound too.
+        pub fn prepare(self: *Packet, decoded_length: usize) void {
+            assert(self.reservation != null and self.credit == null);
+            assert(decoded_length > 0 and decoded_length <= self.bytes.len);
+            self.reservation.?.decoded_length = decoded_length;
+        }
+
+        fn boundLength(self: *const Packet, length: usize) usize {
+            return @max(length, self.reservation.?.decoded_length);
+        }
 
         pub fn cancel(self: *Packet) void {
+            if (self.credit) |held| self.owner.refund(held.handle, held.bytes);
+            self.credit = null;
             if (self.reservation) |reservation| self.owner.output.cancel(reservation);
             self.reservation = null;
             self.bytes = &.{};
@@ -324,7 +382,10 @@ pub const Service = struct {
                 if (epoch & 1 != 0 or self.owner.epoch.load(.acquire) != epoch) return error.Backpressured;
             }
             reservation.bytes = reservation.bytes[0..length];
-            try self.owner.publish(reservation, recipients);
+            try self.owner.admitPacket(self, length, recipients);
+            const published = self.owner.output.publish(reservation, recipients);
+            assert(published);
+            _ = self.owner.published_since_flush.fetchAdd(1, .release);
             self.reservation = null;
         }
 
@@ -336,7 +397,8 @@ pub const Service = struct {
             var count: usize = 0;
 
             for (recipients) |handle| {
-                if (!self.owner.canSend(handle, length)) continue;
+                const prepaid = if (self.credit) |held| std.meta.eql(held.handle, handle) else false;
+                if (!prepaid and !self.owner.canSend(handle, self.boundLength(length))) continue;
                 recipients[count] = handle;
                 count += 1;
             }
@@ -375,6 +437,26 @@ pub const Service = struct {
         return count;
     }
 
+    /// Whether shutdown began, after which every reservation fails as closed.
+    pub fn stopped(self: *const Service) bool {
+        return self.stopping.load(.acquire);
+    }
+
+    /// How many of `wanted` packets the shared output pool can hold right now if each takes
+    /// one unit. A shortfall publishes pending output, as a failed reservation does, so the
+    /// pool can drain.
+    /// How many of these reservations, taken in order, the output pool has room for
+    /// now. Asked before the work a packet needs is done, so that none of it is done
+    /// for a packet that cannot be reserved.
+    pub fn outputFit(self: *Service, lengths: []const usize) usize {
+        const room = self.output.fit(lengths);
+        if (room != lengths.len) {
+            self.instruments.reserve_failures.add(1);
+            self.flushPressure();
+        }
+        return room;
+    }
+
     pub fn reserveBatch(self: *Service, lengths: []const usize, packets: []Packet) SendError!usize {
         assert(lengths.len == packets.len and packets.len <= batch_max);
         if (self.stopping.load(.acquire)) return error.Closed;
@@ -387,6 +469,68 @@ pub const Service = struct {
             self.flushPressure();
         }
         return count;
+    }
+
+    pub const RecipientReservation = struct {
+        const Credit = struct { handle: network.Handle, bytes: usize };
+        owner: *Service,
+        credits: [batch_max]Credit = undefined,
+        count: usize = 0,
+
+        pub fn available(self: *const RecipientReservation, handle: network.Handle) usize {
+            for (self.credits[0..self.count]) |held| if (std.meta.eql(held.handle, handle)) return held.bytes;
+            return 0;
+        }
+
+        pub fn canWrite(self: *const RecipientReservation, packet: *const Packet, handle: network.Handle) bool {
+            assert(packet.owner == self.owner and packet.reservation != null and packet.credit == null);
+            if (packet.epoch) |epoch| if (epoch & 1 != 0 or self.owner.epoch.load(.acquire) != epoch) return false;
+            return self.available(handle) >= self.owner.framedBound(packet.bytes.len);
+        }
+
+        pub fn finish(self: *RecipientReservation, packet: *Packet, handle: network.Handle, length: usize) void {
+            assert(packet.owner == self.owner and packet.reservation != null and packet.credit == null);
+            assert(length > 0 and length <= packet.bytes.len);
+            const bytes = self.owner.framedBound(packet.boundLength(length));
+            for (self.credits[0..self.count]) |*held| if (std.meta.eql(held.handle, handle)) {
+                assert(held.bytes >= self.owner.framedBound(packet.bytes.len));
+                held.bytes -= bytes;
+                packet.credit = .{ .handle = handle, .bytes = bytes };
+                return;
+            };
+            unreachable;
+        }
+
+        pub fn release(self: *RecipientReservation) void {
+            for (self.credits[0..self.count]) |held| self.owner.refund(held.handle, held.bytes);
+            self.count = 0;
+        }
+    };
+
+    /// Hold each recipient's available credit once. Actual packet lengths consume the reservation.
+    pub fn reserveRecipients(self: *Service, packets: []const Packet, recipients: []const network.Handle) RecipientReservation {
+        assert(packets.len == recipients.len and packets.len <= batch_max);
+        var reservation: RecipientReservation = .{ .owner = self };
+        self.publication.lockUncancelable(self.output.producer_io);
+        defer self.publication.unlock(self.output.producer_io);
+        for (packets, recipients, 0..) |packet, handle, index| {
+            assert(packet.owner == self and packet.reservation != null and packet.credit == null);
+            var duplicate = false;
+            for (recipients[0..index]) |previous| duplicate = duplicate or std.meta.eql(previous, handle);
+            if (duplicate) continue;
+            var maximum: usize = 0;
+            for (packets[index..], recipients[index..]) |candidate, recipient| {
+                if (std.meta.eql(recipient, handle)) maximum = @min(self.config.buffer_bytes, maximum + self.framedBound(candidate.bytes.len));
+            }
+            // Whatever is held here is out of reach of the simulation until the batch
+            // ends, so the floor stays where it is.
+            const bytes = @min(maximum, self.outputCredit(handle) -| self.backgroundFloor());
+            if (bytes == 0) continue;
+            self.chargeRecipients(bytes, &.{handle}) catch continue;
+            reservation.credits[reservation.count] = .{ .handle = handle, .bytes = bytes };
+            reservation.count += 1;
+        }
+        return reservation;
     }
 
     pub const Publication = struct { packet: *Packet, length: usize, recipients: []network.Handle };
@@ -413,9 +557,9 @@ pub const Service = struct {
             var stale = false;
             for (packets) |entry| {
                 assert(entry.packet.epoch == packets[0].packet.epoch);
-                assert(entry.packet.owner == self and entry.length > 0 and entry.length <= entry.packet.bytes.len);
+                assert(entry.packet.owner == self and entry.packet.credit == null and entry.length > 0 and entry.length <= entry.packet.bytes.len);
                 if (entry.packet.epoch) |epoch| stale = stale or epoch & 1 != 0 or self.epoch.load(.acquire) != epoch;
-                charge += self.framedBound(entry.length);
+                charge += self.framedBound(entry.packet.boundLength(entry.length));
             }
             if (stale) continue;
             assert(charge <= self.config.buffer_bytes);
@@ -475,6 +619,8 @@ pub const Service = struct {
         var reservations: [batch_max]shared.Reservation = undefined;
         var count: usize = 0;
         for (packets) |*packet| {
+            if (packet.credit) |held| self.refund(held.handle, held.bytes);
+            packet.credit = null;
             if (packet.reservation) |reservation| {
                 reservations[count] = reservation;
                 count += 1;
@@ -496,6 +642,8 @@ pub const Service = struct {
             var canceled: [batch_max]shared.Reservation = undefined;
             var cancel_count: usize = 0;
             for (publications) |publication| {
+                if (publication.packet.credit) |held| self.refund(held.handle, held.bytes);
+                publication.packet.credit = null;
                 if (publication.packet.reservation) |reservation| {
                     canceled[cancel_count] = reservation;
                     cancel_count += 1;
@@ -511,14 +659,15 @@ pub const Service = struct {
             if (packet.epoch) |epoch| if (epoch & 1 != 0 or self.epoch.load(.acquire) != epoch) continue;
             var recipients: usize = 0;
             for (publication.recipients) |handle| {
-                if (!self.canSend(handle, publication.length)) continue;
+                const prepaid = if (packet.credit) |held| std.meta.eql(held.handle, handle) else false;
+                if (!prepaid and !self.canSend(handle, packet.boundLength(publication.length))) continue;
                 publication.recipients[recipients] = handle;
                 recipients += 1;
             }
             if (recipients == 0) continue;
             var reservation = packet.reservation.?;
             reservation.bytes = reservation.bytes[0..publication.length];
-            self.admit(reservation, publication.recipients[0..recipients]) catch continue;
+            self.admitPacket(packet, publication.length, publication.recipients[0..recipients]) catch continue;
             pending[count] = .{ .reservation = reservation, .recipients = publication.recipients[0..recipients] };
             count += 1;
             packet.reservation = null;
@@ -541,19 +690,28 @@ pub const Service = struct {
         return packet;
     }
 
-    fn publish(self: *Service, reservation: shared.Reservation, recipients: []const network.Handle) SendError!void {
-        try self.admit(reservation, recipients);
-        const published = self.output.publish(reservation, recipients);
-        assert(published);
-        _ = self.published_since_flush.fetchAdd(1, .release);
-    }
-
-    fn admit(self: *Service, reservation: shared.Reservation, recipients: []const network.Handle) SendError!void {
-        try self.chargeRecipients(self.framedBound(reservation.bytes.len), recipients);
+    fn admitPacket(self: *Service, packet: *Packet, length: usize, recipients: []const network.Handle) SendError!void {
+        const bytes = self.framedBound(packet.boundLength(length));
+        if (packet.credit) |held| {
+            assert(bytes <= held.bytes);
+            var found: usize = 0;
+            for (recipients) |handle| found += @intFromBool(std.meta.eql(handle, held.handle));
+            assert(found == 1);
+            const value = self.credit[held.handle.index].load(.acquire);
+            if (value >> 32 != held.handle.generation or value & active == 0) return error.Closed;
+            if (self.moves[held.handle.index].state.load(.acquire) == .committed) return error.Closed;
+            try self.chargeRecipientsExcept(bytes, recipients, held.handle);
+            packet.credit = null;
+            self.refund(held.handle, held.bytes - bytes);
+        } else try self.chargeRecipients(bytes, recipients);
         _ = self.preparing.fetchAdd(1, .release);
     }
 
     fn chargeRecipients(self: *Service, charge_bytes: usize, recipients: []const network.Handle) SendError!void {
+        return self.chargeRecipientsExcept(charge_bytes, recipients, null);
+    }
+
+    fn chargeRecipientsExcept(self: *Service, charge_bytes: usize, recipients: []const network.Handle, prepaid: ?network.Handle) SendError!void {
         if (self.stopping.load(.acquire)) return error.Closed;
         self.publication_sequence +%= 1;
         if (self.publication_sequence == 0) {
@@ -561,9 +719,16 @@ pub const Service = struct {
             self.publication_sequence = 1;
         }
         var admitted: usize = 0;
-        errdefer for (recipients[0..admitted]) |handle| self.refund(handle, charge_bytes);
+        errdefer for (recipients[0..admitted]) |handle| {
+            if (prepaid) |held| if (std.meta.eql(handle, held)) continue;
+            self.refund(handle, charge_bytes);
+        };
 
         for (recipients) |handle| {
+            if (prepaid) |held| if (std.meta.eql(handle, held)) {
+                admitted += 1;
+                continue;
+            };
             if (handle.index >= self.credit.len) return error.Closed;
             if (self.moves[handle.index].state.load(.acquire) == .committed) return error.Closed;
 
@@ -738,9 +903,19 @@ pub const Service = struct {
         return length <= self.config.page_bytes and self.outputCredit(handle) >= self.framedBound(length);
     }
 
+    /// How many packets of this size background work may still send a connection.
     pub fn packetCapacity(self: *Service, handle: network.Handle, maximum_bytes: usize) usize {
         if (maximum_bytes > self.config.page_bytes) return 0;
-        return self.outputCredit(handle) / self.framedBound(maximum_bytes);
+        return (self.outputCredit(handle) -| self.backgroundFloor()) / self.framedBound(maximum_bytes);
+    }
+
+    /// Output credit of each connection that background work leaves alone: an eighth
+    /// of it, as far as a packet of the largest size still fits beside it. Terrain is
+    /// prepared on another thread and holds the credit of its players while it is. A
+    /// player whose whole credit was held then looked hopelessly behind to whatever the
+    /// simulation sent at that moment, and chat disconnected them for it.
+    pub fn backgroundFloor(self: *const Service) usize {
+        return @min(self.config.buffer_bytes / 8, self.config.buffer_bytes - self.framedBound(self.config.page_bytes));
     }
 
     pub fn framedBound(self: *const Service, length: usize) usize {
@@ -867,18 +1042,123 @@ pub const Service = struct {
         self.tick_active = true;
         var count: usize = 0;
 
-        while (count < self.batch.len) {
+        var events: usize = 0;
+        while (events < self.events.len) : (events += 1) {
             const event = self.next() orelse break;
             if (event == .input and self.moves[event.input.handle.index].state.load(.acquire) == .committed) {
                 self.release(event.input.handle);
                 continue;
             }
-
+            if (event == .input) {
+                const input = event.input;
+                const pending = &self.pending_inputs[input.handle.index];
+                assert(pending.handle == null and !input.packets.empty());
+                pending.* = .{ .handle = input.handle, .protocol = input.protocol, .original = input.packets, .remaining = input.packets };
+                self.appendInput(input.handle.index);
+                continue;
+            }
             self.batch[count] = event;
             count += 1;
         }
 
+        var cursor = self.input_head;
+        var admitted: system.work.Cost = .{};
+        while (cursor) |index| {
+            const pending = &self.pending_inputs[index];
+            cursor = pending.next;
+            pending.original = pending.remaining;
+            pending.selected = 0;
+            pending.allowance = self.config.input_work.guaranteed;
+            var burst: system.work.Cost = .{};
+            self.selectInput(index, &burst, &admitted);
+        }
+        var burst = self.config.input_work.burst;
+        cursor = self.input_head;
+        const waiting = self.pending_input_count;
+        for (0..waiting) |_| {
+            const index = cursor.?;
+            const pending = &self.pending_inputs[index];
+            cursor = pending.next;
+            const selected = pending.selected;
+            self.selectInput(index, &burst, &admitted);
+            if (pending.selected != selected and index != self.input_tail) {
+                self.unlinkInput(index);
+                self.appendInput(index);
+            }
+        }
+        cursor = self.input_head;
+        var deferred: usize = 0;
+        while (cursor) |index| {
+            const pending = &self.pending_inputs[index];
+            cursor = pending.next;
+            deferred += @intFromBool(!pending.remaining.empty());
+            if (pending.selected == 0) continue;
+            assert(count < self.batch.len);
+            self.batch[count] = .{ .input = .{ .handle = pending.handle.?, .protocol = pending.protocol, .packets = pending.original.before(pending.remaining) } };
+            count += 1;
+        }
+
         self.input_events = self.batch[0..count];
+        const maximum = self.config.input_work.maximum(self.pending_inputs.len) catch unreachable;
+        assert(admitted.operations <= maximum.operations and admitted.bytes <= maximum.bytes);
+        self.instruments.input_packets.add(admitted.operations);
+        self.instruments.input_bytes.add(admitted.bytes);
+        self.instruments.input_deferred.add(deferred);
+        self.instruments.input_pending.set(deferred);
+    }
+
+    fn appendInput(self: *Service, index: usize) void {
+        const pending = &self.pending_inputs[index];
+        assert(pending.previous == null and pending.next == null);
+        pending.previous = self.input_tail;
+        if (self.input_tail) |tail| self.pending_inputs[tail].next = index else self.input_head = index;
+        self.input_tail = index;
+        self.pending_input_count += 1;
+        assert(self.pending_input_count <= self.pending_inputs.len);
+    }
+
+    fn unlinkInput(self: *Service, index: usize) void {
+        const pending = &self.pending_inputs[index];
+        if (pending.previous) |previous| self.pending_inputs[previous].next = pending.next else self.input_head = pending.next;
+        if (pending.next) |following| self.pending_inputs[following].previous = pending.previous else self.input_tail = pending.previous;
+        pending.previous = null;
+        pending.next = null;
+        assert(self.pending_input_count > 0);
+        self.pending_input_count -= 1;
+    }
+
+    fn selectInput(self: *Service, index: usize, burst: *system.work.Cost, admitted: *system.work.Cost) void {
+        const pending = &self.pending_inputs[index];
+        const allowance: system.work.Allowance = .{ .guaranteed = &pending.allowance, .burst = burst };
+        while (!pending.remaining.empty()) {
+            var rest = pending.remaining;
+            const packet = (rest.next() catch unreachable).?;
+            assert(packet.len <= self.config.max_input_bytes);
+            if (!allowance.take(.{ .operations = 1, .bytes = packet.len })) break;
+            pending.remaining = rest;
+            pending.selected += 1;
+            admitted.operations += 1;
+            admitted.bytes += packet.len;
+        }
+    }
+
+    /// The simulation consumer must be quiescent before abandoning its loans.
+    pub fn discardInputs(self: *Service) void {
+        assert(!self.tick_active);
+        var notify = false;
+        while (self.input_head) |index| {
+            const handle = self.pending_inputs[index].handle.?;
+            self.unlinkInput(index);
+            self.pending_inputs[index] = .{};
+            self.releaseInput(handle);
+            notify = true;
+        }
+        while (self.next()) |event| if (event == .input) {
+            self.releaseInput(event.input.handle);
+            notify = true;
+        };
+        if (notify) self.transport.notify(self.io);
+        self.instruments.input_pending.set(0);
     }
 
     pub fn endTick(self: *Service, completed: bool) void {
@@ -886,8 +1166,15 @@ pub const Service = struct {
 
         var notify = false;
         for (self.input_events) |event| if (event == .input) {
-            self.releaseInput(event.input.handle);
-            notify = true;
+            const index = event.input.handle.index;
+            const pending = &self.pending_inputs[index];
+            assert(std.meta.eql(pending.handle.?, event.input.handle));
+            if (pending.remaining.empty() or !completed or self.moves[index].state.load(.acquire) == .staged) {
+                self.unlinkInput(index);
+                pending.* = .{};
+                self.releaseInput(event.input.handle);
+                notify = true;
+            }
         };
 
         if (completed) for (self.input_events) |event| {
@@ -918,10 +1205,23 @@ pub const Service = struct {
                 move.state.store(.idle, .release);
             }
         }
+        var pending_cursor = self.input_head;
+        while (pending_cursor) |index| {
+            const pending = &self.pending_inputs[index];
+            pending_cursor = pending.next;
+            const handle = pending.handle.?;
+            if (!completed or self.moves[index].state.load(.acquire) == .committed or self.disconnects[index].load(.acquire) == handle.generation) {
+                self.unlinkInput(index);
+                pending.* = .{};
+                self.releaseInput(handle);
+                notify = true;
+            }
+        }
         const epoch = self.epoch.fetchAdd(1, .release);
         assert(epoch & 1 != 0);
         if (self.background_retry.swap(false, .acq_rel)) self.notifyOutput(self.io);
         if (notify) self.transport.notify(self.io);
+        self.instruments.input_pending.set(self.pending_input_count);
     }
 
     pub fn stop(self: *Service) void {

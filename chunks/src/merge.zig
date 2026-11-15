@@ -39,7 +39,8 @@ pub const Merger = struct {
     pub fn init(allocator: std.mem.Allocator, maximum: usize, section_count: usize, capacity: usize) !*Merger {
         const self = try allocator.create(Merger);
         errdefer allocator.destroy(self);
-        const slots = try allocator.alloc(Slot, @min(capacity, 32));
+        std.debug.assert(capacity > 0 and capacity <= 192);
+        const slots = try allocator.alloc(Slot, capacity);
         errdefer allocator.free(slots);
         @memset(slots, .{});
         const stride = zstandard.bound(maximum);
@@ -114,7 +115,7 @@ pub const Merger = struct {
         const slot_index = claim: while (self.next_group < self.group_count) {
             const key = self.groups[self.next_group];
             store.mutex.lockUncancelable(store.io);
-            if (store.writing or store.draining) {
+            if (store.writing) {
                 store.mutex.unlock(store.io);
                 return false;
             }
@@ -160,7 +161,6 @@ pub const Merger = struct {
         store.mutex.unlock(store.io);
         if (invalidated) return self.next_group < self.group_count or self.scan_more;
         const generation = self.generations[0];
-        if (generation == 0) return self.next_group < self.group_count or self.scan_more;
         for (self.generations[0..store.section_count]) |value| if (value != generation) return error.Corrupt;
         if (generation == std.math.maxInt(u64)) return error.NoSpace;
         std.mem.writeInt(u64, self.raw[0..8], generation + 1, .little);
@@ -176,7 +176,7 @@ pub const Merger = struct {
         store.table_lock.lockSharedUncancelable(store.io);
         const old_length = store.bases.backend.table.get(&slot.key, frame);
         store.table_lock.unlockShared(store.io);
-        const previous = (try old_length) orelse return self.next_group < self.group_count or self.scan_more;
+        const previous = (try old_length) orelse if (generation == 0) 0 else return self.next_group < self.group_count or self.scan_more;
         const encoded = if (offset == store.header_bytes) frame[0..0] else try self.codec.encode(self.raw[0..offset], frame);
         if (encoded.len >= previous + snapshot.overlay_bytes) return self.next_group < self.group_count or self.scan_more;
         store.mutex.lockUncancelable(store.io);

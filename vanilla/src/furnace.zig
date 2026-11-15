@@ -49,7 +49,8 @@ pub const State = struct {
 const batch_size = 32;
 
 pub fn tick(self: *containers.Containers) !void {
-    const capacity = @min(batch_size, self.active.len, self.deps.inventories.cache.entries.len / 3, self.deps.chunks.cache.entries.len);
+    // Sections stay within the simulation share of the chunk cache; the background may pin the rest.
+    const capacity = @min(batch_size, self.active.len, self.deps.inventories.cache.entries.len / 3, self.deps.chunks.demandCapacity());
     std.debug.assert(capacity > 0);
     var end = self.active_count;
     while (end > 0) {
@@ -112,7 +113,7 @@ pub fn tick(self: *containers.Containers) !void {
             const lit = state.burn_left > 0;
             const block_info = self.states.furnaceInfo(block);
             if (block_info.lit != lit) {
-                const updated = self.states.furnaces[@intFromEnum(block_info.facing)][@intFromBool(lit)];
+                const updated = self.states.furnaces[@backingInt(block_info.facing)][@intFromBool(lit)];
                 const section = sections[index];
                 const at = for (changes[0..change_count], 0..) |change, position| {
                     if (std.meta.eql(change.section, section)) break position;

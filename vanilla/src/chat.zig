@@ -22,13 +22,22 @@ pub const Chat = struct {
         length: usize = 0,
         recipients: []sessions.Service.Target,
         count: usize = 0,
+        /// The tick a recipient first had no output credit for this message.
+        blocked_since: ?u64 = null,
     };
+
+    /// Ticks a recipient may go without output credit for a message before it is
+    /// disconnected. A connection whose output is full of terrain is not behind, and
+    /// terrain fills it whenever a player loads an area. One that takes nothing for
+    /// five seconds is.
+    const patience_ticks = 100;
 
     deps: Dependencies,
     messages: []Message,
     delivered: []sessions.Service.Delivery,
     read: u64 = 0,
     write: u64 = 0,
+    ticks: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies, config: Configuration) !*Chat {
         if (config.pending_messages == 0 or config.pending_messages > 4096) return error.InvalidConfiguration;
@@ -45,6 +54,7 @@ pub const Chat = struct {
     }
 
     pub fn tick(self: *Chat) !void {
+        self.ticks += 1;
         try self.flush();
     }
 
@@ -62,7 +72,9 @@ pub const Chat = struct {
 
             for (message.recipients[0..message.count], self.delivered[0..message.count]) |target, result| {
                 if (result != .backpressured) continue;
-                if (!service.canSend(target.handle, message.length + 8)) {
+                if (!service.canSend(target.handle, message.length + 8) and self.ticks - (message.blocked_since orelse self.ticks) >= patience_ticks) {
+                    // An operator needs to tell this from a player who left.
+                    std.log.warn("event=chat_recipient_disconnected connection={d}:{d} output_credit={d} needed={d}", .{ target.handle.index, target.handle.generation, service.outputCredit(target.handle), service.framedBound(message.length + 8) });
                     service.disconnect(target.handle);
                     continue;
                 }
@@ -72,7 +84,11 @@ pub const Chat = struct {
             }
 
             message.count = remaining;
-            if (remaining != 0) break;
+            if (remaining != 0) {
+                if (message.blocked_since == null) message.blocked_since = self.ticks;
+                break;
+            }
+            message.blocked_since = null;
             self.read += 1;
         }
     }

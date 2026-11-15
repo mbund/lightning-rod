@@ -79,6 +79,15 @@ pub const Crypt = struct {
 
     pub const Wire = struct {
         pub const Workspace = java.Wire.Workspace;
+        pub const Encryption = sessions.protocol.Encryption(Crypt.Connection);
+        pub const encryption_batch_size = 4;
+
+        pub fn encryptBatch(source: []const u8, targets: []const Encryption) void {
+            for (targets) |target| {
+                target.connection.encrypt(source[0..target.first.len], target.first);
+                target.connection.encrypt(source[target.first.len..], target.second);
+            }
+        }
         pub const always_copy = true;
         pub const frame_bound: sessions.protocol.Protocol.FrameBound = .{ .expansion_per_mille = 0, .overhead = 2 };
 
@@ -139,6 +148,10 @@ pub const Crypt = struct {
         pub fn encrypt(_: *Connection, source: []const u8, destination: []u8) void {
             std.debug.assert(source.len == destination.len);
             for (source, destination) |byte, *out| out.* = byte ^ 0x5a;
+        }
+
+        pub fn encryption(self: *Connection, first: []u8, second: []u8) Crypt.Wire.Encryption {
+            return .{ .connection = self, .first = first, .second = second };
         }
 
         pub fn clear(self: *Connection) void {

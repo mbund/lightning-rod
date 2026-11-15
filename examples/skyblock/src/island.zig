@@ -23,11 +23,12 @@ const defaults = lightning_rod.plugin.remove(lightning_rod.plugin.replace(lightn
 const Selections = lightning_rod.plugin.Compose(@Tuple(&.{ @TypeOf(defaults), lightning_rod.plugin.Selection(IslandCommands), lightning_rod.plugin.Selection(global_chat.GlobalChat) }));
 const Simulation = lightning_rod.Simulation(Selections);
 
-fn selections(content: vanilla.definition_provider.Dependencies, config: IslandCommands.Configuration, chat: *global_chat.Channel, resources: *records.Resources, wakeup: *std.Io.Event, request: *reload.Request) !Selections {
+fn selections(content: vanilla.definition_provider.Dependencies, config: IslandCommands.Configuration, chat: *global_chat.Channel, resources: *records.Resources, delivery: *vanilla.chunk_delivery.Workspace, wakeup: *std.Io.Event, request: *reload.Request) !Selections {
     const column_sections = (try content.dimensions.dimension("minecraft:overworld")).section_count;
     return lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(lightning_rod.plugin.replace(defaults, vanilla.definition_provider.selections(content)), .{
             lightning_rod.plugin.configured(records.Workspaces, .{ .shared = resources }),
+            lightning_rod.plugin.configured(vanilla.Streaming, .{ .delivery_workspace = delivery }),
             lightning_rod.plugin.configured(vanilla.Operators, .{ .operators = &operators }),
             lightning_rod.plugin.configured(sessions.World, .{ .endpoint = config.routing.endpoints[config.index] }),
             lightning_rod.plugin.configured(Terrain, .{ .kind = if (config.index == 0) .hub else .island }),
@@ -48,6 +49,7 @@ pub const Island = struct {
     slot: ?*Slots.Slot = null,
     worlds: *Worlds,
     record_resources: *records.Resources,
+    delivery: *vanilla.chunk_delivery.Workspace,
     io: std.Io,
     wakeup: *std.Io.Event,
     terrain: ?vanilla.Terrain = null,
@@ -85,7 +87,7 @@ pub const Island = struct {
                 self.scheduled = false;
                 const allocator = self.slot.?.allocator();
                 if (self.scope == null) self.scope = try self.worlds.create(self.index);
-                const plugins = try selections(self.content, .{ .catalog = self.catalog, .routing = self.routing, .index = self.index }, self.chat, self.record_resources, self.wakeup, &self.request);
+                const plugins = try selections(self.content, .{ .catalog = self.catalog, .routing = self.routing, .index = self.index }, self.chat, self.record_resources, self.delivery, self.wakeup, &self.request);
                 self.simulation = try Simulation.init(allocator, self.io, self.worlds.space.store, .{
                     .scratch = scratch,
                     .scope = &self.scope.?,
@@ -143,6 +145,7 @@ pub const Pool = struct {
     pub const Worker = struct {
         io: std.Io,
         record_resources: *records.Resources,
+        delivery: *vanilla.chunk_delivery.Workspace,
         index: usize,
         scratch: [256 * 1024]u8 = undefined,
         thread: ?std.Thread = null,
@@ -255,7 +258,10 @@ pub const Pool = struct {
             worker.islands = islands;
             worker.background_thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, Worker.runBackground, .{worker});
             worker.background_parked.waitUncancelable(worker.io);
-            worker.thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, Worker.run, .{worker});
+            // Opening an island builds every plugin on this thread. A debug build keeps each
+            // one on the stack while it is filled in and needs between two and four MiB for
+            // that. Only the pages that are touched are ever backed by memory.
+            worker.thread = try std.Thread.spawn(.{ .stack_size = 4 * 1024 * 1024 }, Worker.run, .{worker});
         }
     }
 
@@ -287,7 +293,7 @@ pub const Pool = struct {
                 const allocator = slot.allocator();
                 var request: reload.Request = .{ .enabled = true };
                 const simulation = try Simulation.init(allocator, worker.io, prototype.worlds.space.store, .{ .scratch = &worker.scratch });
-                try simulation.reserve(try selections(prototype.content, .{ .catalog = prototype.catalog, .routing = prototype.routing, .index = prototype.index }, prototype.chat, worker.record_resources, &worker.background_ready, &request), .{ .metrics = &simulation.metrics, .routing = prototype.routing });
+                try simulation.reserve(try selections(prototype.content, .{ .catalog = prototype.catalog, .routing = prototype.routing, .index = prototype.index }, prototype.chat, worker.record_resources, worker.delivery, &worker.background_ready, &request), .{ .metrics = &simulation.metrics, .routing = prototype.routing });
                 try simulation.unload(std.Io.Clock.Timestamp.fromNow(worker.io, .{ .clock = .awake, .raw = .fromSeconds(30) }));
                 simulation.deinit(allocator);
             }

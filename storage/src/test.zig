@@ -5,6 +5,31 @@ const metrics = @import("metrics");
 const fault = @import("fault_disk.zig");
 const testing = @import("testing.zig");
 
+test "maintenance work limits validate before opening a database" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/maintenance", .{temporary.sub_path});
+    var options: storage.Store.Options = .{
+        .path = path,
+        .io_mode = .standard,
+        .maximum_wal_pages = 64,
+        .maintenance_work = .{
+            .guaranteed = .{ .operations = 2, .bytes = storage.page_size },
+            .burst = .{ .operations = 3, .bytes = storage.page_size },
+        },
+    };
+    options.maintenance_work.burst.bytes += 1;
+    try std.testing.expectError(error.InvalidMaintenanceBudget, storage.Store.init(std.testing.allocator, std.testing.io, options));
+    options.maintenance_work.burst.bytes -= 1;
+    options.maintenance_work.guaranteed.bytes = 0;
+    try std.testing.expectError(error.InvalidWorkLimits, storage.Store.init(std.testing.allocator, std.testing.io, options));
+    options.maintenance_work.guaranteed.bytes = storage.page_size;
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, options);
+    defer store.deinit();
+    try std.testing.expectEqual(storage.MaintenanceBudget{ .index_entries = 5, .pages = 2 }, store.maintenanceBudget());
+}
+
 test "scoped roots and ticks recover together and discard an incomplete group" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -556,15 +581,15 @@ test "WAL recovery rejects damaged frames and invalid embedded block headers" {
                     frames[0][32] ^= 255;
                     // Keep both outer checksums valid to exercise the embedded header check.
                     @memset(frames[0][16..24], 0);
-                    std.mem.writeInt(u64, frames[0][16..24], std.hash.XxHash64.hash(0x4c52504147455231, &frames[0]), .little);
-                    var digest = std.hash.XxHash64.init(0x4c52504147455231);
+                    std.mem.writeInt(u64, frames[0][16..24], std.hash.Wyhash.hash(0x4c52504147455231, &frames[0]), .little);
+                    var digest = std.hash.Wyhash.init(0x4c52504147455231);
                     var previous: [8]u8 = undefined;
                     std.mem.writeInt(u64, &previous, previous_hash, .little);
                     digest.update(&previous);
                     digest.update(frames[0][16..24]);
                     std.mem.writeInt(u64, frames[1][24..32], digest.final(), .little);
                     @memset(frames[1][16..24], 0);
-                    std.mem.writeInt(u64, frames[1][16..24], std.hash.XxHash64.hash(0x4c52504147455231, &frames[1]), .little);
+                    std.mem.writeInt(u64, frames[1][16..24], std.hash.Wyhash.hash(0x4c52504147455231, &frames[1]), .little);
                 },
             }
             try store.wal.writePositionalAll(io, std.mem.asBytes(&frames), committed_end);
@@ -1941,47 +1966,65 @@ test "cache misses and read completions each notify a blocked maintenance owner"
 
 test "streaming payload reads preserve hot pages and observe current WAL images" {
     const io = std.testing.io;
-    var temporary = std.testing.tmpDir(.{});
-    defer temporary.cleanup();
-    var path_buffer: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/streaming-cache", .{temporary.sub_path});
-    var memory = storage.system.Memory.init(std.testing.allocator, io);
-    defer memory.deinit();
-    const allocator = memory.allocator("storage");
-    const resources = try storage.Resources.init(allocator, io, .{ .cache_pages = 1, .io_mode = .standard });
-    defer resources.deinit();
-    var store = try storage.Store.init(allocator, io, .{ .path = path, .resources = resources, .io_mode = .standard, .maximum_wal_pages = 128 });
-    defer store.deinit();
-    const space = try store.openSpace("pages");
-    var ids: [8]storage.PageId = undefined;
-    try space.allocatePages(&ids);
-    for (ids, 0..) |id, index| try space.writePages(&.{.{ .id = id, .source = &.{@intCast(index)} }});
-    try store.waitDurable(try store.commit(1));
-    memory.seal();
+    for ([_]storage.system.FileBatch.Mode{ .standard, .uring }) |mode| {
+        if (mode == .uring and builtin.os.tag != .linux) continue;
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        var path_buffer: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/streaming-cache", .{temporary.sub_path});
+        var memory = storage.system.Memory.init(std.testing.allocator, io);
+        defer memory.deinit();
+        const allocator = memory.allocator("storage");
+        var registry = try metrics.Registry.init(allocator, io, .{ .capacity = 64 });
+        defer registry.deinit();
+        const resources = try storage.Resources.init(allocator, io, .{ .cache_pages = 1, .io_mode = mode });
+        defer resources.deinit();
+        var store = try storage.Store.init(allocator, io, .{ .path = path, .resources = resources, .io_mode = mode, .maximum_wal_pages = 128, .metrics = &registry });
+        defer store.deinit();
+        const space = try store.openSpace("pages");
+        var ids: [8]storage.PageId = undefined;
+        try space.allocatePages(&ids);
+        for (ids, 0..) |id, index| try space.writePages(&.{.{ .id = id, .source = &.{@intCast(index)} }});
+        try store.waitDurable(try store.commit(1));
+        memory.seal();
 
-    var hot: [1]u8 = undefined;
-    try space.readPages(&.{.{ .id = ids[0], .destination = &hot }});
-    const version = resources.cache[0].generation;
-    var outputs: [8][1]u8 = undefined;
-    var reads: [8]storage.Read = undefined;
-    for (ids, &outputs, &reads) |id, *output, *read| read.* = .{ .id = id, .destination = output, .cache = .stream };
-    for (0..4) |_| {
+        var hot: [1]u8 = undefined;
+        try space.readPages(&.{.{ .id = ids[0], .destination = &hot }});
+        const version = resources.cache[0].generation;
+        var outputs: [8][1]u8 = undefined;
+        var reads: [8]storage.Read = undefined;
+        for (ids, &outputs, &reads) |id, *output, *read| read.* = .{ .id = id, .destination = output, .cache = .stream };
+        for (0..4) |_| {
+            try space.readPages(&reads);
+            for (outputs, 0..) |output, index| try std.testing.expectEqual(@as(u8, @intCast(index)), output[0]);
+            try std.testing.expectEqual(version, resources.cache[0].generation);
+            try std.testing.expectEqual(@backingInt(ids[0]), resources.cache[0].id);
+            try std.testing.expect(resources.cache[0].loaded);
+            try std.testing.expectEqual(@as(usize, 1), resources.cache_index.count());
+        }
+
+        var duplicates: [3][1]u8 = undefined;
+        try space.readPages(&.{
+            .{ .id = ids[1], .destination = &duplicates[0], .cache = .stream },
+            .{ .id = ids[2], .destination = &duplicates[1], .cache = .stream },
+            .{ .id = ids[1], .offset = 1, .destination = &duplicates[2], .cache = .stream },
+        });
+        try std.testing.expectEqualDeep([3][1]u8{ .{1}, .{2}, .{0} }, duplicates);
+        var full: storage.Page = undefined;
+        try space.readPages(&.{.{ .id = ids[3], .destination = &full, .cache = .stream }});
+        try std.testing.expectEqual(@as(u8, 3), full[0]);
+        try std.testing.expect(std.mem.allEqual(u8, full[1..], 0));
+        try std.testing.expectEqual(mode == .uring, store.read_direct_bytes.value() != 0);
+
+        try space.writePages(&.{.{ .id = ids[0], .source = &.{99} }});
         try space.readPages(&reads);
-        for (outputs, 0..) |output, index| try std.testing.expectEqual(@as(u8, @intCast(index)), output[0]);
-        try std.testing.expectEqual(version, resources.cache[0].generation);
-        try std.testing.expectEqual(@backingInt(ids[0]), resources.cache[0].id);
-        try std.testing.expect(resources.cache[0].loaded);
-        try std.testing.expectEqual(@as(usize, 1), resources.cache_index.count());
+        try std.testing.expectEqual(@as(u8, 99), outputs[0][0]);
+        try space.writePages(&.{.{ .id = ids[1], .source = &.{88} }});
+        try space.readPages(&reads);
+        try std.testing.expectEqual(@as(u8, 99), outputs[0][0]);
+        try std.testing.expectEqual(@as(u8, 88), outputs[1][0]);
+        for (outputs[2..], 2..) |output, index| try std.testing.expectEqual(@as(u8, @intCast(index)), output[0]);
     }
-
-    try space.writePages(&.{.{ .id = ids[0], .source = &.{99} }});
-    try space.readPages(&reads);
-    try std.testing.expectEqual(@as(u8, 99), outputs[0][0]);
-    try space.writePages(&.{.{ .id = ids[1], .source = &.{88} }});
-    try space.readPages(&reads);
-    try std.testing.expectEqual(@as(u8, 99), outputs[0][0]);
-    try std.testing.expectEqual(@as(u8, 88), outputs[1][0]);
-    for (outputs[2..], 2..) |output, index| try std.testing.expectEqual(@as(u8, @intCast(index)), output[0]);
 }
 
 test "cache indexing preserves database identity and pinned versions under sealed churn" {
@@ -2153,4 +2196,169 @@ test "WAL index pressure recycles small committed transactions before the byte t
     }
     try std.testing.expectEqual(@as(u64, 199), store.lastTick());
     try std.testing.expectEqual(failing.fail_index, failing.alloc_index);
+}
+
+test "disposable cache writes exceed pending capacity without a WAL or world commit" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/cache-owner", .{temporary.sub_path});
+    const options: storage.Store.Options = .{ .path = path, .io_mode = .standard, .maximum_wal_pages = 64 };
+    for (0..2) |phase| {
+        var owner = try storage.Store.init(std.testing.allocator, io, options);
+        defer owner.deinit();
+        const cache = try owner.openCache(".cache", .{});
+        const space = try cache.openSpace("records");
+        const content: storage.Page = @splat(0x73);
+        if (phase == 0) {
+            const commit = owner.lastCommit();
+            for (0..64) |batch| {
+                var ids: [storage.batch_size]storage.PageId = undefined;
+                var writes: [storage.batch_size]storage.Write = undefined;
+                try space.allocatePages(&ids);
+                for (ids, &writes) |id, *write| write.* = .{ .id = id, .source = &content };
+                try space.writePages(&writes);
+                if (batch == 0) try space.setRoot(ids[0]);
+                try cache.publish();
+            }
+            try std.testing.expectEqual(commit, owner.lastCommit());
+            try std.testing.expectEqual(@as(usize, 0), cache.store.locations.count());
+            try std.testing.expectEqual(@as(u64, 2049), cache.store.metadata.pages);
+            const wal = temporary.dir.openFile(io, "cache-owner.cache.wal", .{});
+            try std.testing.expectError(error.FileNotFound, wal);
+        }
+        var actual: storage.Page = undefined;
+        try space.readPages(&.{.{ .id = (try space.getRoot()).?, .destination = &actual }});
+        try std.testing.expectEqualSlices(u8, &content, &actual);
+    }
+}
+
+test "corrupt disposable cache roots are discarded without changing the world" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/corrupt-cache", .{temporary.sub_path});
+    const options: storage.Store.Options = .{ .path = path, .io_mode = .standard, .maximum_wal_pages = 64 };
+    {
+        var owner = try storage.Store.init(std.testing.allocator, io, options);
+        defer owner.deinit();
+        try owner.waitDurable(try owner.commit(5));
+        const cache = try owner.openCache(".cache", .{});
+        const space = try cache.openSpace("records");
+        var ids: [1]storage.PageId = undefined;
+        try space.allocatePages(&ids);
+        const page: storage.Page = @splat(7);
+        try space.writePages(&.{.{ .id = ids[0], .source = &page }});
+        try space.setRoot(ids[0]);
+        try cache.publish();
+        try cache.store.database.writePositionalAll(io, &.{0xff}, @backingInt(ids[0]) * 4096);
+    }
+    var owner = try storage.Store.init(std.testing.allocator, io, options);
+    defer owner.deinit();
+    const cache = try owner.openCache(".cache", .{});
+    const space = try cache.openSpace("records");
+    try std.testing.expectEqual(@as(?storage.PageId, null), try space.getRoot());
+    try std.testing.expectEqual(@as(u64, 5), owner.lastTick());
+}
+
+test "a damaged disposable cache is emptied in place until damage keeps recurring" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/reset-cache", .{temporary.sub_path});
+    const options: storage.Store.Options = .{ .path = path, .io_mode = .standard, .maximum_wal_pages = 64 };
+    const old: storage.Page = @splat(0x11);
+    const new: storage.Page = @splat(0x22);
+    var actual: storage.Page = undefined;
+    {
+        var owner = try storage.Store.init(std.testing.allocator, io, options);
+        defer owner.deinit();
+        const commit = owner.lastCommit();
+        const cache = try owner.openCache(".cache", .{});
+        const space = try cache.openSpace("records");
+        const other = try cache.openSpace("other");
+        var ids: [8]storage.PageId = undefined;
+        var writes: [8]storage.Write = undefined;
+        try space.allocatePages(&ids);
+        for (ids, &writes) |id, *write| write.* = .{ .id = id, .source = &old };
+        try space.writePages(&writes);
+        try space.setRoot(ids[7]);
+        try cache.publish();
+        // Allocated pages that were never written must not survive either.
+        var pending: [4]storage.PageId = undefined;
+        try other.allocatePages(&pending);
+        try std.testing.expectEqual(@as(usize, 4), cache.store.locations.count());
+        const before = try space.revision();
+        // A healthy cache is left alone.
+        try std.testing.expect(!try cache.reset());
+        cache.store.failed = true;
+        try std.testing.expectError(error.FailedTransaction, space.getRoot());
+        {
+            const use = cache.use();
+            defer use.end();
+            try std.testing.expectEqual(@as(u32, 0), use.generation);
+            try std.testing.expect(use.ready());
+            try std.testing.expect(use.damage());
+            try std.testing.expect(!use.damage());
+            try std.testing.expect(!use.ready());
+        }
+        try std.testing.expect(try cache.reset());
+        try std.testing.expect(!try cache.reset());
+        const after = try space.revision();
+        try std.testing.expect(!std.mem.eql(u8, &before.identity, &after.identity));
+        try std.testing.expect(before.mutation != after.mutation);
+        try std.testing.expectEqual(@as(?storage.PageId, null), try space.getRoot());
+        try std.testing.expectEqual(@as(?storage.PageId, null), try other.getRoot());
+        try std.testing.expectEqual(@as(u64, 1), cache.store.metadata.pages);
+        try std.testing.expectEqual(@as(usize, 0), cache.store.locations.count());
+        try std.testing.expectEqual(@as(usize, 0), cache.store.resources.cache_index.count());
+        try std.testing.expectEqual(@as(u64, 4096), (try cache.store.database.stat(io)).size);
+        try std.testing.expectEqual(commit, owner.lastCommit());
+        {
+            const use = cache.use();
+            defer use.end();
+            try std.testing.expectEqual(@as(u32, 1), use.generation);
+            try std.testing.expect(use.ready());
+        }
+
+        // The first page ID is issued again and must not serve the page cached under it before.
+        var fresh: [1]storage.PageId = undefined;
+        try other.allocatePages(&fresh);
+        try std.testing.expectEqual(ids[0], fresh[0]);
+        try other.writePages(&.{.{ .id = fresh[0], .source = &new }});
+        try other.readPages(&.{.{ .id = fresh[0], .destination = &actual }});
+        try std.testing.expectEqualSlices(u8, &new, &actual);
+        try other.setRoot(fresh[0]);
+        try cache.publish();
+    }
+    var owner = try storage.Store.init(std.testing.allocator, io, options);
+    defer owner.deinit();
+    const cache = try owner.openCache(".cache", .{});
+    const space = try cache.openSpace("records");
+    const other = try cache.openSpace("other");
+    try std.testing.expectEqual(@as(u64, 2), cache.store.metadata.pages);
+    try std.testing.expectEqual(@as(?storage.PageId, null), try space.getRoot());
+    try other.readPages(&.{.{ .id = (try other.getRoot()).?, .destination = &actual }});
+    try std.testing.expectEqualSlices(u8, &new, &actual);
+
+    // The limit counts resets within one process.
+    for (0..storage.DiskCache.resets_max) |round| {
+        const use = cache.use();
+        try std.testing.expectEqual(@as(u32, @intCast(round)), use.generation);
+        try std.testing.expect(use.damage());
+        use.end();
+        try std.testing.expect(try cache.reset());
+    }
+    const use = cache.use();
+    try std.testing.expect(use.damage());
+    use.end();
+    try std.testing.expectError(error.RepeatedDamage, cache.reset());
+    try std.testing.expectEqual(storage.DiskCache.State.discarded, cache.state.load(.acquire));
+    try std.testing.expectError(error.FailedTransaction, other.getRoot());
+    try std.testing.expectError(error.FileNotFound, temporary.dir.access(io, "reset-cache.cache", .{}));
+    try std.testing.expect(!try cache.reset());
+    try std.testing.expect(!try cache.discard());
 }

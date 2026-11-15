@@ -39,8 +39,23 @@ pub const Startup = struct {
     }
 };
 
+/// The pause the next tick keeps from the end of one that overran. Terrain is published
+/// only between ticks, so ticks back to back would leave it no moment to, and an
+/// overloaded server would stop sending terrain altogether.
+pub const overrun_gap_ns = tick_ns / 10;
+
 pub fn nextTick(previous: i96, now: i96) i96 {
-    return @max(previous + tick_ns, now);
+    return @max(previous + tick_ns, now + overrun_gap_ns);
+}
+
+test "a tick that overran is followed by a pause and one on time is not delayed" {
+    const start: i96 = 1_000_000_000;
+    // On time: the next tick keeps its place on the 50 ms grid.
+    try std.testing.expectEqual(start + tick_ns, nextTick(start, start + 10 * std.time.ns_per_ms));
+    try std.testing.expectEqual(start + tick_ns, nextTick(start, start + tick_ns - overrun_gap_ns));
+    // Late: the next one starts a pause after this one ended, not at once.
+    try std.testing.expectEqual(start + 48 * std.time.ns_per_ms + overrun_gap_ns, nextTick(start, start + 48 * std.time.ns_per_ms));
+    try std.testing.expectEqual(start + 3 * tick_ns + overrun_gap_ns, nextTick(start, start + 3 * tick_ns));
 }
 
 pub fn shutdownDeadline(io: std.Io) std.Io.Clock.Timestamp {

@@ -103,6 +103,17 @@ pub fn Endpoint(comptime implementations: anytype, comptime bootstrap: type, com
             return error.UnsupportedProtocol;
         }
 
+        pub fn preparedFrame(number: i32, workspaces: *Workspaces, storage: []u8, length: usize, decoded_length: usize, threshold: ?usize, destination: []u8) ![]const u8 {
+            inline for (implementations, 0..) |Implementation, index| {
+                if (number == Implementation.protocol_number) {
+                    const Wire = connection_types[index].Wire;
+                    if (comptime @hasDecl(Wire, "prepared")) return Wire.prepared(&workspaces[workspace_layout.indices[index]], storage, length, decoded_length, threshold, destination);
+                    return error.UnsupportedEncoding;
+                }
+            }
+            return error.UnsupportedProtocol;
+        }
+
         pub fn playBorrowed(connection: *const Connection) bool {
             return switch (connection.*) {
                 inline else => |*state| state.playBorrowed(),
@@ -169,6 +180,42 @@ pub fn Endpoint(comptime implementations: anytype, comptime bootstrap: type, com
             switch (connection.*) {
                 inline else => |*state| state.encrypt(source, destination),
             }
+        }
+
+        pub const Encryption = protocol.Encryption(Connection);
+        pub const maximum_encryption_batch_size = size: {
+            var maximum: usize = 1;
+            for (connection_types) |ConnectionType| {
+                std.debug.assert(ConnectionType.Wire.encryption_batch_size > 0);
+                maximum = @max(maximum, ConnectionType.Wire.encryption_batch_size);
+            }
+            break :size maximum;
+        };
+
+        pub fn encryptionBatchSize(number: i32) usize {
+            inline for (implementations, 0..) |Implementation, index| {
+                if (number == Implementation.protocol_number) return connection_types[index].Wire.encryption_batch_size;
+            }
+            unreachable;
+        }
+
+        pub fn encryptBatch(number: i32, source: []const u8, targets: []const Encryption) void {
+            std.debug.assert(targets.len <= maximum_encryption_batch_size);
+            if (targets.len == 0) return;
+            inline for (implementations, 0..) |Implementation, index| {
+                if (number == Implementation.protocol_number) {
+                    const ConnectionType = connection_types[index];
+                    var jobs: [ConnectionType.Wire.encryption_batch_size]ConnectionType.Wire.Encryption = undefined;
+                    std.debug.assert(targets.len <= jobs.len);
+                    for (targets, jobs[0..targets.len]) |target, *job| {
+                        const state = &@field(target.connection.*, std.fmt.comptimePrint("{d}", .{Implementation.protocol_number}));
+                        job.* = state.encryption(target.first, target.second);
+                    }
+                    ConnectionType.Wire.encryptBatch(source, jobs[0..targets.len]);
+                    return;
+                }
+            }
+            unreachable;
         }
 
         pub fn clear(connection: *Connection) void {

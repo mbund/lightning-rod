@@ -7,6 +7,9 @@ pub const Wire = struct {
     pub const Workspace = compression.Workspace;
     pub const always_copy = false;
     pub const frame_bound: sessions.protocol.Protocol.FrameBound = .{};
+    pub const Encryption = Cipher.Encryption;
+    pub const encryption_batch_size = Cipher.batch_size;
+    pub const encryptBatch = Cipher.encryptBatch;
 
     compressed: bool = false,
     receive_cipher: ?Cipher = null,
@@ -32,6 +35,10 @@ pub const Wire = struct {
 
     pub fn encrypt(self: *Wire, source: []const u8, destination: []u8) void {
         self.send_cipher.?.transform(.encrypt, source, destination);
+    }
+
+    pub fn encryption(self: *Wire, first: []u8, second: []u8) Encryption {
+        return .{ .cipher = &self.send_cipher.?, .first = first, .second = second };
     }
 
     pub fn save(self: *const Wire, bytes: []u8) ![]const u8 {
@@ -103,6 +110,10 @@ pub const Wire = struct {
             return .{ .first = output[0 .. prefix + source.len] };
         }
         return .{ .first = output[0..prefix], .second = source };
+    }
+
+    pub fn prepared(workspace: *Workspace, storage: []u8, length: usize, decoded_length: usize, threshold: ?usize, destination: []u8) ![]const u8 {
+        return workspace.prepared(storage, length, decoded_length, threshold, destination);
     }
 
     pub fn shared(workspace: *Workspace, storage: []u8, length: usize, threshold: ?usize, destination: []u8) ![]const u8 {

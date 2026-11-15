@@ -16,6 +16,8 @@ pub const crafting = @import("crafting.zig");
 pub const custom_data = @import("custom_data.zig");
 pub const entity_packets = @import("entity_packets.zig");
 pub const Packets = @import("minecraft_packets").Packets;
+pub const chunk_delivery = @import("delivery_cache.zig");
+pub const chunk_encoding = @import("chunk_encoding.zig");
 pub const Status = @import("session_status.zig").Status;
 pub const PayloadChannels = @import("payload_channels.zig");
 pub const OfflineAuthentication = @import("offline_authentication.zig").OfflineAuthentication;
@@ -143,7 +145,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(PayloadChannels.Play, PayloadChannels.Play.Configuration{}),
     lightning_rod.plugin.configured(Worlds, Worlds.Configuration{}),
     lightning_rod.plugin.configured(VanillaWorlds, VanillaWorlds.Configuration{}),
-    lightning_rod.plugin.configured(Chunks, Chunks.Configuration{}),
+    lightning_rod.plugin.configured(Chunks, Chunks.Configuration.forPlayers((Players.Configuration{}).maximum)),
     lightning_rod.plugin.configured(Spawn, Spawn.Configuration{}),
     lightning_rod.plugin.configured(Players, Players.Configuration{}),
     lightning_rod.plugin.configured(Visibility, Visibility.Configuration{}),

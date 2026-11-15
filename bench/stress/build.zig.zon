@@ -1,0 +1,16 @@
+.{
+    .name = .bench_stress,
+    .version = "0.1.0",
+    .fingerprint = 0x21bcf77f475c52d0,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .lightning_rod = .{ .path = "../.." },
+        .vanilla = .{ .path = "../../vanilla" },
+        .sessions = .{ .path = "../../sessions" },
+        .protocols = .{ .path = "../../protocols" },
+        .minecraft_packets = .{ .path = "../../minecraft_packets" },
+        .host = .{ .path = "../../host" },
+        .tps = .{ .path = "../../examples/plugins/tps" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

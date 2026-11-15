@@ -49,7 +49,7 @@ pub fn build(b: *std.Build) void {
     b.step("bench-pipeline", "Count session pipeline operations without threads or timing").dependOn(&run_pipeline.step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/output_test.zig"), .target = target, .optimize = optimize }) })).step);
     test_step.dependOn(&b.addRunArtifact(tests).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/buffers.zig"), .target = target, .optimize = optimize }) })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/buffers.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "metrics", .module = metrics }} }) })).step);
     test_step.dependOn(&b.addRunArtifact(transport_tests).step);
     const initialization_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/initialization_test.zig"),

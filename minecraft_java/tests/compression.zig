@@ -1,6 +1,8 @@
 const std = @import("std");
-const Wire = @import("java").Wire;
-const headroom = @import("sessions").shared_headroom;
+const java = @import("java");
+const sessions = @import("sessions");
+const Wire = java.Wire;
+const headroom = sessions.shared_headroom;
 
 fn allocateWorkspace(allocator: std.mem.Allocator) !void {
     var workspace = try Wire.Workspace.init(allocator);
@@ -172,6 +174,126 @@ test "encryption fanout reads the shared source directly across destination wrap
     try std.testing.expectEqualSlices(u8, &.{ 1, 42, 43, 44 }, packet);
 }
 
+test "batched encryption preserves independent keys wrapped destinations and resumed streams" {
+    var random = std.Random.DefaultPrng.init(493);
+    var source: [1024]u8 = undefined;
+    var actual: [9][1024]u8 = undefined;
+    var expected: [9][1024]u8 = undefined;
+    var wires: [9]Wire = undefined;
+    var references: [9]Wire = undefined;
+    var jobs: [9]Wire.Encryption = undefined;
+    for (0..10) |_| {
+        for (&wires, &references) |*wire, *reference| {
+            var secret: [16]u8 = undefined;
+            random.random().bytes(&secret);
+            wire.* = .{};
+            wire.install(secret);
+            reference.* = wire.*;
+        }
+        for (0..20) |iteration| {
+            random.random().bytes(&source);
+            const length = if (iteration == 0) 0 else random.random().intRangeAtMost(usize, 1, source.len);
+            const count = iteration % (wires.len + 1);
+            var splits: [9]usize = undefined;
+            for (wires[0..count], references[0..count], jobs[0..count], splits[0..count], 0..) |*wire, *reference, *job, *split, index| {
+                split.* = random.random().intRangeAtMost(usize, 0, length);
+                @memset(&actual[index], 0xcc);
+                job.* = wire.encryption(actual[index][length - split.* ..][0..split.*], actual[index][0 .. length - split.*]);
+                reference.encrypt(source[0..length], expected[index][0..length]);
+            }
+            var begin: usize = 0;
+            while (begin < count) {
+                const end = @min(count, begin + Wire.encryption_batch_size);
+                Wire.encryptBatch(source[0..length], jobs[begin..end]);
+                begin = end;
+            }
+            for (wires[0..count], references[0..count], jobs[0..count], splits[0..count], 0..) |*wire, reference, job, split, index| {
+                try std.testing.expectEqualSlices(u8, expected[index][0..split], job.first);
+                try std.testing.expectEqualSlices(u8, expected[index][split..length], job.second);
+                try std.testing.expectEqual(reference.send_cipher.?.feedback, wire.send_cipher.?.feedback);
+                try std.testing.expect(std.mem.allEqual(u8, actual[index][length..], 0xcc));
+                var saved: [50]u8 = undefined;
+                wire.* = try Wire.restore(try wire.save(&saved));
+            }
+        }
+    }
+}
+
+test "CFB8 matches NIST SP 800-38A F.3.7" {
+    var secret: [16]u8 = undefined;
+    var iv: [16]u8 = undefined;
+    var plaintext: [18]u8 = undefined;
+    var ciphertext: [18]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&secret, "2b7e151628aed2a6abf7158809cf4f3c");
+    _ = try std.fmt.hexToBytes(&iv, "000102030405060708090a0b0c0d0e0f");
+    _ = try std.fmt.hexToBytes(&plaintext, "6bc1bee22e409f96e93d7e117393172aae2d");
+    _ = try std.fmt.hexToBytes(&ciphertext, "3b79424c9c0dd436bace9e0ed4586a4f32b9");
+    var wires: [7]Wire = undefined;
+    var output: [7][18]u8 = undefined;
+    var jobs: [7]Wire.Encryption = undefined;
+    for (&wires, &output, &jobs) |*wire, *bytes, *job| {
+        wire.* = .{};
+        wire.install(secret);
+        wire.send_cipher.?.feedback = iv;
+        wire.receive_cipher.?.feedback = iv;
+        job.* = wire.encryption(bytes[0..7], bytes[7..]);
+    }
+    Wire.encryptBatch(&.{}, &.{});
+    var begin: usize = 0;
+    while (begin < jobs.len) {
+        const end = @min(jobs.len, begin + Wire.encryption_batch_size);
+        Wire.encryptBatch(&plaintext, jobs[begin..end]);
+        begin = end;
+    }
+    for (&wires, &output) |*wire, *bytes| {
+        try std.testing.expectEqualSlices(u8, &ciphertext, bytes);
+        wire.receive(bytes);
+        try std.testing.expectEqualSlices(u8, &plaintext, bytes);
+    }
+    wires[0].send_cipher.?.feedback = iv;
+    var in_place = plaintext;
+    wires[0].send(&in_place);
+    try std.testing.expectEqualSlices(u8, &ciphertext, &in_place);
+}
+
+test "endpoint encryption batches preserve each protocol connection" {
+    const First = struct {
+        pub const protocol_number = 1;
+        pub const Connection = java.Connection(struct {});
+    };
+    const Second = struct {
+        pub const protocol_number = 2;
+        pub const Connection = java.Connection(struct {});
+    };
+    const Endpoint = sessions.Endpoint(.{ First, Second }, void, void);
+    var connections: [4]Endpoint.Connection = undefined;
+    var expected: [4]Wire = undefined;
+    var outputs: [4][31]u8 = undefined;
+    var jobs: [4]Endpoint.Encryption = undefined;
+    inline for (.{ 1, 2 }) |number| {
+        const ConnectionType = if (number == 1) First.Connection else Second.Connection;
+        for (&connections, &expected, &jobs, 0..) |*connection, *reference, *job, index| {
+            const tag = std.fmt.comptimePrint("{d}", .{number});
+            connection.* = @unionInit(Endpoint.Connection, tag, ConnectionType.init(.login));
+            @field(connection, tag).wire.install(@splat(@intCast(index + number)));
+            reference.* = @field(connection, tag).wire;
+            job.* = .{ .connection = connection, .first = outputs[index][0..17], .second = outputs[index][17..] };
+        }
+        var begin: usize = 0;
+        while (begin < jobs.len) {
+            const end = @min(jobs.len, begin + Endpoint.encryptionBatchSize(number));
+            Endpoint.encryptBatch(number, "an independent encrypted stream", jobs[begin..end]);
+            begin = end;
+        }
+        for (connections, &expected, outputs) |connection, *reference, actual| {
+            var scalar: [31]u8 = undefined;
+            reference.encrypt("an independent encrypted stream", &scalar);
+            try std.testing.expectEqualSlices(u8, &scalar, &actual);
+            try std.testing.expectEqual(reference.send_cipher.?.feedback, @field(connection, std.fmt.comptimePrint("{d}", .{number})).wire.send_cipher.?.feedback);
+        }
+    }
+}
+
 test "receive batches preserve in-place tails and resumed cipher streams" {
     var random = std.Random.DefaultPrng.init(0);
     for (0..100) |_| {
@@ -213,4 +335,23 @@ test "receive batches preserve in-place tails and resumed cipher streams" {
         try std.testing.expectEqualSlices(u8, &plain, &output);
         try std.testing.expectEqual(receiver.receive_cipher.?.feedback, separate.receive_cipher.?.feedback);
     }
+}
+
+test "prepared frames preserve threshold semantics and bound their decoded fallback" {
+    var workspace = try Wire.Workspace.init(std.testing.allocator);
+    defer workspace.deinit();
+    var raw: [8192]u8 = undefined;
+    for (&raw, 0..) |*byte, index| byte.* = @truncate(index * 17 + index / 31);
+    var storage: [16384]u8 = undefined;
+    var output: [16384]u8 = undefined;
+    var decoded: [8192]u8 = undefined;
+    const encoded = try workspace.compressor.encode(&raw, storage[sessions.shared_headroom..]);
+    for ([_]?usize{ null, 0, 256, raw.len, raw.len + 1 }) |threshold| {
+        const frame = try workspace.prepared(&storage, encoded.len, raw.len, threshold, &output);
+        const parsed = try sessions.frame(frame, output.len);
+        const payload = try workspace.decode(parsed.body, threshold, &decoded);
+        try std.testing.expectEqualSlices(u8, &raw, payload);
+    }
+    try std.testing.expectError(error.InvalidPacket, workspace.prepared(&storage, encoded.len, 0, 256, &output));
+    try std.testing.expectError(error.BufferTooSmall, workspace.prepared(&storage, encoded.len, raw.len, null, output[0..64]));
 }

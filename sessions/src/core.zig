@@ -33,19 +33,26 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
             /// Transfers the listening socket to this instance. Resume uses the handoff socket.
             inherited_listener: ?i32 = null,
             max_players: usize = 32,
+            pending_connections: usize = 8,
+            input_work: lightning_rod.system.work.Limits = sessions.Service.default_input_work,
             compression_threshold: ?usize = 256,
             /// Per-player output credit and maximum input buffer capacity.
             buffer_bytes: usize = 512 * 1024,
-            /// Resident capacity for each input, output, and control buffer.
+            /// Resident capacity for each input, decoded input, output, and control buffer.
             connection_bytes: usize = 8 * 1024,
-            input_burst_slots: usize = 8,
+            input_burst_slots: usize = 2,
             output_burst_slots: usize = 8,
             configuration_slots: usize = 8,
-            decode_slots: usize = 8,
+            decode_slots: usize = 2,
             framing_slots: usize = 8,
+            codec_workers: usize = 1,
             max_pending_wire_bytes: usize = 1024 * 1024,
             endpoints: []const EndpointConfiguration,
-            output_pages: usize = 32,
+            /// Pages of the output pool every endpoint shares. Null takes one page for each
+            /// player slot and no fewer than 32, which keeps the pool in step with the
+            /// output credit the connections can hold between them.
+            output_pages: ?usize = null,
+            output_unit_bytes: usize = 16 * 1024,
             plugin_memory_bytes: usize = 64 * 1024,
             metrics: metrics.Registry.Configuration = .{},
         };
@@ -68,11 +75,12 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
         reload_intent: std.atomic.Value(bool) = .init(false),
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Configuration, options: Options) !*Self {
-            if (config.max_players == 0 or config.max_players > std.math.maxInt(usize) - 8 or config.endpoints.len == 0) return error.InvalidSessionCapacity;
+            if (config.max_players == 0 or config.pending_connections == 0 or config.max_players > std.math.maxInt(usize) - config.pending_connections or config.endpoints.len == 0 or config.buffer_bytes < 512) return error.InvalidSessionCapacity;
+            const connections = config.max_players + config.pending_connections;
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
             const owned = options.memory.allocator(id);
-            self.* = .{ .previous = try owned.alloc(Previous, config.max_players + 8), .allocator = owned, .transport = undefined, .hooks = undefined, .router = config.router, .worker = undefined, .output_pool = undefined, .routing = undefined, .config = config, .registry = try metrics.Registry.init(owned, io, config.metrics) };
+            self.* = .{ .previous = try owned.alloc(Previous, connections), .allocator = owned, .transport = undefined, .hooks = undefined, .router = config.router, .worker = undefined, .output_pool = undefined, .routing = undefined, .config = config, .registry = try metrics.Registry.init(owned, io, config.metrics) };
             errdefer self.registry.deinit();
             try self.registry.attach(options.metrics);
             var maximum_packet: usize = 0;
@@ -81,7 +89,8 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
                 maximum_packet = @max(maximum_packet, endpoint.page_bytes);
                 maximum_recipients = @max(maximum_recipients, endpoint.connections);
             }
-            self.output_pool = try sessions.OutputPool.init(owned, .{ .pages = config.output_pages, .page_bytes = maximum_packet, .recipients_per_page = maximum_recipients });
+            const output_pages = config.output_pages orelse @max(32, config.max_players);
+            self.output_pool = try sessions.OutputPool.init(owned, .{ .pages = output_pages, .page_bytes = maximum_packet, .unit_bytes = config.output_unit_bytes, .recipients_per_page = maximum_recipients });
             errdefer self.output_pool.deinit();
             var inherited: ?i32 = null;
             errdefer if (inherited) |descriptor| {
@@ -99,7 +108,7 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
                 try cloexec(listener);
                 inherited = listener;
             }
-            self.transport = try Transport.init(owned, io, .{ .address = config.address, .connections = config.max_players + 8, .inherited_listener = inherited });
+            self.transport = try Transport.init(owned, io, .{ .address = config.address, .connections = connections, .inherited_listener = inherited });
             inherited = null;
             errdefer self.transport.deinit(io);
             const endpoints = try owned.alloc(*sessions.Service, config.endpoints.len);
@@ -113,19 +122,21 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
                 endpoint.* = try sessions.Service.init(owned, io, self.transport.transport(), .{
                     .connections = endpoint_config.connections,
                     .buffer_bytes = config.buffer_bytes,
+                    .input_work = config.input_work,
+                    .max_input_bytes = config.buffer_bytes - 3,
                     .metrics = options.metrics,
                     .protocols = &config.protocols.values,
-                    .pages = config.output_pages,
+                    .pages = output_pages,
                     .output_pool = &self.output_pool,
                     .page_bytes = endpoint_config.page_bytes,
                 });
                 initialized += 1;
             }
             self.routing = .{ .endpoints = endpoints };
-            self.hooks = try Hooks.init(owned, io, config.plugins, .{ .sessions = endpoints[0], .endpoints = endpoints, .metrics = &self.registry }, config.plugin_memory_bytes, config.max_players + 8);
+            self.hooks = try Hooks.init(owned, io, config.plugins, .{ .sessions = endpoints[0], .endpoints = endpoints, .metrics = &self.registry }, config.plugin_memory_bytes, connections);
             errdefer self.hooks.deinit(io);
             self.worker = try Worker.init(owned, self.transport.transport(), .{
-                .connections = config.max_players + 8,
+                .connections = connections,
                 .max_players = config.max_players,
                 .buffer_bytes = config.buffer_bytes,
                 .connection_bytes = config.connection_bytes,
@@ -134,6 +145,7 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
                 .configuration_slots = config.configuration_slots,
                 .decode_slots = config.decode_slots,
                 .framing_slots = config.framing_slots,
+                .codec_workers = config.codec_workers,
                 .max_pending_wire_bytes = config.max_pending_wire_bytes,
                 .protocols = config.protocols,
                 .hooks = self.hooks,
@@ -152,7 +164,8 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
             for (endpoints) |endpoint| buffer_bytes += endpoint.memoryBytes();
             for (self.worker.frames) |frame| buffer_bytes += frame.bytes.len;
             const engine = self.worker.engine;
-            buffer_bytes += engine.input.len + engine.output.len + engine.decoded.memoryBytes() + engine.input_bursts.memoryBytes() + engine.output_bursts.memoryBytes() + engine.configurations.memoryBytes() + engine.control_raw.memoryBytes() + engine.scratch.len + engine.control_storage.len;
+            buffer_bytes += engine.input.len + engine.output.len + engine.decoded_storage.len + engine.decoded.memoryBytes() + engine.input_bursts.memoryBytes() + engine.output_bursts.memoryBytes() + engine.configurations.memoryBytes() + engine.control_raw.memoryBytes() + engine.scratch.len + engine.control_storage.len;
+            buffer_bytes += engine.packet_bursts.memoryBytes() + engine.control_bursts.memoryBytes();
             buffer_bytes += engine.control_jobs.len * @sizeOf(@TypeOf(engine.control_jobs[0]));
             allocated.set(buffer_bytes);
             self.owned_buffers = allocated;

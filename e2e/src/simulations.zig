@@ -81,7 +81,7 @@ pub const Configuration = struct {
 };
 
 pub fn run(init: std.process.Init, plugins: anytype, endpoints: []*sessions.Service, session_plugins: anytype, config: Configuration) !void {
-    var memory = lightning_rod.Memory.init(std.heap.page_allocator, init.io);
+    var memory = lightning_rod.Memory.init(lightning_rod.system.huge_page_allocator, init.io);
     defer memory.deinit();
     const allocator = memory.allocator("bootstrap");
     const args = try profile.arguments(init);

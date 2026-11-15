@@ -4,6 +4,7 @@ import net.minecraft.client.Minecraft;
 import io.netty.buffer.ByteBuf;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.protocol.game.ClientboundAddEntityPacket;
+import net.minecraft.server.level.ChunkTrackingView;
 import net.minecraft.util.Mth;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 
@@ -53,9 +54,18 @@ abstract class Fixture {
         int missing = 0;
         for (int z = centerZ - radius; z <= centerZ + radius; z++) {
             for (int x = centerX - radius; x <= centerX + radius; x++) {
+                if (!ChunkTrackingView.isInViewDistance(centerX, centerZ, radius, x, z)) continue;
                 if (client.level.getChunkSource().getChunk(x, z, ChunkStatus.FULL, false) == null) missing++;
             }
         }
         return missing;
+    }
+
+    static int horizonColumns(int radius) {
+        int count = 0;
+        for (int z = -radius; z <= radius; z++) for (int x = -radius; x <= radius; x++) {
+            if (ChunkTrackingView.isInViewDistance(0, 0, radius, x, z)) count++;
+        }
+        return count;
     }
 }

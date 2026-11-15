@@ -10,8 +10,7 @@ import net.minecraft.world.item.Items;
 final class ProtocolFixture extends Fixture {
     // Matches Players.Configuration.render_distance in main.zig.
     private static final int RENDER_DISTANCE = 2;
-    private static final int CHUNK_DIAMETER = 2 * RENDER_DISTANCE + 1;
-    private static final int EXPECTED_CHUNKS = CHUNK_DIAMETER * CHUNK_DIAMETER;
+    private static final int EXPECTED_CHUNKS = horizonColumns(RENDER_DISTANCE);
     private final ServerStatusPinger pinger = new ServerStatusPinger();
     private ServerData status;
     private boolean positioned;

@@ -63,6 +63,8 @@ pub const Spawn = struct {
         return self;
     }
 
+    pub const allocate = init;
+
     fn entry(self: *Spawn, world: u32) !*Entry {
         const index = for (self.deps.worlds.all(), 0..) |value, index| {
             if (value.id == world) break index;
@@ -209,7 +211,8 @@ pub const Spawn = struct {
         defer window.deinit();
         var top = dimension.minimum_section + @as(i32, dimension.section_count);
         while (top > dimension.minimum_section) {
-            const count: usize = @min(32, self.deps.chunks.cache.entries.len, @as(usize, @intCast(top - dimension.minimum_section)));
+            // Reads stay within the simulation share of the chunk cache; the background may pin the rest.
+            const count: usize = @min(32, self.deps.chunks.demandCapacity(), @as(usize, @intCast(top - dimension.minimum_section)));
             var sections: [32]chunks.Section = undefined;
             var views: [32]chunks.View = undefined;
             for (sections[0..count], 0..) |*section, index| section.* = .{ .world = world, .x = @divFloor(x, 16), .z = @divFloor(z, 16), .y = top - 1 - @as(i32, @intCast(index)) };
@@ -271,7 +274,7 @@ pub const Spawn = struct {
         var states: [36]u16 = undefined;
         var begin: usize = 0;
         while (begin < count) {
-            const end = @min(begin + @min(32, self.deps.chunks.cache.entries.len), count);
+            const end = @min(begin + @min(32, self.deps.chunks.demandCapacity()), count);
             try window.readMany(sections[begin..end], views[begin..end]);
             for (positions[begin..end], views[begin..end], states[begin..end]) |at, view, *state| state.* = view.get(chunks.localIndex(at));
             begin = end;

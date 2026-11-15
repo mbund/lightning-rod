@@ -12,7 +12,7 @@ comptime {
 
 pub fn main(init: std.process.Init) !void {
     const startup = profile.Startup.capture(init.io);
-    var memory = lightning_rod.Memory.init(std.heap.page_allocator, init.io);
+    var memory = lightning_rod.Memory.init(lightning_rod.system.huge_page_allocator, init.io);
     defer memory.deinit();
     const allocator = memory.allocator("bootstrap");
     var args = try init.minimal.args.iterateAllocator(allocator);

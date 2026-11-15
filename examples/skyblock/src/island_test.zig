@@ -55,7 +55,7 @@ fn pauseCounts(count: usize) !PauseCounts {
     probe.vtable.futexWaitUncancelable = Probe.wait;
     const io: std.Io = .{ .userdata = &probe.threaded, .vtable = &probe.vtable };
     for (workers, 0..) |*worker, index| {
-        worker.* = .{ .io = io, .record_resources = undefined, .index = index };
+        worker.* = .{ .io = io, .record_resources = undefined, .delivery = undefined, .index = index };
         worker.background_mode.store(.active, .release);
     }
     var pool: islands.Pool = .{ .workers = workers, .slots = undefined, .limit = 1 };
@@ -123,7 +123,7 @@ test "bounded worker batches reuse scratch and retire worlds before admitting de
     var world_storage = try Worlds.init(&store, std.testing.io);
     const resources = try records.Resources.init(allocator, std.testing.io, .{ .readers = 2, .writers = 2 });
     defer resources.deinit();
-    workers[0] = .{ .io = std.testing.io, .record_resources = resources, .index = 0 };
+    workers[0] = .{ .io = std.testing.io, .record_resources = resources, .delivery = try vanilla.chunk_delivery.Workspace.init(allocator, selected.values.len), .index = 0 };
     var slots = try Slots.init(allocator, 2);
     defer slots.deinit();
     var pool: islands.Pool = .{ .workers = workers, .slots = &slots, .limit = 2 };
@@ -133,6 +133,7 @@ test "bounded worker batches reuse scratch and retire worlds before admitting de
             .id = index,
             .worlds = &world_storage,
             .record_resources = resources,
+            .delivery = workers[0].delivery,
             .io = workers[0].io,
             .wakeup = &workers[0].ready,
             .routing = &routing,

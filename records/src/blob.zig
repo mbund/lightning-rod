@@ -6,7 +6,7 @@ pub const Index = [index_bytes]u8;
 
 /// Destinations and index scratch remain borrowed until flush returns.
 pub const ReadBatch = struct {
-    const Blob = struct { id: u64, destination: []u8, offset: usize = 0 };
+    const Blob = struct { id: u64, destination: []u8, remaining: usize, offset: usize = 0 };
 
     space: storage.Space,
     indices: []Index,
@@ -24,6 +24,7 @@ pub const ReadBatch = struct {
 
     pub fn flush(self: *ReadBatch) storage.Error!void {
         std.debug.assert(self.indices.len > 0 and self.indices.len <= self.blobs.len);
+        if (self.blob_count == 0) return self.flushPages();
         const indices = self.indices;
         var selected: [storage.batch_size]usize = undefined;
         var cursor: usize = 0;
@@ -46,14 +47,16 @@ pub const ReadBatch = struct {
                 const value = &self.blobs[at];
                 if (!std.mem.eql(u8, index[0..8], "LRBLOB01")) return error.Corrupt;
                 const pages = std.mem.readInt(u32, index[16..20], .little);
-                if (pages == 0 or pages > storage.batch_size or pages > std.math.divCeil(usize, value.destination.len - value.offset, storage.page_size) catch return error.Corrupt) return error.Corrupt;
+                if (pages == 0 or pages > storage.batch_size or pages > std.math.divCeil(usize, value.remaining, storage.page_size) catch return error.Corrupt) return error.Corrupt;
                 for (0..pages) |page| {
+                    if (value.offset == value.destination.len) break;
                     const length = @min(value.destination.len - value.offset, storage.page_size);
                     try self.append(@fromBackingInt(@intCast(std.mem.readInt(u64, index[24 + page * 8 ..][0..8], .little))), value.destination[value.offset..][0..length]);
                     value.offset += length;
                 }
+                value.remaining -= @min(value.remaining, @as(usize, pages) * storage.page_size);
                 value.id = std.mem.readInt(u64, index[8..16], .little);
-                if ((value.offset == value.destination.len) != (value.id == 0)) return error.Corrupt;
+                if ((value.remaining == 0) != (value.id == 0)) return error.Corrupt;
             }
         }
         self.blob_count = 0;
@@ -68,12 +71,17 @@ pub const ReadBatch = struct {
 
     pub fn appendBlob(self: *ReadBatch, root: storage.PageId, length: usize, destination: []u8) storage.Error!usize {
         if (destination.len < length) return error.BufferTooSmall;
+        return self.appendBlobPrefix(root, length, destination);
+    }
+
+    pub fn appendBlobPrefix(self: *ReadBatch, root: storage.PageId, length: usize, destination: []u8) storage.Error!usize {
         if ((length == 0) != (@backingInt(root) == 0)) return error.Corrupt;
-        if (length == 0) return 0;
+        const count = @min(length, destination.len);
+        if (count == 0) return 0;
         if (self.blob_count == self.indices.len) try self.flush();
-        self.blobs[self.blob_count] = .{ .id = @backingInt(root), .destination = destination[0..length] };
+        self.blobs[self.blob_count] = .{ .id = @backingInt(root), .destination = destination[0..count], .remaining = length };
         self.blob_count += 1;
-        return length;
+        return count;
     }
 };
 

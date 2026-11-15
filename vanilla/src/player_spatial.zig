@@ -4,160 +4,232 @@ const IndexSet = @import("lightning_rod").system.IndexSet;
 
 const assert = std.debug.assert;
 
-pub const Index = struct {
-    pub const Position = struct { world: u32, x: i32, z: i32 };
-    const Cell = Position;
-    const width = 8;
-    const absent = std.math.maxInt(usize);
-    const Node = struct {
-        position: ?Position = null,
-        previous: ?usize = null,
-        next: ?usize = null,
+test "spatial windows preserve exact query membership and expire on every position change" {
+    const Spatial = Grid(8);
+    var spatial = try Spatial.init(std.testing.allocator, 257);
+    defer spatial.deinit(std.testing.allocator);
+    var random = std.Random.DefaultPrng.init(0x815c);
+    for (0..257) |index| spatial.update(index, .{
+        .world = @intCast(index % 3),
+        .x = random.random().intRangeAtMost(i32, -96, 96),
+        .z = random.random().intRangeAtMost(i32, -96, 96),
+    });
+    var members: [257]usize = undefined;
+    const captured = spatial.window(.{ .world = 0, .x = -3, .z = 7 }, 64, &members);
+    for ([_]i32{ 0, 1, 8, 32 }) |radius| for (0..128) |_| {
+        const center: Spatial.Position = .{ .world = 0, .x = random.random().intRangeAtMost(i32, -35, 29), .z = random.random().intRangeAtMost(i32, -25, 39) };
+        var direct = spatial.query(center, radius);
+        var retained = captured.query(center, radius).?;
+        var expected: [257]bool = @splat(false);
+        while (direct.next()) |index| expected[index] = true;
+        while (retained.next()) |index| {
+            try std.testing.expect(expected[index]);
+            expected[index] = false;
+        }
+        for (expected) |present| try std.testing.expect(!present);
+        try std.testing.expectEqual(@as(usize, 0), retained.buckets);
     };
+    try std.testing.expect(captured.query(.{ .world = 1, .x = -3, .z = 7 }, 1) == null);
+    try std.testing.expect(captured.query(.{ .world = 0, .x = -3, .z = 7 }, 65) == null);
+    spatial.update(0, .{ .world = 0, .x = 0, .z = 0 });
+    const updated = spatial.window(.{ .world = 0, .x = 0, .z = 0 }, 32, &members);
+    spatial.update(0, .{ .world = 0, .x = 1, .z = 0 });
+    try std.testing.expect(updated.query(.{ .world = 0, .x = 0, .z = 0 }, 16) == null);
+}
 
-    // Different spatial cells can share a hash bucket. Queries match the exact cell before yielding.
-    heads: []usize = &.{},
-    nodes: []Node = &.{},
-    active: IndexSet = .{ .indices = &.{}, .positions = &.{} },
-    revision: u64 = 0,
+pub const Index = Grid(8);
 
-    pub fn init(allocator: std.mem.Allocator, capacity: usize) !Index {
-        if (capacity == 0) return .{};
-        const nodes = try allocator.alloc(Node, capacity);
-        errdefer allocator.free(nodes);
-        @memset(nodes, .{});
-        var active = try IndexSet.init(allocator, capacity);
-        errdefer active.deinit(allocator);
-        const buckets = try std.math.ceilPowerOfTwo(usize, try std.math.mul(usize, capacity, 2));
-        const heads = try allocator.alloc(usize, buckets);
-        @memset(heads, absent);
-        return .{ .nodes = nodes, .active = active, .heads = heads };
-    }
+pub fn Grid(comptime cell_width: i32) type {
+    if (cell_width <= 0) @compileError("Spatial cell width must be positive");
+    return struct {
+        const Self = @This();
+        const width = cell_width;
+        pub const Position = struct { world: u32, x: i32, z: i32 };
+        const Cell = Position;
+        const absent = std.math.maxInt(usize);
+        const Node = struct {
+            position: ?Position = null,
+            previous: ?usize = null,
+            next: ?usize = null,
+        };
 
-    pub fn deinit(self: *Index, allocator: std.mem.Allocator) void {
-        allocator.free(self.heads);
-        if (self.nodes.len != 0) self.active.deinit(allocator);
-        allocator.free(self.nodes);
-        self.* = undefined;
-    }
+        // Different spatial cells can share a hash bucket. Queries match the exact cell before yielding.
+        heads: []usize = &.{},
+        nodes: []Node = &.{},
+        active: IndexSet = .{ .indices = &.{}, .positions = &.{} },
+        revision: u64 = 0,
 
-    pub fn contains(self: *const Index, index: usize) bool {
-        assert(index < self.nodes.len);
-        return self.nodes[index].position != null;
-    }
-
-    fn cell(position: Position) Cell {
-        return .{ .world = position.world, .x = @divFloor(position.x, width), .z = @divFloor(position.z, width) };
-    }
-
-    fn bucket(self: *const Index, key: Cell) usize {
-        assert(self.heads.len > 0 and std.math.isPowerOfTwo(self.heads.len));
-        var hash = std.hash.Wyhash.init(0);
-        std.hash.autoHash(&hash, key);
-        return @intCast(hash.final() & (self.heads.len - 1));
-    }
-
-    /// Membership changes update links without moving other nodes.
-    pub fn update(self: *Index, index: usize, position: ?Position) void {
-        assert(index < self.nodes.len);
-        const node = &self.nodes[index];
-        if (std.meta.eql(node.position, position)) return;
-        self.revision += 1;
-        if (node.position) |old| {
-            if (position) |next| if (std.meta.eql(cell(old), cell(next))) {
-                node.position = next;
-                return;
-            };
-            if (node.previous) |previous| {
-                assert(self.nodes[previous].next == index);
-                self.nodes[previous].next = node.next;
-            } else {
-                const head = &self.heads[self.bucket(cell(old))];
-                assert(head.* == index);
-                head.* = node.next orelse absent;
-            }
-            if (node.next) |next| {
-                assert(self.nodes[next].previous == index);
-                self.nodes[next].previous = node.previous;
-            }
-            self.active.remove(index);
+        pub fn init(allocator: std.mem.Allocator, capacity: usize) !Self {
+            if (capacity == 0) return .{};
+            const nodes = try allocator.alloc(Node, capacity);
+            errdefer allocator.free(nodes);
+            @memset(nodes, .{});
+            var active = try IndexSet.init(allocator, capacity);
+            errdefer active.deinit(allocator);
+            const buckets = try std.math.ceilPowerOfTwo(usize, try std.math.mul(usize, capacity, 2));
+            const heads = try allocator.alloc(usize, buckets);
+            @memset(heads, absent);
+            return .{ .nodes = nodes, .active = active, .heads = heads };
         }
-        node.* = .{ .position = position };
-        if (position) |next| {
-            const head = &self.heads[self.bucket(cell(next))];
-            if (head.* != absent) {
-                node.next = head.*;
-                assert(self.nodes[node.next.?].previous == null);
-                self.nodes[node.next.?].previous = index;
-            }
-            head.* = index;
-            self.active.insert(index);
+
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            allocator.free(self.heads);
+            if (self.nodes.len != 0) self.active.deinit(allocator);
+            allocator.free(self.nodes);
+            self.* = undefined;
         }
-        assert(self.active.contains(index) == (position != null));
-    }
 
-    /// Iterators borrow membership until the next update that changes a position.
-    pub const Query = struct {
-        owner: *const Index,
-        revision: u64,
-        world: u32,
-        minimum: [2]i64,
-        maximum: [2]i64,
-        low: Cell,
-        high: Cell,
-        at: Cell,
-        selected: Cell = undefined,
-        current: ?usize = null,
-        exhausted: bool = false,
-        scan: bool,
-        cursor: usize = 0,
-        visited: usize = 0,
-        buckets: usize = 0,
+        pub fn contains(self: *const Self, index: usize) bool {
+            assert(index < self.nodes.len);
+            return self.nodes[index].position != null;
+        }
 
-        pub fn next(self: *Query) ?usize {
-            assert(self.owner.revision == self.revision);
-            while (true) {
-                const index = if (self.scan) scan: {
-                    if (self.cursor == self.owner.active.count) return null;
-                    const index = self.owner.active.indices[self.cursor];
-                    self.cursor += 1;
-                    break :scan index;
-                } else bucket: {
-                    while (self.current == null) {
-                        if (self.exhausted) return null;
-                        const head = self.owner.heads[self.owner.bucket(self.at)];
-                        self.current = if (head == absent) null else head;
-                        self.selected = self.at;
-                        self.buckets += 1;
-                        if (self.at.z < self.high.z) {
-                            self.at.z += 1;
-                        } else if (self.at.x < self.high.x) {
-                            self.at.x += 1;
-                            self.at.z = self.low.z;
-                        } else self.exhausted = true;
-                    }
-                    const index = self.current.?;
-                    self.current = self.owner.nodes[index].next;
-                    break :bucket index;
+        fn cell(position: Position) Cell {
+            return .{ .world = position.world, .x = @divFloor(position.x, width), .z = @divFloor(position.z, width) };
+        }
+
+        fn bucket(self: *const Self, key: Cell) usize {
+            assert(self.heads.len > 0 and std.math.isPowerOfTwo(self.heads.len));
+            var hash = std.hash.Wyhash.init(0);
+            std.hash.autoHash(&hash, key);
+            return @intCast(hash.final() & (self.heads.len - 1));
+        }
+
+        /// Membership changes update links without moving other nodes.
+        pub fn update(self: *Self, index: usize, position: ?Position) void {
+            assert(index < self.nodes.len);
+            const node = &self.nodes[index];
+            if (std.meta.eql(node.position, position)) return;
+            self.revision += 1;
+            if (node.position) |old| {
+                if (position) |next| if (std.meta.eql(cell(old), cell(next))) {
+                    node.position = next;
+                    return;
                 };
-                self.visited += 1;
-                const position = self.owner.nodes[index].position.?;
-                if (!self.scan and !std.meta.eql(cell(position), self.selected)) continue;
-                if (position.world == self.world and position.x >= self.minimum[0] and position.x <= self.maximum[0] and position.z >= self.minimum[1] and position.z <= self.maximum[1]) return index;
+                if (node.previous) |previous| {
+                    assert(self.nodes[previous].next == index);
+                    self.nodes[previous].next = node.next;
+                } else {
+                    const head = &self.heads[self.bucket(cell(old))];
+                    assert(head.* == index);
+                    head.* = node.next orelse absent;
+                }
+                if (node.next) |next| {
+                    assert(self.nodes[next].previous == index);
+                    self.nodes[next].previous = node.previous;
+                }
+                self.active.remove(index);
             }
+            node.* = .{ .position = position };
+            if (position) |next| {
+                const head = &self.heads[self.bucket(cell(next))];
+                if (head.* != absent) {
+                    node.next = head.*;
+                    assert(self.nodes[node.next.?].previous == null);
+                    self.nodes[node.next.?].previous = index;
+                }
+                head.* = index;
+                self.active.insert(index);
+            }
+            assert(self.active.contains(index) == (position != null));
+        }
+
+        /// Iterators borrow membership until the next update that changes a position.
+        pub const Query = struct {
+            owner: *const Self,
+            revision: u64,
+            world: u32,
+            minimum: [2]i64,
+            maximum: [2]i64,
+            low: Cell,
+            high: Cell,
+            at: Cell,
+            selected: Cell = undefined,
+            current: ?usize = null,
+            exhausted: bool = false,
+            scan: bool,
+            indices: []const usize = &.{},
+            cursor: usize = 0,
+            visited: usize = 0,
+            buckets: usize = 0,
+
+            pub fn next(self: *Query) ?usize {
+                assert(self.owner.revision == self.revision);
+                while (true) {
+                    const index = if (self.scan) scan: {
+                        if (self.cursor == self.indices.len) return null;
+                        const index = self.indices[self.cursor];
+                        self.cursor += 1;
+                        break :scan index;
+                    } else bucket: {
+                        while (self.current == null) {
+                            if (self.exhausted) return null;
+                            const head = self.owner.heads[self.owner.bucket(self.at)];
+                            self.current = if (head == absent) null else head;
+                            self.selected = self.at;
+                            self.buckets += 1;
+                            if (self.at.z < self.high.z) {
+                                self.at.z += 1;
+                            } else if (self.at.x < self.high.x) {
+                                self.at.x += 1;
+                                self.at.z = self.low.z;
+                            } else self.exhausted = true;
+                        }
+                        const index = self.current.?;
+                        self.current = self.owner.nodes[index].next;
+                        break :bucket index;
+                    };
+                    self.visited += 1;
+                    const position = self.owner.nodes[index].position.?;
+                    if (!self.scan and !std.meta.eql(cell(position), self.selected)) continue;
+                    if (position.world == self.world and position.x >= self.minimum[0] and position.x <= self.maximum[0] and position.z >= self.minimum[1] and position.z <= self.maximum[1]) return index;
+                }
+            }
+        };
+
+        pub fn query(self: *const Self, center: Position, radius: i32) Query {
+            assert(radius >= 0);
+            const minimum: [2]i64 = .{ @as(i64, center.x) - radius, @as(i64, center.z) - radius };
+            const maximum: [2]i64 = .{ @as(i64, center.x) + radius, @as(i64, center.z) + radius };
+            const low = cell(.{ .world = center.world, .x = @intCast(@max(std.math.minInt(i32), minimum[0])), .z = @intCast(@max(std.math.minInt(i32), minimum[1])) });
+            const high = cell(.{ .world = center.world, .x = @intCast(@min(std.math.maxInt(i32), maximum[0])), .z = @intCast(@min(std.math.maxInt(i32), maximum[1])) });
+            const cells: u64 = @as(u64, @intCast(@as(i64, high.x) - low.x + 1)) * @as(u64, @intCast(@as(i64, high.z) - low.z + 1));
+            const scan = cells >= self.active.count;
+            return .{ .owner = self, .revision = self.revision, .world = center.world, .minimum = minimum, .maximum = maximum, .low = low, .high = high, .at = low, .scan = scan, .indices = if (scan) self.active.values() else &.{} };
+        }
+
+        pub const Window = struct {
+            owner: *const Self,
+            revision: u64,
+            world: u32,
+            minimum: [2]i64,
+            maximum: [2]i64,
+            indices: []const usize,
+
+            pub fn query(self: Window, center: Position, radius: i32) ?Query {
+                assert(radius >= 0);
+                if (self.owner.revision != self.revision or self.world != center.world) return null;
+                const minimum: [2]i64 = .{ @as(i64, center.x) - radius, @as(i64, center.z) - radius };
+                const maximum: [2]i64 = .{ @as(i64, center.x) + radius, @as(i64, center.z) + radius };
+                for (0..2) |axis| if (minimum[axis] < self.minimum[axis] or maximum[axis] > self.maximum[axis]) return null;
+                return .{ .owner = self.owner, .revision = self.revision, .world = center.world, .minimum = minimum, .maximum = maximum, .scan = true, .indices = self.indices, .low = undefined, .high = undefined, .at = undefined };
+            }
+        };
+
+        /// Members borrow output until it is reused. A position update invalidates the window.
+        pub fn window(self: *const Self, center: Position, radius: i32, output: []usize) Window {
+            assert(output.len >= self.active.count);
+            var selected = self.query(center, radius);
+            var count: usize = 0;
+            while (selected.next()) |index| {
+                assert(count < output.len);
+                output[count] = index;
+                count += 1;
+            }
+            return .{ .owner = self, .revision = self.revision, .world = center.world, .minimum = selected.minimum, .maximum = selected.maximum, .indices = output[0..count] };
         }
     };
-
-    pub fn query(self: *const Index, center: Position, radius: i32) Query {
-        assert(radius >= 0);
-        const minimum: [2]i64 = .{ @as(i64, center.x) - radius, @as(i64, center.z) - radius };
-        const maximum: [2]i64 = .{ @as(i64, center.x) + radius, @as(i64, center.z) + radius };
-        const low = cell(.{ .world = center.world, .x = @intCast(@max(std.math.minInt(i32), minimum[0])), .z = @intCast(@max(std.math.minInt(i32), minimum[1])) });
-        const high = cell(.{ .world = center.world, .x = @intCast(@min(std.math.maxInt(i32), maximum[0])), .z = @intCast(@min(std.math.maxInt(i32), maximum[1])) });
-        const cells: u64 = @as(u64, @intCast(@as(i64, high.x) - low.x + 1)) * @as(u64, @intCast(@as(i64, high.z) - low.z + 1));
-        return .{ .owner = self, .revision = self.revision, .world = center.world, .minimum = minimum, .maximum = maximum, .low = low, .high = high, .at = low, .scan = cells >= self.active.count };
-    }
-};
+}
 
 pub const Groups = struct {
     const Group = struct { head: usize };
@@ -308,7 +380,46 @@ pub fn benchmark() !void {
         try std.testing.expectEqual(count, found);
         try output.interface.print("spatial clustered_players={d} member_updates={d} shifted_indices=0\n", .{ count, index.revision - before });
     }
+    const streaming = try streamingGrids();
+    try output.interface.print("spatial separated_players=32 horizon_radius=32 queries=4128 small_cell_visits={d} horizon_cell_visits={d}\n", .{ streaming[0], streaming[1] });
     try output.interface.flush();
+}
+
+test "streaming grids preserve exhaustive audiences across horizon boundaries" {
+    _ = try streamingGrids();
+}
+
+fn streamingGrids() ![2]usize {
+    const count = 32;
+    const radius = 32;
+    var visited: [2]usize = @splat(0);
+    inline for (.{ 8, 64 }, 0..) |width, mode| {
+        var bounded = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var index = try Grid(width).init(bounded.allocator(), count);
+        defer index.deinit(bounded.allocator());
+        bounded.fail_index = bounded.alloc_index;
+        for (0..count) |player| index.update(player, .{ .world = @intCast(player % 3), .x = @as(i32, @intCast(player % 8)) * 128 - 448, .z = @as(i32, @intCast(player / 8)) * 128 - 192 });
+        for (0..count) |player| for (0..129) |offset| {
+            const center: Grid(width).Position = .{ .world = @intCast(player % 3), .x = @as(i32, @intCast(player % 8)) * 128 - 512 + @as(i32, @intCast(offset)), .z = @as(i32, @intCast(player / 8)) * 128 - 192 };
+            var expected: [count]bool = @splat(false);
+            for (index.nodes, 0..) |node, slot| {
+                const position = node.position.?;
+                expected[slot] = position.world == center.world and @abs(position.x - center.x) <= radius and @abs(position.z - center.z) <= radius;
+            }
+            var actual: [count]bool = @splat(false);
+            var query = index.query(center, radius);
+            while (query.next()) |slot| {
+                try std.testing.expect(!actual[slot]);
+                actual[slot] = true;
+            }
+            try std.testing.expectEqualSlices(bool, &expected, &actual);
+            visited[mode] += query.visited;
+        };
+        try std.testing.expect(!bounded.has_induced_failure);
+    }
+    try std.testing.expectEqual(@as(usize, count * count * 129), visited[0]);
+    try std.testing.expect(visited[1] < visited[0] / 4);
+    return visited;
 }
 
 test "colliding hash buckets preserve exact cells without duplicate recipients" {

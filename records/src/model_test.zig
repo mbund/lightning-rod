@@ -8,6 +8,111 @@ const fault = @import("fault_disk");
 
 const Row = struct { bytes: [8193]u8 = undefined, length: usize = 0, present: bool = false };
 
+test "record prefixes preserve bounds and ordering across inline direct and indexed overflow" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/prefixes", .{temporary.sub_path});
+    var bounded = std.testing.FailingAllocator.init(allocator, .{});
+    const large = try allocator.alloc(u8, 1400000);
+    defer allocator.free(large);
+    const recovered = try allocator.alloc(u8, large.len);
+    defer allocator.free(recovered);
+    for (large, 0..) |*byte, index| byte.* = @truncate(index * 37 + index / 4096);
+    var store = try storage.Store.init(bounded.allocator(), io, .{ .path = path });
+    defer store.deinit();
+    const resources = try records.Resources.init(bounded.allocator(), io, .{ .readers = 1, .writers = 1 });
+    defer resources.deinit();
+    const table = records.Table.init(try store.openSpace("records"), resources);
+    bounded.fail_index = bounded.alloc_index;
+    bounded.resize_fail_index = bounded.resize_index;
+    const sizes = [_]usize{ 0, 1, 31, 1234, 4096, 8192 + 777, 1024 * 1024 + 173, 1400000 };
+    var keys: [sizes.len][2]u8 = undefined;
+    var writes: [sizes.len]records.Write = undefined;
+    for (&keys, &writes, sizes, 0..) |*key, *write, size, index| {
+        std.mem.writeInt(u16, key, @intCast(index), .big);
+        write.* = .{ .key = key, .value = large[0..size] };
+    }
+    var output: [sizes.len + 1][8195]u8 = undefined;
+    var requests: [sizes.len + 1]records.Get = undefined;
+    var lengths: [sizes.len + 1]?usize = undefined;
+    try table.putBatch(&writes);
+    for ([_]usize{ 0, 1, 17, 335, 336, 337, 1199, 1200, 1201, 4095, 4096, 8193 }) |capacity| {
+        @memset(std.mem.asBytes(&output), 0x97);
+        for (&requests, &output, 0..) |*request, *bytes, index| request.* = .{ .key = if (index == sizes.len) "missing" else &keys[sizes.len - index - 1], .destination = bytes[1..][0..capacity], .placement = if (index % 2 == 0) .start else .end };
+        try table.prefixesBatch(&requests, &lengths);
+        for (output, lengths, 0..) |bytes, length, index| {
+            if (index == sizes.len) {
+                try std.testing.expectEqual(null, length);
+                try std.testing.expect(std.mem.allEqual(u8, &bytes, 0x97));
+                continue;
+            }
+            const count = @min(capacity, sizes[sizes.len - index - 1]);
+            try std.testing.expectEqual(@as(?usize, count), length);
+            const offset = 1 + if (index % 2 == 0) @as(usize, 0) else capacity - count;
+            try std.testing.expect(std.mem.allEqual(u8, bytes[0..offset], 0x97));
+            try std.testing.expectEqualSlices(u8, large[0..count], bytes[offset..][0..count]);
+            try std.testing.expect(std.mem.allEqual(u8, bytes[offset + count ..], 0x97));
+        }
+    }
+    for (keys, sizes) |key, size| {
+        try std.testing.expectEqual(@as(?usize, size), try table.get(&key, recovered));
+        try std.testing.expectEqualSlices(u8, large[0..size], recovered[0..size]);
+    }
+    _ = try structure.inspect(table);
+    var too_small: [1]u8 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, table.get(&keys[sizes.len - 1], &too_small));
+    for (&writes) |*write| write.* = .{ .key = write.key, .value = null };
+    try table.putBatch(&writes);
+    try std.testing.expectEqual(@as(usize, 0), (try structure.inspect(table)).records);
+}
+
+test "record length batches preserve ordering without reading overflow payloads" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/lengths", .{temporary.sub_path});
+    var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .capacity = 64 });
+    defer registry.deinit();
+    const pages = try storage.Resources.init(std.testing.allocator, io, .{ .cache_pages = 1 });
+    defer pages.deinit();
+    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path, .metrics = &registry, .resources = pages });
+    defer store.deinit();
+    const resources = try records.Resources.init(std.testing.allocator, io, .{ .readers = 1, .writers = 1 });
+    defer resources.deinit();
+    var table = records.Table.init(try store.openSpace("records"), resources);
+    table.value_cache = .stream;
+    const large: [16384]u8 = @splat(7);
+    try table.putBatch(&.{ .{ .key = "large", .value = &large }, .{ .key = "small", .value = "abc" } });
+    const keys = [_][]const u8{ "large", "absent", "small", "large" };
+    var lengths: [4]?usize = undefined;
+    try table.lengthsBatch(&keys, &lengths);
+    try std.testing.expectEqual([4]?usize{ large.len, null, 3, large.len }, lengths);
+    const reads = store.read_pages.value();
+    try table.lengthsBatch(&keys, &lengths);
+    try std.testing.expectEqual(reads, store.read_pages.value());
+    var bytes: [large.len]u8 = undefined;
+    try std.testing.expectEqual(@as(?usize, large.len), try table.get("large", &bytes));
+    try std.testing.expectEqualSlices(u8, &large, &bytes);
+    try std.testing.expect(store.read_pages.value() > reads);
+    var guarded: [large.len + 39]u8 = @splat(0xa7);
+    var small: [17]u8 = @splat(0xa7);
+    try table.getBatch(&.{
+        .{ .key = "large", .destination = guarded[16 .. guarded.len - 16], .placement = .end },
+        .{ .key = "small", .destination = &small, .placement = .end },
+        .{ .key = "absent", .destination = &.{}, .placement = .end },
+    }, lengths[0..3]);
+    try std.testing.expectEqual([3]?usize{ large.len, 3, null }, lengths[0..3].*);
+    try std.testing.expect(std.mem.allEqual(u8, guarded[0..23], 0xa7));
+    try std.testing.expectEqualSlices(u8, &large, guarded[23 .. guarded.len - 16]);
+    try std.testing.expect(std.mem.allEqual(u8, guarded[guarded.len - 16 ..], 0xa7));
+    try std.testing.expect(std.mem.allEqual(u8, small[0..14], 0xa7));
+    try std.testing.expectEqualStrings("abc", small[14..]);
+}
+
 test "record workspaces remain bounded after initialization across splits and deletion" {
     var temporary = try testing.directory(.{});
     defer temporary.cleanup();
@@ -105,14 +210,14 @@ test "record decoding rejects invalid inline prefixes and older node versions" {
         try table.put("key", &value);
         try store.waitDurable(try store.commit(1));
     }
-    const Invalid = struct { representation: u16, length: u32 = 5964, version: u8 = 1 };
+    const Invalid = struct { representation: u16, length: u32 = 5964, version: u8 = 2 };
     const cases = [_]Invalid{
-        .{ .representation = 3 | (1899 << 2) },
+        .{ .representation = 3 | (5000 << 2) },
         .{ .representation = 3 | (6000 << 2) },
         .{ .representation = 1 | (1 << 2) },
         .{ .representation = 0 | (1 << 2) },
         .{ .representation = 3 | (1900 << 2), .length = 1900 },
-        .{ .representation = 3 | (1900 << 2), .version = 0 },
+        .{ .representation = 3 | (1900 << 2), .version = 1 },
     };
     for (cases) |invalid| {
         var store = try storage.Store.init(std.testing.allocator, io, options);
@@ -1004,6 +1109,101 @@ test "sparse record batches preserve duplicate missing and caller ordered result
                 try std.testing.expectEqual(@as(u32, @intCast(id)), std.mem.readInt(u32, value[0..4], .little));
             }
         }
+    }
+}
+
+test "record navigation survives page eviction and invalidates only changed content" {
+    for ([_]usize{ 1, 2 }) |readers| {
+        const io = std.testing.io;
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        var path_buffer: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/navigation-eviction", .{temporary.sub_path});
+        var registry = try metrics.Registry.init(std.testing.allocator, io, .{});
+        defer registry.deinit();
+        const pages = try storage.Resources.init(std.testing.allocator, io, .{ .cache_pages = 1, .readers = 1 });
+        defer pages.deinit();
+        var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path, .resources = pages });
+        defer store.deinit();
+        const resources = try records.Resources.init(std.testing.allocator, io, .{ .readers = readers, .writers = 1, .navigation_pages = 1, .metrics = &registry });
+        defer resources.deinit();
+        const space = try store.openSpace("records");
+        const table = records.Table.init(space, resources);
+        try table.put("key", "first");
+        var value: [16]u8 = undefined;
+        try std.testing.expectEqual(@as(?usize, 5), try table.get("key", &value));
+        const decoded = resources.navigation_decoded.value();
+        for (0..8) |_| {
+            try std.testing.expectEqual(@as(?usize, 5), try table.get("key", &value));
+            try std.testing.expectEqualStrings("first", value[0..5]);
+        }
+        try std.testing.expectEqual(@as(u64, 1), decoded);
+        try std.testing.expectEqual(decoded, resources.navigation_decoded.value());
+        var ids: [1]storage.PageId = undefined;
+        try space.allocatePages(&ids);
+        const other: storage.Page = @splat(0x37);
+        try space.writePages(&.{.{ .id = ids[0], .source = &other }});
+        try std.testing.expectEqual(@as(?usize, 5), try table.get("key", &value));
+        try std.testing.expectEqualStrings("first", value[0..5]);
+        try std.testing.expectEqual(decoded, resources.navigation_decoded.value());
+        try std.testing.expectEqual(@as(u64, 1), resources.navigation_reused.value());
+        try std.testing.expectEqual(@as(u64, 8), resources.locations_reused.value());
+        try table.put("key", "second");
+        try std.testing.expectEqual(@as(?usize, 6), try table.get("key", &value));
+        try std.testing.expectEqualStrings("second", value[0..6]);
+        try std.testing.expectEqual(decoded + 1, resources.navigation_decoded.value());
+    }
+}
+
+test "cached record locations preserve collisions deletion and root replacement" {
+    const io = std.testing.io;
+    for ([_]usize{ 0, 1, 5 }) |capacity| {
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        var path_buffer: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/locations", .{temporary.sub_path});
+        var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
+        defer store.deinit();
+        const resources = try records.Resources.init(std.testing.allocator, io, .{ .cached_locations = capacity });
+        defer resources.deinit();
+        const space = try store.openSpace("records");
+        const table = records.Table.init(space, resources);
+        try table.putBatch(&.{ .{ .key = "first", .value = "one" }, .{ .key = "second", .value = "two" } });
+        var bytes: [4][32]u8 = undefined;
+        var requests: [4]records.Get = undefined;
+        var lengths: [4]?usize = undefined;
+        for ([_][]const u8{ "first", "second", "first", "missing" }, &bytes, &requests) |key, *output, *request| request.* = .{ .key = key, .destination = output };
+        for (0..4) |_| {
+            try table.prefixesBatch(&requests, &lengths);
+            try std.testing.expectEqual([4]?usize{ 3, 3, 3, null }, lengths);
+            try std.testing.expectEqualStrings("one", bytes[0][0..3]);
+            try std.testing.expectEqualStrings("two", bytes[1][0..3]);
+            try std.testing.expectEqualStrings("one", bytes[2][0..3]);
+        }
+        if (capacity == 1) {
+            try std.testing.expectEqual(@as(?usize, 3), try table.get("first", &bytes[0]));
+            resources.locations[0].hash = std.hash.Wyhash.hash(0, "second");
+            try std.testing.expectEqual(@as(?usize, 3), try table.get("second", &bytes[1]));
+            try std.testing.expectEqualStrings("two", bytes[1][0..3]);
+        }
+        const root = try space.getRoot();
+        try space.setRoot(null);
+        try table.getBatch(&requests, &lengths);
+        try std.testing.expectEqual([4]?usize{ null, null, null, null }, lengths);
+        try space.setRoot(root);
+        try table.getBatch(&requests, &lengths);
+        try std.testing.expectEqual([4]?usize{ 3, 3, 3, null }, lengths);
+        try table.putBatch(&.{ .{ .key = "first", .value = null }, .{ .key = "second", .value = "replacement" } });
+        for (0..4) |_| {
+            try table.getBatch(&requests, &lengths);
+            try std.testing.expectEqual([4]?usize{ null, 11, null, null }, lengths);
+            try std.testing.expectEqualStrings("replacement", bytes[1][0..11]);
+        }
+        try table.put("first", "new");
+        try table.getBatch(&requests, &lengths);
+        try std.testing.expectEqual([4]?usize{ 3, 11, 3, null }, lengths);
+        try std.testing.expectEqualStrings("new", bytes[0][0..3]);
+        try std.testing.expectEqualStrings("new", bytes[2][0..3]);
     }
 }
 

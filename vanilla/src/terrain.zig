@@ -15,7 +15,7 @@ pub const Terrain = struct {
     }
 
     pub fn poll(self: *Terrain) !void {
-        if (!self.chunks.generation.parallel.load(.acquire)) _ = try self.chunks.generation.processOne(self.io);
+        if (!self.chunks.generation.parallel.load(.acquire)) _ = try self.chunks.generation.processBatch(self.io);
         try self.chunks.poll();
         _ = try self.streaming.poll(self.io);
         _ = try self.blocks.poll(self.io);
@@ -23,12 +23,14 @@ pub const Terrain = struct {
     }
 
     pub fn stop(self: *Terrain) void {
+        self.streaming.releaseTile();
         self.chunks.stop();
     }
 };
 
 pub const ThreadedTerrain = struct {
-    pub const stack_size = 256 * 1024;
+    // The DEFLATE initializer and its caller each hold a temporary compressor value in Debug.
+    pub const stack_size = 768 * 1024;
     terrain: Terrain,
     io: std.Io,
     thread: ?std.Thread = null,

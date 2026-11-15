@@ -7,16 +7,17 @@ import net.minecraft.world.level.block.Blocks;
 
 final class OcclusionTransitionFixture extends Fixture {
     private static final int DISTANCE = 32;
-    private static final int COLUMNS = (DISTANCE * 2 + 1) * (DISTANCE * 2 + 1);
+    private static final int COLUMNS = horizonColumns(DISTANCE);
+    private static final int DIAGONAL = (int) Math.floor(DISTANCE / Math.sqrt(2));
     private static final int[] MARKER_COLUMNS = {2, 4, 8, 16, DISTANCE};
     private static final int[] MARKER_HEIGHTS = {80, 112, 144};
     private static final BlockPos RETAINED_LIGHT = new BlockPos(20, 17, 20);
     private static final BlockPos LAMP = RETAINED_LIGHT.below();
     private static final int BLOCK_LIGHT = 14;
     private static final int[][] HORIZON = {
-        {-DISTANCE, -DISTANCE}, {0, -DISTANCE}, {DISTANCE, -DISTANCE},
+        {-DIAGONAL, -DIAGONAL}, {0, -DISTANCE}, {DIAGONAL, -DIAGONAL},
         {-DISTANCE, 0}, {DISTANCE, 0},
-        {-DISTANCE, DISTANCE}, {0, DISTANCE}, {DISTANCE, DISTANCE}
+        {-DIAGONAL, DIAGONAL}, {0, DISTANCE}, {DIAGONAL, DIAGONAL}
     };
     private long started;
     private int initialPackets;

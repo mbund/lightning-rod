@@ -6,14 +6,19 @@ pub const Location = struct {
     current: u64,
     owner: u32,
     committed: u64 = 0,
-    // Null follows committed. Zero preserves absence in the active checkpoint snapshot.
-    checkpoint: ?u64 = null,
+    // A captured zero preserves absence. Uncaptured checkpoints follow committed.
+    checkpoint: u64 = 0,
     uncommitted: u64 = 0,
     materialized: u64 = 0,
     replacement: u64 = 0,
     replacement_dirty: bool = false,
     dirty: bool = false,
+    checkpoint_captured: bool = false,
 };
+
+comptime {
+    assert(@sizeOf(Location) == 64);
+}
 
 /// Removal shifts entries. Do not retain pointers or mutate the index while iterating.
 pub const Index = struct {
@@ -47,6 +52,11 @@ pub const Index = struct {
 
     pub fn count(self: *const Index) usize {
         return self.length;
+    }
+
+    pub fn clear(self: *Index) void {
+        @memset(self.occupied, 0);
+        self.length = 0;
     }
 
     pub fn position(self: *const Index, id: u64) usize {

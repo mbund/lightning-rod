@@ -30,6 +30,38 @@ pub const Profile = protocol_api.Profile;
 
 pub const Disposition = enum { consumed, borrowed, blocked };
 
+/// Why the engine closed a connection.
+pub const CloseReason = enum {
+    none,
+    /// The peer or the transport closed it.
+    transport_closed,
+    receive_failed,
+    send_failed,
+    transport_failed,
+    codec_failed,
+    restore_failed,
+    saved_input_failed,
+    saved_output_failed,
+    /// It did not finish logging in in time.
+    admission_timeout,
+    admission_failed,
+    attach_failed,
+    rejected,
+    reload,
+    stopping,
+    /// The server asked for it, and its last output went out.
+    disconnected,
+    disconnect_failed,
+    invalid_frame,
+    decode_rejected,
+    decode_too_large,
+    packet_rejected,
+    protocol_rejected,
+    input_rejected,
+    input_overflow,
+    output_rejected,
+};
+
 pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
     return struct {
         const Self = @This();
@@ -39,10 +71,10 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             max_players: ?usize = null,
             buffer_bytes: usize = 128 * 1024,
             connection_bytes: usize = 8 * 1024,
-            input_burst_slots: usize = 8,
+            input_burst_slots: usize = 2,
             output_burst_slots: usize = 8,
             configuration_slots: usize = 8,
-            decode_slots: usize = 8,
+            decode_slots: usize = 2,
             max_packet: usize = 128 * 1024 - 3,
             max_pending_wire_bytes: usize = 4 * 1024 * 1024,
             protocols: *const Endpoint.Protocols,
@@ -70,7 +102,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             count: u8,
         };
         const absent = std.math.maxInt(usize);
-        const Wait = enum { external, control, configuration, configuration_admitted, decoded, input };
+        const Wait = enum { external, control, control_admitted, configuration, configuration_admitted, decoded, input };
         const Waiters = struct { head: usize = absent, tail: usize = absent, count: usize = 0 };
         const Connection = struct {
             handle: ?network.Handle = null,
@@ -112,6 +144,8 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             active_next: ?usize = null,
             active: bool = false,
             closing: bool = false,
+            /// Why the connection is closing, for whoever reads the log.
+            close_reason: CloseReason = .none,
             closed: bool = false,
             attached: bool = false,
             resumed: bool = false,
@@ -134,6 +168,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             receive_tail: usize = 0,
             control_building: bool = false,
             decoded_result: ?Codec.Result = null,
+            decode_large: bool = false,
             input_packets: [128][]const u8 = undefined,
             send_loan: ?*Loan = null,
             output_loans: [output_loans_max]SendLoan = undefined,
@@ -141,17 +176,27 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             loan_write: usize = 0,
         };
 
+        /// Marks a connection closing, keeping the first reason it was given.
+        fn markClosing(connection: *Connection, reason: CloseReason) void {
+            if (!connection.closing) connection.close_reason = reason;
+            connection.closing = true;
+        }
+
         allocator: std.mem.Allocator,
         networking: network.Transport,
         config: Configuration,
+
         connections: []Connection,
         input: []align(64) u8,
         output: []align(64) u8,
+        decoded_storage: []align(64) u8,
         events: []network.Event,
         workspaces: Endpoint.Workspaces,
         decoded: Buffers,
         input_bursts: Buffers,
         output_bursts: Buffers,
+        packet_bursts: *Buffers,
+        control_bursts: *Buffers,
         configurations: Buffers,
         control_raw: Buffers,
         scratch: []align(64) u8,
@@ -211,18 +256,42 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             errdefer allocator.free(input);
             const output = try allocator.alignedAlloc(u8, .@"64", bytes);
             errdefer allocator.free(output);
+            const decoded_storage = try allocator.alignedAlloc(u8, .@"64", bytes);
+            errdefer allocator.free(decoded_storage);
             const events = try allocator.alloc(network.Event, config.connections * 3);
             errdefer allocator.free(events);
-            var decoded = try Buffers.init(allocator, if (Endpoint.needsDecoded(config.compression_threshold)) @min(config.decode_slots, config.connections) else 0, config.buffer_bytes);
+            const decode_slots = if (Endpoint.needsDecoded(config.compression_threshold)) @min(config.decode_slots, config.connections) else 0;
+            const input_slots = if (small == config.buffer_bytes) 0 else @min(config.input_burst_slots, config.connections);
+            const output_slots = if (small == config.buffer_bytes) 0 else @min(config.output_burst_slots, config.connections);
+            const packet_slots = @max(decode_slots, input_slots, output_slots);
+            const control_slots = @min(config.configuration_slots, config.connections);
+            const packet_bursts = try allocator.create(Buffers);
+            errdefer allocator.destroy(packet_bursts);
+            packet_bursts.* = try Buffers.init(allocator, .{ .slots = packet_slots - @min(packet_slots, 1), .bytes = config.buffer_bytes });
+            errdefer packet_bursts.deinit(allocator);
+            const control_bursts = try allocator.create(Buffers);
+            errdefer allocator.destroy(control_bursts);
+            // One private control slot progresses configuration while another serves status and login.
+            const control_guaranteed = @min(control_slots, 2);
+            control_bursts.* = try Buffers.init(allocator, .{ .slots = control_slots - control_guaranteed, .bytes = config.max_pending_wire_bytes });
+            errdefer control_bursts.deinit(allocator);
+            var decoded = try Buffers.init(allocator, .{ .slots = decode_slots, .bytes = config.buffer_bytes, .guaranteed = @min(decode_slots, 1), .overflow = packet_bursts });
             errdefer decoded.deinit(allocator);
-            var input_bursts = try Buffers.init(allocator, if (small == config.buffer_bytes) 0 else @min(config.input_burst_slots, config.connections), config.buffer_bytes);
+            var input_bursts = try Buffers.init(allocator, .{ .slots = input_slots, .bytes = config.buffer_bytes, .guaranteed = @min(input_slots, 1), .overflow = packet_bursts });
             errdefer input_bursts.deinit(allocator);
-            var output_bursts = try Buffers.init(allocator, if (small == config.buffer_bytes) 0 else @min(config.output_burst_slots, config.connections), config.buffer_bytes);
+            var output_bursts = try Buffers.init(allocator, .{ .slots = output_slots, .bytes = config.buffer_bytes, .guaranteed = @min(output_slots, 1), .overflow = packet_bursts });
             errdefer output_bursts.deinit(allocator);
-            var configurations = try Buffers.init(allocator, @min(config.configuration_slots, config.connections), config.max_pending_wire_bytes);
+            var configurations = try Buffers.init(allocator, .{ .slots = control_slots, .bytes = config.max_pending_wire_bytes, .guaranteed = control_guaranteed, .overflow = control_bursts });
             errdefer configurations.deinit(allocator);
-            var control_raw = try Buffers.init(allocator, @min(config.configuration_slots, config.connections), config.max_pending_wire_bytes);
+            var control_raw = try Buffers.init(allocator, .{ .slots = control_slots, .bytes = config.max_pending_wire_bytes, .guaranteed = control_guaranteed, .overflow = control_bursts });
             errdefer control_raw.deinit(allocator);
+            try packet_bursts.instrument(config.metrics, "session.buffers.packet_shared");
+            try control_bursts.instrument(config.metrics, "session.buffers.control_shared");
+            try decoded.instrument(config.metrics, "session.buffers.decoded");
+            try input_bursts.instrument(config.metrics, "session.buffers.input_bursts");
+            try output_bursts.instrument(config.metrics, "session.buffers.output_bursts");
+            try configurations.instrument(config.metrics, "session.buffers.configurations");
+            try control_raw.instrument(config.metrics, "session.buffers.control_raw");
             const scratch = try allocator.alignedAlloc(u8, .@"64", config.buffer_bytes);
             errdefer allocator.free(scratch);
             const control_storage = try allocator.alloc(u8, try std.math.mul(usize, config.connections, small));
@@ -240,11 +309,14 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 .input = input,
                 .transport_waiting = transport_waiting,
                 .output = output,
+                .decoded_storage = decoded_storage,
                 .events = events,
                 .workspaces = try Endpoint.initWorkspaces(allocator),
                 .decoded = decoded,
                 .input_bursts = input_bursts,
                 .output_bursts = output_bursts,
+                .packet_bursts = packet_bursts,
+                .control_bursts = control_bursts,
                 .configurations = configurations,
                 .control_raw = control_raw,
                 .scratch = scratch,
@@ -256,7 +328,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
 
         pub fn attachCodec(self: *Self, codec: *Codec) !void {
             assert(self.codec == null and self.control_jobs.len == 0);
-            self.control_jobs = try self.allocator.alloc(Codec.Control, self.configurations.slots.len * Codec.control_batch_max);
+            self.control_jobs = try self.allocator.alloc(Codec.Control, self.configurations.addressableSlots() * Codec.control_batch_max);
             self.codec = codec;
         }
 
@@ -270,11 +342,16 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             self.identities.deinit(self.allocator);
             Endpoint.deinitWorkspaces(&self.workspaces);
             self.allocator.free(self.scratch);
+            self.allocator.free(self.decoded_storage);
             self.decoded.deinit(self.allocator);
             self.input_bursts.deinit(self.allocator);
             self.output_bursts.deinit(self.allocator);
             self.configurations.deinit(self.allocator);
             self.control_raw.deinit(self.allocator);
+            self.packet_bursts.deinit(self.allocator);
+            self.allocator.destroy(self.packet_bursts);
+            self.control_bursts.deinit(self.allocator);
+            self.allocator.destroy(self.control_bursts);
             if (self.resume_file) |file| file.close(self.file_io);
             if (self.spool_file) |file| file.close(self.file_io);
             self.allocator.free(self.events);
@@ -429,7 +506,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 assert(connection.parked);
                 _ = self.advance(io, connection, .restore) catch |err| {
                     std.log.err("event=session_restore_failed reason={s}", .{@errorName(err)});
-                    connection.closing = true;
+                    markClosing(connection, .restore_failed);
                     continue;
                 };
                 connection.parked = false;
@@ -730,7 +807,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             const connection = &self.connections[handle.index];
             if (connection.handle == null or !std.meta.eql(connection.handle.?, handle) or connection.closing or ((self.stopping or connection.disconnect_deadline != null) and connection.group == null) or connection.state.phase != .play) return error.Closed;
             if (connection.codec.state.load(.acquire) != .idle or connection.received != 0) return error.Full;
-            assert(self.codec != null and Endpoint.encrypted(&connection.lifecycle.?));
+            assert(Endpoint.encrypted(&connection.lifecycle.?));
             const buffer = self.ringBuffer(handle.index);
             const used = connection.output_write -% connection.output_read;
             assert(used <= buffer.len);
@@ -743,6 +820,32 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 .offset = connection.output_write % buffer.len,
                 .overflow = if (used == 0 and !connection.sending and !connection.output_control and connection.output_burst == null) &self.output_bursts else null,
             };
+        }
+
+        pub fn commitSend(self: *Self, io: std.Io, handle: network.Handle, count: usize, burst: ?Buffers.Lease) !void {
+            const index = handle.index;
+            const connection = &self.connections[index];
+            assert(std.meta.eql(connection.handle.?, handle));
+            assert(connection.codec.state.load(.acquire) == .idle);
+            if (connection.send_loan) |loan| loan.release();
+            connection.send_loan = null;
+            if (burst) |lease| {
+                assert(connection.output_burst == null and connection.output_write == connection.output_read and !connection.sending and !connection.output_control);
+                connection.output_burst = lease;
+                connection.output_read = 0;
+                connection.output_write = 0;
+                connection.output = &.{};
+            }
+            const capacity = self.ringBuffer(index).len;
+            const used = connection.output_write -% connection.output_read;
+            assert(used <= capacity and count <= capacity - used);
+            if (connection.spooling and count != 0) {
+                const ring = self.ringBuffer(index);
+                const at = connection.output_write % ring.len;
+                const first = @min(count, ring.len - at);
+                try self.appendSpool(io, index, ring[at..][0..first]);
+                try self.appendSpool(io, index, ring[0 .. count - first]);
+            } else connection.output_write +%= count;
         }
 
         const SendBuffers = struct { connection: *Endpoint.Connection, first: []u8, second: []u8 };
@@ -817,7 +920,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                             if (!result.result.more and result.result.errno == @backingInt(std.posix.E.NOBUFS)) continue;
                             if (self.reloading and result.result.errno == @backingInt(std.posix.E.CANCELED)) continue;
                             if (result.result.errno != null or result.result.bytes == 0 or result.result.bytes > self.inputBuffer(handle.index).len - connection.input_end - connection.received) {
-                                connection.closing = true;
+                                markClosing(connection, .receive_failed);
                             } else {
                                 if (self.codec != null and connection.lifecycle != null and Endpoint.encrypted(&connection.lifecycle.?)) {
                                     connection.received += result.result.bytes;
@@ -837,7 +940,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
 
                             if (self.reloading and result.result.errno == @backingInt(std.posix.E.CANCELED)) continue;
                             if (result.result.errno != null or result.result.bytes == 0 or result.result.bytes > connection.sending_bytes) {
-                                connection.closing = true;
+                                markClosing(connection, .send_failed);
                             } else {
                                 assert(result.result.bytes > 0 and result.result.bytes <= connection.sending_bytes);
                                 self.instruments.sent_bytes.add(result.result.bytes);
@@ -847,8 +950,9 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                         .closed => {
                             assert(!connection.receiving and !connection.sending);
                             connection.closed = true;
-                            connection.closing = true;
-                            std.log.info("event=session_closed connection={d}:{d} phase={s}", .{ handle.index, handle.generation, @tagName(connection.state.phase) });
+                            // Closed with no reason of ours, the transport or the peer closed it.
+                            markClosing(connection, .transport_closed);
+                            std.log.info("event=session_closed connection={d}:{d} phase={s} reason={t}", .{ handle.index, handle.generation, @tagName(connection.state.phase), connection.close_reason });
                         },
                         .accepted => unreachable,
                     }
@@ -879,7 +983,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                         return;
                     },
                     else => {
-                        connection.closing = true;
+                        markClosing(connection, .transport_failed);
                         return;
                     },
                 };
@@ -1037,20 +1141,24 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
 
         fn reserveControl(self: *Self, index: usize) bool {
             const connection = &self.connections[index];
-            if (connection.control_raw == null) connection.control_raw = self.control_raw.acquire() orelse {
-                connection.waiting_for = .control;
+            assert((connection.control_raw == null) == (connection.control_burst == null));
+            if (connection.control_burst != null) return true;
+            assert(self.control_raw.maximum == self.configurations.maximum);
+            // Reserve both sides of a control operation before consuming input or holding shared capacity.
+            const limit = self.configurations.maximum - @intFromBool(connection.admitted and self.configurations.maximum > 1);
+            const raw = self.control_raw.acquireWithin(limit) orelse {
+                connection.waiting_for = if (connection.admitted) .control_admitted else .control;
                 self.wait(index);
                 return false;
             };
-            if (connection.control_burst != null or connection.control_output.capacity >= self.config.max_pending_wire_bytes) return true;
-            // Keep one slot available for status and login while admitted clients drain configuration.
-            const limit = self.configurations.slots.len - @intFromBool(connection.admitted and self.configurations.slots.len > 1);
             const lease = self.configurations.acquireWithin(limit) orelse {
+                raw.release();
                 connection.waiting_for = if (connection.admitted) .configuration_admitted else .configuration;
                 self.wait(index);
                 return false;
             };
             assert(connection.control_output.items.len == 0);
+            connection.control_raw = raw;
             connection.control_burst = lease;
             connection.control_output = .initBuffer(lease.bytes);
             return true;
@@ -1282,21 +1390,30 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             const configuration = self.configurations.takeReleased();
             if (!(self.resources_ready or decoded or input or control_released or configuration)) return;
             self.resources_ready = false;
-            if (self.waiting[@backingInt(Wait.decoded)].count != 0) self.wakeWaiters(.decoded, self.decoded.availableCountWithin(self.decoded.slots.len));
-            if (self.waiting[@backingInt(Wait.input)].count != 0) self.wakeWaiters(.input, self.input_bursts.availableCountWithin(self.input_bursts.slots.len));
-            if (self.waiting[@backingInt(Wait.control)].count != 0) self.wakeWaiters(.control, self.control_raw.availableCountWithin(self.control_raw.slots.len));
-            const admitted = &self.waiting[@backingInt(Wait.configuration_admitted)];
-            const other = &self.waiting[@backingInt(Wait.configuration)];
-            if (admitted.count != 0 or other.count != 0) {
-                const capacity = self.configurations.availableCountWithin(self.configurations.slots.len);
-                const limit = self.configurations.slots.len - @intFromBool(self.configurations.slots.len > 1);
-                const count = @min(admitted.count, capacity, self.configurations.availableCountWithin(limit));
-                self.wakeWaiters(.configuration_admitted, count);
-                self.wakeWaiters(.configuration, capacity - count);
+            if (self.waiting[@backingInt(Wait.decoded)].count != 0) self.wakeWaiters(.decoded, self.decoded.availableCountWithin(self.decoded.maximum));
+            if (self.waiting[@backingInt(Wait.input)].count != 0) self.wakeWaiters(.input, self.input_bursts.availableCountWithin(self.input_bursts.maximum));
+            const ControlWaiters = struct { pool: *Buffers, admitted: Wait, other: Wait };
+            for ([_]ControlWaiters{
+                .{ .pool = &self.control_raw, .admitted = .control_admitted, .other = .control },
+                .{ .pool = &self.configurations, .admitted = .configuration_admitted, .other = .configuration },
+            }) |waiting| {
+                const admitted = &self.waiting[@backingInt(waiting.admitted)];
+                const other = &self.waiting[@backingInt(waiting.other)];
+                if (admitted.count == 0 and other.count == 0) continue;
+                const capacity = waiting.pool.availableCountWithin(waiting.pool.maximum);
+                const limit = waiting.pool.maximum - @intFromBool(waiting.pool.maximum > 1);
+                const count = @min(admitted.count, capacity, waiting.pool.availableCountWithin(limit));
+                self.wakeWaiters(waiting.admitted, count);
+                self.wakeWaiters(waiting.other, capacity - count);
             }
         }
 
         pub fn progress(self: *Self, io: std.Io) void {
+            defer {
+                inline for (.{ "decoded", "input_bursts", "output_bursts", "configurations", "control_raw" }) |name| @field(self, name).publishUsage();
+                self.packet_bursts.publishUsage();
+                self.control_bursts.publishUsage();
+            }
             const now = std.Io.Clock.now(.awake, io).nanoseconds;
             self.poll = .{ .now = now };
 
@@ -1313,6 +1430,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 if (!connection.loan.load(.acquire) and connection.codec.state.load(.acquire) == .idle and connection.decoded_result == null) {
                     if (connection.decoded) |lease| {
                         lease.release();
+                        connection.decode_large = false;
                         returned = true;
                     }
                     connection.decoded = null;
@@ -1364,7 +1482,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                     }
                 };
                 if (!(self.progressCodec(io, index) catch {
-                    connection.closing = true;
+                    markClosing(connection, .codec_failed);
                     continue;
                 })) {
                     if (connection.codec.state.load(.acquire) == .idle) self.wait(index);
@@ -1412,7 +1530,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 if (!self.reloading and connection.output.len == 0 and connection.saved_output.length != 0) {
                     const bytes = connection.control_output.unusedCapacitySlice();
                     const count = self.readSpan(&connection.saved_output, bytes) catch {
-                        connection.closing = true;
+                        markClosing(connection, .saved_output_failed);
                         continue;
                     };
                     connection.control_output.items.len = count;
@@ -1422,20 +1540,20 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 var input = self.inputBuffer(index);
 
                 if (!self.reloading and !connection.closing and connection.state.phase != .play and connection.state.phase != .parked) {
-                    if (now >= connection.admission_deadline) connection.closing = true else connection.poll.wakeAt(connection.admission_deadline);
+                    if (now >= connection.admission_deadline) markClosing(connection, .admission_timeout) else connection.poll.wakeAt(connection.admission_deadline);
                 }
 
-                if (self.reloading and (!connection.attached or connection.disconnect_deadline != null)) connection.closing = true;
+                if (self.reloading and (!connection.attached or connection.disconnect_deadline != null)) markClosing(connection, .reload);
 
-                if (connection.state.phase == .rejected and connection.output.len == 0) connection.closing = true;
+                if (connection.state.phase == .rejected and connection.output.len == 0) markClosing(connection, .rejected);
                 const stopping = self.stopping or connection.disconnect_deadline != null;
                 if (stopping and !connection.closing) {
                     if (connection.state.phase != .play or now >= (connection.disconnect_deadline orelse self.stop_deadline)) {
-                        connection.closing = true;
+                        markClosing(connection, .stopping);
                     } else if (connection.group != null) {
                         self.sendOutput(io, index);
                     } else if (connection.disconnecting) {
-                        if (connection.output.len == 0) connection.closing = true;
+                        if (connection.output.len == 0) markClosing(connection, .disconnected);
                     } else if (connection.output.len == 0 and connection.output_read == connection.output_write) {
                         if (!self.reserveControl(index)) {
                             self.wait(index);
@@ -1443,15 +1561,15 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                         }
                         const message = if (self.stopping) "Server shutting down" else "Disconnected by server";
                         const response = self.advance(io, connection, .{ .disconnect = message }) catch {
-                            connection.closing = true;
+                            markClosing(connection, .disconnect_failed);
                             continue;
                         };
                         const bytes = response orelse {
-                            connection.closing = true;
+                            markClosing(connection, .disconnect_failed);
                             continue;
                         };
                         self.queueControl(io, connection, bytes) catch {
-                            connection.closing = true;
+                            markClosing(connection, .disconnect_failed);
                             continue;
                         };
                         connection.disconnecting = true;
@@ -1485,16 +1603,17 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 }
 
                 while (!stopping and connection.group == null and connection.state.phase != .parked and (connection.state.phase == .play or connection.output.len == 0) and !connection.loan.load(.acquire)) {
-                    if (connection.lifecycle != null and connection.output.len == 0 and connection.output_read == connection.output_write and (connection.status or self.reserveControl(index))) {
+                    if (connection.lifecycle != null and connection.output.len == 0 and connection.output_read == connection.output_write) {
+                        if (!connection.status and !self.reserveControl(index)) break;
                         const response = self.advance(io, connection, .poll) catch |err| {
                             std.log.warn("event=session_poll_rejected connection={d}:{d} phase={s} reason={s}", .{ handle.index, handle.generation, @tagName(connection.state.phase), @errorName(err) });
-                            connection.closing = true;
+                            markClosing(connection, .protocol_rejected);
                             break;
                         };
                         if (response) |bytes| {
                             self.queueControl(io, connection, bytes) catch |err| {
                                 std.log.warn("event=session_output_rejected reason={s}", .{@errorName(err)});
-                                connection.closing = true;
+                                markClosing(connection, .output_rejected);
                                 break;
                             };
                             break;
@@ -1525,12 +1644,12 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                             }
                         }
                         const response = self.advance(io, connection, .{ .admitted = rejection }) catch {
-                            connection.closing = true;
+                            markClosing(connection, .admission_failed);
                             break;
                         };
                         if (rejection == null) self.admit(index);
                         if (response) |bytes| self.queueControl(io, connection, bytes) catch {
-                            connection.closing = true;
+                            markClosing(connection, .admission_failed);
                             break;
                         };
                         break;
@@ -1548,7 +1667,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                         }
                         connection.attached = true;
                         _ = self.advance(io, connection, .attached) catch {
-                            connection.closing = true;
+                            markClosing(connection, .attach_failed);
                             break;
                         };
                         std.log.info("event=session_play_attached connection={d}:{d} protocol={d} player={s}", .{ handle.index, handle.generation, connection.protocol.?.number, connection.state.name[0..connection.state.name_len] });
@@ -1556,19 +1675,23 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                     }
 
                     const frame = Endpoint.frame(if (connection.lifecycle) |*lifecycle| lifecycle else null, input[connection.input_start..connection.input_end], self.config.max_packet) catch |err| {
-                        if (err == error.Incomplete) frame_incomplete = true else connection.closing = true;
+                        if (err == error.Incomplete) frame_incomplete = true else markClosing(connection, .invalid_frame);
                         break;
                     };
                     if (frame.body.len == 0 or frame.length > self.config.buffer_bytes or frame.body.len > self.config.max_packet) {
                         std.log.warn("event=session_invalid_frame connection={d}:{d} phase={s} length={d} limit={d}", .{ handle.index, handle.generation, @tagName(connection.state.phase), frame.body.len, self.config.max_packet });
-                        connection.closing = true;
+                        markClosing(connection, .invalid_frame);
                         break;
                     }
 
                     var body = frame.body;
                     const borrowed = connection.lifecycle == null or Endpoint.playBorrowed(&connection.lifecycle.?);
                     const needs_decoded = connection.lifecycle != null and Endpoint.needsDecoded(self.config.compression_threshold) and (!borrowed or Endpoint.compressed(&connection.lifecycle.?));
-                    if (needs_decoded and connection.decoded == null) {
+                    if (connection.state.phase == .play and !connection.decode_large and connection.decoded_result == null) {
+                        if (connection.decoded) |lease| lease.release();
+                        connection.decoded = null;
+                    }
+                    if (needs_decoded and connection.decode_large and connection.decoded == null) {
                         connection.decoded = self.decoded.acquire();
                         if (connection.decoded == null) {
                             connection.waiting_for = .decoded;
@@ -1577,7 +1700,8 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                             break;
                         }
                     }
-                    const decoded: []u8 = if (connection.decoded) |lease| lease.bytes else self.decoded.bytes[0..0];
+                    const small = @min(self.config.connection_bytes, self.config.buffer_bytes);
+                    const decoded: []u8 = if (connection.decoded) |lease| lease.bytes else self.decoded_storage[index * small ..][0..small];
                     if (self.codec) |codec| {
                         if (connection.lifecycle != null and needs_decoded and (connection.state.phase == .play or Endpoint.compressed(&connection.lifecycle.?))) {
                             if (connection.decoded_result == null) {
@@ -1591,7 +1715,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                             const result = connection.decoded_result.?;
                             if (connection.state.phase == .play) {
                                 if (!self.observePlayPackets(io, connection, result.input.?)) {
-                                    connection.closing = true;
+                                    markClosing(connection, .input_rejected);
                                     break;
                                 }
                                 connection.loan.store(true, .release);
@@ -1610,20 +1734,39 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                             connection.decoded_result = null;
                         }
                     }
-                    if (connection.lifecycle != null and connection.state.phase != .play and (self.codec == null or !Endpoint.compressed(&connection.lifecycle.?))) body = Endpoint.decode(&connection.lifecycle.?, &self.workspaces, body, decoded, self.config.compression_threshold) catch |err| {
-                        std.log.warn("event=session_decode_rejected connection={d}:{d} phase={s} reason={s}", .{ handle.index, handle.generation, @tagName(connection.state.phase), @errorName(err) });
-                        connection.closing = true;
-                        break;
-                    };
+                    if (connection.lifecycle != null and connection.state.phase != .play and (self.codec == null or !Endpoint.compressed(&connection.lifecycle.?))) {
+                        const result = Codec.decode(&self.workspaces, .{ .connection = &connection.lifecycle.?, .bytes = body, .output = decoded, .threshold = self.config.compression_threshold }) catch |err| {
+                            std.log.warn("event=session_decode_rejected connection={d}:{d} phase={s} reason={s}", .{ handle.index, handle.generation, @tagName(connection.state.phase), @errorName(err) });
+                            markClosing(connection, .decode_rejected);
+                            break;
+                        };
+                        if (result.needs_output) {
+                            if (connection.decode_large) {
+                                markClosing(connection, .decode_too_large);
+                                break;
+                            }
+                            connection.decode_large = true;
+                            continue;
+                        }
+                        body = result.bytes;
+                    }
 
                     if (connection.state.phase == .play) {
                         if (!borrowed) {
                             const result = Codec.decodeBatch(&self.workspaces, .{ .connection = &connection.lifecycle.?, .bytes = input[connection.input_start..connection.input_end], .output = decoded, .packets = &connection.input_packets, .threshold = self.config.compression_threshold, .maximum = self.config.max_packet }) catch {
-                                connection.closing = true;
+                                markClosing(connection, .decode_rejected);
                                 break;
                             };
+                            if (result.needs_output) {
+                                if (connection.decode_large) {
+                                    markClosing(connection, .decode_too_large);
+                                    break;
+                                }
+                                connection.decode_large = true;
+                                continue;
+                            }
                             if (!self.observePlayPackets(io, connection, result.input.?)) {
-                                connection.closing = true;
+                                markClosing(connection, .input_rejected);
                                 break;
                             }
                             connection.loan.store(true, .release);
@@ -1642,11 +1785,11 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
 
                         while (batch_end < connection.input_end) {
                             const next = Endpoint.frame(&connection.lifecycle.?, input[batch_end..connection.input_end], self.config.max_packet) catch |err| {
-                                if (err != error.Incomplete) connection.closing = true;
+                                if (err != error.Incomplete) markClosing(connection, .invalid_frame);
                                 break;
                             };
                             if (next.body.len == 0 or next.body.len > self.config.max_packet) {
-                                connection.closing = true;
+                                markClosing(connection, .invalid_frame);
                                 break;
                             }
 
@@ -1655,7 +1798,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
 
                         if (connection.closing) break;
                         if (!self.observePlayPackets(io, connection, .{ .framed = input[connection.input_start..batch_end] })) {
-                            connection.closing = true;
+                            markClosing(connection, .input_rejected);
                             break;
                         }
 
@@ -1676,7 +1819,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                     const encrypted = connection.lifecycle != null and Endpoint.encrypted(&connection.lifecycle.?);
                     const response = self.advance(io, connection, .{ .packet = body }) catch |err| {
                         std.log.warn("event=session_packet_rejected connection={d}:{d} phase={s} bytes={d} reason={s}", .{ handle.index, handle.generation, @tagName(connection.state.phase), body.len, @errorName(err) });
-                        connection.closing = true;
+                        markClosing(connection, .packet_rejected);
                         break;
                     };
 
@@ -1695,7 +1838,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                     if (response) |bytes| {
                         self.queueControl(io, connection, bytes) catch |err| {
                             std.log.warn("event=session_output_rejected reason={s}", .{@errorName(err)});
-                            connection.closing = true;
+                            markClosing(connection, .output_rejected);
                             break;
                         };
                     }
@@ -1732,7 +1875,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
 
                 if (connection.input_end == input.len) {
                     if (connection.input_burst != null) {
-                        connection.closing = true;
+                        markClosing(connection, .input_overflow);
                         continue;
                     }
                     const lease = self.input_bursts.acquire() orelse {
@@ -1747,7 +1890,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
 
                 if (connection.saved_input.length != 0) {
                     const count = self.readSpan(&connection.saved_input, input[connection.input_end..]) catch {
-                        connection.closing = true;
+                        markClosing(connection, .saved_input_failed);
                         continue;
                     };
                     connection.input_end += count;
@@ -1761,7 +1904,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                         continue;
                     },
                     else => {
-                        connection.closing = true;
+                        markClosing(connection, .transport_failed);
                         continue;
                     },
                 };
@@ -1872,7 +2015,8 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
 
         fn controlJobs(self: *Self, connection: *Connection) []Codec.Control {
             const lease = connection.control_burst.?;
-            return self.control_jobs[lease.index * Codec.control_batch_max ..][0..Codec.control_batch_max];
+            assert(lease.id < self.configurations.addressableSlots());
+            return self.control_jobs[lease.id * Codec.control_batch_max ..][0..Codec.control_batch_max];
         }
 
         fn buildControl(self: *Self, io: std.Io, connection: *Connection) !void {
@@ -1942,25 +2086,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                             connection.receive_tail = connection.input_end - connection.input_start;
                         }
                     },
-                    .send => {
-                        if (connection.send_loan) |loan| loan.release();
-                        connection.send_loan = null;
-                        if (result.burst) |lease| {
-                            assert(connection.output_burst == null and connection.output_write == connection.output_read and !connection.sending and !connection.output_control);
-                            connection.output_burst = lease;
-                            connection.output_read = 0;
-                            connection.output_write = 0;
-                            connection.output = &.{};
-                        }
-                        const count = result.consumed;
-                        if (connection.spooling and count != 0) {
-                            const ring = self.ringBuffer(index);
-                            const at = connection.output_write % ring.len;
-                            const first = @min(count, ring.len - at);
-                            try self.appendSpool(io, index, ring[at..][0..first]);
-                            try self.appendSpool(io, index, ring[0 .. count - first]);
-                        } else connection.output_write +%= count;
-                    },
+                    .send => try self.commitSend(io, connection.handle.?, result.consumed, result.burst),
                     .receive => {
                         if (connection.receive_tail != 0) {
                             connection.receive_tail = 0;
@@ -1983,12 +2109,20 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                             try self.publishControl(io, connection);
                         }
                     },
-                    .decode => connection.decoded_result = result,
+                    .decode => {
+                        if (result.needs_output) {
+                            if (connection.decode_large) return error.InvalidPacket;
+                            connection.decode_large = true;
+                        } else connection.decoded_result = result;
+                    },
                     .decode_batch => {
                         connection.input_end += result.received;
                         assert(result.received <= connection.received);
                         connection.received -= result.received;
-                        if (result.consumed != 0) connection.decoded_result = result;
+                        if (result.needs_output) {
+                            if (connection.decode_large) return error.InvalidPacket;
+                            connection.decode_large = true;
+                        } else if (result.consumed != 0) connection.decoded_result = result;
                     },
                     .frame, .frame_sequence => unreachable,
                 }
@@ -2003,17 +2137,23 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 const buffer = self.inputBuffer(index);
                 const bytes = if (connection.receive_tail != 0) buffer[connection.input_end - connection.receive_tail .. connection.input_end] else buffer[connection.input_end..][0..connection.received];
                 if (!self.reloading and connection.received != 0 and connection.receive_tail == 0 and connection.state.phase == .play and connection.decoded_result == null and !connection.loan.load(.acquire) and Endpoint.compressed(&connection.lifecycle.?)) {
-                    if (connection.decoded == null) connection.decoded = self.decoded.acquire();
-                    const output = connection.decoded orelse {
+                    if (!connection.decode_large) {
+                        if (connection.decoded) |lease| lease.release();
+                        connection.decoded = null;
+                    }
+                    if (connection.decode_large and connection.decoded == null) connection.decoded = self.decoded.acquire();
+                    if (connection.decode_large and connection.decoded == null) {
                         connection.waiting_for = .decoded;
                         return false;
-                    };
+                    }
+                    const small = @min(self.config.connection_bytes, self.config.buffer_bytes);
+                    const output = if (connection.decoded) |lease| lease.bytes else self.decoded_storage[index * small ..][0..small];
                     codec.submit(&connection.codec, .{ .decode_batch = .{
                         .connection = &connection.lifecycle.?,
                         .encrypted_tail = bytes,
                         .received = connection.received,
                         .bytes = buffer[connection.input_start .. connection.input_end + connection.received],
-                        .output = output.bytes,
+                        .output = output,
                         .packets = &connection.input_packets,
                         .threshold = self.config.compression_threshold,
                         .maximum = self.config.max_packet,

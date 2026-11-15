@@ -7,6 +7,7 @@ const protocol = @import("protocol.zig");
 const router_module = @import("router.zig");
 const shared = @import("shared.zig");
 const metrics = @import("metrics");
+const system = @import("system");
 
 const Endpoint = struct {
     pub const versions = .{};
@@ -59,13 +60,99 @@ fn transport(hooks: *Hooks) network.Transport {
     return .{ .context = hooks, .vtable = network.Transport.adapter(Hooks) };
 }
 fn createEndpoint(allocator: std.mem.Allocator, hooks: *Hooks) !*service_module.Service {
+    return createEndpointWithInputWork(allocator, hooks, service_module.Service.default_input_work);
+}
+
+fn createEndpointWithInputWork(allocator: std.mem.Allocator, hooks: *Hooks, input_work: system.work.Limits) !*service_module.Service {
     return service_module.Service.init(allocator, std.testing.io, transport(hooks), .{
         .connections = 2,
         .buffer_bytes = 512,
         .pages = 4,
         .page_bytes = 128,
         .protocols = &protocols.values,
+        .max_input_bytes = 509,
+        .input_work = input_work,
     });
+}
+
+test "input rounds preserve borrowed suffixes and reserve progress before sharing burst work" {
+    var hooks: Hooks = .{};
+    const endpoint = try createEndpointWithInputWork(std.testing.allocator, &hooks, .{ .guaranteed = .{ .operations = 1, .bytes = 1 }, .burst = .{ .operations = 1, .bytes = 512 } });
+    defer endpoint.deinit();
+    const first = [_][]const u8{ "a", "b", "c", "d", "e", "f" };
+    const second = [_][]const u8{ "g", "h", "i", "j", "k", "l" };
+    for ([_][]const []const u8{ &first, &second }, 0..) |packets, index| try std.testing.expect(endpoint.push(.{ .input = .{ .handle = .{ .index = index, .generation = 1 }, .protocol = 1, .packets = .{ .packets = packets } } }));
+    var consumed: [2]usize = .{ 0, 0 };
+    for (0..4) |round| {
+        endpoint.beginTick();
+        var counts: [2]usize = .{ 0, 0 };
+        for (endpoint.input_events) |event| {
+            var packets = event.input.packets;
+            const index = event.input.handle.index;
+            while (try packets.next()) |packet| {
+                const original = if (index == 0) first[consumed[index]] else second[consumed[index]];
+                try std.testing.expectEqual(original.ptr, packet.ptr);
+                consumed[index] += 1;
+                counts[index] += 1;
+            }
+        }
+        try std.testing.expect(counts[0] + counts[1] <= 3);
+        if (round < 2) {
+            try std.testing.expectEqual(@as(usize, if (round == 0) 2 else 1), counts[0]);
+            try std.testing.expectEqual(@as(usize, if (round == 0) 1 else 2), counts[1]);
+        }
+        endpoint.endTick(true);
+        for (endpoint.releases) |*release| _ = release.swap(0, .acquire);
+    }
+    try std.testing.expectEqual([2]usize{ 6, 6 }, consumed);
+    try std.testing.expectEqual(@as(usize, 0), endpoint.pending_input_count);
+}
+
+test "large input packets take fair burst turns and shutdown releases deferred loans" {
+    var hooks: Hooks = .{};
+    const endpoint = try createEndpointWithInputWork(std.testing.allocator, &hooks, .{ .guaranteed = .{ .operations = 1, .bytes = 1 }, .burst = .{ .operations = 1, .bytes = 512 } });
+    defer endpoint.deinit();
+    const bytes: [400]u8 = @splat(7);
+    const packets = [_][]const u8{ &bytes, &bytes };
+    for (0..2) |index| try std.testing.expect(endpoint.push(.{ .input = .{ .handle = .{ .index = index, .generation = 1 }, .protocol = 1, .packets = .{ .packets = &packets } } }));
+    for (0..2) |round| {
+        endpoint.beginTick();
+        try std.testing.expectEqual(@as(usize, 1), endpoint.input_events.len);
+        try std.testing.expectEqual(round, endpoint.input_events[0].input.handle.index);
+        try std.testing.expectEqual(@as(usize, 1), endpoint.input_events[0].input.packets.packets.len);
+        endpoint.endTick(true);
+        try std.testing.expectEqual(@as(u32, 0), endpoint.releases[round].load(.acquire));
+    }
+    const notifications = hooks.notifications;
+    endpoint.discardInputs();
+    try std.testing.expectEqual(notifications + 1, hooks.notifications);
+    for (endpoint.releases) |*release| try std.testing.expectEqual(@as(u32, 1), release.swap(0, .acquire));
+    try std.testing.expectEqual(@as(usize, 0), endpoint.pending_input_count);
+}
+
+test "framed input retains packet boundaries and releases deferred loans on an aborted tick" {
+    var hooks: Hooks = .{};
+    const endpoint = try createEndpointWithInputWork(std.testing.allocator, &hooks, .{ .guaranteed = .{ .operations = 1, .bytes = 509 }, .burst = .{} });
+    defer endpoint.deinit();
+    const framed = [_]u8{ 2, 'a', 'b', 1, 'c', 3, 'd', 'e', 'f' };
+    const handle: network.Handle = .{ .index = 0, .generation = 1 };
+    try std.testing.expect(endpoint.push(.{ .input = .{ .handle = handle, .protocol = 1, .packets = .{ .framed = &framed } } }));
+    endpoint.beginTick();
+    var first = endpoint.input_events[0].input.packets;
+    const body = (try first.next()).?;
+    try std.testing.expectEqualSlices(u8, "ab", body);
+    try std.testing.expectEqual(framed[1..].ptr, body.ptr);
+    try std.testing.expectEqual(null, try first.next());
+    endpoint.endTick(true);
+    try std.testing.expectEqual(@as(u32, 0), endpoint.releases[0].load(.acquire));
+    endpoint.beginTick();
+    var second = endpoint.input_events[0].input.packets;
+    try std.testing.expectEqualSlices(u8, "c", (try second.next()).?);
+    endpoint.endTick(false);
+    try std.testing.expectEqual(@as(u32, 1), endpoint.releases[0].swap(0, .acquire));
+    try std.testing.expectEqual(@as(usize, 0), endpoint.pending_input_count);
+    endpoint.discardInputs();
+    try std.testing.expectEqual(@as(u32, 0), endpoint.releases[0].load(.acquire));
 }
 fn createWorker(allocator: std.mem.Allocator, hooks: *Hooks, router: *router_module.SingleSimulation, endpoints: []const *service_module.Service) !*Worker {
     return Worker.init(allocator, transport(hooks), .{
@@ -320,6 +407,106 @@ test "a held output reservation cannot publish after shutdown begins" {
     try std.testing.expectError(error.Closed, packet.publish(1, &.{handle}));
     try std.testing.expectEqual(@as(usize, 0), endpoint.preparing.load(.acquire));
     try std.testing.expect(endpoint.output.takeReady() == null);
+}
+
+test "recipient reservations survive backpressure and return credit on every exit" {
+    for (std.meta.tags(enum { batch, direct, cancel, cancel_batch, stale, shutdown })) |mode| {
+        var hooks: Hooks = .{};
+        const endpoint = try createEndpoint(std.testing.allocator, &hooks);
+        defer endpoint.deinit();
+        const handles = [_]network.Handle{ .{ .index = 0, .generation = 1 }, .{ .index = 1, .generation = 1 } };
+        const active_credit = (@as(u64, 1) << 32) | service_module.Service.active;
+        endpoint.credit[0].store(active_credit, .release);
+        endpoint.credit[1].store(active_credit | 512, .release);
+        var packets: [2]service_module.Service.Packet = undefined;
+        try std.testing.expectEqual(@as(usize, 2), try endpoint.reserveMany(8, &packets));
+        for (&packets) |*packet| packet.epoch = endpoint.backgroundEpoch();
+        var reservation = endpoint.reserveRecipients(&packets, &handles);
+        defer reservation.release();
+        try std.testing.expect(!reservation.canWrite(&packets[0], handles[0]));
+        packets[0].cancel();
+        try std.testing.expectEqual(@as(usize, 512) - endpoint.framedBound(8), endpoint.outputCredit(handles[1]));
+        const packet = &packets[1];
+        packet.limit(4);
+        packet.bytes[0] = 17;
+        try std.testing.expect(reservation.canWrite(packet, handles[1]));
+        reservation.finish(packet, handles[1], 1);
+        reservation.release();
+        switch (mode) {
+            .cancel => packet.cancel(),
+            .cancel_batch => endpoint.cancelPackets(packets[1..]),
+            .direct => try packet.publish(1, handles[1..]),
+            .batch, .stale, .shutdown => {
+                if (mode == .stale) packet.epoch = endpoint.backgroundEpoch() + 2;
+                if (mode == .shutdown) endpoint.stopping.store(true, .release);
+                var recipients = handles;
+                var accepted: [1]usize = undefined;
+                endpoint.publishManyReady(&.{.{ .packet = packet, .length = 1, .recipients = &recipients }}, &accepted);
+                try std.testing.expectEqual(@as(usize, if (mode == .batch) 1 else 0), accepted[0]);
+            },
+        }
+        try std.testing.expect(packet.reservation == null and packet.credit == null);
+        if (mode == .batch or mode == .direct) {
+            try std.testing.expectEqual(@as(usize, 512) - endpoint.framedBound(1), endpoint.outputCredit(handles[1]));
+            const sent = endpoint.output.takeReady().?;
+            try std.testing.expectEqualSlices(u8, &.{17}, sent.bytes);
+            endpoint.recycle(std.testing.io, &.{sent});
+            endpoint.refund(handles[1], endpoint.framedBound(1));
+        }
+        try std.testing.expectEqual(active_credit | 512, endpoint.credit[1].load(.acquire));
+        try std.testing.expectEqual(@as(usize, if (mode == .shutdown) 0 else 512), endpoint.outputCredit(handles[1]));
+        try std.testing.expect(endpoint.output.takeReady() == null);
+        try std.testing.expectEqual(@as(usize, 0), endpoint.preparing.load(.acquire));
+        try std.testing.expectEqual(endpoint.output.pages.len, endpoint.output.pool.free_units.count());
+    }
+}
+
+test "a recipient batch shares reserved credit across actual packet lengths" {
+    var hooks: Hooks = .{};
+    const endpoint = try createEndpoint(std.testing.allocator, &hooks);
+    defer endpoint.deinit();
+    const handle: network.Handle = .{ .index = 0, .generation = 1 };
+    // The batch may hold everything above the floor that stays within reach of the simulation.
+    const floor = endpoint.backgroundFloor();
+    try std.testing.expect(floor != 0);
+    const available = floor + endpoint.framedBound(8) + 2 * endpoint.framedBound(1);
+    try std.testing.expect(available <= endpoint.config.buffer_bytes);
+    const active_credit = (@as(u64, 1) << 32) | service_module.Service.active;
+    endpoint.credit[0].store(active_credit | available, .release);
+    var packets: [3]service_module.Service.Packet = undefined;
+    try std.testing.expectEqual(packets.len, try endpoint.reserveMany(8, &packets));
+    defer endpoint.cancelPackets(&packets);
+    const handles: [packets.len]network.Handle = @splat(handle);
+    var reservation = endpoint.reserveRecipients(&packets, &handles);
+    defer reservation.release();
+    try std.testing.expectEqual(floor, endpoint.outputCredit(handle));
+    // What the simulation sends this player meanwhile is refused only if it does not
+    // fit the floor, which in a server holds many times the largest chat message.
+    try std.testing.expectEqual(floor >= endpoint.framedBound(1), endpoint.canSend(handle, 1));
+    try std.testing.expectEqual(@as(usize, 0), endpoint.packetCapacity(handle, 1));
+    var publications: [packets.len]service_module.Service.Publication = undefined;
+    var recipients: [packets.len][1]network.Handle = @splat(.{handle});
+    for (&packets, &publications, &recipients, 0..) |*packet, *publication, *target, index| {
+        try std.testing.expect(reservation.canWrite(packet, handle));
+        packet.bytes[0] = @intCast(index);
+        reservation.finish(packet, handle, 1);
+        publication.* = .{ .packet = packet, .length = 1, .recipients = target };
+    }
+    reservation.release();
+    var accepted: [packets.len]usize = undefined;
+    endpoint.publishManyReady(&publications, &accepted);
+    try std.testing.expectEqual([_]usize{ 1, 1, 1 }, accepted);
+    try std.testing.expectEqual(available - packets.len * endpoint.framedBound(1), endpoint.outputCredit(handle));
+    for (0..packets.len) |index| {
+        const sent = endpoint.output.takeReady().?;
+        try std.testing.expectEqual(index, sent.bytes[0]);
+        endpoint.recycle(std.testing.io, &.{sent});
+        endpoint.refund(handle, endpoint.framedBound(1));
+    }
+    try std.testing.expectEqual(available, endpoint.outputCredit(handle));
+    try std.testing.expect(endpoint.output.takeReady() == null);
+    try std.testing.expectEqual(@as(usize, 0), endpoint.preparing.load(.acquire));
+    try std.testing.expectEqual(endpoint.output.pages.len, endpoint.output.pool.free_units.count());
 }
 
 test "publication batches consume rejected reservations without charging their peers" {
@@ -1222,4 +1409,45 @@ test "failed and empty broadcast capture release audience reservations" {
     try batch.begin(&.{});
     batch.finish();
     try std.testing.expectEqual(endpoint.output.pool.audiences.len, endpoint.output.pool.free_audiences.count());
+}
+
+test "prepared publications charge decoded capacity through cancellation batching and groups" {
+    var hooks: Hooks = .{};
+    const endpoint = try createEndpoint(std.testing.allocator, &hooks);
+    defer endpoint.deinit();
+    const handle: network.Handle = .{ .index = 0, .generation = 1 };
+    for (0..3) |mode| {
+        endpoint.credit[0].store(@as(u64, 1) << 32 | service_module.Service.active | 512, .release);
+        var packet = try endpoint.reserve(128);
+        @memset(packet.bytes[0..8], 37);
+        packet.prepare(100);
+        if (mode == 0) {
+            var credits = endpoint.reserveRecipients(&.{packet}, &.{handle});
+            credits.finish(&packet, handle, 8);
+            credits.release();
+            packet.cancel();
+            try std.testing.expectEqual(@as(usize, 512), endpoint.outputCredit(handle));
+            continue;
+        }
+        if (mode == 1) {
+            var recipients = [_]network.Handle{handle};
+            var accepted: [1]usize = undefined;
+            endpoint.publishManyReady(&.{.{ .packet = &packet, .length = 8, .recipients = &recipients }}, &accepted);
+            try std.testing.expectEqual(@as(usize, 1), accepted[0]);
+        } else {
+            var result = [_]service_module.Service.Delivery{.backpressured};
+            endpoint.publishGroups(&.{.{ .packets = &.{.{ .packet = &packet, .length = 8 }}, .protocol = 1, .targets = &.{.{ .handle = handle, .protocol = 1 }}, .delivered = &result }});
+            try std.testing.expectEqual(service_module.Service.Delivery.queued, result[0]);
+        }
+        endpoint.flush();
+        var batch = endpoint.outputBatch();
+        const published = batch.next().?;
+        try std.testing.expectEqual(@as(usize, 8), published.bytes.len);
+        try std.testing.expectEqual(@as(usize, 100), published.decoded_length);
+        try std.testing.expectEqual(@as(usize, 512 - endpoint.framedBound(100)), endpoint.outputCredit(handle));
+        endpoint.refund(handle, endpoint.framedBound(published.boundLength()));
+        endpoint.recycle(std.testing.io, &.{published});
+        try std.testing.expect(batch.next() == null);
+        try std.testing.expectEqual(@as(usize, 512), endpoint.outputCredit(handle));
+    }
 }

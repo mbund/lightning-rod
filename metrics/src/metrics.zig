@@ -98,19 +98,34 @@ const Record = struct {
     sequence: std.atomic.Value(u64) = .init(0),
     buckets: [bucket_max + 1]std.atomic.Value(u64) = @splat(.init(0)),
 
-    snapshot: Snapshot,
+    definition: struct {
+        name: []const u8,
+        description: []const u8,
+        kind: Kind,
+        unit: Unit,
+        clock: Clock,
+        bounds: [bucket_max]u64 = @splat(0),
+        bounds_count: u8,
+    },
     scalar: std.atomic.Value(u64) = .init(0),
     stream: ?*Stream = null,
     name: [128]u8,
     description: [256]u8,
     pub fn read(self: *Record) Snapshot {
-        if (self.snapshot.kind == .counter or self.snapshot.kind == .gauge) {
-            var snapshot = self.snapshot;
+        var snapshot: Snapshot = .{
+            .name = self.definition.name,
+            .description = self.definition.description,
+            .kind = self.definition.kind,
+            .unit = self.definition.unit,
+            .clock = self.definition.clock,
+            .bounds = self.definition.bounds,
+            .bounds_count = self.definition.bounds_count,
+        };
+        if (self.definition.kind == .counter or self.definition.kind == .gauge) {
             snapshot.value = self.scalar.load(.acquire);
             return snapshot;
         }
         // Observations may advance during collection. Quiescent snapshots are exact.
-        var snapshot = self.snapshot;
         snapshot.count = self.count.load(.monotonic);
         snapshot.value = self.value.load(.monotonic);
         snapshot.total = self.total.load(.monotonic);
@@ -125,14 +140,18 @@ const Record = struct {
 /// Definitions and subscriptions are frozen before workers start.
 /// Keep this address stable after creating timer handles.
 pub const Registry = struct {
-    pub const Configuration = struct { capacity: usize = 256, enabled: bool = true, parent: ?*Registry = null };
+    pub const Configuration = struct { capacity: usize = 256, enabled: bool = true, detailed_timers: bool = false, parent: ?*Registry = null };
     pub const Error = error{ OutOfMemory, Capacity, ConflictingDefinition, InvalidDefinition, InvalidParent, Sealed };
+    const records_per_block = @max(1, (std.heap.page_size_min - @sizeOf(usize)) / @sizeOf(Record));
+    const Block = struct { next: ?*Block, records: [records_per_block]Record = undefined };
 
     allocator: std.mem.Allocator,
     io: std.Io,
-    records: []Record,
+    records: []*Record,
+    blocks: ?*Block = null,
     count: usize = 0,
     enabled: bool = true,
+    detailed_timers: bool = false,
     sealed: bool = false,
     sequence: std.atomic.Value(u64) = .init(0),
     parent: ?*Registry = null,
@@ -142,7 +161,7 @@ pub const Registry = struct {
     next_child: ?*Registry = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Configuration) Error!Registry {
-        return .{ .allocator = allocator, .io = io, .records = try allocator.alloc(Record, if (config.enabled) config.capacity else 0), .enabled = config.enabled, .parent = config.parent };
+        return .{ .allocator = allocator, .io = io, .records = try allocator.alloc(*Record, if (config.enabled) config.capacity else 0), .enabled = config.enabled, .detailed_timers = config.detailed_timers or (if (config.parent) |parent| parent.detailed_timers else false), .parent = config.parent };
     }
 
     pub fn deinit(self: *Registry) void {
@@ -154,6 +173,11 @@ pub const Registry = struct {
             var entry = &parent.first_child;
             while (entry.* != self) entry = &entry.*.?.next_child;
             entry.* = self.next_child;
+        }
+        var current = self.blocks;
+        while (current) |block| {
+            current = block.next;
+            self.allocator.destroy(block);
         }
         self.allocator.free(self.records);
         self.* = undefined;
@@ -227,6 +251,8 @@ pub const Registry = struct {
     }
 
     pub fn timer(self: *Registry, definition: Timer.Definition) Error!Timer {
+        if (self.sealed) return error.Sealed;
+        if (definition.detailed and !self.detailed_timers) return .{};
         return .{ .registry = self, .record = try self.register(.timer, .{
             .namespace = definition.namespace,
             .name = definition.name,
@@ -241,14 +267,19 @@ pub const Registry = struct {
         self.sealed = true;
     }
 
+    pub fn memoryBytes(self: *const Registry) usize {
+        const blocks = std.math.divCeil(usize, self.count, records_per_block) catch unreachable;
+        return self.records.len * @sizeOf(*Record) + blocks * @sizeOf(Block);
+    }
+
     pub fn at(self: *const Registry, index: usize) Snapshot {
         assert(index < self.count);
         return self.records[index].read();
     }
 
     pub fn find(self: *const Registry, name: []const u8) ?Snapshot {
-        for (self.records[0..self.count]) |*record| {
-            if (std.mem.eql(u8, record.snapshot.name, name)) return record.read();
+        for (self.records[0..self.count]) |record| {
+            if (std.mem.eql(u8, record.definition.name, name)) return record.read();
         }
         return null;
     }
@@ -256,15 +287,15 @@ pub const Registry = struct {
     /// Names and descriptions borrow this registry and must outlive snapshot consumers.
     pub fn snapshot(self: *const Registry, destination: []Snapshot) []Snapshot {
         assert(destination.len >= self.count);
-        for (self.records[0..self.count], destination[0..self.count]) |*record, *output| output.* = record.read();
+        for (self.records[0..self.count], destination[0..self.count]) |record, *output| output.* = record.read();
         return destination[0..self.count];
     }
 
     /// Change subscriptions only while the producer is quiescent.
     pub fn subscribe(self: *Registry, name: []const u8, stream: *Stream) !void {
-        for (self.records[0..self.count]) |*record| {
-            if (!std.mem.eql(u8, record.snapshot.name, name)) continue;
-            if (record.snapshot.kind != .timer or record.stream != null) return error.InvalidSubscription;
+        for (self.records[0..self.count]) |record| {
+            if (!std.mem.eql(u8, record.definition.name, name)) continue;
+            if (record.definition.kind != .timer or record.stream != null) return error.InvalidSubscription;
             record.stream = stream;
             return;
         }
@@ -272,9 +303,9 @@ pub const Registry = struct {
     }
 
     fn register(self: *Registry, kind: Kind, definition: Definition) Error!?*Record {
+        if (self.sealed) return error.Sealed;
         // The returned registry must reach its stable address before linking.
         self.link();
-        if (self.sealed) return error.Sealed;
         if (definition.name.len == 0 or definition.name.len > 127 or definition.namespace.len > 127 or definition.namespace.len + definition.name.len > 127 or definition.description.len == 0 or definition.description.len > 256 or definition.buckets.len > bucket_max) return error.InvalidDefinition;
         for (definition.buckets, 0..) |bound, i| {
             if (i != 0 and bound <= definition.buckets[i - 1]) return error.InvalidDefinition;
@@ -289,17 +320,24 @@ pub const Registry = struct {
             name[definition.namespace.len] = '.';
         }
         @memcpy(name[prefix..], definition.name);
-        for (self.records[0..self.count]) |*record| {
-            const existing = &record.snapshot;
+        for (self.records[0..self.count]) |record| {
+            const existing = &record.definition;
             if (!std.mem.eql(u8, existing.name, name)) continue;
             if (existing.kind != kind or existing.unit != definition.unit or existing.clock != definition.clock or !std.mem.eql(u8, existing.description, definition.description) or !std.mem.eql(u64, existing.bounds[0..existing.bounds_count], definition.buckets)) return error.ConflictingDefinition;
             return record;
         }
         if (self.count == self.records.len) return error.Capacity;
-        const record = &self.records[self.count];
+        if (self.count % records_per_block == 0) {
+            const block = try self.allocator.create(Block);
+            block.next = self.blocks;
+            self.blocks = block;
+            const count = @min(block.records.len, self.records.len - self.count);
+            for (self.records[self.count..][0..count], block.records[0..count]) |*entry, *record| entry.* = record;
+        }
+        const record = self.records[self.count];
         @memcpy(record.name[0..name.len], name);
         @memcpy(record.description[0..definition.description.len], definition.description);
-        record.snapshot = .{ .name = record.name[0..name.len], .description = record.description[0..definition.description.len], .kind = kind, .unit = definition.unit, .clock = definition.clock, .bounds_count = @intCast(definition.buckets.len) };
+        record.definition = .{ .name = record.name[0..name.len], .description = record.description[0..definition.description.len], .kind = kind, .unit = definition.unit, .clock = definition.clock, .bounds_count = @intCast(definition.buckets.len) };
         record.scalar = .init(0);
         record.stream = null;
         record.count = .init(0);
@@ -309,7 +347,7 @@ pub const Registry = struct {
         record.recorded_ns = .init(0);
         record.sequence = .init(0);
         record.buckets = @splat(.init(0));
-        @memcpy(record.snapshot.bounds[0..definition.buckets.len], definition.buckets);
+        @memcpy(record.definition.bounds[0..definition.buckets.len], definition.buckets);
         self.count += 1;
         return record;
     }
@@ -322,8 +360,7 @@ pub const Counter = struct {
 
     pub fn add(self: Counter, amount: u64) void {
         const record = self.record orelse return;
-        var current = record.scalar.load(.monotonic);
-        while (true) current = record.scalar.cmpxchgWeak(current, current +| amount, .monotonic, .monotonic) orelse return;
+        addSaturating(&record.scalar, amount);
     }
 
     pub fn value(self: Counter) u64 {
@@ -360,8 +397,9 @@ pub const Histogram = struct {
 };
 
 fn addSaturating(target: *std.atomic.Value(u64), amount: u64) void {
+    if (amount == 0) return;
     var current = target.load(.monotonic);
-    while (true) current = target.cmpxchgWeak(current, current +| amount, .monotonic, .monotonic) orelse return;
+    while (current != std.math.maxInt(u64)) current = target.cmpxchgWeak(current, current +| amount, .monotonic, .monotonic) orelse return;
 }
 
 fn recordObservation(record: *Record, value: u64) void {
@@ -370,7 +408,7 @@ fn recordObservation(record: *Record, value: u64) void {
     addSaturating(&record.total, value);
     _ = record.maximum.fetchMax(value, .monotonic);
     var bucket: usize = 0;
-    while (bucket < record.snapshot.bounds_count and value > record.snapshot.bounds[bucket]) : (bucket += 1) {}
+    while (bucket < record.definition.bounds_count and value > record.definition.bounds[bucket]) : (bucket += 1) {}
     addSaturating(&record.buckets[bucket], 1);
 }
 
@@ -380,6 +418,7 @@ pub const Timer = struct {
         name: []const u8,
         description: []const u8,
         clock: Clock = .wall,
+        detailed: bool = false,
         buckets: []const u64 = duration_buckets,
     };
 
@@ -388,7 +427,7 @@ pub const Timer = struct {
 
     pub fn start(self: Timer) Span {
         const record = self.record orelse return .{};
-        return .{ .timer = self, .started = std.Io.Clock.now(if (record.snapshot.clock == .wall) .awake else .cpu_thread, self.registry.?.io).nanoseconds };
+        return .{ .timer = self, .started = std.Io.Clock.now(if (record.definition.clock == .wall) .awake else .cpu_thread, self.registry.?.io).nanoseconds };
     }
 
     pub fn observe(self: Timer, nanoseconds: u64) void {
@@ -403,8 +442,8 @@ pub const Timer = struct {
         target.recorded_ns.store(@intCast(recorded_ns), .monotonic);
         target.sequence.store(registry.sequence.load(.acquire), .monotonic);
         if (target.stream) |stream| stream.push(registry.io, .{
-            .name = target.snapshot.name,
-            .clock = target.snapshot.clock,
+            .name = target.definition.name,
+            .clock = target.definition.clock,
             .sequence = registry.sequence.load(.acquire),
             .recorded_ns = recorded_ns,
             .value = nanoseconds,
@@ -423,16 +462,16 @@ pub const Span = struct {
 
     pub fn elapsed(self: Span) u64 {
         const record = self.timer.record orelse return 0;
-        const now = std.Io.Clock.now(if (record.snapshot.clock == .wall) .awake else .cpu_thread, self.timer.registry.?.io).nanoseconds;
+        const now = std.Io.Clock.now(if (record.definition.clock == .wall) .awake else .cpu_thread, self.timer.registry.?.io).nanoseconds;
         assert(now >= self.started);
         return @intCast(now - self.started);
     }
     pub fn end(self: Span) void {
         const record = self.timer.record orelse return;
         const registry = self.timer.registry.?;
-        const ended = std.Io.Clock.now(if (record.snapshot.clock == .wall) .awake else .cpu_thread, registry.io).nanoseconds;
+        const ended = std.Io.Clock.now(if (record.definition.clock == .wall) .awake else .cpu_thread, registry.io).nanoseconds;
         assert(ended >= self.started);
-        self.timer.recordAt(@intCast(ended - self.started), if (record.snapshot.clock == .wall) ended else std.Io.Clock.now(.awake, registry.io).nanoseconds);
+        self.timer.recordAt(@intCast(ended - self.started), if (record.definition.clock == .wall) ended else std.Io.Clock.now(.awake, registry.io).nanoseconds);
     }
 };
 
@@ -459,9 +498,8 @@ test "typed instruments share definitions, own names, and reject conflicts" {
     try std.testing.expectError(error.Sealed, registry.counter(.{ .name = "late", .description = "Too late" }));
 }
 
-test "registry owns bounded metadata without allocating during registration" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
-    var registry = try Registry.init(failing.allocator(), std.testing.io, .{ .capacity = 2 });
+test "registry owns bounded names and descriptions" {
+    var registry = try Registry.init(std.testing.allocator, std.testing.io, .{ .capacity = 2 });
     defer registry.deinit();
     var namespace = "server".*;
     var name = "tick".*;
@@ -484,6 +522,56 @@ test "registry owns bounded metadata without allocating during registration" {
     try std.testing.expectError(error.Capacity, registry.counter(.{ .name = "full", .description = "Full registry" }));
     const oversized_name: [128]u8 = @splat('a');
     try std.testing.expectError(error.InvalidDefinition, registry.counter(.{ .name = &oversized_name, .description = "Too long" }));
+}
+
+test "startup registration preserves handles without reserving unused records" {
+    var buffer: [32768]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
+    var failing = std.testing.FailingAllocator.init(fixed.allocator(), .{});
+    var registry = try Registry.init(failing.allocator(), std.testing.io, .{ .capacity = 512 });
+    defer registry.deinit();
+    var counters: [20]Counter = undefined;
+    for (&counters, 0..) |*counter, index| {
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "counter.{d}", .{index});
+        counter.* = try registry.counter(.{ .name = name, .description = "Bounded startup counter" });
+    }
+    registry.seal();
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    for (counters, 0..) |counter, index| {
+        counter.add(index + 1);
+        try std.testing.expectEqual(index + 1, registry.at(index).value);
+    }
+    try std.testing.expectError(error.Sealed, registry.counter(.{ .name = "late", .description = "Registration after sealing" }));
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "registration allocation failure preserves existing handles and allows retry" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var registry = try Registry.init(failing.allocator(), std.testing.io, .{ .capacity = 64 });
+    defer registry.deinit();
+    const first = try registry.counter(.{ .name = "first", .description = "Startup counter" });
+    failing.fail_index = failing.alloc_index;
+    var next: usize = 0;
+    var name_buffer: [16]u8 = undefined;
+    var name: []const u8 = undefined;
+    while (next < 63) : (next += 1) {
+        name = try std.fmt.bufPrint(&name_buffer, "counter.{d}", .{next});
+        _ = registry.counter(.{ .name = name, .description = "Startup counter" }) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            break;
+        };
+    }
+    try std.testing.expect(next < 63);
+    first.add(7);
+    try std.testing.expectEqual(@as(u64, 7), registry.at(0).value);
+    const count = registry.count;
+    failing.fail_index = std.math.maxInt(usize);
+    const retried = try registry.counter(.{ .name = name, .description = "Startup counter" });
+    retried.add(9);
+    try std.testing.expectEqual(@as(u64, 9), registry.at(count).value);
+    try std.testing.expectEqual(count + 1, registry.count);
 }
 
 test "timer streams preserve order, detect overflow, and acknowledge cutoff" {
@@ -600,4 +688,26 @@ test "concurrent observations remain exact after writers join while snapshots ar
     histogram.observe(std.math.maxInt(u64));
     histogram.observe(1);
     try std.testing.expectEqual(std.math.maxInt(u64), registry.at(0).total);
+}
+
+test "detailed timers are explicitly enabled and inherited without affecting normal timers" {
+    var standard = try Registry.init(std.testing.allocator, std.testing.io, .{ .capacity = 1 });
+    defer standard.deinit();
+    const skipped = try standard.timer(.{ .name = "detail", .description = "Detailed timing", .clock = .thread_cpu, .detailed = true });
+    skipped.start().end();
+    try std.testing.expectEqual(@as(usize, 0), standard.count);
+    try std.testing.expect(skipped.read() == null);
+    const normal = try standard.timer(.{ .name = "batch", .description = "Batch timing" });
+    normal.start().end();
+    try std.testing.expectEqual(@as(u64, 1), normal.read().?.count);
+    standard.seal();
+    try std.testing.expectError(error.Sealed, standard.timer(.{ .name = "detail", .description = "Detailed timing", .detailed = true }));
+
+    var detailed = try Registry.init(std.testing.allocator, std.testing.io, .{ .detailed_timers = true });
+    defer detailed.deinit();
+    var child = try Registry.init(std.testing.allocator, std.testing.io, .{ .parent = &detailed });
+    defer child.deinit();
+    const enabled = try child.timer(.{ .name = "detail", .description = "Detailed timing", .clock = .thread_cpu, .detailed = true });
+    enabled.start().end();
+    try std.testing.expectEqual(@as(u64, 1), enabled.read().?.count);
 }

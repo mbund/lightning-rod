@@ -97,7 +97,7 @@ const Fixture = struct {
         });
         const menus = try PlayerInventory.init(allocator, .{}, .{ .crafting = gameplay_definitions.crafting, .furnaces = gameplay_definitions.furnaces, .players = players, .inventories = ownership, .items = items, .equipment = try EquipmentSlots.init(allocator, .{ .items = items, .enchantments = gameplay_definitions.enchantments }), .dropped = dropped });
         const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 64, .demand_sections = 0, .cache_groups = 8 }, .{ .metrics = registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const light = try Lighting.init(allocator, .{ .cache_columns = 1 }, .{ .metrics = registry, .blocks = gameplay_definitions.blocks, .chunks = terrain, .worlds = dimensions });
+        const light = try Lighting.init(allocator, .{}, .{ .metrics = registry, .blocks = gameplay_definitions.blocks, .chunks = terrain, .worlds = dimensions });
         const streaming = try Streaming.init(allocator, std.testing.io, .{ .occlusion = false }, .{ .metrics = registry, .players = players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = light });
         const blocks = try Blocks.init(allocator, std.testing.io, .{ .metrics = registry, .chunks = terrain, .players = players, .streaming = streaming, .sessions = service, .packets = encoding, .worlds = dimensions }, .{ .delta_sections = 16, .queued_sections = 32 });
         const experience = try Experience.init(allocator, .{ .maximum_orbs = 64 }, .{ .enchantments = gameplay_definitions.enchantments, .dimensions = gameplay_definitions.dimensions, .players = players, .entities = bodies, .physics = try ItemPhysics.init(allocator, .{ .blocks = gameplay_definitions.blocks, .chunks = terrain }), .inventories = ownership, .inventory = menus, .storage = try store.openSpace("experience"), .record_workspaces = workspaces });
@@ -206,7 +206,7 @@ pub fn benchmarkReplication() !void {
         const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/mining", .{temporary.sub_path});
         var store = try storage.Store.init(allocator, std.testing.io, .{ .path = path });
         defer store.deinit();
-        var registry = try metrics.Registry.init(allocator, std.testing.io, .{ .capacity = 128 });
+        var registry = try metrics.Registry.init(allocator, std.testing.io, .{});
         defer registry.deinit();
         var fixture = try Fixture.init(allocator, &store, &registry, count);
         defer fixture.deinit();
@@ -246,7 +246,7 @@ pub fn verifyDelivery() !void {
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/mining", .{temporary.sub_path});
     var store = try storage.Store.init(allocator, std.testing.io, .{ .path = path });
     defer store.deinit();
-    var registry = try metrics.Registry.init(allocator, std.testing.io, .{ .capacity = 128 });
+    var registry = try metrics.Registry.init(allocator, std.testing.io, .{});
     defer registry.deinit();
     var fixture = try Fixture.init(allocator, &store, &registry, count);
     defer fixture.deinit();
@@ -388,7 +388,7 @@ pub fn verifyReadWindow() !void {
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/mining-window", .{temporary.sub_path});
     var store = try storage.Store.init(allocator, std.testing.io, .{ .path = path });
     defer store.deinit();
-    var registry = try metrics.Registry.init(allocator, std.testing.io, .{ .capacity = 128 });
+    var registry = try metrics.Registry.init(allocator, std.testing.io, .{});
     defer registry.deinit();
     var fixture = try Fixture.init(allocator, &store, &registry, 2);
     defer fixture.deinit();
@@ -457,7 +457,7 @@ pub fn verifyNeighborhoods() !void {
         const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/mining-neighborhoods", .{temporary.sub_path});
         var store = try storage.Store.init(allocator, std.testing.io, .{ .path = path });
         defer store.deinit();
-        var registry = try metrics.Registry.init(allocator, std.testing.io, .{ .capacity = 128 });
+        var registry = try metrics.Registry.init(allocator, std.testing.io, .{});
         defer registry.deinit();
         var fixture = try Fixture.init(allocator, &store, &registry, count);
         defer fixture.deinit();

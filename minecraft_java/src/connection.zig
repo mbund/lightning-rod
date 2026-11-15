@@ -32,7 +32,7 @@ pub fn Connection(comptime Protocol: type) type {
                 else => return error.InvalidResume,
             };
             if (bytes.len < 1) return error.BufferTooSmall;
-            bytes[0] = @intFromEnum(phase);
+            bytes[0] = @backingInt(phase);
             const wire = try self.wire.save(bytes[1..]);
             return bytes[0 .. 1 + wire.len];
         }
@@ -68,6 +68,10 @@ pub fn Connection(comptime Protocol: type) type {
 
         pub fn encrypt(self: *Self, source: []const u8, destination: []u8) void {
             self.wire.encrypt(source, destination);
+        }
+
+        pub fn encryption(self: *Self, first: []u8, second: []u8) Wire.Encryption {
+            return self.wire.encryption(first, second);
         }
 
         pub fn clear(self: *Self) void {

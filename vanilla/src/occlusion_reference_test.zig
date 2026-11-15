@@ -8,7 +8,7 @@ test "production disclosure preserves independent rational ray witnesses through
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const states = try arena.allocator().alloc(u16, 64 * 48 * 48);
-    var world = try production.World.init(arena.allocator(), .{ .columns = 9, .sources = 1, .radius = 1 });
+    var world = try production.World.init(arena.allocator(), .{ .columns = 9, .views = 1, .radius = 1, .mixed_sections = 36 });
     const stone: u16 = @intCast(game_data.registry.block_stone_default_state);
     const air: u16 = @intCast(game_data.registry.block_air_default_state);
     const eye: oracle.Eye = .{ .coordinates = .{ 4270, 36630, 4910 } };
@@ -16,6 +16,7 @@ test "production disclosure preserves independent rational ray witnesses through
     const rng = random.random();
     var witnesses: usize = 0;
     var hidden: usize = 0;
+    var reused_witnesses: usize = 0;
     for (0..12) |scene| {
         world.invalidate();
         const hole_x = rng.uintLessThan(usize, 44);
@@ -57,37 +58,44 @@ test "production disclosure preserves independent rational ray witnesses through
             world.learn(.{ .world = 0, .x = cx, .z = cz, .minimum = 0 }, views);
         }
         var origin_storage: production.Source = undefined;
-        const origin = world.source(0, 0, 4, eye.block(), &origin_storage).?;
-        world.beginPoll();
-        const query = world.query(origin, 0, 4, 1);
-        while (!world.ready(query)) try std.testing.expectEqual(@as(usize, 0), world.advance().requests.len);
+        // Precise sources hide the most, so they carry the safety proof.
+        const origin = world.narrowSource(0, 0, 4, eye.block(), .head, &origin_storage).?;
+        const view_index = @as(usize, 0);
+        world.begin(view_index, origin, 0, 4, 1);
+        while (!world.ready(view_index)) try std.testing.expectEqual(@as(usize, 0), world.advance().requests.len);
         for (0..9) |column| {
             const at = reference[column * 4].position;
-            masks[column] = world.mask(query, at[0], at[2]);
-            if (scene == 9 and at[0] == -1 and at[2] == 1) try std.testing.expect(masks[column] & 1 == 0);
+            masks[column] = world.mask(view_index, at[0], at[2]);
         }
-        for (reference, 0..) |section, index| {
-            const bit = @as(u32, 1) << @intCast(index % 4);
-            const disclosed = masks[index / 4] & bit != 0;
-            const selected = world.mask(query, section.position[0], section.position[2]) & bit;
-            try std.testing.expectEqual(@as(u32, 0), selected & ~bit);
-            hidden += @intFromBool(!disclosed);
-            for (0..27) |sample| {
-                var target: [3]i64 = undefined;
-                var divisor: usize = 1;
-                for (&target, 0..) |*coordinate, axis| {
-                    coordinate.* = @as(i64, section.position[axis]) * 16 * oracle.Eye.scale + @as(i64, @intCast(sample / divisor % 3)) * 5 * oracle.Eye.scale + oracle.Eye.scale * 5 / 2;
-                    divisor *= 3;
-                }
-                if (!oracle.rayWitness(&reference, eye, target, index)) continue;
-                witnesses += 1;
-                if (!disclosed or selected == 0) {
-                    std.debug.print("scene={d} section={any} visible_target={any}\n", .{ scene, section.position, target });
-                    return error.VisibleSectionConcealed;
+        for ([_]i64{ 1, 16 }) |step| for ([_][3]i32{ .{ 0, 0, 0 }, .{ 1, 0, 0 }, .{ -1, 0, 0 }, .{ 0, 1, 0 }, .{ 0, -1, 0 }, .{ 0, 0, 1 }, .{ 0, 0, -1 }, .{ 1, 0, 1 }, .{ -1, 0, -1 } }) |shift| {
+            var camera = eye;
+            for (&camera.coordinates, shift) |*coordinate, delta| coordinate.* += @as(i64, delta) * step * oracle.Eye.scale;
+            if (!origin.supports(0, camera.block())) continue;
+            for (reference, 0..) |section, index| {
+                const bit = @as(u32, 1) << @intCast(index % 4);
+                const disclosed = masks[index / 4] & bit != 0;
+                const selected = world.mask(view_index, section.position[0], section.position[2]) & bit;
+                try std.testing.expectEqual(@as(u32, 0), selected & ~bit);
+                hidden += @intFromBool(!disclosed);
+                for (0..27) |sample| {
+                    var target: [3]i64 = undefined;
+                    var divisor: usize = 1;
+                    for (&target, 0..) |*coordinate, axis| {
+                        coordinate.* = @as(i64, section.position[axis]) * 16 * oracle.Eye.scale + @as(i64, @intCast(sample / divisor % 3)) * 5 * oracle.Eye.scale + oracle.Eye.scale * 5 / 2;
+                        divisor *= 3;
+                    }
+                    if (!oracle.rayWitness(&reference, camera, target, index)) continue;
+                    witnesses += 1;
+                    reused_witnesses += @intFromBool(!std.meta.eql(camera, eye));
+                    if (!disclosed or selected == 0) {
+                        std.debug.print("scene={d} section={any} visible_target={any}\n", .{ scene, section.position, target });
+                        return error.VisibleSectionConcealed;
+                    }
                 }
             }
-        }
+        };
     }
     try std.testing.expect(witnesses > 100);
     try std.testing.expect(hidden > 0);
+    try std.testing.expect(reused_witnesses > 100);
 }

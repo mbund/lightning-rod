@@ -17,7 +17,7 @@ import dev.lightningrod.e2e.mixin.ClientConnectionAccessor;
 
 final class ReloadWorldFixture extends Fixture {
     private static final int RENDER_DISTANCE = 32;
-    private static final int EXPECTED_CHUNKS = (2 * RENDER_DISTANCE + 1) * (2 * RENDER_DISTANCE + 1);
+    private static final int EXPECTED_CHUNKS = horizonColumns(RENDER_DISTANCE);
     private static final int MINIMUM_PROGRESS_TICKS = 10;
     private static final double BOB_INITIAL_X = 8.5;
     private static final double BOB_RESUMED_X = 12.5;

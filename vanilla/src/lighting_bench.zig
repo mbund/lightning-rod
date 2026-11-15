@@ -132,7 +132,7 @@ test "lighting pipeline retains overlapping neighborhoods in every direction" {
     try output.interface.flush();
 }
 
-test "lighting pipeline simulation queries group points and reuse cached light" {
+test "lighting pipeline simulation queries group points and answer from stored light" {
     const io = std.testing.io;
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
@@ -150,35 +150,64 @@ test "lighting pipeline simulation queries group points and reuse cached light" 
     const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 48, .demand_sections = 24 }, .{ .metrics = &registry, .storage = try store.openSpace("terrain"), .record_workspaces = resources });
     const dimensions = try worlds.Worlds.allocate(allocator, .{});
     const world = try dimensions.create(.{ .name = "test:queries", .dimension = .{ .name = "test:dimension", .minimum_section = -4, .section_count = 24, .skylight = true } });
-    const service = try lighting.Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions });
+    const service = try lighting.Lighting.init(allocator, .{ .store = .forPlayers(1) }, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions });
     var source: Scene = .{};
     terrain.setSource(chunks.Source.init(&source, Scene.read));
+    const Asked = struct {
+        stamp: u64 = 0,
+
+        fn patched(_: *anyopaque, _: u32, _: i32, _: i32, _: [2][9]u32) void {}
+        fn unlit(_: *anyopaque, _: u32, _: i32, _: i32, _: [9]u64) void {}
+        fn wanted(raw: *anyopaque, _: u32, _: i32, _: i32, stamp: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.stamp = stamp;
+        }
+    };
+    var asked: Asked = .{};
+    service.setSink(.{ .context = &asked, .patched = Asked.patched, .unlit = Asked.unlit, .wanted = Asked.wanted });
     const positions: [256]chunks.Position = @splat(.{ .x = 17, .y = 66, .z = 2 });
-    var samples: [positions.len]lighting.Sample = undefined;
+    var samples: [positions.len]?lighting.Sample = undefined;
     var buffer: [2048]u8 = undefined;
     var output = std.Io.File.stdout().writer(io, &buffer);
     try output.interface.writeAll("Simulation queries: points CPU_us decoded_sections cache_hits cache_misses\n");
     bounded.fail_index = bounded.alloc_index;
+    // Nothing has light for the column yet. The query answers at once that it does not
+    // know, and the tick end asks the terrain side for a solve.
     const start = std.Io.Clock.now(.cpu_thread, io).nanoseconds;
     try service.sampleMany(world, positions[0..1], samples[0..1]);
+    service.finishTick();
+    // The terrain side looks for a frame, finds none, and the next tick asks for a solve.
+    while (try service.pollStore()) {}
+    service.finishTick();
     const elapsed = std.Io.Clock.now(.cpu_thread, io).nanoseconds - start;
-    try output.interface.print("cold: 1 {d:.2} {d} {d} {d}\n", .{ @as(f64, @floatFromInt(elapsed)) / 1000, service.simulation.work.decoded_sections, service.cache_hits, service.cache_misses });
-    try std.testing.expectEqual(@as(u64, 9 * 24), service.simulation.work.decoded_sections);
-    const initial = samples[0];
+    try std.testing.expectEqual(@as(?lighting.Sample, null), samples[0]);
+    try std.testing.expect(asked.stamp != 0);
+    const dimension = dimensions.get(world).?.dimension;
+    for (0..256) |_| {
+        if (try service.prepare(world, 1, 0, dimension, 0)) break;
+        while (try terrain.generation.processOne(io)) {}
+        try terrain.poll();
+    } else return error.LightingDidNotSettle;
+    try std.testing.expect(service.offer(asked.stamp));
+    service.finishTick();
+    try output.interface.print("cold: 1 {d:.2} {d} {d} {d}\n", .{ @as(f64, @floatFromInt(elapsed)) / 1000, service.background.work.decoded_sections, service.store.?.snapshot().hits, service.store.?.snapshot().misses });
+    try std.testing.expectEqual(@as(u64, 9 * 24), service.background.work.decoded_sections);
+    try service.sampleMany(world, positions[0..1], samples[0..1]);
+    const initial = samples[0].?;
     for ([_]usize{ 1, 16, 256 }) |count| {
         var timings: [32]u64 = undefined;
         for (&timings) |*timing| {
             const before = std.Io.Clock.now(.cpu_thread, io).nanoseconds;
             try service.sampleMany(world, positions[0..count], samples[0..count]);
             timing.* = @intCast(std.Io.Clock.now(.cpu_thread, io).nanoseconds - before);
-            for (samples[0..count]) |sample| try std.testing.expectEqual(initial, sample);
+            for (samples[0..count]) |sample| try std.testing.expectEqual(initial, sample.?);
         }
         std.mem.sort(u64, &timings, {}, std.sort.asc(u64));
-        try output.interface.print("warm: {d} {d:.2} {d} {d} {d}\n", .{ count, @as(f64, @floatFromInt(timings[timings.len / 2])) / 1000, service.simulation.work.decoded_sections, service.cache_hits, service.cache_misses });
+        try output.interface.print("warm: {d} {d:.2} {d} {d} {d}\n", .{ count, @as(f64, @floatFromInt(timings[timings.len / 2])) / 1000, service.background.work.decoded_sections, service.store.?.snapshot().hits, service.store.?.snapshot().misses });
     }
-    try std.testing.expectEqual(@as(u64, 1), service.cache_misses);
-    try std.testing.expectEqual(@as(u64, 96), service.cache_hits);
-    try std.testing.expectEqual(@as(u64, 9 * 24), service.simulation.work.decoded_sections);
+    try std.testing.expectEqual(@as(u64, 1), service.store.?.snapshot().misses);
+    try std.testing.expectEqual(@as(u64, 97), service.store.?.snapshot().hits);
+    try std.testing.expectEqual(@as(u64, 9 * 24), service.background.work.decoded_sections);
     try std.testing.expectEqual(@as(usize, 0), terrain.borrowed_count);
     try output.interface.flush();
 }

@@ -115,7 +115,7 @@ pub const RecipeBook = struct {
             .candidate = &.{},
             .active = try .init(allocator, players),
             .block_queries = try .init(allocator, players),
-            .block_leases = try allocator.alloc(chunks.Lease, @min(players, deps.chunks.cache.entries.len)),
+            .block_leases = try allocator.alloc(chunks.Lease, @min(players, deps.chunks.demandCapacity())),
             .observer = try deps.inventories.observe(allocator, players),
             .table = records.Table.init(deps.storage, deps.record_workspaces.resources),
             .state_bytes = try allocator.alloc(u8, config.state_bytes),
@@ -464,7 +464,7 @@ pub const RecipeBook = struct {
         }
     }
 
-    fn blocksChanged(self: *RecipeBook, section: chunks.Section, edits: []const chunks.BlockEdit) void {
+    fn blocksChanged(self: *RecipeBook, section: chunks.Section, edits: []const chunks.BlockEdit, _: []const u16) void {
         var index = self.block_watches.get(section) orelse return;
         assert(index != absent);
         var changed: std.StaticBitSet(4096) = .empty;
@@ -540,7 +540,8 @@ pub const RecipeBook = struct {
         }
         var offset: usize = 0;
         while (offset < self.block_queries.count()) {
-            const count = @min(self.block_leases.len, self.deps.chunks.cache.entries.len, self.block_queries.count() - offset);
+            // Batches stay within the simulation share of the cache; the background may pin the rest.
+            const count = @min(self.block_leases.len, self.deps.chunks.demandCapacity(), self.block_queries.count() - offset);
             assert(count > 0);
             const sections = self.block_queries.keys[offset..][0..count];
             const leases = self.block_leases[0..count];

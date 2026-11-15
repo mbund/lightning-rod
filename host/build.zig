@@ -22,4 +22,7 @@ pub fn build(b: *std.Build) void {
 
     const check = b.addLibrary(.{ .name = "host", .root_module = module });
     b.step("check", "Check the host components").dependOn(&check.step);
+
+    const tests = b.addTest(.{ .root_module = module });
+    b.step("test", "Run the host tests").dependOn(&b.addRunArtifact(tests).step);
 }

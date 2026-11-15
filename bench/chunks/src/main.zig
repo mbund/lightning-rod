@@ -162,7 +162,7 @@ fn verify(init: std.process.Init, source: *const corpus.Corpus, trace: *const tr
             } else if (view == .dense) {
                 if (!std.mem.eql(u8, view.dense, dense[1..])) return error.BlockMismatch;
             } else {
-                for (0..4096) |index| if (view.uniform != std.mem.readInt(u16, dense[1 + index * 2 ..][0..2], .little)) return error.BlockMismatch;
+                for (0..4096) |index| if (view.get(@intCast(index)) != std.mem.readInt(u16, dense[1 + index * 2 ..][0..2], .little)) return error.BlockMismatch;
             }
         }
         if (trace.touched[id]) verified += 1;
@@ -205,7 +205,7 @@ fn runCase(init: std.process.Init, source: *corpus.Corpus, trace: *const traces.
             var phase_start = start;
             try terrain.acquireColumns(world, source, step.columns);
             var now = common.Stamp.now(init.io);
-            phases[@intFromEnum(Phase.load)].set(index, now.since(phase_start));
+            phases[@backingInt(Phase.load)].set(index, now.since(phase_start));
             phase_start = now;
             var edits: [6]chunks.BlockEdit = undefined;
             var sections: [6]chunks.SectionEdits = undefined;
@@ -216,7 +216,7 @@ fn runCase(init: std.process.Init, source: *corpus.Corpus, trace: *const traces.
             }
             try world.setSections(sections[0..step.edits.len]);
             now = common.Stamp.now(init.io);
-            phases[@intFromEnum(Phase.edit)].set(index, now.since(phase_start));
+            phases[@backingInt(Phase.edit)].set(index, now.since(phase_start));
             phase_start = now;
             if (step.save) {
                 try world.checkpoint(space);
@@ -226,7 +226,7 @@ fn runCase(init: std.process.Init, source: *corpus.Corpus, trace: *const traces.
             peak_wal_pages = @max(peak_wal_pages, store.locations.count());
             peak_wal_bytes = @max(peak_wal_bytes, store.end);
             now = common.Stamp.now(init.io);
-            phases[@intFromEnum(Phase.save)].set(index, now.since(phase_start));
+            phases[@backingInt(Phase.save)].set(index, now.since(phase_start));
             phase_start = now;
             var remaining = options.maintenance_pages;
             while (remaining != 0) {
@@ -235,7 +235,7 @@ fn runCase(init: std.process.Init, source: *corpus.Corpus, trace: *const traces.
                 remaining -= pages;
             }
             now = common.Stamp.now(init.io);
-            phases[@intFromEnum(Phase.maintain)].set(index, now.since(phase_start));
+            phases[@backingInt(Phase.maintain)].set(index, now.since(phase_start));
             const duration = now.since(start);
             total.set(index, duration);
             wall_timer.observe(duration.wall_ns);

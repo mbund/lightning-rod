@@ -8,6 +8,8 @@ const worlds = @import("worlds");
 const wire_1_21_5 = @import("wire_1_21_5");
 const Players = @import("players.zig").Players;
 const Streaming = @import("streaming.zig").Streaming;
+const game_data = @import("game_data");
+const section_hull = @import("section_hull.zig");
 
 const assert = std.debug.assert;
 const all_blocks: [64]u64 = @splat(std.math.maxInt(u64));
@@ -15,7 +17,11 @@ const all_blocks: [64]u64 = @splat(std.math.maxInt(u64));
 pub const BlockSynchronization = struct {
     pub const id = "minecraft:block_synchronization";
 
-    pub const Configuration = struct { delta_sections: usize = 128, queued_sections: usize = 256 };
+    pub const Configuration = struct {
+        delta_sections: usize = 128,
+        queued_sections: usize = 256,
+        work: lightning_rod.system.work.Limits = .{ .guaranteed = .{ .operations = 1 }, .burst = .{ .operations = 7 } },
+    };
 
     pub const Dependencies = struct {
         metrics: *lightning_rod.metrics.Registry,
@@ -37,6 +43,12 @@ pub const BlockSynchronization = struct {
         pending_bits: []u64 = &.{},
         full_bits: []u64 = &.{},
         nonempty: std.DynamicBitSetUnmanaged = .{},
+        /// With hull replacement, the eye section and, per cell around it, the section whose true
+        /// states were requested with the column delivery they correct.
+        near_eye: chunks.Section = .{ .world = 0, .x = 0, .y = 0, .z = 0 },
+        near: [27]Near = @splat(.{}),
+
+        const Near = struct { section: chunks.Section = .{ .world = 0, .x = 0, .y = 0, .z = 0 }, delivery: u32 = 0, valid: bool = false };
 
         const Selection = struct { bit: ?usize = null, examined: usize = 0 };
 
@@ -160,7 +172,7 @@ pub const BlockSynchronization = struct {
         }
 
         fn overflow(self: *Changes, section: chunks.Section, players: *const Players, side: i32) void {
-            if (section.y < -4 or section.y >= 20) return;
+            if (!sectionTracked(section)) return;
             const radius = @divTrunc(side - 1, 2);
             var nearby = players.nearby(section.world, .{ .x = @as(f64, @floatFromInt(section.x)) * 16, .y = 0, .z = @as(f64, @floatFromInt(section.z)) * 16 }, radius);
             while (nearby.next()) |index| {
@@ -212,6 +224,10 @@ pub const BlockSynchronization = struct {
     free_delta: ?usize = null,
     masks: [][64]u64,
     recipients: []sessions.Handle,
+    /// Terrain is delivered with hidden blocks replaced, see `section_hull`.
+    hull: bool,
+    /// `section_hull` flags per block state when `hull` is set.
+    hull_table: section_hull.Table,
     selections: bit_sets.Matrix,
     remaining: []usize,
     covered: []u8,
@@ -219,6 +235,7 @@ pub const BlockSynchronization = struct {
     next_acknowledgment: usize = 0,
     next_delta: usize = 0,
     next_player: usize = 0,
+    batch_limit: usize = 8,
     packets: std.atomic.Value(u64) = .init(0),
     full_sections: std.atomic.Value(u64) = .init(0),
     blocks: std.atomic.Value(u64) = .init(0),
@@ -232,12 +249,15 @@ pub const BlockSynchronization = struct {
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, deps: Dependencies, config: Configuration) !*BlockSynchronization {
         if (config.delta_sections == 0 or config.queued_sections == 0 or config.queued_sections > std.math.maxInt(u32)) return error.InvalidConfiguration;
+        try config.work.validate(1, .{ .operations = 1 });
+        const maximum = try config.work.maximum(1);
+        if (maximum.operations > 8 or maximum.bytes != 0) return error.InvalidWorkLimits;
         if (deps.sessions.config.page_bytes < 16 + 4096 * 4) return error.PacketPageTooSmall;
 
         const self = try allocator.create(BlockSynchronization);
         const observers = try allocator.alloc(Observer, deps.players.records.len);
         const side = deps.streaming.deliveryRadius() * 2 + 1;
-        const words = (@as(usize, @intCast(side * side)) * 24 + 63) / 64;
+        const words = (@as(usize, @intCast(side * side)) * section_count + 63) / 64;
         for (observers, deps.players.records) |*observer, player| observer.* = .{ .life = player.life, .nonempty = try .initEmpty(allocator, words) };
         const pending = try allocator.alloc(u64, words * observers.len);
         const full = try allocator.alloc(u64, pending.len);
@@ -268,9 +288,10 @@ pub const BlockSynchronization = struct {
             .incoming = try Changes.init(allocator, config.queued_sections, observers.len, words),
             .views = try allocator.dupe(Streaming.View, published.views),
             .batch_duration = try deps.metrics.timer(.{ .name = "blocks.synchronization.batch", .description = "Encode and publish a block update batch" }),
-            .batch_cpu = try deps.metrics.timer(.{ .name = "blocks.synchronization.batch.cpu", .description = "Block update batch work on the owning thread", .clock = .thread_cpu }),
+            .batch_cpu = try deps.metrics.timer(.{ .name = "blocks.synchronization.batch.cpu", .description = "Block update batch work on the owning thread", .clock = .thread_cpu, .detailed = true }),
             .planning_words = try deps.metrics.counter(.{ .name = "blocks.synchronization.planning_words", .description = "Nonempty pending section words examined during block delivery planning" }),
             .deps = deps,
+            .batch_limit = maximum.operations,
             .observers = observers,
             .pending = pending,
             .full = full,
@@ -281,6 +302,8 @@ pub const BlockSynchronization = struct {
             .free_delta = 0,
             .masks = try allocator.alloc([64]u64, deltas.len),
             .recipients = try allocator.alloc(sessions.Handle, observers.len * 8),
+            .hull = deps.streaming.config.hull,
+            .hull_table = if (deps.streaming.config.hull) try section_hull.initTable(allocator) else &.{},
         };
         try deps.chunks.observe(chunks.Observer.init(self, changed));
 
@@ -288,7 +311,7 @@ pub const BlockSynchronization = struct {
     }
 
     pub fn correct(self: *BlockSynchronization, world: u32, position: chunks.Position) void {
-        changed(self, chunks.sectionAt(world, position), &.{.{ .index = chunks.localIndex(position), .state = 0 }});
+        changed(self, chunks.sectionAt(world, position), &.{.{ .index = chunks.localIndex(position), .state = 0 }}, &.{0});
     }
 
     pub fn acknowledge(self: *BlockSynchronization, player: *const Players.Player, sequence: i32) void {
@@ -297,13 +320,137 @@ pub const BlockSynchronization = struct {
         self.staged.acknowledge(handle.index, .{ .state = .{ .generation = handle.generation, .life = player.life, .world = player.world }, .sequence = sequence });
     }
 
-    fn changed(self: *BlockSynchronization, section: chunks.Section, edits: []const chunks.BlockEdit) void {
+    fn changed(self: *BlockSynchronization, section: chunks.Section, edits: []const chunks.BlockEdit, _: []const u16) void {
         const world = self.deps.worlds.get(section.world) orelse return;
         const minimum = world.dimension.minimumSection();
         if (section.y < minimum or section.y >= minimum + @as(i32, @intCast(world.dimension.sectionCount()))) return;
         var mask: [64]u64 = @splat(0);
         for (edits) |edit| mask[edit.index / 64] |= @as(u64, 1) << @intCast(edit.index % 64);
+        if (self.hull) self.exposeNeighbors(section, edits, &mask);
         if (!self.staged.append(section, &mask)) self.staged.overflow(section, self.deps.players, self.side);
+    }
+
+    /// An edit that leaves a non-occluder exposes its six face neighbours, which clients may
+    /// hold as hull filler. Their true states join the delta.
+    fn exposeNeighbors(self: *BlockSynchronization, section: chunks.Section, edits: []const chunks.BlockEdit, mask: *[64]u64) void {
+        var others: [6]Exposed = undefined;
+        exposure(section, edits, mask, &others);
+        const world = self.deps.worlds.get(section.world) orelse return;
+        const minimum = world.dimension.minimumSection();
+        for (&others) |*other| {
+            if (!other.used) continue;
+            if (other.section.y < minimum or other.section.y >= minimum + @as(i32, @intCast(world.dimension.sectionCount()))) continue;
+            if (!self.staged.append(other.section, &other.mask)) self.staged.overflow(other.section, self.deps.players, self.side);
+        }
+    }
+
+    /// Clients hold hull filler in delivered terrain. The 27 sections around the player's eye
+    /// section get every true state once per column delivery, so nearby mining and client
+    /// prediction see real blocks. A redelivered column carries filler again and is corrected
+    /// again. Only sections the player already holds are corrected, after their column arrived.
+    fn requestNearSections(self: *BlockSynchronization) !void {
+        assert(self.hull);
+        const streaming = self.deps.streaming;
+        for (self.views, self.observers, 0..) |view, *observer, index| {
+            const handle = view.handle orelse continue;
+            if (!view.ready) continue;
+            if (observer.generation != handle.generation or observer.life != view.life or observer.world != view.world) self.resetObserver(index, handle.generation, view.life, view.world);
+            const eye: chunks.Section = .{ .world = view.world, .x = @divFloor(view.eye_min[0], 16), .y = @divFloor(view.eye_max, 16), .z = @divFloor(view.eye_min[2], 16) };
+            if (!std.meta.eql(observer.near_eye, eye)) {
+                observer.near = remapNear(&observer.near, eye);
+                observer.near_eye = eye;
+            }
+            for (&observer.near, 0..) |*slot, cell| {
+                const section = nearSection(eye, cell);
+                if (!sectionTracked(section)) continue;
+                const column: Streaming.Position = .{ .x = section.x, .z = section.z };
+                if (!streaming.visibleView(index, view, section.world, section.x, section.z)) continue;
+                if (!streaming.visibilityReady(index, column) or !streaming.sectionVisible(index, section)) continue;
+                const delivery = streaming.columnDelivery(index, column);
+                if (slot.valid and slot.delivery == delivery) {
+                    assert(std.meta.eql(slot.section, section));
+                    continue;
+                }
+                slot.* = .{ .section = section, .delivery = delivery, .valid = true };
+                if (try self.hullChanges(index, section)) self.requestFull(index, sectionBit(self.side, section));
+            }
+        }
+    }
+
+    /// Whether delivered terrain holds filler in `section`, judged like the bake from the section
+    /// and its face neighbours as they are now. Sections not ready to read count as changed, so
+    /// the player still receives their true states. An edit since delivery can only make this
+    /// miss filler that is still hidden, and exposure sends true states once it is not.
+    fn hullChanges(self: *BlockSynchronization, player: usize, section: chunks.Section) !bool {
+        const world = self.deps.worlds.get(section.world) orelse return true;
+        const minimum = world.dimension.minimumSection();
+        const maximum = minimum + @as(i32, @intCast(world.dimension.sectionCount()));
+        assert(section.y >= minimum and section.y < maximum);
+        // The section, then its neighbours in `section_hull.Faces` order.
+        const offsets = [7][3]i32{ .{ 0, 0, 0 }, .{ -1, 0, 0 }, .{ 1, 0, 0 }, .{ 0, -1, 0 }, .{ 0, 1, 0 }, .{ 0, 0, -1 }, .{ 0, 0, 1 } };
+        var sections: [7]chunks.Section = undefined;
+        var faces: [7]?usize = @splat(null);
+        var count: usize = 0;
+        for (offsets, 0..) |offset, index| {
+            const at: chunks.Section = .{ .world = section.world, .x = section.x + offset[0], .y = section.y + offset[1], .z = section.z + offset[2] };
+            if (at.y < minimum or at.y >= maximum) continue;
+            sections[count] = at;
+            faces[index] = count;
+            count += 1;
+        }
+        var leases: [7]chunks.Lease = undefined;
+        var ready: [1]bool = undefined;
+        try self.deps.chunks.prepareMany(&.{.{ .sections = sections[0..count], .leases = leases[0..count], .priority = .{ .urgency = .occupied, .player = player } }}, &ready);
+        if (!ready[0]) return true;
+        defer self.deps.chunks.releaseMany(leases[0..count]);
+        const center = leases[0].view();
+        if (center == .uniform) return false;
+        var states: [section_hull.volume]u16 = undefined;
+        for (&states, 0..) |*state, local| state.* = center.get(@intCast(local));
+        var planes: section_hull.Faces = @splat(@splat(0));
+        inline for (0..6) |side| if (faces[side + 1]) |at| {
+            // The neighbour's cells that touch this section: its +x plane for the -x face.
+            const plane = if (side % 2 == 0) section_hull.side - 1 else 0;
+            planes[side] = section_hull.readPlane(leases[at].view(), self.hull_table, side / 2, plane);
+        };
+        return section_hull.changes(&states, &planes, self.hull_table);
+    }
+
+    /// Keeps corrections of sections that stay within one section of the new eye section.
+    fn remapNear(near: *const [27]Observer.Near, eye: chunks.Section) [27]Observer.Near {
+        var result: [27]Observer.Near = @splat(.{});
+        for (near) |entry| {
+            if (!entry.valid or entry.section.world != eye.world) continue;
+            const offset = [3]i32{ entry.section.x - eye.x, entry.section.y - eye.y, entry.section.z - eye.z };
+            if (@abs(offset[0]) > 1 or @abs(offset[1]) > 1 or @abs(offset[2]) > 1) continue;
+            const cell: usize = @intCast((offset[2] + 1) * 9 + (offset[1] + 1) * 3 + offset[0] + 1);
+            assert(std.meta.eql(nearSection(eye, cell), entry.section));
+            result[cell] = entry;
+        }
+        return result;
+    }
+
+    fn nearSection(eye: chunks.Section, cell: usize) chunks.Section {
+        assert(cell < 27);
+        return .{
+            .world = eye.world,
+            .x = eye.x + @as(i32, @intCast(cell % 3)) - 1,
+            .y = eye.y + @as(i32, @intCast(cell / 3 % 3)) - 1,
+            .z = eye.z + @as(i32, @intCast(cell / 9)) - 1,
+        };
+    }
+
+    /// Sends every true state of a pending section to one observer.
+    fn requestFull(self: *BlockSynchronization, index: usize, bit: usize) void {
+        const observer = &self.observers[index];
+        assert(observer.generation != 0 and bit < self.words * 64);
+        const word = bit / 64;
+        const flag = @as(u64, 1) << @intCast(bit % 64);
+        observer.pending += @intFromBool(observer.pending_bits[word] & flag == 0);
+        observer.pending_bits[word] |= flag;
+        observer.full_bits[word] |= flag;
+        observer.nonempty.set(word);
+        self.selections.row(0).insert(index);
     }
 
     fn changedOwned(self: *BlockSynchronization, section: chunks.Section, mask: *const [64]u64) void {
@@ -443,7 +590,7 @@ pub const BlockSynchronization = struct {
     pub fn poll(self: *BlockSynchronization, io: std.Io) !bool {
         if (!self.deps.chunks.ownsCurrentThread()) return error.InvalidChunkOwner;
         defer self.deps.sessions.retryBackground(self.epoch);
-        const progressed = try self.sendBatch(io, 8);
+        const progressed = try self.sendBatch(io, self.batch_limit);
         const acknowledged = try self.sendAcknowledgments();
         self.deps.sessions.flush();
         if (progressed or acknowledged) self.changed_event.set(io);
@@ -475,6 +622,7 @@ pub const BlockSynchronization = struct {
             observer.full_bits[word] |= bits;
             if (observer.pending != 0) self.selections.row(0).insert(index);
         }
+        if (self.hull) try self.requestNearSections();
         for (self.incoming.acknowledging.values()) |index| {
             const view = self.views[index];
             const handle = view.handle orelse continue;
@@ -536,7 +684,7 @@ pub const BlockSynchronization = struct {
             const selection = observer.select(excluded[0..excluding]);
             examined += selection.examined;
             const at = selection.bit orelse unreachable;
-            observer.cursor = (at + 1) % (@as(usize, @intCast(self.side * self.side)) * 24);
+            observer.cursor = (at + 1) % (@as(usize, @intCast(self.side * self.side)) * section_count);
             const flag = @as(u64, 1) << @intCast(at % 64);
             const center = self.deps.streaming.streams[selected].center;
             const radius = @divTrunc(self.side - 1, 2);
@@ -874,9 +1022,17 @@ pub const BlockSynchronization = struct {
     }
 };
 
+/// Pending section bits cover this vertical range in every dimension.
+const section_minimum = -4;
+const section_count = 24;
+
+fn sectionTracked(section: chunks.Section) bool {
+    return section.y >= section_minimum and section.y < section_minimum + section_count;
+}
+
 fn sectionBit(side: i32, section: chunks.Section) usize {
-    assert(section.y >= -4 and section.y < 20);
-    return @as(usize, @intCast(@mod(section.z, side) * side + @mod(section.x, side))) * 24 + @as(usize, @intCast(section.y + 4));
+    assert(sectionTracked(section));
+    return @as(usize, @intCast(@mod(section.z, side) * side + @mod(section.x, side))) * section_count + @as(usize, @intCast(section.y - section_minimum));
 }
 
 test "block acknowledgments coalesce within a player lifetime and discard aborted publications" {
@@ -974,7 +1130,7 @@ test "a saturated block queue marks only the changed section for matching viewer
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const side = 65;
-    const words = (side * side * 24 + 63) / 64;
+    const words = (side * side * section_count + 63) / 64;
     var changes = try BlockSynchronization.Changes.init(arena.allocator(), 2, 2, words);
     var records = [_]Players.Player{
         .{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = 1, .stage = .ready },
@@ -1029,4 +1185,83 @@ test "block publication waits for visibility from the same completed tick" {
     try std.testing.expectEqual(@as(usize, 0), published.changes.count);
     try std.testing.expectEqual(@as(usize, 1), blocks.incoming.count);
     try std.testing.expectEqual(changed, blocks.incoming.entries[0].section);
+}
+
+const Exposed = struct { section: chunks.Section, mask: [64]u64, used: bool };
+
+/// Adds the face neighbours of every edit that leaves a non-occluder: inside `section` to
+/// `mask`, across a face to the matching entry of `others`.
+fn exposure(section: chunks.Section, edits: []const chunks.BlockEdit, mask: *[64]u64, others: *[6]Exposed) void {
+    for (others) |*other| other.used = false;
+    for (edits) |edit| {
+        if (game_data.physics.rendering(edit.state).occluder) continue;
+        const at = [3]i32{ edit.index % 16, edit.index / 256, edit.index / 16 % 16 };
+        inline for (0..6) |side| {
+            var next = at;
+            next[side / 2] += if (side % 2 == 0) -1 else 1;
+            const local: u12 = @intCast(@mod(next[1], 16) * 256 + @mod(next[2], 16) * 16 + @mod(next[0], 16));
+            const bit = @as(u64, 1) << @intCast(local % 64);
+            if (next[side / 2] >= 0 and next[side / 2] < 16) {
+                mask[local / 64] |= bit;
+            } else {
+                const other = &others[side];
+                if (!other.used) {
+                    other.* = .{ .section = section, .mask = @splat(0), .used = true };
+                    const offsets = [3]*i32{ &other.section.x, &other.section.y, &other.section.z };
+                    offsets[side / 2].* += if (side % 2 == 0) -1 else 1;
+                }
+                other.mask[local / 64] |= bit;
+            }
+        }
+    }
+}
+
+test "edits that open a block expose their face neighbours across section borders" {
+    const section: chunks.Section = .{ .world = 0, .x = 2, .y = 1, .z = -1 };
+    const stone: u16 = @intCast(game_data.registry.block_stone_default_state);
+    var mask: [64]u64 = @splat(0);
+    var others: [6]Exposed = undefined;
+    // A placed occluder exposes nothing.
+    exposure(section, &.{.{ .index = 5 * 256 + 5 * 16 + 5, .state = stone }}, &mask, &others);
+    for (mask) |word| try std.testing.expectEqual(@as(u64, 0), word);
+    for (others) |other| try std.testing.expect(!other.used);
+    // Mining the corner block at x 15, y 0, z 0 exposes three neighbours inside and three across.
+    const corner: u12 = 0 * 256 + 0 * 16 + 15;
+    exposure(section, &.{.{ .index = corner, .state = 0 }}, &mask, &others);
+    var inside: usize = 0;
+    for (mask) |word| inside += @popCount(word);
+    try std.testing.expectEqual(@as(usize, 3), inside);
+    for ([_]u12{ 14, 256 + 15, 16 + 15 }) |cell| try std.testing.expect(mask[cell / 64] & (@as(u64, 1) << @intCast(cell % 64)) != 0);
+    try std.testing.expect(!others[0].used and !others[3].used and !others[5].used);
+    try std.testing.expectEqual(chunks.Section{ .world = 0, .x = 3, .y = 1, .z = -1 }, others[1].section);
+    try std.testing.expect(others[1].mask[0] & 1 != 0);
+    try std.testing.expectEqual(chunks.Section{ .world = 0, .x = 2, .y = 0, .z = -1 }, others[2].section);
+    const below: u12 = 15 * 256 + 0 * 16 + 15;
+    try std.testing.expect(others[2].mask[below / 64] & (@as(u64, 1) << @intCast(below % 64)) != 0);
+    try std.testing.expectEqual(chunks.Section{ .world = 0, .x = 2, .y = 1, .z = -2 }, others[4].section);
+    const north: u12 = 0 * 256 + 15 * 16 + 15;
+    try std.testing.expect(others[4].mask[north / 64] & (@as(u64, 1) << @intCast(north % 64)) != 0);
+}
+
+test "near corrections follow the eye section and drop sections that leave its neighbourhood" {
+    const eye: chunks.Section = .{ .world = 1, .x = 4, .y = 2, .z = -3 };
+    var near: [27]BlockSynchronization.Observer.Near = undefined;
+    for (&near, 0..) |*entry, cell| entry.* = .{ .section = BlockSynchronization.nearSection(eye, cell), .delivery = @intCast(cell), .valid = true };
+    const moved: chunks.Section = .{ .world = 1, .x = 5, .y = 2, .z = -3 };
+    const result = BlockSynchronization.remapNear(&near, moved);
+    var kept: usize = 0;
+    for (result, 0..) |entry, cell| {
+        if (!entry.valid) {
+            // Cells on the leading side were never corrected.
+            try std.testing.expectEqual(@as(usize, 2), cell % 3);
+            continue;
+        }
+        kept += 1;
+        try std.testing.expectEqual(BlockSynchronization.nearSection(moved, cell), entry.section);
+        // The entry came from the cell one step further along x around the old eye.
+        try std.testing.expectEqual(@as(u32, @intCast(cell + 1)), entry.delivery);
+    }
+    try std.testing.expectEqual(@as(usize, 18), kept);
+    const other_world = BlockSynchronization.remapNear(&near, .{ .world = 2, .x = 4, .y = 2, .z = -3 });
+    for (other_world) |entry| try std.testing.expect(!entry.valid);
 }

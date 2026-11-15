@@ -10,6 +10,19 @@ pub const Registry = struct {
     effects: []const i32,
     attributes: []const i32,
 
+    pub fn forVersion(comptime Version: type) Registry {
+        return .{
+            .entities = Version.Registry.canonical_entity_to_wire,
+            .items = Version.Registry.canonical_item_to_wire,
+            .blocks = Version.Registry.canonical_block_to_wire,
+            .block_states = Version.Registry.canonical_block_state_to_wire,
+            .block_state_bits = Version.Registry.block_state_bits,
+            .sounds = Version.Registry.canonical_sound_to_wire,
+            .effects = Version.Registry.canonical_effect_to_wire,
+            .attributes = Version.Registry.canonical_attribute_to_wire,
+        };
+    }
+
     pub fn entityId(self: Registry, canonical: i32) !i32 {
         return lookup(self.entities, canonical);
     }

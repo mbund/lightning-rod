@@ -18,7 +18,9 @@ const help =
     \\  --player UUID=NAME  Map a saved player to NAME's offline-mode UUID.
     \\                      May be repeated. Otherwise original UUIDs are preserved.
     \\  --help             Show this message.
-    \\  --no-lighting      Leave lighting to be reconstructed when terrain is used.
+    \\  --prewarm          Build disposable lighting and delivery caches after import.
+    \\  --prewarm-existing DATABASE
+    \\                     Build those caches for an already imported database, then exit.
     \\
     \\Scheduled ticks, POIs, non-recipe advancements, statistics,
     \\and other game rules are not represented by the current native world format.
@@ -38,7 +40,7 @@ pub fn main(init: std.process.Init) !void {
     var input: ?[]const u8 = null;
     var output: ?[]const u8 = null;
     var skip = false;
-    var bake_lighting = true;
+    var bake_lighting = false;
     var mappings: std.ArrayList(world_import.Mapping) = .empty;
     while (args.next()) |flag| {
         if (std.mem.eql(u8, flag, "--help")) {
@@ -52,8 +54,12 @@ pub fn main(init: std.process.Init) !void {
             skip = true;
             continue;
         }
-        if (std.mem.eql(u8, flag, "--no-lighting")) {
-            bake_lighting = false;
+        if (std.mem.eql(u8, flag, "--prewarm-existing")) {
+            const database = args.next() orelse return error.MissingArgument;
+            return prewarmExisting(allocator, init.io, database);
+        }
+        if (std.mem.eql(u8, flag, "--prewarm")) {
+            bake_lighting = true;
             continue;
         }
         const value = args.next() orelse return error.MissingArgument;
@@ -171,4 +177,15 @@ test {
 fn syncDirectory(io: std.Io, directory: std.Io.Dir) !void {
     const file: std.Io.File = .{ .handle = directory.handle, .flags = .{ .nonblocking = false } };
     try file.sync(io);
+}
+
+/// Fills the disposable caches of an imported database in place. The database stays readable
+/// by the server, and its terrain is only read.
+pub fn prewarmExisting(allocator: std.mem.Allocator, io: std.Io, database: []const u8) !void {
+    var metrics = try lightning_rod.metrics.Registry.init(allocator, io, .{ .capacity = 256, .enabled = false });
+    defer metrics.deinit();
+    var store = try lightning_rod.storage.Store.init(allocator, io, .{ .path = database });
+    defer store.deinit();
+    var importer = try world_import.Import.init(allocator, io, .{ .input = database, .output = database, .lighting = true }, &store, &metrics);
+    try importer.prewarmExisting();
 }

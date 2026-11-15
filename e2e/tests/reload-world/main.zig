@@ -78,7 +78,9 @@ const Probe = struct {
         const visibility = self.deps.streaming.snapshotVisibility();
         const center = visibility.viewCenter(handle.index);
         for (0..2 * render_distance + 1) |z| for (0..2 * render_distance + 1) |x| {
-            if (!visibility.visible(handle.index, player, player.world, center.x + @as(i32, @intCast(x)) - render_distance, center.z + @as(i32, @intCast(z)) - render_distance)) return error.ReloadTerrainIncomplete;
+            const at: vanilla.Streaming.Position = .{ .x = center.x + @as(i32, @intCast(x)) - render_distance, .z = center.z + @as(i32, @intCast(z)) - render_distance };
+            if (!vanilla.Streaming.Horizon.contains(render_distance, center, at)) continue;
+            if (!visibility.visible(handle.index, player, player.world, at.x, at.z)) return error.ReloadTerrainIncomplete;
         };
         if (self.ready & (@as(u2, 1) << index) != 0) return error.DuplicateReloadReadiness;
         self.ready |= @as(u2, 1) << index;

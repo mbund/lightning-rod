@@ -80,8 +80,104 @@ test "demand reclaims only the missing capacity while retaining useful prefetch"
 }
 
 test {
+    _ = @import("prepared.zig");
     _ = @import("store_test.zig");
     _ = @import("patch_test.zig");
+}
+
+test "generation capacity is independent of retained terrain and drains larger demand batches" {
+    const Source = struct {
+        generated: usize = 0,
+        fn read(self: *@This(), _: std.Io, batch: chunks.Source.Batch) void {
+            self.generated += batch.requests.len;
+            for (batch.requests) |*request| request.result = chunks.uniform(@intCast(request.section.x + 7), request.output);
+        }
+    };
+    const io = std.testing.io;
+    for ([_]usize{ 8, 256 }) |capacity| {
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        var path_buffer: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/generation-capacity", .{temporary.sub_path});
+        var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
+        defer store.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
+        const allocator = bounded.allocator();
+        var registry = try metrics.Registry.init(allocator, io, .{ .enabled = false });
+        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = capacity, .generation_slots = 2, .demand_sections = 8, .cache_groups = 2 }, .{
+            .metrics = &registry,
+            .storage = try store.openSpace(chunks.Chunks.id),
+            .record_workspaces = try records.Workspaces.init(allocator, io, .{}),
+        });
+        try std.testing.expectEqual(@as(usize, 2), terrain.generation.slots.len);
+        var source: Source = .{};
+        terrain.setSource(chunks.Source.init(&source, Source.read));
+        bounded.fail_index = bounded.alloc_index;
+        bounded.resize_fail_index = bounded.resize_index;
+        var sections: [8]chunks.Section = undefined;
+        var leases: [8]chunks.Lease = undefined;
+        for (&sections, 0..) |*section, index| section.* = .{ .world = 0, .x = @intCast(index), .y = 0, .z = 0 };
+        try terrain.acquireMany(&sections, &leases);
+        defer terrain.releaseMany(&leases);
+        for (leases, 0..) |lease, index| try std.testing.expectEqual(@as(u16, @intCast(index + 7)), lease.get(0));
+        try std.testing.expectEqual(sections.len, source.generated);
+        try std.testing.expectEqual(terrain.generation.slots.len, terrain.generation.free_count);
+        try std.testing.expectEqual(@as(usize, 0), terrain.generating_count);
+        try std.testing.expect(!bounded.has_induced_failure);
+    }
+}
+
+test "the maximum pinned section batch fits incompressible terrain without runtime allocation" {
+    const Source = struct {
+        fn read(_: *@This(), _: std.Io, batch: chunks.Source.Batch) void {
+            for (batch.requests) |*request| {
+                request.output[0] = 3;
+                for (0..encoding.biome_cells) |index| std.mem.writeInt(u16, request.output[1 + index * 2 ..][0..2], @intCast(index), .little);
+                request.output[encoding.biome_header_bytes] = 1;
+                for (0..encoding.blocks) |index| std.mem.writeInt(u16, request.output[encoding.biome_header_bytes + 1 + index * 2 ..][0..2], @intCast(index), .little);
+                request.result = encoding.maximum_decoded_bytes;
+            }
+        }
+    };
+    const io = std.testing.io;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/maximum-pins", .{directory.sub_path});
+    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
+    const allocator = bounded.allocator();
+    var registry = try metrics.Registry.init(allocator, io, .{ .enabled = false });
+    const terrain = try chunks.Chunks.init(allocator, io, .{}, .{
+        .metrics = &registry,
+        .storage = try store.openSpace(chunks.Chunks.id),
+        .record_workspaces = try records.Workspaces.init(allocator, io, .{}),
+    });
+    var source: Source = .{};
+    terrain.setSource(chunks.Source.init(&source, Source.read));
+    bounded.fail_index = bounded.alloc_index;
+    bounded.resize_fail_index = bounded.resize_index;
+    var sections: [192]chunks.Section = undefined;
+    var leases: [192]chunks.Lease = undefined;
+    for (&sections, 0..) |*section, index| section.* = .{ .world = 0, .x = @intCast(index), .y = 0, .z = 0 };
+    try terrain.acquireMany(&sections, &leases);
+    defer terrain.releaseMany(&leases);
+    try std.testing.expectEqual(leases.len, terrain.cache.pinned_entries);
+    var bytes: usize = 0;
+    for (leases) |lease| {
+        try std.testing.expect(lease.view() == .dense);
+        try std.testing.expectEqual(@as(u16, 4095), lease.get(4095));
+        try std.testing.expectEqual(@as(u16, 63), lease.biomes().?.get(63));
+        bytes += lease.record.read().?.len;
+    }
+    try std.testing.expectEqual(leases.len * encoding.maximum_decoded_bytes, bytes);
+    try std.testing.expect(terrain.cache.values.len >= bytes and terrain.cache.values.len - bytes < leases.len * 64);
+    try std.testing.expect(!bounded.has_induced_failure);
 }
 
 test "read windows reuse duplicate and retained views within cache capacity" {
@@ -184,6 +280,113 @@ test "section decoder rejects malformed lengths palettes and indices" {
     try std.testing.expectError(error.Corrupt, encoding.decode(&bytes, 1032));
     try std.testing.expectError(error.Corrupt, encoding.decode(&bytes, 1034));
     try std.testing.expectError(error.BufferTooSmall, encoding.decode(bytes[0..1033], 1033));
+}
+
+test "section edits preserve palettes biomes and caller order across rebuilds" {
+    for ([_]usize{ 0, encoding.biome_header_bytes }) |offset| {
+        for ([_]u16{ 1, 2, 3, 4, 17, 257, 1024, 1278, 1279, 1280, 4096 }) |count| {
+            var reference: [encoding.maximum_decoded_bytes]u8 = undefined;
+            var buffer: [encoding.maximum_decoded_bytes]u8 = undefined;
+            var scratch: [encoding.maximum_decoded_bytes]u8 = undefined;
+            if (offset != 0) {
+                reference[0] = 3;
+                for (0..encoding.biome_cells) |index| std.mem.writeInt(u16, reference[1 + index * 2 ..][0..2], @intCast(index * 101), .little);
+            }
+            reference[offset] = 1;
+            for (0..encoding.blocks) |index| std.mem.writeInt(u16, reference[offset + 1 + index * 2 ..][0..2], @intCast(index % count), .little);
+            const encoded = try encoding.encode(reference[0 .. offset + encoding.dense_block_bytes], &buffer);
+            var length = encoded.len;
+            if (encoded.ptr != buffer[0..].ptr) @memcpy(buffer[0..length], encoded);
+            var additions: [16]chunks.BlockEdit = undefined;
+            for (&additions, 0..) |*edit, index| edit.* = .{ .index = @intCast(128 + index), .state = @intCast(55000 + index) };
+            for ([_][]const chunks.BlockEdit{
+                &.{ .{ .index = 7, .state = 1 % count }, .{ .index = 15, .state = 0 }, .{ .index = 7, .state = 0 } },
+                &.{ .{ .index = 0, .state = 65535 }, .{ .index = 4095, .state = 65535 } },
+                &additions,
+            }, 0..) |edits, step| {
+                const before = length;
+                length = try encoding.edit(&buffer, length, edits, &scratch);
+                if (step == 0 and count >= 2 and count <= 1024) try std.testing.expectEqual(before, length);
+                for (edits) |edit| std.mem.writeInt(u16, reference[offset + 1 + @as(usize, edit.index) * 2 ..][0..2], edit.state, .little);
+                const view = try encoding.Packed.init(buffer[0..length]);
+                for (0..256) |row| {
+                    const states = view.row(@intCast(row));
+                    for (states, 0..) |state, lane| {
+                        const index = row * 16 + lane;
+                        try std.testing.expectEqual(std.mem.readInt(u16, reference[offset + 1 + index * 2 ..][0..2], .little), state);
+                        try std.testing.expectEqual(state, view.get(@intCast(index)));
+                    }
+                }
+                for (0..128) |group| {
+                    var rows: [2][16]u16 = undefined;
+                    view.pair(@intCast(group), &rows[0], &rows[1]);
+                    for (rows, 0..) |cells, half| try std.testing.expectEqualSlices(u16, &view.row(@intCast(group * 2 + half)), &cells);
+                }
+                try std.testing.expectEqualSlices(u8, reference[0..offset], buffer[0..offset]);
+            }
+            var replacement: [encoding.blocks]chunks.BlockEdit = undefined;
+            for (&replacement, 0..) |*edit, index| edit.* = .{ .index = @intCast(index), .state = 42 };
+            length = try encoding.edit(&buffer, length, &replacement, &scratch);
+            try std.testing.expectEqual(offset + 3, length);
+            try std.testing.expectEqualSlices(u8, reference[0..offset], buffer[0..offset]);
+            try std.testing.expectEqual(@as(u16, 42), (try encoding.Packed.init(buffer[0..length])).get(4095));
+            try std.testing.expectEqual(buffer[0..].ptr, (try encoding.encode(buffer[0..length], &scratch)).ptr);
+        }
+    }
+}
+
+test "generated loaded and edited sections stay paletted without runtime allocation" {
+    const Source = struct {
+        fn read(_: *@This(), _: std.Io, batch: chunks.Source.Batch) void {
+            for (batch.requests) |*request| {
+                request.output[0] = 3;
+                for (0..encoding.biome_cells) |index| std.mem.writeInt(u16, request.output[1 + index * 2 ..][0..2], @intCast(index + 7), .little);
+                request.output[encoding.biome_header_bytes] = 1;
+                for (0..encoding.blocks) |index| std.mem.writeInt(u16, request.output[encoding.biome_header_bytes + 1 + index * 2 ..][0..2], @intCast(index % 2), .little);
+                request.result = encoding.maximum_decoded_bytes;
+            }
+        }
+    };
+    const io = std.testing.io;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/palette-cache", .{directory.sub_path});
+    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
+    const allocator = bounded.allocator();
+    var registry = try metrics.Registry.init(allocator, io, .{ .enabled = false });
+    const space = try store.openSpace(chunks.Chunks.id);
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 1, .demand_sections = 0, .cache_groups = 2 }, .{
+        .metrics = &registry,
+        .storage = space,
+        .record_workspaces = try records.Workspaces.init(allocator, io, .{}),
+    });
+    var source: Source = .{};
+    terrain.setSource(chunks.Source.init(&source, Source.read));
+    bounded.fail_index = bounded.alloc_index;
+    bounded.resize_fail_index = bounded.resize_index;
+    const original: chunks.Section = .{ .world = 0, .x = 0, .y = 0, .z = 0 };
+    const other: chunks.Section = .{ .world = 0, .x = 1, .y = 0, .z = 0 };
+    for (0..4) |step| {
+        const lease = try terrain.acquire(original);
+        try std.testing.expect(lease.view() == .palette);
+        try std.testing.expect(lease.record.read().?.len < encoding.maximum_decoded_bytes / 4);
+        const expected: u16 = if (step == 0) 1 else 23;
+        try std.testing.expectEqual(expected, lease.get(7));
+        const row = lease.view().row(0);
+        try std.testing.expectEqual(expected, row[7]);
+        try std.testing.expectEqual(@as(u16, 10), lease.biomes().?.get(3));
+        lease.release();
+        try terrain.setBlocks(original, &.{ .{ .index = 6, .state = 1 }, .{ .index = 7, .state = 23 } });
+        const evict = try terrain.acquire(other);
+        evict.release();
+        try terrain.checkpoint(space);
+    }
+    try std.testing.expect(!bounded.has_induced_failure);
 }
 
 test "chunk eviction and reload preserve edits while clean sections are never rewritten" {
@@ -493,6 +696,83 @@ test "repeated sections in an edit batch observe preceding edits without extra b
     try std.testing.expectEqual(@as(u16, 19), lease.get(1));
 }
 
+test "observers receive the state each edited cell held before its batch" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_bytes: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_bytes, ".zig-cache/tmp/{s}/chunks", .{directory.sub_path});
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var store = try storage.Store.init(allocator, io, .{ .path = path });
+    defer store.deinit();
+    var registry = try metrics.Registry.init(allocator, io, .{ .enabled = false });
+    defer registry.deinit();
+    const world = try chunks.Chunks.init(arena.allocator(), io, .{ .demand_sections = 0, .cache_sections = 4 }, .{
+        .metrics = &registry,
+        .storage = try store.openSpace(chunks.Chunks.id),
+        .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}),
+    });
+    const Recorder = struct {
+        const Call = struct { section: chunks.Section, count: usize, states: [2000]u16, previous: [2000]u16 };
+        calls: []Call,
+        count: usize = 0,
+
+        fn changed(self: *@This(), section: chunks.Section, edits: []const chunks.BlockEdit, previous: []const u16) void {
+            const call = &self.calls[self.count];
+            self.count += 1;
+            call.section = section;
+            call.count = edits.len;
+            for (edits, call.states[0..edits.len]) |edit, *state| state.* = edit.state;
+            @memcpy(call.previous[0..previous.len], previous);
+        }
+    };
+    var recorder: Recorder = .{ .calls = try arena.allocator().alloc(Recorder.Call, 6) };
+    try world.observe(chunks.Observer.init(&recorder, Recorder.changed));
+    const section: chunks.Section = .{ .world = 0, .x = 0, .y = 0, .z = 0 };
+
+    // A cell written twice in one batch reports the state before the batch both times.
+    try world.setBlocks(section, &.{ .{ .index = 5, .state = 7 }, .{ .index = 9, .state = 3 }, .{ .index = 5, .state = 8 } });
+    try std.testing.expectEqual(@as(usize, 1), recorder.count);
+    try std.testing.expectEqualSlices(u16, &.{ 0, 0, 0 }, recorder.calls[0].previous[0..recorder.calls[0].count]);
+    // A batch that changes nothing is not announced.
+    try world.setBlocks(section, &.{.{ .index = 5, .state = 8 }});
+    try std.testing.expectEqual(@as(usize, 1), recorder.count);
+    // Batches for one section apply in order, each seeing the one before it.
+    recorder.count = 0;
+    try world.setSections(&.{
+        .{ .section = section, .edits = &.{.{ .index = 5, .state = 1 }} },
+        .{ .section = section, .edits = &.{ .{ .index = 5, .state = 2 }, .{ .index = 9, .state = 4 } } },
+    });
+    try std.testing.expectEqual(@as(usize, 2), recorder.count);
+    try std.testing.expectEqualSlices(u16, &.{8}, recorder.calls[0].previous[0..recorder.calls[0].count]);
+    try std.testing.expectEqualSlices(u16, &.{ 1, 3 }, recorder.calls[1].previous[0..recorder.calls[1].count]);
+
+    // Three sections carry more edits than one batch keeps previous states for, so the
+    // call splits. Every observer still sees its own section's states.
+    var edits: [3][2000]chunks.BlockEdit = undefined;
+    var batches: [3]chunks.SectionEdits = undefined;
+    for (0..2) |round| {
+        for (&edits, &batches, 0..) |*list, *batch, at| {
+            for (list, 0..) |*edit, index| edit.* = .{ .index = @intCast(index * 2), .state = @intCast(1000 * (at + 1) + index + round * 7000) };
+            batch.* = .{ .section = .{ .world = 0, .x = @intCast(at + 1), .y = 0, .z = 0 }, .edits = list };
+        }
+        recorder.count = 0;
+        try world.setSections(&batches);
+        try std.testing.expectEqual(@as(usize, 3), recorder.count);
+        for (recorder.calls[0..3], 0..) |call, at| {
+            try std.testing.expectEqual(batches[at].section, call.section);
+            try std.testing.expectEqual(@as(usize, 2000), call.count);
+            for (call.previous[0..call.count], 0..) |previous, index| {
+                const expected: u16 = if (round == 0) 0 else @intCast(1000 * (at + 1) + index);
+                try std.testing.expectEqual(expected, previous);
+            }
+        }
+    }
+    try std.testing.expectError(error.WorkingSetTooLarge, world.setBlocks(section, &(@as([4097]chunks.BlockEdit, @splat(.{ .index = 0, .state = 1 })))));
+}
+
 test "palette property projections agree with scalar voxels and reject invalid palette indices" {
     var properties: [4096]u8 = undefined;
     var raw: [encoding.maximum_decoded_bytes]u8 = undefined;
@@ -532,12 +812,12 @@ test "palette property projections agree with scalar voxels and reject invalid p
                         const state = std.mem.readInt(u16, raw[offset + 1 + index * 2 ..][0..2], .little);
                         if (properties[state] & flag != 0) selected[index / 64] |= @as(u64, 1) << @intCast(index % 64);
                     }
-                    const dense = try encoding.classify(input, &properties, flag, .complete);
-                    const packed_section = try encoding.classify(representation, &properties, flag, .complete);
-                    try std.testing.expectEqual(expected, dense.known.common);
-                    try std.testing.expectEqual(expected, packed_section.known.common);
-                    try std.testing.expectEqualSlices(u64, &selected, &dense.known.selected);
-                    try std.testing.expectEqualSlices(u64, &selected, &packed_section.known.selected);
+                    const dense = try encoding.classify(input, &properties, flag);
+                    const packed_section = try encoding.classify(representation, &properties, flag);
+                    try std.testing.expectEqual(expected, dense.common);
+                    try std.testing.expectEqual(expected, packed_section.common);
+                    try std.testing.expectEqualSlices(u64, &selected, &dense.selected);
+                    try std.testing.expectEqualSlices(u64, &selected, &packed_section.selected);
                 }
             }
         }
@@ -548,16 +828,16 @@ test "palette property projections agree with scalar voxels and reject invalid p
     std.mem.writeInt(u16, invalid[5..7], 1, .little);
     std.mem.writeInt(u16, invalid[7..9], 2, .little);
     @memset(&properties, 7);
-    try std.testing.expectEqual(@as(u8, 7), (try encoding.classify(&invalid, &properties, 1, .complete)).known.common);
+    try std.testing.expectEqual(@as(u8, 7), (try encoding.classify(&invalid, &properties, 1)).common);
     invalid[9] = 1;
     invalid[9 + 512] = 1;
     try std.testing.expect(encoding.valid(&invalid));
-    try std.testing.expectError(error.Corrupt, encoding.classify(&invalid, &properties, 1, .complete));
+    try std.testing.expectError(error.Corrupt, encoding.classify(&invalid, &properties, 1));
     invalid[9] = 0;
     invalid[9 + 512] = 0;
     properties[1] = 2;
-    try std.testing.expectEqual(@as(u8, 2), (try encoding.classify(&invalid, &properties, 1, .complete)).known.common);
-    try std.testing.expectError(error.Corrupt, encoding.classify(&.{ 0, 255, 255 }, &properties, 1, .complete));
+    try std.testing.expectEqual(@as(u8, 2), (try encoding.classify(&invalid, &properties, 1)).common);
+    try std.testing.expectError(error.Corrupt, encoding.classify(&.{ 0, 255, 255 }, &properties, 1));
 }
 
 test "mixed property requests share one compressed group read without allocating" {
@@ -596,8 +876,8 @@ test "mixed property requests share one compressed group read without allocating
     properties[99] = 2;
     var results: [5]encoding.Classification = undefined;
     const requests = [_]chunks.Chunks.ClassificationRequest{
-        .{ .section = sections[0], .result = &results[0], .mode = .homogeneous },
-        .{ .section = sections[1], .result = &results[1], .mode = .homogeneous },
+        .{ .section = sections[0], .result = &results[0] },
+        .{ .section = sections[1], .result = &results[1] },
         .{ .section = sections[1], .result = &results[2] },
         .{ .section = sections[2], .result = &results[3] },
         .{ .section = sections[0], .result = &results[4] },
@@ -606,7 +886,8 @@ test "mixed property requests share one compressed group read without allocating
     try terrain.classify(&requests, &properties, 1);
     try std.testing.expectEqual(reads + 1, terrain.cache.backend.store.bases.metrics.reads.value());
     try std.testing.expectEqual(@as(u8, 1), results[0].known.common);
-    try std.testing.expect(results[1] == .unavailable and results[3] == .unavailable);
+    try std.testing.expectEqualDeep(results[1], results[2]);
+    try std.testing.expect(results[3] == .unavailable);
     try std.testing.expectEqual(@as(u8, 0), results[2].known.common);
     try std.testing.expectEqual(std.math.maxInt(u64) >> 1, results[2].known.selected[63]);
     try std.testing.expectEqualDeep(results[0], results[4]);
@@ -646,6 +927,9 @@ test "property reads preserve pending edits without generating or admitting deco
     var revisions: [2]u64 = undefined;
     watch.configure(region, &revisions);
     const key = chunks.encodeKey(sections[0]);
+    var properties: [256]u8 = @splat(1);
+    properties[99] = 2;
+    _ = try terrain.registerClassification(allocator, &properties, 1, null);
     try terrain.cache.backend.store.putBatch(&.{.{ .key = &key, .value = &.{ 0, 7, 0 } }});
     try terrain.cache.backend.store.flush();
     var generator: Generator = .{};
@@ -653,9 +937,16 @@ test "property reads preserve pending edits without generating or admitting deco
     terrain.attach();
     defer terrain.stop();
     bounded.fail_index = bounded.alloc_index;
-    var properties: [256]u8 = @splat(1);
-    properties[99] = 2;
     var values: [2]encoding.Classification = undefined;
+    const columns = [_]chunks.classification.Column{
+        .{ .world = 0, .x = 0, .z = 0, .minimum = 0, .count = 1 },
+        .{ .world = 0, .x = 1, .z = 0, .minimum = 0, .count = 1 },
+    };
+    var summaries: [columns.len]chunks.classification.ColumnSummary = undefined;
+    try terrain.summarize(&columns, &summaries, &properties, 1);
+    try std.testing.expectEqual(@as(u32, 1), summaries[0].known);
+    try std.testing.expectEqual(@as(u8, 1), summaries[0].common[0]);
+    try std.testing.expectEqual(@as(u32, 0), summaries[1].known);
     const requests = [_]chunks.Chunks.ClassificationRequest{
         .{ .section = sections[0], .result = &values[0] },
         .{ .section = sections[1], .result = &values[1] },
@@ -666,10 +957,11 @@ test "property reads preserve pending edits without generating or admitting deco
     try std.testing.expect(values[1] == .unavailable);
     try std.testing.expectEqual(@as(usize, 0), terrain.cache.lookup.count());
     try std.testing.expectEqual(@as(usize, 0), terrain.generation.queued_count);
+    var pins: [2]chunks.Chunks.PackedPin = undefined;
     var borrowed: [2]chunks.Chunks.PackedSection = undefined;
-    try std.testing.expect(try terrain.tryBorrowPacked(&sections, &borrowed, watch) == null);
+    try std.testing.expect(try terrain.tryBorrowPacked(&sections, &borrowed, watch, &pins) == null);
     try std.testing.expectEqual(@as(usize, 0), terrain.cache.backend.store.readers);
-    const window = (try terrain.tryBorrowPacked(sections[0..1], borrowed[0..1], watch)).?;
+    const window = (try terrain.tryBorrowPacked(sections[0..1], borrowed[0..1], watch, &pins)).?;
     try std.testing.expectEqual(@as(u16, 7), borrowed[0].view.get(4095));
     try terrain.classify(&requests, &properties, 1);
     try std.testing.expectEqual(@as(usize, 0), terrain.cache.lookup.count());
@@ -680,22 +972,90 @@ test "property reads preserve pending edits without generating or admitting deco
     try std.testing.expectEqual(chunks.Section{ .world = 3, .x = -2, .y = -4, .z = 4 }, group.minimum);
     try terrain.setBlock(0, .{ .x = 0, .y = 0, .z = 0 }, 99);
     try std.testing.expect(!watch.unchanged());
-    try std.testing.expect(try terrain.tryBorrowPacked(sections[0..1], borrowed[0..1], watch) == null);
+    try std.testing.expect(try terrain.tryBorrowPacked(sections[0..1], borrowed[0..1], watch, &pins) == null);
     watch.configure(region, &revisions);
-    try std.testing.expect(try terrain.tryBorrowPacked(sections[0..1], borrowed[0..1], watch) == null);
+    try std.testing.expect(try terrain.tryBorrowPacked(sections[0..1], borrowed[0..1], watch, &pins) == null);
     try terrain.classify(&requests, &properties, 1);
     try std.testing.expectEqual(@as(u8, 0), values[0].known.common);
     try std.testing.expectEqual(std.math.maxInt(u64) - 1, values[0].known.selected[0]);
     try std.testing.expect(values[1] == .unavailable);
+    try terrain.summarize(&columns, &summaries, &properties, 1);
+    try std.testing.expectEqual(@as(u32, 1), summaries[0].known);
+    try std.testing.expectEqual(@as(u8, 0), summaries[0].common[0]);
+    try std.testing.expectEqual(@as(u32, 0), summaries[0].prefixed);
+    try std.testing.expectEqual(@as(u32, 0), summaries[1].known);
     try terrain.checkpoint(space);
     terrain.cache.invalidate(&key);
     try terrain.classify(&requests, &properties, 1);
-    for (values) |value| try std.testing.expect(value == .unavailable);
+    try std.testing.expectEqual(@as(u8, 0), values[0].known.common);
+    try std.testing.expectEqual(std.math.maxInt(u64) - 1, values[0].known.selected[0]);
+    try std.testing.expect(values[1] == .unavailable);
+    try terrain.summarize(&columns, &summaries, &properties, 1);
+    try std.testing.expectEqual(@as(u32, 1), summaries[0].known);
+    try std.testing.expectEqual(@as(u8, 0), summaries[0].common[0]);
+    try std.testing.expectEqual(@as(u32, 0), summaries[1].known);
     watch.configure(region, &revisions);
-    try std.testing.expect(try terrain.tryBorrowPacked(sections[0..1], borrowed[0..1], watch) == null);
+    try std.testing.expect(try terrain.tryBorrowPacked(sections[0..1], borrowed[0..1], watch, &pins) == null);
     try std.testing.expectEqual(@as(usize, 0), terrain.cache.backend.store.readers);
     try std.testing.expectEqual(@as(usize, 0), terrain.generation.queued_count);
     try std.testing.expectEqual(@as(usize, 0), terrain.borrowed_count);
+    try std.testing.expect(!bounded.has_induced_failure);
+}
+
+test "packed batches share group pins while independently validating every column watch" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/packed-batches", .{temporary.sub_path}) });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
+    const allocator = bounded.allocator();
+    var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .enabled = false });
+    defer registry.deinit();
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .demand_sections = 1, .cache_sections = 4, .cache_groups = 2, .storage_group_side = 2 }, .{
+        .metrics = &registry,
+        .storage = try store.openSpace(chunks.Chunks.id),
+        .record_workspaces = try records.Workspaces.init(allocator, io, .{}),
+    });
+    var positions: [2]chunks.Section = undefined;
+    var keys: [2][16]u8 = undefined;
+    var requests: [2]chunks.Chunks.PackedRequest = undefined;
+    var writes: [2]records.Write = undefined;
+    for (&positions, &keys, &requests, &writes, 0..) |*section, *key, *request, *write, index| {
+        section.* = .{ .world = @intCast(index), .x = 0, .y = 0, .z = 0 };
+        key.* = chunks.encodeKey(section.*);
+        const watch = try chunks.Watch.init(allocator, terrain, 1);
+        var revisions: [1]u64 = undefined;
+        watch.configure(.{ .world = section.world, .minimum = .{ .x = 0, .y = 0, .z = 0 }, .maximum = .{ .x = 0, .y = 0, .z = 0 } }, &revisions);
+        request.* = .{ .sections = positions[index..][0..1], .watch = watch };
+        write.* = .{ .key = key, .value = if (index == 0) &.{ 0, 7, 0 } else &.{ 0, 9, 0 } };
+    }
+    try terrain.cache.backend.store.putBatch(&writes);
+    try terrain.cache.backend.store.flush();
+    terrain.attach();
+    defer terrain.stop();
+    bounded.fail_index = bounded.alloc_index;
+    bounded.resize_fail_index = bounded.resize_index;
+    var pins: [2]chunks.Chunks.PackedPin = undefined;
+    var additional_pins: [2]chunks.Chunks.PackedPin = undefined;
+    var output: [2]chunks.Chunks.PackedSection = undefined;
+    const window = (try terrain.tryBorrowPackedMany(&requests, &output, &pins)).?;
+    defer window.release();
+    try std.testing.expectEqual(@as(usize, 2), window.leases.len);
+    try std.testing.expectEqual(@as(u16, 7), output[0].view.get(0));
+    try std.testing.expectEqual(@as(u16, 9), output[1].view.get(0));
+    try terrain.setBlock(0, .{ .x = 0, .y = 0, .z = 0 }, 11);
+    try std.testing.expect(!requests[0].watch.unchanged());
+    try std.testing.expect(requests[1].watch.unchanged());
+    try std.testing.expectEqual(@as(u16, 7), output[0].view.get(0));
+    try std.testing.expect(try terrain.tryBorrowPackedMany(&requests, &output, &pins) == null);
+    try std.testing.expectEqual(@as(usize, 1), terrain.cache.backend.store.readers);
+    const unaffected = (try terrain.tryBorrowPackedMany(requests[1..], output[1..], &additional_pins)).?;
+    unaffected.release();
+    try std.testing.expectEqual(@as(usize, 1), terrain.cache.backend.store.readers);
     try std.testing.expect(!bounded.has_induced_failure);
 }
 
@@ -1001,21 +1361,28 @@ test "snapshot watches invalidate only intersecting worlds and section bounds" {
     const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 4, .demand_sections = 1 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = try records.Workspaces.init(allocator, io, .{}) });
     const watch = try chunks.Watch.init(allocator, terrain, 2);
     const other = try chunks.Watch.init(allocator, terrain, 2);
+    const invalidation = try chunks.Watch.initInvalidation(allocator, terrain);
     const first: chunks.Watch.Region = .{ .world = 0, .minimum = .{ .x = -1, .y = 4, .z = 0 }, .maximum = .{ .x = -1, .y = 5, .z = 0 } };
     const second: chunks.Watch.Region = .{ .world = 1, .minimum = .{ .x = -1, .y = 4, .z = 0 }, .maximum = .{ .x = -1, .y = 5, .z = 0 } };
     var previous: [2]u64 = undefined;
     watch.configure(first, &previous);
+    invalidation.observe(first);
     other.configure(second, &previous);
     try std.testing.expectEqual([2]u64{ 0, 0 }, previous);
     try terrain.setBlock(0, .{ .x = 0, .y = 64, .z = 0 }, 1);
     try terrain.setBlock(0, .{ .x = -1, .y = 96, .z = 0 }, 1);
     try std.testing.expectEqual(@as(u64, 0), watch.revision(0));
+    try std.testing.expect(invalidation.unchanged());
     try terrain.setBlock(0, .{ .x = -1, .y = 64, .z = 0 }, 1);
+    try std.testing.expect(!invalidation.unchanged());
+    invalidation.observe(second);
+    try std.testing.expect(invalidation.unchanged());
     try std.testing.expectEqual(@as(u64, 1), watch.revision(0));
     try terrain.setBlock(0, .{ .x = -1, .y = 64, .z = 0 }, 1);
     try std.testing.expectEqual(@as(u64, 1), watch.revision(0));
     try std.testing.expectEqual(@as(u64, 0), other.revision(0));
     try terrain.setBlock(1, .{ .x = -1, .y = 95, .z = 0 }, 1);
+    try std.testing.expect(!invalidation.unchanged());
     try std.testing.expectEqual(@as(u64, 1), other.revision(1));
     watch.configure(second, &previous);
     try std.testing.expectEqual([2]u64{ 1, 0 }, previous);
@@ -1034,4 +1401,76 @@ test "snapshot watches invalidate only intersecting worlds and section bounds" {
     try std.testing.expect(!captured.capture(other, &.{ 1, 0 }));
     try std.testing.expect(captured.capture(other, &.{ 1, 1 }));
     try std.testing.expect(captured.unchanged());
+}
+
+test "unaligned biome views detect uniform little endian values without changing scalar reads" {
+    var bytes: [129]u8 = undefined;
+    const view: chunks.BiomeView = .{ .bytes = bytes[1..129] };
+    for ([_]u16{ 0, 1, 255, 256, 65535 }) |value| {
+        for (0..64) |cell| std.mem.writeInt(u16, bytes[1 + cell * 2 ..][0..2], value, .little);
+        try std.testing.expectEqual(@as(?u16, value), view.uniform());
+        for (0..64) |cell| {
+            bytes[1 + cell * 2] ^= 1;
+            try std.testing.expect(view.uniform() == null);
+            for (0..64) |index| try std.testing.expectEqual(if (index == cell) value ^ 1 else value, view.get(@intCast(index)));
+            bytes[1 + cell * 2] ^= 1;
+        }
+    }
+}
+
+test {
+    _ = chunks.Delivery;
+    _ = chunks.Light;
+}
+
+test "cached leases and the unsaved snapshot never read storage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/cached", .{temporary.sub_path});
+    var database = try storage.Store.init(allocator, io, .{ .path = path, .io_mode = .standard });
+    defer database.deinit();
+    var registry = try metrics.Registry.init(allocator, io, .{});
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 8, .demand_sections = 2 }, .{ .metrics = &registry, .storage = try database.openSpace(chunks.Chunks.id), .record_workspaces = try records.Workspaces.init(allocator, io, .{}) });
+    const here: chunks.Section = .{ .world = 0, .x = 0, .y = 0, .z = 0 };
+    const far: chunks.Section = .{ .world = 0, .x = 9, .y = 0, .z = 0 };
+    var leases: [2]chunks.Lease = undefined;
+    // Nothing is in memory, so nothing is leased and nothing is read.
+    try std.testing.expect(!terrain.acquireCached(&.{ here, far }, &leases));
+    try std.testing.expectEqual(@as(usize, 0), terrain.borrowed_count);
+    try terrain.setBlock(0, .{ .x = 1, .y = 2, .z = 3 }, 5);
+    try std.testing.expect(terrain.acquireCached(&.{here}, leases[0..1]));
+    try std.testing.expectEqual(@as(u16, 5), leases[0].view().get(chunks.localIndex(.{ .x = 1, .y = 2, .z = 3 })));
+    terrain.releaseMany(leases[0..1]);
+    try std.testing.expect(!terrain.acquireCached(&.{ here, far }, &leases));
+
+    // The edit is in memory only, dated by its batch.
+    var unsaved: [4]chunks.Chunks.Unsaved = undefined;
+    const first = terrain.unsavedAround(.{ .world = 0, .x = 1, .z = 1 }, 0, 1, &unsaved).?;
+    try std.testing.expectEqual(@as(usize, 1), first.count);
+    try std.testing.expectEqual(here, unsaved[0].section);
+    try std.testing.expectEqual(first.stamp, unsaved[0].since);
+    // A column whose neighbourhood does not reach the edit sees nothing.
+    try std.testing.expectEqual(@as(usize, 0), terrain.unsavedAround(.{ .world = 0, .x = 2, .z = 0 }, 0, 1, &unsaved).?.count);
+    // A later edit of the same dirty section keeps the date of the first.
+    try terrain.setBlock(0, .{ .x = 2, .y = 2, .z = 3 }, 6);
+    const second = terrain.unsavedAround(.{ .world = 0, .x = 0, .z = 0 }, 0, 1, &unsaved).?;
+    try std.testing.expect(second.stamp > first.stamp);
+    try std.testing.expectEqual(first.stamp, unsaved[0].since);
+    // Saving it leaves nothing unsaved and moves the write mark.
+    try terrain.checkpoint(try database.openSpace(chunks.Chunks.id));
+    const saved = terrain.unsavedAround(.{ .world = 0, .x = 0, .z = 0 }, 0, 1, &unsaved).?;
+    try std.testing.expectEqual(@as(usize, 0), saved.count);
+    try std.testing.expect(saved.write_mark != second.write_mark);
+    // Dirty again, it is dated by the edit that made it so.
+    try terrain.setBlock(0, .{ .x = 1, .y = 2, .z = 3 }, 7);
+    const again = terrain.unsavedAround(.{ .world = 0, .x = 0, .z = 0 }, 0, 1, &unsaved).?;
+    try std.testing.expectEqual(again.stamp, unsaved[0].since);
+    try std.testing.expect(again.stamp > second.stamp);
+    // More dirty sections than the caller has room for is no answer at all.
+    try terrain.setBlock(0, .{ .x = 17, .y = 2, .z = 3 }, 7);
+    try std.testing.expectEqual(@as(?chunks.Chunks.UnsavedSnapshot, null), terrain.unsavedAround(.{ .world = 0, .x = 0, .z = 0 }, 0, 1, unsaved[0..1]));
 }

@@ -871,3 +871,220 @@ test "dirty flushes preserve key ordering and exclude acknowledged writeback" {
     try std.testing.expectEqual(@as(usize, 3), cache.backend.writes);
     try std.testing.expectEqual(@as(usize, 0), cache.dirty_entries.count);
 }
+
+test "pooled values retain stable disjoint addresses and recover full capacity" {
+    for ([_]usize{ 1, 2, 8 }) |capacity| for ([_]usize{ 1, 63, 8193, 532616 }) |maximum| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
+        const allocator = bounded.allocator();
+        var pool = try records.PooledValues.init(allocator, capacity, maximum);
+        const bytes = try allocator.alignedAlloc(u8, .@"64", try records.PooledValues.bytes(capacity, maximum));
+        const count = try records.PooledValues.slots(capacity);
+        const addresses = try allocator.alloc([]u8, count);
+        bounded.fail_index = bounded.alloc_index;
+        bounded.resize_fail_index = bounded.resize_index;
+        for (addresses, 0..) |*address, index| {
+            try std.testing.expect(pool.reserve(index, 1));
+            address.* = pool.buffer(bytes, maximum, index);
+            try std.testing.expectEqual(@as(usize, 0), @intFromPtr(address.ptr) % 64);
+            @memset(address.*, @intCast(index));
+            for (addresses[0..index]) |previous| try std.testing.expect(@intFromPtr(previous.ptr) + previous.len <= @intFromPtr(address.ptr) or @intFromPtr(address.ptr) + address.len <= @intFromPtr(previous.ptr));
+        }
+        for (addresses, 0..) |address, index| {
+            try std.testing.expectEqual(address.ptr, pool.buffer(bytes, maximum, index).ptr);
+            try std.testing.expect(std.mem.allEqual(u8, address, @intCast(index)));
+        }
+        for (0..count) |index| pool.release(index);
+        for (0..capacity) |index| {
+            try std.testing.expect(pool.reserve(index, maximum));
+            @memset(pool.buffer(bytes, maximum, index), @intCast(index));
+        }
+        if (maximum > pool.root_bytes / 2) try std.testing.expect(!pool.reserve(capacity, maximum));
+        for (0..capacity) |index| {
+            const before = pool.buffer(bytes, maximum, index);
+            pool.shrink(index, 1);
+            try std.testing.expectEqual(before.ptr, pool.buffer(bytes, maximum, index).ptr);
+            try std.testing.expectEqual(@as(u8, @intCast(index)), pool.buffer(bytes, maximum, index)[0]);
+            pool.release(index);
+        }
+        for (0..capacity) |index| try std.testing.expect(pool.reserve(index, maximum));
+        try std.testing.expect(!bounded.has_induced_failure);
+    };
+}
+
+test "pooled root availability tracks full roots partial releases and split blocks" {
+    var pool = try records.PooledValues.init(std.testing.allocator, 65, 1024);
+    defer pool.deinit(std.testing.allocator);
+    for (0..65) |index| try std.testing.expect(pool.reserve(index, 1024));
+    try std.testing.expect(!pool.reserve(65, 1));
+    pool.release(64);
+    try std.testing.expect(pool.reserve(65, 1024));
+    try std.testing.expect(!pool.reserve(64, 1));
+    pool.shrink(0, 64);
+    try std.testing.expect(!pool.reserve(64, 1024));
+    try std.testing.expect(pool.reserve(64, 512));
+    pool.release(64);
+    pool.release(0);
+    try std.testing.expect(pool.reserve(0, 1024));
+    for (0..66) |index| pool.release(index);
+    try std.testing.expectEqual(@as(usize, 0), pool.used_bytes);
+    for (0..65) |index| try std.testing.expect(pool.reserve(index, 1024));
+    try std.testing.expect(!pool.reserve(65, 1));
+}
+
+test "pooled cache shares its byte budget and batches dirty reclamation" {
+    const Backend = struct {
+        pub const write_batch_size = 32;
+        batches: usize = 0,
+        writes: usize = 0,
+        pub fn getBatch(_: *@This(), _: []const records.Get, _: []?usize) !void {
+            return error.UnexpectedRead;
+        }
+        pub fn putBatch(self: *@This(), values: []const records.Write) !void {
+            self.batches += 1;
+            self.writes += values.len;
+            for (values) |entry| try std.testing.expect(std.mem.allEqual(u8, entry.value.?, entry.key[0]));
+        }
+        pub fn fail(_: *@This()) void {}
+    };
+    const Pooled = records.CacheWithValues(Backend, records.PooledValues);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
+    var cache = try Pooled.init(bounded.allocator(), std.testing.io, .{}, .{ .slots = 1, .key_bytes = 1, .value_bytes = 4096 });
+    bounded.fail_index = bounded.alloc_index;
+    bounded.resize_fail_index = bounded.resize_index;
+    var leases: [1]Pooled.Lease = undefined;
+    var victims: [16]Pooled.Lease = undefined;
+    for (0..14) |index| {
+        const key = [_]u8{@intCast(index)};
+        try std.testing.expect((try cache.reserveMany(&.{&key}, &leases, &victims, cache.capacity)) == .ready);
+        var fill = leases[0].reserve();
+        try std.testing.expect((try fill.prepare(64, &victims)) == .ready);
+        @memset(fill.bytes[0..64], @intCast(index));
+        fill.load(64);
+        leases[0].release();
+    }
+    for (0..14) |index| {
+        const key = [_]u8{@intCast(index)};
+        try std.testing.expect((try cache.reserveMany(&.{&key}, &leases, &victims, cache.capacity)) == .ready);
+        try std.testing.expect(std.mem.allEqual(u8, leases[0].read().?, @intCast(index)));
+        if (index < 2) {
+            _ = leases[0].edit();
+            leases[0].commit(64);
+        }
+        leases[0].release();
+    }
+    try std.testing.expectEqual(@as(usize, 4096), cache.values.len);
+    try std.testing.expect((try cache.reserveMany(&.{&.{99}}, &leases, &victims, cache.capacity)) == .ready);
+    var incoming = leases[0].reserve();
+    const reservation = try incoming.prepare(4096, &victims);
+    try std.testing.expect(reservation == .writeback);
+    const dirty = reservation.writeback;
+    try std.testing.expectEqual(@as(usize, 2), dirty.len);
+    var writes: [2]records.Write = undefined;
+    for (dirty, &writes) |lease, *write| write.* = .{ .key = lease.key(), .value = lease.read() };
+    try cache.writeBack(&writes);
+    for (dirty) |lease| {
+        lease.markWritten();
+        lease.release();
+    }
+    try std.testing.expect((try incoming.prepare(4096, &victims)) == .ready);
+    @memset(incoming.bytes, 99);
+    incoming.load(4096);
+    try std.testing.expect(std.mem.allEqual(u8, leases[0].read().?, 99));
+    leases[0].release();
+    try std.testing.expectEqual(@as(usize, 1), cache.backend.batches);
+    try std.testing.expectEqual(@as(usize, 2), cache.backend.writes);
+    try std.testing.expectEqual(@as(usize, 0), cache.dirty_entries.count);
+    try std.testing.expectEqual(@as(usize, 0), cache.pinned_entries);
+    try std.testing.expect(!bounded.has_induced_failure);
+}
+
+test "packed reads bound their buffer and distinguish missing from unfinished values" {
+    const io = std.testing.io;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/packed", .{directory.sub_path});
+    const resources = try records.Resources.init(std.testing.allocator, io, .{ .readers = 1, .writers = 1 });
+    defer resources.deinit();
+    var database = try Store.init(std.testing.allocator, io, .{ .path = path, .io_mode = .standard });
+    defer database.deinit();
+    const table = records.Table.init(try database.openSpace("packed"), resources);
+    const medium: [8193]u8 = @splat(17);
+    const large: [16384]u8 = @splat(29);
+    const tail: [63]u8 = @splat(43);
+    try table.putBatch(&.{ .{ .key = "a", .value = "" }, .{ .key = "b", .value = "small" }, .{ .key = "c", .value = &medium }, .{ .key = "d", .value = &large }, .{ .key = "e", .value = &tail } });
+    const keys = [_][]const u8{ "a", "b", "c", "d", "missing", "b", "e" };
+    const expected = [_]?[]const u8{ "", "small", &medium, &large, null, "small", &tail };
+    var pending = keys;
+    var mapping = [_]usize{ 0, 1, 2, 3, 4, 5, 6 };
+    var count = pending.len;
+    var bytes: [large.len + 32]u8 = @splat(0xa5);
+    var values: [keys.len]?[]const u8 = undefined;
+    var completed: [keys.len]bool = undefined;
+    var batches: usize = 0;
+    while (count != 0) : (batches += 1) {
+        try std.testing.expect(batches < keys.len);
+        var output: records.PackedRead = .{ .bytes = bytes[16 .. bytes.len - 16], .values = values[0..count], .complete = completed[0..count] };
+        try table.getPacked(pending[0..count], &output);
+        var remaining: usize = 0;
+        for (0..count) |index| {
+            if (!completed[index]) {
+                try std.testing.expect(values[index] == null);
+                pending[remaining] = pending[index];
+                mapping[remaining] = mapping[index];
+                remaining += 1;
+                continue;
+            }
+            if (expected[mapping[index]]) |value| {
+                const actual = values[index].?;
+                try std.testing.expectEqualSlices(u8, value, actual);
+                try std.testing.expect(@intFromPtr(actual.ptr) >= @intFromPtr(output.bytes.ptr));
+                try std.testing.expect(@intFromPtr(actual.ptr) + actual.len <= @intFromPtr(output.bytes.ptr) + output.used);
+            } else try std.testing.expect(values[index] == null);
+        }
+        try std.testing.expect(remaining < count);
+        try std.testing.expect(std.mem.allEqual(u8, bytes[0..16], 0xa5));
+        try std.testing.expect(std.mem.allEqual(u8, bytes[bytes.len - 16 ..], 0xa5));
+        count = remaining;
+    }
+    try std.testing.expect(batches > 1);
+    var insufficient: records.PackedRead = .{ .bytes = bytes[0..4], .values = values[0..1], .complete = completed[0..1] };
+    try std.testing.expectError(error.BufferTooSmall, table.getPacked(&.{"e"}, &insufficient));
+
+    var first_values: [3]?[]const u8 = undefined;
+    var first_complete: [3]bool = undefined;
+    var second_values: [3]?[]const u8 = undefined;
+    var second_complete: [3]bool = undefined;
+    var first_bytes: [large.len]u8 = undefined;
+    var second_bytes: [medium.len + tail.len]u8 = undefined;
+    var first_output: records.PackedRead = .{ .bytes = &first_bytes, .values = &first_values, .complete = &first_complete };
+    var second_output: records.PackedRead = .{ .bytes = &second_bytes, .values = &second_values, .complete = &second_complete };
+    try table.getPackedMany(&.{
+        .{ .keys = &.{ "d", "b", "missing" }, .output = &first_output },
+        .{ .keys = &.{ "c", "e", "a" }, .output = &second_output },
+    });
+    try std.testing.expectEqualSlices(u8, &large, first_values[0].?);
+    try std.testing.expectEqual([_]bool{ true, false, true }, first_complete);
+    try std.testing.expectEqual(null, first_values[1]);
+    try std.testing.expectEqual(null, first_values[2]);
+    try std.testing.expectEqualSlices(u8, &medium, second_values[0].?);
+    try std.testing.expectEqualSlices(u8, &tail, second_values[1].?);
+    try std.testing.expectEqual(@as(usize, 0), second_values[2].?.len);
+    try std.testing.expectEqual([_]bool{ true, true, true }, second_complete);
+    first_output.prefix_bytes = 17;
+    second_output.prefix_bytes = 0;
+    try table.getPackedMany(&.{
+        .{ .keys = &.{ "c", "d", "missing" }, .output = &first_output },
+        .{ .keys = &.{ "e", "b", "a" }, .output = &second_output },
+    });
+    try std.testing.expectEqualSlices(u8, medium[0..17], first_values[0].?);
+    try std.testing.expectEqualSlices(u8, large[0..17], first_values[1].?);
+    try std.testing.expectEqual(null, first_values[2]);
+    try std.testing.expectEqual(@as(usize, 34), first_output.used);
+    for (second_values) |value| try std.testing.expectEqual(@as(usize, 0), value.?.len);
+    try std.testing.expectEqual(@as(usize, 0), second_output.used);
+}

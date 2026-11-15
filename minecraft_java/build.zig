@@ -12,26 +12,9 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "sessions", .module = sessions.module("sessions") },
             .{ .name = "support", .module = encoding.module("encoding") },
+            .{ .name = "deflate", .module = b.dependency("deflate", .{ .target = target, .optimize = optimize }).module("deflate") },
         },
     });
-    const source = b.dependency("libdeflate", .{});
-    const library = b.addObject(.{
-        .name = "deflate",
-        .root_module = b.createModule(.{ .root_source_file = b.path("src/libdeflate.zig"), .target = target, .optimize = optimize }),
-    });
-    library.root_module.addIncludePath(source.path(""));
-    library.root_module.addCSourceFiles(.{
-        .root = source.path(""),
-        .files = &.{
-            "lib/arm/cpu_features.c", "lib/x86/cpu_features.c",
-            "lib/deflate_compress.c", "lib/deflate_decompress.c",
-            "lib/adler32.c",          "lib/zlib_compress.c",
-            "lib/zlib_decompress.c",
-        },
-        // Zig's Clang rejects upstream AVX-512 VNNI target attributes.
-        .flags = &.{ "-std=c99", "-DLIBDEFLATE_STATIC", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI", "-ffreestanding", "-DFREESTANDING" },
-    });
-    module.addObject(library);
     b.step("check", "Check Java protocol support").dependOn(&b.addLibrary(.{ .name = "minecraft_java", .root_module = module }).step);
 
     const tests = b.addTest(.{ .root_module = b.createModule(.{
