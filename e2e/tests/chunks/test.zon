@@ -1,52 +1,57 @@
-.{ .client = "ChunksFixture", .scenarios = .{
-    .{ .name = "chunks" },
-    .{
-        .name = "chunks-registry",
-        .fixture = "registry",
-        .peers = .{ "alice", "bob" },
-        .mixed_versions = true,
+.{
+    .client = "ChunksFixture",
+    // Separated players each stream radius 32 within the client time limit, which a debug server misses.
+    .release = true,
+    .scenarios = .{
+        .{ .name = "chunks" },
+        .{
+            .name = "chunks-registry",
+            .fixture = "registry",
+            .peers = .{ "alice", "bob" },
+            .mixed_versions = true,
+        },
+        .{
+            .name = "chunks-disk",
+            .fixture = "disk",
+            .prepare = "chunks-prepare",
+        },
+        .{ .name = "chunks-multi", .peers = .{ "alice", "bob" } },
+        .{
+            .name = "chunks-protocol-multi",
+            .peers = .{ "alice", "bob" },
+            .mixed_versions = true,
+        },
+        .{
+            .name = "chunks-parallel-multi",
+            .fixture = "parallel",
+            .peers = .{ "alice", "bob" },
+        },
+        .{
+            .name = "chunks-disk-multi",
+            .fixture = "disk",
+            .prepare = "chunks-prepare-multi",
+            .peers = .{ "alice", "bob" },
+        },
+        .{
+            .name = "chunks-encrypted-multi",
+            .fixture = "encryption",
+            .peers = .{ "alice", "bob" },
+        },
+        .{
+            .name = "chunks-simulations-multi",
+            .fixture = "simulations",
+            .peers = .{ "alice", "bob" },
+        },
+        .{
+            .name = "chunks-isolation",
+            .fixture = "isolation",
+            .peers = .{ "alice", "bob" },
+        },
+        .{ .name = "chunks-prepare", .internal = true },
+        .{
+            .name = "chunks-prepare-multi",
+            .peers = .{ "alice", "bob" },
+            .internal = true,
+        },
     },
-    .{
-        .name = "chunks-disk",
-        .fixture = "disk",
-        .prepare = "chunks-prepare",
-    },
-    .{ .name = "chunks-multi", .peers = .{ "alice", "bob" } },
-    .{
-        .name = "chunks-protocol-multi",
-        .peers = .{ "alice", "bob" },
-        .mixed_versions = true,
-    },
-    .{
-        .name = "chunks-parallel-multi",
-        .fixture = "parallel",
-        .peers = .{ "alice", "bob" },
-    },
-    .{
-        .name = "chunks-disk-multi",
-        .fixture = "disk",
-        .prepare = "chunks-prepare-multi",
-        .peers = .{ "alice", "bob" },
-    },
-    .{
-        .name = "chunks-encrypted-multi",
-        .fixture = "encryption",
-        .peers = .{ "alice", "bob" },
-    },
-    .{
-        .name = "chunks-simulations-multi",
-        .fixture = "simulations",
-        .peers = .{ "alice", "bob" },
-    },
-    .{
-        .name = "chunks-isolation",
-        .fixture = "isolation",
-        .peers = .{ "alice", "bob" },
-    },
-    .{ .name = "chunks-prepare", .internal = true },
-    .{
-        .name = "chunks-prepare-multi",
-        .peers = .{ "alice", "bob" },
-        .internal = true,
-    },
-} }
+}

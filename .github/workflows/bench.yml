@@ -15,6 +15,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/dependencies
+        with:
+          registries: 'true'
       - working-directory: occlusion
         run: |
           mkdir -p .zig-cache
@@ -145,7 +147,7 @@ jobs:
         run: |
           bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe run -- \
             --input "$RUNNER_TEMP/benchmark-world/generator/world" \
-            --output "$RUNNER_TEMP/benchmark-world/native" --no-lighting --skip-unsupported
+            --output "$RUNNER_TEMP/benchmark-world/native" --skip-unsupported
       - name: Archive benchmark worlds
         if: steps.corpus.outputs.cache-hit != 'true'
         run: |

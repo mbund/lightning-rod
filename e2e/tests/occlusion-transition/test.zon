@@ -1,1 +1,6 @@
-.{ .client = "OcclusionTransitionFixture", .scenarios = .{.{ .name = "occlusion-transition" }} }
+.{
+    .client = "OcclusionTransitionFixture",
+    // Streams radius 32 through a cave exit within the client time limit, which a debug server misses.
+    .release = true,
+    .scenarios = .{.{ .name = "occlusion-transition" }},
+}

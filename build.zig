@@ -114,9 +114,16 @@ pub fn build(b: *std.Build) void {
         .{ .directory = "e2e", .targets = &.{ "test-performance", "test-harness", "test-artifacts", "test-client" } },
         .{ .directory = "e2e/tests", .targets = &.{"list-tests"} },
     };
+    // Nested suites run one after another, so CI splits them across runners.
+    const shard_option = b.option([]const u8, "shard", "Run only every COUNT-th suite starting at INDEX, given as INDEX/COUNT") orelse "0/1";
+    const separator = std.mem.indexOfScalar(u8, shard_option, '/') orelse std.debug.panic("-Dshard takes INDEX/COUNT, not {s}", .{shard_option});
+    const shard_index = std.fmt.parseInt(usize, shard_option[0..separator], 10) catch std.debug.panic("-Dshard takes INDEX/COUNT, not {s}", .{shard_option});
+    const shard_count = std.fmt.parseInt(usize, shard_option[separator + 1 ..], 10) catch std.debug.panic("-Dshard takes INDEX/COUNT, not {s}", .{shard_option});
+    if (shard_count == 0 or shard_index >= shard_count) std.debug.panic("-Dshard takes INDEX/COUNT with INDEX below COUNT, not {s}", .{shard_option});
     const triple = target.query.zigTriple(b.allocator) catch @panic("OOM");
     const cpu = target.query.serializeCpuAlloc(b.allocator) catch @panic("OOM");
-    for (suites) |suite| {
+    for (suites, 0..) |suite, suite_index| {
+        if (suite_index % shard_count != shard_index) continue;
         const run = b.addSystemCommand(&.{
             b.graph.zig_exe,
             "build",

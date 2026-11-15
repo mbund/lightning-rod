@@ -5,9 +5,13 @@ on:
 
 jobs:
   test:
-    name: Unit and integration tests
+    name: Unit and integration tests (${{ matrix.shard }}/4)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/dependencies
@@ -15,7 +19,7 @@ jobs:
           jdk: 'true'
           registries: 'true'
           clients: default
-      - run: bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe test
+      - run: bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe test "-Dshard=${{ matrix.shard }}/4"
 
   codegen:
     name: Generated cursor contracts

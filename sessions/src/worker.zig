@@ -993,7 +993,9 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                             var sending = pending.remaining.iterator(.{});
                             while (sending.next()) |recipient| {
                                 const handle = packet.recipients.at(recipient);
-                                const native = endpoint.routes[handle.index] orelse unreachable;
+                                // A send above can close a connection, which detaches its route. The next pass
+                                // finds the session gone and completes the recipient.
+                                const native = endpoint.routes[handle.index] orelse continue;
                                 if (!self.engine.groupReady(native, index, packet.group) or self.blocked.isSet(native.index)) continue;
                                 const connection = &self.engine.connections[native.index];
                                 if (connection.protocol.?.number != frame.protocol or Endpoint.compressed(&connection.lifecycle.?) != frame.compressed) continue;
@@ -1053,7 +1055,8 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                     var blocking = pending.remaining.iterator(.{});
                     while (blocking.next()) |recipient| {
                         const handle = packet.recipients.at(recipient);
-                        const native = endpoint.routes[handle.index].?;
+                        // Sending can have detached this recipient. The next pass completes it.
+                        const native = endpoint.routes[handle.index] orelse continue;
                         if (self.engine.groupReady(native, index, packet.group)) self.block(native.index);
                     }
                     previous = pending;

@@ -582,6 +582,10 @@ pub const Streaming = struct {
     /// later deliveries of it read the stored record instead of solving inside a delivery.
     cold: [cold_capacity]Cold = undefined,
     cold_count: usize = 0,
+    /// Cold columns whose bake found their neighbourhood edited, so no frame could be stored.
+    /// An edit every tick lands before each bake, so these are solved inline, unstored.
+    unstorable: [cold_capacity]DeliveryColumn = undefined,
+    unstorable_count: usize = 0,
     group_window: *chunks.Chunks.GroupWindow,
     tile_watch: *chunks.Watch,
     tile_revisions: []u64,
@@ -1558,7 +1562,7 @@ pub const Streaming = struct {
             const column: section_visibility_world.Column = .{ .world = item.world, .x = item.at.x, .z = item.at.z, .minimum = dimension.minimumSection() };
             // A dirty or generating neighbourhood cannot be stored, so baking it would be wasted.
             const clean = self.deps.chunks.lightClean(.{ .world = item.world, .x = item.at.x, .z = item.at.z }, dimension.minimumSection(), dimension.sectionCount());
-            if (!clean or self.missingSections(item.owner, item.at, self.collisionMask(item.owner, column, dimension.sectionCount())) != 0) urgent = item;
+            if (!clean or self.unstorablePending(item.world, item.at) or self.missingSections(item.owner, item.at, self.collisionMask(item.owner, column, dimension.sectionCount())) != 0) urgent = item;
         }
         if (urgent != null and stored_count != 0 and !self.urgent_deferred) {
             // The stored columns of this batch were read and decoded already. They go out
@@ -1575,6 +1579,7 @@ pub const Streaming = struct {
             count = kept;
         } else if (urgent) |first| {
             self.urgent_deferred = false;
+            self.clearUnstorable(first.world, first.at);
             // The urgent column gets the batch to itself. The rest return through selection.
             var kept: usize = 0;
             for (pending[0..count]) |item| {
@@ -1957,6 +1962,31 @@ pub const Streaming = struct {
         return best;
     }
 
+    fn markUnstorable(self: *Streaming, world: u32, at: Position) void {
+        assert(self.unstorable_count <= self.unstorable.len);
+        if (self.unstorablePending(world, at)) return;
+        // A full list drops the column, which then waits for the baker as before.
+        if (self.unstorable_count == self.unstorable.len) return;
+        self.unstorable[self.unstorable_count] = .{ .world = world, .at = at };
+        self.unstorable_count += 1;
+    }
+
+    fn unstorablePending(self: *const Streaming, world: u32, at: Position) bool {
+        for (self.unstorable[0..self.unstorable_count]) |column| {
+            if (column.world == world and std.meta.eql(column.at, at)) return true;
+        }
+        return false;
+    }
+
+    fn clearUnstorable(self: *Streaming, world: u32, at: Position) void {
+        for (self.unstorable[0..self.unstorable_count], 0..) |column, index| {
+            if (column.world != world or !std.meta.eql(column.at, at)) continue;
+            self.unstorable[index] = self.unstorable[self.unstorable_count - 1];
+            self.unstorable_count -= 1;
+            return;
+        }
+    }
+
     fn queueCold(self: *Streaming, item: Pending) void {
         assert(self.cold_count <= self.cold.len);
         if (self.coldPending(item.world, item.at)) return;
@@ -1982,7 +2012,9 @@ pub const Streaming = struct {
         const frame = switch (try self.deps.lighting.bakeDelivery(cold.world, cold.at.x, cold.at.z, dimension, cold.owner)) {
             .loading => return false,
             .unstorable => {
-                // The neighbourhood changed after selection checked it. It returns through selection.
+                // The neighbourhood changed after selection checked it. Waiting for it to settle
+                // would wait forever beside a block edited every tick, so selection solves it inline.
+                self.markUnstorable(cold.world, cold.at);
                 return true;
             },
             .baked => |view| view,

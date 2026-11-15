@@ -33,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
         lightning_rod.plugin.configured(vanilla.Flat, .{}),
     });
     const simulation = try lightning_rod.Simulation(@TypeOf(plugins)).init(allocator, init.io, &store, .{
-        .memory_bytes = 16 * 1024 * 1024,
+        .memory_bytes = 32 * 1024 * 1024,
         .metrics = .{ .enabled = false },
         .autosave = .{ .ticks = null },
     });
