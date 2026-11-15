@@ -1026,7 +1026,7 @@ pub fn benchmarkItemVisibility() !void {
             }
             if (mode == 7) {
                 var publication = streaming.published.streams[0];
-                publication.setup = .terrain;
+                publication.setup = .opening;
                 streaming.published.setStream(0, publication);
             }
             if (mode == 8) {
@@ -1252,7 +1252,7 @@ pub fn benchmarkIdleTerrain() !void {
         defer background.stop();
         const side: usize = @intCast(players.config.render_distance * 2 + 1);
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
-            stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .cursor = side * side, .delivered = side * side };
+            stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .announced = true, .cursor = side * side, .delivered = side * side };
             streaming.published.setStream(index, stream.snapshot());
             service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
         }
@@ -1538,7 +1538,7 @@ pub fn benchmarkBlockPlanning() !void {
         defer background.stop();
         const side: usize = @intCast(players.config.render_distance * 2 + 1);
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
-            stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .cursor = side * side, .delivered = side * side, .minimum_section = 0, .section_count = 16 };
+            stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .announced = true, .cursor = side * side, .delivered = side * side, .minimum_section = 0, .section_count = 16 };
             streaming.published.setStream(index, stream.snapshot());
             service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
         }
@@ -1845,7 +1845,7 @@ pub fn benchmarkTerrainBackpressure() !void {
         defer terrain.stop();
         const side: usize = @intCast(players.config.render_distance * 2 + 1);
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
-            stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .cursor = if (mode == .blocks) side * side else 0, .delivered = if (mode == .blocks) side * side else 0 };
+            stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .announced = true, .cursor = if (mode == .blocks) side * side else 0, .delivered = if (mode == .blocks) side * side else 0 };
             streaming.published.setStream(index, stream.snapshot());
             service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
         }
@@ -2046,10 +2046,10 @@ pub fn benchmarkSparseTerrainStreaming() !void {
         defer background.stop();
         const side: usize = @intCast(players.config.render_distance * 2 + 1);
         if (populated) for (streaming.streams, 0..) |*stream, index| {
-            stream.* = .{ .generation = 1, .life = player_records[index].life, .setup = .streaming, .cursor = side * side, .delivered = side * side, .center = .{ .x = @intCast(index * 64), .z = 0 }, .target = .{ .x = @intCast(index * 64), .z = 0 } };
+            stream.* = .{ .generation = 1, .life = player_records[index].life, .setup = .streaming, .announced = true, .cursor = side * side, .delivered = side * side, .center = .{ .x = @intCast(index * 64), .z = 0 }, .target = .{ .x = @intCast(index * 64), .z = 0 } };
             streaming.published.setStream(index, stream.snapshot());
         };
-        streaming.streams[0] = .{ .generation = 1, .life = player_records[0].life, .setup = .streaming, .cursor = 0, .delivered = side * side - 1 };
+        streaming.streams[0] = .{ .generation = 1, .life = player_records[0].life, .setup = .streaming, .announced = true, .cursor = 0, .delivered = side * side - 1 };
         @memset(streaming.sent, std.math.maxInt(u64));
         streaming.sent[0] &= ~@as(u64, 1);
         service.credit[0].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
@@ -2158,7 +2158,7 @@ pub fn benchmarkSparseBlockPlanning() !void {
         defer background.stop();
         const side: usize = @intCast(players.config.render_distance * 2 + 1);
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
-            stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .minimum_section = 0, .section_count = 16, .cursor = side * side, .delivered = side * side, .center = .{ .x = @intCast(index * 64), .z = 0 }, .target = .{ .x = @intCast(index * 64), .z = 0 } };
+            stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .announced = true, .minimum_section = 0, .section_count = 16, .cursor = side * side, .delivered = side * side, .center = .{ .x = @intCast(index * 64), .z = 0 }, .target = .{ .x = @intCast(index * 64), .z = 0 } };
             streaming.published.setStream(index, stream.snapshot());
             service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
         }
@@ -2270,7 +2270,7 @@ pub fn verifyBlockBatchRetirement() !void {
         defer background.stop();
         const side: usize = @intCast(players.config.render_distance * 2 + 1);
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
-            stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .minimum_section = 0, .section_count = 16, .cursor = side * side, .delivered = side * side };
+            stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .announced = true, .minimum_section = 0, .section_count = 16, .cursor = side * side, .delivered = side * side };
             streaming.published.setStream(index, stream.snapshot());
             service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
         }

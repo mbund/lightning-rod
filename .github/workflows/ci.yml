@@ -235,7 +235,7 @@ jobs:
         id: server
         with:
           path: ${{ runner.temp }}/ci-prepared/previous.tar.zst
-          key: ci-previous-debug-x86_64-baseline-${{ steps.previous.outputs.sha }}-${{ hashFiles('protocols/catalog.zig', 'build.zig.zon') }}
+          key: ci-previous-safe-x86_64-baseline-${{ steps.previous.outputs.sha }}-${{ hashFiles('protocols/catalog.zig', 'build.zig.zon') }}
       - uses: ./.github/actions/dependencies
         if: steps.server.outputs.cache-hit != 'true'
         with:
@@ -250,7 +250,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/previous-source" "$RUNNER_TEMP/previous-server/$PREVIOUS" "$RUNNER_TEMP/ci-prepared"
           git archive "$PREVIOUS" | tar -xf - -C "$RUNNER_TEMP/previous-source"
           (cd "$RUNNER_TEMP/previous-source" && bash "$GITHUB_WORKSPACE/.github/scripts/install-zig.sh" "$RUNNER_TEMP/previous-zig")
-          (cd "$RUNNER_TEMP/previous-source/examples/vanilla" && "$RUNNER_TEMP/previous-zig/zig" build -Dtarget=x86_64-linux -Dcpu=baseline "-Dreleases=$releases")
+          (cd "$RUNNER_TEMP/previous-source/examples/vanilla" && "$RUNNER_TEMP/previous-zig/zig" build --release=safe -Dtarget=x86_64-linux -Dcpu=baseline "-Dreleases=$releases")
           cp "$RUNNER_TEMP/previous-source/examples/vanilla/zig-out/bin/lightning_rod" "$RUNNER_TEMP/previous-server/$PREVIOUS/"
           tar --zstd -cf "$RUNNER_TEMP/ci-prepared/previous.tar.zst" -C "$RUNNER_TEMP/previous-server" .
       - uses: actions/upload-artifact@v7

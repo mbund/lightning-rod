@@ -115,8 +115,22 @@ pub const Heights = struct {
         };
         var heights: @Vector(256, u8) = @shuffle(u8, low, high, even);
         if (self.mode == sparse) {
-            const bits: @Vector(256, bool) = @bitCast(self.bytes[0..mask_bytes].*);
-            heights = @select(u8, bits, heights, @as(@Vector(256, u8), @splat(0)));
+            // Each cell reads its byte of the mask and tests its bit there. Bitcasting the mask to
+            // a bool vector decoded differently under the LLVM and self-hosted backends.
+            const cell_bytes = comptime blk: {
+                var lanes: [256]i32 = undefined;
+                for (&lanes, 0..) |*lane, cell| lane.* = @intCast(cell / 8);
+                break :blk lanes;
+            };
+            const cell_bits: @Vector(256, u8) = comptime blk: {
+                var bits: [256]u8 = undefined;
+                for (&bits, 0..) |*bit, cell| bit.* = @as(u8, 1) << @intCast(cell % 8);
+                break :blk bits;
+            };
+            const mask: @Vector(mask_bytes, u8) = self.bytes[0..mask_bytes].*;
+            const spread = @shuffle(u8, mask, undefined, cell_bytes);
+            const present = spread & cell_bits != @as(@Vector(256, u8), @splat(0));
+            heights = @select(u8, present, heights, @as(@Vector(256, u8), @splat(0)));
         }
         output.* = heights;
     }
@@ -461,4 +475,17 @@ fn wordBytes(bits: u8) u32 {
     assert(bits >= 4 and bits <= 8);
     const per_word: u32 = 64 / @as(u32, bits);
     return (4096 + per_word - 1) / per_word * 8;
+}
+
+test "sparse column heights decode every cell as encoded" {
+    var random = std.Random.DefaultPrng.init(7);
+    var heights: [256]u8 = undefined;
+    var output: [Heights.encoded_maximum]u8 = undefined;
+    var decoded: [256]u8 = undefined;
+    for (0..64) |_| {
+        for (&heights) |*height| height.* = if (random.random().boolean()) 0 else random.random().intRangeAtMost(u8, 1, 16);
+        const encoded = Heights.encode(&heights, &output);
+        (Heights{ .mode = encoded.mode, .bytes = output[0..encoded.length] }).decode(&decoded);
+        try std.testing.expectEqualSlices(u8, &heights, &decoded);
+    }
 }

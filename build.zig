@@ -114,16 +114,34 @@ pub fn build(b: *std.Build) void {
         .{ .directory = "e2e", .targets = &.{ "test-performance", "test-harness", "test-artifacts", "test-client" } },
         .{ .directory = "e2e/tests", .targets = &.{"list-tests"} },
     };
-    // Nested suites run one after another, so CI splits them across runners.
-    const shard_option = b.option([]const u8, "shard", "Run only every COUNT-th suite starting at INDEX, given as INDEX/COUNT") orelse "0/1";
-    const separator = std.mem.indexOfScalar(u8, shard_option, '/') orelse std.debug.panic("-Dshard takes INDEX/COUNT, not {s}", .{shard_option});
-    const shard_index = std.fmt.parseInt(usize, shard_option[0..separator], 10) catch std.debug.panic("-Dshard takes INDEX/COUNT, not {s}", .{shard_option});
-    const shard_count = std.fmt.parseInt(usize, shard_option[separator + 1 ..], 10) catch std.debug.panic("-Dshard takes INDEX/COUNT, not {s}", .{shard_option});
-    if (shard_count == 0 or shard_index >= shard_count) std.debug.panic("-Dshard takes INDEX/COUNT with INDEX below COUNT, not {s}", .{shard_option});
+    // Nested suites run one after another, so CI runs each as its own job, by the name
+    // list-suites prints. The e2e suite runs Java and needs the client runtime.
+    var names: [suites.len][]const u8 = undefined;
+    for (suites, &names) |suite, *name| name.* = if (suite.arguments.len == 0)
+        suite.directory
+    else
+        b.fmt("{s} {s}", .{ suite.directory, std.mem.join(b.allocator, " ", suite.arguments) catch @panic("OOM") });
+    const selected_suite = b.option([]const u8, "suite", "Run only the suite of this name, as list-suites prints it");
+    // The root package's own tests form the core suite.
+    if (selected_suite) |wanted| if (!std.mem.eql(u8, wanted, "core")) {
+        for (names) |name| {
+            if (std.mem.eql(u8, name, wanted)) break;
+        } else std.debug.panic("Unknown suite '{s}'; use zig build list-suites", .{wanted});
+        test_step.dependencies.clearRetainingCapacity();
+    };
+    const Entry = struct { suite: []const u8, java: bool };
+    var entries: [suites.len + 1]Entry = undefined;
+    entries[0] = .{ .suite = "core", .java = false };
+    for (suites, names, entries[1..]) |suite, name, *entry| entry.* = .{ .suite = name, .java = std.mem.eql(u8, suite.directory, "e2e") };
+    const matrix = std.json.Stringify.valueAlloc(b.allocator, .{ .include = entries }, .{}) catch @panic("OOM");
+    const print_suites = b.addSystemCommand(&.{"cat"});
+    print_suites.addFileArg(b.addWriteFiles().add("suites.json", matrix));
+    print_suites.has_side_effects = true;
+    b.step("list-suites", "Print the CI matrix of test suites as JSON").dependOn(&print_suites.step);
     const triple = target.query.zigTriple(b.allocator) catch @panic("OOM");
     const cpu = target.query.serializeCpuAlloc(b.allocator) catch @panic("OOM");
-    for (suites, 0..) |suite, suite_index| {
-        if (suite_index % shard_count != shard_index) continue;
+    for (suites, names) |suite, name| {
+        if (selected_suite) |wanted| if (!std.mem.eql(u8, name, wanted)) continue;
         const run = b.addSystemCommand(&.{
             b.graph.zig_exe,
             "build",
@@ -133,7 +151,7 @@ pub fn build(b: *std.Build) void {
         });
         run.addArg("--cache-dir");
         run.addDirectoryArg(.cache_root);
-        run.setName(if (suite.arguments.len == 0) b.fmt("test {s}", .{suite.directory}) else b.fmt("test {s} {s}", .{ suite.directory, suite.arguments[0] }));
+        run.setName(b.fmt("test {s}", .{name}));
         run.setCwd(b.path(suite.directory));
         run.addArgs(suite.targets);
         run.addArgs(suite.arguments);

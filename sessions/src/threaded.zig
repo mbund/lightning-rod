@@ -44,7 +44,9 @@ fn Driver(comptime Core: type) type {
             std.debug.assert(self.thread == null and !self.closing.load(.acquire));
             try self.core.worker.engine.codec.?.start();
             errdefer self.core.worker.engine.codec.?.stop();
-            self.thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, execute, .{self});
+            // Unoptimized builds keep a frame per protocol state, which outgrew 256 KiB for a
+            // debug server on a baseline CPU.
+            self.thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, execute, .{self});
         }
 
         fn execute(self: *Self) void {

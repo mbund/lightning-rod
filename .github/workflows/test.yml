@@ -4,22 +4,34 @@ on:
   workflow_call:
 
 jobs:
+  discover:
+    name: Discover test suites
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.suites.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/dependencies
+      - id: suites
+        run: echo "matrix=$(bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build list-suites)" >> "$GITHUB_OUTPUT"
+
   test:
-    name: Unit and integration tests (${{ matrix.shard }}/4)
+    name: Test ${{ matrix.suite }}
+    needs: discover
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix:
-        shard: [0, 1, 2, 3]
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/dependencies
         with:
-          jdk: 'true'
+          jdk: ${{ matrix.java }}
           registries: 'true'
-          clients: default
-      - run: bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe test "-Dshard=${{ matrix.shard }}/4"
+          clients: ${{ matrix.java && 'default' || '' }}
+      - run: bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe test "-Dsuite=${{ matrix.suite }}"
 
   codegen:
     name: Generated cursor contracts
