@@ -36,6 +36,9 @@ pub const Scenario = struct {
 pub const Manifest = struct {
     /// The fixture class in package dev.lightningrod.e2e.
     client: []const u8,
+    /// The test measures throughput a debug server cannot reach, so its build optimizes the
+    /// server and enforces the tick budget even when debug is requested.
+    release: bool = false,
     scenarios: []const Scenario,
 
     pub fn find(self: Manifest, name: []const u8) ?Scenario {
@@ -100,7 +103,7 @@ fn testParse(source: [:0]const u8) Error!void {
 
 test "manifests parse and reject invalid scenarios" {
     try testParse(
-        \\.{ .client = "ChunksFixture", .scenarios = .{
+        \\.{ .client = "ChunksFixture", .release = true, .scenarios = .{
         \\    .{ .name = "chunks" },
         \\    .{ .name = "chunks-disk", .prepare = "chunks-prepare", .fixture = "disk" },
         \\    .{ .name = "chunks-prepare", .internal = true, .peers = .{ "alice", "bob" } },

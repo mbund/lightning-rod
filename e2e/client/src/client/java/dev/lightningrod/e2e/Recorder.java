@@ -160,6 +160,9 @@ public final class Recorder {
     }
     public synchronized void gameStateChange(int reason, float value) {
         if (observedReadinessEvents++ < 16) event("game_state_change", "reason", reason, "value", value);
+        // Vanilla places the player before it announces terrain loading. A client told first waits
+        // for the chunk under whatever position it held, and may show the world from there.
+        if (reason == 13 && !positioned && enabled) fail("terrain_loading_before_position");
     }
     public void configurationStarted() { protocolPhase = "configuration"; }
     public void playStarted() { protocolPhase = "play"; }

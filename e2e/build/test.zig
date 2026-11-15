@@ -140,7 +140,7 @@ pub const Test = struct {
 
 pub fn add(b: *std.Build, options: Options) *Test {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    const requested_optimize = b.standardOptimizeOption(.{});
     const single_threaded = b.option(bool, "single-threaded", "Run all fixture services on the simulation owner") orelse false;
     const realtime = b.option(bool, "realtime", "Run the server and its threads with FIFO scheduling") orelse false;
     const server_releases = b.option([]const u8, "server-releases", "Minecraft releases selected for the test server");
@@ -155,6 +155,7 @@ pub fn add(b: *std.Build, options: Options) *Test {
     const manifest_path = b.root.joinString(b.allocator, options.manifest) catch @panic("OOM");
     const test_manifest = manifest.read(b.graph.io, b.allocator, b.allocator, manifest_path) catch |err|
         std.debug.panic("Cannot read {s}: {s}", .{ manifest_path, @errorName(err) });
+    const optimize: std.lang.Optimize = if (test_manifest.release and requested_optimize == .debug) .safe else requested_optimize;
 
     var selected: std.ArrayList(manifest.Scenario) = .empty;
     if (requested_scenario) |name| {

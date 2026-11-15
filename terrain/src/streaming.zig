@@ -95,6 +95,8 @@ pub const Streaming = struct {
         life: u32,
         teleport_id: i32 = 0,
         ready: bool,
+        /// The position for this life has gone out.
+        placed: bool = false,
         center: Position,
         eye_min: [3]i32 = .{ 0, 0, 0 },
         eye_max: i32 = 0,
@@ -115,6 +117,7 @@ pub const Streaming = struct {
                     .teleport, .awaiting_teleport, .ready => !player.configuring,
                     else => false,
                 },
+                .placed = (player.stage == .awaiting_teleport or player.stage == .ready) and !player.configuring,
                 .center = .{ .x = @intFromFloat(@floor(player.position.x / 16)), .z = @intFromFloat(@floor(player.position.z / 16)) },
             };
         }
@@ -348,13 +351,15 @@ pub const Streaming = struct {
         }
     };
 
-    const Setup = enum { terrain, center, streaming, unloading };
+    /// A stream opens by sending its view center. It recenters by unloading what leaves and
+    /// sending the new center.
+    const Setup = enum { opening, center, streaming, unloading };
 
     const Snapshot = struct {
         generation: u32 = 0,
         life: u32 = 0,
         prepared_teleport: i32 = 0,
-        setup: Setup = .terrain,
+        setup: Setup = .opening,
         center: Position = .{ .x = 0, .z = 0 },
         minimum_section: i32 = -4,
         section_count: usize = 24,
@@ -366,7 +371,10 @@ pub const Streaming = struct {
         generation: u32 = 0,
         life: u32 = 0,
         prepared_teleport: i32 = 0,
-        setup: Setup = .terrain,
+        setup: Setup = .opening,
+        /// The client was told terrain is loading for this life. Clients from 1.21.4 then wait for
+        /// the chunk under their position, so this follows the position, as vanilla orders them.
+        announced: bool = false,
         center: Position = .{ .x = 0, .z = 0 },
         target: Position = .{ .x = 0, .z = 0 },
         cursor: usize = 0,
@@ -1242,7 +1250,7 @@ pub const Streaming = struct {
                 }
 
                 self.pending = self.pending or stream.setup != .streaming or stream.cursor < side * side or
-                    self.needsSource(index) or !std.meta.eql(center, stream.center);
+                    self.needsSource(index) or !std.meta.eql(center, stream.center) or (!stream.announced and player.placed);
                 if (!service.canSend(handle, 1) and (stream.setup != .streaming or !std.meta.eql(center, stream.center))) continue;
 
                 if (stream.setup == .streaming and !std.meta.eql(center, stream.center)) {
@@ -1280,19 +1288,32 @@ pub const Streaming = struct {
                         else => return err,
                     };
                     defer packet.cancel();
-                    const bytes = if (stream.setup == .terrain)
-                        try self.deps.packets.writePacket(writeTerrainReady, player.protocol, packet.bytes, .{})
-                    else
-                        try self.deps.packets.writePacket(writeViewCenter, player.protocol, packet.bytes, .{stream.center});
+                    const bytes = try self.deps.packets.writePacket(writeViewCenter, player.protocol, packet.bytes, .{stream.center});
                     packet.publish(bytes.len, &.{handle}) catch |err| switch (err) {
                         error.Backpressured, error.Closed => continue,
                         else => return err,
                     };
-                    stream.setup = if (stream.setup == .terrain) .center else .streaming;
+                    stream.setup = .streaming;
                     self.publication_players.insert(index);
                     progressed = true;
                     setup_progress = true;
                     continue;
+                }
+                if (!stream.announced and player.placed) {
+                    var packet = service.reserveBackground(64, self.epoch) catch |err| switch (err) {
+                        error.Backpressured => continue,
+                        error.Closed => return false,
+                        else => return err,
+                    };
+                    defer packet.cancel();
+                    const bytes = try self.deps.packets.writePacket(writeTerrainReady, player.protocol, packet.bytes, .{});
+                    packet.publish(bytes.len, &.{handle}) catch |err| switch (err) {
+                        error.Backpressured, error.Closed => continue,
+                        else => return err,
+                    };
+                    stream.announced = true;
+                    progressed = true;
+                    setup_progress = true;
                 }
                 assert(std.meta.eql(center, stream.center));
                 self.setup_players.remove(index);
@@ -2644,7 +2665,7 @@ pub const Streaming = struct {
 
             const handle = record.handle orelse return false;
             const slot = self.grid.bit(player, .{ .x = x, .z = z });
-            return stream.generation == handle.generation and stream.life == record.life and stream.setup != .terrain and
+            return stream.generation == handle.generation and stream.life == record.life and stream.setup != .opening and
                 chunk_horizon.contains(self.radius, stream.center, .{ .x = x, .z = z }) and
                 self.sent[slot.word] & slot.mask != 0;
         }
@@ -2739,7 +2760,7 @@ pub const Streaming = struct {
         const handle = view.handle orelse return false;
         const stream = self.streams[index];
         return view.world == world and stream.generation == handle.generation and stream.life == view.life and
-            stream.setup != .terrain and chunk_horizon.contains(self.deliveryRadius(), stream.center, .{ .x = x, .z = z }) and self.hasSent(index, .{ .x = x, .z = z });
+            stream.setup != .opening and chunk_horizon.contains(self.deliveryRadius(), stream.center, .{ .x = x, .z = z }) and self.hasSent(index, .{ .x = x, .z = z });
     }
 
     fn sentIndex(self: *const Streaming, index: usize, at: Position) chunk_horizon.Index.Bit {

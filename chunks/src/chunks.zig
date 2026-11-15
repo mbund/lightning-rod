@@ -259,6 +259,9 @@ pub const Source = struct {
     }
 };
 
+/// Writebacks one background preparation may make before it yields.
+const background_writeback_attempts = 4;
+
 pub const Chunks = struct {
     pub const id = "lightning_rod:chunks";
 
@@ -1160,16 +1163,24 @@ pub const Chunks = struct {
             keys[index] = encodeKey(section);
             slices[index] = &keys[index];
         }
-        var victims: [192]Cache.Lease = undefined;
-        const reservation = try self.cache.reserveMany(slices[0..count], leases[0..count], &victims, self.backgroundCapacity());
-        switch (reservation) {
-            .blocked => return,
-            .ready => {},
-            .writeback => |held| {
-                try self.writebackLocked(held);
-                self.ready().set(self.io);
-                return;
-            },
+        // A writeback cleans its victims, so the reservation is tried again at once. Returning
+        // instead lets an edit dirty a victim before the next call, and a request as large as
+        // the background capacity then never finds every victim clean.
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            var victims: [192]Cache.Lease = undefined;
+            switch (try self.cache.reserveMany(slices[0..count], leases[0..count], &victims, self.backgroundCapacity())) {
+                .blocked => return,
+                .ready => break,
+                .writeback => |held| {
+                    try self.writebackLocked(held);
+                    // Only edits made while the write released the lock dirty victims again.
+                    if (attempt + 1 == background_writeback_attempts) {
+                        self.ready().set(self.io);
+                        return;
+                    }
+                },
+            }
         }
         assert(self.cache.pinned_entries <= self.backgroundCapacity());
         defer for (leases[0..count]) |lease| lease.release();

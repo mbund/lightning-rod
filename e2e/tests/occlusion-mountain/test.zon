@@ -1,1 +1,6 @@
-.{ .client = "OcclusionMountainFixture", .scenarios = .{.{ .name = "occlusion-mountain" }} }
+.{
+    .client = "OcclusionMountainFixture",
+    // An 80 block per second flight at radius 32 needs more cold columns than a debug server bakes.
+    .release = true,
+    .scenarios = .{.{ .name = "occlusion-mountain" }},
+}
