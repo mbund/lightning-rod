@@ -5,6 +5,17 @@ const selected_protocol = @import("protocols");
 const profile = @import("e2e_profile");
 const sessions = @import("sessions");
 const vanilla = @import("vanilla");
+const Disconnect = @import("connection").session_disconnect.Disconnect;
+const Keepalive = @import("connection").session_keepalive.Keepalive;
+const LoginCompression = @import("connection").session_compression.LoginCompression;
+const LoginEncryption = @import("connection").session_encryption.LoginEncryption;
+const LoginStart = @import("connection").session_login_start.LoginStart;
+const LoginSuccess = @import("connection").session_login_success.LoginSuccess;
+const OfflineAuthentication = @import("connection").offline_authentication.OfflineAuthentication;
+const Players = @import("players").players.Players;
+const SessionConfiguration = @import("connection").session_configuration.Plugin;
+const Status = @import("connection").session_status.Status;
+const Worlds = @import("worlds").Worlds;
 const persistence = @import("storage");
 const ExtraNegotiation = @import("extra_negotiation.zig").ExtraNegotiation;
 
@@ -13,7 +24,7 @@ const WorldProvider = struct {
     pub const Configuration = struct {};
     pub const Dependencies = struct {
         registry_identity: *vanilla.RegistryIdentity,
-        worlds: *vanilla.Worlds,
+        worlds: *Worlds,
         dimensions: *vanilla.Dimensions,
     };
     pub const Provides = .{*vanilla.VanillaWorlds};
@@ -53,24 +64,24 @@ pub fn main(init: std.process.Init) !void {
     const gameplay_plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(vanilla.plugins(), .{
             lightning_rod.plugin.configured(WorldProvider, WorldProvider.Configuration{}),
-            lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .maximum = maximum_players, .render_distance = 2 }),
+            lightning_rod.plugin.configured(Players, Players.Configuration{ .maximum = maximum_players, .render_distance = 2 }),
         }),
         lightning_rod.plugin.configured(e2e_control.Control, .{}),
     });
     var selected = try selected_protocol.Protocols.init(allocator);
     defer selected.deinit(allocator);
-    const ConfigurationPlugin = vanilla.SessionConfiguration(selected_protocol.Protocols);
+    const ConfigurationPlugin = SessionConfiguration(selected_protocol.Protocols);
     const session_plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.configured(selected_protocol.Handshake, selected_protocol.Handshake.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.LoginStart, vanilla.LoginStart.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.LoginEncryption, vanilla.LoginEncryption.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.Disconnect, vanilla.Disconnect.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.OfflineAuthentication, vanilla.OfflineAuthentication.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.LoginCompression, vanilla.LoginCompression.Configuration{}),
+        lightning_rod.plugin.configured(LoginStart, LoginStart.Configuration{}),
+        lightning_rod.plugin.configured(LoginEncryption, LoginEncryption.Configuration{}),
+        lightning_rod.plugin.configured(Disconnect, Disconnect.Configuration{}),
+        lightning_rod.plugin.configured(OfflineAuthentication, OfflineAuthentication.Configuration{}),
+        lightning_rod.plugin.configured(LoginCompression, LoginCompression.Configuration{}),
         lightning_rod.plugin.configured(ExtraNegotiation, ExtraNegotiation.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.LoginSuccess, vanilla.LoginSuccess.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.Keepalive, vanilla.Keepalive.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.Status, vanilla.Status.Configuration{}),
+        lightning_rod.plugin.configured(LoginSuccess, LoginSuccess.Configuration{}),
+        lightning_rod.plugin.configured(Keepalive, Keepalive.Configuration{}),
+        lightning_rod.plugin.configured(Status, Status.Configuration{}),
         lightning_rod.plugin.configured(ConfigurationPlugin, ConfigurationPlugin.Configuration{ .protocols = &selected }),
     });
     var store = try persistence.Store.init(allocator, init.io, .{ .path = "custom-store" });

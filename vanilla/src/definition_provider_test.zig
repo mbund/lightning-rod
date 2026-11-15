@@ -1,11 +1,11 @@
-const vanilla_content = @import("vanilla_content.zig");
+const vanilla_content = @import("vanilla_definitions").defaults;
 const std = @import("std");
 const game_data = @import("game_data");
-const loot = @import("loot.zig");
-const Enchantments = @import("enchantments.zig").Enchantments;
-const item_data = @import("item_data.zig");
+const loot = @import("vanilla_items").loot;
+const Enchantments = @import("vanilla_items").enchantments.Enchantments;
+const item_data = @import("vanilla_items").item_data;
 
-const provider = @import("definition_provider.zig");
+const provider = @import("vanilla_definitions").definition_provider;
 test "vanilla content initializes from native definitions without a datapack loader" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

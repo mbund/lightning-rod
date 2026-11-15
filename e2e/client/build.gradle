@@ -40,57 +40,24 @@ processResources {
     inputs.property "minecraft_version", project.minecraft_version
     filesMatching("fabric.mod.json") { expand "version": project.version, "minecraft_version": project.minecraft_version }
 }
-tasks.withType(JavaCompile).configureEach { options.release = unobfuscated ? 25 : 21 }
-def testsDirectory = file(providers.gradleProperty('testRoot').getOrElse(System.getenv('LIGHTNING_ROD_E2E_TEST_ROOT') ?: new File(clientSource, '../tests').absolutePath))
-def testManifests = fileTree(testsDirectory).matching { include '*/test.json' }.files.sort()
-def generatedTests = layout.buildDirectory.dir('generated/e2e')
-// Keep fixtures with their scenarios while giving each one a package-correct
-// source root that both javac and JDT LS can import.
-sourceSets.client.java.srcDirs(testManifests.collect { new File(it.parentFile, 'client') })
-sourceSets.client.java.exclude '**/.zig-cache/**', '**/zig-out/**', '**/zig-pkg/**'
-sourceSets.client.java.srcDir(generatedTests)
+def javaRelease = unobfuscated ? 25 : 21
+tasks.withType(JavaCompile).configureEach { options.release = javaRelease }
+// The IDE compiles this repository's fixtures with the client, from each test's client/
+// directory. Exported runtimes leave them out with -Pfixtures= because each test compiles its
+// own fixtures against the runtime.
+def fixturesRoot = providers.gradleProperty('fixtures').getOrElse(new File(clientSource, '../tests').absolutePath)
+if (!fixturesRoot.isEmpty()) {
+    def fixtureSources = (file(fixturesRoot).listFiles() ?: []).collect { new File(it, 'client') }.findAll { it.isDirectory() }.sort()
+    sourceSets.client.java.srcDirs(fixtureSources)
+    sourceSets.client.java.exclude '**/.zig-cache/**', '**/zig-out/**', '**/zig-pkg/**'
+}
 sourceSets.test.java.setSrcDirs([new File(clientSource, 'src/test/java')])
 sourceSets.test.compileClasspath += sourceSets.client.output + sourceSets.client.compileClasspath
 sourceSets.test.runtimeClasspath += sourceSets.client.output + sourceSets.client.runtimeClasspath
-sourceSets.client.resources.srcDir(testsDirectory)
-sourceSets.client.resources.exclude '**/*.java', '**/*.zig', '**/build.zig.zon', '**/test.json', '**/.zig-cache/**', '**/zig-out/**', '**/zig-pkg/**', '**/artifacts/**'
-def discoverTests = tasks.register('discoverTests') {
-    inputs.files(fileTree(testsDirectory) { include '*/test.json' })
-    outputs.dir(generatedTests)
-    doLast {
-        def names = new HashSet<String>()
-        def cases = []
-        fileTree(testsDirectory).matching { include '*/test.json' }.files.sort().each { manifest ->
-            def test = new groovy.json.JsonSlurper().parse(manifest)
-            if (!(test.client ==~ /[A-Za-z][A-Za-z0-9]*/)) throw new GradleException("Invalid test class: ${manifest}")
-            test.variants.each { variant ->
-                if (!(variant.name ==~ /[a-z][a-z0-9-]*/) || !names.add(variant.name)) throw new GradleException("Invalid or duplicate test: ${variant.name}")
-                cases.add("case \"${variant.name}\" -> new ${test.client}(r);")
-            }
-        }
-        def output = generatedTests.get().file('dev/lightningrod/e2e/DiscoveredTests.java').asFile
-        output.parentFile.mkdirs()
-        output.text = """package dev.lightningrod.e2e;
-final class DiscoveredTests {
-    static Fixture create(Recorder r, String name) {
-        return switch (name) {
-            ${cases.join('\n            ')}
-            default -> throw new IllegalArgumentException("Unknown E2E test: " + name);
-        };
-    }
-}
-"""
-    }
-}
-tasks.named('compileClientJava') { dependsOn discoverTests }
-// Buildship/JDT LS must generate the fixture factory on the first IDE import,
-// before the editor compiles Fixture.java or any test source.
-eclipse.synchronizationTasks(discoverTests)
-tasks.named('eclipseClasspath') { dependsOn discoverTests }
 tasks.withType(JavaExec).configureEach {
     maxHeapSize = '1G'
     jvmArgs '-XX:ActiveProcessorCount=2'
-    ["mcc.version", "mcc.events", "mcc.artifacts", "mcc.peer", "mcc.server", "mcc.scenario", "mcc.expectedPeers", "mcc.targetChunks", "mcc.minimumRadius", "mcc.minimumSoakTicks", "mcc.timeoutTicks", "mcc.connectTick"].each {
+    ["mcc.version", "mcc.events", "mcc.artifacts", "mcc.peer", "mcc.server", "mcc.scenario", "mcc.expectedPeers", "mcc.targetChunks", "mcc.minimumRadius", "mcc.minimumSoakTicks", "mcc.timeoutTicks", "mcc.connectTick", "mcc.fixture"].each {
         key -> if (System.getProperty(key) != null) systemProperty key, System.getProperty(key)
     }
     if (System.getProperty("mcc.peer") != null) args "--username", System.getProperty("mcc.peer")
@@ -162,7 +129,7 @@ tasks.register('exportRuntime') {
         def jvm = run.allJvmArgs.findAll { !it.startsWith('@') }.collect { relocate(it) }
         def args = (run.args + run.argumentProviders.collectMany { it.asArguments() }).collect { relocate(it) }
         new File(output, 'runtime.json').text = groovy.json.JsonOutput.toJson([
-            version: minecraft_version, main: run.mainClass.get(), jvm: jvm, args: args,
+            version: minecraft_version, java_release: javaRelease, main: run.mainClass.get(), jvm: jvm, args: args,
             classpath: classpath, test_classpath: testClasspath, templates: templates,
         ])
         println "Client runtime ${minecraft_version}: ${included.size()} classpath entries"

@@ -1,6 +1,11 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
+const Chunks = @import("chunks").Chunks;
+const Inventories = @import("inventories").Inventories;
+const Players = @import("players").players.Players;
+const Replication = @import("replication").replication.Replication;
+const Visibility = @import("replication").visibility.Visibility;
 const sessions = @import("sessions");
 const network = @import("networking");
 const protocols = @import("protocols");
@@ -35,8 +40,8 @@ const Sink = struct {
 const Policy = struct {
     pub const id = "benchmark:visibility";
     pub const Configuration = struct {};
-    pub const Dependencies = struct { visibility: *vanilla.Visibility };
-    layer: vanilla.Visibility.Layer,
+    pub const Dependencies = struct { visibility: *Visibility };
+    layer: Visibility.Layer,
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Policy {
         const self = try allocator.create(Policy);
         self.* = .{ .layer = try deps.visibility.createLayer() };
@@ -76,11 +81,11 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     if (maximum < count or maximum == 0) return error.InvalidCapacity;
     const service = try sessions.Service.init(backing, io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = maximum, .pages = options.pages, .page_bytes = 32768, .buffer_bytes = 128 * 1024, .protocols = selected });
     defer service.deinit();
-    const chunk_defaults: vanilla.Chunks.Configuration = .{};
+    const chunk_defaults: Chunks.Configuration = .{};
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(vanilla.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = maximum, .render_distance = 8 }),
-            lightning_rod.plugin.configured(vanilla.Chunks, .{ .cache_sections = @max(chunk_defaults.cache_sections, count) }),
+            lightning_rod.plugin.configured(Players, .{ .maximum = maximum, .render_distance = 8 }),
+            lightning_rod.plugin.configured(Chunks, .{ .cache_sections = @max(chunk_defaults.cache_sections, count) }),
             lightning_rod.plugin.configured(sessions.World, .{ .endpoint = service }),
             lightning_rod.plugin.configured(vanilla.RecipeBook, .{ .packet_bytes = service.config.page_bytes }),
         }),
@@ -93,13 +98,16 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
         simulation.close(.{ .clock = .awake, .raw = .{ .nanoseconds = std.Io.Clock.now(.awake, io).nanoseconds + 5 * std.time.ns_per_s } }) catch @panic("benchmark shutdown failed");
         simulation.deinit(backing);
     }
-    const players = simulation.get(vanilla.Players);
+    const players = simulation.get(Players);
+    const player_states = simulation.get(vanilla.PlayerStates);
+    const spawn_world = try players.spawnWorld();
     const handles = try backing.alloc(sessions.Handle, count);
     const buffers = [2][][64]u8{ try backing.alloc([64]u8, count), try backing.alloc([64]u8, count) };
     const payloads = [2][][1][]const u8{ try backing.alloc([1][]const u8, count), try backing.alloc([1][]const u8, count) };
     for (players.records[0..count], 0..) |*player, index| {
         handles[index] = .{ .index = @intCast(index), .generation = 1 };
-        player.* = .{ .handle = handles[index], .uuid = index + 1, .name_len = 1, .protocol = selected[0].number, .world = players.spawn_world, .stage = .ready, .loaded = true, .gamemode = .creative, .on_ground = true, .position = .{ .x = if (mode == .spread) @as(f64, @floatFromInt(index * 512)) + 8 else 8, .y = 65, .z = 8 } };
+        player.* = .{ .handle = handles[index], .uuid = index + 1, .name_len = 1, .protocol = selected[0].number, .world = spawn_world, .stage = .ready, .loaded = true, .on_ground = true, .position = .{ .x = if (mode == .spread) @as(f64, @floatFromInt(index * 512)) + 8 else 8, .y = 65, .z = 8 } };
+        player_states.records[index] = .{ .uuid = player.uuid, .gamemode = .creative };
         player.name[0] = 'p';
         for (0..2) |phase| {
             const packet = try Protocol.play.toServer.write(&buffers[phase][index]).position_look();
@@ -112,7 +120,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
         }
     }
     players.rebuildIndexes();
-    const visibility = simulation.get(vanilla.Visibility);
+    const visibility = simulation.get(Visibility);
     const layer = simulation.get(Policy).layer;
     if (mode == .hidden) try layer.updateMany(&.{.{ .subjects = handles[0..count], .channels = &.{visibility.player_entity}, .excluded = true }});
     const stages = try backing.alloc(lightning_rod.metrics.Snapshot, simulation.metrics.count);
@@ -120,7 +128,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     const cpus = try backing.alloc(u64, options.samples);
     const walls = try backing.alloc(u64, options.samples);
     if (options.detail) {
-        const replication = simulation.get(vanilla.Replication);
+        const replication = simulation.get(Replication);
         const mining = simulation.get(vanilla.Mining);
         const equipment = simulation.get(vanilla.Equipment);
         try writer.print("# protocols={d} metrics={d} instrumentation={any} assigned_bytes={d}\n", .{ selected.len, simulation.metrics.count, options.instrumentation, memory.assigned_bytes });
@@ -131,8 +139,8 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     var packets: u64 = 0;
     var recipients: u64 = 0;
     for (0..200) |tick| try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
-    const inventories = simulation.get(vanilla.Inventories);
-    const chunks = simulation.get(vanilla.Chunks);
+    const inventories = simulation.get(Inventories);
+    const chunks = simulation.get(Chunks);
     const reads = inventories.cache.metrics.reads.value() + inventories.items.metrics.reads.value() + chunks.cache.metrics.reads.value();
     _ = simulation.metrics.snapshot(before);
     tick_time = 0;

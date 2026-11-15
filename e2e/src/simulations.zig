@@ -6,6 +6,21 @@ const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const host = @import("host");
 const vanilla = @import("vanilla");
+const BlockSynchronization = @import("terrain").block_sync.BlockSynchronization;
+const Chat = @import("chat").chat.Chat;
+const Chunks = @import("chunks").Chunks;
+const Entities = @import("entities").Entities;
+const Generation = @import("terrain").generation.Generation;
+const Inventories = @import("inventories").Inventories;
+const LoginEncryption = @import("connection").session_encryption.LoginEncryption;
+const Players = @import("players").players.Players;
+const Reload = @import("reload").Reload;
+const SessionConfiguration = @import("connection").session_configuration.Plugin;
+const Status = @import("connection").session_status.Status;
+const Streaming = @import("terrain").streaming.Streaming;
+const Terrain = @import("terrain").terrain.Terrain;
+const ThreadedTerrain = @import("terrain").terrain.ThreadedTerrain;
+const connection_plugins = @import("connection").plugins;
 const sessions = @import("sessions");
 const execution = @import("execution");
 const wire_1_21_5 = @import("wire_1_21_5");
@@ -93,21 +108,21 @@ pub fn run(init: std.process.Init, plugins: anytype, endpoints: []*sessions.Serv
     std.debug.assert(plugins.len == endpoints.len);
     std.debug.assert(plugins.len == 2 or plugins.len == 3);
     const limits = .{
-        lightning_rod.plugin.configured(vanilla.Chunks, vanilla.Chunks.Configuration{ .cache_sections = 48, .demand_sections = 24, .cache_groups = 6 }),
-        lightning_rod.plugin.configured(vanilla.BlockSynchronization, vanilla.BlockSynchronization.Configuration{ .delta_sections = 8, .queued_sections = 8 }),
-        lightning_rod.plugin.configured(vanilla.Entities, vanilla.Entities.Configuration{ .cache_records = 16 }),
+        lightning_rod.plugin.configured(Chunks, Chunks.Configuration{ .cache_sections = 48, .demand_sections = 24, .cache_groups = 6 }),
+        lightning_rod.plugin.configured(BlockSynchronization, BlockSynchronization.Configuration{ .delta_sections = 8, .queued_sections = 8 }),
+        lightning_rod.plugin.configured(Entities, Entities.Configuration{ .cache_records = 16 }),
         lightning_rod.plugin.configured(vanilla.ItemEntities, vanilla.ItemEntities.Configuration{ .cache_records = 16, .maximum = 64 }),
         lightning_rod.plugin.configured(vanilla.ItemReplication, vanilla.ItemReplication.Configuration{}),
-        lightning_rod.plugin.configured(vanilla.Inventories, vanilla.Inventories.Configuration{ .cache_items = vanilla.crafting.maximum_inputs + 1 }),
-        lightning_rod.plugin.configured(vanilla.Chat, vanilla.Chat.Configuration{ .pending_messages = 8 }),
+        lightning_rod.plugin.configured(Inventories, Inventories.Configuration{ .cache_items = vanilla.crafting.maximum_inputs + 1 }),
+        lightning_rod.plugin.configured(Chat, Chat.Configuration{ .pending_messages = 8 }),
     };
-    const selected = lightning_rod.plugin.replace(lightning_rod.plugin.insertAfter(plugins[0], vanilla.Reload, lightning_rod.plugin.configured(control.Control, .{})), limits);
+    const selected = lightning_rod.plugin.replace(lightning_rod.plugin.insertAfter(plugins[0], Reload, lightning_rod.plugin.configured(control.Control, .{})), limits);
     const routing = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.configured(protocol_set.Handshake, .{}),
-        lightning_rod.plugin.insertAfter(lightning_rod.plugin.replace(vanilla.session_plugins(&protocols), .{
-            lightning_rod.plugin.configured(vanilla.LoginEncryption, .{ .key = if (key) |*value| value else null }),
-            lightning_rod.plugin.configured(vanilla.Status, .{ .description = "E2E islands" }),
-        }), vanilla.SessionConfiguration(protocol_set.Default), lightning_rod.plugin.configured(RoutePlayers, .{})),
+        lightning_rod.plugin.insertAfter(lightning_rod.plugin.replace(connection_plugins(&protocols), .{
+            lightning_rod.plugin.configured(LoginEncryption, .{ .key = if (key) |*value| value else null }),
+            lightning_rod.plugin.configured(Status, .{ .description = "E2E islands" }),
+        }), SessionConfiguration(protocol_set.Default), lightning_rod.plugin.configured(RoutePlayers, .{})),
         session_plugins,
     });
     const Network = if (execution.single_threaded)
@@ -136,9 +151,9 @@ pub fn run(init: std.process.Init, plugins: anytype, endpoints: []*sessions.Serv
     var worlds: [plugins.len]*Simulation = undefined;
     var registries: [plugins.len]lightning_rod.metrics.Registry = undefined;
     var exporters: [plugins.len]lightning_rod.metrics.Exporter = undefined;
-    var terrain: [plugins.len]vanilla.Terrain = undefined;
-    var background: [plugins.len]vanilla.ThreadedTerrain = undefined;
-    var generation: [plugins.len]*vanilla.Generation = undefined;
+    var terrain: [plugins.len]Terrain = undefined;
+    var background: [plugins.len]ThreadedTerrain = undefined;
+    var generation: [plugins.len]*Generation = undefined;
     var initialized: usize = 0;
     defer {
         for (worlds[0..initialized], stores[0..initialized], registries[0..initialized], exporters[0..initialized], generation[0..initialized]) |world, *store, *registry, *exporter, producer| {
@@ -151,14 +166,14 @@ pub fn run(init: std.process.Init, plugins: anytype, endpoints: []*sessions.Serv
         }
     }
     inline for (plugins, 0..) |selection, index| {
-        const players_index = comptime lightning_rod.plugin.indexOfId(@TypeOf(selection), vanilla.Players.id).?;
+        const players_index = comptime lightning_rod.plugin.indexOfId(@TypeOf(selection), Players.id).?;
         var players = selection[players_index].configuration;
         players.maximum = config.connections;
         players.render_distance = config.render_distance;
-        const bounded = lightning_rod.plugin.replace(lightning_rod.plugin.insertAfter(selection, vanilla.Reload, lightning_rod.plugin.configured(control.Control, .{})), limits);
+        const bounded = lightning_rod.plugin.replace(lightning_rod.plugin.insertAfter(selection, Reload, lightning_rod.plugin.configured(control.Control, .{})), limits);
         const island = lightning_rod.plugin.replace(bounded, .{
             lightning_rod.plugin.configured(sessions.World, .{ .endpoint = endpoints[index] }),
-            lightning_rod.plugin.configured(vanilla.Players, players),
+            lightning_rod.plugin.configured(Players, players),
         });
         registries[index] = try .init(allocator, init.io, .{});
         errdefer if (initialized <= index) registries[index].deinit();
@@ -173,8 +188,8 @@ pub fn run(init: std.process.Init, plugins: anytype, endpoints: []*sessions.Serv
         try world.initialize(island, .{ .memory = &memory, .metrics = &world.metrics });
         exporters[index] = try .init(allocator, init.io, &world.metrics, metrics_export, index, &.{ "server.tick", "server.work" });
         errdefer if (initialized <= index) exporters[index].deinit(allocator, init.io, &world.metrics) catch {};
-        generation[index] = try vanilla.Generation.init(allocator, init.io, world.get(vanilla.Chunks).generation, if (execution.single_threaded) 0 else 1);
-        terrain[index] = .{ .chunks = world.get(vanilla.Chunks), .streaming = world.get(vanilla.Streaming), .blocks = world.get(vanilla.BlockSynchronization), .io = init.io };
+        generation[index] = try Generation.init(allocator, init.io, world.get(Chunks).generation, if (execution.single_threaded) 0 else 1);
+        terrain[index] = .{ .chunks = world.get(Chunks), .streaming = world.get(Streaming), .blocks = world.get(BlockSynchronization), .io = init.io };
         background[index] = .{ .terrain = terrain[index], .io = init.io };
         initialized += 1;
     }

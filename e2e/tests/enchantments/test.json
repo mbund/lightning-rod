@@ -1,4 +1,0 @@
-{
-  "client": "EnchantmentsFixture",
-  "variants": [{ "name": "enchantments", "peers": ["alice"] }]
-}

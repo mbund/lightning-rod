@@ -1,4 +1,4 @@
-const vanilla_content = @import("vanilla_content.zig");
+const vanilla_content = @import("vanilla_definitions").defaults;
 const std = @import("std");
 const storage = @import("storage");
 const records = @import("records");
@@ -6,11 +6,12 @@ const metrics = @import("metrics");
 const entities = @import("entities");
 const inventories = @import("inventories");
 const worlds = @import("worlds");
-const Items = @import("items.zig").Items;
-const Players = @import("players.zig").Players;
-const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
-const ItemEntities = @import("item_entities.zig").ItemEntities;
-const ItemPickup = @import("item_pickup.zig").ItemPickup;
+const Items = @import("vanilla_items").items.Items;
+const Players = @import("players").players.Players;
+const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
+const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
+const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
+const ItemPickup = @import("vanilla_inventory").item_pickup.ItemPickup;
 
 const Snapshot = struct {
     slots: [2][37]?inventories.Stack = undefined,
@@ -60,11 +61,14 @@ test "pickup batches preserve player priority item order and partial collection"
             });
             const player_records = try allocator.alloc(Players.Player, player_capacity);
             @memset(player_records, .{});
+            const state_records = try allocator.alloc(PlayerStates.State, player_capacity);
+            @memset(state_records, .{});
             const player_indices = [_]usize{ 0, player_capacity - 1 };
             var slots: [2][37]inventories.Slot = undefined;
             for (player_indices, &slots, 0..) |player_index, *destinations, index| {
                 const player = &player_records[player_index];
-                player.* = .{ .handle = .{ .index = player_index, .generation = 1 }, .uuid = index + 1, .world = world, .stage = .ready, .loaded = true, .gamemode = .survival, .position = .{ .x = 0, .y = 65, .z = 0 } };
+                player.* = .{ .handle = .{ .index = player_index, .generation = 1 }, .uuid = index + 1, .world = world, .stage = .ready, .loaded = true, .position = .{ .x = 0, .y = 65, .z = 0 } };
+                state_records[player_index] = .{ .uuid = player.uuid, .gamemode = .survival };
                 var edits: [37]inventories.Edit = undefined;
                 for (destinations, &edits, 0..) |*slot, *edit, at| {
                     slot.* = .{ .owner = player.uuid, .index = @intCast(if (at < 9) at + 36 else if (at == 36) 45 else at) };
@@ -73,24 +77,26 @@ test "pickup batches preserve player priority item order and partial collection"
                 try std.testing.expect(try ownership.editMany(&edits));
             }
             switch (scenario) {
-                .creative => player_records[0].gamemode = .creative,
-                .spectator => player_records[0].gamemode = .spectator,
-                .dead => player_records[0].health = 0,
+                .creative => state_records[0].gamemode = .creative,
+                .spectator => state_records[0].gamemode = .spectator,
+                .dead => state_records[0].health = 0,
                 else => {},
             }
             var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
+            var player_states: PlayerStates = .{ .deps = undefined, .config = .{}, .records = state_records };
             try players.initIndexes(allocator);
             players.rebuildIndexes();
             const menu = try PlayerInventory.init(allocator, .{}, .{
                 .crafting = gameplay_definitions.crafting,
                 .furnaces = gameplay_definitions.furnaces,
-                    .players = &players,
+                .players = &players,
+                .player_states = &player_states,
                 .inventories = ownership,
                 .items = items,
                 .equipment = undefined,
                 .dropped = dropped,
             });
-            const pickup = try ItemPickup.init(allocator, .{ .players = &players, .menus = menu, .inventories = ownership, .entities = bodies, .items = items, .dropped = dropped });
+            const pickup = try ItemPickup.init(allocator, .{ .players = &players, .player_states = &player_states, .menus = menu, .inventories = ownership, .entities = bodies, .items = items, .dropped = dropped });
             var ids: [3]entities.Id = undefined;
             var item_bodies: [3]entities.State = undefined;
             for (&ids, &item_bodies, 0..) |*id, *body, index| {

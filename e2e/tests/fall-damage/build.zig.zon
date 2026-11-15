@@ -1,0 +1,10 @@
+.{
+    .name = .e2e_fall_damage,
+    .fingerprint = 0x7f214c462a6646d9,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .lightning_rod_e2e = .{ .path = "../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "test.zon", "client", "main.zig" },
+}

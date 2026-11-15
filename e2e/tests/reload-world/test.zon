@@ -1,0 +1,5 @@
+.{ .client = "ReloadWorldFixture", .scenarios = .{.{
+    .name = "reload-world",
+    .peers = .{ "alice", "bob" },
+    .full_protocols = true,
+}} }

@@ -18,5 +18,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "wire_1_21_5", .module = wire.module("wire") },
         },
     });
+    inline for (.{ "chunks", "entities", "minecraft_packets", "players", "replication" }) |name|
+        module.addImport(name, b.dependency(name, .{ .target = target, .optimize = optimize }).module(name));
     b.step("check", "Check Storm Calling stick enchantment").dependOn(&b.addLibrary(.{ .name = "storm_stick", .root_module = module }).step);
 }

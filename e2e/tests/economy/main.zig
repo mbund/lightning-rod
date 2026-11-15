@@ -1,17 +1,17 @@
 const e2e = @import("e2e");
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
-const vanilla = @import("vanilla");
+const commands = @import("commands");
 const economy = @import("economy");
 const shop = @import("shop");
 const EconomyCommands = @import("economy_commands").EconomyCommands;
 const ShopCommands = @import("shop_commands").ShopCommands;
 
 pub fn main(init: std.process.Init) !void {
-    var grants = vanilla.commands.Grants{ .everyone = &.{ &EconomyCommands.balance_permission, &EconomyCommands.pay_permission, &ShopCommands.buy_permission, &ShopCommands.sell_permission } };
+    var grants = commands.Grants{ .everyone = &.{ &EconomyCommands.balance_permission, &EconomyCommands.pay_permission, &ShopCommands.buy_permission, &ShopCommands.sell_permission } };
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.commands.Commands, .{
+            lightning_rod.plugin.configured(commands.Commands, .{
                 .permission_policy = grants.policy(),
             }),
         }),

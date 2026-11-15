@@ -1,11 +1,11 @@
 const std = @import("std");
-const catalog = @import("catalog.zig");
+const manifest = @import("manifest.zig");
 const protocols = @import("protocol_catalog");
 const selection = @import("selection.zig");
 
 test "ordinary scenarios follow latest and use one version for all peers" {
     const allocator = std.testing.allocator;
-    const case: catalog.Case = .{ .name = "ordinary", .peers = &.{ "alice", "bob" } };
+    const case: manifest.Scenario = .{ .name = "ordinary", .peers = &.{ "alice", "bob" } };
     const versions = try selection.matrixVersions(protocols, allocator, case, null);
     defer allocator.free(versions);
     try std.testing.expectEqual(@as(usize, 1), versions.len);
@@ -17,7 +17,7 @@ test "ordinary scenarios follow latest and use one version for all peers" {
 
 test "mixed matrix covers the catalog and rotates the primary through peer versions" {
     const allocator = std.testing.allocator;
-    const case: catalog.Case = .{ .name = "mixed", .mixed_versions = true, .peers = &.{ "alice", "bob", "carol", "dave", "eve", "frank", "grace", "heidi" } };
+    const case: manifest.Scenario = .{ .name = "mixed", .mixed_versions = true, .peers = &.{ "alice", "bob", "carol", "dave", "eve", "frank", "grace", "heidi" } };
     const supported = protocols.versions;
     const versions = try selection.matrixVersions(protocols, allocator, case, null);
     defer allocator.free(versions);
@@ -33,7 +33,7 @@ test "mixed matrix covers the catalog and rotates the primary through peer versi
 
 test "legacy pins retain their primary and mix with supported gameplay versions" {
     const allocator = std.testing.allocator;
-    const case: catalog.Case = .{ .name = "legacy", .version = "1.21.5", .mixed_versions = true, .peers = &.{ "alice", "bob" } };
+    const case: manifest.Scenario = .{ .name = "legacy", .version = "1.21.5", .mixed_versions = true, .peers = &.{ "alice", "bob" } };
     const versions = try selection.matrixVersions(protocols, allocator, case, null);
     defer allocator.free(versions);
     try std.testing.expectEqual(@as(usize, 1), versions.len);
@@ -67,7 +67,7 @@ test "suite override selects ordinary and mixed primaries while preserving pins"
         try std.testing.expectEqual(@as(usize, 1), versions.len);
         try std.testing.expectEqualStrings("1.21.8", versions[0]);
     }
-    const pinned: catalog.Case = .{ .name = "pinned", .version = "1.21.5" };
+    const pinned: manifest.Scenario = .{ .name = "pinned", .version = "1.21.5" };
     const versions = try selection.matrixVersions(protocols, allocator, pinned, "1.21.8");
     defer allocator.free(versions);
     try std.testing.expectEqualStrings("1.21.5", versions[0]);
@@ -76,7 +76,7 @@ test "suite override selects ordinary and mixed primaries while preserving pins"
 
 test "upgrade runs once at latest with two existing clients and one newly supported client" {
     const allocator = std.testing.allocator;
-    const case: catalog.Case = .{ .name = "upgrade", .upgrade = true, .peers = &.{ "alice", "bob", "newcomer" } };
+    const case: manifest.Scenario = .{ .name = "upgrade", .upgrade = true, .peers = &.{ "alice", "bob", "newcomer" } };
     const versions = try selection.matrixVersions(protocols, allocator, case, null);
     defer allocator.free(versions);
     try std.testing.expectEqual(@as(usize, 1), versions.len);

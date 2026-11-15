@@ -1,0 +1,5 @@
+.{ .client = "GamemodeFixture", .scenarios = .{.{
+    .name = "gamemode-multi",
+    .fixture = "gamemode",
+    .peers = .{ "alice", "bob" },
+}} }

@@ -1,0 +1,20 @@
+.{
+    .name = .vanilla_definitions,
+    .fingerprint = 0x25f811b10be83f04,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .datapacks = .{ .path = "../../datapacks" },
+        .game_data = .{ .path = "../../game_data" },
+        .lighting = .{ .path = "../../lighting" },
+        .lightning_rod = .{ .path = "../.." },
+        .minecraft_packets = .{ .path = "../../minecraft_packets" },
+        .protocol_support = .{ .path = "../../protocol_encoding" },
+        .vanilla_blocks = .{ .path = "../blocks" },
+        .vanilla_content = .{ .path = "../content" },
+        .vanilla_crafting = .{ .path = "../crafting" },
+        .vanilla_items = .{ .path = "../items" },
+        .protocols = .{ .path = "../../protocols", .lazy = true },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

@@ -2,6 +2,11 @@ const std = @import("std");
 const inventories = @import("inventories");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
+const BlockPosition = @import("chunks").Position;
+const Chunks = @import("chunks").Chunks;
+const Inventories = @import("inventories").Inventories;
+const Players = @import("players").players.Players;
+const Reload = @import("reload").Reload;
 const protocols = @import("protocols");
 const sessions = @import("sessions");
 const e2e = @import("e2e");
@@ -11,7 +16,8 @@ pub fn main(init: std.process.Init) !void {
     const mode: Mode = if (std.mem.startsWith(u8, args.fixture, "chests")) .chests else if (std.mem.startsWith(u8, args.fixture, "furnace")) .furnace else .crafting;
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = if (mode == .chests) 2 else 1, .render_distance = 2, .gamemode = .survival }),
+            lightning_rod.plugin.configured(Players, .{ .maximum = if (mode == .chests) 2 else 1, .render_distance = 2 }),
+            lightning_rod.plugin.configured(vanilla.PlayerStates, .{ .gamemode = .survival }),
         }),
         lightning_rod.plugin.configured(Probe, .{ .mode = mode, .fuel_callback = std.mem.eql(u8, args.fixture, "furnace-callback") }),
     });
@@ -19,8 +25,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 const Mode = enum { chests, furnace, crafting };
-const chest: vanilla.BlockPosition = .{ .x = 2, .y = 65, .z = 0 };
-const oven: vanilla.BlockPosition = .{ .x = 4, .y = 65, .z = 0 };
+const chest: BlockPosition = .{ .x = 2, .y = 65, .z = 0 };
+const oven: BlockPosition = .{ .x = 4, .y = 65, .z = 0 };
 const bread_count = 17;
 
 const Probe = struct {
@@ -28,14 +34,15 @@ const Probe = struct {
     pub const Configuration = struct { mode: Mode, fuel_callback: bool = false };
     pub const Parameters = struct {};
     pub const Dependencies = struct {
-        players: *vanilla.Players,
+        players: *Players,
+        player_states: *vanilla.PlayerStates,
         menus: *vanilla.PlayerInventory,
         furnaces: *vanilla.Furnaces,
-        inventories: *vanilla.Inventories,
+        inventories: *Inventories,
         items: *vanilla.Items,
-        chunks: *vanilla.Chunks,
+        chunks: *Chunks,
         containers: *vanilla.Containers,
-        reload: *vanilla.Reload,
+        reload: *Reload,
         control: *e2e.Control,
     };
     deps: Dependencies,
@@ -82,7 +89,7 @@ const Probe = struct {
         return .{ .properties = properties, .replacement = .{ .stack = result.finish() } };
     }
 
-    fn checkFuel(self: *Probe, player: *const vanilla.Players.Player) !void {
+    fn checkFuel(self: *Probe, player: *const Players.Player) !void {
         if (!self.config.fuel_callback) return;
         const value = self.deps.containers.furnaceState(player.world, oven);
         if (value.burn_total != self.deps.furnaces.table.fuels[itemKind("minecraft:coal")].ticks * 2) return error.CustomFuelDuration;
@@ -110,7 +117,8 @@ const Probe = struct {
                     const completed = std.mem.eql(u8, self.deps.reload.latest().?.token(), "e2e:furnace-taken");
                     if (completed) {
                         try self.assertPlayerCount(handle.index, "minecraft:iron_ingot", 2);
-                        if (player.experience.total < 1 or player.experience.total > 2) return error.FurnaceExperienceLost;
+                        const total = self.deps.player_states.of(&player).experience.total;
+                        if (total < 1 or total > 2) return error.FurnaceExperienceLost;
                     }
                     try self.deps.control.send(handle, if (completed) "complete" else "reloaded");
                 } else try self.deps.control.send(handle, "reloaded");
@@ -152,7 +160,8 @@ const Probe = struct {
             if ((try self.deps.inventories.get(vanilla.Containers.slot(player.world, oven, 0))).stack != null) return error.FurnaceInputNotConsumed;
             try self.deps.control.send(handle, "cooked");
         } else if (std.mem.eql(u8, text, "taken")) {
-            if (player.experience.total < 1 or player.experience.total > 2) return error.FurnaceExperienceIncorrect;
+            const total = self.deps.player_states.of(&player).experience.total;
+            if (total < 1 or total > 2) return error.FurnaceExperienceIncorrect;
             try self.assertPlayerCount(handle.index, "minecraft:iron_ingot", 2);
             if ((try self.deps.inventories.get(vanilla.Containers.slot(player.world, oven, 2))).stack != null) return error.FurnaceOutputDuplicated;
             try self.deps.reload.stage("e2e:furnace-taken");

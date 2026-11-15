@@ -1,9 +1,0 @@
-{
-  "client": "FallDamageFixture",
-  "variants": [
-    {
-      "name": "fall-damage",
-      "fixture": "fall_damage"
-    }
-  ]
-}

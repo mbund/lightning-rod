@@ -2,6 +2,8 @@ const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const sessions = @import("sessions");
 const vanilla = @import("vanilla");
+const ChatInput = @import("commands").chat_input.ChatInput;
+const Players = @import("players").players.Players;
 const skyblock = @import("skyblock");
 const e2e = @import("e2e");
 const minecraft = @import("minecraft_model");
@@ -13,8 +15,9 @@ pub fn main(init: std.process.Init) !void {
     var endpoints: [3]*sessions.Service = undefined;
     var routing: sessions.Routing = .{ .endpoints = &endpoints };
     const hub = lightning_rod.plugin.compose(.{
-        lightning_rod.plugin.replace(lightning_rod.plugin.remove(lightning_rod.plugin.remove(e2e.profile.plugins(), vanilla.ChatInput), vanilla.JoinLeaveMessages), .{
-            lightning_rod.plugin.configured(vanilla.Players, .{ .spawn_for_player = spawn, .world_border = 512 }),
+        lightning_rod.plugin.replace(lightning_rod.plugin.remove(lightning_rod.plugin.remove(e2e.profile.plugins(), ChatInput), vanilla.JoinLeaveMessages), .{
+            lightning_rod.plugin.configured(Players, .{ .spawn_for_player = spawn, .spawn = .{ .x = 0.5, .y = 65, .z = 0.5 } }),
+            lightning_rod.plugin.configured(vanilla.PlayerStates, .{ .world_border = 512 }),
             lightning_rod.plugin.configured(skyblock.Terrain, .{ .kind = .hub }),
         }),
         lightning_rod.plugin.configured(skyblock.IslandCommands, .{ .catalog = &directory, .routing = &routing, .index = 0 }),
@@ -37,14 +40,14 @@ pub fn main(init: std.process.Init) !void {
     });
 }
 
-fn spawn(player: *const vanilla.Players.Player) minecraft.Position {
+fn spawn(player: *const Players.Player) minecraft.Position {
     return .{ .x = if (std.mem.eql(u8, player.name[0..player.name_len], "alice")) 0.5 else 1.5, .y = 65, .z = 0.5 };
 }
 
 const Probe = struct {
     pub const id = "e2e:skyblock";
     pub const Configuration = struct { catalog: *skyblock.catalog.Catalog, index: usize };
-    pub const Dependencies = struct { control: *e2e.Control, players: *vanilla.Players };
+    pub const Dependencies = struct { control: *e2e.Control, players: *Players };
     deps: Dependencies,
     config: Configuration,
 

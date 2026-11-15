@@ -1,6 +1,8 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
+const Chunks = @import("chunks").Chunks;
+const Worlds = @import("worlds").Worlds;
 const chunks = @import("chunks");
 const records = @import("records");
 
@@ -25,9 +27,9 @@ pub fn main(init: std.process.Init) !void {
         vanilla.definition_provider.selections(content),
         lightning_rod.plugin.configured(records.Workspaces, .{}),
         lightning_rod.plugin.configured(vanilla.RegistryIdentity, .{}),
-        lightning_rod.plugin.configured(vanilla.Worlds, .{}),
+        lightning_rod.plugin.configured(Worlds, .{}),
         lightning_rod.plugin.configured(vanilla.VanillaWorlds, .{}),
-        lightning_rod.plugin.configured(vanilla.Chunks, .{ .demand_sections = 0, .cache_sections = batch_sections }),
+        lightning_rod.plugin.configured(Chunks, .{ .demand_sections = 0, .cache_sections = batch_sections }),
         lightning_rod.plugin.configured(vanilla.Flat, .{}),
     });
     const simulation = try lightning_rod.Simulation(@TypeOf(plugins)).init(allocator, init.io, &store, .{
@@ -37,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
     });
     try simulation.initialize(plugins, .{ .metrics = &simulation.metrics });
     const world = simulation.get(vanilla.VanillaWorlds).overworld;
-    const sections = simulation.get(vanilla.Chunks);
+    const sections = simulation.get(Chunks);
     var cursor: usize = 0;
     const total_sections = side * side * section_count;
     while (cursor < total_sections) {

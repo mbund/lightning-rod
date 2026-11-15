@@ -1,0 +1,1 @@
+.{ .client = "ItemCapacityFixture", .scenarios = .{ .{ .name = "item-capacity", .fixture = "survival" }, .{ .name = "item-capacity-creative", .fixture = "creative" } } }

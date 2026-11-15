@@ -18,7 +18,7 @@ jobs:
       - uses: ./.github/actions/dependencies
       - id: tests
         shell: bash
-        working-directory: e2e
+        working-directory: e2e/tests
         env:
           UPGRADE: ${{ inputs.upgrade }}
         run: |

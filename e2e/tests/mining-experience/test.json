@@ -1,4 +1,0 @@
-{
-  "client": "MiningExperienceFixture",
-  "variants": [{ "name": "mining-experience", "peers": ["alice"] }]
-}

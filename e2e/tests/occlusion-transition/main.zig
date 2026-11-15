@@ -1,6 +1,9 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
-const vanilla = @import("vanilla");
+const BlockEdit = @import("chunks").BlockEdit;
+const Chunks = @import("chunks").Chunks;
+const Players = @import("players").players.Players;
+const Streaming = @import("terrain").streaming.Streaming;
 const protocols = @import("protocols");
 const sessions = @import("sessions");
 const e2e = @import("e2e");
@@ -8,8 +11,8 @@ const e2e = @import("e2e");
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 1, .render_distance = 32, .spawn = .{ .x = 20.5, .y = 17, .z = 20.5 } }),
-            lightning_rod.plugin.configured(vanilla.Streaming, .{ .prefetch = 2 }),
+            lightning_rod.plugin.configured(Players, .{ .maximum = 1, .render_distance = 32, .spawn = .{ .x = 20.5, .y = 17, .z = 20.5 } }),
+            lightning_rod.plugin.configured(Streaming, .{ .prefetch = 2 }),
         }),
         lightning_rod.plugin.configured(Probe, .{}),
     });
@@ -19,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
 const Probe = struct {
     pub const id = "e2e:occlusion_transition";
     pub const Configuration = struct {};
-    pub const Dependencies = struct { control: *e2e.Control, players: *vanilla.Players, chunks: *vanilla.Chunks };
+    pub const Dependencies = struct { control: *e2e.Control, players: *Players, chunks: *Chunks };
     deps: Dependencies,
     ascending: bool = false,
     lamp: enum { initial, extinguished, restored } = .initial,
@@ -27,7 +30,7 @@ const Probe = struct {
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Probe {
         const self = try allocator.create(Probe);
         self.* = .{ .deps = deps };
-        const edits = try allocator.alloc(vanilla.BlockEdit, 4096);
+        const edits = try allocator.alloc(BlockEdit, 4096);
         defer allocator.free(edits);
         for (edits, 0..) |*edit, index| edit.* = .{ .index = @intCast(index), .state = if (index < 256) @intCast(protocols.registry.block_stone_default_state) else 0 };
         edits[4 * 16 + 4].state = @intCast(protocols.registry.block_glowstone_default_state);

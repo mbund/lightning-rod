@@ -1,1 +1,5 @@
-.{ .name = .economy_commands, .fingerprint = 0x4b911d99bfb22447, .version = "0.1.0", .dependencies = .{ .economy = .{ .path = "../economy" }, .vanilla = .{ .path = "../../../vanilla" } }, .paths = .{ "build.zig", "build.zig.zon", "src" } }
+.{ .name = .economy_commands, .fingerprint = 0x4b911d99bfb22447, .version = "0.1.0", .dependencies = .{
+    .economy = .{ .path = "../economy" },
+    .commands = .{ .path = "../../../commands" },
+    .players = .{ .path = "../../../players" },
+}, .paths = .{ "build.zig", "build.zig.zon", "src" } }

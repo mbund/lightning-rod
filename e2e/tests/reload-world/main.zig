@@ -2,6 +2,10 @@ const records = @import("records");
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
+const Chunks = @import("chunks").Chunks;
+const Players = @import("players").players.Players;
+const Reload = @import("reload").Reload;
+const Streaming = @import("terrain").streaming.Streaming;
 const protocols = @import("protocols");
 const sessions = @import("sessions");
 const e2e = @import("e2e");
@@ -15,7 +19,7 @@ const progress_ticks = 10;
 
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
-        lightning_rod.plugin.replace(e2e.profile.plugins(), .{lightning_rod.plugin.configured(vanilla.Players, .{ .render_distance = render_distance })}),
+        lightning_rod.plugin.replace(e2e.profile.plugins(), .{lightning_rod.plugin.configured(Players, .{ .render_distance = render_distance })}),
         lightning_rod.plugin.configured(Probe, .{}),
     });
     try e2e.profile.run(init, plugins, .{ .reload_executable = "/proc/self/exe" });
@@ -25,10 +29,11 @@ const Probe = struct {
     pub const id = "e2e:reload_world";
     pub const Configuration = struct {};
     pub const Dependencies = struct {
-        players: *vanilla.Players,
-        streaming: *vanilla.Streaming,
-        chunks: *vanilla.Chunks,
-        reload: *vanilla.Reload,
+        players: *Players,
+        player_states: *vanilla.PlayerStates,
+        streaming: *Streaming,
+        chunks: *Chunks,
+        reload: *Reload,
         control: *e2e.Control,
         storage: lightning_rod.storage.Space,
         metrics: *lightning_rod.metrics.Registry,
@@ -63,7 +68,7 @@ const Probe = struct {
             if (self.uuids[0] == 0 or self.uuids[1] == 0 or self.uuids[0] == self.uuids[1]) return error.InvalidReloadPlayers;
             self.phase = .resumed;
         } else {
-            for (blocks, 0..) |block, index| try deps.chunks.setBlock(deps.players.spawn_world, .{ .x = 3 + @as(i32, @intCast(index)), .y = 65, .z = 3 }, @intCast(protocols.registry.blockStateId(block).?));
+            for (blocks, 0..) |block, index| try deps.chunks.setBlock(try deps.players.spawnWorld(), .{ .x = 3 + @as(i32, @intCast(index)), .y = 65, .z = 3 }, @intCast(protocols.registry.blockStateId(block).?));
         }
         deps.control.on(self, message);
         return self;
@@ -78,8 +83,8 @@ const Probe = struct {
         const visibility = self.deps.streaming.snapshotVisibility();
         const center = visibility.viewCenter(handle.index);
         for (0..2 * render_distance + 1) |z| for (0..2 * render_distance + 1) |x| {
-            const at: vanilla.Streaming.Position = .{ .x = center.x + @as(i32, @intCast(x)) - render_distance, .z = center.z + @as(i32, @intCast(z)) - render_distance };
-            if (!vanilla.Streaming.Horizon.contains(render_distance, center, at)) continue;
+            const at: Streaming.Position = .{ .x = center.x + @as(i32, @intCast(x)) - render_distance, .z = center.z + @as(i32, @intCast(z)) - render_distance };
+            if (!Streaming.Horizon.contains(render_distance, center, at)) continue;
             if (!visibility.visible(handle.index, player, player.world, at.x, at.z)) return error.ReloadTerrainIncomplete;
         };
         if (self.ready & (@as(u2, 1) << index) != 0) return error.DuplicateReloadReadiness;
@@ -103,7 +108,7 @@ const Probe = struct {
 
     pub fn tick(self: *Probe) !void {
         if (self.phase == .complete) return;
-        var present: [player_names.len]?*vanilla.Players.Player = @splat(null);
+        var present: [player_names.len]?*Players.Player = @splat(null);
         var count: usize = 0;
         for (self.deps.players.records) |*player| {
             if (!player.inWorld()) continue;
@@ -131,15 +136,16 @@ const Probe = struct {
         }
         const alice = present[0].?;
         const bob = present[1].?;
+        const bob_state = self.deps.player_states.of(bob);
         if (self.ticks == 0) {
             if (alice.position.x != 0.5 or bob.position.x != bob_initial_x or alice.world != bob.world) return error.ReloadLostPlayerState;
             for (blocks, 0..) |block, index| {
                 if (try self.deps.chunks.getBlock(alice.world, .{ .x = 3 + @as(i32, @intCast(index)), .y = 65, .z = 3 }) != protocols.registry.blockStateId(block).?) return error.ReloadLostWorld;
             }
-            bob.health = bob_resumed_health;
+            bob_state.health = bob_resumed_health;
             try self.deps.players.teleport(bob, bob.world, .{ .x = bob_resumed_x, .y = 65, .z = 0.5 }, .{ .yaw = 0, .pitch = 0 });
         }
-        if (bob.health != bob_resumed_health or bob.position.x != bob_resumed_x) return error.ReloadRestoredStalePlayer;
+        if (bob_state.health != bob_resumed_health or bob.position.x != bob_resumed_x) return error.ReloadRestoredStalePlayer;
         self.ticks += 1;
         self.presence_ticks.add(1);
         if (alice.stage == .ready and bob.configuring) {

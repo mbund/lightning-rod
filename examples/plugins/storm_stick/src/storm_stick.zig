@@ -1,5 +1,12 @@
 const std = @import("std");
 const vanilla = @import("vanilla");
+const Chunks = @import("chunks").Chunks;
+const Entities = @import("entities").Entities;
+const EntityId = @import("entities").Id;
+const EntityState = @import("entities").State;
+const Packets = @import("minecraft_packets").Packets;
+const Players = @import("players").players.Players;
+const entity_packets = @import("replication").entity_packets;
 const game_data = @import("game_data");
 const sessions = @import("sessions");
 const wire = @import("wire_1_21_5");
@@ -7,8 +14,8 @@ const wire = @import("wire_1_21_5");
 pub const StormStick = struct {
     pub const id = "example:storm_stick";
     pub const Configuration = struct { maximum_strikes: usize = 8 };
-    pub const Dependencies = struct { enchantments: *vanilla.Enchantments.Registry, players: *vanilla.Players, chunks: *vanilla.Chunks, packets: *vanilla.Packets, entities: *vanilla.Entities };
-    const Strike = struct { entity: vanilla.EntityId = 0, expires: u64 = 0, body: vanilla.EntityState = undefined };
+    pub const Dependencies = struct { enchantments: *vanilla.Enchantments.Registry, players: *Players, chunks: *Chunks, packets: *Packets, entities: *Entities };
+    const Strike = struct { entity: EntityId = 0, expires: u64 = 0, body: EntityState = undefined };
     deps: Dependencies,
     strikes: []Strike,
     known: []u32,
@@ -47,7 +54,7 @@ pub const StormStick = struct {
         } else return .denied;
         const entity = self.deps.entities.next_id;
         if (entity > std.math.maxInt(i32)) return error.EntityIdExhausted;
-        const body: vanilla.EntityState = .{ .uuid = @as(u128, entity) | (@as(u128, 0x5702) << 64), .kind = @intCast(game_data.registry.entityId("minecraft:lightning_bolt").?), .world = player.world, .position = .{ hit.position.x, hit.position.y, hit.position.z } };
+        const body: EntityState = .{ .uuid = @as(u128, entity) | (@as(u128, 0x5702) << 64), .kind = @intCast(game_data.registry.entityId("minecraft:lightning_bolt").?), .world = player.world, .position = .{ hit.position.x, hit.position.y, hit.position.z } };
         const created = try self.deps.entities.reserveIds(1);
         std.debug.assert(created == entity);
         self.strikes[index] = .{ .entity = entity, .expires = self.deps.players.ticks + 40, .body = body };
@@ -79,7 +86,7 @@ pub const StormStick = struct {
                 count += 1;
             }
             const network_id = -@as(i32, @intCast(strike.entity));
-            if (expired) try self.deps.packets.fanout(remove, self.targets[0..count], .{network_id}, 32, self.deliveries[0..count]) else try self.deps.packets.fanout(vanilla.entity_packets.spawn, self.targets[0..count], .{ network_id, strike.body }, 128, self.deliveries[0..count]);
+            if (expired) try self.deps.packets.fanout(remove, self.targets[0..count], .{network_id}, 32, self.deliveries[0..count]) else try self.deps.packets.fanout(entity_packets.spawn, self.targets[0..count], .{ network_id, strike.body }, 128, self.deliveries[0..count]);
             var pending = false;
             for (self.targets[0..count], self.deliveries[0..count]) |target, delivery| switch (delivery) {
                 .queued => known[target.handle.index] = if (expired) 0 else target.handle.generation,

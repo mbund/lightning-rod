@@ -8,6 +8,11 @@
         .game_data = .{ .path = "../../../game_data" },
         .sessions = .{ .path = "../../../sessions" },
         .protocol_1_21_5 = .{ .path = "../../../protocol_versions/v1_21_5" },
+        .chunks = .{ .path = "../../../chunks" },
+        .entities = .{ .path = "../../../entities" },
+        .minecraft_packets = .{ .path = "../../../minecraft_packets" },
+        .players = .{ .path = "../../../players" },
+        .replication = .{ .path = "../../../replication" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

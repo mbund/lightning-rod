@@ -1,7 +1,7 @@
-const vanilla_content = @import("vanilla_content.zig");
-const Visibility = @import("visibility.zig").Visibility;
-const Streaming = @import("streaming.zig").Streaming;
-const Lighting = @import("lighting.zig").Lighting;
+const vanilla_content = @import("vanilla_definitions").defaults;
+const Visibility = @import("replication").visibility.Visibility;
+const Streaming = @import("terrain").streaming.Streaming;
+const Lighting = @import("terrain").lighting.Lighting;
 const std = @import("std");
 const storage = @import("storage");
 const records = @import("records");
@@ -11,27 +11,28 @@ const entities = @import("entities");
 const worlds = @import("worlds");
 const chunks = @import("chunks");
 const sessions = @import("sessions");
-const protocols = @import("protocols");
+const protocols = @import("minecraft_packets").protocols;
 const network = @import("networking");
 const game_data = @import("game_data");
 const packets = @import("minecraft_packets");
 const minecraft = @import("minecraft_model");
-const Experience = @import("experience.zig").Experience;
-const ItemPhysics = @import("item_physics.zig").ItemPhysics;
-const Enchantments = @import("enchantments.zig").Enchantments;
-const item_data = @import("item_data.zig");
-const EquipmentAttributes = @import("equipment_attributes.zig").EquipmentAttributes;
-const Mining = @import("mining.zig").Mining;
-const Items = @import("items.zig").Items;
-const ItemEntities = @import("item_entities.zig").ItemEntities;
-const Durability = @import("item_properties.zig").Durability;
-const EquipmentSlots = @import("item_properties.zig").EquipmentSlots;
-const Players = @import("players.zig").Players;
-const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
-const Input = @import("input.zig").Input;
-const BlockActions = @import("block_actions.zig").BlockActions;
-const Blocks = @import("block_sync.zig").BlockSynchronization;
-const BlockLoot = @import("block_loot.zig").BlockLoot;
+const Experience = @import("vanilla_survival").experience.Experience;
+const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
+const Enchantments = @import("vanilla_items").enchantments.Enchantments;
+const item_data = @import("vanilla_items").item_data;
+const EquipmentAttributes = @import("vanilla_items").equipment_attributes.EquipmentAttributes;
+const Mining = @import("vanilla_blocks").mining.Mining;
+const Items = @import("vanilla_items").items.Items;
+const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
+const Durability = @import("vanilla_items").item_properties.Durability;
+const EquipmentSlots = @import("vanilla_items").item_properties.EquipmentSlots;
+const Players = @import("players").players.Players;
+const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
+const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
+const Input = @import("players").input.Input;
+const BlockActions = @import("vanilla_blocks").block_actions.BlockActions;
+const Blocks = @import("terrain").block_sync.BlockSynchronization;
+const BlockLoot = @import("vanilla_blocks").block_loot.BlockLoot;
 const Protocol = protocols.implementations[0].Protocol;
 const selected_protocols = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
 const position: minecraft.BlockPosition = .{ .x = 8, .y = 65, .z = 8 };
@@ -79,9 +80,11 @@ const Fixture = struct {
         const dimension: worlds.Worlds.Dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 };
         const world = try dimensions.create(.{ .name = "test:first", .dimension = dimension });
         const other_world = try dimensions.create(.{ .name = "test:second", .dimension = dimension });
-        const players = try Players.init(allocator, .{ .maximum = count, .world = world, .render_distance = 2 }, .{ .record_workspaces = workspaces, .sessions = service, .packets = encoding, .input = input, .storage = try store.openSpace("players"), .worlds = dimensions, .vanilla_worlds = undefined });
-        for (players.records, 0..) |*player, at| player.* = .{ .handle = .{ .index = @intCast(at), .generation = 1 }, .uuid = at + 1, .world = world, .stage = .ready, .gamemode = .survival, .protocol = selected_protocols[0].number, .position = .{ .x = 8, .y = 65, .z = 6.5 }, .on_ground = true };
+        const players = try Players.init(allocator, .{ .maximum = count, .world = world, .render_distance = 2 }, .{ .record_workspaces = workspaces, .sessions = service, .packets = encoding, .input = input, .storage = try store.openSpace("players"), .worlds = dimensions });
+        for (players.records, 0..) |*player, at| player.* = .{ .handle = .{ .index = @intCast(at), .generation = 1 }, .uuid = at + 1, .world = world, .stage = .ready, .protocol = selected_protocols[0].number, .position = .{ .x = 8, .y = 65, .z = 6.5 }, .on_ground = true };
         players.rebuildIndexes();
+        const player_states = try PlayerStates.init(allocator, .{ .gamemode = .survival }, .{ .record_workspaces = workspaces, .players = players, .input = input, .packets = encoding, .storage = try store.openSpace(PlayerStates.id), .worlds = dimensions, .vanilla_worlds = undefined });
+        for (player_states.records, 0..) |*state, at| state.* = .{ .uuid = at + 1, .gamemode = .survival };
         const ownership = try inventories.Inventories.init(allocator, std.testing.io, .{ .cache_slots = 1024, .cache_items = 8, .max_item_bytes = 1024 }, .{ .metrics = registry, .storage = try store.openSpace("inventory"), .record_workspaces = workspaces });
         const gameplay_definitions = try vanilla_content.prepare(allocator);
         const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
@@ -95,13 +98,13 @@ const Fixture = struct {
             .metrics = registry,
             .record_workspaces = workspaces,
         });
-        const menus = try PlayerInventory.init(allocator, .{}, .{ .crafting = gameplay_definitions.crafting, .furnaces = gameplay_definitions.furnaces, .players = players, .inventories = ownership, .items = items, .equipment = try EquipmentSlots.init(allocator, .{ .items = items, .enchantments = gameplay_definitions.enchantments }), .dropped = dropped });
+        const menus = try PlayerInventory.init(allocator, .{}, .{ .crafting = gameplay_definitions.crafting, .furnaces = gameplay_definitions.furnaces, .players = players, .player_states = player_states, .inventories = ownership, .items = items, .equipment = try EquipmentSlots.init(allocator, .{ .items = items, .enchantments = gameplay_definitions.enchantments }), .dropped = dropped });
         const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 64, .demand_sections = 0, .cache_groups = 8 }, .{ .metrics = registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const light = try Lighting.init(allocator, .{}, .{ .metrics = registry, .blocks = gameplay_definitions.blocks, .chunks = terrain, .worlds = dimensions });
-        const streaming = try Streaming.init(allocator, std.testing.io, .{ .occlusion = false }, .{ .metrics = registry, .players = players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = light });
+        const light = try Lighting.init(allocator, .{}, .{ .metrics = registry, .blocks = &gameplay_definitions.blocks.published, .chunks = terrain, .worlds = dimensions });
+        const streaming = try Streaming.init(allocator, std.testing.io, .{ .occlusion = false }, .{ .metrics = registry, .players = players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = light, .blocks = &gameplay_definitions.blocks.published });
         const blocks = try Blocks.init(allocator, std.testing.io, .{ .metrics = registry, .chunks = terrain, .players = players, .streaming = streaming, .sessions = service, .packets = encoding, .worlds = dimensions }, .{ .delta_sections = 16, .queued_sections = 32 });
-        const experience = try Experience.init(allocator, .{ .maximum_orbs = 64 }, .{ .enchantments = gameplay_definitions.enchantments, .dimensions = gameplay_definitions.dimensions, .players = players, .entities = bodies, .physics = try ItemPhysics.init(allocator, .{ .blocks = gameplay_definitions.blocks, .chunks = terrain }), .inventories = ownership, .inventory = menus, .storage = try store.openSpace("experience"), .record_workspaces = workspaces });
-        const mining = try Mining.allocate(allocator, .{}, .{ .enchantments = gameplay_definitions.enchantments, .block_definitions = gameplay_definitions.blocks, .attributes = try EquipmentAttributes.init(allocator, .{}, .{ .players = players, .items = items, .enchantments = gameplay_definitions.enchantments, .client = gameplay_definitions.client }), .definitions = gameplay_definitions.mining, .visibility = try Visibility.init(allocator, .{}, .{ .players = players }), .metrics = registry, .storage = try store.openSpace("mining"), .players = players, .input = input, .inventories = ownership, .items = items, .durability = try Durability.init(allocator, .{ .items = items, .inventories = ownership, .enchantments = gameplay_definitions.enchantments }), .worlds = dimensions, .chunks = terrain, .menus = menus, .loot = try BlockLoot.init(allocator, .{ .loot = gameplay_definitions.loot }), .experience = experience, .dropped = dropped, .blocks = blocks, .actions = try BlockActions.init(allocator, .{}) });
+        const experience = try Experience.init(allocator, .{ .maximum_orbs = 64 }, .{ .enchantments = gameplay_definitions.enchantments, .dimensions = gameplay_definitions.dimensions, .players = players, .player_states = player_states, .entities = bodies, .physics = try ItemPhysics.init(allocator, .{ .blocks = gameplay_definitions.blocks, .chunks = terrain }), .inventories = ownership, .inventory = menus, .storage = try store.openSpace("experience"), .record_workspaces = workspaces });
+        const mining = try Mining.allocate(allocator, .{}, .{ .enchantments = gameplay_definitions.enchantments, .block_definitions = gameplay_definitions.blocks, .attributes = try EquipmentAttributes.init(allocator, .{}, .{ .players = players, .player_states = player_states, .items = items, .enchantments = gameplay_definitions.enchantments, .client = gameplay_definitions.client }), .definitions = gameplay_definitions.mining, .visibility = try Visibility.init(allocator, .{}, .{ .players = players }), .metrics = registry, .storage = try store.openSpace("mining"), .players = players, .player_states = player_states, .input = input, .inventories = ownership, .items = items, .durability = try Durability.init(allocator, .{ .items = items, .inventories = ownership, .enchantments = gameplay_definitions.enchantments }), .worlds = dimensions, .chunks = terrain, .menus = menus, .loot = try BlockLoot.init(allocator, .{ .loot = gameplay_definitions.loot }), .experience = experience, .dropped = dropped, .blocks = blocks, .actions = try BlockActions.init(allocator, .{}) });
         const tool: inventories.Stack = .{ .item = try items.define("minecraft:diamond_pickaxe"), .count = 1 };
         for (players.records) |player| try std.testing.expect(try ownership.set(.{ .owner = player.uuid, .index = 36 }, 0, tool));
         try terrain.setBlock(world, .{ .x = position.x, .y = position.y, .z = position.z }, game_data.registry.block_obsidian_default_state);
@@ -408,7 +411,7 @@ pub fn verifyReadWindow() !void {
     const obsidian: u16 = @intCast(game_data.registry.block_obsidian_default_state);
     try fixture.mining.deps.actions.register(BlockActions.Handler.init(&action, obsidian, obsidian, Action.apply));
     for (fixture.mining.deps.players.records, fixture.mining.states, 0..) |*player, *state, index| {
-        player.gamemode = .creative;
+        fixture.mining.deps.player_states.records[index].gamemode = .creative;
         state.* = .{ .generation = player.handle.?.generation, .teleport_id = player.teleport_id, .active = true, .complete = true, .position = .{ .x = position.x + @as(i32, @intCast(index)), .y = position.y, .z = position.z } };
     }
     _ = try fixture.tick();
@@ -422,7 +425,7 @@ pub fn verifyReadWindow() !void {
     try std.testing.expectEqual(dropped.residents.len, dropped.free_count);
 
     const player = &fixture.mining.deps.players.records[0];
-    player.gamemode = .survival;
+    fixture.mining.deps.player_states.records[0].gamemode = .survival;
     const ownership = fixture.mining.deps.inventories;
     const slot: inventories.Slot = .{ .owner = player.uuid, .index = 36 };
     const before = (try ownership.get(slot)).stack.?;
@@ -488,7 +491,7 @@ pub fn verifyNeighborhoods() !void {
                     if (index % 2 == 0) player.world = fixture.other_world;
                 },
                 3 => {
-                    player.world = players.spawn_world;
+                    player.world = try players.spawnWorld();
                     player.position.x = -16.1;
                 },
                 else => unreachable,
@@ -593,7 +596,7 @@ pub fn verifyExperience() !void {
         var fixture = try Fixture.init(allocator, &store, &registry, 1);
         defer fixture.deinit();
         const player = &fixture.mining.deps.players.records[0];
-        player.gamemode = case.mode;
+        fixture.mining.deps.player_states.records[0].gamemode = case.mode;
         const world = player.world;
         const state: u16 = @intCast(game_data.registry.blockStateId(case.block).?);
         const target: chunks.Position = .{ .x = position.x, .y = position.y, .z = position.z };

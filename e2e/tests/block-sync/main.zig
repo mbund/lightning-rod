@@ -1,15 +1,20 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const protocols = @import("protocols");
-const vanilla = @import("vanilla");
+const BlockEdit = @import("chunks").BlockEdit;
+const BlockSynchronization = @import("terrain").block_sync.BlockSynchronization;
+const Chunks = @import("chunks").Chunks;
+const Players = @import("players").players.Players;
+const SectionEdits = @import("chunks").SectionEdits;
+const Streaming = @import("terrain").streaming.Streaming;
 const e2e = @import("e2e");
 const sessions = @import("sessions");
 
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.BlockSynchronization, .{ .delta_sections = 2 }),
-            lightning_rod.plugin.configured(vanilla.Streaming, .{ .occlusion = false }),
+            lightning_rod.plugin.configured(BlockSynchronization, .{ .delta_sections = 2 }),
+            lightning_rod.plugin.configured(Streaming, .{ .occlusion = false }),
         }),
         lightning_rod.plugin.configured(Probe, .{}),
     });
@@ -20,10 +25,10 @@ const Probe = struct {
     pub const id = "e2e:block-sync";
     pub const Configuration = struct {};
     pub const Dependencies = struct {
-        chunks: *vanilla.Chunks,
+        chunks: *Chunks,
         control: *e2e.Control,
-        players: *vanilla.Players,
-        synchronization: *vanilla.BlockSynchronization,
+        players: *Players,
+        synchronization: *BlockSynchronization,
     };
     const clock_ticks = 64;
 
@@ -61,8 +66,8 @@ const Probe = struct {
         }
 
         if (std.mem.eql(u8, text, "blocks_burst")) {
-            var edits: [4096]vanilla.BlockEdit = undefined;
-            var sections: [125]vanilla.SectionEdits = undefined;
+            var edits: [4096]BlockEdit = undefined;
+            var sections: [125]SectionEdits = undefined;
 
             for (&edits, 0..) |*edit, local| edit.* = .{
                 .index = @intCast(local),

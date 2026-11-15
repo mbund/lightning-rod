@@ -1,5 +1,7 @@
 const std = @import("std");
-const vanilla = @import("vanilla");
+const Chat = @import("chat").chat.Chat;
+const Players = @import("players").players.Players;
+const commands = @import("commands");
 const sessions = @import("sessions");
 const lightning_rod = @import("lightning_rod");
 const catalog = @import("catalog.zig");
@@ -8,10 +10,10 @@ pub const IslandCommands = struct {
     pub const id = catalog.island_namespace;
     pub const Configuration = struct { catalog: *catalog.Catalog, routing: *sessions.Routing, index: usize };
     pub const Dependencies = struct {
-        commands: *vanilla.commands.Commands,
-        players: *vanilla.Players,
+        commands: *commands.Commands,
+        players: *Players,
         sessions: *sessions.Service,
-        chat: *vanilla.Chat,
+        chat: *Chat,
         storage: lightning_rod.storage.Space,
     };
     const None = struct {};
@@ -34,56 +36,56 @@ pub const IslandCommands = struct {
         const self = try allocator.create(IslandCommands);
         self.* = .{ .deps = deps, .config = config, .saved = .{} };
         inline for (.{ "island", "is" }) |name| {
-            const island = try deps.commands.register(self, vanilla.commands.leaf(IslandCommands, None, .{
+            const island = try deps.commands.register(self, commands.leaf(IslandCommands, None, .{
                 .name = name,
                 .description = "Travel to your home island",
                 .handler = home,
                 .arguments = .{},
             }));
-            _ = try island.add(self, vanilla.commands.leaf(IslandCommands, None, .{
+            _ = try island.add(self, commands.leaf(IslandCommands, None, .{
                 .name = "create",
                 .description = "Create your home island",
                 .handler = create,
                 .arguments = .{},
             }));
-            _ = try island.add(self, vanilla.commands.leaf(IslandCommands, None, .{
+            _ = try island.add(self, commands.leaf(IslandCommands, None, .{
                 .name = "home",
                 .description = "Travel to your home island",
                 .handler = home,
                 .arguments = .{},
             }));
-            _ = try island.add(self, vanilla.commands.leaf(IslandCommands, Player, .{
+            _ = try island.add(self, commands.leaf(IslandCommands, Player, .{
                 .name = "invite",
                 .description = "Invite a player to join your island",
                 .handler = invite,
                 .arguments = .{ .player = .{ .parse = parsePlayer, .suggest = suggestPlayers } },
             }));
-            _ = try island.add(self, vanilla.commands.leaf(IslandCommands, Player, .{
+            _ = try island.add(self, commands.leaf(IslandCommands, Player, .{
                 .name = "accept",
                 .description = "Accept an island owner's invitation",
                 .handler = accept,
                 .arguments = .{ .player = .{ .parse = parsePlayer, .suggest = suggestPlayers } },
             }));
         }
-        const visits = try deps.commands.register(self, vanilla.commands.leaf(IslandCommands, Player, .{
+        const visits = try deps.commands.register(self, commands.leaf(IslandCommands, Player, .{
             .name = "visit",
             .description = "Visit another player's home island",
             .handler = visit,
             .arguments = .{ .player = .{ .parse = parsePlayer, .suggest = suggestPlayers } },
         }));
-        _ = try visits.add(self, vanilla.commands.leaf(IslandCommands, Player, .{
+        _ = try visits.add(self, commands.leaf(IslandCommands, Player, .{
             .name = "accept",
             .description = "Accept a visit request",
             .handler = acceptVisit,
             .arguments = .{ .player = .{ .parse = parsePlayer, .suggest = suggestPlayers } },
         }));
-        _ = try deps.commands.register(self, vanilla.commands.leaf(IslandCommands, None, .{
+        _ = try deps.commands.register(self, commands.leaf(IslandCommands, None, .{
             .name = "hub",
             .description = "Return to the hub",
             .handler = hub,
             .arguments = .{},
         }));
-        _ = try deps.commands.register(self, vanilla.commands.leaf(IslandCommands, Kick, .{
+        _ = try deps.commands.register(self, commands.leaf(IslandCommands, Kick, .{
             .name = "kick",
             .description = "Return to the hub or send a visitor there",
             .handler = kick,
@@ -97,7 +99,7 @@ pub const IslandCommands = struct {
         return catalog.Member.named(uuid, player.name[0..player.name_len]);
     }
 
-    fn create(self: *IslandCommands, context: vanilla.commands.Context, _: None) !void {
+    fn create(self: *IslandCommands, context: commands.Context, _: None) !void {
         const owner = self.member(context.sender) orelse return;
         _ = self.config.catalog.create(owner) catch |err| {
             context.reply(failure(err));
@@ -105,14 +107,14 @@ pub const IslandCommands = struct {
         };
     }
 
-    fn home(self: *IslandCommands, context: vanilla.commands.Context, _: None) !void {
+    fn home(self: *IslandCommands, context: commands.Context, _: None) !void {
         self.config.catalog.requestHome(context.sender) catch |err| {
             context.reply(failure(err));
             return;
         };
     }
 
-    fn invite(self: *IslandCommands, context: vanilla.commands.Context, args: Player) !void {
+    fn invite(self: *IslandCommands, context: commands.Context, args: Player) !void {
         self.config.catalog.invite(context.sender, args.player) catch |err| {
             context.reply(failure(err));
             return;
@@ -120,7 +122,7 @@ pub const IslandCommands = struct {
         context.reply("Invitation sent.");
     }
 
-    fn accept(self: *IslandCommands, context: vanilla.commands.Context, args: Player) !void {
+    fn accept(self: *IslandCommands, context: commands.Context, args: Player) !void {
         const player = self.member(context.sender) orelse return;
         self.config.catalog.accept(player, args.player) catch |err| {
             context.reply(failure(err));
@@ -128,7 +130,7 @@ pub const IslandCommands = struct {
         };
     }
 
-    fn visit(self: *IslandCommands, context: vanilla.commands.Context, args: Player) !void {
+    fn visit(self: *IslandCommands, context: commands.Context, args: Player) !void {
         const requested = self.config.catalog.visit(context.sender, args.player) catch |err| {
             context.reply(failure(err));
             return;
@@ -136,7 +138,7 @@ pub const IslandCommands = struct {
         if (requested) context.reply("Visit request sent.");
     }
 
-    fn acceptVisit(self: *IslandCommands, context: vanilla.commands.Context, args: Player) !void {
+    fn acceptVisit(self: *IslandCommands, context: commands.Context, args: Player) !void {
         self.config.catalog.acceptVisit(context.sender, args.player) catch |err| {
             context.reply(failure(err));
             return;
@@ -144,11 +146,11 @@ pub const IslandCommands = struct {
         context.reply("Visit accepted.");
     }
 
-    fn hub(self: *IslandCommands, context: vanilla.commands.Context, _: None) !void {
+    fn hub(self: *IslandCommands, context: commands.Context, _: None) !void {
         try self.kick(context, .{});
     }
 
-    fn kick(self: *IslandCommands, context: vanilla.commands.Context, args: Kick) !void {
+    fn kick(self: *IslandCommands, context: commands.Context, args: Kick) !void {
         self.config.catalog.kick(context.sender, args.player) catch |err| {
             context.reply(failure(err));
             return;
@@ -156,12 +158,12 @@ pub const IslandCommands = struct {
         if (args.player != null) context.reply("Visitor sent to hub.");
     }
 
-    fn parsePlayer(self: *IslandCommands, _: vanilla.commands.Context, name: []const u8) vanilla.commands.ParseError!u128 {
+    fn parsePlayer(self: *IslandCommands, _: commands.Context, name: []const u8) commands.ParseError!u128 {
         const player = self.config.catalog.find(name) orelse return error.InvalidArgument;
         return player.uuid;
     }
 
-    fn suggestPlayers(self: *IslandCommands, context: vanilla.commands.CompletionContext, output: *vanilla.commands.Suggestions) void {
+    fn suggestPlayers(self: *IslandCommands, context: commands.CompletionContext, output: *commands.Suggestions) void {
         var members: [catalog.maximum_players + catalog.maximum * catalog.maximum_members]catalog.Member = undefined;
         const count = self.config.catalog.list(&members);
         for (members[0..count]) |player| {
@@ -217,7 +219,7 @@ pub const IslandCommands = struct {
             const target = update.destination orelse continue;
             if (target == self.config.index) {
                 directory.moved(player.uuid, self.config.index, target);
-                try self.deps.players.teleport(&self.deps.players.records[handle.index], self.deps.players.spawn_world, self.deps.players.config.spawn.?, .{ .yaw = 0, .pitch = 0 });
+                try self.deps.players.teleport(&self.deps.players.records[handle.index], try self.deps.players.spawnWorld(), self.deps.players.config.spawn.?, .{ .yaw = 0, .pitch = 0 });
                 continue;
             }
             self.deps.sessions.transfer(handle, self.config.routing.endpoints[target]) catch |err| switch (err) {

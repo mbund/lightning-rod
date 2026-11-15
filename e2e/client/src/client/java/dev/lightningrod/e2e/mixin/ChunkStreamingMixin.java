@@ -26,6 +26,11 @@ abstract class ChunkStreamingMixin {
         if (packet.overlay()) Recorder.instance().overlay(packet.content().getString());
     }
 
+    @Inject(method = "handleMovePlayer", at = @At("TAIL"))
+    private void positioned(net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket packet, CallbackInfo info) {
+        Recorder.instance().positioned();
+    }
+
     @Inject(method = "handleSetChunkCacheCenter", at = @At("TAIL"))
     private void viewCenter(ClientboundSetChunkCacheCenterPacket packet, CallbackInfo info) {
         Recorder.instance().viewCenter(packet.getX(), packet.getZ());

@@ -2,12 +2,14 @@ const e2e = @import("e2e");
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
+const Players = @import("players").players.Players;
 const sessions = @import("sessions");
 
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = 2, .gamemode = .survival }),
+            lightning_rod.plugin.configured(Players, Players.Configuration{ .render_distance = 2 }),
+            lightning_rod.plugin.configured(vanilla.PlayerStates, .{ .gamemode = .survival }),
         }),
         lightning_rod.plugin.configured(Probe, .{}),
     });
@@ -18,7 +20,8 @@ const Probe = struct {
     pub const id = "e2e:respawn";
     pub const Configuration = struct {};
     pub const Dependencies = struct {
-        players: *vanilla.Players,
+        players: *Players,
+        player_states: *vanilla.PlayerStates,
         sessions: *sessions.Service,
     };
     deps: Dependencies,
@@ -40,7 +43,7 @@ const Probe = struct {
         for (self.deps.players.records, self.killed) |*player, *killed| {
             const handle = player.handle orelse continue;
             if (player.stage != .ready or !player.loaded or killed.* == handle.generation) continue;
-            player.health = 0;
+            self.deps.player_states.of(player).health = 0;
             killed.* = handle.generation;
         }
     }

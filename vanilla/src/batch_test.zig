@@ -1,4 +1,4 @@
-const vanilla_content = @import("vanilla_content.zig");
+const vanilla_content = @import("vanilla_definitions").defaults;
 const storage = @import("storage");
 const persistent_records = @import("records");
 const metrics = @import("metrics");
@@ -7,11 +7,11 @@ const entities = @import("entities");
 const inventories = @import("inventories");
 const worlds = @import("worlds");
 const game_data = @import("game_data");
-const Items = @import("items.zig").Items;
-const ItemEntities = @import("item_entities.zig").ItemEntities;
-const Players = @import("players.zig").Players;
+const Items = @import("vanilla_items").items.Items;
+const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
+const Players = @import("players").players.Players;
 const chunks = @import("chunks");
-const ItemPhysics = @import("item_physics.zig").ItemPhysics;
+const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
 
 fn itemPhysicsProbe(output: *std.Io.Writer) !void {
     const Source = struct {

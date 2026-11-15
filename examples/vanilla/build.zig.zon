@@ -15,6 +15,12 @@
         .storm_stick = .{ .path = "../plugins/storm_stick" },
         .inventories = .{ .path = "../../inventories" },
         .game_data = .{ .path = "../../game_data" },
+        .chunks = .{ .path = "../../chunks" },
+        .commands = .{ .path = "../../commands" },
+        .connection = .{ .path = "../../connection" },
+        .players = .{ .path = "../../players" },
+        .replication = .{ .path = "../../replication" },
+        .terrain = .{ .path = "../../terrain" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

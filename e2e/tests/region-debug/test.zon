@@ -1,0 +1,1 @@
+.{ .client = "RegionDebugFixture", .scenarios = .{.{ .name = "region-debug-multi", .peers = .{ "alice", "bob" } }} }

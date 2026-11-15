@@ -1,6 +1,7 @@
 const std = @import("std");
 const economy = @import("economy");
 const vanilla = @import("vanilla");
+const Players = @import("players").players.Players;
 const game_data = @import("game_data");
 
 pub const Offer = struct {
@@ -15,7 +16,7 @@ pub const Shop = struct {
     pub const Configuration = struct { offers: []const Offer = &.{} };
 
     pub const Dependencies = struct {
-        players: *vanilla.Players,
+        players: *Players,
         menus: *vanilla.PlayerInventory,
         economy: *economy.Economy,
     };

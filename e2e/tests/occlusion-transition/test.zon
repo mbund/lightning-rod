@@ -1,0 +1,1 @@
+.{ .client = "OcclusionTransitionFixture", .scenarios = .{.{ .name = "occlusion-transition" }} }

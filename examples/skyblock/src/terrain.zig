@@ -9,7 +9,7 @@ pub const Terrain = struct {
     pub const Kind = enum { hub, island };
     pub const Dependencies = struct {
         registry_identity: *vanilla.RegistryIdentity,
-        chunks: *vanilla.Chunks,
+        chunks: *chunks.Chunks,
         worlds: *vanilla.VanillaWorlds,
     };
 
@@ -28,7 +28,7 @@ pub const Terrain = struct {
     }
 
     fn readOne(self: *Terrain, _: std.Io, section: chunks.Section, output: []u8) !usize {
-        if (section.world != self.deps.worlds.overworld) return chunks.uniform(0, output);
+        if (section.world != self.deps.worlds.overworld) return voidSection(output);
         return generate(self.kind, section, output);
     }
 };
@@ -51,11 +51,21 @@ fn block(kind: Terrain.Kind, x: i32, y: i32, z: i32) u16 {
     return 0;
 }
 
+/// Islands float in the void, so every section has the biome of a vanilla void world.
+fn voidSection(output: []u8) usize {
+    std.debug.assert(output.len >= chunks.encoding.maximum_decoded_bytes);
+    output[0] = 3;
+    const biome: u16 = @intCast(game_data.registry.biomeId("minecraft:the_void").?);
+    for (0..64) |index| std.mem.writeInt(u16, output[1 + index * 2 ..][0..2], biome, .little);
+    return chunks.encoding.biome_header_bytes + chunks.uniform(0, output[chunks.encoding.biome_header_bytes..]);
+}
+
 fn generate(kind: Terrain.Kind, section: chunks.Section, output: []u8) usize {
-    std.debug.assert(output.len >= 8193);
+    const empty = voidSection(output);
     if (section.x < -1 or section.x > 0 or section.z < -1 or section.z > 0 or section.y < 3 or section.y > 4 or
-        (kind == .hub and section.y != 4)) return chunks.uniform(0, output);
-    output[0] = 1;
+        (kind == .hub and section.y != 4)) return empty;
+    const blocks = output[chunks.encoding.biome_header_bytes..];
+    blocks[0] = 1;
     var occupied = false;
     for (0..4096) |index| {
         const x = section.x * 16 + @as(i32, @intCast(index % 16));
@@ -63,9 +73,9 @@ fn generate(kind: Terrain.Kind, section: chunks.Section, output: []u8) usize {
         const z = section.z * 16 + @as(i32, @intCast(index / 16 % 16));
         const state = block(kind, x, y, z);
         occupied = occupied or state != 0;
-        std.mem.writeInt(u16, output[1 + index * 2 ..][0..2], state, .little);
+        std.mem.writeInt(u16, blocks[1 + index * 2 ..][0..2], state, .little);
     }
-    return if (occupied) 8193 else chunks.uniform(0, output);
+    return if (occupied) chunks.encoding.maximum_decoded_bytes else voidSection(output);
 }
 
 test "starter island has an L shaped grass surface two dirt layers a tree and one chest" {
@@ -90,7 +100,9 @@ test "starter island has an L shaped grass surface two dirt layers a tree and on
 }
 
 test "hub is a single stone platform and section generation leaves the rest void" {
-    var buffer: [8193]u8 = undefined;
+    var buffer: [chunks.encoding.maximum_decoded_bytes]u8 = undefined;
+    const header = chunks.encoding.biome_header_bytes;
+    const void_biome: u16 = @intCast(game_data.registry.biomeId("minecraft:the_void").?);
     for ([_]Terrain.Kind{ .hub, .island }) |kind| {
         for ([_]chunks.Section{
             .{ .world = 0, .x = 0, .y = -4, .z = 0 },
@@ -99,15 +111,17 @@ test "hub is a single stone platform and section generation leaves the rest void
             .{ .world = 0, .x = std.math.minInt(i32), .y = 4, .z = 0 },
             .{ .world = 0, .x = 0, .y = 4, .z = std.math.maxInt(i32) },
         }) |section| {
-            try std.testing.expectEqual(@as(usize, 3), generate(kind, section, &buffer));
-            try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, buffer[0..3]);
+            try std.testing.expectEqual(header + 3, generate(kind, section, &buffer));
+            try std.testing.expectEqual(void_biome, std.mem.readInt(u16, buffer[1..3], .little));
+            try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, buffer[header..][0..3]);
         }
     }
     var stone: usize = 0;
     for ([_]i32{ -1, 0 }) |x| for ([_]i32{ -1, 0 }) |z| {
-        try std.testing.expectEqual(@as(usize, 8193), generate(.hub, .{ .world = 0, .x = x, .y = 4, .z = z }, &buffer));
+        try std.testing.expectEqual(buffer.len, generate(.hub, .{ .world = 0, .x = x, .y = 4, .z = z }, &buffer));
+        try std.testing.expectEqual(void_biome, std.mem.readInt(u16, buffer[127..129], .little));
         for (0..4096) |index| {
-            const state = std.mem.readInt(u16, buffer[1 + index * 2 ..][0..2], .little);
+            const state = std.mem.readInt(u16, buffer[header + 1 + index * 2 ..][0..2], .little);
             if (state != 0) {
                 try std.testing.expectEqual(@as(u16, game_data.registry.block_stone_default_state), state);
                 try std.testing.expect(index < 256);

@@ -3,12 +3,14 @@ const e2e = @import("e2e");
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
+const Players = @import("players").players.Players;
+const Reload = @import("reload").Reload;
 const sessions = @import("sessions");
 
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 2, .render_distance = 2 }),
+            lightning_rod.plugin.configured(Players, .{ .maximum = 2, .render_distance = 2 }),
         }),
         lightning_rod.plugin.configured(Probe, .{}),
     });
@@ -22,10 +24,10 @@ const Probe = struct {
         time: *vanilla.Time,
         weather: *vanilla.Weather,
         environment: *vanilla.Environment,
-        players: *vanilla.Players,
+        players: *Players,
         worlds: *vanilla.VanillaWorlds,
         control: *e2e.Control,
-        reload: *vanilla.Reload,
+        reload: *Reload,
         storage: lightning_rod.storage.Space,
     };
 

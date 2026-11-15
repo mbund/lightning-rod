@@ -1,9 +1,0 @@
-{
-  "client": "LightingFixture",
-  "variants": [
-    {
-      "name": "lighting-multi",
-      "peers": ["alice", "bob"]
-    }
-  ]
-}

@@ -1,0 +1,1 @@
+.{ .client = "SkyblockFixture", .scenarios = .{.{ .name = "skyblock-multi", .peers = .{ "alice", "bob" } }} }

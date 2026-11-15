@@ -1,6 +1,0 @@
-{
-  "client": "SkyblockFixture",
-  "variants": [
-    { "name": "skyblock-multi", "peers": ["alice", "bob"] }
-  ]
-}

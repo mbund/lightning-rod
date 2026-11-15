@@ -1,0 +1,1 @@
+.{ .client = "LoginFixture", .scenarios = .{ .{ .name = "login" }, .{ .name = "status-plugin", .fixture = "isolation" } } }

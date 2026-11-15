@@ -1,0 +1,5 @@
+.{ .client = "OcclusionFixture", .scenarios = .{ .{ .name = "occlusion-multi", .peers = .{ "alice", "bob" } }, .{
+    .name = "occlusion-protocol-multi",
+    .peers = .{ "alice", "bob" },
+    .mixed_versions = true,
+} } }

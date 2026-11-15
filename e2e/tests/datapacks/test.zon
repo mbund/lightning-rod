@@ -1,0 +1,1 @@
+.{ .client = "DatapacksFixture", .scenarios = .{.{ .name = "datapacks" }} }

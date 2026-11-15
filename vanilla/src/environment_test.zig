@@ -1,7 +1,10 @@
 const std = @import("std");
 const vanilla = @import("lib.zig");
+const Packets = @import("minecraft_packets").Packets;
+const Worlds = @import("worlds").Worlds;
+const Players = @import("players").players.Players;
 const sessions = @import("sessions");
-const protocols = @import("protocols");
+const protocols = @import("minecraft_packets").protocols;
 
 test "environment updates admit healthy clients independently and retry blocked clients" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -12,15 +15,15 @@ test "environment updates admit healthy clients independently and retry blocked 
         .registries = &.{.{ .name = "minecraft:world_clock", .entries = &.{ "minecraft:overworld", "minecraft:the_end" } }},
     }};
     const service = try sessions.Service.init(allocator, std.testing.io, undefined, .{ .connections = 2, .pages = 128, .page_bytes = 4096, .buffer_bytes = 32768, .protocols = &selected });
-    const packets = try vanilla.Packets.init(allocator, .{ .sessions = service });
-    const worlds = try vanilla.Worlds.allocate(allocator, .{ .maximum = 1 });
+    const packets = try Packets.init(allocator, .{ .sessions = service });
+    const worlds = try Worlds.allocate(allocator, .{ .maximum = 1 });
     const world = try worlds.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16, .skylight = true } });
-    var records: [2]vanilla.Players.Player = undefined;
+    var records: [2]Players.Player = undefined;
     for (&records, 0..) |*player, i| {
         player.* = .{ .handle = .{ .index = @intCast(i), .generation = 1 }, .uuid = i + 1, .world = world, .protocol = selected[0].number, .name = @splat(0), .name_len = 1, .stage = .ready };
         service.credit[i].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
     }
-    var players: vanilla.Players = .{ .deps = .{ .sessions = service, .packets = packets, .input = undefined, .storage = undefined, .worlds = worlds, .vanilla_worlds = undefined, .record_workspaces = undefined }, .config = .{ .maximum = 2 }, .spawn_world = world, .records = &records, .dig_handlers = &.{} };
+    var players: Players = .{ .deps = .{ .sessions = service, .packets = packets, .input = undefined, .storage = undefined, .worlds = worlds, .record_workspaces = undefined }, .config = .{ .maximum = 2 }, .spawn_world = world, .records = &records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
     players.rebuildIndexes();
     const time = try vanilla.Time.allocate(allocator, .{});

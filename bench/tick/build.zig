@@ -7,7 +7,6 @@ pub fn build(b: *std.Build) void {
     const selection = if (releases.len == 0) b.dependency("protocols", .{ .target = target, .optimize = optimize }) else b.dependency("protocols", .{ .target = target, .optimize = optimize, .releases = releases });
     const protocols = selection.module("protocols");
     const vanilla = b.dependency("vanilla", .{ .target = target, .optimize = optimize }).module("lightning_rod_vanilla_1_21_6");
-    vanilla.addImport("protocols", protocols);
     b.dependency("minecraft_packets", .{ .target = target, .optimize = optimize }).module("minecraft_packets").addImport("protocols", protocols);
     const sessions = b.dependency("sessions", .{ .target = target, .optimize = optimize }).module("sessions");
     const executable = b.addExecutable(.{
@@ -17,6 +16,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "chunks", .module = b.dependency("chunks", .{ .target = target, .optimize = optimize }).module("chunks") },
+                .{ .name = "inventories", .module = b.dependency("inventories", .{ .target = target, .optimize = optimize }).module("inventories") },
+                .{ .name = "players", .module = b.dependency("players", .{ .target = target, .optimize = optimize }).module("players") },
+                .{ .name = "replication", .module = b.dependency("replication", .{ .target = target, .optimize = optimize }).module("replication") },
                 .{ .name = "lightning_rod", .module = b.dependency("lightning_rod", .{ .target = target, .optimize = optimize }).module("lightning_rod") },
                 .{ .name = "vanilla", .module = vanilla },
                 .{ .name = "sessions", .module = sessions },

@@ -1,0 +1,5 @@
+.{ .client = "ProtocolFixture", .scenarios = .{.{
+    .name = "protocol-extension",
+    .peers = .{ "alice", "bob" },
+    .version = "1.21.8",
+}} }

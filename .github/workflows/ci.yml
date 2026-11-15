@@ -102,12 +102,13 @@ jobs:
         id: client
         with:
           path: ${{ runner.temp }}/ci-prepared/client-${{ matrix.release }}.tar.zst
-          key: ci-client-${{ matrix.release }}-${{ runner.os }}-${{ hashFiles('e2e/client/**', 'e2e/src/client_bundle.zig', 'e2e/tests/*/test.json', 'e2e/tests/*/client/**') }}
+          key: ci-client-${{ matrix.release }}-${{ runner.os }}-${{ hashFiles('e2e/client/**') }}
       - uses: ./.github/actions/dependencies
         if: steps.client.outputs.cache-hit != 'true'
         with:
           zig: 'false'
           jdk: 'true'
+      # Each test compiles its own fixtures against this runtime.
       - name: Build client and verify fixture API
         if: steps.client.outputs.cache-hit != 'true'
         working-directory: e2e/client
@@ -116,7 +117,7 @@ jobs:
           API: ${{ matrix.api }}
           FABRIC: ${{ matrix.fabric }}
         run: |
-          ./gradlew --no-daemon "-Pminecraft_version=$VERSION" "-Pclient_api=$API" "-Pfabric_api_version=$FABRIC" exportRuntime testFixtureApi
+          ./gradlew --no-daemon "-Pminecraft_version=$VERSION" "-Pclient_api=$API" "-Pfabric_api_version=$FABRIC" -Pfixtures= exportRuntime testFixtureApi
           mkdir -p "$RUNNER_TEMP/ci-prepared"
           tar --zstd -cf "$RUNNER_TEMP/ci-prepared/client-$VERSION.tar.zst" -C build/runtime .
           du -h "$RUNNER_TEMP/ci-prepared/client-$VERSION.tar.zst"
@@ -234,7 +235,7 @@ jobs:
         id: server
         with:
           path: ${{ runner.temp }}/ci-prepared/previous.tar.zst
-          key: ci-previous-safe-x86_64-baseline-${{ steps.previous.outputs.sha }}-${{ hashFiles('protocols/catalog.zig', 'build.zig.zon') }}
+          key: ci-previous-debug-x86_64-baseline-${{ steps.previous.outputs.sha }}-${{ hashFiles('protocols/catalog.zig', 'build.zig.zon') }}
       - uses: ./.github/actions/dependencies
         if: steps.server.outputs.cache-hit != 'true'
         with:
@@ -248,7 +249,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/previous-source" "$RUNNER_TEMP/previous-server/$PREVIOUS" "$RUNNER_TEMP/ci-prepared"
           git archive "$PREVIOUS" | tar -xf - -C "$RUNNER_TEMP/previous-source"
           (cd "$RUNNER_TEMP/previous-source" && bash "$GITHUB_WORKSPACE/.github/scripts/install-zig.sh" "$RUNNER_TEMP/previous-zig")
-          (cd "$RUNNER_TEMP/previous-source/examples/vanilla" && "$RUNNER_TEMP/previous-zig/zig" build --release=safe -Dtarget=x86_64-linux -Dcpu=baseline "-Dreleases=$releases")
+          (cd "$RUNNER_TEMP/previous-source/examples/vanilla" && "$RUNNER_TEMP/previous-zig/zig" build -Dtarget=x86_64-linux -Dcpu=baseline "-Dreleases=$releases")
           cp "$RUNNER_TEMP/previous-source/examples/vanilla/zig-out/bin/lightning_rod" "$RUNNER_TEMP/previous-server/$PREVIOUS/"
           tar --zstd -cf "$RUNNER_TEMP/ci-prepared/previous.tar.zst" -C "$RUNNER_TEMP/previous-server" .
       - uses: actions/upload-artifact@v7

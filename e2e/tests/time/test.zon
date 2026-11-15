@@ -1,0 +1,5 @@
+.{ .client = "TimeFixture", .scenarios = .{.{
+    .name = "time",
+    .peers = .{ "alice", "bob" },
+    .mixed_versions = true,
+}} }

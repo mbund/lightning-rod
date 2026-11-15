@@ -1,0 +1,5 @@
+.{ .client = "ChatFixture", .scenarios = .{ .{ .name = "chat-multi", .peers = .{ "alice", "bob" } }, .{
+    .name = "chat-legacy",
+    .peers = .{ "alice", "bob" },
+    .version = "1.21.5",
+} } }

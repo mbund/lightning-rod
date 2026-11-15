@@ -4,6 +4,8 @@ const host = @import("host");
 const protocols = @import("protocols");
 const sessions = @import("sessions");
 const vanilla = @import("vanilla");
+const chunk_delivery = @import("terrain").delivery_cache;
+const connection_plugins = @import("connection").plugins;
 const reload = @import("reload");
 const execve = @import("reload_execve");
 const islands_api = @import("island.zig");
@@ -83,7 +85,7 @@ pub fn run(init: std.process.Init, config: Configuration) !void {
     try vanilla.definition_provider.configureProtocols(content, protocols.Default, protocol_allocator, &selected);
     const session_plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.configured(protocols.Handshake, .{}),
-        vanilla.session_plugins(&selected),
+        connection_plugins(&selected),
         lightning_rod.plugin.configured(Presence, .{ .catalog = &catalog, .chat = chat }),
     });
     const Network = sessions.Threaded(protocols.Endpoint, @TypeOf(session_plugins), Router);
@@ -142,7 +144,7 @@ pub fn run(init: std.process.Init, config: Configuration) !void {
         worker.* = .{
             .io = init.io,
             .record_resources = try records.Resources.init(memory.allocator("records"), init.io, .{ .readers = 2, .writers = 2 }),
-            .delivery = try vanilla.chunk_delivery.Workspace.init(memory.allocator("delivery"), selected.values.len),
+            .delivery = try chunk_delivery.Workspace.init(memory.allocator("delivery"), selected.values.len),
             .index = index,
         };
         workers_initialized += 1;

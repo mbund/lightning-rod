@@ -5,8 +5,8 @@ const storage = @import("storage");
 const records = @import("records");
 const metrics = @import("metrics");
 const Worlds = @import("worlds").Worlds;
-const definitions = @import("vanilla_content.zig");
-const spawn_module = @import("spawn.zig");
+const definitions = @import("vanilla_definitions").defaults;
+const spawn_module = @import("vanilla_world").spawn;
 const Spawn = spawn_module.Spawn;
 
 const Source = struct {

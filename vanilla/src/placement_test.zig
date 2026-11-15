@@ -1,4 +1,4 @@
-const vanilla_content = @import("vanilla_content.zig");
+const vanilla_content = @import("vanilla_definitions").defaults;
 const std = @import("std");
 const storage = @import("storage");
 const records = @import("records");
@@ -7,28 +7,30 @@ const inventories = @import("inventories");
 const worlds = @import("worlds");
 const chunks = @import("chunks");
 const sessions = @import("sessions");
-const protocols = @import("protocols");
+const protocols = @import("minecraft_packets").protocols;
 const game_data = @import("game_data");
 const packets = @import("minecraft_packets");
-const Items = @import("items.zig").Items;
-const Players = @import("players.zig").Players;
-const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
-const Input = @import("input.zig").Input;
-const Placement = @import("placement.zig").Placement;
+const Items = @import("vanilla_items").items.Items;
+const Players = @import("players").players.Players;
+const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
+const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
+const Input = @import("players").input.Input;
+const Placement = @import("vanilla_blocks").placement.Placement;
 const minecraft_model = @import("minecraft_model");
-const raycast = @import("raycast.zig");
-const ItemActions = @import("item_actions.zig").ItemActions;
-const BlockActions = @import("block_actions.zig").BlockActions;
-const BlockSynchronization = @import("block_sync.zig").BlockSynchronization;
-const Streaming = @import("streaming.zig").Streaming;
-const Lighting = @import("lighting.zig").Lighting;
-const Doors = @import("doors.zig").Doors;
+const raycast = @import("vanilla_blocks").raycast;
+const ItemActions = @import("vanilla_items").item_actions.ItemActions;
+const BlockActions = @import("vanilla_blocks").block_actions.BlockActions;
+const BlockSynchronization = @import("terrain").block_sync.BlockSynchronization;
+const Streaming = @import("terrain").streaming.Streaming;
+const Lighting = @import("terrain").lighting.Lighting;
+const Doors = @import("vanilla_blocks").doors.Doors;
 const selected_protocols = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
 
 const Fixture = struct {
     service: *sessions.Service,
     input: *Input,
     players: *Players,
+    player_states: *PlayerStates,
     terrain: *chunks.Chunks,
     streaming: *Streaming,
     inventories: *inventories.Inventories,
@@ -52,15 +54,23 @@ const Fixture = struct {
             .input = input,
             .storage = try store.openSpace("players"),
             .worlds = dimensions,
-            .vanilla_worlds = undefined,
         });
         for (players.records, 0..) |*player, index| player.* = .{
             .handle = .{ .index = @intCast(index), .generation = 1 },
             .uuid = index + 1,
             .world = world,
             .stage = .ready,
-            .gamemode = .creative,
         };
+        const player_states = try PlayerStates.init(allocator, .{}, .{
+            .record_workspaces = workspaces,
+            .players = players,
+            .input = input,
+            .packets = encoding,
+            .storage = try store.openSpace(PlayerStates.id),
+            .worlds = dimensions,
+            .vanilla_worlds = undefined,
+        });
+        for (player_states.records, 0..) |*state, index| state.* = .{ .uuid = index + 1 };
         const ownership = try inventories.Inventories.init(allocator, io, .{ .cache_slots = 64, .cache_items = 8, .max_item_bytes = 1024 }, .{
             .metrics = registry,
             .storage = try store.openSpace("inventory"),
@@ -72,6 +82,7 @@ const Fixture = struct {
             .crafting = gameplay_definitions.crafting,
             .furnaces = gameplay_definitions.furnaces,
             .players = players,
+            .player_states = player_states,
             .inventories = ownership,
             .items = items,
             .equipment = undefined,
@@ -89,7 +100,8 @@ const Fixture = struct {
             .sessions = service,
             .packets = encoding,
             .worlds = dimensions,
-            .lighting = try Lighting.init(allocator, .{}, .{ .metrics = registry, .blocks = gameplay_definitions.blocks, .chunks = terrain, .worlds = dimensions }),
+            .blocks = &gameplay_definitions.blocks.published,
+            .lighting = try Lighting.init(allocator, .{}, .{ .metrics = registry, .blocks = &gameplay_definitions.blocks.published, .chunks = terrain, .worlds = dimensions }),
         });
         const blocks = try BlockSynchronization.init(allocator, io, .{
             .metrics = registry,
@@ -101,12 +113,13 @@ const Fixture = struct {
             .worlds = dimensions,
         }, .{ .delta_sections = 16, .queued_sections = 32 });
         const actions = try BlockActions.init(allocator, .{});
-        _ = try Doors.init(allocator, .{ .actions = actions, .chunks = terrain, .players = players, .worlds = dimensions, .synchronization = blocks });
+        _ = try Doors.init(allocator, .{ .actions = actions, .chunks = terrain, .players = players, .player_states = player_states, .worlds = dimensions, .synchronization = blocks });
         _ = try Placement.init(allocator, .{
-            .item_actions = try ItemActions.init(allocator, .{}, .{ .items = items }),
+            .item_actions = try ItemActions.init(allocator, .{}, .{ .player_states = player_states, .items = items }),
             .definitions = gameplay_definitions.placement,
             .menus = menus,
             .players = players,
+            .player_states = player_states,
             .input = input,
             .inventories = ownership,
             .items = items,
@@ -115,7 +128,7 @@ const Fixture = struct {
             .blocks = blocks,
             .actions = actions,
         });
-        return .{ .service = service, .input = input, .players = players, .terrain = terrain, .streaming = streaming, .inventories = ownership, .items = items, .other_world = other_world };
+        return .{ .service = service, .input = input, .players = players, .player_states = player_states, .terrain = terrain, .streaming = streaming, .inventories = ownership, .items = items, .other_world = other_world };
     }
 
     fn deinit(self: *Fixture) void {
@@ -211,9 +224,9 @@ test "block and door placement retain collision boundaries across chunk edges" {
                 .handle = if (case.connected) .{ .index = 1, .generation = 1 } else null,
                 .uuid = 2,
                 .world = if (case.elsewhere) fixture.other_world else fixture.players.records[0].world,
-                .gamemode = if (case.spectator) .spectator else .survival,
                 .position = .{ .x = @as(f64, @floatFromInt(coordinate)) + case.offset[0], .y = 65 + case.offset[1], .z = @as(f64, @floatFromInt(coordinate)) + case.offset[2] },
             };
+            fixture.player_states.records[1] = .{ .uuid = 2, .gamemode = if (case.spectator) .spectator else .survival };
             const placed = try fixture.place(position, item);
             try std.testing.expectEqual(!case.blocked, placed != 0);
             const upper = try fixture.terrain.getBlock(fixture.players.records[0].world, .{ .x = coordinate, .y = 66, .z = coordinate });

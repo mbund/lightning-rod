@@ -1,0 +1,1 @@
+.{ .client = "BossbarsFixture", .scenarios = .{.{ .name = "bossbars-multi", .peers = .{ "alice", "bob" } }} }

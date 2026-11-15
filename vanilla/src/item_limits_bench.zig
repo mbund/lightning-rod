@@ -1,4 +1,4 @@
-const vanilla_content = @import("vanilla_content.zig");
+const vanilla_content = @import("vanilla_definitions").defaults;
 const game_data = @import("game_data");
 const std = @import("std");
 const storage = @import("storage");
@@ -8,12 +8,12 @@ const metrics = @import("metrics");
 const entities = @import("entities");
 const worlds = @import("worlds");
 const chunks = @import("chunks");
-const Items = @import("items.zig").Items;
-const ItemEntities = @import("item_entities.zig").ItemEntities;
-const Players = @import("players.zig").Players;
-const ItemPhysics = @import("item_physics.zig").ItemPhysics;
-const ItemMerging = @import("item_merging.zig").ItemMerging;
-const tick_module = @import("item_tick.zig");
+const Items = @import("vanilla_items").items.Items;
+const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
+const Players = @import("players").players.Players;
+const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
+const ItemMerging = @import("vanilla_item_entities").item_merging.ItemMerging;
+const tick_module = @import("vanilla_inventory").item_tick;
 pub fn benchmark() !void {
     const io = std.testing.io;
     var output_buffer: [2048]u8 = undefined;

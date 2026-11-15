@@ -1,6 +1,16 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
+const BlockSynchronization = @import("terrain").block_sync.BlockSynchronization;
+const ChatInput = @import("commands").chat_input.ChatInput;
+const Chunks = @import("chunks").Chunks;
+const Inventories = @import("inventories").Inventories;
+const Operators = @import("commands").operators.Operators;
+const Players = @import("players").players.Players;
+const Reload = @import("reload").Reload;
+const Streaming = @import("terrain").streaming.Streaming;
+const BackgroundTerrain = @import("terrain").terrain.Terrain;
+const chunk_delivery = @import("terrain").delivery_cache;
 const sessions = @import("sessions");
 const reload = @import("reload");
 const catalog = @import("catalog.zig");
@@ -19,24 +29,25 @@ const operators = blk: {
     break :blk [_]u128{std.mem.readInt(u128, &digest, .big)};
 };
 
-const defaults = lightning_rod.plugin.remove(lightning_rod.plugin.replace(lightning_rod.plugin.remove(lightning_rod.plugin.remove(vanilla.plugins(), vanilla.ChatInput), vanilla.JoinLeaveMessages), .{lightning_rod.plugin.configured(Terrain, .{ .kind = .island })}), vanilla.Vanilla);
+const defaults = lightning_rod.plugin.remove(lightning_rod.plugin.replace(lightning_rod.plugin.remove(lightning_rod.plugin.remove(vanilla.plugins(), ChatInput), vanilla.JoinLeaveMessages), .{lightning_rod.plugin.configured(Terrain, .{ .kind = .island })}), vanilla.Vanilla);
 const Selections = lightning_rod.plugin.Compose(@Tuple(&.{ @TypeOf(defaults), lightning_rod.plugin.Selection(IslandCommands), lightning_rod.plugin.Selection(global_chat.GlobalChat) }));
 const Simulation = lightning_rod.Simulation(Selections);
 
-fn selections(content: vanilla.definition_provider.Dependencies, config: IslandCommands.Configuration, chat: *global_chat.Channel, resources: *records.Resources, delivery: *vanilla.chunk_delivery.Workspace, wakeup: *std.Io.Event, request: *reload.Request) !Selections {
+fn selections(content: vanilla.definition_provider.Dependencies, config: IslandCommands.Configuration, chat: *global_chat.Channel, resources: *records.Resources, delivery: *chunk_delivery.Workspace, wakeup: *std.Io.Event, request: *reload.Request) !Selections {
     const column_sections = (try content.dimensions.dimension("minecraft:overworld")).section_count;
     return lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(lightning_rod.plugin.replace(defaults, vanilla.definition_provider.selections(content)), .{
             lightning_rod.plugin.configured(records.Workspaces, .{ .shared = resources }),
-            lightning_rod.plugin.configured(vanilla.Streaming, .{ .delivery_workspace = delivery }),
-            lightning_rod.plugin.configured(vanilla.Operators, .{ .operators = &operators }),
+            lightning_rod.plugin.configured(Streaming, .{ .delivery_workspace = delivery }),
+            lightning_rod.plugin.configured(Operators, .{ .operators = &operators }),
             lightning_rod.plugin.configured(sessions.World, .{ .endpoint = config.routing.endpoints[config.index] }),
             lightning_rod.plugin.configured(Terrain, .{ .kind = if (config.index == 0) .hub else .island }),
-            lightning_rod.plugin.configured(vanilla.Reload, .{ .request = request }),
-            lightning_rod.plugin.configured(vanilla.Chunks, .{ .wakeup = wakeup, .cache_sections = column_sections * 2, .demand_sections = column_sections, .cache_groups = 4, .storage_group_side = 1 }),
-            lightning_rod.plugin.configured(vanilla.Inventories, .{ .cache_items = 6 }),
-            lightning_rod.plugin.configured(vanilla.BlockSynchronization, .{ .delta_sections = 32, .queued_sections = 32 }),
-            lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = if (config.index == 0) catalog.maximum_players else catalog.island_connections, .render_distance = 4, .world_border = 512, .spawn = .{ .x = 0.5, .y = 65, .z = 0.5 } }),
+            lightning_rod.plugin.configured(Reload, .{ .request = request }),
+            lightning_rod.plugin.configured(Chunks, .{ .wakeup = wakeup, .cache_sections = column_sections * 2, .demand_sections = column_sections, .cache_groups = 4, .storage_group_side = 1 }),
+            lightning_rod.plugin.configured(Inventories, .{ .cache_items = 6 }),
+            lightning_rod.plugin.configured(BlockSynchronization, .{ .delta_sections = 32, .queued_sections = 32 }),
+            lightning_rod.plugin.configured(Players, .{ .maximum = if (config.index == 0) catalog.maximum_players else catalog.island_connections, .render_distance = 4, .spawn = .{ .x = 0.5, .y = 65, .z = 0.5 } }),
+            lightning_rod.plugin.configured(vanilla.PlayerStates, .{ .world_border = 512 }),
         }),
         lightning_rod.plugin.configured(IslandCommands, config),
         lightning_rod.plugin.configured(global_chat.GlobalChat, .{ .channel = chat }),
@@ -49,10 +60,10 @@ pub const Island = struct {
     slot: ?*Slots.Slot = null,
     worlds: *Worlds,
     record_resources: *records.Resources,
-    delivery: *vanilla.chunk_delivery.Workspace,
+    delivery: *chunk_delivery.Workspace,
     io: std.Io,
     wakeup: *std.Io.Event,
-    terrain: ?vanilla.Terrain = null,
+    terrain: ?BackgroundTerrain = null,
     terrain_active: bool = false,
     routing: *sessions.Routing,
     catalog: *catalog.Catalog,
@@ -99,12 +110,12 @@ pub const Island = struct {
                 });
                 const definitions = vanilla.definition_provider.from(@TypeOf(simulation.*), simulation);
                 inline for (@typeInfo(vanilla.definition_provider.Dependencies).@"struct".field_names) |field| try @field(definitions, field).registry.validate();
-                self.terrain = .{ .chunks = simulation.get(vanilla.Chunks), .streaming = simulation.get(vanilla.Streaming), .blocks = simulation.get(vanilla.BlockSynchronization), .io = self.io };
+                self.terrain = .{ .chunks = simulation.get(Chunks), .streaming = simulation.get(Streaming), .blocks = simulation.get(BlockSynchronization), .io = self.io };
             },
             .retire => {
                 const simulation = self.simulation orelse return;
                 if (self.routing.endpoints[self.index].hasConnections()) return;
-                for (simulation.get(vanilla.Players).records) |player| if (player.handle != null) return;
+                for (simulation.get(Players).records) |player| if (player.handle != null) return;
                 if (self.terrain_active) self.terrain.?.stop();
                 self.terrain_active = false;
                 try simulation.unload(deadline);
@@ -145,7 +156,7 @@ pub const Pool = struct {
     pub const Worker = struct {
         io: std.Io,
         record_resources: *records.Resources,
-        delivery: *vanilla.chunk_delivery.Workspace,
+        delivery: *chunk_delivery.Workspace,
         index: usize,
         scratch: [256 * 1024]u8 = undefined,
         thread: ?std.Thread = null,
@@ -347,7 +358,7 @@ pub const Pool = struct {
     pub fn reconcile(self: *Pool, islands: []Island) !void {
         const retiring = for (islands) |*island| {
             if (island.simulation == null or island.routing.endpoints[island.index].hasConnections()) continue;
-            const occupied = for (island.simulation.?.get(vanilla.Players).records) |player| {
+            const occupied = for (island.simulation.?.get(Players).records) |player| {
                 if (player.handle != null) break true;
             } else false;
             if (!occupied) break true;

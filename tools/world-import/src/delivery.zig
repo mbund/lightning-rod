@@ -1,28 +1,30 @@
 const std = @import("std");
 const chunks = @import("chunks");
-const vanilla = @import("vanilla");
+const BlockProperties = @import("block_properties").BlockProperties;
+const chunk_delivery = @import("terrain").delivery_cache;
+const chunk_encoding = @import("terrain").chunk_encoding;
 const protocols = @import("protocols");
 const assert = std.debug.assert;
 
 pub const Compiler = struct {
-    workspace: *vanilla.chunk_delivery.Workspace,
-    catalog: vanilla.chunk_delivery.Catalog,
-    encoder: *vanilla.chunk_encoding.Workspace,
-    columns: [vanilla.chunk_delivery.batch_max]chunks.Light.Column = undefined,
+    workspace: *chunk_delivery.Workspace,
+    catalog: chunk_delivery.Catalog,
+    encoder: *chunk_encoding.Workspace,
+    columns: [chunk_delivery.batch_max]chunks.Light.Column = undefined,
     count: usize = 0,
 
-    pub fn init(allocator: std.mem.Allocator, selected: *protocols.Default) !Compiler {
-        var catalog = try vanilla.chunk_encoding.Workspace.initDeliveryCatalog(allocator, &selected.values);
+    pub fn init(allocator: std.mem.Allocator, selected: *protocols.Default, blocks: *const BlockProperties) !Compiler {
+        var catalog = try chunk_encoding.Workspace.initDeliveryCatalog(allocator, &selected.values);
         _ = try catalog.index(selected.values[0].number);
-        const workspace = try vanilla.chunk_delivery.Workspace.init(allocator, selected.values.len);
+        const workspace = try chunk_delivery.Workspace.init(allocator, selected.values.len);
         // A prewarm prepares every format the server accepts, not only the one asked for first.
         workspace.eager = true;
-        return .{ .workspace = workspace, .catalog = catalog, .encoder = try .init(allocator, 1 << 20, &selected.values) };
+        return .{ .workspace = workspace, .catalog = catalog, .encoder = try .init(allocator, 1 << 20, &selected.values, blocks) };
     }
 
     pub fn capacity(self: *const Compiler) usize {
         assert(self.catalog.initialized and self.catalog.variants.len > 0);
-        return vanilla.chunk_delivery.batch_max;
+        return chunk_delivery.batch_max;
     }
 
     pub fn begin(self: *Compiler, columns: []const chunks.Light.Column) !void {
@@ -33,7 +35,7 @@ pub const Compiler = struct {
     }
 
     fn restart(self: *Compiler) !void {
-        var requests: [vanilla.chunk_delivery.batch_max]vanilla.chunk_delivery.Request = undefined;
+        var requests: [chunk_delivery.batch_max]chunk_delivery.Request = undefined;
         for (self.columns[0..self.count], requests[0..self.count]) |column, *request| request.* = .{ .column = column, .protocol = self.catalog.variants[0].codec.number };
         _ = try self.workspace.begin(&self.catalog, requests[0..self.count]);
     }
@@ -42,12 +44,12 @@ pub const Compiler = struct {
         // The first format a column lacks compiles every missing one into a single bundle.
         // The rest of the pass finds theirs present, or compiles what did not fit.
         for (self.catalog.variants) |variant| {
-            self.encoder.compileFrame(self.workspace, column, frame, variant.codec.number) catch |err| switch (err) {
+            self.encoder.compileFrame(self.workspace, column, frame, variant.codec.number, null) catch |err| switch (err) {
                 error.DeliveryDeferred => {
                     if (self.workspace.used == 0) return error.DeliveryRecordTooLarge;
                     try self.finish(terrain);
                     try self.restart();
-                    try self.encoder.compileFrame(self.workspace, column, frame, variant.codec.number);
+                    try self.encoder.compileFrame(self.workspace, column, frame, variant.codec.number, null);
                 },
                 else => return err,
             };

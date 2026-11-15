@@ -2,6 +2,11 @@ const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const protocols = @import("protocols");
 const vanilla = @import("vanilla");
+const BlockEdit = @import("chunks").BlockEdit;
+const ChunkSource = @import("chunks").Source;
+const Chunks = @import("chunks").Chunks;
+const Players = @import("players").players.Players;
+const Section = @import("chunks").Section;
 const e2e = @import("e2e");
 const sessions = @import("sessions");
 const minecraft = @import("minecraft_model");
@@ -10,9 +15,10 @@ const spawn_offset = 4096;
 
 pub fn main(init: std.process.Init) !void {
     const args = try e2e.profile.arguments(init);
-    const distance: i32 = if (std.mem.eql(u8, args.fixture, "registry")) 2 else 32;
+    // Isolation matches the smaller radius its fixture asks for.
+    const distance: i32 = if (std.mem.eql(u8, args.fixture, "registry")) 2 else if (std.mem.eql(u8, args.fixture, "isolation")) 12 else 32;
     const terrain_plugins = lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-        lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = distance, .spawn_for_player = spawn }),
+        lightning_rod.plugin.configured(Players, Players.Configuration{ .render_distance = distance, .spawn_for_player = spawn }),
         lightning_rod.plugin.configured(vanilla.Flat, .{ .biomes = biomePattern }),
     });
     if (std.mem.eql(u8, args.fixture, "simulations")) {
@@ -35,12 +41,12 @@ pub fn main(init: std.process.Init) !void {
     try e2e.profile.run(init, plugins, .{ .plaintext = !std.mem.eql(u8, args.fixture, "encryption"), .compression_threshold = if (std.mem.eql(u8, args.fixture, "isolation")) null else 256, .generation_workers = if (std.mem.eql(u8, args.fixture, "parallel")) 4 else 0 });
 }
 
-fn spawn(player: *const vanilla.Players.Player) minecraft.Position {
+fn spawn(player: *const Players.Player) minecraft.Position {
     const coordinate: f64 = if (std.mem.eql(u8, player.name[0..player.name_len], "alice")) -spawn_offset + 0.5 else spawn_offset + 0.5;
     return .{ .x = coordinate, .y = 65, .z = coordinate };
 }
 
-fn biomePattern(_: vanilla.Section, values: *[64]u16) void {
+fn biomePattern(_: Section, values: *[64]u16) void {
     const names = [_][]const u8{ "minecraft:plains", "minecraft:desert", "minecraft:forest" };
     for (values, 0..) |*biome, index| biome.* = @intCast(protocols.registry.biomeId(names[index % names.len]).?);
 }
@@ -49,20 +55,20 @@ fn biomePattern(_: vanilla.Section, values: *[64]u16) void {
 const NoGeneration = struct {
     pub const id = vanilla.Flat.id;
     pub const Configuration = struct {};
-    pub const Dependencies = struct { chunks: *vanilla.Chunks };
+    pub const Dependencies = struct { chunks: *Chunks };
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*NoGeneration {
         const self = try allocator.create(NoGeneration);
         self.* = .{};
-        deps.chunks.setSource(vanilla.ChunkSource.init(self, read));
+        deps.chunks.setSource(ChunkSource.init(self, read));
         return self;
     }
 
-    fn read(self: *NoGeneration, io: std.Io, batch: vanilla.ChunkSource.Batch) void {
+    fn read(self: *NoGeneration, io: std.Io, batch: ChunkSource.Batch) void {
         for (batch.requests) |*request| request.result = self.readOne(io, request.section, request.output);
     }
 
-    fn readOne(_: *NoGeneration, _: std.Io, _: vanilla.Section, _: []u8) !usize {
+    fn readOne(_: *NoGeneration, _: std.Io, _: Section, _: []u8) !usize {
         return error.E2eUnexpectedTerrainGeneration;
     }
 };
@@ -72,8 +78,8 @@ const Probe = struct {
     pub const Configuration = struct { disk: bool = false };
     pub const Dependencies = struct {
         control: *e2e.Control,
-        players: *vanilla.Players,
-        chunks: *vanilla.Chunks,
+        players: *Players,
+        chunks: *Chunks,
         vanilla_worlds: *vanilla.VanillaWorlds,
     };
     disk: bool,
@@ -86,7 +92,7 @@ const Probe = struct {
         if (!config.disk) {
             const name = if (protocols.registry.itemId("minecraft:chain") != null) "minecraft:chain" else "minecraft:iron_chain";
             for ([_]i32{ -spawn_offset, spawn_offset }) |coordinate| {
-                var edits: [6]vanilla.BlockEdit = undefined;
+                var edits: [6]BlockEdit = undefined;
                 for (&edits, 0..) |*edit, index| {
                     var buffer: [128]u8 = undefined;
                     const state_name = try std.fmt.bufPrint(&buffer, "{s}[axis={s},waterlogged={s}]", .{ name, ([_][]const u8{ "x", "y", "z" })[index / 2], if (index % 2 == 0) "true" else "false" });

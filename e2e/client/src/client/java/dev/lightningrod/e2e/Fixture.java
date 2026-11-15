@@ -14,8 +14,19 @@ abstract class Fixture {
 
     Fixture(Recorder recorder) { r = recorder; client = new TestClient(recorder); }
 
+    // The class a test names in its manifest, compiled from the test's own client directory into
+    // this package and class loader.
     static Fixture create(Recorder r, String name) {
-        return DiscoveredTests.create(r, name);
+        if (name == null || name.isBlank()) throw new IllegalArgumentException("mcc.fixture names no fixture class");
+        try {
+            Class<?> type = Class.forName(Fixture.class.getPackageName() + "." + name, true, Fixture.class.getClassLoader());
+            if (!Fixture.class.isAssignableFrom(type)) throw new IllegalArgumentException("Not a fixture: " + name);
+            var constructor = type.getDeclaredConstructor(Recorder.class);
+            constructor.setAccessible(true);
+            return (Fixture) constructor.newInstance(r);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalArgumentException("Cannot create fixture " + name, e);
+        }
     }
 
     void poll(Minecraft game) {}

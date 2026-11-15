@@ -11,6 +11,8 @@
         .host = .{ .path = "../host" },
         .sessions = .{ .path = "../sessions" },
         .vanilla = .{ .path = "../vanilla" },
+        .chunks = .{ .path = "../chunks" },
+        .terrain = .{ .path = "../terrain" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

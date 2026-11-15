@@ -1,0 +1,5 @@
+.{ .client = "ExperienceFixture", .scenarios = .{ .{ .name = "experience-multi", .peers = .{ "alice", "bob" } }, .{
+    .name = "experience-mixed",
+    .peers = .{ "alice", "bob" },
+    .mixed_versions = true,
+} } }

@@ -1,0 +1,35 @@
+const PlacementDefinition = @import("vanilla_blocks").placement_registry.Definition;
+const MiningDefinition = @import("vanilla_blocks").mining_registry.Definition;
+const BlockState = @import("vanilla_content").blocks.State;
+const ItemDefinition = @import("vanilla_items").item_registry.Definition;
+const game_data = @import("game_data");
+const lighting = @import("lighting");
+const recipes = @import("vanilla_crafting").recipes;
+const item_registry = @import("vanilla_items").item_registry;
+const tags = @import("vanilla_content").content_tags;
+const definitions = @import("vanilla_content").content_definitions;
+const registries = @import("vanilla_content").content_registries;
+const enchantments = @import("vanilla_items").enchantment_effects;
+const unlocks = @import("vanilla_crafting").recipe_unlocks;
+const loot = @import("vanilla_items").loot;
+
+pub const Definitions = struct {
+    items: []const ItemDefinition = &.{},
+    block_states: []const BlockState = &.{},
+    visibility: []const []const bool = &.{},
+    physics: []const []const game_data.physics_data.State = &.{},
+    lighting: []const lighting.Registry = &.{},
+    mining: []const MiningDefinition = &.{},
+    placement: []const PlacementDefinition = &.{},
+    recipes: []const recipes.Entry = &.{},
+    fuels: []const recipes.FuelDefinition = &.{},
+    remainders: []const item_registry.RemainderDefinition = &.{},
+    fuel_conversions: []const recipes.FuelConversionDefinition = &.{},
+    tags: []const tags.Definition = &.{},
+    dimension_types: []const definitions.DimensionType = &.{},
+    registries: []const registries.Registries.Definition = &.{},
+    client_registries: []const registries.Registries.Presentation = &.{},
+    enchantments: []const enchantments.Effects.Entry = &.{},
+    loot_tables: []const loot.Definition = &.{},
+    recipe_unlocks: []const unlocks.Definition = &.{},
+};

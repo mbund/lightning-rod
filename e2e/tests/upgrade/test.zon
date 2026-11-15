@@ -1,0 +1,9 @@
+.{ .client = "UpgradeFixture", .scenarios = .{.{
+    .name = "upgrade",
+    .peers = .{
+        "alice",
+        "bob",
+        "newcomer",
+    },
+    .upgrade = true,
+}} }

@@ -2,6 +2,7 @@ const std = @import("std");
 const nbt = @import("nbt");
 const anvil = @import("anvil");
 const vanilla = @import("vanilla");
+const Players = @import("players").players.Players;
 const level = @import("level.zig");
 const book = @import("book.zig");
 const fields = @import("nbt.zig");
@@ -61,7 +62,7 @@ fn one(owner: *world_import.Import, scratch: std.mem.Allocator, doc: nbt.Documen
     identity.value_ptr.* = original;
     var key: [16]u8 = undefined;
     std.mem.writeInt(u128, &key, uuid, .little);
-    var previous: [vanilla.Players.saved_size]u8 = undefined;
+    var previous: [Players.saved_size]u8 = undefined;
     if (try owner.players.get(&key, &previous) != null) return;
     const dimension = try (try fields.field(doc, root, "Dimension")).string();
     const world = owner.worlds.find(dimension) orelse {
@@ -80,30 +81,30 @@ fn one(owner: *world_import.Import, scratch: std.mem.Allocator, doc: nbt.Documen
     if (mode < 0 or mode > 3 or slot < 0 or slot > 8) return error.InvalidPlayer;
     const health: f32 = if (root.childNamed(doc.nodes, "Health")) |value| @floatCast(try fields.number(value)) else 20;
     if (health < 0 or health > 20) return error.InvalidPlayerHealth;
-    var player: vanilla.Players.Player = .{
+    var player: Players.Player = .{
         .uuid = uuid,
         .world = world.id,
         .position = .{ .x = position[0], .y = position[1], .z = position[2] },
         .rotation = .{ .yaw = @floatCast(@mod(yaw + 180, 360) - 180), .pitch = @floatCast(std.math.clamp(pitch, -90, 90)) },
-        .gamemode = @fromBackingInt(@intCast(mode)),
-        .selected_slot = @intCast(slot),
-        .health = health,
         .on_ground = try fields.optionalInt(doc, root, "OnGround", 0) != 0,
     };
     player.flags.burning = try fields.optionalInt(doc, root, "Fire", 0) > 0;
     player.flags.glowing = try fields.optionalInt(doc, root, "Glowing", 0) != 0;
     player.flags.gliding = try fields.optionalInt(doc, root, "FallFlying", 0) != 0;
-    if (root.childNamed(doc.nodes, "XpP")) |value| player.experience.progress = @floatCast(try fields.number(value));
-    player.experience.level = std.math.cast(i32, try fields.optionalInt(doc, root, "XpLevel", 0)) orelse return error.InvalidExperience;
-    player.experience.total = std.math.cast(i32, try fields.optionalInt(doc, root, "XpTotal", 0)) orelse return error.InvalidExperience;
-    player.experience.score = std.math.cast(i32, try fields.optionalInt(doc, root, "Score", 0)) orelse return error.InvalidExperience;
-    const points = player.experience.encode();
-    _ = try @TypeOf(player.experience).decode(&points);
+    var state: vanilla.PlayerStates.State = .{ .uuid = uuid, .gamemode = @fromBackingInt(@intCast(mode)), .selected_slot = @intCast(slot), .health = health };
+    if (root.childNamed(doc.nodes, "XpP")) |value| state.experience.progress = @floatCast(try fields.number(value));
+    state.experience.level = std.math.cast(i32, try fields.optionalInt(doc, root, "XpLevel", 0)) orelse return error.InvalidExperience;
+    state.experience.total = std.math.cast(i32, try fields.optionalInt(doc, root, "XpTotal", 0)) orelse return error.InvalidExperience;
+    state.experience.score = std.math.cast(i32, try fields.optionalInt(doc, root, "Score", 0)) orelse return error.InvalidExperience;
+    const points = state.experience.encode();
+    _ = try @TypeOf(state.experience).decode(&points);
     if (root.childNamed(doc.nodes, "Inventory")) |inventory| try items.inventory(owner, scratch, doc, inventory, uuid, true, 46);
     if (root.childNamed(doc.nodes, "EnderItems")) |inventory| if (inventory.child_count != 0) try owner.unsupported("player inventory", "ender chest");
     const bytes = player.encode();
-    const experience_key = vanilla.Players.experienceKey(uuid);
-    try owner.players.putBatch(&.{ .{ .key = &key, .value = &bytes }, .{ .key = &experience_key, .value = &points } });
+    const body = state.encode();
+    const experience_key = vanilla.PlayerStates.experienceKey(uuid);
+    try owner.players.putBatch(&.{.{ .key = &key, .value = &bytes }});
+    try owner.player_states.putBatch(&.{ .{ .key = &key, .value = &body }, .{ .key = &experience_key, .value = &points } });
     try book.read(owner, scratch, doc, root, original, uuid);
     owner.counts.players += 1;
 }

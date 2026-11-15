@@ -2,6 +2,10 @@ const std = @import("std");
 const inventories = @import("inventories");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
+const Chunks = @import("chunks").Chunks;
+const Inventories = @import("inventories").Inventories;
+const Players = @import("players").players.Players;
+const Reload = @import("reload").Reload;
 const protocols = @import("protocols");
 const sessions = @import("sessions");
 const e2e = @import("e2e");
@@ -14,7 +18,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .directory = try std.fs.path.join(init.arena.allocator(), &.{ directory, "pack" }) },
     };
     const defaults = lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-        lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 1, .render_distance = 2, .gamemode = .survival }),
+        lightning_rod.plugin.configured(Players, .{ .maximum = 1, .render_distance = 2 }),
+        lightning_rod.plugin.configured(vanilla.PlayerStates, .{ .gamemode = .survival }),
     });
     const plugins = lightning_rod.plugin.compose(.{
         defaults,
@@ -35,11 +40,11 @@ const ChargedRecipe = struct {
     pub fn display(_: *ChargedRecipe, allocator: std.mem.Allocator, parameters: *const Parameters) !vanilla.recipes.Display {
         var input: vanilla.custom_data.Editor = .{ .allocator = allocator };
         try input.setInt("charge", parameters.charge);
-        const input_components = try allocator.alloc(vanilla.recipes.Component, 1);
+        const input_components = try allocator.alloc(vanilla.item_data.Component, 1);
         input_components[0] = .{ .key = vanilla.item_data.key(.custom_data), .value = try input.finish() };
         var output: vanilla.custom_data.Editor = .{ .allocator = allocator };
         try output.setInt("charge", try std.math.add(i32, parameters.charge, parameters.increment));
-        const output_components = try allocator.alloc(vanilla.recipes.Component, 1);
+        const output_components = try allocator.alloc(vanilla.item_data.Component, 1);
         output_components[0] = .{ .key = vanilla.item_data.key(.custom_data), .value = try output.finish() };
         const ingredients = try allocator.alloc(vanilla.recipes.DisplayInput, 1);
         ingredients[0] = .{ .input = .{ .item = "minecraft:paper" }, .components = input_components };
@@ -96,14 +101,14 @@ const Probe = struct {
         item_definitions: *vanilla.Items.Registry,
         dimensions: *vanilla.Dimensions,
         datapacks: *vanilla.Datapacks,
-        players: *vanilla.Players,
-        inventories: *vanilla.Inventories,
+        players: *Players,
+        inventories: *Inventories,
         items: *vanilla.Items,
         menus: *vanilla.PlayerInventory,
         book: *vanilla.RecipeBook,
         control: *e2e.Control,
-        reload: *vanilla.Reload,
-        chunks: *vanilla.Chunks,
+        reload: *Reload,
+        chunks: *Chunks,
     };
     deps: Dependencies,
     recipe: ChargedRecipe = .{},

@@ -1,11 +1,14 @@
+//! e2e-suite MATRIX ROOT ZIG [ZIG BUILD OPTIONS]...
+//! Runs every matrix entry with its test's own build, one after another.
+
 const std = @import("std");
 
-const Case = struct { scenario: []const u8, version: []const u8 };
+const Case = struct { scenario: []const u8, directory: []const u8, version: []const u8 };
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
-    if (args.len < 3) return error.ExpectedMatrixAndZig;
+    if (args.len < 4) return error.ExpectedMatrixRootAndZig;
     const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, args[1], allocator, .limited(1024 * 1024));
     const matrix = try std.json.parseFromSlice(struct { include: []const Case }, allocator, bytes, .{ .ignore_unknown_fields = true });
     const cases = matrix.value.include;
@@ -14,10 +17,14 @@ pub fn main(init: std.process.Init) !void {
     for (cases, 1..) |case, index| {
         std.debug.print("E2E [{d}/{d}] {s} / {s}\n", .{ index, cases.len, case.scenario, case.version });
         var argv: std.ArrayList([]const u8) = .empty;
-        try argv.appendSlice(allocator, &.{ "timeout", "--signal=INT", "--kill-after=10s", "900s", args[2], "build" });
-        try argv.appendSlice(allocator, args[3..]);
+        try argv.appendSlice(allocator, &.{ "timeout", "--signal=INT", "--kill-after=10s", "900s", args[3], "build" });
+        try argv.appendSlice(allocator, args[4..]);
         try argv.appendSlice(allocator, &.{ "e2e", try std.fmt.allocPrint(allocator, "-Dscenario={s}", .{case.scenario}), try std.fmt.allocPrint(allocator, "-Dclient-version={s}", .{case.version}) });
-        var child = try std.process.spawn(init.io, .{ .argv = argv.items, .environ_map = init.environ_map });
+        var child = try std.process.spawn(init.io, .{
+            .argv = argv.items,
+            .cwd = .{ .path = try std.fs.path.join(allocator, &.{ args[2], case.directory }) },
+            .environ_map = init.environ_map,
+        });
         const term = try child.wait(init.io);
         if (term != .exited or term.exited != 0) try failures.append(allocator, case);
     }

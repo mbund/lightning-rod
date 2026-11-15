@@ -13,7 +13,6 @@ pub fn build(b: *std.Build) void {
     packets.module("minecraft_packets").addImport("protocols", protocols.module("protocols"));
     const profile = b.dependency("lightning_rod_linux", .{ .target = target, .optimize = optimize });
     const vanilla = b.dependency("lightning_rod_vanilla_1_21_6", .{ .target = target, .optimize = optimize });
-    vanilla.module("lightning_rod_vanilla_1_21_6").addImport("protocols", protocols.module("protocols"));
     const executable = b.addExecutable(.{
         .name = "lightning_rod",
         .root_module = b.createModule(.{
@@ -21,6 +20,12 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "chunks", .module = b.dependency("chunks", .{ .target = target, .optimize = optimize }).module("chunks") },
+                .{ .name = "commands", .module = b.dependency("commands", .{ .target = target, .optimize = optimize }).module("commands") },
+                .{ .name = "connection", .module = b.dependency("connection", .{ .target = target, .optimize = optimize }).module("connection") },
+                .{ .name = "players", .module = b.dependency("players", .{ .target = target, .optimize = optimize }).module("players") },
+                .{ .name = "replication", .module = b.dependency("replication", .{ .target = target, .optimize = optimize }).module("replication") },
+                .{ .name = "terrain", .module = b.dependency("terrain", .{ .target = target, .optimize = optimize }).module("terrain") },
                 .{ .name = "minecraft_java", .module = b.dependency("minecraft_java", .{ .target = target, .optimize = optimize }).module("minecraft_java") },
                 .{ .name = "protocols", .module = protocols.module("protocols") },
                 .{ .name = "lightning_rod", .module = lightning_rod.module("lightning_rod") },

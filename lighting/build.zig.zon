@@ -3,5 +3,8 @@
     .version = "0.1.0",
     .fingerprint = 0xcb0815734b7a6fde,
     .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .chunks = .{ .path = "../chunks" },
+    },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

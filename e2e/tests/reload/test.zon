@@ -1,0 +1,12 @@
+.{ .client = "ReloadFixture", .scenarios = .{ .{
+    .name = "reload-multi",
+    .fixture = "reload",
+    .peers = .{ "alice", "bob" },
+    .reload = true,
+}, .{
+    .name = "reload-creative",
+    .fixture = "reload_creative",
+    .peers = .{ "alice", "bob" },
+    .reload = true,
+    .protocol_mismatch = true,
+} } }

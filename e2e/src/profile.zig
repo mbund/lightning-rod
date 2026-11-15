@@ -6,6 +6,11 @@ const protocols = @import("protocols");
 const profile = @import("e2e_profile");
 const sessions = @import("sessions");
 const vanilla = @import("vanilla");
+const LoginEncryption = @import("connection").session_encryption.LoginEncryption;
+const Players = @import("players").players.Players;
+const Reload = @import("reload").Reload;
+const Status = @import("connection").session_status.Status;
+const connection_plugins = @import("connection").plugins;
 const java = @import("minecraft_java");
 const execution = @import("execution");
 
@@ -23,7 +28,7 @@ pub const Arguments = struct { fixture: []const u8 = "", port: u16 = 0 };
 
 pub fn plugins() @TypeOf(vanilla.plugins()) {
     return lightning_rod.plugin.replace(vanilla.plugins(), .{
-        lightning_rod.plugin.configured(vanilla.Players, .{ .render_distance = 2 }),
+        lightning_rod.plugin.configured(Players, .{ .render_distance = 2 }),
         lightning_rod.plugin.configured(vanilla.Spawn, .{ .radius = 0 }),
     });
 }
@@ -63,8 +68,8 @@ pub fn run(init: std.process.Init, selections: anytype, config: Configuration) !
     const protocols_timer = try registry.timer(.{ .name = "bootstrap.protocols", .description = "Initialize protocol tables and canonical registry translations" });
     const encryption_timer = try registry.timer(.{ .name = "bootstrap.encryption", .description = "Read and initialize the RSA private key" });
     if (config.generation_workers > 64) return error.InvalidGenerationWorkers;
-    const play_plugins = lightning_rod.plugin.insertAfter(selections, vanilla.Reload, lightning_rod.plugin.configured(control.Control, .{}));
-    const players_index = comptime lightning_rod.plugin.indexOfId(@TypeOf(selections), vanilla.Players.id).?;
+    const play_plugins = lightning_rod.plugin.insertAfter(selections, Reload, lightning_rod.plugin.configured(control.Control, .{}));
+    const players_index = comptime lightning_rod.plugin.indexOfId(@TypeOf(selections), Players.id).?;
     const arguments_started = arguments_timer.start();
     const args = try arguments(init);
     arguments_started.end();
@@ -78,9 +83,9 @@ pub fn run(init: std.process.Init, selections: anytype, config: Configuration) !
     encryption_started.end();
     const session_plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.configured(protocols.Handshake, protocols.Handshake.Configuration{}),
-        lightning_rod.plugin.replace(vanilla.session_plugins(&selected), .{
-            lightning_rod.plugin.configured(vanilla.LoginEncryption, vanilla.LoginEncryption.Configuration{ .key = if (key) |*value| value else null }),
-            lightning_rod.plugin.configured(vanilla.Status, vanilla.Status.Configuration{ .description = "E2E Vanilla Status" }),
+        lightning_rod.plugin.replace(connection_plugins(&selected), .{
+            lightning_rod.plugin.configured(LoginEncryption, LoginEncryption.Configuration{ .key = if (key) |*value| value else null }),
+            lightning_rod.plugin.configured(Status, Status.Configuration{ .description = "E2E Vanilla Status" }),
         }),
     });
     total.observe(@intCast(std.Io.Clock.now(.awake, init.io).nanoseconds - started.nanoseconds));

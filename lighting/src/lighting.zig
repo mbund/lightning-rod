@@ -2,6 +2,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 pub const testing = @import("testing.zig");
 pub const patch = @import("patch.zig");
+pub const light_store = @import("light_store.zig");
+pub const section_views = @import("section_views.zig");
 const reference = testing.reference;
 
 pub const lanes = 16;
@@ -287,11 +289,8 @@ pub const Engine = struct {
     edit_scratch: [batch_max]EditIndex = undefined,
     edit_counts: [1 << @bitSizeOf(EditDigit)]u16 = undefined,
 
-    pub fn init(allocator: std.mem.Allocator, dimensions: Dimensions, registry: Registry) !Engine {
-        if (dimensions.x == 0 or dimensions.x % lanes != 0 or dimensions.y == 0 or dimensions.z == 0) return error.InvalidDimensions;
-        const plane = try std.math.mul(usize, dimensions.x / lanes, dimensions.z);
-        const count = try std.math.mul(usize, plane, dimensions.y);
-        if (count > (none - 1) / lanes) return error.InvalidDimensions;
+    /// Rules the engine can light by. Content checks its rules here before publishing them.
+    pub fn validate(registry: Registry) !void {
         if (registry.states.len == 0 or registry.states.len > 65536 or registry.faces == 0 or registry.occlusion.len != try std.math.mul(usize, registry.faces, registry.faces)) return error.InvalidRegistry;
         if (registry.states[0].opacity != 0 or registry.states[0].emission != 0 or !std.mem.allEqual(u16, &registry.states[0].faces, 0)) return error.InvalidAirState;
         if (registry.occlusion[0] != 0) return error.InvalidEmptyFace;
@@ -299,13 +298,35 @@ pub const Engine = struct {
             if (properties.opacity > 15 or properties.emission > 15) return error.InvalidRegistry;
             for (properties.faces) |face| if (face >= registry.faces) return error.InvalidRegistry;
         }
-        const materials = try allocator.alloc(Material, registry.states.len);
-        errdefer allocator.free(materials);
+    }
+
+    fn fillMaterials(registry: Registry, materials: []Material) void {
+        assert(registry.states.len == materials.len);
         for (registry.states, materials) |properties, *material| material.* = .{
             .opacity = @intCast(properties.opacity),
             .emission = @intCast(properties.emission),
             .shaped = !std.mem.allEqual(u16, &properties.faces, 0),
         };
+    }
+
+    /// New rules for how light passes blocks, for as many states as before. Light already
+    /// in the engine stays as it was until it is solved again.
+    pub fn changeRegistry(self: *Engine, registry: Registry) !void {
+        try validate(registry);
+        if (registry.states.len != self.materials.len) return error.InvalidRegistry;
+        fillMaterials(registry, self.materials);
+        self.registry = registry;
+    }
+
+    pub fn init(allocator: std.mem.Allocator, dimensions: Dimensions, registry: Registry) !Engine {
+        if (dimensions.x == 0 or dimensions.x % lanes != 0 or dimensions.y == 0 or dimensions.z == 0) return error.InvalidDimensions;
+        const plane = try std.math.mul(usize, dimensions.x / lanes, dimensions.z);
+        const count = try std.math.mul(usize, plane, dimensions.y);
+        if (count > (none - 1) / lanes) return error.InvalidDimensions;
+        try validate(registry);
+        const materials = try allocator.alloc(Material, registry.states.len);
+        errdefer allocator.free(materials);
+        fillMaterials(registry, materials);
         const rows = try allocator.alloc(Row, count);
         errdefer allocator.free(rows);
         const blocks = try allocator.alloc(BlockRow, count);
@@ -2129,4 +2150,45 @@ test "section descriptors match dense lighting without reading uniform backing s
 
 test {
     _ = patch;
+}
+
+test "an engine whose rules change lights by the new rules as a fresh engine does" {
+    const bright = [_]Properties{
+        .{ .opacity = 0, .emission = 0, .faces = @splat(0) },
+        .{ .opacity = 15, .emission = 0, .faces = @splat(0) },
+        .{ .opacity = 0, .emission = 15, .faces = @splat(0) },
+    };
+    var dim = bright;
+    dim[1].opacity = 2;
+    dim[2].emission = 7;
+    const dimensions: Dimensions = .{ .x = 48, .y = 32, .z = 48 };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const blocks = try allocator.alloc(u16, dimensions.volume());
+    for (blocks, 0..) |*state, index| {
+        const x = index % 48;
+        const y = index / (48 * 48);
+        const z = index / 48 % 48;
+        state.* = if (x == 20 and y == 12 and z == 20) 2 else if (y < 8 or (x == 24 and y < 20)) 1 else 0;
+    }
+    var engine = try Engine.init(allocator, dimensions, .{ .states = &bright, .faces = 1, .occlusion = &.{0} });
+    try engine.load(.{ .dense = blocks });
+    engine.relight(true);
+    try engine.changeRegistry(.{ .states = &dim, .faces = 1, .occlusion = &.{0} });
+    try engine.load(.{ .dense = blocks });
+    engine.relight(true);
+    var fresh = try Engine.init(allocator, dimensions, .{ .states = &dim, .faces = 1, .occlusion = &.{0} });
+    try fresh.load(.{ .dense = blocks });
+    fresh.relight(true);
+    for ([_]Layer{ .block, .sky }) |layer| for (0..blocks.len) |index| {
+        try std.testing.expectEqual(fresh.get(layer, index), engine.get(layer, index));
+    };
+    try std.testing.expectEqual(@as(u4, 7), engine.get(.block, (12 * 48 + 20) * 48 + 20));
+    try std.testing.expectError(error.InvalidRegistry, engine.changeRegistry(.{ .states = dim[0..2], .faces = 1, .occlusion = &.{0} }));
+}
+
+test {
+    _ = light_store;
+    _ = section_views;
 }

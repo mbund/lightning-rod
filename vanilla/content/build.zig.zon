@@ -1,0 +1,17 @@
+.{
+    .name = .vanilla_content,
+    .fingerprint = 0x96eb98caf91bf16e,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .block_properties = .{ .path = "../../block_properties" },
+        .chunks = .{ .path = "../../chunks" },
+        .game_data = .{ .path = "../../game_data" },
+        .lighting = .{ .path = "../../lighting" },
+        .lightning_rod = .{ .path = "../.." },
+        .records = .{ .path = "../../records" },
+        .storage = .{ .path = "../../storage" },
+        .worlds = .{ .path = "../../worlds" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

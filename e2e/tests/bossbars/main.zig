@@ -2,12 +2,14 @@ const sessions = @import("sessions");
 const e2e = @import("e2e");
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
-const vanilla = @import("vanilla");
+const Bossbars = @import("bossbars").bossbars.Bossbars;
+const Players = @import("players").players.Players;
+const Reload = @import("reload").Reload;
 
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 2, .render_distance = 2 }),
+            lightning_rod.plugin.configured(Players, .{ .maximum = 2, .render_distance = 2 }),
         }),
         lightning_rod.plugin.configured(Probe, .{}),
     });
@@ -18,17 +20,17 @@ const Probe = struct {
     pub const id = "e2e:bossbars";
     pub const Configuration = struct {};
     pub const Dependencies = struct {
-        players: *vanilla.Players,
-        bars: *vanilla.Bossbars,
+        players: *Players,
+        bars: *Bossbars,
         control: *e2e.Control,
-        reload: *vanilla.Reload,
+        reload: *Reload,
     };
     const Phase = enum { waiting, created, updated, alice, bob, removed, recreated, reloaded };
 
     deps: Dependencies,
     phase: Phase = .waiting,
     observed: u2 = 0,
-    bar: ?vanilla.Bossbars.Handle = null,
+    bar: ?Bossbars.Handle = null,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Probe {
         const self = try allocator.create(Probe);

@@ -1,0 +1,9 @@
+.{ .client = "TeleportFixture", .scenarios = .{ .{
+    .name = "teleport-multi",
+    .fixture = "teleport",
+    .peers = .{ "alice", "bob" },
+}, .{
+    .name = "teleport-world-isolation",
+    .fixture = "teleport",
+    .peers = .{ "alice", "bob" },
+} } }

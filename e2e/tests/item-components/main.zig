@@ -3,12 +3,15 @@ const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const protocols = @import("protocols");
 const vanilla = @import("vanilla");
+const Inventories = @import("inventories").Inventories;
+const Players = @import("players").players.Players;
+const Reload = @import("reload").Reload;
 const sessions = @import("sessions");
 
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(lightning_rod.plugin.remove(e2e.profile.plugins(), vanilla.Lore), .{
-            lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 2, .render_distance = 2 }),
+            lightning_rod.plugin.configured(Players, .{ .maximum = 2, .render_distance = 2 }),
         }),
         lightning_rod.plugin.configured(Economy, .{}),
         lightning_rod.plugin.configured(PriceLore, .{}),
@@ -25,11 +28,11 @@ const Economy = struct {
     pub const Configuration = struct {};
     pub const Dependencies = struct {
         items: *vanilla.Items,
-        inventories: *vanilla.Inventories,
+        inventories: *Inventories,
         menus: *vanilla.PlayerInventory,
-        players: *vanilla.Players,
+        players: *Players,
         control: *e2e.Control,
-        reload: *vanilla.Reload,
+        reload: *Reload,
     };
 
     deps: Dependencies,

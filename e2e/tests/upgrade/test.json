@@ -1,4 +1,0 @@
-{
-  "client": "UpgradeFixture",
-  "variants": [{ "name": "upgrade", "upgrade": true, "peers": ["alice", "bob", "newcomer"] }]
-}

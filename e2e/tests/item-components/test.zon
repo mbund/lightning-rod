@@ -1,0 +1,5 @@
+.{ .client = "ItemComponentsFixture", .scenarios = .{.{
+    .name = "item-components",
+    .peers = .{ "alice", "bob" },
+    .mixed_versions = true,
+}} }

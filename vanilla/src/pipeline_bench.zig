@@ -1,11 +1,11 @@
-const player_spatial = @import("player_spatial.zig");
+const player_spatial = @import("players").player_spatial;
 const item_limits = @import("item_limits_bench.zig");
 const gameplay = @import("batch_test.zig");
 const command = @import("command_bench.zig");
 const inventory = @import("inventory_bench.zig");
 const mining_replication = @import("mining_replication_test.zig");
 const mining = @import("mining_bench.zig");
-const item_entities = @import("item_entities.zig");
+const item_entities = @import("vanilla_item_entities").item_entities;
 
 test "operation counts for item physics section acquisition" {
     try gameplay.benchmarkItemPhysics();

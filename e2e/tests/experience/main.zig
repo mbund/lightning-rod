@@ -2,6 +2,9 @@ const game_data = @import("game_data");
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
+const Inventories = @import("inventories").Inventories;
+const Players = @import("players").players.Players;
+const Reload = @import("reload").Reload;
 const sessions = @import("sessions");
 const minecraft = @import("minecraft_model");
 const e2e = @import("e2e");
@@ -9,14 +12,15 @@ const e2e = @import("e2e");
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 2, .render_distance = 2, .gamemode = .survival, .spawn_for_player = spawn }),
+            lightning_rod.plugin.configured(Players, .{ .maximum = 2, .render_distance = 2, .spawn_for_player = spawn }),
+            lightning_rod.plugin.configured(vanilla.PlayerStates, .{ .gamemode = .survival }),
         }),
         lightning_rod.plugin.configured(Probe, .{}),
     });
     try e2e.profile.run(init, plugins, .{ .reload_executable = "/proc/self/exe" });
 }
 
-fn spawn(player: *const vanilla.Players.Player) minecraft.Position {
+fn spawn(player: *const Players.Player) minecraft.Position {
     return .{ .x = if (std.mem.eql(u8, player.name[0..player.name_len], "alice")) -8.5 else 16.5, .y = 65, .z = 0.5 };
 }
 
@@ -24,12 +28,13 @@ const Probe = struct {
     pub const id = "e2e:experience";
     pub const Configuration = struct {};
     pub const Dependencies = struct {
-        players: *vanilla.Players,
-        inventories: *vanilla.Inventories,
+        players: *Players,
+        player_states: *vanilla.PlayerStates,
+        inventories: *Inventories,
         inventory: *vanilla.PlayerInventory,
         experience: *vanilla.Experience,
         control: *e2e.Control,
-        reload: *vanilla.Reload,
+        reload: *Reload,
     };
     deps: Dependencies,
     ready: [2]u32 = @splat(0),
@@ -47,7 +52,7 @@ const Probe = struct {
         if (std.mem.eql(u8, text, "ready")) {
             if (self.ready[handle.index] == handle.generation) return error.DuplicateExperienceReady;
             self.ready[handle.index] = handle.generation;
-            if (!std.mem.eql(u8, player.name[0..player.name_len], "alice")) player.gamemode = .spectator;
+            if (!std.mem.eql(u8, player.name[0..player.name_len], "alice")) _ = self.deps.player_states.setGameMode(player, .spectator);
             for (self.ready) |generation| if (generation == 0) return .handled;
             const previous = self.deps.reload.latest();
             if (previous != null and previous.?.sequence > 0) {
@@ -111,9 +116,10 @@ const Probe = struct {
     fn verifyPlayers(self: *Probe, amount: i32) !void {
         for (self.deps.players.activeSlots()) |index| {
             const player = self.deps.players.records[index];
+            const points = self.deps.player_states.records[index].experience;
             const expected = if (std.mem.eql(u8, player.name[0..player.name_len], "alice")) amount else 0;
-            if (player.experience.total != expected or player.experience.score != expected) return error.PlayerExperienceIncorrect;
-            if (expected == 99 and (player.experience.level != 7 or @abs(player.experience.progress - @as(f32, 8.0 / 21.0)) > 0.00001)) return error.PlayerLevelIncorrect;
+            if (points.total != expected or points.score != expected) return error.PlayerExperienceIncorrect;
+            if (expected == 99 and (points.level != 7 or @abs(points.progress - @as(f32, 8.0 / 21.0)) > 0.00001)) return error.PlayerLevelIncorrect;
         }
     }
 };

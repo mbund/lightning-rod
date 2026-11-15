@@ -1,0 +1,16 @@
+.{
+    .name = .chat,
+    .fingerprint = 0x659df2aacb845bbe,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .game_data = .{ .path = "../game_data" },
+        .lightning_rod = .{ .path = ".." },
+        .minecraft_packets = .{ .path = "../minecraft_packets" },
+        .players = .{ .path = "../players" },
+        .protocol_1_21_5 = .{ .path = "../protocol_versions/v1_21_5" },
+        .sessions = .{ .path = "../sessions" },
+        .protocols = .{ .path = "../protocols", .lazy = true },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

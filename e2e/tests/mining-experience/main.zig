@@ -2,6 +2,10 @@ const inventories = @import("inventories");
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
+const Chunks = @import("chunks").Chunks;
+const Inventories = @import("inventories").Inventories;
+const Players = @import("players").players.Players;
+const Reload = @import("reload").Reload;
 const game_data = @import("game_data");
 const sessions = @import("sessions");
 const minecraft = @import("minecraft_model");
@@ -10,14 +14,15 @@ const e2e = @import("e2e");
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 1, .render_distance = 2, .gamemode = .survival, .spawn_for_player = spawn }),
+            lightning_rod.plugin.configured(Players, .{ .maximum = 1, .render_distance = 2, .spawn_for_player = spawn }),
+            lightning_rod.plugin.configured(vanilla.PlayerStates, .{ .gamemode = .survival }),
         }),
         lightning_rod.plugin.configured(Probe, .{}),
     });
     try e2e.profile.run(init, plugins, .{ .reload_executable = "/proc/self/exe" });
 }
 
-fn spawn(_: *const vanilla.Players.Player) minecraft.Position {
+fn spawn(_: *const Players.Player) minecraft.Position {
     return .{ .x = 0.5, .y = 65, .z = 3.5 };
 }
 
@@ -25,14 +30,15 @@ const Probe = struct {
     pub const id = "e2e:mining_experience";
     pub const Configuration = struct {};
     pub const Dependencies = struct {
-        players: *vanilla.Players,
-        chunks: *vanilla.Chunks,
-        inventories: *vanilla.Inventories,
+        players: *Players,
+        player_states: *vanilla.PlayerStates,
+        chunks: *Chunks,
+        inventories: *Inventories,
         inventory: *vanilla.PlayerInventory,
         experience: *vanilla.Experience,
         mining: *vanilla.Mining,
         control: *e2e.Control,
-        reload: *vanilla.Reload,
+        reload: *Reload,
     };
     const Phase = enum { waiting, normal, normal_mined, silk, silk_mined, wrong, wrong_mined, reloading, restored };
     const target: minecraft.BlockPosition = .{ .x = 0, .y = 66, .z = 0 };
@@ -52,7 +58,7 @@ const Probe = struct {
             if (self.phase != .waiting) return error.UnexpectedMiningReady;
             if (self.deps.reload.latest()) |previous| if (previous.sequence > 0) {
                 if (!std.mem.eql(u8, previous.token(), "e2e:mining-xp")) return error.UnexpectedMiningReload;
-                const amount = self.deps.players.records[handle.index].experience.total;
+                const amount = self.deps.player_states.records[handle.index].experience.total;
                 if (amount < 3 or amount > 7) return error.MiningExperienceNotPersisted;
                 self.phase = .restored;
                 try self.deps.control.send(handle, "restored");
@@ -94,17 +100,18 @@ const Probe = struct {
         const player = self.deps.players.records[0];
         if (player.handle == null or self.deps.mining.states[0].active or try self.deps.chunks.getBlock(player.world, .{ .x = target.x, .y = target.y, .z = target.z }) != 0) return;
         var remaining: i64 = 0;
+        const points = self.deps.player_states.records[0].experience;
         for (self.deps.experience.active.values()) |index| {
             const orb = self.deps.experience.orbs[index];
             if (orb.alive) remaining += @as(i64, orb.count) * orb.value;
         }
         if (self.phase == .normal) {
             if (remaining > 0) return;
-            if (player.experience.total < 3 or player.experience.total > 7) return error.MiningExperienceIncorrect;
-            self.total = player.experience.total;
+            if (points.total < 3 or points.total > 7) return error.MiningExperienceIncorrect;
+            self.total = points.total;
             self.phase = .normal_mined;
         } else {
-            if (remaining != 0 or player.experience.total != self.total) return error.UnexpectedMiningExperience;
+            if (remaining != 0 or points.total != self.total) return error.UnexpectedMiningExperience;
             self.phase = if (self.phase == .silk) .silk_mined else .wrong_mined;
         }
         try self.deps.control.send(player.handle.?, @tagName(self.phase));

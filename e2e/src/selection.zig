@@ -1,7 +1,7 @@
 const std = @import("std");
-const catalog = @import("catalog.zig");
+const manifest = @import("manifest.zig");
 
-pub fn matrixVersions(comptime protocols: type, allocator: std.mem.Allocator, case: catalog.Case, requested: ?[]const u8) ![]const []const u8 {
+pub fn matrixVersions(comptime protocols: type, allocator: std.mem.Allocator, case: manifest.Scenario, requested: ?[]const u8) ![]const []const u8 {
     const requested_index = if (requested) |version| protocols.releaseIndex(version) orelse return error.UnsupportedClientVersion else null;
     if (case.upgrade) {
         return allocator.dupe([]const u8, &.{protocols.latest.minecraft_version});
@@ -15,8 +15,8 @@ pub fn matrixVersions(comptime protocols: type, allocator: std.mem.Allocator, ca
     return result;
 }
 
-pub fn peerVersions(comptime protocols: type, allocator: std.mem.Allocator, case: catalog.Case, primary: []const u8) ![]const []const u8 {
-    if (case.peers.len == 0 or case.peers.len > catalog.maximum_peers) return error.InvalidPeerVersions;
+pub fn peerVersions(comptime protocols: type, allocator: std.mem.Allocator, case: manifest.Scenario, primary: []const u8) ![]const []const u8 {
+    if (case.peers.len == 0 or case.peers.len > manifest.maximum_peers) return error.InvalidPeerVersions;
     const index = protocols.releaseIndex(primary) orelse return error.UnsupportedClientVersion;
     if (case.version) |version| {
         const required = protocols.releaseIndex(version) orelse return error.UnsupportedClientVersion;

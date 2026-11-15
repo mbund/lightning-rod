@@ -3,6 +3,12 @@ const chunks = @import("chunks");
 const anvil = @import("anvil");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
+const Chunks = @import("chunks").Chunks;
+const Entities = @import("entities").Entities;
+const Lighting = @import("terrain").lighting.Lighting;
+const Players = @import("players").players.Players;
+const Streaming = @import("terrain").streaming.Streaming;
+const Worlds = @import("worlds").Worlds;
 const records = @import("records");
 const inventories = @import("inventories");
 const game_data = @import("game_data");
@@ -61,14 +67,15 @@ pub const Import = struct {
     options: Options,
     store: *lightning_rod.storage.Store,
     content: vanilla.definition_provider.Dependencies,
-    worlds: *vanilla.Worlds,
-    chunks: *vanilla.Chunks,
+    worlds: *Worlds,
+    chunks: *Chunks,
     spawn: *vanilla.Spawn,
     inventories: *inventories.Inventories,
     items: *vanilla.Items,
-    entities: *vanilla.Entities,
+    entities: *Entities,
     workspace: *records.Workspaces,
     players: records.Table,
+    player_states: records.Table,
     containers: vanilla.container_storage.Persistence,
     dropped: records.Table,
     orbs: records.Table,
@@ -83,14 +90,14 @@ pub const Import = struct {
     player_ids: std.AutoHashMap(u128, u128),
     sequence: u64 = 0,
     columns_since_save: usize = 0,
-    lighting: *vanilla.Lighting,
+    lighting: *Lighting,
     columns: std.AutoArrayHashMapUnmanaged(chunks.Light.Column, void),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options, store: *lightning_rod.storage.Store, metrics: *lightning_rod.metrics.Registry) !Import {
         const content = try vanilla.prepareDefinitions(allocator);
         const workspace = try records.Workspaces.init(allocator, io, .{});
         const identity = try vanilla.RegistryIdentity.init(allocator, .{ .storage = try store.openSpace(vanilla.RegistryIdentity.id) });
-        const worlds = try vanilla.Worlds.init(allocator, .{}, .{ .storage = try store.openSpace(vanilla.Worlds.id) });
+        const worlds = try Worlds.init(allocator, .{}, .{ .storage = try store.openSpace(Worlds.id) });
         _ = try vanilla.VanillaWorlds.init(allocator, .{ .registry_identity = identity, .worlds = worlds, .dimensions = content.dimensions });
         var recipe_names = std.StringHashMap(usize).init(allocator);
         const recipe_identities = try allocator.alloc([32]u8, content.book.table.book.len);
@@ -99,10 +106,10 @@ pub const Import = struct {
             std.crypto.hash.Blake3.hash(recipe.name, recipe_identity, .{});
         }
         const ownership = try inventories.Inventories.init(allocator, io, .{ .cache_slots = 256, .cache_items = 16 }, .{ .record_workspaces = workspace, .metrics = metrics, .storage = try store.openSpace(inventories.Inventories.id) });
-        const terrain = try vanilla.Chunks.init(allocator, io, chunk_configuration, .{ .record_workspaces = workspace, .metrics = metrics, .storage = try store.openSpace(vanilla.Chunks.id) });
+        const terrain = try Chunks.init(allocator, io, chunk_configuration, .{ .record_workspaces = workspace, .metrics = metrics, .storage = try store.openSpace(Chunks.id) });
         const spawn = try vanilla.Spawn.init(allocator, .{}, .{ .record_workspaces = workspace, .storage = try store.openSpace(vanilla.Spawn.id), .worlds = worlds, .chunks = terrain, .blocks = content.blocks, .dimensions = content.dimensions });
-        const lighting = try vanilla.Lighting.init(allocator, .{}, .{ .metrics = metrics, .blocks = content.blocks, .chunks = terrain, .worlds = worlds });
-        if (options.lighting) lighting.includeClassification(try vanilla.Streaming.prepareMetadata(allocator, terrain));
+        const lighting = try Lighting.init(allocator, .{}, .{ .metrics = metrics, .blocks = &content.blocks.published, .chunks = terrain, .worlds = worlds });
+        if (options.lighting) lighting.includeClassification(try Streaming.prepareMetadata(allocator, terrain));
         return .{
             .allocator = allocator,
             .io = io,
@@ -117,8 +124,9 @@ pub const Import = struct {
             .lighting = lighting,
             .columns = .empty,
             .items = try vanilla.Items.init(allocator, .{}, .{ .definitions = content.items, .registry_identity = identity, .inventories = ownership }),
-            .entities = try vanilla.Entities.init(allocator, io, .{}, .{ .record_workspaces = workspace, .metrics = metrics, .storage = try store.openSpace(vanilla.Entities.id) }),
-            .players = records.Table.init(try store.openSpace(vanilla.Players.id), workspace.resources),
+            .entities = try Entities.init(allocator, io, .{}, .{ .record_workspaces = workspace, .metrics = metrics, .storage = try store.openSpace(Entities.id) }),
+            .players = records.Table.init(try store.openSpace(Players.id), workspace.resources),
+            .player_states = records.Table.init(try store.openSpace(vanilla.PlayerStates.id), workspace.resources),
             .containers = try vanilla.container_storage.Persistence.init(try store.openSpace(vanilla.Containers.id), workspace),
             .dropped = records.Table.init(try store.openSpace(vanilla.ItemEntities.id), workspace.resources),
             .orbs = records.Table.init(try store.openSpace(vanilla.Experience.id), workspace.resources),
@@ -152,10 +160,10 @@ pub const Import = struct {
     }
 
     pub fn save(self: *Import) !void {
-        try self.chunks.checkpoint(try self.store.openSpace(vanilla.Chunks.id));
+        try self.chunks.checkpoint(try self.store.openSpace(Chunks.id));
         try self.inventories.checkpoint(self.inventories.deps.storage);
         try self.entities.checkpoint(self.entities.deps.storage);
-        try self.worlds.checkpoint(try self.store.openSpace(vanilla.Worlds.id));
+        try self.worlds.checkpoint(try self.store.openSpace(Worlds.id));
         try self.spawn.checkpoint(try self.store.openSpace(vanilla.Spawn.id));
         self.sequence += 1;
         try self.store.waitDurable(try self.store.commit(self.sequence));
@@ -285,7 +293,7 @@ pub const Import = struct {
         std.log.info("event=lighting_bake_started columns={d} cache_bytes={d}", .{ self.columns.count(), before });
         var selected = try protocols.Default.init(self.allocator);
         defer selected.deinit(self.allocator);
-        var compiler = try delivery.Compiler.init(self.allocator, &selected);
+        var compiler = try delivery.Compiler.init(self.allocator, &selected, &self.content.blocks.published);
         defer compiler.workspace.cancel();
         const columns = self.columns.keys();
         var offset: usize = 0;
@@ -336,7 +344,7 @@ pub const Import = struct {
         }
     }
 
-    fn regions(self: *Import, directory: []const u8, world: *const vanilla.Worlds.World, entities: bool) !void {
+    fn regions(self: *Import, directory: []const u8, world: *const Worlds.World, entities: bool) !void {
         const path = try std.fs.path.join(self.allocator, &.{ directory, if (entities) "entities" else "region" });
         var dir = std.Io.Dir.cwd().openDir(self.io, path, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => return,
@@ -401,7 +409,7 @@ pub const Import = struct {
         }
     }
 
-    fn column(self: *Import, scratch: std.mem.Allocator, doc: nbt.Document, world: *const vanilla.Worlds.World, x: i32, z: i32) !void {
+    fn column(self: *Import, scratch: std.mem.Allocator, doc: nbt.Document, world: *const Worlds.World, x: i32, z: i32) !void {
         self.source = .{ .scratch = scratch, .registry = &self.registry, .doc = doc, .world = world.id, .x = x, .z = z, .minimum = world.dimension.minimum_section, .sections = @splat(null) };
         const source = &self.source;
         if (world.dimension.section_count > source.sections.len) return error.DimensionTooTall;

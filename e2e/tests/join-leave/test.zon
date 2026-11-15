@@ -1,0 +1,5 @@
+.{ .client = "JoinLeaveFixture", .scenarios = .{.{
+    .name = "join-leave",
+    .peers = .{ "alice", "bob" },
+    .mixed_versions = true,
+}} }

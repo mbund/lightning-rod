@@ -5,6 +5,9 @@ const profile = @import("profile");
 const protocols = @import("protocols");
 const sessions = @import("sessions");
 const vanilla = @import("vanilla");
+const Players = @import("players").players.Players;
+const RecordWorkspaces = @import("records").Workspaces;
+const connection_plugins = @import("connection").plugins;
 
 comptime {
     std.debug.assert(builtin.single_threaded);
@@ -32,11 +35,11 @@ pub fn main(init: std.process.Init) !void {
     defer selected.deinit(allocator);
     const session_plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.configured(protocols.Handshake, .{}),
-        vanilla.session_plugins(&selected),
+        connection_plugins(&selected),
     });
     const plugins = lightning_rod.plugin.replace(vanilla.plugins(), .{
-        lightning_rod.plugin.configured(vanilla.RecordWorkspaces, .{ .readers = 1, .writers = 1 }),
-        lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 4, .render_distance = 4 }),
+        lightning_rod.plugin.configured(RecordWorkspaces, .{ .readers = 1, .writers = 1 }),
+        lightning_rod.plugin.configured(Players, .{ .maximum = 4, .render_distance = 4 }),
     });
     try profile.Server(@TypeOf(plugins), protocols.Endpoint, @TypeOf(session_plugins), sessions.SingleSimulation).run(&memory, init, .{
         .plugins = plugins,

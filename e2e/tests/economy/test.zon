@@ -1,0 +1,5 @@
+.{ .client = "EconomyFixture", .scenarios = .{ .{ .name = "economy-multi", .peers = .{ "alice", "bob" } }, .{
+    .name = "economy-reopen-multi",
+    .prepare = "economy-multi",
+    .peers = .{ "alice", "bob" },
+} } }

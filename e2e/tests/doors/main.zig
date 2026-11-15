@@ -3,13 +3,16 @@ const e2e = @import("e2e");
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
+const Chunks = @import("chunks").Chunks;
+const Operators = @import("commands").operators.Operators;
+const Players = @import("players").players.Players;
 
 pub fn main(init: std.process.Init) !void {
     const operators = e2e.profile.aliceOperator();
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 2, .render_distance = 2 }),
-            lightning_rod.plugin.configured(vanilla.Operators, .{ .operators = &operators }),
+            lightning_rod.plugin.configured(Players, .{ .maximum = 2, .render_distance = 2 }),
+            lightning_rod.plugin.configured(Operators, .{ .operators = &operators }),
         }),
         lightning_rod.plugin.configured(Scene, .{}),
     });
@@ -22,7 +25,7 @@ const Scene = struct {
     pub const Configuration = struct {};
 
     pub const Dependencies = struct {
-        chunks: *vanilla.Chunks,
+        chunks: *Chunks,
         worlds: *vanilla.VanillaWorlds,
     };
 

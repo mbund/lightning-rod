@@ -1,0 +1,12 @@
+.{
+    .name = .e2e_enchantments,
+    .fingerprint = 0x780924b495de1fbf,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .lightning_rod_e2e = .{ .path = "../.." },
+        .silk_spawners = .{ .path = "../../../examples/plugins/silk_spawners" },
+        .storm_stick = .{ .path = "../../../examples/plugins/storm_stick" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "test.zon", "client", "main.zig" },
+}

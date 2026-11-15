@@ -1,7 +1,8 @@
 const e2e = @import("e2e");
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
-const vanilla = @import("vanilla");
+const Inventories = @import("inventories").Inventories;
+const Players = @import("players").players.Players;
 const sessions = @import("sessions");
 
 pub fn main(init: std.process.Init) !void {
@@ -25,8 +26,8 @@ const Probe = struct {
     pub const id = "e2e:transfer";
     pub const Dependencies = struct {
         control: *e2e.Control,
-        inventories: *vanilla.Inventories,
-        players: *vanilla.Players,
+        inventories: *Inventories,
+        players: *Players,
         sessions: *sessions.Service,
     };
     pub const Configuration = struct {

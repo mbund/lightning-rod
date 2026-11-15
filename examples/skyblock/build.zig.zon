@@ -13,6 +13,12 @@
         .protocols = .{ .path = "../../protocols" },
         .minecraft_packets = .{ .path = "../../minecraft_packets" },
         .vanilla = .{ .path = "../../vanilla" },
+        .players = .{ .path = "../../players" },
+        .terrain = .{ .path = "../../terrain" },
+        .connection = .{ .path = "../../connection" },
+        .commands = .{ .path = "../../commands" },
+        .chat = .{ .path = "../../chat" },
+        .inventories = .{ .path = "../../inventories" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

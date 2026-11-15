@@ -1,5 +1,7 @@
 const std = @import("std");
-const vanilla = @import("vanilla");
+const Chat = @import("chat").chat.Chat;
+const Input = @import("players").input.Input;
+const Players = @import("players").players.Players;
 const sessions = @import("sessions");
 const wire = @import("wire_1_21_5");
 const catalog = @import("catalog.zig");
@@ -170,7 +172,7 @@ pub const Channel = struct {
 pub const GlobalChat = struct {
     pub const id = "skyblock:global_chat";
     pub const Configuration = struct { channel: *Channel };
-    pub const Dependencies = struct { input: *vanilla.Input, players: *vanilla.Players, chat: *vanilla.Chat, sessions: *sessions.Service };
+    pub const Dependencies = struct { input: *Input, players: *Players, chat: *Chat, sessions: *sessions.Service };
 
     deps: Dependencies,
     channel: *Channel,

@@ -1,0 +1,5 @@
+.{ .client = "TransferFixture", .scenarios = .{.{
+    .name = "transfer-multi",
+    .fixture = "transfer",
+    .peers = .{ "alice", "bob" },
+}} }

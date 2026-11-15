@@ -1,0 +1,18 @@
+.{
+    .name = .connection,
+    .fingerprint = 0x29f77366b4486c57,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .lightning_rod = .{ .path = ".." },
+        .game_data = .{ .path = "../game_data" },
+        .minecraft_java = .{ .path = "../minecraft_java" },
+        .minecraft_packets = .{ .path = "../minecraft_packets" },
+        .players = .{ .path = "../players" },
+        .protocol_1_21_5 = .{ .path = "../protocol_versions/v1_21_5" },
+        .protocol_26_2 = .{ .path = "../protocol_versions/v26_2" },
+        .sessions = .{ .path = "../sessions" },
+        .protocols = .{ .path = "../protocols", .lazy = true },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

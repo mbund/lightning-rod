@@ -1,6 +1,10 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
+const BlockEdit = @import("chunks").BlockEdit;
+const Chunks = @import("chunks").Chunks;
+const Players = @import("players").players.Players;
+const Streaming = @import("terrain").streaming.Streaming;
 const protocols = @import("protocols");
 const sessions = @import("sessions");
 const e2e = @import("e2e");
@@ -9,14 +13,14 @@ const minecraft = @import("minecraft_model");
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 2, .render_distance = 2, .spawn_for_player = spawn }),
+            lightning_rod.plugin.configured(Players, .{ .maximum = 2, .render_distance = 2, .spawn_for_player = spawn }),
         }),
         lightning_rod.plugin.configured(Probe, .{}),
     });
     try e2e.profile.run(init, plugins, .{});
 }
 
-fn spawn(player: *const vanilla.Players.Player) minecraft.Position {
+fn spawn(player: *const Players.Player) minecraft.Position {
     return .{ .x = if (std.mem.eql(u8, player.name[0..player.name_len], "alice")) 20.5 else 21.5, .y = 65, .z = 20.5 };
 }
 
@@ -25,12 +29,12 @@ const Probe = struct {
     pub const Configuration = struct {};
     pub const Dependencies = struct {
         control: *e2e.Control,
-        players: *vanilla.Players,
-        chunks: *vanilla.Chunks,
+        players: *Players,
+        chunks: *Chunks,
         experience: *vanilla.Experience,
         dropped: *vanilla.ItemEntities,
         items: *vanilla.Items,
-        streaming: *vanilla.Streaming,
+        streaming: *Streaming,
     };
     deps: Dependencies,
     surface: [2]bool = .{ false, false },
@@ -42,7 +46,7 @@ const Probe = struct {
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Probe {
         const self = try allocator.create(Probe);
         self.* = .{ .deps = deps };
-        const edits = try allocator.alloc(vanilla.BlockEdit, 4096);
+        const edits = try allocator.alloc(BlockEdit, 4096);
         defer allocator.free(edits);
         for (edits, 0..) |*edit, index| edit.* = .{
             .index = @intCast(index),
@@ -90,7 +94,7 @@ const Probe = struct {
             try self.broadcast("check_surface");
         } else if (std.mem.eql(u8, text, "open")) {
             if (alice or self.phase != .checking) return error.UnexpectedOcclusionPhase;
-            var edits: [16]vanilla.BlockEdit = undefined;
+            var edits: [16]BlockEdit = undefined;
             for (2..5) |section| {
                 const count: usize = if (section == 4) 1 else 16;
                 for (edits[0..count], 0..) |*edit, y| edit.* = .{ .index = @intCast(y * 256 + 4 * 16 + 4), .state = 0 };
@@ -104,7 +108,7 @@ const Probe = struct {
             if (self.opened[index]) return error.DuplicateOcclusionObservation;
             self.opened[index] = true;
             if (!self.opened[0] or !self.opened[1]) return .handled;
-            var edits: [256]vanilla.BlockEdit = undefined;
+            var edits: [256]BlockEdit = undefined;
             for (&edits, 0..) |*edit, voxel| edit.* = .{ .index = @intCast(voxel), .state = 0 };
             try self.deps.chunks.setBlocks(.{ .world = 0, .x = 1, .y = 1, .z = 1 }, &edits);
             self.phase = .lid_opened;
@@ -115,7 +119,7 @@ const Probe = struct {
             if (self.lid[index]) return error.DuplicateOcclusionObservation;
             self.lid[index] = true;
             if (!self.lid[0] or !self.lid[1]) return .handled;
-            var edits: [4096]vanilla.BlockEdit = undefined;
+            var edits: [4096]BlockEdit = undefined;
             for (&edits, 0..) |*edit, voxel| edit.* = .{ .index = @intCast(voxel), .state = 0 };
             try self.deps.chunks.setBlocks(.{ .world = 0, .x = 1, .y = 0, .z = 1 }, &edits);
             self.phase = .floor_opened;

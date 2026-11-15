@@ -1,6 +1,7 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
-const vanilla = @import("vanilla");
+const Chat = @import("chat").chat.Chat;
+const Players = @import("players").players.Players;
 const e2e = @import("e2e");
 const sessions = @import("sessions");
 
@@ -12,7 +13,7 @@ pub fn main(init: std.process.Init) !void {
 const Probe = struct {
     pub const id = "e2e:chat";
     pub const Configuration = struct {};
-    pub const Dependencies = struct { control: *e2e.Control, chat: *vanilla.Chat, players: *vanilla.Players };
+    pub const Dependencies = struct { control: *e2e.Control, chat: *Chat, players: *Players };
     deps: Dependencies,
     pending: []?sessions.Handle,
 

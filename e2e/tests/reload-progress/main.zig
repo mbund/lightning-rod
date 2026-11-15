@@ -2,12 +2,14 @@ const records = @import("records");
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
+const Players = @import("players").players.Players;
+const Reload = @import("reload").Reload;
 const e2e = @import("e2e");
 const sessions = @import("sessions");
 
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
-        lightning_rod.plugin.replace(e2e.profile.plugins(), .{lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 2, .render_distance = 2, .gamemode = .survival })}),
+        lightning_rod.plugin.replace(e2e.profile.plugins(), .{ lightning_rod.plugin.configured(Players, .{ .maximum = 2, .render_distance = 2 }), lightning_rod.plugin.configured(vanilla.PlayerStates, .{ .gamemode = .survival }) }),
         lightning_rod.plugin.configured(Probe, .{}),
     });
     try e2e.profile.run(init, plugins, .{ .reload_executable = "/proc/self/exe" });
@@ -17,9 +19,10 @@ const Probe = struct {
     pub const id = "e2e:reload_progress";
     pub const Configuration = struct {};
     pub const Dependencies = struct {
-        players: *vanilla.Players,
+        players: *Players,
+        player_states: *vanilla.PlayerStates,
         control: *e2e.Control,
-        reload: *vanilla.Reload,
+        reload: *Reload,
         storage: lightning_rod.storage.Space,
     };
     const Phase = enum { waiting, restored, configuring, progressing, released };
@@ -76,7 +79,7 @@ const Probe = struct {
     pub fn tick(self: *Probe) !void {
         if (self.phase == .waiting or self.phase == .released) return;
         var count: usize = 0;
-        var alice: ?*vanilla.Players.Player = null;
+        var alice: ?*Players.Player = null;
         for (self.deps.players.records) |*player| {
             if (player.handle == null) continue;
             count += 1;
@@ -84,13 +87,14 @@ const Probe = struct {
         }
         if (count != 2 or alice == null or !alice.?.configuring or !alice.?.inWorld()) return error.ReloadLostPlayer;
         const player = alice.?;
+        const state = self.deps.player_states.of(player);
         const expected = rounds[self.round - 1];
         if (self.phase == .restored) {
-            player.health = expected.health;
+            state.health = expected.health;
             try self.deps.players.teleport(player, player.world, .{ .x = expected.x, .y = 65, .z = 0.5 }, .{ .yaw = 0, .pitch = 0 });
             self.phase = .configuring;
         }
-        if (player.health != expected.health or player.position.x != expected.x) return error.ReloadRestoredStalePlayer;
+        if (state.health != expected.health or player.position.x != expected.x) return error.ReloadRestoredStalePlayer;
         if (self.phase == .progressing) {
             self.ticks += 1;
             if (self.ticks == progress_ticks) {

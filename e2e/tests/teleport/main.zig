@@ -3,16 +3,24 @@ const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const protocols = @import("protocols");
 const vanilla = @import("vanilla");
+const Chunks = @import("chunks").Chunks;
+const Entities = @import("entities").Entities;
+const Inventories = @import("inventories").Inventories;
+const Operators = @import("commands").operators.Operators;
+const Players = @import("players").players.Players;
+const Section = @import("chunks").Section;
+const Worlds = @import("worlds").Worlds;
 const sessions = @import("sessions");
 
 pub fn main(init: std.process.Init) !void {
     const operators = e2e.profile.aliceOperator();
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = 2, .gamemode = .survival }),
-            lightning_rod.plugin.configured(vanilla.Worlds, .{ .maximum = 4 }),
+            lightning_rod.plugin.configured(Players, Players.Configuration{ .render_distance = 2 }),
+            lightning_rod.plugin.configured(vanilla.PlayerStates, .{ .gamemode = .survival }),
+            lightning_rod.plugin.configured(Worlds, .{ .maximum = 4 }),
             lightning_rod.plugin.configured(vanilla.Flat, .{ .biomes = biomePattern }),
-            lightning_rod.plugin.configured(vanilla.Operators, vanilla.Operators.Configuration{ .operators = &operators }),
+            lightning_rod.plugin.configured(Operators, Operators.Configuration{ .operators = &operators }),
         }),
         lightning_rod.plugin.configured(e2e.Inventory, .{ .starting_bread = 17 }),
         lightning_rod.plugin.configured(Probe, .{}),
@@ -20,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
     try e2e.profile.run(init, plugins, .{});
 }
 
-fn biomePattern(section: vanilla.Section, values: *[64]u16) void {
+fn biomePattern(section: Section, values: *[64]u16) void {
     const names = [_][]const u8{ "minecraft:plains", "minecraft:nether_wastes", "minecraft:the_end", "minecraft:basalt_deltas" };
     std.debug.assert(section.world < names.len);
     @memset(values, @intCast(protocols.registry.biomeId(names[section.world]).?));
@@ -33,15 +41,15 @@ const Probe = struct {
 
     pub const Dependencies = struct {
         control: *e2e.Control,
-        players: *vanilla.Players,
-        chunks: *vanilla.Chunks,
+        players: *Players,
+        chunks: *Chunks,
         menus: *vanilla.PlayerInventory,
         dropped: *vanilla.ItemEntities,
-        worlds: *vanilla.Worlds,
+        worlds: *Worlds,
         vanilla_worlds: *vanilla.VanillaWorlds,
         dimensions: *vanilla.Dimensions,
-        inventories: *vanilla.Inventories,
-        entities: *vanilla.Entities,
+        inventories: *Inventories,
+        entities: *Entities,
     };
 
     deps: Dependencies,
@@ -120,7 +128,7 @@ const Probe = struct {
 
     fn isolation(self: *Probe, handle: sessions.Handle, phase: Isolation) !void {
         const alice = &self.deps.players.records[handle.index];
-        var bob: ?*vanilla.Players.Player = null;
+        var bob: ?*Players.Player = null;
 
         for (self.deps.players.records) |*player| if (player.handle != null and std.mem.eql(u8, player.name[0..player.name_len], "bob")) {
             bob = player;

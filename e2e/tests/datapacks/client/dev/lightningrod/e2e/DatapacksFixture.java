@@ -132,7 +132,10 @@ final class DatapacksFixture extends Fixture {
                 }
                 if (game.player.getInventory().countItem(Items.PAPER) != 4) { client.fail("rejected_paper_not_preserved"); return; }
                 if (!game.player.getRecipeBook().isFiltering(RecipeBookType.CRAFTING)) { client.fail("recipe_book_filter_lost_on_reload"); return; }
-                if (GuiApi.screen(game) == null) GuiApi.screen(game, new InventoryScreen(game.player));
+                // The reconnect after the reload shows the level loading screen until terrain arrives.
+                var screen = GuiApi.screen(game);
+                if (screen != null && !(screen instanceof InventoryScreen)) return;
+                if (screen == null) GuiApi.screen(game, new InventoryScreen(game.player));
                 RecipeBookApi.open(game, true);
                 var restoredRecipe = RecipeBookApi.find(game, "diamond", stack -> stack.is(Items.DIAMOND) && charged(stack));
                 if (restoredRecipe == null) return;

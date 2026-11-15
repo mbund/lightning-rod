@@ -1,12 +1,12 @@
-const vanilla_content = @import("vanilla_content.zig");
-const audience_storage = @import("audience.zig");
+const vanilla_content = @import("vanilla_definitions").defaults;
+const audience_storage = @import("players").audience;
 const bit_sets = @import("lightning_rod").system.bit_sets;
-const Visibility = @import("visibility.zig").Visibility;
+const Visibility = @import("replication").visibility.Visibility;
 const std = @import("std");
-const block_synchronization = @import("block_sync.zig");
-const terrain_background = @import("terrain.zig");
+const block_synchronization = @import("terrain").block_sync;
+const terrain_background = @import("terrain").terrain;
 const network = @import("networking");
-const protocols = @import("protocols");
+const protocols = @import("minecraft_packets").protocols;
 const sessions = @import("sessions");
 const packets = @import("minecraft_packets");
 const storage = @import("storage");
@@ -14,25 +14,26 @@ const records = @import("records");
 const inventories = @import("inventories");
 const metrics = @import("metrics");
 const game_data = @import("game_data");
-const data = @import("item_data.zig");
-const Items = @import("items.zig").Items;
-const ItemProperties = @import("item_properties.zig").ItemProperties;
-const Players = @import("players.zig").Players;
-const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
-const Bossbars = @import("bossbars.zig").Bossbars;
-const Equipment = @import("equipment.zig").Equipment;
-const Replication = @import("replication.zig").Replication;
-const item_packets = @import("item_packets.zig");
+const data = @import("vanilla_items").item_data;
+const Items = @import("vanilla_items").items.Items;
+const ItemProperties = @import("vanilla_items").item_properties.ItemProperties;
+const Players = @import("players").players.Players;
+const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
+const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
+const Bossbars = @import("bossbars").bossbars.Bossbars;
+const Equipment = @import("vanilla_equipment").equipment.Equipment;
+const Replication = @import("replication").replication.Replication;
+const item_packets = @import("vanilla_items").item_packets;
 const wire = @import("wire_1_21_5");
-const ItemPickup = @import("item_pickup.zig").ItemPickup;
+const ItemPickup = @import("vanilla_inventory").item_pickup.ItemPickup;
 const chunks = @import("chunks");
 const entities = @import("entities");
 const worlds = @import("worlds");
-const Lighting = @import("lighting.zig").Lighting;
-const Streaming = @import("streaming.zig").Streaming;
-const ItemEntities = @import("item_entities.zig").ItemEntities;
-const ItemReplication = @import("item_replication.zig").ItemReplication;
-const InventoryMenus = @import("inventory_menus.zig").InventoryMenus;
+const Lighting = @import("terrain").lighting.Lighting;
+const Streaming = @import("terrain").streaming.Streaming;
+const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
+const ItemReplication = @import("vanilla_inventory").item_replication.ItemReplication;
+const InventoryMenus = @import("vanilla_containers").inventory_menus.InventoryMenus;
 
 const Sink = struct {
     pub fn notify(_: *Sink, _: std.Io) void {}
@@ -97,20 +98,22 @@ pub fn benchmark() !void {
         defer service.deinit();
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
         const handle: sessions.Handle = .{ .index = 0, .generation = 1 };
-        var players_buffer: [1]Players.Player = .{.{ .handle = handle, .uuid = 1, .stage = .ready, .loaded = true, .gamemode = .survival, .protocol = catalog.values[0].number }};
+        var players_buffer: [1]Players.Player = .{.{ .handle = handle, .uuid = 1, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number }};
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &players_buffer, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
+        const player_states = try survivalStates(allocator, &players_buffer);
         const menu = try PlayerInventory.init(allocator, .{}, .{
             .crafting = gameplay_definitions.crafting,
             .furnaces = gameplay_definitions.furnaces,
             .players = &players,
+            .player_states = player_states,
             .inventories = ownership,
             .items = items,
             .equipment = undefined,
             .dropped = undefined,
         });
-        var survival: InventoryMenus = .{ .deps = .{ .containers = undefined, .inventory = menu, .players = &players, .inventories = ownership, .items = items, .packets = encoding, .sessions = service, .input = undefined } };
+        var survival: InventoryMenus = .{ .deps = .{ .containers = undefined, .inventory = menu, .players = &players, .player_states = player_states, .inventories = ownership, .items = items, .packets = encoding, .sessions = service, .input = undefined } };
         const Mode = enum { survival_dirty_one, survival_dirty_many, survival_cursor, survival_full, full_direct, single_slot_direct };
         for ([_]bool{ true, false }) |available| for (std.enums.values(Mode)) |mode| {
             const player = players_buffer[0];
@@ -226,11 +229,13 @@ pub fn benchmarkEquipment() !void {
             try std.testing.expect(try ownership.editMany(&edits));
         }
         players.rebuildIndexes();
+        const player_states = try survivalStates(allocator, player_records);
         const replication = try Replication.init(allocator, .{}, .{ .players = &players, .visibility = try Visibility.init(allocator, .{}, .{ .players = &players }) });
         const equipment = try Equipment.init(allocator, .{}, .{
             .replication = replication,
             .menus = undefined,
             .players = &players,
+            .player_states = player_states,
             .inventories = ownership,
             .items = items,
             .sessions = service,
@@ -257,9 +262,9 @@ pub fn benchmarkEquipment() !void {
                     try std.testing.expect(try ownership.set(.{ .owner = 1, .index = 36 }, old.revision, .{ .item = stacks[0].item, .count = 2 }));
                 },
                 .failed_edit => try std.testing.expect(!try ownership.set(.{ .owner = 1, .index = 36 }, 0, null)),
-                .selected_slot => player_records[0].selected_slot = 1,
+                .selected_slot => player_states.records[0].selected_slot = 1,
                 .inventory_move => {
-                    player_records[0].selected_slot = 0;
+                    player_states.records[0].selected_slot = 0;
                     const from = try ownership.get(.{ .owner = 1, .index = 36 });
                     const to = try ownership.get(.{ .owner = 1, .index = 45 });
                     try std.testing.expectEqual(inventories.MoveResult.moved, try ownership.move(.{
@@ -378,14 +383,16 @@ pub fn benchmarkPickup() !void {
         const gameplay_definitions = try vanilla_content.prepare(allocator);
         const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const stack: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 1 };
-        var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .stage = .ready, .loaded = true, .gamemode = .survival }};
+        var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .stage = .ready, .loaded = true }};
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
+        const player_states = try survivalStates(allocator, &player_records);
         const menu = try PlayerInventory.init(allocator, .{}, .{
             .crafting = gameplay_definitions.crafting,
             .furnaces = gameplay_definitions.furnaces,
             .players = &players,
+            .player_states = player_states,
             .inventories = ownership,
             .items = items,
             .equipment = undefined,
@@ -402,7 +409,7 @@ pub fn benchmarkPickup() !void {
             .worlds = dimensions,
             .storage = try store.openSpace("metadata"),
         });
-        const pickup = try ItemPickup.init(allocator, .{ .players = &players, .menus = menu, .inventories = ownership, .entities = bodies, .items = items, .dropped = dropped });
+        const pickup = try ItemPickup.init(allocator, .{ .players = &players, .player_states = player_states, .menus = menu, .inventories = ownership, .entities = bodies, .items = items, .dropped = dropped });
         var sources: [64]inventories.Slot = undefined;
         var edits: [101]inventories.Edit = undefined;
         for (sources[0..count], edits[0..count], 0..) |*source, *edit, index| {
@@ -504,12 +511,13 @@ pub fn benchmarkItemReplication() !void {
         const service = try sessions.Service.init(allocator, io, transport, .{ .connections = 1, .pages = 512, .page_bytes = 4096, .buffer_bytes = 1024 * 1024, .protocols = &catalog.values });
         defer service.deinit();
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
-        var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .loaded = true, .gamemode = .survival, .protocol = catalog.values[0].number }};
+        var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number }};
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 2 }, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const block_properties = &(try vanilla_content.blocks(allocator)).published;
+        const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -759,10 +767,12 @@ pub fn benchmarkDrops() !void {
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
+        const player_states = try survivalStates(allocator, &player_records);
         const menu = try PlayerInventory.init(allocator, .{}, .{
             .crafting = gameplay_definitions.crafting,
             .furnaces = gameplay_definitions.furnaces,
             .players = &players,
+            .player_states = player_states,
             .inventories = ownership,
             .items = items,
             .equipment = undefined,
@@ -855,14 +865,15 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
     const connection = capacity - 1;
     const player_records = try allocator.alloc(Players.Player, capacity);
     @memset(player_records, .{});
-    player_records[connection] = .{ .handle = .{ .index = connection, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .loaded = true, .gamemode = .survival, .protocol = catalog.values[0].number };
+    player_records[connection] = .{ .handle = .{ .index = connection, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number };
     var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 8 }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
     player_records[connection].position.x = 1;
     player_records[connection].position.z = 1;
     players.rebuildIndexes();
     const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-    const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+    const block_properties = &(try vanilla_content.blocks(allocator)).published;
+    const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
     defer service.unsubscribeOutput(streaming.changed);
     defer terrain.unsubscribeReady(streaming.changed);
     streaming.published.setStream(connection, .{ .generation = 1, .life = player_records[connection].life, .setup = .streaming });
@@ -980,14 +991,15 @@ pub fn benchmarkItemVisibility() !void {
         const service = try sessions.Service.init(allocator, io, transport, .{ .connections = 2, .pages = 8192, .page_bytes = 4096, .buffer_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
         defer service.deinit();
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
-        var player_records: [2]Players.Player = .{ .{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .loaded = true, .gamemode = .survival, .protocol = catalog.values[0].number }, .{ .handle = .{ .index = 1, .generation = 1 }, .uuid = 2, .world = world, .stage = .ready, .loaded = true, .gamemode = .survival, .protocol = catalog.values[0].number, .position = .{ .x = 10000, .y = 65, .z = 10000 } } };
+        var player_records: [2]Players.Player = .{ .{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number }, .{ .handle = .{ .index = 1, .generation = 1 }, .uuid = 2, .world = world, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number, .position = .{ .x = 10000, .y = 65, .z = 10000 } } };
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 8 }, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         player_records[0].position.x = 1;
         player_records[0].position.z = 1;
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const block_properties = &(try vanilla_content.blocks(allocator)).published;
+        const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -1078,14 +1090,16 @@ pub fn benchmarkPickupAdmission() !void {
         const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const stack: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 1 };
         var player_records: [32]Players.Player = undefined;
-        for (player_records[0..player_count], 0..) |*player, index| player.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 }, .uuid = index + 1, .stage = .ready, .loaded = true, .gamemode = .survival };
+        for (player_records[0..player_count], 0..) |*player, index| player.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 }, .uuid = index + 1, .stage = .ready, .loaded = true };
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = player_records[0..player_count], .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
+        const player_states = try survivalStates(allocator, player_records[0..player_count]);
         const menu = try PlayerInventory.init(allocator, .{}, .{
             .crafting = gameplay_definitions.crafting,
             .furnaces = gameplay_definitions.furnaces,
             .players = &players,
+            .player_states = player_states,
             .inventories = ownership,
             .items = items,
             .equipment = undefined,
@@ -1102,7 +1116,7 @@ pub fn benchmarkPickupAdmission() !void {
             .worlds = dimensions,
             .storage = try store.openSpace("metadata"),
         });
-        const pickup = try ItemPickup.init(allocator, .{ .players = &players, .menus = menu, .inventories = ownership, .entities = bodies, .items = items, .dropped = dropped });
+        const pickup = try ItemPickup.init(allocator, .{ .players = &players, .player_states = player_states, .menus = menu, .inventories = ownership, .entities = bodies, .items = items, .dropped = dropped });
         var sources: [64]inventories.Slot = undefined;
         var edits: [101]inventories.Edit = undefined;
         for (sources[0..count], edits[0..count], 0..) |*source, *edit, index| {
@@ -1162,10 +1176,10 @@ pub fn benchmarkPickupAdmission() !void {
             try std.testing.expect(try ownership.set(slots[36], previous.revision, null));
             try pickup.collect(0, requests[1..2], results[1..2]);
             try std.testing.expectEqual(@as(u16, 0), results[1].collected);
-            player_records[0].gamemode = .creative;
+            player_states.records[0].gamemode = .creative;
             try pickup.collect(0, requests[1..2], results[1..2]);
             try std.testing.expectEqual(@as(u16, 1), results[1].collected);
-            player_records[0].gamemode = .survival;
+            player_states.records[0].gamemode = .survival;
             previous = try ownership.get(destination);
             try std.testing.expect(try ownership.set(destination, previous.revision, null));
             var restricted = requests[2];
@@ -1181,6 +1195,7 @@ pub fn benchmarkPickupAdmission() !void {
             if (player_count > 1) {
                 player_records[1].handle = null;
                 player_records[0].uuid = 2;
+                player_states.records[0] = .{ .uuid = 2, .gamemode = .survival };
                 try pickup.collect(0, requests[3..4], results[3..4]);
                 try std.testing.expectEqual(@as(u16, 0), results[3].collected);
             }
@@ -1222,7 +1237,8 @@ pub fn benchmarkIdleTerrain() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{ .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const block_properties = &(try vanilla_content.blocks(allocator)).published;
+        const streaming = try Streaming.init(allocator, io, .{ .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -1343,14 +1359,14 @@ pub fn benchmarkItemBroadcast() !void {
             .world = world,
             .stage = .ready,
             .loaded = true,
-            .gamemode = .survival,
             .protocol = catalog.values[index % catalog.values.len].number,
         };
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 2 }, .spawn_world = world, .records = player_records[0..viewers], .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const block_properties = &(try vanilla_content.blocks(allocator)).published;
+        const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         for (players.records, 0..) |player, index| streaming.published.setStream(index, .{ .generation = player.handle.?.generation, .life = player.life, .setup = .streaming });
@@ -1507,7 +1523,8 @@ pub fn benchmarkBlockPlanning() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{ .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const block_properties = &(try vanilla_content.blocks(allocator)).published;
+        const streaming = try Streaming.init(allocator, io, .{ .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -1710,12 +1727,13 @@ pub fn benchmarkItemBoundaries() !void {
         defer service.deinit();
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
         const player_records = try allocator.alloc(Players.Player, viewers);
-        for (player_records, 0..) |*player, index| player.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 }, .uuid = index + 1, .world = world, .stage = .ready, .loaded = true, .gamemode = .survival, .protocol = catalog.values[0].number, .position = .{ .x = 1, .y = 65, .z = 1 } };
+        for (player_records, 0..) |*player, index| player.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 }, .uuid = index + 1, .world = world, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number, .position = .{ .x = 1, .y = 65, .z = 1 } };
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 8 }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const block_properties = &(try vanilla_content.blocks(allocator)).published;
+        const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         for (players.records, 0..) |player, index| streaming.published.setStream(index, .{ .generation = player.handle.?.generation, .life = player.life, .setup = .streaming });
@@ -1814,7 +1832,8 @@ pub fn benchmarkTerrainBackpressure() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 128, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const block_properties = &(try vanilla_content.blocks(allocator)).published;
+        const streaming = try Streaming.init(allocator, io, .{ .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
 
@@ -1953,7 +1972,7 @@ test "operation counts for audience overflow preserve unrelated connections" {
         player_records[index].handle = .{ .index = index, .generation = 1 };
         service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
     }
-    var players: Players = .{ .deps = .{ .sessions = service, .packets = undefined, .input = undefined, .storage = undefined, .worlds = undefined, .vanilla_worlds = undefined, .record_workspaces = undefined }, .config = .{}, .spawn_world = 0, .records = player_records, .dig_handlers = &.{} };
+    var players: Players = .{ .deps = .{ .sessions = service, .packets = undefined, .input = undefined, .storage = undefined, .worlds = undefined, .record_workspaces = undefined }, .config = .{}, .spawn_world = 0, .records = player_records, .dig_handlers = &.{} };
     const matrix = try audience_storage.Matrix.init(allocator, &players, 101, 0, .recipients);
     const selected = try bit_sets.Matrix.init(allocator, 1, capacity);
     selected.row(0).insert(0);
@@ -2012,7 +2031,8 @@ pub fn benchmarkSparseTerrainStreaming() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{ .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const block_properties = &(try vanilla_content.blocks(allocator)).published;
+        const streaming = try Streaming.init(allocator, io, .{ .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -2123,7 +2143,8 @@ pub fn benchmarkSparseBlockPlanning() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{ .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const block_properties = &(try vanilla_content.blocks(allocator)).published;
+        const streaming = try Streaming.init(allocator, io, .{ .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -2234,7 +2255,8 @@ pub fn verifyBlockBatchRetirement() !void {
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const streaming = try Streaming.init(allocator, io, .{ .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = try vanilla_content.blocks(allocator), .chunks = terrain, .worlds = dimensions }) });
+        const block_properties = &(try vanilla_content.blocks(allocator)).published;
+        const streaming = try Streaming.init(allocator, io, .{ .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
@@ -2297,4 +2319,13 @@ pub fn verifyBlockBatchRetirement() !void {
             }
         }
     }
+}
+
+/// Vanilla state for bench players, all in survival.
+fn survivalStates(allocator: std.mem.Allocator, players: []const Players.Player) !*PlayerStates {
+    const states = try allocator.alloc(PlayerStates.State, players.len);
+    for (states, players) |*state, player| state.* = .{ .uuid = player.uuid, .gamemode = .survival };
+    const result = try allocator.create(PlayerStates);
+    result.* = .{ .deps = undefined, .config = .{ .gamemode = .survival }, .records = states };
+    return result;
 }

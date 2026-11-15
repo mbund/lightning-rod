@@ -1,6 +1,10 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
+const Chunks = @import("chunks").Chunks;
+const Inventories = @import("inventories").Inventories;
+const Players = @import("players").players.Players;
+const Reload = @import("reload").Reload;
 const game_data = @import("game_data");
 const minecraft = @import("minecraft_model");
 const sessions = @import("sessions");
@@ -11,7 +15,7 @@ const StormStick = @import("storm_stick").StormStick;
 
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
-        lightning_rod.plugin.replace(e2e.profile.plugins(), .{lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 1, .render_distance = 2, .gamemode = .survival, .spawn_for_player = spawn })}),
+        lightning_rod.plugin.replace(e2e.profile.plugins(), .{ lightning_rod.plugin.configured(Players, .{ .maximum = 1, .render_distance = 2, .spawn_for_player = spawn }), lightning_rod.plugin.configured(vanilla.PlayerStates, .{ .gamemode = .survival }) }),
         lightning_rod.plugin.configured(SilkSpawners, .{}),
         lightning_rod.plugin.configured(StormStick, .{}),
         lightning_rod.plugin.configured(Probe, .{}),
@@ -19,14 +23,14 @@ pub fn main(init: std.process.Init) !void {
     try e2e.profile.run(init, plugins, .{ .reload_executable = "/proc/self/exe" });
 }
 
-fn spawn(_: *const vanilla.Players.Player) minecraft.Position {
+fn spawn(_: *const Players.Player) minecraft.Position {
     return .{ .x = 0.5, .y = 65, .z = 3.5 };
 }
 
 const Probe = struct {
     pub const id = "e2e:enchantments";
     pub const Configuration = struct {};
-    pub const Dependencies = struct { players: *vanilla.Players, chunks: *vanilla.Chunks, inventories: *vanilla.Inventories, inventory: *vanilla.PlayerInventory, items: *vanilla.Items, experience: *vanilla.Experience, dropped: *vanilla.ItemEntities, storm: *StormStick, control: *e2e.Control, reload: *vanilla.Reload };
+    pub const Dependencies = struct { players: *Players, player_states: *vanilla.PlayerStates, chunks: *Chunks, inventories: *Inventories, inventory: *vanilla.PlayerInventory, items: *vanilla.Items, experience: *vanilla.Experience, dropped: *vanilla.ItemEntities, storm: *StormStick, control: *e2e.Control, reload: *Reload };
     const Phase = enum { waiting, normal, normal_done, silk, silk_done, plain, enchanted, lightning, reloading, restored };
     const spawner: minecraft.BlockPosition = .{ .x = 0, .y = 66, .z = 0 };
     const target: minecraft.BlockPosition = .{ .x = 0, .y = 65, .z = -8 };
@@ -55,7 +59,7 @@ const Probe = struct {
     }
 
     fn totalExperience(self: *Probe) i64 {
-        var amount: i64 = self.deps.players.records[0].experience.total;
+        var amount: i64 = self.deps.player_states.records[0].experience.total;
         for (self.deps.experience.active.values()) |index| {
             const orb = self.deps.experience.orbs[index];
             if (orb.alive) amount += @as(i64, orb.value) * orb.count;

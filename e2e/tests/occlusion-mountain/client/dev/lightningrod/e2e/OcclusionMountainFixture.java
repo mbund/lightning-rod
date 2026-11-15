@@ -14,6 +14,7 @@ final class OcclusionMountainFixture extends Fixture {
     private static final double RADIUS = 224;
     private static final double STEP = 4;
     private static final int FLIGHT_TICKS = (int) Math.ceil(2 * Math.PI * RADIUS / STEP);
+    private static final long DELIVERY_TICKS = 10;
     private final BlockPos.MutableBlockPos sample = new BlockPos.MutableBlockPos();
     private int flightTick;
     private long frames;
@@ -27,12 +28,24 @@ final class OcclusionMountainFixture extends Fixture {
     private int loadingColumns;
     private int viewX;
     private int viewZ;
+    // View centers with the client tick each arrived on, newest last.
+    private final long[] viewTicks = new long[64];
+    private final int[] viewXs = new int[64];
+    private final int[] viewZs = new int[64];
+    private int views;
 
     OcclusionMountainFixture(Recorder recorder) { super(recorder); }
     @Override boolean encrypted() { return true; }
     @Override int renderDistance() { return DISTANCE; }
     @Override boolean prepare(Minecraft game) { return true; }
-    @Override void viewCenter(int x, int z) { viewX = x; viewZ = z; }
+    @Override void viewCenter(int x, int z) {
+        viewX = x;
+        viewZ = z;
+        int slot = views++ % viewTicks.length;
+        viewTicks[slot] = r.tick;
+        viewXs[slot] = x;
+        viewZs[slot] = z;
+    }
     @Override void connected(Minecraft game) {
         if (!game.player.getAbilities().flying) {
             game.player.getAbilities().flying = true;
@@ -66,10 +79,12 @@ final class OcclusionMountainFixture extends Fixture {
                 return;
             }
             if (loaded < COLUMNS || missing != 0 || missingChunks(game, CACHE_DISTANCE) != 0) return;
-            for (int z = -32; z <= 32; z += 16) for (int x = 48; x <= 96; x += 16) {
+            // The face toward the start position is in view. The far side is behind the peak, so it
+            // is disclosed once the flight brings it into view, where the flight checks it.
+            for (int z = -32; z <= 32; z += 16) for (int x = -96; x <= -48; x += 16) {
                 sample.set(x, height(x, z), z);
                 if (!game.level.getBlockState(sample).is(reference(x, height(x, z), z))) {
-                    fail("exterior_region_missing_mountain_backside", x, height(x, z), z);
+                    fail("visible_mountain_face_missing", x, height(x, z), z);
                     return;
                 }
             }
@@ -106,7 +121,7 @@ final class OcclusionMountainFixture extends Fixture {
         if (missingHorizon != 0) {
             StringBuilder gaps = new StringBuilder();
             int nearest = Integer.MAX_VALUE;
-            int cx = game.player.getBlockX() >> 4, cz = game.player.getBlockZ() >> 4;
+            int cx = viewX, cz = viewZ;
             for (int dz = -DISTANCE; dz <= DISTANCE; dz++) for (int dx = -DISTANCE; dx <= DISTANCE; dx++) {
                 if (game.level.getChunkSource().getChunk(cx + dx, cz + dz, ChunkStatus.FULL, false) != null) continue;
                 nearest = Math.min(nearest, dx * dx + dz * dz);
@@ -134,17 +149,29 @@ final class OcclusionMountainFixture extends Fixture {
         }
     }
 
-    private static int missingHorizonChunks(Minecraft game) {
-        int cx = game.player.getBlockX() >> 4, cz = game.player.getBlockZ() >> 4;
-        double px = game.player.getX(), pz = game.player.getZ();
+    // The server promises the ring around the view center it sent, and a column on the leading edge
+    // may take a few ticks to arrive. A client that renders few frames also handles both late, so
+    // its own position runs ahead of the ring. Columns count once both the current ring and the ring
+    // from DELIVERY_TICKS ago hold them.
+    private int missingHorizonChunks(Minecraft game) {
+        if (views == 0) return 0;
+        int settled = views - 1;
+        while (settled > 0 && settled > views - viewTicks.length && r.tick - viewTicks[settled % viewTicks.length] < DELIVERY_TICKS) settled--;
+        int ox = viewXs[settled % viewTicks.length], oz = viewZs[settled % viewTicks.length];
+        int cx = viewX, cz = viewZ;
         int missing = 0;
         for (int z = cz - DISTANCE; z <= cz + DISTANCE; z++) for (int x = cx - DISTANCE; x <= cx + DISTANCE; x++) {
-            double dx = Math.max(x * 16 - px, Math.max(0, px - (x + 1) * 16));
-            double dz = Math.max(z * 16 - pz, Math.max(0, pz - (z + 1) * 16));
-            if (dx * dx + dz * dz > DISTANCE * DISTANCE * 256) continue;
+            if (!inRing(cx, cz, x, z) || !inRing(ox, oz, x, z)) continue;
             if (game.level.getChunkSource().getChunk(x, z, ChunkStatus.FULL, false) == null) missing++;
         }
         return missing;
+    }
+
+    private static boolean inRing(int cx, int cz, int x, int z) {
+        double px = cx * 16 + 8, pz = cz * 16 + 8;
+        double dx = Math.max(x * 16 - px, Math.max(0, px - (x + 1) * 16));
+        double dz = Math.max(z * 16 - pz, Math.max(0, pz - (z + 1) * 16));
+        return dx * dx + dz * dz <= DISTANCE * DISTANCE * 256;
     }
 
     private void ray(Minecraft game, double ox, double oy, double oz, double tx, double ty, double tz) {

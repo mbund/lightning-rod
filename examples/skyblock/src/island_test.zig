@@ -9,6 +9,9 @@ const Worlds = @import("worlds.zig").Worlds;
 const records = @import("records");
 const Slots = @import("slots.zig").Slots;
 const vanilla = @import("vanilla");
+const Chunks = @import("chunks").Chunks;
+const Section = @import("chunks").Section;
+const chunk_delivery = @import("terrain").delivery_cache;
 const game_data = @import("game_data");
 const chunks = @import("chunks");
 
@@ -123,7 +126,7 @@ test "bounded worker batches reuse scratch and retire worlds before admitting de
     var world_storage = try Worlds.init(&store, std.testing.io);
     const resources = try records.Resources.init(allocator, std.testing.io, .{ .readers = 2, .writers = 2 });
     defer resources.deinit();
-    workers[0] = .{ .io = std.testing.io, .record_resources = resources, .delivery = try vanilla.chunk_delivery.Workspace.init(allocator, selected.values.len), .index = 0 };
+    workers[0] = .{ .io = std.testing.io, .record_resources = resources, .delivery = try chunk_delivery.Workspace.init(allocator, selected.values.len), .index = 0 };
     var slots = try Slots.init(allocator, 2);
     defer slots.deinit();
     var pool: islands.Pool = .{ .workers = workers, .slots = &slots, .limit = 2 };
@@ -161,8 +164,8 @@ test "bounded worker batches reuse scratch and retire worlds before admitting de
     try std.testing.expect(worlds[2].simulation == null);
     try std.testing.expect(worlds[0].slot == &slots.hub);
     const block_index: u12 = 12;
-    const section: vanilla.Section = .{ .world = worlds[0].simulation.?.get(vanilla.VanillaWorlds).overworld, .x = 0, .y = 4, .z = 0 };
-    try worlds[0].simulation.?.get(vanilla.Chunks).setBlocks(section, &.{.{ .index = block_index, .state = game_data.registry.block_dirt_default_state }});
+    const section: Section = .{ .world = worlds[0].simulation.?.get(vanilla.VanillaWorlds).overworld, .x = 0, .y = 4, .z = 0 };
+    try worlds[0].simulation.?.get(Chunks).setBlocks(section, &.{.{ .index = block_index, .state = game_data.registry.block_dirt_default_state }});
     for (worlds[0..2]) |world| try std.testing.expectEqual(@intFromPtr(&workers[0].scratch), @intFromPtr(world.simulation.?.temporary.buffer.ptr));
     try pool.apply(&worlds, .tick);
     try std.testing.expectEqual(@as(u64, 1), worlds[0].simulation.?.completed_tick);
@@ -188,7 +191,7 @@ test "bounded worker batches reuse scratch and retire worlds before admitting de
         }
     };
     try pool.apply(&worlds, .pause);
-    const terrain = worlds[0].simulation.?.get(vanilla.Chunks);
+    const terrain = worlds[0].simulation.?.get(Chunks);
     var gate: Gate = .{ .source = terrain.generation.source.? };
     terrain.generation.source = chunks.Source.init(&gate, Gate.generate);
     var ready: [1]bool = undefined;
@@ -234,13 +237,13 @@ test "bounded worker batches reuse scratch and retire worlds before admitting de
     defer worlds[0].execute(.close, &workers[0].scratch) catch unreachable;
     {
         const Read = struct {
-            fn run(chunk_cache: *vanilla.Chunks, at: vanilla.Section, index: u12) !u16 {
+            fn run(chunk_cache: *Chunks, at: Section, index: u12) !u16 {
                 const chunk = try chunk_cache.acquire(at);
                 defer chunk.release();
                 return chunk.view().get(index);
             }
         };
-        try std.testing.expectEqual(@as(u16, game_data.registry.block_dirt_default_state), try Read.run(worlds[0].simulation.?.get(vanilla.Chunks), section, block_index));
+        try std.testing.expectEqual(@as(u16, game_data.registry.block_dirt_default_state), try Read.run(worlds[0].simulation.?.get(Chunks), section, block_index));
     }
     var restored = (try world_storage.open(1)).?;
     try std.testing.expectEqual(@as(u128, 1), (try catalog.State.read(try restored.transaction().openSpace(catalog.island_namespace))).owner().?);

@@ -28,6 +28,7 @@ public final class FixtureApiTest {
         markerAcknowledgements();
         lateChatFailure(false);
         lateChatFailure(true);
+        fixtureLookup();
         Recorder timing = new Recorder();
         timing.firstChunkTick = 7;
         timing.firstChunkNanos = 123;
@@ -142,17 +143,41 @@ public final class FixtureApiTest {
         }
     }
 
-    private static void lateChatFailure(boolean roster) throws Exception {
+    static final class LookupFixture extends Fixture {
+        LookupFixture(Recorder recorder) { super(recorder); }
+        @Override void tick(Minecraft game, int loaded, int missing) {}
+    }
+
+    private static void fixtureLookup() {
+        Recorder recorder = new Recorder();
+        require(Fixture.create(recorder, "FixtureApiTest$LookupFixture") instanceof LookupFixture, "the named fixture class must be created");
+        for (String name : new String[] { null, "", "Missing", "Recorder" }) {
+            boolean rejected = false;
+            try { Fixture.create(recorder, name); }
+            catch (IllegalArgumentException expected) { rejected = true; }
+            require(rejected, "a missing or non-fixture class must be rejected: " + name);
+        }
+    }
+
+    // A fixture may check a message before it records it, or record it first and count copies.
+    private static void lateChatFailure(boolean recordFirst) throws Exception {
         Path directory = Files.createTempDirectory("e2e-late-chat-");
         Recorder recorder = new Recorder();
         recorder.artifacts = directory;
         recorder.enabled = true;
         recorder.expectedPeers = java.util.List.of("alice", "bob");
         recorder.peer = "alice";
-        recorder.fixture = roster ? new JoinLeaveFixture(recorder) : new ChatFixture(recorder);
+        recorder.fixture = new Fixture(recorder) {
+            @Override void tick(Minecraft game, int loaded, int missing) {}
+            @Override void chat(String text) {
+                if (!recordFirst && r.receivedChat.contains(text)) client.fail("chat_duplicate");
+                super.chat(text);
+                if (recordFirst && r.receivedChat.stream().filter(text::equals).count() > 1) client.fail("chat_duplicate");
+            }
+        };
         try (var events = Files.newBufferedWriter(directory.resolve("events.jsonl"))) {
             recorder.events = events;
-            String message = roster ? "alice joined the game" : "<alice> e2e-chat:alice:short";
+            String message = "<alice> e2e-chat:alice:short";
             recorder.chatReceived(message);
             recorder.pass("chat_complete");
             Recorder.Capture success = recorder.pendingScreenshots.getFirst();
@@ -162,8 +187,7 @@ public final class FixtureApiTest {
             recorder.captureFinished(success, true);
             require(!recorder.resultPublished, "a superseded capture must not publish");
             recorder.captureFinished(recorder.pendingScreenshots.getFirst(), true);
-            String reason = roster ? "duplicate_join_or_leave" : "chat_duplicate_or_reordered";
-            require(Files.readString(directory.resolve("alice.result")).equals("FAIL " + reason + "\n"),
+            require(Files.readString(directory.resolve("alice.result")).equals("FAIL chat_duplicate\n"),
                 "late assertion failure must be published");
         } finally {
             try (var files = Files.list(directory)) {

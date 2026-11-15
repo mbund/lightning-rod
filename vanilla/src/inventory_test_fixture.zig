@@ -1,7 +1,7 @@
-const definition_provider = @import("definition_provider.zig");
-const vanilla_content = @import("vanilla_content.zig");
-const crafting = @import("crafting.zig");
-const menu_click = @import("menu_click.zig");
+const definition_provider = @import("vanilla_definitions").definition_provider;
+const vanilla_content = @import("vanilla_definitions").defaults;
+const crafting = @import("vanilla_crafting").crafting;
+const menu_click = @import("vanilla_inventory").menu_click;
 const std = @import("std");
 const storage = @import("storage");
 const records = @import("records");
@@ -10,20 +10,22 @@ const worlds = @import("worlds");
 const entities = @import("entities");
 const inventories = @import("inventories");
 const sessions = @import("sessions");
-const ItemEntities = @import("item_entities.zig").ItemEntities;
-const InventoryMenus = @import("inventory_menus.zig").InventoryMenus;
-const CreativeInventory = @import("creative_inventory.zig").CreativeInventory;
-const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
-const Players = @import("players.zig").Players;
-const Input = @import("input.zig").Input;
-const Items = @import("items.zig").Items;
-const EquipmentSlots = @import("item_properties.zig").EquipmentSlots;
+const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
+const InventoryMenus = @import("vanilla_containers").inventory_menus.InventoryMenus;
+const CreativeInventory = @import("vanilla_inventory").creative_inventory.CreativeInventory;
+const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
+const Players = @import("players").players.Players;
+const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
+const Input = @import("players").input.Input;
+const Items = @import("vanilla_items").items.Items;
+const EquipmentSlots = @import("vanilla_items").item_properties.EquipmentSlots;
 
 pub const InventoryFixture = struct {
     definitions: definition_provider.Dependencies,
     service: *sessions.Service,
     input: *Input,
     players: *Players,
+    player_states: *PlayerStates,
     ownership: *inventories.Inventories,
     items: *Items,
     menu: *PlayerInventory,
@@ -55,10 +57,19 @@ pub const InventoryFixture = struct {
             .input = input,
             .storage = try store.openSpace("players"),
             .worlds = dimensions,
+        });
+        players.records[0] = .{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .loaded = true };
+        players.rebuildIndexes();
+        const player_states = try PlayerStates.init(allocator, .{}, .{
+            .record_workspaces = workspaces,
+            .players = players,
+            .input = input,
+            .packets = undefined,
+            .storage = try store.openSpace(PlayerStates.id),
+            .worlds = dimensions,
             .vanilla_worlds = undefined,
         });
-        players.records[0] = .{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .loaded = true, .gamemode = .creative };
-        players.rebuildIndexes();
+        player_states.records[0] = .{ .uuid = 1, .gamemode = .creative };
         const ownership = try inventories.Inventories.init(allocator, io, .{ .cache_slots = 128, .cache_items = 8, .max_item_bytes = 1024 }, .{
             .metrics = registry,
             .storage = try store.openSpace("inventory"),
@@ -80,6 +91,7 @@ pub const InventoryFixture = struct {
             .crafting = gameplay_definitions.crafting,
             .furnaces = gameplay_definitions.furnaces,
             .players = players,
+            .player_states = player_states,
             .inventories = ownership,
             .items = items,
             .equipment = try EquipmentSlots.init(allocator, .{ .items = items, .enchantments = gameplay_definitions.enchantments }),
@@ -89,12 +101,13 @@ pub const InventoryFixture = struct {
             .inventory = menu,
             .input = input,
             .players = players,
+            .player_states = player_states,
             .sessions = service,
             .packets = undefined,
             .inventories = ownership,
             .items = items,
         });
-        const menus = try InventoryMenus.init(allocator, .{ .containers = undefined, .inventory = menu, .input = input, .players = players, .inventories = ownership, .items = items, .packets = undefined, .sessions = service });
-        return .{ .definitions = gameplay_definitions, .service = service, .input = input, .players = players, .ownership = ownership, .items = items, .menu = menu, .menus = menus, .creative = creative, .bodies = bodies, .dropped = dropped };
+        const menus = try InventoryMenus.init(allocator, .{ .containers = undefined, .inventory = menu, .input = input, .players = players, .player_states = player_states, .inventories = ownership, .items = items, .packets = undefined, .sessions = service });
+        return .{ .definitions = gameplay_definitions, .service = service, .input = input, .players = players, .player_states = player_states, .ownership = ownership, .items = items, .menu = menu, .menus = menus, .creative = creative, .bodies = bodies, .dropped = dropped };
     }
 };

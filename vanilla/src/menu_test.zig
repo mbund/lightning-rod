@@ -1,36 +1,37 @@
-const fuel = @import("fuel.zig");
-const custom_data = @import("custom_data.zig");
-const vanilla_content = @import("vanilla_content.zig");
-const recipe_placement = @import("recipe_placement.zig");
-const FuelConversionDefinition = @import("recipes.zig").FuelConversionDefinition;
+const fuel = @import("vanilla_crafting").fuel;
+const custom_data = @import("vanilla_content").custom_data;
+const vanilla_content = @import("vanilla_definitions").defaults;
+const recipe_placement = @import("vanilla_crafting").recipe_placement;
+const FuelConversionDefinition = @import("vanilla_crafting").recipes.FuelConversionDefinition;
 const std = @import("std");
 const storage = @import("storage");
 const fault = @import("fault_disk");
 const metrics = @import("metrics");
 const packets = @import("minecraft_packets");
 const sessions = @import("sessions");
-const protocols = @import("protocols");
+const protocols = @import("minecraft_packets").protocols;
 const game_data = @import("game_data");
-const provider = @import("definition_provider.zig");
-const Crafting = @import("crafting_registry.zig").Crafting;
+const provider = @import("vanilla_definitions").definition_provider;
+const Crafting = @import("vanilla_crafting").crafting_registry.Crafting;
 const inventories = @import("inventories");
-const menu_click = @import("menu_click.zig");
+const menu_click = @import("vanilla_inventory").menu_click;
 const InventoryFixture = @import("inventory_test_fixture.zig").InventoryFixture;
-const item_data = @import("item_data.zig");
-const ItemEntities = @import("item_entities.zig").ItemEntities;
-const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
-const Experience = @import("experience.zig").Experience;
-const ExperienceState = @import("experience_state.zig").State;
-const Random = @import("random.zig").Random;
-const Enchantments = @import("enchantments.zig").Enchantments;
-const ItemPhysics = @import("item_physics.zig").ItemPhysics;
-const InventoryCapacity = @import("inventory_capacity.zig").InventoryCapacity;
+const item_data = @import("vanilla_items").item_data;
+const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
+const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
+const Experience = @import("vanilla_survival").experience.Experience;
+const ExperienceState = @import("vanilla_player").experience_state.State;
+const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
+const Random = @import("vanilla_content").random.Random;
+const Enchantments = @import("vanilla_items").enchantments.Enchantments;
+const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
+const InventoryCapacity = @import("vanilla_inventory").inventory_capacity.InventoryCapacity;
 const records = @import("records");
 const chunks = @import("chunks");
-const BlockActions = @import("block_actions.zig").BlockActions;
-const Containers = @import("containers.zig").Containers;
-const ContainerKey = @import("containers.zig").Key;
-const furnace = @import("furnace.zig");
+const BlockActions = @import("vanilla_blocks").block_actions.BlockActions;
+const Containers = @import("vanilla_containers").containers.Containers;
+const ContainerKey = @import("vanilla_containers").containers.Key;
+const furnace = @import("vanilla_containers").furnace;
 const conservation = @import("menu_conservation_test.zig");
 
 test {
@@ -60,42 +61,43 @@ test "experience pickup consumes one merged count every two ticks and ignores sp
     const experience = containers.deps.experience;
     bounded.fail_index = bounded.alloc_index;
     fixture.players.records[0].position = .{ .x = 0.5, .y = 8, .z = 0.5 };
-    fixture.players.records[0].gamemode = .spectator;
+    fixture.player_states.records[0].gamemode = .spectator;
     fixture.players.rebuildIndexes();
     try experience.award(fixture.players.records[0].world, .{ 0.5, 8, 0.5 }, 7);
     const index = experience.active.values()[0];
     experience.orbs[index].count = 3;
     try experience.tick();
-    try std.testing.expectEqual(@as(i32, 0), fixture.players.records[0].experience.total);
+    try std.testing.expectEqual(@as(i32, 0), fixture.player_states.records[0].experience.total);
     try std.testing.expectEqual(@as(i32, 3), experience.orbs[index].count);
-    fixture.players.records[0].gamemode = .survival;
+    fixture.player_states.records[0].gamemode = .survival;
     for ([_]i32{ 7, 7, 14, 14, 21 }) |total| {
         try experience.tick();
-        try std.testing.expectEqual(total, fixture.players.records[0].experience.total);
+        try std.testing.expectEqual(total, fixture.player_states.records[0].experience.total);
     }
     try std.testing.expect(!experience.orbs[index].alive);
     try experience.tick();
     try std.testing.expectEqual(@as(usize, 0), experience.active.values().len);
     const player = &fixture.players.records[0];
-    player.health = 0;
-    player.experience = .{ .level = 30, .total = 1500 };
+    const state = &fixture.player_states.records[0];
+    state.health = 0;
+    state.experience = .{ .level = 30, .total = 1500 };
     try experience.tick();
-    try std.testing.expectEqual(@as(i32, 0), player.experience.total);
+    try std.testing.expectEqual(@as(i32, 0), state.experience.total);
     try experience.tick();
     var reward: i32 = 0;
     for (experience.active.values()) |at| reward += experience.orbs[at].count * experience.orbs[at].value;
     try std.testing.expectEqual(@as(i32, 100), reward);
     player.life += 1;
-    player.experience = .{ .level = 1, .total = 7 };
+    state.experience = .{ .level = 1, .total = 7 };
     experience.config.keep_inventory = true;
     try experience.tick();
-    try std.testing.expectEqual(@as(i32, 7), player.experience.total);
+    try std.testing.expectEqual(@as(i32, 7), state.experience.total);
     experience.config.keep_inventory = false;
     player.handle.?.generation += 1;
     player.life = 1;
-    player.experience = .{ .level = 30, .total = 1500 };
+    state.experience = .{ .level = 30, .total = 1500 };
     try experience.tick();
-    try std.testing.expectEqual(@as(i32, 0), player.experience.total);
+    try std.testing.expectEqual(@as(i32, 0), state.experience.total);
     reward = 0;
     for (experience.active.values()) |at| reward += experience.orbs[at].count * experience.orbs[at].value;
     try std.testing.expectEqual(@as(i32, 200), reward);
@@ -172,8 +174,9 @@ test "competing experience collectors conserve every point under sustained bound
     fixture.players.records[1] = fixture.players.records[0];
     fixture.players.records[1].handle = .{ .index = 1, .generation = 1 };
     fixture.players.records[1].uuid = 2;
-    for (fixture.players.records) |*player| {
-        player.gamemode = .survival;
+    fixture.player_states.records[1] = .{ .uuid = 2 };
+    for (fixture.players.records, fixture.player_states.records) |*player, *state| {
+        state.gamemode = .survival;
         player.position = .{ .x = 0.5, .y = 8, .z = 0.5 };
     }
     fixture.players.rebuildIndexes();
@@ -194,11 +197,11 @@ test "competing experience collectors conserve every point under sustained bound
             for (experience.active.values()) |at| if (experience.orbs[at].alive) {
                 remaining += experience.orbs[at].value * experience.orbs[at].count;
             };
-            try std.testing.expectEqual(generated, remaining + fixture.players.records[0].experience.total + fixture.players.records[1].experience.total);
+            try std.testing.expectEqual(generated, remaining + fixture.player_states.records[0].experience.total + fixture.player_states.records[1].experience.total);
         }
         try std.testing.expectEqual(@as(usize, 0), experience.active.values().len);
     }
-    for (fixture.players.records) |player| try std.testing.expectEqual(@divExact(generated, 2), player.experience.total);
+    for (fixture.player_states.records) |state| try std.testing.expectEqual(@divExact(generated, 2), state.experience.total);
 }
 
 test "spawn time orb merging uses the vanilla signed entity group and resets age" {
@@ -281,7 +284,8 @@ fn verifyAtomicExperience(mode: fault.Disk.Mode) !void {
         const experience = (try blockContainers(arena.allocator(), &store, &registry, fixture)).deps.experience;
         const player = &fixture.players.records[0];
         player.position = .{ .x = 0.5, .y = 8, .z = 0.5 };
-        player.gamemode = .survival;
+        const state = &fixture.player_states.records[0];
+        state.gamemode = .survival;
         fixture.players.rebuildIndexes();
         const hand: inventories.Slot = .{ .owner = player.uuid, .index = 36 };
         if (phase == 0) {
@@ -299,16 +303,14 @@ fn verifyAtomicExperience(mode: fault.Disk.Mode) !void {
             entity = experience.residents[index].id;
             experience.orbs[index].count = 3;
         } else {
-            const table = records.Table.init(fixture.players.deps.storage, fixture.players.deps.record_workspaces.resources);
-            var key: [17]u8 = undefined;
-            key[0] = 1;
-            std.mem.writeInt(u128, key[1..17], player.uuid, .little);
+            const table = records.Table.init(fixture.player_states.deps.storage, fixture.player_states.deps.record_workspaces.resources);
+            const key = PlayerStates.experienceKey(player.uuid);
             var bytes: [ExperienceState.encoded_size]u8 = undefined;
             const length = (try table.get(&key, &bytes)).?;
-            player.experience = try ExperienceState.decode(bytes[0..length]);
+            state.experience = try ExperienceState.decode(bytes[0..length]);
             const expected: i32 = if (phase == 3) 12 else 5;
-            try std.testing.expectEqual(expected, player.experience.total);
-            try std.testing.expectEqual(expected, player.experience.score);
+            try std.testing.expectEqual(expected, state.experience.total);
+            try std.testing.expectEqual(expected, state.experience.score);
             try std.testing.expectEqual(repaired_item, (try fixture.ownership.get(hand)).stack.?.item);
             const index = experience.ids.get(entity).?;
             try std.testing.expectEqual(@as(i32, if (phase == 3) 1 else 2), experience.orbs[index].count);
@@ -317,8 +319,9 @@ fn verifyAtomicExperience(mode: fault.Disk.Mode) !void {
             if (phase == 3) continue;
         }
         try experience.tick();
-        try std.testing.expectEqual(@as(i32, if (phase == 0) 5 else 12), player.experience.total);
+        try std.testing.expectEqual(@as(i32, if (phase == 0) 5 else 12), state.experience.total);
         try fixture.players.checkpoint(fixture.players.deps.storage);
+        try fixture.player_states.checkpoint(fixture.player_states.deps.storage);
         try fixture.ownership.checkpoint(fixture.ownership.deps.storage);
         try experience.checkpoint(experience.deps.storage);
         if (phase != 1) try store.waitDurable(try store.commit(if (phase == 0) 1 else 2));
@@ -389,7 +392,7 @@ test "orb merges preserve denomination counts and minimum age and expiry removes
     const containers = try blockContainers(arena.allocator(), &store, &registry, fixture);
     const experience = containers.deps.experience;
     fixture.players.records[0].position = .{ .x = 0, .y = 8, .z = 0 };
-    fixture.players.records[0].gamemode = .spectator;
+    fixture.player_states.records[0].gamemode = .spectator;
     fixture.players.rebuildIndexes();
     const world = fixture.players.records[0].world;
     try experience.award(world, .{ 8, 8, 0 }, 3);
@@ -432,7 +435,7 @@ test "orb placement fluid currents block effects and fire follow vanilla physics
     const containers = try blockContainers(arena.allocator(), &store, &registry, fixture);
     const experience = containers.deps.experience;
     const world = fixture.players.records[0].world;
-    fixture.players.records[0].gamemode = .spectator;
+    fixture.player_states.records[0].gamemode = .spectator;
     fixture.players.records[0].position = .{ .x = 8, .y = 8, .z = 8 };
     fixture.players.rebuildIndexes();
     try containers.deps.chunks.setBlock(world, .{ .x = 0, .y = 8, .z = 0 }, @intCast(game_data.registry.blockStateId("minecraft:stone").?));
@@ -599,7 +602,7 @@ test "crafting consumes inputs once and cursor ownership survives durable restar
         var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
         const fixture = try InventoryFixture.init(bounded.allocator(), &store, &registry, &selected);
         defer fixture.service.deinit();
-        fixture.players.records[0].gamemode = .survival;
+        fixture.player_states.records[0].gamemode = .survival;
         bounded.fail_index = bounded.alloc_index;
         if (!reopen) {
             const log: inventories.Stack = .{ .item = try fixture.items.define("minecraft:oak_log"), .count = 2 };
@@ -666,6 +669,7 @@ fn blockContainers(allocator: std.mem.Allocator, store: *storage.Store, registry
         .enchantments = fixture.definitions.enchantments,
         .dimensions = fixture.definitions.dimensions,
         .players = fixture.players,
+        .player_states = fixture.player_states,
         .entities = fixture.bodies,
         .physics = try ItemPhysics.init(allocator, .{ .blocks = fixture.definitions.blocks, .chunks = terrain }),
         .inventories = fixture.ownership,
@@ -679,6 +683,7 @@ fn blockContainers(allocator: std.mem.Allocator, store: *storage.Store, registry
         .experience = experience,
         .metrics = registry,
         .players = fixture.players,
+        .player_states = fixture.player_states,
         .inventory = fixture.menu,
         .inventories = fixture.ownership,
         .chunks = terrain,
@@ -912,9 +917,10 @@ test "shared chest clicks revalidate drag slots and preserve independent cursors
     try std.testing.expect(try fixture.ownership.set(Containers.slot(key.world, key.position, 0), 0, bread));
     fixture.players.records[1] = fixture.players.records[0];
     fixture.players.records[1].uuid = 2;
+    fixture.player_states.records[1] = .{ .uuid = 2 };
     fixture.players.records[1].handle = .{ .index = 1, .generation = 1 };
-    for (fixture.players.records) |*player| {
-        player.gamemode = .survival;
+    for (fixture.players.records, fixture.player_states.records) |*player, *state| {
+        state.gamemode = .survival;
         player.position = .{ .x = 2, .y = 1, .z = 3 };
         player.protocol = selected[0].number;
         try std.testing.expectEqual(BlockActions.Result.applied, try containers.deps.actions.apply(.{ .action = .use, .player = player, .position = key.position, .state = chest }));
@@ -1075,14 +1081,15 @@ test "interrupted container saves recover a complete ownership snapshot" {
             bounded.fail_index = bounded.alloc_index;
             fixture.players.records[1] = fixture.players.records[0];
             fixture.players.records[1].uuid = 2;
+            fixture.player_states.records[1] = .{ .uuid = 2 };
             fixture.players.records[1].handle = .{ .index = 1, .generation = 1 };
             chest_key = .{ .world = fixture.players.records[0].world, .position = .{ .x = 2, .y = 1, .z = 0 } };
             furnace_key = .{ .world = chest_key.world, .position = .{ .x = 4, .y = 1, .z = 0 } };
             const chest = containers.states.chests[0][0][0];
             try containers.deps.chunks.setBlock(chest_key.world, chest_key.position, chest);
             try containers.deps.chunks.setBlock(furnace_key.world, furnace_key.position, containers.states.furnaces[0][0]);
-            for (fixture.players.records) |*player| {
-                player.gamemode = .survival;
+            for (fixture.players.records, fixture.player_states.records) |*player, *state| {
+                state.gamemode = .survival;
                 player.position = .{ .x = 2, .y = 1, .z = 3 };
                 player.protocol = selected[0].number;
                 try std.testing.expectEqual(BlockActions.Result.applied, try containers.deps.actions.apply(.{ .action = .use, .player = player, .position = chest_key.position, .state = chest }));
@@ -1147,9 +1154,10 @@ test "interrupted container saves recover a complete ownership snapshot" {
             const containers = try blockContainers(bounded.allocator(), &store, &registry, fixture);
             fixture.players.records[1] = fixture.players.records[0];
             fixture.players.records[1].uuid = 2;
+            fixture.player_states.records[1] = .{ .uuid = 2 };
             fixture.players.records[1].handle = .{ .index = 1, .generation = 1 };
-            fixture.players.records[0].gamemode = .survival;
-            fixture.players.records[1].gamemode = .survival;
+            fixture.player_states.records[0].gamemode = .survival;
+            fixture.player_states.records[1].gamemode = .survival;
             bounded.fail_index = bounded.alloc_index;
             const complete = cut == image.len;
             try std.testing.expectEqual(@as(u64, if (complete) 2 else 1), store.lastTick());
@@ -1199,7 +1207,7 @@ test "inventory cache defaults follow player capacity and preserve explicit over
     try std.testing.expectEqual(@as(usize, 256), standalone.cache.entries.len);
 }
 
-const crafting = @import("crafting.zig");
+const crafting = @import("vanilla_crafting").crafting;
 
 const ChargedRecipe = struct {
     pub const id = "test:charged";
@@ -1271,7 +1279,7 @@ test "algorithmic crafting derives NBT and commits effects only with the invento
     var owner: ChargedRecipe = .{};
     const implementation = try ChargedRecipe.Implementation.define(allocator, &owner, .{ .increment = 5 });
     const content = try Crafting.init(allocator, .{ .definitions = .{ .recipes = &.{.{ .name = "test:charged", .definition = .{ .algorithmic = implementation } }} } }, .{ .items = fixture.definitions.items });
-    fixture.players.records[0].gamemode = .survival;
+    fixture.player_states.records[0].gamemode = .survival;
     fixture.menu.states[0] = .{ .generation = 1, .life = fixture.players.records[0].life, .close = false, .gamemode = .survival };
     fixture.menu.recipes = &content.table;
     fixture.menu.deps.crafting = content;
@@ -1376,7 +1384,7 @@ test "recipe book placement validates real crafting table and furnace views befo
         const containers = try blockContainers(bounded.allocator(), &store, &registry, fixture);
         const player = &fixture.players.records[0];
         player.position = .{ .x = 0.5, .y = 2, .z = 0.5 };
-        player.gamemode = .survival;
+        fixture.player_states.records[0].gamemode = .survival;
         const key: ContainerKey = .{ .world = player.world, .position = .{ .x = 2, .y = 1, .z = 0 } };
         const source: inventories.Slot = .{ .owner = player.uuid, .index = 9 };
         const item = try fixture.items.define(if (station == 0) "minecraft:oak_planks" else "minecraft:iron_ore");
@@ -1664,7 +1672,7 @@ test "fuel callbacks receive actor position and NBT and preserve plugin provenan
         const player = &fixture.players.records[0];
         player.protocol = selected[0].number;
         player.position = .{ .x = 2, .y = 1, .z = 3 };
-        player.gamemode = .survival;
+        fixture.player_states.records[0].gamemode = .survival;
         const key: ContainerKey = .{ .world = player.world, .position = .{ .x = 2, .y = 1, .z = 0 } };
         bounded.fail_index = bounded.alloc_index;
         if (pass == 0) {

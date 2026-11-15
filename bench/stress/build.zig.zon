@@ -11,6 +11,12 @@
         .minecraft_packets = .{ .path = "../../minecraft_packets" },
         .host = .{ .path = "../../host" },
         .tps = .{ .path = "../../examples/plugins/tps" },
+        .connection = .{ .path = "../../connection" },
+        .inventories = .{ .path = "../../inventories" },
+        .players = .{ .path = "../../players" },
+        .replication = .{ .path = "../../replication" },
+        .terrain = .{ .path = "../../terrain" },
+        .minecraft_java = .{ .path = "../../minecraft_java" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

@@ -1,6 +1,8 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
-const vanilla = @import("vanilla");
+const Operators = @import("commands").operators.Operators;
+const Players = @import("players").players.Players;
+const RegionDebug = @import("replication").region_debug.RegionDebug;
 const sessions = @import("sessions");
 const e2e = @import("e2e");
 const minecraft = @import("minecraft_model");
@@ -9,23 +11,23 @@ pub fn main(init: std.process.Init) !void {
     const operators = e2e.profile.aliceOperator();
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 2, .render_distance = 2, .spawn_for_player = spawn }),
-            lightning_rod.plugin.configured(vanilla.Operators, .{ .operators = &operators }),
+            lightning_rod.plugin.configured(Players, .{ .maximum = 2, .render_distance = 2, .spawn_for_player = spawn }),
+            lightning_rod.plugin.configured(Operators, .{ .operators = &operators }),
         }),
-        lightning_rod.plugin.configured(vanilla.RegionDebug, .{}),
+        lightning_rod.plugin.configured(RegionDebug, .{}),
         lightning_rod.plugin.configured(Probe, .{}),
     });
     try e2e.profile.run(init, plugins, .{});
 }
 
-fn spawn(player: *const vanilla.Players.Player) minecraft.Position {
+fn spawn(player: *const Players.Player) minecraft.Position {
     return .{ .x = if (std.mem.eql(u8, player.name[0..player.name_len], "alice")) 0.5 else 12.5, .y = 65, .z = 0.5 };
 }
 
 const Probe = struct {
     pub const id = "e2e:region_debug";
     pub const Configuration = struct {};
-    pub const Dependencies = struct { control: *e2e.Control, players: *vanilla.Players };
+    pub const Dependencies = struct { control: *e2e.Control, players: *Players };
     deps: Dependencies,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Probe {

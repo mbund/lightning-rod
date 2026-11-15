@@ -1,13 +1,18 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
+const ChunkSource = @import("chunks").Source;
+const Chunks = @import("chunks").Chunks;
+const Players = @import("players").players.Players;
+const Section = @import("chunks").Section;
+const Streaming = @import("terrain").streaming.Streaming;
 const protocols = @import("protocols");
 const e2e = @import("e2e");
 
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-        lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 1, .render_distance = 32, .spawn = .{ .x = -224, .y = 112, .z = 0 } }),
-        lightning_rod.plugin.configured(vanilla.Streaming, .{ .prefetch = 3 }),
+        lightning_rod.plugin.configured(Players, .{ .maximum = 1, .render_distance = 32, .spawn = .{ .x = -224, .y = 112, .z = 0 } }),
+        lightning_rod.plugin.configured(Streaming, .{ .prefetch = 3 }),
         lightning_rod.plugin.configured(Mountain, .{}),
     });
     try e2e.profile.run(init, plugins, .{});
@@ -16,16 +21,16 @@ pub fn main(init: std.process.Init) !void {
 const Mountain = struct {
     pub const id = vanilla.Flat.id;
     pub const Configuration = struct {};
-    pub const Dependencies = struct { chunks: *vanilla.Chunks };
+    pub const Dependencies = struct { chunks: *Chunks };
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Mountain {
         const self = try allocator.create(Mountain);
         self.* = .{};
-        deps.chunks.setSource(vanilla.ChunkSource.init(self, read));
+        deps.chunks.setSource(ChunkSource.init(self, read));
         return self;
     }
 
-    fn read(_: *Mountain, _: std.Io, batch: vanilla.ChunkSource.Batch) void {
+    fn read(_: *Mountain, _: std.Io, batch: ChunkSource.Batch) void {
         for (batch.requests) |*request| request.result = section(request.section, request.output);
     }
 
@@ -35,7 +40,7 @@ const Mountain = struct {
         return 3;
     }
 
-    fn section(at: vanilla.Section, output: []u8) usize {
+    fn section(at: Section, output: []u8) usize {
         const stone: u16 = @intCast(protocols.registry.block_stone_default_state);
         if (at.y < 4 and at.y != 1) return uniformSection(stone, output);
         const x0 = at.x * 16;

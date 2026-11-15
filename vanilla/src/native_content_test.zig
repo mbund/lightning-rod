@@ -1,10 +1,10 @@
-const Registries = @import("content_registries.zig").Registries;
-const provider = @import("definition_provider.zig");
+const Registries = @import("vanilla_content").content_registries.Registries;
+const provider = @import("vanilla_definitions").definition_provider;
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("lib.zig");
-const protocols = @import("protocols");
-const native_nbt = @import("native_nbt.zig");
+const protocols = @import("minecraft_packets").protocols;
+const native_nbt = @import("vanilla_content").native_nbt;
 
 test "default gameplay composition and client configuration have no datapack dependency" {
     const selections = vanilla.plugins();

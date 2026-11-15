@@ -1,0 +1,11 @@
+.{
+    .name = .e2e_skyblock,
+    .fingerprint = 0xe37ddc63cdd0d3af,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .lightning_rod_e2e = .{ .path = "../.." },
+        .skyblock = .{ .path = "../../../examples/skyblock" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "test.zon", "client", "main.zig" },
+}

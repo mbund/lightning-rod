@@ -1,13 +1,13 @@
-const Chat = @import("chat.zig").Chat;
-const JoinLeaveMessages = @import("join_leave_messages.zig").JoinLeaveMessages;
+const Chat = @import("chat").chat.Chat;
+const JoinLeaveMessages = @import("vanilla_player").join_leave_messages.JoinLeaveMessages;
 const std = @import("std");
 const sessions = @import("sessions");
-const protocols = @import("protocols");
+const protocols = @import("minecraft_packets").protocols;
 const support = @import("protocol_support");
 const packets = @import("minecraft_packets");
-const Players = @import("players.zig").Players;
-const Replication = @import("replication.zig").Replication;
-const Visibility = @import("visibility.zig").Visibility;
+const Players = @import("players").players.Players;
+const Replication = @import("replication").replication.Replication;
+const Visibility = @import("replication").visibility.Visibility;
 const Protocol = protocols.implementations[0].Protocol;
 
 const View = struct { known: bool = false, listed: bool = false, spawned: bool = false };
@@ -105,7 +105,7 @@ test "visibility independently reconciles profiles tab listing and entities unde
         player.name[0] = @intCast('a' + index);
         service.credit[index].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
     }
-    var players: Players = .{ .deps = .{ .sessions = service, .packets = encoding, .input = undefined, .storage = undefined, .worlds = undefined, .vanilla_worlds = undefined, .record_workspaces = undefined }, .config = .{ .maximum = 3, .render_distance = 2 }, .spawn_world = 0, .records = &records, .dig_handlers = &.{} };
+    var players: Players = .{ .deps = .{ .sessions = service, .packets = encoding, .input = undefined, .storage = undefined, .worlds = undefined, .record_workspaces = undefined }, .config = .{ .maximum = 3, .render_distance = 2 }, .spawn_world = 0, .records = &records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
     players.rebuildIndexes();
     const visibility = try Visibility.init(allocator, .{}, .{ .players = &players });

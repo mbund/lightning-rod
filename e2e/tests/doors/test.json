@@ -1,9 +1,0 @@
-{
-  "client": "DoorsFixture",
-  "variants": [
-    {
-      "name": "doors-multi",
-      "peers": ["alice", "bob"]
-    }
-  ]
-}

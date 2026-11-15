@@ -2,6 +2,10 @@ const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const protocols = @import("protocols");
 const vanilla = @import("vanilla");
+const Chunks = @import("chunks").Chunks;
+const Entities = @import("entities").Entities;
+const Inventories = @import("inventories").Inventories;
+const Players = @import("players").players.Players;
 const e2e = @import("e2e");
 const sessions = @import("sessions");
 const inventories = @import("inventories");
@@ -10,7 +14,8 @@ pub fn main(init: std.process.Init) !void {
     const args = try e2e.profile.arguments(init);
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = 2, .gamemode = if (std.mem.eql(u8, args.fixture, "creative")) .creative else .survival }),
+            lightning_rod.plugin.configured(Players, Players.Configuration{ .render_distance = 2 }),
+            lightning_rod.plugin.configured(vanilla.PlayerStates, .{ .gamemode = if (std.mem.eql(u8, args.fixture, "creative")) .creative else .survival }),
             lightning_rod.plugin.configured(vanilla.ItemEntities, vanilla.ItemEntities.Configuration{ .maximum = 2 }),
         }),
         lightning_rod.plugin.configured(Probe, .{}),
@@ -23,13 +28,13 @@ const Probe = struct {
     pub const Configuration = struct {};
     pub const Dependencies = struct {
         control: *e2e.Control,
-        players: *vanilla.Players,
+        players: *Players,
         dropped: *vanilla.ItemEntities,
-        entities: *vanilla.Entities,
-        inventories: *vanilla.Inventories,
+        entities: *Entities,
+        inventories: *Inventories,
         items: *vanilla.Items,
         menus: *vanilla.PlayerInventory,
-        chunks: *vanilla.Chunks,
+        chunks: *Chunks,
         mining: *vanilla.Mining,
     };
     const bread_count = 17;

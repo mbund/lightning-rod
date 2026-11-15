@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/dependencies
-      - working-directory: vanilla
+      - working-directory: occlusion
         run: |
           mkdir -p .zig-cache
           bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe bench-sections | tee .zig-cache/section-results.txt
@@ -23,7 +23,7 @@ jobs:
         if: always()
         with:
           name: section-benchmark
-          path: vanilla/.zig-cache/section-results.txt
+          path: occlusion/.zig-cache/section-results.txt
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7
@@ -60,7 +60,7 @@ jobs:
       - uses: ./.github/actions/dependencies
         with:
           registries: 'true'
-      - working-directory: vanilla
+      - working-directory: terrain
         run: |
           mkdir -p .zig-cache
           bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe bench-lighting | tee .zig-cache/lighting-results.txt
@@ -68,7 +68,7 @@ jobs:
         if: always()
         with:
           name: lighting-pipeline-benchmark
-          path: vanilla/.zig-cache/lighting-results.txt
+          path: terrain/.zig-cache/lighting-results.txt
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7

@@ -1,0 +1,5 @@
+.{ .client = "CommandsFixture", .scenarios = .{.{
+    .name = "commands-multi",
+    .fixture = "commands",
+    .peers = .{ "alice", "bob" },
+}} }

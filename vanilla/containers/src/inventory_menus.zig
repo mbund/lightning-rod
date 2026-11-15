@@ -1,0 +1,183 @@
+const recipes = @import("vanilla_crafting").recipes;
+const recipe_placement = @import("vanilla_crafting").recipe_placement;
+const std = @import("std");
+const menu_click = @import("vanilla_inventory").menu_click;
+const Containers = @import("containers.zig").Containers;
+const wire_1_21_5 = @import("wire_1_21_5");
+const inventories = @import("inventories");
+const sessions = @import("sessions");
+const minecraft = @import("minecraft_model");
+const packets = @import("minecraft_packets");
+const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
+const Players = @import("players").players.Players;
+const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
+const Input = @import("players").input.Input;
+const Items = @import("vanilla_items").items.Items;
+
+const cursor = PlayerInventory.cursor;
+const all_slots = PlayerInventory.all_slots;
+
+pub const InventoryMenus = struct {
+    pub const id = "minecraft:inventory_menus";
+    pub const Configuration = struct {};
+    pub const Dependencies = struct {
+        inventory: *PlayerInventory,
+        containers: *Containers,
+        input: *Input,
+        players: *Players,
+        player_states: *PlayerStates,
+        inventories: *inventories.Inventories,
+        items: *Items,
+        packets: *packets.Packets,
+        sessions: *sessions.Service,
+    };
+    const Action = union(enum) { inventory_click: minecraft.InventoryClick, dig: minecraft.Dig };
+    deps: Dependencies,
+
+    pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*InventoryMenus {
+        const self = try allocator.create(InventoryMenus);
+        self.* = .{ .deps = deps };
+        try deps.input.on(.window_click, self, onClick);
+        try deps.input.on(.close_window, self, onClose);
+        try deps.players.observeDig(self, onDig);
+        return self;
+    }
+
+    fn onDig(self: *InventoryMenus, handle: sessions.Handle, dig: minecraft.Dig) !void {
+        if (dig.action != .swap_hands and dig.action != .drop_item and dig.action != .drop_stack) return;
+        try self.apply(handle.index, .{ .dig = dig });
+    }
+
+    fn onClose(self: *InventoryMenus, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_close_window.Reader) !void {
+        const window, const done = body.windowId() catch return error.InvalidPacket;
+        done.finish() catch return error.InvalidPacket;
+        if (window != 0) return self.deps.containers.closeWindow(handle, window);
+        if (!self.deps.inventory.states[handle.index].external) try self.deps.inventory.closeMenu(handle.index);
+    }
+
+    fn onClick(self: *InventoryMenus, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_window_click.Reader) !void {
+        const window, const a = body.windowId() catch return error.InvalidPacket;
+        const state_id, const b = a.stateId() catch return error.InvalidPacket;
+        const slot, const c = b.slot() catch return error.InvalidPacket;
+        const button, const d = c.mouseButton() catch return error.InvalidPacket;
+        const mode, const e = d.mode() catch return error.InvalidPacket;
+        var changed = e.changedSlots() catch return error.InvalidPacket;
+        _, const f = changed.encoded() catch return error.InvalidPacket;
+        var cursor_item = f.cursorItem() catch return error.InvalidPacket;
+        _, const done = cursor_item.encoded() catch return error.InvalidPacket;
+        done.finish() catch return error.InvalidPacket;
+        const click: minecraft.InventoryClick = .{ .window_id = window, .state_id = state_id, .slot = slot, .button = button, .mode = mode };
+        if (window != 0) return self.deps.containers.click(handle, click);
+        if (!self.deps.inventory.states[handle.index].external) try self.apply(handle.index, .{ .inventory_click = click });
+    }
+
+    pub fn placeRecipe(self: *InventoryMenus, handle: sessions.Handle, window: i32, table: *const recipes.BookTable, recipe: *const recipes.BookEntry, all: bool) !recipe_placement.Result {
+        if (window != 0) return self.deps.containers.placeRecipe(handle, window, table, recipe, all);
+        const index = handle.index;
+        const player = self.deps.players.records[index];
+        const state = &self.deps.inventory.states[index];
+        if (player.handle == null or !std.meta.eql(player.handle.?, handle) or player.stage != .ready or state.external or recipe.furnace) return .blocked;
+        const gamemode = self.deps.player_states.of(&player).gamemode;
+        if (gamemode == .spectator) return .blocked;
+        var slots: [47]inventories.Slot = undefined;
+        var contents: [47]inventories.Contents = undefined;
+        try self.deps.inventory.load(index, &slots, &contents);
+        var next: [47]?inventories.Stack = undefined;
+        for (contents, &next) |value, *stack| stack.* = value.stack;
+        const result = try recipe_placement.place(self.deps.items, table, recipe, &next, &.{ 1, 2, 3, 4 }, 2, 9, all);
+        if (result == .blocked) return result;
+        const menu: menu_click.Menu = .{ .inventory = self.deps.inventory, .player = player.uuid, .location = .{ .player = .{ .world = player.world, .position = player.position } }, .kind = .player, .container_slots = 0, .stacks = &next, .drag = &state.drag, .creative = gamemode == .creative };
+        try menu.refresh();
+        if (!try self.deps.inventory.apply(index, &slots, &contents, &next, &.{})) return .blocked;
+        self.deps.inventory.changed(index);
+        return result;
+    }
+
+    fn apply(self: *InventoryMenus, player_index: usize, event: Action) !void {
+        const menu = self.deps.inventory;
+        const player = &self.deps.players.records[player_index];
+        const state = &menu.states[player_index];
+        if (player.handle == null) return;
+        const status = self.deps.player_states.of(player);
+        if (status.gamemode == .creative or player.stage != .ready) return;
+        state.selected = status.selected_slot;
+        var slots: [47]inventories.Slot = undefined;
+        var contents: [47]inventories.Contents = undefined;
+        try menu.load(player_index, &slots, &contents);
+
+        const before = state.*;
+        action: {
+            var drops: [10]inventories.Stack = undefined;
+            var drop_count: usize = 0;
+            var craft_batch: ?PlayerInventory.CraftBatch = null;
+            var next: [47]?inventories.Stack = undefined;
+
+            for (&next, contents) |*stack, value| stack.* = value.stack;
+
+            switch (event) {
+                .dig => |dig| {
+                    if (status.gamemode == .spectator or status.health == 0) break :action;
+
+                    const at = 36 + @as(usize, state.selected);
+
+                    if (dig.action == .swap_hands) {
+                        std.mem.swap(?inventories.Stack, &next[at], &next[45]);
+                    } else if (dig.action == .drop_item or dig.action == .drop_stack) {
+                        const held = next[at] orelse break :action;
+                        const amount = if (dig.action == .drop_stack) held.count else 1;
+                        drops[drop_count] = .{ .item = held.item, .count = amount };
+                        drop_count += 1;
+                        next[at] = if (amount == held.count) null else .{ .item = held.item, .count = held.count - amount };
+                    } else break :action;
+                },
+                .inventory_click => |click| {
+                    if (click.mode != 5) state.dirty = all_slots;
+                    if (click.window_id != 0 or status.gamemode == .spectator) break :action;
+                    const view: menu_click.Menu = .{ .inventory = menu, .player = player.uuid, .location = .{ .player = .{ .world = player.world, .position = player.position } }, .kind = .player, .container_slots = 0, .stacks = &next, .drag = &state.drag, .creative = false };
+                    const result = try view.apply(click);
+                    craft_batch = result.craft_batch;
+                    @memcpy(drops[0..result.count], result.drops[0..result.count]);
+                    drop_count = result.count;
+                    try view.refresh();
+                },
+            }
+
+            if (craft_batch) |batch| if (!menu.validateCraft(batch)) {
+                state.* = before;
+                state.dirty = all_slots;
+                break :action;
+            };
+            if (!try menu.apply(player_index, &slots, &contents, &next, drops[0..drop_count])) {
+                state.* = before;
+                state.dirty = all_slots;
+                break :action;
+            }
+            if (craft_batch) |batch| menu.completeCraft(batch);
+        }
+    }
+
+    pub fn tick(self: *InventoryMenus) !void {
+        const menu = self.deps.inventory;
+        const service = self.deps.sessions;
+        connections: for (self.deps.players.activeSlots()) |player_index| {
+            const player = &self.deps.players.records[player_index];
+            const state = &menu.states[player_index];
+            const handle = player.handle orelse continue;
+            const gamemode = self.deps.player_states.of(player).gamemode;
+            // Sent once the position is confirmed, before the client can click anything.
+            if (gamemode == .creative or player.stage != .ready) continue;
+            if (state.external) continue;
+            if (state.presentation != self.deps.items.components.revision) {
+                state.presentation = self.deps.items.components.revision;
+                state.dirty = PlayerInventory.all_slots;
+            }
+            if (state.close) try menu.closeMenu(player_index);
+            if (state.dirty == 0 and state.generation == handle.generation and state.life == player.life and state.gamemode == gamemode) continue;
+            menu.synchronize(player_index, self.deps.packets, service) catch |err| switch (err) {
+                error.EndOfStream, error.UnsupportedItem, error.UnsupportedComponent => service.disconnect(handle),
+                error.Backpressured, error.Closed => continue :connections,
+                else => return err,
+            };
+        }
+    }
+};

@@ -6,7 +6,10 @@
     .dependencies = .{
         .lightning_rod = .{ .path = "../.." },
         .sessions = .{ .path = "../../sessions" },
-        .vanilla = .{ .path = "../../vanilla" },
+        .connection = .{ .path = "../../connection" },
+        .minecraft_packets = .{ .path = "../../minecraft_packets" },
+        .players = .{ .path = "../../players" },
+        .reload = .{ .path = "../../reload" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

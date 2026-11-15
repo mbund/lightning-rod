@@ -7,7 +7,6 @@ pub fn build(b: *std.Build) void {
     const protocols = b.dependency("protocols", .{ .target = target, .optimize = optimize, .releases = releases });
     const vanilla = b.dependency("vanilla", .{ .target = target, .optimize = optimize });
     const records = b.dependency("records", .{ .target = target, .optimize = optimize }).module("records");
-    vanilla.module("lightning_rod_vanilla_1_21_6").addImport("protocols", protocols.module("protocols"));
     b.dependency("minecraft_packets", .{ .target = target, .optimize = optimize }).module("minecraft_packets").addImport("protocols", protocols.module("protocols"));
     const executable = b.addExecutable(.{
         .name = "lightning_rod_skyblock",
@@ -16,6 +15,12 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "players", .module = b.dependency("players", .{ .target = target, .optimize = optimize }).module("players") },
+                .{ .name = "terrain", .module = b.dependency("terrain", .{ .target = target, .optimize = optimize }).module("terrain") },
+                .{ .name = "connection", .module = b.dependency("connection", .{ .target = target, .optimize = optimize }).module("connection") },
+                .{ .name = "commands", .module = b.dependency("commands", .{ .target = target, .optimize = optimize }).module("commands") },
+                .{ .name = "chat", .module = b.dependency("chat", .{ .target = target, .optimize = optimize }).module("chat") },
+                .{ .name = "inventories", .module = b.dependency("inventories", .{ .target = target, .optimize = optimize }).module("inventories") },
                 .{ .name = "protocols", .module = protocols.module("protocols") },
                 .{ .name = "lightning_rod", .module = b.dependency("lightning_rod", .{ .target = target, .optimize = optimize }).module("lightning_rod") },
                 .{ .name = "host", .module = b.dependency("host", .{ .target = target, .optimize = optimize }).module("host") },

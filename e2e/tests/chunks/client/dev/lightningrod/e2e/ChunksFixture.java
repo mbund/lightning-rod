@@ -13,7 +13,9 @@ final class ChunksFixture extends Fixture {
 
     ChunksFixture(Recorder r) { super(r); }
     @Override boolean encrypted() { return r.scenario.contains("encrypted"); }
-    @Override int renderDistance() { return r.scenario.equals("chunks-registry") ? 2 : 32; }
+    // The slow reader stops reading until alice finishes, and its client drops a connection it has
+    // not read for 30 seconds, so alice streams a radius a debug server finishes well within that.
+    @Override int renderDistance() { return r.scenario.equals("chunks-registry") ? 2 : r.scenario.equals("chunks-isolation") ? 12 : 32; }
 
     @Override public void tick(Minecraft game, int loaded, int missing) {
         if (loaded >= r.targetChunks && missing == 0 && r.terrainTick >= 0) {

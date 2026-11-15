@@ -1,0 +1,10 @@
+.{
+    .name = .e2e_occlusion_transition,
+    .fingerprint = 0x70fcb4990c8a145f,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .lightning_rod_e2e = .{ .path = "../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "test.zon", "client", "main.zig" },
+}

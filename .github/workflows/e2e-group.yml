@@ -27,13 +27,13 @@ jobs:
           assets: 'true'
           previous: ${{ matrix.upgrade }}
       - name: Real-client acceptance
-        working-directory: e2e
+        working-directory: e2e/tests/${{ matrix.directory }}
         env:
           SCENARIO: ${{ matrix.scenario }}
           VERSION: ${{ matrix.version }}
           LIBGL_ALWAYS_SOFTWARE: '1'
         run: |
-          bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build --release=safe e2e -Dscenario="$SCENARIO" -Dclient-version="$VERSION"
+          bash "$GITHUB_WORKSPACE/.github/scripts/offline.sh" zig build e2e -Dscenario="$SCENARIO" -Dclient-version="$VERSION"
       - name: Preserve evidence
         if: always()
         uses: actions/upload-artifact@v7

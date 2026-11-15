@@ -2,6 +2,10 @@ const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const protocols = @import("protocols");
 const vanilla = @import("vanilla");
+const Chunks = @import("chunks").Chunks;
+const Inventories = @import("inventories").Inventories;
+const Players = @import("players").players.Players;
+const Reload = @import("reload").Reload;
 const e2e = @import("e2e");
 const sessions = @import("sessions");
 
@@ -9,7 +13,8 @@ pub fn main(init: std.process.Init) !void {
     const args = try e2e.profile.arguments(init);
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .render_distance = 2, .gamemode = .survival }),
+            lightning_rod.plugin.configured(Players, Players.Configuration{ .render_distance = 2 }),
+            lightning_rod.plugin.configured(vanilla.PlayerStates, .{ .gamemode = .survival }),
         }),
         lightning_rod.plugin.configured(Probe, .{}),
     });
@@ -20,16 +25,16 @@ const Probe = struct {
     pub const id = "e2e:items";
     pub const Configuration = struct {};
     pub const Dependencies = struct {
-        chunks: *vanilla.Chunks,
+        chunks: *Chunks,
         control: *e2e.Control,
         dropped: *vanilla.ItemEntities,
-        inventories: *vanilla.Inventories,
+        inventories: *Inventories,
         item_tick: *vanilla.ItemTick,
         items: *vanilla.Items,
         menus: *vanilla.PlayerInventory,
         mining: *vanilla.Mining,
-        players: *vanilla.Players,
-        reload: *vanilla.Reload,
+        players: *Players,
+        reload: *Reload,
     };
     deps: Dependencies,
     phase: enum { waiting, held, released } = .waiting,

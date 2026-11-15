@@ -1,9 +1,0 @@
-{
-  "client": "RespawnFixture",
-  "variants": [
-    {
-      "name": "respawn",
-      "fixture": "respawn"
-    }
-  ]
-}

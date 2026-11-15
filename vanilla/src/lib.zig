@@ -1,128 +1,106 @@
-const game_data = @import("game_data");
-pub const smelting = @import("smelting.zig");
-pub const enchantment_effects = @import("enchantment_effects.zig");
-pub const placement_behavior = @import("placement_behavior.zig");
-pub const mining_behavior = @import("mining_behavior.zig");
-pub const fuel = @import("fuel.zig");
-const lightning_rod = @import("lightning_rod");
+//! Vanilla gameplay as plugins on the engine, and the default server that composes them with
+//! the engine's own plugins.
 const std = @import("std");
+const lightning_rod = @import("lightning_rod");
 const sessions = @import("sessions");
 const records = @import("records");
-pub const Datapacks = @import("datapacks.zig").Datapacks;
-pub const tags = @import("content_tags.zig");
-pub const recipes = @import("recipes.zig");
-pub const loot = @import("loot.zig");
-pub const crafting = @import("crafting.zig");
-pub const custom_data = @import("custom_data.zig");
-pub const entity_packets = @import("entity_packets.zig");
-pub const Packets = @import("minecraft_packets").Packets;
-pub const chunk_delivery = @import("delivery_cache.zig");
-pub const chunk_encoding = @import("chunk_encoding.zig");
-pub const Status = @import("session_status.zig").Status;
-pub const PayloadChannels = @import("payload_channels.zig");
-pub const OfflineAuthentication = @import("offline_authentication.zig").OfflineAuthentication;
-pub const Keepalive = @import("session_keepalive.zig").Keepalive;
-pub const SessionConfiguration = @import("session_configuration.zig").Plugin;
-pub const LoginStart = @import("session_login_start.zig").LoginStart;
-pub const LoginSuccess = @import("session_login_success.zig").LoginSuccess;
-pub const LoginEncryption = @import("session_encryption.zig").LoginEncryption;
-pub const LoginCompression = @import("session_compression.zig").LoginCompression;
-pub const Disconnect = @import("session_disconnect.zig").Disconnect;
-pub const Bossbars = @import("bossbars.zig").Bossbars;
-pub const Players = @import("players.zig").Players;
-pub const Spawn = @import("spawn.zig").Spawn;
-pub const Time = @import("time.zig").Time;
-pub const TimeCommands = @import("time_commands.zig").TimeCommands;
-pub const Weather = @import("weather.zig").Weather;
-pub const Environment = @import("environment.zig").Environment;
-pub const Worlds = @import("worlds").Worlds;
-pub const VanillaWorlds = @import("default_worlds.zig").VanillaWorlds;
-pub const Operators = @import("operators.zig").Operators;
-pub const TeleportCommands = @import("teleport_commands.zig").TeleportCommands;
-pub const GamemodeCommands = @import("gamemode_commands.zig").GamemodeCommands;
-pub const RegionDebug = @import("region_debug.zig").RegionDebug;
-pub const Input = @import("input.zig").Input;
-pub const Chat = @import("chat.zig").Chat;
-pub const ChatInput = @import("chat_input.zig").ChatInput;
-pub const JoinLeaveMessages = @import("join_leave_messages.zig").JoinLeaveMessages;
-pub const commands = @import("commands");
-pub const Reload = @import("reload").Reload;
-pub const ReloadCommands = @import("reload_commands.zig").ReloadCommands;
-pub const CommandDispatch = @import("commands.zig").CommandDispatch;
-pub const FallDamage = @import("fall_damage.zig").FallDamage;
-pub const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
-pub const definitions = @import("vanilla_content.zig").definitions;
-pub const prepareDefinitions = @import("vanilla_content.zig").prepare;
-pub const definition_provider = @import("definition_provider.zig");
-pub const Vanilla = @import("vanilla_content.zig").Vanilla;
-pub const Crafting = @import("crafting_registry.zig").Crafting;
-pub const Furnaces = @import("furnaces.zig").Furnaces;
-pub const Loot = @import("loot_registry.zig").Loot;
-pub const Dimensions = @import("dimensions.zig").Dimensions;
-pub const Blocks = @import("blocks.zig").Blocks;
-pub const ClientRegistries = @import("client_registries.zig").ClientRegistries;
-pub const RecipeCommands = @import("recipe_commands.zig").RecipeCommands;
-pub const RecipeBook = @import("recipe_book.zig").RecipeBook;
-pub const InventoryMenus = @import("inventory_menus.zig").InventoryMenus;
-pub const CreativeInventory = @import("creative_inventory.zig").CreativeInventory;
-pub const Visibility = @import("visibility.zig").Visibility;
-pub const Replication = @import("replication.zig").Replication;
-pub const ChunkSource = @import("chunks").Source;
-pub const Chunks = @import("chunks").Chunks;
-pub const BlockPosition = @import("chunks").Position;
-pub const Section = @import("chunks").Section;
-pub const BlockEdit = @import("chunks").BlockEdit;
-pub const SectionEdits = @import("chunks").SectionEdits;
-pub const Entities = @import("entities").Entities;
-pub const EntityId = @import("entities").Id;
-pub const EntityState = @import("entities").State;
-pub const Inventories = @import("inventories").Inventories;
-pub const InventoryCapacity = @import("inventory_capacity.zig").InventoryCapacity;
-pub const Items = @import("items.zig").Items;
-pub const ItemProperties = @import("item_properties.zig").ItemProperties;
-pub const Durability = @import("item_properties.zig").Durability;
-pub const EquipmentAttributes = @import("equipment_attributes.zig").EquipmentAttributes;
-pub const EquipmentSlots = @import("item_properties.zig").EquipmentSlots;
-pub const Lore = @import("item_lore.zig").Lore;
-pub const item_lore = @import("item_lore.zig");
-pub const item_components = @import("item_components.zig");
-pub const item_data = @import("item_data.zig");
-pub const ItemMerging = @import("item_merging.zig").ItemMerging;
-pub const ItemPickup = @import("item_pickup.zig").ItemPickup;
-pub const ItemEntities = @import("item_entities.zig").ItemEntities;
-pub const ItemPhysics = @import("item_physics.zig").ItemPhysics;
-pub const raycast = @import("raycast.zig");
-pub const ItemUse = @import("item_use.zig").ItemUse;
-pub const ItemActions = @import("item_actions.zig").ItemActions;
-pub const item_actions = @import("item_actions.zig");
-pub const Enchantments = @import("enchantments.zig").Enchantments;
-pub const ItemContent = @import("item_content.zig").ItemContent;
-pub const Experience = @import("experience.zig").Experience;
-pub const ExperienceReplication = @import("experience_replication.zig").ExperienceReplication;
-pub const ItemTick = @import("item_tick.zig").ItemTick;
-pub const ItemReplication = @import("item_replication.zig").ItemReplication;
-pub const BlockLoot = @import("block_loot.zig").BlockLoot;
-pub const Mining = @import("mining.zig").Mining;
-pub const Placement = @import("placement.zig").Placement;
-pub const BlockActions = @import("block_actions.zig").BlockActions;
-pub const container_storage = @import("containers.zig");
-pub const furnace_state = @import("furnace.zig");
-pub const content_components = @import("content_components.zig");
-pub const Containers = @import("containers.zig").Containers;
-pub const Doors = @import("doors.zig").Doors;
-pub const Equipment = @import("equipment.zig").Equipment;
-pub const item = @import("item.zig");
-pub const Flat = @import("flat.zig").Flat;
-pub const Generation = @import("generation.zig").Generation;
-pub const Terrain = @import("terrain.zig").Terrain;
-pub const ThreadedTerrain = @import("terrain.zig").ThreadedTerrain;
-pub const Lighting = @import("lighting.zig").Lighting;
-pub const LightSample = @import("lighting.zig").Sample;
-pub const Streaming = @import("streaming.zig").Streaming;
-pub const BlockSynchronization = @import("block_sync.zig").BlockSynchronization;
-pub const RegistryIdentity = @import("registry_identity.zig").RegistryIdentity;
+const commands = @import("commands");
+const Chunks = @import("chunks").Chunks;
+const Entities = @import("entities").Entities;
+const Inventories = @import("inventories").Inventories;
+const Worlds = @import("worlds").Worlds;
+const Reload = @import("reload").Reload;
+const Packets = @import("minecraft_packets").Packets;
+const Input = @import("players").input.Input;
+const Players = @import("players").players.Players;
+const PayloadChannels = @import("connection").payload_channels;
+const Visibility = @import("replication").visibility.Visibility;
+const Replication = @import("replication").replication.Replication;
+const Bossbars = @import("bossbars").bossbars.Bossbars;
+const Chat = @import("chat").chat.Chat;
+const ChatInput = commands.chat_input.ChatInput;
+const Operators = commands.operators.Operators;
+const ReloadCommands = commands.reload_commands.ReloadCommands;
+const CommandDispatch = commands.dispatch.CommandDispatch;
+const Lighting = @import("terrain").lighting.Lighting;
+const Streaming = @import("terrain").streaming.Streaming;
+const BlockSynchronization = @import("terrain").block_sync.BlockSynchronization;
+const RecordWorkspaces = records.Workspaces;
 
-pub const RecordWorkspaces = records.Workspaces;
+pub const smelting = @import("vanilla_crafting").smelting;
+pub const enchantment_effects = @import("vanilla_items").enchantment_effects;
+pub const placement_behavior = @import("vanilla_blocks").placement_behavior;
+pub const mining_behavior = @import("vanilla_blocks").mining_behavior;
+pub const fuel = @import("vanilla_crafting").fuel;
+pub const Datapacks = @import("vanilla_definitions").datapacks.Datapacks;
+pub const tags = @import("vanilla_content").content_tags;
+pub const recipes = @import("vanilla_crafting").recipes;
+pub const loot = @import("vanilla_items").loot;
+pub const crafting = @import("vanilla_crafting").crafting;
+pub const custom_data = @import("vanilla_content").custom_data;
+pub const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
+pub const Spawn = @import("vanilla_world").spawn.Spawn;
+pub const Time = @import("vanilla_world").time.Time;
+pub const TimeCommands = @import("vanilla_world").time_commands.TimeCommands;
+pub const Weather = @import("vanilla_world").weather.Weather;
+pub const Environment = @import("vanilla_world").environment.Environment;
+pub const VanillaWorlds = @import("vanilla_world").default_worlds.VanillaWorlds;
+pub const TeleportCommands = @import("vanilla_world").teleport_commands.TeleportCommands;
+pub const GamemodeCommands = @import("vanilla_player").gamemode_commands.GamemodeCommands;
+pub const JoinLeaveMessages = @import("vanilla_player").join_leave_messages.JoinLeaveMessages;
+pub const FallDamage = @import("vanilla_survival").fall_damage.FallDamage;
+pub const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
+pub const definitions = @import("vanilla_definitions").defaults.definitions;
+pub const prepareDefinitions = @import("vanilla_definitions").defaults.prepare;
+pub const definition_provider = @import("vanilla_definitions").definition_provider;
+pub const Vanilla = @import("vanilla_definitions").defaults.Vanilla;
+pub const Crafting = @import("vanilla_crafting").crafting_registry.Crafting;
+pub const Furnaces = @import("vanilla_crafting").furnaces.Furnaces;
+pub const Loot = @import("vanilla_items").loot_registry.Loot;
+pub const Dimensions = @import("vanilla_content").dimensions.Dimensions;
+pub const Blocks = @import("vanilla_content").blocks.Blocks;
+pub const ClientRegistries = @import("vanilla_content").client_registries.ClientRegistries;
+pub const RecipeCommands = @import("vanilla_containers").recipe_commands.RecipeCommands;
+pub const RecipeBook = @import("vanilla_containers").recipe_book.RecipeBook;
+pub const InventoryMenus = @import("vanilla_containers").inventory_menus.InventoryMenus;
+pub const CreativeInventory = @import("vanilla_inventory").creative_inventory.CreativeInventory;
+pub const InventoryCapacity = @import("vanilla_inventory").inventory_capacity.InventoryCapacity;
+pub const Items = @import("vanilla_items").items.Items;
+pub const ItemProperties = @import("vanilla_items").item_properties.ItemProperties;
+pub const Durability = @import("vanilla_items").item_properties.Durability;
+pub const EquipmentAttributes = @import("vanilla_items").equipment_attributes.EquipmentAttributes;
+pub const EquipmentSlots = @import("vanilla_items").item_properties.EquipmentSlots;
+pub const Lore = @import("vanilla_items").item_lore.Lore;
+pub const item_lore = @import("vanilla_items").item_lore;
+pub const item_components = @import("vanilla_items").item_components;
+pub const item_data = @import("vanilla_items").item_data;
+pub const ItemMerging = @import("vanilla_item_entities").item_merging.ItemMerging;
+pub const ItemPickup = @import("vanilla_inventory").item_pickup.ItemPickup;
+pub const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
+pub const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
+pub const raycast = @import("vanilla_blocks").raycast;
+pub const ItemUse = @import("vanilla_blocks").item_use.ItemUse;
+pub const ItemActions = @import("vanilla_items").item_actions.ItemActions;
+pub const item_actions = @import("vanilla_items").item_actions;
+pub const Enchantments = @import("vanilla_items").enchantments.Enchantments;
+pub const ItemContent = @import("vanilla_items").item_content.ItemContent;
+pub const Experience = @import("vanilla_survival").experience.Experience;
+pub const ExperienceReplication = @import("vanilla_survival").experience_replication.ExperienceReplication;
+pub const ItemTick = @import("vanilla_inventory").item_tick.ItemTick;
+pub const ItemReplication = @import("vanilla_inventory").item_replication.ItemReplication;
+pub const BlockLoot = @import("vanilla_blocks").block_loot.BlockLoot;
+pub const Mining = @import("vanilla_blocks").mining.Mining;
+pub const Placement = @import("vanilla_blocks").placement.Placement;
+pub const BlockActions = @import("vanilla_blocks").block_actions.BlockActions;
+pub const container_storage = @import("vanilla_containers").containers;
+pub const furnace_state = @import("vanilla_containers").furnace;
+pub const content_components = @import("vanilla_definitions").content_components;
+pub const Containers = @import("vanilla_containers").containers.Containers;
+pub const Doors = @import("vanilla_blocks").doors.Doors;
+pub const Equipment = @import("vanilla_equipment").equipment.Equipment;
+pub const item = @import("vanilla_item_entities").item;
+pub const Flat = @import("vanilla_world").flat.Flat;
+pub const RegistryIdentity = @import("vanilla_content").registry_identity.RegistryIdentity;
 
 const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Items.Registry, .{}),
@@ -148,6 +126,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Chunks, Chunks.Configuration.forPlayers((Players.Configuration{}).maximum)),
     lightning_rod.plugin.configured(Spawn, Spawn.Configuration{}),
     lightning_rod.plugin.configured(Players, Players.Configuration{}),
+    lightning_rod.plugin.configured(PlayerStates, PlayerStates.Configuration{}),
     lightning_rod.plugin.configured(Visibility, Visibility.Configuration{}),
     lightning_rod.plugin.configured(Bossbars, Bossbars.Configuration{}),
     lightning_rod.plugin.configured(Time, Time.Configuration{}),
@@ -207,35 +186,4 @@ const defaults = lightning_rod.plugin.compose(.{
 
 pub fn plugins() @TypeOf(defaults) {
     return defaults;
-}
-
-pub fn SessionPlugins(comptime Catalog: type) type {
-    return @Tuple(&.{
-        lightning_rod.plugin.Selection(LoginStart),
-        lightning_rod.plugin.Selection(LoginEncryption),
-        lightning_rod.plugin.Selection(Disconnect),
-        lightning_rod.plugin.Selection(OfflineAuthentication),
-        lightning_rod.plugin.Selection(LoginCompression),
-        lightning_rod.plugin.Selection(LoginSuccess),
-        lightning_rod.plugin.Selection(Keepalive),
-        lightning_rod.plugin.Selection(Status),
-        lightning_rod.plugin.Selection(PayloadChannels.Session),
-        lightning_rod.plugin.Selection(SessionConfiguration(Catalog)),
-    });
-}
-
-pub fn session_plugins(protocols: anytype) SessionPlugins(@typeInfo(@TypeOf(protocols)).pointer.child) {
-    const ConfigurationPlugin = SessionConfiguration(@typeInfo(@TypeOf(protocols)).pointer.child);
-    return .{
-        lightning_rod.plugin.configured(LoginStart, LoginStart.Configuration{}),
-        lightning_rod.plugin.configured(LoginEncryption, LoginEncryption.Configuration{}),
-        lightning_rod.plugin.configured(Disconnect, Disconnect.Configuration{}),
-        lightning_rod.plugin.configured(OfflineAuthentication, OfflineAuthentication.Configuration{}),
-        lightning_rod.plugin.configured(LoginCompression, LoginCompression.Configuration{}),
-        lightning_rod.plugin.configured(LoginSuccess, LoginSuccess.Configuration{}),
-        lightning_rod.plugin.configured(Keepalive, Keepalive.Configuration{}),
-        lightning_rod.plugin.configured(Status, Status.Configuration{}),
-        lightning_rod.plugin.configured(PayloadChannels.Session, PayloadChannels.Session.Configuration{}),
-        lightning_rod.plugin.configured(ConfigurationPlugin, ConfigurationPlugin.Configuration{ .protocols = protocols }),
-    };
 }

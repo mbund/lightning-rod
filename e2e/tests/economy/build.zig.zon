@@ -1,0 +1,14 @@
+.{
+    .name = .e2e_economy,
+    .fingerprint = 0x9184d267d9255ce3,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .lightning_rod_e2e = .{ .path = "../.." },
+        .economy = .{ .path = "../../../examples/plugins/economy" },
+        .economy_commands = .{ .path = "../../../examples/plugins/economy_commands" },
+        .shop = .{ .path = "../../../examples/plugins/shop" },
+        .shop_commands = .{ .path = "../../../examples/plugins/shop_commands" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "test.zon", "client", "main.zig" },
+}

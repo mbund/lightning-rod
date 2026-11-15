@@ -14,7 +14,6 @@ pub fn build(b: *std.Build) void {
     const profile = b.dependency("lightning_rod_linux", .{ .target = target, .optimize = optimize });
     const tui = b.dependency("lightning_rod_tui", .{ .target = target, .optimize = optimize });
     const vanilla = b.dependency("lightning_rod_vanilla_1_21_6", .{ .target = target, .optimize = optimize });
-    vanilla.module("lightning_rod_vanilla_1_21_6").addImport("protocols", protocols.module("protocols"));
     const economy = b.dependency("economy", .{ .target = target, .optimize = optimize });
     const shop = b.dependency("shop", .{ .target = target, .optimize = optimize });
     const economy_commands = b.dependency("economy_commands", .{ .target = target, .optimize = optimize });
@@ -26,6 +25,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "commands", .module = b.dependency("commands", .{ .target = target, .optimize = optimize }).module("commands") },
+                .{ .name = "connection", .module = b.dependency("connection", .{ .target = target, .optimize = optimize }).module("connection") },
                 .{ .name = "protocols", .module = protocols.module("protocols") },
                 .{ .name = "lightning_rod", .module = lightning_rod.module("lightning_rod") },
                 .{ .name = "profile", .module = profile.module("lightning_rod_linux") },

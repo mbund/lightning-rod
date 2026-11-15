@@ -1,6 +1,9 @@
 const Control = @import("e2e_control").Control;
 const std = @import("std");
 const vanilla = @import("vanilla");
+const Entities = @import("entities").Entities;
+const Inventories = @import("inventories").Inventories;
+const Players = @import("players").players.Players;
 const protocols = @import("protocols");
 const sessions = @import("sessions");
 const inventories = @import("inventories");
@@ -11,11 +14,12 @@ pub const Inventory = struct {
     pub const Dependencies = struct {
         control: *Control,
         dropped: *vanilla.ItemEntities,
-        entities: *vanilla.Entities,
-        inventories: *vanilla.Inventories,
+        entities: *Entities,
+        inventories: *Inventories,
         items: *vanilla.Items,
         menus: *vanilla.PlayerInventory,
-        players: *vanilla.Players,
+        players: *Players,
+        player_states: *vanilla.PlayerStates,
         sessions: *sessions.Service,
     };
     deps: Dependencies,
@@ -89,7 +93,7 @@ pub const Inventory = struct {
         }
         var edits: [47]inventories.Edit = undefined;
         for (descriptions, counts, contents, 0..) |name, count, value, index| {
-            if (!setup and index == 46 and player.gamemode == .creative) continue;
+            if (!setup and index == 46 and self.deps.player_states.of(&player).gamemode == .creative) continue;
             if (setup) {
                 edits[index] = .{
                     .slot = slots[index],

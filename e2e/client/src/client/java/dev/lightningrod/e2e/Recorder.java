@@ -62,6 +62,7 @@ public final class Recorder {
     long playTick = -1;
     long firstChunkTick = -1;
     long terrainTick = -1;
+    boolean positioned;
     private long targetTick = -1;
     private long streamStartTick = -1;
     private long streamStartNanos;
@@ -108,7 +109,7 @@ public final class Recorder {
         minimumSoakTicks = integer("mcc.minimumSoakTicks", minimumSoakTicks);
         timeoutTicks = integer("mcc.timeoutTicks", timeoutTicks);
         connectTick = integer("mcc.connectTick", connectTick);
-        fixture = Fixture.create(this, scenario);
+        fixture = Fixture.create(this, System.getProperty("mcc.fixture"));
         int distance = fixture.renderDistance();
         minimumRadius = integer("mcc.minimumRadius", distance);
         targetChunks = integer("mcc.targetChunks", Fixture.horizonColumns(distance));
@@ -121,6 +122,15 @@ public final class Recorder {
         } catch (IOException error) {
             throw new IllegalStateException("cannot initialize e2e probe", error);
         }
+    }
+    // The server places the player after it streams the column under them, and a 1.21.5 client
+    // can close its loading screen at the position it held before. Terrain counts as loaded only
+    // once the server has placed the player.
+    public synchronized void positioned() {
+        if (positioned) return;
+        positioned = true;
+        var player = Minecraft.getInstance().player;
+        if (player != null) event("positioned", "x", player.getX(), "y", player.getY(), "z", player.getZ());
     }
     public synchronized void viewCenter(int x, int z) {
         event("view_center", "x", x, "z", z);
@@ -226,7 +236,7 @@ public final class Recorder {
                 firstChunkNanos = System.nanoTime();
                 if (streamStartTick < 0) restartStream();
             }
-            if (loaded > 0 && terrainTick < 0 && GuiApi.screen(client) == null) {
+            if (loaded > 0 && positioned && terrainTick < 0 && GuiApi.screen(client) == null) {
                 terrainTick = tick;
                 terrainNanos = System.nanoTime();
             }

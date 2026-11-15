@@ -6,6 +6,11 @@ const reload = @import("reload");
 const host = @import("host");
 const sessions = @import("sessions");
 const vanilla = @import("vanilla");
+const BlockSynchronization = @import("terrain").block_sync.BlockSynchronization;
+const Chunks = @import("chunks").Chunks;
+const Generation = @import("terrain").generation.Generation;
+const Streaming = @import("terrain").streaming.Streaming;
+const ThreadedTerrain = @import("terrain").terrain.ThreadedTerrain;
 const execve = @import("reload_execve");
 pub const Startup = host.Startup;
 
@@ -49,15 +54,15 @@ pub fn Server(comptime Plugins: type, comptime Endpoint: type, comptime SessionP
             const network = process.network;
             try vanilla.definition_provider.configureProtocols(vanilla.definition_provider.from(@TypeOf(simulation.*), simulation), Endpoint.Protocols, memory.allocator("content_protocols"), options.network.protocols);
             const request = &process.reloading.request;
-            const generation = try vanilla.Generation.init(memory.allocator("generation"), init.io, simulation.get(vanilla.Chunks).generation, options.generation_workers);
+            const generation = try Generation.init(memory.allocator("generation"), init.io, simulation.get(Chunks).generation, options.generation_workers);
             defer generation.deinit();
             try generation.start();
             defer generation.stop();
             var maintenance: storage.Maintenance = .{ .store = process.store };
             try maintenance.start();
             defer maintenance.stop();
-            var background: vanilla.ThreadedTerrain = .{
-                .terrain = .{ .chunks = simulation.get(vanilla.Chunks), .streaming = simulation.get(vanilla.Streaming), .blocks = simulation.get(vanilla.BlockSynchronization), .io = init.io },
+            var background: ThreadedTerrain = .{
+                .terrain = .{ .chunks = simulation.get(Chunks), .streaming = simulation.get(Streaming), .blocks = simulation.get(BlockSynchronization), .io = init.io },
                 .io = init.io,
             };
             try background.start();

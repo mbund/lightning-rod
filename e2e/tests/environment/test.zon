@@ -1,0 +1,5 @@
+.{ .client = "EnvironmentFixture", .scenarios = .{.{
+    .name = "environment",
+    .peers = .{ "alice", "bob" },
+    .mixed_versions = true,
+}} }

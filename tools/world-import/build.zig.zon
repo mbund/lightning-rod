@@ -15,6 +15,10 @@
         .protocols = .{ .path = "../../protocols" },
         .minecraft_packets = .{ .path = "../../minecraft_packets" },
         .nbt = .{ .path = "../../nbt" },
+        .block_properties = .{ .path = "../../block_properties" },
+        .players = .{ .path = "../../players" },
+        .terrain = .{ .path = "../../terrain" },
+        .worlds = .{ .path = "../../worlds" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

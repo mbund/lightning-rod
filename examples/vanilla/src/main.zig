@@ -5,6 +5,13 @@ const lightning_rod = @import("lightning_rod");
 const profile = @import("profile");
 const sessions = @import("sessions");
 const vanilla = @import("lightning_rod_vanilla_1_21_6");
+const Chunks = @import("chunks").Chunks;
+const LoginEncryption = @import("connection").session_encryption.LoginEncryption;
+const Operators = @import("commands").operators.Operators;
+const Players = @import("players").players.Players;
+const RegionDebug = @import("replication").region_debug.RegionDebug;
+const Streaming = @import("terrain").streaming.Streaming;
+const connection_plugins = @import("connection").plugins;
 const tps = @import("tps");
 const storm_stick = @import("storm_stick");
 
@@ -75,19 +82,19 @@ pub fn main(init: std.process.Init) !void {
     digest[8] = (digest[8] & 63) | 0x80;
     const operators = [_]u128{std.mem.readInt(u128, &digest, .big)};
 
-    var chunk_configuration = vanilla.Chunks.Configuration.forPlayers(max_players);
+    var chunk_configuration = Chunks.Configuration.forPlayers(max_players);
     chunk_configuration.storage_batch_groups = storage_batch_groups;
     const gameplay_plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(vanilla.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Streaming, .{ .prefetch = 3, .hull = hull }),
-            lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .maximum = max_players }),
-            lightning_rod.plugin.configured(vanilla.Chunks, chunk_configuration),
-            lightning_rod.plugin.configured(vanilla.Operators, vanilla.Operators.Configuration{
+            lightning_rod.plugin.configured(Streaming, .{ .prefetch = 3, .hull = hull }),
+            lightning_rod.plugin.configured(Players, Players.Configuration{ .maximum = max_players }),
+            lightning_rod.plugin.configured(Chunks, chunk_configuration),
+            lightning_rod.plugin.configured(Operators, Operators.Configuration{
                 .operators = &operators,
             }),
         }),
         lightning_rod.plugin.configured(tps.Tps, .{}),
-        lightning_rod.plugin.configured(vanilla.RegionDebug, .{}),
+        lightning_rod.plugin.configured(RegionDebug, .{}),
     });
     var protocols = try protocol_set.Default.init(allocator);
     defer protocols.deinit(allocator);
@@ -95,8 +102,8 @@ pub fn main(init: std.process.Init) !void {
     defer if (key) |*private_key| private_key.deinit();
     const session_plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.configured(protocol_set.Handshake, protocol_set.Handshake.Configuration{}),
-        lightning_rod.plugin.replace(vanilla.session_plugins(&protocols), .{
-            lightning_rod.plugin.configured(vanilla.LoginEncryption, .{ .key = if (key) |*value| value else null }),
+        lightning_rod.plugin.replace(connection_plugins(&protocols), .{
+            lightning_rod.plugin.configured(LoginEncryption, .{ .key = if (key) |*value| value else null }),
         }),
     });
     std.log.info("Starting Lightning Rod", .{});

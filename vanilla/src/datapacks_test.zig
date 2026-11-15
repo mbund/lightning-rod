@@ -1,11 +1,12 @@
-const provider = @import("definition_provider.zig");
-const vanilla_content = @import("vanilla_content.zig");
+const provider = @import("vanilla_definitions").definition_provider;
+const vanilla_content = @import("vanilla_definitions").defaults;
 const std = @import("std");
-const Datapacks = @import("datapacks.zig").Datapacks;
-const crafting = @import("crafting.zig");
-const recipes = @import("recipes.zig");
-const loot = @import("loot.zig");
-const protocols = @import("protocols");
+const Datapacks = @import("vanilla_definitions").datapacks.Datapacks;
+const crafting = @import("vanilla_crafting").crafting;
+const recipes = @import("vanilla_crafting").recipes;
+const item_data = @import("vanilla_items").item_data;
+const loot = @import("vanilla_items").loot;
+const protocols = @import("minecraft_packets").protocols;
 const game_data = @import("game_data");
 
 const Reward = struct {
@@ -140,7 +141,7 @@ test "mixed pack formats share native compilation and preserve layer formats aft
         const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{d}", .{ directory.sub_path, format });
         try packs.add(.{ .sources = &.{.{ .directory = path }} });
     }
-    var first: ?[]const recipes.Component = null;
+    var first: ?[]const item_data.Component = null;
     var count: usize = 0;
     for (content.book.table.book) |recipe| {
         if (!std.mem.startsWith(u8, recipe.name, "test:reward_")) continue;

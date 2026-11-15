@@ -1,6 +1,16 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
+const BlockSynchronization = @import("terrain").block_sync.BlockSynchronization;
+const Chunks = @import("chunks").Chunks;
+const Generation = @import("terrain").generation.Generation;
+const Inventories = @import("inventories").Inventories;
+const Lighting = @import("terrain").lighting.Lighting;
+const Players = @import("players").players.Players;
+const RegionDebug = @import("replication").region_debug.RegionDebug;
+const Streaming = @import("terrain").streaming.Streaming;
+const ThreadedTerrain = @import("terrain").terrain.ThreadedTerrain;
+const connection_plugins = @import("connection").plugins;
 const sessions = @import("sessions");
 const protocols = @import("protocols");
 const host = @import("host");
@@ -47,15 +57,15 @@ const ticks_per_second = 20;
 const edit_height = 149;
 const plugins = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.replace(vanilla.plugins(), .{
-        lightning_rod.plugin.configured(vanilla.Streaming, .{ .prefetch = 3 }),
-        lightning_rod.plugin.configured(vanilla.Players, .{ .spawn = .{ .x = 0.5, .y = 150, .z = 0.5 } }),
+        lightning_rod.plugin.configured(Streaming, .{ .prefetch = 3 }),
+        lightning_rod.plugin.configured(Players, .{ .spawn = .{ .x = 0.5, .y = 150, .z = 0.5 } }),
     }),
     lightning_rod.plugin.configured(tps.Tps, .{}),
-    lightning_rod.plugin.configured(vanilla.RegionDebug, .{}),
+    lightning_rod.plugin.configured(RegionDebug, .{}),
 });
 const session_plugins_type = @TypeOf(lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(protocols.Handshake, .{}),
-    vanilla.session_plugins(@as(*protocols.Default, undefined)),
+    connection_plugins(@as(*protocols.Default, undefined)),
 }));
 const Network = sessions.Threaded(protocols.Endpoint, session_plugins_type, sessions.SingleSimulation);
 const Process = host.Process(@TypeOf(plugins), Network);
@@ -240,13 +250,13 @@ fn server(init: std.process.Init, world: []const u8, directory: []const u8, fd: 
     const allocator = memory.allocator("bootstrap");
     var catalog = try protocols.Default.init(allocator);
     defer catalog.deinit(allocator);
-    const session_plugins = lightning_rod.plugin.compose(.{ lightning_rod.plugin.configured(protocols.Handshake, .{}), vanilla.session_plugins(&catalog) });
-    var chunk_configuration = vanilla.Chunks.Configuration.forPlayers(player_count);
+    const session_plugins = lightning_rod.plugin.compose(.{ lightning_rod.plugin.configured(protocols.Handshake, .{}), connection_plugins(&catalog) });
+    var chunk_configuration = Chunks.Configuration.forPlayers(player_count);
     chunk_configuration.storage_batch_groups = burst_slots;
     const gameplay = lightning_rod.plugin.replace(plugins, .{
-        lightning_rod.plugin.configured(vanilla.Players, vanilla.Players.Configuration{ .maximum = player_count, .spawn = .{ .x = 0.5, .y = 150, .z = 0.5 } }),
-        lightning_rod.plugin.configured(vanilla.Chunks, chunk_configuration),
-        lightning_rod.plugin.configured(vanilla.Streaming, vanilla.Streaming.Configuration{ .prefetch = workload.prefetch, .retain_client_storage = workload.retain }),
+        lightning_rod.plugin.configured(Players, Players.Configuration{ .maximum = player_count, .spawn = .{ .x = 0.5, .y = 150, .z = 0.5 } }),
+        lightning_rod.plugin.configured(Chunks, chunk_configuration),
+        lightning_rod.plugin.configured(Streaming, Streaming.Configuration{ .prefetch = workload.prefetch, .retain_client_storage = workload.retain }),
     });
     const process = try Process.init(&memory, init, .{
         .plugins = gameplay,
@@ -272,14 +282,14 @@ fn server(init: std.process.Init, world: []const u8, directory: []const u8, fd: 
     const simulation = process.simulation;
     const network = process.network;
     try vanilla.definition_provider.configureProtocols(vanilla.definition_provider.from(@TypeOf(simulation.*), simulation), protocols.Endpoint.Protocols, memory.allocator("content_protocols"), &catalog);
-    const generation = try vanilla.Generation.init(memory.allocator("generation"), init.io, simulation.get(vanilla.Chunks).generation, 1);
+    const generation = try Generation.init(memory.allocator("generation"), init.io, simulation.get(Chunks).generation, 1);
     defer generation.deinit();
     try generation.start();
     defer generation.stop();
     var maintenance: lightning_rod.storage.Maintenance = .{ .store = process.store };
     try maintenance.start();
     defer maintenance.stop();
-    var background: vanilla.ThreadedTerrain = .{ .terrain = .{ .chunks = simulation.get(vanilla.Chunks), .streaming = simulation.get(vanilla.Streaming), .blocks = simulation.get(vanilla.BlockSynchronization), .io = init.io }, .io = init.io };
+    var background: ThreadedTerrain = .{ .terrain = .{ .chunks = simulation.get(Chunks), .streaming = simulation.get(Streaming), .blocks = simulation.get(BlockSynchronization), .io = init.io }, .io = init.io };
     try background.start();
     defer background.stop();
     try network.start();
@@ -299,7 +309,8 @@ fn server(init: std.process.Init, world: []const u8, directory: []const u8, fd: 
         const angle = random.random().float(f64) * std.math.pi * 2;
         direction.* = .{ @cos(angle) * step, @sin(angle) * step };
     }
-    const players = simulation.get(vanilla.Players);
+    const players = simulation.get(Players);
+    const player_states = simulation.get(vanilla.PlayerStates);
     var moving: usize = 0;
     var waiting: usize = 0;
     var joined: usize = 0;
@@ -312,7 +323,7 @@ fn server(init: std.process.Init, world: []const u8, directory: []const u8, fd: 
     var cube_edits: [Cube.sections_max][4096]terrain_chunks.BlockEdit = undefined;
     var cube: Cube = .{ .edits = &cube_edits };
     const cube_side: i32 = @intCast(workload.edit_size);
-    const terrain = simulation.get(vanilla.Chunks);
+    const terrain = simulation.get(Chunks);
     const started_tick = simulation.completed_tick;
     while (moving < ticks) {
         try network.check();
@@ -334,7 +345,7 @@ fn server(init: std.process.Init, world: []const u8, directory: []const u8, fd: 
             const player = &players.records[slot];
             if (player.stage != .ready) continue;
             joined += 1;
-            player.flying = true;
+            player_states.of(player).flying = true;
             if (!placed[slot]) {
                 const rows = (player_count + workload.columns - 1) / workload.columns;
                 player.position.x = (@as(f64, @floatFromInt(slot % workload.columns)) - @as(f64, @floatFromInt(workload.columns - 1)) / 2) * @as(f64, @floatFromInt(workload.spacing[0]));
@@ -388,13 +399,13 @@ fn server(init: std.process.Init, world: []const u8, directory: []const u8, fd: 
                     }
                     edits += workload.edit_size * workload.edit_size * workload.edit_size;
                 };
-                const snapshot = simulation.get(vanilla.Streaming).snapshotVisibility();
+                const snapshot = simulation.get(Streaming).snapshotVisibility();
                 var missing: usize = 0;
                 var center_lag: usize = 0;
                 var open_cursors: usize = 0;
                 var setting_up: usize = 0;
                 var missing_players: usize = 0;
-                const radius = simulation.get(vanilla.Streaming).deliveryRadius();
+                const radius = simulation.get(Streaming).deliveryRadius();
                 const side: usize = @intCast(2 * radius + 1);
                 // A column is missing while a player has not been sent it inside the delivery radius.
                 for (players.activeSlots()) |slot| {
@@ -408,7 +419,7 @@ fn server(init: std.process.Init, world: []const u8, directory: []const u8, fd: 
                     while (z <= center.z + radius) : (z += 1) {
                         var x = center.x - radius;
                         while (x <= center.x + radius) : (x += 1) {
-                            if (!vanilla.Streaming.Horizon.contains(radius, center, .{ .x = x, .z = z })) continue;
+                            if (!Streaming.Horizon.contains(radius, center, .{ .x = x, .z = z })) continue;
                             missing += @intFromBool(!snapshot.visible(slot, record, record.world, x, z));
                         }
                     }
@@ -427,7 +438,7 @@ fn server(init: std.process.Init, world: []const u8, directory: []const u8, fd: 
         } else if (waiting != 0 or moving != 0) return error.PlayerLostDuringStress;
         if (joined != player_count and simulation.completed_tick - started_tick > 1200) return error.ClientAdmissionTimeout;
         if ((simulation.completed_tick - started_tick) % 100 == 0) {
-            const stalled = simulation.get(vanilla.Streaming);
+            const stalled = simulation.get(Streaming);
             var stages: [16]usize = @splat(0);
             var configuring: usize = 0;
             for (players.activeSlots()) |slot| {
@@ -519,11 +530,11 @@ fn nanosecondsToMilliseconds(value: u64) f64 {
 
 fn reservations(process: *Process, output: *std.Io.Writer) !void {
     const simulation = process.simulation;
-    const streaming = simulation.get(vanilla.Streaming);
-    const chunks = simulation.get(vanilla.Chunks);
+    const streaming = simulation.get(Streaming);
+    const chunks = simulation.get(Chunks);
     const store = &chunks.cache.backend.store;
     const compressed = &store.bases.backend;
-    const lighting = simulation.get(vanilla.Lighting);
+    const lighting = simulation.get(Lighting);
     var read_bytes: usize = 0;
     var codecs: usize = compressed.compressor.memory.len + store.merger.codec.memory.len;
     for (compressed.readers) |reader| {
@@ -582,11 +593,11 @@ fn usage(process: *Process, output: *std.Io.Writer) !void {
     const pages = &process.network.core.output_pool;
     try output.print("shared output units                {d:>6} / {d:<6} {d:>20.2}\nlargest_output_reservation_bytes={d} peak_published_payload_MiB={d:.2}\n", .{ pages.peak_units, pages.pages.len, @as(f64, @floatFromInt(pages.bytes.len)) / 1048576, pages.largest_reservation, @as(f64, @floatFromInt(pages.peak_payload_bytes)) / 1048576 });
     const simulation = process.simulation;
-    const chunks = simulation.get(vanilla.Chunks);
-    const streaming = simulation.get(vanilla.Streaming);
+    const chunks = simulation.get(Chunks);
+    const streaming = simulation.get(Streaming);
     try output.writeAll("\nCache                              occupied / capacity      payload MiB / reserved MiB\n");
     const names = .{ "sections", "decoded groups", "inventory slots", "inventory items" };
-    const inventories = simulation.get(vanilla.Inventories);
+    const inventories = simulation.get(Inventories);
     const caches = .{ &chunks.cache, &chunks.cache.backend.store.bases, &inventories.cache, &inventories.items };
     inline for (names, caches) |name, cache| {
         var occupied: usize = 0;
@@ -605,7 +616,7 @@ fn usage(process: *Process, output: *std.Io.Writer) !void {
     }
     try output.print("\nVisibility: columns={d}/{d} classified_sections={d} mixed_sections={d} section_capacity={d} views={d} completed={d}\n", .{ streaming.geometry.lookup.count(), streaming.geometry.tiles.len, classified, mixed, streaming.geometry.tiles.len * streaming.geometry.tiles[0].sections.len, streaming.geometry.views.len, streaming.geometry.completed });
     try output.print("Mixed topology: used={d} peak={d} capacity={d} evictions={d}\n", .{ streaming.geometry.mixed_used, streaming.geometry.mixed_peak, streaming.geometry.mixed.len, streaming.geometry.mixed_evictions });
-    const lighting = simulation.get(vanilla.Lighting);
+    const lighting = simulation.get(Lighting);
     if (lighting.store) |store| {
         const stored = store.snapshot();
         try output.print("Lighting: stored_columns={d} overflowed_columns={d} unlit_columns={d} sections={d}/{d} store_bytes={d} patches={d} failures={d} darkened={d} frames={d} restores={d} solves={d} evictions={d} overflows={d} forgotten={d} resets={d} sample_hits={d} sample_misses={d} background_relights={d}\n", .{ stored.resident, stored.overflowed, stored.unlit, stored.sections, store.bytes.len, lighting.storeMemory(), stored.patches, stored.failures, stored.darkened, stored.frames, stored.restores, stored.solves, stored.evictions, stored.overflows, stored.forgotten, stored.resets, stored.hits, stored.misses, lighting.background.work.relights });

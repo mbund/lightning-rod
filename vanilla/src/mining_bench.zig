@@ -1,15 +1,15 @@
-const vanilla_content = @import("vanilla_content.zig");
+const vanilla_content = @import("vanilla_definitions").defaults;
 const std = @import("std");
 const storage = @import("storage");
 const records = @import("records");
 const inventories = @import("inventories");
 const metrics = @import("metrics");
 const game_data = @import("game_data");
-const Items = @import("items.zig").Items;
-const RegistryIdentity = @import("registry_identity.zig").RegistryIdentity;
-const loot_tables = @import("loot.zig");
-const item_data = @import("item_data.zig");
-const BlockLoot = @import("block_loot.zig").BlockLoot;
+const Items = @import("vanilla_items").items.Items;
+const RegistryIdentity = @import("vanilla_content").registry_identity.RegistryIdentity;
+const loot_tables = @import("vanilla_items").loot;
+const item_data = @import("vanilla_items").item_data;
+const BlockLoot = @import("vanilla_blocks").block_loot.BlockLoot;
 
 pub fn benchmark() !void {
     const io = std.testing.io;

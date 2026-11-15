@@ -1,0 +1,1 @@
+.{ .client = "EncryptionRejectFixture", .scenarios = .{.{ .name = "encryption-reject", .fixture = "encryption_reject" }} }

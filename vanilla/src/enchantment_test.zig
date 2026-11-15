@@ -3,21 +3,21 @@ const storage = @import("storage");
 const metrics = @import("metrics");
 const sessions = @import("sessions");
 const packets = @import("minecraft_packets");
-const protocols = @import("protocols");
+const protocols = @import("minecraft_packets").protocols;
 const game_data = @import("game_data");
 const entities = @import("entities");
 const inventories = @import("inventories");
 const InventoryFixture = @import("inventory_test_fixture.zig").InventoryFixture;
-const Enchantments = @import("enchantments.zig").Enchantments;
-const effects = @import("enchantment_effects.zig");
-const decoder = @import("datapack_enchantments.zig");
-const item_data = @import("item_data.zig");
-const Durability = @import("item_properties.zig").Durability;
-const EquipmentAttributes = @import("equipment_attributes.zig").EquipmentAttributes;
-const FallDamage = @import("fall_damage.zig").FallDamage;
-const ItemActions = @import("item_actions.zig").ItemActions;
-const item_actions = @import("item_actions.zig");
-const menu_click = @import("menu_click.zig");
+const Enchantments = @import("vanilla_items").enchantments.Enchantments;
+const effects = @import("vanilla_items").enchantment_effects;
+const decoder = @import("vanilla_definitions").datapack_enchantments;
+const item_data = @import("vanilla_items").item_data;
+const Durability = @import("vanilla_items").item_properties.Durability;
+const EquipmentAttributes = @import("vanilla_items").equipment_attributes.EquipmentAttributes;
+const FallDamage = @import("vanilla_survival").fall_damage.FallDamage;
+const ItemActions = @import("vanilla_items").item_actions.ItemActions;
+const item_actions = @import("vanilla_items").item_actions;
+const menu_click = @import("vanilla_inventory").menu_click;
 
 const Test = struct {
     directory: std.testing.TmpDir,
@@ -110,7 +110,7 @@ test "efficiency and curse behavior follow equipment slots and inventory ownersh
     defer context.deinit();
     const fixture = context.fixture;
     const tool = try context.item("minecraft:iron_pickaxe", &.{.{ .name = "minecraft:efficiency", .level = 5 }});
-    const attributes = try EquipmentAttributes.init(arena.allocator(), .{}, .{ .players = fixture.players, .items = fixture.items, .enchantments = fixture.definitions.enchantments, .client = fixture.definitions.client });
+    const attributes = try EquipmentAttributes.init(arena.allocator(), .{}, .{ .players = fixture.players, .player_states = fixture.player_states, .items = fixture.items, .enchantments = fixture.definitions.enchantments, .client = fixture.definitions.client });
     try context.equip(36, tool);
     try std.testing.expectEqual(@as(f64, 26), try attributes.value(0, "minecraft:mining_efficiency"));
     try context.equip(36, null);
@@ -140,26 +140,26 @@ test "fall damage combines armor protection caps it and excludes unrelated sourc
     var context = try Test.init(arena.allocator());
     defer context.deinit();
     const fixture = context.fixture;
-    const fall = try FallDamage.init(arena.allocator(), .{}, .{ .players = fixture.players, .inventories = fixture.ownership, .items = fixture.items, .enchantments = fixture.definitions.enchantments, .client = fixture.definitions.client, .attributes = try EquipmentAttributes.init(arena.allocator(), .{}, .{ .players = fixture.players, .items = fixture.items, .enchantments = fixture.definitions.enchantments, .client = fixture.definitions.client }), .storage = try context.store.openSpace("fall") });
-    const player = &fixture.players.records[0];
-    player.gamemode = .survival;
+    const fall = try FallDamage.init(arena.allocator(), .{}, .{ .players = fixture.players, .player_states = fixture.player_states, .inventories = fixture.ownership, .items = fixture.items, .enchantments = fixture.definitions.enchantments, .client = fixture.definitions.client, .attributes = try EquipmentAttributes.init(arena.allocator(), .{}, .{ .players = fixture.players, .player_states = fixture.player_states, .items = fixture.items, .enchantments = fixture.definitions.enchantments, .client = fixture.definitions.client }), .storage = try context.store.openSpace("fall") });
+    const state = &fixture.player_states.records[0];
+    state.gamemode = .survival;
     const boots = try context.item("minecraft:iron_boots", &.{.{ .name = "minecraft:feather_falling", .level = 4 }});
     const helmet = try context.item("minecraft:iron_helmet", &.{.{ .name = "minecraft:protection", .level = 4 }});
     const chestplate = try context.item("minecraft:iron_chestplate", &.{.{ .name = "minecraft:protection", .level = 4 }});
     const leggings = try context.item("minecraft:iron_leggings", &.{.{ .name = "minecraft:protection", .level = 4 }});
     try context.equip(8, boots);
     try fall.damage(0, 10);
-    try std.testing.expectApproxEqAbs(@as(f32, 14.8), player.health, 0.0001);
-    player.health = 20;
+    try std.testing.expectApproxEqAbs(@as(f32, 14.8), state.health, 0.0001);
+    state.health = 20;
     try context.equip(5, helmet);
     try context.equip(6, chestplate);
     try context.equip(7, leggings);
     try fall.damage(0, 10);
-    try std.testing.expectApproxEqAbs(@as(f32, 18), player.health, 0.0001);
-    player.health = 20;
-    player.gamemode = .creative;
+    try std.testing.expectApproxEqAbs(@as(f32, 18), state.health, 0.0001);
+    state.health = 20;
+    state.gamemode = .creative;
     try fall.damage(0, 10);
-    try std.testing.expectEqual(@as(f32, 20), player.health);
+    try std.testing.expectEqual(@as(f32, 20), state.health);
 }
 
 const Custom = struct {
@@ -241,7 +241,7 @@ test "item actions dispatch custom enchantments only for the actual held hand an
     var owner: Use = .{};
     const callback = effects.UseBinding.bind(Use, &owner, Use.activate);
     try fixture.definitions.enchantments.addEnchantments(&.{.{ .name = "test:wand", .description = "Wand", .supported_items = &.{"minecraft:stick"}, .effects = .{ .slots = .{ .mainhand = true, .offhand = true }, .on_use = &.{callback} } }});
-    const actions = try ItemActions.init(bounded.allocator(), .{}, .{ .items = fixture.items });
+    const actions = try ItemActions.init(bounded.allocator(), .{}, .{ .player_states = fixture.player_states, .items = fixture.items });
     _ = try Enchantments.init(bounded.allocator(), .{ .items = fixture.items, .packets = undefined, .actions = actions, .definitions = fixture.definitions.enchantments });
     const ordinary = try context.item("minecraft:stick", &.{});
     const enchanted = try context.item("minecraft:stick", &.{.{ .name = "test:wand", .level = 1 }});
@@ -254,7 +254,7 @@ test "item actions dispatch custom enchantments only for the actual held hand an
     try std.testing.expectEqual(.applied, try actions.apply(player, 1, null));
     try context.equip(36, unrelated);
     try std.testing.expectEqual(.pass, try actions.apply(player, 0, null));
-    player.gamemode = .spectator;
+    fixture.player_states.records[0].gamemode = .spectator;
     try std.testing.expectEqual(.denied, try actions.apply(player, 1, null));
     try std.testing.expectEqual(@as(usize, 1), owner.calls);
     try std.testing.expectEqual(@as(usize, 0), actions.scratch.end_index);
@@ -267,7 +267,7 @@ test "equipment attributes combine operations distinguish slots and replace dupl
     var context = try Test.init(bounded.allocator());
     defer context.deinit();
     const fixture = context.fixture;
-    const attributes = try EquipmentAttributes.init(bounded.allocator(), .{}, .{ .players = fixture.players, .items = fixture.items, .enchantments = fixture.definitions.enchantments, .client = fixture.definitions.client });
+    const attributes = try EquipmentAttributes.init(bounded.allocator(), .{}, .{ .players = fixture.players, .player_states = fixture.player_states, .items = fixture.items, .enchantments = fixture.definitions.enchantments, .client = fixture.definitions.client });
     try fixture.definitions.enchantments.addEnchantments(&.{
         .{ .name = "test:first", .description = "First", .supported_items = &.{"minecraft:stick"}, .effects = .{ .slots = .{ .mainhand = true, .offhand = true }, .attributes = &.{
             .{ .id = "test:shared", .attribute = "minecraft:mining_efficiency", .amount = .{ .constant = 5 }, .operation = .add_value },
@@ -288,7 +288,7 @@ test "equipment attributes combine operations distinguish slots and replace dupl
     try context.equip(45, off);
     try std.testing.expectEqual(@as(f64, 14), try attributes.value(0, "minecraft:mining_efficiency"));
     try std.testing.expectEqual(@as(f64, 88), try attributes.value(0, "minecraft:block_break_speed"));
-    fixture.players.records[0].selected_slot = 1;
+    fixture.player_states.records[0].selected_slot = 1;
     try std.testing.expectEqual(@as(f64, 5), try attributes.value(0, "minecraft:mining_efficiency"));
     try context.equip(45, null);
     try std.testing.expectEqual(@as(f64, 0), try attributes.value(0, "minecraft:mining_efficiency"));
@@ -333,7 +333,7 @@ test "attribute synchronization sends configured bases updates changes and skips
     fixture.players.deps.packets = try packets.Packets.init(arena.allocator(), .{ .sessions = fixture.service });
     fixture.players.records[0].protocol = protocols.implementations[0].protocol_number;
     fixture.service.credit[0].store(@as(u64, 1) << 32 | sessions.Service.active | fixture.service.config.buffer_bytes, .release);
-    const attributes = try EquipmentAttributes.init(arena.allocator(), .{ .bases = &.{.{ .name = "minecraft:mining_efficiency", .value = 5 }} }, .{ .players = fixture.players, .items = fixture.items, .enchantments = fixture.definitions.enchantments, .client = fixture.definitions.client });
+    const attributes = try EquipmentAttributes.init(arena.allocator(), .{ .bases = &.{.{ .name = "minecraft:mining_efficiency", .value = 5 }} }, .{ .players = fixture.players, .player_states = fixture.player_states, .items = fixture.items, .enchantments = fixture.definitions.enchantments, .client = fixture.definitions.client });
     try attributes.tick();
     try std.testing.expectEqual(@as(usize, 1), drain(fixture.service));
     try std.testing.expectEqual(@as(f64, 5), try attributes.value(0, "minecraft:mining_efficiency"));
@@ -357,9 +357,10 @@ test "equipment watches follow player identities when connection slots are reass
     var context = try Test.init(bounded.allocator());
     defer context.deinit();
     const fixture = context.fixture;
-    const attributes = try EquipmentAttributes.init(bounded.allocator(), .{}, .{ .players = fixture.players, .items = fixture.items, .enchantments = fixture.definitions.enchantments, .client = fixture.definitions.client });
+    const attributes = try EquipmentAttributes.init(bounded.allocator(), .{}, .{ .players = fixture.players, .player_states = fixture.player_states, .items = fixture.items, .enchantments = fixture.definitions.enchantments, .client = fixture.definitions.client });
     fixture.players.records[1] = fixture.players.records[0];
     fixture.players.records[1].uuid = 2;
+    fixture.player_states.records[1] = .{ .uuid = 2 };
     fixture.players.records[1].handle = .{ .index = 1, .generation = 1 };
     fixture.players.rebuildIndexes();
     bounded.fail_index = bounded.alloc_index;
@@ -367,6 +368,7 @@ test "equipment watches follow player identities when connection slots are reass
     _ = try attributes.value(1, "minecraft:mining_efficiency");
     for (0..3) |_| {
         std.mem.swap(@TypeOf(fixture.players.records[0]), &fixture.players.records[0], &fixture.players.records[1]);
+        std.mem.swap(@TypeOf(fixture.player_states.records[0]), &fixture.player_states.records[0], &fixture.player_states.records[1]);
         for (fixture.players.records, 0..) |*player, index| {
             player.handle.?.index = index;
             player.handle.?.generation += 1;

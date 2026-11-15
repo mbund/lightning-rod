@@ -4,6 +4,7 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
+        .lightning_rod_e2e = .{ .path = "../.." },
         .e2e_control = .{ .path = "../../control" },
         .protocol_codegen = .{ .path = "../../../protocol_codegen" },
         .registry_snapshotter = .{ .path = "../../../registry_snapshotter" },
@@ -20,6 +21,9 @@
         },
         .minecraft_packets = .{ .path = "../../../minecraft_packets" },
         .minecraft_java = .{ .path = "../../../minecraft_java" },
+        .connection = .{ .path = "../../../connection" },
+        .players = .{ .path = "../../../players" },
+        .worlds = .{ .path = "../../../worlds" },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "canonical.zig", "main.zig", "protocol.zig", "extra_negotiation.zig" },
+    .paths = .{ "build.zig", "build.zig.zon", "test.zon", "client", "canonical.zig", "main.zig", "protocol.zig", "extra_negotiation.zig" },
 }

@@ -1,6 +1,13 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
-const vanilla = @import("vanilla");
+const BlockEdit = @import("chunks").BlockEdit;
+const BlockPosition = @import("chunks").Position;
+const Chunks = @import("chunks").Chunks;
+const LightSample = @import("terrain").lighting.Sample;
+const Lighting = @import("terrain").lighting.Lighting;
+const Players = @import("players").players.Players;
+const Reload = @import("reload").Reload;
+const SectionEdits = @import("chunks").SectionEdits;
 const protocols = @import("protocols");
 const sessions = @import("sessions");
 const e2e = @import("e2e");
@@ -8,7 +15,7 @@ const e2e = @import("e2e");
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 2, .render_distance = 2 }),
+            lightning_rod.plugin.configured(Players, .{ .maximum = 2, .render_distance = 2 }),
         }),
         lightning_rod.plugin.configured(Probe, .{}),
     });
@@ -19,22 +26,27 @@ const Probe = struct {
     pub const id = "e2e:lighting";
     pub const Configuration = struct {};
     pub const Dependencies = struct {
-        players: *vanilla.Players,
-        chunks: *vanilla.Chunks,
-        lighting: *vanilla.Lighting,
+        players: *Players,
+        chunks: *Chunks,
+        lighting: *Lighting,
         control: *e2e.Control,
-        reload: *vanilla.Reload,
+        reload: *Reload,
     };
     const Phase = enum { waiting, lit, obstructed, dark, opened, closed, restored, reloaded };
-    const source: vanilla.BlockPosition = .{ .x = 15, .y = 66, .z = 2 };
-    const obstruction: vanilla.BlockPosition = .{ .x = 16, .y = 66, .z = 2 };
-    const opening: vanilla.BlockPosition = .{ .x = 17, .y = 69, .z = 2 };
+    const source: BlockPosition = .{ .x = 15, .y = 66, .z = 2 };
+    const obstruction: BlockPosition = .{ .x = 16, .y = 66, .z = 2 };
+    const opening: BlockPosition = .{ .x = 17, .y = 69, .z = 2 };
     const stone: u16 = protocols.registry.block_stone_default_state;
     const glowstone: u16 = @intCast(protocols.registry.block_glowstone_default_state);
+
+    /// Ticks the expected light may take to settle before the probe fails.
+    const wait_limit = 100;
 
     deps: Dependencies,
     phase: Phase = .waiting,
     observed: u2 = 0,
+    checking: bool = false,
+    waited: u8 = 0,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Probe {
         const self = try allocator.create(Probe);
@@ -58,8 +70,8 @@ const Probe = struct {
         self.observed = 0;
         switch (self.phase) {
             .waiting => {
-                var sections: [2]vanilla.SectionEdits = undefined;
-                var edits: [2][6 * 6 * 6]vanilla.BlockEdit = undefined;
+                var sections: [2]SectionEdits = undefined;
+                var edits: [2][6 * 6 * 6]BlockEdit = undefined;
                 var counts: [2]usize = .{ 0, 0 };
                 for (14..20) |x| for (0..6) |z| for (64..70) |y| {
                     const column: usize = @intFromBool(x >= 16);
@@ -102,15 +114,30 @@ const Probe = struct {
             },
             .reloaded => {},
         }
-        var samples: [1]vanilla.LightSample = undefined;
+        self.waited = 0;
+        self.checking = true;
+        return .handled;
+    }
+
+    /// Light follows edits a few ticks later, as in vanilla, and a column that is not in
+    /// memory yet answers nothing. The check waits for the expected light before the
+    /// players move on.
+    pub fn tick(self: *Probe) !void {
+        if (!self.checking) return;
+        var samples: [1]?LightSample = undefined;
         try self.deps.lighting.sampleMany(0, &.{.{ .x = 17, .y = 66, .z = 2 }}, &samples);
         const emitter = self.phase == .lit or self.phase == .obstructed or self.phase == .restored or self.phase == .reloaded;
-        const expected: vanilla.LightSample = .{
+        const expected: LightSample = .{
             .block = if (self.phase == .obstructed) 11 else if (emitter) 13 else 0,
             .sky = if (self.phase == .opened) 15 else 0,
         };
-        if (!std.meta.eql(samples[0], expected)) return error.IncorrectSimulationLight;
+        const matches = if (samples[0]) |sample| std.meta.eql(sample, expected) else false;
+        if (!matches) {
+            self.waited += 1;
+            if (self.waited == wait_limit) return if (samples[0] == null) error.MissingSimulationLight else error.IncorrectSimulationLight;
+            return;
+        }
+        self.checking = false;
         for (self.deps.players.records) |player| try self.deps.control.send(player.handle.?, @tagName(self.phase));
-        return .handled;
     }
 };

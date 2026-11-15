@@ -20,6 +20,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &imports,
     });
+    inline for (.{"players"}) |name|
+        module.addImport(name, b.dependency(name, .{ .target = target, .optimize = optimize }).module(name));
     const check = b.addLibrary(.{ .name = "shop", .root_module = module });
     b.step("check", "Check the Shop module").dependOn(&check.step);
 }

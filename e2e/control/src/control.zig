@@ -1,16 +1,19 @@
 const lightning_rod = @import("lightning_rod");
 const std = @import("std");
 const sessions = @import("sessions");
-const vanilla = @import("vanilla");
+const Packets = @import("minecraft_packets").Packets;
+const PayloadChannels = @import("connection").payload_channels;
+const Players = @import("players").players.Players;
+const Reload = @import("reload").Reload;
 const protocols = @import("protocols");
 
 pub const Control = struct {
     pub const id = "e2e:control";
     pub const Configuration = struct {};
     pub const Dependencies = struct {
-        payloads: *vanilla.PayloadChannels.Play,
-        players: *vanilla.Players,
-        reload: *vanilla.Reload,
+        payloads: *PayloadChannels.Play,
+        players: *Players,
+        reload: *Reload,
         persistence: *lightning_rod.storage.Store,
         checkpoint: *lightning_rod.Checkpoint,
     };
@@ -138,10 +141,11 @@ pub const Control = struct {
         for (self.fences[0..self.fence_count]) |*fence| {
             const player = self.deps.players.records[fence.handle.index];
             if (!std.meta.eql(player.handle, fence.handle)) continue;
-            fence.remaining -|= 1;
             // Input precedes plugin ticks. Waiting for the following tick covers every plugin,
-            // regardless of where this control plugin appears in dependency order.
-            if (fence.remaining == 0 and player.stage == .ready and (fence.durable == null or self.deps.persistence.durableTick() >= fence.durable.?)) {
+            // regardless of where this control plugin appears in dependency order. The count
+            // starts once the client has loaded the world, as some state waits for that.
+            fence.remaining = if (player.stage == .ready and player.loaded) fence.remaining -| 1 else 2;
+            if (fence.remaining == 0 and (fence.durable == null or self.deps.persistence.durableTick() >= fence.durable.?)) {
                 var buffer: [134]u8 = undefined;
                 const target: sessions.Service.Target = .{ .handle = fence.handle, .protocol = player.protocol };
                 try self.fanout(&.{target}, try std.fmt.bufPrint(&buffer, "fence {s}", .{fence.name.bytes[0..fence.name.len]}));
@@ -157,7 +161,9 @@ pub const Control = struct {
         var count: usize = 0;
         for (self.deps.players.records) |player| {
             const handle = player.handle orelse continue;
-            if (player.stage != .ready) continue;
+            // A client reports in once its chunks load, which can be before its position is
+            // confirmed, so everyone already in play hears a broadcast.
+            if (!player.inPlay()) continue;
             self.targets[count] = .{ .handle = handle, .protocol = player.protocol };
             count += 1;
         }
@@ -232,13 +238,13 @@ test "markers catch up after readiness backpressure and connection reuse" {
     for ([_]sessions.Handle{ alice, bob }) |handle|
         service.credit[handle.index].store((@as(u64, handle.generation) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
 
-    var records: [2]vanilla.Players.Player = .{
+    var records: [2]Players.Player = .{
         .{ .handle = alice, .protocol = protocol, .stage = .ready },
         .{ .handle = bob, .protocol = protocol, .stage = .awaiting_teleport },
     };
-    var players: vanilla.Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &records, .dig_handlers = &.{} };
-    var packets: vanilla.Packets = .{ .deps = .{ .sessions = service } };
-    var payloads: vanilla.PayloadChannels.Play = .{ .deps = .{ .input = undefined, .packets = &packets }, .subscriptions = &.{} };
+    var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &records, .dig_handlers = &.{} };
+    var packets: Packets = .{ .deps = .{ .sessions = service } };
+    var payloads: PayloadChannels.Play = .{ .deps = .{ .input = undefined, .packets = &packets }, .subscriptions = &.{} };
     var cursors: [2]Control.Cursor = @splat(.{});
     var targets: [2]sessions.Service.Target = undefined;
     var delivered: [2]sessions.Service.Delivery = undefined;

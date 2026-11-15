@@ -2,9 +2,9 @@ const std = @import("std");
 const storage = @import("storage");
 const metrics = @import("metrics");
 const sessions = @import("sessions");
-const protocols = @import("protocols");
+const protocols = @import("minecraft_packets").protocols;
 const inventories = @import("inventories");
-const menu_click = @import("menu_click.zig");
+const menu_click = @import("vanilla_inventory").menu_click;
 const InventoryFixture = @import("inventory_test_fixture.zig").InventoryFixture;
 
 fn countItems(stacks: []const ?inventories.Stack, items: [2]inventories.ItemId) ![2]u64 {

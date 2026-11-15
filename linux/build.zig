@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const names = .{ "host", "reload_execve", "storage", "reload", "lightning_rod", "sessions", "vanilla" };
+    const names = .{ "host", "reload_execve", "storage", "reload", "lightning_rod", "sessions", "vanilla", "chunks", "terrain" };
     var imports: [names.len]std.Build.Module.Import = undefined;
     inline for (names, 0..) |name, index| {
         const dependency = b.dependency(name, .{ .target = target, .optimize = optimize });

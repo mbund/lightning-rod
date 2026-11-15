@@ -10,6 +10,10 @@
         .protocols = .{ .path = "../../protocols" },
         .minecraft_packets = .{ .path = "../../minecraft_packets" },
         .tps = .{ .path = "../../examples/plugins/tps" },
+        .chunks = .{ .path = "../../chunks" },
+        .inventories = .{ .path = "../../inventories" },
+        .players = .{ .path = "../../players" },
+        .replication = .{ .path = "../../replication" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

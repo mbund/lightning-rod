@@ -1,5 +1,6 @@
 const std = @import("std");
-const vanilla = @import("vanilla");
+const Players = @import("players").players.Players;
+const commands = @import("commands");
 const Shop = @import("shop").Shop;
 
 pub const ShopCommands = struct {
@@ -9,12 +10,12 @@ pub const ShopCommands = struct {
 
     pub const Dependencies = struct {
         shop: *Shop,
-        commands: *vanilla.commands.Commands,
-        players: *vanilla.Players,
+        commands: *commands.Commands,
+        players: *Players,
     };
 
-    pub const buy_permission: vanilla.commands.Permission = .{ .name = "shop.buy", .description = "Purchase items" };
-    pub const sell_permission: vanilla.commands.Permission = .{ .name = "shop.sell", .description = "Sell items" };
+    pub const buy_permission: commands.Permission = .{ .name = "shop.buy", .description = "Purchase items" };
+    pub const sell_permission: commands.Permission = .{ .name = "shop.sell", .description = "Sell items" };
 
     const TradeArgs = struct {
         item: usize,
@@ -26,14 +27,14 @@ pub const ShopCommands = struct {
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*ShopCommands {
         const self = try allocator.create(ShopCommands);
         self.* = .{ .deps = deps };
-        _ = try deps.commands.register(self, vanilla.commands.leaf(ShopCommands, TradeArgs, .{
+        _ = try deps.commands.register(self, commands.leaf(ShopCommands, TradeArgs, .{
             .name = "buy",
             .description = "Purchase an offered item",
             .permission = &buy_permission,
             .handler = buy,
             .arguments = .{ .item = .{ .parse = parseItem, .suggest = suggestItems }, .amount = .{ .minimum = 1 } },
         }));
-        _ = try deps.commands.register(self, vanilla.commands.leaf(ShopCommands, TradeArgs, .{
+        _ = try deps.commands.register(self, commands.leaf(ShopCommands, TradeArgs, .{
             .name = "sell",
             .description = "Sell an offered item",
             .permission = &sell_permission,
@@ -43,15 +44,15 @@ pub const ShopCommands = struct {
         return self;
     }
 
-    fn buy(self: *ShopCommands, context: vanilla.commands.Context, args: TradeArgs) !void {
+    fn buy(self: *ShopCommands, context: commands.Context, args: TradeArgs) !void {
         try self.trade(context, args, true);
     }
 
-    fn sell(self: *ShopCommands, context: vanilla.commands.Context, args: TradeArgs) !void {
+    fn sell(self: *ShopCommands, context: commands.Context, args: TradeArgs) !void {
         try self.trade(context, args, false);
     }
 
-    fn trade(self: *ShopCommands, context: vanilla.commands.Context, args: TradeArgs, buying: bool) !void {
+    fn trade(self: *ShopCommands, context: commands.Context, args: TradeArgs, buying: bool) !void {
         for (self.deps.players.records, 0..) |player, index| {
             if (player.handle == null or player.uuid != context.sender) continue;
             self.deps.shop.trade(index, args.item, args.amount orelse 1, buying) catch |err| {
@@ -69,13 +70,13 @@ pub const ShopCommands = struct {
         }
     }
 
-    fn parseItem(self: *ShopCommands, _: vanilla.commands.Context, text: []const u8) vanilla.commands.ParseError!usize {
+    fn parseItem(self: *ShopCommands, _: commands.Context, text: []const u8) commands.ParseError!usize {
         for (self.deps.shop.config.offers, 0..) |offer, index|
             if (std.mem.eql(u8, offer.item, text) or (std.mem.startsWith(u8, offer.item, "minecraft:") and std.mem.eql(u8, offer.item[10..], text))) return index;
         return error.InvalidArgument;
     }
 
-    fn suggestItems(self: *ShopCommands, context: vanilla.commands.CompletionContext, output: *vanilla.commands.Suggestions) void {
+    fn suggestItems(self: *ShopCommands, context: commands.CompletionContext, output: *commands.Suggestions) void {
         for (self.deps.shop.config.offers) |offer| {
             const name = if (std.mem.startsWith(u8, offer.item, "minecraft:")) offer.item[10..] else offer.item;
             if (std.mem.startsWith(u8, name, context.prefix)) output.add(.{ .text = name, .tooltip = "Available in this shop" }) catch return;

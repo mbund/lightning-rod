@@ -1,13 +1,17 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
+const BlockEdit = @import("chunks").BlockEdit;
+const Chunks = @import("chunks").Chunks;
+const Players = @import("players").players.Players;
+const Section = @import("chunks").Section;
 const protocols = @import("protocols");
 const e2e = @import("e2e");
 
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 1, .render_distance = 2, .spawn = .{ .x = 20.5, .y = 17, .z = 20.5 } }),
+            lightning_rod.plugin.configured(Players, .{ .maximum = 1, .render_distance = 2, .spawn = .{ .x = 20.5, .y = 17, .z = 20.5 } }),
             lightning_rod.plugin.configured(vanilla.Flat, .{ .biomes = biomePattern }),
         }),
         lightning_rod.plugin.configured(Probe, .{}),
@@ -15,7 +19,7 @@ pub fn main(init: std.process.Init) !void {
     try e2e.profile.run(init, plugins, .{});
 }
 
-fn biomePattern(section: vanilla.Section, values: *[64]u16) void {
+fn biomePattern(section: Section, values: *[64]u16) void {
     for (values, 0..) |*biome, cell| {
         const name = if (section.x == 3 and section.z == 1)
             "minecraft:lush_caves"
@@ -30,12 +34,12 @@ fn biomePattern(section: vanilla.Section, values: *[64]u16) void {
 const Probe = struct {
     pub const id = "e2e:occlusion_biomes";
     pub const Configuration = struct {};
-    pub const Dependencies = struct { chunks: *vanilla.Chunks };
+    pub const Dependencies = struct { chunks: *Chunks };
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Probe {
         const self = try allocator.create(Probe);
         self.* = .{};
-        const edits = try allocator.alloc(vanilla.BlockEdit, 4096);
+        const edits = try allocator.alloc(BlockEdit, 4096);
         defer allocator.free(edits);
         for (edits, 0..) |*edit, index| edit.* = .{
             .index = @intCast(index),

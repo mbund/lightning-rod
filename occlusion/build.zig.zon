@@ -1,0 +1,14 @@
+.{
+    .name = .occlusion,
+    .fingerprint = 0xb90ecf8fd47c1287,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .chunks = .{ .path = "../chunks" },
+        .game_data = .{ .path = "../game_data" },
+        .lighting = .{ .path = "../lighting" },
+        .records = .{ .path = "../records" },
+        .storage = .{ .path = "../storage" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

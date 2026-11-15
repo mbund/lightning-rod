@@ -1,6 +1,9 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
-const vanilla = @import("vanilla");
+const BlockEdit = @import("chunks").BlockEdit;
+const Chunks = @import("chunks").Chunks;
+const Players = @import("players").players.Players;
+const Streaming = @import("terrain").streaming.Streaming;
 const protocols = @import("protocols");
 const sessions = @import("sessions");
 const e2e = @import("e2e");
@@ -10,21 +13,21 @@ const render_distance = 2;
 pub fn main(init: std.process.Init) !void {
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(vanilla.Players, .{ .maximum = 2, .render_distance = render_distance, .spawn_for_player = spawn }),
+            lightning_rod.plugin.configured(Players, .{ .maximum = 2, .render_distance = render_distance, .spawn_for_player = spawn }),
         }),
         lightning_rod.plugin.configured(Probe, .{}),
     });
     try e2e.profile.run(init, plugins, .{});
 }
 
-fn spawn(player: *const vanilla.Players.Player) minecraft.Position {
+fn spawn(player: *const Players.Player) minecraft.Position {
     return .{ .x = 20.5, .y = if (std.mem.eql(u8, player.name[0..player.name_len], "alice")) 65 else 17, .z = 20.5 };
 }
 
 const Probe = struct {
     pub const id = "e2e:player_occlusion";
     pub const Configuration = struct {};
-    pub const Dependencies = struct { control: *e2e.Control, players: *vanilla.Players, chunks: *vanilla.Chunks, streaming: *vanilla.Streaming };
+    pub const Dependencies = struct { control: *e2e.Control, players: *Players, chunks: *Chunks, streaming: *Streaming };
     deps: Dependencies,
     checked: [2]bool = @splat(false),
     edit: usize = 0,
@@ -33,7 +36,7 @@ const Probe = struct {
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Probe {
         const self = try allocator.create(Probe);
         self.* = .{ .deps = deps };
-        const edits = try allocator.alloc(vanilla.BlockEdit, 4096);
+        const edits = try allocator.alloc(BlockEdit, 4096);
         defer allocator.free(edits);
         for (edits, 0..) |*edit, index| edit.* = .{ .index = @intCast(index), .state = if (index < 256) @intCast(protocols.registry.block_stone_default_state) else 0 };
         try deps.chunks.setBlocks(.{ .world = 0, .x = 1, .y = 1, .z = 1 }, edits);
@@ -77,7 +80,7 @@ const Probe = struct {
             return .handled;
         }
         const open = self.phase != .hidden_again;
-        var edits: [16]vanilla.BlockEdit = undefined;
+        var edits: [16]BlockEdit = undefined;
         for (2..5) |section| {
             const count: usize = if (section == 4) 1 else 16;
             for (edits[0..count], 0..) |*edit, y| edit.* = .{ .index = @intCast(y * 256 + 4 * 16 + 5), .state = if (open) 0 else @intCast(protocols.registry.block_stone_default_state) };

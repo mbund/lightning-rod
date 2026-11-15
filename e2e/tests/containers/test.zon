@@ -1,0 +1,10 @@
+.{ .client = "ContainersFixture", .scenarios = .{
+    .{
+        .name = "chests-multi",
+        .fixture = "chests",
+        .peers = .{ "alice", "bob" },
+    },
+    .{ .name = "furnace", .fixture = "furnace" },
+    .{ .name = "furnace-callback", .fixture = "furnace-callback" },
+    .{ .name = "crafting", .fixture = "crafting" },
+} }
