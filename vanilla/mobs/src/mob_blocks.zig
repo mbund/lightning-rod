@@ -135,12 +135,25 @@ pub const State = struct {
     collision: u16 = shape_classes.empty,
 };
 
+/// A shape reaching past its block (BlockState.hasLargeCollisionShape, or a moving piston), which
+/// collision scans look one block further for.
+pub const mark_large: u8 = 1;
+/// A fluid, which bodies float in and are pushed by.
+pub const mark_fluid: u8 = 2;
+/// A block that acts on a mob inside it (BlockBehaviour.entityInside).
+pub const mark_inside: u8 = 4;
+
 pub const MobBlocks = struct {
     states: []State,
     block_definitions: *Blocks,
     /// Blocks by name, for tags, whose members name blocks by their place in another registry.
     names: std.StringHashMapUnmanaged(u16) = .empty,
     /// By block, the tags read through a property, filled while tags are read.
+    /// The collision class of a whole block, as stone has.
+    full_cube: u16 = 0,
+    /// By state, what sections are marked for holding (see `mark_large` and the others), so a
+    /// mob's window knows what its blocks cannot do.
+    marks: []u8,
     trapdoors: []bool,
     campfires: []bool,
 
@@ -150,6 +163,7 @@ pub const MobBlocks = struct {
             .states = try allocator.alloc(State, registry.block_state_names.len),
             .block_definitions = block_definitions,
             .trapdoors = try allocator.alloc(bool, registry.blocks.len),
+            .marks = try allocator.alloc(u8, registry.block_state_names.len),
             .campfires = try allocator.alloc(bool, registry.blocks.len),
         };
         try self.names.ensureTotalCapacity(allocator, @intCast(registry.blocks.len));
@@ -159,6 +173,13 @@ pub const MobBlocks = struct {
         defer allocator.free(collisions);
         try shape_classes.classify(allocator, collisions);
         for (self.states, collisions) |*entry, collision| entry.collision = collision;
+        self.full_cube = self.states[@intCast(registry.blockStateId("minecraft:stone").?)].collision;
+        for (self.marks, self.states, 0..) |*mark, entry, state| {
+            mark.* = 0;
+            if (entry.flags.large_shape) mark.* |= mark_large;
+            if (game_data.physics.get(@intCast(state)).fluid != .none) mark.* |= mark_fluid;
+            if (@import("block_effects.zig").insideActs(entry.kind)) mark.* |= mark_inside;
+        }
         try self.readTags();
         try block_definitions.registry.onChange(self, readTags);
         return self;

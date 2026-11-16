@@ -31,6 +31,11 @@ pub const Copies = struct {
     /// Copies read lately, by the low two bits of each section coordinate, as reads come in runs
     /// over a few neighbouring sections: any four by four by four of them fit at once.
     recent: [64]u32 = @splat(no_slot),
+    /// By state, bits the reader wants to know a section holds, and by slot the bits it may hold:
+    /// set when it is decoded with them or a state with them is edited in, kept until the section
+    /// is decoded again.
+    marks: ?[]const u8 = null,
+    marked: []u8,
     /// Sections decoded, for measuring.
     decoded: u64 = 0,
 
@@ -44,6 +49,7 @@ pub const Copies = struct {
             .sections = try allocator.alloc(chunks.Section, capacity),
             .states = try allocator.alloc([chunks.encoding.blocks]u16, capacity),
             .absent = try allocator.alloc(bool, capacity),
+            .marked = try allocator.alloc(u8, capacity),
             .referenced = try allocator.alloc(bool, capacity),
             .used = try allocator.alloc(bool, capacity),
             .free = try allocator.alloc(u32, capacity),
@@ -61,6 +67,22 @@ pub const Copies = struct {
         const section: chunks.Section = .{ .world = world, .x = @divFloor(position.x, 16), .y = @divFloor(position.y, 16), .z = @divFloor(position.z, 16) };
         const slot = try self.find(section);
         return self.states[slot][chunks.localIndex(position)];
+    }
+
+    /// The slot holding a section's states, until a read of another section replaces it, which
+    /// `holds` tells.
+    pub fn sectionSlot(self: *Copies, world: u32, x: i32, y: i32, z: i32) !u32 {
+        return self.find(.{ .world = world, .x = x, .y = y, .z = z });
+    }
+
+    pub fn holds(self: *const Copies, slot: u32, world: u32, x: i32, y: i32, z: i32) bool {
+        return self.used[slot] and sameSection(self.sections[slot], .{ .world = world, .x = x, .y = y, .z = z });
+    }
+
+    /// Startup only, before anything is read: the states sections are marked for holding.
+    pub fn mark(self: *Copies, marks: []const u8) void {
+        assert(self.index.count() == 0);
+        self.marks = marks;
     }
 
     /// Writes through to the chunks. The edit comes back through the observer to the copy.
@@ -103,6 +125,10 @@ pub const Copies = struct {
         defer lease.release();
         const view = lease.view();
         for (&self.states[slot], 0..) |*state, cell| state.* = view.get(@intCast(cell));
+        self.marked[slot] = 0;
+        if (self.marks) |marks| for (self.states[slot]) |state| {
+            self.marked[slot] |= marks[state];
+        };
         self.sections[slot] = section;
         self.absent[slot] = lease.record.read() == null;
         self.used[slot] = true;
@@ -149,6 +175,9 @@ pub const Copies = struct {
         const slot = self.index.get(section) orelse return;
         // An edit generates a section that was absent first, which the air copy does not hold.
         if (self.absent[slot]) return self.drop(slot);
-        for (edits) |edit| self.states[slot][edit.index] = edit.state;
+        for (edits) |edit| {
+            self.states[slot][edit.index] = edit.state;
+            if (self.marks) |marks| self.marked[slot] |= marks[edit.state];
+        }
     }
 };

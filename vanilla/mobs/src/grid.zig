@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const mth = @import("mth.zig");
+const Box = @import("body.zig").Box;
 
 const assert = std.debug.assert;
 
@@ -21,6 +22,8 @@ pub const Grid = struct {
     previous: []u32,
     /// The cell each mob is in, by slot.
     cells: []Cell,
+    /// Each mob's box as it last stood, so queries test boxes without reading the mobs.
+    boxes: []Box,
     placed: []bool,
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !Grid {
@@ -30,6 +33,7 @@ pub const Grid = struct {
             .next = try allocator.alloc(u32, capacity),
             .previous = try allocator.alloc(u32, capacity),
             .cells = try allocator.alloc(Cell, capacity),
+            .boxes = try allocator.alloc(Box, capacity),
             .placed = try allocator.alloc(bool, capacity),
         };
         @memset(grid.heads, absent);
@@ -47,7 +51,8 @@ pub const Grid = struct {
     }
 
     /// Puts a mob in the cell of a position, moving it if it was elsewhere.
-    pub fn place(self: *Grid, slot: u32, cell: Cell) void {
+    pub fn place(self: *Grid, slot: u32, cell: Cell, box: Box) void {
+        self.boxes[slot] = box;
         if (self.placed[slot]) {
             if (std.meta.eql(self.cells[slot], cell)) return;
             self.remove(slot);
@@ -149,16 +154,17 @@ test "the grid finds the mobs near a span and nothing farther" {
         std.testing.allocator.free(grid.previous);
         std.testing.allocator.free(grid.cells);
         std.testing.allocator.free(grid.placed);
+        std.testing.allocator.free(grid.boxes);
     }
-    grid.place(0, Grid.cellOf(0, 0.5, 0.5));
-    grid.place(1, Grid.cellOf(0, 3.5, 0.5));
-    grid.place(2, Grid.cellOf(0, 40.5, 0.5));
-    grid.place(3, Grid.cellOf(1, 0.5, 0.5));
+    grid.place(0, Grid.cellOf(0, 0.5, 0.5), .{ .min = .{ 0, 0, 0 }, .max = .{ 1, 1, 1 } });
+    grid.place(1, Grid.cellOf(0, 3.5, 0.5), .{ .min = .{ 0, 0, 0 }, .max = .{ 1, 1, 1 } });
+    grid.place(2, Grid.cellOf(0, 40.5, 0.5), .{ .min = .{ 0, 0, 0 }, .max = .{ 1, 1, 1 } });
+    grid.place(3, Grid.cellOf(1, 0.5, 0.5), .{ .min = .{ 0, 0, 0 }, .max = .{ 1, 1, 1 } });
     var found: [8]bool = @splat(false);
     var query = grid.query(0, .{ -1, -1 }, .{ 4, 1 });
     while (query.next()) |slot| found[slot] = true;
     try std.testing.expect(found[0] and found[1] and !found[2] and !found[3]);
-    grid.place(1, Grid.cellOf(0, 41.5, 0.5));
+    grid.place(1, Grid.cellOf(0, 41.5, 0.5), .{ .min = .{ 0, 0, 0 }, .max = .{ 1, 1, 1 } });
     grid.remove(0);
     found = @splat(false);
     query = grid.query(0, .{ -1, -1 }, .{ 4, 1 });

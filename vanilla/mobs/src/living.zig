@@ -16,6 +16,8 @@ const Mobs = @import("mobs.zig").Mobs;
 const Sound = @import("mobs.zig").Sound;
 
 const Box = body.Box;
+/// Debug builds still do what a skip would spare and check it found nothing.
+const verify_skips = @import("builtin").mode == .debug;
 const assert = std.debug.assert;
 
 pub fn width(mobs: *const Mobs, mob: *const Mob) f32 {
@@ -410,6 +412,9 @@ fn fluidHeightAndPush(mobs: *Mobs, mob: *Mob, fluid: game_data.physics_data.Flui
     const current = box(mobs, mob).inflate(-0.001, -0.001, -0.001);
     const first: [3]i32 = .{ mth.floor(current.min[0]), mth.floor(current.min[1]), mth.floor(current.min[2]) };
     const last: [3]i32 = .{ mth.ceil(current.max[0]), mth.ceil(current.max[1]), mth.ceil(current.max[2]) };
+    // No fluid around the mob ticking means nothing to find, which Debug still looks for.
+    const dry = level.without(mob_blocks.mark_fluid, first, .{ last[0] - 1, last[1] - 1, last[2] - 1 });
+    if (dry and !verify_skips) return .{ .touching = false, .height = 0 };
     var deepest: f64 = 0;
     var touching = false;
     var push: [3]f64 = .{ 0, 0, 0 };
@@ -434,6 +439,7 @@ fn fluidHeightAndPush(mobs: *Mobs, mob: *Mob, fluid: game_data.physics_data.Flui
             }
         }
     }
+    if (dry) assert(!touching and pushes == 0);
     if (@sqrt(lengthSquared(push)) > 0) {
         if (pushes > 0) {
             const scale = 1.0 / @as(f64, @floatFromInt(pushes));

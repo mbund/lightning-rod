@@ -9,6 +9,7 @@ const game_data = @import("game_data");
 const chunks = @import("chunks");
 const mth = @import("mth.zig");
 const mob_blocks = @import("mob_blocks.zig");
+const shape_classes = @import("shape_classes.zig");
 const JavaRandom = @import("java_random.zig").JavaRandom;
 
 const MobBlocks = mob_blocks.MobBlocks;
@@ -129,11 +130,130 @@ test "an overlay shows the world right after each edit of a batch" {
     try std.testing.expectEqual(@as(u32, 0), overlay.states.count());
 }
 
+/// The blocks around one mob, read once as its tick begins, which its body then reads many times
+/// over: collisions, the block it stands on, fluids, what it is inside. Reads outside fall
+/// through to the world, and edits during the tick change it as they change the world.
+pub const Window = struct {
+    world: u32 = 0,
+    origin: [3]i32 = .{ 0, 0, 0 },
+    states: [width * height * width]u16 = undefined,
+    /// What the sections it reads from may hold, by mob_blocks' marks.
+    marks: u8 = 0xff,
+
+    /// Two blocks either side of the mob's block, and from two below its feet to three above,
+    /// which covers a walking body's collision cells.
+    const width = 5;
+    const height = 6;
+
+    pub fn fill(self: *Window, level: *const Level, at: [3]i32) !void {
+        assert(level.window == null and level.overlay == null);
+        self.world = level.world;
+        self.origin = .{ at[0] - 2, at[1] - 2, at[2] - 2 };
+        const copies = level.copies orelse {
+            // Worlds held in memory, for tests, read block by block.
+            self.marks = 0xff;
+            for (0..height) |dy| for (0..width) |dz| for (0..width) |dx| {
+                self.states[(dy * width + dz) * width + dx] = try level.state(self.origin[0] + @as(i32, @intCast(dx)), self.origin[1] + @as(i32, @intCast(dy)), self.origin[2] + @as(i32, @intCast(dz)));
+            };
+            return;
+        };
+        // The window spans at most two sections along each axis. Each is fetched, then all are
+        // checked still held, as a later fetch may take an earlier one's slot when the copies are
+        // full, and fetched again until none was.
+        const base: [3]i32 = .{ @divFloor(self.origin[0], 16), @divFloor(self.origin[1], 16), @divFloor(self.origin[2], 16) };
+        const top: [3]i32 = .{ @divFloor(self.origin[0] + width - 1, 16), @divFloor(self.origin[1] + height - 1, 16), @divFloor(self.origin[2] + width - 1, 16) };
+        const lowest = @divFloor(level.minimum_y, 16);
+        const highest = @divFloor(level.minimum_y + level.height - 1, 16);
+        var slots: [8]u32 = undefined;
+        var rounds: usize = 0;
+        while (true) : (rounds += 1) {
+            assert(rounds < 3);
+            for (0..8) |which| {
+                const key = sectionKey(base, which);
+                if (key[0] > top[0] or key[1] > top[1] or key[2] > top[2] or key[1] < lowest or key[1] > highest) continue;
+                slots[which] = try copies.sectionSlot(level.world, key[0], key[1], key[2]);
+            }
+            var held = true;
+            for (0..8) |which| {
+                const key = sectionKey(base, which);
+                if (key[0] > top[0] or key[1] > top[1] or key[2] > top[2] or key[1] < lowest or key[1] > highest) continue;
+                if (!copies.holds(slots[which], level.world, key[0], key[1], key[2])) held = false;
+            }
+            if (held) break;
+        }
+        self.marks = 0;
+        const split = @min(width, @as(usize, @intCast(16 - @mod(self.origin[0], 16))));
+        for (0..height) |dy| {
+            const y = self.origin[1] + @as(i32, @intCast(dy));
+            const ky: usize = @intCast(@divFloor(y, 16) - base[1]);
+            for (0..width) |dz| {
+                const z = self.origin[2] + @as(i32, @intCast(dz));
+                const kz: usize = @intCast(@divFloor(z, 16) - base[2]);
+                const row = self.states[(dy * width + dz) * width ..][0..width];
+                if (y < level.minimum_y or y >= level.minimum_y + level.height) {
+                    @memset(row, level.air);
+                    continue;
+                }
+                const local: usize = @intCast(@mod(y, 16) * 256 + @mod(z, 16) * 16);
+                for (0..2) |kx| {
+                    const begin: usize = if (kx == 0) 0 else split;
+                    const end: usize = if (kx == 0) split else width;
+                    if (begin >= end) continue;
+                    const section_slot = slots[(ky * 2 + kz) * 2 + kx];
+                    self.marks |= copies.marked[section_slot];
+                    const section = &copies.states[section_slot];
+                    const start: usize = local + @as(usize, @intCast(@mod(self.origin[0] + @as(i32, @intCast(begin)), 16)));
+                    for (row[begin..end], section[start..][0 .. end - begin]) |*state, value| state.* = value;
+                }
+            }
+        }
+    }
+
+    fn sectionKey(base: [3]i32, which: usize) [3]i32 {
+        return .{ base[0] + @as(i32, @intCast(which & 1)), base[1] + @as(i32, @intCast(which >> 2)), base[2] + @as(i32, @intCast((which >> 1) & 1)) };
+    }
+
+    fn slot(self: *const Window, world: u32, x: i32, y: i32, z: i32) ?usize {
+        if (world != self.world) return null;
+        const dx = x -% self.origin[0];
+        const dy = y -% self.origin[1];
+        const dz = z -% self.origin[2];
+        if (@as(u32, @bitCast(dx)) >= width or @as(u32, @bitCast(dy)) >= height or @as(u32, @bitCast(dz)) >= width) return null;
+        return @intCast((dy * width + dz) * width + dx);
+    }
+
+    /// Whether every cell from first to last, inclusive, lies in the window.
+    pub fn covers(self: *const Window, world: u32, first: [3]i32, last: [3]i32) bool {
+        if (world != self.world) return false;
+        return first[0] >= self.origin[0] and first[1] >= self.origin[1] and first[2] >= self.origin[2] and
+            last[0] < self.origin[0] + width and last[1] < self.origin[1] + height and last[2] < self.origin[2] + width;
+    }
+
+    /// A cell the window covers.
+    pub fn cell(self: *const Window, x: i32, y: i32, z: i32) u16 {
+        return self.states[@intCast(((y - self.origin[1]) * height_stride + (z - self.origin[2])) * width + (x - self.origin[0]))];
+    }
+
+    const height_stride = width;
+
+    pub fn get(self: *const Window, world: u32, x: i32, y: i32, z: i32) ?u16 {
+        return self.states[self.slot(world, x, y, z) orelse return null];
+    }
+
+    pub fn edit(self: *Window, world: u32, position: [3]i32, state: u16) void {
+        const at = self.slot(world, position[0], position[1], position[2]) orelse return;
+        self.states[at] = state;
+    }
+};
+
 /// The world as a body reads it.
 pub const Level = struct {
     copies: ?*chunks.Copies,
     volume: ?*const Volume = null,
     overlay: ?*const Overlay = null,
+    window: ?*const Window = null,
+    /// Room to gather colliders in, which moving bodies need and too large to fill on the stack.
+    colliders: ?*Colliders = null,
     blocks: *const MobBlocks,
     world: u32,
     minimum_y: i32,
@@ -144,8 +264,16 @@ pub const Level = struct {
     pub fn state(self: *const Level, x: i32, y: i32, z: i32) !u16 {
         if (y < self.minimum_y or y >= self.minimum_y + self.height) return self.air;
         if (self.overlay) |overlay| if (overlay.get(self.world, x, y, z)) |earlier| return earlier;
+        if (self.window) |window| if (window.get(self.world, x, y, z)) |near| return near;
         if (self.volume) |volume| return volume.get(x, y, z, self.air);
         return self.copies.?.get(self.world, .{ .x = x, .y = y, .z = z });
+    }
+
+    /// Whether the window around the mob ticking holds every cell from first to last and none of
+    /// them is marked with any of the bits, so a scan for them there would find nothing.
+    pub fn without(self: *const Level, marks: u8, first: [3]i32, last: [3]i32) bool {
+        const window = self.window orelse return false;
+        return self.overlay == null and window.marks & marks == 0 and window.covers(self.world, first, last);
     }
 
     pub fn fluid(self: *const Level, x: i32, y: i32, z: i32) !game_data.physics_data.State {
@@ -186,12 +314,15 @@ pub fn collisionBoxes(level: *const Level, state: u16, x: i32, y: i32, z: i32, c
 // PowderSnowBlock.FALLING_COLLISION_SHAPE, a box 0.9 high, is no shape the snapshot names, so
 // the caller treats this marker specially.
 const powder_snow_falling: game_data.physics.Boxes = .{ .offset = std.math.maxInt(u32), .count = 1, .translation = @splat(0) };
+// A whole block, marked as powder snow's shape is, for states whose shape is the whole block.
+const full_cube: game_data.physics.Boxes = .{ .offset = std.math.maxInt(u32) - 1, .count = 1, .translation = @splat(0) };
 
 fn box(boxes: game_data.physics.Boxes, index: usize, x: i32, y: i32, z: i32) Box {
     const origin: [3]f64 = .{ @floatFromInt(x), @floatFromInt(y), @floatFromInt(z) };
     if (boxes.offset == std.math.maxInt(u32)) {
         return .{ .min = origin, .max = .{ origin[0] + 1, origin[1] + @as(f64, @as(f32, 0.9)), origin[2] + 1 } };
     }
+    if (boxes.offset == full_cube.offset) return .{ .min = origin, .max = .{ origin[0] + 1, origin[1] + 1, origin[2] + 1 } };
     const value = boxes.get(index);
     return .{ .min = .{ origin[0] + value[0], origin[1] + value[1], origin[2] + value[2] }, .max = .{ origin[0] + value[3], origin[1] + value[4], origin[2] + value[5] } };
 }
@@ -217,11 +348,26 @@ pub const Shapes = struct {
     first: [3]i32,
     last: [3]i32,
     at: [3]i32,
+    /// The window holding every cell scanned, read directly.
+    inside: ?*const Window = null,
+    /// No shape around reaches past its block, so only the cells inside the outer layer matter.
+    inner: bool = false,
 
     pub fn init(level: *const Level, query: Box, context: Context) Shapes {
         const first: [3]i32 = .{ mth.floor(query.min[0] - 1.0e-7) - 1, mth.floor(query.min[1] - 1.0e-7) - 1, mth.floor(query.min[2] - 1.0e-7) - 1 };
         const last: [3]i32 = .{ mth.floor(query.max[0] + 1.0e-7) + 1, mth.floor(query.max[1] + 1.0e-7) + 1, mth.floor(query.max[2] + 1.0e-7) + 1 };
-        return .{ .level = level, .query = query, .context = context, .first = first, .last = last, .at = first };
+        var shapes: Shapes = .{ .level = level, .query = query, .context = context, .first = first, .last = last, .at = first };
+        if (level.window) |window| if (level.overlay == null and window.covers(level.world, first, last)) {
+            shapes.inside = window;
+            // SteelMC's trick: cells on the outer layer yield only shapes that reach in, and none do.
+            if (window.marks & mob_blocks.mark_large == 0) {
+                shapes.inner = true;
+                shapes.first = .{ first[0] + 1, first[1] + 1, first[2] + 1 };
+                shapes.last = .{ last[0] - 1, last[1] - 1, last[2] - 1 };
+                shapes.at = shapes.first;
+            }
+        };
+        return shapes;
     }
 
     pub fn next(self: *Shapes) !?Shape {
@@ -240,15 +386,22 @@ pub const Shapes = struct {
             }
             // Cursor3D's type: how many coordinates lie on the outer layer.
             var edges: u2 = 0;
-            if (x == self.first[0] or x == self.last[0]) edges += 1;
-            if (y == self.first[1] or y == self.last[1]) edges += 1;
-            if (z == self.first[2] or z == self.last[2]) edges += 1;
-            if (edges == 3) continue;
-            const state = try self.level.state(x, y, z);
+            if (!self.inner) {
+                if (x == self.first[0] or x == self.last[0]) edges += 1;
+                if (y == self.first[1] or y == self.last[1]) edges += 1;
+                if (z == self.first[2] or z == self.last[2]) edges += 1;
+                if (edges == 3) continue;
+            }
+            const state = if (self.inside) |window| window.cell(x, y, z) else try self.level.state(x, y, z);
+            // Air, the most common cell, has no shape, and neither has a state whose shape is empty
+            // for any entity, which all but scaffolding and powder snow show with no entity.
+            if (state == self.level.air) continue;
             const entry = self.level.blocks.get(state);
+            if (entry.collision == shape_classes.empty and entry.kind != .scaffolding and entry.kind != .powder_snow) continue;
             if (edges == 1 and !entry.flags.large_shape) continue;
             if (edges == 2 and entry.kind != .moving_piston) continue;
-            const boxes = collisionBoxes(self.level, state, x, y, z, self.context);
+            // A full block, as most floors are, needs no decoding.
+            const boxes = if (entry.collision == self.level.blocks.full_cube) full_cube else collisionBoxes(self.level, state, x, y, z, self.context);
             if (boxes.count == 0) continue;
             const shape: Shape = .{ .boxes = boxes, .x = x, .y = y, .z = z };
             for (0..boxes.count) |index| {
@@ -305,13 +458,16 @@ pub const Colliders = struct {
 
     const box_capacity = 256;
 
-    pub fn gather(level: *const Level, query: Box, context: Context) !Colliders {
-        var self: Colliders = .{};
+    /// Fills in place, as the boxes are too many to copy around.
+    pub fn gather(self: *Colliders, level: *const Level, query: Box, context: Context) !void {
+        self.box_count = 0;
+        self.shape_count = 0;
+        self.complete = true;
         var shapes: Shapes = .init(level, query, context);
         while (try shapes.next()) |shape| {
             if (self.box_count + shape.boxes.count > box_capacity) {
                 self.complete = false;
-                return self;
+                return;
             }
             for (0..shape.boxes.count) |index| {
                 self.boxes[self.box_count] = shape.get(index);
@@ -320,7 +476,6 @@ pub const Colliders = struct {
             self.ends[self.shape_count] = @intCast(self.box_count);
             self.shape_count += 1;
         }
-        return self;
     }
 
     /// Shapes.collide along one axis.
@@ -369,7 +524,8 @@ pub const Colliders = struct {
 
 /// Entity.collideWithShapes against what a query gathers, or the world itself past what fits.
 fn collideWithShapes(level: *const Level, query: Box, context: Context, movement: [3]f64, start: Box) ![3]f64 {
-    const colliders = try Colliders.gather(level, query, context);
+    const colliders = level.colliders.?;
+    try colliders.gather(level, query, context);
     if (colliders.complete) return colliders.collideWith(movement, start);
     var result: [3]f64 = .{ 0, 0, 0 };
     const order: [3]usize = if (@abs(movement[0]) < @abs(movement[2])) .{ 1, 2, 0 } else .{ 1, 0, 2 };
@@ -392,7 +548,8 @@ pub fn collide(level: *const Level, start: Box, movement: [3]f64, context: Conte
         const base = if (landed) start.move(.{ 0, collided[1], 0 }) else start;
         var query = base.expandTowards(.{ movement[0], max_up_step, movement[2] });
         if (!landed) query = query.expandTowards(.{ 0, -@as(f64, @as(f32, 1.0e-5)), 0 });
-        const colliders = try Colliders.gather(level, query, context);
+        const colliders = level.colliders.?;
+        try colliders.gather(level, query, context);
         var heights: [64]f32 = undefined;
         const count = if (colliders.complete) colliders.stepHeights(base, max_up_step, @floatCast(collided[1]), &heights) else try stepHeights(level, query, context, base, max_up_step, @floatCast(collided[1]), &heights);
         for (heights[0..count]) |height| {

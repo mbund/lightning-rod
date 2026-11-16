@@ -183,6 +183,12 @@ pub const Mobs = struct {
     /// Blocks as they stood after the edit being answered, which levels read while it is set.
     overlay: body.Overlay,
     overlay_view: ?*const body.Overlay = null,
+    /// The blocks around the awake mob ticking, which levels read while it is set.
+    window: body.Window = .{},
+    window_view: ?*const body.Window = null,
+    /// Room a move and its block effects work in, reused by every mob.
+    colliders: body.Colliders = .{},
+    effects_scratch: @import("block_effects.zig").Scratch = .{},
     /// By player slot, whether the player holds cow food in either hand, noted as mobs start
     /// ticking: tempting asks every other tick for every mob, and hands change only between.
     holding_food: []bool,
@@ -264,6 +270,7 @@ pub const Mobs = struct {
             .damage_flags = try allocator.alloc(damage.Flags, @typeInfo(mob_state.DamageType).@"enum".field_names.len),
             .damage_ids = try allocator.alloc(i32, @typeInfo(mob_state.DamageType).@"enum".field_names.len),
         };
+        self.copies.mark(self.blocks.marks);
         try self.readTags();
         try deps.items.deps.definitions.registry.onChange(self, readTags);
         try deps.chunks.observe(.init(self, blocksChanged));
@@ -283,6 +290,8 @@ pub const Mobs = struct {
     pub fn level(self: *Mobs, world: u32) body.Level {
         var result = self.view(world).level;
         result.overlay = self.overlay_view;
+        result.window = self.window_view;
+        result.colliders = &self.colliders;
         return result;
     }
 
@@ -413,7 +422,7 @@ pub const Mobs = struct {
         if (mob.removed) return self.grid.remove(index);
         const section = sectionOf(mob.position);
         if (!std.meta.eql(section, self.arrivals[index].section)) self.arrivals[index] = .{ .section = section, .stamp = self.nextArrival() };
-        self.grid.place(index, grid_state.Grid.cellOf(mob.world, mob.position[0], mob.position[2]));
+        self.grid.place(index, grid_state.Grid.cellOf(mob.world, mob.position[0], mob.position[2]), living.box(self, mob));
     }
 
     fn nextArrival(self: *Mobs) u64 {
@@ -568,7 +577,17 @@ pub const Mobs = struct {
             self.herd.still.dormant_revision[place] = self.domain_revision;
             return;
         }
-        try mob_tick.tick(self, mob);
+        // An awake mob reads the blocks around it many times over, so they are read once. A resting
+        // one reads almost none.
+        if (!mob.resting) {
+            const around = self.level(mob.world);
+            try self.window.fill(&around, mob.blockPosition());
+            self.window_view = &self.window;
+        }
+        {
+            defer self.window_view = null;
+            try mob_tick.tick(self, mob);
+        }
         self.locate(index);
         // Blocks the mob changed, as trampled farmland, before the next mob moves.
         try self.answerEdits();
@@ -649,6 +668,11 @@ pub const Mobs = struct {
     /// is kept until the next answer, so each path that recomputes can see the world as it stood.
     fn blocksChanged(self: *Mobs, section: chunks.Section, edits: []const chunks.BlockEdit, previous: []const u16) void {
         if (self.active.values().len == 0) return;
+        // The window around the mob ticking shows edits as they happen.
+        if (self.window_view != null) for (edits) |edit| {
+            const at: i32 = edit.index;
+            self.window.edit(section.world, .{ section.x * 16 + (at & 15), section.y * 16 + (at >> 8), section.z * 16 + ((at >> 4) & 15) }, edit.state);
+        };
         // Resting mobs near any edit wake, a section's batch at a time.
         var low: [3]i32 = .{ 15, 15, 15 };
         var high: [3]i32 = .{ 0, 0, 0 };
@@ -1075,9 +1099,16 @@ pub const Mobs = struct {
         mob.age = age;
         if (was_baby == (age < 0)) return;
         mob.revision +%= 1;
-        // A new size reaches new blocks and mobs.
+        // A new size reaches new blocks and mobs, and others find it by its new box at once.
         const grown = living.box(self, mob);
         self.wake(mob.world, grown.min, grown.max);
+        if (self.stored(mob)) self.locate(@intCast(self.indexOf(mob)));
+    }
+
+    /// Whether a mob is one the plugin holds, and not a copy Debug checks run on.
+    fn stored(self: *const Mobs, mob: *const Mob) bool {
+        const address = @intFromPtr(mob);
+        return address >= @intFromPtr(self.mobs.ptr) and address < @intFromPtr(self.mobs.ptr + self.mobs.len);
     }
 
     /// Wakes the resting mobs within reach of a region, which then tick in full. A resting mob
@@ -1139,9 +1170,9 @@ pub const Mobs = struct {
         var count: usize = 0;
         var candidates = self.grid.query(mob.world, .{ query.min[0] - self.widest_half, query.min[2] - self.widest_half }, .{ query.max[0] + self.widest_half, query.max[2] + self.widest_half });
         while (candidates.next()) |index| {
+            if (!self.grid.boxes[index].intersects(query)) continue;
             const other = &self.mobs[index];
             if (other.id == mob.id or other.removed) continue;
-            if (!living.box(self, other).intersects(query)) continue;
             switch (which) {
                 .pushable => if (!other.alive() or try living.onClimbable(self, other)) continue,
                 .same_species => if (other.species != mob.species) continue,

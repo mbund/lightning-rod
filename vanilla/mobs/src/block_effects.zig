@@ -13,6 +13,7 @@ const Mobs = @import("mobs.zig").Mobs;
 const Mob = mob_state.Mob;
 const Movement = mob_state.Movement;
 const Box = body.Box;
+const assert = std.debug.assert;
 
 /// InsideBlockEffectType, in its order of application.
 const Effect = enum(u2) { freeze, fire_ignite, lava_ignite, extinguish };
@@ -42,6 +43,16 @@ const Collector = struct {
     last_step: i32 = -1,
     /// Whether a block or fluid with an inside effect was within reach.
     acted: bool = false,
+
+    /// Empty, without touching the arrays the counts guard.
+    fn reset(self: *Collector) void {
+        self.in_step = @splat(false);
+        self.before_count = @splat(0);
+        self.after_count = @splat(0);
+        self.final_count = 0;
+        self.last_step = -1;
+        self.acted = false;
+    }
 
     fn advanceStep(self: *Collector, step: i32) void {
         if (self.last_step == step) return;
@@ -114,8 +125,13 @@ pub fn applyEffectsFromBlocks(mobs: *Mobs, mob: *Mob) !bool {
     const burning = onFire(mobs, mob);
     const freezing = mob.ticks_frozen > 0;
     const fire_before = mob.fire_ticks;
-    var collector: Collector = .{};
-    try checkInsideBlocks(mobs, mob, movements[0..count], &collector);
+    const collector = &mobs.effects_scratch.collector;
+    collector.reset();
+    // With no fluid and no block that acts on a mob inside it around the mob ticking, the walk
+    // finds nothing, which Debug still checks.
+    const quiet = quietAround(mobs, mob, movements[0..count]);
+    if (!quiet or verify_skips) try checkInsideBlocks(mobs, mob, movements[0..count], collector);
+    if (quiet) assert(collector.final_count == 0 and !collector.acted and collector.before_count[0] == 0);
     collector.flush();
     for (collector.final[0..collector.final_count]) |action| {
         if (!mob.alive()) break;
@@ -161,10 +177,30 @@ fn stepOn(mobs: *Mobs, mob: *Mob) !bool {
     return kind == .magma_block or kind == .slime_block or kind == .turtle_egg;
 }
 
+/// Whether the window around the mob holds every cell the movements could visit, one block more
+/// for the fluid above, and none of them is a fluid or acts on what is inside it.
+fn quietAround(mobs: *Mobs, mob: *const Mob, movements: []const Movement) bool {
+    const level = mobs.level(mob.world);
+    const half: f64 = living.width(mobs, mob) / 2.0;
+    const tall: f64 = living.height(mobs, mob);
+    var low: [3]f64 = movements[0].from;
+    var high: [3]f64 = movements[0].from;
+    for (movements) |movement| for ([2][3]f64{ movement.from, movement.to }) |point| for (0..3) |axis| {
+        low[axis] = @min(low[axis], point[axis]);
+        high[axis] = @max(high[axis], point[axis]);
+    };
+    const first: [3]i32 = .{ mth.floor(low[0] - half) - 1, mth.floor(low[1]) - 1, mth.floor(low[2] - half) - 1 };
+    const last: [3]i32 = .{ mth.floor(high[0] + half) + 1, mth.floor(high[1] + tall) + 1, mth.floor(high[2] + half) + 1 };
+    return level.without(@import("mob_blocks.zig").mark_fluid | @import("mob_blocks.zig").mark_inside, first, last);
+}
+
+const verify_skips = @import("builtin").mode == .debug;
+
 /// Entity.checkInsideBlocks over the tick's movements, each split by axis where it moved
 /// along them one at a time.
 fn checkInsideBlocks(mobs: *Mobs, mob: *Mob, movements: []const Movement, collector: *Collector) !void {
-    var visited: Visited = .{};
+    const visited = &mobs.effects_scratch.visited;
+    visited.count = 0;
     for (movements) |movement| {
         var from = movement.from;
         const delta: [3]f64 = .{ movement.to[0] - from[0], movement.to[1] - from[1], movement.to[2] - from[2] };
@@ -174,14 +210,21 @@ fn checkInsideBlocks(mobs: *Mobs, mob: *Mob, movements: []const Movement, collec
                 if (delta[axis] == 0) continue;
                 var to = from;
                 to[axis] += delta[axis];
-                try checkSegment(mobs, mob, from, to, collector, &visited);
+                try checkSegment(mobs, mob, from, to, collector, visited);
                 from = to;
             }
         } else {
-            try checkSegment(mobs, mob, movement.from, movement.to, collector, &visited);
+            try checkSegment(mobs, mob, movement.from, movement.to, collector, visited);
         }
     }
 }
+
+/// What block effects work in, kept by Mobs so its arrays are not filled anew each tick.
+pub const Scratch = struct {
+    collector: Collector = .{},
+    visited: Visited = .{},
+    along: Visited = .{},
+};
 
 /// Blocks visited this tick, which act once however many movements cross them.
 const Visited = struct {
@@ -208,9 +251,10 @@ fn checkSegment(mobs: *Mobs, mob: *Mob, from: [3]f64, to: [3]f64, collector: *Co
         return;
     }
     // Long moves walk the box's corner along the travel first, then the rest of the box.
-    var along: Visited = .{};
-    const step = try travel(mobs, mob, at_to, delta, from, to, collector, visited, &along);
-    try visitBox(mobs, mob, at_to, step + 1, from, to, collector, visited, &along);
+    const along = &mobs.effects_scratch.along;
+    along.count = 0;
+    const step = try travel(mobs, mob, at_to, delta, from, to, collector, visited, along);
+    try visitBox(mobs, mob, at_to, step + 1, from, to, collector, visited, along);
 }
 
 fn visitBox(mobs: *Mobs, mob: *Mob, target: Box, step: i32, from: [3]f64, to: [3]f64, collector: *Collector, visited: *Visited, skip: ?*Visited) !void {
@@ -416,7 +460,7 @@ fn clipBox(box: Box, from: [3]f64, to: [3]f64) bool {
 }
 
 /// The kinds entityInside does something for, lit or not.
-fn insideActs(kind: @import("mob_blocks.zig").Kind) bool {
+pub fn insideActs(kind: @import("mob_blocks.zig").Kind) bool {
     return switch (kind) {
         .cactus, .fire, .soul_fire, .campfire, .soul_campfire, .sweet_berry_bush, .cobweb, .powder_snow, .honey_block, .bubble_column, .lava_cauldron, .water_cauldron, .powder_snow_cauldron => true,
         else => false,
