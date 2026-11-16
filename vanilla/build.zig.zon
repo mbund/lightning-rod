@@ -19,6 +19,8 @@
         .minecraft_packets = .{ .path = "../minecraft_packets" },
         .occlusion = .{ .path = "../occlusion" },
         .domains = .{ .path = "../domains" },
+        .random_ticks = .{ .path = "../random_ticks" },
+        .ticks = .{ .path = "../ticks" },
         .players = .{ .path = "../players" },
         .protocol_1_21_5 = .{ .path = "../protocol_versions/v1_21_5" },
         .protocol_support = .{ .path = "../protocol_encoding" },

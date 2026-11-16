@@ -35,7 +35,10 @@ pub fn defaults(allocator: std.mem.Allocator) !content.Definitions {
     for (game_data.registry.items, item_definitions, game_data.registry.item_names) |item, *definition, name| {
         definition.* = .{ .name = name, .stack_size = item.stack_size, .durability = @intCast(item.max_durability), .equipment = item_properties.equipment(name) };
         if (item.block_state != 0) {
-            placements[placement_count] = .{ .item = name, .state = game_data.registry.block_state_names[@intCast(item.block_state)] };
+            const state = game_data.registry.block_state_names[@intCast(item.block_state)];
+            // Vanilla places leaves persistent, so leaves a player builds never decay.
+            const persistent = std.mem.indexOf(u8, state, "_leaves[") != null and std.mem.indexOf(u8, state, "persistent=false") != null;
+            placements[placement_count] = .{ .item = name, .state = if (persistent) try std.mem.replaceOwned(u8, allocator, state, "persistent=false", "persistent=true") else state };
             placement_count += 1;
         }
     }

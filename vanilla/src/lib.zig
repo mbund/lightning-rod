@@ -14,6 +14,9 @@ const Packets = @import("minecraft_packets").Packets;
 const Input = @import("players").input.Input;
 const Players = @import("players").players.Players;
 const Domains = @import("domains").domains.Domains;
+const game_data = @import("game_data");
+const Ticks = @import("ticks").ticks.Ticks;
+pub const RandomTicks = @import("random_ticks").random_ticks.RandomTicks;
 const PayloadChannels = @import("connection").payload_channels;
 const Visibility = @import("replication").visibility.Visibility;
 const Replication = @import("replication").replication.Replication;
@@ -91,6 +94,8 @@ pub const ItemTick = @import("vanilla_inventory").item_tick.ItemTick;
 pub const ItemReplication = @import("vanilla_inventory").item_replication.ItemReplication;
 pub const BlockLoot = @import("vanilla_blocks").block_loot.BlockLoot;
 pub const Mining = @import("vanilla_blocks").mining.Mining;
+pub const Growth = @import("vanilla_blocks").growth.Growth;
+pub const growth = @import("vanilla_blocks").growth;
 pub const Placement = @import("vanilla_blocks").placement.Placement;
 pub const BlockActions = @import("vanilla_blocks").block_actions.BlockActions;
 pub const container_storage = @import("vanilla_containers").containers;
@@ -129,6 +134,8 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Players, Players.Configuration{}),
     lightning_rod.plugin.configured(PlayerStates, PlayerStates.Configuration{}),
     lightning_rod.plugin.configured(Domains, Domains.Configuration{}),
+    lightning_rod.plugin.configured(Ticks, Ticks.Configuration{}),
+    lightning_rod.plugin.configured(RandomTicks, RandomTicks.Configuration{ .tickable = growth.randomlyTicks, .states = @intCast(game_data.registry.block_state_names.len) }),
     lightning_rod.plugin.configured(Visibility, Visibility.Configuration{}),
     lightning_rod.plugin.configured(Bossbars, Bossbars.Configuration{}),
     lightning_rod.plugin.configured(Time, Time.Configuration{}),
@@ -182,6 +189,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Doors, Doors.Configuration{}),
     lightning_rod.plugin.configured(Mining, Mining.Configuration{}),
     lightning_rod.plugin.configured(Placement, Placement.Configuration{}),
+    lightning_rod.plugin.configured(Growth, Growth.Configuration{}),
     lightning_rod.plugin.configured(Equipment, Equipment.Configuration{}),
     lightning_rod.plugin.configured(ItemReplication, ItemReplication.Configuration{}),
 });
