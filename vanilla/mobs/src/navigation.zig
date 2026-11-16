@@ -135,6 +135,7 @@ fn find(mobs: *Mobs, mob: *Mob, target: [3]i32, accuracy: i32) !Created {
     if (!canUpdatePath(mob)) return .none;
     const navigation = &mob.navigation;
     if (!done(mob)) if (navigation.target) |current| if (std.meta.eql(current, target)) return .current;
+    mobs.path_searches += 1;
     const evaluator_mob = pathfindingMob(mobs, mob);
     const found = (try mobs.search.findPath(&level, &evaluator_mob, .{
         .target = target,
@@ -219,7 +220,7 @@ fn entityPositionAt(mobs: *Mobs, mob: *const Mob, index: usize) [3]f64 {
 pub fn tick(mobs: *Mobs, mob: *Mob) !void {
     const navigation = &mob.navigation;
     navigation.tick += 1;
-    if (navigation.has_delayed_recomputation) try recomputePath(mobs, mob);
+    if (navigation.has_delayed_recomputation) try recomputePath(mobs, mob, mobs.gameTime());
     if (done(mob)) return;
     if (canUpdatePath(mob)) {
         try followThePath(mobs, mob);
@@ -333,10 +334,11 @@ fn resetStuckTimeout(mob: *Mob) void {
     mob.navigation.stuck = false;
 }
 
-/// PathNavigation.recomputePath: at most once a second, the way to the same target again.
-pub fn recomputePath(mobs: *Mobs, mob: *Mob) !void {
+/// PathNavigation.recomputePath: at most once a second, the way to the same target again. `now`
+/// is the game time it happens at, which for an edit is when the edit was made.
+pub fn recomputePath(mobs: *Mobs, mob: *Mob, now: i64) !void {
     const navigation = &mob.navigation;
-    if (mobs.gameTime() - navigation.time_last_recompute > 20) {
+    if (now - navigation.time_last_recompute > 20) {
         if (navigation.target) |target| {
             navigation.path.active = false;
             const created = try createPath(mobs, mob, target, navigation.reach_range);
@@ -348,7 +350,7 @@ pub fn recomputePath(mobs: *Mobs, mob: *Mob) !void {
                     navigation.path = .{ .active = true, .count = mobs.scratch.count, .next = 0, .target = mobs.scratch.target, .reached = mobs.scratch.reached };
                 },
             }
-            navigation.time_last_recompute = mobs.gameTime();
+            navigation.time_last_recompute = now;
             navigation.has_delayed_recomputation = false;
         }
     } else {

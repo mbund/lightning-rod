@@ -4,6 +4,7 @@ const std = @import("std");
 pub const mth = @import("mth.zig");
 pub const java_random = @import("java_random.zig");
 pub const mob_blocks = @import("mob_blocks.zig");
+pub const shape_classes = @import("shape_classes.zig");
 pub const body = @import("body.zig");
 pub const mob = @import("mob.zig");
 pub const species = @import("species.zig");

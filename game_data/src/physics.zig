@@ -226,6 +226,13 @@ pub fn Data(comptime expected_states: usize, comptime expected_blocks: usize, co
             std.debug.assert(@as(usize, result.offset) + result.count <= box_count);
             return result;
         }
+        /// How far a state's shapes move with its position: horizontally, then down. Two states
+        /// with the same limits move alike at every position.
+        pub fn offsetLimits(state: u16) [2]f32 {
+            std.debug.assert(state < expected_states);
+            const offset_entry = bytes[20 + @as(usize, state) * 26 + 18 ..][0..8];
+            return .{ @bitCast(std.mem.readInt(u32, offset_entry[0..4], .little)), @bitCast(std.mem.readInt(u32, offset_entry[4..8], .little)) };
+        }
         /// The outline shape, which raycasts for using items and blocks trace, at a position.
         pub fn outline(state: u16, x: i32, z: i32) Boxes {
             std.debug.assert(state < expected_states);

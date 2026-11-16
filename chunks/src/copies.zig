@@ -28,8 +28,9 @@ pub const Copies = struct {
     free: []u32,
     free_count: usize,
     hand: usize = 0,
-    /// The copy the last read used, as reads come in runs over one section.
-    last: ?u32 = null,
+    /// Copies read lately, by the low two bits of each section coordinate, as reads come in runs
+    /// over a few neighbouring sections: any four by four by four of them fit at once.
+    recent: [64]u32 = @splat(no_slot),
     /// Sections decoded, for measuring.
     decoded: u64 = 0,
 
@@ -81,14 +82,20 @@ pub const Copies = struct {
         self.referenced[slot] = false;
         self.free[self.free_count] = slot;
         self.free_count += 1;
-        if (self.last == slot) self.last = null;
+        const recent = recentIndex(self.sections[slot]);
+        if (self.recent[recent] == slot) self.recent[recent] = no_slot;
     }
 
     fn find(self: *Copies, section: chunks.Section) !u32 {
-        if (self.last) |slot| if (std.meta.eql(self.sections[slot], section)) return slot;
+        const recent = recentIndex(section);
+        const cached = self.recent[recent];
+        if (cached != no_slot and sameSection(self.sections[cached], section)) {
+            self.referenced[cached] = true;
+            return cached;
+        }
         if (self.index.get(section)) |slot| {
             self.referenced[slot] = true;
-            self.last = slot;
+            self.recent[recent] = slot;
             return slot;
         }
         const slot = self.take();
@@ -101,9 +108,22 @@ pub const Copies = struct {
         self.used[slot] = true;
         self.referenced[slot] = true;
         self.index.putAssumeCapacityNoClobber(section, slot);
-        self.last = slot;
+        self.recent[recent] = slot;
         self.decoded += 1;
         return slot;
+    }
+
+    const no_slot = std.math.maxInt(u32);
+
+    fn recentIndex(section: chunks.Section) usize {
+        const x: usize = @as(u2, @truncate(@as(u32, @bitCast(section.x))));
+        const y: usize = @as(u2, @truncate(@as(u32, @bitCast(section.y))));
+        const z: usize = @as(u2, @truncate(@as(u32, @bitCast(section.z))));
+        return x | y << 2 | z << 4;
+    }
+
+    fn sameSection(a: chunks.Section, b: chunks.Section) bool {
+        return a.x == b.x and a.y == b.y and a.z == b.z and a.world == b.world;
     }
 
     /// A free slot, or the first the clock finds unread since it last passed.

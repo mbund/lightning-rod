@@ -38,10 +38,7 @@ fn outsideLimits(mobs: *Mobs, mob: *const Mob, position: [3]i32) bool {
 fn hasMalus(mobs: *Mobs, mob: *const Mob, position: [3]i32) !bool {
     const level = mobs.level(mob.world);
     const evaluator_mob = navigation.pathfindingMob(mobs, mob);
-    var search = &mobs.search;
-    search.level = &level;
-    search.mob = &evaluator_mob;
-    const path_type = try search.pathTypeStatic(position[0], position[1], position[2]);
+    const path_type = try pathfinding.staticPathType(&level, position[0], position[1], position[2]);
     return evaluator_mob.pathfindingMalus(path_type) != 0;
 }
 

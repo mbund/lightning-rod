@@ -10,6 +10,7 @@ const sessions = @import("sessions");
 const network = @import("networking");
 const protocols = @import("protocols");
 const tps = @import("tps");
+const game_data = @import("game_data");
 
 pub const std_options: std.Options = .{ .log_level = .err };
 
@@ -61,6 +62,10 @@ const Options = struct {
     instrumentation: bool = true,
     detail: bool = false,
     paced: bool = false,
+    /// Cows on a grid around the players, settled before measuring.
+    cows: usize = 0,
+    /// Ticks between block edits among the cows, a fence placed then taken away.
+    edit_interval: usize = 0,
 };
 
 fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize, mode: Mode, writer: *std.Io.Writer) !void {
@@ -81,11 +86,10 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     if (maximum < count or maximum == 0) return error.InvalidCapacity;
     const service = try sessions.Service.init(backing, io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = maximum, .pages = options.pages, .page_bytes = 32768, .buffer_bytes = 128 * 1024, .protocols = selected });
     defer service.deinit();
-    const chunk_defaults: Chunks.Configuration = .{};
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(vanilla.plugins(), .{
             lightning_rod.plugin.configured(Players, .{ .maximum = maximum, .render_distance = 8 }),
-            lightning_rod.plugin.configured(Chunks, .{ .cache_sections = @max(chunk_defaults.cache_sections, count) }),
+            lightning_rod.plugin.configured(Chunks, Chunks.Configuration.forPlayers(maximum)),
             lightning_rod.plugin.configured(sessions.World, .{ .endpoint = service }),
             lightning_rod.plugin.configured(vanilla.RecipeBook, .{ .packet_bytes = service.config.page_bytes }),
         }),
@@ -139,6 +143,22 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     var packets: u64 = 0;
     var recipients: u64 = 0;
     for (0..200) |tick| try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
+    const mobs = simulation.get(vanilla.Mobs);
+    if (options.cows > 0) {
+        // Two blocks apart on the flat grass, around the players at 8, 8.
+        const side = std.math.sqrt(options.cows - 1) + 1;
+        for (0..options.cows) |index| {
+            const x = 8.5 + 2 * (@as(f64, @floatFromInt(index % side)) - @as(f64, @floatFromInt(side / 2)));
+            const z = 8.5 + 2 * (@as(f64, @floatFromInt(index / side)) - @as(f64, @floatFromInt(side / 2)));
+            _ = try mobs.spawn(.{ .species = .cow, .world = spawn_world, .position = .{ x, 65, z }, .yaw = 0 });
+        }
+        for (0..400) |tick| try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
+    }
+    const fence: u16 = @intCast(game_data.registry.blockStateId("minecraft:oak_fence[east=false,north=false,south=false,waterlogged=false,west=false]").?);
+    const air: u16 = @intCast(game_data.registry.blockStateId("minecraft:air").?);
+    var edits: usize = 0;
+    const searches_before = mobs.path_searches;
+    const recomputes_before = mobs.edit_recomputes;
     const inventories = simulation.get(Inventories);
     const chunks = simulation.get(Chunks);
     const reads = inventories.cache.metrics.reads.value() + inventories.items.metrics.reads.value() + chunks.cache.metrics.reads.value();
@@ -151,18 +171,26 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
         const wall = std.Io.Clock.now(.awake, io).nanoseconds;
         for (0..options.ticks) |tick| {
             if (options.paced) try std.Io.sleep(io, .fromMilliseconds(50), .awake);
+            if (options.edit_interval > 0 and tick % options.edit_interval == 0) {
+                // Eight spots among the cows in turn, each a fence one time and air again the next.
+                const spot: i32 = @intCast((edits / 2) % 8);
+                try simulation.get(Chunks).setBlock(spawn_world, .{ .x = 8 + 4 * (spot - 4), .y = 65, .z = 9 }, if (edits % 2 == 0) fence else air);
+                edits += 1;
+            }
             try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
         }
         cpus[sample] = @intCast(std.Io.Clock.now(.cpu_thread, io).nanoseconds - cpu);
         walls[sample] = @intCast(std.Io.Clock.now(.awake, io).nanoseconds - wall);
     }
-    if (reads != inventories.cache.metrics.reads.value() + inventories.items.metrics.reads.value() + chunks.cache.metrics.reads.value()) return error.UnexpectedSteadyStateReads;
+    // Cows walk into sections they have not read yet, so only a world without them is steady.
+    if (options.cows == 0 and reads != inventories.cache.metrics.reads.value() + inventories.items.metrics.reads.value() + chunks.cache.metrics.reads.value()) return error.UnexpectedSteadyStateReads;
     const snapshots = simulation.metrics.snapshot(stages);
     std.mem.sort(u64, cpus, {}, std.sort.asc(u64));
     std.mem.sort(u64, walls, {}, std.sort.asc(u64));
     const ticks = options.ticks * options.samples;
     const tick_ns = tick_time / ticks;
     try writer.print("{s: <10} {d: >7} {d: >7} {d: >11.2} {d: >11.2} {d: >11.2} {d: >10.2} {d: >12.2}\n", .{ @tagName(mode), count, maximum, @as(f64, @floatFromInt(cpus[options.samples / 2])) / @as(f64, @floatFromInt(options.ticks)) / 1000, @as(f64, @floatFromInt(walls[options.samples / 2])) / @as(f64, @floatFromInt(options.ticks)) / 1000, @as(f64, @floatFromInt(tick_ns)) / 1000, @as(f64, @floatFromInt(packets)) / @as(f64, @floatFromInt(ticks)), @as(f64, @floatFromInt(recipients)) / @as(f64, @floatFromInt(ticks)) });
+    if (options.cows > 0) try writer.print("  cows={d} path_searches={d:.3}/tick edits={d} edit_recomputes={d} edits_dropped={d} sections_decoded={d}\n", .{ mobs.active.values().len, @as(f64, @floatFromInt(mobs.path_searches - searches_before)) / @as(f64, @floatFromInt(ticks)), edits, mobs.edit_recomputes - recomputes_before, mobs.edits_dropped, mobs.copies.decoded });
     if (options.detail) for (snapshots, before[0..snapshots.len]) |after, previous| {
         if (after.kind == .counter) {
             const operations = after.value - previous.value;
@@ -220,6 +248,10 @@ pub fn main(init: std.process.Init) !void {
             options.ticks = try std.fmt.parseInt(usize, argument[8..], 10);
         } else if (std.mem.startsWith(u8, argument, "--samples=")) {
             options.samples = try std.fmt.parseInt(usize, argument[10..], 10);
+        } else if (std.mem.startsWith(u8, argument, "--cows=")) {
+            options.cows = try std.fmt.parseInt(usize, argument[7..], 10);
+        } else if (std.mem.startsWith(u8, argument, "--edit-interval=")) {
+            options.edit_interval = try std.fmt.parseInt(usize, argument[16..], 10);
         } else if (std.mem.eql(u8, argument, "--detail")) {
             options.detail = true;
         } else if (std.mem.eql(u8, argument, "--paced")) {

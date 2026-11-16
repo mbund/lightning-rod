@@ -54,7 +54,6 @@ pub fn makeBox(position: [3]f64, width: f32, height: f32) Box {
     return .{ .min = .{ position[0] - half, position[1], position[2] - half }, .max = .{ position[0] + half, position[1] + height, position[2] + half } };
 }
 
-/// The world as a body reads it.
 /// Blocks held in memory, for tests that build a world of their own.
 pub const Volume = struct {
     size: [3]i32,
@@ -67,9 +66,74 @@ pub const Volume = struct {
     }
 };
 
+/// Blocks as they stood before edits that came later, laid over the latest state. A path an
+/// edit recomputes sees the world as of that edit, as vanilla finds it in the middle of a batch.
+pub const Overlay = struct {
+    states: std.AutoHashMapUnmanaged(Key, u16) = .empty,
+
+    pub const Key = struct { world: u32, x: i32, y: i32, z: i32 };
+
+    pub fn init(allocator: std.mem.Allocator, capacity: u32) !Overlay {
+        var overlay: Overlay = .{};
+        try overlay.states.ensureTotalCapacity(allocator, capacity);
+        return overlay;
+    }
+
+    pub fn get(self: *const Overlay, world: u32, x: i32, y: i32, z: i32) ?u16 {
+        return self.states.get(.{ .world = world, .x = x, .y = y, .z = z });
+    }
+
+    /// The world right after edit `at`: each block edited later holds the state the first of
+    /// those edits replaced.
+    pub fn layAfter(self: *Overlay, edits: []const Edit, at: usize) void {
+        assert(at < edits.len and edits.len <= self.states.capacity());
+        self.states.clearRetainingCapacity();
+        // From the last edit back, so the earliest one after `at` at each block wins.
+        var later = edits.len;
+        while (later > at + 1) {
+            later -= 1;
+            const edit = edits[later];
+            self.states.putAssumeCapacity(.{ .world = edit.world, .x = edit.position[0], .y = edit.position[1], .z = edit.position[2] }, edit.previous);
+        }
+    }
+};
+
+/// A block edit held for paths to answer.
+pub const Edit = struct {
+    world: u32,
+    position: [3]i32,
+    /// The state it replaced.
+    previous: u16,
+    /// Whether it changed a collision shape, which is what paths answer.
+    collision: bool,
+    game_time: i64,
+};
+
+test "an overlay shows the world right after each edit of a batch" {
+    var overlay = try Overlay.init(std.testing.allocator, 8);
+    defer overlay.states.deinit(std.testing.allocator);
+    // A door's two halves open, then the lower one closes again, all in one batch.
+    const edits = [_]Edit{
+        .{ .world = 0, .position = .{ 4, 64, 4 }, .previous = 10, .collision = true, .game_time = 7 },
+        .{ .world = 0, .position = .{ 4, 65, 4 }, .previous = 20, .collision = true, .game_time = 7 },
+        .{ .world = 0, .position = .{ 4, 64, 4 }, .previous = 11, .collision = true, .game_time = 7 },
+    };
+    overlay.layAfter(&edits, 0);
+    try std.testing.expectEqual(@as(?u16, 11), overlay.get(0, 4, 64, 4));
+    try std.testing.expectEqual(@as(?u16, 20), overlay.get(0, 4, 65, 4));
+    try std.testing.expectEqual(@as(?u16, null), overlay.get(1, 4, 64, 4));
+    overlay.layAfter(&edits, 1);
+    try std.testing.expectEqual(@as(?u16, 11), overlay.get(0, 4, 64, 4));
+    try std.testing.expectEqual(@as(?u16, null), overlay.get(0, 4, 65, 4));
+    overlay.layAfter(&edits, 2);
+    try std.testing.expectEqual(@as(u32, 0), overlay.states.count());
+}
+
+/// The world as a body reads it.
 pub const Level = struct {
     copies: ?*chunks.Copies,
     volume: ?*const Volume = null,
+    overlay: ?*const Overlay = null,
     blocks: *const MobBlocks,
     world: u32,
     minimum_y: i32,
@@ -79,6 +143,7 @@ pub const Level = struct {
     /// Outside the world's height a level reads void air, which collides with nothing.
     pub fn state(self: *const Level, x: i32, y: i32, z: i32) !u16 {
         if (y < self.minimum_y or y >= self.minimum_y + self.height) return self.air;
+        if (self.overlay) |overlay| if (overlay.get(self.world, x, y, z)) |earlier| return earlier;
         if (self.volume) |volume| return volume.get(x, y, z, self.air);
         return self.copies.?.get(self.world, .{ .x = x, .y = y, .z = z });
     }
@@ -332,8 +397,9 @@ test "a box stops at a block and steps up a slab" {
 /// BlockState.getCollisionShape with no entity (CollisionContext.empty): scaffolding is stable,
 /// since the empty context counts as above every block, and powder snow has no shape.
 pub fn contextFreeBoxes(state: u16, x: i32, z: i32) game_data.physics.Boxes {
-    const name = game_data.registry.blockStateName(state).?;
-    if (std.mem.startsWith(u8, name, "minecraft:scaffolding[")) return game_data.physics.spawnCollision(state, x, -1, z);
+    const registry = game_data.registry;
+    const scaffolding = registry.block_state_to_block[registry.block_scaffolding_default_state];
+    if (registry.block_state_to_block[state] == scaffolding) return game_data.physics.spawnCollision(state, x, -1, z);
     return game_data.physics.spawnCollision(state, x, 0, z);
 }
 

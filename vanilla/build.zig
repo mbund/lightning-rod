@@ -69,6 +69,13 @@ pub fn build(b: *std.Build) void {
     run_pipeline.addArtifactArg(pipeline_bench);
     test_step.dependOn(&run_pipeline.step);
     b.step("bench-pipeline", "Count gameplay operations without timing").dependOn(&run_pipeline.step);
+    // Timed, so it runs only when asked, alone on a quiet core.
+    const paths_module = b.createModule(.{ .root_source_file = b.path("src/path_bench.zig"), .target = target, .optimize = optimize });
+    for (module.import_table.keys(), module.import_table.values()) |name, dependency| paths_module.addImport(name, dependency);
+    const run_paths = std.Build.Step.Run.create(b, "path search cost");
+    run_paths.addArtifactArg(b.addTest(.{ .root_module = paths_module }));
+    run_paths.has_side_effects = true;
+    b.step("bench-paths", "Measure what a path search costs, in instructions and CPU time").dependOn(&run_paths.step);
     const check = b.addLibrary(.{ .name = "vanilla", .root_module = module });
     b.step("check", "Check the Vanilla module").dependOn(&check.step);
 }

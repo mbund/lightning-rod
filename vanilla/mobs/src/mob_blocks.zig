@@ -7,6 +7,7 @@
 const std = @import("std");
 const game_data = @import("game_data");
 const Blocks = @import("vanilla_content").blocks.Blocks;
+const shape_classes = @import("shape_classes.zig");
 
 const registry = game_data.registry;
 const assert = std.debug.assert;
@@ -129,6 +130,9 @@ pub const State = struct {
     facing: Facing = .none,
     flags: Flags = .{},
     path: PathType = .open,
+    /// The space its collision shape covers, by shape_classes: an edit between two states of
+    /// one class changes no collision.
+    collision: u16 = shape_classes.empty,
 };
 
 pub const MobBlocks = struct {
@@ -151,6 +155,10 @@ pub const MobBlocks = struct {
         try self.names.ensureTotalCapacity(allocator, @intCast(registry.blocks.len));
         for (registry.blocks, 0..) |info, block| self.names.putAssumeCapacity(blockName(registry.blockStateName(info.default_state).?), @intCast(block));
         self.readFixed();
+        const collisions = try allocator.alloc(u16, self.states.len);
+        defer allocator.free(collisions);
+        try shape_classes.classify(allocator, collisions);
+        for (self.states, collisions) |*entry, collision| entry.collision = collision;
         try self.readTags();
         try block_definitions.registry.onChange(self, readTags);
         return self;

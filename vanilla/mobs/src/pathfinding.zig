@@ -104,6 +104,55 @@ pub const Path = struct {
 
 pub const PathNode = struct { x: i32, y: i32, z: i32, type: PathType };
 
+/// Path types by position for one search, emptied slot by slot for the next.
+const TypeTable = struct {
+    keys: []u64,
+    values: []PathType,
+    used: []bool,
+    /// The slots this search filled.
+    filled: []u32,
+    count: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, capacity: u32) !TypeTable {
+        assert(std.math.isPowerOfTwo(capacity));
+        const table: TypeTable = .{
+            .keys = try allocator.alloc(u64, capacity),
+            .values = try allocator.alloc(PathType, capacity),
+            .used = try allocator.alloc(bool, capacity),
+            .filled = try allocator.alloc(u32, capacity / 2),
+        };
+        @memset(table.used, false);
+        return table;
+    }
+
+    fn clear(self: *TypeTable) void {
+        for (self.filled[0..self.count]) |slot| self.used[slot] = false;
+        self.count = 0;
+    }
+
+    const Found = union(enum) { found: PathType, empty: usize };
+
+    fn find(self: *const TypeTable, key: u64) Found {
+        const mask = self.keys.len - 1;
+        var slot: usize = @as(usize, @truncate(key *% 0x9e3779b97f4a7c15 >> 32)) & mask;
+        while (self.used[slot]) : (slot = (slot + 1) & mask) {
+            if (self.keys[slot] == key) return .{ .found = self.values[slot] };
+        }
+        return .{ .empty = slot };
+    }
+
+    /// A full table only stops remembering, which costs time but not the result.
+    fn remember(self: *TypeTable, slot: usize, key: u64, value: PathType) void {
+        assert(!self.used[slot]);
+        if (self.count == self.filled.len) return;
+        self.filled[self.count] = @intCast(slot);
+        self.used[slot] = true;
+        self.keys[slot] = key;
+        self.values[slot] = value;
+        self.count += 1;
+    }
+};
+
 /// A search's working memory, preallocated and reused by every search on the thread.
 pub const Search = struct {
     nodes: []Node,
@@ -115,11 +164,12 @@ pub const Search = struct {
     /// The binary heap of open nodes, by node.
     heap: []u32,
     heap_size: u32 = 0,
-    /// Path types this search looked up, by position, as pathTypesByPosCacheByMob keeps them.
-    type_keys: []u64,
-    type_values: []PathType,
-    type_used: []bool,
-    type_count: usize = 0,
+    /// Path types of the mob's whole box this search looked up, as pathTypesByPosCacheByMob
+    /// keeps them.
+    mob_types: TypeTable,
+    /// Path types of single blocks with their surroundings, getPathTypeStatic, which a search asks
+    /// for many times over as neighbouring nodes cover the same blocks.
+    static_types: TypeTable,
     neighbors: [32]u32 = undefined,
     reusable: [4]?u32 = .{ null, null, null, null },
     level: *const body.Level = undefined,
@@ -132,18 +182,15 @@ pub const Search = struct {
 
     pub fn init(allocator: std.mem.Allocator, capacity: u32) !Search {
         assert(capacity > 0 and std.math.isPowerOfTwo(capacity));
-        const types = capacity * 4;
         const self: Search = .{
             .nodes = try allocator.alloc(Node, capacity),
             .slots = try allocator.alloc(u32, capacity * 2),
             .node_slots = try allocator.alloc(u32, capacity),
             .heap = try allocator.alloc(u32, capacity),
-            .type_keys = try allocator.alloc(u64, types),
-            .type_values = try allocator.alloc(PathType, types),
-            .type_used = try allocator.alloc(bool, types),
+            .mob_types = try .init(allocator, capacity * 4),
+            .static_types = try .init(allocator, capacity * 8),
         };
         @memset(self.slots, empty_slot);
-        @memset(self.type_used, false);
         return self;
     }
 
@@ -151,8 +198,8 @@ pub const Search = struct {
         for (self.node_slots[0..self.node_count]) |slot| self.slots[slot] = empty_slot;
         self.node_count = 0;
         self.heap_size = 0;
-        @memset(self.type_used, false);
-        self.type_count = 0;
+        self.mob_types.clear();
+        self.static_types.clear();
         self.level = level;
         self.mob = mob;
         // NodeEvaluator.prepare.
@@ -197,47 +244,16 @@ pub const Search = struct {
         return self.level.state(x, y, z);
     }
 
-    fn baseType(self: *Search, x: i32, y: i32, z: i32) !PathType {
-        return self.level.blocks.get(try self.state(x, y, z)).path;
-    }
-
-    /// WalkNodeEvaluator.getPathTypeStatic: an open block over ground is walkable, or dangerous
-    /// by what is under or around it.
-    pub fn pathTypeStatic(self: *Search, x: i32, y: i32, z: i32) !PathType {
-        const own = try self.baseType(x, y, z);
-        if (own != .open or y < self.level.minimum_y + 1) return own;
-        return switch (try self.baseType(x, y - 1, z)) {
-            .open, .water, .lava, .walkable => .open,
-            .damage_fire => .damage_fire,
-            .damage_other => .damage_other,
-            .sticky_honey => .sticky_honey,
-            .powder_snow => .danger_powder_snow,
-            .damage_cautious => .damage_cautious,
-            .trapdoor => .danger_trapdoor,
-            else => try self.checkNeighbourBlocks(x, y, z, .walkable),
+    /// staticPathType, remembered for the rest of the search.
+    fn pathTypeStatic(self: *Search, x: i32, y: i32, z: i32) !PathType {
+        const key = blockKey(x, y, z);
+        const slot = switch (self.static_types.find(key)) {
+            .found => |path_type| return path_type,
+            .empty => |slot| slot,
         };
-    }
-
-    /// WalkNodeEvaluator.checkNeighbourBlocks, in vanilla's order, first match winning.
-    fn checkNeighbourBlocks(self: *Search, x: i32, y: i32, z: i32, fallback: PathType) !PathType {
-        var dx: i32 = -1;
-        while (dx <= 1) : (dx += 1) {
-            var dy: i32 = -1;
-            while (dy <= 1) : (dy += 1) {
-                var dz: i32 = -1;
-                while (dz <= 1) : (dz += 1) {
-                    if (dx == 0 and dz == 0) continue;
-                    switch (try self.baseType(x + dx, y + dy, z + dz)) {
-                        .damage_other => return .danger_other,
-                        .damage_fire, .lava => return .danger_fire,
-                        .water => return .water_border,
-                        .damage_cautious => return .damage_cautious,
-                        else => {},
-                    }
-                }
-            }
-        }
-        return fallback;
+        const path_type = try staticPathType(self.level, x, y, z);
+        self.static_types.remember(slot, key, path_type);
+        return path_type;
     }
 
     /// WalkNodeEvaluator.getPathTypeWithinMobBB, as a set of types by bit.
@@ -287,24 +303,22 @@ pub const Search = struct {
     /// WalkNodeEvaluator.getCachedPathType.
     fn cachedPathType(self: *Search, x: i32, y: i32, z: i32) !PathType {
         const key = blockKey(x, y, z);
-        const mask = self.type_keys.len - 1;
-        var slot: usize = @as(usize, @truncate(key *% 0x9e3779b97f4a7c15 >> 32)) & mask;
-        while (self.type_used[slot]) : (slot = (slot + 1) & mask) {
-            if (self.type_keys[slot] == key) return self.type_values[slot];
-        }
+        const slot = switch (self.mob_types.find(key)) {
+            .found => |path_type| return path_type,
+            .empty => |slot| slot,
+        };
         const path_type = try self.pathTypeOfMob(x, y, z);
-        // A full table only stops remembering, which costs time but not the result.
-        if (self.type_count * 2 < self.type_keys.len) {
-            self.type_used[slot] = true;
-            self.type_keys[slot] = key;
-            self.type_values[slot] = path_type;
-            self.type_count += 1;
-        }
+        self.mob_types.remember(slot, key, path_type);
         return path_type;
     }
 
+    /// BlockPos.asLong: 26 bits of x, 26 of z and 12 of y, one to one within the world border.
     fn blockKey(x: i32, y: i32, z: i32) u64 {
-        return (@as(u64, @as(u32, @bitCast(x))) << 32) ^ (@as(u64, @as(u32, @bitCast(z))) << 12) ^ @as(u64, @as(u32, @bitCast(y)));
+        assert(x >= -(1 << 25) and x < 1 << 25 and z >= -(1 << 25) and z < 1 << 25 and y >= -(1 << 11) and y < 1 << 11);
+        const packed_x: u64 = @as(u26, @truncate(@as(u32, @bitCast(x))));
+        const packed_z: u64 = @as(u26, @truncate(@as(u32, @bitCast(z))));
+        const packed_y: u64 = @as(u12, @truncate(@as(u32, @bitCast(y))));
+        return packed_x << 38 | packed_z << 12 | packed_y;
     }
 
     /// WalkNodeEvaluator.getFloorLevel: where a mob stands in a block, on the collision shape of
@@ -735,6 +749,49 @@ pub const Search = struct {
 
 /// WalkNodeEvaluator.getFloorLevel(BlockGetter, BlockPos): the top of the collision shape of
 /// the block below, with no entity's context.
+/// WalkNodeEvaluator.getPathTypeStatic: an open block over ground is walkable, or dangerous by
+/// what is under or around it. A search remembers these, see Search.pathTypeStatic.
+pub fn staticPathType(level: *const body.Level, x: i32, y: i32, z: i32) !PathType {
+    const own = try baseType(level, x, y, z);
+    if (own != .open or y < level.minimum_y + 1) return own;
+    return switch (try baseType(level, x, y - 1, z)) {
+        .open, .water, .lava, .walkable => .open,
+        .damage_fire => .damage_fire,
+        .damage_other => .damage_other,
+        .sticky_honey => .sticky_honey,
+        .powder_snow => .danger_powder_snow,
+        .damage_cautious => .damage_cautious,
+        .trapdoor => .danger_trapdoor,
+        else => try checkNeighbourBlocks(level, x, y, z, .walkable),
+    };
+}
+
+/// WalkNodeEvaluator.checkNeighbourBlocks, in vanilla's order, first match winning.
+fn checkNeighbourBlocks(level: *const body.Level, x: i32, y: i32, z: i32, fallback: PathType) !PathType {
+    var dx: i32 = -1;
+    while (dx <= 1) : (dx += 1) {
+        var dy: i32 = -1;
+        while (dy <= 1) : (dy += 1) {
+            var dz: i32 = -1;
+            while (dz <= 1) : (dz += 1) {
+                if (dx == 0 and dz == 0) continue;
+                switch (try baseType(level, x + dx, y + dy, z + dz)) {
+                    .damage_other => return .danger_other,
+                    .damage_fire, .lava => return .danger_fire,
+                    .water => return .water_border,
+                    .damage_cautious => return .damage_cautious,
+                    else => {},
+                }
+            }
+        }
+    }
+    return fallback;
+}
+
+fn baseType(level: *const body.Level, x: i32, y: i32, z: i32) !PathType {
+    return level.blocks.get(try level.state(x, y, z)).path;
+}
+
 pub fn staticFloorLevel(level: *const body.Level, x: i32, y: i32, z: i32) !f64 {
     const below = try level.state(x, y - 1, z);
     const boxes = body.contextFreeBoxes(below, x, z);

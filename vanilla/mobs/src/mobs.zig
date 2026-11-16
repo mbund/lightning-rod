@@ -28,6 +28,7 @@ const species_data = @import("species.zig");
 const mob_state = @import("mob.zig");
 const JavaRandom = @import("java_random.zig").JavaRandom;
 const pathfinding = @import("pathfinding.zig");
+const navigation = @import("navigation.zig");
 const goals = @import("goals.zig");
 const inventories = @import("inventories");
 const Lighting = @import("terrain").lighting.Lighting;
@@ -96,6 +97,9 @@ pub const Mobs = struct {
         maximum: usize = 1024,
         /// Sections of blocks mobs keep decoded across ticks.
         copies: u32 = 512,
+        /// Block edits held for paths to answer in a batch, from the first that changes a
+        /// collision. Edits past it are counted and go unanswered.
+        edits: u32 = 16384,
         seed: u64 = 0x6d6f6273,
     };
 
@@ -151,6 +155,23 @@ pub const Mobs = struct {
     search: pathfinding.Search,
     /// Each mob's path, at its index, path_capacity nodes apiece.
     paths: []pathfinding.PathNode,
+    /// Edits since the first that changed a collision, which paths answer in a batch, in order.
+    edits: []body.Edit,
+    edit_count: usize = 0,
+    /// Edits past the capacity, which no path answers.
+    edits_dropped: u64 = 0,
+    /// Path searches run, and recomputations edits asked for, for measuring.
+    path_searches: u64 = 0,
+    edit_recomputes: u64 = 0,
+    /// Mobs following a path while a batch of edits is answered.
+    candidates: []u32,
+    /// Blocks as they stood after the edit being answered, which levels read while it is set.
+    overlay: body.Overlay,
+    overlay_view: ?*const body.Overlay = null,
+    /// Worlds' levels found this tick, kept only while mobs tick.
+    views: [8]WorldView = undefined,
+    view_count: usize = 0,
+    ticking: bool = false,
     /// The last path found, until a navigation takes it.
     scratch_path: []pathfinding.PathNode,
     scratch: struct { count: u16 = 0, target: [3]i32 = .{ 0, 0, 0 }, reached: bool = false } = .{},
@@ -171,6 +192,7 @@ pub const Mobs = struct {
 
     pub fn allocate(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Mobs {
         if (config.maximum == 0 or config.maximum > 65536) return error.InvalidMobCapacity;
+        if (config.edits == 0) return error.InvalidEditCapacity;
         const self = try allocator.create(Mobs);
         const residents = try allocator.alloc(spatial.Resident, config.maximum);
         @memset(residents, .{});
@@ -198,11 +220,15 @@ pub const Mobs = struct {
             .search = try .init(allocator, search_nodes),
             .paths = try allocator.alloc(pathfinding.PathNode, config.maximum * path_capacity),
             .scratch_path = try allocator.alloc(pathfinding.PathNode, path_capacity),
+            .edits = try allocator.alloc(body.Edit, config.edits),
+            .candidates = try allocator.alloc(u32, config.maximum),
+            .overlay = try .init(allocator, config.edits),
             .damage_flags = try allocator.alloc(damage.Flags, @typeInfo(mob_state.DamageType).@"enum".field_names.len),
             .damage_ids = try allocator.alloc(i32, @typeInfo(mob_state.DamageType).@"enum".field_names.len),
         };
         try self.readTags();
         try deps.items.deps.definitions.registry.onChange(self, readTags);
+        try deps.chunks.observe(.init(self, blocksChanged));
         try deps.client.registry.onChange(self, readTags);
         for (self.free, 0..) |*slot, index| slot.* = @intCast(config.maximum - 1 - index);
         inline for (@typeInfo(Species).@"enum".field_names, 0..) |field, index| self.species[index] = species_data.traits(@field(Species, field));
@@ -215,21 +241,43 @@ pub const Mobs = struct {
     }
 
     pub fn level(self: *Mobs, world: u32) body.Level {
-        const definition = self.deps.worlds.get(world).?;
-        return .{
-            .copies = self.copies,
-            .blocks = self.blocks,
-            .world = world,
-            .minimum_y = definition.dimension.minimumSection() * 16,
-            .height = @intCast(definition.dimension.sectionCount() * 16),
-            .air = self.air_state,
-        };
+        var result = self.view(world).level;
+        result.overlay = self.overlay_view;
+        return result;
     }
 
-    pub fn ultrawarm(self: *const Mobs, world: u32) bool {
-        const definition = self.deps.worlds.get(world) orelse return false;
-        const dimension = self.deps.dimensions.get(definition.dimension.name) orelse return false;
-        return dimension.ultrawarm;
+    pub fn ultrawarm(self: *Mobs, world: u32) bool {
+        return self.view(world).ultrawarm;
+    }
+
+    /// A world's level and dimension facts, found once a tick, as definitions change only
+    /// between ticks.
+    fn view(self: *Mobs, world: u32) *const WorldView {
+        for (self.views[0..self.view_count]) |*known| if (known.world == world) return known;
+        const definition = self.deps.worlds.get(world).?;
+        const dimension = self.deps.dimensions.get(definition.dimension.name);
+        const made: WorldView = .{
+            .world = world,
+            .level = .{
+                .copies = self.copies,
+                .blocks = self.blocks,
+                .world = world,
+                .minimum_y = definition.dimension.minimumSection() * 16,
+                .height = @intCast(definition.dimension.sectionCount() * 16),
+                .air = self.air_state,
+            },
+            .ultrawarm = if (dimension) |found| found.ultrawarm else false,
+        };
+        // Outside the tick nothing is kept, and more worlds than places only means finding one again.
+        const at = if (!self.ticking) 0 else if (self.view_count < self.views.len) self.view_count else self.views.len - 1;
+        if (self.ticking) self.view_count = @max(self.view_count, at + 1);
+        self.views[at] = made;
+        return &self.views[at];
+    }
+
+    fn tickViews(self: *Mobs, ticking: bool) void {
+        self.view_count = 0;
+        self.ticking = ticking;
     }
 
     pub fn levelRandom(self: *Mobs) *JavaRandom {
@@ -349,7 +397,10 @@ pub const Mobs = struct {
     }
 
     pub fn tick(self: *Mobs) !void {
+        self.tickViews(true);
+        defer self.tickViews(false);
         defer self.copies.endTick();
+        try self.answerEdits();
         for (self.active.values()) |index| {
             const mob = &self.mobs[index];
             if (mob.removed) continue;
@@ -357,7 +408,71 @@ pub const Mobs = struct {
             if (!self.deps.domains.ticks(.{ .world = mob.world, .x = @divFloor(at[0], 16), .z = @divFloor(at[2], 16) })) continue;
             try mob_tick.tick(self, mob);
             self.locate(@intCast(index));
+            // Blocks the mob changed, as trampled farmland, before the next mob moves.
+            try self.answerEdits();
         }
+    }
+
+    /// ServerLevel.sendBlockUpdated, first half. Edits come here after they apply, a batch at a
+    /// time, with what they replaced. From the first that changes a collision shape on, every edit
+    /// is kept until the next answer, so each path that recomputes can see the world as it stood.
+    fn blocksChanged(self: *Mobs, section: chunks.Section, edits: []const chunks.BlockEdit, previous: []const u16) void {
+        if (self.active.values().len == 0) return;
+        for (edits, previous) |edit, old| {
+            const collision = self.blocks.get(old).collision != self.blocks.get(edit.state).collision;
+            if (!collision and self.edit_count == 0) continue;
+            if (self.edit_count == self.edits.len) {
+                self.edits_dropped += 1;
+                continue;
+            }
+            const index: i32 = edit.index;
+            self.edits[self.edit_count] = .{
+                .world = section.world,
+                .position = .{ section.x * 16 + (index & 15), section.y * 16 + (index >> 8), section.z * 16 + ((index >> 4) & 15) },
+                .previous = old,
+                .collision = collision,
+                .game_time = self.gameTime(),
+            };
+            self.edit_count += 1;
+        }
+    }
+
+    /// ServerLevel.sendBlockUpdated, second half, for the edits held since the last answer, in
+    /// their order. A mob following a path near an edit that changed a collision finds the way
+    /// again, at the edit's game time and against the world as of the edit. Mobs have not moved
+    /// since, as edits are answered before mobs tick and after each one that ticks.
+    fn answerEdits(self: *Mobs) !void {
+        if (self.edit_count == 0) return;
+        defer self.edit_count = 0;
+        var candidate_count: usize = 0;
+        for (self.active.values()) |index| {
+            const mob = &self.mobs[index];
+            if (mob.removed or navigation.done(mob) or mob.navigation.has_delayed_recomputation) continue;
+            if (!self.loaded(mob.world, mob.blockPosition())) continue;
+            self.candidates[candidate_count] = @intCast(index);
+            candidate_count += 1;
+        }
+        if (candidate_count == 0) return;
+        defer self.overlay_view = null;
+        var laid_after: ?usize = null;
+        for (self.edits[0..self.edit_count], 0..) |edit, at| {
+            if (!edit.collision) continue;
+            for (self.candidates[0..candidate_count]) |index| {
+                const mob = &self.mobs[index];
+                if (mob.world != edit.world or !navigation.shouldRecomputePath(self, mob, edit.position)) continue;
+                if (laid_after != at) {
+                    self.layOver(at);
+                    laid_after = at;
+                }
+                self.edit_recomputes += 1;
+                try navigation.recomputePath(self, mob, edit.game_time);
+            }
+        }
+    }
+
+    fn layOver(self: *Mobs, at: usize) void {
+        self.overlay.layAfter(self.edits[0..self.edit_count], at);
+        self.overlay_view = if (self.overlay.states.count() == 0) null else &self.overlay;
     }
 
     /// The game time, Level.getGameTime, which navigation times stalls and recomputations by.
@@ -971,6 +1086,8 @@ fn push(pushed: *Mob, pusher: *Mob) void {
     pusher.velocity[2] += dz;
     pusher.has_impulse = true;
 }
+
+const WorldView = struct { world: u32, level: body.Level, ultrawarm: bool };
 
 /// Nodes one path search may make. A cow visits at most 285 and makes a few per visit.
 const search_nodes = 16384;
