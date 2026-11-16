@@ -69,7 +69,7 @@ test "resident merge candidates filter metadata and conserve item ownership with
             }
         };
         var source: Source = .{};
-        const terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 24, .cache_groups = 2 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
+        const terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = 16, .cache_sections = 24, .cache_groups = 2 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
         terrain.setSource(chunks.Source.init(&source, Source.read));
         const physics = try ItemPhysics.init(allocator, .{ .blocks = gameplay_definitions.blocks, .chunks = terrain });
         const merging = try ItemMerging.init(allocator);
