@@ -170,6 +170,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     for (mobs.mobs, ticks_before) |mob, *tick_count| tick_count.* = mob.tick_count;
     const searches_before = mobs.path_searches;
     const skipped_before = mobs.travels_skipped;
+    const idle_before = mobs.idle_ticks;
     const run_before = mobs.travels_run;
     const recomputes_before = mobs.edit_recomputes;
     if (options.perf_control) |control| {
@@ -216,7 +217,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
         const mob = &mobs.mobs[index];
         if (options.detail and !mob.resting and mob.tick_count != ticks_before[index] and ticked % 97 == 0) try writer.print("  awake {any} v={any} ground={} hc={} fall={d} water={}\n", .{ mob.position, mob.velocity, mob.on_ground, mob.horizontal_collision, mob.fall_distance, mob.touching_water });
     }
-    if (options.cows > 0) try writer.print("  cows={d} ticked={d} resting={d} travels_skipped={d} travels_run={d} path_searches={d:.3}/tick edits={d} edit_recomputes={d} edits_dropped={d} sections_decoded={d}\n", .{ mobs.active.values().len, ticked, resting, mobs.travels_skipped - skipped_before, mobs.travels_run - run_before, @as(f64, @floatFromInt(mobs.path_searches - searches_before)) / @as(f64, @floatFromInt(ticks)), edits, mobs.edit_recomputes - recomputes_before, mobs.edits_dropped, mobs.copies.decoded });
+    if (options.cows > 0) try writer.print("  audience_changes={d} cows={d} ticked={d} resting={d} idle_ticks={d} travels_skipped={d} travels_run={d} path_searches={d:.3}/tick edits={d} edit_recomputes={d} edits_dropped={d} sections_decoded={d}\n", .{ simulation.get(vanilla.MobReplication).audience_changes, mobs.active.values().len, ticked, resting, mobs.idle_ticks - idle_before, mobs.travels_skipped - skipped_before, mobs.travels_run - run_before, @as(f64, @floatFromInt(mobs.path_searches - searches_before)) / @as(f64, @floatFromInt(ticks)), edits, mobs.edit_recomputes - recomputes_before, mobs.edits_dropped, mobs.copies.decoded });
     if (options.detail) for (snapshots, before[0..snapshots.len]) |after, previous| {
         if (after.kind == .counter) {
             const operations = after.value - previous.value;

@@ -90,6 +90,8 @@ pub const MobReplication = struct {
     mark_count: usize = 0,
     /// A player's connection or world changed since audiences were last worked out.
     connections_changed: bool = false,
+    /// Ticks on which audiences had to be worked out again, for measuring.
+    audience_changes: u64 = 0,
     known: audience.Matrix,
     scratch: audience.Matrix,
     targets: []sessions.Service.Target,
@@ -124,10 +126,23 @@ pub const MobReplication = struct {
         self.forgetChangedConnections();
         const visibility = self.deps.streaming.snapshotVisibility();
         const audience_changed = self.audienceChanged(visibility);
+        if (audience_changed) self.audience_changes += 1;
+        // Only cows idle.
+        const idle_interval = mobs.traits(.cow).update_interval;
         var offset: usize = 0;
         while (offset < mobs.active.values().len) {
             const index = mobs.active.values()[offset];
             offset += 1;
+            // An idle mob changes nothing a viewer sees, and neither do its viewers, so until its next
+            // send tick only the count moves, read without touching its Mob.
+            if (!audience_changed and mobs.idles(index)) {
+                const idle_view = &self.views[index];
+                const place = mobs.herd.place_of[index];
+                if (idle_view.audience_at) |at| if (std.meta.eql(at, mobs.herd.still.position[place]) and idle_view.tick_count % idle_interval != 0) {
+                    idle_view.tick_count += 1;
+                    continue;
+                };
+            }
             const mob = &mobs.mobs[index];
             const view = &self.views[index];
             const known = self.known.row(index);

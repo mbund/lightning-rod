@@ -15,6 +15,7 @@ pub const goals = @import("goals.zig");
 pub const navigation = @import("navigation.zig");
 pub const block_effects = @import("block_effects.zig");
 pub const mobs = @import("mobs.zig");
+pub const herd = @import("herd.zig");
 pub const mob_replication = @import("mob_replication.zig");
 pub const spawn_eggs = @import("spawn_eggs.zig");
 pub const pathfinding = @import("pathfinding.zig");

@@ -29,6 +29,7 @@ const mob_state = @import("mob.zig");
 const JavaRandom = @import("java_random.zig").JavaRandom;
 const pathfinding = @import("pathfinding.zig");
 const navigation = @import("navigation.zig");
+const herd_state = @import("herd.zig");
 const goals = @import("goals.zig");
 const inventories = @import("inventories");
 const Lighting = @import("terrain").lighting.Lighting;
@@ -166,6 +167,8 @@ pub const Mobs = struct {
     /// Travels resting mobs skipped, and travels run, for measuring.
     travels_skipped: u64 = 0,
     travels_run: u64 = 0,
+    /// Ticks idle mobs took in the herd, for measuring.
+    idle_ticks: u64 = 0,
     /// Mobs following a path while a batch of edits is answered.
     candidates: []u32,
     /// Blocks as they stood after the edit being answered, which levels read while it is set.
@@ -174,6 +177,13 @@ pub const Mobs = struct {
     /// By player slot, whether the player holds cow food in either hand, noted as mobs start
     /// ticking: tempting asks every other tick for every mob, and hands change only between.
     holding_food: []bool,
+    /// Mobs in entity id order, the order they tick in, with idle mobs' hot state.
+    herd: herd_state.Herd,
+    /// The players idle mobs look for this tick.
+    present: []herd_state.Audience.Player,
+    present_count: usize = 0,
+    holders: []herd_state.Audience.Player,
+    holder_count: usize = 0,
     /// Worlds' levels found this tick, kept only while mobs tick.
     views: [8]WorldView = undefined,
     view_count: usize = 0,
@@ -231,6 +241,9 @@ pub const Mobs = struct {
             .edits = try allocator.alloc(body.Edit, config.edits),
             .candidates = try allocator.alloc(u32, config.maximum),
             .holding_food = try allocator.alloc(bool, deps.players.records.len),
+            .herd = try .init(allocator, config.maximum),
+            .present = try allocator.alloc(herd_state.Audience.Player, deps.players.records.len),
+            .holders = try allocator.alloc(herd_state.Audience.Player, deps.players.records.len),
             .overlay = try .init(allocator, config.edits),
             .damage_flags = try allocator.alloc(damage.Flags, @typeInfo(mob_state.DamageType).@"enum".field_names.len),
             .damage_ids = try allocator.alloc(i32, @typeInfo(mob_state.DamageType).@"enum".field_names.len),
@@ -367,6 +380,7 @@ pub const Mobs = struct {
         self.ids.putAssumeCapacityNoClobber(created.id, index);
         self.active.insert(index);
         self.residents[index] = .{ .id = created.id };
+        self.herd.add(self.mobs, index);
         self.locate(index);
         // A mob appearing touches the mobs around it.
         const placed = living.box(self, &self.mobs[index]);
@@ -399,13 +413,34 @@ pub const Mobs = struct {
         self.residents[index].alive = false;
         assert(self.ids.remove(mob.id));
         self.active.remove(index);
+        self.herd.remove(index);
         self.free[self.free_count] = index;
         self.free_count += 1;
     }
 
+    /// A mob for systems outside the tick, which may change it, so it stops idling first.
     pub fn get(self: *Mobs, entity: u64) ?*Mob {
         const index = self.ids.get(entity) orelse return null;
+        self.stopIdling(index);
         return &self.mobs[index];
+    }
+
+    /// The mob's hot fields go back to it from the herd, if it idles.
+    fn stopIdling(self: *Mobs, index: u32) void {
+        const place = self.herd.place_of[index];
+        if (place != herd_state.no_place and self.herd.idling[place]) self.herd.leave(place, &self.mobs[index]);
+    }
+
+    /// Whether the mob idles in the herd, so nothing about it changes but its counters.
+    pub fn idles(self: *const Mobs, index: usize) bool {
+        const place = self.herd.place_of[index];
+        return place != herd_state.no_place and self.herd.idling[place];
+    }
+
+    /// Wakes a resting mob, which then ticks in full.
+    pub fn rouse(self: *Mobs, index: u32) void {
+        self.stopIdling(index);
+        self.mobs[index].resting = false;
     }
 
     pub fn tick(self: *Mobs) !void {
@@ -414,17 +449,90 @@ pub const Mobs = struct {
         try self.noteHeldFood();
         defer self.copies.endTick();
         try self.answerEdits();
-        for (self.active.values()) |index| {
+        self.herd.tidy(self.mobs);
+        const audience = self.noteAudience();
+        const tempt_range = self.traits(.cow).attribute(.tempt_range);
+        var ticking: TickingMemo = .{};
+        // ServerLevel's entity tick list, by entity id.
+        for (0..self.herd.count) |place| {
+            const index = self.herd.slots[place];
+            if (index == herd_state.no_place) continue;
+            // An idle mob is read from the herd alone, without touching its Mob.
+            if (self.herd.idling[place]) {
+                if (!ticking.ticks(self, self.herd.still.world[place], self.herd.still.chunk[place])) continue;
+                const before = if (verify_idle) self.idleBefore(place) else {};
+                switch (herd_state.advance(&self.herd, place, audience, tempt_range)) {
+                    .idled => {
+                        self.idle_ticks += 1;
+                        if (verify_idle) try self.checkIdle(place, before);
+                        continue;
+                    },
+                    // Something starts, so the mob takes its full tick from the start.
+                    .started => self.herd.leave(place, &self.mobs[index]),
+                }
+            }
             const mob = &self.mobs[index];
             if (mob.removed) continue;
-            const at = mob.blockPosition();
-            if (!self.deps.domains.ticks(.{ .world = mob.world, .x = @divFloor(at[0], 16), .z = @divFloor(at[2], 16) })) continue;
+            if (!ticking.ticks(self, mob.world, chunkOf(mob.position))) continue;
             try mob_tick.tick(self, mob);
-            self.locate(@intCast(index));
+            self.locate(index);
             // Blocks the mob changed, as trampled farmland, before the next mob moves.
             try self.answerEdits();
+            if (!self.herd.idling[place] and herd_state.idle(mob)) self.herd.enter(place, mob);
         }
     }
+
+    /// The players idle mobs look for, as mobs start ticking and players stand still.
+    fn noteAudience(self: *Mobs) herd_state.Audience {
+        self.present_count = 0;
+        self.holder_count = 0;
+        for (self.deps.players.activeSlots()) |slot| {
+            const player = &self.deps.players.records[slot];
+            if (player.stage != .ready or self.deps.player_states.of(player).gamemode == .spectator) continue;
+            const entry: herd_state.Audience.Player = .{ .world = player.world, .position = .{ player.position.x, player.position.y, player.position.z } };
+            self.present[self.present_count] = entry;
+            self.present_count += 1;
+            if (!self.holding_food[slot]) continue;
+            self.holders[self.holder_count] = entry;
+            self.holder_count += 1;
+        }
+        return .{ .present = self.present[0..self.present_count], .holding_food = self.holders[0..self.holder_count] };
+    }
+
+    /// Debug builds check every idle tick against the full tick it stands for.
+    const verify_idle = @import("builtin").mode == .debug;
+
+    fn idleBefore(self: *Mobs, place: usize) Mob {
+        var before = self.mobs[self.herd.slots[place]];
+        self.herd.writeBack(place, &before);
+        return before;
+    }
+
+    fn checkIdle(self: *Mobs, place: usize, before: Mob) !void {
+        var expected = before;
+        try mob_tick.tick(self, &expected);
+        var actual = self.mobs[self.herd.slots[place]];
+        self.herd.writeBack(place, &actual);
+        if (!std.meta.eql(expected, actual)) {
+            std.debug.print("idle tick diverged for mob {d}\n", .{actual.id});
+            unreachable;
+        }
+    }
+
+    /// Whether a mob's chunk ticks, remembering the last chunk asked about.
+    const TickingMemo = struct {
+        world: u32 = 0,
+        chunk: ?[2]i32 = null,
+        result: bool = false,
+
+        fn ticks(self: *TickingMemo, mobs: *Mobs, world: u32, chunk: [2]i32) bool {
+            if (self.chunk) |known| if (known[0] == chunk[0] and known[1] == chunk[1] and self.world == world) return self.result;
+            self.world = world;
+            self.chunk = chunk;
+            self.result = mobs.deps.domains.ticks(.{ .world = world, .x = chunk[0], .z = chunk[1] });
+            return self.result;
+        }
+    };
 
     /// ServerLevel.sendBlockUpdated, first half. Edits come here after they apply, a batch at a
     /// time, with what they replaced. From the first that changes a collision shape on, every edit
@@ -871,7 +979,7 @@ pub const Mobs = struct {
         var candidates = self.spatial.rectangle(world, first, last);
         while (candidates.next()) |index| {
             const mob = &self.mobs[index];
-            if (mob.resting and living.box(self, mob).intersects(reach)) mob.resting = false;
+            if (mob.resting and living.box(self, mob).intersects(reach)) self.rouse(index);
         }
     }
 
@@ -904,7 +1012,7 @@ pub const Mobs = struct {
             const other = &self.mobs[index];
             if (other.id == mob.id or other.removed or !other.alive()) continue;
             if (!living.box(self, other).intersects(own)) continue;
-            other.resting = false;
+            self.rouse(index);
             touched += 1;
             push(other, mob);
         }
@@ -1097,7 +1205,11 @@ pub const Mobs = struct {
             const mob = &self.mobs[index];
             if (mob.removed) continue;
             keys[count] = keyFor(mob.id);
-            values[count] = encode(mob);
+            // An idle mob's hot fields are in the herd.
+            var current = mob.*;
+            const place = self.herd.place_of[index];
+            if (place != herd_state.no_place and self.herd.idling[place]) self.herd.writeBack(place, &current);
+            values[count] = encode(&current);
             writes[count] = .{ .key = &keys[count], .value = &values[count] };
             count += 1;
             self.saved[self.saved_count] = mob.id;
@@ -1162,6 +1274,11 @@ fn push(pushed: *Mob, pusher: *Mob) void {
 }
 
 const WorldView = struct { world: u32, level: body.Level, ultrawarm: bool };
+
+/// The chunk column a position is in.
+pub fn chunkOf(position: [3]f64) [2]i32 {
+    return .{ @divFloor(mth_floor(position[0]), 16), @divFloor(mth_floor(position[2]), 16) };
+}
 
 /// Nodes one path search may make. A cow visits at most 285 and makes a few per visit.
 const search_nodes = 16384;
