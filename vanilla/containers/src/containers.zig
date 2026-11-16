@@ -14,6 +14,7 @@ const packets = @import("minecraft_packets");
 const minecraft = @import("minecraft_model");
 const game_data = @import("game_data");
 const wire = @import("wire_1_21_5");
+const Domains = @import("domains").domains.Domains;
 const Players = @import("players").players.Players;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
 const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
@@ -71,6 +72,7 @@ pub const Containers = struct {
         experience: *Experience,
         metrics: *metrics.Registry,
         players: *Players,
+        domains: *Domains,
         player_states: *PlayerStates,
         inventory: *PlayerInventory,
         inventories: *inventories.Inventories,

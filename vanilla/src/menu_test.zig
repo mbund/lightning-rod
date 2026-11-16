@@ -4,6 +4,7 @@ const vanilla_content = @import("vanilla_definitions").defaults;
 const recipe_placement = @import("vanilla_crafting").recipe_placement;
 const FuelConversionDefinition = @import("vanilla_crafting").recipes.FuelConversionDefinition;
 const std = @import("std");
+const Domains = @import("domains").domains.Domains;
 const storage = @import("storage");
 const fault = @import("fault_disk");
 const metrics = @import("metrics");
@@ -665,10 +666,13 @@ test "default item identity matches the serialized definition" {
 fn blockContainers(allocator: std.mem.Allocator, store: *storage.Store, registry: *metrics.Registry, fixture: InventoryFixture) !*Containers {
     const resources = try records.Workspaces.init(allocator, std.testing.io, .{});
     const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 16, .demand_sections = 4, .cache_groups = 4 }, .{ .storage = try store.openSpace("chunks"), .metrics = registry, .record_workspaces = resources });
+    const domains = try Domains.init(allocator, .{}, .{ .players = fixture.players });
+    domains.tick();
     const experience = try Experience.init(allocator, .{ .maximum_orbs = 16 }, .{
         .enchantments = fixture.definitions.enchantments,
         .dimensions = fixture.definitions.dimensions,
         .players = fixture.players,
+        .domains = domains,
         .player_states = fixture.player_states,
         .entities = fixture.bodies,
         .physics = try ItemPhysics.init(allocator, .{ .blocks = fixture.definitions.blocks, .chunks = terrain }),
@@ -685,6 +689,7 @@ fn blockContainers(allocator: std.mem.Allocator, store: *storage.Store, registry
         .players = fixture.players,
         .player_states = fixture.player_states,
         .inventory = fixture.menu,
+        .domains = domains,
         .inventories = fixture.ownership,
         .chunks = terrain,
         .actions = try BlockActions.init(allocator, .{}),

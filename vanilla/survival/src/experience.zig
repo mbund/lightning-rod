@@ -9,6 +9,7 @@ const game_data = @import("game_data");
 const sessions = @import("sessions");
 const minecraft = @import("minecraft_model");
 const inventories = @import("inventories");
+const Domains = @import("domains").domains.Domains;
 const Players = @import("players").players.Players;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
 const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
@@ -27,6 +28,7 @@ pub const Experience = struct {
         enchantments: *EnchantmentRegistry,
         dimensions: *Dimensions,
         players: *Players,
+        domains: *Domains,
         player_states: *PlayerStates,
         entities: *entities.Entities,
         physics: *ItemPhysics,
@@ -341,8 +343,7 @@ pub const Experience = struct {
             offset += 1;
             const entity = self.residents[index].id;
             var body = orb.body;
-            var nearby = self.deps.players.nearby(body.world, .{ .x = body.position[0], .y = body.position[1], .z = body.position[2] }, self.deps.players.config.simulation_distance);
-            if (nearby.next() == null) continue;
+            if (!self.deps.domains.ticks(.{ .world = body.world, .x = @intFromFloat(@floor(body.position[0] / 16)), .z = @intFromFloat(@floor(body.position[2] / 16)) })) continue;
             const world = self.deps.players.deps.worlds.get(body.world) orelse return error.CorruptExperienceOrb;
             if (body.position[1] < @as(f64, @floatFromInt(world.dimension.minimum_section * 16)) - 64) {
                 try self.retire(index);

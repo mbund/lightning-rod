@@ -13,6 +13,7 @@ const Reload = @import("reload").Reload;
 const Packets = @import("minecraft_packets").Packets;
 const Input = @import("players").input.Input;
 const Players = @import("players").players.Players;
+const Domains = @import("domains").domains.Domains;
 const PayloadChannels = @import("connection").payload_channels;
 const Visibility = @import("replication").visibility.Visibility;
 const Replication = @import("replication").replication.Replication;
@@ -127,6 +128,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Spawn, Spawn.Configuration{}),
     lightning_rod.plugin.configured(Players, Players.Configuration{}),
     lightning_rod.plugin.configured(PlayerStates, PlayerStates.Configuration{}),
+    lightning_rod.plugin.configured(Domains, Domains.Configuration{}),
     lightning_rod.plugin.configured(Visibility, Visibility.Configuration{}),
     lightning_rod.plugin.configured(Bossbars, Bossbars.Configuration{}),
     lightning_rod.plugin.configured(Time, Time.Configuration{}),

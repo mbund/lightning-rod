@@ -12,6 +12,7 @@
         .metrics = .{ .path = "../../metrics" },
         .minecraft_model = .{ .path = "../../minecraft_model" },
         .minecraft_packets = .{ .path = "../../minecraft_packets" },
+        .domains = .{ .path = "../../domains" },
         .players = .{ .path = "../../players" },
         .protocol_1_21_5 = .{ .path = "../../protocol_versions/v1_21_5" },
         .records = .{ .path = "../../records" },

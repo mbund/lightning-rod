@@ -60,13 +60,7 @@ pub fn tick(self: *containers.Containers) !void {
         var count: usize = 0;
         for (self.active[begin..end]) |resident| {
             const key = resident.key;
-            var nearby = self.deps.players.nearby(key.world, .{ .x = @floatFromInt(key.position.x), .y = @floatFromInt(key.position.y), .z = @floatFromInt(key.position.z) }, self.deps.players.config.simulation_distance);
-            var loaded = false;
-            while (nearby.next()) |player| if (self.deps.players.records[player].inWorld()) {
-                loaded = true;
-                break;
-            };
-            if (!loaded) continue;
+            if (!self.deps.domains.ticks(.{ .world = key.world, .x = key.position.x >> 4, .z = key.position.z >> 4 })) continue;
             keys[count] = key;
             sections[count] = chunks.sectionAt(key.world, key.position);
             count += 1;

@@ -3,6 +3,7 @@ const Visibility = @import("replication").visibility.Visibility;
 const Streaming = @import("terrain").streaming.Streaming;
 const Lighting = @import("terrain").lighting.Lighting;
 const std = @import("std");
+const Domains = @import("domains").domains.Domains;
 const storage = @import("storage");
 const records = @import("records");
 const metrics = @import("metrics");
@@ -103,7 +104,9 @@ const Fixture = struct {
         const light = try Lighting.init(allocator, .{}, .{ .metrics = registry, .blocks = &gameplay_definitions.blocks.published, .chunks = terrain, .worlds = dimensions });
         const streaming = try Streaming.init(allocator, std.testing.io, .{ .occlusion = false }, .{ .metrics = registry, .players = players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = light, .blocks = &gameplay_definitions.blocks.published });
         const blocks = try Blocks.init(allocator, std.testing.io, .{ .metrics = registry, .chunks = terrain, .players = players, .streaming = streaming, .sessions = service, .packets = encoding, .worlds = dimensions }, .{ .delta_sections = 16, .queued_sections = 32 });
-        const experience = try Experience.init(allocator, .{ .maximum_orbs = 64 }, .{ .enchantments = gameplay_definitions.enchantments, .dimensions = gameplay_definitions.dimensions, .players = players, .player_states = player_states, .entities = bodies, .physics = try ItemPhysics.init(allocator, .{ .blocks = gameplay_definitions.blocks, .chunks = terrain }), .inventories = ownership, .inventory = menus, .storage = try store.openSpace("experience"), .record_workspaces = workspaces });
+        const domains = try Domains.init(allocator, .{}, .{ .players = players });
+        domains.tick();
+        const experience = try Experience.init(allocator, .{ .maximum_orbs = 64 }, .{ .enchantments = gameplay_definitions.enchantments, .dimensions = gameplay_definitions.dimensions, .players = players, .domains = domains, .player_states = player_states, .entities = bodies, .physics = try ItemPhysics.init(allocator, .{ .blocks = gameplay_definitions.blocks, .chunks = terrain }), .inventories = ownership, .inventory = menus, .storage = try store.openSpace("experience"), .record_workspaces = workspaces });
         const mining = try Mining.allocate(allocator, .{}, .{ .enchantments = gameplay_definitions.enchantments, .block_definitions = gameplay_definitions.blocks, .attributes = try EquipmentAttributes.init(allocator, .{}, .{ .players = players, .player_states = player_states, .items = items, .enchantments = gameplay_definitions.enchantments, .client = gameplay_definitions.client }), .definitions = gameplay_definitions.mining, .visibility = try Visibility.init(allocator, .{}, .{ .players = players }), .metrics = registry, .storage = try store.openSpace("mining"), .players = players, .player_states = player_states, .input = input, .inventories = ownership, .items = items, .durability = try Durability.init(allocator, .{ .items = items, .inventories = ownership, .enchantments = gameplay_definitions.enchantments }), .worlds = dimensions, .chunks = terrain, .menus = menus, .loot = try BlockLoot.init(allocator, .{ .loot = gameplay_definitions.loot }), .experience = experience, .dropped = dropped, .blocks = blocks, .actions = try BlockActions.init(allocator, .{}) });
         const tool: inventories.Stack = .{ .item = try items.define("minecraft:diamond_pickaxe"), .count = 1 };
         for (players.records) |player| try std.testing.expect(try ownership.set(.{ .owner = player.uuid, .index = 36 }, 0, tool));

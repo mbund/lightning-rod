@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const module = b.addModule("vanilla_containers", .{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
-    inline for (.{ "chunks", "commands", "game_data", "inventories", "lightning_rod", "metrics", "minecraft_model", "minecraft_packets", "players", "records", "sessions", "storage", "vanilla_blocks", "vanilla_content", "vanilla_crafting", "vanilla_inventory", "vanilla_item_entities", "vanilla_items", "vanilla_player", "vanilla_survival" }) |name|
+    inline for (.{ "domains", "chunks", "commands", "game_data", "inventories", "lightning_rod", "metrics", "minecraft_model", "minecraft_packets", "players", "records", "sessions", "storage", "vanilla_blocks", "vanilla_content", "vanilla_crafting", "vanilla_inventory", "vanilla_item_entities", "vanilla_items", "vanilla_player", "vanilla_survival" }) |name|
         module.addImport(name, b.dependency(name, .{ .target = target, .optimize = optimize }).module(name));
     module.addImport("wire_1_21_5", b.dependency("protocol_1_21_5", .{ .target = target, .optimize = optimize }).module("wire"));
 

@@ -89,6 +89,7 @@ pub fn build(b: *std.Build) void {
         // Every supported release by default. The suites that depend on the protocol
         // catalog run again with the one release a minimal server selects.
         .{ .directory = "players" },
+        .{ .directory = "domains" },
         .{ .directory = "occlusion" },
         .{ .directory = "terrain" },
         .{ .directory = "terrain", .arguments = &.{"-Dsingle-release=true"} },
