@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const module = b.addModule("lightning_rod_vanilla_1_21_6", .{ .root_source_file = b.path("src/lib.zig"), .target = target, .optimize = optimize });
-    inline for (.{ "block_properties", "bossbars", "chat", "chunks", "commands", "connection", "domains", "entities", "game_data", "inventories", "lightning_rod", "metrics", "minecraft_model", "minecraft_packets", "players", "random_ticks", "records", "reload", "replication", "sessions", "storage", "terrain", "ticks", "vanilla_blocks", "vanilla_containers", "vanilla_content", "vanilla_crafting", "vanilla_definitions", "vanilla_equipment", "vanilla_inventory", "vanilla_item_entities", "vanilla_items", "vanilla_player", "vanilla_survival", "vanilla_world", "worlds" }) |name|
+    inline for (.{ "block_properties", "bossbars", "chat", "chunks", "commands", "connection", "domains", "entities", "game_data", "inventories", "lightning_rod", "metrics", "minecraft_model", "minecraft_packets", "players", "random_ticks", "records", "reload", "replication", "sessions", "storage", "terrain", "ticks", "vanilla_blocks", "vanilla_containers", "vanilla_content", "vanilla_crafting", "vanilla_definitions", "vanilla_equipment", "vanilla_inventory", "vanilla_item_entities", "vanilla_items", "vanilla_mobs", "vanilla_player", "vanilla_survival", "vanilla_world", "worlds" }) |name|
         module.addImport(name, b.dependency(name, .{ .target = target, .optimize = optimize }).module(name));
     module.addImport("protocol_support", b.dependency("protocol_support", .{ .target = target, .optimize = optimize }).module("encoding"));
     module.addImport("wire_1_21_5", b.dependency("protocol_1_21_5", .{ .target = target, .optimize = optimize }).module("wire"));
@@ -76,7 +76,7 @@ pub fn build(b: *std.Build) void {
 /// release. Every package that reads game data gets this one, and the vanilla definitions are
 /// generated again with the host build of it.
 pub fn replaceGameData(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, gameplay: *std.Build.Module, host_gameplay: *std.Build.Module) void {
-    inline for (.{ "occlusion", "terrain", "replication", "vanilla_content", "vanilla_world", "vanilla_items", "vanilla_crafting", "vanilla_item_entities", "vanilla_inventory", "vanilla_survival", "vanilla_blocks", "vanilla_containers", "vanilla_definitions" }) |name|
+    inline for (.{ "occlusion", "terrain", "replication", "vanilla_content", "vanilla_world", "vanilla_items", "vanilla_crafting", "vanilla_item_entities", "vanilla_inventory", "vanilla_survival", "vanilla_blocks", "vanilla_mobs", "vanilla_containers", "vanilla_definitions" }) |name|
         b.dependency(name, .{ .target = target, .optimize = optimize }).module(name).addImport("game_data", gameplay);
     b.modules.get("lightning_rod_vanilla_1_21_6").?.addImport("game_data", gameplay);
     const definitions = b.dependency("vanilla_definitions", .{ .target = target, .optimize = optimize });

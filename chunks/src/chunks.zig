@@ -293,7 +293,8 @@ pub const Chunks = struct {
         generation_work: storage.system.work.Limits = Generation.default_work,
         /// Side length of each persisted base group, measured in sections.
         storage_group_side: u8 = 4,
-        observers: usize = 8,
+        /// Edit observers: block systems and the copies simulation systems read through.
+        observers: usize = 16,
 
         /// The policy for a server with this many player slots. A vanilla server registers 480
         /// sections of budgets: edits 24, the simulation 64, streaming and the lighting solver

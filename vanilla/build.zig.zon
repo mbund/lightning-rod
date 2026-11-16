@@ -42,6 +42,7 @@
         .vanilla_items = .{ .path = "items" },
         .vanilla_player = .{ .path = "player" },
         .vanilla_survival = .{ .path = "survival" },
+        .vanilla_mobs = .{ .path = "mobs" },
         .vanilla_world = .{ .path = "world" },
         .worlds = .{ .path = "../worlds" },
     },

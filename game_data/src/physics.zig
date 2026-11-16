@@ -48,6 +48,48 @@ pub const Experience = struct {
     }
 };
 
+/// What mobs read about a block state that its tags cannot tell.
+pub const MobState = struct {
+    solid: bool,
+    solid_render: bool,
+    pathfindable_land: bool,
+    pathfindable_water: bool,
+    pathfindable_air: bool,
+    door: bool,
+    door_open: bool,
+    door_by_hand: bool,
+    rail: bool,
+    leaves: bool,
+    fence_gate: bool,
+    fence_gate_open: bool,
+    trapdoor: bool,
+    suffocating: bool,
+    jump_factor: f32,
+    /// The path type vanilla gives the state alone, with vanilla's tags. Only for checking the
+    /// port, which reads tags from the registry so datapacks apply. 255 where it is unknown.
+    vanilla_path_type: u8,
+};
+
+pub const EntityType = struct {
+    width: f32,
+    height: f32,
+    eye_height: f32,
+    fixed: bool,
+    fire_immune: bool,
+    track_deltas: bool,
+    summonable: bool,
+    living: bool,
+    category: u8,
+    /// In chunks.
+    tracking_range: u8,
+    /// In ticks.
+    update_interval: u32,
+    attribute_offset: u32,
+    attribute_count: u8,
+};
+
+const mob_state_size = 7;
+
 pub fn Data(comptime expected_states: usize, comptime expected_blocks: usize, comptime bytes: []const u8) type {
     const shape_count = std.mem.readInt(u32, bytes[12..16], .big);
     const box_count = std.mem.readInt(u32, bytes[16..20], .big);
@@ -56,11 +98,106 @@ pub fn Data(comptime expected_states: usize, comptime expected_blocks: usize, co
     const experience_offset = boxes_offset + box_count * 48;
     const rendering_offset = experience_offset + 4 + expected_blocks * 4;
     const outline_offset = rendering_offset + expected_states;
-    std.debug.assert(bytes.len == outline_offset + expected_states * 2);
-    std.debug.assert(std.mem.eql(u8, bytes[0..8], "LRPHYS06"));
+    const mob_states_offset = outline_offset + expected_states * 2;
+    const entity_types_offset = mob_states_offset + 4 + expected_states * mob_state_size;
+    const entity_type_count = std.mem.readInt(u32, bytes[entity_types_offset..][0..4], .big);
+    const layout = comptime entities: {
+        @setEvalBranchQuota(100_000);
+        var offsets: [entity_type_count]u32 = undefined;
+        var at: usize = entity_types_offset + 4;
+        for (&offsets) |*offset_value| {
+            offset_value.* = at;
+            at += 20 + @as(usize, bytes[at + 19]) * 10;
+        }
+        break :entities .{ .offsets = offsets, .eggs = at };
+    };
+    const egg_count = std.mem.readInt(u32, bytes[layout.eggs..][0..4], .big);
+    const sine_offset = layout.eggs + 4 + egg_count * 8;
+    const arcsine_offset = sine_offset + 65536 * 4;
+    std.debug.assert(bytes.len == arcsine_offset + 257 * 16);
+    std.debug.assert(std.mem.eql(u8, bytes[0..8], "LRPHYS07"));
     std.debug.assert(std.mem.readInt(u32, bytes[8..12], .big) == expected_states);
     std.debug.assert(std.mem.readInt(u32, bytes[experience_offset..][0..4], .big) == expected_blocks);
+    std.debug.assert(std.mem.readInt(u32, bytes[mob_states_offset..][0..4], .big) == expected_states);
     return struct {
+        pub const entity_types = entity_type_count;
+
+        /// Mth.SIN, sine in 65536 steps of a turn, as the JVM rounds it.
+        pub fn sine(index: u16) f32 {
+            return @bitCast(std.mem.readInt(u32, bytes[sine_offset + @as(usize, index) * 4 ..][0..4], .little));
+        }
+
+        /// Mth.ASIN_TAB and Mth.COS_TAB, which Mth.atan2 reads.
+        pub fn arcsine(index: u9) [2]f64 {
+            std.debug.assert(index <= 256);
+            const entry = bytes[arcsine_offset + @as(usize, index) * 16 ..][0..16];
+            return .{ @bitCast(std.mem.readInt(u64, entry[0..8], .little)), @bitCast(std.mem.readInt(u64, entry[8..16], .little)) };
+        }
+
+        pub fn mobState(state: u16) MobState {
+            std.debug.assert(state < expected_states);
+            const entry = bytes[mob_states_offset + 4 + @as(usize, state) * mob_state_size ..][0..mob_state_size];
+            const flags = std.mem.readInt(u16, entry[0..2], .little);
+            return .{
+                .solid = flags & 1 != 0,
+                .solid_render = flags & 2 != 0,
+                .pathfindable_land = flags & 4 != 0,
+                .pathfindable_water = flags & 8 != 0,
+                .pathfindable_air = flags & 16 != 0,
+                .door = flags & 32 != 0,
+                .door_open = flags & 64 != 0,
+                .door_by_hand = flags & 128 != 0,
+                .rail = flags & 256 != 0,
+                .leaves = flags & 512 != 0,
+                .fence_gate = flags & 1024 != 0,
+                .fence_gate_open = flags & 2048 != 0,
+                .trapdoor = flags & 4096 != 0,
+                .suffocating = flags & 8192 != 0,
+                .jump_factor = @bitCast(std.mem.readInt(u32, entry[2..6], .little)),
+                .vanilla_path_type = entry[6],
+            };
+        }
+
+        pub fn entityType(kind: u32) EntityType {
+            std.debug.assert(kind < entity_type_count);
+            const at = layout.offsets[kind];
+            const entry = bytes[at..][0..20];
+            return .{
+                .width = @bitCast(std.mem.readInt(u32, entry[0..4], .little)),
+                .height = @bitCast(std.mem.readInt(u32, entry[4..8], .little)),
+                .eye_height = @bitCast(std.mem.readInt(u32, entry[8..12], .little)),
+                .fixed = entry[12] & 1 != 0,
+                .fire_immune = entry[12] & 2 != 0,
+                .track_deltas = entry[12] & 4 != 0,
+                .summonable = entry[12] & 8 != 0,
+                .living = entry[12] & 16 != 0,
+                .category = entry[13],
+                .tracking_range = entry[14],
+                .update_interval = std.mem.readInt(u32, entry[15..19], .little),
+                .attribute_offset = at + 20,
+                .attribute_count = entry[19],
+            };
+        }
+
+        /// The base value of an attribute the entity type has by default, by attribute id.
+        pub fn attribute(kind: u32, id: u16) ?f64 {
+            const entity = entityType(kind);
+            for (0..entity.attribute_count) |index| {
+                const entry = bytes[entity.attribute_offset + index * 10 ..][0..10];
+                if (std.mem.readInt(u16, entry[0..2], .little) == id) return @bitCast(std.mem.readInt(u64, entry[2..10], .little));
+            }
+            return null;
+        }
+
+        /// The entity type a spawn egg item makes.
+        pub fn spawnEgg(item: i32) ?u32 {
+            for (0..egg_count) |index| {
+                const entry = bytes[layout.eggs + 4 + index * 8 ..][0..8];
+                if (std.mem.readInt(i32, entry[0..4], .little) == item) return @intCast(std.mem.readInt(i32, entry[4..8], .little));
+            }
+            return null;
+        }
+
         pub const Boxes = struct {
             offset: u32,
             count: u16,

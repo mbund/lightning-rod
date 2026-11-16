@@ -58,7 +58,7 @@ final class PhysicsSnapshot {
         }
         int boxCount = shapes.keySet().stream().mapToInt(List::size).sum();
         try (var output = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(destination)))) {
-            output.write("LRPHYS06".getBytes(StandardCharsets.US_ASCII));
+            output.write("LRPHYS07".getBytes(StandardCharsets.US_ASCII));
             output.writeInt(Block.BLOCK_STATE_REGISTRY.size());
             output.writeInt(shapes.size());
             output.writeInt(boxCount);
@@ -139,6 +139,7 @@ final class PhysicsSnapshot {
                 if (shape > 65535) throw new IllegalStateException("Too many outline shapes");
                 output.writeShort(Short.reverseBytes((short)shape));
             }
+            MobSnapshot.write(output);
         }
     }
 }
