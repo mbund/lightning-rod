@@ -1,0 +1,19 @@
+.{
+    .name = .random_ticks,
+    .fingerprint = 0xbdc5489264f72cb8,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .domains = .{ .path = "../domains" },
+        .game_data = .{ .path = "../game_data" },
+        .metrics = .{ .path = "../metrics" },
+        .minecraft_packets = .{ .path = "../minecraft_packets" },
+        .players = .{ .path = "../players" },
+        .chunks = .{ .path = "../chunks" },
+        .records = .{ .path = "../records" },
+        .worlds = .{ .path = "../worlds" },
+        .storage = .{ .path = "../storage" },
+        .protocols = .{ .path = "../protocols", .lazy = true },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

@@ -1,0 +1,108 @@
+const std = @import("std");
+const chunks = @import("chunks");
+const storage = @import("storage");
+const records = @import("records");
+const metrics = @import("metrics");
+const Worlds = @import("worlds").Worlds;
+const Players = @import("players").players.Players;
+const Domains = @import("domains").domains.Domains;
+const RandomTicks = @import("random_ticks.zig").RandomTicks;
+const Hit = @import("random_ticks.zig").Hit;
+
+/// Section 0 of every column ticks on its even cells, section 1 is empty.
+const Source = struct {
+    fn read(_: *@This(), _: std.Io, batch: chunks.Source.Batch) void {
+        for (batch.requests) |*request| {
+            if (request.section.y != 0) {
+                request.result = chunks.uniform(0, request.output);
+                continue;
+            }
+            request.output[0] = 1;
+            for (0..4096) |index| std.mem.writeInt(u16, request.output[1 + index * 2 ..][0..2], @intFromBool(index % 2 == 0), .little);
+            request.result = chunks.encoding.dense_block_bytes;
+        }
+    }
+};
+
+fn tickableState(state: u16) bool {
+    return state == 1;
+}
+
+const Counter = struct {
+    hits: usize = 0,
+    misplaced: usize = 0,
+
+    fn run(self: *Counter, hit: Hit) !void {
+        self.hits += 1;
+        const cell = chunks.localIndex(hit.position);
+        if (hit.state != 1 or cell % 2 != 0 or hit.position.y >= 16 or hit.position.x < -16 or hit.position.x >= 32) self.misplaced += 1;
+    }
+};
+
+test "hits land on tickable cells at vanilla's rate, follow edits and read counts from the store" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path: [256]u8 = undefined;
+    var store = try storage.Store.init(allocator, io, .{ .path = try std.fmt.bufPrint(&path, ".zig-cache/tmp/{s}/random-ticks", .{directory.sub_path}) });
+    defer store.deinit();
+    var registry = try metrics.Registry.init(allocator, io, .{ .enabled = false });
+    defer registry.deinit();
+    const space = try store.openSpace(chunks.Chunks.id);
+    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .edit_sections = 1, .simulation_sections = 2, .cache_sections = 40 }, .{
+        .metrics = &registry,
+        .storage = space,
+        .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}),
+    });
+    var source: Source = .{};
+    terrain.setSource(chunks.Source.init(&source, Source.read));
+    const catalog = try Worlds.allocate(arena.allocator(), .{ .maximum = 1 });
+    const world = try catalog.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 2 } });
+    var player_records = [_]Players.Player{.{ .handle = .{ .index = 0, .generation = 1 }, .world = world, .position = .{ .x = 8, .y = 4, .z = 8 } }};
+    var player_plugin: Players = .{ .deps = undefined, .config = .{ .render_distance = 2, .simulation_distance = 1 }, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
+    const domains = try Domains.init(arena.allocator(), .{}, .{ .players = &player_plugin });
+    const random = try RandomTicks.init(arena.allocator(), .{ .tickable = tickableState, .states = 16 }, .{ .domains = domains, .chunks = terrain, .worlds = catalog });
+    var counter: Counter = .{};
+    try random.register(tickableState, .init(Counter, &counter, Counter.run));
+    terrain.attach();
+    defer terrain.stop();
+
+    // The ticking columns are written, so their counts come from records rather than memory.
+    const reader = try terrain.client(.{ .name = "test", .sections = 2 });
+    for (0..3) |x| for (0..3) |z| for (0..2) |y| {
+        const lease = try reader.acquire(.{ .world = world, .x = @as(i32, @intCast(x)) - 1, .z = @as(i32, @intCast(z)) - 1, .y = @intCast(y) });
+        lease.release();
+    };
+    try terrain.checkpoint(space);
+
+    const ticks = 2000;
+    for (0..ticks) |_| {
+        domains.tick();
+        try terrain.poll();
+        try random.tick();
+    }
+    // Nine columns of 2048 tickable cells, three picks of 4096 cells a tick.
+    const expected: f64 = ticks * 9 * 2048 * 3.0 / 4096.0;
+    const deviation = @sqrt(expected);
+    const hits: f64 = @floatFromInt(counter.hits);
+    try std.testing.expect(@abs(hits - expected) < 6 * deviation + 9 * 3 * 2);
+    try std.testing.expectEqual(@as(usize, 0), counter.misplaced);
+
+    // Clearing the centre column's section stops its hits at once.
+    var edits: [2048]chunks.BlockEdit = undefined;
+    for (&edits, 0..) |*edit, index| edit.* = .{ .index = @intCast(index * 2), .state = 0 };
+    try terrain.setBlocks(.{ .world = world, .x = 0, .y = 0, .z = 0 }, &edits);
+    const before = counter.hits;
+    for (0..ticks) |_| {
+        domains.tick();
+        try terrain.poll();
+        try random.tick();
+    }
+    const after: f64 = @floatFromInt(counter.hits - before);
+    const remaining = expected * 8 / 9;
+    try std.testing.expect(@abs(after - remaining) < 6 * @sqrt(remaining) + 8 * 3 * 2);
+    try std.testing.expectEqual(@as(usize, 0), counter.misplaced);
+}

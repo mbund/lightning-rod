@@ -90,6 +90,8 @@ pub fn build(b: *std.Build) void {
         // catalog run again with the one release a minimal server selects.
         .{ .directory = "players" },
         .{ .directory = "domains" },
+        .{ .directory = "ticks" },
+        .{ .directory = "random_ticks" },
         .{ .directory = "occlusion" },
         .{ .directory = "terrain" },
         .{ .directory = "terrain", .arguments = &.{"-Dsingle-release=true"} },
