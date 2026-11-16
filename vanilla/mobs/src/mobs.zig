@@ -36,6 +36,8 @@ const Time = @import("vanilla_world").time.Time;
 const Weather = @import("vanilla_world").weather.Weather;
 const Items = @import("vanilla_items").items.Items;
 const ClientRegistries = @import("vanilla_content").client_registries.ClientRegistries;
+const Experience = @import("vanilla_survival").experience.Experience;
+const damage = @import("damage.zig");
 
 const Mob = mob_state.Mob;
 const Species = mob_state.Species;
@@ -106,6 +108,7 @@ pub const Mobs = struct {
         items: *Items,
         inventories: *inventories.Inventories,
         client: *ClientRegistries,
+        experience: *Experience,
     };
 
     deps: Dependencies,
@@ -141,7 +144,9 @@ pub const Mobs = struct {
     scratch: struct { count: u16 = 0, target: [3]i32 = .{ 0, 0, 0 }, reached: bool = false } = .{},
     /// The cow_food item tag and the panic_causes damage type tag, read when definitions change.
     food_tag: ?content_tags.Tags.Id = null,
-    panic_damage: []bool,
+    /// By damage type: what its tags say, and its id in the registry.
+    damage_flags: []damage.Flags,
+    damage_ids: []i32,
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Mobs {
         const self = try allocate(allocator, config, deps);
@@ -176,7 +181,8 @@ pub const Mobs = struct {
             .search = try .init(allocator, search_nodes),
             .paths = try allocator.alloc(pathfinding.PathNode, config.maximum * path_capacity),
             .scratch_path = try allocator.alloc(pathfinding.PathNode, path_capacity),
-            .panic_damage = try allocator.alloc(bool, @typeInfo(mob_state.DamageType).@"enum".field_names.len),
+            .damage_flags = try allocator.alloc(damage.Flags, @typeInfo(mob_state.DamageType).@"enum".field_names.len),
+            .damage_ids = try allocator.alloc(i32, @typeInfo(mob_state.DamageType).@"enum".field_names.len),
         };
         try self.readTags();
         try deps.items.deps.definitions.registry.onChange(self, readTags);
@@ -361,12 +367,38 @@ pub const Mobs = struct {
     fn readTags(self: *Mobs) !void {
         const tags = &self.deps.items.deps.definitions.tags;
         self.food_tag = tags.find("minecraft:cow_food");
-        @memset(self.panic_damage, false);
+        @memset(self.damage_flags, .{});
         const registry = self.deps.client.client.get("minecraft:damage_type") orelse return;
-        const panic = registry.tags.find("minecraft:panic_causes") orelse return;
-        inline for (@typeInfo(mob_state.DamageType).@"enum".field_names, 0..) |field, index| {
-            if (registry.id("minecraft:" ++ field)) |damage| self.panic_damage[index] = registry.tags.contains(panic, damage);
+        const Tag = struct { name: []const u8, flag: []const u8 };
+        const read = [_]Tag{
+            .{ .name = "minecraft:is_fire", .flag = "fire" },
+            .{ .name = "minecraft:bypasses_cooldown", .flag = "bypasses_cooldown" },
+            .{ .name = "minecraft:no_impact", .flag = "no_impact" },
+            .{ .name = "minecraft:no_knockback", .flag = "no_knockback" },
+            .{ .name = "minecraft:panic_causes", .flag = "panic" },
+            .{ .name = "minecraft:bypasses_invulnerability", .flag = "bypasses_invulnerability" },
+        };
+        inline for (read) |tag| {
+            if (registry.tags.find(tag.name)) |found| {
+                inline for (@typeInfo(mob_state.DamageType).@"enum".field_names, 0..) |field, index| {
+                    if (registry.id("minecraft:" ++ field)) |type_id| {
+                        if (registry.tags.contains(found, type_id)) @field(self.damage_flags[index], tag.flag) = true;
+                    }
+                }
+            }
         }
+        inline for (@typeInfo(mob_state.DamageType).@"enum".field_names, 0..) |field, index| {
+            self.damage_ids[index] = if (registry.id("minecraft:" ++ field)) |type_id| @intCast(type_id) else 0;
+        }
+    }
+
+    pub fn damageFlags(self: *const Mobs, damage_type: mob_state.DamageType) damage.Flags {
+        return self.damage_flags[@backingInt(damage_type)];
+    }
+
+    /// The damage type's id in the registry players were sent.
+    pub fn damageTypeId(self: *const Mobs, damage_type: mob_state.DamageType) i32 {
+        return self.damage_ids[@backingInt(damage_type)];
     }
 
     /// AbstractCow.isFood: the cow_food item tag.
@@ -381,8 +413,8 @@ pub const Mobs = struct {
     /// LivingEntity.getLastDamageSource forgets older damage.
     pub fn shouldPanic(self: *Mobs, mob: *Mob) bool {
         if (self.gameTime() - mob.last_damage_stamp > 40) mob.last_damage = null;
-        const damage = mob.last_damage orelse return false;
-        return self.panic_damage[@backingInt(damage.type)];
+        const dealt = mob.last_damage orelse return false;
+        return self.damage_flags[@backingInt(dealt.type)].panic;
     }
 
     /// Animal.getWalkTargetValue: grass underfoot is best, else the light, through
@@ -468,15 +500,78 @@ pub const Mobs = struct {
     /// ServerLevel.sendParticles of block particles. Particle packets are not written yet.
     pub fn blockParticles(_: *Mobs, _: u32, _: [3]f64, _: u16, _: i32, _: f32) void {}
 
-    /// LivingEntity.hurtServer. Damage beyond health is applied, the rest comes with combat.
-    pub fn hurt(_: *Mobs, mob: *Mob, damage: mob_state.Damage, amount: f32) !bool {
-        if (!mob.alive()) return false;
-        mob.last_damage = damage;
-        mob.health = @max(0, mob.health - amount);
-        mob.hurt_time = 10;
-        mob.hurt_duration = 10;
-        return true;
+    pub fn hurt(self: *Mobs, mob: *Mob, dealt: mob_state.Damage, amount: f32) !bool {
+        return damage.hurt(self, mob, dealt, amount);
     }
+
+    /// ServerLevel.broadcastDamageEvent, for the replication to send.
+    pub fn damageEvent(_: *Mobs, mob: *Mob, dealt: mob_state.Damage) void {
+        if (mob.damage_event_count == mob.damage_events.len) {
+            mob.damage_events[0] = mob.damage_events[1];
+            mob.damage_event_count -= 1;
+        }
+        mob.damage_events[mob.damage_event_count] = dealt;
+        mob.damage_event_count += 1;
+    }
+
+    /// LivingEntity.knockback. A direction too short to normalize turns random, from Math.random
+    /// rather than the mob's random.
+    pub fn knockback(self: *Mobs, mob: *Mob, strength_in: f64, x_in: f64, z_in: f64) void {
+        const strength = strength_in * (1.0 - self.traits(mob.species).attribute(.knockback_resistance));
+        if (strength <= 0) return;
+        mob.has_impulse = true;
+        var x = x_in;
+        var z = z_in;
+        const random = self.seeds.random();
+        while (x * x + z * z < @as(f64, @as(f32, 1.0e-5))) {
+            x = (random.float(f64) - random.float(f64)) * 0.01;
+            z = (random.float(f64) - random.float(f64)) * 0.01;
+        }
+        const direction = living.normalize(.{ x, 0, z });
+        const velocity = mob.velocity;
+        mob.velocity = .{
+            velocity[0] / 2.0 - direction[0] * strength,
+            if (mob.on_ground) @min(0.4, velocity[1] / 2.0 + strength) else velocity[1],
+            velocity[2] / 2.0 - direction[2] * strength,
+        };
+    }
+
+    /// LivingEntity.makeSound: at the mob's volume and voice pitch.
+    pub fn makeSound(self: *Mobs, mob: *Mob, sound: Sound) void {
+        const volume = self.traits(mob.species).sound_volume;
+        const pitch = self.voicePitch(mob);
+        self.playSound(mob, sound, volume, pitch);
+    }
+
+    /// Animal.setInLove: ten seconds of hearts.
+    pub fn setInLove(self: *Mobs, mob: *Mob, cause: ?u128) void {
+        mob.in_love = 600;
+        mob.love_cause = cause;
+        self.entityEvent(mob, 18);
+    }
+
+    /// AgeableMob.ageUp: a baby grows by seconds, and the growth fed to it is remembered.
+    pub fn ageUp(self: *Mobs, mob: *Mob, seconds: i32, forced: bool) void {
+        const before = mob.age;
+        var age = before + seconds * 20;
+        if (age > 0) age = 0;
+        const grown = age - before;
+        self.setAge(mob, age);
+        if (forced) {
+            mob.forced_age += grown;
+            if (mob.forced_age_timer == 0) mob.forced_age_timer = 40;
+        }
+        if (mob.age == 0) self.setAge(mob, mob.forced_age);
+    }
+
+    /// ExperienceOrb.award at the mob, as LivingEntity.dropExperience does.
+    pub fn awardExperience(self: *Mobs, mob: *const Mob, amount: i32) !void {
+        if (!self.deps.experience.canAward(amount)) return;
+        try self.deps.experience.award(mob.world, mob.position, amount);
+    }
+
+    /// LivingEntity.dropFromLootTable. Mob loot tables come next.
+    pub fn dropLoot(_: *Mobs, _: *Mob, _: mob_state.Damage, _: bool) !void {}
 
     /// Level.broadcastEntityEvent: a status byte every viewer gets.
     pub fn entityEvent(_: *Mobs, mob: *Mob, event: u8) void {

@@ -130,6 +130,12 @@ pub const MobReplication = struct {
                 for (mob.events[0..mob.event_count]) |event| try self.deliver(known.view(), .{ .status = .{ .id = networkId(mob), .status = event } });
                 mob.event_count = 0;
             }
+            for (mob.damage_events[0..mob.damage_event_count]) |dealt| {
+                // Players' network ids are their slots plus one, and the packet adds one more.
+                const cause: i32 = if (dealt.attacker) |slot| @as(i32, @intCast(slot)) + 2 else 0;
+                try self.deliver(known.view(), .{ .damage = .{ .id = networkId(mob), .type_id = mobs.damageTypeId(dealt.type), .cause = cause } });
+            }
+            mob.damage_event_count = 0;
             pending.subtract(known.view(), desired.view());
             try self.deliver(pending.view(), .{ .remove = networkId(mob) });
             for (self.targetsSent()) |player| known.remove(player);
@@ -235,7 +241,15 @@ pub const MobReplication = struct {
         const changes = Changes.between(view.data, now);
         const interval = self.deps.mobs.traits(mob.species).update_interval;
         defer view.tick_count += 1;
-        if (!(view.tick_count % interval == 0 or mob.has_impulse or changes.any())) return;
+        if (view.tick_count % interval == 0 or mob.has_impulse or changes.any()) try self.sendDue(known, mob, view, now, changes);
+        // A hurt mob's new motion goes out at once, whatever the interval.
+        if (mob.hurt_marked) {
+            mob.hurt_marked = false;
+            try self.deliver(known, .{ .velocity = .{ .id = networkId(mob), .velocity = mob.velocity } });
+        }
+    }
+
+    fn sendDue(self: *MobReplication, known: lightning_rod.system.bit_sets.Set, mob: *Mob, view: *View, now: Data, changes: Changes) !void {
         const yaw = mth.packDegrees(mob.yaw);
         const pitch = mth.packDegrees(mob.pitch);
         const turned = @abs(@as(i32, yaw) - view.yaw) >= 1 or @abs(@as(i32, pitch) - view.pitch) >= 1;
@@ -330,6 +344,7 @@ pub const MobReplication = struct {
             .look => |value| try encoder.fanout(writeLook, targets, .{ value.id, value.yaw, value.pitch, value.on_ground }, 32, deliveries),
             .move_look => |value| try encoder.fanout(writeMoveLook, targets, .{ value.id, value.delta, value.yaw, value.pitch, value.on_ground }, 32, deliveries),
             .head => |value| try encoder.fanout(writeHead, targets, .{ value.id, value.yaw }, 32, deliveries),
+            .damage => |value| try encoder.fanout(writeDamage, targets, .{ value.id, value.type_id, value.cause }, 32, deliveries),
         }
         for (targets, deliveries) |target, delivery| switch (delivery) {
             .queued, .closed => {
@@ -354,6 +369,7 @@ const Outgoing = union(enum) {
     look: struct { id: i32, yaw: i8, pitch: i8, on_ground: bool },
     move_look: struct { id: i32, delta: [3]i16, yaw: i8, pitch: i8, on_ground: bool },
     head: struct { id: i32, yaw: i8 },
+    damage: struct { id: i32, type_id: i32, cause: i32 },
 };
 
 /// Negative entity ids, as items and orbs use, since players take the small positive ones.
@@ -518,4 +534,12 @@ fn writeRemove(packet: wire.play.toClient.packet_entity_destroy.Writer, id_value
     const ids = try packet.entityIds(1);
     const entry = try ids.element(id_value);
     return (try entry.finish()).finish();
+}
+
+/// ClientboundDamageEventPacket. The cause and the direct cause are the same here, and no
+/// damage mobs take has a position of its own.
+fn writeDamage(packet: wire.play.toClient.packet_damage_event.Writer, id_value: i32, type_id: i32, cause: i32) ![]u8 {
+    const typed = try (try (try (try packet.entityId(id_value)).sourceTypeId(type_id)).sourceCauseId(cause)).sourceDirectId(cause);
+    var position = try typed.sourcePosition();
+    return (try position.advance(try (try position.begin()).none())).finish();
 }

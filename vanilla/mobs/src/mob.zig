@@ -40,6 +40,8 @@ pub const Damage = struct {
     type: DamageType,
     /// The player that dealt it, as a slot in Players, for player attacks.
     attacker: ?u32 = null,
+    /// DamageSource.getSourcePosition, which knockback pushes away from.
+    source: ?[3]f64 = null,
 };
 
 pub const MoveOperation = enum(u2) { wait, move_to, strafe, jumping };
@@ -120,7 +122,8 @@ pub const Mob = struct {
     on_ground_no_blocks: bool = false,
     fall_distance: f64 = 0,
     stuck: [3]f64 = .{ 0, 0, 0 },
-    fire_ticks: i32 = -1,
+    /// Entity.remainingFireTicks, which rests at -getFireImmuneTicks, 0 for mobs.
+    fire_ticks: i32 = 0,
     touching_water: bool = false,
     eye_in_water: bool = false,
     water_height: f64 = 0,
@@ -198,6 +201,9 @@ pub const Mob = struct {
     /// Entity events (Level.broadcastEntityEvent) since the replication last sent them.
     events: [4]u8 = undefined,
     event_count: u8 = 0,
+    /// Damage events (ServerLevel.broadcastDamageEvent) since the replication last sent them.
+    damage_events: [2]Damage = undefined,
+    damage_event_count: u8 = 0,
     /// Rises when data viewers see changes: health, age, fire, air, pose.
     revision: u32 = 0,
 
