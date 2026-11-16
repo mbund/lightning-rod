@@ -40,6 +40,8 @@ const Collector = struct {
     final: [128]Action = undefined,
     final_count: usize = 0,
     last_step: i32 = -1,
+    /// Whether a block or fluid with an inside effect was within reach.
+    acted: bool = false,
 
     fn advanceStep(self: *Collector, step: i32) void {
         if (self.last_step == step) return;
@@ -86,12 +88,13 @@ const Collector = struct {
     }
 };
 
-/// Entity.applyEffectsFromBlocks.
-pub fn applyEffectsFromBlocks(mobs: *Mobs, mob: *Mob) !void {
+/// Entity.applyEffectsFromBlocks. Whether a block under or around the mob could act on it, as
+/// resting mobs need none to.
+pub fn applyEffectsFromBlocks(mobs: *Mobs, mob: *Mob) !bool {
     defer mob.movement_count = 0;
-    var movements: [mob.movements.len + 1]Movement = undefined;
+    var movements: [mobs.movements.len + 1]Movement = undefined;
     var count: usize = mob.movement_count;
-    @memcpy(movements[0..count], mob.movements[0..count]);
+    @memcpy(movements[0..count], mobs.movements[0..count]);
     if (count == 0) {
         movements[0] = .{ .from = mob.old_position, .to = mob.position, .axis_independent = false };
         count = 1;
@@ -105,8 +108,9 @@ pub fn applyEffectsFromBlocks(mobs: *Mobs, mob: *Mob) !void {
             count += 1;
         }
     }
-    if (mob.removed) return;
-    if (mob.on_ground) try stepOn(mobs, mob);
+    if (mob.removed) return true;
+    var acted = false;
+    if (mob.on_ground) acted = try stepOn(mobs, mob);
     const burning = onFire(mobs, mob);
     const freezing = mob.ticks_frozen > 0;
     const fire_before = mob.fire_ticks;
@@ -124,6 +128,7 @@ pub fn applyEffectsFromBlocks(mobs: *Mobs, mob: *Mob) !void {
     }
     const ignited = mob.fire_ticks > fire_before;
     if (!onFire(mobs, mob) and !ignited) mob.fire_ticks = 0;
+    return acted or collector.acted;
 }
 
 /// Entity.isOnFire on the server.
@@ -131,12 +136,13 @@ pub fn onFire(mobs: *Mobs, mob: *const Mob) bool {
     return !mobs.traits(mob.species).fire_immune and mob.fire_ticks > 0;
 }
 
-/// Block.stepOn for the block under the mob's feet.
-fn stepOn(mobs: *Mobs, mob: *Mob) !void {
+/// Block.stepOn for the block under the mob's feet, and whether that block does anything.
+fn stepOn(mobs: *Mobs, mob: *Mob) !bool {
     const level = mobs.level(mob.world);
     const at = try living.onPosition(mobs, mob, 0.2);
     const state = try level.state(at[0], at[1], at[2]);
-    switch (level.blocks.get(state).kind) {
+    const kind = level.blocks.get(state).kind;
+    switch (kind) {
         // MagmaBlock: mobs never step carefully.
         .magma_block => _ = try mobs.hurt(mob, .{ .type = .hot_floor }, 1.0),
         // SlimeBlock: slow on it unless falling or rising fast.
@@ -152,6 +158,7 @@ fn stepOn(mobs: *Mobs, mob: *Mob) !void {
         .turtle_egg => if (mobs.mobGriefing() and mobs.levelRandom().nextIntBounded(100) == 0) try mobs.crackTurtleEgg(mob.world, at, state),
         else => {},
     }
+    return kind == .magma_block or kind == .slime_block or kind == .turtle_egg;
 }
 
 /// Entity.checkInsideBlocks over the tick's movements, each split by axis where it moved
@@ -314,6 +321,7 @@ fn visit(mobs: *Mobs, mob: *Mob, position: [3]i32, step: i32, from: [3]f64, to: 
     const entry = level.blocks.get(state);
     if (entry.flags.air) return true;
     if (!visited.add(position)) return true;
+    if (insideActs(entry.kind) or game_data.physics.get(state).fluid != .none) collector.acted = true;
     if (try meetsInside(mobs, mob, state, position, from, to)) {
         collector.advanceStep(step);
         try entityInside(mobs, mob, state, position, collector);
@@ -405,6 +413,14 @@ fn clipBox(box: Box, from: [3]f64, to: [3]f64) bool {
         if (enter > leave) return false;
     }
     return true;
+}
+
+/// The kinds entityInside does something for, lit or not.
+fn insideActs(kind: @import("mob_blocks.zig").Kind) bool {
+    return switch (kind) {
+        .cactus, .fire, .soul_fire, .campfire, .soul_campfire, .sweet_berry_bush, .cobweb, .powder_snow, .honey_block, .bubble_column, .lava_cauldron, .water_cauldron, .powder_snow_cauldron => true,
+        else => false,
+    };
 }
 
 /// BlockBehaviour.entityInside, for the blocks that do something to a mob.

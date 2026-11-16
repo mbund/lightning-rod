@@ -226,7 +226,7 @@ pub const MobInteraction = struct {
             return;
         }
         // Animal.mobInteract.
-        if (try self.deps.mobs.isFood(mob, held)) {
+        if (try self.deps.mobs.isFood(held)) {
             if (mob.age == 0 and mob.in_love <= 0) {
                 try self.usePlayerItem(slot, hand);
                 self.deps.mobs.setInLove(mob, player.uuid);

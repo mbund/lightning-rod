@@ -64,6 +64,13 @@ const Options = struct {
     paced: bool = false,
     /// Cows on a grid around the players, settled before measuring.
     cows: usize = 0,
+    /// Blocks between neighbouring cows, and how far east of the players the field's middle is.
+    cow_spacing: f64 = 2,
+    cow_offset: f64 = 0,
+    /// Ticks the cows get to settle before measuring.
+    settle: usize = 400,
+    /// A perf control FIFO to enable recording on as measuring starts (perf record -D -1 --control).
+    perf_control: ?[]const u8 = null,
     /// Ticks between block edits among the cows, a fence placed then taken away.
     edit_interval: usize = 0,
 };
@@ -90,6 +97,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
         lightning_rod.plugin.replace(vanilla.plugins(), .{
             lightning_rod.plugin.configured(Players, .{ .maximum = maximum, .render_distance = 8 }),
             lightning_rod.plugin.configured(Chunks, Chunks.Configuration.forPlayers(maximum)),
+            lightning_rod.plugin.configured(vanilla.Mobs, .{ .maximum = @max(1024, options.cows) }),
             lightning_rod.plugin.configured(sessions.World, .{ .endpoint = service }),
             lightning_rod.plugin.configured(vanilla.RecipeBook, .{ .packet_bytes = service.config.page_bytes }),
         }),
@@ -145,20 +153,30 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     for (0..200) |tick| try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
     const mobs = simulation.get(vanilla.Mobs);
     if (options.cows > 0) {
-        // Two blocks apart on the flat grass, around the players at 8, 8.
+        // A square field on the flat grass, its middle east of the players at 8, 8 by the offset.
         const side = std.math.sqrt(options.cows - 1) + 1;
         for (0..options.cows) |index| {
-            const x = 8.5 + 2 * (@as(f64, @floatFromInt(index % side)) - @as(f64, @floatFromInt(side / 2)));
-            const z = 8.5 + 2 * (@as(f64, @floatFromInt(index / side)) - @as(f64, @floatFromInt(side / 2)));
+            const x = 8.5 + options.cow_offset + options.cow_spacing * (@as(f64, @floatFromInt(index % side)) - @as(f64, @floatFromInt(side / 2)));
+            const z = 8.5 + options.cow_spacing * (@as(f64, @floatFromInt(index / side)) - @as(f64, @floatFromInt(side / 2)));
             _ = try mobs.spawn(.{ .species = .cow, .world = spawn_world, .position = .{ x, 65, z }, .yaw = 0 });
         }
-        for (0..400) |tick| try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
+        for (0..options.settle) |tick| try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
     }
     const fence: u16 = @intCast(game_data.registry.blockStateId("minecraft:oak_fence[east=false,north=false,south=false,waterlogged=false,west=false]").?);
     const air: u16 = @intCast(game_data.registry.blockStateId("minecraft:air").?);
     var edits: usize = 0;
+    const ticks_before = try allocator.alloc(i32, mobs.mobs.len);
+    defer allocator.free(ticks_before);
+    for (mobs.mobs, ticks_before) |mob, *tick_count| tick_count.* = mob.tick_count;
     const searches_before = mobs.path_searches;
+    const skipped_before = mobs.travels_skipped;
+    const run_before = mobs.travels_run;
     const recomputes_before = mobs.edit_recomputes;
+    if (options.perf_control) |control| {
+        const fifo = try std.Io.Dir.cwd().openFile(io, control, .{ .mode = .write_only });
+        defer fifo.close(io);
+        try fifo.writeStreamingAll(io, "enable\n");
+    }
     const inventories = simulation.get(Inventories);
     const chunks = simulation.get(Chunks);
     const reads = inventories.cache.metrics.reads.value() + inventories.items.metrics.reads.value() + chunks.cache.metrics.reads.value();
@@ -190,7 +208,15 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     const ticks = options.ticks * options.samples;
     const tick_ns = tick_time / ticks;
     try writer.print("{s: <10} {d: >7} {d: >7} {d: >11.2} {d: >11.2} {d: >11.2} {d: >10.2} {d: >12.2}\n", .{ @tagName(mode), count, maximum, @as(f64, @floatFromInt(cpus[options.samples / 2])) / @as(f64, @floatFromInt(options.ticks)) / 1000, @as(f64, @floatFromInt(walls[options.samples / 2])) / @as(f64, @floatFromInt(options.ticks)) / 1000, @as(f64, @floatFromInt(tick_ns)) / 1000, @as(f64, @floatFromInt(packets)) / @as(f64, @floatFromInt(ticks)), @as(f64, @floatFromInt(recipients)) / @as(f64, @floatFromInt(ticks)) });
-    if (options.cows > 0) try writer.print("  cows={d} path_searches={d:.3}/tick edits={d} edit_recomputes={d} edits_dropped={d} sections_decoded={d}\n", .{ mobs.active.values().len, @as(f64, @floatFromInt(mobs.path_searches - searches_before)) / @as(f64, @floatFromInt(ticks)), edits, mobs.edit_recomputes - recomputes_before, mobs.edits_dropped, mobs.copies.decoded });
+    var resting: usize = 0;
+    var ticked: usize = 0;
+    for (mobs.active.values()) |index| {
+        if (mobs.mobs[index].resting) resting += 1;
+        if (mobs.mobs[index].tick_count != ticks_before[index]) ticked += 1;
+        const mob = &mobs.mobs[index];
+        if (options.detail and !mob.resting and mob.tick_count != ticks_before[index] and ticked % 97 == 0) try writer.print("  awake {any} v={any} ground={} hc={} fall={d} water={}\n", .{ mob.position, mob.velocity, mob.on_ground, mob.horizontal_collision, mob.fall_distance, mob.touching_water });
+    }
+    if (options.cows > 0) try writer.print("  cows={d} ticked={d} resting={d} travels_skipped={d} travels_run={d} path_searches={d:.3}/tick edits={d} edit_recomputes={d} edits_dropped={d} sections_decoded={d}\n", .{ mobs.active.values().len, ticked, resting, mobs.travels_skipped - skipped_before, mobs.travels_run - run_before, @as(f64, @floatFromInt(mobs.path_searches - searches_before)) / @as(f64, @floatFromInt(ticks)), edits, mobs.edit_recomputes - recomputes_before, mobs.edits_dropped, mobs.copies.decoded });
     if (options.detail) for (snapshots, before[0..snapshots.len]) |after, previous| {
         if (after.kind == .counter) {
             const operations = after.value - previous.value;
@@ -250,6 +276,14 @@ pub fn main(init: std.process.Init) !void {
             options.samples = try std.fmt.parseInt(usize, argument[10..], 10);
         } else if (std.mem.startsWith(u8, argument, "--cows=")) {
             options.cows = try std.fmt.parseInt(usize, argument[7..], 10);
+        } else if (std.mem.startsWith(u8, argument, "--cow-spacing=")) {
+            options.cow_spacing = try std.fmt.parseFloat(f64, argument[14..]);
+        } else if (std.mem.startsWith(u8, argument, "--perf-control=")) {
+            options.perf_control = argument[15..];
+        } else if (std.mem.startsWith(u8, argument, "--settle=")) {
+            options.settle = try std.fmt.parseInt(usize, argument[9..], 10);
+        } else if (std.mem.startsWith(u8, argument, "--cow-offset=")) {
+            options.cow_offset = try std.fmt.parseFloat(f64, argument[13..]);
         } else if (std.mem.startsWith(u8, argument, "--edit-interval=")) {
             options.edit_interval = try std.fmt.parseInt(usize, argument[16..], 10);
         } else if (std.mem.eql(u8, argument, "--detail")) {

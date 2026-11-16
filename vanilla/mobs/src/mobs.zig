@@ -163,15 +163,23 @@ pub const Mobs = struct {
     /// Path searches run, and recomputations edits asked for, for measuring.
     path_searches: u64 = 0,
     edit_recomputes: u64 = 0,
+    /// Travels resting mobs skipped, and travels run, for measuring.
+    travels_skipped: u64 = 0,
+    travels_run: u64 = 0,
     /// Mobs following a path while a batch of edits is answered.
     candidates: []u32,
     /// Blocks as they stood after the edit being answered, which levels read while it is set.
     overlay: body.Overlay,
     overlay_view: ?*const body.Overlay = null,
+    /// By player slot, whether the player holds cow food in either hand, noted as mobs start
+    /// ticking: tempting asks every other tick for every mob, and hands change only between.
+    holding_food: []bool,
     /// Worlds' levels found this tick, kept only while mobs tick.
     views: [8]WorldView = undefined,
     view_count: usize = 0,
     ticking: bool = false,
+    /// Entity.movementThisTick for the mob ticking, which only it adds to and reads.
+    movements: [8]mob_state.Movement = undefined,
     /// The last path found, until a navigation takes it.
     scratch_path: []pathfinding.PathNode,
     scratch: struct { count: u16 = 0, target: [3]i32 = .{ 0, 0, 0 }, reached: bool = false } = .{},
@@ -222,6 +230,7 @@ pub const Mobs = struct {
             .scratch_path = try allocator.alloc(pathfinding.PathNode, path_capacity),
             .edits = try allocator.alloc(body.Edit, config.edits),
             .candidates = try allocator.alloc(u32, config.maximum),
+            .holding_food = try allocator.alloc(bool, deps.players.records.len),
             .overlay = try .init(allocator, config.edits),
             .damage_flags = try allocator.alloc(damage.Flags, @typeInfo(mob_state.DamageType).@"enum".field_names.len),
             .damage_ids = try allocator.alloc(i32, @typeInfo(mob_state.DamageType).@"enum".field_names.len),
@@ -359,6 +368,9 @@ pub const Mobs = struct {
         self.active.insert(index);
         self.residents[index] = .{ .id = created.id };
         self.locate(index);
+        // A mob appearing touches the mobs around it.
+        const placed = living.box(self, &self.mobs[index]);
+        self.wake(created.world, placed.min, placed.max);
         return created.id;
     }
 
@@ -399,6 +411,7 @@ pub const Mobs = struct {
     pub fn tick(self: *Mobs) !void {
         self.tickViews(true);
         defer self.tickViews(false);
+        try self.noteHeldFood();
         defer self.copies.endTick();
         try self.answerEdits();
         for (self.active.values()) |index| {
@@ -418,6 +431,19 @@ pub const Mobs = struct {
     /// is kept until the next answer, so each path that recomputes can see the world as it stood.
     fn blocksChanged(self: *Mobs, section: chunks.Section, edits: []const chunks.BlockEdit, previous: []const u16) void {
         if (self.active.values().len == 0) return;
+        // Resting mobs near any edit wake, a section's batch at a time.
+        var low: [3]i32 = .{ 15, 15, 15 };
+        var high: [3]i32 = .{ 0, 0, 0 };
+        for (edits) |edit| {
+            const index: i32 = edit.index;
+            const cell: [3]i32 = .{ index & 15, index >> 8, (index >> 4) & 15 };
+            for (0..3) |axis| {
+                low[axis] = @min(low[axis], cell[axis]);
+                high[axis] = @max(high[axis], cell[axis]);
+            }
+        }
+        const origin: [3]i32 = .{ section.x * 16, section.y * 16, section.z * 16 };
+        self.wake(section.world, .{ @floatFromInt(origin[0] + low[0]), @floatFromInt(origin[1] + low[1]), @floatFromInt(origin[2] + low[2]) }, .{ @floatFromInt(origin[0] + high[0] + 1), @floatFromInt(origin[1] + high[1] + 1), @floatFromInt(origin[2] + high[2] + 1) });
         for (edits, previous) |edit, old| {
             const collision = self.blocks.get(old).collision != self.blocks.get(edit.state).collision;
             if (!collision and self.edit_count == 0) continue;
@@ -534,7 +560,32 @@ pub const Mobs = struct {
     }
 
     /// AbstractCow.isFood: the cow_food item tag.
-    pub fn isFood(self: *Mobs, _: *const Mob, stack: inventories.Stack) !bool {
+    fn noteHeldFood(self: *Mobs) !void {
+        for (self.deps.players.activeSlots()) |slot| self.holding_food[slot] = try self.holdsFoodNow(@intCast(slot));
+    }
+
+    /// Whether a player holds food the mob is tempted by in either hand.
+    fn holdsFoodNow(self: *Mobs, slot: u32) !bool {
+        const player = &self.deps.players.records[slot];
+        const state = self.deps.player_states.of(player);
+        const slots = [_]inventories.Slot{
+            .{ .owner = player.uuid, .index = 36 + @as(u16, state.selected_slot) },
+            .{ .owner = player.uuid, .index = 45 },
+        };
+        for (slots) |held| {
+            const stack = (try self.deps.inventories.get(held)).stack orelse continue;
+            if (try self.isFood(stack)) return true;
+        }
+        return false;
+    }
+
+    /// Whether the player held cow food when mobs started ticking.
+    pub fn holdsFood(self: *const Mobs, slot: u32) bool {
+        assert(self.ticking);
+        return self.holding_food[slot];
+    }
+
+    pub fn isFood(self: *Mobs, stack: inventories.Stack) !bool {
         const tag = self.food_tag orelse return false;
         const pinned = try self.deps.items.acquire(stack);
         defer pinned.release();
@@ -800,10 +851,28 @@ pub const Mobs = struct {
     }
 
     /// AgeableMob.setAge: growing up or becoming a baby changes the size viewers see.
-    pub fn setAge(_: *Mobs, mob: *Mob, age: i32) void {
+    pub fn setAge(self: *Mobs, mob: *Mob, age: i32) void {
         const was_baby = mob.age < 0;
         mob.age = age;
-        if (was_baby != (age < 0)) mob.revision +%= 1;
+        if (was_baby == (age < 0)) return;
+        mob.revision +%= 1;
+        // A new size reaches new blocks and mobs.
+        const grown = living.box(self, mob);
+        self.wake(mob.world, grown.min, grown.max);
+    }
+
+    /// Wakes the resting mobs within reach of a region, which then tick in full. A resting mob
+    /// reads blocks up to two outside its box, and touches mobs inside it.
+    pub fn wake(self: *Mobs, world: u32, low: [3]f64, high: [3]f64) void {
+        const margin = 2.0;
+        const reach: body.Box = .{ .min = .{ low[0] - margin, low[1] - margin, low[2] - margin }, .max = .{ high[0] + margin, high[1] + margin, high[2] + margin } };
+        const first: [2]i32 = .{ @divFloor(mth_floor(reach.min[0]), 16), @divFloor(mth_floor(reach.min[2]), 16) };
+        const last: [2]i32 = .{ @divFloor(mth_floor(reach.max[0]), 16), @divFloor(mth_floor(reach.max[2]), 16) };
+        var candidates = self.spatial.rectangle(world, first, last);
+        while (candidates.next()) |index| {
+            const mob = &self.mobs[index];
+            if (mob.resting and living.box(self, mob).intersects(reach)) mob.resting = false;
+        }
     }
 
     /// The squared distance to the nearest player in the world who is not a spectator, as
@@ -824,17 +893,22 @@ pub const Mobs = struct {
     }
 
     /// LivingEntity.pushEntities: mobs push the mobs their box overlaps, and each moves apart.
-    pub fn pushEntities(self: *Mobs, mob: *Mob) !void {
+    /// How many it touched, each of which wakes, as resting mobs skip their own query.
+    pub fn pushEntities(self: *Mobs, mob: *Mob) !u32 {
         const own = living.box(self, mob);
         const low: [2]i32 = .{ @divFloor(mth_floor(own.min[0]) - 1, 16), @divFloor(mth_floor(own.min[2]) - 1, 16) };
         const high: [2]i32 = .{ @divFloor(mth_floor(own.max[0]) + 1, 16), @divFloor(mth_floor(own.max[2]) + 1, 16) };
         var candidates = self.spatial.rectangle(mob.world, low, high);
+        var touched: u32 = 0;
         while (candidates.next()) |index| {
             const other = &self.mobs[index];
-            if (other == mob or other.removed or !other.alive()) continue;
+            if (other.id == mob.id or other.removed or !other.alive()) continue;
             if (!living.box(self, other).intersects(own)) continue;
+            other.resting = false;
+            touched += 1;
             push(other, mob);
         }
+        return touched;
     }
 
     /// FarmBlock.turnToDirt.

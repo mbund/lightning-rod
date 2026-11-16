@@ -67,7 +67,13 @@ const View = struct {
     teleport_delay: u32 = 0,
     was_on_ground: bool = false,
     data: Data = .{},
+    /// Where the mob stood when its audience was last worked out, which holds while neither it nor
+    /// any player or what players see changes.
+    audience_at: ?[3]f64 = null,
 };
+
+/// What a player was, as audiences last saw them.
+const PlayerMark = struct { position: [3]f64 = .{ 0, 0, 0 }, world: u32 = 0, ready: bool = false };
 
 const Connection = struct { generation: u32 = 0, life: u32 = 0, world: u32 = 0, ready: bool = false };
 
@@ -80,6 +86,10 @@ pub const MobReplication = struct {
     views: []View,
     connections: []Connection,
     tracked: lightning_rod.system.IndexSet,
+    marks: []PlayerMark,
+    mark_count: usize = 0,
+    /// A player's connection or world changed since audiences were last worked out.
+    connections_changed: bool = false,
     known: audience.Matrix,
     scratch: audience.Matrix,
     targets: []sessions.Service.Target,
@@ -96,6 +106,7 @@ pub const MobReplication = struct {
             .views = try allocator.alloc(View, count),
             .connections = try allocator.alloc(Connection, deps.players.records.len),
             .tracked = try .init(allocator, deps.players.records.len),
+            .marks = try allocator.alloc(PlayerMark, deps.players.records.len),
             .known = try .init(allocator, deps.players, count, config.audience_words, .recipients),
             .scratch = try .init(allocator, deps.players, 2, config.audience_words, .recipients),
             .targets = try allocator.alloc(sessions.Service.Target, deps.players.records.len),
@@ -104,6 +115,7 @@ pub const MobReplication = struct {
         };
         @memset(self.views, .{});
         @memset(self.connections, .{});
+        @memset(self.marks, .{});
         return self;
     }
 
@@ -111,6 +123,7 @@ pub const MobReplication = struct {
         const mobs = self.deps.mobs;
         self.forgetChangedConnections();
         const visibility = self.deps.streaming.snapshotVisibility();
+        const audience_changed = self.audienceChanged(visibility);
         var offset: usize = 0;
         while (offset < mobs.active.values().len) {
             const index = mobs.active.values()[offset];
@@ -122,9 +135,6 @@ pub const MobReplication = struct {
                 assert(!known.view().any());
                 view.* = start(mob);
             }
-            const desired = self.scratch.row(0);
-            if (mob.removed) desired.clear() else self.interest(mob, visibility, desired);
-            const pending = self.scratch.row(1);
             // Events first, so a death's puff arrives before the removal.
             if (mob.event_count > 0) {
                 for (mob.events[0..mob.event_count]) |event| try self.deliver(known.view(), .{ .status = .{ .id = networkId(mob), .status = event } });
@@ -136,11 +146,19 @@ pub const MobReplication = struct {
                 try self.deliver(known.view(), .{ .damage = .{ .id = networkId(mob), .type_id = mobs.damageTypeId(dealt.type), .cause = cause } });
             }
             mob.damage_event_count = 0;
-            pending.subtract(known.view(), desired.view());
-            try self.deliver(pending.view(), .{ .remove = networkId(mob) });
-            for (self.targetsSent()) |player| known.remove(player);
-            pending.subtract(desired.view(), known.view());
-            try self.pair(index, mob, view, pending);
+            // The audience holds while neither the mob nor any player or what they see changed.
+            const settled = !audience_changed and !mob.removed and view.audience_at != null and std.meta.eql(view.audience_at.?, mob.position);
+            if (!settled) {
+                const desired = self.scratch.row(0);
+                if (mob.removed) desired.clear() else self.interest(mob, visibility, desired);
+                const pending = self.scratch.row(1);
+                pending.subtract(known.view(), desired.view());
+                try self.deliver(pending.view(), .{ .remove = networkId(mob) });
+                for (self.targetsSent()) |player| known.remove(player);
+                pending.subtract(desired.view(), known.view());
+                try self.pair(index, mob, view, pending);
+                view.audience_at = mob.position;
+            }
             try self.sendChanges(index, mob, view);
             if (mob.removed and !known.view().any()) {
                 view.* = .{};
@@ -148,6 +166,25 @@ pub const MobReplication = struct {
                 offset -= 1;
             }
         }
+    }
+
+    /// Whether anything an audience depends on changed since last tick: a connection, a player's
+    /// place or readiness, the set of players, or the columns any player sees.
+    fn audienceChanged(self: *MobReplication, visibility: *const Streaming.Visibility) bool {
+        var changed = self.connections_changed;
+        self.connections_changed = false;
+        if (visibility.reset.values().len != 0 or visibility.changed_words.values().len != 0) changed = true;
+        const active = self.deps.players.activeSlots();
+        if (active.len != self.mark_count) changed = true;
+        self.mark_count = active.len;
+        for (active) |slot| {
+            const player = self.deps.players.records[slot];
+            const mark: PlayerMark = .{ .position = .{ player.position.x, player.position.y, player.position.z }, .world = player.world, .ready = player.stage == .ready and player.handle != null };
+            if (std.meta.eql(self.marks[slot], mark)) continue;
+            self.marks[slot] = mark;
+            changed = true;
+        }
+        return changed;
     }
 
     fn targetsSent(self: *const MobReplication) []const usize {
@@ -167,10 +204,12 @@ pub const MobReplication = struct {
             const ready = player.stage == .ready and player.handle != null;
             if (connection.generation != generation or connection.life != player.life or connection.world != player.world or connection.ready != ready) {
                 for (mobs.active.values()) |index| self.known.row(index).remove(at);
+                self.connections_changed = true;
                 connection.* = .{ .generation = generation, .life = player.life, .world = player.world, .ready = ready };
             }
             if (player.handle == null) {
                 self.tracked.remove(at);
+                self.connections_changed = true;
                 continue;
             }
             cursor += 1;

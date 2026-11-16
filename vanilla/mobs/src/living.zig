@@ -51,13 +51,14 @@ fn lengthSquared(vector: [3]f64) f64 {
 
 /// Entity.addMovementThisTick: block effects trace these at the end of the tick. Vanilla
 /// keeps up to 100 and merges the oldest two past that, the same rule over fewer.
-fn addMovement(mob: *Mob, movement: Movement) void {
-    if (mob.movement_count == mob.movements.len) {
-        mob.movements[1] = .{ .from = mob.movements[0].from, .to = mob.movements[1].to, .axis_independent = false };
-        std.mem.copyForwards(Movement, mob.movements[0 .. mob.movements.len - 1], mob.movements[1..]);
+fn addMovement(mobs: *Mobs, mob: *Mob, movement: Movement) void {
+    const movements = &mobs.movements;
+    if (mob.movement_count == movements.len) {
+        movements[1] = .{ .from = movements[0].from, .to = movements[1].to, .axis_independent = false };
+        std.mem.copyForwards(Movement, movements[0 .. movements.len - 1], movements[1..]);
         mob.movement_count -= 1;
     }
-    mob.movements[mob.movement_count] = movement;
+    movements[mob.movement_count] = movement;
     mob.movement_count += 1;
 }
 
@@ -80,7 +81,7 @@ pub fn move(mobs: *Mobs, mob: *Mob, requested_in: [3]f64) !void {
         }
         const from = mob.position;
         const to: [3]f64 = .{ from[0] + moved[0], from[1] + moved[1], from[2] + moved[2] };
-        addMovement(mob, .{ .from = from, .to = to, .axis_independent = true });
+        addMovement(mobs, mob, .{ .from = from, .to = to, .axis_independent = true });
         mob.position = to;
     }
     const blocked_x = !mth.equal(requested[0], moved[0]);

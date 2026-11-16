@@ -4,7 +4,6 @@
 
 const std = @import("std");
 const game_data = @import("game_data");
-const inventories = @import("inventories");
 const mth = @import("mth.zig");
 const body = @import("body.zig");
 const living = @import("living.zig");
@@ -52,7 +51,6 @@ pub fn test_(mobs: *Mobs, mob: *const Mob, conditions: Conditions, slot: u32) !b
     const state = mobs.deps.player_states.of(player);
     // LivingEntity.canBeSeenByAnyone.
     if (state.gamemode == .spectator or state.health <= 0) return false;
-    if (conditions.holding_food and !try holdsFood(mobs, mob, slot)) return false;
     // LivingEntity.getVisibilityPercent: sneaking players are noticed closer.
     const visibility: f64 = if (player.flags.sneaking) 0.8 else 1.0;
     const reach = @max(conditions.range * visibility, 2.0);
@@ -60,6 +58,8 @@ pub fn test_(mobs: *Mobs, mob: *const Mob, conditions: Conditions, slot: u32) !b
     const dy = mob.position[1] - player.position.y;
     const dz = mob.position[2] - player.position.z;
     if (dx * dx + dy * dy + dz * dz > reach * reach) return false;
+    // Vanilla tests the selector before the range, and both only read, so the cheaper goes first.
+    if (conditions.holding_food and !mobs.holdsFood(slot)) return false;
     if (conditions.line_of_sight and !try hasLineOfSight(mobs, mob, .{ player.position.x, player.position.y + playerEyeHeight(player.flags.sneaking), player.position.z })) return false;
     return true;
 }
@@ -67,21 +67,6 @@ pub fn test_(mobs: *Mobs, mob: *const Mob, conditions: Conditions, slot: u32) !b
 pub fn playerEye(mobs: *Mobs, slot: u32) [3]f64 {
     const player = &mobs.deps.players.records[slot];
     return .{ player.position.x, player.position.y + playerEyeHeight(player.flags.sneaking), player.position.z };
-}
-
-/// Whether the player holds food the mob is tempted by in either hand.
-fn holdsFood(mobs: *Mobs, mob: *const Mob, slot: u32) !bool {
-    const player = &mobs.deps.players.records[slot];
-    const state = mobs.deps.player_states.of(player);
-    const slots = [_]inventories.Slot{
-        .{ .owner = player.uuid, .index = 36 + @as(u16, state.selected_slot) },
-        .{ .owner = player.uuid, .index = 45 },
-    };
-    for (slots) |held| {
-        const stack = (try mobs.deps.inventories.get(held)).stack orelse continue;
-        if (try mobs.isFood(mob, stack)) return true;
-    }
-    return false;
 }
 
 /// LivingEntity.hasLineOfSight: no collision shape between the eyes, within 128 blocks.

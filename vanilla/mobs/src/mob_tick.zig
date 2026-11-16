@@ -1,8 +1,14 @@
 //! One mob's tick in vanilla's order: ServerLevel.tickNonPassenger with Mob.checkDespawn before
 //! it, then Mob.tick, which runs LivingEntity.tick (base tick, AI step, travel, block effects,
 //! pushing) and turns the body.
+//!
+//! A resting mob (Mob.resting) skips the parts that only read blocks and neighbours: fluids and
+//! eyes, the wall check, travel, block effects and pushing. Each would find what it found last
+//! tick, so skipping changes nothing, and in Debug every skip runs the full part on a copy and
+//! asserts the copy comes out the same. Random draws, goals, timers and turning always run.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const game_data = @import("game_data");
 const mth = @import("mth.zig");
 const living = @import("living.zig");
@@ -12,6 +18,17 @@ const mob_state = @import("mob.zig");
 const Mobs = @import("mobs.zig").Mobs;
 
 const Mob = mob_state.Mob;
+const assert = std.debug.assert;
+
+/// Debug builds check every skip against the work it skips.
+const verify_rest = builtin.mode == .debug;
+
+/// What this tick found that keeps a mob from resting.
+const Findings = struct {
+    in_wall: bool = false,
+    blocks_acted: bool = false,
+    touched: u32 = 0,
+};
 
 pub fn tick(mobs: *Mobs, mob: *Mob) !void {
     checkDespawn(mobs, mob);
@@ -19,11 +36,40 @@ pub fn tick(mobs: *Mobs, mob: *Mob) !void {
     mob.old_yaw = mob.yaw;
     mob.old_pitch = mob.pitch;
     mob.tick_count += 1;
-    try baseTick(mobs, mob);
-    if (!mob.removed) try aiStep(mobs, mob);
+    var findings: Findings = .{};
+    try baseTick(mobs, mob, &findings);
+    if (!mob.removed) try aiStep(mobs, mob, &findings);
     turnBody(mobs, mob);
     // Mob.tick: passengers decide the control flags, and mobs here carry none.
     if (@rem(mob.tick_count, 5) == 0) mob.goals.disabled = 0;
+    settle(mob, findings);
+}
+
+/// Whether the mob is where it rested, so what it read there still holds.
+fn restsInPlace(mob: *const Mob) bool {
+    return mob.resting and std.meta.eql(mob.position, mob.rest_position);
+}
+
+/// Rests after a tick that left the mob standing still on the ground, moving only as gravity
+/// pulls it into the floor, with nothing in or under it acting on it and no mob touching it.
+fn settle(mob: *Mob, findings: Findings) void {
+    mob.resting = !mob.removed and mob.alive() and !findings.in_wall and !findings.blocks_acted and findings.touched == 0 and
+        mob.on_ground and !mob.horizontal_collision and std.meta.eql(mob.position, mob.old_position) and
+        mob.velocity[0] == 0 and mob.velocity[2] == 0 and mob.fall_distance == 0 and
+        !mob.touching_water and mob.lava_height == 0 and !mob.eye_in_water and
+        !mob.in_powder_snow and !mob.was_in_powder_snow and mob.ticks_frozen == 0 and mob.fire_ticks == 0 and
+        std.meta.eql(mob.stuck, [3]f64{ 0, 0, 0 }) and mob.last_climbable == null and mob.movement_count == 0;
+    if (!mob.resting) return;
+    mob.rest_position = mob.position;
+    mob.rest_velocity = mob.velocity;
+}
+
+/// In Debug, the skipped part run on a copy must leave it as the skip leaves the mob.
+fn checkSkip(mob: *const Mob, copy: *const Mob) void {
+    if (!std.meta.eql(copy.*, mob.*)) {
+        std.debug.print("rest skip diverged for mob {d} at {any}\n", .{ mob.id, mob.position });
+        unreachable;
+    }
 }
 
 /// Mob.checkDespawn. Animals never despawn, but a mob no player is near stops counting as
@@ -44,12 +90,21 @@ fn checkDespawn(mobs: *Mobs, mob: *Mob) void {
 }
 
 /// Entity.baseTick, LivingEntity.baseTick and Mob.baseTick.
-fn baseTick(mobs: *Mobs, mob: *Mob) !void {
+fn baseTick(mobs: *Mobs, mob: *Mob, findings: *Findings) !void {
     // Entity.baseTick.
     mob.was_in_powder_snow = mob.in_powder_snow;
     mob.in_powder_snow = false;
-    try living.updateFluids(mobs, mob);
-    try living.updateEyes(mobs, mob);
+    if (restsInPlace(mob)) {
+        if (verify_rest) {
+            var copy = mob.*;
+            try living.updateFluids(mobs, &copy);
+            try living.updateEyes(mobs, &copy);
+            checkSkip(mob, &copy);
+        }
+    } else {
+        try living.updateFluids(mobs, mob);
+        try living.updateEyes(mobs, mob);
+    }
     if (mob.fire_ticks > 0) {
         if (mobs.traits(mob.species).fire_immune) {
             mob.fire_ticks -= 4;
@@ -70,11 +125,14 @@ fn baseTick(mobs: *Mobs, mob: *Mob) !void {
     // LivingEntity.baseTick.
     if (mobs.traits(mob.species).fire_immune) mob.fire_ticks = 0;
     if (mob.alive()) {
-        if (try inWall(mobs, mob)) _ = try mobs.hurt(mob, .{ .type = .in_wall }, 1);
-        const level = mobs.level(mob.world);
-        const eye = living.eyeY(mobs, mob);
-        const at_eye = level.blocks.get(try level.state(mth.floor(mob.position[0]), mth.floor(eye), mth.floor(mob.position[2])));
-        if (mob.eye_in_water and at_eye.kind != .bubble_column) {
+        if (restsInPlace(mob)) {
+            if (verify_rest) assert(!try inWall(mobs, mob));
+        } else if (try inWall(mobs, mob)) {
+            findings.in_wall = true;
+            _ = try mobs.hurt(mob, .{ .type = .in_wall }, 1);
+        }
+        // The block at the eyes is only read for a mob whose eyes are in water.
+        if (mob.eye_in_water and !try bubbleAtEyes(mobs, mob)) {
             mob.air_supply = decreaseAir(mobs, mob, mob.air_supply);
             if (mob.air_supply == -20) {
                 mob.air_supply = 0;
@@ -109,6 +167,12 @@ fn baseTick(mobs: *Mobs, mob: *Mob) !void {
             mobs.ambientSound(mob);
         }
     }
+}
+
+fn bubbleAtEyes(mobs: *Mobs, mob: *const Mob) !bool {
+    const level = mobs.level(mob.world);
+    const eye = living.eyeY(mobs, mob);
+    return level.blocks.get(try level.state(mth.floor(mob.position[0]), mth.floor(eye), mth.floor(mob.position[2]))).kind == .bubble_column;
 }
 
 /// LivingEntity.decreaseAirSupply, with no oxygen bonus.
@@ -152,7 +216,7 @@ fn inWall(mobs: *Mobs, mob: *const Mob) !bool {
 }
 
 /// LivingEntity.aiStep with Mob, AgeableMob and Animal's additions.
-fn aiStep(mobs: *Mobs, mob: *Mob) !void {
+fn aiStep(mobs: *Mobs, mob: *Mob, findings: *Findings) !void {
     if (mob.no_jump_delay > 0) mob.no_jump_delay -= 1;
     if (@abs(mob.velocity[0]) < 0.003) mob.velocity[0] = 0;
     if (@abs(mob.velocity[1]) < 0.003) mob.velocity[1] = 0;
@@ -183,8 +247,33 @@ fn aiStep(mobs: *Mobs, mob: *Mob) !void {
     } else {
         mob.no_jump_delay = 0;
     }
-    if (!mob.no_ai) try living.travel(mobs, mob, .{ mob.strafe, mob.vertical_input, mob.forward });
-    try effects.applyEffectsFromBlocks(mobs, mob);
+    const input: [3]f32 = .{ mob.strafe, mob.vertical_input, mob.forward };
+    if (!mob.no_ai) {
+        // At rest with no input, travel pulls the mob into the floor and back as last tick.
+        const still = std.meta.eql(input, [3]f32{ 0, 0, 0 }) and std.meta.eql(mob.velocity, mob.rest_velocity);
+        if (restsInPlace(mob) and still) {
+            mobs.travels_skipped += 1;
+            if (verify_rest) {
+                var copy = mob.*;
+                try living.travel(mobs, &copy, input);
+                checkSkip(mob, &copy);
+            }
+        } else {
+            mobs.travels_run += 1;
+            try living.travel(mobs, mob, input);
+        }
+    }
+    // Blocks act on a mob that moved, or stands in or on one that acts.
+    const unmoved = std.meta.eql(mob.position, mob.old_position) and mob.movement_count == 0 and mob.fire_ticks == 0 and mob.ticks_frozen == 0;
+    if (restsInPlace(mob) and unmoved) {
+        if (verify_rest) {
+            var copy = mob.*;
+            assert(!try effects.applyEffectsFromBlocks(mobs, &copy));
+            checkSkip(mob, &copy);
+        }
+    } else {
+        findings.blocks_acted = try effects.applyEffectsFromBlocks(mobs, mob);
+    }
     // Freezing: powder snow chills, and thaws two ticks at a time outside it.
     if (!mob.in_powder_snow) mob.ticks_frozen = @max(0, mob.ticks_frozen - 2);
     // LivingEntity.removeFrost, then tryAddFrost over anything but air.
@@ -197,7 +286,16 @@ fn aiStep(mobs: *Mobs, mob: *Mob) !void {
         }
     }
     if (@rem(mob.tick_count, 40) == 0 and mob.ticks_frozen >= 140) _ = try mobs.hurt(mob, .{ .type = .freeze }, 1);
-    try mobs.pushEntities(mob);
+    // A mob coming into contact wakes a resting one, so one at rest touches nothing.
+    if (restsInPlace(mob)) {
+        if (verify_rest) {
+            var copy = mob.*;
+            assert(try mobs.pushEntities(&copy) == 0);
+            checkSkip(mob, &copy);
+        }
+    } else {
+        findings.touched = try mobs.pushEntities(mob);
+    }
 
     // AgeableMob.aiStep.
     if (mob.alive()) {

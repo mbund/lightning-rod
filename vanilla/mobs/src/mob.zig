@@ -136,7 +136,7 @@ pub const Mob = struct {
     has_impulse: bool = false,
     hurt_marked: bool = false,
     removed: bool = false,
-    movements: [8]Movement = undefined,
+    /// Movements this tick, held in Mobs.movements while the mob ticks.
     movement_count: u8 = 0,
 
     // LivingEntity.
@@ -208,6 +208,13 @@ pub const Mob = struct {
     damage_event_count: u8 = 0,
     /// Rises when data viewers see changes: health, age, fire, air, pose.
     revision: u32 = 0,
+    /// Standing still on blocks that act on nothing, touching no other mob, after a tick that
+    /// found so: the next tick skips what only reads blocks and neighbours, as it would find the
+    /// same. Edits nearby, a mob coming into contact, a spawn and a change of size clear it, and
+    /// each skip checks the mob is still where and as it rested. See mob_tick.zig.
+    resting: bool = false,
+    rest_position: [3]f64 = .{ 0, 0, 0 },
+    rest_velocity: [3]f64 = .{ 0, 0, 0 },
 
     pub fn baby(self: *const Mob) bool {
         return self.age < 0;
