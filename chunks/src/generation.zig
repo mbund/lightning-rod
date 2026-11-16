@@ -31,8 +31,6 @@ pub const Generation = struct {
         children: [2]?usize = .{ null, null },
         parent: ?usize = null,
         height: u8 = 1,
-        // Least valuable queued prefetch in this subtree.
-        prefetch: ?usize = null,
         section: chunks.Section = undefined,
         priority: Priority = .{},
         sequence: u64 = 0,
@@ -246,32 +244,6 @@ pub const Generation = struct {
         return submitted;
     }
 
-    /// Cancel at most limit queued requests, preserving running, completed, and required work.
-    pub fn cancelPrefetch(self: *Generation, limit: usize) usize {
-        assert(limit > 0 and limit <= 192);
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        var count: usize = 0;
-        while (count < limit) : (count += 1) {
-            const root = self.waiting orelse break;
-            const index = self.slots[root].prefetch orelse break;
-            assert(self.slots[index].state == .queued and self.slots[index].priority.urgency != .required);
-            self.cancelLocked(index);
-        }
-        if (count != 0) self.signalCompletions();
-        self.queued.set(self.slots.len - self.free_count);
-        assert(count <= limit);
-        return count;
-    }
-
-    fn reclaimLess(self: *const Generation, a: usize, b: usize) bool {
-        const first = &self.slots[a];
-        const second = &self.slots[b];
-        if (first.priority.urgency != second.priority.urgency) return @backingInt(first.priority.urgency) < @backingInt(second.priority.urgency);
-        if (first.priority.distance != second.priority.distance) return first.priority.distance < second.priority.distance;
-        return first.sequence < second.sequence;
-    }
-
     fn cancelLocked(self: *Generation, index: usize) void {
         const slot = &self.slots[index];
         assert(slot.state == .queued or slot.state == .ready);
@@ -388,11 +360,6 @@ pub const Generation = struct {
         const slot = &self.slots[index];
         assert(slot.state == .queued);
         slot.height = 1 + @max(self.height(slot.children[0]), self.height(slot.children[1]));
-        slot.prefetch = if (slot.priority.urgency == .required) null else index;
-        for (slot.children) |child| {
-            const candidate = self.slots[child orelse continue].prefetch orelse continue;
-            if (slot.prefetch == null or self.reclaimLess(slot.prefetch.?, candidate)) slot.prefetch = candidate;
-        }
         assert(slot.height <= 32);
     }
 
@@ -448,7 +415,7 @@ pub const Generation = struct {
 
     fn enqueue(self: *Generation, index: usize) void {
         const slot = &self.slots[index];
-        assert(slot.state == .queued and self.waiting != index and slot.parent == null and slot.children[0] == null and slot.children[1] == null and slot.prefetch == null);
+        assert(slot.state == .queued and self.waiting != index and slot.parent == null and slot.children[0] == null and slot.children[1] == null);
         var parent: ?usize = null;
         var current = self.waiting;
         var side: usize = 0;
@@ -484,7 +451,6 @@ pub const Generation = struct {
         slot.children = .{ null, null };
         slot.parent = null;
         slot.height = 1;
-        slot.prefetch = null;
         self.balance(changed);
     }
 
@@ -841,59 +807,6 @@ test "demand generation progresses without a parallel worker reply" {
     try std.testing.expectEqualSlices(i32, &.{7}, source.order[0..source.count]);
 }
 
-test "bounded reclamation chooses distant queued work and preserves completed running and required work" {
-    const Source = struct {
-        queue: *Generation,
-        reclaim: bool = false,
-        canceled: usize = 0,
-        fn read(self: *@This(), _: std.Io, batch: chunks.Source.Batch) void {
-            if (self.reclaim) self.canceled = self.queue.cancelPrefetch(2);
-            for (batch.requests) |*request| request.result = chunks.uniform(7, request.output);
-        }
-    };
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
-    defer registry.deinit();
-    var notify: std.Io.Event = .unset;
-    const queue = try Generation.init(arena.allocator(), std.testing.io, 8, &notify, &registry);
-    var source: Source = .{ .queue = queue };
-    queue.setSource(chunks.Source.init(&source, Source.read));
-    var destinations: [8][section_bytes]u8 = undefined;
-    var requests: [8]Generation.Request = undefined;
-    for (&requests, &destinations, 0..) |*request, *destination, index| request.* = .{ .section = testSection(@intCast(index)), .destination = destination, .token = index };
-    _ = queue.submit(requests[7..8], .{ .distance = 1000 });
-    try std.testing.expect(try queue.processOne(std.testing.io));
-    _ = queue.submit(requests[0..1], .{ .urgency = .required });
-    _ = queue.submit(requests[1..2], .{ .urgency = .occupied, .distance = 1000 });
-    _ = queue.submit(requests[2..3], .{ .distance = 1 });
-    _ = queue.submit(requests[3..4], .{ .distance = 20 });
-    _ = queue.submit(requests[4..5], .{ .distance = 30 });
-    _ = queue.submit(requests[5..6], .{ .urgency = .required });
-    _ = queue.submit(requests[6..7], .{ .distance = 10 });
-    source.reclaim = true;
-    try std.testing.expect(try queue.processOne(std.testing.io));
-    source.reclaim = false;
-    try std.testing.expectEqual(@as(usize, 2), source.canceled);
-    var canceled: u8 = 0;
-    while (queue.next()) |completion| {
-        if (completion.result) |_| {
-            try std.testing.expect(completion.token == 7 or completion.token == 0);
-        } else |err| {
-            try std.testing.expectEqual(error.Obsolete, err);
-            canceled |= @as(u8, 1) << @intCast(completion.token);
-        }
-        queue.release(completion);
-    }
-    try std.testing.expectEqual(@as(u8, (1 << 3) | (1 << 4)), canceled);
-    while (try queue.processOne(std.testing.io)) {}
-    while (queue.next()) |completion| {
-        _ = try completion.result;
-        queue.release(completion);
-    }
-    try std.testing.expectEqual(queue.slots.len, queue.free_count);
-}
-
 test "cancellation returns each caller slot before reuse and preserves required work" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1003,23 +916,6 @@ test "generation observes CPU time once per nonempty batch" {
 }
 
 const ScheduleModel = struct {
-    fn reclaim(queue: *Generation) ?usize {
-        var worst: ?usize = null;
-        for (queue.slots, 0..) |slot, index| {
-            if (slot.state != .queued or slot.priority.urgency == .required) continue;
-            if (worst) |previous| {
-                const other = queue.slots[previous];
-                if (slot.priority.urgency != other.priority.urgency) {
-                    if (@backingInt(slot.priority.urgency) < @backingInt(other.priority.urgency)) continue;
-                } else if (slot.priority.distance != other.priority.distance) {
-                    if (slot.priority.distance < other.priority.distance) continue;
-                } else if (slot.sequence < other.sequence) continue;
-            }
-            worst = index;
-        }
-        return worst;
-    }
-
     fn before(a: Generation.Slot, b: Generation.Slot, last_player: usize) bool {
         if ((a.priority.urgency == .required) != (b.priority.urgency == .required)) return a.priority.urgency == .required;
         if (a.priority.urgency == .required and b.priority.urgency == .required) return Generation.ordered(&a, &b);
@@ -1057,12 +953,6 @@ const ScheduleModel = struct {
         const right = queue.height(slot.children[1]);
         try std.testing.expectEqual(1 + @max(left, right), slot.height);
         try std.testing.expect(@max(left, right) - @min(left, right) <= 1);
-        var prefetch: ?usize = if (slot.priority.urgency == .required) null else at;
-        for (slot.children) |child| {
-            const candidate = queue.slots[child orelse continue].prefetch orelse continue;
-            if (prefetch == null or queue.reclaimLess(prefetch.?, candidate)) prefetch = candidate;
-        }
-        try std.testing.expectEqual(prefetch, slot.prefetch);
         return count;
     }
 };
@@ -1090,7 +980,7 @@ test "indexed scheduling matches linear priority and fairness through updates ca
     const destinations = try arena.allocator().alloc([section_bytes]u8, queue.slots.len);
     var random = std.Random.DefaultPrng.init(0x5c4ed01e);
     for (0..10000) |step| {
-        switch (random.random().uintLessThan(u8, 6)) {
+        switch (random.random().uintLessThan(u8, 5)) {
             0, 1 => if (queue.free_count != 0) {
                 const slot = queue.free[queue.free_count - 1];
                 const player = random.random().uintLessThan(usize, 13);
@@ -1105,20 +995,10 @@ test "indexed scheduling matches linear priority and fairness through updates ca
             },
             3 => if (queue.pick(false)) |slot| queue.promote(&.{queue.slots[slot].section}),
             4 => queue.update(random.random().uintLessThan(usize, 13), .{ .world = 0, .x = @intCast(step / 2), .z = 0, .radius = 100 }),
-            5 => {
-                const worst = ScheduleModel.reclaim(queue);
-                const count = queue.cancelPrefetch(1);
-                try std.testing.expectEqual(@as(usize, @intFromBool(worst != null)), count);
-                if (worst) |index| {
-                    try std.testing.expectEqual(Generation.State.ready, queue.slots[index].state);
-                    try std.testing.expectError(error.Obsolete, queue.slots[index].result);
-                }
-            },
             else => unreachable,
         }
         try std.testing.expectEqual(ScheduleModel.pick(queue, false), queue.pick(false));
         try std.testing.expectEqual(ScheduleModel.pick(queue, true), queue.pick(true));
-        try std.testing.expectEqual(ScheduleModel.reclaim(queue), if (queue.waiting) |root| queue.slots[root].prefetch else null);
         try std.testing.expectEqual(queue.queued_count, try ScheduleModel.inspect(queue, queue.waiting, null, 0));
         var completions: [257]Generation.Completion = undefined;
         const count = queue.nextMany(&completions);

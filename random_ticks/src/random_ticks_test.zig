@@ -24,7 +24,7 @@ const Source = struct {
     }
 };
 
-fn tickableState(state: u16) bool {
+fn selected(state: u16) bool {
     return state == 1;
 }
 
@@ -64,9 +64,11 @@ test "hits land on tickable cells at vanilla's rate, follow edits and read count
     var player_records = [_]Players.Player{.{ .handle = .{ .index = 0, .generation = 1 }, .world = world, .position = .{ .x = 8, .y = 4, .z = 8 } }};
     var player_plugin: Players = .{ .deps = undefined, .config = .{ .render_distance = 2, .simulation_distance = 1 }, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
     const domains = try Domains.init(arena.allocator(), .{}, .{ .players = &player_plugin });
-    const random = try RandomTicks.init(arena.allocator(), .{ .tickable = tickableState, .states = 16 }, .{ .domains = domains, .chunks = terrain, .worlds = catalog });
+    const handlers = try RandomTicks.Registry.init(arena.allocator(), .{ .states = 16 });
     var counter: Counter = .{};
-    try random.register(tickableState, .init(Counter, &counter, Counter.run));
+    try handlers.register(selected, .init(Counter, &counter, Counter.run));
+    const random = try RandomTicks.init(arena.allocator(), .{}, .{ .domains = domains, .chunks = terrain, .worlds = catalog, .registry = handlers });
+    try std.testing.expectError(error.RandomTicksStarted, handlers.register(selected, .init(Counter, &counter, Counter.run)));
     terrain.attach();
     defer terrain.stop();
 

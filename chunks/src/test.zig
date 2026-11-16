@@ -978,24 +978,13 @@ test "property reads preserve pending edits without generating or admitting deco
     try std.testing.expect(values[1] == .unavailable);
     try std.testing.expectEqual(@as(usize, 0), terrain.cache.lookup.count());
     try std.testing.expectEqual(@as(usize, 0), terrain.generation.queued_count);
-    var pins: [2]chunks.Chunks.PackedPin = undefined;
-    var borrowed: [2]chunks.Chunks.PackedSection = undefined;
-    try std.testing.expect(try terrain.tryBorrowPacked(&sections, &borrowed, watch, &pins) == null);
-    try std.testing.expectEqual(@as(usize, 0), terrain.cache.backend.store.readers);
-    const window = (try terrain.tryBorrowPacked(sections[0..1], borrowed[0..1], watch, &pins)).?;
-    try std.testing.expectEqual(@as(u16, 7), borrowed[0].view.get(4095));
-    try terrain.classify(&requests, &properties, 1);
-    try std.testing.expectEqual(@as(usize, 0), terrain.cache.lookup.count());
-    window.release();
-    try std.testing.expectEqual(@as(usize, 0), terrain.cache.backend.store.readers);
     const group = terrain.storageGroup(.{ .world = 3, .x = -1, .y = -3, .z = 4 });
     try std.testing.expectEqual(@as(u8, 2), group.side);
     try std.testing.expectEqual(chunks.Section{ .world = 3, .x = -2, .y = -4, .z = 4 }, group.minimum);
     try terrain.setBlock(0, .{ .x = 0, .y = 0, .z = 0 }, 99);
     try std.testing.expect(!watch.unchanged());
-    try std.testing.expect(try terrain.tryBorrowPacked(sections[0..1], borrowed[0..1], watch, &pins) == null);
     watch.configure(region, &revisions);
-    try std.testing.expect(try terrain.tryBorrowPacked(sections[0..1], borrowed[0..1], watch, &pins) == null);
+    try std.testing.expect(watch.unchanged());
     try terrain.classify(&requests, &properties, 1);
     try std.testing.expectEqual(@as(u8, 0), values[0].known.common);
     try std.testing.expectEqual(std.math.maxInt(u64) - 1, values[0].known.selected[0]);
@@ -1015,68 +1004,9 @@ test "property reads preserve pending edits without generating or admitting deco
     try std.testing.expectEqual(@as(u32, 1), summaries[0].known);
     try std.testing.expectEqual(@as(u8, 0), summaries[0].common[0]);
     try std.testing.expectEqual(@as(u32, 0), summaries[1].known);
-    watch.configure(region, &revisions);
-    try std.testing.expect(try terrain.tryBorrowPacked(sections[0..1], borrowed[0..1], watch, &pins) == null);
     try std.testing.expectEqual(@as(usize, 0), terrain.cache.backend.store.readers);
     try std.testing.expectEqual(@as(usize, 0), terrain.generation.queued_count);
     try std.testing.expectEqual(@as(usize, 0), terrain.borrowed_count);
-    try std.testing.expect(!bounded.has_induced_failure);
-}
-
-test "packed batches share group pins while independently validating every column watch" {
-    const io = std.testing.io;
-    var temporary = std.testing.tmpDir(.{});
-    defer temporary.cleanup();
-    var path_buffer: [256]u8 = undefined;
-    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/packed-batches", .{temporary.sub_path}) });
-    defer store.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
-    const allocator = bounded.allocator();
-    var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .enabled = false });
-    defer registry.deinit();
-    const terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 4, .cache_groups = 2, .storage_group_side = 2 }, .{
-        .metrics = &registry,
-        .storage = try store.openSpace(chunks.Chunks.id),
-        .record_workspaces = try records.Workspaces.init(allocator, io, .{}),
-    });
-    var positions: [2]chunks.Section = undefined;
-    var keys: [2][16]u8 = undefined;
-    var requests: [2]chunks.Chunks.PackedRequest = undefined;
-    var writes: [2]records.Write = undefined;
-    for (&positions, &keys, &requests, &writes, 0..) |*section, *key, *request, *write, index| {
-        section.* = .{ .world = @intCast(index), .x = 0, .y = 0, .z = 0 };
-        key.* = chunks.encodeKey(section.*);
-        const watch = try chunks.Watch.init(allocator, terrain, 1);
-        var revisions: [1]u64 = undefined;
-        watch.configure(.{ .world = section.world, .minimum = .{ .x = 0, .y = 0, .z = 0 }, .maximum = .{ .x = 0, .y = 0, .z = 0 } }, &revisions);
-        request.* = .{ .sections = positions[index..][0..1], .watch = watch };
-        write.* = .{ .key = key, .value = if (index == 0) &.{ 0, 7, 0 } else &.{ 0, 9, 0 } };
-    }
-    try terrain.cache.backend.store.putBatch(&writes);
-    try terrain.cache.backend.store.flush();
-    terrain.attach();
-    defer terrain.stop();
-    bounded.fail_index = bounded.alloc_index;
-    bounded.resize_fail_index = bounded.resize_index;
-    var pins: [2]chunks.Chunks.PackedPin = undefined;
-    var additional_pins: [2]chunks.Chunks.PackedPin = undefined;
-    var output: [2]chunks.Chunks.PackedSection = undefined;
-    const window = (try terrain.tryBorrowPackedMany(&requests, &output, &pins)).?;
-    defer window.release();
-    try std.testing.expectEqual(@as(usize, 2), window.leases.len);
-    try std.testing.expectEqual(@as(u16, 7), output[0].view.get(0));
-    try std.testing.expectEqual(@as(u16, 9), output[1].view.get(0));
-    try terrain.setBlock(0, .{ .x = 0, .y = 0, .z = 0 }, 11);
-    try std.testing.expect(!requests[0].watch.unchanged());
-    try std.testing.expect(requests[1].watch.unchanged());
-    try std.testing.expectEqual(@as(u16, 7), output[0].view.get(0));
-    try std.testing.expect(try terrain.tryBorrowPackedMany(&requests, &output, &pins) == null);
-    try std.testing.expectEqual(@as(usize, 1), terrain.cache.backend.store.readers);
-    const unaffected = (try terrain.tryBorrowPackedMany(requests[1..], output[1..], &additional_pins)).?;
-    unaffected.release();
-    try std.testing.expectEqual(@as(usize, 1), terrain.cache.backend.store.readers);
     try std.testing.expect(!bounded.has_induced_failure);
 }
 
@@ -1158,7 +1088,7 @@ test "column preparation returns ready columns while independently queuing missi
         try std.testing.expectEqual(@as(usize, 3), world.generating_count);
         try std.testing.expectEqual(@as(usize, 2), generator.sections);
     }
-    _ = world.generation.cancelPrefetch(192);
+    world.generation.update(0, null);
     try world.poll();
     try std.testing.expectEqual(@as(usize, 0), world.generating_count);
 }
@@ -1277,7 +1207,7 @@ pub fn benchmarkDemandBatches() !void {
         try std.testing.expect(terrain.generation.index.contains(prefetch));
         try std.testing.expectEqual(@as(usize, 1), terrain.generation.queued_count);
         try output.interface.print("{d:17} | {d:12} | {d:20} | {d}\n", .{ count, source.calls, source.maximum, terrain.generation.queued_count });
-        _ = terrain.generation.cancelPrefetch(1);
+        terrain.generation.update(1, null);
         try terrain.poll();
     }
     try output.interface.flush();

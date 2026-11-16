@@ -24,13 +24,6 @@ const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities
 const assert = std.debug.assert;
 const registry = game_data.registry;
 
-/// Whether a block state ticks randomly in vanilla, for the states growth gives behaviour. The
-/// random tick topology persists counts of these states, so the set is fixed per release.
-pub fn randomlyTicks(state: u16) bool {
-    ensureTables();
-    return tables.kinds[state] == .grass or tables.kinds[state] == .sugar_cane or (tables.kinds[state] == .leaves and tables.distance[state] == 7 and !tables.persistent[state]);
-}
-
 const Kind = enum(u8) { other, grass, leaves, sugar_cane };
 
 /// What growth knows of each block state from its name, built once.
@@ -145,11 +138,11 @@ fn prepareTables(allocator: std.mem.Allocator) !void {
 
 pub const Growth = struct {
     pub const id = "minecraft:growth";
-    pub const Configuration = struct { loot_scratch_bytes: usize = 16 * 1024 };
+    pub const Configuration = struct { loot_scratch_bytes: usize = 16 * 1024, seed: u64 = 0x67726f777468 };
     pub const Dependencies = struct {
         chunks: *chunks.Chunks,
         ticks: *ticks.Ticks,
-        random_ticks: *random_ticks.RandomTicks,
+        random_ticks: *random_ticks.RandomTicks.Registry,
         lighting: *Lighting,
         block_definitions: *Blocks,
         time: *Time,
@@ -172,6 +165,7 @@ pub const Growth = struct {
     sugar_cane_ground: []bool,
     snow: []bool,
     loot_scratch: std.heap.FixedBufferAllocator,
+    random: std.Random.DefaultPrng,
 
     pub fn init(allocator: std.mem.Allocator, configuration: Configuration, deps: Dependencies) !*Growth {
         ensureTables();
@@ -186,6 +180,7 @@ pub const Growth = struct {
             .sugar_cane_ground = try allocator.alloc(bool, registry.blocks.len),
             .snow = try allocator.alloc(bool, registry.blocks.len),
             .loot_scratch = .init(try allocator.alloc(u8, configuration.loot_scratch_bytes)),
+            .random = .init(configuration.seed),
         };
         try self.readTags();
         try deps.block_definitions.registry.onChange(self, readTags);
@@ -305,7 +300,7 @@ pub const Growth = struct {
         const light = sample[0] orelse return;
         const brightness = @max(light.block, light.sky -| self.skyDarken());
         if (brightness < 9) return;
-        const random = self.deps.random_ticks.rng();
+        const random = self.random.random();
         for (0..4) |_| {
             const target = offset(position, random.intRangeAtMost(i32, -1, 1), random.intRangeAtMost(i32, -3, 1), random.intRangeAtMost(i32, -1, 1));
             if (!self.inside(world, target)) continue;
@@ -501,7 +496,7 @@ pub const Growth = struct {
             const cell = offset(position, at.x, at.y, at.z);
             neighbor.* = .{ .offset = at, .state = if (self.inside(world, cell)) try self.get(world, cell) else 0 };
         }
-        const random = self.deps.random_ticks.rng();
+        const random = self.random.random();
         var buffer: [loot_tables.maximum_drops]loot_tables.Drop = undefined;
         const context: loot_tables.Context = .{
             .items = self.deps.items.deps.definitions,

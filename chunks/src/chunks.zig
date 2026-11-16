@@ -788,7 +788,6 @@ pub const Chunks = struct {
         self.releaseLocked(retention.leases[keep..]);
         retention.leases = retention.leases[0..keep];
         self.available.broadcast(self.io);
-        if (self.background_owner.load(.acquire) != std.Thread.getCurrentId()) self.ready().set(self.io);
     }
 
     fn acquireLocked(self: *Chunks, client_index: u8, sections: []const Section, output: []Lease, retention: ?*Retention) !void {
@@ -1030,49 +1029,6 @@ pub const Chunks = struct {
     };
 
     pub const StorageGroup = struct { minimum: Section, side: u8 };
-    pub const PackedPin = ChunkStore.PackedPin;
-    pub const PackedWindow = ChunkStore.PackedWindow;
-    pub const PackedSection = ChunkStore.PackedSection;
-    pub const PackedRequest = struct { sections: []const Section, watch: *const Watch };
-
-    pub fn tryBorrowPacked(self: *Chunks, sections: []const Section, output: []PackedSection, watch: *const Watch, pins: []PackedPin) !?PackedWindow {
-        return self.tryBorrowPackedMany(&.{.{ .sections = sections, .watch = watch }}, output, pins);
-    }
-
-    /// Views borrow immutable group storage until release. Recheck watches before publication.
-    pub fn tryBorrowPackedMany(self: *Chunks, requests: []const PackedRequest, output: []PackedSection, pins: []PackedPin) !?PackedWindow {
-        assert(self.ownsCurrentThread() and output.len > 0 and output.len <= 192 and pins.len >= output.len);
-        var count: usize = 0;
-        for (requests) |request| {
-            assert(request.watch.owner == self and request.watch.count != 0);
-            if (!request.watch.unchanged()) return null;
-            count += request.sections.len;
-        }
-        assert(count == output.len);
-        var keys: [192][16]u8 = undefined;
-        var reads: [192][]const u8 = undefined;
-        var pending = false;
-        self.mutex.lockUncancelable(self.io);
-        var index: usize = 0;
-        for (requests) |request| for (request.sections) |section| {
-            assert(request.watch.region.contains(section));
-            keys[index] = encodeKey(section);
-            reads[index] = &keys[index];
-            if (self.cache.lookup.get(&keys[index])) |slot| pending = pending or !self.cache.entries[slot].loaded or self.cache.entries[slot].dirty or self.generating[slot] != null or self.writing[slot];
-            index += 1;
-        };
-        self.mutex.unlock(self.io);
-        if (pending) return null;
-        const window = self.cache.backend.store.tryBorrowPacked(reads[0..count], output, pins) catch |err| switch (err) {
-            error.WritebackRequired, error.WorkingSetTooLarge => null,
-            else => return err,
-        };
-        for (requests) |request| if (!request.watch.unchanged()) {
-            if (window) |held| held.release();
-            return null;
-        };
-        return window;
-    }
 
     pub fn storageGroup(self: *const Chunks, section: Section) StorageGroup {
         const side = self.cache.backend.store.side;
@@ -1450,9 +1406,9 @@ pub const Chunks = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.releaseLocked(leases);
+        // Releases wake only blocking acquirers. Budgets fit the cache, so terrain thread
+        // batches wait on writes, loads and generation, which wake it when they finish.
         self.available.broadcast(self.io);
-        // The background owner schedules retries only when it makes progress.
-        if (self.background_owner.load(.acquire) != std.Thread.getCurrentId()) self.ready().set(self.io);
     }
 
     fn releaseLocked(self: *Chunks, leases: []const Lease) void {

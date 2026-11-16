@@ -145,7 +145,6 @@ pub const Store = struct {
     light_reading: metrics.Timer,
     classification_decoded_bytes: metrics.Counter,
     classification_header_reads: metrics.Counter,
-    packed_bytes: metrics.Counter,
     scratch: []u8,
     io: std.Io,
     mutex: std.Io.Mutex = .init,
@@ -266,7 +265,6 @@ pub const Store = struct {
             .light_reading = try registry.timer(.{ .name = "chunks.light.read.cpu", .description = "Read stored lighting or bake dependency revisions", .clock = .thread_cpu, .detailed = true }),
             .classification_decoded_bytes = try registry.counter(.{ .name = "chunks.classifications.decoded_bytes", .description = "Decompressed prepared classification bytes", .unit = .bytes }),
             .classification_header_reads = try registry.counter(.{ .name = "chunks.classifications.header_reads", .description = "Classification column summaries read from the record index" }),
-            .packed_bytes = try registry.counter(.{ .name = "chunks.bases.requested_bytes", .description = "Encoded section bytes borrowed from decoded groups", .unit = .bytes }),
             .merger = try Merger.init(allocator, maximum, section_count, @min(batch_groups, options.prepared_groups)),
             .side = options.side,
             .section_count = section_count,
@@ -359,9 +357,7 @@ pub const Store = struct {
     const Layout = struct {
         generation: u64 = 0,
         revision: u64 = 0,
-        validated: u64 = 0,
         locations: [maximum_sections]Location = undefined,
-        views: [maximum_sections]encoding.Packed = undefined,
     };
     fn locate(self: *const Store, bytes: ?[]const u8, locations: []Location) !void {
         std.debug.assert(locations.len == self.section_count);
@@ -388,7 +384,6 @@ pub const Store = struct {
             if (layout.generation == lease.generation and layout.revision == revision) continue;
             const bytes = lease.read();
             try self.locate(bytes, layout.locations[0..self.section_count]);
-            layout.validated = 0;
             layout.generation = lease.generation;
             layout.revision = revision;
             self.layout_builds += 1;
@@ -403,7 +398,6 @@ pub const Store = struct {
         try self.readBatch(requests, lengths, .decoded, .{}, null);
     }
 
-    pub const PackedSection = struct { view: encoding.Packed, index: usize, generation: u64, revision: u64 };
     /// Retains matching groups on first read until reset. Admission does not load terrain.
     pub const GroupWindow = struct {
         /// Section coordinates. Horizontal bounds are the containing storage group.
@@ -501,101 +495,6 @@ pub const Store = struct {
         self.mutating = mutating;
         self.pipeline_capacity = capacity;
         std.debug.assert(self.bases.physical_capacity == physical);
-    }
-
-    pub const PackedPin = GroupCache.Lease;
-    pub const PackedWindow = struct {
-        owner: *Store,
-        leases: []const PackedPin,
-
-        pub fn release(self: PackedWindow) void {
-            const owner = self.owner;
-            owner.mutex.lockUncancelable(owner.io);
-            defer owner.mutex.unlock(owner.io);
-            std.debug.assert(owner.readers > 0);
-            for (self.leases) |lease| lease.release();
-            owner.readers -= 1;
-            owner.available.broadcast(owner.io);
-        }
-    };
-
-    /// Complete batches borrow caller pin storage until release. Incomplete batches retain no pins.
-    pub fn tryBorrowPacked(self: *Store, keys: []const []const u8, output: []PackedSection, pins: []PackedPin) !?PackedWindow {
-        std.debug.assert(keys.len == output.len and keys.len <= 192 and pins.len >= keys.len);
-        const read_lease = self.acquireRead();
-        defer read_lease.end();
-        const workspace = read_lease.workspace;
-        self.mutex.lockUncancelable(self.io);
-        self.readers += 1;
-        self.mutex.unlock(self.io);
-        errdefer {
-            self.mutex.lockUncancelable(self.io);
-            self.readers -= 1;
-            self.available.broadcast(self.io);
-            self.mutex.unlock(self.io);
-        }
-        const batch = &workspace.batch;
-        batch.count = 0;
-        batch.unique = 0;
-        try batch.plan(keys, self.bases.capacity, self.side, 0);
-        if (batch.count != keys.len) return error.WorkingSetTooLarge;
-        const held = workspace.leases[0..batch.unique];
-        self.mutex.lockUncancelable(self.io);
-        const loaded = self.loadTilesLocked(batch.keys[0..batch.unique], held, false, &workspace.load);
-        self.mutex.unlock(self.io);
-        try loaded;
-        errdefer {
-            self.mutex.lockUncancelable(self.io);
-            for (held) |lease| lease.release();
-            self.available.broadcast(self.io);
-            self.mutex.unlock(self.io);
-        }
-        self.table_lock.lockSharedUncancelable(self.io);
-        const read = self.overlays.lengthsBatch(keys, workspace.lengths[0..keys.len]);
-        self.table_lock.unlockShared(self.io);
-        try read;
-        var complete = true;
-        var borrowed_bytes: usize = 0;
-        {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            for (held, 0..) |lease, group| {
-                const layout = &self.layouts[lease.index];
-                std.debug.assert(layout.generation == lease.generation and layout.revision == lease.revision());
-                const locations = layout.locations[0..self.section_count];
-                var member = batch.first[group];
-                while (member != Batch.absent) {
-                    const index: usize = member;
-                    member = batch.next[index];
-                    const at = batch.addresses[index];
-                    const location = locations[at.part];
-                    if (workspace.lengths[index] != null or location.begin == location.end) {
-                        complete = false;
-                        continue;
-                    }
-                    const bit = @as(u64, 1) << @intCast(at.part);
-                    if (layout.validated & bit == 0) {
-                        layout.views[at.part] = try encoding.Packed.init(lease.read().?[location.begin..location.end]);
-                        layout.validated |= bit;
-                    }
-                    output[index] = .{
-                        .view = layout.views[at.part],
-                        .index = lease.index * self.section_count + at.part,
-                        .generation = lease.generation,
-                        .revision = lease.revision(),
-                    };
-                    borrowed_bytes += location.end - location.begin;
-                }
-            }
-        }
-        @memcpy(pins[0..held.len], held);
-        const window: PackedWindow = .{ .owner = self, .leases = pins[0..held.len] };
-        if (!complete) {
-            window.release();
-            return null;
-        }
-        self.packed_bytes.add(borrowed_bytes);
-        return window;
     }
 
     pub const ClassificationRead = struct { key: []const u8, result: *encoding.Classification, prepared: ?*classification.Prepared = null, projection: classification.Projection = .full };
@@ -1493,7 +1392,6 @@ pub const Store = struct {
                 }
             }
             if (old) |bytes| @memcpy(self.bases.value_storage.buffer(self.bases.values, self.bases.value_bytes, lease.index)[0..bytes.len], self.scratch[0..bytes.len]);
-            self.layouts[lease.index].validated = 0;
         }
     }
 

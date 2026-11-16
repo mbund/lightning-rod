@@ -17,15 +17,73 @@ const Topology = chunks.topology.Topology;
 
 pub const Hit = struct { world: u32, position: chunks.Position, state: u16 };
 
-pub const RandomTicks = struct {
-    pub const id = "lightning_rod:random_ticks";
+pub const Handler = struct {
+    context: *anyopaque,
+    run: *const fn (*anyopaque, Hit) anyerror!void,
+
+    pub fn init(comptime Context: type, context: *Context, comptime run: fn (*Context, Hit) anyerror!void) Handler {
+        const Adapter = struct {
+            fn call(raw: *anyopaque, hit: Hit) anyerror!void {
+                return run(@ptrCast(@alignCast(raw)), hit);
+            }
+        };
+        return .{ .context = context, .run = Adapter.call };
+    }
+};
+
+/// Which block states tick randomly and what runs when they do. Plugins register here while the
+/// server starts, and the states they select are the ones that tick. Compose it before them and
+/// RandomTicks after them. RandomTicks seals it, as the topology it persists is keyed by the
+/// states selected.
+const RandomTickRegistry = struct {
+    pub const id = "lightning_rod:random_tick_registry";
 
     pub const Configuration = struct {
-        /// Whether a block state ticks randomly. Fixed for the life of the server, as the
-        /// topology persisted for it is keyed by the states it selects.
-        tickable: *const fn (u16) bool = never,
-        /// Block states, the length of the tables `tickable` fills.
+        /// Block states, the length of the table handlers select from.
         states: u16 = 0,
+        handlers: u8 = 32,
+    };
+
+    pub const none = std.math.maxInt(u8);
+
+    /// The handler of each block state, or none for states that do not tick.
+    by_state: []u8,
+    handlers: []Handler,
+    count: u8 = 0,
+    sealed: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator, config: Configuration) !*RandomTickRegistry {
+        if (config.states == 0 or config.handlers == 0 or config.handlers == none) return error.InvalidConfiguration;
+        const self = try allocator.create(RandomTickRegistry);
+        self.* = .{ .by_state = try allocator.alloc(u8, config.states), .handlers = try allocator.alloc(Handler, config.handlers) };
+        @memset(self.by_state, none);
+        return self;
+    }
+
+    /// Runs `handler` when a hit lands on a state `selects` picks. Every such state ticks
+    /// randomly.
+    pub fn register(self: *RandomTickRegistry, selects: *const fn (u16) bool, handler: Handler) !void {
+        if (self.sealed) return error.RandomTicksStarted;
+        if (self.count == self.handlers.len) return error.HandlerCapacity;
+        const index = self.count;
+        var selected: usize = 0;
+        for (self.by_state, 0..) |*slot, state| {
+            if (!selects(@intCast(state))) continue;
+            if (slot.* != none) return error.DuplicateHandler;
+            slot.* = index;
+            selected += 1;
+        }
+        if (selected == 0) return error.NoStates;
+        self.handlers[index] = handler;
+        self.count += 1;
+    }
+};
+
+pub const RandomTicks = struct {
+    pub const id = "lightning_rod:random_ticks";
+    pub const Registry = RandomTickRegistry;
+
+    pub const Configuration = struct {
         /// Cells vanilla picks in each section per game tick, its randomTickSpeed.
         speed: u8 = 3,
         /// Ticking columns tracked at once.
@@ -34,36 +92,17 @@ pub const RandomTicks = struct {
         sections: u32 = 1 << 15,
         /// Column summaries asked for and not yet answered.
         requests: u32 = 256,
-        handlers: u8 = 32,
         seed: u64 = 0x72616e646f6d,
-
-        fn never(_: u16) bool {
-            return false;
-        }
     };
 
     pub const Dependencies = struct {
         domains: *Domains,
         chunks: *chunks.Chunks,
         worlds: *Worlds,
-    };
-
-    pub const Handler = struct {
-        context: *anyopaque,
-        run: *const fn (*anyopaque, Hit) anyerror!void,
-
-        pub fn init(comptime Context: type, context: *Context, comptime run: fn (*Context, Hit) anyerror!void) Handler {
-            const Adapter = struct {
-                fn call(raw: *anyopaque, hit: Hit) anyerror!void {
-                    return run(@ptrCast(@alignCast(raw)), hit);
-                }
-            };
-            return .{ .context = context, .run = Adapter.call };
-        }
+        registry: *Registry,
     };
 
     const none = std.math.maxInt(u32);
-    const no_handler = std.math.maxInt(u8);
     const sections_max = 32;
 
     const ColumnState = struct {
@@ -95,9 +134,6 @@ pub const RandomTicks = struct {
     deps: Dependencies,
     config: Configuration,
     tickable: []u8,
-    handlers: []u8,
-    handler_list: []Handler,
-    handler_count: u8 = 0,
     topology: *Topology,
     client: chunks.Chunks.Client,
     random: std.Random.DefaultPrng,
@@ -117,28 +153,24 @@ pub const RandomTicks = struct {
     /// The next pick not drawn yet. Counts that change draw their next hit from here.
     cursor: u64 = 0,
     overflow: bool = false,
-    hits: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*RandomTicks {
-        if (config.states == 0 or config.speed == 0 or config.columns == 0 or config.sections == 0 or config.requests == 0 or config.handlers == 0 or config.handlers == no_handler) return error.InvalidConfiguration;
-        const states: usize = config.states;
+        if (config.speed == 0 or config.columns == 0 or config.sections == 0 or config.requests == 0) return error.InvalidConfiguration;
+        assert(!deps.registry.sealed);
+        deps.registry.sealed = true;
         const self = try allocator.create(RandomTicks);
-        const tickable = try allocator.alloc(u8, states);
-        for (tickable, 0..) |*flag, state| flag.* = @intFromBool(config.tickable(@intCast(state)));
+        const tickable = try allocator.alloc(u8, deps.registry.by_state.len);
+        for (tickable, deps.registry.by_state) |*flag, handler| flag.* = @intFromBool(handler != Registry.none);
         const column_states = try allocator.alloc(ColumnState, config.columns);
         for (column_states, 0..) |*state, index| state.* = .{ .world = 0, .x = 0, .z = 0, .next_free = if (index + 1 < column_states.len) @intCast(index + 1) else none };
         const slots = try allocator.alloc(SectionSlot, config.sections);
         for (slots, 0..) |*slot, index| slot.* = .{ .column = none, .offset = 0, .next = 0, .heap = none, .next_free = if (index + 1 < slots.len) @intCast(index + 1) else none };
         const by_column = try allocator.alloc(u32, try std.math.ceilPowerOfTwo(usize, 2 * @as(usize, config.columns)));
         @memset(by_column, none);
-        const handlers = try allocator.alloc(u8, states);
-        @memset(handlers, no_handler);
         self.* = .{
             .deps = deps,
             .config = config,
             .tickable = tickable,
-            .handlers = handlers,
-            .handler_list = try allocator.alloc(Handler, config.handlers),
             .topology = try deps.chunks.openTopology(allocator, tickable, 1, .{ .identity = "lightning_rod:random_ticks:count:1", .maximum = 2, .prefix_bytes = 2, .encode = encodeCount }, config.requests),
             .client = try deps.chunks.simulation(1),
             .random = .init(config.seed),
@@ -160,26 +192,6 @@ pub const RandomTicks = struct {
         for (known.selected) |word| count += @popCount(word);
         std.mem.writeInt(u16, output[0..2], count, .little);
         return 2;
-    }
-
-    /// Runs `handler` when a hit lands on a state `selects` picks. Every such state ticks
-    /// randomly. Startup only.
-    pub fn register(self: *RandomTicks, selects: *const fn (u16) bool, handler: Handler) !void {
-        if (self.handler_count == self.handler_list.len) return error.HandlerCapacity;
-        const index = self.handler_count;
-        self.handler_list[index] = handler;
-        self.handler_count += 1;
-        for (self.handlers, self.tickable, 0..) |*slot, flag, state| {
-            if (!selects(@intCast(state))) continue;
-            if (flag == 0) return error.NotTickable;
-            if (slot.* != no_handler) return error.DuplicateHandler;
-            slot.* = index;
-        }
-    }
-
-    /// The source of randomness hits run with.
-    pub fn rng(self: *RandomTicks) std.Random {
-        return self.random.random();
     }
 
     fn domainChanged(self: *RandomTicks, entered: []const DomainColumn, left: []const DomainColumn) void {
@@ -361,34 +373,41 @@ pub const RandomTicks = struct {
             const lease = try self.client.acquire(section);
             defer lease.release();
             const bytes = lease.record.read() orelse break :hit null;
-            const known = try chunks.encoding.classify(bytes, self.tickable, 1);
-            var count: u16 = 0;
-            for (known.selected) |word| count += @popCount(word);
-            if (count != state.counts[slot.offset]) {
-                // The count was out of date. The true one draws the next hit.
-                self.setCount(slot.column, slot.offset, count, slot.next + 1);
-                if (count == 0) break :hit null;
-            }
-            var rank = self.random.random().uintLessThan(u16, count);
-            const cell: u12 = for (known.selected, 0..) |word, index| {
-                const ones: u16 = @popCount(word);
-                if (rank < ones) {
-                    var bits = word;
-                    for (0..rank) |_| bits &= bits - 1;
-                    break @intCast(index * 64 + @ctz(bits));
-                }
-                rank -= ones;
-            } else unreachable;
+            const cell = try self.classifyPick(slot_index, bytes) orelse break :hit null;
             break :hit Hit{
                 .world = state.world,
                 .position = .{ .x = state.x * 16 + (cell & 15), .y = section.y * 16 + (cell >> 8), .z = state.z * 16 + ((cell >> 4) & 15) },
                 .state = lease.get(cell),
             };
         } orelse return;
-        self.hits += 1;
-        const handler = self.handlers[hit.state];
-        if (handler == no_handler) return;
-        try self.handler_list[handler].run(self.handler_list[handler].context, hit);
+        const index = self.deps.registry.by_state[hit.state];
+        assert(index != Registry.none);
+        const handler = self.deps.registry.handlers[index];
+        try handler.run(handler.context, hit);
+    }
+
+    /// Classifies the section, corrects its count and picks one of its tickable cells.
+    fn classifyPick(self: *RandomTicks, slot_index: u32, bytes: []const u8) !?u12 {
+        const slot = self.slots[slot_index];
+        const known = try chunks.encoding.classify(bytes, self.tickable, 1);
+        var count: u16 = 0;
+        for (known.selected) |word| count += @popCount(word);
+        if (count != self.column_states[slot.column].counts[slot.offset]) {
+            // The count was out of date. The true one draws the next hit.
+            self.setCount(slot.column, slot.offset, count, slot.next + 1);
+            if (count == 0) return null;
+        }
+        var rank = self.random.random().uintLessThan(u16, count);
+        for (known.selected, 0..) |word, index| {
+            const ones: u16 = @popCount(word);
+            if (rank < ones) {
+                var bits = word;
+                for (0..rank) |_| bits &= bits - 1;
+                return @intCast(index * 64 + @ctz(bits));
+            }
+            rank -= ones;
+        }
+        unreachable;
     }
 
     fn dropColumn(self: *RandomTicks, at: usize) void {

@@ -13,7 +13,7 @@ pub fn main(init: std.process.Init) !void {
             // Noon without a cycle, so the sky lights the grass the whole run.
             lightning_rod.plugin.configured(vanilla.Time, .{ .day_time = 6000, .daylight_cycle = false }),
             // Eighty-five times vanilla's rate, so a run sees growth in seconds.
-            lightning_rod.plugin.configured(vanilla.RandomTicks, .{ .tickable = vanilla.growth.randomlyTicks, .states = @intCast(protocols.registry.block_state_names.len), .speed = 255 }),
+            lightning_rod.plugin.configured(vanilla.RandomTicks, .{ .speed = 255 }),
         }),
         lightning_rod.plugin.configured(Scene, .{}),
     });

@@ -151,13 +151,13 @@ test "adding sections preserves borrowed group bytes and persists through consol
         var disk = try storage.Store.init(allocator, io, .{ .path = path, .io_mode = .standard });
         defer disk.deinit();
         var store = try ChunkStore.init(allocator, io, try disk.openSpace("chunks"), 1, &registry, resources, .{ .side = 4 });
+        const window = try store.createGroupWindow(allocator, 1);
         try store.putBatch(&.{ .{ .key = &first, .value = &.{ 0, 1, 0 } }, .{ .key = &last, .value = &.{ 0, 2, 0 } } });
-        var pins: [2]ChunkStore.PackedPin = undefined;
-        var reused_pins: [2]ChunkStore.PackedPin = undefined;
-        var projected: [2]ChunkStore.PackedSection = undefined;
-        var window = (try store.tryBorrowPacked(&.{ &first, &last }, &projected, &pins)).?;
+        window.begin(.{ .world = 0, .x = 0, .z = 0, .minimum = 0, .count = 3 });
         var borrowed = true;
-        defer if (borrowed) window.release();
+        defer if (borrowed) window.reset();
+        try store.getBatch(&.{.{ .key = &first, .destination = &output }}, &lengths);
+        try std.testing.expectEqual(@as(usize, 1), window.count);
         const before = try allocator.dupe(u8, window.leases[0].read().?);
         const revision = window.leases[0].revision();
         const parsed = store.layout_builds;
@@ -168,21 +168,18 @@ test "adding sections preserves borrowed group bytes and persists through consol
         try std.testing.expectEqual(@as(usize, 1), store.readers);
         for ([_]u8{ 0, 17, 93 }) |state| {
             try store.putBatch(&.{.{ .key = &middle, .value = &.{ 0, state, 0 } }});
+            // The retained group keeps the bytes it was read with while edits go to the overlay.
             try std.testing.expectEqualSlices(u8, before, window.leases[0].read().?);
             try std.testing.expectEqual(revision, window.leases[0].revision());
-            try std.testing.expectEqual(@as(u16, 2), projected[1].view.get(42));
+            try store.getBatch(&.{.{ .key = &last, .destination = &output }}, &lengths);
+            try std.testing.expectEqual(@as(u16, 2), (try encoding.Packed.init(output[0..lengths[0].?])).get(42));
             try store.getBatch(&.{.{ .key = &middle, .destination = &output }}, &lengths);
             try std.testing.expectEqual(@as(u16, state), (try encoding.Packed.init(output[0..lengths[0].?])).get(42));
         }
-        for (0..64) |_| {
-            var views: [2]ChunkStore.PackedSection = undefined;
-            const reused = (try store.tryBorrowPacked(&.{ &first, &last }, &views, &reused_pins)).?;
-            try std.testing.expectEqual(projected[1].view.bytes.ptr, views[1].view.bytes.ptr);
-            reused.release();
-        }
         try std.testing.expectEqual(parsed, store.layout_builds);
-        window.release();
+        window.reset();
         borrowed = false;
+        try std.testing.expectEqual(@as(usize, 0), store.readers);
         try store.flush();
         while (try store.prepareMerge()) {}
         try std.testing.expectEqual(@as(usize, 1), try store.publishPrepared());
@@ -233,16 +230,14 @@ test "single group staging bounds overlay windows for large section batches" {
     defer registry.deinit();
     var store = try ChunkStore.init(allocator, io, try database.openSpace(chunks.Chunks.id), 8, &registry, try records.Resources.init(allocator, io, .{ .readers = 2, .writers = 1 }), .{ .side = 4, .batch_groups = 1 });
     var keys: [96][16]u8 = undefined;
-    var slices: [96][]const u8 = undefined;
     var writes: [96]records.Write = undefined;
     var gets: [96]records.Get = undefined;
     var contents: [96][3]u8 = undefined;
     var results: [96]encoding.Classification = undefined;
     var reads: [96]ChunkStore.ClassificationRead = undefined;
     var lengths: [96]?usize = undefined;
-    for (&keys, &slices, &writes, &gets, &contents, &results, &reads, 0..) |*key, *slice, *write, *get, *bytes, *result, *read, index| {
+    for (&keys, &writes, &gets, &contents, &results, &reads, 0..) |*key, *write, *get, *bytes, *result, *read, index| {
         key.* = chunks.encodeKey(.{ .world = 0, .x = @intCast(index % 4), .z = @intCast(index / 4 % 4), .y = @intCast(index / 16) });
-        slice.* = key;
         bytes.* = .{ 0, @intCast(index % 2), 0 };
         write.* = .{ .key = key, .value = bytes };
         get.* = .{ .key = key, .destination = bytes };
@@ -259,12 +254,6 @@ test "single group staging bounds overlay windows for large section batches" {
     for (contents, lengths, 0..) |bytes, length, index| {
         try std.testing.expectEqual(@as(?usize, 3), length);
         try std.testing.expectEqual([3]u8{ 0, @intCast(index % 2), 0 }, bytes);
-    }
-    var pins: [96]ChunkStore.PackedPin = undefined;
-    var projections: [96]ChunkStore.PackedSection = undefined;
-    if (try store.tryBorrowPacked(&slices, &projections, &pins)) |window| {
-        defer window.release();
-        for (projections, 0..) |projection, index| try std.testing.expectEqual(@as(u16, @intCast(index % 2)), projection.view.get(0));
     }
     try std.testing.expectEqual(@as(usize, 0), store.readers);
 }
