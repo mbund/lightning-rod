@@ -292,9 +292,85 @@ fn anyShape(level: *const Level, query: Box, context: Context) !bool {
     return try shapes.next() != null;
 }
 
-/// Entity.collideWithShapes: Y first, then the larger of X and Z last.
+/// The shapes BlockCollisions yields for a query, gathered once as Entity.collectColliders does,
+/// so every axis and every step height after reads them from here and not the world.
+pub const Colliders = struct {
+    boxes: [box_capacity]Box = undefined,
+    /// Where each shape's boxes end, as Shapes.collide checks its tolerance between shapes.
+    ends: [box_capacity]u16 = undefined,
+    box_count: usize = 0,
+    shape_count: usize = 0,
+    /// False when a long move met more boxes than fit, and callers walk the world instead.
+    complete: bool = true,
+
+    const box_capacity = 256;
+
+    pub fn gather(level: *const Level, query: Box, context: Context) !Colliders {
+        var self: Colliders = .{};
+        var shapes: Shapes = .init(level, query, context);
+        while (try shapes.next()) |shape| {
+            if (self.box_count + shape.boxes.count > box_capacity) {
+                self.complete = false;
+                return self;
+            }
+            for (0..shape.boxes.count) |index| {
+                self.boxes[self.box_count] = shape.get(index);
+                self.box_count += 1;
+            }
+            self.ends[self.shape_count] = @intCast(self.box_count);
+            self.shape_count += 1;
+        }
+        return self;
+    }
+
+    /// Shapes.collide along one axis.
+    fn collideAxis(self: *const Colliders, moving: Box, axis: usize, distance: f64) f64 {
+        var result = distance;
+        var begin: usize = 0;
+        for (self.ends[0..self.shape_count]) |end| {
+            if (@abs(result) < 1.0e-7) return 0;
+            for (self.boxes[begin..end]) |obstacle| result = collideBox(obstacle, moving, axis, result);
+            begin = end;
+        }
+        return result;
+    }
+
+    /// Entity.collideWithShapes: Y first, then the larger of X and Z last.
+    fn collideWith(self: *const Colliders, movement: [3]f64, start: Box) [3]f64 {
+        if (self.shape_count == 0) return movement;
+        var result: [3]f64 = .{ 0, 0, 0 };
+        const order: [3]usize = if (@abs(movement[0]) < @abs(movement[2])) .{ 1, 2, 0 } else .{ 1, 0, 2 };
+        for (order) |axis| {
+            if (movement[axis] == 0) continue;
+            result[axis] = self.collideAxis(start.move(result), axis, movement[axis]);
+        }
+        return result;
+    }
+
+    /// Entity.collectCandidateStepUpHeights: the heights above the box's bottom of shape edges
+    /// no higher than the step, sorted. Shape edges are box bottoms and tops here.
+    fn stepHeights(self: *const Colliders, base: Box, max_up_step: f32, skip: f32, output: *[64]f32) usize {
+        var count: usize = 0;
+        for (self.boxes[0..self.box_count]) |value| {
+            for ([2]f64{ value.min[1], value.max[1] }) |coordinate| {
+                const height: f32 = @floatCast(coordinate - base.min[1]);
+                if (height < 0 or height == skip or height > max_up_step) continue;
+                if (std.mem.indexOfScalar(f32, output[0..count], height) != null) continue;
+                // Distinct edges below one step cannot run out in any block vanilla has.
+                assert(count < output.len);
+                output[count] = height;
+                count += 1;
+            }
+        }
+        std.mem.sort(f32, output[0..count], {}, std.sort.asc(f32));
+        return count;
+    }
+};
+
+/// Entity.collideWithShapes against what a query gathers, or the world itself past what fits.
 fn collideWithShapes(level: *const Level, query: Box, context: Context, movement: [3]f64, start: Box) ![3]f64 {
-    if (!try anyShape(level, query, context)) return movement;
+    const colliders = try Colliders.gather(level, query, context);
+    if (colliders.complete) return colliders.collideWith(movement, start);
     var result: [3]f64 = .{ 0, 0, 0 };
     const order: [3]usize = if (@abs(movement[0]) < @abs(movement[2])) .{ 1, 2, 0 } else .{ 1, 0, 2 };
     for (order) |axis| {
@@ -316,10 +392,11 @@ pub fn collide(level: *const Level, start: Box, movement: [3]f64, context: Conte
         const base = if (landed) start.move(.{ 0, collided[1], 0 }) else start;
         var query = base.expandTowards(.{ movement[0], max_up_step, movement[2] });
         if (!landed) query = query.expandTowards(.{ 0, -@as(f64, @as(f32, 1.0e-5)), 0 });
+        const colliders = try Colliders.gather(level, query, context);
         var heights: [64]f32 = undefined;
-        const count = try stepHeights(level, query, context, base, max_up_step, @floatCast(collided[1]), &heights);
+        const count = if (colliders.complete) colliders.stepHeights(base, max_up_step, @floatCast(collided[1]), &heights) else try stepHeights(level, query, context, base, max_up_step, @floatCast(collided[1]), &heights);
         for (heights[0..count]) |height| {
-            const stepped = try collideWithShapes(level, query, context, .{ movement[0], height, movement[2] }, base);
+            const stepped = if (colliders.complete) colliders.collideWith(.{ movement[0], height, movement[2] }, base) else try collideWithShapes(level, query, context, .{ movement[0], height, movement[2] }, base);
             if (stepped[0] * stepped[0] + stepped[2] * stepped[2] > collided[0] * collided[0] + collided[2] * collided[2]) {
                 const lowered = start.min[1] - base.min[1];
                 return .{ stepped[0], stepped[1] - lowered, stepped[2] };

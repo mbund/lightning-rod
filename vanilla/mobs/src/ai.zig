@@ -119,22 +119,34 @@ fn lookControl(mobs: *Mobs, mob: *Mob) void {
     mob.pitch = 0;
     if (mob.look_cooldown > 0) {
         mob.look_cooldown -= 1;
-        const dx = mob.look_wanted[0] - mob.position[0];
-        const dz = mob.look_wanted[2] - mob.position[2];
-        if (@abs(dz) > @as(f64, @as(f32, 1.0e-5)) or @abs(dx) > @as(f64, @as(f32, 1.0e-5))) {
-            const yaw: f32 = @as(f32, @floatCast(mth.atan2(dz, dx) * @as(f64, @as(f32, 180.0)) / @as(f64, @as(f32, std.math.pi)))) - 90.0;
-            mob.head_yaw = mth.rotateTowards(mob.head_yaw, yaw, mob.look_max_yaw);
-        }
-        const dy = mob.look_wanted[1] - living.eyeY(mobs, mob);
-        const horizontal = @sqrt(dx * dx + dz * dz);
-        if (@abs(dy) > @as(f64, @as(f32, 1.0e-5)) or @abs(horizontal) > @as(f64, @as(f32, 1.0e-5))) {
-            const pitch: f32 = @floatCast(-(mth.atan2(dy, horizontal) * @as(f64, @as(f32, 180.0)) / @as(f64, @as(f32, std.math.pi))));
-            mob.pitch = setPitch(mth.rotateTowards(mob.pitch, pitch, mob.look_max_pitch));
-        }
+        if (lookYaw(mob)) |yaw| mob.head_yaw = mth.rotateTowards(mob.head_yaw, yaw, mob.look_max_yaw);
+        if (lookPitch(mobs, mob)) |pitch| mob.pitch = setPitch(mth.rotateTowards(mob.pitch, pitch, mob.look_max_pitch));
     } else {
         mob.head_yaw = mth.rotateTowards(mob.head_yaw, mob.body_yaw, 10);
     }
     if (navigation.inProgress(mob)) mob.head_yaw = mth.rotateIfNecessary(mob.head_yaw, mob.body_yaw, max_head_yaw);
+}
+
+/// LookControl.getYRotD: the yaw toward what the mob looks at, unless it is straight above or below.
+pub fn lookYaw(mob: *const Mob) ?f32 {
+    return lookYawAt(mob.look_wanted, mob.position);
+}
+
+pub fn lookYawAt(wanted: [3]f64, position: [3]f64) ?f32 {
+    const dx = wanted[0] - position[0];
+    const dz = wanted[2] - position[2];
+    if (!(@abs(dz) > @as(f64, @as(f32, 1.0e-5)) or @abs(dx) > @as(f64, @as(f32, 1.0e-5)))) return null;
+    return @as(f32, @floatCast(mth.atan2(dz, dx) * @as(f64, @as(f32, 180.0)) / @as(f64, @as(f32, std.math.pi)))) - 90.0;
+}
+
+/// LookControl.getXRotD: the pitch toward what the mob looks at, unless it is right there.
+pub fn lookPitch(mobs: *const Mobs, mob: *const Mob) ?f32 {
+    const dx = mob.look_wanted[0] - mob.position[0];
+    const dz = mob.look_wanted[2] - mob.position[2];
+    const dy = mob.look_wanted[1] - living.eyeY(mobs, mob);
+    const horizontal = @sqrt(dx * dx + dz * dz);
+    if (!(@abs(dy) > @as(f64, @as(f32, 1.0e-5)) or @abs(horizontal) > @as(f64, @as(f32, 1.0e-5)))) return null;
+    return @floatCast(-(mth.atan2(dy, horizontal) * @as(f64, @as(f32, 180.0)) / @as(f64, @as(f32, std.math.pi))));
 }
 
 /// Entity.setXRot: clamped to [-90, 90] after taking it modulo 360.

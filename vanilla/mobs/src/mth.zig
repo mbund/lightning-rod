@@ -55,9 +55,20 @@ pub fn sqrt(value: f32) f32 {
     return @floatCast(@sqrt(@as(f64, value)));
 }
 
+/// Java's float % 360: the sign of the dividend, exact. Below 360 it is the value itself, and below
+/// 720 one subtraction is exact (Sterbenz), keeping a zero's sign, which spares the library call.
+pub fn remainder360(value: f32) f32 {
+    const size = @abs(value);
+    if (size < 360.0) return value;
+    if (size < 720.0) {
+        const reduced = if (value > 0) value - 360.0 else value + 360.0;
+        return if (reduced == 0) std.math.copysign(@as(f32, 0), value) else reduced;
+    }
+    return @rem(value, 360.0);
+}
+
 pub fn wrapDegrees(value: f32) f32 {
-    // Java % keeps the sign of the dividend, as @rem does.
-    var wrapped = @rem(value, 360.0);
+    var wrapped = remainder360(value);
     if (wrapped >= 180.0) wrapped -= 360.0;
     if (wrapped < -180.0) wrapped += 360.0;
     return wrapped;
@@ -169,4 +180,14 @@ test "table sine and atan2 follow vanilla" {
     try std.testing.expectEqual(@as(f32, 170), wrapDegrees(-190));
     try std.testing.expectEqual(@as(i8, -128), packDegrees(180));
     try std.testing.expectEqual(@as(i32, -2), floor(-1.5));
+}
+
+test "the fast remainder by 360 matches the library's bit for bit" {
+    const edges = [_]f32{ 0.0, -0.0, 359.99997, 360.0, -360.0, 360.00003, 540.0, -540.0, 719.99994, -719.99994, 720.0, -720.0, 1000.5, -1000.5 };
+    for (edges) |value| try std.testing.expectEqual(@as(u32, @bitCast(@rem(value, @as(f32, 360.0)))), @as(u32, @bitCast(remainder360(value))));
+    var prng = std.Random.DefaultPrng.init(360);
+    for (0..1_000_000) |_| {
+        const value = (prng.random().float(f32) - 0.5) * 2000.0;
+        try std.testing.expectEqual(@as(u32, @bitCast(@rem(value, @as(f32, 360.0)))), @as(u32, @bitCast(remainder360(value))));
+    }
 }

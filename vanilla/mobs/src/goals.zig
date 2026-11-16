@@ -152,7 +152,7 @@ fn canUse(mobs: *Mobs, mob: *Mob, goal: Goal) !bool {
         .panic => try panicCanUse(mobs, mob),
         .breed => try breedCanUse(mobs, mob),
         .tempt => try temptCanUse(mobs, mob),
-        .follow_parent => followParentCanUse(mobs, mob),
+        .follow_parent => try followParentCanUse(mobs, mob),
         .stroll => try strollCanUse(mobs, mob),
         .look_at_player => try lookAtPlayerCanUse(mobs, mob),
         .look_around => mob.random.nextFloat() < 0.02,
@@ -303,17 +303,16 @@ fn lookForWater(mobs: *Mobs, mob: *const Mob) !?[3]i32 {
 
 fn breedCanUse(mobs: *Mobs, mob: *Mob) !bool {
     if (mob.in_love <= 0) return false;
-    mob.goals.breed_partner = freePartner(mobs, mob);
+    mob.goals.breed_partner = try freePartner(mobs, mob);
     return mob.goals.breed_partner != null;
 }
 
 /// BreedGoal.getFreePartner: the nearest mob of the kind within 8 blocks that can mate and
 /// does not panic.
-fn freePartner(mobs: *Mobs, mob: *Mob) ?u32 {
+fn freePartner(mobs: *Mobs, mob: *Mob) !?u32 {
     var best: ?u32 = null;
     var best_distance = std.math.floatMax(f64);
-    var kin = senses.Kin.init(mobs, mob, living.box(mobs, mob).inflate(8, 8, 8));
-    while (kin.next()) |index| {
+    for (try mobs.near(mob, living.box(mobs, mob).inflate(8, 8, 8), .same_species)) |index| {
         const other = &mobs.mobs[index];
         if (!other.alive()) continue;
         const distance = senses.distanceSquared(mob, other);
@@ -376,12 +375,11 @@ fn temptTick(mobs: *Mobs, mob: *Mob) !void {
 
 // FollowParentGoal.
 
-fn followParentCanUse(mobs: *Mobs, mob: *Mob) bool {
+fn followParentCanUse(mobs: *Mobs, mob: *Mob) !bool {
     if (mob.age >= 0) return false;
     var best: ?u32 = null;
     var best_distance = std.math.floatMax(f64);
-    var kin = senses.Kin.init(mobs, mob, living.box(mobs, mob).inflate(8, 4, 8));
-    while (kin.next()) |index| {
+    for (try mobs.near(mob, living.box(mobs, mob).inflate(8, 4, 8), .same_species)) |index| {
         const other = &mobs.mobs[index];
         if (other.age < 0) continue;
         const distance = senses.distanceSquared(mob, other);

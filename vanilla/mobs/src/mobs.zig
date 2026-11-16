@@ -1,4 +1,4 @@
-//! The mobs of every world, in a fixed array with a spatial index, ticked in vanilla's order
+//! The mobs of every world, in a fixed array with a grid of where they stand, ticked in vanilla's order
 //! where the ticking domain reaches and saved at checkpoints. Mobs read blocks through copies
 //! of the sections they touch, kept across ticks.
 
@@ -16,7 +16,6 @@ const Dimensions = @import("vanilla_content").dimensions.Dimensions;
 const Players = @import("players").players.Players;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
 const Domains = @import("domains").domains.Domains;
-const spatial = @import("vanilla_item_entities").item_spatial;
 const world_effects = @import("vanilla_blocks").world_effects;
 const body = @import("body.zig");
 const living = @import("living.zig");
@@ -30,6 +29,7 @@ const JavaRandom = @import("java_random.zig").JavaRandom;
 const pathfinding = @import("pathfinding.zig");
 const navigation = @import("navigation.zig");
 const herd_state = @import("herd.zig");
+const grid_state = @import("grid.zig");
 const goals = @import("goals.zig");
 const inventories = @import("inventories");
 const Lighting = @import("terrain").lighting.Lighting;
@@ -131,8 +131,14 @@ pub const Mobs = struct {
     deps: Dependencies,
     config: Configuration,
     mobs: []Mob,
-    residents: []spatial.Resident,
-    spatial: spatial.Index,
+    /// Mobs by the cell they stand in, and where and when they came into their section.
+    grid: grid_state.Grid,
+    arrivals: []grid_state.Arrival,
+    arrival_stamp: u64 = 0,
+    /// Room for what a query near a box finds.
+    nearby: []u32,
+    /// Half the width of the widest mob, which a box query reaches out by.
+    widest_half: f64,
     ids: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     active: lightning_rod.system.IndexSet,
     free: []u32,
@@ -169,6 +175,9 @@ pub const Mobs = struct {
     travels_run: u64 = 0,
     /// Ticks idle mobs took in the herd, for measuring.
     idle_ticks: u64 = 0,
+    /// Blocks of eight idle mobs advanced together, and lanes in them left to the scalar tick.
+    idle_blocks: u64 = 0,
+    rare_lanes: u64 = 0,
     /// Mobs following a path while a batch of edits is answered.
     candidates: []u32,
     /// Blocks as they stood after the edit being answered, which levels read while it is set.
@@ -184,6 +193,12 @@ pub const Mobs = struct {
     present_count: usize = 0,
     holders: []herd_state.Audience.Player,
     holder_count: usize = 0,
+    /// Set while Debug checks an idle tick against the full one, which then plays no sound.
+    muted: bool = false,
+    /// Rises whenever columns start or stop ticking.
+    domain_revision: u64 = 0,
+    /// By slot, whether the mob's column ticked, as of a domains revision.
+    column_ticks: []ColumnTicks,
     /// Worlds' levels found this tick, kept only while mobs tick.
     views: [8]WorldView = undefined,
     view_count: usize = 0,
@@ -212,14 +227,14 @@ pub const Mobs = struct {
         if (config.maximum == 0 or config.maximum > 65536) return error.InvalidMobCapacity;
         if (config.edits == 0) return error.InvalidEditCapacity;
         const self = try allocator.create(Mobs);
-        const residents = try allocator.alloc(spatial.Resident, config.maximum);
-        @memset(residents, .{});
         self.* = .{
             .deps = deps,
             .config = config,
             .mobs = try allocator.alloc(Mob, config.maximum),
-            .residents = residents,
-            .spatial = try .init(allocator, residents),
+            .grid = try .init(allocator, config.maximum),
+            .arrivals = try allocator.alloc(grid_state.Arrival, config.maximum),
+            .nearby = try allocator.alloc(u32, config.maximum),
+            .widest_half = 0,
             .active = try .init(allocator, config.maximum),
             .free = try allocator.alloc(u32, config.maximum),
             .free_count = config.maximum,
@@ -241,6 +256,7 @@ pub const Mobs = struct {
             .edits = try allocator.alloc(body.Edit, config.edits),
             .candidates = try allocator.alloc(u32, config.maximum),
             .holding_food = try allocator.alloc(bool, deps.players.records.len),
+            .column_ticks = try allocator.alloc(ColumnTicks, config.maximum),
             .herd = try .init(allocator, config.maximum),
             .present = try allocator.alloc(herd_state.Audience.Player, deps.players.records.len),
             .holders = try allocator.alloc(herd_state.Audience.Player, deps.players.records.len),
@@ -251,9 +267,11 @@ pub const Mobs = struct {
         try self.readTags();
         try deps.items.deps.definitions.registry.onChange(self, readTags);
         try deps.chunks.observe(.init(self, blocksChanged));
+        try deps.domains.observe(.init(Mobs, self, domainsChanged));
         try deps.client.registry.onChange(self, readTags);
         for (self.free, 0..) |*slot, index| slot.* = @intCast(config.maximum - 1 - index);
         inline for (@typeInfo(Species).@"enum".field_names, 0..) |field, index| self.species[index] = species_data.traits(@field(Species, field));
+        for (self.species) |species| self.widest_half = @max(self.widest_half, @as(f64, species.width) / 2);
         try self.ids.ensureTotalCapacity(allocator, @intCast(config.maximum));
         return self;
     }
@@ -379,8 +397,9 @@ pub const Mobs = struct {
         self.mobs[index] = created;
         self.ids.putAssumeCapacityNoClobber(created.id, index);
         self.active.insert(index);
-        self.residents[index] = .{ .id = created.id };
         self.herd.add(self.mobs, index);
+        self.arrivals[index] = .{ .section = sectionOf(created.position), .stamp = self.nextArrival() };
+        self.column_ticks[index] = .{};
         self.locate(index);
         // A mob appearing touches the mobs around it.
         const placed = living.box(self, &self.mobs[index]);
@@ -388,29 +407,25 @@ pub const Mobs = struct {
         return created.id;
     }
 
-    /// Keeps the spatial index on the section a mob is in.
+    /// Keeps a mob in the grid cell it stands in, and notes when it comes into a new section.
     pub fn locate(self: *Mobs, index: u32) void {
         const mob = &self.mobs[index];
-        const resident = &self.residents[index];
-        const x = @divFloor(mob.blockPosition()[0], 16);
-        const y = @divFloor(mob.blockPosition()[1], 16);
-        const z = @divFloor(mob.blockPosition()[2], 16);
-        const alive = !mob.removed;
-        if (resident.alive and resident.world == mob.world and resident.x == x and resident.y == y and resident.z == z) {
-            resident.position = .{ mob.position[0], mob.position[2] };
-            return;
-        }
-        if (resident.alive) self.spatial.remove(index);
-        resident.* = .{ .id = mob.id, .world = mob.world, .x = x, .y = y, .z = z, .position = .{ mob.position[0], mob.position[2] }, .alive = alive };
-        if (alive) self.spatial.insert(index);
+        if (mob.removed) return self.grid.remove(index);
+        const section = sectionOf(mob.position);
+        if (!std.meta.eql(section, self.arrivals[index].section)) self.arrivals[index] = .{ .section = section, .stamp = self.nextArrival() };
+        self.grid.place(index, grid_state.Grid.cellOf(mob.world, mob.position[0], mob.position[2]));
+    }
+
+    fn nextArrival(self: *Mobs) u64 {
+        self.arrival_stamp += 1;
+        return self.arrival_stamp;
     }
 
     /// Forgets a removed mob. Its viewers have been told, so the slot is free.
     pub fn release(self: *Mobs, index: u32) void {
         const mob = &self.mobs[index];
         assert(mob.removed);
-        if (self.residents[index].alive) self.spatial.remove(index);
-        self.residents[index].alive = false;
+        self.grid.remove(index);
         assert(self.ids.remove(mob.id));
         self.active.remove(index);
         self.herd.remove(index);
@@ -422,6 +437,9 @@ pub const Mobs = struct {
     pub fn get(self: *Mobs, entity: u64) ?*Mob {
         const index = self.ids.get(entity) orelse return null;
         self.stopIdling(index);
+        // It may be moved, so whether it ticks is asked again.
+        const place = self.herd.place_of[index];
+        if (place != herd_state.no_place) self.herd.still.dormant_revision[place] = std.math.maxInt(u64);
         return &self.mobs[index];
     }
 
@@ -451,35 +469,110 @@ pub const Mobs = struct {
         try self.answerEdits();
         self.herd.tidy(self.mobs);
         const audience = self.noteAudience();
-        const tempt_range = self.traits(.cow).attribute(.tempt_range);
-        var ticking: TickingMemo = .{};
-        // ServerLevel's entity tick list, by entity id.
-        for (0..self.herd.count) |place| {
-            const index = self.herd.slots[place];
-            if (index == herd_state.no_place) continue;
-            // An idle mob is read from the herd alone, without touching its Mob.
-            if (self.herd.idling[place]) {
-                if (!ticking.ticks(self, self.herd.still.world[place], self.herd.still.chunk[place])) continue;
-                const before = if (verify_idle) self.idleBefore(place) else {};
-                switch (herd_state.advance(&self.herd, place, audience, tempt_range)) {
-                    .idled => {
-                        self.idle_ticks += 1;
-                        if (verify_idle) try self.checkIdle(place, before);
-                        continue;
-                    },
-                    // Something starts, so the mob takes its full tick from the start.
-                    .started => self.herd.leave(place, &self.mobs[index]),
-                }
+        const cow = self.traits(.cow);
+        const species: herd_state.Species = .{ .tempt_range = cow.attribute(.tempt_range), .eye_height = cow.eye_height, .ambient_interval = cow.ambient_interval };
+        var context: TickContext = .{ .audience = audience, .species = species, .volume = cow.sound_volume };
+        // ServerLevel's entity tick list, by entity id. Runs of eight idle mobs advance at once.
+        var place: usize = 0;
+        while (place < self.herd.count) {
+            if (place + herd_state.lane_count <= self.herd.count and self.idleRun(place, &context.ticking)) {
+                try self.tickBlock(place, &context);
+                place += herd_state.lane_count;
+                continue;
             }
-            const mob = &self.mobs[index];
-            if (mob.removed) continue;
-            if (!ticking.ticks(self, mob.world, chunkOf(mob.position))) continue;
-            try mob_tick.tick(self, mob);
-            self.locate(index);
-            // Blocks the mob changed, as trampled farmland, before the next mob moves.
-            try self.answerEdits();
-            if (!self.herd.idling[place] and herd_state.idle(mob)) self.herd.enter(place, mob);
+            try self.tickPlace(place, &context);
+            place += 1;
         }
+    }
+
+    const TickContext = struct {
+        audience: herd_state.Audience,
+        species: herd_state.Species,
+        volume: f32,
+        ticking: TickingMemo = .{},
+    };
+
+    /// Whether an idle mob's column ticks, which holds until the domains change.
+    fn idleTicks(self: *Mobs, place: usize, ticking: *TickingMemo) bool {
+        const still = &self.herd.still;
+        if (still.ticks_revision[place] != self.domain_revision) {
+            still.ticks[place] = ticking.ticks(self, still.world[place], still.chunk[place]);
+            still.ticks_revision[place] = self.domain_revision;
+        }
+        return still.ticks[place];
+    }
+
+    /// Whether the eight places from one are all idle mobs that tick.
+    fn idleRun(self: *Mobs, first: usize, ticking: *TickingMemo) bool {
+        for (first..first + herd_state.lane_count) |place| {
+            if (self.herd.slots[place] == herd_state.no_place or !self.herd.idling[place]) return false;
+            if (!self.idleTicks(place, ticking)) return false;
+        }
+        return true;
+    }
+
+    fn tickBlock(self: *Mobs, first: usize, context: *TickContext) !void {
+        var before: [herd_state.lane_count]Mob = undefined;
+        if (verify_idle) for (&before, 0..) |*lane, offset| {
+            lane.* = self.idleBefore(first + offset);
+        };
+        const block = herd_state.advanceBlock(&self.herd, first, context.audience, context.species);
+        self.idle_blocks += 1;
+        if (!block.any_rare) {
+            herd_state.commitBlock(&self.herd, first, &block);
+            self.idle_ticks += herd_state.lane_count;
+            if (verify_idle) for (before, 0..) |lane, offset| try self.checkIdle(first + offset, lane);
+            return;
+        }
+        // In order: a rare lane takes its own tick, which may wake the lanes after it.
+        for (0..herd_state.lane_count) |offset| {
+            const place = first + offset;
+            if (block.rare[offset] or !self.herd.idling[place]) {
+                if (block.rare[offset]) self.rare_lanes += 1;
+                try self.tickPlace(place, context);
+                continue;
+            }
+            herd_state.commitLane(&self.herd, first, &block, offset);
+            self.idle_ticks += 1;
+            if (verify_idle) try self.checkIdle(place, before[offset]);
+        }
+    }
+
+    fn tickPlace(self: *Mobs, place: usize, context: *TickContext) !void {
+        const index = self.herd.slots[place];
+        if (index == herd_state.no_place) return;
+        // An idle mob is read from the herd alone, without touching its Mob.
+        if (self.herd.idling[place]) {
+            if (!self.idleTicks(place, &context.ticking)) return;
+            const before = if (verify_idle) self.idleBefore(place) else {};
+            switch (herd_state.advance(&self.herd, place, context.audience, context.species)) {
+                .idled => |sound| {
+                    self.idle_ticks += 1;
+                    // Mob.playAmbientSound, once the tick is sure to stand.
+                    if (sound) |pitch| {
+                        const still = &self.herd.still;
+                        const at = still.position[place];
+                        self.effects.sound(still.world[place], .{ .x = at[0], .y = at[1], .z = at[2] }, Sound.cow_ambient.name(), .neutral, context.volume, pitch, @bitCast(self.sound_seeds.next()), null);
+                    }
+                    if (verify_idle) try self.checkIdle(place, before);
+                    return;
+                },
+                // Something starts, so the mob takes its full tick from the start.
+                .started => self.herd.leave(place, &self.mobs[index]),
+            }
+        }
+        if (self.herd.still.dormant_revision[place] == self.domain_revision) return;
+        const mob = &self.mobs[index];
+        if (mob.removed) return;
+        if (!self.columnTicks(index, &context.ticking)) {
+            self.herd.still.dormant_revision[place] = self.domain_revision;
+            return;
+        }
+        try mob_tick.tick(self, mob);
+        self.locate(index);
+        // Blocks the mob changed, as trampled farmland, before the next mob moves.
+        try self.answerEdits();
+        if (!self.herd.idling[place] and herd_state.idle(self, mob)) self.herd.enter(place, mob);
     }
 
     /// The players idle mobs look for, as mobs start ticking and players stand still.
@@ -510,6 +603,9 @@ pub const Mobs = struct {
 
     fn checkIdle(self: *Mobs, place: usize, before: Mob) !void {
         var expected = before;
+        // The full tick on the copy plays nothing, as the idle tick already did.
+        self.muted = true;
+        defer self.muted = false;
         try mob_tick.tick(self, &expected);
         var actual = self.mobs[self.herd.slots[place]];
         self.herd.writeBack(place, &actual);
@@ -533,6 +629,20 @@ pub const Mobs = struct {
             return self.result;
         }
     };
+
+    /// Whether a mob's column ticks, asking the domains only when they or the column changed.
+    fn columnTicks(self: *Mobs, index: u32, ticking: *TickingMemo) bool {
+        const mob = &self.mobs[index];
+        const chunk = chunkOf(mob.position);
+        const known = &self.column_ticks[index];
+        if (known.revision == self.domain_revision and known.world == mob.world and std.meta.eql(known.chunk, chunk)) return known.ticks;
+        known.* = .{ .revision = self.domain_revision, .world = mob.world, .chunk = chunk, .ticks = ticking.ticks(self, mob.world, chunk) };
+        return known.ticks;
+    }
+
+    fn domainsChanged(self: *Mobs, _: []const @import("domains").domains.Column, _: []const @import("domains").domains.Column) void {
+        self.domain_revision += 1;
+    }
 
     /// ServerLevel.sendBlockUpdated, first half. Edits come here after they apply, a batch at a
     /// time, with what they replaced. From the first that changes a collision shape on, every edit
@@ -765,6 +875,7 @@ pub const Mobs = struct {
     // What moving and living cause.
 
     pub fn playSound(self: *Mobs, mob: *const Mob, sound: Sound, volume: f32, pitch: f32) void {
+        if (self.muted) return;
         const at: minecraft.Position = .{ .x = mob.position[0], .y = mob.position[1], .z = mob.position[2] };
         self.effects.sound(mob.world, at, sound.name(), .neutral, volume, pitch, @bitCast(self.sound_seeds.next()), null);
     }
@@ -974,9 +1085,7 @@ pub const Mobs = struct {
     pub fn wake(self: *Mobs, world: u32, low: [3]f64, high: [3]f64) void {
         const margin = 2.0;
         const reach: body.Box = .{ .min = .{ low[0] - margin, low[1] - margin, low[2] - margin }, .max = .{ high[0] + margin, high[1] + margin, high[2] + margin } };
-        const first: [2]i32 = .{ @divFloor(mth_floor(reach.min[0]), 16), @divFloor(mth_floor(reach.min[2]), 16) };
-        const last: [2]i32 = .{ @divFloor(mth_floor(reach.max[0]), 16), @divFloor(mth_floor(reach.max[2]), 16) };
-        var candidates = self.spatial.rectangle(world, first, last);
+        var candidates = self.grid.query(world, .{ reach.min[0] - self.widest_half, reach.min[2] - self.widest_half }, .{ reach.max[0] + self.widest_half, reach.max[2] + self.widest_half });
         while (candidates.next()) |index| {
             const mob = &self.mobs[index];
             if (mob.resting and living.box(self, mob).intersects(reach)) self.rouse(index);
@@ -1000,23 +1109,53 @@ pub const Mobs = struct {
         return best;
     }
 
-    /// LivingEntity.pushEntities: mobs push the mobs their box overlaps, and each moves apart.
-    /// How many it touched, each of which wakes, as resting mobs skip their own query.
+    /// LivingEntity.pushEntities: mobs push the pushable mobs their box overlaps, in the order vanilla
+    /// finds them, and each moves apart, after the cramming check. How many it touched, each of
+    /// which wakes, as resting mobs skip their own query.
     pub fn pushEntities(self: *Mobs, mob: *Mob) !u32 {
         const own = living.box(self, mob);
-        const low: [2]i32 = .{ @divFloor(mth_floor(own.min[0]) - 1, 16), @divFloor(mth_floor(own.min[2]) - 1, 16) };
-        const high: [2]i32 = .{ @divFloor(mth_floor(own.max[0]) + 1, 16), @divFloor(mth_floor(own.max[2]) + 1, 16) };
-        var candidates = self.spatial.rectangle(mob.world, low, high);
-        var touched: u32 = 0;
+        const found = try self.near(mob, own, .pushable);
+        if (found.len == 0) return 0;
+        // The maxEntityCramming rule at its default: past 23 others, one tick in four hurts.
+        const cramming = 24;
+        if (found.len > cramming - 1 and mob.random.nextIntBounded(4) == 0) {
+            // None of them rides anything here.
+            _ = try self.hurt(mob, .{ .type = .cramming }, 6.0);
+        }
+        for (found) |index| {
+            self.rouse(index);
+            push(&self.mobs[index], mob);
+        }
+        return @intCast(found.len);
+    }
+
+    pub const Nearness = enum { pushable, same_species };
+
+    /// The other mobs whose boxes meet a box, in the order EntitySectionStorage.getEntities finds
+    /// them: by section, then by when each came into its section. LivingEntity.isPushable keeps
+    /// the living off climbables, and asking marks a climber as vanilla's check does. The slice
+    /// lasts until the next query.
+    pub fn near(self: *Mobs, mob: *const Mob, query: body.Box, which: Nearness) ![]const u32 {
+        var count: usize = 0;
+        var candidates = self.grid.query(mob.world, .{ query.min[0] - self.widest_half, query.min[2] - self.widest_half }, .{ query.max[0] + self.widest_half, query.max[2] + self.widest_half });
         while (candidates.next()) |index| {
             const other = &self.mobs[index];
-            if (other.id == mob.id or other.removed or !other.alive()) continue;
-            if (!living.box(self, other).intersects(own)) continue;
-            self.rouse(index);
-            touched += 1;
-            push(other, mob);
+            if (other.id == mob.id or other.removed) continue;
+            if (!living.box(self, other).intersects(query)) continue;
+            switch (which) {
+                .pushable => if (!other.alive() or try living.onClimbable(self, other)) continue,
+                .same_species => if (other.species != mob.species) continue,
+            }
+            self.nearby[count] = index;
+            count += 1;
         }
-        return touched;
+        const found = self.nearby[0..count];
+        std.mem.sort(u32, found, self, inVanillaOrder);
+        return found;
+    }
+
+    fn inVanillaOrder(self: *const Mobs, a: u32, b: u32) bool {
+        return grid_state.Arrival.before(self.arrivals[a], self.arrivals[b]);
     }
 
     /// FarmBlock.turnToDirt.
@@ -1273,7 +1412,14 @@ fn push(pushed: *Mob, pusher: *Mob) void {
     pusher.has_impulse = true;
 }
 
+const ColumnTicks = struct { revision: u64 = std.math.maxInt(u64), world: u32 = 0, chunk: [2]i32 = .{ 0, 0 }, ticks: bool = false };
+
 const WorldView = struct { world: u32, level: body.Level, ultrawarm: bool };
+
+/// The entity section a position is in, as SectionPos.of(blockPosition).
+fn sectionOf(position: [3]f64) [3]i32 {
+    return .{ @divFloor(mth_floor(position[0]), 16), @divFloor(mth_floor(position[1]), 16), @divFloor(mth_floor(position[2]), 16) };
+}
 
 /// The chunk column a position is in.
 pub fn chunkOf(position: [3]f64) [2]i32 {

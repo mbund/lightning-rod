@@ -2,9 +2,9 @@
 //! kept apart as arrays by place in that order, so runs of idle mobs advance together over
 //! compact memory.
 //!
-//! An idle mob rests (Mob.resting), runs no goal, looks at nothing, follows no path and is
-//! grown, calm and whole (see `idle`). Its whole vanilla tick is then a few counters and random
-//! draws, which `advance` computes. A draw that would start something, a sound or a goal, or a
+//! An idle mob rests (Mob.resting), runs at most the look around goal, follows no path and is
+//! grown, calm and whole (see `idle`). Its whole vanilla tick is then counters, random draws and
+//! its head and body turning toward a fixed point, which `advance` computes. A draw that would start something, a sound or a goal, or a
 //! player holding food nearby, sends the mob back to its scalar tick from the start, as if it
 //! had never been idle. While a mob idles, the fields in Hot live here and are stale in its
 //! Mob, and leaving writes them back.
@@ -12,11 +12,19 @@
 const std = @import("std");
 const mob_state = @import("mob.zig");
 const JavaRandom = @import("java_random.zig").JavaRandom;
+const ai = @import("ai.zig");
+const mth = @import("mth.zig");
+const mob_tick = @import("mob_tick.zig");
+const Mobs = @import("mobs.zig").Mobs;
 
 const Mob = mob_state.Mob;
 const assert = std.debug.assert;
 
 pub const no_place = std.math.maxInt(u32);
+
+/// RandomLookAroundGoal, last of the cow's goals.
+const look_around_priority = 7;
+const look_around_bit: u8 = 1 << look_around_priority;
 
 /// The fields an idle tick changes, by place.
 const Hot = struct {
@@ -28,6 +36,26 @@ const Hot = struct {
     head_stable_time: []i32,
     tempt_calm_down: []i32,
     age: []i32,
+    head_yaw: []f32,
+    body_yaw: []f32,
+    old_head_yaw: []f32,
+    old_body_yaw: []f32,
+    last_stable_head_yaw: []f32,
+    look_cooldown: []i32,
+    look_around_time: []i32,
+    /// RandomLookAroundGoal runs, holding the move and look flags.
+    gazing: []bool,
+    /// Its direction, and what the look control turns toward with what limits.
+    look_vector: [][2]f64,
+    look_wanted: [][3]f64,
+    look_max_yaw: []f32,
+    look_max_pitch: []f32,
+    /// LookControl.getYRotD for the wanted point, which stays put while the mob does. NaN when
+    /// there is none.
+    gaze_yaw: []f32,
+    /// Began idling since replication last sent the mob from its Mob, which it does once to
+    /// catch anything that changed on the way in.
+    fresh: []bool,
 };
 
 /// What an idle tick reads and never changes, by place.
@@ -37,6 +65,18 @@ const Still = struct {
     position: [][3]f64,
     world: []u32,
     persistence_required: []bool,
+    id: []u64,
+    yaw: []f32,
+    /// The velocity it rests with, gravity pulling it into the floor.
+    velocity: [][3]f64,
+    /// For replication: the tick count, modulo the send interval, on which it sends.
+    send_phase: []u8,
+    /// Whether its column ticked, as of a domains revision.
+    ticks: []bool,
+    ticks_revision: []u64,
+    /// For any mob, idle or not: the domains revision as of which its column did not tick, so
+    /// it waits without its Mob being read. A mob that does not tick cannot move itself.
+    dormant_revision: []u64,
     /// The chunk column the mob stands in, which decides whether it ticks.
     chunk: [][2]i32,
 };
@@ -74,6 +114,7 @@ pub const Herd = struct {
         self.slots[self.count] = slot;
         self.place_of[slot] = @intCast(self.count);
         self.idling[self.count] = false;
+        self.still.dormant_revision[self.count] = std.math.maxInt(u64);
         self.count += 1;
     }
 
@@ -125,7 +166,7 @@ pub const Herd = struct {
 
     /// The mob starts idling: its hot fields move here.
     pub fn enter(self: *Herd, place: usize, mob: *const Mob) void {
-        assert(!self.idling[place] and idle(mob));
+        assert(!self.idling[place]);
         self.idling[place] = true;
         self.hot.seed[place] = mob.random.state();
         self.hot.tick_count[place] = mob.tick_count;
@@ -135,6 +176,24 @@ pub const Herd = struct {
         self.hot.head_stable_time[place] = mob.head_stable_time;
         self.hot.tempt_calm_down[place] = mob.goals.tempt_calm_down;
         self.hot.age[place] = mob.age;
+        self.hot.head_yaw[place] = mob.head_yaw;
+        self.hot.body_yaw[place] = mob.body_yaw;
+        self.hot.old_head_yaw[place] = mob.old_head_yaw;
+        self.hot.old_body_yaw[place] = mob.old_body_yaw;
+        self.hot.last_stable_head_yaw[place] = mob.last_stable_head_yaw;
+        self.hot.look_cooldown[place] = mob.look_cooldown;
+        self.hot.look_around_time[place] = mob.goals.look_around_time;
+        self.hot.gazing[place] = mob.goals.running != 0;
+        self.hot.gaze_yaw[place] = ai.lookYaw(mob) orelse std.math.nan(f32);
+        self.hot.look_max_yaw[place] = mob.look_max_yaw;
+        self.hot.look_max_pitch[place] = mob.look_max_pitch;
+        self.hot.look_vector[place] = mob.goals.look_around;
+        self.hot.look_wanted[place] = mob.look_wanted;
+        self.still.id[place] = mob.id;
+        self.still.yaw[place] = mob.yaw;
+        self.still.velocity[place] = mob.velocity;
+        self.still.ticks_revision[place] = std.math.maxInt(u64);
+        self.hot.fresh[place] = true;
         self.still.parity_id[place] = @intCast(mob.id & 0x7fffffff);
         self.still.position[place] = mob.position;
         self.still.world[place] = mob.world;
@@ -153,6 +212,21 @@ pub const Herd = struct {
         mob.head_stable_time = self.hot.head_stable_time[place];
         mob.goals.tempt_calm_down = self.hot.tempt_calm_down[place];
         mob.age = self.hot.age[place];
+        mob.head_yaw = self.hot.head_yaw[place];
+        mob.body_yaw = self.hot.body_yaw[place];
+        mob.old_head_yaw = self.hot.old_head_yaw[place];
+        mob.old_body_yaw = self.hot.old_body_yaw[place];
+        mob.last_stable_head_yaw = self.hot.last_stable_head_yaw[place];
+        mob.look_cooldown = self.hot.look_cooldown[place];
+        mob.goals.look_around_time = self.hot.look_around_time[place];
+        mob.goals.look_around = self.hot.look_vector[place];
+        mob.look_wanted = self.hot.look_wanted[place];
+        mob.look_max_yaw = self.hot.look_max_yaw[place];
+        mob.look_max_pitch = self.hot.look_max_pitch[place];
+        const gazing = self.hot.gazing[place];
+        mob.goals.running = if (gazing) look_around_bit else 0;
+        mob.goals.move_owner = if (gazing) look_around_priority else null;
+        mob.goals.look_owner = if (gazing) look_around_priority else null;
     }
 
     /// The mob stops idling: its hot fields go back to it.
@@ -162,15 +236,19 @@ pub const Herd = struct {
     }
 };
 
-/// Whether a resting mob's tick is only counters and draws: nothing runs, turns or hurts.
-pub fn idle(mob: *const Mob) bool {
+/// Whether a resting mob's tick is only counters, draws and turning: no goal but the look
+/// around runs, nothing hurts, and the look control's pitch stays level.
+pub fn idle(mobs: *const Mobs, mob: *const Mob) bool {
+    const goals = mob.goals;
+    const gazing = goals.running == look_around_bit and goals.move_owner == look_around_priority and goals.look_owner == look_around_priority;
+    const still = goals.running == 0 and goals.move_owner == null and goals.look_owner == null;
+    if (!(gazing or still)) return false;
+    // While the look control counts down, the pitch it turns toward must keep the head level.
+    if (mob.look_cooldown > 0) if (ai.lookPitch(mobs, mob)) |pitch| if (mth.rotateTowards(0, pitch, mob.look_max_pitch) != 0) return false;
     return mob.resting and mob.alive() and !mob.no_ai and !mob.first_tick and mob.species == .cow and
-        mob.goals.running == 0 and mob.goals.move_owner == null and mob.goals.look_owner == null and mob.goals.jump_owner == null and
-        mob.goals.disabled == 0 and mob.goals.tempt_player == null and mob.goals.look_at_player == null and
+        goals.jump_owner == null and goals.disabled == 0 and goals.tempt_player == null and goals.look_at_player == null and
         !mob.navigation.path.active and !mob.navigation.has_delayed_recomputation and
-        mob.look_cooldown == 0 and mob.pitch == 0 and mob.old_pitch == 0 and mob.yaw == mob.old_yaw and
-        mob.head_yaw == mob.body_yaw and mob.old_head_yaw == mob.head_yaw and mob.old_body_yaw == mob.body_yaw and
-        @abs(mob.head_yaw - mob.last_stable_head_yaw) <= 15 and
+        mob.pitch == 0 and mob.old_pitch == 0 and mob.yaw == mob.old_yaw and
         mob.age >= 0 and mob.in_love == 0 and mob.hurt_time == 0 and mob.invulnerable_time == 0 and
         mob.last_hurt_by_player == null and mob.last_hurt_by_player_time == 0 and mob.last_hurt_by_mob == null and mob.last_damage == null and
         mob.air_supply == 300 and mob.no_jump_delay == 0 and !mob.jumping and !mob.jump and mob.move_operation == .wait and
@@ -199,6 +277,18 @@ pub const Audience = struct {
         return best;
     }
 
+    /// Whether a present player is within a range of a position.
+    fn within(self: Audience, world: u32, position: [3]f64, range: f64) bool {
+        for (self.present) |player| {
+            if (player.world != world) continue;
+            const dx = position[0] - player.position[0];
+            const dy = position[1] - player.position[1];
+            const dz = position[2] - player.position[2];
+            if (dx * dx + dy * dy + dz * dz <= range * range) return true;
+        }
+        return false;
+    }
+
     /// Whether a holder is close enough that TemptGoal must look properly: within its 10
     /// blocks, before sneaking narrows that.
     fn temptsNear(self: Audience, world: u32, position: [3]f64, range: f64) bool {
@@ -213,16 +303,33 @@ pub const Audience = struct {
     }
 };
 
-pub const Outcome = enum { idled, started };
+/// What an idle tick needs of the species, all cows here.
+pub const Species = struct {
+    tempt_range: f64,
+    eye_height: f32,
+    ambient_interval: i32,
+};
+
+/// An idle tick that stays idle, with the pitch of the ambient sound it plays, if it does.
+pub const Outcome = union(enum) {
+    idled: ?f32,
+    /// Something started that only the full tick does, so the place is left as it was.
+    started,
+};
 
 /// One idle tick for the mob at a place: Mob.checkDespawn, then Mob.tick as mob_tick.zig runs
-/// it for an idle mob. Commits only when nothing started; `started` leaves the place as it was.
-pub fn advance(herd: *Herd, place: usize, audience: Audience, tempt_range: f64) Outcome {
-    var random = JavaRandom.restore(herd.hot.seed[place]);
-    var tick_count = herd.hot.tick_count[place];
-    var ambient = herd.hot.ambient_sound_time[place];
-    var no_action = herd.hot.no_action_time[place];
-    var calm_down = herd.hot.tempt_calm_down[place];
+/// it for an idle mob. Commits only when it stays idle.
+pub fn advance(herd: *Herd, place: usize, audience: Audience, species: Species) Outcome {
+    const hot = &herd.hot;
+    var random = JavaRandom.restore(hot.seed[place]);
+    var tick_count = hot.tick_count[place];
+    var ambient = hot.ambient_sound_time[place];
+    var no_action = hot.no_action_time[place];
+    var calm_down = hot.tempt_calm_down[place];
+    var gazing = hot.gazing[place];
+    var look_around_time = hot.look_around_time[place];
+    var cooldown = hot.look_cooldown[place];
+    var gaze_yaw = hot.gaze_yaw[place];
     const position = herd.still.position[place];
     const world = herd.still.world[place];
     // Mob.checkDespawn: an animal never despawns, but the draw happens after 600 idle ticks.
@@ -237,34 +344,329 @@ pub fn advance(herd: *Herd, place: usize, audience: Audience, tempt_range: f64) 
         }
     }
     tick_count += 1;
-    // Mob.baseTick: the ambient sound.
+    // Mob.baseTick: the ambient sound, its pitch Mob.getVoicePitch for a grown mob.
+    var sound: ?f32 = null;
     const roll = random.nextIntBounded(1000);
     const time = ambient;
     ambient += 1;
-    if (roll < time) return .started;
+    if (roll < time) {
+        ambient = -species.ambient_interval;
+        sound = (random.nextFloat() - random.nextFloat()) * 0.2 + 1.0;
+    }
     // Mob.serverAiStep.
     no_action += 1;
+    var started_gazing = false;
+    var look_vector = hot.look_vector[place];
     const parity = @rem(tick_count +% herd.still.parity_id[place], 2);
     if (!(parity != 0 and tick_count > 1)) {
-        // GoalSelector.tick with nothing running: each goal in turn may start.
+        // GoalSelector.tick: the look around stops when its time runs out, then each goal not
+        // running may start.
+        if (gazing and !(look_around_time >= 0)) gazing = false;
         if (calm_down > 0) {
             calm_down -= 1;
-        } else if (audience.temptsNear(world, position, tempt_range)) {
+        } else if (audience.temptsNear(world, position, species.tempt_range)) {
             return .started;
         }
         if (no_action < 100 and random.nextIntBounded(60) == 0) return .started;
-        if (!(random.nextFloat() >= 0.02)) return .started;
-        if (random.nextFloat() < 0.02) return .started;
+        // LookAtPlayerGoal: on its roll it looks for a player within 6 blocks, measured from the
+        // mob, and starts only for one it sees.
+        if (!(random.nextFloat() >= 0.02) and audience.within(world, position, 6.0)) return .started;
+        // RandomLookAroundGoal.
+        if (!gazing and random.nextFloat() < 0.02) {
+            const angle = (std.math.pi * 2.0) * random.nextDouble();
+            look_vector = .{ @cos(angle), @sin(angle) };
+            look_around_time = 20 + random.nextIntBounded(20);
+            gazing = true;
+            started_gazing = true;
+        }
     }
-    herd.hot.seed[place] = random.state();
-    herd.hot.tick_count[place] = tick_count;
-    herd.hot.ambient_sound_time[place] = ambient;
-    herd.hot.no_action_time[place] = no_action;
-    herd.hot.tempt_calm_down[place] = calm_down;
-    herd.hot.navigation_tick[place] += 1;
+    // RandomLookAroundGoal.tick, which runs every tick, and LookControl.setLookAt.
+    if (gazing) {
+        look_around_time -= 1;
+        cooldown = 2;
+        if (started_gazing) {
+            const wanted: [3]f64 = .{ position[0] + look_vector[0], position[1] + species.eye_height, position[2] + look_vector[1] };
+            hot.look_wanted[place] = wanted;
+            hot.look_max_yaw[place] = ai.head_rotation_speed;
+            hot.look_max_pitch[place] = ai.max_head_pitch;
+            gaze_yaw = ai.lookYawAt(wanted, position) orelse std.math.nan(f32);
+        }
+    }
+    // LookControl.tick. The pitch stays level, as `idle` and a look around both ensure.
+    var head = hot.head_yaw[place];
+    const body = hot.body_yaw[place];
+    if (cooldown > 0) {
+        cooldown -= 1;
+        if (!std.math.isNan(gaze_yaw)) head = mth.rotateTowards(head, gaze_yaw, hot.look_max_yaw[place]);
+    } else {
+        head = mth.rotateTowards(head, body, 10);
+    }
+    // BodyRotationControl, for a mob that stood still.
+    var turn: mob_tick.Turn = .{ .body = body, .last_stable = hot.last_stable_head_yaw[place], .stable_time = hot.head_stable_time[place] };
+    mob_tick.turnStill(head, &turn);
+    hot.seed[place] = random.state();
+    hot.tick_count[place] = tick_count;
+    hot.ambient_sound_time[place] = ambient;
+    hot.no_action_time[place] = no_action;
+    hot.tempt_calm_down[place] = calm_down;
+    hot.navigation_tick[place] += 1;
+    hot.gazing[place] = gazing;
+    hot.look_around_time[place] = look_around_time;
+    hot.look_vector[place] = look_vector;
+    hot.look_cooldown[place] = cooldown;
+    hot.gaze_yaw[place] = gaze_yaw;
+    // Entity.baseTick keeps last tick's angles before anything turns.
+    hot.old_head_yaw[place] = hot.head_yaw[place];
+    hot.old_body_yaw[place] = body;
+    hot.head_yaw[place] = head;
+    hot.body_yaw[place] = turn.body;
+    hot.last_stable_head_yaw[place] = turn.last_stable;
+    hot.head_stable_time[place] = turn.stable_time;
     // AgeableMob.aiStep: a grown mob's breeding cooldown runs down, and it stays grown.
-    if (herd.hot.age[place] > 0) herd.hot.age[place] -= 1;
-    // BodyRotationControl: still and facing its head, the head counts as stable.
-    herd.hot.head_stable_time[place] += 1;
-    return .idled;
+    if (hot.age[place] > 0) hot.age[place] -= 1;
+    return .{ .idled = sound };
+}
+
+// Eight lanes at once.
+
+pub const lane_count = 8;
+const U64 = @Vector(lane_count, u64);
+const I32 = @Vector(lane_count, i32);
+const F32 = @Vector(lane_count, f32);
+const F64 = @Vector(lane_count, f64);
+const Mask = @Vector(lane_count, bool);
+
+const none: Mask = @splat(false);
+
+/// What `advanceBlock` found for eight places, kept until each lane is committed.
+pub const Block = struct {
+    /// Lanes that met something rare and take `advance` instead.
+    rare: [lane_count]bool,
+    any_rare: bool,
+    seed: [lane_count]u64,
+    tick_count: [lane_count]i32,
+    ambient_sound_time: [lane_count]i32,
+    no_action_time: [lane_count]i32,
+    tempt_calm_down: [lane_count]i32,
+    gazing: [lane_count]bool,
+    look_around_time: [lane_count]i32,
+    look_cooldown: [lane_count]i32,
+    head_yaw: [lane_count]f32,
+    body_yaw: [lane_count]f32,
+    last_stable_head_yaw: [lane_count]f32,
+    head_stable_time: [lane_count]i32,
+};
+
+fn load(comptime T: type, items: []const T, first: usize) @Vector(lane_count, T) {
+    return items[first..][0..lane_count].*;
+}
+
+fn lcg(seed: U64) U64 {
+    return (seed *% @as(U64, @splat(0x5DEECE66D)) +% @as(U64, @splat(11))) & @as(U64, @splat((1 << 48) - 1));
+}
+
+/// JavaRandom.next for the lanes that draw, which alone move their seed.
+fn draw(seed: *U64, drawing: Mask, comptime bits: u6) I32 {
+    const advanced = lcg(seed.*);
+    seed.* = @select(u64, drawing, advanced, seed.*);
+    const shifted: @Vector(lane_count, u32) = @truncate(advanced >> @splat(48 - @as(u7, bits)));
+    return @bitCast(shifted);
+}
+
+/// JavaRandom.nextIntBounded for a bound that is no power of two. A lane whose draw vanilla would
+/// draw again is rare.
+fn boundedInt(seed: *U64, drawing: Mask, comptime bound: i32, rare: *Mask) I32 {
+    const bits = draw(seed, drawing, 31);
+    const value = @rem(bits, @as(I32, @splat(bound)));
+    const accepted = (bits -% value +% @as(I32, @splat(bound - 1))) >= @as(I32, @splat(0));
+    rare.* = rare.* | (drawing & !accepted);
+    return value;
+}
+
+fn nextFloat(seed: *U64, drawing: Mask) F32 {
+    return @as(F32, @floatFromInt(draw(seed, drawing, 24))) * @as(F32, @splat(5.9604645e-8));
+}
+
+/// mth.wrapDegrees, with mth.remainder360 up to 720. A lane that needs more is rare.
+fn wrapDegrees(value: F32, rare: *Mask) F32 {
+    const size = @abs(value);
+    rare.* = rare.* | (size >= @as(F32, @splat(720.0)));
+    const turn: F32 = @splat(360.0);
+    const reduced = @select(f32, value > @as(F32, @splat(0)), value - turn, value + turn);
+    const zero: F32 = @splat(0);
+    const signed_zero = @select(f32, value < zero, @as(F32, @splat(-0.0)), zero);
+    const remainder = @select(f32, reduced == zero, signed_zero, reduced);
+    var wrapped = @select(f32, size < turn, value, remainder);
+    wrapped = @select(f32, wrapped >= @as(F32, @splat(180.0)), wrapped - @as(F32, @splat(360.0)), wrapped);
+    wrapped = @select(f32, wrapped < @as(F32, @splat(-180.0)), wrapped + @as(F32, @splat(360.0)), wrapped);
+    return wrapped;
+}
+
+fn clamp(value: F32, minimum: F32, maximum: F32) F32 {
+    return @select(f32, value < minimum, minimum, @min(value, maximum));
+}
+
+fn rotateTowards(angle: F32, target: F32, limit: F32, rare: *Mask) F32 {
+    return angle + clamp(wrapDegrees(target - angle, rare), -limit, limit);
+}
+
+fn rotateIfNecessary(angle: F32, target: F32, limit: F32, rare: *Mask) F32 {
+    return target - clamp(wrapDegrees(target - angle, rare), -limit, limit);
+}
+
+/// `advance` for the eight places from `first`, all idle and ticking, without committing.
+pub fn advanceBlock(herd: *const Herd, first: usize, audience: Audience, species: Species) Block {
+    const hot = &herd.hot;
+    const still = &herd.still;
+    var rare = none;
+    var seed = load(u64, hot.seed, first);
+    var tick_count = load(i32, hot.tick_count, first);
+    var ambient = load(i32, hot.ambient_sound_time, first);
+    var no_action = load(i32, hot.no_action_time, first);
+    var calm_down = load(i32, hot.tempt_calm_down, first);
+    var gazing = load(bool, hot.gazing, first);
+    var look_around_time = load(i32, hot.look_around_time, first);
+    var cooldown = load(i32, hot.look_cooldown, first);
+    const persistent = load(bool, still.persistence_required, first);
+    const positions = still.position[first..][0..lane_count];
+    const worlds = load(u32, still.world, first);
+    var x: F64 = undefined;
+    var y: F64 = undefined;
+    var z: F64 = undefined;
+    inline for (0..lane_count) |lane| {
+        x[lane] = positions[lane][0];
+        y[lane] = positions[lane][1];
+        z[lane] = positions[lane][2];
+    }
+    const zero: I32 = @splat(0);
+    // Mob.checkDespawn, with the nearest player in each lane's world.
+    var nearest: F64 = @splat(std.math.inf(f64));
+    var seen = none;
+    for (audience.present) |player| {
+        const here = worlds == @as(@Vector(lane_count, u32), @splat(player.world));
+        const dx = @as(F64, @splat(player.position[0])) - x;
+        const dy = @as(F64, @splat(player.position[1])) - y;
+        const dz = @as(F64, @splat(player.position[2])) - z;
+        const distance = dx * dx + dy * dy + dz * dz;
+        nearest = @select(f64, here & (distance < nearest), distance, nearest);
+        seen = seen | here;
+    }
+    const near: F64 = @splat(32 * 32);
+    const counting = seen & !persistent;
+    const despawn_draw = counting & (no_action > @as(I32, @splat(600)));
+    const despawn_roll = boundedInt(&seed, despawn_draw, 800, &rare);
+    const despawning = despawn_draw & (despawn_roll == zero) & (nearest > near);
+    no_action = @select(i32, persistent | (counting & !despawning & (nearest < near)), zero, no_action);
+    tick_count +%= @splat(1);
+    // Mob.baseTick: a lane whose ambient sound plays is rare.
+    const roll = boundedInt(&seed, @splat(true), 1000, &rare);
+    rare = rare | (roll < ambient);
+    ambient +%= @splat(1);
+    // Mob.serverAiStep and GoalSelector.tick on the ticks it runs in full.
+    no_action +%= @splat(1);
+    const parity_odd = ((tick_count +% load(i32, still.parity_id, first)) & @as(I32, @splat(1))) != zero;
+    const full = !(parity_odd & (tick_count > @as(I32, @splat(1))));
+    gazing = gazing & !(full & (look_around_time < zero));
+    const calming = full & (calm_down > zero);
+    calm_down = @select(i32, calming, calm_down -% @as(I32, @splat(1)), calm_down);
+    if (audience.holding_food.len > 0) {
+        inline for (0..lane_count) |lane| {
+            if (full[lane] and !calming[lane] and audience.temptsNear(worlds[lane], positions[lane], species.tempt_range)) rare[lane] = true;
+        }
+    }
+    const strolling = full & (no_action < @as(I32, @splat(100)));
+    const stroll = boundedInt(&seed, strolling, 60, &rare);
+    rare = rare | (strolling & (stroll == zero));
+    const look_at = nextFloat(&seed, full);
+    rare = rare | (full & !(look_at >= @as(F32, @splat(0.02))));
+    const looking_around = full & !gazing;
+    const look_around = nextFloat(&seed, looking_around);
+    rare = rare | (looking_around & (look_around < @as(F32, @splat(0.02))));
+    // RandomLookAroundGoal.tick and LookControl.setLookAt.
+    look_around_time = @select(i32, gazing, look_around_time -% @as(I32, @splat(1)), look_around_time);
+    cooldown = @select(i32, gazing, @as(I32, @splat(2)), cooldown);
+    // LookControl.tick.
+    const head = load(f32, hot.head_yaw, first);
+    const body = load(f32, hot.body_yaw, first);
+    const gaze_yaw = load(f32, hot.gaze_yaw, first);
+    const counting_down = cooldown > zero;
+    cooldown = @select(i32, counting_down, cooldown -% @as(I32, @splat(1)), cooldown);
+    const toward_gaze = counting_down & (gaze_yaw == gaze_yaw);
+    const target = @select(f32, toward_gaze, gaze_yaw, body);
+    const limit = @select(f32, toward_gaze, load(f32, hot.look_max_yaw, first), @as(F32, @splat(10)));
+    const turned = rotateTowards(head, target, limit, &rare);
+    const new_head = @select(f32, toward_gaze | !counting_down, turned, head);
+    // BodyRotationControl for a mob that stood still.
+    var last_stable = load(f32, hot.last_stable_head_yaw, first);
+    var stable_time = load(i32, hot.head_stable_time, first);
+    const moved_head = @abs(new_head - last_stable) > @as(F32, @splat(15));
+    stable_time = @select(i32, moved_head, zero, stable_time +% @as(I32, @splat(1)));
+    last_stable = @select(f32, moved_head, new_head, last_stable);
+    const fraction = clamp(@as(F32, @floatFromInt(stable_time -% @as(I32, @splat(10)))) / @as(F32, @splat(10.0)), @splat(0), @splat(1));
+    const settling_limit = @as(F32, @splat(75)) * (@as(F32, @splat(1)) - fraction);
+    const body_limit = @select(f32, moved_head, @as(F32, @splat(75)), settling_limit);
+    const follows = moved_head | (stable_time > @as(I32, @splat(10)));
+    const new_body = @select(f32, follows, rotateIfNecessary(body, new_head, body_limit, &rare), body);
+    return .{
+        .rare = rare,
+        .any_rare = @reduce(.Or, rare),
+        .seed = seed,
+        .tick_count = tick_count,
+        .ambient_sound_time = ambient,
+        .no_action_time = no_action,
+        .tempt_calm_down = calm_down,
+        .gazing = gazing,
+        .look_around_time = look_around_time,
+        .look_cooldown = cooldown,
+        .head_yaw = new_head,
+        .body_yaw = new_body,
+        .last_stable_head_yaw = last_stable,
+        .head_stable_time = stable_time,
+    };
+}
+
+/// Commits one lane of a block, as `advance` would have left it.
+pub fn commitLane(herd: *Herd, first: usize, block: *const Block, lane: usize) void {
+    assert(!block.rare[lane]);
+    const place = first + lane;
+    const hot = &herd.hot;
+    hot.seed[place] = block.seed[lane];
+    hot.tick_count[place] = block.tick_count[lane];
+    hot.ambient_sound_time[place] = block.ambient_sound_time[lane];
+    hot.no_action_time[place] = block.no_action_time[lane];
+    hot.tempt_calm_down[place] = block.tempt_calm_down[lane];
+    hot.navigation_tick[place] += 1;
+    hot.gazing[place] = block.gazing[lane];
+    hot.look_around_time[place] = block.look_around_time[lane];
+    hot.look_cooldown[place] = block.look_cooldown[lane];
+    hot.old_head_yaw[place] = hot.head_yaw[place];
+    hot.old_body_yaw[place] = hot.body_yaw[place];
+    hot.head_yaw[place] = block.head_yaw[lane];
+    hot.body_yaw[place] = block.body_yaw[lane];
+    hot.last_stable_head_yaw[place] = block.last_stable_head_yaw[lane];
+    hot.head_stable_time[place] = block.head_stable_time[lane];
+    if (hot.age[place] > 0) hot.age[place] -= 1;
+}
+
+/// Commits a whole block with no rare lane.
+pub fn commitBlock(herd: *Herd, first: usize, block: *const Block) void {
+    assert(!block.any_rare);
+    const hot = &herd.hot;
+    hot.seed[first..][0..lane_count].* = block.seed;
+    hot.tick_count[first..][0..lane_count].* = block.tick_count;
+    hot.ambient_sound_time[first..][0..lane_count].* = block.ambient_sound_time;
+    hot.no_action_time[first..][0..lane_count].* = block.no_action_time;
+    hot.tempt_calm_down[first..][0..lane_count].* = block.tempt_calm_down;
+    hot.navigation_tick[first..][0..lane_count].* = load(i32, hot.navigation_tick, first) +% @as(I32, @splat(1));
+    hot.gazing[first..][0..lane_count].* = block.gazing;
+    hot.look_around_time[first..][0..lane_count].* = block.look_around_time;
+    hot.look_cooldown[first..][0..lane_count].* = block.look_cooldown;
+    hot.old_head_yaw[first..][0..lane_count].* = load(f32, hot.head_yaw, first);
+    hot.old_body_yaw[first..][0..lane_count].* = load(f32, hot.body_yaw, first);
+    hot.head_yaw[first..][0..lane_count].* = block.head_yaw;
+    hot.body_yaw[first..][0..lane_count].* = block.body_yaw;
+    hot.last_stable_head_yaw[first..][0..lane_count].* = block.last_stable_head_yaw;
+    hot.head_stable_time[first..][0..lane_count].* = block.head_stable_time;
+    const age = load(i32, hot.age, first);
+    hot.age[first..][0..lane_count].* = @select(i32, age > @as(I32, @splat(0)), age -% @as(I32, @splat(1)), age);
 }

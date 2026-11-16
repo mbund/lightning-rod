@@ -35,7 +35,8 @@ pub const JavaRandom = struct {
         return self.next(32);
     }
 
-    pub fn nextIntBounded(self: *JavaRandom, bound: i32) i32 {
+    /// Inline, so a bound known where it is called turns the remainder into a multiply.
+    pub inline fn nextIntBounded(self: *JavaRandom, bound: i32) i32 {
         std.debug.assert(bound > 0);
         if (bound & (bound - 1) == 0) return @intCast((@as(i64, bound) * self.next(31)) >> 31);
         while (true) {

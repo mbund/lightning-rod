@@ -334,15 +334,26 @@ fn turnBody(mobs: *Mobs, mob: *Mob) void {
         mob.head_stable_time = 0;
         return;
     }
-    if (@abs(mob.head_yaw - mob.last_stable_head_yaw) > 15) {
-        mob.head_stable_time = 0;
-        mob.last_stable_head_yaw = mob.head_yaw;
-        mob.body_yaw = mth.rotateIfNecessary(mob.body_yaw, mob.head_yaw, 75);
+    var turn: Turn = .{ .body = mob.body_yaw, .last_stable = mob.last_stable_head_yaw, .stable_time = mob.head_stable_time };
+    turnStill(mob.head_yaw, &turn);
+    mob.body_yaw = turn.body;
+    mob.last_stable_head_yaw = turn.last_stable;
+    mob.head_stable_time = turn.stable_time;
+}
+
+/// The body of a mob that did not move, as BodyRotationControl turns it toward the head.
+pub const Turn = struct { body: f32, last_stable: f32, stable_time: i32 };
+
+pub fn turnStill(head: f32, turn: *Turn) void {
+    if (@abs(head - turn.last_stable) > 15) {
+        turn.stable_time = 0;
+        turn.last_stable = head;
+        turn.body = mth.rotateIfNecessary(turn.body, head, 75);
     } else {
-        mob.head_stable_time += 1;
-        if (mob.head_stable_time > 10) {
-            const fraction = mth.clamp(@as(f32, @floatFromInt(mob.head_stable_time - 10)) / 10.0, 0, 1);
-            mob.body_yaw = mth.rotateIfNecessary(mob.body_yaw, mob.head_yaw, 75 * (1 - fraction));
+        turn.stable_time += 1;
+        if (turn.stable_time > 10) {
+            const fraction = mth.clamp(@as(f32, @floatFromInt(turn.stable_time - 10)) / 10.0, 0, 1);
+            turn.body = mth.rotateIfNecessary(turn.body, head, 75 * (1 - fraction));
         }
     }
 }

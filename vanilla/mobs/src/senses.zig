@@ -147,31 +147,6 @@ fn entersBox(target: body.Box, from: [3]f64, delta: [3]f64) bool {
     return enter <= 1.0;
 }
 
-/// Mobs of the same species whose boxes meet a box, by index, calling back for each in the
-/// spatial index's order.
-pub const Kin = struct {
-    mobs: *Mobs,
-    mob: *const Mob,
-    query: body.Box,
-    rectangle: @import("vanilla_item_entities").item_spatial.Index.Rectangle,
-
-    pub fn init(mobs: *Mobs, mob: *const Mob, query: body.Box) Kin {
-        const low: [2]i32 = .{ @divFloor(mth.floor(query.min[0]) - 2, 16), @divFloor(mth.floor(query.min[2]) - 2, 16) };
-        const high: [2]i32 = .{ @divFloor(mth.floor(query.max[0]) + 2, 16), @divFloor(mth.floor(query.max[2]) + 2, 16) };
-        return .{ .mobs = mobs, .mob = mob, .query = query, .rectangle = mobs.spatial.rectangle(mob.world, low, high) };
-    }
-
-    pub fn next(self: *Kin) ?u32 {
-        while (self.rectangle.next()) |index| {
-            const other = &self.mobs.mobs[index];
-            if (other == self.mob or other.removed or other.species != self.mob.species) continue;
-            if (!living.box(self.mobs, other).intersects(self.query)) continue;
-            return index;
-        }
-        return null;
-    }
-};
-
 pub fn distanceSquared(a: *const Mob, b: *const Mob) f64 {
     const dx = a.position[0] - b.position[0];
     const dy = a.position[1] - b.position[1];

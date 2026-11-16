@@ -43,6 +43,19 @@ const Data = struct {
     }
 };
 
+/// What a send reads of a mob: from its Mob, or from the herd while it idles.
+const Subject = struct {
+    network_id: i32,
+    position: [3]f64,
+    velocity: [3]f64,
+    yaw: f32,
+    pitch: f32,
+    head_yaw: f32,
+    on_ground: bool,
+    has_impulse: bool,
+    track_deltas: bool,
+};
+
 /// CowVariants.TEMPERATE, the variant a cow has unless it spawned elsewhere.
 pub const default_variant: u8 = variant: {
     @setEvalBranchQuota(1_000_000);
@@ -63,7 +76,8 @@ const View = struct {
     pitch: i8 = 0,
     head_yaw: i8 = 0,
     velocity: [3]f64 = .{ 0, 0, 0 },
-    tick_count: u32 = 0,
+    /// The replication tick the view began, so ServerEntity.tickCount is the ticks since.
+    started: u64 = 0,
     teleport_delay: u32 = 0,
     was_on_ground: bool = false,
     data: Data = .{},
@@ -90,6 +104,8 @@ pub const MobReplication = struct {
     mark_count: usize = 0,
     /// A player's connection or world changed since audiences were last worked out.
     connections_changed: bool = false,
+    /// Ticks replication has run.
+    tick_count: u64 = 0,
     /// Ticks on which audiences had to be worked out again, for measuring.
     audience_changes: u64 = 0,
     known: audience.Matrix,
@@ -123,25 +139,39 @@ pub const MobReplication = struct {
 
     pub fn tick(self: *MobReplication) !void {
         const mobs = self.deps.mobs;
+        defer self.tick_count += 1;
         self.forgetChangedConnections();
         const visibility = self.deps.streaming.snapshotVisibility();
         const audience_changed = self.audienceChanged(visibility);
         if (audience_changed) self.audience_changes += 1;
         // Only cows idle.
         const idle_interval = mobs.traits(.cow).update_interval;
-        var offset: usize = 0;
-        while (offset < mobs.active.values().len) {
-            const index = mobs.active.values()[offset];
-            offset += 1;
-            // An idle mob changes nothing a viewer sees, and neither do its viewers, so until its next
-            // send tick only the count moves, read without touching its Mob.
-            if (!audience_changed and mobs.idles(index)) {
+        // ChunkMap.tick goes through tracked entities by id, so packets leave in that order.
+        for (0..mobs.herd.count) |place| {
+            const index = mobs.herd.slots[place];
+            if (index == @import("herd.zig").no_place) continue;
+            // An idle mob that went through here once since it began idling changes nothing a viewer
+            // sees but its head, nor do its viewers change, so it is sent from the herd alone.
+            if (!audience_changed and mobs.herd.idling[place] and !mobs.herd.hot.fresh[place]) {
                 const idle_view = &self.views[index];
-                const place = mobs.herd.place_of[index];
-                if (idle_view.audience_at) |at| if (std.meta.eql(at, mobs.herd.still.position[place]) and idle_view.tick_count % idle_interval != 0) {
-                    idle_view.tick_count += 1;
+                {
+                    // Between send ticks there is nothing to look at.
+                    if (self.tick_count % idle_interval != mobs.herd.still.send_phase[place]) continue;
+                    const at = idle_view.audience_at.?;
+                    assert(std.meta.eql(at, mobs.herd.still.position[place]));
+                    try self.sendDue(self.known.row(index).view(), .{
+                        .network_id = -@as(i32, @intCast(mobs.herd.still.id[place])),
+                        .position = at,
+                        .velocity = mobs.herd.still.velocity[place],
+                        .yaw = mobs.herd.still.yaw[place],
+                        .pitch = 0,
+                        .head_yaw = mobs.herd.hot.head_yaw[place],
+                        .on_ground = true,
+                        .has_impulse = false,
+                        .track_deltas = mobs.traits(.cow).track_deltas,
+                    }, idle_view, idle_view.data, .{});
                     continue;
-                };
+                }
             }
             const mob = &mobs.mobs[index];
             const view = &self.views[index];
@@ -149,6 +179,7 @@ pub const MobReplication = struct {
             if (view.id != mob.id) {
                 assert(!known.view().any());
                 view.* = start(mob);
+                view.started = self.tick_count;
             }
             // Events first, so a death's puff arrives before the removal.
             if (mob.event_count > 0) {
@@ -174,11 +205,17 @@ pub const MobReplication = struct {
                 try self.pair(index, mob, view, pending);
                 view.audience_at = mob.position;
             }
-            try self.sendChanges(index, mob, view);
+            // An idle mob's head turns in the herd.
+            const head_yaw = if (mobs.idles(index)) mobs.herd.hot.head_yaw[mobs.herd.place_of[index]] else mob.head_yaw;
+            try self.sendChanges(index, mob, view, head_yaw);
+            if (mobs.idles(index)) {
+                // From here the herd alone sends it, on the ticks its count says.
+                mobs.herd.hot.fresh[place] = false;
+                mobs.herd.still.send_phase[place] = @intCast(view.started % idle_interval);
+            }
             if (mob.removed and !known.view().any()) {
                 view.* = .{};
                 mobs.release(@intCast(index));
-                offset -= 1;
             }
         }
     }
@@ -289,13 +326,25 @@ pub const MobReplication = struct {
     }
 
     /// ServerEntity.sendChanges.
-    fn sendChanges(self: *MobReplication, index: usize, mob: *Mob, view: *View) !void {
+    fn sendChanges(self: *MobReplication, index: usize, mob: *Mob, view: *View, head_yaw: f32) !void {
         const known = self.known.row(index).view();
         const now = Data.of(mob);
         const changes = Changes.between(view.data, now);
         const interval = self.deps.mobs.traits(mob.species).update_interval;
-        defer view.tick_count += 1;
-        if (view.tick_count % interval == 0 or mob.has_impulse or changes.any()) try self.sendDue(known, mob, view, now, changes);
+        if ((self.tick_count - view.started) % interval == 0 or mob.has_impulse or changes.any()) {
+            try self.sendDue(known, .{
+                .network_id = networkId(mob),
+                .position = mob.position,
+                .velocity = mob.velocity,
+                .yaw = mob.yaw,
+                .pitch = mob.pitch,
+                .head_yaw = head_yaw,
+                .on_ground = mob.on_ground,
+                .has_impulse = mob.has_impulse,
+                .track_deltas = self.deps.mobs.traits(mob.species).track_deltas,
+            }, view, now, changes);
+            mob.has_impulse = false;
+        }
         // A hurt mob's new motion goes out at once, whatever the interval.
         if (mob.hurt_marked) {
             mob.hurt_marked = false;
@@ -303,15 +352,16 @@ pub const MobReplication = struct {
         }
     }
 
-    fn sendDue(self: *MobReplication, known: lightning_rod.system.bit_sets.Set, mob: *Mob, view: *View, now: Data, changes: Changes) !void {
-        const yaw = mth.packDegrees(mob.yaw);
-        const pitch = mth.packDegrees(mob.pitch);
+    fn sendDue(self: *MobReplication, known: lightning_rod.system.bit_sets.Set, subject: Subject, view: *View, now: Data, changes: Changes) !void {
+        const yaw = mth.packDegrees(subject.yaw);
+        const pitch = mth.packDegrees(subject.pitch);
         const turned = @abs(@as(i32, yaw) - view.yaw) >= 1 or @abs(@as(i32, pitch) - view.pitch) >= 1;
         view.teleport_delay += 1;
-        const encoded: [3]i64 = .{ encode(mob.position[0]) - encode(view.base[0]), encode(mob.position[1]) - encode(view.base[1]), encode(mob.position[2]) - encode(view.base[2]) };
+        // A mob where it was last sent moved by nothing, which spares the rounding.
+        const encoded: [3]i64 = if (std.meta.eql(subject.position, view.base)) .{ 0, 0, 0 } else .{ encode(subject.position[0]) - encode(view.base[0]), encode(subject.position[1]) - encode(view.base[1]), encode(subject.position[2]) - encode(view.base[2]) };
         const delta: [3]f64 = .{ @as(f64, @floatFromInt(encoded[0])) / 4096.0, @as(f64, @floatFromInt(encoded[1])) / 4096.0, @as(f64, @floatFromInt(encoded[2])) / 4096.0 };
         const moved = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2] >= @as(f64, @as(f32, 7.6293945e-6));
-        const position_due = moved or view.tick_count % 60 == 0;
+        const position_due = moved or (self.tick_count - view.started) % 60 == 0;
         var sent_position = false;
         var sent_rotation = false;
         const far = for (encoded) |component| {
@@ -319,8 +369,8 @@ pub const MobReplication = struct {
         } else false;
         const Movement = enum { none, sync, position, rotation, both };
         var movement: Movement = .none;
-        if (far or view.teleport_delay > 400 or view.was_on_ground != mob.on_ground) {
-            view.was_on_ground = mob.on_ground;
+        if (far or view.teleport_delay > 400 or view.was_on_ground != subject.on_ground) {
+            view.was_on_ground = subject.on_ground;
             view.teleport_delay = 0;
             movement = .sync;
             sent_position = true;
@@ -338,39 +388,38 @@ pub const MobReplication = struct {
             sent_position = true;
             sent_rotation = true;
         }
-        if (mob.has_impulse or self.deps.mobs.traits(mob.species).track_deltas) {
-            const difference: [3]f64 = .{ mob.velocity[0] - view.velocity[0], mob.velocity[1] - view.velocity[1], mob.velocity[2] - view.velocity[2] };
+        if (subject.has_impulse or subject.track_deltas) {
+            const difference: [3]f64 = .{ subject.velocity[0] - view.velocity[0], subject.velocity[1] - view.velocity[1], subject.velocity[2] - view.velocity[2] };
             const squared = difference[0] * difference[0] + difference[1] * difference[1] + difference[2] * difference[2];
-            const length = mob.velocity[0] * mob.velocity[0] + mob.velocity[1] * mob.velocity[1] + mob.velocity[2] * mob.velocity[2];
+            const length = subject.velocity[0] * subject.velocity[0] + subject.velocity[1] * subject.velocity[1] + subject.velocity[2] * subject.velocity[2];
             if (squared > 1.0e-7 or (squared > 0 and length == 0)) {
-                view.velocity = mob.velocity;
-                try self.deliver(known, .{ .velocity = .{ .id = networkId(mob), .velocity = view.velocity } });
+                view.velocity = subject.velocity;
+                try self.deliver(known, .{ .velocity = .{ .id = subject.network_id, .velocity = view.velocity } });
             }
         }
-        const id_value = networkId(mob);
+        const id_value = subject.network_id;
         const short: [3]i16 = .{ @truncate(encoded[0]), @truncate(encoded[1]), @truncate(encoded[2]) };
         switch (movement) {
             .none => {},
-            .sync => try self.deliver(known, .{ .sync = .{ .id = id_value, .position = mob.position, .velocity = mob.velocity, .yaw = mob.yaw, .pitch = mob.pitch, .on_ground = mob.on_ground } }),
-            .position => try self.deliver(known, .{ .relative = .{ .id = id_value, .delta = short, .on_ground = mob.on_ground } }),
-            .rotation => try self.deliver(known, .{ .look = .{ .id = id_value, .yaw = yaw, .pitch = pitch, .on_ground = mob.on_ground } }),
-            .both => try self.deliver(known, .{ .move_look = .{ .id = id_value, .delta = short, .yaw = yaw, .pitch = pitch, .on_ground = mob.on_ground } }),
+            .sync => try self.deliver(known, .{ .sync = .{ .id = id_value, .position = subject.position, .velocity = subject.velocity, .yaw = subject.yaw, .pitch = subject.pitch, .on_ground = subject.on_ground } }),
+            .position => try self.deliver(known, .{ .relative = .{ .id = id_value, .delta = short, .on_ground = subject.on_ground } }),
+            .rotation => try self.deliver(known, .{ .look = .{ .id = id_value, .yaw = yaw, .pitch = pitch, .on_ground = subject.on_ground } }),
+            .both => try self.deliver(known, .{ .move_look = .{ .id = id_value, .delta = short, .yaw = yaw, .pitch = pitch, .on_ground = subject.on_ground } }),
         }
         if (changes.any()) {
             try self.deliver(known, .{ .metadata = .{ .id = id_value, .data = now, .changes = changes } });
             view.data = now;
         }
-        if (sent_position) view.base = mob.position;
+        if (sent_position) view.base = subject.position;
         if (sent_rotation) {
             view.yaw = yaw;
             view.pitch = pitch;
         }
-        const head = mth.packDegrees(mob.head_yaw);
+        const head = mth.packDegrees(subject.head_yaw);
         if (@abs(@as(i32, head) - view.head_yaw) >= 1) {
             try self.deliver(known, .{ .head = .{ .id = id_value, .yaw = head } });
             view.head_yaw = head;
         }
-        mob.has_impulse = false;
     }
 
     /// Sends a packet to a set of players, noting in `sent` who got it.
