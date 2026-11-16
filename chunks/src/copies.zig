@@ -1,8 +1,12 @@
-//! Copies of the sections a system on the simulation thread reads, decoded once and kept until
-//! it clears them, normally at the end of the tick. A section is leased only while it is
-//! decoded, so nothing is held when the reader edits blocks, which an edit waits for. Every edit
-//! is applied to the copies as well, so they read as the chunks do, including the reader's own
-//! writes. Reads after the first are an array lookup.
+//! Copies of the sections a system on the simulation thread reads, decoded once and kept across
+//! ticks. A section is leased only while it is decoded, so nothing is held when the reader edits
+//! blocks, which an edit waits for. Every edit is applied to the copies as well, so they read as
+//! the chunks do, including the reader's own writes. Reads after the first are an array lookup.
+//!
+//! A section held in the chunks changes only by an edit, so its copy stays true. A section that
+//! is not there yet reads as air and may be filled by generation without an edit, so its copy
+//! lasts only until the end of the tick. When the copies are full, the clock replaces one not
+//! read since it last came round.
 
 const std = @import("std");
 const chunks = @import("chunks.zig");
@@ -14,14 +18,23 @@ pub const Copies = struct {
     client: chunks.Chunks.Client,
     sections: []chunks.Section,
     states: [][chunks.encoding.blocks]u16,
-    count: usize = 0,
+    /// Copies of sections that were absent, dropped at the end of the tick.
+    absent: []bool,
+    referenced: []bool,
+    used: []bool,
+    /// Slots by section. Its capacity is reserved at init.
+    index: std.AutoHashMapUnmanaged(chunks.Section, u32) = .empty,
+    /// Slots never used or freed, taken before the clock replaces any.
+    free: []u32,
+    free_count: usize,
+    hand: usize = 0,
     /// The copy the last read used, as reads come in runs over one section.
-    last: usize = 0,
-    /// Sections decoded since the copies were made, for measuring.
+    last: ?u32 = null,
+    /// Sections decoded, for measuring.
     decoded: u64 = 0,
 
-    /// Startup only. Registers an edit observer, so make one per reader rather than per tick.
-    pub fn init(allocator: std.mem.Allocator, owner: *chunks.Chunks, capacity: usize) !*Copies {
+    /// Startup only. Registers an edit observer, so make one per reader.
+    pub fn init(allocator: std.mem.Allocator, owner: *chunks.Chunks, capacity: u32) !*Copies {
         if (capacity == 0) return error.InvalidConfiguration;
         const self = try allocator.create(Copies);
         self.* = .{
@@ -29,15 +42,24 @@ pub const Copies = struct {
             .client = try owner.simulation(1),
             .sections = try allocator.alloc(chunks.Section, capacity),
             .states = try allocator.alloc([chunks.encoding.blocks]u16, capacity),
+            .absent = try allocator.alloc(bool, capacity),
+            .referenced = try allocator.alloc(bool, capacity),
+            .used = try allocator.alloc(bool, capacity),
+            .free = try allocator.alloc(u32, capacity),
+            .free_count = capacity,
         };
+        @memset(self.used, false);
+        @memset(self.referenced, false);
+        for (self.free, 0..) |*slot, at| slot.* = @intCast(capacity - 1 - at);
+        try self.index.ensureTotalCapacity(allocator, capacity);
         try owner.observe(.init(self, changed));
         return self;
     }
 
     pub fn get(self: *Copies, world: u32, position: chunks.Position) !u16 {
         const section: chunks.Section = .{ .world = world, .x = @divFloor(position.x, 16), .y = @divFloor(position.y, 16), .z = @divFloor(position.z, 16) };
-        const index = try self.find(section);
-        return self.states[index][chunks.localIndex(position)];
+        const slot = try self.find(section);
+        return self.states[slot][chunks.localIndex(position)];
     }
 
     /// Writes through to the chunks. The edit comes back through the observer to the copy.
@@ -45,39 +67,68 @@ pub const Copies = struct {
         try self.owner.setBlock(world, position, state);
     }
 
-    /// Drops every copy. Sections can change without an edit, as when generation fills one, so
-    /// copies do not outlive the tick they were made in.
-    pub fn clear(self: *Copies) void {
-        self.count = 0;
-        self.last = 0;
+    /// Drops the copies of sections that were absent, which generation may fill.
+    pub fn endTick(self: *Copies) void {
+        for (self.used, self.absent, 0..) |used, absent, slot| {
+            if (used and absent) self.drop(@intCast(slot));
+        }
     }
 
-    fn find(self: *Copies, section: chunks.Section) !usize {
-        if (self.last < self.count and std.meta.eql(self.sections[self.last], section)) return self.last;
-        for (self.sections[0..self.count], 0..) |held, index| {
-            if (!std.meta.eql(held, section)) continue;
-            self.last = index;
-            return index;
+    fn drop(self: *Copies, slot: u32) void {
+        assert(self.used[slot]);
+        assert(self.index.remove(self.sections[slot]));
+        self.used[slot] = false;
+        self.referenced[slot] = false;
+        self.free[self.free_count] = slot;
+        self.free_count += 1;
+        if (self.last == slot) self.last = null;
+    }
+
+    fn find(self: *Copies, section: chunks.Section) !u32 {
+        if (self.last) |slot| if (std.meta.eql(self.sections[slot], section)) return slot;
+        if (self.index.get(section)) |slot| {
+            self.referenced[slot] = true;
+            self.last = slot;
+            return slot;
         }
-        // Copies are a cache of the chunks, so a full set may start over at any time.
-        if (self.count == self.sections.len) self.clear();
-        const index = self.count;
+        const slot = self.take();
         const lease = try self.client.acquire(section);
         defer lease.release();
         const view = lease.view();
-        for (&self.states[index], 0..) |*state, cell| state.* = view.get(@intCast(cell));
-        self.sections[index] = section;
-        self.count += 1;
-        self.last = index;
+        for (&self.states[slot], 0..) |*state, cell| state.* = view.get(@intCast(cell));
+        self.sections[slot] = section;
+        self.absent[slot] = lease.record.read() == null;
+        self.used[slot] = true;
+        self.referenced[slot] = true;
+        self.index.putAssumeCapacityNoClobber(section, slot);
+        self.last = slot;
         self.decoded += 1;
-        return index;
+        return slot;
+    }
+
+    /// A free slot, or the first the clock finds unread since it last passed.
+    fn take(self: *Copies) u32 {
+        if (self.free_count != 0) {
+            self.free_count -= 1;
+            return self.free[self.free_count];
+        }
+        while (true) : (self.hand = (self.hand + 1) % self.sections.len) {
+            if (self.referenced[self.hand]) {
+                self.referenced[self.hand] = false;
+                continue;
+            }
+            const slot: u32 = @intCast(self.hand);
+            self.hand = (self.hand + 1) % self.sections.len;
+            self.drop(slot);
+            self.free_count -= 1;
+            return slot;
+        }
     }
 
     fn changed(self: *Copies, section: chunks.Section, edits: []const chunks.BlockEdit, _: []const u16) void {
-        for (self.sections[0..self.count], self.states[0..self.count]) |held, *states| {
-            if (!std.meta.eql(held, section)) continue;
-            for (edits) |edit| states[edit.index] = edit.state;
-            return;
-        }
+        const slot = self.index.get(section) orelse return;
+        // An edit generates a section that was absent first, which the air copy does not hold.
+        if (self.absent[slot]) return self.drop(slot);
+        for (edits) |edit| self.states[slot][edit.index] = edit.state;
     }
 };

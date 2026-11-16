@@ -4,8 +4,8 @@
 //! soonest to a drop. Edits schedule the fluids next to them, as vanilla's neighbour updates
 //! do, and lava that touches water hardens.
 //!
-//! Ticks read blocks through copies decoded once per tick, so the flood fill of a spreading
-//! fluid is array lookups rather than a lease per block.
+//! Ticks read blocks through copies decoded once and kept as edits change them, so the flood
+//! fill of a spreading fluid is array lookups rather than a lease per block.
 
 const std = @import("std");
 const chunks = @import("chunks");
@@ -427,8 +427,8 @@ pub const Fluids = struct {
         /// The waterSourceConversion and lavaSourceConversion game rules.
         water_source_conversion: bool = true,
         lava_source_conversion: bool = false,
-        /// Sections fluid ticks keep decoded within a tick.
-        copies: usize = 64,
+        /// Sections fluid ticks keep decoded, 8 KiB each.
+        copies: u32 = 256,
         loot_scratch_bytes: usize = 16 * 1024,
         seed: u64 = 0x666c756964,
     };
@@ -497,9 +497,9 @@ pub const Fluids = struct {
         }
     }
 
-    /// The copies fluid ticks read last only for the tick.
+    /// Copies of absent sections last only for the tick.
     pub fn tick(self: *Fluids) void {
-        self.copies.clear();
+        self.copies.endTick();
     }
 
     fn kindOf(self: *const Fluids, fluid: Variant) ticks.Kind {

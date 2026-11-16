@@ -719,6 +719,45 @@ test "repeated sections in an edit batch observe preceding edits without extra b
     try std.testing.expectEqual(@as(u16, 19), lease.get(1));
 }
 
+test "copies read as the chunks do through edits and replacement" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_bytes: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_bytes, ".zig-cache/tmp/{s}/chunks", .{directory.sub_path});
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var store = try storage.Store.init(allocator, io, .{ .path = path });
+    defer store.deinit();
+    var registry = try metrics.Registry.init(allocator, io, .{ .enabled = false });
+    defer registry.deinit();
+    const world = try chunks.Chunks.init(arena.allocator(), io, .{ .edit_sections = 1, .simulation_sections = 1, .cache_sections = 4 }, .{
+        .metrics = &registry,
+        .storage = try store.openSpace(chunks.Chunks.id),
+        .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}),
+    });
+    const copies = try chunks.Copies.init(arena.allocator(), world, 2);
+    // Sections that exist, so their copies stay across ticks.
+    for (0..3) |x| try world.setBlock(0, .{ .x = @as(i32, @intCast(x)) * 16, .y = 0, .z = 0 }, 1);
+    try std.testing.expectEqual(@as(u16, 1), try copies.get(0, .{ .x = 0, .y = 0, .z = 0 }));
+    try std.testing.expectEqual(@as(u16, 0), try copies.get(0, .{ .x = 1, .y = 0, .z = 0 }));
+    // An edit by anyone reaches the copy without decoding it again.
+    try world.setBlock(0, .{ .x = 1, .y = 0, .z = 0 }, 5);
+    try copies.set(0, .{ .x = 2, .y = 0, .z = 0 }, 6);
+    const decoded = copies.decoded;
+    try std.testing.expectEqual(@as(u16, 5), try copies.get(0, .{ .x = 1, .y = 0, .z = 0 }));
+    try std.testing.expectEqual(@as(u16, 6), try copies.get(0, .{ .x = 2, .y = 0, .z = 0 }));
+    copies.endTick();
+    try std.testing.expectEqual(@as(u16, 6), try copies.get(0, .{ .x = 2, .y = 0, .z = 0 }));
+    try std.testing.expectEqual(decoded, copies.decoded);
+    // Two copies held, a third section replaces one, and every read stays true.
+    for (0..3) |_| for (0..3) |x| {
+        try std.testing.expectEqual(@as(u16, 1), try copies.get(0, .{ .x = @as(i32, @intCast(x)) * 16, .y = 0, .z = 0 }));
+    };
+    try std.testing.expectEqual(@as(u16, 6), try copies.get(0, .{ .x = 2, .y = 0, .z = 0 }));
+}
+
 test "observers chain edits that land before the edit that caused them returns" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

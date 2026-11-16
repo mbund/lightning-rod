@@ -75,7 +75,7 @@ const Process = host.Process(@TypeOf(plugins), Network);
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--server")) {
-        if (args.len != 21) return error.InvalidServerArguments;
+        if (args.len != 22) return error.InvalidServerArguments;
         return server(init, args[2], args[3], try std.fmt.parseInt(i32, args[4], 10), .{
             .ticks = try std.fmt.parseInt(usize, args[5], 10),
             .warmup = try std.fmt.parseInt(usize, args[6], 10),
