@@ -29,7 +29,10 @@ pub const Column = struct {
 
     /// Patched light is the copy of light that block edits changed after its frame was
     /// baked. Only the process that wrote it can use it.
-    pub fn key(self: Column, kind: enum(u8) { revision = 0, light = 1, patched = 2, metadata = 3 }) [13]u8 {
+    /// Layer records hold what a layer counts in the column, stamped with its neighbourhood.
+    pub const Kind = enum(u8) { revision = 0, light = 1, patched = 2, metadata = 3, layer = 4 };
+
+    pub fn key(self: Column, kind: Kind) [13]u8 {
         var bytes: [13]u8 = undefined;
         bytes[0] = @backingInt(kind);
         std.mem.writeInt(u32, bytes[1..5], self.world, .big);

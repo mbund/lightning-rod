@@ -166,6 +166,8 @@ pub const Growth = struct {
     snow: []bool,
     loot_scratch: std.heap.FixedBufferAllocator,
     random: std.Random.DefaultPrng,
+    /// The sections around the random tick being run, read once for its section.
+    hit_blocks: ?*const random_ticks.Blocks = null,
 
     pub fn init(allocator: std.mem.Allocator, configuration: Configuration, deps: Dependencies) !*Growth {
         ensureTables();
@@ -186,9 +188,7 @@ pub const Growth = struct {
         try deps.block_definitions.registry.onChange(self, readTags);
         self.leaves_tick = try deps.ticks.register("minecraft:leaves", .init(Growth, self, leavesTick));
         self.sugar_cane_tick = try deps.ticks.register("minecraft:sugar_cane", .init(Growth, self, sugarCaneTick));
-        try deps.random_ticks.register(isGrass, .init(Growth, self, grassRandomTick));
-        try deps.random_ticks.register(isDecayingLeaves, .init(Growth, self, leavesRandomTick));
-        try deps.random_ticks.register(isSugarCane, .init(Growth, self, sugarCaneRandomTick));
+        try self.registerRandomTicks(deps.random_ticks);
         try deps.chunks.observe(.init(self, blocksChanged));
         return self;
     }
@@ -214,23 +214,72 @@ pub const Growth = struct {
         }
     }
 
-    fn isGrass(state: u16) bool {
-        return tables.kinds[state] == .grass;
-    }
-
-    fn isDecayingLeaves(state: u16) bool {
-        return tables.kinds[state] == .leaves and tables.distance[state] == 7 and !tables.persistent[state];
-    }
-
-    fn isSugarCane(state: u16) bool {
-        return tables.kinds[state] == .sugar_cane;
+    /// Random ticks reach only cells a hit could change: grass that dies or has dirt to spread
+    /// to, sugar cane that can grow, and leaves that decay. A hit on any other of them does
+    /// nothing in vanilla.
+    fn registerRandomTicks(self: *Growth, ticking: *random_ticks.RandomTicks.Registry) !void {
+        const grass = try ticking.addSet();
+        const dirt = try ticking.addSet();
+        // What grass and dirt cannot live under: grass under it dies, and dirt under it is
+        // no target to spread onto.
+        const cover = try ticking.addSet();
+        const water = try ticking.addSet();
+        const sugar_cane = try ticking.addSet();
+        const air = try ticking.addSet();
+        const decaying = try ticking.addSet();
+        for (0..registry.block_state_names.len) |index| {
+            const state: u16 = @intCast(index);
+            if (tables.kinds[state] == .grass) ticking.include(grass, state);
+            if (state == tables.dirt) ticking.include(dirt, state);
+            if (!self.livesUnder(tables.grass[0], state)) ticking.include(cover, state);
+            if (self.physics(state).fluid == .water) ticking.include(water, state);
+            if (tables.kinds[state] == .sugar_cane) ticking.include(sugar_cane, state);
+            if (self.physics(state).air) ticking.include(air, state);
+            if (tables.kinds[state] == .leaves and tables.distance[state] == 7 and !tables.persistent[state]) ticking.include(decaying, state);
+        }
+        // SpreadingSnowyBlock.randomTick: grass dies when covered, and otherwise tries cells
+        // from 3 below to 1 above it for dirt with neither cover nor water on top.
+        const grass_nodes = [_]random_ticks.Node{
+            .{ .set = dirt },
+            .{ .set = cover },
+            .{ .set = water },
+            .{ .either = .{ 1, 2 } },
+            .{ .offset = .{ .of = 3, .by = .{ 0, 1, 0 } } },
+            .{ .not = 4 },
+            .{ .both = .{ 0, 5 } },
+            .{ .any = .{ .of = 6, .low = .{ -1, -3, -1 }, .high = .{ 1, 1, 1 } } },
+            .{ .offset = .{ .of = 1, .by = .{ 0, 1, 0 } } },
+            .{ .either = .{ 7, 8 } },
+        };
+        try ticking.register(.{ .selected = grass, .nodes = &grass_nodes }, .init(Growth, self, grassRandomTick));
+        // SugarCaneBlock.randomTick: cane grows into air above it until it is three tall.
+        const sugar_cane_nodes = [_]random_ticks.Node{
+            .{ .set = air },
+            .{ .offset = .{ .of = 0, .by = .{ 0, 1, 0 } } },
+            .{ .set = sugar_cane },
+            .{ .offset = .{ .of = 2, .by = .{ 0, -1, 0 } } },
+            .{ .offset = .{ .of = 2, .by = .{ 0, -2, 0 } } },
+            .{ .both = .{ 3, 4 } },
+            .{ .not = 5 },
+            .{ .both = .{ 1, 6 } },
+        };
+        try ticking.register(.{ .selected = sugar_cane, .nodes = &sugar_cane_nodes }, .init(Growth, self, sugarCaneRandomTick));
+        // LeavesBlock.randomTick: leaves no log holds decay.
+        try ticking.register(.{ .selected = decaying }, .init(Growth, self, leavesRandomTick));
     }
 
     fn block(state: u16) u16 {
         return registry.block_state_to_block[state];
     }
 
+    /// During a random tick, writes wait for the hit to end, so they apply together.
+    fn set(self: *Growth, world: u32, position: chunks.Position, state: u16) !void {
+        if (self.hit_blocks) |blocks| return blocks.set(position, state);
+        try self.deps.chunks.setBlock(world, position, state);
+    }
+
     fn get(self: *Growth, world: u32, position: chunks.Position) !u16 {
+        if (self.hit_blocks) |blocks| if (blocks.get(position)) |state| return state;
         return self.chunk_client.getBlock(world, position);
     }
 
@@ -256,7 +305,10 @@ pub const Growth = struct {
     fn canStayAlive(self: *Growth, world: u32, state: u16, position: chunks.Position) !bool {
         const up = offset(position, 0, 1, 0);
         if (!self.inside(world, up)) return true;
-        const above = try self.get(world, up);
+        return self.livesUnder(state, try self.get(world, up));
+    }
+
+    fn livesUnder(self: *Growth, state: u16, above: u16) bool {
         if (above == tables.snow_layer) return true;
         const fluid = self.physics(above);
         if (fluid.fluid != .none and fluid.amount == 8) return false;
@@ -285,10 +337,12 @@ pub const Growth = struct {
     }
 
     fn grassRandomTick(self: *Growth, hit: random_ticks.Hit) !void {
+        self.hit_blocks = hit.blocks;
+        defer self.hit_blocks = null;
         const world = hit.world;
         const position = hit.position;
         if (!try self.canStayAlive(world, hit.state, position)) {
-            try self.deps.chunks.setBlock(world, position, tables.dirt);
+            try self.set(world, position, tables.dirt);
             return;
         }
         const up = offset(position, 0, 1, 0);
@@ -308,7 +362,7 @@ pub const Growth = struct {
             if (!try self.canPropagate(world, tables.grass[0], target)) continue;
             const over = offset(target, 0, 1, 0);
             const snowy = self.inside(world, over) and self.snow[block(try self.get(world, over))];
-            try self.deps.chunks.setBlock(world, target, tables.grass[@intFromBool(snowy)]);
+            try self.set(world, target, tables.grass[@intFromBool(snowy)]);
         }
     }
 
@@ -336,13 +390,15 @@ pub const Growth = struct {
             if (distance == 1) break;
         }
         const updated = withDistance(state, distance);
-        if (updated != state) try self.deps.chunks.setBlock(event.world, position, updated);
+        if (updated != state) try self.set(event.world, position, updated);
     }
 
     fn leavesRandomTick(self: *Growth, hit: random_ticks.Hit) !void {
+        self.hit_blocks = hit.blocks;
+        defer self.hit_blocks = null;
         try self.dropLoot(hit.world, hit.position, hit.state);
         // A waterlogged leaf leaves its water behind.
-        try self.deps.chunks.setBlock(hit.world, hit.position, if (tables.waterlogged[hit.state]) tables.water else 0);
+        try self.set(hit.world, hit.position, if (tables.waterlogged[hit.state]) tables.water else 0);
     }
 
     // Sugar cane, SugarCaneBlock.
@@ -365,10 +421,12 @@ pub const Growth = struct {
         const state = try self.get(event.world, position);
         if (tables.kinds[state] != .sugar_cane or try self.canSurvive(event.world, position)) return;
         try self.dropLoot(event.world, position, state);
-        try self.deps.chunks.setBlock(event.world, position, 0);
+        try self.set(event.world, position, 0);
     }
 
     fn sugarCaneRandomTick(self: *Growth, hit: random_ticks.Hit) !void {
+        self.hit_blocks = hit.blocks;
+        defer self.hit_blocks = null;
         const world = hit.world;
         const position = hit.position;
         const up = offset(position, 0, 1, 0);
@@ -381,9 +439,9 @@ pub const Growth = struct {
         if (height >= 3) return;
         const age = hit.state - tables.sugar_cane;
         if (age == 15) {
-            try self.deps.chunks.setBlock(world, up, tables.sugar_cane);
-            try self.deps.chunks.setBlock(world, position, tables.sugar_cane);
-        } else try self.deps.chunks.setBlock(world, position, hit.state + 1);
+            try self.set(world, up, tables.sugar_cane);
+            try self.set(world, position, tables.sugar_cane);
+        } else try self.set(world, position, hit.state + 1);
     }
 
     // Neighbour changes, as vanilla's updateShape.

@@ -478,7 +478,10 @@ pub const Store = struct {
         return window;
     }
 
-    fn reservePipeline(self: *Store, allocator: std.mem.Allocator, groups: usize) !void {
+    /// Initialization only. Adds decoded storage groups beside the cache for one more reader
+    /// on the terrain thread, so the groups its other readers keep pinned never leave it
+    /// waiting on itself.
+    pub fn reservePipeline(self: *Store, allocator: std.mem.Allocator, groups: usize) !void {
         std.debug.assert(self.readers == 0 and !self.writing and self.pipeline_pins == 0);
         const capacity = try std.math.add(usize, self.pipeline_capacity, groups);
         const physical = try std.math.add(usize, self.bases.capacity, capacity);
@@ -2032,18 +2035,18 @@ pub const Store = struct {
         return use.ready();
     }
 
-    /// Columns one patched light read or write may name.
+    /// Columns one column record read or write may name.
     pub const patched_batch_max = 64;
 
-    /// Stores, replaces or with a null value deletes the patched light of several columns
-    /// in the disposable cache, as one write. False when the cache took none of it.
-    pub fn putPatchedLights(self: *Store, columns: []const light.Column, values: []const ?[]const u8) bool {
+    /// Stores, replaces or with a null value deletes column records of one kind in the
+    /// disposable cache, as one write. False when the cache took none of it.
+    pub fn putColumnRecords(self: *Store, kind: light.Column.Kind, columns: []const light.Column, values: []const ?[]const u8) bool {
         std.debug.assert(columns.len == values.len and columns.len != 0 and columns.len <= patched_batch_max);
         var keys: [patched_batch_max][13]u8 = undefined;
         var writes: [patched_batch_max]records.Write = undefined;
         for (columns, values, keys[0..columns.len], writes[0..columns.len]) |column, value, *key, *write| {
             if (value) |bytes| std.debug.assert(bytes.len != 0 and bytes.len <= light.maximum_bytes);
-            key.* = column.key(.patched);
+            key.* = column.key(kind);
             write.* = .{ .key = key, .value = value };
         }
         self.derived_tables.lockUncancelable(self.io);
@@ -2058,15 +2061,15 @@ pub const Store = struct {
         return use.ready();
     }
 
-    /// Reads the patched light of several columns into one buffer. A value is null when
+    /// Reads column records of one kind into one buffer. A value is null when
     /// the cache holds none, also after the cache was emptied or dropped. A value the
     /// buffer had no room left for is null and not complete.
-    pub fn patchedLights(self: *Store, columns: []const light.Column, output: *records.PackedRead) void {
+    pub fn columnRecords(self: *Store, kind: light.Column.Kind, columns: []const light.Column, output: *records.PackedRead) void {
         std.debug.assert(columns.len == output.values.len and columns.len == output.complete.len and columns.len != 0 and columns.len <= patched_batch_max);
         var keys: [patched_batch_max][13]u8 = undefined;
         var slices: [patched_batch_max][]const u8 = undefined;
         for (columns, keys[0..columns.len], slices[0..columns.len]) |column, *key, *slice| {
-            key.* = column.key(.patched);
+            key.* = column.key(kind);
             slice.* = key;
         }
         output.used = 0;

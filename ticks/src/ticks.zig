@@ -106,6 +106,11 @@ pub const Ticks = struct {
         return self;
     }
 
+    /// Storage is read only as columns load, so allocating is initializing.
+    pub fn allocate(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Ticks {
+        return init(allocator, config, deps);
+    }
+
     /// Registers a kind of tick while the server starts. The name keeps saved ticks of the kind
     /// across restarts that register kinds in another order.
     pub fn register(self: *Ticks, name: []const u8, handler: Handler) !Kind {

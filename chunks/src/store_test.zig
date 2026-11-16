@@ -1661,55 +1661,55 @@ test "patched light records are stored replaced and deleted beside the frames of
     var values: [2]?[]const u8 = undefined;
     var complete: [2]bool = undefined;
     var read: records.PackedRead = .{ .bytes = destination, .values = &values, .complete = &complete };
-    store.patchedLights(&.{ column, other }, &read);
+    store.columnRecords(.patched, &.{ column, other }, &read);
     try std.testing.expectEqual(@as(?[]const u8, null), values[0]);
     try std.testing.expect(complete[0] and complete[1]);
 
     // A record as large as a column of fully dense light fits.
     const large = try allocator.alloc(u8, 2 * 26 * 2048 + 64);
     for (large, 0..) |*byte, index| byte.* = @truncate(index * 31);
-    try std.testing.expect(store.putPatchedLights(&.{column}, &.{large}));
-    store.patchedLights(&.{ column, other }, &read);
+    try std.testing.expect(store.putColumnRecords(.patched, &.{column}, &.{large}));
+    store.columnRecords(.patched, &.{ column, other }, &read);
     try std.testing.expectEqualSlices(u8, large, values[0].?);
     try std.testing.expectEqual(@as(?[]const u8, null), values[1]);
 
     // It shares the column with a baked frame and neither disturbs the other.
     const encoded = try savedLight(&workspace, "beside", @splat(0));
     try std.testing.expect(try store.putLight(column, @splat(0), encoded));
-    store.patchedLights(&.{ column, other }, &read);
+    store.columnRecords(.patched, &.{ column, other }, &read);
     try std.testing.expectEqualSlices(u8, large, values[0].?);
 
     // One write replaces a record and adds another.
-    try std.testing.expect(store.putPatchedLights(&.{ column, other }, &.{ "replaced", "second" }));
-    store.patchedLights(&.{ column, other }, &read);
+    try std.testing.expect(store.putColumnRecords(.patched, &.{ column, other }, &.{ "replaced", "second" }));
+    store.columnRecords(.patched, &.{ column, other }, &read);
     try std.testing.expectEqualSlices(u8, "replaced", values[0].?);
     try std.testing.expectEqualSlices(u8, "second", values[1].?);
 
     // A value the buffer has no room left for is not complete and reads alone later.
-    try std.testing.expect(store.putPatchedLights(&.{column}, &.{large}));
+    try std.testing.expect(store.putColumnRecords(.patched, &.{column}, &.{large}));
     var small: records.PackedRead = .{ .bytes = destination[0 .. large.len + 3], .values = &values, .complete = &complete };
-    store.patchedLights(&.{ column, other }, &small);
+    store.columnRecords(.patched, &.{ column, other }, &small);
     try std.testing.expectEqualSlices(u8, large, values[0].?);
     try std.testing.expect(complete[0] and !complete[1] and values[1] == null);
     var alone: records.PackedRead = .{ .bytes = destination, .values = values[0..1], .complete = complete[0..1] };
-    store.patchedLights(&.{other}, &alone);
+    store.columnRecords(.patched, &.{other}, &alone);
     try std.testing.expectEqualSlices(u8, "second", values[0].?);
 
     // Deleting leaves the frame of the column alone. Deleting what is not there is not an error.
-    try std.testing.expect(store.putPatchedLights(&.{column}, &.{null}));
-    try std.testing.expect(store.putPatchedLights(&.{column}, &.{null}));
-    store.patchedLights(&.{ column, other }, &read);
+    try std.testing.expect(store.putColumnRecords(.patched, &.{column}, &.{null}));
+    try std.testing.expect(store.putColumnRecords(.patched, &.{column}, &.{null}));
+    store.columnRecords(.patched, &.{ column, other }, &read);
     try std.testing.expectEqual(@as(?[]const u8, null), values[0]);
     try std.testing.expectEqualSlices(u8, "second", values[1].?);
 
     // Clearing removes every patched record and nothing else.
     for (0..150) |index| {
-        try std.testing.expect(store.putPatchedLights(&.{.{ .world = 9, .x = @intCast(index), .z = -3 }}, &.{"left behind"}));
+        try std.testing.expect(store.putColumnRecords(.patched, &.{.{ .world = 9, .x = @intCast(index), .z = -3 }}, &.{"left behind"}));
     }
     var passes: usize = 1;
     while (store.clearPatchedLights()) passes += 1;
     try std.testing.expect(passes >= 3);
-    store.patchedLights(&.{ other, .{ .world = 9, .x = 149, .z = -3 } }, &read);
+    store.columnRecords(.patched, &.{ other, .{ .world = 9, .x = 149, .z = -3 } }, &read);
     try std.testing.expectEqual(@as(?[]const u8, null), values[0]);
     try std.testing.expectEqual(@as(?[]const u8, null), values[1]);
     var after: [64]u8 = undefined;
@@ -1752,7 +1752,7 @@ test "a store opens and works without a place in the cache" {
     try late.putBatch(&.{.{ .key = &chunks.encodeKey(.{ .world = 0, .x = 0, .y = 0, .z = 0 }), .value = &.{ 0, 1, 0 } }});
     try std.testing.expect(!try late.putLight(column, @splat(0), encoded));
     try expectLightFrame(&late, column, null);
-    try std.testing.expect(!late.putPatchedLights(&.{column}, &.{"light"}));
+    try std.testing.expect(!late.putColumnRecords(.patched, &.{column}, &.{"light"}));
     try std.testing.expect(!late.clearPatchedLights());
     try std.testing.expect(try placed.putLight(column, @splat(0), encoded));
     try expectLightFrame(&placed, column, encoded);

@@ -14,6 +14,7 @@ pub const Light = @import("light.zig");
 pub const ReadWindow = @import("read_window.zig").ReadWindow;
 pub const classification = @import("classification.zig");
 pub const topology = @import("topology.zig");
+pub const layer = @import("layer.zig");
 
 const Cache = records.CacheFor(Backend);
 const Backend = struct {
@@ -662,13 +663,13 @@ pub const Chunks = struct {
     /// in the disposable cache, as one write. The bytes mean something only to the
     /// process that wrote them. False when the cache took none of it.
     pub fn putPatchedLights(self: *Chunks, columns: []const Light.Column, values: []const ?[]const u8) bool {
-        return self.cache.backend.store.putPatchedLights(columns, values);
+        return self.cache.backend.store.putColumnRecords(.patched, columns, values);
     }
 
     /// Reads the patched light of several columns into one buffer. A value is null when
     /// the cache holds none or the buffer had no room left for it.
     pub fn patchedLights(self: *Chunks, columns: []const Light.Column, output: *records.PackedRead) void {
-        self.cache.backend.store.patchedLights(columns, output);
+        self.cache.backend.store.columnRecords(.patched, columns, output);
     }
 
     /// Deletes patched light records, a batch at a time. True while more may remain.
@@ -1046,11 +1047,15 @@ pub const Chunks = struct {
         return self.cache.backend.store.registerClassification(allocator, properties, selected, codec);
     }
 
-    /// Registers a classification and opens a queue for its column summaries. Startup only.
-    pub fn openTopology(self: *Chunks, allocator: std.mem.Allocator, properties: []const u8, selected: u8, codec: ?classification.Codec, capacity: usize) !*topology.Topology {
+    /// Opens a queue that finds what a layer says acts in columns. `identity` names what the
+    /// layer is for, and its records keep it. Startup only.
+    pub fn openTopology(self: *Chunks, allocator: std.mem.Allocator, counted: *const layer.Layer, identity: []const u8, capacity: usize, mask_capacity: usize) !*topology.Topology {
         assert(self.background_owner.load(.acquire) == 0);
-        _ = try self.registerClassification(allocator, properties, selected, codec);
-        const opened = try topology.Topology.init(allocator, self.io, properties, selected, capacity, self.ready());
+        // One read of the sections around a section spans two storage groups per axis, or
+        // three when a group is a single section.
+        const side = self.cache.backend.store.side;
+        try self.cache.backend.store.reservePipeline(allocator, if (side == 1) 27 else 8);
+        const opened = try topology.Topology.init(allocator, self.io, counted, counted.fingerprint(identity), capacity, mask_capacity, self.ready());
         opened.next = self.topologies;
         self.topologies = opened;
         return opened;
@@ -1061,21 +1066,144 @@ pub const Chunks = struct {
         var cursor = self.topologies;
         while (cursor) |queue| : (cursor = queue.next) {
             while (true) {
-                const count = queue.claim(queue.claimed);
+                const count = queue.claim(&queue.claimed);
                 if (count == 0) break;
                 const columns = queue.claimed[0..count];
-                const summaries = queue.summaries[0..count];
+                const answers = queue.found[0..count];
                 // A failed read is answered too, so the asker may try again.
-                var available = true;
-                self.summarize(columns, summaries, queue.properties, queue.selected) catch |err| {
-                    std.log.warn("event=topology_summary_failed reason={t}", .{err});
-                    available = false;
+                self.countColumns(queue, columns, answers) catch |err| {
+                    std.log.warn("event=topology_count_failed reason={t}", .{err});
+                    for (answers, columns) |*result, column| result.* = .{ .column = column, .result = .unavailable };
                 };
-                queue.answer(columns, summaries, available);
+                queue.answer(answers, queue.found_masks[0..count]);
                 answered = true;
             }
         }
         return answered;
+    }
+
+    /// Terrain thread. Answers columns from their layer records, or finds what acts from the
+    /// sections around them, and saves that when nothing around them is edited in memory only.
+    fn countColumns(self: *Chunks, queue: *topology.Topology, columns: []const topology.Column, answers: []topology.Answer) !void {
+        assert(self.ownsCurrentThread() and columns.len == answers.len and columns.len <= topology.batch_max);
+        comptime assert(topology.batch_max <= Light.dependency_batch_max and topology.batch_max <= ChunkStore.patched_batch_max);
+        var requests: [topology.batch_max]Light.Request = undefined;
+        var places: [topology.batch_max]Light.Column = undefined;
+        for (columns, requests[0..columns.len], places[0..columns.len]) |column, *request, *place| {
+            place.* = .{ .world = column.world, .x = column.x, .z = column.z };
+            request.* = .{ .column = place.*, .minimum = column.minimum, .count = column.count };
+        }
+        var before: [topology.batch_max]Light.Dependencies = undefined;
+        try self.lightDependencies(requests[0..columns.len], before[0..columns.len]);
+        var values: [topology.batch_max]?[]const u8 = undefined;
+        var complete: [topology.batch_max]bool = undefined;
+        var read: records.PackedRead = .{ .bytes = queue.record_bytes, .values = values[0..columns.len], .complete = complete[0..columns.len] };
+        self.cache.backend.store.columnRecords(.layer, places[0..columns.len], &read);
+        var counted: [topology.batch_max]bool = @splat(false);
+        for (columns, answers, before[0..columns.len], values[0..columns.len], queue.found_masks[0..columns.len], 0..) |column, *result, dependencies, value, *masks, index| {
+            result.* = .{ .column = column, .result = .counted };
+            if (dependencies.clean) if (value) |bytes| {
+                if (topology.decodeRecord(bytes, queue.fingerprint, dependencies.revisions, column, &result.counts, masks)) |acting| {
+                    result.masks = acting;
+                    continue;
+                }
+            };
+            if (!try self.countColumn(queue, column, result, masks)) {
+                result.* = .{ .column = column, .result = .unavailable };
+                continue;
+            }
+            counted[index] = dependencies.clean;
+        }
+        // A record vouches for the revisions read before its blocks, and only if nothing
+        // around the column was edited or saved while it was counted.
+        var after: [topology.batch_max]Light.Dependencies = undefined;
+        try self.lightDependencies(requests[0..columns.len], after[0..columns.len]);
+        var writes: [topology.batch_max]?[]const u8 = undefined;
+        var written: [topology.batch_max]Light.Column = undefined;
+        var count: usize = 0;
+        for (columns, answers, before[0..columns.len], after[0..columns.len], counted[0..columns.len], places[0..columns.len], queue.found_masks[0..columns.len]) |column, result, earlier, later, fresh, place, *masks| {
+            if (!fresh) continue;
+            if (!later.clean or !std.mem.eql(u64, &earlier.revisions, &later.revisions)) continue;
+            // The record buffer is free again, as every record read was decoded above.
+            const encoded = queue.record_bytes[count * topology.record_max ..][0..topology.record_max];
+            writes[count] = topology.encodeRecord(queue.fingerprint, earlier.revisions, column, result.counts[0..column.count], masks[0..result.masks], encoded);
+            written[count] = place;
+            count += 1;
+        }
+        if (count != 0) _ = self.cache.backend.store.putColumnRecords(.layer, written[0..count], writes[0..count]);
+    }
+
+    /// Terrain thread. Finds what acts in each section of a column, reading the sections around
+    /// from memory where they are there and from the store elsewhere. Absent sections hold air.
+    /// False when a section it needs is still being generated.
+    fn countColumn(self: *Chunks, queue: *topology.Topology, column: topology.Column, result: *topology.Answer, masks: *[topology.sections_max]topology.Mask) !bool {
+        for (0..column.count) |offset| {
+            const y = column.minimum + @as(i32, @intCast(offset));
+            var around: layer.Neighbourhood = @splat(null);
+            if (!try self.readAround(queue, column, y, &.{layer.neighbour(0, 0, 0)}, &around)) return false;
+            const wanted = try queue.layer.candidates(around[layer.neighbour(0, 0, 0)]);
+            if (wanted.rules == 0) continue;
+            if (wanted.neighbours) {
+                var others: [26]usize = undefined;
+                var count: usize = 0;
+                for (0..27) |place| {
+                    if (place == layer.neighbour(0, 0, 0)) continue;
+                    others[count] = place;
+                    count += 1;
+                }
+                if (!try self.readAround(queue, column, y, others[0..count], &around)) return false;
+            }
+            const acting = try queue.layer.evaluate(queue.workspace, &around, &masks[result.masks]);
+            result.counts[offset] = acting;
+            if (acting != 0) result.masks += 1;
+        }
+        return true;
+    }
+
+    /// Reads the sections at `places` around the section at `y` of `column` into the
+    /// topology's buffers. False when one is still being generated.
+    fn readAround(self: *Chunks, queue: *topology.Topology, column: topology.Column, y: i32, places: []const usize, around: *layer.Neighbourhood) !bool {
+        var keys: [27][16]u8 = undefined;
+        var reads: [27]records.Get = undefined;
+        var slots: [27]usize = undefined;
+        var lengths: [27]?usize = undefined;
+        var stored: usize = 0;
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            try self.collectGenerated();
+            for (places) |place| {
+                const section_y = y + @as(i32, @intCast(place / 9)) - 1;
+                if (section_y < column.minimum or section_y >= column.minimum + @as(i32, column.count)) continue;
+                // Columns past the edge of the coordinate range hold air.
+                const x = std.math.add(i32, column.x, @as(i32, @intCast(place % 3)) - 1) catch continue;
+                const z = std.math.add(i32, column.z, @as(i32, @intCast(place / 3 % 3)) - 1) catch continue;
+                const key = encodeKey(.{ .world = column.world, .x = x, .y = section_y, .z = z });
+                if (self.cache.lookup.get(&key)) |slot| {
+                    if (self.generating[slot] != null) return false;
+                    if (self.cache.entries[slot].loaded) {
+                        // Memory holds the section as it is now, edits included.
+                        const lease = self.cache.pin(slot);
+                        defer lease.release();
+                        if (lease.read()) |bytes| {
+                            @memcpy(queue.around_bytes[place][0..bytes.len], bytes);
+                            around[place] = queue.around_bytes[place][0..bytes.len];
+                        }
+                        continue;
+                    }
+                }
+                keys[stored] = key;
+                reads[stored] = .{ .key = &keys[stored], .destination = &queue.around_bytes[place] };
+                slots[stored] = place;
+                stored += 1;
+            }
+        }
+        if (stored == 0) return true;
+        try self.cache.backend.store.decodeBatch(reads[0..stored], lengths[0..stored]);
+        for (slots[0..stored], lengths[0..stored]) |place, length| {
+            if (length) |n| around[place] = queue.around_bytes[place][0..n];
+        }
+        return true;
     }
 
     pub const GroupWindow = ChunkStore.GroupWindow;
