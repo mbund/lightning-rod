@@ -2279,17 +2279,60 @@ pub const Data = struct {
     // Unselected light sections retain their existing client data.
     selection: ?u32 = null,
     retained: [2]u32 = .{ 0, 0 },
+    /// Sky sections left out of both masks: the top of a column, lit 15 throughout, where the
+    /// client holds nothing. The vanilla client reads a sky section without data from the
+    /// nearest section above that has some, or as 15 when none does, as vanilla leaves
+    /// sections above the ground out. Any later change to one is selected and sent.
+    implied: u32 = 0,
 
     pub const capacity = 64 + 2 * (maximum_sections + 2) * 2051;
 
     fn selected(self: Data) [2]u32 {
         const selection = self.selection orelse (@as(u32, 1) << @intCast(self.count)) - 1;
-        return .{ selection & ~self.retained[0], selection & ~self.retained[1] };
+        return .{ selection & ~self.retained[0], selection & ~self.retained[1] & ~self.implied };
     }
 
     fn nonzero(self: Data) [2]u32 {
         const disclosure = (self.disclosure << 1) | 1 | (@as(u32, 1) << @intCast(self.count - 1));
         return .{ self.masks[0] & disclosure, self.masks[1] & disclosure };
+    }
+
+    /// Leaves the lit top of a full send to the client, where every recipient holds no sky data
+    /// (`absent`), and returns the sections left out.
+    pub fn leaveTop(self: *Data, absent: u32) u32 {
+        if (self.selection != null) return 0;
+        const top = self.fullSkyTop() & absent;
+        var implied: u32 = 0;
+        var section = self.count;
+        while (section > 0) {
+            section -= 1;
+            const bit = @as(u32, 1) << @intCast(section);
+            if (top & bit == 0) break;
+            implied |= bit;
+        }
+        self.implied = implied;
+        return implied;
+    }
+
+    /// Sky sections from the top of the column down that are lit 15 throughout, the run a full
+    /// send may leave to the client.
+    fn fullSkyTop(self: Data) u32 {
+        if (self.source == .patched) return 0;
+        const lit = self.nonzero()[1];
+        var run: u32 = 0;
+        var section = self.count;
+        while (section > 0) {
+            section -= 1;
+            const bit = @as(u32, 1) << @intCast(section);
+            const level = switch (self.source) {
+                .stored => |view| view.layers[1][section].level(),
+                .computed => |engine| engine.sectionUniform(.sky, .{ 1, section, 1 }),
+                .patched => unreachable,
+            };
+            if (lit & bit == 0 or level != 15) break;
+            run |= bit;
+        }
+        return run;
     }
 
     pub fn encodedSize(self: Data) usize {
@@ -2404,6 +2447,16 @@ pub const Receipt = struct {
 
     revision: u64 = 0,
     layers: [2]Layer = @splat(.{}),
+    /// Sky sections the client holds data for, current or not. A section it holds nothing for
+    /// reads from the sections above it, so only those may be left out of a send.
+    sky_held: u32 = 0,
+
+    /// Sky sections the client holds no data for.
+    fn absentSky(self: *const Receipt, update: Update) u32 {
+        const all = (@as(u32, 1) << @intCast(update.count)) - 1;
+        if (self.layers[1].count != update.count) return all;
+        return all & ~self.sky_held;
+    }
 
     fn retained(self: *const Receipt, update: Update) [2]u32 {
         assert(self.layers[0].count == self.layers[1].count);
@@ -2420,6 +2473,7 @@ pub const Receipt = struct {
         assert(update.count > 2 and update.count <= maximum_sections + 2);
         const all = (@as(u32, 1) << @intCast(update.count)) - 1;
         if (self.layers[0].count != update.count) self.* = .{};
+        self.sky_held |= update.selected[1];
         if (update.version) |version| {
             if (self.revision != version) for (&self.layers) |*layer| {
                 layer.present = 0;
@@ -2470,6 +2524,11 @@ pub const Receipts = struct {
         };
     }
 
+    pub fn absentSky(self: *const Receipts, index: usize, update: Receipt.Update) u32 {
+        assert(update.owner == self);
+        return self.entries[index].absentSky(update);
+    }
+
     pub fn retained(self: *const Receipts, index: usize, update: Receipt.Update) [2]u32 {
         assert(update.owner == self);
         return self.entries[index].retained(update);
@@ -2488,7 +2547,7 @@ pub const Receipts = struct {
 
 comptime {
     assert(maximum_sections + 2 <= 29);
-    assert(@sizeOf(Receipt) == 24);
+    assert(@sizeOf(Receipt) == 32);
 }
 
 pub fn writeUpdate(packet: wire_1_21_5.play.toClient.packet_update_light.Writer, x: i32, z: i32, data: Data) ![]u8 {
@@ -2723,6 +2782,98 @@ test "retained lighting matches a client model through rejected updates reveals 
             }
         }
     }
+}
+
+test "a client that reads unsent sky above as lit sees true light through full sends and updates" {
+    const count = 6;
+    var view: chunks.Light.View = .{ .header = .{ .rules = @splat(1), .minimum = 0, .count = count - 2, .skylight = true, .coverage = (1 << (count - 2)) - 1, .revisions = @splat(0), .biomes = @splat(0) } };
+    var receipt_storage: [1]Receipt = @splat(.{});
+    var receipts: Receipts = .{ .entries = &receipt_storage, .rules = @splat(1) };
+    var truth: [2][count]u4 = @splat(@splat(0));
+    // What the client holds per layer and section, null where it has no data.
+    var client: [2][count]?u8 = @splat(@splat(null));
+    var buffer: [Data.capacity]u8 = undefined;
+    var prng: std.Random.DefaultPrng = .init(0x5ec7);
+    const random = prng.random();
+    var left_out: usize = 0;
+    for (0..4000) |step| {
+        // Only a client that holds nothing for a column gets its top left out, so columns unload often.
+        if (step % 11 == 0) {
+            receipts.reset(0, 1);
+            client = @splat(@splat(null));
+        }
+        const full = client[1][0] == null or random.uintLessThan(u8, 3) == 0;
+        var selection: u32 = if (full) (1 << count) - 1 else random.intRangeAtMost(u32, 1, (1 << count) - 1);
+        var next = truth;
+        for (0..2) |layer| for (0..count) |section| {
+            if (selection & (@as(u32, 1) << @intCast(section)) == 0) continue;
+            // Mostly a lit sky above a dark ground, so full sends often have a top to leave out.
+            next[layer][section] = switch (random.uintLessThan(u8, 4)) {
+                0 => random.int(u4),
+                1 => 0,
+                else => if (layer == 1 and section >= count / 2) 15 else random.int(u4),
+            };
+        };
+        // Sky light under a section never exceeds it, and streaming selects every section whose
+        // light changed.
+        var below: usize = count - 1;
+        while (below > 0) {
+            below -= 1;
+            next[1][below] = @min(next[1][below], next[1][below + 1]);
+        }
+        for (0..2) |layer| for (0..count) |section| {
+            if (next[layer][section] != truth[layer][section]) selection |= @as(u32, 1) << @intCast(section);
+        };
+        truth = next;
+        view.header.revisions[step % 9] = step + 1;
+        var data: Data = .{ .source = .{ .stored = &view }, .count = count, .masks = .{ 0, 0 }, .selection = if (full) null else selection };
+        for (0..2) |layer| for (0..count) |section| {
+            view.layers[layer][section] = .uniform(truth[layer][section]);
+            if (truth[layer][section] != 0) data.masks[layer] |= @as(u32, 1) << @intCast(section);
+        };
+        var update = receipts.capture(data);
+        data.retained = receipts.retained(0, update);
+        for (&update.selected, data.retained) |*selected, known| selected.* &= ~known;
+        const implied = data.leaveTop(receipts.absentSky(0, update));
+        update.selected[1] &= ~implied;
+        if (implied != 0) left_out += 1;
+
+        var writer: std.Io.Writer = .fixed(&buffer);
+        try data.write(&writer);
+        try std.testing.expectEqual(data.encodedSize(), writer.end);
+        var reader = std.Io.Reader.fixed(writer.buffered());
+        var masks: [4]u64 = undefined;
+        for (&masks) |*mask| {
+            try std.testing.expectEqual(@as(u32, 1), try reader.takeLeb128(u32));
+            mask.* = try reader.takeInt(u64, .big);
+        }
+        for ([_]usize{ 1, 0 }, 0..) |layer, order| {
+            try std.testing.expectEqual(@as(u32, @popCount(masks[order])), try reader.takeLeb128(u32));
+            for (0..count) |section| {
+                const bit = @as(u64, 1) << @intCast(section);
+                if (masks[order] & bit != 0) {
+                    try std.testing.expectEqual(@as(u32, 2048), try reader.takeLeb128(u32));
+                    client[layer][section] = (try reader.take(2048))[0];
+                } else if (masks[order + 2] & bit != 0) client[layer][section] = 0;
+            }
+        }
+        try std.testing.expectEqual(writer.end, reader.seek);
+        receipts.apply(0, update);
+
+        for (0..2) |layer| for (0..count) |section| {
+            // The vanilla client: a sky section without data reads the nearest one above that
+            // has some, or 15 when none does. A block section without data reads 0.
+            var seen: u8 = if (layer == 1) 15 * 17 else 0;
+            var above = section;
+            while (above < count) : (above += 1) if (client[layer][above]) |value| {
+                seen = value;
+                break;
+            } else if (layer == 0) break;
+            try std.testing.expectEqual(@as(u8, truth[layer][section]) * 17, seen);
+        };
+    }
+    // The rule must actually have left sections out, or the test proves nothing.
+    try std.testing.expect(left_out > 100);
 }
 
 test "terrain lighting crosses chunk boundaries and reconstructs after persistence" {

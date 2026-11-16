@@ -2834,6 +2834,12 @@ pub const Streaming = struct {
         }
         data.retained = retained;
         for (&update.selected, retained) |*selected, known| selected.* &= ~known;
+        if (data.selection == null) {
+            // A full send leaves the lit top of the column to clients that hold nothing there.
+            var absent: u32 = std.math.maxInt(u32);
+            for (recipients) |handle| absent &= self.light_receipts.absentSky(self.columnIndex(handle.index, at), update);
+            update.selected[1] &= ~data.leaveTop(absent);
+        }
         return update;
     }
 

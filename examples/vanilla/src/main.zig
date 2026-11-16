@@ -35,6 +35,9 @@ pub fn main(init: std.process.Init) !void {
     var metrics_export: ?lightning_rod.metrics.Exporter.Configuration = null;
     var storage_path: []const u8 = "lightning-rod-data/world";
     var hull = true;
+    // One column past the view, the ring vanilla sends so every column in view has its neighbours.
+    var prefetch: u2 = 1;
+    var tps_bar = true;
     var render_distance: i32 = 32;
     var simulation_distance: i32 = 8;
     var port: u16 = if (init.environ_map.get("LIGHTNING_ROD_PORT")) |value| try std.fmt.parseInt(u16, value, 10) else 25565;
@@ -75,6 +78,10 @@ pub fn main(init: std.process.Init) !void {
             render_distance = try std.fmt.parseInt(i32, argument["--view-distance=".len..], 10);
         } else if (std.mem.startsWith(u8, argument, "--simulation-distance=")) {
             simulation_distance = try std.fmt.parseInt(i32, argument["--simulation-distance=".len..], 10);
+        } else if (std.mem.startsWith(u8, argument, "--prefetch=")) {
+            prefetch = try std.fmt.parseInt(u2, argument["--prefetch=".len..], 10);
+        } else if (std.mem.eql(u8, argument, "--no-tps-bar")) {
+            tps_bar = false;
         } else if (std.mem.eql(u8, argument, "--no-hull")) {
             hull = false;
         } else if (std.mem.eql(u8, argument, "--startup-report")) {
@@ -92,14 +99,14 @@ pub fn main(init: std.process.Init) !void {
     chunk_configuration.storage_batch_groups = storage_batch_groups;
     const gameplay_plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(vanilla.plugins(), .{
-            lightning_rod.plugin.configured(Streaming, .{ .prefetch = 3, .hull = hull }),
+            lightning_rod.plugin.configured(Streaming, .{ .prefetch = prefetch, .hull = hull }),
             lightning_rod.plugin.configured(Players, Players.Configuration{ .maximum = max_players, .render_distance = render_distance, .simulation_distance = simulation_distance }),
             lightning_rod.plugin.configured(Chunks, chunk_configuration),
             lightning_rod.plugin.configured(Operators, Operators.Configuration{
                 .operators = &operators,
             }),
         }),
-        lightning_rod.plugin.configured(tps.Tps, .{}),
+        lightning_rod.plugin.configured(tps.Tps, .{ .shown = tps_bar }),
         lightning_rod.plugin.configured(RegionDebug, .{}),
     });
     var protocols = try protocol_set.Default.init(allocator);

@@ -5,7 +5,11 @@ const Bossbars = @import("bossbars").bossbars.Bossbars;
 pub const Tps = struct {
     pub const id = "lightning_rod:tps";
 
-    pub const Configuration = struct { update_interval_ms: u32 = 500 };
+    pub const Configuration = struct {
+        update_interval_ms: u32 = 500,
+        /// Off creates no bars and does no work, for runs where the bars would only cost bandwidth.
+        shown: bool = true,
+    };
 
     pub const Dependencies = struct { bossbars: *Bossbars, metrics: *lightning_rod.metrics.Registry };
 
@@ -32,6 +36,7 @@ pub const Tps = struct {
 
         const self = try allocator.create(Tps);
         self.* = .{ .deps = deps, .config = config, .bars = undefined };
+        if (!config.shown) return self;
 
         for (&self.bars, windows) |*bar, seconds| {
             var title: [80]u8 = undefined;
@@ -46,6 +51,7 @@ pub const Tps = struct {
     }
 
     pub fn tick(self: *Tps) !void {
+        if (!self.config.shown) return;
         const sample = self.deps.metrics.find("server.tick") orelse return;
         if (sample.sequence == 0 or sample.sequence == self.previous) return;
 
