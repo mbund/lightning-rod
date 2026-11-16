@@ -96,6 +96,7 @@ pub const BlockLoot = @import("vanilla_blocks").block_loot.BlockLoot;
 pub const Mining = @import("vanilla_blocks").mining.Mining;
 pub const Growth = @import("vanilla_blocks").growth.Growth;
 pub const Fluids = @import("vanilla_blocks").fluids.Fluids;
+pub const Buckets = @import("vanilla_blocks").buckets.Buckets;
 pub const Placement = @import("vanilla_blocks").placement.Placement;
 pub const BlockActions = @import("vanilla_blocks").block_actions.BlockActions;
 pub const container_storage = @import("vanilla_containers").containers;
@@ -191,6 +192,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Placement, Placement.Configuration{}),
     lightning_rod.plugin.configured(Growth, Growth.Configuration{}),
     lightning_rod.plugin.configured(Fluids, Fluids.Configuration{}),
+    lightning_rod.plugin.configured(Buckets, Buckets.Configuration{}),
     lightning_rod.plugin.configured(RandomTicks, RandomTicks.Configuration{}),
     lightning_rod.plugin.configured(Equipment, Equipment.Configuration{}),
     lightning_rod.plugin.configured(ItemReplication, ItemReplication.Configuration{}),

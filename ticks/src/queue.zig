@@ -42,11 +42,16 @@ pub const Priority = enum(i8) {
     extremely_low = 3,
 };
 
+/// Vanilla runs every due block tick and then every due fluid tick, each scheduler in its own order.
+pub const Scheduler = enum(u1) { block, fluid };
+
 pub const Event = struct {
     world: u32,
     position: Position,
     kind: Kind,
     priority: Priority = .normal,
+    /// Set from the kind by Ticks.
+    scheduler: Scheduler = .block,
 
     fn hash(self: Event) u64 {
         var bytes: [18]u8 = undefined;
@@ -105,8 +110,9 @@ pub const Queue = struct {
     slots: []Slot,
     free: u32,
     used: u32 = 0,
-    heap: []u32,
-    heap_count: u32 = 0,
+    /// One heap per scheduler.
+    heaps: [2][]u32,
+    heap_counts: [2]u32 = .{ 0, 0 },
     /// Open addressing by event, linear probing, backward shift deletion. Holds slot indices.
     by_event: []u32,
     column_states: []ColumnState,
@@ -121,8 +127,10 @@ pub const Queue = struct {
         if (config.events == 0 or config.columns == 0 or config.events >= none / 2 or config.columns >= none / 2) return error.InvalidConfiguration;
         const slots = try allocator.alloc(Slot, config.events);
         errdefer allocator.free(slots);
-        const heap = try allocator.alloc(u32, config.events);
-        errdefer allocator.free(heap);
+        const block_heap = try allocator.alloc(u32, config.events);
+        errdefer allocator.free(block_heap);
+        const fluid_heap = try allocator.alloc(u32, config.events);
+        errdefer allocator.free(fluid_heap);
         const by_event = try allocator.alloc(u32, try std.math.ceilPowerOfTwo(usize, 2 * @as(usize, config.events)));
         errdefer allocator.free(by_event);
         const column_states = try allocator.alloc(ColumnState, config.columns);
@@ -137,12 +145,12 @@ pub const Queue = struct {
             .live = false,
             .next_free = if (index + 1 < column_states.len) @intCast(index + 1) else none,
         };
-        return .{ .slots = slots, .free = 0, .heap = heap, .by_event = by_event, .column_states = column_states, .column_free = 0, .by_column = by_column };
+        return .{ .slots = slots, .free = 0, .heaps = .{ block_heap, fluid_heap }, .by_event = by_event, .column_states = column_states, .column_free = 0, .by_column = by_column };
     }
 
     pub fn deinit(self: *Queue, allocator: std.mem.Allocator) void {
         allocator.free(self.slots);
-        allocator.free(self.heap);
+        for (self.heaps) |heap| allocator.free(heap);
         allocator.free(self.by_event);
         allocator.free(self.column_states);
         allocator.free(self.by_column);
@@ -228,11 +236,13 @@ pub const Queue = struct {
         self.now += 1;
     }
 
-    /// Takes due events in run order, at most `output.len`. Events not taken stay due.
-    pub fn takeDue(self: *Queue, output: []Event) usize {
+    /// Takes the scheduler's due events in run order, at most `output.len`. Events not taken stay
+    /// due.
+    pub fn takeDue(self: *Queue, scheduler: Scheduler, output: []Event) usize {
+        const heap = @backingInt(scheduler);
         var count: usize = 0;
-        while (count < output.len and self.heap_count != 0) {
-            const top = self.heap[0];
+        while (count < output.len and self.heap_counts[heap] != 0) {
+            const top = self.heaps[heap][0];
             if (self.slots[top].time > self.now) break;
             output[count] = self.slots[top].event;
             count += 1;
@@ -249,7 +259,7 @@ pub const Queue = struct {
         var index = state.head;
         while (index != none) : (index = self.slots[index].next) {
             const slot = &self.slots[index];
-            self.heapRemove(slot.heap);
+            self.heapRemove(slot.event.scheduler, slot.heap);
             slot.time -|= self.now;
         }
     }
@@ -284,7 +294,7 @@ pub const Queue = struct {
 
     fn remove(self: *Queue, index: u32) void {
         const slot = &self.slots[index];
-        if (slot.heap != none) self.heapRemove(slot.heap);
+        if (slot.heap != none) self.heapRemove(slot.event.scheduler, slot.heap);
         const state = &self.column_states[slot.column];
         if (slot.previous != none) self.slots[slot.previous].next = slot.next else state.head = slot.next;
         if (slot.next != none) self.slots[slot.next].previous = slot.previous;
@@ -358,50 +368,54 @@ pub const Queue = struct {
     }
 
     fn place(self: *Queue, at: u32, index: u32) void {
-        self.heap[at] = index;
+        self.heaps[@backingInt(self.slots[index].event.scheduler)][at] = index;
         self.slots[index].heap = at;
     }
 
     fn push(self: *Queue, index: u32) void {
-        assert(self.slots[index].heap == none and self.heap_count < self.heap.len);
-        self.heap_count += 1;
-        self.place(self.heap_count - 1, index);
-        self.siftUp(self.heap_count - 1);
+        const heap = @backingInt(self.slots[index].event.scheduler);
+        assert(self.slots[index].heap == none and self.heap_counts[heap] < self.heaps[heap].len);
+        self.heap_counts[heap] += 1;
+        self.place(self.heap_counts[heap] - 1, index);
+        self.siftUp(heap, self.heap_counts[heap] - 1);
     }
 
-    fn heapRemove(self: *Queue, at: u32) void {
-        assert(at < self.heap_count);
-        const removed = self.heap[at];
+    fn heapRemove(self: *Queue, scheduler: Scheduler, at: u32) void {
+        const heap = @backingInt(scheduler);
+        assert(at < self.heap_counts[heap]);
+        const removed = self.heaps[heap][at];
         self.slots[removed].heap = none;
-        self.heap_count -= 1;
-        if (at == self.heap_count) return;
-        self.place(at, self.heap[self.heap_count]);
-        self.siftDown(at);
-        self.siftUp(self.slots[self.heap[at]].heap);
+        self.heap_counts[heap] -= 1;
+        if (at == self.heap_counts[heap]) return;
+        self.place(at, self.heaps[heap][self.heap_counts[heap]]);
+        self.siftDown(heap, at);
+        self.siftUp(heap, self.slots[self.heaps[heap][at]].heap);
     }
 
-    fn siftUp(self: *Queue, start: u32) void {
+    fn siftUp(self: *Queue, heap: u1, start: u32) void {
+        const entries = self.heaps[heap];
         var at = start;
         while (at > 0) {
             const parent = (at - 1) / 2;
-            if (!self.before(self.heap[at], self.heap[parent])) break;
-            const moved = self.heap[parent];
-            self.place(parent, self.heap[at]);
+            if (!self.before(entries[at], entries[parent])) break;
+            const moved = entries[parent];
+            self.place(parent, entries[at]);
             self.place(at, moved);
             at = parent;
         }
     }
 
-    fn siftDown(self: *Queue, start: u32) void {
+    fn siftDown(self: *Queue, heap: u1, start: u32) void {
+        const entries = self.heaps[heap];
         var at = start;
         while (true) {
             var best = at;
             for ([_]u32{ 2 * at + 1, 2 * at + 2 }) |child| {
-                if (child < self.heap_count and self.before(self.heap[child], self.heap[best])) best = child;
+                if (child < self.heap_counts[heap] and self.before(entries[child], entries[best])) best = child;
             }
             if (best == at) return;
-            const moved = self.heap[best];
-            self.place(best, self.heap[at]);
+            const moved = entries[best];
+            self.place(best, entries[at]);
             self.place(at, moved);
             at = best;
         }
@@ -426,12 +440,12 @@ test "due events run in trigger, priority and scheduling order and duplicates ke
     try std.testing.expectEqual(Queue.Scheduled.present, try queue.schedule(eventAt(0, 3, 0, 0, 0), 5));
     try std.testing.expectError(error.Untracked, queue.schedule(eventAt(0, 16, 0, 0, 0), 1));
     var due: [8]Event = undefined;
-    try std.testing.expectEqual(@as(usize, 0), queue.takeDue(&due));
+    try std.testing.expectEqual(@as(usize, 0), queue.takeDue(.block, &due));
     queue.advance();
-    try std.testing.expectEqual(@as(usize, 1), queue.takeDue(&due));
+    try std.testing.expectEqual(@as(usize, 1), queue.takeDue(.block, &due));
     try std.testing.expectEqual(@as(i32, 3), due[0].position.x);
     queue.advance();
-    try std.testing.expectEqual(@as(usize, 3), queue.takeDue(&due));
+    try std.testing.expectEqual(@as(usize, 3), queue.takeDue(.block, &due));
     try std.testing.expectEqual([3]i32{ 2, 1, 4 }, .{ due[0].position.x, due[1].position.x, due[2].position.x });
     try std.testing.expectEqual(@as(u32, 0), queue.used);
 }
@@ -447,7 +461,7 @@ test "parked columns keep the delay they had left and resume from it" {
     queue.park(column);
     for (0..100) |_| queue.advance();
     var due: [4]Event = undefined;
-    try std.testing.expectEqual(@as(usize, 0), queue.takeDue(&due));
+    try std.testing.expectEqual(@as(usize, 0), queue.takeDue(.block, &due));
     var listed: [4]Pending = undefined;
     try std.testing.expectEqual(@as(usize, 1), queue.pending(column, &listed));
     try std.testing.expectEqual(@as(u64, 3), listed[0].delay);
@@ -455,11 +469,11 @@ test "parked columns keep the delay they had left and resume from it" {
     _ = try queue.schedule(eventAt(0, 2, 0, 0, 0), 1);
     queue.unpark(column);
     queue.advance();
-    try std.testing.expectEqual(@as(usize, 1), queue.takeDue(&due));
+    try std.testing.expectEqual(@as(usize, 1), queue.takeDue(.block, &due));
     try std.testing.expectEqual(@as(i32, 2), due[0].position.x);
     queue.advance();
     queue.advance();
-    try std.testing.expectEqual(@as(usize, 1), queue.takeDue(&due));
+    try std.testing.expectEqual(@as(usize, 1), queue.takeDue(.block, &due));
     try std.testing.expectEqual(@as(i32, 1), due[0].position.x);
     queue.forget(column);
     try std.testing.expect(queue.columnState(column) == null);
@@ -513,7 +527,7 @@ test "a random schedule matches a linear model and never outgrows its memory" {
                 queue.advance();
                 var due: [64]Event = undefined;
                 const limit = rng.uintLessThan(usize, 9);
-                const count = queue.takeDue(due[0..limit]);
+                const count = queue.takeDue(.block, due[0..limit]);
                 for (due[0..count]) |event| {
                     // The model's next is the earliest unparked due event.
                     var best: ?usize = null;
@@ -535,4 +549,26 @@ test "a random schedule matches a linear model and never outgrows its memory" {
         }
         try std.testing.expectEqual(model_count, queue.used);
     }
+}
+
+test "block and fluid ticks are taken apart, each in its own order" {
+    var queue = try Queue.init(std.testing.allocator, .{ .events = 8, .columns = 2 });
+    defer queue.deinit(std.testing.allocator);
+    _ = try queue.track(.{ .world = 0, .x = 0, .z = 0 }, false);
+    var fluid = eventAt(0, 1, 64, 1, 1);
+    fluid.scheduler = .fluid;
+    _ = try queue.schedule(fluid, 1);
+    var block = eventAt(0, 2, 64, 2, 0);
+    block.priority = .low;
+    _ = try queue.schedule(block, 1);
+    queue.advance();
+    var due: [4]Event = undefined;
+    // The block tick comes first even though the fluid tick was scheduled before it.
+    try std.testing.expectEqual(@as(usize, 1), queue.takeDue(.block, &due));
+    try std.testing.expectEqual(@as(Kind, 0), due[0].kind);
+    // A block tick due now, scheduled while block ticks ran, waits for the block scheduler.
+    _ = try queue.schedule(eventAt(0, 3, 64, 3, 0), 0);
+    try std.testing.expectEqual(@as(usize, 1), queue.takeDue(.fluid, &due));
+    try std.testing.expectEqual(@as(Kind, 1), due[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), queue.takeDue(.block, &due));
 }

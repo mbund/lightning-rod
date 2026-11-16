@@ -18,6 +18,7 @@ pub const Position = queue.Position;
 pub const Priority = queue.Priority;
 pub const Kind = queue.Kind;
 pub const Event = queue.Event;
+pub const Scheduler = queue.Scheduler;
 
 pub const Ticks = struct {
     pub const id = "lightning_rod:ticks";
@@ -55,7 +56,7 @@ pub const Ticks = struct {
         }
     };
 
-    const KindEntry = struct { name: []const u8, handler: Handler, saved: ?u16 = null };
+    const KindEntry = struct { name: []const u8, scheduler: Scheduler, handler: Handler, saved: ?u16 = null };
 
     /// Saved bytes per tick: local x and z, y, saved kind, priority and delay.
     const entry_bytes = 1 + 4 + 2 + 1 + 4;
@@ -113,12 +114,12 @@ pub const Ticks = struct {
 
     /// Registers a kind of tick while the server starts. The name keeps saved ticks of the kind
     /// across restarts that register kinds in another order.
-    pub fn register(self: *Ticks, name: []const u8, handler: Handler) !Kind {
+    pub fn register(self: *Ticks, name: []const u8, scheduler: Scheduler, handler: Handler) !Kind {
         assert(!self.started);
         if (name.len == 0 or name.len > 64) return error.InvalidName;
         for (self.kinds[0..self.kind_count]) |entry| if (std.mem.eql(u8, entry.name, name)) return error.DuplicateKind;
         if (self.kind_count == self.kinds.len) return error.KindCapacity;
-        self.kinds[self.kind_count] = .{ .name = name, .handler = handler };
+        self.kinds[self.kind_count] = .{ .name = name, .scheduler = scheduler, .handler = handler };
         self.kind_count += 1;
         return self.kind_count - 1;
     }
@@ -134,7 +135,9 @@ pub const Ticks = struct {
             // loaded but do not tick. The column's saved ticks come first.
             try self.loadColumns(&.{column}, true);
         }
-        _ = self.queue.schedule(event, delay) catch |err| switch (err) {
+        var queued = event;
+        queued.scheduler = self.kinds[event.kind].scheduler;
+        _ = self.queue.schedule(queued, delay) catch |err| switch (err) {
             error.EventCapacity => {
                 self.dropped += 1;
                 return error.TickCapacity;
@@ -184,8 +187,12 @@ pub const Ticks = struct {
             self.loading_count = 0;
         }
         self.queue.advance();
-        const count = self.queue.takeDue(self.due);
-        for (self.due[0..count]) |event| try self.kinds[event.kind].handler.run(self.kinds[event.kind].handler.context, event);
+        // ServerWorld.tick runs the block scheduler and then the fluid one, each taking what is
+        // due before it runs any, at most 65536 by default.
+        for ([_]Scheduler{ .block, .fluid }) |scheduler| {
+            const count = self.queue.takeDue(scheduler, self.due);
+            for (self.due[0..count]) |event| try self.kinds[event.kind].handler.run(self.kinds[event.kind].handler.context, event);
+        }
     }
 
     fn loadColumns(self: *Ticks, columns: []const Column, parked: bool) !void {
@@ -218,6 +225,7 @@ pub const Ticks = struct {
                 .position = .{ .x = column.x * 16 + (entry[0] & 15), .y = std.mem.readInt(i32, entry[1..5], .little), .z = column.z * 16 + (entry[0] >> 4) },
                 .kind = kind,
                 .priority = @fromBackingInt(@intCast(priority)),
+                .scheduler = self.kinds[kind].scheduler,
             };
             _ = self.queue.schedule(event, std.mem.readInt(u32, entry[8..12], .little)) catch |err| switch (err) {
                 error.EventCapacity => return error.TickCapacity,

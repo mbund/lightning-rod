@@ -23,6 +23,7 @@ const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities
 
 const assert = std.debug.assert;
 const registry = game_data.registry;
+const state_names = @import("state_names.zig");
 
 const Kind = enum(u8) { other, grass, leaves, sugar_cane };
 
@@ -104,7 +105,7 @@ fn prepareTables(allocator: std.mem.Allocator) !void {
         for (&ids, 1..) |*id, value| {
             const begin = std.mem.indexOf(u8, name, "distance=").?;
             const renamed = try std.fmt.bufPrint(&scratch, "{s}distance={d}{s}", .{ name[0..begin], value, name[begin + "distance=".len + 1 ..] });
-            id.* = try stateId(renamed);
+            id.* = state_names.id(renamed) orelse return error.UnknownBlockState;
         }
         leaf_base[state] = ids[0];
         leaf_stride[state] = ids[1] - ids[0];
@@ -186,8 +187,8 @@ pub const Growth = struct {
         };
         try self.readTags();
         try deps.block_definitions.registry.onChange(self, readTags);
-        self.leaves_tick = try deps.ticks.register("minecraft:leaves", .init(Growth, self, leavesTick));
-        self.sugar_cane_tick = try deps.ticks.register("minecraft:sugar_cane", .init(Growth, self, sugarCaneTick));
+        self.leaves_tick = try deps.ticks.register("minecraft:leaves", .block, .init(Growth, self, leavesTick));
+        self.sugar_cane_tick = try deps.ticks.register("minecraft:sugar_cane", .block, .init(Growth, self, sugarCaneTick));
         try self.registerRandomTicks(deps.random_ticks);
         try deps.chunks.observe(.init(self, blocksChanged));
         return self;

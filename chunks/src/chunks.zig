@@ -455,6 +455,12 @@ pub const Chunks = struct {
     ready_count: usize = 0,
     observer_count: usize = 0,
     notifying: bool = false,
+    /// Edits observers made in answer to the notification under way.
+    chained: [chain_max]Chained = undefined,
+    chained_count: usize = 0,
+    /// Chained edits waiting to apply, the next on top.
+    chain_stack: [chain_stack_max]Chained = undefined,
+    chain_stack_count: usize = 0,
     edit_scratch: [encoding.maximum_decoded_bytes]u8 = undefined,
     /// States the cells of one applied batch held before it, kept for its notifications.
     edit_previous: [edit_previous_max]u16 = undefined,
@@ -679,6 +685,22 @@ pub const Chunks = struct {
     }
 
     /// Only the chunk owner may use the encoder. The workspace must not outlive these chunks.
+    pub const chain_max = 64;
+    pub const chain_stack_max = 1024;
+    /// Chained edits one edit may set off, as vanilla bounds chained neighbour updates.
+    pub const chain_limit = 1 << 16;
+    const Chained = struct { world: World, position: Position, state: u16 };
+
+    /// An edit an observer makes in answer to a notification, as a block does in a neighbour
+    /// update. It applies once the notification ends, before the edit that caused it returns,
+    /// and its own notification may chain further, as vanilla's chained neighbour updates do.
+    pub fn chain(self: *Chunks, world: World, position: Position, state: u16) !void {
+        assert(self.notifying);
+        if (self.chained_count == self.chained.len) return error.ChainCapacity;
+        self.chained[self.chained_count] = .{ .world = world, .position = position, .state = state };
+        self.chained_count += 1;
+    }
+
     pub fn setBlock(self: *Chunks, world: World, pos: Position, state: u16) !void {
         try self.setBlocks(sectionAt(world, pos), &.{.{ .index = localIndex(pos), .state = state }});
     }
@@ -691,8 +713,20 @@ pub const Chunks = struct {
     }
 
     /// Apply section batches in caller order. Notify observers after releasing each acquired batch.
+    /// Edits observers chain apply before this returns, each with what it chains in turn first.
     pub fn setSections(self: *Chunks, sections: []const SectionEdits) !void {
-        assert(!self.notifying);
+        assert(!self.notifying and self.chain_stack_count == 0);
+        try self.applyBatches(sections);
+        var applied: usize = 0;
+        while (self.chain_stack_count != 0) : (applied += 1) {
+            if (applied == chain_limit) return error.ChainLimit;
+            self.chain_stack_count -= 1;
+            const edit = self.chain_stack[self.chain_stack_count];
+            try self.applyBatches(&.{.{ .section = sectionAt(edit.world, edit.position), .edits = &.{.{ .index = localIndex(edit.position), .state = edit.state }} }});
+        }
+    }
+
+    fn applyBatches(self: *Chunks, sections: []const SectionEdits) !void {
         var changed: [192]bool = undefined;
         var start: usize = 0;
         while (start < sections.len) {
@@ -725,7 +759,20 @@ pub const Chunks = struct {
             }
             assert(offset == edits);
             self.notifying = false;
+            try self.stackChained();
             start += count;
+        }
+    }
+
+    /// Puts the edits the last notification chained on the stack, the first on top.
+    fn stackChained(self: *Chunks) !void {
+        defer self.chained_count = 0;
+        if (self.chain_stack_count + self.chained_count > self.chain_stack.len) return error.ChainCapacity;
+        var index = self.chained_count;
+        while (index > 0) {
+            index -= 1;
+            self.chain_stack[self.chain_stack_count] = self.chained[index];
+            self.chain_stack_count += 1;
         }
     }
 

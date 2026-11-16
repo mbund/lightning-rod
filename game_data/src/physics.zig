@@ -55,8 +55,9 @@ pub fn Data(comptime expected_states: usize, comptime expected_blocks: usize, co
     const boxes_offset = shapes_offset + shape_count * 6;
     const experience_offset = boxes_offset + box_count * 48;
     const rendering_offset = experience_offset + 4 + expected_blocks * 4;
-    std.debug.assert(bytes.len == rendering_offset + expected_states);
-    std.debug.assert(std.mem.eql(u8, bytes[0..8], "LRPHYS05"));
+    const outline_offset = rendering_offset + expected_states;
+    std.debug.assert(bytes.len == outline_offset + expected_states * 2);
+    std.debug.assert(std.mem.eql(u8, bytes[0..8], "LRPHYS06"));
     std.debug.assert(std.mem.readInt(u32, bytes[8..12], .big) == expected_states);
     std.debug.assert(std.mem.readInt(u32, bytes[experience_offset..][0..4], .big) == expected_blocks);
     return struct {
@@ -88,6 +89,20 @@ pub fn Data(comptime expected_states: usize, comptime expected_blocks: usize, co
             std.debug.assert(@as(usize, result.offset) + result.count <= box_count);
             return result;
         }
+        /// The outline shape, which raycasts for using items and blocks trace, at a position.
+        pub fn outline(state: u16, x: i32, z: i32) Boxes {
+            std.debug.assert(state < expected_states);
+            const shape = std.mem.readInt(u16, bytes[outline_offset + @as(usize, state) * 2 ..][0..2], .little);
+            std.debug.assert(shape < shape_count);
+            const entry = bytes[shapes_offset + @as(usize, shape) * 6 ..][0..6];
+            const offset_entry = bytes[20 + @as(usize, state) * 26 + 18 ..][0..8];
+            const horizontal: f32 = @bitCast(std.mem.readInt(u32, offset_entry[0..4], .little));
+            const vertical: f32 = @bitCast(std.mem.readInt(u32, offset_entry[4..8], .little));
+            const result: Boxes = .{ .offset = std.mem.readInt(u32, entry[0..4], .little), .count = std.mem.readInt(u16, entry[4..6], .little), .translation = offset(x, z, horizontal, vertical) };
+            std.debug.assert(@as(usize, result.offset) + result.count <= box_count);
+            return result;
+        }
+
         pub fn experience(block: u16) Experience {
             std.debug.assert(block < expected_blocks);
             const entry = bytes[experience_offset + 4 + @as(usize, block) * 4 ..][0..4];

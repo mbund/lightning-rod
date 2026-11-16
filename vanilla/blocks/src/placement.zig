@@ -17,6 +17,8 @@ const Input = @import("players").input.Input;
 const Items = @import("vanilla_items").items.Items;
 const ItemActions = @import("vanilla_items").item_actions.ItemActions;
 const BlockSynchronization = @import("terrain").block_sync.BlockSynchronization;
+const replaceable = @import("replaceable.zig");
+const fluids = @import("fluids.zig");
 
 const Chunks = chunks.Chunks;
 
@@ -106,11 +108,22 @@ pub const Placement = struct {
 
         if (try self.deps.item_actions.apply(&player, place.hand, place) != .pass) return;
         if (state.gamemode != .creative and state.gamemode != .survival) return;
+        // The block the held item places, as AbstractBlockState.canReplace compares it.
+        const placing: ?u16 = if (held.stack) |stack| placing: {
+            const pinned = try self.deps.items.acquire(stack);
+            defer pinned.release();
+            const placed = self.deps.definitions.states[pinned.view.kind];
+            break :placing if (placed == 0) null else game_data.registry.block_state_to_block[placed];
+        } else null;
+        // ItemPlacementContext: a block that gives way is replaced where it is, and otherwise the
+        // block goes against the clicked face.
         var position = place.position;
-        const offset = [_][3]i32{ .{ 0, -1, 0 }, .{ 0, 1, 0 }, .{ 0, 0, -1 }, .{ 0, 0, 1 }, .{ -1, 0, 0 }, .{ 1, 0, 0 } };
-        position.x += offset[@intCast(place.face)][0];
-        position.y += offset[@intCast(place.face)][1];
-        position.z += offset[@intCast(place.face)][2];
+        if (!replaceable.canReplace(try self.chunk_client.getBlock(player.world, clicked), placing orelse std.math.maxInt(u16))) {
+            const offset = [_][3]i32{ .{ 0, -1, 0 }, .{ 0, 1, 0 }, .{ 0, 0, -1 }, .{ 0, 0, 1 }, .{ -1, 0, 0 }, .{ 1, 0, 0 } };
+            position.x += offset[@intCast(place.face)][0];
+            position.y += offset[@intCast(place.face)][1];
+            position.z += offset[@intCast(place.face)][2];
+        }
         if (position.y < minimum_y or position.y >= minimum_y + @as(i32, @intCast(dimension.sectionCount() * 16))) return;
         if (!self.deps.player_states.insideBorder(.{ .x = @as(f64, @floatFromInt(position.x)) + 0.5, .y = @floatFromInt(position.y), .z = @as(f64, @floatFromInt(position.z)) + 0.5 })) return;
 
@@ -143,7 +156,7 @@ pub const Placement = struct {
                 plan = try callback.call(&context) orelse .{ .state = 0 };
                 try placement_behavior.validate(plan, stack.count);
             }
-            block = plan.state;
+            block = fluids.placedIn(plan.state, previous);
             switch (plan.replacement) {
                 .normal => if (state.gamemode != .creative) {
                     remaining = if (stack.count == plan.consume) null else .{ .item = stack.item, .count = stack.count - plan.consume };
@@ -156,7 +169,7 @@ pub const Placement = struct {
             }
         }
 
-        var allowed = block != 0 and previous == 0 and state.health > 0 and (state.gamemode == .creative or state.gamemode == .survival);
+        var allowed = block != 0 and replaceable.canReplace(previous, game_data.registry.block_state_to_block[block]) and state.health > 0 and (state.gamemode == .creative or state.gamemode == .survival);
         const custom = if (allowed) try self.deps.actions.apply(.{
             .action = .place,
             .player = &player,

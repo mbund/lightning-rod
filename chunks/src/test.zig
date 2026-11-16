@@ -719,6 +719,47 @@ test "repeated sections in an edit batch observe preceding edits without extra b
     try std.testing.expectEqual(@as(u16, 19), lease.get(1));
 }
 
+test "observers chain edits that land before the edit that caused them returns" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_bytes: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_bytes, ".zig-cache/tmp/{s}/chunks", .{directory.sub_path});
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var store = try storage.Store.init(allocator, io, .{ .path = path });
+    defer store.deinit();
+    var registry = try metrics.Registry.init(allocator, io, .{ .enabled = false });
+    defer registry.deinit();
+    const world = try chunks.Chunks.init(arena.allocator(), io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 4 }, .{
+        .metrics = &registry,
+        .storage = try store.openSpace(chunks.Chunks.id),
+        .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}),
+    });
+    // Each state below 3 placed at a cell places the next state one cell along, as a block
+    // reacting in its neighbour update would.
+    const Spreader = struct {
+        owner: *chunks.Chunks,
+        seen: usize = 0,
+
+        fn changed(self: *@This(), _: chunks.Section, edits: []const chunks.BlockEdit, _: []const u16) void {
+            for (edits) |edit| {
+                self.seen += 1;
+                if (edit.state == 0 or edit.state >= 3) continue;
+                self.owner.chain(0, .{ .x = edit.index + 1, .y = 0, .z = 0 }, edit.state + 1) catch unreachable;
+            }
+        }
+    };
+    var spreader: Spreader = .{ .owner = world };
+    try world.observe(chunks.Observer.init(&spreader, Spreader.changed));
+    try world.setBlock(0, .{ .x = 0, .y = 0, .z = 0 }, 1);
+    // The whole chain applied before setBlock returned, each link announced in turn.
+    try std.testing.expectEqual(@as(usize, 3), spreader.seen);
+    const reader = try world.client(.{ .name = "test", .sections = 1 });
+    for ([_]u16{ 1, 2, 3, 0 }, 0..) |expected, x| try std.testing.expectEqual(expected, try reader.getBlock(0, .{ .x = @intCast(x), .y = 0, .z = 0 }));
+}
+
 test "observers receive the state each edited cell held before its batch" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

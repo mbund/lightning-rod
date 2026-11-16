@@ -35,6 +35,9 @@ final class PhysicsSnapshot {
         var collisions = new ArrayList<int[]>();
         var context = new SpawnContext();
         var offsets = new ArrayList<net.minecraft.world.phys.Vec3>();
+        // Outline shapes, which raycasts for using items and blocks trace, as offset free as the
+        // collision shapes.
+        var outlines = new ArrayList<Integer>();
         for (var state : Block.BLOCK_STATE_REGISTRY) {
             int[] indices = new int[3];
             var offset = net.minecraft.world.phys.Vec3.ZERO;
@@ -49,10 +52,13 @@ final class PhysicsSnapshot {
                 indices[i] = shapes.computeIfAbsent(boxes, key -> shapes.size());
             }
             collisions.add(indices);
+            var outlineOffset = state.hasOffsetFunction() ? state.getOffset(BlockPos.ZERO) : net.minecraft.world.phys.Vec3.ZERO;
+            var outline = List.copyOf(state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO).move(-outlineOffset.x, -outlineOffset.y, -outlineOffset.z).toAabbs());
+            outlines.add(shapes.computeIfAbsent(outline, key -> shapes.size()));
         }
         int boxCount = shapes.keySet().stream().mapToInt(List::size).sum();
         try (var output = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(destination)))) {
-            output.write("LRPHYS05".getBytes(StandardCharsets.US_ASCII));
+            output.write("LRPHYS06".getBytes(StandardCharsets.US_ASCII));
             output.writeInt(Block.BLOCK_STATE_REGISTRY.size());
             output.writeInt(shapes.size());
             output.writeInt(boxCount);
@@ -128,6 +134,10 @@ final class PhysicsSnapshot {
                 if (name.equals("end_gateway")) rendering |= 8;
                 if (name.equals("structure_block") || name.equals("test_instance_block")) rendering |= 16;
                 output.writeByte(rendering);
+            }
+            for (int shape : outlines) {
+                if (shape > 65535) throw new IllegalStateException("Too many outline shapes");
+                output.writeShort(Short.reverseBytes((short)shape));
             }
         }
     }

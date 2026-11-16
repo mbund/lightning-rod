@@ -38,8 +38,8 @@ const World = struct {
         const workspaces = try records.Workspaces.init(allocator, store.io, .{});
         self.ticks = try Ticks.init(allocator, .{ .events = 64, .columns = 64, .column_events = 64 }, .{ .domains = self.domains, .record_workspaces = workspaces, .storage = try store.openSpace(Ticks.id) });
         self.recorder = .{ .owner = self.ticks };
-        if (before) |name| _ = try self.ticks.register(name, .init(Recorder, &self.recorder, Recorder.run));
-        self.kind = try self.ticks.register("test:mark", .init(Recorder, &self.recorder, Recorder.run));
+        if (before) |name| _ = try self.ticks.register(name, .block, .init(Recorder, &self.recorder, Recorder.run));
+        self.kind = try self.ticks.register("test:mark", .block, .init(Recorder, &self.recorder, Recorder.run));
     }
 
     fn step(self: *World) !void {

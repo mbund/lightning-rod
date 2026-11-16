@@ -49,6 +49,8 @@ const Workload = struct {
     /// Side of the cube of blocks one edit places and later removes. One is a single block.
     /// A larger cube is centred on a column corner, so it spans four columns.
     edit_size: u32,
+    /// The block state edits place, by name. Water makes every edit a fluid that falls and spreads.
+    edit_block: []const u8,
 };
 
 // Flight speed is set in whole blocks per second. Positions advance by fractions per tick.
@@ -90,6 +92,7 @@ pub fn main(init: std.process.Init) !void {
             .edit_interval = try std.fmt.parseInt(u32, args[18], 10),
             .edit_lead = try std.fmt.parseInt(u32, args[19], 10),
             .edit_size = try std.fmt.parseInt(u32, args[20], 10),
+            .edit_block = args[21],
         });
     }
     var world: ?[]const u8 = null;
@@ -109,10 +112,11 @@ pub fn main(init: std.process.Init) !void {
     var edit_interval: u32 = 0;
     var edit_lead: u32 = 0;
     var edit_size: u32 = 1;
+    var edit_block: []const u8 = "minecraft:stone";
     var index: usize = 1;
     while (index < args.len) : (index += 2) {
         if (index + 1 == args.len) return error.MissingArgument;
-        if (std.mem.eql(u8, args[index], "--world")) world = args[index + 1] else if (std.mem.eql(u8, args[index], "--output")) directory = args[index + 1] else if (std.mem.eql(u8, args[index], "--ticks")) ticks = try std.fmt.parseInt(usize, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--warmup-ticks")) warmup = try std.fmt.parseInt(usize, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--players")) player_count = try std.fmt.parseInt(usize, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--burst-slots")) burst_slots = try std.fmt.parseInt(usize, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--metrics-export")) metrics_export = try parseBoolean(args[index + 1]) else if (std.mem.eql(u8, args[index], "--prefetch")) prefetch = try std.fmt.parseInt(u2, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--retain")) retain = try parseBoolean(args[index + 1]) else if (std.mem.eql(u8, args[index], "--round-trip")) round_trip = try std.fmt.parseInt(u32, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--detailed-timers")) detailed_timers = try parseBoolean(args[index + 1]) else if (std.mem.eql(u8, args[index], "--speed")) speed = try std.fmt.parseInt(u32, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--columns")) columns = try std.fmt.parseInt(usize, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--spacing-x")) spacing[0] = try std.fmt.parseInt(u32, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--spacing-z")) spacing[1] = try std.fmt.parseInt(u32, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--edit-interval")) edit_interval = try std.fmt.parseInt(u32, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--edit-lead")) edit_lead = try std.fmt.parseInt(u32, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--edit-size")) edit_size = try std.fmt.parseInt(u32, args[index + 1], 10) else return error.UnknownArgument;
+        if (std.mem.eql(u8, args[index], "--world")) world = args[index + 1] else if (std.mem.eql(u8, args[index], "--output")) directory = args[index + 1] else if (std.mem.eql(u8, args[index], "--ticks")) ticks = try std.fmt.parseInt(usize, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--warmup-ticks")) warmup = try std.fmt.parseInt(usize, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--players")) player_count = try std.fmt.parseInt(usize, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--burst-slots")) burst_slots = try std.fmt.parseInt(usize, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--metrics-export")) metrics_export = try parseBoolean(args[index + 1]) else if (std.mem.eql(u8, args[index], "--prefetch")) prefetch = try std.fmt.parseInt(u2, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--retain")) retain = try parseBoolean(args[index + 1]) else if (std.mem.eql(u8, args[index], "--round-trip")) round_trip = try std.fmt.parseInt(u32, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--detailed-timers")) detailed_timers = try parseBoolean(args[index + 1]) else if (std.mem.eql(u8, args[index], "--speed")) speed = try std.fmt.parseInt(u32, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--columns")) columns = try std.fmt.parseInt(usize, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--spacing-x")) spacing[0] = try std.fmt.parseInt(u32, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--spacing-z")) spacing[1] = try std.fmt.parseInt(u32, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--edit-interval")) edit_interval = try std.fmt.parseInt(u32, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--edit-lead")) edit_lead = try std.fmt.parseInt(u32, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--edit-size")) edit_size = try std.fmt.parseInt(u32, args[index + 1], 10) else if (std.mem.eql(u8, args[index], "--edit-block")) edit_block = args[index + 1] else return error.UnknownArgument;
     }
     if (speed == 0 or speed > 400) return error.InvalidSpeed;
     if (columns == 0 or columns > maximum) return error.InvalidGrid;
@@ -153,7 +157,7 @@ pub fn main(init: std.process.Init) !void {
     defer result.close(io);
     var executable: [std.fs.max_path_bytes]u8 = undefined;
     const name = executable[0..try std.process.executablePath(io, &executable)];
-    var child = try std.process.spawn(io, .{ .argv = &.{ name, "--server", copy, directory, fd, try std.fmt.allocPrint(allocator, "{d}", .{ticks}), try std.fmt.allocPrint(allocator, "{d}", .{warmup}), try std.fmt.allocPrint(allocator, "{d}", .{player_count}), try std.fmt.allocPrint(allocator, "{d}", .{burst_slots}), if (metrics_export) "true" else "false", try std.fmt.allocPrint(allocator, "{d}", .{prefetch}), if (retain) "true" else "false", try std.fmt.allocPrint(allocator, "{d}", .{round_trip}), if (detailed_timers) "true" else "false", try std.fmt.allocPrint(allocator, "{d}", .{speed}), try std.fmt.allocPrint(allocator, "{d}", .{columns}), try std.fmt.allocPrint(allocator, "{d}", .{spacing[0]}), try std.fmt.allocPrint(allocator, "{d}", .{spacing[1]}), try std.fmt.allocPrint(allocator, "{d}", .{edit_interval}), try std.fmt.allocPrint(allocator, "{d}", .{edit_lead}), try std.fmt.allocPrint(allocator, "{d}", .{edit_size}) }, .stdin = .ignore, .stdout = .{ .file = result }, .stderr = .{ .file = log }, .inherit_files = &.{.{ .handle = listener.socket.handle, .flags = .{ .nonblocking = false } }} });
+    var child = try std.process.spawn(io, .{ .argv = &.{ name, "--server", copy, directory, fd, try std.fmt.allocPrint(allocator, "{d}", .{ticks}), try std.fmt.allocPrint(allocator, "{d}", .{warmup}), try std.fmt.allocPrint(allocator, "{d}", .{player_count}), try std.fmt.allocPrint(allocator, "{d}", .{burst_slots}), if (metrics_export) "true" else "false", try std.fmt.allocPrint(allocator, "{d}", .{prefetch}), if (retain) "true" else "false", try std.fmt.allocPrint(allocator, "{d}", .{round_trip}), if (detailed_timers) "true" else "false", try std.fmt.allocPrint(allocator, "{d}", .{speed}), try std.fmt.allocPrint(allocator, "{d}", .{columns}), try std.fmt.allocPrint(allocator, "{d}", .{spacing[0]}), try std.fmt.allocPrint(allocator, "{d}", .{spacing[1]}), try std.fmt.allocPrint(allocator, "{d}", .{edit_interval}), try std.fmt.allocPrint(allocator, "{d}", .{edit_lead}), try std.fmt.allocPrint(allocator, "{d}", .{edit_size}), edit_block }, .stdin = .ignore, .stdout = .{ .file = result }, .stderr = .{ .file = log }, .inherit_files = &.{.{ .handle = listener.socket.handle, .flags = .{ .nonblocking = false } }} });
     listener.deinit(io);
     listener_open = false;
     var clients: [maximum]client.Client = undefined;
@@ -323,6 +327,7 @@ fn server(init: std.process.Init, world: []const u8, directory: []const u8, fd: 
     var cube_edits: [Cube.sections_max][4096]terrain_chunks.BlockEdit = undefined;
     var cube: Cube = .{ .edits = &cube_edits };
     const cube_side: i32 = @intCast(workload.edit_size);
+    const edit_state: u16 = @intCast(game_data.registry.blockStateId(workload.edit_block) orelse return error.UnknownEditBlock);
     const terrain = simulation.get(Chunks);
     const started_tick = simulation.completed_tick;
     while (moving < ticks) {
@@ -394,7 +399,7 @@ fn server(init: std.process.Init, world: []const u8, directory: []const u8, fd: 
                         // A single block lands where the player looks. A cube is centred on the
                         // nearest column corner.
                         const low: [3]i32 = if (cube_side == 1) .{ ahead, edit_height, across } else .{ @divFloor(ahead + 8, 16) * 16 - @divFloor(cube_side, 2), edit_height + 1 - cube_side, @divFloor(across + 8, 16) * 16 - @divFloor(cube_side, 2) };
-                        try terrain.setSections(cube.fill(record.world, low, workload.edit_size, game_data.registry.block_stone_default_state));
+                        try terrain.setSections(cube.fill(record.world, low, workload.edit_size, edit_state));
                         placed_blocks[slot] = low;
                     }
                     edits += workload.edit_size * workload.edit_size * workload.edit_size;

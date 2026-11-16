@@ -21,10 +21,13 @@ const loot_tables = @import("vanilla_items").loot;
 const item_data = @import("vanilla_items").item_data;
 const BlockLoot = @import("block_loot.zig").BlockLoot;
 const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
+const Players = @import("players").players.Players;
+const Effects = @import("world_effects.zig").Effects;
 
 const assert = std.debug.assert;
 const registry = game_data.registry;
 const physics = game_data.physics;
+const state_names = @import("state_names.zig");
 
 pub const Kind = enum(u2) { empty, water, lava };
 
@@ -100,7 +103,7 @@ const contact_order = [_]Direction{ .down, .south, .north, .east, .west };
 
 const Shape = enum(u2) { empty, full, partial };
 /// FluidFillable blocks: waterloggable ones take still water, water plants take nothing.
-const Fillable = enum(u2) { no, waterloggable, plant };
+pub const Fillable = enum(u2) { no, waterloggable, plant };
 /// A face of a collision box on the boundary of its cell: the range it covers on the two axes
 /// across the face.
 const Rectangle = [4]f32;
@@ -122,6 +125,8 @@ const Tables = struct {
     waterlogged: []const bool,
     /// The same state waterlogged, for waterloggable states that are not.
     waterlog: []const u16,
+    /// The same state dry, for waterlogged states.
+    dry: []const u16,
     shape: []const Shape,
     /// Where each state's rectangles on each face lie in `rectangles`.
     faces: []const [6][2]u32,
@@ -179,6 +184,8 @@ fn prepareTables(allocator: std.mem.Allocator) !void {
     const fillable = try allocator.alloc(Fillable, count);
     const waterlogged = try allocator.alloc(bool, count);
     const waterlog = try allocator.alloc(u16, count);
+    const dry = try allocator.alloc(u16, count);
+    for (dry, 0..) |*state, index| state.* = @intCast(index);
     const shape = try allocator.alloc(Shape, count);
     const faces = try allocator.alloc([6][2]u32, count);
     var rectangles: std.ArrayListUnmanaged(Rectangle) = .empty;
@@ -211,7 +218,8 @@ fn prepareTables(allocator: std.mem.Allocator) !void {
         if (logged) |value| if (std.mem.eql(u8, value, "false")) {
             const begin = std.mem.indexOf(u8, name, "waterlogged=false").?;
             const renamed = try std.fmt.bufPrint(&scratch, "{s}waterlogged=true{s}", .{ name[0..begin], name[begin + "waterlogged=false".len ..] });
-            waterlog[index] = try stateId(renamed);
+            waterlog[index] = state_names.id(renamed) orelse return error.UnknownBlockState;
+            dry[waterlog[index]] = state;
         };
         // Collision boxes, without the offset some plants take from their position.
         const boxes = physics.spawnCollision(state, 0, 64, 0);
@@ -269,6 +277,7 @@ fn prepareTables(allocator: std.mem.Allocator) !void {
         .fillable = fillable,
         .waterlogged = waterlogged,
         .waterlog = waterlog,
+        .dry = dry,
         .shape = shape,
         .faces = faces,
         .rectangles = try rectangles.toOwnedSlice(allocator),
@@ -283,6 +292,56 @@ fn prepareTables(allocator: std.mem.Allocator) !void {
         .blocks = blocks,
     };
     tables_ready.store(true, .release);
+}
+
+/// What the fluid tables know of a block state, for what else handles fluids, like buckets.
+pub fn fluidOf(state: u16) Fluid {
+    ensureTables();
+    return tables.fluid[state];
+}
+
+pub fn fillableOf(state: u16) Fillable {
+    ensureTables();
+    return tables.fillable[state];
+}
+
+pub fn isLiquid(state: u16) bool {
+    ensureTables();
+    return tables.liquid[state];
+}
+
+pub fn isSolid(state: u16) bool {
+    ensureTables();
+    return tables.solid[state];
+}
+
+pub fn isAir(state: u16) bool {
+    ensureTables();
+    return tables.air[state];
+}
+
+pub fn isWaterlogged(state: u16) bool {
+    ensureTables();
+    return tables.waterlogged[state];
+}
+
+pub fn dryOf(state: u16) u16 {
+    ensureTables();
+    return tables.dry[state];
+}
+
+pub fn sourceOf(kind: Kind) u16 {
+    ensureTables();
+    return blockOf(.source(kind));
+}
+
+/// The state a block placed at a cell takes: waterloggable blocks placed in still water come out
+/// waterlogged, as their getPlacementState makes them.
+pub fn placedIn(state: u16, previous: u16) u16 {
+    ensureTables();
+    if (tables.fillable[state] != .waterloggable or tables.waterlogged[state]) return state;
+    const fluid = tables.fluid[previous];
+    return if (fluid.kind == .water and fluid.still()) tables.waterlog[state] else state;
 }
 
 /// The block state that holds a fluid on its own, FlowableFluid.getBlockStateLevel.
@@ -370,8 +429,6 @@ pub const Fluids = struct {
         lava_source_conversion: bool = false,
         /// Sections fluid ticks keep decoded within a tick.
         copies: usize = 64,
-        /// Lava cells an edit put next to something, checked for water at the end of the tick.
-        contacts: usize = 1024,
         loot_scratch_bytes: usize = 16 * 1024,
         seed: u64 = 0x666c756964,
     };
@@ -385,9 +442,8 @@ pub const Fluids = struct {
         items: *Items,
         inventories: *inventories.Inventories,
         dropped: *ItemEntities,
+        players: *Players,
     };
-
-    const Contact = struct { world: u32, position: chunks.Position };
 
     deps: Dependencies,
     config: Configuration,
@@ -398,10 +454,9 @@ pub const Fluids = struct {
     kinds: [4]ticks.Kind,
     /// By block, membership of the sign tag.
     signs: []bool,
-    contacts: []Contact,
-    contact_count: usize = 0,
     loot_scratch: std.heap.FixedBufferAllocator,
     random: std.Random.DefaultPrng,
+    effects: Effects,
     /// The kind of fluid whose tick is running, while one is.
     flowing_kind: Kind = .empty,
     ultrawarm_world: u32 = std.math.maxInt(u32),
@@ -417,14 +472,14 @@ pub const Fluids = struct {
             .window_client = try deps.chunks.simulation(7),
             .kinds = undefined,
             .signs = try allocator.alloc(bool, registry.blocks.len),
-            .contacts = try allocator.alloc(Contact, configuration.contacts),
             .loot_scratch = .init(try allocator.alloc(u8, configuration.loot_scratch_bytes)),
             .random = .init(configuration.seed),
+            .effects = try .init(allocator, deps.players),
         };
         try self.readTags();
         try deps.block_definitions.registry.onChange(self, readTags);
         for ([_][]const u8{ "minecraft:water", "minecraft:flowing_water", "minecraft:lava", "minecraft:flowing_lava" }, &self.kinds) |name, *kind| {
-            kind.* = try deps.ticks.register(name, .init(Fluids, self, fluidTick));
+            kind.* = try deps.ticks.register(name, .fluid, .init(Fluids, self, fluidTick));
         }
         try deps.chunks.observe(.init(self, blocksChanged));
         return self;
@@ -442,16 +497,9 @@ pub const Fluids = struct {
         }
     }
 
-    /// Lava touching water hardens at the end of the tick that brought them together, and the
-    /// copies fluid ticks read last only for the tick.
-    pub fn tick(self: *Fluids) !void {
-        defer self.copies.clear();
-        var index: usize = 0;
-        while (index < self.contact_count) : (index += 1) {
-            const contact = self.contacts[index];
-            try self.touchWater(contact.world, contact.position);
-        }
-        self.contact_count = 0;
+    /// The copies fluid ticks read last only for the tick.
+    pub fn tick(self: *Fluids) void {
+        self.copies.clear();
     }
 
     fn kindOf(self: *const Fluids, fluid: Variant) ticks.Kind {
@@ -684,26 +732,34 @@ pub const Fluids = struct {
     fn flow(self: *Fluids, world: u32, position: chunks.Position, state: u16, direction: Direction, fluid: Fluid) !void {
         if (self.flowing_kind == .lava and direction == .down and tables.fluid[state].kind == .water) {
             if (tables.liquid[state]) try self.set(world, position, tables.stone);
+            try self.extinguished(world, position);
             return;
         }
         switch (tables.fillable[state]) {
             // Waterloggable.tryFillWithFluid takes still water only.
-            .waterloggable => {
-                if (tables.waterlogged[state] or fluid.kind != .water or !fluid.still()) return;
-                try self.set(world, position, tables.waterlog[state]);
-                try self.schedule(world, position, .{ .kind = .water, .still = true }, 5);
-            },
+            .waterloggable => _ = try self.fill(world, position, state, fluid),
             .plant => {},
             .no => {
-                // WaterFluid.beforeBreakingBlock drops what the block drops. Lava only hisses.
-                if (!tables.air[state] and fluid.kind == .water) try self.dropLoot(world, position, state);
+                // WaterFluid.beforeBreakingBlock drops what the block drops, LavaFluid's hisses.
+                if (!tables.air[state]) {
+                    if (fluid.kind == .water) try self.dropLoot(world, position, state) else try self.extinguished(world, position);
+                }
                 try self.set(world, position, blockOf(fluid));
             },
         }
     }
 
-    /// FluidBlock.receiveNeighborFluids: lava next to water becomes obsidian where it is a
-    /// source and cobblestone where it flows, and lava over soul soil next to blue ice basalt.
+    /// Waterloggable.tryFillWithFluid: still water fills a dry waterloggable block and ticks there.
+    pub fn fill(self: *Fluids, world: u32, position: chunks.Position, state: u16, fluid: Fluid) !bool {
+        if (tables.fillable[state] != .waterloggable or tables.waterlogged[state] or fluid.kind != .water or !fluid.still()) return false;
+        try self.set(world, position, tables.waterlog[state]);
+        try self.schedule(world, position, .{ .kind = .water, .still = true }, 5);
+        return true;
+    }
+
+    /// FluidBlock.receiveNeighborFluids, in the neighbour update of an edit: lava next to water
+    /// becomes obsidian where it is a source and cobblestone where it flows, and lava over soul
+    /// soil next to blue ice basalt. The change chains on the edit, as in vanilla.
     fn touchWater(self: *Fluids, world: u32, position: chunks.Position) !void {
         const state = try self.get(world, position);
         const fluid = tables.fluid[state];
@@ -712,14 +768,22 @@ pub const Fluids = struct {
         for (contact_order) |direction| {
             const neighbour = try self.get(world, offset(position, direction.opposite()));
             if (tables.fluid[neighbour].kind == .water) {
-                try self.set(world, position, if (fluid.still()) tables.obsidian else tables.cobblestone);
+                try self.deps.chunks.chain(world, position, if (fluid.still()) tables.obsidian else tables.cobblestone);
+                try self.extinguished(world, position);
                 return;
             }
             if (on_soul_soil and neighbour == tables.blue_ice) {
-                try self.set(world, position, tables.basalt);
+                try self.deps.chunks.chain(world, position, tables.basalt);
+                try self.extinguished(world, position);
                 return;
             }
         }
+    }
+
+    /// WorldEvents.LAVA_EXTINGUISHED, which clients play as a hiss and smoke. World events reach
+    /// the players within 64 blocks, as ServerWorld.syncWorldEvent sends them.
+    fn extinguished(self: *Fluids, world: u32, position: chunks.Position) !void {
+        self.effects.worldEvent(world, position, 1501, 0);
     }
 
     fn blocksChanged(self: *Fluids, section: chunks.Section, edits: []const chunks.BlockEdit, previous: []const u16) void {
@@ -769,7 +833,7 @@ pub const Fluids = struct {
             // FluidBlock.onBlockAdded.
             if (tables.liquid[edit.state] and registry.block_state_to_block[edit.state] != registry.block_state_to_block[old]) {
                 try self.schedule(section.world, position, variant(tables.fluid[edit.state]), self.tickRate(section.world, tables.fluid[edit.state].kind));
-                if (tables.fluid[edit.state].kind == .lava) self.addContact(section.world, position);
+                if (tables.fluid[edit.state].kind == .lava) try self.touchWater(section.world, position);
             }
             for (std.enums.values(Direction)) |direction| {
                 const step = direction.step();
@@ -789,19 +853,9 @@ pub const Fluids = struct {
                 // FluidBlock.neighborUpdate and getStateForNeighborUpdate, and the waterlogged
                 // blocks' own getStateForNeighborUpdate.
                 try self.schedule(section.world, neighbour, variant(fluid), self.tickRate(section.world, fluid.kind));
-                if (fluid.kind == .lava and tables.liquid[state]) self.addContact(section.world, neighbour);
+                if (fluid.kind == .lava and tables.liquid[state]) try self.touchWater(section.world, neighbour);
             }
         }
-    }
-
-    fn addContact(self: *Fluids, world: u32, position: chunks.Position) void {
-        if (self.contact_count == self.contacts.len) {
-            // Lava keeps its scheduled tick, so it is checked again at the next edit near it.
-            std.log.warn("event=fluid_contacts_full capacity={d}", .{self.contacts.len});
-            return;
-        }
-        self.contacts[self.contact_count] = .{ .world = world, .position = position };
-        self.contact_count += 1;
     }
 
     fn holdsFluid(view: chunks.View) bool {
@@ -818,7 +872,8 @@ pub const Fluids = struct {
         }
     }
 
-    fn dropLoot(self: *Fluids, world: u32, position: chunks.Position, state: u16) !void {
+    /// What a block drops when it breaks without a tool, Block.dropStacks.
+    pub fn dropLoot(self: *Fluids, world: u32, position: chunks.Position, state: u16) !void {
         const table = self.deps.loot.table(state) orelse return;
         self.loot_scratch.reset();
         var neighbors: [16]loot_tables.Neighbor = undefined;
