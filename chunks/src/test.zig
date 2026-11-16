@@ -685,6 +685,7 @@ test {
     _ = @import("generation.zig");
     _ = @import("topology.zig");
     _ = @import("layer.zig");
+    _ = @import("copies.zig");
 }
 
 test "repeated sections in an edit batch observe preceding edits without extra buffers" {

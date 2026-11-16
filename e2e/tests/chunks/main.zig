@@ -92,12 +92,32 @@ const Probe = struct {
         if (!config.disk) {
             const name = if (protocols.registry.itemId("minecraft:chain") != null) "minecraft:chain" else "minecraft:iron_chain";
             for ([_]i32{ -spawn_offset, spawn_offset }) |coordinate| {
-                var edits: [6]BlockEdit = undefined;
-                for (&edits, 0..) |*edit, index| {
+                // Chains at every other cell, sealed in stone, so fluids leave the waterlogged ones be:
+                // a waterlogged chain has no open face to flow from, and a dry one no water beside it.
+                const stone: u16 = @intCast(protocols.registry.blockStateId("minecraft:stone").?);
+                var edits: [6 + 7 + 2 * 13 + 3 * 13]BlockEdit = undefined;
+                var count: usize = 0;
+                for (0..6) |index| {
                     var buffer: [128]u8 = undefined;
                     const state_name = try std.fmt.bufPrint(&buffer, "{s}[axis={s},waterlogged={s}]", .{ name, ([_][]const u8{ "x", "y", "z" })[index / 2], if (index % 2 == 0) "true" else "false" });
-                    edit.* = .{ .index = @intCast(256 + 3 * 16 + 2 + index), .state = @intCast(protocols.registry.blockStateId(state_name).?) };
+                    edits[count] = .{ .index = @intCast(256 + 3 * 16 + 2 + 2 * index), .state = @intCast(protocols.registry.blockStateId(state_name).?) };
+                    count += 1;
                 }
+                for (1..14) |x| {
+                    if (x % 2 == 1) {
+                        edits[count] = .{ .index = @intCast(256 + 3 * 16 + x), .state = stone };
+                        count += 1;
+                    }
+                    for ([_]usize{ 2, 4 }) |z| {
+                        edits[count] = .{ .index = @intCast(256 + z * 16 + x), .state = stone };
+                        count += 1;
+                    }
+                    for ([_]usize{ 2, 3, 4 }) |z| {
+                        edits[count] = .{ .index = @intCast(2 * 256 + z * 16 + x), .state = stone };
+                        count += 1;
+                    }
+                }
+                std.debug.assert(count == edits.len);
                 try deps.chunks.setBlocks(.{ .world = deps.vanilla_worlds.overworld, .x = @divExact(coordinate, 16), .z = @divExact(coordinate, 16), .y = 4 }, &edits);
             }
         }

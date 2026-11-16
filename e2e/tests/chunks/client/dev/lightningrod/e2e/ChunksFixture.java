@@ -41,7 +41,7 @@ final class ChunksFixture extends Fixture {
                     }
                 }
                 for (int i = 0; i < 6; i++) {
-                    var at = new net.minecraft.core.BlockPos(game.player.getBlockX() + 2 + i, 65, game.player.getBlockZ() + 3);
+                    var at = new net.minecraft.core.BlockPos(game.player.getBlockX() + 2 + 2 * i, 65, game.player.getBlockZ() + 3);
                     var state = game.level.getBlockState(at);
                     var name = state.getBlock().getDescriptionId();
                     var axis = state.getBlock().getStateDefinition().getProperty("axis");
