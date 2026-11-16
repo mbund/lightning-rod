@@ -42,6 +42,8 @@ const Overlay = struct { section: chunks.Section, solid: [64]u64 };
 
 const Baker = struct {
     terrain: *chunks.Chunks,
+    /// Reads block sections and blocks one at a time.
+    reader: chunks.Chunks.Client,
     geometry: production.World,
     world: u32,
     minimum: i32,
@@ -64,6 +66,7 @@ const Baker = struct {
         const side = 2 * @as(usize, radius) + 1;
         return .{
             .terrain = terrain,
+            .reader = try terrain.client(.{ .name = "bench", .sections = 1 }),
             .geometry = try .init(allocator, .{ .columns = (side + 2) * (side + 2), .summary_columns = (side + 2) * (side + 2) * views, .views = views, .radius = radius, .properties = metadata.properties }),
             .world = world,
             .minimum = minimum,
@@ -334,7 +337,7 @@ fn imported(init: std.process.Init, options: Options, output: *std.Io.Writer) !v
     defer database.deinit();
     const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 16 }, .{ .storage = try database.openSpace(worlds.Worlds.id) });
     const world = dimensions.find("minecraft:overworld") orelse return error.MissingOverworld;
-    const terrain = try chunks.Chunks.init(allocator, init.io, .{ .cache_sections = 48, .demand_sections = 24, .cache_groups = 8 }, .{ .metrics = &registry, .storage = try database.openSpace(chunks.Chunks.id), .record_workspaces = try records.Workspaces.init(allocator, init.io, .{}) });
+    const terrain = try chunks.Chunks.init(allocator, init.io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 48, .cache_groups = 8 }, .{ .metrics = &registry, .storage = try database.openSpace(chunks.Chunks.id), .record_workspaces = try records.Workspaces.init(allocator, init.io, .{}) });
     const tick = database.lastTick();
     var baker = try Baker.init(allocator, terrain, world.id, world.dimension.minimumSection(), world.dimension.sectionCount(), options.radius, options.players);
     const columns = (2 * @as(usize, options.radius) + 1) * (2 * @as(usize, options.radius) + 1);
@@ -354,7 +357,7 @@ fn imported(init: std.process.Init, options: Options, output: *std.Io.Writer) !v
             point[2] = std.math.cast(i32, @as(i64, options.head[2]) + z) orelse return error.InvalidPosition;
         }
         while (point[1] < (baker.minimum + @as(i32, @intCast(baker.height))) * 16) {
-            const state = try terrain.getBlock(baker.world, .{ .x = point[0], .y = point[1], .z = point[2] });
+            const state = try baker.reader.getBlock(baker.world, .{ .x = point[0], .y = point[1], .z = point[2] });
             if (baker.geometry.properties[state] & production.occluder_property == 0) break;
             point[1] += 16;
         }
@@ -666,7 +669,7 @@ const Bytes = struct {
         for (0..9) |column| for (0..height) |y| {
             const at: chunks.Section = .{ .world = baker.world, .x = x + @as(i32, @intCast(column % 3)) - 1, .y = baker.minimum + @as(i32, @intCast(y)), .z = z + @as(i32, @intCast(column / 3)) - 1 };
             const base = offset(column, y);
-            const lease = try baker.terrain.acquire(at);
+            const lease = try baker.reader.acquire(at);
             defer lease.release();
             for (0..section_hull.side) |row_y| for (0..section_hull.side) |row_z| for (0..section_hull.side) |row_x| {
                 self.states[base + (row_y * span + row_z) * span + row_x] = lease.get(@intCast((row_y * section_hull.side + row_z) * section_hull.side + row_x));

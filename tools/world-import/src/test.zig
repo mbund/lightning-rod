@@ -291,9 +291,9 @@ test "Java world import reopens terrain players containers items and orbs throug
     var native = try importer.Import.init(allocator, io, options, &store, &metrics);
     const world = native.worlds.find("minecraft:overworld").?.id;
     try std.testing.expectEqualDeep(vanilla.Spawn.Definition{ .position = .{ .x = -123, .y = 72, .z = 456 }, .angle = 37.5, .radius = 7 }, try native.spawn.get(world));
-    try std.testing.expectEqual(@as(u16, @intCast(game_data.registry.blockStateId("minecraft:chest[facing=north,type=single,waterlogged=false]").?)), try native.chunks.getBlock(world, .{ .x = -16, .y = 64, .z = -16 }));
+    try std.testing.expectEqual(@as(u16, @intCast(game_data.registry.blockStateId("minecraft:chest[facing=north,type=single,waterlogged=false]").?)), try native.reader.getBlock(world, .{ .x = -16, .y = 64, .z = -16 }));
     {
-        const section = try native.chunks.acquire(.{ .world = world, .x = -1, .y = 4, .z = -1 });
+        const section = try native.reader.acquire(.{ .world = world, .x = -1, .y = 4, .z = -1 });
         defer section.release();
         const biomes = section.biomes() orelse return error.MissingImportedBiomes;
         for (0..64) |index| try std.testing.expectEqual(@as(u16, @intCast(game_data.registry.biomeId(if (index % 2 == 0) "minecraft:desert" else "minecraft:forest").?)), biomes.get(@intCast(index)));
@@ -346,7 +346,7 @@ test "Java world import reopens terrain players containers items and orbs throug
     try std.testing.expectEqual(book.end, book.seek);
     for ([_][]const u8{ "minecraft:the_nether", "minecraft:the_end" }) |name| {
         const dimension = native.worlds.find(name).?.id;
-        try std.testing.expectEqual(@as(u16, @intCast(game_data.registry.blockStateId("minecraft:chest[facing=north,type=single,waterlogged=false]").?)), try native.chunks.getBlock(dimension, .{ .x = -16, .y = 64, .z = -16 }));
+        try std.testing.expectEqual(@as(u16, @intCast(game_data.registry.blockStateId("minecraft:chest[facing=north,type=single,waterlogged=false]").?)), try native.reader.getBlock(dimension, .{ .x = -16, .y = 64, .z = -16 }));
     }
     const slots = [_]inventories.Slot{ .{ .owner = mapped, .index = 36 }, .{ .owner = mapped, .index = 8 }, .{ .owner = mapped, .index = 45 }, vanilla.Containers.slot(world, .{ .x = -16, .y = 64, .z = -16 }, 0) };
     var contents: [4]inventories.Contents = undefined;

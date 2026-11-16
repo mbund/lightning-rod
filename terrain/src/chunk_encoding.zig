@@ -1859,10 +1859,10 @@ test "section summaries invalidate on edits and slot reuse and recover after err
     defer store.deinit();
     const transaction = store.transaction();
     defer transaction.fail();
-    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .demand_sections = 1, .cache_sections = 4 }, .{ .metrics = &metric_registry, .storage = try transaction.openSpace("chunks"), .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}) });
+    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 4 }, .{ .metrics = &metric_registry, .storage = try transaction.openSpace("chunks"), .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}) });
     const workspace = try Workspace.init(arena.allocator(), 1 << 20, &.{.{ .number = 0 }}, try testBlocks(arena.allocator()));
     const position: chunks.Section = .{ .world = 0, .x = 0, .y = 0, .z = 0 };
-    const snapshot = try lighting.Workspace.init(arena.allocator(), terrain, try game_data.lighting.init(arena.allocator()));
+    const snapshot = try lighting.Workspace.init(arena.allocator(), try terrain.client(.{ .name = "lighting", .sections = @min(192, terrain.unbudgeted()) }), try game_data.lighting.init(arena.allocator()));
     const world_dimension: worlds.Worlds.Dimension = .{ .name = "test:encoding", .minimum_section = 0, .section_count = 1, .skylight = true };
     try prepareSnapshot(snapshot, terrain, world_dimension, 0);
     try workspace.prepareSections(snapshot.sections());

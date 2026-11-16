@@ -18,6 +18,12 @@ const Lighting = @import("lighting.zig").Lighting;
 const Streaming = @import("streaming.zig").Streaming;
 const BlockSynchronization = @import("block_sync.zig").BlockSynchronization;
 const Terrain = @import("terrain.zig").Terrain;
+
+/// Sections streaming and the lighting solver each read at once in these pipelines.
+const load_budget = 24;
+/// The default edit and simulation budgets, streaming, the solver and block sync, and one
+/// column more that nothing holds.
+const load_cache = 24 + 64 + 2 * load_budget + 8 + 24;
 const BenchmarkNetwork = @import("streaming_network_bench.zig").Network;
 const wire = @import("wire_1_21_5");
 
@@ -148,7 +154,7 @@ test "cold lighting streams do not block a ready player behind a paused generato
         var players: Players = .{ .deps = undefined, .config = .{ .maximum = player_records.len, .render_distance = 1 }, .spawn_world = 0, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 48, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace(chunks.Chunks.id), .record_workspaces = try records.Workspaces.init(allocator, io, .{}) });
+        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = load_cache, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace(chunks.Chunks.id), .record_workspaces = try records.Workspaces.init(allocator, io, .{}) });
         for (0..25) |index| {
             const position: chunks.Position = .{ .x = (@as(i32, @intCast(index % 5)) - 2) * 16, .y = 0, .z = (@as(i32, @intCast(index / 5)) - 2) * 16 };
             try terrain.setBlock(1, position, game_data.registry.block_stone_default_state);
@@ -158,7 +164,7 @@ test "cold lighting streams do not block a ready player behind a paused generato
         terrain.setSource(chunks.Source.init(&source, Scene.read));
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
         const block_properties = try test_blocks.vanilla(allocator);
-        const streaming = try Streaming.init(allocator, io, .{ .occlusion = false, .fallback_biome = @intCast(game_data.registry.biomeId("minecraft:plains").?) }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .stored = false }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
+        const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = load_budget, .occlusion = false, .fallback_biome = @intCast(game_data.registry.biomeId("minecraft:plains").?) }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = load_budget, .stored = false }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
         defer service.unsubscribeOutput(streaming.changed);
         defer terrain.unsubscribeReady(streaming.changed);
         terrain.attach();
@@ -243,11 +249,11 @@ fn lightingLoad(scenario: LightingLoad, output: *std.Io.Writer) !void {
     var players: Players = .{ .deps = undefined, .config = .{ .maximum = count, .render_distance = 2 }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
     players.rebuildIndexes();
-    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 48, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = resources });
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = load_cache, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = resources });
     var source: Scene = .{};
     terrain.setSource(chunks.Source.init(&source, Scene.read));
     const block_properties = try test_blocks.vanilla(allocator);
-    const streaming = try Streaming.init(allocator, io, .{}, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
+    const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = load_budget }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = load_budget }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
     defer service.unsubscribeOutput(streaming.changed);
     defer terrain.unsubscribeReady(streaming.changed);
     const blocks = try BlockSynchronization.init(allocator, io, .{ .metrics = &registry, .chunks = terrain, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .worlds = dimensions }, .{});
@@ -400,11 +406,11 @@ test "edited light reaches every holder exactly and only where it changed" {
     var players: Players = .{ .deps = undefined, .config = .{ .maximum = count, .render_distance = radius }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
     players.rebuildIndexes();
-    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 192, .demand_sections = 48, .cache_groups = 8 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = resources });
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = load_cache + 144, .cache_groups = 8 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = resources });
     var source: Scene = .{};
     terrain.setSource(chunks.Source.init(&source, Scene.read));
     const light_rules = try test_blocks.vanilla(allocator);
-    const streaming = try Streaming.init(allocator, io, .{ .occlusion = false, .fallback_biome = @intCast(game_data.registry.biomeId("minecraft:plains").?) }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = light_rules, .lighting = try Lighting.init(allocator, .{ .stored = false }, .{ .metrics = &registry, .blocks = light_rules, .chunks = terrain, .worlds = dimensions }) });
+    const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = load_budget, .occlusion = false, .fallback_biome = @intCast(game_data.registry.biomeId("minecraft:plains").?) }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = light_rules, .lighting = try Lighting.init(allocator, .{ .chunk_sections = load_budget, .stored = false }, .{ .metrics = &registry, .blocks = light_rules, .chunks = terrain, .worlds = dimensions }) });
     defer service.unsubscribeOutput(streaming.changed);
     defer terrain.unsubscribeReady(streaming.changed);
     const blocks = try BlockSynchronization.init(allocator, io, .{ .metrics = &registry, .chunks = terrain, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .worlds = dimensions }, .{});
@@ -415,7 +421,7 @@ test "edited light reaches every holder exactly and only where it changed" {
     inline for (protocols.implementations) |Version| if (Version.protocol_number == catalog.values[0].number) {
         light_id = Version.Protocol.play.toClient.packetId(.update_light);
     };
-    const reference = try @import("lighting.zig").Workspace.init(allocator, terrain, light_rules.light);
+    const reference = try @import("lighting.zig").Workspace.init(allocator, try terrain.client(.{ .name = "lighting", .sections = @min(192, terrain.unbudgeted()) }), light_rules.light);
     const clients = try allocator.alloc(ClientLight, count * window * window);
     const truth = try allocator.create(ClientLight);
     const Harness = struct {
@@ -639,14 +645,14 @@ test "streaming movement preserves planned owners while delivery catches up" {
     var players: Players = .{ .deps = undefined, .config = .{ .maximum = player_records.len, .render_distance = render_distance }, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
     players.rebuildIndexes();
-    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 48, .demand_sections = 24, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = try records.Workspaces.init(allocator, io, .{}) });
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = load_cache, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = try records.Workspaces.init(allocator, io, .{}) });
     var source: Scene = .{ .empty = true };
     terrain.setSource(chunks.Source.init(&source, Scene.read));
     const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
     // Delivered counts are compared with the horizon, which holds only when columns unload at
     // the delivery radius. The client storage band has its own streaming test.
     const block_properties = try test_blocks.vanilla(allocator);
-    const streaming = try Streaming.init(allocator, io, .{ .retain_client_storage = false }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{}, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
+    const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = load_budget, .retain_client_storage = false }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = load_budget }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
     defer service.unsubscribeOutput(streaming.changed);
     defer terrain.unsubscribeReady(streaming.changed);
     const blocks = try BlockSynchronization.init(allocator, io, .{ .metrics = &registry, .chunks = terrain, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .worlds = dimensions }, .{});
@@ -766,7 +772,7 @@ test "imported world fixture" {
     defer store.deinit();
     const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 16 }, .{ .storage = try store.openSpace(worlds.Worlds.id) });
     const definition = dimensions.find("minecraft:overworld") orelse return error.MissingOverworld;
-    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 1, .demand_sections = 1, .cache_groups = 32 }, .{
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 1, .cache_groups = 32 }, .{
         .metrics = &registry,
         .storage = try store.openSpace(chunks.Chunks.id),
         .record_workspaces = try records.Workspaces.init(allocator, io, .{}),
@@ -1000,7 +1006,7 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
     var players: Players = .{ .deps = undefined, .config = .{ .maximum = count, .render_distance = radius }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
     players.rebuildIndexes();
-    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 192, .demand_sections = 24, .cache_groups = workload.cache_groups }, .{ .metrics = &registry, .storage = try store.openSpace(chunks.Chunks.id), .record_workspaces = resources });
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = load_cache + 144, .cache_groups = workload.cache_groups }, .{ .metrics = &registry, .storage = try store.openSpace(chunks.Chunks.id), .record_workspaces = resources });
     const Disk = struct {
         fn read(_: *@This(), _: std.Io, batch: chunks.Source.Batch) void {
             for (batch.requests) |*request| request.result = error.MissingStoredSection;
@@ -1100,7 +1106,7 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
         }
     }
     const block_properties = try test_blocks.vanilla(allocator);
-    const streaming = try Streaming.init(allocator, io, .{ .occlusion = concealment, .prefetch = prefetch, .occlusion_columns = workload.visibility_columns }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .stored = streaming_options.stored_lighting }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
+    const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = load_budget, .occlusion = concealment, .prefetch = prefetch, .occlusion_columns = workload.visibility_columns }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = load_budget, .stored = streaming_options.stored_lighting }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
     defer service.unsubscribeOutput(streaming.changed);
     defer terrain.unsubscribeReady(streaming.changed);
     if (workload.fragment_level) |level| for ([_]*deflate.fragments.Baker{ &streaming.deps.lighting.stored_workspace.fragment_baker, &streaming.deps.lighting.terrain_baker.compressor, &streaming.encoding.uniform_light.baker, &streaming.delivery.baker }) |baker| {

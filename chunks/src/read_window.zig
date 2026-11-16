@@ -5,13 +5,14 @@ pub fn ReadWindow(comptime capacity: usize) type {
     std.debug.assert(capacity > 0 and capacity <= 192);
     return struct {
         const Self = @This();
-        owner: *chunks.Chunks,
+        client: chunks.Chunks.Client,
         sections: [capacity]chunks.Section = undefined,
         leases: [capacity]chunks.Lease = undefined,
         count: usize = 0,
 
-        pub fn init(owner: *chunks.Chunks) Self {
-            return .{ .owner = owner };
+        /// The window holds at most the client's budget.
+        pub fn init(client: chunks.Chunks.Client) Self {
+            return .{ .client = client };
         }
 
         /// Views borrow the window until the next readMany or deinit. Terrain must remain unmodified.
@@ -47,14 +48,14 @@ pub fn ReadWindow(comptime capacity: usize) type {
                 missing[count] = section;
                 count += 1;
             }
-            const limit = @min(capacity, self.owner.cache.entries.len);
+            const limit = @min(capacity, self.client.budget());
             if (required + count > limit) return error.WorkingSetTooLarge;
             var retention: chunks.Chunks.Retention = .{ .leases = self.leases[required..self.count], .limit = limit - required - count };
             var acquired: usize = 0;
             defer self.count = required + retention.leases.len + acquired;
             if (count != 0) {
                 var fresh: [capacity]chunks.Lease = undefined;
-                try self.owner.acquireManyRetaining(missing[0..count], fresh[0..count], &retention);
+                try self.client.acquireManyRetaining(missing[0..count], fresh[0..count], &retention);
                 const start = required + retention.leases.len;
                 @memcpy(self.sections[start..][0..count], missing[0..count]);
                 @memcpy(self.leases[start..][0..count], fresh[0..count]);
@@ -71,7 +72,7 @@ pub fn ReadWindow(comptime capacity: usize) type {
         }
 
         pub fn deinit(self: *Self) void {
-            self.owner.releaseMany(self.leases[0..self.count]);
+            self.client.chunks.releaseMany(self.leases[0..self.count]);
             self.count = 0;
         }
     };

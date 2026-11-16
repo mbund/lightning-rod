@@ -105,6 +105,8 @@ pub const Mining = struct {
     };
 
     deps: Dependencies,
+    /// Reads block sections from the simulation budget, at most 17 at once.
+    chunk_client: chunks.Chunks.Client,
     actors: IndexSet,
     spatial_changes: SpatialIndex,
     neighborhoods: SpatialGroups,
@@ -152,6 +154,7 @@ pub const Mining = struct {
             .targets = try allocator.alloc(sessions.Service.Target, states.len),
             .deliveries = try allocator.alloc(sessions.Service.Delivery, states.len),
             .deps = deps,
+            .chunk_client = try deps.chunks.simulation(17),
             .states = states,
             .views = views,
             .observers = observers,
@@ -168,7 +171,7 @@ pub const Mining = struct {
 
     fn lootNeighbors(self: *Mining, world: u32, position: chunks.Position, offsets: []const loot_tables.Offset, output: []loot_tables.Neighbor) !void {
         assert(offsets.len == output.len and offsets.len <= 16);
-        var window = chunks.ReadWindow(8).init(self.deps.chunks);
+        var window = chunks.ReadWindow(8).init(self.chunk_client);
         defer window.deinit();
         var cursor: usize = 0;
         while (cursor < offsets.len) {
@@ -249,9 +252,9 @@ pub const Mining = struct {
         result.speed *= @floatCast(try self.deps.attributes.value(player_index, "minecraft:block_break_speed"));
         const eye_y = player.position.y + if (player.flags.sneaking) @as(f64, 1.27) else @as(f64, 1.62);
         const eye: chunks.Position = .{ .x = @intFromFloat(@floor(player.position.x)), .y = @intFromFloat(@floor(eye_y)), .z = @intFromFloat(@floor(player.position.z)) };
-        const fluid = self.deps.block_definitions.properties[try self.deps.chunks.getBlock(player.world, eye)];
+        const fluid = self.deps.block_definitions.properties[try self.chunk_client.getBlock(player.world, eye)];
         if (fluid.fluid == .water) {
-            const above = self.deps.block_definitions.properties[try self.deps.chunks.getBlock(player.world, .{ .x = eye.x, .y = eye.y + 1, .z = eye.z })];
+            const above = self.deps.block_definitions.properties[try self.chunk_client.getBlock(player.world, .{ .x = eye.x, .y = eye.y + 1, .z = eye.z })];
             const height: f64 = if (above.fluid == .water) 1 else fluid.height();
             if (eye_y < @as(f64, @floatFromInt(eye.y)) + height) result.speed *= @floatCast(try self.deps.attributes.value(player_index, "minecraft:submerged_mining_speed"));
         }
@@ -287,7 +290,7 @@ pub const Mining = struct {
         const dy = player.position.y + 1.62 - (@as(f64, @floatFromInt(position.y)) + 0.5);
         const dz = player.position.z - (@as(f64, @floatFromInt(position.z)) + 0.5);
         if (dx * dx + dy * dy + dz * dz > 36) return;
-        const block = try self.deps.chunks.getBlock(player.world, .{ .x = position.x, .y = position.y, .z = position.z });
+        const block = try self.chunk_client.getBlock(player.world, .{ .x = position.x, .y = position.y, .z = position.z });
         if (block == 0 or block >= game_data.registry.block_state_to_block.len) return;
         const slot: inventories.Slot = .{ .owner = player.uuid, .index = 36 + @as(u16, status.selected_slot) };
         const held = try self.deps.inventories.get(slot);
@@ -317,7 +320,7 @@ pub const Mining = struct {
             const view = &self.views[index];
             if (players.records[index].handle == null and self.observers[index].generation == 0 and !view.watchers.view().any() and !view.pending.view().any()) self.actors.remove(index) else retiring += 1;
         }
-        var terrain = chunks.ReadWindow(8).init(self.deps.chunks);
+        var terrain = chunks.ReadWindow(8).init(self.chunk_client);
         defer terrain.deinit();
         for (self.actors.values()) |index| {
             const player = players.records[index];

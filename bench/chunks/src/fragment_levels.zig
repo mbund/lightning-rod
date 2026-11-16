@@ -33,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
     var store = try storage.Store.init(allocator, io, .{ .path = path, .metrics = &registry });
     defer store.deinit();
     const resources = try records.Workspaces.init(allocator, io, .{ .metrics = &registry });
-    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 1, .demand_sections = 0, .cache_groups = 1 }, .{ .metrics = &registry, .storage = try store.openSpace(chunks.Chunks.id), .record_workspaces = resources });
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 1, .cache_groups = 1 }, .{ .metrics = &registry, .storage = try store.openSpace(chunks.Chunks.id), .record_workspaces = resources });
     var after: [64]u8 = undefined;
     var cursor: records.ScanCursor = .{ .after = &after };
     var columns: std.ArrayList(chunks.Light.Column) = .empty;

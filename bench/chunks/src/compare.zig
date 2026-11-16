@@ -78,9 +78,10 @@ fn verifyNative(init: std.process.Init, source: *const corpus.Corpus, path: []co
     var store = try storage.Store.init(init.gpa, init.io, .{ .path = path, .metrics = &registry });
     defer store.deinit();
     const space = try store.openSpace(chunks.Chunks.id);
-    const world = try chunks.Chunks.init(arena.allocator(), init.io, .{}, .{ .metrics = &registry, .storage = space, .record_workspaces = try records.Workspaces.init(arena.allocator(), init.io, .{}) });
+    const world = try chunks.Chunks.init(arena.allocator(), init.io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 193 }, .{ .metrics = &registry, .storage = space, .record_workspaces = try records.Workspaces.init(arena.allocator(), init.io, .{}) });
+    const reader = try world.client(.{ .name = "bench", .sections = 1 });
     for (source.columns) |column| for (column.sections, 0..) |section, y| {
-        const lease = try world.acquire(.{ .world = 0, .x = column.x, .z = column.z, .y = @as(i32, @intCast(y)) + corpus.minimum_y });
+        const lease = try reader.acquire(.{ .world = 0, .x = column.x, .z = column.z, .y = @as(i32, @intCast(y)) + corpus.minimum_y });
         defer lease.release();
         const view = lease.view();
         for (0..4096) |index| {

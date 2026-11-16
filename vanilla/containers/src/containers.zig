@@ -113,6 +113,8 @@ pub const Containers = struct {
     allocator: std.mem.Allocator,
     content_memory: std.heap.ArenaAllocator,
     deps: Dependencies,
+    /// Reads block sections from the simulation budget, at most 32 at once.
+    chunk_client: chunks.Chunks.Client,
     states: blocks.States,
     table: records.Table,
     rewards: records.Cache,
@@ -172,6 +174,7 @@ pub const Containers = struct {
             .allocator = allocator,
             .content_memory = .init(allocator),
             .deps = deps,
+            .chunk_client = try deps.chunks.simulation(32),
             .states = try .init(),
             .table = .{ .space = deps.storage, .root_offset = 8, .resources = deps.record_workspaces.resources },
             .rewards = try records.Cache.init(allocator, io, .{ .space = deps.storage, .root_offset = 16, .resources = deps.record_workspaces.resources }, .{
@@ -400,7 +403,7 @@ pub const Containers = struct {
                     const right = blocks.rightOf(face);
                     for ([_]i32{ -1, 1 }) |sign| {
                         const neighbor: chunks.Position = .{ .x = key.position.x + sign * right[0], .y = key.position.y, .z = key.position.z + sign * right[1] };
-                        const other = try self.deps.chunks.getBlock(key.world, neighbor);
+                        const other = try self.chunk_client.getBlock(key.world, neighbor);
                         if (self.states.kind(other) != .chest or self.states.chestType(other) != .single or self.states.facing(other) != face) continue;
                         state = self.states.chest(state, if (sign == 1) .left else .right);
                         neighbor_position = neighbor;
@@ -433,7 +436,7 @@ pub const Containers = struct {
                 if (kind == .chest) {
                     var above = key.position;
                     above.y += 1;
-                    if (self.blocksLid(try self.deps.chunks.getBlock(key.world, above))) return .denied;
+                    if (self.blocksLid(try self.chunk_client.getBlock(key.world, above))) return .denied;
                 }
                 try self.open(request.player.handle.?.index, key, request.state);
                 return .applied;
@@ -471,7 +474,7 @@ pub const Containers = struct {
                 assert(self.deps.dropped.canCreate(request.following_drops));
                 if (kind == .chest) {
                     if (self.states.partner(request.state, key.position)) |partner| {
-                        const other = try self.deps.chunks.getBlock(key.world, partner);
+                        const other = try self.chunk_client.getBlock(key.world, partner);
                         if (self.states.kind(other) == .chest) try self.deps.chunks.setBlock(key.world, partner, self.states.chest(other, .single));
                     }
                 } else {
@@ -506,11 +509,11 @@ pub const Containers = struct {
         };
         view.owners[0] = if (view.kind == .crafting) player.uuid else key.owner();
         if (view.kind == .chest) if (self.states.partner(state, key.position)) |partner| {
-            const other = try self.deps.chunks.getBlock(key.world, partner);
+            const other = try self.chunk_client.getBlock(key.world, partner);
             if (self.states.kind(other) != .chest or self.states.facing(other) != self.states.facing(state)) return;
             var above = partner;
             above.y += 1;
-            if (self.blocksLid(try self.deps.chunks.getBlock(key.world, above))) return;
+            if (self.blocksLid(try self.chunk_client.getBlock(key.world, above))) return;
             const partner_owner = (Key{ .world = key.world, .position = partner }).owner();
             view.owners = if (self.states.chestType(state) == .right) .{ key.owner(), partner_owner } else .{ partner_owner, key.owner() };
             view.container_slots = 54;

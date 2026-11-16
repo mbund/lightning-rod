@@ -17,6 +17,8 @@ pub const StormStick = struct {
     pub const Dependencies = struct { enchantments: *vanilla.Enchantments.Registry, players: *Players, chunks: *Chunks, packets: *Packets, entities: *Entities };
     const Strike = struct { entity: EntityId = 0, expires: u64 = 0, body: EntityState = undefined };
     deps: Dependencies,
+    /// Traces rays through the simulation budget, eight sections at a time.
+    chunk_client: Chunks.Client,
     strikes: []Strike,
     known: []u32,
     targets: []sessions.Service.Target,
@@ -29,6 +31,7 @@ pub const StormStick = struct {
         const self = try allocator.create(StormStick);
         self.* = .{
             .deps = deps,
+            .chunk_client = try deps.chunks.simulation(8),
             .strikes = try allocator.alloc(Strike, configuration.maximum_strikes),
             .known = try allocator.alloc(u32, try std.math.mul(usize, configuration.maximum_strikes, deps.players.records.len)),
             .targets = try allocator.alloc(sessions.Service.Target, deps.players.records.len),
@@ -48,7 +51,7 @@ pub const StormStick = struct {
     fn cast(self: *StormStick, context: *const vanilla.enchantment_effects.UseContext) !vanilla.item_actions.Result {
         if (context.action.item.kind != game_data.registry.itemId("minecraft:stick").?) return .pass;
         const player = context.action.player;
-        const hit = try vanilla.raycast.trace(self.deps.chunks, player.world, .{ .x = player.position.x, .y = player.position.y + if (player.flags.sneaking) @as(f64, 1.27) else @as(f64, 1.62), .z = player.position.z }, vanilla.raycast.direction(player.rotation), 64) orelse return .pass;
+        const hit = try vanilla.raycast.trace(self.chunk_client, player.world, .{ .x = player.position.x, .y = player.position.y + if (player.flags.sneaking) @as(f64, 1.27) else @as(f64, 1.62), .z = player.position.z }, vanilla.raycast.direction(player.rotation), 64) orelse return .pass;
         const index = for (self.strikes, 0..) |strike, index| {
             if (strike.entity == 0) break index;
         } else return .denied;

@@ -22,10 +22,12 @@ pub const Doors = struct {
     };
 
     deps: Dependencies,
+    /// Reads block sections from the simulation budget, at most 5 at once.
+    chunk_client: chunks.Chunks.Client,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Doors {
         const self = try allocator.create(Doors);
-        self.* = .{ .deps = deps };
+        self.* = .{ .deps = deps, .chunk_client = try deps.chunks.simulation(5) };
 
         for (game_data.registry.door_state_ranges) |range|
             try deps.actions.register(BlockActions.Handler.init(self, range.minimum, range.maximum, apply));
@@ -85,7 +87,7 @@ pub const Doors = struct {
             }
             var held: [5]chunks.Lease = undefined;
             var states: [5]u16 = undefined;
-            var iterator = self.deps.chunks.iterate(neighborhood[0..needed], &held);
+            var iterator = self.chunk_client.iterate(neighborhood[0..needed], &held);
             defer iterator.deinit();
             var first: usize = 0;
             while (try iterator.next()) |batch| {
@@ -151,7 +153,7 @@ pub const Doors = struct {
         const sections = [_]chunks.Section{ chunks.sectionAt(world, bottom), chunks.sectionAt(world, top) };
         const count: usize = if (std.meta.eql(sections[0], sections[1])) 1 else 2;
         var leases: [2]chunks.Lease = undefined;
-        try self.deps.chunks.acquireMany(sections[0..count], leases[0..count]);
+        try self.chunk_client.acquireMany(sections[0..count], leases[0..count]);
         var borrowed = true;
         defer if (borrowed) self.deps.chunks.releaseMany(leases[0..count]);
         const lower = leases[0].get(chunks.localIndex(bottom));

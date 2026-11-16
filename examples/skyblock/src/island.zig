@@ -9,6 +9,7 @@ const Operators = @import("commands").operators.Operators;
 const Players = @import("players").players.Players;
 const Reload = @import("reload").Reload;
 const Streaming = @import("terrain").streaming.Streaming;
+const Lighting = @import("terrain").lighting.Lighting;
 const BackgroundTerrain = @import("terrain").terrain.Terrain;
 const chunk_delivery = @import("terrain").delivery_cache;
 const sessions = @import("sessions");
@@ -32,18 +33,23 @@ const operators = blk: {
 const defaults = lightning_rod.plugin.remove(lightning_rod.plugin.replace(lightning_rod.plugin.remove(lightning_rod.plugin.remove(vanilla.plugins(), ChatInput), vanilla.JoinLeaveMessages), .{lightning_rod.plugin.configured(Terrain, .{ .kind = .island })}), vanilla.Vanilla);
 const Selections = lightning_rod.plugin.Compose(@Tuple(&.{ @TypeOf(defaults), lightning_rod.plugin.Selection(IslandCommands), lightning_rod.plugin.Selection(global_chat.GlobalChat) }));
 const Simulation = lightning_rod.Simulation(Selections);
+/// Sections streaming and the lighting solver of one island each read at once.
+const island_budget = 24;
 
 fn selections(content: vanilla.definition_provider.Dependencies, config: IslandCommands.Configuration, chat: *global_chat.Channel, resources: *records.Resources, delivery: *chunk_delivery.Workspace, wakeup: *std.Io.Event, request: *reload.Request) !Selections {
     const column_sections = (try content.dimensions.dimension("minecraft:overworld")).section_count;
     return lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(lightning_rod.plugin.replace(defaults, vanilla.definition_provider.selections(content)), .{
             lightning_rod.plugin.configured(records.Workspaces, .{ .shared = resources }),
-            lightning_rod.plugin.configured(Streaming, .{ .delivery_workspace = delivery }),
+            lightning_rod.plugin.configured(Streaming, .{ .delivery_workspace = delivery, .chunk_sections = island_budget }),
+            lightning_rod.plugin.configured(Lighting, .{ .chunk_sections = island_budget }),
             lightning_rod.plugin.configured(Operators, .{ .operators = &operators }),
             lightning_rod.plugin.configured(sessions.World, .{ .endpoint = config.routing.endpoints[config.index] }),
             lightning_rod.plugin.configured(Terrain, .{ .kind = if (config.index == 0) .hub else .island }),
             lightning_rod.plugin.configured(Reload, .{ .request = request }),
-            lightning_rod.plugin.configured(Chunks, .{ .wakeup = wakeup, .cache_sections = column_sections * 2, .demand_sections = column_sections, .cache_groups = 4, .storage_group_side = 1 }),
+            // Edits and the simulation, streaming and the lighting solver, block sync, and two columns
+            // nothing holds. Many islands live in one process, so each budget is small.
+            lightning_rod.plugin.configured(Chunks, .{ .wakeup = wakeup, .edit_sections = column_sections, .simulation_sections = 48, .cache_sections = column_sections + 48 + 2 * island_budget + 8 + column_sections * 2, .cache_groups = 4, .storage_group_side = 1 }),
             lightning_rod.plugin.configured(Inventories, .{ .cache_items = 6 }),
             lightning_rod.plugin.configured(BlockSynchronization, .{ .delta_sections = 32, .queued_sections = 32 }),
             lightning_rod.plugin.configured(Players, .{ .maximum = if (config.index == 0) catalog.maximum_players else catalog.island_connections, .render_distance = 4, .spawn = .{ .x = 0.5, .y = 65, .z = 0.5 } }),

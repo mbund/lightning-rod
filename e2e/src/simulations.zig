@@ -108,7 +108,9 @@ pub fn run(init: std.process.Init, plugins: anytype, endpoints: []*sessions.Serv
     std.debug.assert(plugins.len == endpoints.len);
     std.debug.assert(plugins.len == 2 or plugins.len == 3);
     const limits = .{
-        lightning_rod.plugin.configured(Chunks, Chunks.Configuration{ .cache_sections = 48, .demand_sections = 24, .cache_groups = 6 }),
+        // The default budgets of edits, the simulation, streaming, the lighting solver and block sync,
+        // and a few columns nothing holds, so the cache evicts all the time.
+        lightning_rod.plugin.configured(Chunks, Chunks.Configuration{ .cache_sections = 24 + 64 + 192 + 192 + 8 + 48, .cache_groups = 6 }),
         lightning_rod.plugin.configured(BlockSynchronization, BlockSynchronization.Configuration{ .delta_sections = 8, .queued_sections = 8 }),
         lightning_rod.plugin.configured(Entities, Entities.Configuration{ .cache_records = 16 }),
         lightning_rod.plugin.configured(vanilla.ItemEntities, vanilla.ItemEntities.Configuration{ .cache_records = 16, .maximum = 64 }),

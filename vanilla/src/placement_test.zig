@@ -32,6 +32,8 @@ const Fixture = struct {
     players: *Players,
     player_states: *PlayerStates,
     terrain: *chunks.Chunks,
+    /// Reads blocks and traces rays for the test.
+    reader: chunks.Chunks.Client,
     streaming: *Streaming,
     inventories: *inventories.Inventories,
     items: *Items,
@@ -88,12 +90,12 @@ const Fixture = struct {
             .equipment = undefined,
             .dropped = undefined,
         });
-        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 64, .demand_sections = 0, .cache_groups = 8 }, .{
+        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 256, .cache_groups = 8 }, .{
             .metrics = registry,
             .storage = try store.openSpace("chunks"),
             .record_workspaces = workspaces,
         });
-        const streaming = try Streaming.init(allocator, io, .{}, .{
+        const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = 24 }, .{
             .metrics = registry,
             .chunks = terrain,
             .players = players,
@@ -101,7 +103,7 @@ const Fixture = struct {
             .packets = encoding,
             .worlds = dimensions,
             .blocks = &gameplay_definitions.blocks.published,
-            .lighting = try Lighting.init(allocator, .{}, .{ .metrics = registry, .blocks = &gameplay_definitions.blocks.published, .chunks = terrain, .worlds = dimensions }),
+            .lighting = try Lighting.init(allocator, .{ .chunk_sections = 24 }, .{ .metrics = registry, .blocks = &gameplay_definitions.blocks.published, .chunks = terrain, .worlds = dimensions }),
         });
         const blocks = try BlockSynchronization.init(allocator, io, .{
             .metrics = registry,
@@ -128,7 +130,7 @@ const Fixture = struct {
             .blocks = blocks,
             .actions = actions,
         });
-        return .{ .service = service, .input = input, .players = players, .player_states = player_states, .terrain = terrain, .streaming = streaming, .inventories = ownership, .items = items, .other_world = other_world };
+        return .{ .service = service, .input = input, .players = players, .player_states = player_states, .terrain = terrain, .reader = try terrain.client(.{ .name = "test", .sections = 8 }), .streaming = streaming, .inventories = ownership, .items = items, .other_world = other_world };
     }
 
     fn deinit(self: *Fixture) void {
@@ -163,7 +165,7 @@ const Fixture = struct {
         self.service.input_events = &events;
         defer self.service.input_events = &.{};
         try self.input.tick(std.testing.failing_allocator);
-        return self.terrain.getBlock(player.world, position);
+        return self.reader.getBlock(player.world, position);
     }
 };
 
@@ -229,7 +231,7 @@ test "block and door placement retain collision boundaries across chunk edges" {
             fixture.player_states.records[1] = .{ .uuid = 2, .gamemode = if (case.spectator) .spectator else .survival };
             const placed = try fixture.place(position, item);
             try std.testing.expectEqual(!case.blocked, placed != 0);
-            const upper = try fixture.terrain.getBlock(fixture.players.records[0].world, .{ .x = coordinate, .y = 66, .z = coordinate });
+            const upper = try fixture.reader.getBlock(fixture.players.records[0].world, .{ .x = coordinate, .y = 66, .z = coordinate });
             try std.testing.expectEqual(!case.blocked and kind == 1, upper != 0);
         }
     };
@@ -256,11 +258,11 @@ test "raycasts test collision shapes across sections without allocating during t
     try fixture.terrain.setBlock(world, .{ .x = 17, .y = 70, .z = 0 }, stone);
     sealed.fail_index = sealed.alloc_index;
     const origin: minecraft_model.Position = .{ .x = 14.5, .y = 70.75, .z = 0.5 };
-    const hit = (try raycast.trace(fixture.terrain, world, origin, .{ 1, 0, 0 }, 4)).?;
+    const hit = (try raycast.trace(fixture.reader, world, origin, .{ 1, 0, 0 }, 4)).?;
     try std.testing.expectEqual(@as(i32, 17), hit.block.x);
     try std.testing.expectEqual(@as(f64, 2.5), hit.distance);
-    const lower = (try raycast.trace(fixture.terrain, world, .{ .x = 14.5, .y = 70.25, .z = 0.5 }, .{ 1, 0, 0 }, 4)).?;
+    const lower = (try raycast.trace(fixture.reader, world, .{ .x = 14.5, .y = 70.25, .z = 0.5 }, .{ 1, 0, 0 }, 4)).?;
     try std.testing.expectEqual(@as(i32, 15), lower.block.x);
-    try std.testing.expect(try raycast.trace(fixture.terrain, world, origin, .{ 1, 0, 0 }, 2) == null);
-    try std.testing.expect(try raycast.trace(fixture.terrain, fixture.other_world, origin, .{ 1, 0, 0 }, 4) == null);
+    try std.testing.expect(try raycast.trace(fixture.reader, world, origin, .{ 1, 0, 0 }, 2) == null);
+    try std.testing.expect(try raycast.trace(fixture.reader, fixture.other_world, origin, .{ 1, 0, 0 }, 4) == null);
 }

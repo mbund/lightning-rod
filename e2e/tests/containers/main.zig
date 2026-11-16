@@ -130,13 +130,13 @@ const Probe = struct {
             for (self.deps.players.activeSlots()) |index| try self.deps.control.send(self.deps.players.records[index].handle.?, "setup");
         } else if (std.mem.eql(u8, text, "placed")) {
             const at = if (self.config.mode == .chests) chest else oven;
-            const state = try self.deps.chunks.getBlock(player.world, at);
+            const state = try (try self.deps.chunks.simulation(1)).getBlock(player.world, at);
             const kind = self.deps.containers.states.kind(state) orelse return error.ContainerNotPlaced;
             switch (self.config.mode) {
                 .chests => {
                     if (kind != .chest or self.deps.containers.states.facing(state) != .north or self.deps.containers.states.chestType(state) == .single) return error.ChestOrientation;
                     const partner = self.deps.containers.states.partner(state, at).?;
-                    const other = try self.deps.chunks.getBlock(player.world, partner);
+                    const other = try (try self.deps.chunks.simulation(1)).getBlock(player.world, partner);
                     if (!std.meta.eql(self.deps.containers.states.partner(other, partner).?, at)) return error.ChestPairing;
                 },
                 .furnace => if (kind != .furnace or self.deps.containers.states.facing(state) != .east) return error.FurnaceOrientation,

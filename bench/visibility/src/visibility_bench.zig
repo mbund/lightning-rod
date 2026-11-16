@@ -155,7 +155,7 @@ pub fn loadWorld(init: std.process.Init, allocator: std.mem.Allocator, options: 
     const dimension = (dimensions.find("minecraft:overworld") orelse return error.MissingOverworld).dimension;
     if (dimension.sectionCount() > 24) return error.UnsupportedWorldHeight;
     var feet = options.feet orelse .{ 8500, 65000, 8500 };
-    const terrain = try chunks.Chunks.init(allocator, init.io, .{ .cache_sections = 48, .demand_sections = 24, .cache_groups = 16 }, .{ .metrics = &registry, .storage = try store.openSpace(chunks.Chunks.id), .record_workspaces = try records.Workspaces.init(allocator, init.io, .{}) });
+    const terrain = try chunks.Chunks.init(allocator, init.io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 48, .cache_groups = 16 }, .{ .metrics = &registry, .storage = try store.openSpace(chunks.Chunks.id), .record_workspaces = try records.Workspaces.init(allocator, init.io, .{}) });
     const Disk = struct {
         fn read(_: *@This(), _: std.Io, batch: chunks.Source.Batch) void {
             for (batch.requests) |*request| request.result = error.MissingStoredSection;
@@ -163,10 +163,11 @@ pub fn loadWorld(init: std.process.Init, allocator: std.mem.Allocator, options: 
     };
     var disk: Disk = .{};
     terrain.setSource(chunks.Source.init(&disk, Disk.read));
+    const reader = try terrain.client(.{ .name = "bench", .sections = 1 });
     var scene = try Scene.init(allocator, options.radius, dimension.minimumSection(), dimension.sectionCount(), feet);
     for (0..scene.grid.count()) |index| {
         const at = scene.grid.position(index);
-        const lease = try terrain.acquire(.{ .world = dimensions.find("minecraft:overworld").?.id, .x = at[0], .y = at[1], .z = at[2] });
+        const lease = try reader.acquire(.{ .world = dimensions.find("minecraft:overworld").?.id, .x = at[0], .y = at[1], .z = at[2] });
         defer lease.release();
         for (scene.blocks[index * 4096 ..][0..4096], 0..) |*state, local| state.* = lease.get(@intCast(local));
         if (lease.biomes()) |biomes| {

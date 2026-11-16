@@ -23,15 +23,17 @@ pub const ItemPhysics = struct {
     };
 
     deps: Dependencies,
+    /// Reads block sections from the simulation budget, two windows of eight at once.
+    chunk_client: chunks.Chunks.Client,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*ItemPhysics {
         const self = try allocator.create(ItemPhysics);
-        self.* = .{ .deps = deps };
+        self.* = .{ .deps = deps, .chunk_client = try deps.chunks.simulation(16) };
         return self;
     }
 
     pub fn readWindow(self: *const ItemPhysics) Window {
-        return Window.init(self.deps.chunks);
+        return Window.init(self.chunk_client);
     }
 
     pub fn advance(self: *ItemPhysics, neighborhood: *Window, entity_id: u32, ticks: u32, body: entities.State, on_ground: bool) !Result {
@@ -97,7 +99,7 @@ pub const ItemPhysics = struct {
     }
 
     fn blockState(self: *ItemPhysics, window: *Window, world: u32, position: chunks.Position) !u16 {
-        assert(window.owner == self.deps.chunks);
+        assert(window.client.chunks == self.deps.chunks and window.client.index == self.chunk_client.index);
         var views: [1]chunks.View = undefined;
         try window.readMany(&.{chunks.sectionAt(world, position)}, &views);
         const state = views[0].get(chunks.localIndex(position));
@@ -177,7 +179,7 @@ pub const ItemPhysics = struct {
     }
 
     pub fn orbCollides(self: *ItemPhysics, window: *Window, body: entities.State) !bool {
-        assert(window.owner == self.deps.chunks);
+        assert(window.client.chunks == self.deps.chunks and window.client.index == self.chunk_client.index);
         const low: [3]f64 = .{ body.position[0] - 0.25, body.position[1], body.position[2] - 0.25 };
         const high: [3]f64 = .{ body.position[0] + 0.25, body.position[1] + 0.5, body.position[2] + 0.25 };
         var y: i32 = @intFromFloat(@floor(low[1] + 1e-7));
@@ -208,7 +210,7 @@ pub const ItemPhysics = struct {
     }
 
     pub fn escapeOrb(self: *ItemPhysics, window: *Window, body: *entities.State, random: std.Random) !void {
-        assert(window.owner == self.deps.chunks);
+        assert(window.client.chunks == self.deps.chunks and window.client.index == self.chunk_client.index);
         const center: [3]f64 = .{ body.position[0], body.position[1] + 0.25, body.position[2] };
         const directions = [_][3]i32{ .{ 0, 0, -1 }, .{ 0, 0, 1 }, .{ -1, 0, 0 }, .{ 1, 0, 0 }, .{ 0, 1, 0 } };
         var selected: usize = 4;
@@ -307,7 +309,7 @@ pub const ItemPhysics = struct {
     }
 
     fn advanceBody(self: *ItemPhysics, comptime orb: bool, neighborhood: *Window, entity_id: u32, ticks: u32, body: entities.State, on_ground: bool, stuck: [3]f64) !Result {
-        assert(entity_id > 0 and neighborhood.owner == self.deps.chunks);
+        assert(entity_id > 0 and neighborhood.client.index == self.chunk_client.index);
         var next = body;
 
         for (body.position ++ body.velocity) |value| assert(std.math.isFinite(value));

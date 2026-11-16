@@ -22,7 +22,9 @@ const delivery = @import("delivery.zig");
 const protocols = @import("protocols");
 const assert = std.debug.assert;
 
-const chunk_configuration: chunks.Chunks.Configuration = .{ .cache_sections = 192, .demand_sections = 0 };
+/// Edits, the simulation budget spawn reads from, the lighting solver, the import client's
+/// column, and room for recently imported columns.
+const chunk_configuration: chunks.Chunks.Configuration = .{ .cache_sections = 24 + 64 + 192 + 64 + 192 };
 
 pub const Mapping = struct {
     original: u128,
@@ -69,6 +71,8 @@ pub const Import = struct {
     content: vanilla.definition_provider.Dependencies,
     worlds: *Worlds,
     chunks: *Chunks,
+    /// Generates a column's sections and reads the block a block entity stands on.
+    reader: Chunks.Client,
     spawn: *vanilla.Spawn,
     inventories: *inventories.Inventories,
     items: *vanilla.Items,
@@ -120,6 +124,7 @@ pub const Import = struct {
             .worlds = worlds,
             .inventories = ownership,
             .chunks = terrain,
+            .reader = try terrain.client(.{ .name = "import", .sections = 64 }),
             .spawn = spawn,
             .lighting = lighting,
             .columns = .empty,
@@ -427,7 +432,7 @@ pub const Import = struct {
             if (source.sections[@intCast(offset)] != null) return error.DuplicateSection;
             source.sections[@intCast(offset)] = section;
         }
-        try source.importSections(self.chunks, world.dimension.section_count);
+        try source.importSections(self.reader, world.dimension.section_count);
         try block_import.column(self, scratch, doc, world.id);
         self.counts.columns += 1;
         try self.columns.put(self.allocator, .{ .world = world.id, .x = x, .z = z }, {});
@@ -485,11 +490,11 @@ const Column = struct {
         }
     }
 
-    fn importSections(self: *Column, owner: *chunks.Chunks, count: usize) !void {
+    fn importSections(self: *Column, owner: chunks.Chunks.Client, count: usize) !void {
         var positions: [64]chunks.Section = undefined;
         var leases: [64]chunks.Lease = undefined;
         for (positions[0..count], 0..) |*position, index| position.* = .{ .world = self.world, .x = self.x, .z = self.z, .y = self.minimum + @as(i32, @intCast(index)) };
         try owner.acquireMany(positions[0..count], leases[0..count]);
-        owner.releaseMany(leases[0..count]);
+        owner.chunks.releaseMany(leases[0..count]);
     }
 };

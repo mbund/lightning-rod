@@ -49,8 +49,8 @@ pub const State = struct {
 const batch_size = 32;
 
 pub fn tick(self: *containers.Containers) !void {
-    // Sections stay within the simulation share of the chunk cache; the background may pin the rest.
-    const capacity = @min(batch_size, self.active.len, self.deps.inventories.cache.entries.len / 3, self.deps.chunks.demandCapacity());
+    // A batch holds no more sections than the containers client may.
+    const capacity = @min(batch_size, self.active.len, self.deps.inventories.cache.entries.len / 3, self.chunk_client.budget());
     std.debug.assert(capacity > 0);
     var end = self.active_count;
     while (end > 0) {
@@ -69,7 +69,7 @@ pub fn tick(self: *containers.Containers) !void {
         if (count == 0) continue;
         var block_states: [batch_size]u16 = undefined;
         {
-            var window = chunks.ReadWindow(batch_size).init(self.deps.chunks);
+            var window = chunks.ReadWindow(batch_size).init(self.chunk_client);
             defer window.deinit();
             var views: [batch_size]chunks.View = undefined;
             try window.readMany(sections[0..count], views[0..count]);

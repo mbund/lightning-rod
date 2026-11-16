@@ -65,6 +65,8 @@ pub const Workspace = struct {
         ready: []bool,
         edits: [lighting.batch_max]lighting.Edit = undefined,
     };
+    /// Reads block sections for the solver. Its budget bounds a batch.
+    client: chunks.Chunks.Client,
     preparation: Preparation,
     work: Work = .{},
     timings: Timings = .{},
@@ -88,10 +90,12 @@ pub const Workspace = struct {
     biome_values: [9 * maximum_sections][64]u16 = undefined,
     biome_present: [9 * maximum_sections]bool = @splat(false),
 
-    pub fn init(allocator: std.mem.Allocator, terrain: *chunks.Chunks, registry: lighting.Registry) !*Workspace {
+    pub fn init(allocator: std.mem.Allocator, client: chunks.Chunks.Client, registry: lighting.Registry) !*Workspace {
         const self = try allocator.create(Workspace);
-        const capacity = @min(192, terrain.cache.entries.len);
+        const terrain = client.chunks;
+        const capacity = client.budget();
         self.* = .{
+            .client = client,
             .watch = try chunks.Watch.init(allocator, terrain, 9 * maximum_sections),
             .engine = try lighting.Engine.init(allocator, .{ .x = side, .y = height, .z = side }, registry),
             .states = try allocator.alloc(u16, side * maximum_sections * 16 * side),
@@ -117,13 +121,7 @@ pub const Workspace = struct {
     }
 
     pub fn prepare(self: *Workspace, terrain: *chunks.Chunks, world: u32, x: i32, z: i32, dimension: worlds.Worlds.Dimension, player: usize) !bool {
-        return self.prepareMode(terrain, world, x, z, dimension, player, .background);
-    }
-
-    const Access = enum { background, required };
-
-    fn prepareMode(self: *Workspace, terrain: *chunks.Chunks, world: u32, x: i32, z: i32, dimension: worlds.Worlds.Dimension, player: usize, access: Access) !bool {
-        if (!try self.prepareInputsMode(terrain, world, x, z, dimension, .{ .player = player }, access)) return false;
+        if (!try self.prepareInputsMode(terrain, world, x, z, dimension, .{ .player = player })) return false;
         try self.solve(std.math.maxInt(u32));
         return true;
     }
@@ -142,10 +140,11 @@ pub const Workspace = struct {
 
     /// Snapshots are borrowed until the next prepare. Lighting is not computed here.
     pub fn prepareInputs(self: *Workspace, terrain: *chunks.Chunks, world: u32, x: i32, z: i32, dimension: worlds.Worlds.Dimension, player: usize) !bool {
-        return self.prepareInputsMode(terrain, world, x, z, dimension, .{ .player = player }, .background);
+        return self.prepareInputsMode(terrain, world, x, z, dimension, .{ .player = player });
     }
 
-    fn prepareInputsMode(self: *Workspace, terrain: *chunks.Chunks, world: u32, x: i32, z: i32, dimension: worlds.Worlds.Dimension, priority: chunks.GenerationPriority, access: Access) !bool {
+    fn prepareInputsMode(self: *Workspace, terrain: *chunks.Chunks, world: u32, x: i32, z: i32, dimension: worlds.Worlds.Dimension, priority: chunks.GenerationPriority) !bool {
+        assert(terrain == self.client.chunks);
         const count = dimension.sectionCount();
         if (count == 0 or count > maximum_sections) return error.UnsupportedLightingHeight;
         const region: Region = .{ .world = world, .x = x, .z = z, .minimum = dimension.minimumSection(), .count = count, .skylight = dimension.skylight };
@@ -183,11 +182,7 @@ pub const Workspace = struct {
                 needed += 1;
             }
         }
-        const capacity = @min(192, switch (access) {
-            .background => terrain.backgroundCapacity(),
-            .required => @max(1, terrain.demand_sections),
-        });
-        if (needed != 0 and capacity == 0) return error.WorkingSetTooLarge;
+        const capacity = self.client.budget();
         var begin: usize = 0;
         while (begin < needed) {
             const end = begin + @min(needed - begin, capacity);
@@ -198,27 +193,19 @@ pub const Workspace = struct {
             {
                 const timing = self.timings.acquire.start();
                 defer timing.end();
-                switch (access) {
-                    .background => {
-                        const requests = self.preparation.requests;
-                        const ready = self.preparation.ready;
-                        for (requests[0 .. end - begin], 0..) |*request, index| request.* = .{
-                            .sections = positions[begin + index ..][0..1],
-                            .leases = leases[index..][0..1],
-                            .priority = priority,
-                        };
-                        try terrain.prepareMany(requests[0 .. end - begin], ready[0 .. end - begin]);
-                        for (ready[0 .. end - begin], 0..) |complete, index| if (complete) {
-                            leases[held] = leases[index];
-                            indices[begin + held] = indices[begin + index];
-                            held += 1;
-                        };
-                    },
-                    .required => {
-                        try terrain.acquireMany(positions[begin..end], leases[0 .. end - begin]);
-                        held = end - begin;
-                    },
-                }
+                const requests = self.preparation.requests;
+                const ready = self.preparation.ready;
+                for (requests[0 .. end - begin], 0..) |*request, index| request.* = .{
+                    .sections = positions[begin + index ..][0..1],
+                    .leases = leases[index..][0..1],
+                    .priority = priority,
+                };
+                try self.client.prepareMany(requests[0 .. end - begin], ready[0 .. end - begin]);
+                for (ready[0 .. end - begin], 0..) |complete, index| if (complete) {
+                    leases[held] = leases[index];
+                    indices[begin + held] = indices[begin + index];
+                    held += 1;
+                };
             }
             self.capture(count, reuse, leases[0..held], indices[begin..][0..held]);
             begin = end;
@@ -520,7 +507,12 @@ pub const Lighting = struct {
     pub const id = "minecraft:lighting";
     /// The light store is sized by whoever knows the player limit. A server gets one from
     /// streaming. Set `store` to have one without it.
-    pub const Configuration = struct { store: ?light_store.Configuration = null, stored: bool = true };
+    pub const Configuration = struct {
+        store: ?light_store.Configuration = null,
+        stored: bool = true,
+        /// Sections the solver reads at once on the terrain thread, generation it waits for included.
+        chunk_sections: usize = 192,
+    };
     pub const Dependencies = struct { metrics: *metrics.Registry, blocks: *BlockProperties, chunks: *chunks.Chunks, worlds: *worlds.Worlds };
     pub const delivery_batch_max = storage.batch_size;
     const batch_max = 256;
@@ -718,6 +710,8 @@ pub const Lighting = struct {
     /// Light kept in memory for edits and gameplay. The simulation thread owns it and
     /// does no IO for it. The terrain thread does every disk read and write it needs.
     store: ?*light_store.LightStore = null,
+    /// Reads the block sections a patch needs, from memory only, on the simulation thread.
+    store_client: ?chunks.Chunks.Client = null,
     /// Marks the overflow records of this process. Older ones describe blocks that may
     /// never have been saved.
     stamp: u64 = 0,
@@ -796,7 +790,7 @@ pub const Lighting = struct {
         const self = try allocator.create(Lighting);
         self.* = .{
             .deps = deps,
-            .background = try Workspace.init(allocator, deps.chunks, registry),
+            .background = try Workspace.init(allocator, try deps.chunks.client(.{ .name = "lighting", .sections = config.chunk_sections }), registry),
             .config = config,
             .rules = rulesHash(registry, false),
             .stored_workspace = try chunks.Light.Workspace.init(allocator),
@@ -853,6 +847,8 @@ pub const Lighting = struct {
     /// sizes it is known. A second call keeps the first store.
     pub fn includeStore(self: *Lighting, allocator: std.mem.Allocator, config: light_store.Configuration) !void {
         if (self.store != null) return;
+        // One column of sections at a time, all a patch of one column reads together.
+        self.store_client = try self.deps.chunks.simulation(light_store.sections_max - 2);
         self.scratch = try allocator.create(Scratch);
         self.terrain_scratch = try allocator.create(Scratch);
         for ([_]*Scratch{ self.scratch, self.terrain_scratch }) |scratch| scratch.* = .{ .copy = .{ .bytes = &scratch.bytes } };
@@ -1133,7 +1129,7 @@ pub const Lighting = struct {
             }
         }
         self.stored_misses.add(1);
-        return if (try self.background.prepareInputsMode(self.deps.chunks, world, x, z, dimension, priority, .background)) .ready else .pending;
+        return if (try self.background.prepareInputsMode(self.deps.chunks, world, x, z, dimension, priority)) .ready else .pending;
     }
 
     pub fn validateDelivery(self: *Lighting) bool {
@@ -1710,7 +1706,7 @@ pub const Lighting = struct {
         for (edits, self.patch_edits[0..len]) |edit, *cell| {
             cell.* = .{ .section = @intCast(@as(i64, edit.section.y) - shape.minimum), .local = edit.index };
         }
-        switch (store.settle(self.deps.chunks, key, shape, self.patch_edits[0..len], waiting)) {
+        switch (store.settle(self.store_client.?, key, shape, self.patch_edits[0..len], waiting)) {
             .patched => |changes| if (self.sink) |sink| sink.patched(sink.context, key.world, key.x, key.z, changes.sections),
             .failed => self.darkenAround(key, shape),
             .waiting => |sections| {
@@ -2078,9 +2074,9 @@ pub const Lighting = struct {
         var leases: [9 * maximum_sections]chunks.Lease = undefined;
         var begin: usize = 0;
         while (begin < count) {
-            const end = begin + @min(count - begin, @max(1, self.deps.chunks.backgroundCapacity() / 2));
+            const end = begin + @min(count - begin, self.background.client.budget());
             const held = leases[begin..end];
-            try self.deps.chunks.acquireMany(positions[begin..end], held);
+            try self.background.client.acquireMany(positions[begin..end], held);
             self.deps.chunks.releaseMany(held);
             begin = end;
         }
@@ -2743,8 +2739,8 @@ test "terrain lighting crosses chunk boundaries and reconstructs after persisten
     var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
     defer store.deinit();
     const resources = try records.Workspaces.init(allocator, io, .{});
-    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 4, .demand_sections = 1 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = resources });
-    const workspace = try Workspace.init(allocator, terrain, try game_data.lighting.init(allocator));
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = resources });
+    const workspace = try Workspace.init(allocator, try terrain.client(.{ .name = "lighting", .sections = @min(192, terrain.unbudgeted()) }), try game_data.lighting.init(allocator));
     const dimension: worlds.Worlds.Dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 1 };
     const glowstone: u16 = @intCast(game_data.registry.blockStateId("minecraft:glowstone").?);
     const stone: u16 = @intCast(game_data.registry.blockStateId("minecraft:stone").?);
@@ -2766,8 +2762,8 @@ test "terrain lighting crosses chunk boundaries and reconstructs after persisten
     try std.testing.expectEqualSlices(u8, &before, &after);
     try terrain.checkpoint(try store.openSpace("chunks"));
     try store.waitDurable(try store.commit(1));
-    const restored = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 4, .demand_sections = 1 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = resources });
-    const reloaded = try Workspace.init(allocator, restored, try game_data.lighting.init(allocator));
+    const restored = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = resources });
+    const reloaded = try Workspace.init(allocator, try restored.client(.{ .name = "lighting", .sections = @min(192, restored.unbudgeted()) }), try game_data.lighting.init(allocator));
     try settle(reloaded, restored, dimension);
     reloaded.engine.packSection(.block, .{ 1, 1, 1 }, &after);
     try std.testing.expectEqualSlices(u8, &before, &after);
@@ -2786,8 +2782,8 @@ test "terrain lighting crosses chunk boundaries and reconstructs after persisten
     };
     var failing = std.testing.FailingAllocator.init(allocator, .{});
     const bounded = failing.allocator();
-    const asynchronous = try chunks.Chunks.init(bounded, io, .{ .cache_sections = 4, .demand_sections = 1 }, .{ .metrics = &registry, .storage = try store.openSpace("asynchronous"), .record_workspaces = resources });
-    const pending = try Workspace.init(bounded, asynchronous, try game_data.lighting.init(bounded));
+    const asynchronous = try chunks.Chunks.init(bounded, io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("asynchronous"), .record_workspaces = resources });
+    const pending = try Workspace.init(bounded, try asynchronous.client(.{ .name = "lighting", .sections = @min(192, asynchronous.unbudgeted()) }), try game_data.lighting.init(bounded));
     var source: Source = .{};
     asynchronous.setSource(chunks.Source.init(&source, Source.read));
     failing.fail_index = failing.alloc_index;
@@ -2823,7 +2819,7 @@ const ConcurrentLighting = struct {
     service: *Lighting = undefined,
     generation: *Generation = undefined,
     source: Source = .{},
-    configuration: Lighting.Configuration = .{ .store = .forPlayers(1) },
+    configuration: Lighting.Configuration = .{ .store = .forPlayers(1), .chunk_sections = 6 },
     metrics_enabled: bool = false,
     path: [256]u8 = undefined,
     delivery_bytes: []u8 = undefined,
@@ -2855,7 +2851,9 @@ const ConcurrentLighting = struct {
         errdefer self.registry.deinit();
         self.store = try storage.Store.init(std.testing.allocator, io, .{ .path = try std.fmt.bufPrint(&self.path, ".zig-cache/tmp/{s}/concurrent-lighting", .{self.directory.sub_path}) });
         errdefer self.store.deinit();
-        self.terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 8, .demand_sections = 2, .cache_groups = 2 }, .{
+        // The cache holds the budgets and nothing more, so every read past them evicts.
+        const store_sections: usize = if (self.configuration.store != null) light_store.sections_max - 2 else 0;
+        self.terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = store_sections, .cache_sections = 1 + self.configuration.chunk_sections + store_sections, .cache_groups = 2 }, .{
             .metrics = &self.registry,
             .storage = try self.store.openSpace("chunks"),
             .record_workspaces = try records.Workspaces.init(allocator, io, .{}),
@@ -3244,7 +3242,7 @@ test "stored delivery exceeds decoded cache capacity without expanding sections"
     try worker.start();
     defer worker.stop();
     const stone: u16 = @intCast(game_data.registry.block_stone_default_state);
-    const count = fixture.terrain.backgroundCapacity() + 1;
+    const count = fixture.service.background.client.budget() + 1;
     try std.testing.expect(count <= 8);
     for (0..count) |index| try fixture.terrain.setBlock(0, .{ .x = 8, .y = @intCast(index * 16 + 8), .z = 8 }, stone);
     try worker.begin(.{ .mode = .snapshot });
@@ -3375,11 +3373,12 @@ test "persisted lighting and generated eviction fit the worker stack without run
     const terrain = try chunks.Chunks.init(allocator, io, .{}, .{ .metrics = &registry, .storage = space, .record_workspaces = resources });
     var source: Source = .{};
     terrain.setSource(chunks.Source.init(&source, Source.read));
+    const reader = try terrain.client(.{ .name = "test", .sections = maximum_sections });
     for (0..9) |column| {
         var sections: [maximum_sections]chunks.Section = undefined;
         var leases: [maximum_sections]chunks.Lease = undefined;
         for (&sections, 0..) |*section, index| section.* = .{ .world = 0, .x = @as(i32, @intCast(column % 3)) - 1, .z = @as(i32, @intCast(column / 3)) - 1, .y = @as(i32, @intCast(index)) - 4 };
-        try terrain.acquireMany(&sections, &leases);
+        try reader.acquireMany(&sections, &leases);
         terrain.releaseMany(&leases);
     }
     try terrain.checkpoint(space);
@@ -3389,13 +3388,14 @@ test "persisted lighting and generated eviction fit the worker stack without run
     var reopened = try storage.Store.init(allocator, io, options);
     defer reopened.deinit();
     const restored = try chunks.Chunks.init(allocator, io, .{}, .{ .metrics = &registry, .storage = try reopened.openSpace(chunks.Chunks.id), .record_workspaces = resources });
+    const restored_reader = try restored.client(.{ .name = "test", .sections = maximum_sections });
     restored.setSource(chunks.Source.init(&source, Source.read));
     var dirty_sections: [maximum_sections]chunks.Section = undefined;
     var dirty_leases: [maximum_sections]chunks.Lease = undefined;
     for (&dirty_sections, 0..) |*section, index| section.* = .{ .world = 0, .x = 32, .z = 0, .y = @as(i32, @intCast(index)) - 4 };
-    try restored.acquireMany(&dirty_sections, &dirty_leases);
+    try restored_reader.acquireMany(&dirty_sections, &dirty_leases);
     restored.releaseMany(&dirty_leases);
-    const workspace = try Workspace.init(allocator, restored, try game_data.lighting.init(allocator));
+    const workspace = try Workspace.init(allocator, try restored.client(.{ .name = "lighting", .sections = @min(192, restored.unbudgeted()) }), try game_data.lighting.init(allocator));
     failing.fail_index = failing.alloc_index;
     const Actor = struct {
         workspace: *Workspace,
@@ -3528,16 +3528,32 @@ const StoreFixture = struct {
         const allocator = self.arena.allocator();
         self.registry = try metrics.Registry.init(std.testing.allocator, io, .{ .enabled = false });
         self.database = try storage.Store.init(std.testing.allocator, io, .{ .path = try std.fmt.bufPrint(&self.path, ".zig-cache/tmp/{s}/light-store", .{self.directory.sub_path}) });
-        self.terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 96, .demand_sections = 16 }, .{ .metrics = &self.registry, .storage = try self.database.openSpace("chunks"), .record_workspaces = try records.Workspaces.init(allocator, io, .{}) });
+        // Edits, the service solver, the light store reading on the simulation thread, and the
+        // reference solver.
+        self.terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = light_store.sections_max - 2, .cache_sections = 1 + 48 + (light_store.sections_max - 2) + 48 }, .{ .metrics = &self.registry, .storage = try self.database.openSpace("chunks"), .record_workspaces = try records.Workspaces.init(allocator, io, .{}) });
         self.ground = .{ .stone = @intCast(game_data.registry.blockStateId("minecraft:stone").?) };
         self.terrain.setSource(chunks.Source.init(&self.ground, Ground.read));
         self.dimensions = try worlds.Worlds.allocate(allocator, .{});
         self.dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = count, .skylight = true };
         assert(try self.dimensions.create(.{ .name = "test:stored", .dimension = self.dimension }) == 0);
         const blocks = try test_blocks.vanilla(allocator);
-        self.service = try Lighting.init(allocator, .{ .store = config }, .{ .metrics = &self.registry, .blocks = blocks, .chunks = self.terrain, .worlds = self.dimensions });
+        self.service = try Lighting.init(allocator, .{ .store = config, .chunk_sections = 48 }, .{ .metrics = &self.registry, .blocks = blocks, .chunks = self.terrain, .worlds = self.dimensions });
         self.service.setSink(.{ .context = &self.heard, .patched = Heard.onPatched, .unlit = Heard.onUnlit, .wanted = Heard.onWanted });
-        self.reference = try Workspace.init(allocator, self.terrain, blocks.light);
+        self.reference = try Workspace.init(allocator, try self.terrain.client(.{ .name = "reference", .sections = 48 }), blocks.light);
+    }
+
+    /// Reads twice as many far sections as the cache holds, so no block section the test
+    /// touched stays in memory.
+    fn evictBlocks(self: *StoreFixture) !void {
+        const client = self.reference.client;
+        var far: [48]chunks.Section = undefined;
+        var leases: [48]chunks.Lease = undefined;
+        var done: usize = 0;
+        while (done < 2 * self.terrain.cache.entries.len) : (done += far.len) {
+            for (&far, 0..) |*section, index| section.* = .{ .world = 0, .x = 500 + @as(i32, @intCast(done + index)), .y = 0, .z = 0 };
+            try client.acquireMany(&far, &leases);
+            self.terrain.releaseMany(&leases);
+        }
     }
 
     fn deinit(self: *StoreFixture) void {
@@ -4184,13 +4200,9 @@ test "a patch waits a tick for block states that are not in memory and reads not
     try fixture.settleAll();
     try fixture.checkpoint();
     for (0..fixture.terrain.cache.entries.len) |_| {
-        _ = try fixture.terrain.getBlock(0, .{ .x = 2000, .y = 0, .z = 0 });
+        _ = try fixture.reference.client.getBlock(0, .{ .x = 2000, .y = 0, .z = 0 });
     }
-    var far: [96]chunks.Section = undefined;
-    for (&far, 0..) |*section, index| section.* = .{ .world = 0, .x = 500 + @as(i32, @intCast(index)), .y = 0, .z = 0 };
-    var leases: [96]chunks.Lease = undefined;
-    try fixture.terrain.acquireMany(&far, &leases);
-    fixture.terrain.releaseMany(&leases);
+    try fixture.evictBlocks();
     // The edit itself reads its own section. Its neighbours stay on disk.
     const reads = fixture.terrain.cache.backend.store.bases.metrics.reads.value();
     const waits = store.snapshot().waits;
@@ -4321,11 +4333,7 @@ test "a solve beside an edit still waiting is not taken for the light that edit 
     try fixture.settleAll();
     try fixture.checkpoint();
     // Its blocks leave memory, so that removing it has to wait a tick for them.
-    var far: [96]chunks.Section = undefined;
-    for (&far, 0..) |*section, index| section.* = .{ .world = 0, .x = 500 + @as(i32, @intCast(index)), .y = 0, .z = 0 };
-    var leases: [96]chunks.Lease = undefined;
-    try fixture.terrain.acquireMany(&far, &leases);
-    fixture.terrain.releaseMany(&leases);
+    try fixture.evictBlocks();
     try fixture.terrain.setBlock(0, .{ .x = 15, .y = 20, .z = 8 }, 0);
     fixture.tick();
     try std.testing.expectEqual(@as(usize, 1), service.unsettled_count);

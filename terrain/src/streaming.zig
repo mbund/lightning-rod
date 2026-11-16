@@ -30,6 +30,8 @@ pub const Streaming = struct {
 
     pub const Configuration = struct {
         /// Shared workspaces require sequential polling on one worker.
+        /// Sections read at once to learn occlusion geometry, generation it waits for included.
+        chunk_sections: usize = section_visibility_world.World.batch_max,
         delivery_workspace: ?*delivery_cache.Workspace = null,
         prefetch: u2 = 0,
         /// Keep delivered columns loaded until they leave the client chunk storage, so turning
@@ -552,6 +554,8 @@ pub const Streaming = struct {
         bake: metrics.Timer = .{},
     } = .{},
     deps: Dependencies,
+    /// Reads block sections to learn occlusion geometry.
+    chunk_client: chunks.Chunks.Client,
     io: std.Io,
     native_io: std.Io,
     published: *Published,
@@ -629,7 +633,8 @@ pub const Streaming = struct {
         try config.work.validate(1, .{ .operations = 1 });
         const turn = try config.work.maximum(1);
         if (turn.operations > batch_max or turn.bytes != 0) return error.InvalidWorkLimits;
-        if (deps.chunks.backgroundCapacity() < 24) return error.ChunkCacheTooSmall;
+        if (config.chunk_sections < 24 or config.chunk_sections > section_visibility_world.World.batch_max) return error.InvalidConfiguration;
+        const chunk_client = try deps.chunks.client(.{ .name = "streaming", .sections = config.chunk_sections });
         if (config.fallback_biome < 0 or config.fallback_biome >= game_data.registry.biome_names.len) return error.UnsupportedBiome;
 
         const metadata = try prepareMetadata(allocator, deps.chunks);
@@ -794,6 +799,7 @@ pub const Streaming = struct {
             .light_resolves = try LightResolves.init(allocator, streams.len),
             .light_fresh = try allocator.alloc(bool, streams.len),
             .deps = deps,
+            .chunk_client = chunk_client,
             .changed_players = try lightning_rod.system.IndexSet.init(allocator, streams.len),
             .background_players = try lightning_rod.system.IndexSet.init(allocator, streams.len),
             .occupied_players = try lightning_rod.system.IndexSet.init(allocator, streams.len),
@@ -1119,12 +1125,12 @@ pub const Streaming = struct {
                 }
             }
             if (self.config.occlusion and !geometry_overflow and geometry_count != 0) {
-                var window = chunks.ReadWindow(192).init(self.deps.chunks);
+                var window = chunks.ReadWindow(section_visibility_world.World.batch_max).init(self.chunk_client);
                 defer window.deinit();
                 var views: [192]chunks.View = undefined;
                 var begin: usize = 0;
                 while (begin < geometry_count) {
-                    const count = @min(geometry_count - begin, @min(views.len, self.deps.chunks.backgroundCapacity()));
+                    const count = @min(geometry_count - begin, views.len, self.chunk_client.budget());
                     var sections: [192]chunks.Section = undefined;
                     for (self.geometry_changes[begin..][0..count], sections[0..count]) |change, *section| section.* = change.section;
                     try window.readMany(sections[0..count], views[0..count]);
@@ -3133,7 +3139,7 @@ pub const Streaming = struct {
     fn learnSources(self: *Streaming, positions: []const chunks.Section, player: usize) !bool {
         assert(positions.len <= section_visibility_world.World.batch_max);
         if (positions.len == 0) return false;
-        const capacity = @min(section_visibility_world.World.batch_max, self.deps.chunks.backgroundCapacity());
+        const capacity = self.chunk_client.budget();
         assert(capacity > 0);
         var batch: [section_visibility_world.World.batch_max]chunks.Section = undefined;
         const reads = self.classification_requests;
@@ -3168,7 +3174,7 @@ pub const Streaming = struct {
         const dimension = self.deps.worlds.get(columns[0].world).?.dimension;
         const minimum = dimension.minimumSection();
         const count = dimension.sectionCount();
-        const capacity = @min(section_visibility_world.World.batch_max, self.deps.chunks.backgroundCapacity());
+        const capacity = self.chunk_client.budget();
         var unresolved: [chunks.classification.column_batch_max]chunks.classification.Column = undefined;
         var unresolved_count: usize = 0;
         var learned = false;
@@ -3236,12 +3242,12 @@ pub const Streaming = struct {
     }
 
     fn learnPrepared(self: *Streaming, positions: []const chunks.Section, player: usize) !bool {
-        assert(positions.len > 0 and positions.len <= self.deps.chunks.backgroundCapacity() and positions.len <= section_visibility_world.World.batch_max);
+        assert(positions.len > 0 and positions.len <= self.chunk_client.budget());
         var leases: [section_visibility_world.World.batch_max]chunks.Lease = undefined;
         var requests: [section_visibility_world.World.batch_max]chunks.Chunks.Preparation = undefined;
         var ready: [section_visibility_world.World.batch_max]bool = undefined;
         for (positions, 0..) |_, index| requests[index] = .{ .sections = positions[index..][0..1], .leases = leases[index..][0..1], .priority = .{ .urgency = .occupied, .player = player } };
-        try self.deps.chunks.prepareMany(requests[0..positions.len], ready[0..positions.len]);
+        try self.chunk_client.prepareMany(requests[0..positions.len], ready[0..positions.len]);
         defer for (leases[0..positions.len], ready[0..positions.len]) |lease, complete| if (complete) lease.release();
         var learned = false;
         for (positions, leases[0..positions.len], ready[0..positions.len]) |position, lease, complete| {
@@ -3547,7 +3553,7 @@ test "visibility metadata batches respect background capacity and release leases
         defer store.deinit();
         var registry = try metrics.Registry.init(allocator, io, .{ .enabled = false });
         defer registry.deinit();
-        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = capacity + 24, .demand_sections = 24 }, .{
+        const terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = capacity + 1 }, .{
             .metrics = &registry,
             .storage = try store.openSpace(chunks.Chunks.id),
             .record_workspaces = try persistent_records.Workspaces.init(allocator, io, .{}),
@@ -3559,6 +3565,7 @@ test "visibility metadata batches respect background capacity and release leases
         var streaming: Streaming = undefined;
         streaming.cpu = .{};
         streaming.deps.chunks = terrain;
+        streaming.chunk_client = try terrain.client(.{ .name = "streaming", .sections = capacity });
         streaming.deps.worlds = catalog;
         var player_records = [_]players.Players.Player{.{ .world = world }};
         var player_plugin: players.Players = .{ .deps = undefined, .config = .{ .render_distance = 1 }, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
@@ -3619,7 +3626,7 @@ test "stored topology supplies adjacent mixed sections without decoding block gr
     defer database.deinit();
     var registry = try metrics.Registry.init(allocator, io, .{});
     defer registry.deinit();
-    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 48, .demand_sections = 24 }, .{
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .simulation_sections = 0, .cache_sections = 48 }, .{
         .metrics = &registry,
         .storage = try database.openSpace(chunks.Chunks.id),
         .record_workspaces = try persistent_records.Workspaces.init(allocator, io, .{}),
@@ -3658,6 +3665,7 @@ test "stored topology supplies adjacent mixed sections without decoding block gr
     var streaming: Streaming = undefined;
     streaming.cpu = .{};
     streaming.deps.chunks = terrain;
+    streaming.chunk_client = try terrain.client(.{ .name = "streaming", .sections = 24 });
     streaming.deps.worlds = catalog;
     var delivery: lighting.Lighting = undefined;
     delivery.config = .{ .stored = false };

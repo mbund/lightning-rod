@@ -8,7 +8,7 @@ const common = @import("common.zig");
 
 pub const seed_columns = 128;
 
-pub fn acquireColumns(world: *chunks.Chunks, source: *const corpus.Corpus, ids: []const u32) !void {
+pub fn acquireColumns(reader: chunks.Chunks.Client, source: *const corpus.Corpus, ids: []const u32) !void {
     var start: usize = 0;
     while (start < ids.len) {
         const count: usize = @min(8, ids.len - start);
@@ -19,7 +19,7 @@ pub fn acquireColumns(world: *chunks.Chunks, source: *const corpus.Corpus, ids: 
             for (0..corpus.section_count) |y| sections[index * corpus.section_count + y] = .{ .world = 0, .x = column.x, .z = column.z, .y = @as(i32, @intCast(y)) + corpus.minimum_y };
         }
         const n = count * corpus.section_count;
-        try world.acquireMany(sections[0..n], leases[0..n]);
+        try reader.acquireMany(sections[0..n], leases[0..n]);
         for (leases[0..n]) |lease| lease.release();
         start += count;
     }
@@ -36,7 +36,8 @@ pub fn seedDatabase(init: std.process.Init, source: *corpus.Corpus, path: []cons
     var store = try storage.Store.init(init.gpa, init.io, .{ .path = path, .metrics = &registry });
     defer store.deinit();
     const space = try store.openSpace(chunks.Chunks.id);
-    const world = try chunks.Chunks.init(arena.allocator(), init.io, .{}, .{ .metrics = &registry, .storage = space, .record_workspaces = try records.Workspaces.init(arena.allocator(), init.io, .{}) });
+    const world = try chunks.Chunks.init(arena.allocator(), init.io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 193 }, .{ .metrics = &registry, .storage = space, .record_workspaces = try records.Workspaces.init(arena.allocator(), init.io, .{}) });
+    const reader = try world.client(.{ .name = "bench", .sections = 192 });
     world.setSource(chunks.Source.init(source, corpus.Corpus.read));
     var ids: [seed_columns]u32 = undefined;
     var start: usize = 0;
@@ -44,7 +45,7 @@ pub fn seedDatabase(init: std.process.Init, source: *corpus.Corpus, path: []cons
     while (start < source.columns.len) {
         const count = @min(ids.len, source.columns.len - start);
         for (ids[0..count], 0..) |*id, index| id.* = @intCast(start + index);
-        try acquireColumns(world, source, ids[0..count]);
+        try acquireColumns(reader, source, ids[0..count]);
         try world.checkpoint(space);
         tick += 1;
         try store.waitDurable(try store.commit(tick));

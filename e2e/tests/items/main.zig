@@ -69,7 +69,7 @@ const Probe = struct {
                 if (state.active and state.position.x == position.x and state.position.y == position.y and state.position.z == position.z)
                     started.* = state.started;
                 if (started.*) |started_tick| {
-                    if (try self.deps.chunks.getBlock(player.world, .{ .x = position.x, .y = position.y, .z = position.z }) != 0) continue;
+                    if (try (try self.deps.chunks.simulation(1)).getBlock(player.world, .{ .x = position.x, .y = position.y, .z = position.z }) != 0) continue;
                     const elapsed = self.deps.players.ticks - started_tick + 1;
                     if (tool == 0 and elapsed < minimum_hand_ticks) return error.HandMiningTooFast;
                     if (tool == 1 and elapsed > maximum_pickaxe_ticks) return error.PickaxeMiningTooSlow;
@@ -87,7 +87,7 @@ const Probe = struct {
         if (std.mem.eql(u8, text, "items_place_setup")) {
             if (!try self.deps.menus.give(index, "minecraft:dirt", 8)) return error.PlacementSetup;
         } else if (std.mem.eql(u8, text, "items_reload")) {
-            if (try self.deps.chunks.getBlock(player.world, .{ .x = 3, .y = 65, .z = -1 }) != protocols.registry.block_dirt_default_state)
+            if (try (try self.deps.chunks.simulation(1)).getBlock(player.world, .{ .x = 3, .y = 65, .z = -1 }) != protocols.registry.block_dirt_default_state)
                 return error.PlacementNotAuthoritative;
             try self.deps.reload.stage("e2e:survival");
         } else if (std.mem.eql(u8, text, "items_mine_setup")) {

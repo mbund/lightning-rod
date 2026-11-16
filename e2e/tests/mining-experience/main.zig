@@ -98,7 +98,7 @@ const Probe = struct {
     pub fn tick(self: *Probe) !void {
         if (self.phase != .normal and self.phase != .silk and self.phase != .wrong) return;
         const player = self.deps.players.records[0];
-        if (player.handle == null or self.deps.mining.states[0].active or try self.deps.chunks.getBlock(player.world, .{ .x = target.x, .y = target.y, .z = target.z }) != 0) return;
+        if (player.handle == null or self.deps.mining.states[0].active or try (try self.deps.chunks.simulation(1)).getBlock(player.world, .{ .x = target.x, .y = target.y, .z = target.z }) != 0) return;
         var remaining: i64 = 0;
         const points = self.deps.player_states.records[0].experience;
         for (self.deps.experience.active.values()) |index| {

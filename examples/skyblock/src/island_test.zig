@@ -192,11 +192,12 @@ test "bounded worker batches reuse scratch and retire worlds before admitting de
     };
     try pool.apply(&worlds, .pause);
     const terrain = worlds[0].simulation.?.get(Chunks);
+    const reader = try terrain.client(.{ .name = "test", .sections = 1 });
     var gate: Gate = .{ .source = terrain.generation.source.? };
     terrain.generation.source = chunks.Source.init(&gate, Gate.generate);
     var ready: [1]bool = undefined;
     var prepared: [1]chunks.Lease = undefined;
-    try terrain.prepareMany(&.{.{ .sections = &.{.{ .world = section.world, .x = 8, .y = 4, .z = 0 }}, .leases = &prepared, .priority = .{} }}, &ready);
+    try reader.prepareMany(&.{.{ .sections = &.{.{ .world = section.world, .x = 8, .y = 4, .z = 0 }}, .leases = &prepared, .priority = .{} }}, &ready);
     if (ready[0]) terrain.releaseMany(&prepared);
     try std.testing.expect(!ready[0]);
     try pool.apply(&worlds, .resume_io);
@@ -238,7 +239,7 @@ test "bounded worker batches reuse scratch and retire worlds before admitting de
     {
         const Read = struct {
             fn run(chunk_cache: *Chunks, at: Section, index: u12) !u16 {
-                const chunk = try chunk_cache.acquire(at);
+                const chunk = try (try chunk_cache.simulation(1)).acquire(at);
                 defer chunk.release();
                 return chunk.view().get(index);
             }

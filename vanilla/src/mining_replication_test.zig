@@ -100,9 +100,9 @@ const Fixture = struct {
             .record_workspaces = workspaces,
         });
         const menus = try PlayerInventory.init(allocator, .{}, .{ .crafting = gameplay_definitions.crafting, .furnaces = gameplay_definitions.furnaces, .players = players, .player_states = player_states, .inventories = ownership, .items = items, .equipment = try EquipmentSlots.init(allocator, .{ .items = items, .enchantments = gameplay_definitions.enchantments }), .dropped = dropped });
-        const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 64, .demand_sections = 0, .cache_groups = 8 }, .{ .metrics = registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const light = try Lighting.init(allocator, .{}, .{ .metrics = registry, .blocks = &gameplay_definitions.blocks.published, .chunks = terrain, .worlds = dimensions });
-        const streaming = try Streaming.init(allocator, std.testing.io, .{ .occlusion = false }, .{ .metrics = registry, .players = players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = light, .blocks = &gameplay_definitions.blocks.published });
+        const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 256, .cache_groups = 8 }, .{ .metrics = registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
+        const light = try Lighting.init(allocator, .{ .chunk_sections = 24 }, .{ .metrics = registry, .blocks = &gameplay_definitions.blocks.published, .chunks = terrain, .worlds = dimensions });
+        const streaming = try Streaming.init(allocator, std.testing.io, .{ .chunk_sections = 24, .occlusion = false }, .{ .metrics = registry, .players = players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = light, .blocks = &gameplay_definitions.blocks.published });
         const blocks = try Blocks.init(allocator, std.testing.io, .{ .metrics = registry, .chunks = terrain, .players = players, .streaming = streaming, .sessions = service, .packets = encoding, .worlds = dimensions }, .{ .delta_sections = 16, .queued_sections = 32 });
         const domains = try Domains.init(allocator, .{}, .{ .players = players });
         domains.tick();
@@ -436,7 +436,7 @@ pub fn verifyReadWindow() !void {
     try action.terrain.setBlock(player.world, at, game_data.registry.block_stone_default_state);
     fixture.mining.states[0] = .{ .generation = player.handle.?.generation, .teleport_id = player.teleport_id, .active = true, .complete = true, .position = position };
     _ = try fixture.tick();
-    try std.testing.expectEqual(@as(u16, 0), try action.terrain.getBlock(player.world, at));
+    try std.testing.expectEqual(@as(u16, 0), try fixture.mining.chunk_client.getBlock(player.world, at));
     try std.testing.expectEqual(@as(usize, 1), action.calls);
     try std.testing.expectEqual(dropped.residents.len - 1, dropped.free_count);
     const worn = (try ownership.get(slot)).stack.?;
@@ -651,7 +651,7 @@ pub fn verifyExperience() !void {
         if (ordinal == 0) normal_experience = total;
         if (ordinal == 1) try std.testing.expectEqual(normal_experience, total);
         const refused = case.exhausted or case.denied or case.mode == .spectator or case.mode == .adventure;
-        try std.testing.expectEqual(if (refused) state else @as(u16, 0), try fixture.mining.deps.chunks.getBlock(world, target));
+        try std.testing.expectEqual(if (refused) state else @as(u16, 0), try fixture.mining.chunk_client.getBlock(world, target));
         if (refused) {
             try std.testing.expectEqual(tool, (try fixture.mining.deps.inventories.get(slot)).stack);
             try std.testing.expectEqualSlices(u8, &random_before, &fixture.mining.random.encode());

@@ -124,7 +124,8 @@ fn verify(init: std.process.Init, source: *const corpus.Corpus, trace: *const tr
     defer store.deinit();
     defer store.transaction().fail();
     const space = try store.openSpace(chunks.Chunks.id);
-    const world = try chunks.Chunks.init(arena.allocator(), init.io, .{}, .{ .metrics = &registry, .storage = space, .record_workspaces = try records.Workspaces.init(arena.allocator(), init.io, .{}) });
+    const world = try chunks.Chunks.init(arena.allocator(), init.io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 193 }, .{ .metrics = &registry, .storage = space, .record_workspaces = try records.Workspaces.init(arena.allocator(), init.io, .{}) });
+    const reader = try world.client(.{ .name = "bench", .sections = 192 });
     const changed = try arena.allocator().alloc(bool, source.columns.len * corpus.section_count);
     @memset(changed, false);
     var iterator = trace.final_edits.keyIterator();
@@ -134,7 +135,7 @@ fn verify(init: std.process.Init, source: *const corpus.Corpus, trace: *const tr
         var sections: [corpus.section_count]chunks.Section = undefined;
         var leases: [corpus.section_count]chunks.Lease = undefined;
         for (&sections, 0..) |*section, y| section.* = .{ .world = 0, .x = column.x, .z = column.z, .y = @as(i32, @intCast(y)) + corpus.minimum_y };
-        try world.acquireMany(&sections, &leases);
+        try reader.acquireMany(&sections, &leases);
         defer for (leases) |lease| lease.release();
         for (leases, 0..) |lease, y| {
             const bytes = lease.record.read();
@@ -190,7 +191,9 @@ fn runCase(init: std.process.Init, source: *corpus.Corpus, trace: *const traces.
         var store = try storage.Store.init(init.gpa, init.io, .{ .path = path, .metrics = &registry, .maximum_wal_pages = options.wal_pages, .checkpoint_bytes = options.checkpoint_bytes });
         defer store.deinit();
         const space = try store.openSpace(chunks.Chunks.id);
-        const world = try chunks.Chunks.init(allocator, init.io, .{ .demand_sections = 0, .cache_sections = cache }, .{ .metrics = &registry, .storage = space, .record_workspaces = try records.Workspaces.init(arena.allocator(), init.io, .{}) });
+        const world = try chunks.Chunks.init(allocator, init.io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = cache + 1 }, .{ .metrics = &registry, .storage = space, .record_workspaces = try records.Workspaces.init(arena.allocator(), init.io, .{}) });
+        // Every section but the one edits hold, as the cache size compared is what the trace reads.
+        const reader = try world.client(.{ .name = "bench", .sections = @min(192, cache) });
         if (pattern == .exploration) world.setSource(chunks.Source.init(source, corpus.Corpus.read));
         const wall_timer = try registry.timer(.{ .namespace = "bench", .name = "step", .description = "One logical second of the access trace" });
         const cpu_timer = try registry.timer(.{ .namespace = "bench", .name = "step_cpu", .description = "Simulation thread CPU per trace step", .clock = .thread_cpu });
@@ -203,7 +206,7 @@ fn runCase(init: std.process.Init, source: *corpus.Corpus, trace: *const traces.
             errdefer std.debug.print("Failed step={d} WAL pages={d}/{d} bytes={d} maintenance={t} copied={d}/{d} committed={d} durable={d} dirty={d}\n", .{ index, store.locations.count(), store.limits.maximum_wal_pages, store.end, store.phase, store.checkpoint_at, store.checkpoint_count, store.saved.sequence, store.durable_sequence, store.dirty_count });
             const start = common.Stamp.now(init.io);
             var phase_start = start;
-            try terrain.acquireColumns(world, source, step.columns);
+            try terrain.acquireColumns(reader, source, step.columns);
             var now = common.Stamp.now(init.io);
             phases[@backingInt(Phase.load)].set(index, now.since(phase_start));
             phase_start = now;

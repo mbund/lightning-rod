@@ -140,7 +140,7 @@ const Probe = struct {
         if (self.ticks == 0) {
             if (alice.position.x != 0.5 or bob.position.x != bob_initial_x or alice.world != bob.world) return error.ReloadLostPlayerState;
             for (blocks, 0..) |block, index| {
-                if (try self.deps.chunks.getBlock(alice.world, .{ .x = 3 + @as(i32, @intCast(index)), .y = 65, .z = 3 }) != protocols.registry.blockStateId(block).?) return error.ReloadLostWorld;
+                if (try (try self.deps.chunks.simulation(1)).getBlock(alice.world, .{ .x = 3 + @as(i32, @intCast(index)), .y = 65, .z = 3 }) != protocols.registry.blockStateId(block).?) return error.ReloadLostWorld;
             }
             bob_state.health = bob_resumed_health;
             try self.deps.players.teleport(bob, bob.world, .{ .x = bob_resumed_x, .y = 65, .z = 0.5 }, .{ .yaw = 0, .pitch = 0 });

@@ -13,6 +13,7 @@ pub const GenerationPriority = @import("generation.zig").Priority;
 pub const Light = @import("light.zig");
 pub const ReadWindow = @import("read_window.zig").ReadWindow;
 pub const classification = @import("classification.zig");
+pub const topology = @import("topology.zig");
 
 const Cache = records.CacheFor(Backend);
 const Backend = struct {
@@ -265,12 +266,23 @@ const background_writeback_attempts = 4;
 pub const Chunks = struct {
     pub const id = "lightning_rod:chunks";
 
+    const edits_client: u8 = 0;
+    const simulation_client: u8 = 1;
+    const unowned: u8 = std.math.maxInt(u8);
+
     pub const Configuration = struct {
         wakeup: ?*std.Io.Event = null,
         cache_sections: usize = 192,
+        /// Sections generated at once. A section being generated for a preparation counts
+        /// against the budget of the client that prepared it.
         generation_slots: usize = 192,
-        /// Background fills leave this capacity available for synchronous demand.
-        demand_sections: usize = 24,
+        /// Sections one batch of edits holds while applying it. Larger batches apply in parts.
+        edit_sections: usize = 24,
+        /// Sections gameplay on the simulation thread holds at once, all plugins together. They
+        /// run one after another, so they share one budget sized for the deepest nesting.
+        simulation_sections: usize = 64,
+        /// Clients that may register a budget.
+        clients: usize = 32,
         cache_groups: usize = 8,
         /// Maximum groups per storage read batch. Write bytes and prepared results are independent.
         storage_batch_groups: usize = 8,
@@ -281,13 +293,100 @@ pub const Chunks = struct {
         storage_group_side: u8 = 4,
         observers: usize = 8,
 
-        /// The policy for a server with this many player slots. The section cache grows
-        /// by one column of sections for each slot. Two thirds of that is kept for the
-        /// simulation, which reads blocks where players build while the terrain thread
-        /// fills the rest with whatever it delivers.
+        /// The policy for a server with this many player slots. A vanilla server registers 480
+        /// sections of budgets: edits 24, the simulation 64, streaming and the lighting solver
+        /// 192 each and block sync 8. As much again stays warm for whoever reads next, and the
+        /// cache grows by two columns of sections for each slot.
         pub fn forPlayers(slots: usize) Configuration {
             assert(slots != 0);
-            return .{ .cache_sections = 192 + 48 * slots, .demand_sections = 24 + 16 * slots };
+            return .{ .cache_sections = 2 * 480 + 48 * slots };
+        }
+    };
+
+    /// What a client of the section cache may hold at once. Budgets are registered while the
+    /// server starts and together fit the cache, so a client waits only on its own work, on
+    /// I/O and on generation, never on what another client holds.
+    pub const Budget = struct {
+        name: []const u8,
+        sections: usize,
+    };
+
+    const ClientState = struct {
+        name: []const u8,
+        budget: usize,
+        /// Leases and sections being generated for the client's preparations.
+        held: usize = 0,
+        /// Of `held`, the sections being generated.
+        generating: usize = 0,
+    };
+
+    /// A registered reader of the section cache. Every lease it takes counts against its budget
+    /// until released.
+    pub const Client = struct {
+        chunks: *Chunks,
+        index: u8,
+
+        pub fn budget(self: Client) usize {
+            return self.chunks.clients[self.index].budget;
+        }
+
+        /// Sections the client may still lease or prepare. Sections being generated for its
+        /// preparations count until they are ready, so this only grows behind its back.
+        pub fn available(self: Client) usize {
+            const owner = self.chunks;
+            owner.mutex.lockUncancelable(owner.io);
+            defer owner.mutex.unlock(owner.io);
+            const state = owner.clients[self.index];
+            return state.budget - state.held;
+        }
+
+        pub fn acquire(self: Client, section: Section) !Lease {
+            var out: [1]Lease = undefined;
+            try self.acquireMany(&.{section}, &out);
+            return out[0];
+        }
+
+        pub fn acquireMany(self: Client, sections: []const Section, output: []Lease) !void {
+            const owner = self.chunks;
+            owner.mutex.lockUncancelable(owner.io);
+            defer owner.mutex.unlock(owner.io);
+            try owner.acquireLocked(self.index, sections, output, null);
+        }
+
+        /// Optional leases may be released to fit the budget or before waiting for I/O. The
+        /// caller owns the remaining slice on both success and failure.
+        pub fn acquireManyRetaining(self: Client, sections: []const Section, output: []Lease, retention: *Retention) !void {
+            const owner = self.chunks;
+            assert(sections.len == output.len and sections.len <= 192);
+            assert(retention.limit <= self.budget() -| sections.len);
+            owner.mutex.lockUncancelable(owner.io);
+            defer owner.mutex.unlock(owner.io);
+            owner.releaseRetained(retention, @min(retention.limit, retention.leases.len));
+            try owner.acquireLocked(self.index, sections, output, retention);
+        }
+
+        /// Leases sections only if every one is in memory already. Does no IO and waits for
+        /// nothing but the cache lock. False leases nothing.
+        pub fn acquireCached(self: Client, sections: []const Section, output: []Lease) bool {
+            return self.chunks.acquireCached(self.index, sections, output);
+        }
+
+        /// Complete results transfer their leases to the caller. Incomplete outputs remain
+        /// untouched. Never waits on I/O the batch did not start.
+        pub fn prepareMany(self: Client, requests: []const Preparation, completed: []bool) !void {
+            return self.chunks.prepareMany(self.index, requests, completed);
+        }
+
+        pub fn iterate(self: Client, sections: []const Section, leases: []Lease) Iterator {
+            assert(leases.len > 0);
+            return .{ .client = self, .sections = sections, .leases = leases };
+        }
+
+        /// Reads one block, from storage if the section is not in memory.
+        pub fn getBlock(self: Client, world: World, pos: Position) !u16 {
+            const lease = try self.acquire(sectionAt(world, pos));
+            defer lease.release();
+            return lease.get(localIndex(pos));
         }
     };
 
@@ -322,10 +421,17 @@ pub const Chunks = struct {
     };
     read_workspaces: []ReadWorkspace,
     generating: []?Cache.Fill,
+    /// By cache entry, the client whose budget a section being generated counts against, or
+    /// `unowned` when generation fills a section its requester holds a lease on.
+    generating_owner: []u8,
     generating_count: usize = 0,
     borrowed_count: usize = 0,
     cache: Cache,
-    demand_sections: usize,
+    clients: []ClientState,
+    client_count: usize = 0,
+    /// Sections reserved by edits and registered clients together.
+    budgeted: usize,
+    edit_sections: usize,
     mutex: std.Io.Mutex = .init,
     writeback_mutex: std.Io.Mutex = .init,
     available: std.Io.Condition = .init,
@@ -339,6 +445,8 @@ pub const Chunks = struct {
     io: std.Io,
     wakeup: ?*std.Io.Event = null,
 
+    /// Topologies the simulation thread reads summaries of, answered in `poll`.
+    topologies: ?*topology.Topology = null,
     generation: *Generation,
     observers: []Observer,
     ready_observers: []*std.Io.Event,
@@ -367,12 +475,18 @@ pub const Chunks = struct {
     }
 
     pub fn allocate(allocator: std.mem.Allocator, io: std.Io, configuration: Configuration, deps: Dependencies) !*Chunks {
-        if (configuration.demand_sections > configuration.cache_sections or configuration.generation_slots == 0) return error.InvalidConfiguration;
+        const generation_slots = @min(configuration.cache_sections, configuration.generation_slots);
+        if (configuration.generation_slots == 0 or configuration.edit_sections == 0 or configuration.edit_sections > 192 or configuration.clients == 0 or configuration.clients >= unowned)
+            return error.InvalidConfiguration;
+        if (configuration.simulation_sections > 192) return error.InvalidConfiguration;
+        if (configuration.clients < 2 or configuration.edit_sections + configuration.simulation_sections > configuration.cache_sections) return error.InvalidConfiguration;
         const self = try allocator.create(Chunks);
         self.* = .{
             .io = io,
             .wakeup = configuration.wakeup,
-            .demand_sections = configuration.demand_sections,
+            .clients = try allocator.alloc(ClientState, configuration.clients),
+            .budgeted = configuration.edit_sections + configuration.simulation_sections,
+            .edit_sections = configuration.edit_sections,
             .cache = try Cache.init(allocator, io, .{ .store = try ChunkStore.allocate(allocator, io, deps.storage, configuration.cache_groups, deps.metrics, deps.record_workspaces.resources, .{
                 .side = configuration.storage_group_side,
                 .batch_groups = configuration.storage_batch_groups,
@@ -390,16 +504,54 @@ pub const Chunks = struct {
             .ready_observers = try allocator.alloc(*std.Io.Event, configuration.observers),
             .generation = undefined,
             .generating = try allocator.alloc(?Cache.Fill, configuration.cache_sections),
+            .generating_owner = try allocator.alloc(u8, configuration.cache_sections),
             .writing = try allocator.alloc(bool, configuration.cache_sections),
             .dirty_since = try allocator.alloc(u64, configuration.cache_sections),
             .checkpoint_leases = try allocator.alloc(Cache.Lease, configuration.cache_sections),
             .read_workspaces = try ReadWorkspace.init(allocator, deps.record_workspaces.resources.readers.slots.len, @min(192, configuration.cache_sections)),
         };
         @memset(self.generating, null);
+        @memset(self.generating_owner, unowned);
         @memset(self.writing, false);
-        self.generation = try Generation.init(allocator, io, @min(configuration.cache_sections, configuration.generation_slots), self.ready(), deps.metrics);
+        // Edits and the simulation are the first clients. Their budgets are part of `budgeted` already.
+        self.clients[edits_client] = .{ .name = "edits", .budget = configuration.edit_sections };
+        self.clients[simulation_client] = .{ .name = "simulation", .budget = configuration.simulation_sections };
+        self.client_count = 2;
+        self.generation = try Generation.init(allocator, io, generation_slots, self.ready(), deps.metrics);
         try self.generation.configureWork(configuration.generation_work);
         return self;
+    }
+
+    /// Registers a client while the server starts. Fails when the budgets would outgrow the cache,
+    /// naming each one, so a server is sized before it runs rather than starved while it does.
+    pub fn client(self: *Chunks, budget: Budget) !Client {
+        if (budget.sections == 0 or budget.sections > 192 or budget.name.len == 0) return error.InvalidBudget;
+        if (self.client_count == self.clients.len) return error.ClientCapacity;
+        if (self.budgeted + budget.sections > self.cache.entries.len) {
+            std.log.warn("event=chunk_budget_exceeded cache_sections={d} budgeted={d} requested={d} client={s}", .{ self.cache.entries.len, self.budgeted, budget.sections, budget.name });
+            for (self.clients[0..self.client_count]) |state| std.log.warn("event=chunk_budget client={s} sections={d}", .{ state.name, state.budget });
+            return error.CacheBudgetExceeded;
+        }
+        self.clients[self.client_count] = .{ .name = budget.name, .budget = budget.sections };
+        self.budgeted += budget.sections;
+        self.client_count += 1;
+        return .{ .chunks = self, .index = @intCast(self.client_count - 1) };
+    }
+
+    /// The client gameplay reads through on the simulation thread. A plugin names the most it
+    /// holds at once, nested reads included, so a server too small for it fails at startup.
+    pub fn simulation(self: *Chunks, sections: usize) !Client {
+        const state = self.clients[simulation_client];
+        if (sections > state.budget) {
+            std.log.warn("event=chunk_budget_exceeded client=simulation sections={d} requested={d}", .{ state.budget, sections });
+            return error.CacheBudgetExceeded;
+        }
+        return .{ .chunks = self, .index = simulation_client };
+    }
+
+    /// Sections no budget holds, which further clients may register.
+    pub fn unbudgeted(self: *const Chunks) usize {
+        return self.cache.entries.len - self.budgeted;
     }
 
     pub fn setSource(self: *Chunks, source: Source) void {
@@ -443,12 +595,6 @@ pub const Chunks = struct {
 
     /// This targeted query may read disk. Reuse section leases for scans and
     /// acquireMany for a known neighborhood instead of repeatedly calling it.
-    pub fn getBlock(self: *Chunks, world: World, pos: Position) !u16 {
-        const lease = try self.acquire(sectionAt(world, pos));
-        defer lease.release();
-        return lease.get(localIndex(pos));
-    }
-
     pub fn lightDependencies(self: *Chunks, input: []const Light.Request, snapshots: []Light.Dependencies) !void {
         assert(input.len == snapshots.len and input.len <= Light.dependency_batch_max);
         // A flush can clear dirtiness after reading older revisions. Observe dirtiness first.
@@ -549,7 +695,7 @@ pub const Chunks = struct {
         var start: usize = 0;
         while (start < sections.len) {
             // A batch ends where its edits would outgrow the previous states kept for observers.
-            const limit = @min(changed.len, self.cache.entries.len, sections.len - start);
+            const limit = @min(changed.len, self.edit_sections, sections.len - start);
             var count: usize = 0;
             var edits: usize = 0;
             while (count < limit) : (count += 1) {
@@ -591,7 +737,7 @@ pub const Chunks = struct {
         }
         var indices: [192]usize = undefined;
         while (true) {
-            try self.acquireLocked(positions[0..sections.len], leases[0..sections.len], null);
+            try self.acquireLocked(edits_client, positions[0..sections.len], leases[0..sections.len], null);
             for (leases[0..sections.len], indices[0..sections.len]) |lease, *index| index.* = lease.record.index;
             std.mem.sort(usize, indices[0..sections.len], {}, std.sort.asc(usize));
             var first: usize = 0;
@@ -634,30 +780,7 @@ pub const Chunks = struct {
         }
     }
 
-    pub fn acquire(self: *Chunks, section: Section) !Lease {
-        var out: [1]Lease = undefined;
-        try self.acquireMany(&.{section}, &out);
-        return out[0];
-    }
-
-    pub fn acquireMany(self: *Chunks, sections: []const Section, output: []Lease) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.acquireLocked(sections, output, null);
-    }
-
     pub const Retention = struct { leases: []Lease, limit: usize };
-
-    /// Optional leases may be released to fit the window or before waiting for cache space.
-    /// The caller owns the remaining slice on both success and failure.
-    pub fn acquireManyRetaining(self: *Chunks, sections: []const Section, output: []Lease, retention: *Retention) !void {
-        assert(sections.len == output.len and sections.len <= 192);
-        assert(retention.limit <= self.cache.entries.len -| sections.len);
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        self.releaseRetained(retention, @min(retention.limit, retention.leases.len));
-        try self.acquireLocked(sections, output, retention);
-    }
 
     fn releaseRetained(self: *Chunks, retention: *Retention, keep: usize) void {
         assert(keep <= retention.leases.len);
@@ -668,9 +791,19 @@ pub const Chunks = struct {
         if (self.background_owner.load(.acquire) != std.Thread.getCurrentId()) self.ready().set(self.io);
     }
 
-    fn acquireLocked(self: *Chunks, sections: []const Section, output: []Lease, retention: ?*Retention) !void {
+    fn acquireLocked(self: *Chunks, client_index: u8, sections: []const Section, output: []Lease, retention: ?*Retention) !void {
         assert(sections.len == output.len);
-        if (sections.len > self.cache.entries.len) return error.WorkingSetTooLarge;
+        const state = &self.clients[client_index];
+        if (sections.len > state.budget) return error.WorkingSetTooLarge;
+        // Optional leases count against the budget too, so they give way first.
+        if (retention) |optional| if (state.held + sections.len > state.budget) self.releaseRetained(optional, 0);
+        // The client's own sections being generated free room once they are ready.
+        while (state.held + sections.len > state.budget and state.held - state.generating + sections.len <= state.budget) try self.waitGenerated();
+        const retained = if (retention) |optional| optional.leases.len else 0;
+        if (state.held + sections.len > state.budget) {
+            std.log.warn("event=chunk_budget_overrun client={s} budget={d} held={d} requested={d} retained={d}", .{ state.name, state.budget, state.held, sections.len, retained });
+            return error.CacheBudgetExceeded;
+        }
         self.generation.promote(sections);
         try self.collectGenerated();
         var done: usize = 0;
@@ -693,21 +826,11 @@ pub const Chunks = struct {
                 switch (reservation) {
                     .blocked => |shortfall| {
                         assert(shortfall > 0 and shortfall <= count);
-                        if (retention) |optional| if (optional.leases.len != 0) {
-                            self.releaseRetained(optional, 0);
-                            continue;
-                        };
-                        const writing = std.mem.indexOfScalar(bool, self.writing, true) != null;
-                        const loading = for (self.cache.entries) |entry| {
-                            if (entry.filling and !entry.loaded) break true;
-                        } else false;
-                        if (writing or loading) {
-                            self.waitAvailableLocked();
-                            continue;
-                        }
-                        if (self.generating_count == 0) return error.CachePinned;
-                        _ = self.generation.cancelPrefetch(shortfall);
-                        try self.waitGenerated();
+                        // Every lease and every section generated for a preparation counts against
+                        // a budget, and budgets fit the cache. Only the pins a write holds on
+                        // sections nobody leases are left, and the write ends on its own.
+                        assert(std.mem.indexOfScalar(bool, self.writing, true) != null);
+                        self.waitAvailableLocked();
                         continue;
                     },
                     .ready => break,
@@ -719,14 +842,16 @@ pub const Chunks = struct {
             if (self.generation.source != null) try self.generate(sections[done..][0..count], cached[0..count]);
             for (cached[0..count], output[done..][0..count]) |lease, *out| out.* = .{
                 .owner = self,
+                .client = client_index,
                 .record = .{ .index = lease.index, .generation = lease.generation, .version = lease.revision(), .bytes = lease.read() },
             };
             self.borrowed_count += count;
+            state.held += count;
             done += count;
         }
     }
 
-    fn submitGenerated(self: *Chunks, sections: []const Section, leases: []const Cache.Lease, priority: GenerationPriority) void {
+    fn submitGenerated(self: *Chunks, sections: []const Section, leases: []const Cache.Lease, priority: GenerationPriority, owner: u8) void {
         var requests: [192]Generation.Request = undefined;
         var held: [192]Cache.Fill = undefined;
         var count: usize = 0;
@@ -742,6 +867,11 @@ pub const Chunks = struct {
         for (held[0..count], 0..) |fill, index| {
             if (index < accepted) {
                 self.generating_count += 1;
+                self.generating_owner[fill.lease.index] = owner;
+                if (owner != unowned) {
+                    self.clients[owner].held += 1;
+                    self.clients[owner].generating += 1;
+                }
             } else {
                 self.generating[fill.lease.index] = null;
                 fill.cancel();
@@ -884,7 +1014,7 @@ pub const Chunks = struct {
     fn generate(self: *Chunks, sections: []const Section, leases: []const Cache.Lease) !void {
         while (true) {
             try self.collectGenerated();
-            self.submitGenerated(sections, leases, .{ .urgency = .required });
+            self.submitGenerated(sections, leases, .{ .urgency = .required }, unowned);
             for (leases) |lease| {
                 if (self.generating[lease.index] != null) break;
                 if (lease.read() == null) break;
@@ -958,6 +1088,38 @@ pub const Chunks = struct {
 
     pub fn registerClassification(self: *Chunks, allocator: std.mem.Allocator, properties: []const u8, selected: u8, codec: ?classification.Codec) !*const classification.Index {
         return self.cache.backend.store.registerClassification(allocator, properties, selected, codec);
+    }
+
+    /// Registers a classification and opens a queue for its column summaries. Startup only.
+    pub fn openTopology(self: *Chunks, allocator: std.mem.Allocator, properties: []const u8, selected: u8, codec: ?classification.Codec, capacity: usize) !*topology.Topology {
+        assert(self.background_owner.load(.acquire) == 0);
+        _ = try self.registerClassification(allocator, properties, selected, codec);
+        const opened = try topology.Topology.init(allocator, self.io, properties, selected, capacity, self.ready());
+        opened.next = self.topologies;
+        self.topologies = opened;
+        return opened;
+    }
+
+    fn answerTopologies(self: *Chunks) bool {
+        var answered = false;
+        var cursor = self.topologies;
+        while (cursor) |queue| : (cursor = queue.next) {
+            while (true) {
+                const count = queue.claim(queue.claimed);
+                if (count == 0) break;
+                const columns = queue.claimed[0..count];
+                const summaries = queue.summaries[0..count];
+                // A failed read is answered too, so the asker may try again.
+                var available = true;
+                self.summarize(columns, summaries, queue.properties, queue.selected) catch |err| {
+                    std.log.warn("event=topology_summary_failed reason={t}", .{err});
+                    available = false;
+                };
+                queue.answer(columns, summaries, available);
+                answered = true;
+            }
+        }
+        return answered;
     }
 
     pub const GroupWindow = ChunkStore.GroupWindow;
@@ -1047,10 +1209,6 @@ pub const Chunks = struct {
         try self.cache.backend.store.classify(reads[0..count], properties, selected);
     }
 
-    pub fn backgroundCapacity(self: *const Chunks) usize {
-        return self.cache.entries.len - self.demand_sections;
-    }
-
     /// The stamp of the edit batch being announced. Valid during a change notification only.
     pub fn editStamp(self: *const Chunks) u64 {
         assert(self.notifying);
@@ -1087,12 +1245,12 @@ pub const Chunks = struct {
         return .{ .stamp = self.edit_stamp, .write_mark = self.write_mark.load(.monotonic), .count = found };
     }
 
-    /// Leases sections only if every one is in memory already. Does no IO and waits for
-    /// nothing but the cache lock. False leases nothing.
-    pub fn acquireCached(self: *Chunks, sections: []const Section, output: []Lease) bool {
-        assert(sections.len == output.len and sections.len <= self.cache.entries.len);
+    fn acquireCached(self: *Chunks, client_index: u8, sections: []const Section, output: []Lease) bool {
+        assert(sections.len == output.len);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        const state = &self.clients[client_index];
+        assert(state.held + sections.len <= state.budget);
         var slots: [192]usize = undefined;
         assert(sections.len <= slots.len);
         for (sections, slots[0..sections.len]) |section, *slot| {
@@ -1105,9 +1263,10 @@ pub const Chunks = struct {
             const lease = self.cache.pin(slot);
             // In use like any other lease, so it is the last to be evicted.
             self.cache.entries[slot].referenced = true;
-            out.* = .{ .owner = self, .record = .{ .index = lease.index, .generation = lease.generation, .version = lease.revision(), .bytes = lease.read() } };
+            out.* = .{ .owner = self, .client = client_index, .record = .{ .index = lease.index, .generation = lease.generation, .version = lease.revision(), .bytes = lease.read() } };
         }
         self.borrowed_count += sections.len;
+        state.held += sections.len;
         return true;
     }
 
@@ -1130,17 +1289,7 @@ pub const Chunks = struct {
         return self.flush_mark;
     }
 
-    /// Sections one simulation-thread acquire can always obtain while the background
-    /// holds its full share. Larger batches can find every other entry pinned. A
-    /// configuration without a reserved share still reports one section so that
-    /// batch loops always advance.
-    pub fn demandCapacity(self: *const Chunks) usize {
-        assert(self.demand_sections <= self.cache.entries.len);
-        return @max(self.demand_sections, 1);
-    }
-
-    /// Complete results transfer their leases to the caller. Incomplete outputs remain untouched.
-    pub fn prepareMany(self: *Chunks, requests: []const Preparation, completed: []bool) !void {
+    fn prepareMany(self: *Chunks, client_index: u8, requests: []const Preparation, completed: []bool) !void {
         assert(self.ownsCurrentThread() and requests.len == completed.len);
         @memset(completed, false);
         var sections: [192]Section = undefined;
@@ -1152,24 +1301,45 @@ pub const Chunks = struct {
             @memcpy(sections[count..][0..request.sections.len], request.sections);
             count += request.sections.len;
         }
-        if (count > self.backgroundCapacity()) return error.WorkingSetTooLarge;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.collectGenerated();
         var keys: [192][16]u8 = undefined;
         var slices: [192][]const u8 = undefined;
         var leases: [192]Cache.Lease = undefined;
+        // A section this client is having generated counts against its budget already, so
+        // preparing it again while it generates takes nothing more.
+        var fresh: usize = 0;
         for (sections[0..count], 0..) |section, index| {
             keys[index] = encodeKey(section);
             slices[index] = &keys[index];
+            const slot = self.cache.lookup.get(&keys[index]);
+            fresh += @intFromBool(slot == null or self.generating[slot.?] == null or self.generating_owner[slot.?] != client_index);
         }
+        const state = &self.clients[client_index];
+        if (fresh > state.budget) return error.WorkingSetTooLarge;
+        if (state.held + fresh > state.budget) {
+            // Leases the client holds itself never free on their own.
+            if (state.held - state.generating + fresh > state.budget) {
+                std.log.warn("event=chunk_budget_overrun client={s} budget={d} held={d} generating={d} requested={d}", .{ state.name, state.budget, state.held, state.generating, fresh });
+                return error.CacheBudgetExceeded;
+            }
+            // Room comes back as its own sections finish generating, and the ready event wakes
+            // it then, so the batch is not ready yet.
+            return;
+        }
+        // The batch pins its fresh sections until it returns, including while I/O releases the lock.
+        state.held += fresh;
+        defer state.held -= fresh;
         // A writeback cleans its victims, so the reservation is tried again at once. Returning
         // instead lets an edit dirty a victim before the next call, and a request as large as
         // the background capacity then never finds every victim clean.
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
             var victims: [192]Cache.Lease = undefined;
-            switch (try self.cache.reserveMany(slices[0..count], leases[0..count], &victims, self.backgroundCapacity())) {
+            switch (try self.cache.reserveMany(slices[0..count], leases[0..count], &victims, self.cache.entries.len)) {
+                // Budgets fit the cache, so only writes, loads and generation in flight block.
+                // The batch returns and tries again on the next wake.
                 .blocked => return,
                 .ready => break,
                 .writeback => |held| {
@@ -1182,7 +1352,6 @@ pub const Chunks = struct {
                 },
             }
         }
-        assert(self.cache.pinned_entries <= self.backgroundCapacity());
         defer for (leases[0..count]) |lease| lease.release();
         try self.loadLocked(leases[0..count]);
         var begin: usize = 0;
@@ -1196,9 +1365,10 @@ pub const Chunks = struct {
             if (complete.*) {
                 for (held, request.leases) |lease, *out| {
                     _ = lease.retain();
-                    out.* = .{ .owner = self, .record = .{ .index = lease.index, .generation = lease.generation, .version = lease.revision(), .bytes = lease.read() } };
+                    out.* = .{ .owner = self, .client = client_index, .record = .{ .index = lease.index, .generation = lease.generation, .version = lease.revision(), .bytes = lease.read() } };
                 }
                 self.borrowed_count += held.len;
+                state.held += held.len;
             }
             begin += held.len;
         }
@@ -1211,7 +1381,7 @@ pub const Chunks = struct {
                 var last = first;
                 var end = start;
                 while (last < requests.len and std.meta.eql(requests[last].priority, priority)) : (last += 1) end += requests[last].sections.len;
-                self.submitGenerated(sections[start..end], leases[start..end], priority);
+                self.submitGenerated(sections[start..end], leases[start..end], priority, client_index);
                 first = last;
                 start = end;
             }
@@ -1242,6 +1412,15 @@ pub const Chunks = struct {
                 const fill = self.generating[completion.token].?;
                 self.generating[completion.token] = null;
                 self.generating_count -= 1;
+                const owner = self.generating_owner[completion.token];
+                self.generating_owner[completion.token] = unowned;
+                if (owner != unowned) {
+                    assert(self.clients[owner].held > 0 and self.clients[owner].generating > 0);
+                    self.clients[owner].held -= 1;
+                    self.clients[owner].generating -= 1;
+                    // The owner may be waiting for its budget to free.
+                    self.available.broadcast(self.io);
+                }
                 const bytes = completion.result catch |err| {
                     fill.cancel();
                     if (err != error.Obsolete and failure == null) failure = err;
@@ -1279,6 +1458,9 @@ pub const Chunks = struct {
     fn releaseLocked(self: *Chunks, leases: []const Lease) void {
         for (leases) |lease| {
             assert(lease.owner == self);
+            const state = &self.clients[lease.client];
+            assert(state.held > 0);
+            state.held -= 1;
             lease.cached().release();
         }
         assert(self.borrowed_count >= leases.len);
@@ -1286,7 +1468,7 @@ pub const Chunks = struct {
     }
 
     pub const Iterator = struct {
-        chunks: *Chunks,
+        client: Client,
         sections: []const Section,
         leases: []Lease,
         live: usize = 0,
@@ -1298,9 +1480,9 @@ pub const Chunks = struct {
             if (self.next_section == self.sections.len)
                 return null;
 
-            const count = @min(self.leases.len, self.chunks.cache.entries.len, self.sections.len - self.next_section);
+            const count = @min(self.leases.len, self.client.budget(), self.sections.len - self.next_section);
             assert(count > 0);
-            try self.chunks.acquireMany(self.sections[self.next_section..][0..count], self.leases[0..count]);
+            try self.client.acquireMany(self.sections[self.next_section..][0..count], self.leases[0..count]);
             self.live = count;
             self.next_section += count;
             assert(self.next_section <= self.sections.len);
@@ -1308,20 +1490,11 @@ pub const Chunks = struct {
         }
 
         pub fn deinit(self: *Iterator) void {
-            self.chunks.releaseMany(self.leases[0..self.live]);
+            self.client.chunks.releaseMany(self.leases[0..self.live]);
 
             self.live = 0;
         }
     };
-
-    pub fn iterate(self: *Chunks, sections: []const Section, leases: []Lease) Iterator {
-        assert(leases.len > 0);
-        return .{
-            .chunks = self,
-            .sections = sections,
-            .leases = leases,
-        };
-    }
 
     pub fn checkpoint(self: *Chunks, _: storage.Space) !void {
         self.mutex.lockUncancelable(self.io);
@@ -1364,6 +1537,7 @@ pub const Chunks = struct {
         self.mutex.unlock(self.io);
         try collected;
         var progressed = try self.cache.backend.store.prepareMerge();
+        progressed = self.answerTopologies() or progressed;
         if (self.writeback_mutex.tryLock()) {
             defer self.writeback_mutex.unlock(self.io);
             progressed = try self.cache.backend.store.publishPrepared() != 0 or progressed;
@@ -1375,6 +1549,8 @@ pub const Chunks = struct {
 /// Release a read lease before editing its section. Pin bookkeeping is synchronized separately.
 pub const Lease = struct {
     owner: *Chunks,
+    /// The client whose budget this lease counts against.
+    client: u8,
     record: Record,
 
     pub const Record = struct {

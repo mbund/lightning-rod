@@ -52,13 +52,15 @@ pub const Spawn = struct {
         }
     };
     deps: Dependencies,
+    /// Reads block sections from the simulation budget, at most 32 at once.
+    chunk_client: chunks.Chunks.Client,
     config: Configuration,
     entries: []Entry,
 
     pub fn init(allocator: std.mem.Allocator, configuration: Configuration, deps: Dependencies) !*Spawn {
         try validate(.{ .position = configuration.origin, .radius = configuration.radius });
         const self = try allocator.create(Spawn);
-        self.* = .{ .deps = deps, .config = configuration, .entries = try allocator.alloc(Entry, deps.worlds.entries.len) };
+        self.* = .{ .deps = deps, .chunk_client = try deps.chunks.simulation(32), .config = configuration, .entries = try allocator.alloc(Entry, deps.worlds.entries.len) };
         @memset(self.entries, .{});
         return self;
     }
@@ -207,12 +209,11 @@ pub const Spawn = struct {
         var candidate: ?i32 = null;
         var blocked = false;
         var above: ?u16 = null;
-        var window = chunks.ReadWindow(32).init(self.deps.chunks);
+        var window = chunks.ReadWindow(32).init(self.chunk_client);
         defer window.deinit();
         var top = dimension.minimum_section + @as(i32, dimension.section_count);
         while (top > dimension.minimum_section) {
-            // Reads stay within the simulation share of the chunk cache; the background may pin the rest.
-            const count: usize = @min(32, self.deps.chunks.demandCapacity(), @as(usize, @intCast(top - dimension.minimum_section)));
+            const count: usize = @min(32, self.chunk_client.budget(), @as(usize, @intCast(top - dimension.minimum_section)));
             var sections: [32]chunks.Section = undefined;
             var views: [32]chunks.View = undefined;
             for (sections[0..count], 0..) |*section, index| section.* = .{ .world = world, .x = @divFloor(x, 16), .z = @divFloor(z, 16), .y = top - 1 - @as(i32, @intCast(index)) };
@@ -258,7 +259,7 @@ pub const Spawn = struct {
                 if (low[0] < minimum or high[0] > maximum or low[2] < minimum or high[2] > maximum) return false;
             }
         }
-        var window = chunks.ReadWindow(32).init(self.deps.chunks);
+        var window = chunks.ReadWindow(32).init(self.chunk_client);
         defer window.deinit();
         var positions: [36]chunks.Position = undefined;
         var sections: [36]chunks.Section = undefined;
@@ -274,7 +275,7 @@ pub const Spawn = struct {
         var states: [36]u16 = undefined;
         var begin: usize = 0;
         while (begin < count) {
-            const end = @min(begin + @min(32, self.deps.chunks.demandCapacity()), count);
+            const end = @min(begin + @min(32, self.chunk_client.budget()), count);
             try window.readMany(sections[begin..end], views[begin..end]);
             for (positions[begin..end], views[begin..end], states[begin..end]) |at, view, *state| state.* = view.get(chunks.localIndex(at));
             begin = end;

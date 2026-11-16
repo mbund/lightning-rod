@@ -72,7 +72,7 @@ const Probe = struct {
         const self = try allocator.create(Probe);
         self.* = .{ .deps = deps };
         if (deps.worlds.find("e2e:overworld_two")) |restored| {
-            if (try deps.chunks.getBlock(restored.id, .{ .x = 10, .y = 64, .z = 10 }) != protocols.registry.block_stone_default_state)
+            if (try (try deps.chunks.simulation(1)).getBlock(restored.id, .{ .x = 10, .y = 64, .z = 10 }) != protocols.registry.block_stone_default_state)
                 return error.RuntimeWorldNotRestored;
             std.log.info("event=runtime_world_restored id={d}", .{restored.id});
         }
@@ -152,7 +152,7 @@ const Probe = struct {
                 try self.deps.dropped.put(self.isolated_item, metadata);
             },
             .verify => {
-                if (try self.deps.chunks.getBlock(0, .{ .x = 10, .y = 65, .z = 10 }) != protocols.registry.block_stone_default_state or try self.deps.chunks.getBlock(1, .{ .x = 10, .y = 65, .z = 10 }) != 0)
+                if (try (try self.deps.chunks.simulation(1)).getBlock(0, .{ .x = 10, .y = 65, .z = 10 }) != protocols.registry.block_stone_default_state or try (try self.deps.chunks.simulation(1)).getBlock(1, .{ .x = 10, .y = 65, .z = 10 }) != 0)
                     return error.CrossWorldPlacement;
 
                 var metadata = try self.deps.dropped.get(self.isolated_item);

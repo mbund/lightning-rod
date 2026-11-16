@@ -214,6 +214,8 @@ pub const BlockSynchronization = struct {
     views: []Streaming.View,
     epoch: u64 = 0,
     deps: Dependencies,
+    /// Reads the changed sections and their neighbours, eight at a time.
+    chunk_client: chunks.Chunks.Client,
     observers: []Observer,
     pending: []u64,
     full: []u64,
@@ -291,6 +293,7 @@ pub const BlockSynchronization = struct {
             .batch_cpu = try deps.metrics.timer(.{ .name = "blocks.synchronization.batch.cpu", .description = "Block update batch work on the owning thread", .clock = .thread_cpu, .detailed = true }),
             .planning_words = try deps.metrics.counter(.{ .name = "blocks.synchronization.planning_words", .description = "Nonempty pending section words examined during block delivery planning" }),
             .deps = deps,
+            .chunk_client = try deps.chunks.client(.{ .name = "block sync", .sections = 8 }),
             .batch_limit = maximum.operations,
             .observers = observers,
             .pending = pending,
@@ -400,7 +403,7 @@ pub const BlockSynchronization = struct {
         }
         var leases: [7]chunks.Lease = undefined;
         var ready: [1]bool = undefined;
-        try self.deps.chunks.prepareMany(&.{.{ .sections = sections[0..count], .leases = leases[0..count], .priority = .{ .urgency = .occupied, .player = player } }}, &ready);
+        try self.chunk_client.prepareMany(&.{.{ .sections = sections[0..count], .leases = leases[0..count], .priority = .{ .urgency = .occupied, .player = player } }}, &ready);
         if (!ready[0]) return true;
         defer self.deps.chunks.releaseMany(leases[0..count]);
         const center = leases[0].view();
@@ -657,7 +660,7 @@ pub const BlockSynchronization = struct {
         defer self.planning_words.add(examined);
 
         while (candidates.view().any()) {
-            if (completed == maximum_items or planned == @min(maximum_items, self.deps.chunks.cache.entries.len)) break;
+            if (completed == maximum_items or planned == @min(maximum_items, self.chunk_client.budget())) break;
 
             const selected = candidates.view().firstFrom(self.next_player) orelse candidates.view().firstFrom(0).?;
             self.next_player = (selected + 1) % self.observers.len;
@@ -802,7 +805,7 @@ pub const BlockSynchronization = struct {
             sections[index] = plan.section;
             preparations[index] = .{ .sections = sections[index..][0..1], .leases = leases[index..][0..1], .priority = .{ .urgency = .occupied, .player = plan.recipients[0].index } };
         }
-        try self.deps.chunks.prepareMany(preparations[0..planned], ready[0..planned]);
+        try self.chunk_client.prepareMany(preparations[0..planned], ready[0..planned]);
         var available: usize = 0;
         for (ready[0..planned], 0..) |complete, index| {
             if (!complete) {

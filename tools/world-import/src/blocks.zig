@@ -28,7 +28,7 @@ pub fn column(owner: *world_import.Import, scratch: std.mem.Allocator, doc: nbt.
         const dimension = owner.worlds.get(world).?.dimension;
         const section = @divFloor(key.position.y, 16);
         if (section < dimension.minimum_section or section >= dimension.minimum_section + dimension.section_count) return error.BlockEntityOutsideDimension;
-        const block = try owner.chunks.getBlock(world, key.position);
+        const block = try owner.reader.getBlock(world, key.position);
         const expected: usize = @intCast(if (chest) game_data.registry.block_chest_default_state else game_data.registry.block_furnace_default_state);
         if (game_data.registry.block_state_to_block[block] != game_data.registry.block_state_to_block[expected]) return error.BlockEntityMismatch;
         for ([_][]const u8{ "LootTable", "CustomName", "Lock", "lock" }) |unsupported| if (node.childNamed(doc.nodes, unsupported) != null) try owner.unsupported("container field", unsupported);

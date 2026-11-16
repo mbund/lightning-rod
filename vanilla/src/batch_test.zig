@@ -35,7 +35,7 @@ fn itemPhysicsProbe(output: *std.Io.Writer) !void {
     defer arena.deinit();
     var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .capacity = 128 });
     defer registry.deinit();
-    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .cache_sections = 8, .demand_sections = 0, .cache_groups = 2 }, .{
+    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 19, .cache_groups = 2 }, .{
         .metrics = &registry,
         .storage = try store.openSpace(chunks.Chunks.id),
         .record_workspaces = try persistent_records.Workspaces.init(arena.allocator(), io, .{}),
@@ -43,9 +43,10 @@ fn itemPhysicsProbe(output: *std.Io.Writer) !void {
     var source: Source = .{};
     terrain.setSource(chunks.Source.init(&source, Source.read));
     const section: chunks.Section = .{ .world = 0, .x = 0, .y = 4, .z = 0 };
-    const warm = try terrain.acquire(section);
+    const reader = try terrain.client(.{ .name = "test", .sections = 2 });
+    const warm = try reader.acquire(section);
     warm.release();
-    var physics: ItemPhysics = .{ .deps = .{ .blocks = try vanilla_content.blocks(arena.allocator()), .chunks = terrain } };
+    var physics: ItemPhysics = .{ .deps = .{ .blocks = try vanilla_content.blocks(arena.allocator()), .chunks = terrain }, .chunk_client = try terrain.client(.{ .name = "item physics", .sections = 16 }) };
     const body: entities.State = .{ .uuid = 1, .kind = 1, .world = 0, .position = .{ 8, 70, 8 }, .velocity = .{ 0.1, 0, 0.1 } };
     try output.writeAll("moving items | section acquisitions | storage reads | generated sections\n");
     for ([_]usize{ 1, 64, 1024 }) |count| {
@@ -96,8 +97,8 @@ fn itemPhysicsProbe(output: *std.Io.Writer) !void {
         var edits: [4096]chunks.BlockEdit = undefined;
         for (&edits, 0..) |*edit, at| edit.* = .{ .index = @intCast(at), .state = state };
         try terrain.setBlocks(dense_section, &edits);
-        const uniform = try terrain.acquire(uniform_section);
-        const dense = try terrain.acquire(dense_section);
+        const uniform = try reader.acquire(uniform_section);
+        const dense = try reader.acquire(dense_section);
         try std.testing.expect(uniform.view() == .uniform and dense.view() == .uniform);
         uniform.release();
         dense.release();
@@ -432,14 +433,14 @@ pub fn benchmarkItemPhysicsWindow() !void {
     defer arena.deinit();
     var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .capacity = 128 });
     defer registry.deinit();
-    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .cache_sections = 8, .demand_sections = 0, .cache_groups = 2 }, .{
+    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 19, .cache_groups = 2 }, .{
         .metrics = &registry,
         .storage = try store.openSpace(chunks.Chunks.id),
         .record_workspaces = try persistent_records.Workspaces.init(arena.allocator(), io, .{}),
     });
     var source: Source = .{};
     terrain.setSource(chunks.Source.init(&source, Source.read));
-    var physics: ItemPhysics = .{ .deps = .{ .blocks = try vanilla_content.blocks(arena.allocator()), .chunks = terrain } };
+    var physics: ItemPhysics = .{ .deps = .{ .blocks = try vanilla_content.blocks(arena.allocator()), .chunks = terrain }, .chunk_client = try terrain.client(.{ .name = "item physics", .sections = 16 }) };
     const body: entities.State = .{ .uuid = 1, .kind = 1, .world = 0, .position = .{ 15.875, 65, 8 }, .velocity = .{ 0.1, 0, 0.1 } };
     {
         var window = physics.readWindow();

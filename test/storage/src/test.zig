@@ -16,12 +16,15 @@ const Model = struct { blocks: [section_count][4096]u16 = @splat(@splat(0)), slo
 
 const Plugins = struct {
     world: *chunks.Chunks,
+    reader: chunks.Chunks.Client,
     inventory: *inventories.Inventories,
 
     fn init(allocator: std.mem.Allocator, store: *storage.Store, registry: *metrics.Registry) !Plugins {
         const workspaces = try records.Workspaces.init(allocator, store.io, .{});
+        const world = try chunks.Chunks.init(allocator, store.io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 3, .cache_groups = 1 }, .{ .metrics = registry, .storage = try store.openSpace(chunks.Chunks.id), .record_workspaces = workspaces });
         return .{
-            .world = try chunks.Chunks.init(allocator, store.io, .{ .demand_sections = 0, .cache_sections = 2, .cache_groups = 1 }, .{ .metrics = registry, .storage = try store.openSpace(chunks.Chunks.id), .record_workspaces = workspaces }),
+            .world = world,
+            .reader = try world.client(.{ .name = "test", .sections = 2 }),
             .inventory = try inventories.Inventories.init(allocator, store.io, .{ .cache_slots = 2, .cache_items = 2 }, .{ .metrics = registry, .storage = try store.openSpace(inventories.Inventories.id), .record_workspaces = workspaces }),
         };
     }
@@ -33,7 +36,7 @@ const Plugins = struct {
 
     fn verify(self: Plugins, model: *const Model) !void {
         for (model.blocks, 0..) |expected, id| {
-            const lease = try self.world.acquire(section(id));
+            const lease = try self.reader.acquire(section(id));
             defer lease.release();
             for (expected, 0..) |state, index| try std.testing.expectEqual(state, lease.get(@intCast(index)));
         }
@@ -197,7 +200,7 @@ fn recovered(store: *storage.Store) !void {
     const plugins = try Plugins.init(arena.allocator(), store, &registry);
     const tick = store.lastTick();
     for ([_]usize{ 0, 9 }) |id| {
-        const lease = try plugins.world.acquire(section(id));
+        const lease = try plugins.reader.acquire(section(id));
         defer lease.release();
         for (0..4096) |index| try std.testing.expectEqual(@as(u16, @intCast(index % (tick * 7))), lease.get(@intCast(index)));
     }

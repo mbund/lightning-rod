@@ -29,7 +29,7 @@ pub fn main(init: std.process.Init) !void {
         lightning_rod.plugin.configured(vanilla.RegistryIdentity, .{}),
         lightning_rod.plugin.configured(Worlds, .{}),
         lightning_rod.plugin.configured(vanilla.VanillaWorlds, .{}),
-        lightning_rod.plugin.configured(Chunks, .{ .demand_sections = 0, .cache_sections = batch_sections }),
+        lightning_rod.plugin.configured(Chunks, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = batch_sections + 1 }),
         lightning_rod.plugin.configured(vanilla.Flat, .{}),
     });
     const simulation = try lightning_rod.Simulation(@TypeOf(plugins)).init(allocator, init.io, &store, .{
@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
     });
     try simulation.initialize(plugins, .{ .metrics = &simulation.metrics });
     const world = simulation.get(vanilla.VanillaWorlds).overworld;
-    const sections = simulation.get(Chunks);
+    const sections = try simulation.get(Chunks).client(.{ .name = "bench", .sections = batch_sections });
     var cursor: usize = 0;
     const total_sections = side * side * section_count;
     while (cursor < total_sections) {
@@ -53,7 +53,7 @@ pub fn main(init: std.process.Init) !void {
             .y = dimension.minimum_section + @as(i32, @intCast(index % section_count)),
         };
         try sections.acquireMany(requests[0..count], leases[0..count]);
-        for (leases[0..count]) |lease| lease.release();
+        sections.chunks.releaseMany(leases[0..count]);
         cursor += count;
     }
     try simulation.tick();

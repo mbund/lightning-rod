@@ -41,7 +41,7 @@ const Fixture = struct {
         registry.* = try metrics.Registry.init(allocator, std.testing.io, .{ .enabled = false });
         const worlds = try Worlds.init(allocator, .{}, .{ .storage = try store.openSpace(Worlds.id) });
         const world = try worlds.create(.{ .name = "test:world", .dimension = .{ .name = "minecraft:overworld", .minimum_section = -1, .section_count = 3, .skylight = true } });
-        const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 64, .demand_sections = 0, .cache_groups = 4 }, .{ .record_workspaces = workspaces, .metrics = registry, .storage = try store.openSpace(chunks.Chunks.id) });
+        const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 256, .cache_groups = 4 }, .{ .record_workspaces = workspaces, .metrics = registry, .storage = try store.openSpace(chunks.Chunks.id) });
         terrain.setSource(chunks.Source.init(source, Source.read));
         const spawn = try Spawn.init(allocator, .{}, .{ .chunks = terrain, .blocks = content.blocks, .worlds = worlds, .dimensions = content.dimensions, .record_workspaces = workspaces, .storage = try store.openSpace(Spawn.id) });
         return .{ .store = store, .terrain = terrain, .spawn = spawn, .world = world };

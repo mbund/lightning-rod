@@ -42,10 +42,12 @@ pub const Placement = struct {
     };
 
     deps: Dependencies,
+    /// Reads block sections from the simulation budget, at most 1 at once.
+    chunk_client: chunks.Chunks.Client,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Placement {
         const self = try allocator.create(Placement);
-        self.* = .{ .deps = deps };
+        self.* = .{ .deps = deps, .chunk_client = try deps.chunks.simulation(1) };
         try deps.input.on(.block_place, self, onPlace);
         return self;
     }
@@ -93,7 +95,7 @@ pub const Placement = struct {
                 .action = .use,
                 .player = &player,
                 .position = clicked,
-                .state = try self.deps.chunks.getBlock(player.world, clicked),
+                .state = try self.chunk_client.getBlock(player.world, clicked),
                 .hit = place,
             });
             if (used != .pass) {
@@ -118,7 +120,7 @@ pub const Placement = struct {
         if (dx * dx + dy * dy + dz * dz > 36) return;
 
         const pos: chunks.Position = .{ .x = position.x, .y = position.y, .z = position.z };
-        const previous = try self.deps.chunks.getBlock(player.world, pos);
+        const previous = try self.chunk_client.getBlock(player.world, pos);
         var block: u16 = 0;
         var remaining = held.stack;
         if (held.stack) |stack| {

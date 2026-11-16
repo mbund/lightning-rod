@@ -37,8 +37,8 @@ test "lighting pipeline makes progress under sustained edits" {
         var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
         defer store.deinit();
         const resources = try records.Workspaces.init(allocator, io, .{});
-        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 4, .demand_sections = 1 }, .{ .metrics = &registry, .storage = try store.openSpace("terrain"), .record_workspaces = resources });
-        const workspace = try lighting.Workspace.init(allocator, terrain, try game_data.lighting.init(allocator));
+        const terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("terrain"), .record_workspaces = resources });
+        const workspace = try lighting.Workspace.init(allocator, try terrain.client(.{ .name = "lighting", .sections = @min(192, terrain.unbudgeted()) }), try game_data.lighting.init(allocator));
         var source: Source = .{};
         terrain.setSource(chunks.Source.init(&source, Source.read));
         bounded.fail_index = bounded.alloc_index;
@@ -83,8 +83,8 @@ test "lighting pipeline retains overlapping neighborhoods in every direction" {
     var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
     defer store.deinit();
     const resources = try records.Workspaces.init(allocator, io, .{});
-    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 48, .demand_sections = 24 }, .{ .metrics = &registry, .storage = try store.openSpace("terrain"), .record_workspaces = resources });
-    const workspace = try lighting.Workspace.init(allocator, terrain, try game_data.lighting.init(allocator));
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .simulation_sections = 0, .cache_sections = 48 }, .{ .metrics = &registry, .storage = try store.openSpace("terrain"), .record_workspaces = resources });
+    const workspace = try lighting.Workspace.init(allocator, try terrain.client(.{ .name = "lighting", .sections = @min(192, terrain.unbudgeted()) }), try game_data.lighting.init(allocator));
     var source: Scene = .{};
     terrain.setSource(chunks.Source.init(&source, Scene.read));
     const dimension: worlds.Worlds.Dimension = .{ .name = "test:dimension", .minimum_section = 4, .section_count = 1, .skylight = true };
@@ -147,10 +147,11 @@ test "lighting pipeline simulation queries group points and answer from stored l
     var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
     defer store.deinit();
     const resources = try records.Workspaces.init(allocator, io, .{});
-    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 48, .demand_sections = 24 }, .{ .metrics = &registry, .storage = try store.openSpace("terrain"), .record_workspaces = resources });
+    // Edits, the solver and the light store on the simulation thread, a column each.
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .simulation_sections = 24, .cache_sections = 3 * 24 }, .{ .metrics = &registry, .storage = try store.openSpace("terrain"), .record_workspaces = resources });
     const dimensions = try worlds.Worlds.allocate(allocator, .{});
     const world = try dimensions.create(.{ .name = "test:queries", .dimension = .{ .name = "test:dimension", .minimum_section = -4, .section_count = 24, .skylight = true } });
-    const service = try lighting.Lighting.init(allocator, .{ .store = .forPlayers(1) }, .{ .metrics = &registry, .blocks = try test_blocks.vanilla(allocator), .chunks = terrain, .worlds = dimensions });
+    const service = try lighting.Lighting.init(allocator, .{ .store = .forPlayers(1), .chunk_sections = 24 }, .{ .metrics = &registry, .blocks = try test_blocks.vanilla(allocator), .chunks = terrain, .worlds = dimensions });
     var source: Scene = .{};
     terrain.setSource(chunks.Source.init(&source, Scene.read));
     const Asked = struct {

@@ -109,7 +109,7 @@ const Probe = struct {
     pub fn tick(self: *Probe) !void {
         if (self.phase == .normal or self.phase == .silk) {
             const player = self.deps.players.records[0];
-            if (try self.deps.chunks.getBlock(player.world, .{ .x = spawner.x, .y = spawner.y, .z = spawner.z }) != 0) return;
+            if (try (try self.deps.chunks.simulation(1)).getBlock(player.world, .{ .x = spawner.x, .y = spawner.y, .z = spawner.z }) != 0) return;
             if (self.phase == .normal) {
                 self.experience = self.totalExperience();
                 if (self.experience < 15 or self.experience > 43) return error.SpawnerExperienceIncorrect;

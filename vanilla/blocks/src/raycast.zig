@@ -74,7 +74,7 @@ pub const Ray = struct {
 };
 
 /// Traces collision shapes. Fluids and blocks without collision are ignored.
-pub fn trace(terrain: *chunks.Chunks, world: u32, origin: minecraft.Position, vector: [3]f64, maximum: f64) !?Hit {
+pub fn trace(terrain: chunks.Chunks.Client, world: u32, origin: minecraft.Position, vector: [3]f64, maximum: f64) !?Hit {
     var ray = try Ray.init(origin, vector, maximum);
     var window = chunks.ReadWindow(8).init(terrain);
     defer window.deinit();

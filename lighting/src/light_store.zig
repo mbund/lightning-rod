@@ -782,7 +782,7 @@ pub const LightStore = struct {
     /// `waiting` holds the edits to other columns that are not settled yet. The patch sees
     /// their cells as they were, because the light it starts from was exact for that.
     /// The edits being settled are not among them.
-    pub fn settle(self: *LightStore, terrain: *chunks.Chunks, key: Key, shape: Shape, edits: []const patch.Edit, waiting: Waiting) Outcome {
+    pub fn settle(self: *LightStore, terrain: chunks.Chunks.Client, key: Key, shape: Shape, edits: []const patch.Edit, waiting: Waiting) Outcome {
         assert(edits.len != 0);
         assert(waiting.of(key).len == 0);
         var members: [9]*Column = undefined;
@@ -920,7 +920,7 @@ pub const LightStore = struct {
     /// that are not in memory stay unloaded and are answered. Outside the centre column,
     /// cells that other unsettled edits changed read as they were before those edits.
     /// The centre column's own edits are what the patch settles.
-    fn loadColumn(self: *LightStore, terrain: *chunks.Chunks, at: Key, shape: Shape, sections: u32, waiting: Waiting, states: *[sections_max - 2]?patch.States, decoded: *usize) u32 {
+    fn loadColumn(self: *LightStore, terrain: chunks.Chunks.Client, at: Key, shape: Shape, sections: u32, waiting: Waiting, states: *[sections_max - 2]?patch.States, decoded: *usize) u32 {
         var absent: u32 = 0;
         const pending = waiting.of(at);
         var positions: [sections_max - 2]chunks.Section = undefined;
@@ -935,10 +935,10 @@ pub const LightStore = struct {
             indices[count] = section;
             count += 1;
         }
-        // A batch may ask for no more than the share the simulation is sure to get.
+        // A batch asks for no more than the client's budget.
         var begin: usize = 0;
         while (begin < count) {
-            var end = begin + @min(count - begin, @max(1, terrain.demandCapacity()));
+            var end = begin + @min(count - begin, terrain.budget());
             // Named now. The release runs after the cursor has moved on.
             var held = leases[begin..end];
             if (!terrain.acquireCached(positions[begin..end], held)) {
@@ -951,7 +951,7 @@ pub const LightStore = struct {
                     continue;
                 }
             }
-            defer terrain.releaseMany(held);
+            defer terrain.chunks.releaseMany(held);
             for (held, positions[begin..end], indices[begin..end]) |lease, position, section| {
                 const view = lease.view();
                 var edited = false;

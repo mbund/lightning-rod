@@ -61,7 +61,7 @@ const Probe = struct {
             if (state.active and state.position.x == 1 and state.position.y == 65 and state.position.z == 1)
                 self.mining = .active;
             if (self.mining == .active and !state.active) {
-                if (try self.deps.chunks.getBlock(self.deps.players.records[0].world, .{ .x = 1, .y = 65, .z = 1 }) != protocols.registry.block_stone_default_state)
+                if (try (try self.deps.chunks.simulation(1)).getBlock(self.deps.players.records[0].world, .{ .x = 1, .y = 65, .z = 1 }) != protocols.registry.block_stone_default_state)
                     return error.BlockMinedAtCapacity;
                 self.mining = .rejected;
                 try self.deps.control.send(self.deps.players.records[0].handle.?, "capacity mining rejected");
@@ -94,7 +94,7 @@ const Probe = struct {
             if (held.count != bread_count or self.deps.dropped.canCreate(1)) return error.CapacityDropApplied;
             const tool = (try self.deps.inventories.get(.{ .owner = player.uuid, .index = 37 })).stack orelse return error.ToolLost;
             if (!std.mem.eql(u8, &tool.item, &self.tool)) return error.ToolWornAtCapacity;
-            if (try self.deps.chunks.getBlock(player.world, .{ .x = 1, .y = 65, .z = 1 }) != protocols.registry.block_stone_default_state) return error.BlockMinedAtCapacity;
+            if (try (try self.deps.chunks.simulation(1)).getBlock(player.world, .{ .x = 1, .y = 65, .z = 1 }) != protocols.registry.block_stone_default_state) return error.BlockMinedAtCapacity;
             try self.deps.control.send(handle, "capacity unchanged");
         } else if (std.mem.eql(u8, text, "capacity_free")) {
             if (self.phase != .full) return error.UnexpectedCapacityPhase;

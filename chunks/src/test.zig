@@ -5,7 +5,7 @@ const encoding = @import("encoding.zig");
 const metrics = @import("metrics");
 const records = @import("records");
 
-fn demandCancellationProbe(output: *std.Io.Writer) !void {
+fn demandBesidePrefetchProbe(output: *std.Io.Writer) !void {
     const Source = struct {
         generated: usize = 0,
         fn read(self: *@This(), _: std.Io, batch: chunks.Source.Batch) void {
@@ -16,25 +16,29 @@ fn demandCancellationProbe(output: *std.Io.Writer) !void {
         }
     };
     const io = std.testing.io;
-    try output.writeAll("prefetched | demanded | slot shortfall | canceled requests | preserved requests | generated sections\n");
-    const Case = struct { prefetched: usize, reserve: usize };
-    for ([_]Case{ .{ .prefetched = 6, .reserve = 2 }, .{ .prefetched = 14, .reserve = 2 }, .{ .prefetched = 62, .reserve = 2 }, .{ .prefetched = 168, .reserve = 24 } }) |case| {
+    try output.writeAll("prefetched | demanded | canceled requests | generated sections\n");
+    const Case = struct { prefetched: usize, demanded: usize };
+    for ([_]Case{ .{ .prefetched = 6, .demanded = 3 }, .{ .prefetched = 14, .demanded = 3 }, .{ .prefetched = 62, .demanded = 3 }, .{ .prefetched = 168, .demanded = 25 } }) |case| {
         const prefetched = case.prefetched;
         var temporary = std.testing.tmpDir(.{});
         defer temporary.cleanup();
         var path_buffer: [256]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/cancellation", .{temporary.sub_path});
+        const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/budgets", .{temporary.sub_path});
         var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
         defer store.deinit();
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .enabled = false });
         defer registry.deinit();
-        const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .cache_sections = prefetched + case.reserve, .demand_sections = case.reserve, .cache_groups = 2 }, .{
+        // The cache holds the two budgets and the edits budget and nothing more.
+        const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .cache_sections = 1 + prefetched + case.demanded, .edit_sections = 1, .simulation_sections = 0, .cache_groups = 2 }, .{
             .metrics = &registry,
             .storage = try store.openSpace(chunks.Chunks.id),
             .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}),
         });
+        const background = try terrain.client(.{ .name = "background", .sections = prefetched });
+        const demand = try terrain.client(.{ .name = "demand", .sections = case.demanded });
+        try std.testing.expectError(error.CacheBudgetExceeded, terrain.client(.{ .name = "extra", .sections = 1 }));
         var source: Source = .{};
         terrain.setSource(chunks.Source.init(&source, Source.read));
         terrain.attach();
@@ -43,40 +47,47 @@ fn demandCancellationProbe(output: *std.Io.Writer) !void {
         var prepared: [192]chunks.Lease = undefined;
         for (sections[0..prefetched], 0..) |*section, index| section.* = .{ .world = 0, .x = @intCast(index / 24), .y = @as(i32, @intCast(index % 24)) - 4, .z = 0 };
         var ready: [1]bool = undefined;
-        try terrain.prepareMany(&.{.{ .sections = sections[0..prefetched], .leases = prepared[0..prefetched], .priority = .{ .player = 1 } }}, &ready);
+        try background.prepareMany(&.{.{ .sections = sections[0..prefetched], .leases = prepared[0..prefetched], .priority = .{ .player = 1 } }}, &ready);
         try std.testing.expect(!ready[0]);
         try std.testing.expectEqual(prefetched, terrain.generation.queued_count);
-        terrain.generation.update(1, .{ .world = 0, .x = 3, .z = 0, .radius = 32 });
+        // Sections being generated for a preparation count against its client until ready.
+        try std.testing.expectEqual(@as(usize, 0), background.available());
+        const more: chunks.Section = .{ .world = 0, .x = 100, .y = 0, .z = 0 };
+        // More waits until some of them are ready.
+        try background.prepareMany(&.{.{ .sections = &.{more}, .leases = prepared[0..1], .priority = .{ .player = 1 } }}, &ready);
+        try std.testing.expect(!ready[0]);
+        try std.testing.expectEqual(prefetched, terrain.generation.queued_count);
         var requested: [32]chunks.Section = undefined;
-        const needed = requested[0 .. case.reserve + 1];
+        const needed = requested[0..case.demanded];
         for (needed, 0..) |*section, index| section.* = .{ .world = 0, .x = @intCast(8 + index / 24), .y = @as(i32, @intCast(index % 24)) - 4, .z = 0 };
         var demanded: [32]chunks.Lease = undefined;
         {
-            try terrain.acquireMany(needed, demanded[0..needed.len]);
+            try demand.acquireMany(needed, demanded[0..needed.len]);
             defer terrain.releaseMany(demanded[0..needed.len]);
             for (demanded[0..needed.len]) |lease| try std.testing.expectEqual(@as(u16, 7), lease.get(0));
         }
+        // Demand never takes what another client prepared.
         var preserved: usize = 0;
         for (sections[0..prefetched]) |section| preserved += @intFromBool(terrain.generation.index.contains(section));
-        const shortfall = needed.len - (terrain.cache.entries.len - prefetched);
-        try std.testing.expectEqual(shortfall, prefetched - preserved);
-        try output.print("{d:10} | {d:8} | {d:14} | {d:17} | {d:18} | {d}\n", .{ prefetched, needed.len, shortfall, prefetched - preserved, preserved, source.generated });
-        _ = terrain.generation.cancelPrefetch(192);
+        try std.testing.expectEqual(prefetched, preserved);
+        try output.print("{d:10} | {d:8} | {d:17} | {d}\n", .{ prefetched, needed.len, prefetched - preserved, source.generated });
+        terrain.generation.update(1, null);
         try terrain.poll();
+        try std.testing.expectEqual(prefetched, background.available());
     }
 }
 
-pub fn benchmarkDemandCancellation() !void {
+pub fn benchmarkDemandBesidePrefetch() !void {
     var buffer: [1024]u8 = undefined;
     var output = std.Io.File.stdout().writerStreaming(std.testing.io, &buffer);
-    try demandCancellationProbe(&output.interface);
+    try demandBesidePrefetchProbe(&output.interface);
     try output.interface.flush();
 }
 
-test "demand reclaims only the missing capacity while retaining useful prefetch" {
+test "demand within its budget never cancels another client's prefetch" {
     var buffer: [256]u8 = undefined;
     var output = std.Io.Writer.Discarding.init(&buffer);
-    try demandCancellationProbe(&output.writer);
+    try demandBesidePrefetchProbe(&output.writer);
 }
 
 test {
@@ -106,11 +117,12 @@ test "generation capacity is independent of retained terrain and drains larger d
         var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
         const allocator = bounded.allocator();
         var registry = try metrics.Registry.init(allocator, io, .{ .enabled = false });
-        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = capacity, .generation_slots = 2, .demand_sections = 8, .cache_groups = 2 }, .{
+        const terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = capacity + 1, .generation_slots = 2, .cache_groups = 2 }, .{
             .metrics = &registry,
             .storage = try store.openSpace(chunks.Chunks.id),
             .record_workspaces = try records.Workspaces.init(allocator, io, .{}),
         });
+        const reader = try terrain.client(.{ .name = "test", .sections = @min(192, terrain.unbudgeted()) });
         try std.testing.expectEqual(@as(usize, 2), terrain.generation.slots.len);
         var source: Source = .{};
         terrain.setSource(chunks.Source.init(&source, Source.read));
@@ -119,7 +131,7 @@ test "generation capacity is independent of retained terrain and drains larger d
         var sections: [8]chunks.Section = undefined;
         var leases: [8]chunks.Lease = undefined;
         for (&sections, 0..) |*section, index| section.* = .{ .world = 0, .x = @intCast(index), .y = 0, .z = 0 };
-        try terrain.acquireMany(&sections, &leases);
+        try reader.acquireMany(&sections, &leases);
         defer terrain.releaseMany(&leases);
         for (leases, 0..) |lease, index| try std.testing.expectEqual(@as(u16, @intCast(index + 7)), lease.get(0));
         try std.testing.expectEqual(sections.len, source.generated);
@@ -153,11 +165,12 @@ test "the maximum pinned section batch fits incompressible terrain without runti
     var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
     const allocator = bounded.allocator();
     var registry = try metrics.Registry.init(allocator, io, .{ .enabled = false });
-    const terrain = try chunks.Chunks.init(allocator, io, .{}, .{
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 193 }, .{
         .metrics = &registry,
         .storage = try store.openSpace(chunks.Chunks.id),
         .record_workspaces = try records.Workspaces.init(allocator, io, .{}),
     });
+    const reader = try terrain.client(.{ .name = "test", .sections = @min(192, terrain.unbudgeted()) });
     var source: Source = .{};
     terrain.setSource(chunks.Source.init(&source, Source.read));
     bounded.fail_index = bounded.alloc_index;
@@ -165,7 +178,7 @@ test "the maximum pinned section batch fits incompressible terrain without runti
     var sections: [192]chunks.Section = undefined;
     var leases: [192]chunks.Lease = undefined;
     for (&sections, 0..) |*section, index| section.* = .{ .world = 0, .x = @intCast(index), .y = 0, .z = 0 };
-    try terrain.acquireMany(&sections, &leases);
+    try reader.acquireMany(&sections, &leases);
     defer terrain.releaseMany(&leases);
     try std.testing.expectEqual(leases.len, terrain.cache.pinned_entries);
     var bytes: usize = 0;
@@ -176,7 +189,8 @@ test "the maximum pinned section batch fits incompressible terrain without runti
         bytes += lease.record.read().?.len;
     }
     try std.testing.expectEqual(leases.len * encoding.maximum_decoded_bytes, bytes);
-    try std.testing.expect(terrain.cache.values.len >= bytes and terrain.cache.values.len - bytes < leases.len * 64);
+    const slot = terrain.cache.values.len / terrain.cache.entries.len;
+    try std.testing.expect(slot >= encoding.maximum_decoded_bytes and slot - encoding.maximum_decoded_bytes < 64);
     try std.testing.expect(!bounded.has_induced_failure);
 }
 
@@ -197,14 +211,15 @@ test "read windows reuse duplicate and retained views within cache capacity" {
         defer arena.deinit();
         var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
         defer registry.deinit();
-        const terrain = try chunks.Chunks.init(arena.allocator(), std.testing.io, .{ .cache_sections = capacity, .demand_sections = 0, .cache_groups = 2 }, .{
+        const terrain = try chunks.Chunks.init(arena.allocator(), std.testing.io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = capacity + 1, .cache_groups = 2 }, .{
             .metrics = &registry,
             .storage = try store.openSpace(chunks.Chunks.id),
             .record_workspaces = try records.Workspaces.init(arena.allocator(), std.testing.io, .{}),
         });
+        const reader = try terrain.client(.{ .name = "test", .sections = @min(192, terrain.unbudgeted()) });
         var source: Source = .{};
         terrain.setSource(chunks.Source.init(&source, Source.read));
-        var window = chunks.ReadWindow(2).init(terrain);
+        var window = chunks.ReadWindow(2).init(reader);
         defer window.deinit();
         const a: chunks.Section = .{ .world = 0, .x = 0, .y = 0, .z = 0 };
         const b: chunks.Section = .{ .world = 0, .x = 1, .y = 0, .z = 0 };
@@ -360,19 +375,21 @@ test "generated loaded and edited sections stay paletted without runtime allocat
     const allocator = bounded.allocator();
     var registry = try metrics.Registry.init(allocator, io, .{ .enabled = false });
     const space = try store.openSpace(chunks.Chunks.id);
-    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 1, .demand_sections = 0, .cache_groups = 2 }, .{
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 2, .cache_groups = 2 }, .{
         .metrics = &registry,
         .storage = space,
         .record_workspaces = try records.Workspaces.init(allocator, io, .{}),
     });
+    const reader = try terrain.client(.{ .name = "test", .sections = @min(192, terrain.unbudgeted()) });
     var source: Source = .{};
     terrain.setSource(chunks.Source.init(&source, Source.read));
     bounded.fail_index = bounded.alloc_index;
     bounded.resize_fail_index = bounded.resize_index;
     const original: chunks.Section = .{ .world = 0, .x = 0, .y = 0, .z = 0 };
-    const other: chunks.Section = .{ .world = 0, .x = 1, .y = 0, .z = 0 };
+    // Two other sections fill the two entries, so the original is evicted and loaded again.
+    const others = [_]chunks.Section{ .{ .world = 0, .x = 1, .y = 0, .z = 0 }, .{ .world = 0, .x = 2, .y = 0, .z = 0 } };
     for (0..4) |step| {
-        const lease = try terrain.acquire(original);
+        const lease = try reader.acquire(original);
         try std.testing.expect(lease.view() == .palette);
         try std.testing.expect(lease.record.read().?.len < encoding.maximum_decoded_bytes / 4);
         const expected: u16 = if (step == 0) 1 else 23;
@@ -382,9 +399,8 @@ test "generated loaded and edited sections stay paletted without runtime allocat
         try std.testing.expectEqual(@as(u16, 10), lease.biomes().?.get(3));
         lease.release();
         try terrain.setBlocks(original, &.{ .{ .index = 6, .state = 1 }, .{ .index = 7, .state = 23 } });
-        const evict = try terrain.acquire(other);
-        evict.release();
         try terrain.checkpoint(space);
+        for (others) |other| (try reader.acquire(other)).release();
     }
     try std.testing.expect(!bounded.has_induced_failure);
 }
@@ -408,7 +424,7 @@ test "chunk eviction and reload preserve edits while clean sections are never re
         defer store.deinit();
         const tx = store.transaction();
         const space = try tx.openSpace(chunks.Chunks.id);
-        const world = try chunks.Chunks.init(arena.allocator(), io, .{ .demand_sections = 0, .cache_sections = 2 }, .{ .metrics = &registry, .storage = space, .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}) });
+        const world = try chunks.Chunks.init(arena.allocator(), io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 2 }, .{ .metrics = &registry, .storage = space, .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}) });
         try world.setBlocks(a, &.{ .{ .index = 0, .state = 9 }, .{ .index = 4095, .state = 65535 } });
         try world.setBlocks(b, &.{.{ .index = 123, .state = 17 }});
         try world.setBlocks(c, &.{.{ .index = 4095, .state = 42 }});
@@ -438,9 +454,10 @@ test "chunk eviction and reload preserve edits while clean sections are never re
         const tx = store.transaction();
         defer tx.fail();
         const space = try tx.openSpace(chunks.Chunks.id);
-        const world = try chunks.Chunks.init(arena.allocator(), io, .{ .demand_sections = 0, .cache_sections = 2 }, .{ .metrics = &registry, .storage = space, .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}) });
+        const world = try chunks.Chunks.init(arena.allocator(), io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 2 }, .{ .metrics = &registry, .storage = space, .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}) });
+        const reader = try world.client(.{ .name = "test", .sections = @min(192, world.unbudgeted()) });
         for ([_]chunks.Section{ a, b, c, a }) |section| {
-            const lease = try world.acquire(section);
+            const lease = try reader.acquire(section);
             defer lease.release();
             for (0..encoding.blocks) |i| {
                 const expected: u16 = if (section.x == 0) switch (i) {
@@ -574,7 +591,8 @@ test "simulation reads and edits progress without the attached background thread
     var registry = try metrics.Registry.init(allocator, io, .{});
     defer registry.deinit();
     const space = try store.openSpace(chunks.Chunks.id);
-    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .demand_sections = 0, .cache_sections = 2, .cache_groups = 2 }, .{ .metrics = &registry, .storage = space, .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}) });
+    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 3, .cache_groups = 2 }, .{ .metrics = &registry, .storage = space, .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}) });
+    const reader = try terrain.client(.{ .name = "test", .sections = @min(192, terrain.unbudgeted()) });
     var source: Source = .{ .caller = std.Thread.getCurrentId() };
     terrain.setSource(chunks.Source.init(&source, Source.read));
     var worker: Worker = .{ .terrain = terrain };
@@ -586,17 +604,18 @@ test "simulation reads and edits progress without the attached background thread
     }
     defer worker.stop(thread);
     const section: chunks.Section = .{ .world = 0, .x = 3, .y = 4, .z = -2 };
-    const old = try terrain.acquire(section);
+    const old = try reader.acquire(section);
     try std.testing.expectEqual(source.destination.load(.acquire), @intFromPtr(old.record.bytes.?.ptr));
     try std.testing.expectEqual(@as(u16, 7), old.get(0));
-    const hit = try terrain.acquire(section);
+    const hit = try reader.acquire(section);
     try std.testing.expectEqual(old.record.bytes.?.ptr, hit.record.bytes.?.ptr);
     hit.release();
     try std.testing.expectEqual(@as(usize, 1), source.reads.load(.acquire));
-    const second = try terrain.acquire(.{ .world = 0, .x = 4, .y = 4, .z = -2 });
-    try std.testing.expectError(error.CachePinned, terrain.acquire(.{ .world = 0, .x = 5, .y = 4, .z = -2 }));
+    const second = try reader.acquire(.{ .world = 0, .x = 4, .y = 4, .z = -2 });
+    // Holding its whole budget, the reader may take no more.
+    try std.testing.expectError(error.CacheBudgetExceeded, reader.acquire(.{ .world = 0, .x = 5, .y = 4, .z = -2 }));
     second.release();
-    const third = try terrain.acquire(.{ .world = 0, .x = 5, .y = 4, .z = -2 });
+    const third = try reader.acquire(.{ .world = 0, .x = 5, .y = 4, .z = -2 });
     try std.testing.expectEqual(@as(u16, 7), old.get(0));
     third.release();
     const Writer = struct {
@@ -623,7 +642,7 @@ test "simulation reads and edits progress without the attached background thread
         try std.testing.expectEqual(@as(u16, 7), old.get(0));
     }
     try writer.result;
-    const updated = try terrain.acquire(section);
+    const updated = try reader.acquire(section);
     try std.testing.expectEqual(@as(u16, 19), updated.get(0));
     updated.release();
     try terrain.checkpoint(space);
@@ -631,7 +650,7 @@ test "simulation reads and edits progress without the attached background thread
     try std.testing.expectEqual(@as(u64, 42), store.lastTick());
     try std.testing.expectEqual(@as(u64, 42), store.durableTick());
     const Reader = struct {
-        terrain: *chunks.Chunks,
+        reader: chunks.Chunks.Client,
         section: chunks.Section,
         done: std.Io.Event = .unset,
         result: anyerror!u16 = error.NotRead,
@@ -640,18 +659,18 @@ test "simulation reads and edits progress without the attached background thread
             self.done.set(std.testing.io);
         }
         fn read(self: *@This()) !u16 {
-            const lease = try self.terrain.acquire(self.section);
+            const lease = try self.reader.acquire(self.section);
             defer lease.release();
             return lease.get(0);
         }
     };
     source.blocked = 6;
-    var miss: Reader = .{ .terrain = terrain, .section = .{ .world = 0, .x = 6, .y = 4, .z = -2 } };
+    var miss: Reader = .{ .reader = reader, .section = .{ .world = 0, .x = 6, .y = 4, .z = -2 } };
     const missing_thread = try std.Thread.spawn(.{}, Reader.run, .{&miss});
     defer missing_thread.join();
     defer source.release_read.set(io);
     try source.entered.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } });
-    var cached: Reader = .{ .terrain = terrain, .section = section };
+    var cached: Reader = .{ .reader = reader, .section = section };
     const cached_thread = try std.Thread.spawn(.{}, Reader.run, .{&cached});
     defer cached_thread.join();
     errdefer source.release_read.set(io);
@@ -664,6 +683,7 @@ test "simulation reads and edits progress without the attached background thread
 
 test {
     _ = @import("generation.zig");
+    _ = @import("topology.zig");
 }
 
 test "repeated sections in an edit batch observe preceding edits without extra buffers" {
@@ -679,18 +699,19 @@ test "repeated sections in an edit batch observe preceding edits without extra b
     defer arena.deinit();
     var registry = try metrics.Registry.init(allocator, io, .{ .enabled = false });
     defer registry.deinit();
-    const world = try chunks.Chunks.init(arena.allocator(), io, .{ .demand_sections = 0, .cache_sections = 3 }, .{
+    const world = try chunks.Chunks.init(arena.allocator(), io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 3 }, .{
         .metrics = &registry,
         .storage = try store.openSpace(chunks.Chunks.id),
         .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}),
     });
+    const reader = try world.client(.{ .name = "test", .sections = @min(192, world.unbudgeted()) });
     const section: chunks.Section = .{ .world = 0, .x = 0, .y = 0, .z = 0 };
     try world.setSections(&.{
         .{ .section = section, .edits = &.{.{ .index = 0, .state = 17 }} },
         .{ .section = section, .edits = &.{.{ .index = 1, .state = 19 }} },
         .{ .section = section, .edits = &.{.{ .index = 0, .state = 23 }} },
     });
-    const lease = try world.acquire(section);
+    const lease = try reader.acquire(section);
     defer lease.release();
     try std.testing.expectEqual(@as(u16, 23), lease.get(0));
     try std.testing.expectEqual(@as(u16, 19), lease.get(1));
@@ -709,7 +730,7 @@ test "observers receive the state each edited cell held before its batch" {
     defer store.deinit();
     var registry = try metrics.Registry.init(allocator, io, .{ .enabled = false });
     defer registry.deinit();
-    const world = try chunks.Chunks.init(arena.allocator(), io, .{ .demand_sections = 0, .cache_sections = 4 }, .{
+    const world = try chunks.Chunks.init(arena.allocator(), io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 4 }, .{
         .metrics = &registry,
         .storage = try store.openSpace(chunks.Chunks.id),
         .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}),
@@ -854,7 +875,7 @@ test "mixed property requests share one compressed group read without allocating
     const allocator = bounded.allocator();
     var registry = try metrics.Registry.init(std.testing.allocator, io, .{});
     defer registry.deinit();
-    const terrain = try chunks.Chunks.init(allocator, io, .{ .demand_sections = 0, .cache_sections = 8, .cache_groups = 1, .storage_group_side = 2 }, .{
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 8, .cache_groups = 1, .storage_group_side = 2 }, .{
         .metrics = &registry,
         .storage = try store.openSpace(chunks.Chunks.id),
         .record_workspaces = try records.Workspaces.init(allocator, io, .{}),
@@ -916,7 +937,7 @@ test "property reads preserve pending edits without generating or admitting deco
     var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .enabled = false });
     defer registry.deinit();
     const space = try store.openSpace(chunks.Chunks.id);
-    const terrain = try chunks.Chunks.init(allocator, io, .{ .demand_sections = 1, .cache_sections = 8, .storage_group_side = 2 }, .{
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 8, .storage_group_side = 2 }, .{
         .metrics = &registry,
         .storage = space,
         .record_workspaces = try records.Workspaces.init(allocator, io, .{}),
@@ -1015,7 +1036,7 @@ test "packed batches share group pins while independently validating every colum
     const allocator = bounded.allocator();
     var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .enabled = false });
     defer registry.deinit();
-    const terrain = try chunks.Chunks.init(allocator, io, .{ .demand_sections = 1, .cache_sections = 4, .cache_groups = 2, .storage_group_side = 2 }, .{
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 4, .cache_groups = 2, .storage_group_side = 2 }, .{
         .metrics = &registry,
         .storage = try store.openSpace(chunks.Chunks.id),
         .record_workspaces = try records.Workspaces.init(allocator, io, .{}),
@@ -1080,11 +1101,13 @@ test "column preparation returns ready columns while independently queuing missi
     defer arena.deinit();
     var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .enabled = false });
     defer registry.deinit();
-    const world = try chunks.Chunks.init(arena.allocator(), io, .{ .demand_sections = 1, .cache_sections = 4 }, .{
+    const world = try chunks.Chunks.init(arena.allocator(), io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 5 }, .{
         .metrics = &registry,
         .storage = try store.openSpace(chunks.Chunks.id),
         .record_workspaces = try records.Workspaces.init(arena.allocator(), io, .{}),
     });
+    const background = try world.client(.{ .name = "background", .sections = 3 });
+    const demand = try world.client(.{ .name = "demand", .sections = 1 });
     const existing: chunks.Section = .{ .world = 0, .x = 0, .y = 0, .z = 0 };
     const missing: chunks.Section = .{ .world = 0, .x = 1, .y = 0, .z = 0 };
     try world.setBlocks(existing, &.{.{ .index = 0, .state = 17 }});
@@ -1099,20 +1122,20 @@ test "column preparation returns ready columns while independently queuing missi
     };
     var complete: [2]bool = undefined;
     world.ready().reset();
-    try world.prepareMany(&requests, &complete);
+    try background.prepareMany(&requests, &complete);
     try std.testing.expect(world.ready().isSet());
     try std.testing.expectEqualSlices(bool, &.{ false, true }, &complete);
     try std.testing.expectEqual(@as(usize, 0), generator.sections);
     world.releaseMany(prepared[1..2]);
     try std.testing.expect(try world.generation.processOne(io));
-    try world.prepareMany(&requests, &complete);
+    try background.prepareMany(&requests, &complete);
     try std.testing.expectEqualSlices(bool, &.{ true, true }, &complete);
     try std.testing.expectEqual(@as(usize, 1), generator.sections);
     world.ready().reset();
     world.releaseMany(prepared[0..2]);
     try std.testing.expect(!world.ready().isSet());
     {
-        const lease = try world.acquire(missing);
+        const lease = try demand.acquire(missing);
         defer lease.release();
         try std.testing.expectEqual(@as(u16, 19), lease.get(0));
     }
@@ -1122,12 +1145,14 @@ test "column preparation returns ready columns while independently queuing missi
         .{ .world = 0, .x = 4, .y = 0, .z = 0 },
     };
     var ready: [1]bool = undefined;
-    for (0..2) |_| try world.prepareMany(&.{.{ .sections = &prefetched, .leases = &prepared, .priority = .{} }}, &ready);
+    for (0..2) |_| try background.prepareMany(&.{.{ .sections = &prefetched, .leases = &prepared, .priority = .{} }}, &ready);
     try std.testing.expectEqual(@as(usize, 3), world.generating_count);
-    try world.prepareMany(&.{.{ .sections = &.{.{ .world = 0, .x = 5, .y = 0, .z = 0 }}, .leases = prepared[0..1], .priority = .{} }}, &ready);
+    // Its three sections being generated take the whole background budget, so a fourth waits.
+    try background.prepareMany(&.{.{ .sections = &.{.{ .world = 0, .x = 5, .y = 0, .z = 0 }}, .leases = prepared[0..1], .priority = .{} }}, &ready);
+    try std.testing.expect(!ready[0]);
     try std.testing.expectEqual(@as(usize, 3), world.generating_count);
     {
-        const demanded = try world.acquire(.{ .world = 0, .x = 6, .y = 0, .z = 0 });
+        const demanded = try demand.acquire(.{ .world = 0, .x = 6, .y = 0, .z = 0 });
         defer demanded.release();
         try std.testing.expectEqual(@as(u16, 19), demanded.get(0));
         try std.testing.expectEqual(@as(usize, 3), world.generating_count);
@@ -1156,18 +1181,22 @@ test "checkpoint releases its dirty snapshot across multiple batches and failure
         var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .capacity = 64 });
         defer registry.deinit();
         const space = try store.openSpace("chunks");
-        const terrain = try chunks.Chunks.init(arena.allocator(), std.testing.io, .{ .cache_sections = 193, .demand_sections = 0, .cache_groups = 8 }, .{
+        const terrain = try chunks.Chunks.init(arena.allocator(), std.testing.io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 193, .cache_groups = 8 }, .{
             .storage = space,
             .metrics = &registry,
             .record_workspaces = try records.Workspaces.init(arena.allocator(), std.testing.io, .{}),
         });
+        const reader = try terrain.client(.{ .name = "test", .sections = @min(192, terrain.unbudgeted()) });
         var source: Source = .{};
         terrain.setSource(chunks.Source.init(&source, Source.read));
         var sections: [193]chunks.Section = undefined;
         var leases: [193]chunks.Lease = undefined;
         for (&sections, 0..) |*section, index| section.* = .{ .world = 0, .x = @intCast(index / 24), .y = @intCast(index % 24), .z = 0 };
-        try terrain.acquireMany(&sections, &leases);
-        terrain.releaseMany(&leases);
+        // More dirty sections than one batch writes, leased in two batches as no budget holds them all.
+        for ([_][2]usize{ .{ 0, 192 }, .{ 192, 193 } }) |range| {
+            try reader.acquireMany(sections[range[0]..range[1]], leases[range[0]..range[1]]);
+            terrain.releaseMany(leases[range[0]..range[1]]);
+        }
         if (fail) {
             terrain.cache.backend.store.bases.failed = true;
             try std.testing.expectError(error.FailedTransaction, terrain.checkpoint(space));
@@ -1177,7 +1206,7 @@ test "checkpoint releases its dirty snapshot across multiple batches and failure
             try terrain.setBlock(0, .{ .x = 0, .y = 0, .z = 0 }, 3);
             try terrain.checkpoint(space);
             try std.testing.expectEqual(@as(u64, sections.len + 1), terrain.cache.metrics.writes.value());
-            try std.testing.expectEqual(@as(u16, 3), try terrain.getBlock(0, .{ .x = 0, .y = 0, .z = 0 }));
+            try std.testing.expectEqual(@as(u16, 3), try reader.getBlock(0, .{ .x = 0, .y = 0, .z = 0 }));
         }
         try std.testing.expectEqual(@as(usize, 0), terrain.cache.pinned_entries);
         try std.testing.expectEqual(@as(usize, 0), terrain.writing_count);
@@ -1216,11 +1245,12 @@ pub fn benchmarkDemandBatches() !void {
         defer registry.deinit();
         var store = try storage.Store.init(allocator, std.testing.io, .{ .path = path });
         defer store.deinit();
-        const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 192, .demand_sections = 0, .cache_groups = 32 }, .{
+        const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 192, .cache_groups = 32 }, .{
             .metrics = &registry,
             .storage = try store.openSpace("chunks"),
             .record_workspaces = try records.Workspaces.init(allocator, std.testing.io, .{}),
         });
+        const reader = try terrain.client(.{ .name = "test", .sections = @min(192, terrain.unbudgeted()) });
         var source: Source = .{};
         terrain.setSource(chunks.Source.init(&source, Source.read));
         terrain.attach();
@@ -1228,7 +1258,7 @@ pub fn benchmarkDemandBatches() !void {
         const prefetch: chunks.Section = .{ .world = 0, .x = 100, .y = 4, .z = 0 };
         var prepared: [1]chunks.Lease = undefined;
         var complete: [1]bool = undefined;
-        try terrain.prepareMany(&.{.{ .sections = &.{prefetch}, .leases = &prepared, .priority = .{ .player = 1 } }}, &complete);
+        try reader.prepareMany(&.{.{ .sections = &.{prefetch}, .leases = &prepared, .priority = .{ .player = 1 } }}, &complete);
         try std.testing.expect(!complete[0]);
         var sections: [96]chunks.Section = undefined;
         var leases: [96]chunks.Lease = undefined;
@@ -1238,7 +1268,7 @@ pub fn benchmarkDemandBatches() !void {
             .y = @as(i32, @intCast(index % 24)) - 4,
             .z = 0,
         };
-        try terrain.acquireMany(sections[0..count], leases[0..count]);
+        try reader.acquireMany(sections[0..count], leases[0..count]);
         for (leases[0..count]) |lease| try std.testing.expectEqual(@as(u16, 7), lease.get(0));
         terrain.releaseMany(leases[0..count]);
         try std.testing.expectEqual(count, source.sections);
@@ -1253,69 +1283,69 @@ pub fn benchmarkDemandBatches() !void {
     try output.interface.flush();
 }
 
-test "read windows release optional leases under external pressure and preserve required views" {
+test "read windows release optional leases to fit their budget and ignore other clients" {
     const Source = struct {
         fn read(_: *@This(), _: std.Io, batch: chunks.Source.Batch) void {
             for (batch.requests) |*request| request.result = chunks.uniform(@intCast(request.section.x + 7), request.output);
         }
     };
-    for ([_]usize{ 2, 4 }) |capacity| {
-        var temporary = std.testing.tmpDir(.{});
-        defer temporary.cleanup();
-        var path_buffer: [256]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/retention", .{temporary.sub_path});
-        var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
-        defer store.deinit();
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        var failing = std.testing.FailingAllocator.init(arena.allocator(), .{});
-        const allocator = failing.allocator();
-        var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .capacity = 128 });
-        defer registry.deinit();
-        const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = capacity, .demand_sections = 0, .cache_groups = 2 }, .{
-            .metrics = &registry,
-            .storage = try store.openSpace(chunks.Chunks.id),
-            .record_workspaces = try records.Workspaces.init(allocator, std.testing.io, .{}),
-        });
-        var source: Source = .{};
-        terrain.setSource(chunks.Source.init(&source, Source.read));
-        failing.fail_index = failing.alloc_index;
-        const a: chunks.Section = .{ .world = 0, .x = 0, .y = 0, .z = 0 };
-        const b: chunks.Section = .{ .world = 0, .x = 1, .y = 0, .z = 0 };
-        const c: chunks.Section = .{ .world = 0, .x = 2, .y = 0, .z = 0 };
-        const d: chunks.Section = .{ .world = 0, .x = 3, .y = 0, .z = 0 };
-        const e: chunks.Section = .{ .world = 0, .x = 4, .y = 0, .z = 0 };
-        var window = chunks.ReadWindow(4).init(terrain);
-        defer window.deinit();
-        var views: [2]chunks.View = undefined;
-        try window.readMany(&.{ a, b }, &views);
-        const before = terrain.cache.metrics.acquired.value();
-        try window.readMany(&.{b}, views[0..1]);
-        try window.readMany(&.{ a, b }, &views);
-        try std.testing.expectEqual(before, terrain.cache.metrics.acquired.value());
-        try std.testing.expectEqual(@as(usize, 2), window.count);
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/retention", .{temporary.sub_path});
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var failing = std.testing.FailingAllocator.init(arena.allocator(), .{});
+    const allocator = failing.allocator();
+    var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .capacity = 128 });
+    defer registry.deinit();
+    const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 5, .cache_groups = 2 }, .{
+        .metrics = &registry,
+        .storage = try store.openSpace(chunks.Chunks.id),
+        .record_workspaces = try records.Workspaces.init(allocator, std.testing.io, .{}),
+    });
+    const windowed = try terrain.client(.{ .name = "window", .sections = 2 });
+    const other = try terrain.client(.{ .name = "other", .sections = 2 });
+    var source: Source = .{};
+    terrain.setSource(chunks.Source.init(&source, Source.read));
+    failing.fail_index = failing.alloc_index;
+    const a: chunks.Section = .{ .world = 0, .x = 0, .y = 0, .z = 0 };
+    const b: chunks.Section = .{ .world = 0, .x = 1, .y = 0, .z = 0 };
+    const c: chunks.Section = .{ .world = 0, .x = 2, .y = 0, .z = 0 };
+    const d: chunks.Section = .{ .world = 0, .x = 3, .y = 0, .z = 0 };
+    const e: chunks.Section = .{ .world = 0, .x = 4, .y = 0, .z = 0 };
+    // The window may retain more than its budget holds, and holds no more than the budget.
+    var window = chunks.ReadWindow(4).init(windowed);
+    defer window.deinit();
+    var views: [2]chunks.View = undefined;
+    try window.readMany(&.{ a, b }, &views);
+    const before = terrain.cache.metrics.acquired.value();
+    try window.readMany(&.{b}, views[0..1]);
+    try window.readMany(&.{ a, b }, &views);
+    try std.testing.expectEqual(before, terrain.cache.metrics.acquired.value());
+    try std.testing.expectEqual(@as(usize, 2), window.count);
 
-        var external: [2]chunks.Lease = undefined;
-        try terrain.acquireMany(if (capacity == 2) &.{ a, b } else &.{ c, d }, &external);
-        try std.testing.expectEqual(@as(usize, 4), terrain.borrowed_count);
-        if (capacity == 2) {
-            try std.testing.expectError(error.CachePinned, window.readMany(&.{e}, views[0..1]));
-            try std.testing.expectEqual(@as(usize, 0), window.count);
-            try std.testing.expectEqual(@as(usize, 2), terrain.borrowed_count);
-            terrain.releaseMany(&external);
-            try window.readMany(&.{e}, views[0..1]);
-            try std.testing.expectEqual(@as(u16, 11), views[0].get(0));
-        } else {
-            try window.readMany(&.{ a, e }, &views);
-            try std.testing.expectEqual(@as(u16, 7), views[0].get(0));
-            try std.testing.expectEqual(@as(u16, 11), views[1].get(0));
-            try std.testing.expectEqual(@as(usize, 2), window.count);
-            try std.testing.expectEqual(@as(usize, 4), terrain.borrowed_count);
-            terrain.releaseMany(&external);
-        }
-        window.deinit();
-        try std.testing.expectEqual(@as(usize, 0), terrain.borrowed_count);
-    }
+    // Another client holding the rest of the cache takes nothing from the window.
+    var external: [2]chunks.Lease = undefined;
+    try other.acquireMany(&.{ c, d }, &external);
+    const after = terrain.cache.metrics.acquired.value();
+    try window.readMany(&.{ a, b }, &views);
+    try std.testing.expectEqual(after, terrain.cache.metrics.acquired.value());
+    try std.testing.expectEqual(@as(usize, 4), terrain.borrowed_count);
+
+    // A new section displaces a retained one to fit the budget, and the required view stays.
+    try window.readMany(&.{ a, e }, &views);
+    try std.testing.expectEqual(@as(u16, 7), views[0].get(0));
+    try std.testing.expectEqual(@as(u16, 11), views[1].get(0));
+    try std.testing.expectEqual(@as(usize, 2), window.count);
+    try std.testing.expectEqual(@as(usize, 4), terrain.borrowed_count);
+    var three: [3]chunks.View = undefined;
+    try std.testing.expectError(error.WorkingSetTooLarge, window.readMany(&.{ a, b, e }, &three));
+    terrain.releaseMany(&external);
+    window.deinit();
+    try std.testing.expectEqual(@as(usize, 0), terrain.borrowed_count);
 }
 
 test "two-state sections preserve every packed byte and little endian palette value" {
@@ -1358,7 +1388,7 @@ test "snapshot watches invalidate only intersecting worlds and section bounds" {
     var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
     defer store.deinit();
     const allocator = arena.allocator();
-    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 4, .demand_sections = 1 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = try records.Workspaces.init(allocator, io, .{}) });
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = try records.Workspaces.init(allocator, io, .{}) });
     const watch = try chunks.Watch.init(allocator, terrain, 2);
     const other = try chunks.Watch.init(allocator, terrain, 2);
     const invalidation = try chunks.Watch.initInvalidation(allocator, terrain);
@@ -1434,18 +1464,19 @@ test "cached leases and the unsaved snapshot never read storage" {
     var database = try storage.Store.init(allocator, io, .{ .path = path, .io_mode = .standard });
     defer database.deinit();
     var registry = try metrics.Registry.init(allocator, io, .{});
-    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 8, .demand_sections = 2 }, .{ .metrics = &registry, .storage = try database.openSpace(chunks.Chunks.id), .record_workspaces = try records.Workspaces.init(allocator, io, .{}) });
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 8 }, .{ .metrics = &registry, .storage = try database.openSpace(chunks.Chunks.id), .record_workspaces = try records.Workspaces.init(allocator, io, .{}) });
+    const reader = try terrain.client(.{ .name = "test", .sections = @min(192, terrain.unbudgeted()) });
     const here: chunks.Section = .{ .world = 0, .x = 0, .y = 0, .z = 0 };
     const far: chunks.Section = .{ .world = 0, .x = 9, .y = 0, .z = 0 };
     var leases: [2]chunks.Lease = undefined;
     // Nothing is in memory, so nothing is leased and nothing is read.
-    try std.testing.expect(!terrain.acquireCached(&.{ here, far }, &leases));
+    try std.testing.expect(!reader.acquireCached(&.{ here, far }, &leases));
     try std.testing.expectEqual(@as(usize, 0), terrain.borrowed_count);
     try terrain.setBlock(0, .{ .x = 1, .y = 2, .z = 3 }, 5);
-    try std.testing.expect(terrain.acquireCached(&.{here}, leases[0..1]));
+    try std.testing.expect(reader.acquireCached(&.{here}, leases[0..1]));
     try std.testing.expectEqual(@as(u16, 5), leases[0].view().get(chunks.localIndex(.{ .x = 1, .y = 2, .z = 3 })));
     terrain.releaseMany(leases[0..1]);
-    try std.testing.expect(!terrain.acquireCached(&.{ here, far }, &leases));
+    try std.testing.expect(!reader.acquireCached(&.{ here, far }, &leases));
 
     // The edit is in memory only, dated by its batch.
     var unsaved: [4]chunks.Chunks.Unsaved = undefined;

@@ -665,7 +665,7 @@ test "default item identity matches the serialized definition" {
 
 fn blockContainers(allocator: std.mem.Allocator, store: *storage.Store, registry: *metrics.Registry, fixture: InventoryFixture) !*Containers {
     const resources = try records.Workspaces.init(allocator, std.testing.io, .{});
-    const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .cache_sections = 16, .demand_sections = 4, .cache_groups = 4 }, .{ .storage = try store.openSpace("chunks"), .metrics = registry, .record_workspaces = resources });
+    const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 96, .cache_groups = 4 }, .{ .storage = try store.openSpace("chunks"), .metrics = registry, .record_workspaces = resources });
     const domains = try Domains.init(allocator, .{}, .{ .players = fixture.players });
     domains.tick();
     const experience = try Experience.init(allocator, .{ .maximum_orbs = 16 }, .{
@@ -740,7 +740,7 @@ test "furnaces preserve exact cooking fuel and light transitions across durable 
             try std.testing.expectEqual(@as(u32, 73), value.cook);
             try std.testing.expectEqual(@as(u32, 200), value.duration);
             expected_burn = value.burn_left;
-            try std.testing.expectEqual(north[1], try containers.deps.chunks.getBlock(key.world, key.position));
+            try std.testing.expectEqual(north[1], try containers.chunk_client.getBlock(key.world, key.position));
             var encoded = key.encode();
             var bytes: [furnace.encoded_bytes]u8 = undefined;
             var lengths: [1]?usize = undefined;
@@ -765,7 +765,7 @@ test "furnaces preserve exact cooking fuel and light transitions across durable 
             try std.testing.expect((try fixture.ownership.get(.{ .owner = key.owner(), .index = 0 })).stack == null);
             for (0..1201) |_| try furnace.tick(containers);
             try std.testing.expectEqual(@as(usize, 0), containers.active_count);
-            try std.testing.expectEqual(north[0], try containers.deps.chunks.getBlock(key.world, key.position));
+            try std.testing.expectEqual(north[0], try containers.chunk_client.getBlock(key.world, key.position));
             try containers.checkpoint(containers.deps.storage);
             try fixture.ownership.checkpoint(fixture.ownership.deps.storage);
             try containers.deps.chunks.checkpoint(try store.openSpace("chunks"));
@@ -871,14 +871,14 @@ test "container clicks enforce output fuel stack and recipe remainder rules" {
         for ([_]ContainerKey{ first, second }) |key| {
             try std.testing.expectEqual(BlockActions.Result.applied, try blocks.deps.actions.apply(.{ .action = .place, .player = &fixture.players.records[0], .position = key.position, .state = blocks.states.chests[0][0][0] }));
         }
-        const state = try blocks.deps.chunks.getBlock(first.world, first.position);
+        const state = try blocks.chunk_client.getBlock(first.world, first.position);
         try std.testing.expectEqual(second.position, blocks.states.partner(state, first.position).?);
         try std.testing.expect(try fixture.ownership.set(Containers.slot(first.world, first.position, 0), 0, bread));
         try std.testing.expectEqual(BlockActions.Result.applied, try blocks.deps.actions.apply(.{ .action = .remove, .player = &fixture.players.records[0], .position = first.position, .state = state }));
         try std.testing.expect((try fixture.ownership.get(Containers.slot(first.world, first.position, 0))).stack == null);
         try std.testing.expectEqual(@as(u64, 0), (try fixture.ownership.get(Containers.slot(first.world, first.position, 1))).revision);
-        try std.testing.expectEqual(@as(u16, 0), try blocks.deps.chunks.getBlock(first.world, first.position));
-        try std.testing.expectEqual(blocks.states.chests[0][0][0], try blocks.deps.chunks.getBlock(second.world, second.position));
+        try std.testing.expectEqual(@as(u16, 0), try blocks.chunk_client.getBlock(first.world, first.position));
+        try std.testing.expectEqual(blocks.states.chests[0][0][0], try blocks.chunk_client.getBlock(second.world, second.position));
         var cursor: ItemEntities.Cursor = .{};
         const drops = try fixture.dropped.scan(&cursor);
         try std.testing.expectEqual(@as(usize, 1), drops.len);
@@ -1168,7 +1168,7 @@ test "interrupted container saves recover a complete ownership snapshot" {
             try std.testing.expectEqual(@as(u64, if (complete) 2 else 1), store.lastTick());
             const totals = try countOwned(fixture, &.{ chest_key, furnace_key });
             try std.testing.expectEqualSlices(u64, &.{ 17, 6, 3, if (complete) 1 else 2, if (complete) 1 else 0 }, &totals);
-            try std.testing.expectEqual(complete, (try containers.deps.chunks.getBlock(chest_key.world, chest_key.position)) == 0);
+            try std.testing.expectEqual(complete, (try containers.chunk_client.getBlock(chest_key.world, chest_key.position)) == 0);
             try std.testing.expectEqual(@as(usize, if (complete) 7 else 8), fixture.dropped.free_count);
             const counters = containers.furnaceState(furnace_key.world, furnace_key.position);
             try std.testing.expectEqual(@as(u32, if (complete) 0 else 73), counters.cook);

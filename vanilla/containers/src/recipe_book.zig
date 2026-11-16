@@ -8,6 +8,8 @@ const inventories = @import("inventories");
 const sessions = @import("sessions");
 const packets = @import("minecraft_packets");
 const game_data = @import("game_data");
+/// Sections of crafting tables a tick reads at once.
+const block_batch = 16;
 const chunks = @import("chunks");
 const wire = @import("wire_1_21_5");
 const RecipeBookRegistry = @import("vanilla_crafting").recipe_book_registry.RecipeBookRegistry;
@@ -75,6 +77,8 @@ pub const RecipeBook = struct {
     allocator: std.mem.Allocator,
     content_memory: std.heap.ArenaAllocator,
     deps: Dependencies,
+    /// Reads block sections from the simulation budget, at most 16 at once.
+    chunk_client: chunks.Chunks.Client,
     config: Configuration,
     states: []State,
     flags: []u8,
@@ -107,6 +111,7 @@ pub const RecipeBook = struct {
             .allocator = allocator,
             .content_memory = .init(allocator),
             .deps = deps,
+            .chunk_client = try deps.chunks.simulation(block_batch),
             .config = config,
             .states = try allocator.alloc(State, players),
             .flags = &.{},
@@ -115,7 +120,7 @@ pub const RecipeBook = struct {
             .candidate = &.{},
             .active = try .init(allocator, players),
             .block_queries = try .init(allocator, players),
-            .block_leases = try allocator.alloc(chunks.Lease, @min(players, deps.chunks.demandCapacity())),
+            .block_leases = try allocator.alloc(chunks.Lease, @min(players, block_batch)),
             .observer = try deps.inventories.observe(allocator, players),
             .table = records.Table.init(deps.storage, deps.record_workspaces.resources),
             .state_bytes = try allocator.alloc(u8, config.state_bytes),
@@ -540,12 +545,11 @@ pub const RecipeBook = struct {
         }
         var offset: usize = 0;
         while (offset < self.block_queries.count()) {
-            // Batches stay within the simulation share of the cache; the background may pin the rest.
-            const count = @min(self.block_leases.len, self.deps.chunks.demandCapacity(), self.block_queries.count() - offset);
+            const count = @min(self.block_leases.len, self.block_queries.count() - offset);
             assert(count > 0);
             const sections = self.block_queries.keys[offset..][0..count];
             const leases = self.block_leases[0..count];
-            try self.deps.chunks.acquireMany(sections, leases);
+            try self.chunk_client.acquireMany(sections, leases);
             defer self.deps.chunks.releaseMany(leases);
             for (sections, leases, self.block_queries.values()[offset..][0..count]) |section, lease, head| {
                 var index = head;
