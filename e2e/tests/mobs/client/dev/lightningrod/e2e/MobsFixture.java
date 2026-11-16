@@ -23,12 +23,15 @@ import net.minecraft.world.phys.Vec3;
  */
 final class MobsFixture extends Fixture {
     private static final BlockPos GRASS = new BlockPos(8, 64, 8);
-    private enum Phase { GIVE, PLACE, PLACED, STANDING, TEMPT, SECOND, SECOND_PLACED, FEED, BRED, MILK, MILKED, ATTACK, PANIC, DONE }
+    private enum Phase { GIVE, PLACE, PLACED, STANDING, TEMPT, SECOND, SECOND_PLACED, FEED, BRED, MILK, MILKED, ATTACK, PANIC, KILL, LOOT, DONE }
     private Phase phase = Phase.GIVE;
     private long waitUntil;
     private long phaseStart;
     private Vec3 attackedFrom;
     private int attackedId;
+    private Vec3 deathPlace;
+    private long lastHit;
+    private int experienceBefore = -1;
 
     MobsFixture(Recorder r) { super(r); }
 
@@ -167,8 +170,34 @@ final class MobsFixture extends Fixture {
                 for (var candidate : cows) if (candidate.getId() == attackedId) cow = candidate;
                 if (cow == null) { client.fail("attacked_cow_gone"); return; }
                 // PanicGoal runs at twice the speed to a random place nearby.
-                if (cow.getHealth() < 10.0F && cow.position().distanceTo(attackedFrom) > 3.0) { next(Phase.DONE, 0); return; }
+                if (cow.getHealth() < 10.0F && cow.position().distanceTo(attackedFrom) > 3.0) { next(Phase.KILL, 0); return; }
                 if (timedOut(200)) client.fail("no_panic_health_" + cow.getHealth() + "_moved_" + cow.position().distanceTo(attackedFrom));
+            }
+            case KILL -> {
+                // Full strength punches, past the ten ticks of invulnerability each leaves, until it dies.
+                LivingEntity cow = null;
+                for (var candidate : cows) if (candidate.getId() == attackedId) cow = candidate;
+                if (experienceBefore < 0) experienceBefore = game.player.totalExperience;
+                if (cow == null || !cow.isAlive()) { next(Phase.LOOT, 0); return; }
+                deathPlace = cow.position();
+                if (r.tick - lastHit >= 12) {
+                    game.player.setPos(cow.getX() + 1.5, cow.getY(), cow.getZ());
+                    game.gameMode.attack(game.player, cow);
+                    lastHit = r.tick;
+                }
+                if (timedOut(600)) client.fail("cow_never_died_" + cow.getHealth());
+            }
+            case LOOT -> {
+                // A grown cow killed by a player drops beef and experience where it died. The player
+                // stands beside it and may take the experience at once.
+                boolean beef = false, orb = game.player.totalExperience > experienceBefore;
+                for (var entity : game.level.getEntities((Entity) null, new AABB(deathPlace, deathPlace).inflate(4))) {
+                    var type = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).getPath();
+                    if (type.equals("experience_orb")) orb = true;
+                    if (entity instanceof net.minecraft.world.entity.item.ItemEntity item && (item.getItem().is(Items.BEEF) || item.getItem().is(Items.COOKED_BEEF))) beef = true;
+                }
+                if (beef && orb) { next(Phase.DONE, 0); return; }
+                if (timedOut(200)) client.fail("no_loot_beef_" + beef + "_orb_" + orb);
             }
             case DONE -> client.pass("mobs");
         }

@@ -26,6 +26,7 @@
         .terrain = .{ .path = "../../terrain" },
         .vanilla_blocks = .{ .path = "../blocks" },
         .vanilla_content = .{ .path = "../content" },
+        .vanilla_crafting = .{ .path = "../crafting" },
         .vanilla_inventory = .{ .path = "../inventory" },
         .vanilla_item_entities = .{ .path = "../item_entities" },
         .vanilla_items = .{ .path = "../items" },

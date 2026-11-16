@@ -37,6 +37,12 @@ const Weather = @import("vanilla_world").weather.Weather;
 const Items = @import("vanilla_items").items.Items;
 const ClientRegistries = @import("vanilla_content").client_registries.ClientRegistries;
 const Experience = @import("vanilla_survival").experience.Experience;
+const Loot = @import("vanilla_items").loot_registry.Loot;
+const loot = @import("vanilla_items").loot;
+const item_data = @import("vanilla_items").item_data;
+const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
+const Furnaces = @import("vanilla_crafting").furnaces.Furnaces;
+const EnchantmentRegistry = @import("vanilla_items").enchantment_registry.EnchantmentRegistry;
 const damage = @import("damage.zig");
 
 const Mob = mob_state.Mob;
@@ -109,6 +115,10 @@ pub const Mobs = struct {
         inventories: *inventories.Inventories,
         client: *ClientRegistries,
         experience: *Experience,
+        loot: *Loot,
+        dropped: *ItemEntities,
+        furnaces: *Furnaces,
+        enchantment_registry: *EnchantmentRegistry,
     };
 
     deps: Dependencies,
@@ -144,6 +154,9 @@ pub const Mobs = struct {
     scratch: struct { count: u16 = 0, target: [3]i32 = .{ 0, 0, 0 }, reached: bool = false } = .{},
     /// The cow_food item tag and the panic_causes damage type tag, read when definitions change.
     food_tag: ?content_tags.Tags.Id = null,
+    /// Loot tables draw from their own random, as each vanilla table has its own sequence.
+    loot_random: std.Random.DefaultPrng,
+    loot_scratch: std.heap.FixedBufferAllocator,
     /// By damage type: what its tags say, and its id in the registry.
     damage_flags: []damage.Flags,
     damage_ids: []i32,
@@ -174,6 +187,8 @@ pub const Mobs = struct {
             .level_random = .init(@bitCast(config.seed)),
             .seeds = .init(config.seed ^ 0x73656564),
             .sound_seeds = .init(config.seed ^ 0x736f756e64),
+            .loot_random = .init(config.seed ^ 0x6c6f6f74),
+            .loot_scratch = .init(try allocator.alloc(u8, 16 * 1024)),
             .effects = try .init(allocator, deps.players),
             .table = records.Table.init(deps.storage, deps.record_workspaces.resources),
             .saved = try allocator.alloc(u64, config.maximum),
@@ -461,17 +476,15 @@ pub const Mobs = struct {
         mob.in_love = 0;
         partner.in_love = 0;
         self.entityEvent(mob, 18);
-        try self.dropExperience(mob, mob.random.nextIntBounded(7) + 1);
+        // One orb of one to seven, from the mob's own random, when mobs drop loot.
+        const value = mob.random.nextIntBounded(7) + 1;
+        if (self.deps.experience.free_count > 0) try self.deps.experience.spawnOrb(mob.world, mob.position, value);
     }
 
     fn spawnChild(self: *Mobs, parent: *Mob, variant: u8) !u64 {
         // EntityType.create for breeding, then setBaby and snapTo the parent with no rotation.
         return self.spawn(.{ .species = parent.species, .world = parent.world, .position = parent.position, .yaw = 0, .baby = true, .variant = variant, .finalize = false });
     }
-
-    /// An experience orb, as Animal.finalizeSpawnChildFromBreeding adds one. Orbs come with the
-    /// survival package's experience, which mobs reach once loot lands.
-    fn dropExperience(_: *Mobs, _: *Mob, _: i32) !void {}
 
     // What moving and living cause.
 
@@ -570,8 +583,70 @@ pub const Mobs = struct {
         try self.deps.experience.award(mob.world, mob.position, amount);
     }
 
-    /// LivingEntity.dropFromLootTable. Mob loot tables come next.
-    pub fn dropLoot(_: *Mobs, _: *Mob, _: mob_state.Damage, _: bool) !void {}
+    /// LivingEntity.dropFromLootTable: the species' table, knowing whether the mob burned, who
+    /// killed it and with what, dropped where it died as Entity.spawnAtLocation drops items.
+    pub fn dropLoot(self: *Mobs, mob: *Mob, dealt: mob_state.Damage, by_player: bool) !void {
+        const name = switch (mob.species) {
+            .cow => "minecraft:entities/cow",
+        };
+        const table = self.deps.loot.tables.get(name) orelse return;
+        self.loot_scratch.reset();
+        var weapon: ?Items.Prepared = null;
+        defer if (weapon) |pinned| pinned.release();
+        if (dealt.attacker) |slot| {
+            const player = &self.deps.players.records[slot];
+            const held: inventories.Slot = .{ .owner = player.uuid, .index = 36 + @as(u16, self.deps.player_states.of(player).selected_slot) };
+            if ((try self.deps.inventories.get(held)).stack) |stack| weapon = try self.deps.items.acquire(stack);
+        }
+        var buffer: [loot.maximum_drops]loot.Drop = undefined;
+        const context: loot.Context = .{
+            .items = self.deps.items.deps.definitions,
+            .location = .{ .world = mob.world, .x = mob.position[0], .y = mob.position[1], .z = mob.position[2] },
+            .on_fire = mob.fire_ticks > 0,
+            .killed_by_player = by_player,
+            .attacker_weapon = if (weapon) |pinned| pinned.view else null,
+            .smelter = .{ .context = self, .smelt = smelt },
+            .enchantment_tags = .{ .context = self, .contains = enchantmentInTag },
+            .random = self.loot_random.random(),
+            .scratch = &self.loot_scratch,
+        };
+        const drops = table.evaluate(&context, &buffer) catch |err| switch (err) {
+            error.OutOfMemory, error.LootCapacity => return,
+            else => return err,
+        };
+        if (drops.len == 0 or !self.deps.dropped.canCreate(drops.len)) return;
+        var requests: [loot.maximum_drops]ItemEntities.Spawn = undefined;
+        var spawned: [loot.maximum_drops]entities.Id = undefined;
+        for (drops, requests[0..drops.len]) |drop, *request| {
+            const dx = self.level_random.nextDouble() * 0.2 - 0.1;
+            const dz = self.level_random.nextDouble() * 0.2 - 0.1;
+            request.* = .{
+                .world = mob.world,
+                .position = mob.position,
+                .velocity = .{ dx, 0.2, dz },
+                .stack = .{ .item = try item_data.define(self.deps.inventories, drop.kind, drop.components), .count = @intCast(drop.count) },
+            };
+        }
+        try self.deps.dropped.createMany(requests[0..drops.len], spawned[0..drops.len]);
+    }
+
+    fn enchantmentInTag(context: *const anyopaque, tag: []const u8, enchantment: []const u8) bool {
+        const self: *const Mobs = @ptrCast(@alignCast(context));
+        const registry = self.deps.enchantment_registry.client.get("minecraft:enchantment") orelse return false;
+        const found = registry.tags.find(tag) orelse return false;
+        const member = registry.id(enchantment) orelse return false;
+        return registry.tags.contains(found, member);
+    }
+
+    /// SmeltItemFunction: a smelting recipe's result, by the server's furnace recipes.
+    fn smelt(context: *const anyopaque, kind: u32) ?loot.Smelted {
+        const self: *const Mobs = @ptrCast(@alignCast(context));
+        const recipes = self.deps.furnaces.table.recipes;
+        if (kind >= recipes.len) return null;
+        const recipe = recipes[kind] orelse return null;
+        if (recipe.callback != null) return null;
+        return .{ .kind = recipe.output, .count = recipe.count };
+    }
 
     /// Level.broadcastEntityEvent: a status byte every viewer gets.
     pub fn entityEvent(_: *Mobs, mob: *Mob, event: u8) void {

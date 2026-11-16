@@ -145,11 +145,19 @@ pub const Compiler = struct {
             return .{ .table_bonus = .{ .enchantment = try self.allocator.dupe(u8, try text(json, "enchantment")), .chances = chances } };
         }
         if (std.mem.eql(u8, kind, "minecraft:entity_properties")) {
-            if (!std.mem.eql(u8, try text(json, "entity"), "this")) return error.UnsupportedLootPredicate;
+            const entity = try text(json, "entity");
             const predicate = field(json, "predicate") orelse return error.InvalidLootCondition;
-            if (predicate != .object or predicate.object.count() != 0) return error.UnsupportedLootPredicate;
-            return .entity;
+            if (predicate != .object) return error.UnsupportedLootPredicate;
+            if (std.mem.eql(u8, entity, "direct_attacker")) return .{ .attacker_enchanted = try self.mainHandEnchantmentTag(predicate) };
+            if (!std.mem.eql(u8, entity, "this")) return error.UnsupportedLootPredicate;
+            if (predicate.object.count() == 0) return .entity;
+            // The one entity predicate entity tables here use: whether the entity burns.
+            const flags = field(predicate, "flags") orelse return error.UnsupportedLootPredicate;
+            if (predicate.object.count() != 1 or flags != .object or flags.object.count() != 1) return error.UnsupportedLootPredicate;
+            if (field(flags, "is_on_fire") == null) return error.UnsupportedLootPredicate;
+            return .{ .entity_on_fire = try boolean(flags, "is_on_fire", false) };
         }
+        if (std.mem.eql(u8, kind, "minecraft:killed_by_player")) return .killed_by_player;
         if (std.mem.eql(u8, kind, "minecraft:location_check")) {
             const predicate = field(json, "predicate") orelse return error.InvalidLootCondition;
             const block = field(predicate, "block") orelse return error.UnsupportedLootPredicate;
@@ -161,6 +169,23 @@ pub const Compiler = struct {
         if (try self.extension(json, .condition)) |binding| return .{ .custom = binding.condition };
         return error.UnsupportedLootCondition;
     }
+    /// The one attacker predicate entity tables here use: an enchantment of a tag on the main hand,
+    /// as {"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#tag"}]}}}}.
+    fn mainHandEnchantmentTag(self: *Compiler, predicate: std.json.Value) ![]const u8 {
+        if (predicate.object.count() != 1) return error.UnsupportedLootPredicate;
+        const equipment = field(predicate, "equipment") orelse return error.UnsupportedLootPredicate;
+        if (equipment != .object or equipment.object.count() != 1) return error.UnsupportedLootPredicate;
+        const main_hand = field(equipment, "mainhand") orelse return error.UnsupportedLootPredicate;
+        if (main_hand != .object or main_hand.object.count() != 1) return error.UnsupportedLootPredicate;
+        const predicates = field(main_hand, "predicates") orelse return error.UnsupportedLootPredicate;
+        if (predicates != .object or predicates.object.count() != 1) return error.UnsupportedLootPredicate;
+        const conditions_json = optionalArray(predicates, "minecraft:enchantments") orelse return error.UnsupportedLootPredicate;
+        if (conditions_json.len != 1 or conditions_json[0] != .object or conditions_json[0].object.count() != 1) return error.UnsupportedLootPredicate;
+        const tag = try text(conditions_json[0], "enchantments");
+        if (!std.mem.startsWith(u8, tag, "#")) return error.UnsupportedLootPredicate;
+        return self.allocator.dupe(u8, tag[1..]);
+    }
+
     fn functions(self: *Compiler, json: std.json.Value, depth: usize) anyerror![]const Function {
         if (depth >= 64) return error.LootDepthLimit;
         const values = optionalArray(json, "functions") orelse return error.InvalidLootFunction;
@@ -192,6 +217,12 @@ pub const Compiler = struct {
                     bonus.probability = try probability(field(parameters, "probability") orelse return error.InvalidLootFunction);
                 } else return error.UnsupportedLootFormula;
                 function.operation = .{ .bonus = bonus };
+            } else if (std.mem.eql(u8, kind, "minecraft:furnace_smelt")) {
+                function.operation = .smelt;
+            } else if (std.mem.eql(u8, kind, "minecraft:enchanted_count_increase")) {
+                const limit = try intField(value, "limit", 0);
+                if (limit < 0) return error.InvalidLootFunction;
+                function.operation = .{ .enchanted_count = .{ .count = try number(field(value, "count") orelse return error.InvalidLootFunction), .name = try self.allocator.dupe(u8, try text(value, "enchantment")), .limit = @intCast(limit) } };
             } else if (std.mem.eql(u8, kind, "minecraft:set_components")) {
                 function.operation = .{ .components = try self.format.components(self.allocator, field(value, "components") orelse return error.InvalidLootFunction) };
             } else if (std.mem.eql(u8, kind, "minecraft:copy_components")) {

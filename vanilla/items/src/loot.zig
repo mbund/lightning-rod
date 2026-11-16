@@ -23,8 +23,29 @@ pub const Context = struct {
     entity: bool = true,
     block_components: []const item_data.Component = &.{},
     dynamic: []const Drop = &.{},
+    /// For entity tables: whether the entity burned, whether a player killed it, the weapon
+    /// that killed it, and the furnace recipes furnace_smelt cooks by.
+    on_fire: bool = false,
+    killed_by_player: bool = false,
+    attacker_weapon: ?item_data.View = null,
+    smelter: ?Smelter = null,
+    enchantment_tags: ?EnchantmentTags = null,
     random: std.Random,
     scratch: *std.heap.FixedBufferAllocator,
+};
+
+/// What a furnace makes of an item, for furnace_smelt, which loot reaches through the server.
+pub const Smelter = struct {
+    context: *const anyopaque,
+    smelt: *const fn (context: *const anyopaque, kind: u32) ?Smelted,
+};
+
+pub const Smelted = struct { kind: u32, count: i32 };
+
+/// Whether an enchantment is in an enchantment tag, which loot asks of the killer's weapon.
+pub const EnchantmentTags = struct {
+    context: *const anyopaque,
+    contains: *const fn (context: *const anyopaque, tag: []const u8, enchantment: []const u8) bool,
 };
 
 pub const Kind = enum { condition, function, entry };
@@ -163,6 +184,11 @@ pub const ConditionDefinition = union(enum) {
     table_bonus: struct { enchantment: []const u8, chances: []const f32 },
     location: struct { offset: Offset, state: State },
     entity,
+    /// entity_properties of the entity the table drops for, by its is_on_fire flag.
+    entity_on_fire: bool,
+    /// entity_properties of the direct attacker, by an enchantment tag on its main hand.
+    attacker_enchanted: []const u8,
+    killed_by_player,
     explosion,
 };
 
@@ -215,6 +241,9 @@ pub const Condition = union(enum) {
     table_bonus: struct { enchantment: []const u8, chances: []const f32 },
     location: struct { offset: Offset, state: State },
     entity,
+    entity_on_fire: bool,
+    attacker_enchanted: []const u8,
+    killed_by_player,
     explosion,
 
     fn matches(self: Condition, context: *const Context) anyerror!bool {
@@ -256,6 +285,15 @@ pub const Condition = union(enum) {
                 break :blk true;
             },
             .entity => context.entity,
+            .entity_on_fire => |burning| context.on_fire == burning,
+            .attacker_enchanted => |tag| blk: {
+                const view = context.attacker_weapon orelse break :blk false;
+                const tags = context.enchantment_tags orelse break :blk false;
+                var iterator = try Enchantments.Iterator.init(view.value(.enchantments) orelse break :blk false);
+                while (try iterator.next()) |entry| if (tags.contains(tags.context, tag, entry.name)) break :blk true;
+                break :blk false;
+            },
+            .killed_by_player => context.killed_by_player,
             .explosion => true,
         };
     }
@@ -269,6 +307,10 @@ pub const Operation = union(enum) {
     components: []const item_data.Component,
     copy_components: struct { include: ?[]const u64, exclude: []const u64 },
     copy_state: []const struct { state: u16, value: []const u8 },
+    /// SmeltItemFunction: the furnace result, as many as the drop.
+    smelt,
+    /// EnchantedCountIncreaseFunction: more for the killer's weapon's enchantment level.
+    enchanted_count: struct { count: Number, name: []const u8, limit: i32 = 0 },
     explosion,
 };
 
@@ -308,6 +350,19 @@ pub const Function = struct {
                     try drop.put(.{ .key = item_data.key(.block_state), .value = value.value });
                     break;
                 }
+            },
+            .smelt => if (context.smelter) |smelter| if (smelter.smelt(smelter.context, drop.kind)) |smelted| {
+                drop.kind = smelted.kind;
+                drop.count *|= smelted.count;
+            },
+            .enchanted_count => |increase| {
+                const view = context.attacker_weapon orelse return;
+                const enchantment_level = try Enchantments.level(view, increase.name);
+                if (enchantment_level == 0) return;
+                const amount = @as(f32, @floatFromInt(enchantment_level)) * increase.count.sample(context.random);
+                // Math.round, half up.
+                drop.count +|= @intFromFloat(@floor(amount + 0.5));
+                if (increase.limit > 0) drop.count = @min(drop.count, increase.limit);
             },
             .explosion => {},
         }
@@ -626,6 +681,9 @@ const Preparation = struct {
             },
             .state => |state_value| condition.* = .{ .state = state_value },
             .entity => condition.* = .entity,
+            .entity_on_fire => |burning| condition.* = .{ .entity_on_fire = burning },
+            .attacker_enchanted => |tag| condition.* = .{ .attacker_enchanted = tag },
+            .killed_by_player => condition.* = .killed_by_player,
             .explosion => condition.* = .explosion,
         };
         return conditions;
@@ -643,6 +701,7 @@ const Preparation = struct {
                     if (limit.maximum) |maximum| try validateNumber(maximum);
                 },
                 .bonus => |bonus| if (!std.math.isFinite(bonus.probability) or bonus.probability < 0 or bonus.probability > 1 or bonus.extra > 4096 or bonus.multiplier > 4096) return error.InvalidLootFunction,
+                .enchanted_count => |increase| try validateNumber(increase.count),
                 else => {},
             }
         }

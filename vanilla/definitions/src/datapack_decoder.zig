@@ -119,9 +119,16 @@ pub fn decode(allocator: std.mem.Allocator, scratch: std.mem.Allocator, resource
         const resource = resources.entries[index];
         const name = try resourceName(allocator, resource.name, "loot_table");
         const path = name[std.mem.indexOfScalar(u8, name, ':').? + 1 ..];
-        if (options.baseline and !std.mem.startsWith(u8, path, "blocks/")) continue;
+        const entity_table = std.mem.startsWith(u8, path, "entities/");
+        if (options.baseline and !std.mem.startsWith(u8, path, "blocks/") and !entity_table) continue;
         loot_compiler.format = try Format.select(resource.format);
-        try loot_definitions.append(scratch, .{ .name = name, .table = (try loot_compiler.decode(resource.bytes)).* });
+        const table = loot_compiler.decode(resource.bytes) catch |err| switch (err) {
+            // The baseline keeps the entity tables loot can read, among them those of the mobs
+            // this server simulates, and leaves the rest until their features and mobs come.
+            error.UnsupportedLootCondition, error.UnsupportedLootEntry, error.UnsupportedLootFormula, error.UnsupportedLootFunction, error.UnsupportedLootNumber, error.UnsupportedLootPredicate => if (options.baseline and entity_table) continue else return err,
+            else => return err,
+        };
+        try loot_definitions.append(scratch, .{ .name = name, .table = table.* });
     }
     result.registries = try allocator.dupe(Registries.Definition, registry_definitions.items);
     result.dimension_types = try allocator.dupe(dimension_types.DimensionType, dimensions.items);

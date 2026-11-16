@@ -50,6 +50,7 @@ pub fn build(b: *std.Build) void {
         .{ .source = "definition_provider_test", .step = "test-content", .description = "Verify loaded content and client registry configuration", .native = true },
         .{ .source = "native_content_test", .step = "test-native-content", .description = "Verify gameplay composition without the datapack package", .native = true },
         .{ .source = "datapacks_test", .step = "test-datapacks", .description = "Verify optional datapack adapters and native composition" },
+        .{ .source = "mobs_test", .step = "test-mobs", .description = "Verify mob path types and loot against vanilla" },
     }) |root| {
         const test_module = b.createModule(.{ .root_source_file = b.path(b.fmt("src/{s}.zig", .{root.source})), .target = target, .optimize = optimize });
         for (module.import_table.keys(), module.import_table.values()) |name, dependency|

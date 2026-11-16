@@ -271,6 +271,26 @@ pub const Experience = struct {
         if (body_count > 0) try self.createBodies(bodies[0..body_count]);
     }
 
+    /// One orb of the whole value, as `new ExperienceOrb(level, x, y, z, value)` makes it, where
+    /// award would split the value and merge into orbs nearby. Animals bred drop one this way.
+    pub fn spawnOrb(self: *Experience, world: u32, position: [3]f64, value: i32) !void {
+        for (position) |component| assert(std.math.isFinite(component) and @abs(component) <= 30_000_000);
+        if (self.deps.players.deps.worlds.get(world) == null) return error.UnknownWorld;
+        if (value <= 0) return error.InvalidExperience;
+        if (self.free_count == 0 or !self.canAwardMany(&.{1})) return error.ExperienceCapacity;
+        errdefer self.deps.storage.fail();
+        var window = self.deps.physics.readWindow();
+        defer window.deinit();
+        const random = self.random.random();
+        const yaw = random.float(f32) * 360;
+        const velocity: [3]f64 = .{ (random.float(f64) * 0.2 - 0.1) * 2, random.float(f64) * 0.2 * 2, (random.float(f64) * 0.2 - 0.1) * 2 };
+        const expected = self.deps.entities.next_id;
+        var body: entities.State = .{ .uuid = @as(u128, expected) | (@as(u128, 0xe000) << 64), .kind = @intCast(game_data.registry.entityId("minecraft:experience_orb").?), .world = world, .position = position, .velocity = velocity, .yaw = yaw };
+        try self.deps.physics.placeOrb(&window, &body);
+        _ = self.insert(expected, body, .{ .value = value, .alive = true });
+        try self.createBodies(&.{body});
+    }
+
     fn createBodies(self: *Experience, bodies: []const entities.State) !void {
         assert(bodies.len > 0 and bodies.len <= 64);
         var created: [64]entities.Id = undefined;
