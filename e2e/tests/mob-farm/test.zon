@@ -1,0 +1,1 @@
+.{ .client = "MobFarmFixture", .scenarios = .{.{ .name = "mob-farm", .peers = .{"alice"} }} }

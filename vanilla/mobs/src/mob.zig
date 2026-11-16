@@ -165,6 +165,8 @@ pub const Mob = struct {
     no_jump_delay: i32 = 0,
     speed: f32 = 0,
     ticks_frozen: i32 = 0,
+    /// LivingEntity.tryAddFrost's slowdown, added to the movement speed while freezing.
+    frost_speed: f32 = 0,
     last_climbable: ?[3]i32 = null,
     /// FOLLOW_RANGE's random spawn bonus, a multiplier of its base.
     follow_range_bonus: f64 = 0,

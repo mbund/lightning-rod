@@ -187,6 +187,15 @@ fn aiStep(mobs: *Mobs, mob: *Mob) !void {
     try effects.applyEffectsFromBlocks(mobs, mob);
     // Freezing: powder snow chills, and thaws two ticks at a time outside it.
     if (!mob.in_powder_snow) mob.ticks_frozen = @max(0, mob.ticks_frozen - 2);
+    // LivingEntity.removeFrost, then tryAddFrost over anything but air.
+    mob.frost_speed = 0;
+    if (mob.ticks_frozen > 0) {
+        const under = try living.onPosition(mobs, mob, 0.2);
+        const level = mobs.level(mob.world);
+        if (!level.blocks.get(try level.state(under[0], under[1], under[2])).flags.air) {
+            mob.frost_speed = -0.05 * (@as(f32, @floatFromInt(@min(140, mob.ticks_frozen))) / 140.0);
+        }
+    }
     if (@rem(mob.tick_count, 40) == 0 and mob.ticks_frozen >= 140) _ = try mobs.hurt(mob, .{ .type = .freeze }, 1);
     try mobs.pushEntities(mob);
 

@@ -84,6 +84,10 @@ pub const Kind = enum(u8) {
     turtle_egg,
     soul_sand,
     moving_piston,
+    fire,
+    soul_fire,
+    campfire,
+    soul_campfire,
 };
 
 pub const Facing = enum(u3) { none, north, south, west, east, up, down };
@@ -113,7 +117,11 @@ pub const Flags = packed struct(u32) {
     drag: bool = false,
     /// BlockState.hasLargeCollisionShape: a collision shape reaching past its block, as fences do.
     large_shape: bool = false,
-    padding: u11 = 0,
+    /// An age property above zero, as grown sweet berry bushes have.
+    aged: bool = false,
+    /// A cauldron's fill level, 1 to 3.
+    level: u2 = 0,
+    padding: u8 = 0,
 };
 
 pub const State = struct {
@@ -174,6 +182,8 @@ pub const MobBlocks = struct {
                     .top = std.mem.eql(u8, property(name, "half") orelse "", "top") or std.mem.eql(u8, property(name, "type") orelse "", "top"),
                     .drag = std.mem.eql(u8, property(name, "drag") orelse "", "true"),
                     .large_shape = largeShape(state),
+                    .aged = !std.mem.eql(u8, property(name, "age") orelse "0", "0"),
+                    .level = if (property(name, "level")) |value| (if (value.len == 1 and value[0] >= '1' and value[0] <= '3') @as(u2, @intCast(value[0] - '0')) else 0) else 0,
                 },
             };
             if (entry.kind == .moving_piston) entry.flags.large_shape = true;

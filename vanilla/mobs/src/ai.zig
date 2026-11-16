@@ -51,7 +51,7 @@ fn rotlerp(angle: f32, target: f32, limit: f32) f32 {
 }
 
 pub fn movementSpeed(mobs: *const Mobs, mob: *const Mob) f64 {
-    return mobs.traits(mob.species).attribute(.movement_speed);
+    return @max(0, mobs.traits(mob.species).attribute(.movement_speed) + mob.frost_speed);
 }
 
 /// MoveControl.tick.

@@ -65,6 +65,7 @@ pub const Sound = enum {
     cow_step,
     cow_milk,
     amethyst_block_chime,
+    turtle_egg_break,
 
     pub fn name(self: Sound) []const u8 {
         return switch (self) {
@@ -82,6 +83,7 @@ pub const Sound = enum {
             .cow_step => "minecraft:entity.cow.step",
             .cow_milk => "minecraft:entity.cow.milk",
             .amethyst_block_chime => "minecraft:block.amethyst_block.chime",
+            .turtle_egg_break => "minecraft:entity.turtle.egg_break",
         };
     }
 };
@@ -725,8 +727,41 @@ pub const Mobs = struct {
         try self.deps.chunks.setBlock(world, .{ .x = position[0], .y = position[1], .z = position[2] }, @intCast(game_data.registry.blockStateId("minecraft:dirt").?));
     }
 
-    /// TurtleEggBlock.decreaseEggs. Turtle eggs keep their count until turtles exist.
-    pub fn crackTurtleEgg(_: *Mobs, _: u32, _: [3]i32, _: u16) !void {}
+    /// TurtleEggBlock.decreaseEggs: the crack sound, then one egg fewer, or none left.
+    pub fn crackTurtleEgg(self: *Mobs, world: u32, position: [3]i32, state: u16) !void {
+        const pitch = 0.9 + self.level_random.nextFloat() * 0.2;
+        self.blockSound(world, centerOf(position), .turtle_egg_break, 0.7, pitch);
+        const name = game_data.registry.blockStateName(state).?;
+        const eggs = propertyValue(name, "eggs") orelse return;
+        if (eggs.len != 1 or eggs[0] <= '1') return self.destroyBlock(world, position);
+        const fewer = withProperty(state, "eggs", &.{eggs[0] - 1}) orelse return;
+        try self.deps.chunks.setBlock(world, .{ .x = position[0], .y = position[1], .z = position[2] }, fewer);
+        self.effects.worldEvent(world, .{ .x = position[0], .y = position[1], .z = position[2] }, 2001, state);
+    }
+
+    /// Level.destroyBlock with no drops: the block's break effect, then air.
+    pub fn destroyBlock(self: *Mobs, world: u32, position: [3]i32) !void {
+        const level_view = self.level(world);
+        const state = try level_view.state(position[0], position[1], position[2]);
+        if (game_data.physics.get(state).air) return;
+        self.effects.worldEvent(world, .{ .x = position[0], .y = position[1], .z = position[2] }, 2001, state);
+        try self.deps.chunks.setBlock(world, .{ .x = position[0], .y = position[1], .z = position[2] }, self.air_state);
+    }
+
+    /// LayeredCauldronBlock.handleEntityOnFireInside: a burning mob takes a level of water, and
+    /// powder snow turns to water a level lower.
+    pub fn lowerCauldron(self: *Mobs, world: u32, position: [3]i32) !void {
+        const level_view = self.level(world);
+        const state = try level_view.state(position[0], position[1], position[2]);
+        const entry = level_view.blocks.get(state);
+        if (entry.flags.level == 0) return;
+        const remaining = entry.flags.level - 1;
+        const lowered: u16 = if (remaining == 0) @intCast(game_data.registry.blockStateId("minecraft:cauldron").?) else blk: {
+            const water = game_data.registry.blockStateId(if (remaining == 1) "minecraft:water_cauldron[level=1]" else "minecraft:water_cauldron[level=2]").?;
+            break :blk @intCast(water);
+        };
+        try self.deps.chunks.setBlock(world, .{ .x = position[0], .y = position[1], .z = position[2] }, lowered);
+    }
 
     // Saving.
 
@@ -941,3 +976,39 @@ fn push(pushed: *Mob, pusher: *Mob) void {
 const search_nodes = 16384;
 /// Nodes one path may hold: the most a search can visit, plus its start.
 const path_capacity = 320;
+
+fn centerOf(position: [3]i32) [3]f64 {
+    return .{ @as(f64, @floatFromInt(position[0])) + 0.5, @as(f64, @floatFromInt(position[1])) + 0.5, @as(f64, @floatFromInt(position[2])) + 0.5 };
+}
+
+fn propertyValue(name: []const u8, key: []const u8) ?[]const u8 {
+    const begin = std.mem.indexOfScalar(u8, name, '[') orelse return null;
+    var properties = std.mem.splitScalar(u8, name[begin + 1 .. name.len - 1], ',');
+    while (properties.next()) |entry| {
+        const separator = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        if (std.mem.eql(u8, entry[0..separator], key)) return entry[separator + 1 ..];
+    }
+    return null;
+}
+
+/// The state with one property changed, found by name, for the rare edits mobs make.
+fn withProperty(state: u16, key: []const u8, value: []const u8) ?u16 {
+    const name = game_data.registry.blockStateName(state).?;
+    var buffer: [256]u8 = undefined;
+    const begin = std.mem.indexOfScalar(u8, name, '[') orelse return null;
+    var writer = std.Io.Writer.fixed(&buffer);
+    writer.writeAll(name[0 .. begin + 1]) catch return null;
+    var properties = std.mem.splitScalar(u8, name[begin + 1 .. name.len - 1], ',');
+    var first = true;
+    while (properties.next()) |entry| {
+        const separator = std.mem.indexOfScalar(u8, entry, '=') orelse return null;
+        if (!first) writer.writeByte(',') catch return null;
+        first = false;
+        if (std.mem.eql(u8, entry[0..separator], key)) {
+            writer.print("{s}={s}", .{ key, value }) catch return null;
+        } else writer.writeAll(entry) catch return null;
+    }
+    writer.writeByte(']') catch return null;
+    const found = game_data.registry.blockStateId(writer.buffered()) orelse return null;
+    return @intCast(found);
+}
