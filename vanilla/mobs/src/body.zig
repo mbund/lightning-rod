@@ -18,6 +18,11 @@ pub const Box = struct {
     min: [3]f64,
     max: [3]f64,
 
+    /// The AABB constructor, which takes two corners in either order.
+    pub fn corners(a: [3]f64, b: [3]f64) Box {
+        return .{ .min = .{ @min(a[0], b[0]), @min(a[1], b[1]), @min(a[2], b[2]) }, .max = .{ @max(a[0], b[0]), @max(a[1], b[1]), @max(a[2], b[2]) } };
+    }
+
     pub fn move(self: Box, by: [3]f64) Box {
         return .{ .min = .{ self.min[0] + by[0], self.min[1] + by[1], self.min[2] + by[2] }, .max = .{ self.max[0] + by[0], self.max[1] + by[1], self.max[2] + by[2] } };
     }
@@ -50,8 +55,21 @@ pub fn makeBox(position: [3]f64, width: f32, height: f32) Box {
 }
 
 /// The world as a body reads it.
+/// Blocks held in memory, for tests that build a world of their own.
+pub const Volume = struct {
+    size: [3]i32,
+    /// By (y * size z + z) * size x + x.
+    states: []const u16,
+
+    pub fn get(self: *const Volume, x: i32, y: i32, z: i32, air: u16) u16 {
+        if (x < 0 or y < 0 or z < 0 or x >= self.size[0] or y >= self.size[1] or z >= self.size[2]) return air;
+        return self.states[@intCast((y * self.size[2] + z) * self.size[0] + x)];
+    }
+};
+
 pub const Level = struct {
-    copies: *chunks.Copies,
+    copies: ?*chunks.Copies,
+    volume: ?*const Volume = null,
     blocks: *const MobBlocks,
     world: u32,
     minimum_y: i32,
@@ -61,7 +79,8 @@ pub const Level = struct {
     /// Outside the world's height a level reads void air, which collides with nothing.
     pub fn state(self: *const Level, x: i32, y: i32, z: i32) !u16 {
         if (y < self.minimum_y or y >= self.minimum_y + self.height) return self.air;
-        return self.copies.get(self.world, .{ .x = x, .y = y, .z = z });
+        if (self.volume) |volume| return volume.get(x, y, z, self.air);
+        return self.copies.?.get(self.world, .{ .x = x, .y = y, .z = z });
     }
 
     pub fn fluid(self: *const Level, x: i32, y: i32, z: i32) !game_data.physics_data.State {

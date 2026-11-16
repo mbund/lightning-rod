@@ -110,6 +110,8 @@ pub const Search = struct {
     node_count: u32 = 0,
     /// Open addressing from Node.createHash to a node.
     slots: []u32,
+    /// The slot each node took, to empty exactly those for the next search.
+    node_slots: []u32,
     /// The binary heap of open nodes, by node.
     heap: []u32,
     heap_size: u32 = 0,
@@ -134,6 +136,7 @@ pub const Search = struct {
         const self: Search = .{
             .nodes = try allocator.alloc(Node, capacity),
             .slots = try allocator.alloc(u32, capacity * 2),
+            .node_slots = try allocator.alloc(u32, capacity),
             .heap = try allocator.alloc(u32, capacity),
             .type_keys = try allocator.alloc(u64, types),
             .type_values = try allocator.alloc(PathType, types),
@@ -145,7 +148,7 @@ pub const Search = struct {
     }
 
     fn reset(self: *Search, level: *const body.Level, mob: *const Mob) void {
-        for (self.nodes[0..self.node_count]) |made| self.slots[self.slotOf(nodeHash(made.x, made.y, made.z))] = empty_slot;
+        for (self.node_slots[0..self.node_count]) |slot| self.slots[slot] = empty_slot;
         self.node_count = 0;
         self.heap_size = 0;
         @memset(self.type_used, false);
@@ -180,6 +183,7 @@ pub const Search = struct {
         self.nodes[index] = .{ .x = x, .y = y, .z = z };
         self.node_count += 1;
         self.slots[slot] = index;
+        self.node_slots[index] = @intCast(slot);
         return index;
     }
 
@@ -468,10 +472,11 @@ pub const Search = struct {
         const center_x = @as(f64, @floatFromInt(x - step[0])) + 0.5;
         const center_z = @as(f64, @floatFromInt(z - step[1])) + 0.5;
         const half: f64 = self.mob.width / 2.0;
-        const query: body.Box = .{
-            .min = .{ center_x - half, try staticFloorLevelAt(self, center_x, @as(f64, @floatFromInt(y + 1)), center_z) + 0.001, center_z - half },
-            .max = .{ center_x + half, @as(f64, self.mob.height) + try self.floorLevel(n.x, n.y, n.z) - 0.002, center_z + half },
-        };
+        // The floor here may stand above the head room there, which turns the box inside out.
+        const query: body.Box = .corners(
+            .{ center_x - half, try self.floorLevel(mth.floor(center_x), y + 1, mth.floor(center_z)) + 0.001, center_z - half },
+            .{ center_x + half, @as(f64, self.mob.height) + try self.floorLevel(n.x, n.y, n.z) - 0.002, center_z + half },
+        );
         return if (try self.hasCollisions(query)) null else found;
     }
 
@@ -739,10 +744,6 @@ pub fn staticFloorLevel(level: *const body.Level, x: i32, y: i32, z: i32) !f64 {
         top = if (top) |current| @max(current, value) else value;
     }
     return @as(f64, @floatFromInt(y - 1)) + (top orelse 0.0);
-}
-
-fn staticFloorLevelAt(search: *Search, x: f64, y: f64, z: f64) !f64 {
-    return staticFloorLevel(search.level, mth.floor(x), mth.floor(y), mth.floor(z));
 }
 
 pub const Direction = enum {
