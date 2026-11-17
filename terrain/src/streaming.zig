@@ -1620,7 +1620,11 @@ pub const Streaming = struct {
             // built from live sections can be larger, and its packet is stored nowhere, so
             // a retry would read the same bound again. It gets a whole page.
             const stored = self.deps.lighting.deliveryStored(item.world, item.at.x, item.at.z);
-            const declared = if (stored) try self.delivery.packetBound(.{ .world = item.world, .x = item.at.x, .z = item.at.z }, item.protocol) else null;
+            const record = if (stored) try self.delivery.packetBound(.{ .world = item.world, .x = item.at.x, .z = item.at.z }, item.protocol) else null;
+            // Records bound what they hold without light, which changes after they are kept, so
+            // the reservation adds the most light a column of this height carries.
+            const sections = self.deps.worlds.get(item.world).?.dimension.sectionCount();
+            const declared = if (record) |bound| bound + lighting.Data.maximumEncodedSize(@intCast(sections)) else null;
             if (declared) |bound| self.reserve_typical = @min(bound, service.config.page_bytes);
             if (declared == null) self.deliveries.page_reservations.add(1);
             size.* = @min(service.config.page_bytes, declared orelse service.config.page_bytes);

@@ -195,7 +195,10 @@ pub const Workspace = struct {
         self.baked_generation = self.preparation;
         const sections = self.representation(chunk);
         if (record == null or storedHeightmap(chunk) == null) try self.prepareSections(sections);
-        return .{ .packet = .{ .chunk = chunk, .sections = sections, .maximum_size = if (record) |value| value.maximum_size else self.maximumSize(chunk, sections.len), .preparation = self.preparation }, .encoding = if (record) |value| .{ .record = value } else .uniform, .owner = cache, .generation = cache.generation };
+        var light = chunk.light;
+        light.disclosure &= chunk.disclosure;
+        const maximum_size = if (record) |value| value.maximum_size + light.encodedSize() else self.maximumSize(chunk, sections.len);
+        return .{ .packet = .{ .chunk = chunk, .sections = sections, .maximum_size = maximum_size, .preparation = self.preparation }, .encoding = if (record) |value| .{ .record = value } else .uniform, .owner = cache, .generation = cache.generation };
     }
 
     /// A column whose neighbourhood stores no biomes, as in terrain generated without any,
@@ -277,11 +280,9 @@ pub const Workspace = struct {
             try encodeTraced(.init(cache.plain), variant.codec.registry, &prepared, variant.definition, true, &trace)
         else
             try encodeTraced(.init(cache.plain), variant.codec.registry, &prepared, variant.definition, false, &trace);
-        var maximum_light = full.light;
-        maximum_light.disclosure = std.math.maxInt(u32);
-        maximum_light.selection = null;
-        maximum_light.retained = .{ 0, 0 };
-        const maximum_size = @min((1 << 21) - 1, prepared.maximum_size - full.light.encodedSize() + maximum_light.encodedSize() + prepared.sections.len * 64 + 64);
+        // Light changes after the record is kept, so the record bounds what it holds and each
+        // send adds the light it carries.
+        const maximum_size = @min((1 << 21) - 1, prepared.maximum_size - full.light.encodedSize() + prepared.sections.len * 64 + 64);
         var writer = chunks.Delivery.Writer.begin(destination, source, maximum_size) catch return deliverySpace(cache);
         for (prepared.sections, 0..) |section, index| {
             const entry = trace.sections[index];

@@ -2363,6 +2363,13 @@ pub const Data = struct {
         return 4 * 9 + 2 + layers * (2 + 2048);
     }
 
+    /// The most `encodedSize` gives for a column of `sections` sections, with every layer of both
+    /// kinds of light sent.
+    pub fn maximumEncodedSize(sections: usize) usize {
+        assert(sections > 0 and sections <= maximum_sections);
+        return 4 * 9 + 2 + 2 * (sections + 2) * (2 + 2048);
+    }
+
     pub fn write(self: Data, writer: *std.Io.Writer) !void {
         return self.writeData(writer, null, null);
     }

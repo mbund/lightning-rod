@@ -192,6 +192,7 @@ pub const Section = struct {
 pub const View = struct {
     bytes: []const u8,
     count: u8,
+    /// The largest packet the record makes without its light, which each send adds as it stands.
     maximum_size: u32,
     entity_sections: u32,
 
