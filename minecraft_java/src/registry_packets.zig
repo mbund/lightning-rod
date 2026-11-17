@@ -143,9 +143,10 @@ pub fn RegistryPackets(comptime Wire: type) type {
 
         /// Registries changed from vanilla's `vanilla` snapshot of `core_version`. A client that holds
         /// that pack gets the data of the entries that differ only, as vanilla sends data-pack edits.
-        pub fn buildOver(allocator: std.mem.Allocator, protocol_number: i32, snapshot: Snapshot, vanilla: Snapshot, core_version: []const u8) !PreparedRegistries {
+        /// A protocol with no release has no pack to offer, so every entry goes in full.
+        pub fn buildOver(allocator: std.mem.Allocator, protocol_number: i32, snapshot: Snapshot, vanilla: Snapshot, core_version: ?[]const u8) !PreparedRegistries {
             try validateSnapshot(snapshot);
-            return prepare(allocator, protocol_number, snapshot, core_version, vanilla);
+            return prepare(allocator, protocol_number, snapshot, core_version, if (core_version != null) vanilla else null);
         }
 
         /// A `core_version` names the vanilla release the registries come from: all of them, or only
