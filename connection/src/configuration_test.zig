@@ -265,3 +265,35 @@ test "configuration offers vanilla's pack and leaves out the data of entries a c
         try std.testing.expectEqual(prepared.packets.values.len - 1, smaller);
     }
 }
+
+test "rebuilt registries leave out only the entries still equal to vanilla's" {
+    const Version = protocols.implementations[protocols.implementations.len - 1];
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const vanilla = try Version.RegistryProvider.snapshot(allocator);
+    var embedded = try Version.RegistryProvider.init(allocator);
+    defer embedded.deinit(allocator);
+    // Change one entry of the first synchronized registry, as a server's own content would.
+    var changed = try allocator.dupe(Version.RegistryProvider.Builder.Registry, vanilla.registries);
+    const target = for (changed, 0..) |registry, index| {
+        if (registry.synchronized and registry.entries.len > 1) break index;
+    } else unreachable;
+    const entries = try allocator.dupe(Version.RegistryProvider.Builder.RegistryEntry, changed[target].entries);
+    entries[0].nbt = entries[1].nbt;
+    changed[target].entries = entries;
+    var rebuilt = try Version.RegistryProvider.Builder.buildOver(allocator, Version.protocol_number, .{ .registries = changed, .tags = vanilla.tags }, vanilla, Version.minecraft_name);
+    defer rebuilt.deinit(allocator);
+    try std.testing.expectEqualStrings(Version.minecraft_name, rebuilt.core_version.?);
+    var packet: usize = 0;
+    for (changed, 0..) |registry, index| {
+        if (!registry.synchronized) continue;
+        const known = rebuilt.known.values[packet].bytes;
+        if (index == target) {
+            // The changed entry carries its data, the rest of the registry does not.
+            try std.testing.expect(known.len > embedded.known.values[packet].bytes.len);
+            try std.testing.expect(known.len < rebuilt.packets.values[packet].bytes.len);
+        } else try std.testing.expectEqualSlices(u8, embedded.known.values[packet].bytes, known);
+        packet += 1;
+    }
+}

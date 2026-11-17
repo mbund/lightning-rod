@@ -117,7 +117,7 @@ pub fn RegistryPackets(comptime Wire: type) type {
         pub fn read(allocator: std.mem.Allocator, protocol_number: i32, bytes: []const u8, version: []const u8) !PreparedRegistries {
             const snapshot = try Snapshot.read(allocator, bytes, version);
             defer snapshot.deinit(allocator);
-            return prepare(allocator, protocol_number, snapshot, version);
+            return prepare(allocator, protocol_number, snapshot, version, null);
         }
 
         pub fn readEmbedded(allocator: std.mem.Allocator, comptime Version: type) !PreparedRegistries {
@@ -138,16 +138,24 @@ pub fn RegistryPackets(comptime Wire: type) type {
             snapshot: Snapshot,
         ) !PreparedRegistries {
             try validateSnapshot(snapshot);
-            return prepare(allocator, protocol_number, snapshot, null);
+            return prepare(allocator, protocol_number, snapshot, null, null);
         }
 
-        /// A `core_version` marks the snapshot as vanilla's registries of that release.
-        fn prepare(allocator: std.mem.Allocator, protocol_number: i32, snapshot: Snapshot, core_version: ?[]const u8) !PreparedRegistries {
+        /// Registries changed from vanilla's `vanilla` snapshot of `core_version`. A client that holds
+        /// that pack gets the data of the entries that differ only, as vanilla sends data-pack edits.
+        pub fn buildOver(allocator: std.mem.Allocator, protocol_number: i32, snapshot: Snapshot, vanilla: Snapshot, core_version: []const u8) !PreparedRegistries {
+            try validateSnapshot(snapshot);
+            return prepare(allocator, protocol_number, snapshot, core_version, vanilla);
+        }
+
+        /// A `core_version` names the vanilla release the registries come from: all of them, or only
+        /// the entries equal to `vanilla`'s when that is given.
+        fn prepare(allocator: std.mem.Allocator, protocol_number: i32, snapshot: Snapshot, core_version: ?[]const u8, vanilla: ?Snapshot) !PreparedRegistries {
             var registry_memory = std.heap.ArenaAllocator.init(allocator);
             errdefer registry_memory.deinit();
             const arena = registry_memory.allocator();
-            const packets = try writePackets(arena, snapshot, true);
-            const known: PacketList = if (core_version != null) try writePackets(arena, snapshot, false) else .{ .values = &.{} };
+            const packets = try writePackets(arena, snapshot, false, null);
+            const known: PacketList = if (core_version != null) try writePackets(arena, snapshot, true, vanilla) else .{ .values = &.{} };
             const registries = try arena.alloc(sessions.Protocol.Registry, snapshot.registries.len);
             for (snapshot.registries, registries) |source, *destination| {
                 const entries = try arena.alloc([]const u8, source.entries.len);
@@ -165,7 +173,9 @@ pub fn RegistryPackets(comptime Wire: type) type {
             };
         }
 
-        fn writePackets(allocator: std.mem.Allocator, snapshot: Snapshot, data: bool) !PacketList {
+        /// With `known`, entries the client holds go without data: every one, or those equal to the
+        /// same entry of `vanilla`.
+        fn writePackets(allocator: std.mem.Allocator, snapshot: Snapshot, known: bool, vanilla: ?Snapshot) !PacketList {
             var count: usize = 1;
             for (snapshot.registries) |registry| count += @intFromBool(registry.synchronized);
             const values = try allocator.alloc(Packet, count);
@@ -174,7 +184,10 @@ pub fn RegistryPackets(comptime Wire: type) type {
             for (snapshot.registries) |registry| {
                 if (!registry.synchronized) continue;
                 const storage = try allocatePacket(allocator, registryPacketCapacity(registry));
-                values[initialized] = .{ .bytes = try encodeRegistry(storage, registry, data) };
+                const reference: ?Registry = if (vanilla) |base| for (base.registries) |candidate| {
+                    if (std.mem.eql(u8, candidate.id, registry.id)) break candidate;
+                } else Registry{ .id = registry.id, .entries = &.{} } else null;
+                values[initialized] = .{ .bytes = try encodeRegistry(storage, registry, known, reference) };
                 initialized += 1;
             }
 
@@ -183,7 +196,7 @@ pub fn RegistryPackets(comptime Wire: type) type {
             return .{ .values = values };
         }
 
-        fn encodeRegistry(storage: []u8, registry: Registry, data: bool) ![]const u8 {
+        fn encodeRegistry(storage: []u8, registry: Registry, known: bool, reference: ?Registry) ![]const u8 {
             var cursor = try (try Wire.configuration.toClient.write(storage[framing_headroom..])
                 .registry_data())
                 .id(registry.id);
@@ -193,7 +206,10 @@ pub fn RegistryPackets(comptime Wire: type) type {
                 const value = try (try entries.next()).?.key(entry.id);
                 var optional = try value.value();
                 const child = try optional.begin();
-                const completed = if (data) try child.some(entry.nbt) else try child.none();
+                const held = known and if (reference) |base| for (base.entries) |candidate| {
+                    if (std.mem.eql(u8, candidate.id, entry.id)) break std.mem.eql(u8, candidate.nbt, entry.nbt);
+                } else false else true;
+                const completed = if (held) try child.none() else try child.some(entry.nbt);
                 try entries.advance(try optional.advance(completed));
             }
 

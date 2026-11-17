@@ -150,8 +150,10 @@ pub fn configure(registries: *const Registries, presentations: []const Registrie
         const tags = try writeTags(scratch, groups.items);
         changed = changed or !std.mem.eql(u8, snapshot.tags, tags);
         snapshot.tags = tags;
+        // Clients holding the vanilla pack still get no data for the entries left as vanilla's.
+        const vanilla: Builder.Snapshot = .{ .registries = previous_registries, .tags = snapshot.tags };
         const prepared = if (changed)
-            try Builder.build(allocator, Version.protocol_number, snapshot)
+            try Builder.buildOver(allocator, Version.protocol_number, snapshot, vanilla, Version.minecraft_name)
         else
             try Version.RegistryProvider.init(allocator);
         catalog.prepared[version_index].deinit(allocator);
