@@ -30,15 +30,15 @@ pub fn build(b: *std.Build) void {
     benchmark.root_module.addImport("records", records);
     run_benchmark.addPassthruArgs();
     b.step("bench", "Measure terrain encoding and deterministic player access patterns").dependOn(&run_benchmark.step);
-    const fragments = b.addExecutable(.{ .name = "fragment-levels", .root_module = b.createModule(.{
-        .root_source_file = b.path("src/fragment_levels.zig"),
+    const fragments = b.addExecutable(.{ .name = "fragment-table", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/fragment_table.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{ .{ .name = "chunks", .module = chunks }, .{ .name = "storage", .module = storage }, .{ .name = "metrics", .module = metrics }, .{ .name = "records", .module = records }, .{ .name = "deflate", .module = chunks.import_table.get("deflate").? } },
     }) });
     const run_fragments = b.addRunArtifact(fragments);
     run_fragments.addPassthruArgs();
-    b.step("fragment-levels", "Compare compression CPU and size for real cached fragments").dependOn(&run_fragments.step);
+    b.step("fragment-table", "Fit the shared fragment table to a world's cached fragments and write its source").dependOn(&run_fragments.step);
     const java = b.dependency("minecraft_java", .{ .target = target, .optimize = optimize }).module("minecraft_java");
     const codec = b.addExecutable(.{ .name = "streaming-codec-bench", .root_module = b.createModule(.{
         .root_source_file = b.path("src/codec.zig"),

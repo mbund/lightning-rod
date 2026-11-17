@@ -1881,3 +1881,49 @@ test "classification records of superseded revisions are deleted when a column i
         settled = held;
     }
 }
+
+test "a cache written under another fragment table is emptied when opened" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/table", .{temporary.sub_path});
+    const column: light.Column = .{ .world = 0, .x = 100, .z = 0 };
+    for (0..3) |phase| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var database = try storage.Store.init(allocator, io, .{ .path = path, .io_mode = .standard });
+        defer database.deinit();
+        var registry = try metrics.Registry.init(allocator, io, .{});
+        var store = try ChunkStore.init(allocator, io, try database.openSpace(chunks.Chunks.id), 1, &registry, try records.Resources.init(allocator, io, .{ .readers = 1, .writers = 1 }), .{ .side = 1 });
+        var workspace = try light.Workspace.init(allocator);
+        const encoded = try savedLight(&workspace, "table", @splat(0));
+        switch (phase) {
+            0 => {
+                try std.testing.expect(try store.putLight(column, @splat(0), encoded));
+                try expectLightFrame(&store, column, encoded);
+                // The root page names the table its fragments were coded with, from byte 64.
+                const space = store.lights.space;
+                const root = (try space.getRoot()).?;
+                var page: storage.Page = undefined;
+                try space.readPages(&.{.{ .id = root, .destination = &page }});
+                page[70] = ~page[70];
+                try space.writePages(&.{.{ .id = root, .source = &page }});
+                try store.flush();
+            },
+            1 => {
+                try expectLightFrame(&store, column, null);
+                // The next write empties the file in place.
+                try std.testing.expect(try store.putLight(column, @splat(0), encoded));
+                try std.testing.expectEqual(@as(u32, 1), store.derived.generation.load(.acquire));
+                try expectLightFrame(&store, column, encoded);
+            },
+            else => {
+                // The emptied file carries this table again, so its frames survive a reopen.
+                try expectLightFrame(&store, column, encoded);
+                try std.testing.expectEqual(@as(u32, 0), store.derived.generation.load(.acquire));
+            },
+        }
+    }
+}

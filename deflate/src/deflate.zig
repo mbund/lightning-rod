@@ -12,8 +12,6 @@ pub fn checksum(bytes: []const u8) u32 {
 pub const Encoder = struct {
     handle: *Compressor,
     memory_bytes: usize,
-    /// The last fragment left the match tables cleared, so the next one skips clearing them.
-    clean: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, level: u4) error{OutOfMemory}!Encoder {
         assert(level <= 12 and allocation_context == null);
@@ -30,21 +28,9 @@ pub const Encoder = struct {
     }
 
     pub fn encode(self: *Encoder, input: []const u8, output: []u8) Error![]u8 {
-        // Ordinary compression clears the tables itself and leaves them used.
-        self.clean = false;
         const length = libdeflate_zlib_compress(self.handle, input.ptr, input.len, output.ptr, output.len);
         if (length == 0) return error.BufferTooSmall;
         assert(length <= output.len);
-        return output[0..length];
-    }
-
-    /// A nonfinal raw stream ending at a byte boundary. Null when the output does not fit or
-    /// the input needed more than one block.
-    pub fn fragment(self: *Encoder, input: []const u8, output: []u8) ?[]u8 {
-        assert(input.len > 0);
-        const length = lightning_rod_deflate_fragment(self.handle, input.ptr, input.len, output.ptr, output.len, &self.clean);
-        if (length == 0) return null;
-        assert(length <= output.len and output[0] & 1 == 0);
         return output[0..length];
     }
 };
@@ -91,7 +77,6 @@ extern fn libdeflate_free_compressor(*Compressor) void;
 extern fn libdeflate_alloc_decompressor_ex(*const AllocatorOptions) ?*Decompressor;
 extern fn libdeflate_free_decompressor(*Decompressor) void;
 extern fn libdeflate_zlib_compress(*Compressor, [*]const u8, usize, [*]u8, usize) usize;
-extern fn lightning_rod_deflate_fragment(*Compressor, [*]const u8, usize, [*]u8, usize, *bool) usize;
 extern fn libdeflate_zlib_decompress_ex(*Decompressor, [*]const u8, usize, [*]u8, usize, *usize, *usize) c_int;
 
 // Libdeflate allocates only during init and has no callback context.

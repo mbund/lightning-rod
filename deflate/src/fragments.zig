@@ -1,8 +1,10 @@
 const std = @import("std");
 const deflate = @import("deflate.zig");
+const generated = @import("fragment_table.zig");
 const assert = std.debug.assert;
 
-/// An independent nonfinal DEFLATE stream ending at a byte boundary.
+/// Data coded with the shared table and no block around it, then one marker bit and zero
+/// padding, so the highest set bit of the last byte is where the data ends.
 pub const Fragment = struct {
     bytes: []const u8,
     decoded: u32,
@@ -20,100 +22,501 @@ pub const Digest = struct {
     }
 };
 
-pub const Baker = struct {
-    pub const default_level = 6;
-    allocator: std.mem.Allocator,
-    /// Libdeflate encodes each fragment as one block. It compresses a 2 KiB light section
-    /// several times faster than std, which also rebuilt its 64 KiB hash heads per fragment.
-    fast: deflate.Encoder,
-    /// Encodes inputs libdeflate splits into several blocks, whose final bits it hides.
-    compressor: *std.compress.flate.Compress,
-    history: []u8,
-    /// Compress keeps its stream functions private, so init captures them once.
-    vtable: *const std.Io.Writer.VTable,
-    options: std.compress.flate.Compress.Options,
-    level: u4,
+pub const literal_symbols = 286;
+pub const distance_symbols = 30;
+/// The longest literal or length code, which bounds what any byte costs.
+pub const maximum_literal_bits = 13;
+const maximum_distance_bits = 15;
 
-    pub fn init(allocator: std.mem.Allocator) !Baker {
-        return initLevel(allocator, default_level);
+/// Code lengths for both alphabets. Every symbol has a code, so any bytes can be written.
+pub const Table = struct {
+    literal: [literal_symbols]u8,
+    distance: [distance_symbols]u8,
+
+    /// The lengths themselves, which caches of fragments coded with the table hash.
+    pub fn identity(self: *const Table) [literal_symbols + distance_symbols]u8 {
+        return self.literal ++ self.distance;
     }
 
-    /// Levels follow libdeflate. Above 9 its matcher exceeds the module memory limit.
-    pub fn initLevel(allocator: std.mem.Allocator, level: u4) !Baker {
-        if (level == 0 or level > 9) return error.InvalidLevel;
-        var fast = try deflate.Encoder.init(allocator, level);
-        errdefer fast.deinit();
-        const compressor = try allocator.create(std.compress.flate.Compress);
-        errdefer allocator.destroy(compressor);
-        const history = try allocator.alloc(u8, std.compress.flate.max_window_len);
-        const fallback = [_]std.compress.flate.Compress.Options{ .level_1, .level_2, .level_3, .level_4, .level_5, .level_6, .level_7, .level_8, .level_9 };
-        var sink: [16]u8 = undefined;
-        var writer: std.Io.Writer = .fixed(&sink);
-        compressor.* = try .init(&writer, history, .raw, .level_5);
-        return .{
-            .allocator = allocator,
-            .fast = fast,
-            .compressor = compressor,
-            .history = history,
-            .vtable = compressor.writer.vtable,
-            .options = fallback[@min(level, fallback.len) - 1],
-            .level = level,
-        };
+    /// Lengths of complete prefix codes within the limits the stitcher assumes.
+    pub fn valid(self: *const Table) bool {
+        return complete(&self.literal, maximum_literal_bits) and complete(&self.distance, maximum_distance_bits);
+    }
+
+    fn complete(lengths: []const u8, maximum: u8) bool {
+        var space: u64 = 0;
+        for (lengths) |length| {
+            if (length == 0 or length > maximum) return false;
+            space += @as(u64, 1) << @intCast(15 - length);
+        }
+        return space == 1 << 15;
+    }
+};
+
+pub const shared: Table = .{ .literal = generated.literal, .distance = generated.distance };
+
+comptime {
+    assert(shared.valid());
+}
+
+/// Bytes a fragment of `length` input bytes takes at most: every byte as its longest literal,
+/// then the marker.
+pub fn bound(length: usize) usize {
+    return (length * maximum_literal_bits + 7) / 8 + 1;
+}
+
+/// How often a parse used each symbol, for training a table.
+pub const Counts = struct {
+    literal: [literal_symbols]u64 = @splat(0),
+    distance: [distance_symbols]u64 = @splat(0),
+};
+
+/// Huffman code lengths of at most `maximum` bits for symbols with nonzero counts, and zero for
+/// the rest. Counts are halved until the longest code fits.
+pub fn huffmanLengths(counts: []const u64, lengths: []u8, maximum: u4) void {
+    assert(counts.len == lengths.len and counts.len <= 2 * literal_symbols);
+    var used: usize = 0;
+    for (counts) |value| used += @intFromBool(value != 0);
+    assert(used >= 2 and maximum >= std.math.log2_int_ceil(usize, used));
+    var shift: u6 = 0;
+    while (true) : (shift += 1) {
+        var weights: [2 * literal_symbols]u64 = undefined;
+        var parents: [2 * literal_symbols]usize = undefined;
+        var active: [2 * literal_symbols]bool = @splat(false);
+        for (counts, 0..) |value, index| {
+            weights[index] = if (value == 0) 0 else (value >> shift) + 1;
+            active[index] = value != 0;
+        }
+        var nodes = counts.len;
+        while (true) {
+            var first: ?usize = null;
+            var second: ?usize = null;
+            for (0..nodes) |index| {
+                if (!active[index]) continue;
+                if (first == null or weights[index] < weights[first.?]) {
+                    second = first;
+                    first = index;
+                } else if (second == null or weights[index] < weights[second.?]) second = index;
+            }
+            if (second == null) break;
+            weights[nodes] = weights[first.?] + weights[second.?];
+            active[nodes] = true;
+            active[first.?] = false;
+            active[second.?] = false;
+            parents[first.?] = nodes;
+            parents[second.?] = nodes;
+            nodes += 1;
+        }
+        var longest: usize = 0;
+        for (counts, lengths, 0..) |value, *length, index| {
+            var depth: usize = 0;
+            if (value != 0) {
+                var node = index;
+                while (node != nodes - 1) : (depth += 1) node = parents[node];
+            }
+            length.* = @intCast(@min(depth, 255));
+            longest = @max(longest, depth);
+        }
+        if (longest <= maximum) return;
+    }
+}
+
+const Code = struct { code: u16, bits: u6 };
+
+/// Canonical codes for lengths, bit reversed for least significant bit first output.
+fn canonical(comptime count: usize, lengths: *const [count]u8) [count]Code {
+    var per_length: [16]u16 = @splat(0);
+    for (lengths) |length| per_length[length] += 1;
+    per_length[0] = 0;
+    var next: [16]u16 = undefined;
+    var code: u16 = 0;
+    for (1..16) |length| {
+        code = (code + per_length[length - 1]) << 1;
+        next[length] = code;
+    }
+    var result: [count]Code = undefined;
+    for (lengths, 0..) |length, symbol| {
+        if (length == 0) {
+            result[symbol] = .{ .code = 0, .bits = 0 };
+            continue;
+        }
+        result[symbol] = .{ .code = @bitReverse(next[length]) >> @intCast(16 - @as(u5, @intCast(length))), .bits = @intCast(length) };
+        next[length] += 1;
+    }
+    return result;
+}
+
+/// What canonical decoding needs: codes per length and symbols in code order.
+fn Decoding(comptime count: usize) type {
+    return struct {
+        per_length: [16]u16,
+        symbols: [count]u16,
+
+        fn of(lengths: *const [count]u8) @This() {
+            var result: @This() = .{ .per_length = @splat(0), .symbols = undefined };
+            for (lengths) |length| result.per_length[length] += 1;
+            var offsets: [16]u16 = undefined;
+            offsets[1] = 0;
+            for (1..15) |length| offsets[length + 1] = offsets[length] + result.per_length[length];
+            for (lengths, 0..) |length, symbol| {
+                result.symbols[offsets[length]] = @intCast(symbol);
+                offsets[length] += 1;
+            }
+            return result;
+        }
+
+        fn decode(self: *const @This(), reader: *Reader) u16 {
+            var code: u32 = 0;
+            var first: u32 = 0;
+            var index: u32 = 0;
+            for (1..16) |length| {
+                code |= reader.bit();
+                const here = self.per_length[length];
+                if (code < first + here) return self.symbols[index + code - first];
+                index += here;
+                first = (first + here) << 1;
+                code <<= 1;
+            }
+            unreachable;
+        }
+    };
+}
+
+const literal_codes = canonical(literal_symbols, &shared.literal);
+const distance_codes = canonical(distance_symbols, &shared.distance);
+const literal_decoding = Decoding(literal_symbols).of(&shared.literal);
+const distance_decoding = Decoding(distance_symbols).of(&shared.distance);
+
+const length_base = [29]u16{ 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
+const length_extra = [29]u6{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
+const distance_base = [30]u16{ 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
+const distance_extra = [30]u6{ 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
+
+/// The length symbol of each match length, offset from 257.
+const length_codes = codes: {
+    @setEvalBranchQuota(10_000);
+    var table: [259]u8 = @splat(0);
+    for (3..259) |length| {
+        var code: u8 = 28;
+        while (length_base[code] > length) code -= 1;
+        table[length] = code;
+    }
+    break :codes table;
+};
+
+fn distanceSlot(distance: usize) usize {
+    assert(distance >= 1 and distance <= 32768);
+    if (distance <= 4) return distance - 1;
+    const bits = std.math.log2_int(usize, distance - 1);
+    return 2 * bits + @intFromBool((distance - 1) >> @intCast(bits - 1) & 1 != 0);
+}
+
+/// Bits each choice costs under a table.
+const Costs = struct {
+    literal: [256]u8,
+    /// A match's length symbol and extra bits, by length.
+    length: [259]u8,
+    /// A distance symbol and extra bits, by slot.
+    distance: [distance_symbols]u8,
+
+    fn of(table: *const Table) Costs {
+        var result: Costs = .{ .literal = table.literal[0..256].*, .length = @splat(0), .distance = undefined };
+        for (3..259) |length| result.length[length] = table.literal[257 + @as(usize, length_codes[length])] + length_extra[length_codes[length]];
+        for (&result.distance, table.distance, distance_extra) |*cost, bits, extra| cost.* = bits + extra;
+        return result;
+    }
+};
+
+const shared_costs = Costs.of(&shared);
+
+/// Bits written least significant first into a buffer the caller sized.
+const Writer = struct {
+    bytes: []u8,
+    end: usize = 0,
+    accumulator: u64 = 0,
+    count: u6 = 0,
+
+    fn put(self: *Writer, value: u32, width: u6) void {
+        assert(width <= 32 and (width == 32 or value >> @intCast(width) == 0));
+        self.accumulator |= @as(u64, value) << self.count;
+        self.count += width;
+        while (self.count >= 8) : (self.count -= 8) {
+            self.bytes[self.end] = @truncate(self.accumulator);
+            self.end += 1;
+            self.accumulator >>= 8;
+        }
+    }
+
+    fn code(self: *Writer, entry: Code) void {
+        self.put(entry.code, entry.bits);
+    }
+
+    fn pad(self: *Writer) void {
+        if (self.count != 0) self.put(0, 8 - self.count);
+    }
+};
+
+const Reader = struct {
+    bytes: []const u8,
+    position: usize,
+
+    fn bit(self: *Reader) u1 {
+        const value: u1 = @truncate(self.bytes[self.position / 8] >> @intCast(self.position % 8));
+        self.position += 1;
+        return value;
+    }
+
+    fn take(self: *Reader, width: u6) u32 {
+        var value: u32 = 0;
+        for (0..width) |index| value |= @as(u32, self.bit()) << @intCast(index);
+        return value;
+    }
+};
+
+/// The dynamic block header every stitched stream opens with: final, the shared lengths, and
+/// those lengths run length coded under a code of their own.
+const header = header: {
+    @setEvalBranchQuota(2_000_000);
+    const all = shared.identity();
+    const Token = struct { symbol: u5, extra: u2 };
+    var tokens: [all.len]Token = undefined;
+    var token_count: usize = 0;
+    var at: usize = 0;
+    while (at < all.len) {
+        var run: usize = 1;
+        while (at + run < all.len and all[at + run] == all[at]) run += 1;
+        tokens[token_count] = .{ .symbol = all[at], .extra = 0 };
+        token_count += 1;
+        var left = run - 1;
+        while (left >= 3) {
+            const repeat = @min(left, 6);
+            tokens[token_count] = .{ .symbol = 16, .extra = repeat - 3 };
+            token_count += 1;
+            left -= repeat;
+        }
+        for (0..left) |_| {
+            tokens[token_count] = .{ .symbol = all[at], .extra = 0 };
+            token_count += 1;
+        }
+        at += run;
+    }
+    var counts: [19]u64 = @splat(0);
+    for (tokens[0..token_count]) |token| counts[token.symbol] += 1;
+    var lengths: [19]u8 = undefined;
+    huffmanLengths(&counts, &lengths, 7);
+    const codes = canonical(19, &lengths);
+    const order = [19]u8{ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
+    var used: usize = 19;
+    while (used > 4 and lengths[order[used - 1]] == 0) used -= 1;
+    var bytes: [256]u8 = @splat(0);
+    var writer: Writer = .{ .bytes = &bytes };
+    writer.put(0b101, 3);
+    writer.put(literal_symbols - 257, 5);
+    writer.put(distance_symbols - 1, 5);
+    writer.put(used - 4, 4);
+    for (order[0..used]) |symbol| writer.put(lengths[symbol], 3);
+    for (tokens[0..token_count]) |token| {
+        writer.code(codes[token.symbol]);
+        if (token.symbol == 16) writer.put(token.extra, 2);
+    }
+    const bits = writer.end * 8 + writer.count;
+    writer.pad();
+    const end = writer.end;
+    const Header = struct { bytes: [end]u8, bits: usize };
+    break :header Header{ .bytes = bytes[0..end].*, .bits = bits };
+};
+
+/// Room a stream needs around the fragments and literals it holds.
+pub const stream_overhead = 2 + header.bytes.len + Stream.tail_room + 2;
+
+/// Codes fragments with the shared table. Its costs are fixed, so the cheapest parse of the
+/// matches it finds is one pass of shortest paths, and no table is built per fragment.
+pub const Baker = struct {
+    /// Fragments are sections, light layers and heightmaps, all well below this.
+    pub const maximum_input = 16384;
+    const hash_bits = 14;
+    /// Candidates each position compares, and the length that ends its search.
+    const chain_limit = 16;
+    const nice_length = 64;
+    const none = std.math.maxInt(u16);
+    const literal_step = 0;
+
+    allocator: std.mem.Allocator,
+    state: *State,
+
+    const State = struct {
+        /// A position plus the base of the input it came from. Heads from earlier inputs fall
+        /// below the current base and read as empty, so nothing is cleared per input.
+        head: [1 << hash_bits]u32,
+        base: u32,
+        previous: [maximum_input]u16,
+        /// Bits to reach each position, then the steps of the chosen path in reverse.
+        cost: [maximum_input + 1]u32,
+        /// How each position is reached: a literal, or a length with its distance above bit 9.
+        step: [maximum_input + 1]u32,
+    };
+
+    pub fn init(allocator: std.mem.Allocator) !Baker {
+        const state = try allocator.create(State);
+        state.head = @splat(0);
+        state.base = 1;
+        return .{ .allocator = allocator, .state = state };
     }
 
     pub fn deinit(self: *Baker) void {
-        self.fast.deinit();
-        self.allocator.destroy(self.compressor);
-        self.allocator.free(self.history);
+        self.allocator.destroy(self.state);
         self.* = undefined;
     }
 
     pub fn memoryBytes(self: *const Baker) usize {
-        return self.fast.memory_bytes + @sizeOf(std.compress.flate.Compress) + self.history.len;
+        _ = self;
+        return @sizeOf(State);
     }
 
-    /// Borrows output. Compression and all of its working memory are reused.
-    pub fn encode(self: *Baker, input: []const u8, output: []u8) !Fragment {
-        assert(input.len > 0 and input.len <= std.math.maxInt(u32));
-        if (self.fast.fragment(input, output)) |bytes| return .{ .bytes = bytes, .decoded = @intCast(input.len), .checksum = deflate.checksum(input) };
-        return self.encodeStd(input, output);
+    /// Borrows output. `bound(input.len)` bytes always suffice.
+    pub fn encode(self: *Baker, input: []const u8, output: []u8) error{ InputTooLarge, NoSpaceLeft }!Fragment {
+        assert(input.len > 0);
+        if (input.len > maximum_input) return error.InputTooLarge;
+        const bits = self.parse(input, &shared_costs);
+        if (bits / 8 + 1 > output.len) return error.NoSpaceLeft;
+        const steps = self.path(input.len);
+        var writer: Writer = .{ .bytes = output };
+        var at: usize = 0;
+        var index = steps.len;
+        while (index > 0) {
+            index -= 1;
+            const step = steps[index];
+            if (step == literal_step) {
+                writer.code(literal_codes[input[at]]);
+                at += 1;
+                continue;
+            }
+            const length = step & 511;
+            const distance = step >> 9;
+            const code = length_codes[length];
+            writer.code(literal_codes[257 + @as(usize, code)]);
+            writer.put(length - length_base[code], length_extra[code]);
+            const slot = distanceSlot(distance);
+            writer.code(distance_codes[slot]);
+            writer.put(distance - distance_base[slot], distance_extra[slot]);
+            at += length;
+        }
+        assert(at == input.len and writer.end * 8 + writer.count == bits);
+        writer.put(1, 1);
+        writer.pad();
+        return .{ .bytes = output[0..writer.end], .decoded = @intCast(input.len), .checksum = deflate.checksum(input) };
     }
 
-    /// The path for inputs libdeflate splits into several blocks. Public so tests reach it.
-    pub fn encodeStd(self: *Baker, input: []const u8, output: []u8) !Fragment {
-        assert(input.len > 0 and input.len <= std.math.maxInt(u32));
-        var writer: std.Io.Writer = .fixed(output);
-        self.reset(&writer);
-        try self.compressor.writer.writeAll(input);
-        try self.compressor.writer.flush();
-        return .{ .bytes = writer.buffered(), .decoded = @intCast(input.len), .checksum = deflate.checksum(input) };
+    /// Bits the cheapest parse under a table costs, adding the symbols it used to counts.
+    pub fn measure(self: *Baker, input: []const u8, table: *const Table, counts: *Counts) usize {
+        assert(input.len > 0 and input.len <= maximum_input and table.valid());
+        const costs = Costs.of(table);
+        const bits = self.parse(input, &costs);
+        const steps = self.path(input.len);
+        var at: usize = 0;
+        var index = steps.len;
+        while (index > 0) {
+            index -= 1;
+            const step = steps[index];
+            if (step == literal_step) {
+                counts.literal[input[at]] += 1;
+                at += 1;
+                continue;
+            }
+            counts.literal[257 + @as(usize, length_codes[step & 511])] += 1;
+            counts.distance[distanceSlot(step >> 9)] += 1;
+            at += step & 511;
+        }
+        return bits;
     }
 
-    /// Matches Compress.init for a raw stream without building a new value. Assigning init
-    /// copied all 224 KiB through an error union, which cost more than compressing a section.
-    fn reset(self: *Baker, writer: *std.Io.Writer) void {
-        const options = self.options;
-        assert(options.chain != 0 and options.good >= 3 and options.nice >= 3);
-        assert(options.good <= 258 and options.nice <= 258 and options.lazy <= options.nice);
-        const compressor = self.compressor;
-        compressor.writer = .{ .buffer = self.history, .vtable = self.vtable };
-        compressor.history_len = 0;
-        compressor.history_end_unhashed = false;
-        compressor.bit_writer = .init(writer);
-        compressor.buffered_tokens.pos = 0;
-        compressor.buffered_tokens.n = 0;
-        @memset(&compressor.buffered_tokens.lit_freqs, 0);
-        @memset(&compressor.buffered_tokens.dist_freqs, 0);
-        // Every head is null with the maximum position, as init sets it.
-        @memset(&compressor.lookup.head, @bitCast(@as(u16, std.math.maxInt(u16))));
-        compressor.lookup.chain_pos = std.math.maxInt(u15);
-        compressor.container = .raw;
-        compressor.hasher = .init(.raw);
-        compressor.opts = options;
+    /// Finds the cheapest bits to reach every position from the matches the chains offer.
+    /// Every length of every longer match is a candidate, so a shorter match that leaves a
+    /// cheaper continuation wins.
+    fn parse(self: *Baker, input: []const u8, costs: *const Costs) u32 {
+        const state = self.state;
+        const n = input.len;
+        if (state.base > std.math.maxInt(u32) - 2 * maximum_input) {
+            @memset(&state.head, 0);
+            state.base = 1;
+        }
+        const base = state.base;
+        state.base += @intCast(n + 1);
+        const cost = state.cost[0 .. n + 1];
+        @memset(cost[1..], std.math.maxInt(u32));
+        cost[0] = 0;
+        var skip_until: usize = 0;
+        for (0..n) |at| {
+            const here = cost[at];
+            const literal = here + costs.literal[input[at]];
+            if (literal < cost[at + 1]) {
+                cost[at + 1] = literal;
+                state.step[at + 1] = literal_step;
+            }
+            if (at + 3 > n) continue;
+            const key = @as(u32, input[at]) | @as(u32, input[at + 1]) << 8 | @as(u32, input[at + 2]) << 16;
+            const hash = (key *% 0x9e3779b1) >> (32 - hash_bits);
+            const tagged = state.head[hash];
+            state.head[hash] = base + @as(u32, @intCast(at));
+            state.previous[at] = if (tagged >= base) @intCast(tagged - base) else none;
+            // Inside a long match, positions join the chains but search nothing.
+            if (at < skip_until) continue;
+            var candidate = state.previous[at];
+            var best: usize = 2;
+            var remaining: usize = chain_limit;
+            const limit = @min(258, n - at);
+            while (candidate != none and remaining > 0) : (remaining -= 1) {
+                const from: usize = candidate;
+                candidate = state.previous[from];
+                if (input[from + best] != input[at + best]) continue;
+                const length = matchLength(input, from, at, limit);
+                if (length <= best) continue;
+                const distance_cost = costs.distance[distanceSlot(at - from)];
+                const step: u32 = @intCast((at - from) << 9);
+                for (best + 1..length + 1) |each| {
+                    const total = here + costs.length[each] + distance_cost;
+                    if (total < cost[at + each]) {
+                        cost[at + each] = total;
+                        state.step[at + each] = step | @as(u32, @intCast(each));
+                    }
+                }
+                best = length;
+                if (length >= nice_length or length == limit) {
+                    skip_until = at + length;
+                    break;
+                }
+            }
+        }
+        return cost[n];
+    }
+
+    /// The chosen steps from the end back to the start, kept in the cost array.
+    fn path(self: *Baker, n: usize) []const u32 {
+        const state = self.state;
+        var position = n;
+        var count: usize = 0;
+        while (position > 0) {
+            const step = state.step[position];
+            state.cost[count] = step;
+            count += 1;
+            position -= if (step == literal_step) 1 else step & 511;
+        }
+        return state.cost[0..count];
+    }
+
+    fn matchLength(input: []const u8, from: usize, at: usize, limit: usize) usize {
+        var length: usize = 0;
+        while (length + 8 <= limit) {
+            const a = std.mem.readInt(u64, input[from + length ..][0..8], .little);
+            const b = std.mem.readInt(u64, input[at + length ..][0..8], .little);
+            if (a != b) return length + @ctz(a ^ b) / 8;
+            length += 8;
+        }
+        while (length < limit and input[from + length] == input[at + length]) length += 1;
+        return length;
     }
 };
 
-/// Patterns and their baker outlive the cache. One owner builds each immutable result once.
 pub fn Repetitions(comptime encoded_maximum: usize) type {
     return struct {
         const Self = @This();
@@ -180,7 +583,7 @@ pub const Decoder = struct {
     pub fn init(allocator: std.mem.Allocator, maximum: usize) !Decoder {
         var codec = try deflate.Decoder.init(allocator);
         errdefer codec.deinit();
-        const frame = try allocator.alloc(u8, try std.math.add(usize, maximum, 11));
+        const frame = try allocator.alloc(u8, try std.math.add(usize, maximum, stream_overhead));
         return .{ .allocator = allocator, .codec = codec, .frame = frame };
     }
 
@@ -191,10 +594,10 @@ pub const Decoder = struct {
     }
 
     pub fn decode(self: *Decoder, fragment: Fragment, output: []u8) ![]u8 {
-        if (fragment.decoded > output.len or fragment.bytes.len > self.frame.len - 11) return error.InvalidData;
+        if (fragment.decoded > output.len or fragment.bytes.len > self.frame.len - stream_overhead) return error.InvalidData;
         var writer = try Stream.begin(self.frame);
         try writer.append(fragment);
-        const frame = try writer.finish();
+        const frame = try writer.seal(false);
         const decoded = try self.codec.decode(frame, output[0..fragment.decoded]);
         if (decoded.len != fragment.decoded) return error.InvalidData;
         return decoded;
@@ -210,12 +613,11 @@ fn combine(a: u32, b: u32, length: usize) u32 {
     return @as(u32, @intCast(high << 16 | low));
 }
 
-/// Joins fragments into one zlib stream at the bit where each one's data ends, and writes the
-/// bytes between them as fixed Huffman literal blocks with runs of one byte as matches. Literals
-/// collect high in the output and are encoded below, which never overtakes them. Fragments that
-/// carry no end marker join at a byte boundary instead. Patched bytes stay in stored blocks.
+/// One zlib stream of a single block under the shared table. Fragments join at the bit their
+/// data ends, and the bytes between them are coded with the same table, a run of one byte as
+/// matches one back. Literals collect high in the output and are coded below, which never
+/// overtakes them. A small stream may end as fixed codes instead, without the header.
 pub const Stream = struct {
-    pub const Patch = struct { owner: *const Stream, bytes: []u8, offset: u32 };
     storage: []u8,
     writer: std.Io.Writer,
     /// Whole bytes written, then `bit_count` more bits held in `bits`.
@@ -225,16 +627,32 @@ pub const Stream = struct {
     decoded: u32 = 0,
     checksum: u32 = 1,
     finished: bool = false,
+    /// Counts what it is given and writes nothing.
+    counting: bool = false,
 
-    /// Room kept for the final block, its padding and the checksum.
+    /// Room kept for the end code, its padding and the checksum.
     const tail_room = 8;
+    /// Below this many bits of codes, fixed codes without the header can come out smaller.
+    const fixed_check_bits = 6 * header.bits;
 
     pub fn begin(output: []u8) std.Io.Writer.Error!Stream {
-        if (output.len < 11) return error.WriteFailed;
+        if (output.len < stream_overhead) return error.WriteFailed;
         output[0..2].* = .{ 0x78, 0x01 };
         var result: Stream = .{ .storage = output, .writer = .{ .vtable = &.{ .drain = drain, .rebase = rebase }, .buffer = &.{} } };
+        const whole = header.bits / 8;
+        @memcpy(output[2..][0..whole], header.bytes[0..whole]);
+        result.end = 2 + whole;
+        const rest: u3 = @intCast(header.bits % 8);
+        if (rest != 0) result.put(header.bytes[whole] & ((@as(u8, 1) << rest) - 1), rest);
         result.refresh();
         return result;
+    }
+
+    /// A stream that only counts the bytes it would decode to, for a length that precedes them.
+    /// Its writer buffers in scratch.
+    pub fn counter(scratch: []u8) Stream {
+        assert(scratch.len > 0);
+        return .{ .storage = &.{}, .counting = true, .writer = .{ .vtable = &.{ .drain = countDrain, .rebase = countRebase }, .buffer = scratch } };
     }
 
     pub fn count(self: *const Stream) u32 {
@@ -242,42 +660,18 @@ pub const Stream = struct {
         return self.decoded + @as(u32, @intCast(self.writer.end));
     }
 
-    /// Bytes a later `patch` rewrites, in a stored block of their own.
-    pub fn placeholder(self: *Stream, bytes: []const u8) std.Io.Writer.Error!Patch {
-        assert(!self.finished);
-        if (bytes.len == 0 or bytes.len > 65535) return error.WriteFailed;
-        self.flushLiteral();
-        const offset = self.decoded;
-        const destination = try self.stored(bytes);
-        return .{ .owner = self, .bytes = destination, .offset = offset };
-    }
-
-    pub fn patch(self: *Stream, field: Patch, bytes: []const u8) void {
-        assert(!self.finished and field.owner == self and bytes.len == field.bytes.len);
-        assert(field.offset <= self.decoded and bytes.len <= self.decoded - field.offset);
-        var a: i64 = self.checksum & 65535;
-        var b: i64 = self.checksum >> 16;
-        for (field.bytes, bytes, 0..) |before, after, index| {
-            const difference = @as(i64, after) - before;
-            a += difference;
-            // Adler's second sum weights each byte by the following decoded length.
-            b += difference * @as(i64, @intCast(self.decoded - field.offset - index));
-        }
-        self.checksum = @as(u32, @intCast(@mod(b, 65521))) << 16 | @as(u32, @intCast(@mod(a, 65521)));
-        @memcpy(field.bytes, bytes);
-    }
-
     /// Bytes from `end` on that output can reach, short of the tail room.
     fn limit(self: *const Stream) usize {
         return self.storage.len -| tail_room;
     }
 
-    /// Places the literal buffer where encoding its contents can never write past what it has
-    /// read: a fixed block spends at most nine bits on a byte, plus a header and an end.
+    /// Places the literal buffer where coding its contents can never write past what it has
+    /// read: no byte costs more than the longest literal code.
     fn refresh(self: *Stream) void {
         const top = self.limit();
-        const start = @min(top, (8 * (self.end + 4) + top + 8) / 9 + 1);
-        const length = @min(65535, top - start, std.math.maxInt(u32) - self.decoded);
+        const most = maximum_literal_bits;
+        const start = @min(top, (8 * (self.end + 4) + (most - 8) * top + most - 1) / most + 1);
+        const length = @min(top - start, std.math.maxInt(u32) - self.decoded);
         self.writer.buffer = self.storage[start..][0..length];
         self.writer.end = 0;
     }
@@ -295,76 +689,55 @@ pub const Stream = struct {
         self.bit_count = @intCast(pending);
     }
 
-    /// Ends the current byte with the header of a stored block and its padding.
-    fn toBoundary(self: *Stream, final: bool) void {
-        self.put(@intFromBool(final), 3);
-        if (self.bit_count != 0) self.put(0, 8 - @as(u6, self.bit_count));
-    }
-
-    /// Writes bytes as one stored block and returns where they landed.
-    fn stored(self: *Stream, bytes: []const u8) std.Io.Writer.Error![]u8 {
-        if (bytes.len + 6 > self.limit() -| self.end) return error.WriteFailed;
-        self.toBoundary(false);
-        const length: u16 = @intCast(bytes.len);
-        std.mem.writeInt(u16, self.storage[self.end..][0..2], length, .little);
-        std.mem.writeInt(u16, self.storage[self.end + 2 ..][0..2], ~length, .little);
-        self.end += 4;
-        const destination = self.storage[self.end..][0..bytes.len];
-        std.mem.copyForwards(u8, destination, bytes);
-        self.end += bytes.len;
-        self.checksum = combine(self.checksum, deflate.checksum(bytes), bytes.len);
-        self.decoded += length;
-        self.refresh();
-        return destination;
-    }
-
     fn flushLiteral(self: *Stream) void {
-        assert(!self.finished);
+        assert(!self.finished and !self.counting);
         const bytes = self.writer.buffered();
         if (bytes.len == 0) return;
         self.checksum = combine(self.checksum, deflate.checksum(bytes), bytes.len);
         self.decoded += @intCast(bytes.len);
-        // A nonfinal block of fixed codes.
-        self.put(0b010, 3);
         var at: usize = 0;
         while (at < bytes.len) {
             const byte = bytes[at];
             self.symbol(byte);
             at += 1;
-            // A run of the byte just written is one match a byte back, in pieces of at most 258.
+            // A run of the byte just written goes as matches one back where those cost less.
             var run: usize = 0;
             while (at + run < bytes.len and bytes[at + run] == byte) run += 1;
             while (run >= 3) {
                 const length = @min(run, 258);
+                if (shared_costs.length[length] + shared_costs.distance[0] >= length * @as(usize, shared_costs.literal[byte])) break;
                 self.match(length);
                 at += length;
                 run -= length;
             }
+            for (0..run) |_| self.symbol(byte);
+            at += run;
         }
-        self.symbol(256);
         self.refresh();
     }
 
     fn symbol(self: *Stream, value: u16) void {
-        const entry = fixed_codes[value];
+        const entry = literal_codes[value];
         self.put(entry.code, entry.bits);
     }
 
     /// A match one byte back.
     fn match(self: *Stream, length: usize) void {
         assert(length >= 3 and length <= 258);
-        var code: usize = 28;
-        while (length_base[code] > length) code -= 1;
-        self.symbol(@intCast(257 + code));
+        const code = length_codes[length];
+        self.symbol(257 + @as(u16, code));
         self.put(@intCast(length - length_base[code]), length_extra[code]);
-        // Distance code zero, a distance of one, five zero bits.
-        self.put(0, 5);
+        self.put(distance_codes[0].code, distance_codes[0].bits);
     }
 
     pub fn append(self: *Stream, fragment: Fragment) std.Io.Writer.Error!void {
         assert(!self.finished and fragment.bytes.len > 0 and fragment.decoded > 0);
+        if (fragment.decoded > std.math.maxInt(u32) - self.count()) return error.WriteFailed;
+        if (self.counting) {
+            self.decoded += fragment.decoded;
+            return;
+        }
         self.flushLiteral();
-        if (fragment.decoded > std.math.maxInt(u32) - self.decoded) return error.WriteFailed;
         try self.join(fragment.bytes);
         self.checksum = combine(self.checksum, fragment.checksum, fragment.decoded);
         self.decoded += fragment.decoded;
@@ -373,47 +746,33 @@ pub const Stream = struct {
 
     pub fn appendMany(self: *Stream, fragments: []const Fragment, digest: Digest) std.Io.Writer.Error!void {
         assert(!self.finished and fragments.len > 0);
-        self.flushLiteral();
         var decoded: u64 = 0;
         for (fragments) |fragment| {
             assert(fragment.bytes.len > 0 and fragment.decoded > 0);
             decoded = std.math.add(u64, decoded, fragment.decoded) catch return error.WriteFailed;
         }
         assert(decoded == digest.decoded);
-        if (decoded > std.math.maxInt(u32) - self.decoded) return error.WriteFailed;
+        if (decoded > std.math.maxInt(u32) - self.count()) return error.WriteFailed;
+        if (self.counting) {
+            self.decoded += digest.decoded;
+            return;
+        }
+        self.flushLiteral();
         for (fragments) |fragment| try self.join(fragment.bytes);
         self.checksum = combine(self.checksum, digest.checksum, digest.decoded);
         self.decoded += digest.decoded;
         self.refresh();
     }
 
-    /// Copies a fragment's blocks. One that marks where its data ends joins at that bit and
-    /// leaves its closing stored block out. Any other joins whole at a byte boundary.
+    /// Copies a fragment's data to the current bit, without its marker.
     fn join(self: *Stream, bytes: []const u8) std.Io.Writer.Error!void {
-        if (bytes.len + 6 > self.limit() -| self.end) return error.WriteFailed;
+        if (bytes.len + 2 > self.limit() -| self.end) return error.WriteFailed;
         assert(@intFromPtr(bytes.ptr) + bytes.len <= @intFromPtr(self.storage.ptr + self.end) or
-            @intFromPtr(self.storage.ptr + self.end + bytes.len + 6) <= @intFromPtr(bytes.ptr));
-        const data = dataBits(bytes) orelse {
-            if (self.bit_count != 0) {
-                self.toBoundary(false);
-                self.storage[self.end..][0..4].* = .{ 0, 0, 0xff, 0xff };
-                self.end += 4;
-            }
-            @memcpy(self.storage[self.end..][0..bytes.len], bytes);
-            self.end += bytes.len;
-            return;
-        };
+            @intFromPtr(self.storage.ptr + self.end + bytes.len + 2) <= @intFromPtr(bytes.ptr));
+        const last = bytes[bytes.len - 1];
+        if (last == 0) return error.WriteFailed;
+        const data = (bytes.len - 1) * 8 + 7 - @as(usize, @clz(last));
         const whole = data / 8;
-        // A stored block keeps its bytes on byte boundaries, so it cannot shift. Its header goes
-        // here, padding follows, and its lengths and bytes copy whole. A baked fragment is one
-        // block, so a stored one ends on a boundary too.
-        if ((bytes[0] >> 1) & 3 == 0) {
-            if (data % 8 != 0 or whole < 5) return error.WriteFailed;
-            self.toBoundary(false);
-            @memcpy(self.storage[self.end..][0 .. whole - 1], bytes[1..whole]);
-            self.end += whole - 1;
-            return;
-        }
         if (self.bit_count == 0) {
             @memcpy(self.storage[self.end..][0..whole], bytes[0..whole]);
             self.end += whole;
@@ -433,17 +792,66 @@ pub const Stream = struct {
     }
 
     pub fn finish(self: *Stream) std.Io.Writer.Error![]u8 {
-        assert(!self.finished);
+        return self.seal(true);
+    }
+
+    /// Ends the block and the stream. With `compact`, a small stream is rewritten as fixed codes
+    /// when those and no header come out shorter.
+    fn seal(self: *Stream, compact: bool) std.Io.Writer.Error![]u8 {
+        assert(!self.finished and !self.counting);
         self.flushLiteral();
-        // An empty final block of fixed codes, then the boundary and the checksum.
-        if (self.end + 6 > self.storage.len) return error.WriteFailed;
-        self.put(0b011, 3);
+        if (self.end + 7 > self.storage.len) return error.WriteFailed;
         self.symbol(256);
+        if (compact) self.compactFixed();
         if (self.bit_count != 0) self.put(0, 8 - @as(u6, self.bit_count));
         std.mem.writeInt(u32, self.storage[self.end..][0..4], self.checksum, .big);
         self.end += 4;
         self.finished = true;
         return self.storage[0..self.end];
+    }
+
+    fn compactFixed(self: *Stream) void {
+        const start = 16 + header.bits;
+        const total = self.end * 8 + self.bit_count;
+        if (total - start >= fixed_check_bits) return;
+        // The partial byte joins the storage so the codes read back whole.
+        self.storage[self.end] = self.bits;
+        const fixed = 16 + 3 + transcode(self.storage, start, null);
+        const used = (total + 7) / 8;
+        const needed = (fixed + 7) / 8;
+        if (needed >= used or used + needed + 1 > self.storage.len) return;
+        var writer: Writer = .{ .bytes = self.storage[used..] };
+        writer.put(0b011, 3);
+        assert(transcode(self.storage, start, &writer) == fixed - 19);
+        std.mem.copyForwards(u8, self.storage[2..][0..writer.end], writer.bytes[0..writer.end]);
+        self.end = 2 + writer.end;
+        self.bits = @truncate(writer.accumulator);
+        self.bit_count = @intCast(writer.count);
+    }
+
+    /// Reads shared codes from `start` through the end code and returns what fixed codes for
+    /// the same symbols cost, writing them when given a writer.
+    fn transcode(bytes: []const u8, start: usize, writer: ?*Writer) usize {
+        var reader: Reader = .{ .bytes = bytes, .position = start };
+        var bits: usize = 0;
+        while (true) {
+            const value = literal_decoding.decode(&reader);
+            const fixed = fixed_codes[value];
+            bits += fixed.bits;
+            if (writer) |output| output.code(fixed);
+            if (value == 256) return bits;
+            if (value < 256) continue;
+            const extra = length_extra[value - 257];
+            const length = reader.take(extra);
+            const slot = distance_decoding.decode(&reader);
+            const distance = reader.take(distance_extra[slot]);
+            bits += extra + 5 + distance_extra[slot];
+            if (writer) |output| {
+                output.put(length, extra);
+                output.put(@bitReverse(@as(u5, @intCast(slot))), 5);
+                output.put(distance, distance_extra[slot]);
+            }
+        }
     }
 
     fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
@@ -476,7 +884,7 @@ pub const Stream = struct {
     fn rebase(writer: *std.Io.Writer, preserve: usize, minimum: usize) std.Io.Writer.Error!void {
         const self: *Stream = @alignCast(@fieldParentPtr("writer", writer));
         const kept = @min(preserve, writer.end);
-        // Encoding writes below the literal buffer, so the kept bytes survive the flush in place.
+        // Coding writes below the literal buffer, so the kept bytes survive the flush in place.
         const tail = writer.buffer[writer.end - kept .. writer.end];
         writer.end -= kept;
         self.flushLiteral();
@@ -485,27 +893,32 @@ pub const Stream = struct {
         if (@intFromPtr(destination.ptr) <= @intFromPtr(tail.ptr)) std.mem.copyForwards(u8, destination, tail) else std.mem.copyBackwards(u8, destination, tail);
         writer.end = kept;
     }
+
+    fn countDrain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *Stream = @alignCast(@fieldParentPtr("writer", writer));
+        var written: usize = 0;
+        for (data, 0..) |slice, index| written += slice.len * (if (index + 1 == data.len) splat else 1);
+        if (written + writer.end > std.math.maxInt(u32) - self.decoded) return error.WriteFailed;
+        self.decoded += @intCast(written + writer.end);
+        writer.end = 0;
+        return written;
+    }
+
+    fn countRebase(writer: *std.Io.Writer, preserve: usize, minimum: usize) std.Io.Writer.Error!void {
+        const self: *Stream = @alignCast(@fieldParentPtr("writer", writer));
+        const kept = @min(preserve, writer.end);
+        if (kept > writer.buffer.len or minimum > writer.buffer.len - kept) return error.WriteFailed;
+        self.decoded += @intCast(writer.end - kept);
+        std.mem.copyForwards(u8, writer.buffer[0..kept], writer.buffer[writer.end - kept .. writer.end]);
+        writer.end = kept;
+    }
 };
-
-/// Where a fragment's data ends, in bits, when its closing stored block is padded with ones:
-/// the three zero bits of the stored header sit right below the padding. Null for fragments
-/// padded with zeros, whose end cannot be told from their data.
-fn dataBits(bytes: []const u8) ?usize {
-    if (bytes.len < 6 or !std.mem.eql(u8, bytes[bytes.len - 4 ..], &.{ 0, 0, 0xff, 0xff })) return null;
-    const last = bytes[bytes.len - 5];
-    if (last & 0x80 == 0) return null;
-    const padding: usize = @clz(~last);
-    return (bytes.len - 5) * 8 + (8 - padding) - 3;
-}
-
-const length_base = [29]u16{ 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
-const length_extra = [29]u6{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
 
 /// DEFLATE's fixed literal and length codes, bit reversed for least significant bit first output.
 const fixed_codes = codes: {
-    var table: [288]struct { code: u16, bits: u6 } = undefined;
-    for (&table, 0..) |*entry, symbol| {
-        const code: u16, const bits: u6 = if (symbol < 144) .{ 0x30 + symbol, 8 } else if (symbol < 256) .{ 0x190 + symbol - 144, 9 } else if (symbol < 280) .{ symbol - 256, 7 } else .{ 0xc0 + symbol - 280, 8 };
+    var table: [288]Code = undefined;
+    for (&table, 0..) |*entry, value| {
+        const code: u16, const bits: u6 = if (value < 144) .{ 0x30 + value, 8 } else if (value < 256) .{ 0x190 + value - 144, 9 } else if (value < 280) .{ value - 256, 7 } else .{ 0xc0 + value - 280, 8 };
         entry.* = .{ .code = @bitReverse(code) >> @intCast(16 - bits), .bits = bits };
     }
     break :codes table;

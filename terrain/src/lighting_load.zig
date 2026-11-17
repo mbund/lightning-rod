@@ -2,7 +2,6 @@ const test_blocks = @import("test_blocks.zig");
 const std = @import("std");
 const streaming_options = @import("streaming_benchmark_options");
 const chunks = @import("chunks");
-const deflate = @import("deflate");
 const storage = @import("storage");
 const records = @import("records");
 const metrics = @import("metrics");
@@ -914,7 +913,6 @@ const StreamingCase = struct {
     protocol: ?i32 = null,
     encryption: bool = streaming_options.encryption,
     codec_workers: ?usize = null,
-    fragment_level: ?u4 = null,
 };
 
 test "imported world horizon scaling" {
@@ -1112,11 +1110,6 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
     const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = load_budget, .occlusion = concealment, .prefetch = prefetch, .occlusion_columns = workload.visibility_columns }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = load_budget, .stored = streaming_options.stored_lighting }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
     defer service.unsubscribeOutput(streaming.changed);
     defer terrain.unsubscribeReady(streaming.changed);
-    if (workload.fragment_level) |level| for ([_]*deflate.fragments.Baker{ &streaming.deps.lighting.stored_workspace.fragment_baker, &streaming.deps.lighting.terrain_baker.compressor, &streaming.encoding.uniform_light.baker, &streaming.delivery.baker }) |baker| {
-        const owner = baker.allocator;
-        baker.deinit();
-        baker.* = try .initLevel(owner, level);
-    };
     const blocks = try BlockSynchronization.init(allocator, io, .{ .metrics = &registry, .chunks = terrain, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .worlds = dimensions }, .{});
 
     var background: Terrain = .{ .chunks = terrain, .streaming = streaming, .blocks = blocks, .io = io };
@@ -1510,53 +1503,4 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
         }
     }
     return .{ .packet_hash = if (benchmark_network) |owner| owner.terrainHash() else digest.final(), .cpu_ns = @intCast(elapsed_cpu), .wire_bytes = recipient_bytes };
-}
-
-test "imported world DEFLATE levels" {
-    const io = std.testing.io;
-    const path = streaming_options.world orelse return error.MissingStreamingWorld;
-    if (!streaming_options.stored_lighting or streaming_options.codec_workers != null or streaming_options.corpus != null) return error.InvalidCompressionOptions;
-    const samples = streaming_options.compression_samples;
-    if (samples == 0 or samples > 15) return error.InvalidSampleCount;
-    const levels = [_]u4{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
-    const allocator = std.testing.allocator;
-    const cold = try allocator.alloc(u64, levels.len * samples);
-    defer allocator.free(cold);
-    const warm = try allocator.alloc(u64, cold.len);
-    defer allocator.free(warm);
-    const cache_path = try std.mem.concat(allocator, u8, &.{ path, ".cache" });
-    defer allocator.free(cache_path);
-    var wire_bytes: [levels.len]u64 = @splat(0);
-    var cache_bytes: [levels.len]u64 = @splat(0);
-    var expected: ?u64 = null;
-    for (0..samples) |sample| for (0..levels.len) |rank| {
-        const level = (rank + sample * 3) % levels.len;
-        std.Io.Dir.cwd().deleteFile(io, cache_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-        const workload: StreamingCase = .{ .occlusion = streaming_options.occlusion orelse true, .players = streaming_options.players, .spacing = streaming_options.spacing, .encryption = true, .fragment_level = levels[level] };
-        const built = try streamPlayers(workload);
-        const reused = try streamPlayers(workload);
-        try std.testing.expectEqual(built.packet_hash, reused.packet_hash);
-        try std.testing.expectEqual(built.wire_bytes, reused.wire_bytes);
-        if (expected) |hash| try std.testing.expectEqual(hash, built.packet_hash) else expected = built.packet_hash;
-        cold[level * samples + sample] = built.cpu_ns;
-        warm[level * samples + sample] = reused.cpu_ns;
-        if (sample != 0) try std.testing.expectEqual(wire_bytes[level], built.wire_bytes);
-        wire_bytes[level] = built.wire_bytes;
-        const file = try std.Io.Dir.cwd().openFile(io, cache_path, .{});
-        defer file.close(io);
-        cache_bytes[level] = (try file.stat(io)).size;
-        std.debug.print("DEFLATE level={d} sample={d}/{d} cold_CPU_ms={d:.2} warm_CPU_ms={d:.2} wire_bytes={d}\n", .{ level + 1, sample + 1, samples, @as(f64, @floatFromInt(built.cpu_ns)) / std.time.ns_per_ms, @as(f64, @floatFromInt(reused.cpu_ns)) / std.time.ns_per_ms, built.wire_bytes });
-    };
-    std.debug.print("\nReal terrain streaming. Median thread CPU, including lighting, cache work and encryption.\nlevel cold_CPU_ms warm_CPU_ms wire_MiB saved_percent cache_MiB\n", .{});
-    for (levels, 0..) |_, level| {
-        const build_samples = cold[level * samples ..][0..samples];
-        const reuse_samples = warm[level * samples ..][0..samples];
-        std.mem.sort(u64, build_samples, {}, std.sort.asc(u64));
-        std.mem.sort(u64, reuse_samples, {}, std.sort.asc(u64));
-        const saved = 100 * (1 - @as(f64, @floatFromInt(wire_bytes[level])) / @as(f64, @floatFromInt(wire_bytes[0])));
-        std.debug.print("{d} {d:.2} {d:.2} {d:.4} {d:.2} {d:.2}\n", .{ level + 1, @as(f64, @floatFromInt(build_samples[samples / 2])) / std.time.ns_per_ms, @as(f64, @floatFromInt(reuse_samples[samples / 2])) / std.time.ns_per_ms, @as(f64, @floatFromInt(wire_bytes[level])) / (1024 * 1024), saved, @as(f64, @floatFromInt(cache_bytes[level])) / (1024 * 1024) });
-    }
 }

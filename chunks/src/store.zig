@@ -3,6 +3,7 @@ const storage = @import("storage");
 const records = @import("records");
 const metrics = @import("metrics");
 const zstandard = @import("zstandard");
+const deflate = @import("deflate");
 const encoding = @import("encoding.zig");
 const patch = @import("patch.zig");
 const compressed = @import("compressed.zig");
@@ -28,6 +29,8 @@ const overlay_root_offset = 16;
 const group_side_offset = 24;
 const revision_root_offset = 32;
 const classification_root_offset = 40;
+/// Where the derived root page keeps the digest of the table its fragments were coded with.
+const derived_table_offset = 64;
 const revision_batch_max = records.Table.write_batch_size;
 const OverlayHeader = packed struct(u8) {
     kind: enum(u6) { removed, patch, _ },
@@ -1593,8 +1596,9 @@ pub const Store = struct {
             const id = try space.getRoot() orelse break :root try createDerivedRoot(space, self.derived_identity);
             var page: storage.Page = undefined;
             try space.readPages(&.{.{ .id = id, .destination = &page }});
-            // Pages derived from another world or layout would stay in the file unreachable.
-            if (!std.mem.eql(u8, page[0..8], derived_magic) or !std.mem.eql(u8, page[8..24], &self.derived_identity)) return error.Outdated;
+            // Pages derived from another world or layout would stay in the file unreachable, and
+            // fragments coded with another table would not decode.
+            if (!std.mem.eql(u8, page[0..8], derived_magic) or !std.mem.eql(u8, page[8..24], &self.derived_identity) or !std.mem.eql(u8, page[derived_table_offset..][0..32], &fragmentTable())) return error.Outdated;
             break :root id;
         };
         self.lights.directory = root;
@@ -1611,9 +1615,16 @@ pub const Store = struct {
         var page: storage.Page = @splat(0);
         @memcpy(page[0..8], derived_magic);
         @memcpy(page[8..24], &identity);
+        page[derived_table_offset..][0..32].* = fragmentTable();
         try space.writePages(&.{.{ .id = ids[0], .source = &page }});
         try space.setRoot(ids[0]);
         return ids[0];
+    }
+
+    fn fragmentTable() [32]u8 {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(&deflate.fragments.shared.identity(), &digest, .{});
+        return digest;
     }
 
     /// Finds or creates this store's roots in the cache file being served.

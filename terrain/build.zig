@@ -39,7 +39,6 @@ pub fn build(b: *std.Build) void {
     const lighting_load_module = b.createModule(.{ .root_source_file = b.path("src/lighting_load.zig"), .target = target, .optimize = optimize });
     for (lighting_bench_module.import_table.keys(), lighting_bench_module.import_table.values()) |name, dependency| lighting_load_module.addImport(name, dependency);
     const streaming_options = b.addOptions();
-    streaming_options.addOption(usize, "compression_samples", b.option(usize, "compression-samples", "Samples per DEFLATE level in the streaming comparison") orelse 3);
     streaming_options.addOption(usize, "radius", b.option(usize, "streaming-radius", "Render distance for the imported world benchmark") orelse 32);
     streaming_options.addOption(u2, "prefetch", b.option(u2, "streaming-prefetch", "Additional delivery distance beyond the measured render horizon") orelse 0);
     streaming_options.addOption(usize, "players", b.option(usize, "streaming-players", "Concurrent observers in the imported world benchmark") orelse 1);
@@ -63,10 +62,6 @@ pub fn build(b: *std.Build) void {
     streaming_options.addOption(?[]const u8, "hidden", b.option([]const u8, "streaming-hidden", "Semicolon separated X,Y,Z block positions that must remain concealed"));
     lighting_load_module.addOptions("streaming_benchmark_options", streaming_options);
     const streaming_bench = b.addTest(.{ .root_module = lighting_load_module, .filters = &.{"imported world streaming"} });
-    const compression_bench = b.addTest(.{ .root_module = lighting_load_module, .filters = &.{"imported world DEFLATE levels"} });
-    const compression_levels = std.Build.Step.Run.create(b, "imported world DEFLATE levels");
-    compression_levels.addArtifactArg(compression_bench);
-    b.step("bench-streaming-compression", "Rebuild a world copy's delivery cache and compare DEFLATE levels").dependOn(&compression_levels.step);
     const streaming_fixture = b.addRunArtifact(b.addTest(.{ .root_module = lighting_load_module, .filters = &.{"imported world fixture"} }));
     b.step("verify-streaming-world", "Verify complete and distinct terrain for streaming observers").dependOn(&streaming_fixture.step);
     const movement_tests = b.addRunArtifact(b.addTest(.{ .root_module = lighting_load_module, .filters = &.{"streaming movement"} }));

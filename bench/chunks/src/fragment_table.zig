@@ -4,28 +4,34 @@ const storage = @import("storage");
 const records = @import("records");
 const metrics = @import("metrics");
 const deflate = @import("deflate");
+const fragments = deflate.fragments;
+
 
 const Corpus = struct {
     allocator: std.mem.Allocator,
     decoder: deflate.fragments.Decoder,
     inputs: std.ArrayList([]const u8) = .empty,
     raw_bytes: usize = 0,
+    cached_bytes: usize = 0,
 
     fn append(self: *Corpus, fragment: deflate.fragments.Fragment) !void {
         const bytes = try self.allocator.alloc(u8, fragment.decoded);
         _ = try self.decoder.decode(fragment, bytes);
         try self.inputs.append(self.allocator, bytes);
+        self.cached_bytes += fragment.bytes.len;
         self.raw_bytes += bytes.len;
     }
 };
 
+/// Fits the shared table to the fragments a world's caches hold, which this build wrote, and
+/// writes it as the table source. Each pass parses every fragment under the table so far.
 pub fn main(init: std.process.Init) !void {
     var arguments = init.minimal.args.iterate();
     _ = arguments.next();
     const path = arguments.next() orelse return error.MissingWorld;
-    const samples = if (arguments.next()) |text| try std.fmt.parseInt(usize, text, 10) else 5;
-    const limit = if (arguments.next()) |text| try std.fmt.parseInt(usize, text, 10) else 256;
-    if (arguments.next() != null or samples == 0 or samples > 31 or limit == 0) return error.InvalidArguments;
+    const destination = arguments.next() orelse return error.MissingDestination;
+    const limit = if (arguments.next()) |text| try std.fmt.parseInt(usize, text, 10) else 512;
+    if (arguments.next() != null or limit == 0) return error.InvalidArguments;
     const allocator = init.arena.allocator();
     const io = init.io;
     var registry = try metrics.Registry.init(allocator, io, .{ .capacity = 128 });
@@ -80,40 +86,39 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
-    // Each level runs through libdeflate, then through the std path used for multi-block inputs.
-    const levels = [_]u4{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
-    const variants = 2 * levels.len;
-    var bakers: [levels.len]deflate.fragments.Baker = undefined;
-    for (&bakers, levels) |*baker, level| baker.* = try .initLevel(allocator, level);
-    defer for (&bakers) |*baker| baker.deinit();
-    const encoded = try allocator.alloc(u8, 65536);
-    const decoded = try allocator.alloc(u8, 32768);
-    const durations = try allocator.alloc(u64, samples * variants);
-    var sizes: [variants]usize = @splat(0);
-    for (0..samples) |sample| for (0..variants) |rank| {
-        const variant = (rank + sample * 4) % variants;
-        const baker = &bakers[variant % levels.len];
-        const standard = variant >= levels.len;
-        var size: usize = 0;
-        const start = std.Io.Clock.now(.cpu_thread, io).nanoseconds;
-        for (corpus.inputs.items) |input| size += (try if (standard) baker.encodeStd(input, encoded) else baker.encode(input, encoded)).bytes.len;
-        const end = std.Io.Clock.now(.cpu_thread, io).nanoseconds;
-        durations[variant * samples + sample] = @intCast(end - start);
-        if (sample == 0) {
-            for (corpus.inputs.items) |input| {
-                const fragment = try if (standard) baker.encodeStd(input, encoded) else baker.encode(input, encoded);
-                if (!std.mem.eql(u8, input, try corpus.decoder.decode(fragment, decoded))) return error.RoundtripMismatch;
-            }
-        } else if (sizes[variant] != size) return error.NondeterministicCompression;
-        sizes[variant] = size;
-    };
-    var buffer: [4096]u8 = undefined;
-    var output = std.Io.File.stdout().writerStreaming(io, &buffer);
-    try output.interface.writeAll("encoder level encoded_MiB saved_percent encode_CPU_ms CPU_ratio\n");
-    for (0..variants) |variant| std.mem.sort(u64, durations[variant * samples ..][0..samples], {}, std.sort.asc(u64));
-    for (0..variants) |variant| {
-        const median = durations[variant * samples + samples / 2];
-        try output.interface.print("{s} {d} {d:.4} {d:.2} {d:.2} {d:.2}\n", .{ if (variant >= levels.len) "std" else "libdeflate", levels[variant % levels.len], @as(f64, @floatFromInt(sizes[variant])) / (1024 * 1024), 100 * (1 - @as(f64, @floatFromInt(sizes[variant])) / @as(f64, @floatFromInt(sizes[0]))), @as(f64, @floatFromInt(median)) / std.time.ns_per_ms, @as(f64, @floatFromInt(median)) / @as(f64, @floatFromInt(durations[samples / 2])) });
+    var baker = try fragments.Baker.init(allocator);
+    defer baker.deinit();
+    var fitted = fragments.shared;
+    var bits: [5]usize = undefined;
+    for (&bits) |*total| {
+        var counts: fragments.Counts = .{};
+        total.* = 0;
+        for (corpus.inputs.items) |input| total.* += baker.measure(input, &fitted, &counts);
+        // Every symbol keeps a code, so any bytes between fragments can still be written.
+        for (&counts.literal) |*value| value.* += 1;
+        for (&counts.distance) |*value| value.* += 1;
+        fragments.huffmanLengths(&counts.literal, &fitted.literal, fragments.maximum_literal_bits);
+        fragments.huffmanLengths(&counts.distance, &fitted.distance, 15);
+        if (!fitted.valid()) return error.InvalidTable;
     }
+    var output_buffer: [1024]u8 = undefined;
+    var output = std.Io.File.stdout().writer(io, &output_buffer);
+    try output.interface.print("fragments {d}, decoded {d:.2} MiB, cached {d:.4} MiB\n", .{ corpus.inputs.items.len, mebibytes(corpus.raw_bytes), mebibytes(corpus.cached_bytes) });
+    for (bits, 0..) |total, pass| try output.interface.print("pass {d}: {d:.4} MiB of codes\n", .{ pass, mebibytes(total / 8) });
     try output.interface.flush();
+    var file = try std.Io.Dir.cwd().createFile(io, destination, .{});
+    defer file.close(io);
+    var file_buffer: [4096]u8 = undefined;
+    var writer = file.writer(io, &file_buffer);
+    try writer.interface.writeAll("//! Code lengths every fragment and every stitched stream share. Generated by `zig build\n//! fragment-table -- <world>` in bench/chunks from the fragments a world's caches hold.\n\n");
+    for ([_][]const u8{ "literal", "distance" }, [_][]const u8{ &fitted.literal, &fitted.distance }) |name, lengths| {
+        try writer.interface.print("pub const {s} = [{d}]u8{{ ", .{ name, lengths.len });
+        for (lengths, 0..) |length, index| try writer.interface.print("{s}{d}", .{ if (index == 0) "" else ", ", length });
+        try writer.interface.writeAll(" };\n");
+    }
+    try writer.interface.flush();
+}
+
+fn mebibytes(bytes: usize) f64 {
+    return @as(f64, @floatFromInt(bytes)) / (1024 * 1024);
 }

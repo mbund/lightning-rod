@@ -1101,8 +1101,36 @@ fn encodeDelivery(cursor: support.cursor.State(.write), registry: packets.Regist
         try varint(writer, @intCast(chunks.Prepared.Heightmap.wordCount(prepared.sections.len)));
         if (heightmap) |value| try stream.append(value.words) else try writer.writeAll(column.?.heightmap[0..column.?.heightmap_bytes]);
     }
-    const length_field = try stream.placeholder(&.{ 0, 0, 0 });
+    // The stream is one block under one table, so nothing is patched once written. A counting
+    // pass finds the length that goes ahead of the sections.
+    var scratch: [256]u8 = undefined;
+    var counter = deflate.fragments.Stream.counter(&scratch);
+    try writeSections(&counter, registry, prepared, record, mapping, protocol, fluids);
+    const length = counter.count();
+    assert(length < 1 << 21);
+    const length_bytes: [3]u8 = .{ @as(u8, @truncate(length & 127)) | 128, @as(u8, @truncate(length >> 7 & 127)) | 128, @intCast(length >> 14) };
+    try writer.writeAll(&length_bytes);
     const start = stream.count();
+    try writeSections(stream, registry, prepared, record, mapping, protocol, fluids);
+    assert(stream.count() - start == length);
+    var entity_sections = (if (record) |value| value.entity_sections else 0) & chunk.disclosure & ~chunk.frontier;
+    var entity_count: i32 = 0;
+    var remaining = entity_sections;
+    while (remaining != 0) : (remaining &= remaining - 1) entity_count += record.?.section(@ctz(remaining)).entity_count;
+    try varint(writer, entity_count);
+    while (entity_sections != 0) : (entity_sections &= entity_sections - 1) try writer.writeAll(record.?.section(@ctz(entity_sections)).entities);
+    var light = chunk.light;
+    light.disclosure &= chunk.disclosure;
+    try light.writeFragments(stream, workspace.uniform_light);
+    assert(stream.count() <= prepared.maximum_size);
+    return stream.finish();
+}
+
+/// Section data, into the packet or into a counter of its length.
+fn writeSections(stream: *deflate.fragments.Stream, registry: packets.Registry, prepared: *const Prepared, record: ?chunks.Delivery.View, mapping: *Workspace.Mapping, protocol: *const sessions.Protocol, comptime fluids: bool) !void {
+    const chunk = prepared.chunk;
+    const workspace = chunk.workspace;
+    const writer = &stream.writer;
     var index: usize = 0;
     while (index < prepared.sections.len) : (index += 1) {
         const section = prepared.sections[index];
@@ -1165,20 +1193,6 @@ fn encodeDelivery(cursor: support.cursor.State(.write), registry: packets.Regist
             try varint(writer, try mapping.biome(protocol, @intCast(chunk.biome)));
         }
     }
-    const length = stream.count() - start;
-    const length_bytes: [3]u8 = .{ @as(u8, @truncate(length & 127)) | 128, @as(u8, @truncate(length >> 7 & 127)) | 128, @intCast(length >> 14) };
-    stream.patch(length_field, &length_bytes);
-    var entity_sections = (if (record) |value| value.entity_sections else 0) & chunk.disclosure & ~chunk.frontier;
-    var entity_count: i32 = 0;
-    var remaining = entity_sections;
-    while (remaining != 0) : (remaining &= remaining - 1) entity_count += record.?.section(@ctz(remaining)).entity_count;
-    try varint(writer, entity_count);
-    while (entity_sections != 0) : (entity_sections &= entity_sections - 1) try writer.writeAll(record.?.section(@ctz(entity_sections)).entities);
-    var light = chunk.light;
-    light.disclosure &= chunk.disclosure;
-    try light.writeFragments(stream, workspace.uniform_light);
-    assert(stream.count() <= prepared.maximum_size);
-    return stream.finish();
 }
 
 fn writeUniformBlock(writer: *std.Io.Writer, registry: packets.Registry, state: u16, comptime fluids: bool) !void {
