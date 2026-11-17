@@ -161,8 +161,6 @@ pub const RandomTicks = struct {
     pub const Configuration = struct {
         /// Cells vanilla picks in each section per game tick, its randomTickSpeed.
         speed: u8 = 3,
-        /// Ticking columns tracked at once.
-        columns: u32 = 1 << 12,
         /// Sections with acting cells tracked at once, each with its 512 byte mask.
         sections: u32 = 1 << 13,
         /// Columns asked for and not yet answered.
@@ -246,14 +244,17 @@ pub const RandomTicks = struct {
     overflow: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*RandomTicks {
-        if (config.speed == 0 or config.columns == 0 or config.sections == 0 or config.requests == 0) return error.InvalidConfiguration;
+        if (config.speed == 0 or config.sections == 0 or config.requests == 0) return error.InvalidConfiguration;
+        // Every column Domains may tick, as players spread out can bring all of them at once.
+        const columns = deps.domains.capacity();
+        if (columns >= none) return error.InvalidConfiguration;
         try deps.registry.seal();
         const self = try allocator.create(RandomTicks);
-        const column_states = try allocator.alloc(ColumnState, config.columns);
+        const column_states = try allocator.alloc(ColumnState, columns);
         for (column_states, 0..) |*state, index| state.* = .{ .world = 0, .x = 0, .z = 0, .next_free = if (index + 1 < column_states.len) @intCast(index + 1) else none };
         const slots = try allocator.alloc(SectionSlot, config.sections);
         for (slots, 0..) |*slot, index| slot.* = .{ .column = none, .offset = 0, .next = 0, .heap = none, .next_free = if (index + 1 < slots.len) @intCast(index + 1) else none };
-        const by_column = try allocator.alloc(u32, try std.math.ceilPowerOfTwo(usize, 2 * @as(usize, config.columns)));
+        const by_column = try allocator.alloc(u32, try std.math.ceilPowerOfTwo(usize, 2 * columns));
         @memset(by_column, none);
         self.* = .{
             .deps = deps,
@@ -265,7 +266,7 @@ pub const RandomTicks = struct {
             .by_column = by_column,
             .slots = slots,
             .heap = try allocator.alloc(u32, config.sections),
-            .unasked = try allocator.alloc(u32, config.columns),
+            .unasked = try allocator.alloc(u32, columns),
             .answer_masks = try allocator.create([sections_max]chunks.topology.Mask),
         };
         try deps.domains.observe(.init(RandomTicks, self, domainChanged));
