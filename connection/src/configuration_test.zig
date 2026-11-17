@@ -12,6 +12,10 @@ test "embedded registry preparation matches runtime validation and packet encodi
         try std.testing.expectEqual(runtime.packets.values.len, embedded.packets.values.len);
         for (runtime.packets.values, embedded.packets.values) |expected, actual|
             try std.testing.expectEqualSlices(u8, expected.bytes, actual.bytes);
+        try std.testing.expectEqualStrings(runtime.core_version.?, embedded.core_version.?);
+        try std.testing.expectEqual(runtime.known.values.len, embedded.known.values.len);
+        for (runtime.known.values, embedded.known.values) |expected, actual|
+            try std.testing.expectEqualSlices(u8, expected.bytes, actual.bytes);
         try std.testing.expectEqual(runtime.registries.len, embedded.registries.len);
         for (runtime.registries, embedded.registries) |expected, actual| {
             try std.testing.expectEqualStrings(expected.name, actual.name);
@@ -210,5 +214,54 @@ test "frozen Minecraft handoff retains compression and independent cipher feedba
         connection.send(&original_output);
         resumed.send(&restored_output);
         try std.testing.expectEqualSlices(u8, &original_output, &restored_output);
+    }
+}
+
+test "configuration offers vanilla's pack and leaves out the data of entries a client holds" {
+    const Catalog = protocols.Default;
+    const Plugin = @import("session_configuration.zig").Plugin(Catalog);
+    var catalog = try Catalog.init(std.testing.allocator);
+    defer catalog.deinit(std.testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var phases = try sessions.Phases.init(arena.allocator(), 1);
+    const plugin = try Plugin.init(arena.allocator(), .{ .protocols = &catalog }, .{ .phases = &phases });
+    inline for (Catalog.versions, 0..) |Version, index| {
+        const prepared = &catalog.prepared[index];
+        const version = prepared.core_version.?;
+        const scope: sessions.PhaseScope = .{ .profile = .{ .connection = .{ .index = 0, .generation = 1 }, .protocol = Version.protocol_number, .uuid = 1, .name = "alice" }, .destination = null, .io = std.testing.io };
+        var output: [512]u8 = undefined;
+        for ([_]bool{ true, false }) |holds| {
+            var state: Plugin.SessionConfigurationState = .{};
+            const flags = try plugin.onConfiguration(scope, &state, .begin, &output);
+            try std.testing.expectEqual(Version.Protocol.configuration.toClient.packetId(.feature_flags), (try Version.Protocol.configuration.toClient.readHeader(flags.send)).id);
+            const offer = try plugin.onConfiguration(scope, &state, .poll, &output);
+            const header = try Version.Protocol.configuration.toClient.readHeader(offer.send);
+            try std.testing.expectEqual(Version.Protocol.configuration.toClient.packetId(.select_known_packs), header.id);
+            try std.testing.expect(std.mem.indexOf(u8, offer.send, version) != null);
+            try std.testing.expectEqual(sessions.ConfigurationStep.wait, try plugin.onConfiguration(scope, &state, .poll, &output));
+
+            // The client replies with the packs it holds, the vanilla pack of this release or not.
+            var reply: [64]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&reply);
+            try writer.writeByte(@intCast(Version.Protocol.configuration.toServer.packetId(.select_known_packs)));
+            try writer.writeByte(1);
+            for ([_][]const u8{ "minecraft", "core", if (holds) version else "0.0" }) |text| {
+                try writer.writeByte(@intCast(text.len));
+                try writer.writeAll(text);
+            }
+            const expected = if (holds) prepared.known else prepared.packets;
+            var step = try plugin.onConfiguration(scope, &state, .{ .packet = writer.buffered() }, &output);
+            for (expected.values) |packet| {
+                try std.testing.expectEqualSlices(u8, packet.bytes, step.send);
+                step = try plugin.onConfiguration(scope, &state, .poll, &output);
+            }
+            try std.testing.expectEqual(sessions.ConfigurationStep.done, step);
+        }
+        // Without its data every registry packet is smaller, and only the tags stay whole.
+        try std.testing.expectEqual(prepared.packets.values.len, prepared.known.values.len);
+        var smaller: usize = 0;
+        for (prepared.packets.values, prepared.known.values) |full, known| smaller += @intFromBool(known.bytes.len < full.bytes.len);
+        try std.testing.expectEqual(prepared.packets.values.len - 1, smaller);
     }
 }

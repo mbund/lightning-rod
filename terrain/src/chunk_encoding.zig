@@ -108,6 +108,8 @@ pub const Workspace = struct {
     word_decoder: deflate.fragments.Decoder,
     fragments: deflate.fragments.Stream = undefined,
     uniform_light: *lighting.Data.Uniforms,
+    /// Runs of alike uniform sections, compressed once and reused for every column and player.
+    section_runs: SectionRuns = .{},
     direct_words: [8192]u8 = undefined,
     biome_padding: [section_views.maximum_sections][64]u16 = undefined,
     biome_projection: BiomeNeighborhood.Cache = .{},
@@ -1119,7 +1121,9 @@ fn encodeDelivery(cursor: support.cursor.State(.write), registry: packets.Regist
                     try writeUniformBlock(&pattern, registry, section.view.uniform, fluids);
                     try pattern.writeByte(0);
                     try varint(&pattern, try mapping.biome(protocol, value));
-                    try writer.splatBytesAll(pattern.buffered(), end - index);
+                    if (workspace.section_runs.get(&workspace.uniform_light.baker, pattern.buffered(), end - index)) |fragment| {
+                        try stream.append(fragment);
+                    } else try writer.splatBytesAll(pattern.buffered(), end - index);
                     index = end - 1;
                     continue;
                 }
@@ -2488,4 +2492,61 @@ test "a column with no stored biomes around it shows the fallback biome" {
     const void_biome: u16 = @intCast(game_data.registry.biomeId("minecraft:the_void").?);
     try compiled.compileFrame(cache, column, &view, selected.values[0].number, void_biome);
     try std.testing.expectEqual(@as(usize, 1), cache.write_count);
+}
+
+/// Runs of alike uniform sections compressed once: a column's sky and deep ground are mostly
+/// such runs, and storing them raw cost more than the rest of a flat column. Entries are replaced
+/// on collision, so a run that misses is compressed again, never sent wrong.
+const SectionRuns = struct {
+    const capacity = 64;
+    const pattern_maximum = 16;
+    const count_maximum = section_views.maximum_sections;
+
+    const Entry = struct {
+        key: [pattern_maximum + 1]u8 = undefined,
+        key_length: u8 = 0,
+        bytes: [128]u8 = undefined,
+        fragment: deflate.fragments.Fragment = undefined,
+    };
+
+    entries: [capacity]Entry = @splat(.{}),
+
+    /// The run of `count` copies of `pattern` as a fragment, or null when it does not fit one.
+    fn get(self: *SectionRuns, baker: *deflate.fragments.Baker, pattern: []const u8, count: usize) ?deflate.fragments.Fragment {
+        assert(count > 1);
+        if (pattern.len == 0 or pattern.len > pattern_maximum or count > count_maximum) return null;
+        var key: [pattern_maximum + 1]u8 = undefined;
+        @memcpy(key[0..pattern.len], pattern);
+        key[pattern.len] = @intCast(count);
+        const length = pattern.len + 1;
+        const entry = &self.entries[std.hash.Wyhash.hash(0, key[0..length]) % capacity];
+        if (entry.key_length == length and std.mem.eql(u8, entry.key[0..length], key[0..length])) return entry.fragment;
+        var input: [pattern_maximum * count_maximum]u8 = undefined;
+        for (0..count) |index| @memcpy(input[index * pattern.len ..][0..pattern.len], pattern);
+        entry.key_length = 0;
+        entry.fragment = baker.encode(input[0 .. count * pattern.len], &entry.bytes) catch return null;
+        @memcpy(entry.key[0..length], key[0..length]);
+        entry.key_length = @intCast(length);
+        return entry.fragment;
+    }
+};
+
+test "runs of alike sections compress once and decode to the run" {
+    var baker = try deflate.fragments.Baker.init(std.testing.allocator);
+    defer baker.deinit();
+    var decoder = try deflate.fragments.Decoder.init(std.testing.allocator, 1024);
+    defer decoder.deinit();
+    var runs: SectionRuns = .{};
+    var output: [1024]u8 = undefined;
+    const pattern = [_]u8{ 0, 0, 0, 1, 0, 0x28, 0 };
+    for (2..section_views.maximum_sections + 1) |count| {
+        const fragment = runs.get(&baker, &pattern, count).?;
+        try std.testing.expectEqual(fragment.bytes.ptr, runs.get(&baker, &pattern, count).?.bytes.ptr);
+        const decoded = try decoder.decode(fragment, &output);
+        try std.testing.expectEqual(count * pattern.len, decoded.len);
+        for (0..count) |index| try std.testing.expectEqualSlices(u8, &pattern, decoded[index * pattern.len ..][0..pattern.len]);
+        try std.testing.expect(fragment.bytes.len < 32);
+    }
+    const long: [17]u8 = @splat(1);
+    try std.testing.expectEqual(null, runs.get(&baker, &long, 2));
 }

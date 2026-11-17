@@ -40,7 +40,7 @@ pub const ExtraNegotiation = struct {
                 return .{ .send = try sessions.packet_api.encodeFor(selected_protocol.implementations, writeRequest, scope.profile.protocol, output, .{}) };
             },
             .poll => return if (state.answered) .done else .wait,
-            .admitted => return error.UnexpectedLoginEvent,
+            .admitted, .packet => return error.UnexpectedLoginEvent,
         }
     }
 

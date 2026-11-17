@@ -182,6 +182,18 @@ pub fn Connection(comptime Protocol: type) type {
                         }
                         return try self.runLogin(Observer, context, .poll);
                     }
+                    if (self.phase == .plugin_configuration) {
+                        // The known packs reply answers a configuration step. The client may send
+                        // anything else at any point of configuration.
+                        const header = try Protocol.configuration.toServer.readHeader(bytes);
+                        if (header.id == Protocol.configuration.toServer.packetId(.select_known_packs))
+                            return try self.configure(Observer, context, .{ .packet = bytes });
+                        const effect = try context.observer.sessionInput(.configuration, profile, context.io, context.now, bytes, output);
+                        return switch (effect) {
+                            .none => null,
+                            .send => |response| response,
+                        };
+                    }
                     if (self.phase == .configuration_ack or self.phase == .restart_finish_ack) {
                         const header = try Protocol.configuration.toServer.readHeader(bytes);
                         if (header.id == Protocol.configuration.toServer.packetId(.finish_configuration)) {
@@ -254,6 +266,7 @@ pub fn Connection(comptime Protocol: type) type {
             const step = try context.observer.configuration(context.io, context.connection, context.state, context.protocol.number, event, context.output);
             return switch (step) {
                 .send => |bytes| bytes,
+                .wait => null,
                 .done => blk: {
                     self.phase = .configuration_ack;
                     break :blk (try Protocol.configuration.toClient.write(context.output).finish_configuration()).finish();

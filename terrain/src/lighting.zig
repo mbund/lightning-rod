@@ -2314,14 +2314,22 @@ pub const Data = struct {
         return implied;
     }
 
-    /// Sky sections from the top of the column down that are lit 15 throughout, the run a full
-    /// send may leave to the client.
+    /// Sky sections from the top of the column down that are lit 15 throughout and lie two or
+    /// more sections above the highest section with blocks, the run a full send may leave to the
+    /// client. Vanilla keeps sky data up to one section above the blocks, and a client that holds
+    /// none for a section with blocks relights the whole column.
     fn fullSkyTop(self: Data) u32 {
         if (self.source == .patched) return 0;
         const lit = self.nonzero()[1];
+        // The light engine proves 15 only in the air two sections above its highest block.
+        const lowest: usize = switch (self.source) {
+            .stored => |view| lowestLeft(view),
+            .computed => 0,
+            .patched => unreachable,
+        };
         var run: u32 = 0;
         var section = self.count;
-        while (section > 0) {
+        while (section > lowest) {
             section -= 1;
             const bit = @as(u32, 1) << @intCast(section);
             const level = switch (self.source) {
@@ -2333,6 +2341,18 @@ pub const Data = struct {
             run |= bit;
         }
         return run;
+    }
+
+    /// The lowest light section a full send may leave out of a stored column: two above the highest
+    /// section holding a block. Light sections start one below the world.
+    fn lowestLeft(view: *const chunks.Light.View) usize {
+        var section: usize = view.header.count;
+        while (section > 0) {
+            section -= 1;
+            const uniform = view.header.uniform & (@as(u32, 1) << @intCast(section)) != 0;
+            if (!uniform or !isAir(view.header.states[section])) return section + 3;
+        }
+        return 2;
     }
 
     pub fn encodedSize(self: Data) usize {
@@ -2787,6 +2807,9 @@ test "retained lighting matches a client model through rejected updates reveals 
 test "a client that reads unsent sky above as lit sees true light through full sends and updates" {
     const count = 6;
     var view: chunks.Light.View = .{ .header = .{ .rules = @splat(1), .minimum = 0, .count = count - 2, .skylight = true, .coverage = (1 << (count - 2)) - 1, .revisions = @splat(0), .biomes = @splat(0) } };
+    // Stone in the lowest world section and air above, so the top two light sections may be left out.
+    view.header.uniform = (1 << (count - 2)) - 1;
+    view.header.states[0] = game_data.registry.block_stone_default_state;
     var receipt_storage: [1]Receipt = @splat(.{});
     var receipts: Receipts = .{ .entries = &receipt_storage, .rules = @splat(1) };
     var truth: [2][count]u4 = @splat(@splat(0));
@@ -4501,4 +4524,22 @@ test "a solve beside an edit still waiting is not taken for the light that edit 
     try fixture.expectSquareExact(0, 0, 1);
     try fixture.expectSquareExact(2, 0, 1);
     try std.testing.expectEqual(@as(usize, 0), fixture.terrain.borrowed_count);
+}
+
+fn isAir(state: u16) bool {
+    return state == game_data.registry.block_air_default_state or state == game_data.registry.block_cave_air_default_state or state == game_data.registry.block_void_air_default_state;
+}
+
+test "full sends keep sky data up to one section above the highest block" {
+    var view: chunks.Light.View = .{ .header = .{ .rules = @splat(1), .minimum = 0, .count = 6, .skylight = true, .coverage = (1 << 6) - 1, .revisions = @splat(0), .biomes = @splat(0) } };
+    // Stone in world section 0, a lone flower in section 2, air in the rest.
+    view.header.uniform = 0b111011;
+    view.header.states[0] = game_data.registry.block_stone_default_state;
+    for (1..6) |section| view.header.states[section] = game_data.registry.block_air_default_state;
+    try std.testing.expectEqual(@as(usize, 2 + 3), Data.lowestLeft(&view));
+    view.header.states[2] = game_data.registry.block_air_default_state;
+    view.header.uniform = 0b111111;
+    try std.testing.expectEqual(@as(usize, 0 + 3), Data.lowestLeft(&view));
+    view.header.states[0] = game_data.registry.block_air_default_state;
+    try std.testing.expectEqual(@as(usize, 2), Data.lowestLeft(&view));
 }

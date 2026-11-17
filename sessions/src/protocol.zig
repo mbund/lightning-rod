@@ -92,6 +92,8 @@ pub const PhaseEvent = union(enum) {
     begin,
     poll,
     admitted: ?[]const u8,
+    /// A packet the client sent in reply to the phase step, as the active step asked for.
+    packet: []const u8,
 };
 
 pub const LoginStep = union(enum) {
@@ -106,6 +108,8 @@ pub const LoginStep = union(enum) {
 // Responses outside the supplied output buffer must remain immutable until configuration drains.
 pub const ConfigurationStep = union(enum) {
     send: []const u8,
+    /// Nothing to send until the client replies.
+    wait,
     done,
     reject: []const u8,
 };

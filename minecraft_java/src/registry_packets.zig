@@ -9,6 +9,11 @@ pub const EmbeddedRegistries = struct {
     };
 
     packets: []const Packet,
+    /// The same packets with the data of every entry left out, for clients that hold the
+    /// vanilla pack of `core_version`, as vanilla sends to them.
+    known_packets: []const Packet = &.{},
+    /// The release the registries came from. Null for registries that are not vanilla's.
+    core_version: ?[]const u8 = null,
     registries: []const sessions.Protocol.Registry,
 };
 
@@ -90,6 +95,8 @@ pub fn RegistryPackets(comptime Wire: type) type {
         pub const PreparedRegistries = struct {
             protocol_number: i32,
             packets: PacketList,
+            known: PacketList = .{ .values = &.{} },
+            core_version: ?[]const u8 = null,
             registry_memory: std.heap.ArenaAllocator,
             registries: []const sessions.Protocol.Registry,
 
@@ -110,7 +117,7 @@ pub fn RegistryPackets(comptime Wire: type) type {
         pub fn read(allocator: std.mem.Allocator, protocol_number: i32, bytes: []const u8, version: []const u8) !PreparedRegistries {
             const snapshot = try Snapshot.read(allocator, bytes, version);
             defer snapshot.deinit(allocator);
-            return prepare(allocator, protocol_number, snapshot);
+            return prepare(allocator, protocol_number, snapshot, version);
         }
 
         pub fn readEmbedded(allocator: std.mem.Allocator, comptime Version: type) !PreparedRegistries {
@@ -118,6 +125,8 @@ pub fn RegistryPackets(comptime Wire: type) type {
             return .{
                 .protocol_number = Version.protocol_number,
                 .packets = .{ .values = prepared.packets },
+                .known = .{ .values = prepared.known_packets },
+                .core_version = prepared.core_version,
                 .registries = prepared.registries,
                 .registry_memory = std.heap.ArenaAllocator.init(allocator),
             };
@@ -129,14 +138,16 @@ pub fn RegistryPackets(comptime Wire: type) type {
             snapshot: Snapshot,
         ) !PreparedRegistries {
             try validateSnapshot(snapshot);
-            return prepare(allocator, protocol_number, snapshot);
+            return prepare(allocator, protocol_number, snapshot, null);
         }
 
-        fn prepare(allocator: std.mem.Allocator, protocol_number: i32, snapshot: Snapshot) !PreparedRegistries {
+        /// A `core_version` marks the snapshot as vanilla's registries of that release.
+        fn prepare(allocator: std.mem.Allocator, protocol_number: i32, snapshot: Snapshot, core_version: ?[]const u8) !PreparedRegistries {
             var registry_memory = std.heap.ArenaAllocator.init(allocator);
             errdefer registry_memory.deinit();
             const arena = registry_memory.allocator();
-            const packets = try writePackets(arena, snapshot);
+            const packets = try writePackets(arena, snapshot, true);
+            const known: PacketList = if (core_version != null) try writePackets(arena, snapshot, false) else .{ .values = &.{} };
             const registries = try arena.alloc(sessions.Protocol.Registry, snapshot.registries.len);
             for (snapshot.registries, registries) |source, *destination| {
                 const entries = try arena.alloc([]const u8, source.entries.len);
@@ -147,12 +158,14 @@ pub fn RegistryPackets(comptime Wire: type) type {
             return .{
                 .protocol_number = protocol_number,
                 .packets = packets,
+                .known = known,
+                .core_version = if (core_version) |version| try arena.dupe(u8, version) else null,
                 .registry_memory = registry_memory,
                 .registries = registries,
             };
         }
 
-        fn writePackets(allocator: std.mem.Allocator, snapshot: Snapshot) !PacketList {
+        fn writePackets(allocator: std.mem.Allocator, snapshot: Snapshot, data: bool) !PacketList {
             var count: usize = 1;
             for (snapshot.registries) |registry| count += @intFromBool(registry.synchronized);
             const values = try allocator.alloc(Packet, count);
@@ -161,7 +174,7 @@ pub fn RegistryPackets(comptime Wire: type) type {
             for (snapshot.registries) |registry| {
                 if (!registry.synchronized) continue;
                 const storage = try allocatePacket(allocator, registryPacketCapacity(registry));
-                values[initialized] = .{ .bytes = try encodeRegistry(storage, registry) };
+                values[initialized] = .{ .bytes = try encodeRegistry(storage, registry, data) };
                 initialized += 1;
             }
 
@@ -170,7 +183,7 @@ pub fn RegistryPackets(comptime Wire: type) type {
             return .{ .values = values };
         }
 
-        fn encodeRegistry(storage: []u8, registry: Registry) ![]const u8 {
+        fn encodeRegistry(storage: []u8, registry: Registry, data: bool) ![]const u8 {
             var cursor = try (try Wire.configuration.toClient.write(storage[framing_headroom..])
                 .registry_data())
                 .id(registry.id);
@@ -180,7 +193,7 @@ pub fn RegistryPackets(comptime Wire: type) type {
                 const value = try (try entries.next()).?.key(entry.id);
                 var optional = try value.value();
                 const child = try optional.begin();
-                const completed = try child.some(entry.nbt);
+                const completed = if (data) try child.some(entry.nbt) else try child.none();
                 try entries.advance(try optional.advance(completed));
             }
 

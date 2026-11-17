@@ -28,7 +28,13 @@ pub fn main(init: std.process.Init) !void {
         try bytes.writer.writeAll(packet.bytes);
         try output.print("        .{{ .bytes = bytes[{}..{}] }},\n", .{ start, bytes.written().len });
     }
-    try output.writeAll("    },\n    .registries = &.{\n");
+    try output.writeAll("    },\n    .known_packets = &.{\n");
+    for (prepared.known.values) |packet| {
+        const start = bytes.written().len;
+        try bytes.writer.writeAll(packet.bytes);
+        try output.print("        .{{ .bytes = bytes[{}..{}] }},\n", .{ start, bytes.written().len });
+    }
+    try output.print("    }},\n    .core_version = \"{f}\",\n    .registries = &.{{\n", .{std.zig.fmtString(prepared.core_version.?)});
     for (prepared.registries) |registry| {
         try output.print("        .{{ .name = \"{f}\", .entries = &.{{\n", .{std.zig.fmtString(registry.name)});
         for (registry.entries) |entry|
