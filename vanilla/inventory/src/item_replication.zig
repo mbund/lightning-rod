@@ -24,7 +24,12 @@ const assert = std.debug.assert;
 pub const ItemReplication = struct {
     pub const id = "minecraft:item_replication";
 
-    pub const Configuration = struct { audience_words: usize = 4096 };
+    pub const Configuration = struct {
+        audience_words: usize = 4096,
+        /// Ticks between an item's position updates. Vanilla tracks dropped items every 20 ticks, and
+        /// clients move them by their velocity in between.
+        position_interval: u8 = 20,
+    };
 
     const tracking_distance = 96;
 
@@ -168,8 +173,11 @@ pub const ItemReplication = struct {
     selection: Selection,
     selection_candidates: lightning_rod.metrics.Counter,
     selection_nodes: lightning_rod.metrics.Counter,
+    position_interval: u8,
+    ticks: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*ItemReplication {
+        if (config.position_interval == 0) return error.InvalidConfiguration;
         const self = try allocator.create(ItemReplication);
         const connections = try allocator.alloc(Connection, deps.players.records.len);
         @memset(connections, .{});
@@ -192,6 +200,7 @@ pub const ItemReplication = struct {
             .selection = try Selection.init(allocator, connections.len * 4, views.len),
             .selection_candidates = try deps.dropped.deps.metrics.counter(.{ .name = "items.replication.selection.candidates", .description = "Spatial candidates examined by batched movement selection" }),
             .selection_nodes = try deps.dropped.deps.metrics.counter(.{ .name = "items.replication.selection.coverage_nodes", .description = "Coverage nodes updated or examined by batched movement selection" }),
+            .position_interval = config.position_interval,
         };
         for (0..views.len) |index| self.resetView(index, 0);
         return self;
@@ -208,6 +217,7 @@ pub const ItemReplication = struct {
 
     pub fn tick(self: *ItemReplication) !void {
         assert(self.selection.count == 0);
+        self.ticks += 1;
         const dropped = self.deps.dropped;
         if (dropped.ids.count() == 0) {
             assert(self.retries.count == 0);
@@ -431,6 +441,8 @@ pub const ItemReplication = struct {
                                 wanted.intersect(interested, view.spawned.view());
                                 wanted.intersect(wanted.view(), view.dirty.view());
                                 wanted.subtract(wanted.view(), view.stacks.view());
+                                // Items take turns, so a moving one goes out once per interval with all it moved.
+                                if ((self.ticks + slot_index) % self.position_interval != 0) wanted.clear();
                             },
                             .collect => {
                                 wanted.clear();
