@@ -33,6 +33,8 @@ pub const Replication = struct {
         /// disconnected to make room.
         lifecycle_exceptions: ?usize = null,
         audience_words: usize = 4096,
+        /// Ticks between a player's movement updates. Vanilla tracks players every second tick.
+        update_interval: u8 = 2,
     };
 
     pub const Dependencies = struct { players: *Players, visibility: *Visibility, streaming: ?*Streaming = null };
@@ -116,6 +118,11 @@ pub const Replication = struct {
     baselines: []CachedBaseline,
     observers: []Observer,
     subjects: []Subject,
+    /// Movement and head turns since a subject's last update tick. Vanilla tracks players every
+    /// second tick, so moves in between go out together.
+    motion: []Motion,
+    ticks: u64 = 0,
+    update_interval: u8,
     viewer_revisions: []u64,
     viewer_masks: audience_storage.Matrix,
     pending_updates: audience_storage.Matrix,
@@ -135,6 +142,7 @@ pub const Replication = struct {
     broadcast_groups: []BroadcastGroup,
     render_distance: i32 = 0,
 
+    const Motion = packed struct(u8) { moved: bool = false, turned: bool = false, _: u6 = 0 };
     const Subject = struct {
         generation: u32 = 0,
         gamemode: minecraft.GameMode = .survival,
@@ -161,7 +169,20 @@ pub const Replication = struct {
         known: u3 = 0,
     };
 
-    const Group = struct { protocol: i32, absolute: bool, baseline: [3]i64 };
+    /// What a relative movement update carries: vanilla sends the position, the look or both,
+    /// whichever changed.
+    const Move = enum(u2) {
+        both,
+        position,
+        look,
+
+        fn of(position: [3]i64, yaw: i8, pitch: i8, base: Baseline) Move {
+            const moved = !std.meta.eql(position, base.position);
+            const turned = yaw != base.yaw or pitch != base.pitch;
+            return if (moved and turned) .both else if (turned) .look else .position;
+        }
+    };
+    const Group = struct { protocol: i32, absolute: bool, baseline: [3]i64, move: Move = .both };
     const Target = struct {
         group: Group,
         handle: sessions.Handle,
@@ -170,11 +191,13 @@ pub const Replication = struct {
             const protocol = std.math.order(a.group.protocol, b.group.protocol);
             const absolute = std.math.order(@intFromBool(a.group.absolute), @intFromBool(b.group.absolute));
             const baseline = std.mem.order(i64, &a.group.baseline, &b.group.baseline);
-            return protocol == .lt or (protocol == .eq and (absolute == .lt or (absolute == .eq and baseline == .lt)));
+            const move = std.math.order(@intFromEnum(a.group.move), @intFromEnum(b.group.move));
+            return protocol == .lt or (protocol == .eq and (absolute == .lt or (absolute == .eq and (baseline == .lt or (baseline == .eq and move == .lt)))));
         }
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Replication {
+        if (config.update_interval == 0) return error.InvalidConfiguration;
         const self = try allocator.create(Replication);
         const slots = deps.players.records.len;
         const lifecycle = try Lifecycle.init(allocator, slots, config.lifecycle_exceptions orelse slots * @min(slots -| 1, 255));
@@ -186,6 +209,8 @@ pub const Replication = struct {
         @memset(observers, .{});
         const subjects = try allocator.alloc(Subject, deps.players.records.len);
         @memset(subjects, .{});
+        const motion = try allocator.alloc(Motion, deps.players.records.len);
+        @memset(motion, .{});
         const viewer_revisions = try allocator.alloc(u64, subjects.len);
         @memset(viewer_revisions, 0);
         const viewer_masks = try audience_storage.Matrix.init(allocator, deps.players, deps.players.records.len, config.audience_words, .recipients);
@@ -227,6 +252,8 @@ pub const Replication = struct {
             .baselines = baselines,
             .observers = observers,
             .subjects = subjects,
+            .motion = motion,
+            .update_interval = config.update_interval,
             .viewer_revisions = viewer_revisions,
             .viewer_masks = viewer_masks,
             .pending_updates = pending_updates,
@@ -340,11 +367,19 @@ pub const Replication = struct {
                 if (subject.generation != 0) self.spatial_changes.update(index * 2, spatialPosition(subject.*));
                 self.spatial_changes.update(index * 2 + 1, spatialPosition(next));
             }
-            if (moved or next.yaw != subject.yaw or next.pitch != subject.pitch or next.on_ground != subject.on_ground) movement_changed.insert(index);
-            if (next.yaw != subject.yaw) head_changed.insert(index);
+            const motion = &self.motion[index];
+            if (moved or next.yaw != subject.yaw or next.pitch != subject.pitch or next.on_ground != subject.on_ground) motion.moved = true;
+            if (next.yaw != subject.yaw) motion.turned = true;
+            // Subjects take turns, so half of them update on each tick.
+            if ((self.ticks + index) % self.update_interval == 0) {
+                if (motion.moved) movement_changed.insert(index);
+                if (motion.turned) head_changed.insert(index);
+                motion.* = .{};
+            }
             if (!std.meta.eql(next.flags, subject.flags)) flags_changed.insert(index);
             subject.* = next;
         }
+        self.ticks += 1;
         for (self.dirty_work.values()) |row| self.work_masks.row(row).clear();
         self.dirty_work.clear();
         const lifecycle_changed = changed.view().any();
@@ -681,7 +716,12 @@ pub const Replication = struct {
                     if (!needed) continue;
                     outstanding.insert(other);
                     const absolute = phase == .movement and (!known or !relative(position, seen.value.position));
-                    const group: Group = .{ .protocol = observer.protocol, .absolute = absolute, .baseline = if (phase == .movement and !absolute) seen.value.position else @splat(0) };
+                    const group: Group = .{
+                        .protocol = observer.protocol,
+                        .absolute = absolute,
+                        .baseline = if (phase == .movement and !absolute) seen.value.position else @splat(0),
+                        .move = if (phase == .movement and !absolute) Move.of(position, yaw, pitch, seen.value) else .both,
+                    };
                     if (target_count != 0) uniform = uniform and std.meta.eql(targets[0].group, group);
                     targets[target_count] = .{ .group = group, .handle = observer.handle.? };
                     target_count += 1;
@@ -707,10 +747,15 @@ pub const Replication = struct {
                     const result = switch (phase) {
                         .movement => if (absolute)
                             players.deps.packets.fanout(writePosition, recipients[0..count], .{ entity_id, subject.position, minecraft.Position{ .x = 0, .y = 0, .z = 0 }, subject.rotation, subject.on_ground }, 128, deliveries[0..count])
-                        else
-                            players.deps.packets.fanout(writeMove, recipients[0..count], .{
+                        else switch (key.move) {
+                            .both => players.deps.packets.fanout(writeMove, recipients[0..count], .{
                                 entity_id, @as(i16, @intCast(position[0] - key.baseline[0])), @as(i16, @intCast(position[1] - key.baseline[1])), @as(i16, @intCast(position[2] - key.baseline[2])), yaw, pitch, subject.on_ground,
                             }, 32, deliveries[0..count]),
+                            .position => players.deps.packets.fanout(writeShift, recipients[0..count], .{
+                                entity_id, @as(i16, @intCast(position[0] - key.baseline[0])), @as(i16, @intCast(position[1] - key.baseline[1])), @as(i16, @intCast(position[2] - key.baseline[2])), subject.on_ground,
+                            }, 32, deliveries[0..count]),
+                            .look => players.deps.packets.fanout(writeLook, recipients[0..count], .{ entity_id, yaw, pitch, subject.on_ground }, 32, deliveries[0..count]),
+                        },
                         .head => players.deps.packets.fanout(writeHeadRotation, recipients[0..count], .{ entity_id, yaw }, 16, deliveries[0..count]),
                         .flags => players.deps.packets.fanout(writeFlags, recipients[0..count], .{ entity_id, subject.flags }, 32, deliveries[0..count]),
                     };
@@ -771,10 +816,15 @@ pub const Replication = struct {
                         const receipt = switch (phase) {
                             .movement => if (!relative(position, common.value.position))
                                 players.deps.packets.broadcast(&self.broadcast, writePosition, excluded, required, .{ entity_id, subject.position, minecraft.Position{ .x = 0, .y = 0, .z = 0 }, subject.rotation, subject.on_ground }, 128)
-                            else
-                                players.deps.packets.broadcast(&self.broadcast, writeMove, excluded, required, .{
+                            else switch (Move.of(position, yaw, pitch, common.value)) {
+                                .both => players.deps.packets.broadcast(&self.broadcast, writeMove, excluded, required, .{
                                     entity_id, @as(i16, @intCast(position[0] - common.value.position[0])), @as(i16, @intCast(position[1] - common.value.position[1])), @as(i16, @intCast(position[2] - common.value.position[2])), yaw, pitch, subject.on_ground,
                                 }, 32),
+                                .position => players.deps.packets.broadcast(&self.broadcast, writeShift, excluded, required, .{
+                                    entity_id, @as(i16, @intCast(position[0] - common.value.position[0])), @as(i16, @intCast(position[1] - common.value.position[1])), @as(i16, @intCast(position[2] - common.value.position[2])), subject.on_ground,
+                                }, 32),
+                                .look => players.deps.packets.broadcast(&self.broadcast, writeLook, excluded, required, .{ entity_id, yaw, pitch, subject.on_ground }, 32),
+                            },
                             .head => players.deps.packets.broadcast(&self.broadcast, writeHeadRotation, excluded, required, .{ entity_id, yaw }, 16),
                             .flags => players.deps.packets.broadcast(&self.broadcast, writeFlags, excluded, required, .{ entity_id, subject.flags }, 32),
                         } catch |err| std.debug.panic("invalid server packet: {s}", .{@errorName(err)});
@@ -1045,6 +1095,17 @@ pub const Replication = struct {
         return (try (try facing.pitch(pitch)).onGround(on_ground)).finish();
     }
 
+    fn writeShift(packet: wire_1_21_5.play.toClient.packet_rel_entity_move.Writer, entity_id: i32, dx: i16, dy: i16, dz: i16, on_ground: bool) ![]u8 {
+        const entity = try packet.entityId(entity_id);
+        const x = try entity.dX(dx);
+        const y = try x.dY(dy);
+        return (try (try y.dZ(dz)).onGround(on_ground)).finish();
+    }
+
+    fn writeLook(packet: wire_1_21_5.play.toClient.packet_entity_look.Writer, entity_id: i32, yaw: i8, pitch: i8, on_ground: bool) ![]u8 {
+        return (try (try (try (try packet.entityId(entity_id)).yaw(yaw)).pitch(pitch)).onGround(on_ground)).finish();
+    }
+
     fn writeHeadRotation(packet: wire_1_21_5.play.toClient.packet_entity_head_rotation.Writer, entity_id: i32, yaw: i8) ![]u8 {
         return (try (try packet.entityId(entity_id)).headYaw(yaw)).finish();
     }
@@ -1140,7 +1201,7 @@ test "movement fanout preserves independent admission and observer baselines" {
     };
     try players.initIndexes(allocator);
     players.rebuildIndexes();
-    const replication = try Replication.init(allocator, .{}, .{ .players = &players, .visibility = try Visibility.init(allocator, .{}, .{ .players = &players }) });
+    const replication = try Replication.init(allocator, .{ .update_interval = 1 }, .{ .players = &players, .visibility = try Visibility.init(allocator, .{}, .{ .players = &players }) });
     const Drain = struct {
         fn run(endpoint: *sessions.Service, recipients: usize) !usize {
             var count: usize = 0;
@@ -1360,7 +1421,7 @@ test "operation counts for shared player neighborhoods and local spatial invalid
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const visibility = try Visibility.init(allocator, .{}, .{ .players = &players });
-        const replication = try Replication.init(allocator, .{}, .{ .players = &players, .visibility = visibility });
+        const replication = try Replication.init(allocator, .{ .update_interval = 1 }, .{ .players = &players, .visibility = visibility });
         failing.fail_index = failing.alloc_index;
         for (0..3) |_| {
             for (endpoint.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | endpoint.config.buffer_bytes, .release);
@@ -1444,4 +1505,79 @@ test "operation counts for shared player neighborhoods and local spatial invalid
             }
         }
     };
+}
+
+test "players update every second tick with the movement that changed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const selected = comptime definitions: {
+        var result: [protocols.implementations.len]sessions.Protocol = undefined;
+        for (protocols.implementations, 0..) |Version, i| result[i] = .{ .number = Version.protocol_number };
+        break :definitions result;
+    };
+    const service = try sessions.Service.init(allocator, std.testing.io, undefined, .{ .connections = 2, .pages = 64, .page_bytes = 4096, .buffer_bytes = 32768, .protocols = &selected });
+    const packet_service = try packets.Packets.init(allocator, .{ .sessions = service });
+    var records: [2]Players.Player = undefined;
+    for (&records, 0..) |*player, i| {
+        player.* = .{ .handle = .{ .index = @intCast(i), .generation = 1 }, .uuid = i + 1, .protocol = selected[0].number, .name = @splat(0), .name_len = 1, .stage = .ready };
+        player.name[0] = @intCast('a' + i);
+        service.credit[i].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+    }
+    var players: Players = .{
+        .deps = .{ .sessions = service, .packets = packet_service, .input = undefined, .storage = undefined, .worlds = undefined, .record_workspaces = undefined },
+        .config = .{ .maximum = 2, .render_distance = 2 },
+        .spawn_world = 0,
+        .records = &records,
+        .dig_handlers = &.{},
+    };
+    try players.initIndexes(allocator);
+    players.rebuildIndexes();
+    const replication = try Replication.init(allocator, .{}, .{ .players = &players, .visibility = try Visibility.init(allocator, .{}, .{ .players = &players }) });
+    const Client = protocols.implementations[0].Protocol.play.toClient;
+    const Seen = struct { shift: usize = 0, look: usize = 0, both: usize = 0 };
+    const drain = struct {
+        fn run(endpoint: *sessions.Service) Seen {
+            var seen: Seen = .{};
+            while (endpoint.output.takeReady()) |packet| {
+                const id = (Client.readHeader(packet.bytes) catch unreachable).id;
+                if (id == Client.packetId(.rel_entity_move)) seen.shift += 1;
+                if (id == Client.packetId(.entity_look)) seen.look += 1;
+                if (id == Client.packetId(.entity_move_look)) seen.both += 1;
+                _ = endpoint.output.releaseReady(packet.page, packet.generation);
+                _ = endpoint.preparing.fetchSub(1, .release);
+            }
+            return seen;
+        }
+    }.run;
+    replication.deps.visibility.tick();
+    replication.tick();
+    _ = drain(service);
+    // Moving every tick for ten ticks: five updates per watcher, each carrying only the position.
+    var total: Seen = .{};
+    for (0..10) |_| {
+        records[0].position.x += 0.1;
+        players.rebuildIndexes();
+        replication.deps.visibility.tick();
+        replication.tick();
+        const seen = drain(service);
+        total.shift += seen.shift;
+        total.look += seen.look;
+        total.both += seen.both;
+    }
+    try std.testing.expectEqual(Seen{ .shift = 5 }, total);
+    // Turning alone sends the look alone, and moving while turning sends both.
+    total = .{};
+    for (0..4) |tick| {
+        records[0].rotation.yaw += 30;
+        if (tick >= 2) records[0].position.z += 0.1;
+        players.rebuildIndexes();
+        replication.deps.visibility.tick();
+        replication.tick();
+        const seen = drain(service);
+        total.shift += seen.shift;
+        total.look += seen.look;
+        total.both += seen.both;
+    }
+    try std.testing.expectEqual(Seen{ .look = 1, .both = 1 }, total);
 }
