@@ -216,7 +216,8 @@ pub const Biome = union(enum) {
     }
 };
 
-pub const Heightmap = struct { sections: u32, words: deflate.fragments.Fragment };
+/// The sections heights depend on, and both heightmaps as a chunk packet carries them.
+pub const Heightmap = struct { sections: u32, packet: deflate.fragments.Fragment };
 
 pub const Prefix = struct {
     rules: [32]u8,
@@ -494,7 +495,8 @@ pub const Workspace = struct {
         const count = self.sections - 2;
         assert(self.terrain_written == count);
         var words: [prepared.Heightmap.maximum_bytes]u8 = undefined;
-        const bytes = prepared.Heightmap.pack(count, heights, &words);
+        var pair: [prepared.Heightmap.packet_bytes]u8 = undefined;
+        const bytes = prepared.Heightmap.packetPair(count, prepared.Heightmap.pack(count, heights, &words), &pair);
         const fragment = try self.fragment_baker.encode(bytes, self.raw[self.cursor + 10 ..][0..prepared.Heightmap.maximum_fragment]);
         std.mem.writeInt(u16, self.raw[self.cursor..][0..2], @intCast(fragment.bytes.len), .little);
         std.mem.writeInt(u32, self.raw[self.cursor + 2 ..][0..4], prepared.Heightmap.dependencies(count, heights), .little);
@@ -664,7 +666,7 @@ pub const Workspace = struct {
             if (count < 32 and sections >> @intCast(count) != 0) return error.Corrupt;
             const checksum = std.mem.readInt(u32, raw[cursor + 4 ..][0..4], .little);
             cursor += 8;
-            view.heightmap = .{ .sections = sections, .words = .{ .bytes = raw[cursor..][0..heightmap_length], .decoded = @intCast(prepared.Heightmap.wordCount(count) * 8), .checksum = checksum } };
+            view.heightmap = .{ .sections = sections, .packet = .{ .bytes = raw[cursor..][0..heightmap_length], .decoded = @intCast(prepared.Heightmap.kinds.len * (2 + prepared.Heightmap.wordCount(count) * 8)), .checksum = checksum } };
             cursor += heightmap_length;
         }
         for (0..2) |layer| for (0..@as(usize, count) + 2) |section_index| {
@@ -689,7 +691,7 @@ pub const Workspace = struct {
     }
 };
 
-test "stored heightmaps preserve packed words and disclosure dependencies without allocation" {
+test "stored heightmaps hold both packet copies in one fragment, with disclosure dependencies, without allocation" {
     var bounded = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var workspace = try Workspace.init(bounded.allocator());
     defer workspace.deinit();
@@ -698,8 +700,10 @@ test "stored heightmaps preserve packed words and disclosure dependencies withou
     bounded.fail_index = bounded.alloc_index;
     bounded.resize_fail_index = bounded.resize_index;
     var heights: [256]u16 = undefined;
-    var expected: [prepared.Heightmap.maximum_bytes]u8 = undefined;
-    var actual: [prepared.Heightmap.maximum_bytes]u8 = undefined;
+    var words: [prepared.Heightmap.maximum_bytes]u8 = undefined;
+    var expected: [prepared.Heightmap.packet_bytes]u8 = undefined;
+    var actual: [prepared.Heightmap.packet_bytes]u8 = undefined;
+    var alone: [prepared.Heightmap.maximum_fragment]u8 = undefined;
     var random = std.Random.DefaultPrng.init(0x482a);
     for (1..maximum_sections + 1) |count| {
         const all: u32 = @truncate((@as(u64, 1) << @intCast(count)) - 1);
@@ -717,7 +721,11 @@ test "stored heightmaps preserve packed words and disclosure dependencies withou
         const view = try workspace.decode(try workspace.finish());
         const heightmap = view.heightmap.?;
         try std.testing.expectEqual(prepared.Heightmap.dependencies(count, &heights), heightmap.sections);
-        try std.testing.expectEqualSlices(u8, prepared.Heightmap.pack(count, &heights, &expected), try decoder.decode(heightmap.words, &actual));
+        const packed_words = prepared.Heightmap.pack(count, &heights, &words);
+        try std.testing.expectEqualSlices(u8, prepared.Heightmap.packetPair(count, packed_words, &expected), try decoder.decode(heightmap.packet, &actual));
+        // The second copy is one match of the first.
+        const single = try workspace.fragment_baker.encode(packed_words, &alone);
+        try std.testing.expect(heightmap.packet.bytes.len <= single.bytes.len + 8);
     }
     try std.testing.expect(!bounded.has_induced_failure);
 }

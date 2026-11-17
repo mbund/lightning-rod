@@ -1051,6 +1051,12 @@ fn appendCompiled(cache: *delivery_cache.Workspace, writer: *chunks.Delivery.Wri
     writer.append(index, component, fragment) catch return deliverySpace(cache);
 }
 
+/// Both heightmaps after their count, from the words a column packed.
+fn writeHeightmaps(writer: *std.Io.Writer, sections: usize, words: []const u8) !void {
+    var pair: [chunks.Prepared.Heightmap.packet_bytes]u8 = undefined;
+    try writer.writeAll(chunks.Prepared.Heightmap.packetPair(sections, words, &pair));
+}
+
 fn storedHeightmap(chunk: Chunk) ?chunks.Light.Heightmap {
     if (chunk.frontier != 0 or chunk.sections != .baked) return null;
     const view = chunk.sections.baked.view;
@@ -1095,12 +1101,8 @@ fn encodeDelivery(cursor: support.cursor.State(.write), registry: packets.Regist
     try writer.writeInt(i32, chunk.z, .big);
     const heightmap = storedHeightmap(chunk);
     const column = if (heightmap == null) workspace.prepareColumn(prepared.sections) else null;
-    try varint(writer, 2);
-    for ([_]i32{ 1, 4 }) |kind| {
-        try varint(writer, kind);
-        try varint(writer, @intCast(chunks.Prepared.Heightmap.wordCount(prepared.sections.len)));
-        if (heightmap) |value| try stream.append(value.words) else try writer.writeAll(column.?.heightmap[0..column.?.heightmap_bytes]);
-    }
+    try varint(writer, chunks.Prepared.Heightmap.kinds.len);
+    if (heightmap) |value| try stream.append(value.packet) else try writeHeightmaps(writer, prepared.sections.len, column.?.heightmap[0..column.?.heightmap_bytes]);
     // The stream is one block under one table, so nothing is patched once written. A counting
     // pass finds the length that goes ahead of the sections.
     var scratch: [256]u8 = undefined;
@@ -1240,12 +1242,8 @@ fn encodeTraced(cursor: support.cursor.State(.write), registry: packets.Registry
     const workspace = chunk.workspace;
     if (trace == null) {
         const column = workspace.prepareColumn(sections);
-        try varint(writer, 2);
-        for ([_]i32{ 1, 4 }) |kind| {
-            try varint(writer, kind);
-            try varint(writer, @intCast(chunks.Prepared.Heightmap.wordCount(sections.len)));
-            try writer.writeAll(column.heightmap[0..column.heightmap_bytes]);
-        }
+        try varint(writer, chunks.Prepared.Heightmap.kinds.len);
+        try writeHeightmaps(writer, sections.len, column.heightmap[0..column.heightmap_bytes]);
     }
 
     const length_offset = writer.end;

@@ -31,6 +31,8 @@ pub fn main(init: std.process.Init) !void {
     const path = arguments.next() orelse return error.MissingWorld;
     const destination = arguments.next() orelse return error.MissingDestination;
     const limit = if (arguments.next()) |text| try std.fmt.parseInt(usize, text, 10) else 512;
+    // Only this world's columns, as each dimension is a world.
+    const only: ?u32 = if (arguments.next()) |text| try std.fmt.parseInt(u32, text, 10) else null;
     if (arguments.next() != null or limit == 0) return error.InvalidArguments;
     const allocator = init.arena.allocator();
     const io = init.io;
@@ -43,12 +45,15 @@ pub fn main(init: std.process.Init) !void {
     var after: [64]u8 = undefined;
     var cursor: records.ScanCursor = .{ .after = &after };
     var columns: std.ArrayList(chunks.Light.Column) = .empty;
+    var seen: [8]usize = @splat(0);
     while (true) {
         var batch: [32]chunks.Light.Column = undefined;
         const result = try terrain.savedLightColumns(&cursor, &batch);
-        try columns.appendSlice(allocator, batch[0..result.count]);
+        for (batch[0..result.count]) |column| if (only == null or column.world == only.?) try columns.append(allocator, column);
+        for (batch[0..result.count]) |column| seen[@min(column.world, seen.len - 1)] += 1;
         if (!result.more) break;
     }
+    for (seen, 0..) |count, world| if (count != 0) std.debug.print("world {d}: {d} columns\n", .{ world, count });
     if (columns.items.len == 0) return error.EmptyDeliveryCache;
     var corpus: Corpus = .{ .allocator = allocator, .decoder = try .init(allocator, 32768) };
     defer corpus.decoder.deinit();
@@ -66,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
         const column = try chunks.Delivery.Column.read(bytes[0..length]);
         const view = try workspace.decode(column.frame);
         for (view.terrain[0..view.header.count]) |section| if (section) |encoded| try corpus.append(encoded.view().words);
-        if (view.heightmap) |heightmap| try corpus.append(heightmap.words);
+        if (view.heightmap) |heightmap| try corpus.append(heightmap.packet);
         for (0..2) |layer| for (0..view.header.count + 2) |section| switch (view.layer(layer, section)) {
             .encoded => |encoded| try corpus.append(encoded.fragment),
             .uniform => {},
@@ -88,6 +93,14 @@ pub fn main(init: std.process.Init) !void {
     }
     var baker = try fragments.Baker.init(allocator);
     defer baker.deinit();
+    // Each fragment with a table of its own, as libdeflate coded them before the shared table.
+    var own_tables: usize = 0;
+    {
+        var encoder = try deflate.Encoder.init(allocator, 6);
+        defer encoder.deinit();
+        const scratch = try allocator.alloc(u8, deflate.fragments.bound(fragments.Baker.maximum_input) + 64);
+        for (corpus.inputs.items) |input| own_tables += (try encoder.encode(input, scratch)).len - 6;
+    }
     var fitted = fragments.shared;
     var bits: [5]usize = undefined;
     for (&bits) |*total| {
@@ -104,6 +117,7 @@ pub fn main(init: std.process.Init) !void {
     var output_buffer: [1024]u8 = undefined;
     var output = std.Io.File.stdout().writer(io, &output_buffer);
     try output.interface.print("fragments {d}, decoded {d:.2} MiB, cached {d:.4} MiB\n", .{ corpus.inputs.items.len, mebibytes(corpus.raw_bytes), mebibytes(corpus.cached_bytes) });
+    try output.interface.print("own table per fragment, libdeflate 6: {d:.4} MiB\n", .{mebibytes(own_tables)});
     for (bits, 0..) |total, pass| try output.interface.print("pass {d}: {d:.4} MiB of codes\n", .{ pass, mebibytes(total / 8) });
     try output.interface.flush();
     var file = try std.Io.Dir.cwd().createFile(io, destination, .{});

@@ -19,7 +19,7 @@ const Properties = struct { table: []const u8 = &.{}, selected: u8 = 1, reads: [
 const overlay_bytes = 1 + patch.maximum;
 const section_bytes = encoding.maximum_decoded_bytes;
 const format_magic = "LRCHNK05";
-const derived_magic = "LRDER002";
+const derived_magic = "LRDER003";
 /// No cache generation reaches this value, so a store holding it has no roots yet.
 const derived_detached = std.math.maxInt(u32);
 /// Page zero holds file metadata and never a table directory.

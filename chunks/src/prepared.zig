@@ -13,7 +13,25 @@ pub const Heightmap = struct {
     const maximum_bits = std.math.log2_int_ceil(u16, maximum_sections * 16 + 1);
     const minimum_per_word = 64 / @as(usize, maximum_bits);
     pub const maximum_bytes = (256 + minimum_per_word - 1) / minimum_per_word * 8;
-    pub const maximum_fragment = 512;
+    /// The heightmap types a chunk packet carries. Both carry the same words.
+    pub const kinds = [2]u8{ 1, 4 };
+    /// Both heightmaps as a chunk packet carries them after their count.
+    pub const packet_bytes = kinds.len * (2 + Heightmap.maximum_bytes);
+    pub const maximum_fragment = deflate.fragments.bound(packet_bytes);
+
+    /// Each type, its word count and the words. One fragment of this codes the second copy as a
+    /// match of the first, where two fragments could not refer to each other.
+    pub fn packetPair(sections: usize, words: []const u8, output: *[packet_bytes]u8) []const u8 {
+        const count = wordCount(sections);
+        assert(words.len == count * 8 and count < 128);
+        var length: usize = 0;
+        for (kinds) |kind| {
+            output[length..][0..2].* = .{ kind, @intCast(count) };
+            @memcpy(output[length + 2 ..][0..words.len], words);
+            length += 2 + words.len;
+        }
+        return output[0..length];
+    }
 
     pub fn bits(sections: usize) u4 {
         assert(sections > 0 and sections <= maximum_sections);
