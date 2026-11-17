@@ -116,19 +116,25 @@ pub fn filler(states: *const [volume]u16, table: Table) ?u16 {
 
 const filler_candidates = 32;
 
-/// True when `apply` would replace any block, without changing the section.
-pub fn changes(states: *const [volume]u16, faces: *const Faces, table: Table) bool {
+/// The cells filler replaced in delivered terrain, as a mask in section order, and how many.
+/// These are the only cells a client holding the filled section lacks the true states of.
+pub fn changedCells(states: *const [volume]u16, faces: *const Faces, table: Table, mask: *[volume / 64]u64) usize {
+    @memset(mask, 0);
     const occupied = rows(states, table);
     const cells = hidden(&occupied, faces);
-    const value = filler(states, table) orelse return false;
+    const value = filler(states, table) orelse return 0;
+    var count: usize = 0;
     for (0..side) |y| for (0..side) |z| {
         var row = cells[y][z];
         while (row != 0) : (row &= row - 1) {
-            const state = states[(y * side + z) * side + @ctz(row)];
-            if (table[state] & replaceable != 0 and state != value) return true;
+            const index = (y * side + z) * side + @ctz(row);
+            const state = states[index];
+            if (table[state] & replaceable == 0 or state == value) continue;
+            mask[index / 64] |= @as(u64, 1) << @intCast(index % 64);
+            count += 1;
         }
     };
-    return false;
+    return count;
 }
 
 /// Occluders of the plane at `at` along `axis` of a neighbouring section, laid out for
@@ -269,7 +275,7 @@ test "sections without replaceable blocks and open sections stay untouched" {
     try std.testing.expectEqual(@as(usize, 0), apply(&open, &sealed, &table));
 }
 
-test "the change test agrees with replacement and planes agree with faces" {
+test "changed cells match replacement and planes agree with faces" {
     const table = testTable();
     var random = std.Random.DefaultPrng.init(0xc4a9);
     const Source = struct {
@@ -291,7 +297,17 @@ test "the change test agrees with replacement and planes agree with faces" {
             row.* = if (trial % 2 == 0) 0xffff else random.random().int(u16);
         };
         var copy = states;
-        try std.testing.expectEqual(apply(&copy, &faces, &table) != 0, changes(&states, &faces, &table));
+        const replaced = apply(&copy, &faces, &table);
+        // The mask names exactly the cells replacement changed.
+        var mask: [volume / 64]u64 = undefined;
+        const marked = changedCells(&states, &faces, &table, &mask);
+        var changed: usize = 0;
+        for (states, copy, 0..) |before, after, index| {
+            try std.testing.expectEqual(before != after, mask[index / 64] >> @intCast(index % 64) & 1 != 0);
+            changed += @intFromBool(before != after);
+        }
+        try std.testing.expectEqual(changed, marked);
+        try std.testing.expectEqual(replaced, marked);
         const occupied = rows(&states, &table);
         const source: Source = .{ .states = &states };
         inline for (0..6) |index| {

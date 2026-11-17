@@ -375,17 +375,23 @@ pub const BlockSynchronization = struct {
                     continue;
                 }
                 slot.* = .{ .section = section, .delivery = delivery, .valid = true };
-                if (try self.hullChanges(index, section)) self.requestFull(index, sectionBit(self.side, section));
+                var cells: [64]u64 = undefined;
+                switch (try self.hullCells(index, section, &cells)) {
+                    .none => {},
+                    .cells => self.requestCells(index, section, &cells),
+                    .all => self.requestFull(index, sectionBit(self.side, section)),
+                }
             }
         }
     }
 
-    /// Whether delivered terrain holds filler in `section`, judged like the bake from the section
-    /// and its face neighbours as they are now. Sections not ready to read count as changed, so
-    /// the player still receives their true states. An edit since delivery can only make this
-    /// miss filler that is still hidden, and exposure sends true states once it is not.
-    fn hullChanges(self: *BlockSynchronization, player: usize, section: chunks.Section) !bool {
-        const world = self.deps.worlds.get(section.world) orelse return true;
+    /// The cells of `section` delivered terrain holds filler in, judged like the bake from the
+    /// section and its face neighbours as they are now. Only those cells need true states, not
+    /// the whole section. Sections not ready to read send every state, so the player still
+    /// receives them. An edit since delivery can only make this miss filler that is still hidden,
+    /// and exposure sends true states once it is not.
+    fn hullCells(self: *BlockSynchronization, player: usize, section: chunks.Section, mask: *[64]u64) !enum { none, cells, all } {
+        const world = self.deps.worlds.get(section.world) orelse return .all;
         const minimum = world.dimension.minimumSection();
         const maximum = minimum + @as(i32, @intCast(world.dimension.sectionCount()));
         assert(section.y >= minimum and section.y < maximum);
@@ -404,10 +410,10 @@ pub const BlockSynchronization = struct {
         var leases: [7]chunks.Lease = undefined;
         var ready: [1]bool = undefined;
         try self.chunk_client.prepareMany(&.{.{ .sections = sections[0..count], .leases = leases[0..count], .priority = .{ .urgency = .occupied, .player = player } }}, &ready);
-        if (!ready[0]) return true;
+        if (!ready[0]) return .all;
         defer self.deps.chunks.releaseMany(leases[0..count]);
         const center = leases[0].view();
-        if (center == .uniform) return false;
+        if (center == .uniform) return .none;
         var states: [section_hull.volume]u16 = undefined;
         for (&states, 0..) |*state, local| state.* = center.get(@intCast(local));
         var planes: section_hull.Faces = @splat(@splat(0));
@@ -416,7 +422,7 @@ pub const BlockSynchronization = struct {
             const plane = if (side % 2 == 0) section_hull.side - 1 else 0;
             planes[side] = section_hull.readPlane(leases[at].view(), self.hull_table, side / 2, plane);
         };
-        return section_hull.changes(&states, &planes, self.hull_table);
+        return if (section_hull.changedCells(&states, &planes, self.hull_table, mask) == 0) .none else .cells;
     }
 
     /// Keeps corrections of sections that stay within one section of the new eye section.
@@ -444,6 +450,20 @@ pub const BlockSynchronization = struct {
     }
 
     /// Sends every true state of a pending section to one observer.
+    /// Sends one player the true states of some cells of a section it holds.
+    fn requestCells(self: *BlockSynchronization, index: usize, section: chunks.Section, mask: *const [64]u64) void {
+        const observer = &self.observers[index];
+        assert(observer.generation != 0);
+        self.recordMask(section, mask);
+        const bit = sectionBit(self.side, section);
+        const word = bit / 64;
+        const flag = @as(u64, 1) << @intCast(bit % 64);
+        observer.pending += @intFromBool(observer.pending_bits[word] & flag == 0);
+        observer.pending_bits[word] |= flag;
+        observer.nonempty.set(word);
+        self.selections.row(0).insert(index);
+    }
+
     fn requestFull(self: *BlockSynchronization, index: usize, bit: usize) void {
         const observer = &self.observers[index];
         assert(observer.generation != 0 and bit < self.words * 64);
@@ -485,7 +505,11 @@ pub const BlockSynchronization = struct {
         }
 
         if (!interested) return;
+        self.recordMask(section, mask);
+    }
 
+    /// Adds cells to the delta of a section, taking a slot for it if it has none.
+    fn recordMask(self: *BlockSynchronization, section: chunks.Section, mask: *const [64]u64) void {
         const found = self.delta_index.get(section);
         if (found) |cached| assert(self.deltas[cached].live and std.meta.eql(self.deltas[cached].section, section));
         const slot = found orelse self.free_delta orelse self.next_delta;
