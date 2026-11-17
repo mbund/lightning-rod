@@ -81,8 +81,8 @@ lightning_rod_deflate_fragment(struct libdeflate_compressor *c, const void *in,
 			       size_t in_nbytes, void *out, size_t out_nbytes_avail,
 			       bool *clean)
 {
-	/* An empty stored block needs at most two header bytes then LEN and NLEN. */
-	const size_t sync_bytes = 6;
+	/* The closing stored block needs at most three bytes of bits then LEN and NLEN. */
+	const size_t sync_bytes = 7;
 	/* Only these implementations use the hash chain matchfinder. */
 	const bool chained = c->impl == deflate_compress_greedy ||
 			     c->impl == deflate_compress_lazy ||
@@ -107,10 +107,30 @@ lightning_rod_deflate_fragment(struct libdeflate_compressor *c, const void *in,
 	if (os.overflow || os.next == bytes || (bytes[0] & 1) == 0)
 		return 0;
 	bytes[0] &= ~1;
-	/* Three zero header bits select a nonfinal stored block, then padding to the boundary. */
-	*os.next++ = os.bitbuf;
-	if (os.bitcount > 5)
-		*os.next++ = 0;
+	/*
+	 * A nonfinal stored block ends the fragment at a byte boundary. Its padding is ones, which
+	 * decoders ignore, so a join can find where the data ends below the three zero header bits
+	 * and leave the stored block out. Without room for padding, an empty fixed block comes
+	 * first: a zero, the type bits one and zero, and seven zero bits of the end code.
+	 */
+	{
+		u64 bits = os.bitbuf;
+		unsigned count = os.bitcount;
+		unsigned padding;
+
+		if (count == 5) {
+			bits |= (u64)2 << count;
+			count += 10;
+		}
+		count += 3;
+		padding = (8 - count % 8) % 8;
+		bits |= (((u64)1 << padding) - 1) << count;
+		count += padding;
+		for (; count != 0; count -= 8) {
+			*os.next++ = (u8)bits;
+			bits >>= 8;
+		}
+	}
 	put_unaligned_le32(0xFFFF0000, os.next);
 	os.next += 4;
 	return os.next - bytes;

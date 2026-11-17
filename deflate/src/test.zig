@@ -352,3 +352,96 @@ test "fragments stay independent when the compressor keeps its match tables" {
         }
     }
 }
+
+test "fragments join at the bit their data ends, among literals and patches, and decode exactly" {
+    var bounded = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var baker = try deflate.fragments.Baker.init(bounded.allocator());
+    defer baker.deinit();
+    var decoder = try deflate.Decoder.init(bounded.allocator());
+    defer decoder.deinit();
+    var random = std.Random.DefaultPrng.init(0xb17);
+    // Small inputs end their data at every bit position across the set.
+    var sources: [24][96]u8 = undefined;
+    var lengths: [24]usize = undefined;
+    var encoded: [24][256]u8 = undefined;
+    var fragments: [24]deflate.fragments.Fragment = undefined;
+    var stale: [24][256]u8 = undefined;
+    var unmarked: [24]deflate.fragments.Fragment = undefined;
+    var ends: u8 = 0;
+    for (&sources, &lengths, &encoded, &fragments, &stale, &unmarked, 0..) |*source, *length, *output, *fragment, *copy, *old, index| {
+        length.* = 8 + index * 3;
+        for (source[0..length.*], 0..) |*byte, at| byte.* = if (index % 3 == 0) random.random().int(u8) else @truncate(at % (index + 2) * 7);
+        fragment.* = try baker.encode(source[0..length.*], output);
+        // The same fragment padded with zeros, as fragments baked before the marker were.
+        @memcpy(copy[0..fragment.bytes.len], fragment.bytes);
+        const last = fragment.bytes.len - 5;
+        copy[last] &= @as(u8, 0xff) >> @intCast(@clz(~copy[last]));
+        old.* = .{ .bytes = copy[0..fragment.bytes.len], .decoded = fragment.decoded, .checksum = fragment.checksum };
+        ends |= @as(u8, 1) << @intCast(fragment.bytes.len % 8);
+    }
+    bounded.fail_index = bounded.alloc_index;
+    bounded.resize_fail_index = bounded.resize_index;
+    var output: [32768]u8 = undefined;
+    var expected: [32768]u8 = undefined;
+    var actual: [32768]u8 = undefined;
+    for (0..400) |round| {
+        var stream = try deflate.fragments.Stream.begin(&output);
+        var plain: std.Io.Writer = .fixed(&expected);
+        var fields: [3]deflate.fragments.Stream.Patch = undefined;
+        var offsets: [3]usize = undefined;
+        var patched: usize = 0;
+        for (0..14) |_| {
+            const pick = random.random().uintLessThan(usize, sources.len);
+            switch (random.random().uintLessThan(u8, 6)) {
+                0, 1 => {
+                    try stream.append(fragments[pick]);
+                    try plain.writeAll(sources[pick][0..lengths[pick]]);
+                },
+                2 => {
+                    try stream.append(unmarked[pick]);
+                    try plain.writeAll(sources[pick][0..lengths[pick]]);
+                },
+                3 => if (patched < fields.len) {
+                    offsets[patched] = plain.end;
+                    fields[patched] = try stream.placeholder(&.{ 0x80, 0x80, 0 });
+                    try plain.writeAll(&.{ 0x80, 0x80, 0 });
+                    patched += 1;
+                },
+                else => {
+                    // Runs of one byte, as light masks and uniform arrays are, or noise.
+                    const length = random.random().intRangeAtMost(usize, 1, 700);
+                    const value = random.random().int(u8);
+                    for (0..length) |at| {
+                        const byte: u8 = if (round % 4 == 0) random.random().int(u8) else if (at % 50 < 40) value else @truncate(at);
+                        try stream.writer.writeByte(byte);
+                        try plain.writeByte(byte);
+                    }
+                },
+            }
+        }
+        for (fields[0..patched], offsets[0..patched]) |field, offset| {
+            var value: [3]u8 = undefined;
+            random.random().bytes(&value);
+            stream.patch(field, &value);
+            @memcpy(expected[offset..][0..3], &value);
+        }
+        try std.testing.expectEqual(plain.end, stream.count());
+        const frame = try stream.finish();
+        try std.testing.expectEqualSlices(u8, plain.buffered(), try decoder.decode(frame, &actual));
+    }
+    // The fragments end at many different bits, so joins land at every offset.
+    try std.testing.expect(@popCount(ends) >= 6);
+    // Joined marked fragments cost fewer bytes than the fragments did whole.
+    var stream = try deflate.fragments.Stream.begin(&output);
+    var whole: usize = 0;
+    for (fragments) |fragment| {
+        try stream.append(fragment);
+        whole += fragment.bytes.len;
+    }
+    try std.testing.expect((try stream.finish()).len + fragments.len * 4 < whole + 6);
+    // A run of one byte is a literal and a few matches.
+    stream = try deflate.fragments.Stream.begin(&output);
+    try stream.writer.splatByteAll(0xff, 4000);
+    try std.testing.expect((try stream.finish()).len < 40);
+    try std.testing.expect(!bounded.has_induced_failure);
+}

@@ -29,14 +29,17 @@ const wire = @import("wire_1_21_5");
 
 const FlightPacket = enum { new_column, replacement, biomes, light, other };
 
-// Fragment assembly starts with a stored header block. The oracle needs only its coordinates.
+// Prepared packets are zlib streams. The oracle needs only the id and coordinates at their start.
+var prefix_history: [std.compress.flate.max_window_len]u8 = undefined;
+var prefix_bytes: [16]u8 = undefined;
+
 fn packetPrefix(packet: sessions.RawPacket) ![]const u8 {
     if (packet.decoded_length == 0) return packet.bytes;
-    const bytes = packet.bytes;
-    if (bytes.len < 7 or bytes[2] != 0) return error.InvalidPreparedHeader;
-    const length = std.mem.readInt(u16, bytes[3..5], .little);
-    if (length < 11 or length > bytes.len - 7 or ~length != std.mem.readInt(u16, bytes[5..7], .little)) return error.InvalidPreparedHeader;
-    return bytes[7..][0..length];
+    var input: std.Io.Reader = .fixed(packet.bytes);
+    var inflate: std.compress.flate.Decompress = .init(&input, .zlib, &prefix_history);
+    const length = @min(prefix_bytes.len, packet.decoded_length);
+    inflate.reader.readSliceAll(prefix_bytes[0..length]) catch return error.InvalidPreparedHeader;
+    return prefix_bytes[0..length];
 }
 
 fn encryptPacket(ciphers: []minecraft_java.Wire, source: []const u8, output: []u8, recipients: sessions.Recipients, timer: metrics.Timer, digest: *std.hash.Wyhash) void {
