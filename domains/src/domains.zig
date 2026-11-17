@@ -64,6 +64,11 @@ pub const Domains = struct {
         self.observer_count += 1;
     }
 
+    /// Columns that may tick at once: every player's simulation distance and the forced ones.
+    pub fn capacity(self: *const Domains) usize {
+        return self.simulation.capacity;
+    }
+
     /// Whether systems that change the world run in a column this tick.
     pub fn ticks(self: *const Domains, column: Column) bool {
         return self.simulation.contains(column);

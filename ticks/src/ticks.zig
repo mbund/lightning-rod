@@ -26,7 +26,8 @@ pub const Ticks = struct {
     pub const Configuration = struct {
         /// Ticks scheduled or parked at once.
         events: u32 = 1 << 16,
-        /// Columns with ticks in memory at once, ticking or waiting for a checkpoint.
+        /// Columns kept in memory past ticking, waiting for a checkpoint. Room for every column that
+        /// may tick comes from Domains.
         columns: u32 = 1 << 12,
         /// Ticks run in one game tick. Vanilla runs at most 65536.
         per_tick: u32 = 1 << 16,
@@ -92,13 +93,16 @@ pub const Ticks = struct {
         if (config.per_tick == 0 or config.column_events == 0 or config.kinds == 0) return error.InvalidConfiguration;
         const self = try allocator.create(Ticks);
         errdefer allocator.destroy(self);
+        // Every column Domains may tick can enter in one tick, as when players spread out join.
+        const ticking = deps.domains.capacity();
+        if (ticking + config.columns > std.math.maxInt(u32)) return error.InvalidConfiguration;
         self.* = .{
             .deps = deps,
             .config = config,
-            .queue = try queue.Queue.init(allocator, .{ .events = config.events, .columns = config.columns }),
+            .queue = try queue.Queue.init(allocator, .{ .events = config.events, .columns = @intCast(ticking + config.columns) }),
             .kinds = try allocator.alloc(KindEntry, config.kinds),
             .saved_kinds = try allocator.alloc(?Kind, config.kinds),
-            .loading = try allocator.alloc(Column, config.columns),
+            .loading = try allocator.alloc(Column, ticking),
             .due = try allocator.alloc(Event, config.per_tick),
             .record = try allocator.alloc(u8, 1 + 4 + @as(usize, config.column_events) * entry_bytes),
             .pending = try allocator.alloc(queue.Pending, config.column_events),
