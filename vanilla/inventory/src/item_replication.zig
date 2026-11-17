@@ -197,7 +197,9 @@ pub const ItemReplication = struct {
             .recipients = try allocator.alloc(sessions.Service.Target, connections.len),
             .views = views,
             .inventory_observer = try deps.inventories.observe(allocator, views.len),
-            .selection = try Selection.init(allocator, connections.len * 4, views.len),
+            // A connection selects at most six regions a tick: both views when its view resets,
+            // and two strips for each axis it moves along.
+            .selection = try Selection.init(allocator, connections.len * 6, views.len),
             .selection_candidates = try deps.dropped.deps.metrics.counter(.{ .name = "items.replication.selection.candidates", .description = "Spatial candidates examined by batched movement selection" }),
             .selection_nodes = try deps.dropped.deps.metrics.counter(.{ .name = "items.replication.selection.coverage_nodes", .description = "Coverage nodes updated or examined by batched movement selection" }),
             .position_interval = config.position_interval,
