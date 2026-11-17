@@ -25,12 +25,23 @@ pub fn stateKey(allocator: std.mem.Allocator, name: []const u8, properties: []Pr
     return key.toOwnedSlice();
 }
 
+/// Blocks later releases renamed, by the name the game data knows them by.
+const renames = [_][2][]const u8{
+    // 1.21.9 named chains after their metal when copper ones came.
+    .{ "minecraft:iron_chain", "minecraft:chain" },
+};
+
+fn renamed(name: []const u8) []const u8 {
+    for (renames) |pair| if (std.mem.eql(u8, name, pair[0])) return pair[1];
+    return name;
+}
+
 pub fn paletteKey(allocator: std.mem.Allocator, doc: nbt.Document, entry: nbt.Node) ![]const u8 {
     const legacy_name = entry.childNamed(doc.nodes, "Name");
     const modern_name = entry.childNamed(doc.nodes, "id");
     if (legacy_name != null and modern_name != null) return error.AmbiguousBlockName;
     const name_field = if (modern_name) |value| value else legacy_name orelse return error.MissingBlockName;
-    const name = try name_field.string();
+    const name = renamed(try name_field.string());
     const legacy_properties = entry.childNamed(doc.nodes, "Properties");
     const modern_properties = entry.childNamed(doc.nodes, "properties");
     if (legacy_properties != null and modern_properties != null) return error.AmbiguousBlockProperties;
@@ -260,7 +271,10 @@ pub fn section(allocator: std.mem.Allocator, registry: *const Registry, doc: nbt
     while (iterator.next()) |entry| {
         const key = try paletteKey(allocator, doc, entry);
         defer allocator.free(key);
-        palette[count] = registry.states.get(key) orelse return error.UnknownBlockState;
+        palette[count] = registry.states.get(key) orelse {
+            std.log.err("unknown block state {s}", .{std.mem.sliceTo(key, 0)});
+            return error.UnknownBlockState;
+        };
         count += 1;
     }
     if (count == 1) {
