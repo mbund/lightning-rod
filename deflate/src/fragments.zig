@@ -277,7 +277,26 @@ const Reader = struct {
 /// those lengths run length coded under a code of their own.
 const header = header: {
     @setEvalBranchQuota(2_000_000);
-    const all = shared.identity();
+    var bytes: [header_capacity]u8 = @splat(0);
+    const bits = writeHeader(&shared, &bytes);
+    const end = (bits + 7) / 8;
+    const Header = struct { bytes: [end]u8, bits: usize };
+    break :header Header{ .bytes = bytes[0..end].*, .bits = bits };
+};
+
+const header_capacity = 256;
+
+/// Bits of the dynamic block header that sends a table, for weighing a table's header against
+/// what it saves.
+pub fn headerBits(table: *const Table) usize {
+    var bytes: [header_capacity]u8 = undefined;
+    return writeHeader(table, &bytes);
+}
+
+/// The dynamic block header for a table: final, the lengths, and those lengths run length coded
+/// under a code of their own. Returns its length in bits.
+fn writeHeader(table: *const Table, bytes: *[header_capacity]u8) usize {
+    const all = table.identity();
     const Token = struct { symbol: u5, extra: u2 };
     var tokens: [all.len]Token = undefined;
     var token_count: usize = 0;
@@ -285,17 +304,17 @@ const header = header: {
     while (at < all.len) {
         var run: usize = 1;
         while (at + run < all.len and all[at + run] == all[at]) run += 1;
-        tokens[token_count] = .{ .symbol = all[at], .extra = 0 };
+        tokens[token_count] = .{ .symbol = @intCast(all[at]), .extra = 0 };
         token_count += 1;
         var left = run - 1;
         while (left >= 3) {
             const repeat = @min(left, 6);
-            tokens[token_count] = .{ .symbol = 16, .extra = repeat - 3 };
+            tokens[token_count] = .{ .symbol = 16, .extra = @intCast(repeat - 3) };
             token_count += 1;
             left -= repeat;
         }
         for (0..left) |_| {
-            tokens[token_count] = .{ .symbol = all[at], .extra = 0 };
+            tokens[token_count] = .{ .symbol = @intCast(all[at]), .extra = 0 };
             token_count += 1;
         }
         at += run;
@@ -308,12 +327,12 @@ const header = header: {
     const order = [19]u8{ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
     var used: usize = 19;
     while (used > 4 and lengths[order[used - 1]] == 0) used -= 1;
-    var bytes: [256]u8 = @splat(0);
-    var writer: Writer = .{ .bytes = &bytes };
+    @memset(bytes, 0);
+    var writer: Writer = .{ .bytes = bytes };
     writer.put(0b101, 3);
     writer.put(literal_symbols - 257, 5);
     writer.put(distance_symbols - 1, 5);
-    writer.put(used - 4, 4);
+    writer.put(@intCast(used - 4), 4);
     for (order[0..used]) |symbol| writer.put(lengths[symbol], 3);
     for (tokens[0..token_count]) |token| {
         writer.code(codes[token.symbol]);
@@ -321,10 +340,8 @@ const header = header: {
     }
     const bits = writer.end * 8 + writer.count;
     writer.pad();
-    const end = writer.end;
-    const Header = struct { bytes: [end]u8, bits: usize };
-    break :header Header{ .bytes = bytes[0..end].*, .bits = bits };
-};
+    return bits;
+}
 
 /// Room a stream needs around the fragments and literals it holds.
 pub const stream_overhead = 2 + header.bytes.len + Stream.tail_room + 2;

@@ -103,8 +103,9 @@ pub fn main(init: std.process.Init) !void {
     }
     var fitted = fragments.shared;
     var bits: [5]usize = undefined;
+    var counts: fragments.Counts = .{};
     for (&bits) |*total| {
-        var counts: fragments.Counts = .{};
+        counts = .{};
         total.* = 0;
         for (corpus.inputs.items) |input| total.* += baker.measure(input, &fitted, &counts);
         // Every symbol keeps a code, so any bytes between fragments can still be written.
@@ -114,8 +115,13 @@ pub fn main(init: std.process.Init) !void {
         fragments.huffmanLengths(&counts.distance, &fitted.distance, 15);
         if (!fitted.valid()) return error.InvalidTable;
     }
+    const fitted_header = fragments.headerBits(&fitted);
+    const fitted_codes = codeBits(&counts, &fitted);
+    const chosen = smallerHeader(&counts, fitted);
     var output_buffer: [1024]u8 = undefined;
     var output = std.Io.File.stdout().writer(io, &output_buffer);
+    try output.interface.print("fitted header {d} B, after swaps {d} B, codes {d:.2}% longer\n", .{ fitted_header / 8, fragments.headerBits(&chosen) / 8, 100 * (@as(f64, @floatFromInt(codeBits(&counts, &chosen))) / @as(f64, @floatFromInt(fitted_codes)) - 1) });
+    fitted = chosen;
     try output.interface.print("fragments {d}, decoded {d:.2} MiB, cached {d:.4} MiB\n", .{ corpus.inputs.items.len, mebibytes(corpus.raw_bytes), mebibytes(corpus.cached_bytes) });
     try output.interface.print("own table per fragment, libdeflate 6: {d:.4} MiB\n", .{mebibytes(own_tables)});
     for (bits, 0..) |total, pass| try output.interface.print("pass {d}: {d:.4} MiB of codes\n", .{ pass, mebibytes(total / 8) });
@@ -131,6 +137,50 @@ pub fn main(init: std.process.Init) !void {
         try writer.interface.writeAll(" };\n");
     }
     try writer.interface.flush();
+}
+
+/// Fragment bits a real terrain chunk packet carries, measured with the bench. The header is
+/// paid once per packet, so this weighs its bits against the codes.
+const packet_code_bits = 12000;
+
+/// Code bits of the counted symbols, without extra bits, which no table changes.
+fn codeBits(counts: *const fragments.Counts, table: *const fragments.Table) u64 {
+    var total: u64 = 0;
+    for (counts.literal, table.literal) |count, length| total += count * length;
+    for (counts.distance, table.distance) |count, length| total += count * length;
+    return total;
+}
+
+/// Swaps lengths between symbols, which keeps the code complete, where a run of equal lengths
+/// shortens the header by more than the codes grow for one packet.
+fn smallerHeader(counts: *const fragments.Counts, start: fragments.Table) fragments.Table {
+    var table = start;
+    const base: f64 = @floatFromInt(codeBits(counts, &start));
+    const cost = struct {
+        fn of(values: *const fragments.Counts, candidate: *const fragments.Table, reference: f64) f64 {
+            return @as(f64, @floatFromInt(fragments.headerBits(candidate))) + packet_code_bits * @as(f64, @floatFromInt(codeBits(values, candidate))) / reference;
+        }
+    }.of;
+    var best = cost(counts, &table, base);
+    var random = std.Random.DefaultPrng.init(0x5eed);
+    for (0..400_000) |_| {
+        const literal = random.random().uintLessThan(u8, 8) != 0;
+        const lengths: []u8 = if (literal) &table.literal else &table.distance;
+        const at = random.random().uintLessThan(usize, lengths.len);
+        const neighbor = if (at == 0) 1 else if (at + 1 == lengths.len) at - 1 else if (random.random().boolean()) at - 1 else at + 1;
+        const wanted = lengths[neighbor];
+        if (lengths[at] == wanted) continue;
+        // Another symbol holding the wanted length gives it up for this one's.
+        var other = random.random().uintLessThan(usize, lengths.len);
+        var tries: usize = 0;
+        while ((lengths[other] != wanted or other == neighbor) and tries < lengths.len) : (tries += 1) other = (other + 1) % lengths.len;
+        if (lengths[other] != wanted or other == neighbor) continue;
+        std.mem.swap(u8, &lengths[at], &lengths[other]);
+        const candidate = cost(counts, &table, base);
+        if (candidate < best) best = candidate else std.mem.swap(u8, &lengths[at], &lengths[other]);
+    }
+    std.debug.assert(table.valid());
+    return table;
 }
 
 fn mebibytes(bytes: usize) f64 {
