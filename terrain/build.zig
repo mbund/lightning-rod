@@ -24,6 +24,14 @@ pub fn build(b: *std.Build) void {
         if (selected) |protocols| b.dependency("minecraft_packets", .{ .target = target, .optimize = optimize }).module("minecraft_packets").addImport("protocols", protocols.module("protocols"));
     }
 
+    const delivery_bench_module = b.createModule(.{ .root_source_file = b.path("src/delivery_bench.zig"), .target = target, .optimize = optimize });
+    for (module.import_table.keys(), module.import_table.values()) |name, dependency| delivery_bench_module.addImport(name, dependency);
+    const delivery_bench = b.addExecutable(.{ .name = "delivery-bench", .root_module = delivery_bench_module });
+    const delivery_bench_run = b.addRunArtifact(delivery_bench);
+    delivery_bench_run.addPassthruArgs();
+    b.step("bench-delivery", "Encode every stored column of a prewarmed world for every protocol").dependOn(&delivery_bench_run.step);
+    b.step("build-delivery-bench", "Compile the stored delivery benchmark").dependOn(&b.addInstallArtifact(delivery_bench, .{}).step);
+
     const filter = b.option([]const u8, "test-filter", "Run matching tests");
     const tests = b.addTest(.{ .root_module = module, .filters = if (filter) |value| &.{value} else &.{} });
     const test_step = b.step("test", "Verify lighting, chunk encoding, delivery and streaming");
