@@ -34,7 +34,10 @@ pub fn Runtime(comptime Endpoint: type, comptime Selections: type) type {
             self.* = .{ .allocator = allocator, .fixed = lightning_rod.PluginAllocator.init(allocator, memory_bytes) };
             errdefer self.fixed.deinit();
             errdefer self.close(io);
-            self.connections = try self.fixed.allocator().alloc(ConnectionPhaseState, connection_count);
+            // A phase state for every connection, which grows with them, so it is kept apart from
+            // the fixed memory the plugins share.
+            self.connections = try allocator.alloc(ConnectionPhaseState, connection_count);
+            errdefer allocator.free(self.connections);
             @memset(self.connections, .{});
             self.inputs.init();
             self.phases = try sessions.Phases.init(self.fixed.allocator(), count);
@@ -69,12 +72,13 @@ pub fn Runtime(comptime Endpoint: type, comptime Selections: type) type {
             self.close(io);
             self.fixed.deinit();
             const allocator = self.allocator;
+            allocator.free(self.connections);
             self.* = undefined;
             allocator.destroy(self);
         }
 
         pub fn memoryBytes(self: *const Self) usize {
-            return @sizeOf(Self) + self.fixed.used();
+            return @sizeOf(Self) + self.connections.len * @sizeOf(ConnectionPhaseState) + self.fixed.used();
         }
 
         pub fn close(self: *Self, io: std.Io) void {

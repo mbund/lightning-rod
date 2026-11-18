@@ -58,6 +58,14 @@ pub fn build(b: *std.Build) void {
         .imports = &.{ .{ .name = "networking", .module = networking }, .{ .name = "metrics", .module = metrics }, .{ .name = "system", .module = system } },
     }) });
     test_step.dependOn(&b.addRunArtifact(initialization_tests).step);
+    const plugin_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/plugins_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "system", .module = system }, .{ .name = "reload", .module = reload }, .{ .name = "lightning_rod", .module = lightning_rod }, .{ .name = "metrics", .module = metrics }, .{ .name = "networking", .module = networking } },
+    }) });
+    plugin_tests.root_module.addObjectFile(core.namedLazyPath("runtime"));
+    test_step.dependOn(&b.addRunArtifact(plugin_tests).step);
     const threaded_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/threaded.zig"),
         .target = target,
