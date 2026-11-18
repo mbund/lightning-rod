@@ -21,15 +21,21 @@ pub const Chat = struct {
         bytes: [1100]u8 = undefined,
         length: usize = 0,
         recipients: []sessions.Service.Target,
+        /// Since when each recipient still to be sent the message has waited for it.
+        waits: []Wait,
         count: usize = 0,
-        /// The tick a recipient first had no output credit for this message.
-        blocked_since: ?u64 = null,
+        /// Whether the message was tried already, so its recipients have waits.
+        tried: bool = false,
     };
 
-    /// Ticks a recipient may go without output credit for a message before it is
-    /// disconnected. A connection whose output is full of terrain is not behind, and
-    /// terrain fills it whenever a player loads an area. One that takes nothing for
-    /// five seconds is.
+    /// A recipient's wait for a message: since the tick it last sent anything, and how much
+    /// credit it had back from sent output then.
+    const Wait = struct { since: u64, returned: u64 };
+
+    /// Ticks a recipient may wait for a message without sending anything before it is
+    /// disconnected. A connection whose output is full is not behind while it drains:
+    /// terrain fills it whenever a player loads an area, and joining a crowded server
+    /// fills it with every other player. One that takes nothing for five seconds is.
     const patience_ticks = 100;
 
     deps: Dependencies,
@@ -45,9 +51,12 @@ pub const Chat = struct {
         const self = try allocator.create(Chat);
         const messages = try allocator.alloc(Message, config.pending_messages);
         const recipients = try allocator.alloc(sessions.Service.Target, messages.len * deps.players.records.len);
+        const waits = try allocator.alloc(Wait, recipients.len);
 
-        for (messages, 0..) |*message, index|
-            message.* = .{ .recipients = recipients[index * deps.players.records.len ..][0..deps.players.records.len] };
+        for (messages, 0..) |*message, index| message.* = .{
+            .recipients = recipients[index * deps.players.records.len ..][0..deps.players.records.len],
+            .waits = waits[index * deps.players.records.len ..][0..deps.players.records.len],
+        };
 
         self.* = .{ .deps = deps, .messages = messages, .delivered = try allocator.alloc(sessions.Service.Delivery, deps.players.records.len) };
         return self;
@@ -70,9 +79,14 @@ pub const Chat = struct {
             try self.deps.packets.fanout(writeChat, message.recipients[0..message.count], .{message.bytes[0..message.length]}, message.length + 8, self.delivered[0..message.count]);
             var remaining: usize = 0;
 
-            for (message.recipients[0..message.count], self.delivered[0..message.count]) |target, result| {
+            for (message.recipients[0..message.count], message.waits[0..message.count], self.delivered[0..message.count]) |target, before, result| {
                 if (result != .backpressured) continue;
-                if (!service.canSend(target.handle, message.length + 8) and self.ticks - (message.blocked_since orelse self.ticks) >= patience_ticks) {
+                const returned = service.returnedCredit(target.handle);
+                // A recipient that sent anything since its wait began is draining, so it waits
+                // afresh from now.
+                var wait = before;
+                if (!message.tried or returned != wait.returned) wait = .{ .since = self.ticks, .returned = returned };
+                if (!service.canSend(target.handle, message.length + 8) and self.ticks - wait.since >= patience_ticks) {
                     // An operator needs to tell this from a player who left.
                     std.log.warn("event=chat_recipient_disconnected connection={d}:{d} output_credit={d} needed={d}", .{ target.handle.index, target.handle.generation, service.outputCredit(target.handle), service.framedBound(message.length + 8) });
                     service.disconnect(target.handle);
@@ -80,15 +94,14 @@ pub const Chat = struct {
                 }
 
                 message.recipients[remaining] = target;
+                message.waits[remaining] = wait;
                 remaining += 1;
             }
 
             message.count = remaining;
-            if (remaining != 0) {
-                if (message.blocked_since == null) message.blocked_since = self.ticks;
-                break;
-            }
-            message.blocked_since = null;
+            message.tried = true;
+            if (remaining != 0) break;
+            message.tried = false;
             self.read += 1;
         }
     }
