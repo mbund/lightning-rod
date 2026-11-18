@@ -37,6 +37,7 @@ pub const Maintenance = struct {
         if (previous != null) return error.MaintenanceAlreadyStarted;
         errdefer self.store.resources.background.store(null, .release);
         self.thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, run, .{self});
+        self.thread.?.setName(self.store.io, "storage") catch {};
         self.notify();
     }
 

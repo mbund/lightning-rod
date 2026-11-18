@@ -19,7 +19,10 @@ pub const Terminal = struct {
     }
 
     pub fn start(self: *Terminal) !void {
-        if (self.config.enabled) self.thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, execute, .{self});
+        if (self.config.enabled) {
+            self.thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, execute, .{self});
+            self.thread.?.setName(self.io, "tui") catch {};
+        }
     }
 
     fn execute(self: *Terminal) void {

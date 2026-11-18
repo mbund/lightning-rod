@@ -42,6 +42,7 @@ pub const ThreadedTerrain = struct {
 
     pub fn start(self: *ThreadedTerrain) !void {
         self.thread = try std.Thread.spawn(.{ .stack_size = stack_size }, execute, .{self});
+        self.thread.?.setName(self.io, "terrain") catch {};
         self.initialized.waitUncancelable(self.io);
     }
 

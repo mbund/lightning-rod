@@ -372,9 +372,11 @@ pub fn Codec(comptime Endpoint: type) type {
                 };
                 self.cancelQueued();
             }
-            for (self.workers) |*worker| {
+            for (self.workers, 0..) |*worker, index| {
                 std.debug.assert(!worker.stopping.load(.acquire));
                 worker.thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, Worker.run, .{worker});
+                var name: [std.Thread.max_name_len]u8 = undefined;
+                worker.thread.?.setName(self.io, std.fmt.bufPrint(&name, "codec {d}", .{index}) catch "codec") catch {};
             }
             // No work can publish to a worker that failed to start.
             self.launched.set(self.io);

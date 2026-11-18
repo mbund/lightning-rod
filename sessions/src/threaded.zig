@@ -47,6 +47,8 @@ fn Driver(comptime Core: type) type {
             // Unoptimized builds keep a frame per protocol state, which outgrew 256 KiB for a
             // debug server on a baseline CPU.
             self.thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, execute, .{self});
+            // Named for profilers and per thread usage. Only a label, so failing to set it is fine.
+            self.thread.?.setName(self.io, "sessions") catch {};
         }
 
         fn execute(self: *Self) void {

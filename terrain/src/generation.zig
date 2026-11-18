@@ -57,6 +57,8 @@ pub const Generation = struct {
                 unreachable;
             } else {
                 worker.thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, Worker.run, .{worker});
+                var name: [std.Thread.max_name_len]u8 = undefined;
+                worker.thread.?.setName(self.io, std.fmt.bufPrint(&name, "generation {d}", .{worker - self.workers.ptr}) catch "generation") catch {};
             }
         }
     }
