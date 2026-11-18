@@ -107,6 +107,9 @@ pub const Service = struct {
     event_write: std.atomic.Value(usize) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
     credit: []std.atomic.Value(u64),
+    /// Credit each connection slot has had back from sent output, ever, which tells a
+    /// connection that is draining from one that takes nothing.
+    returned: []std.atomic.Value(u64),
     disconnects: []std.atomic.Value(u32),
     preparing: std.atomic.Value(usize) = .init(0),
     output_notifications: [16]?*std.Io.Event = @splat(null),
@@ -174,6 +177,9 @@ pub const Service = struct {
         errdefer allocator.free(credit);
 
         for (credit) |*value| value.* = .init(0);
+        const returned = try allocator.alloc(std.atomic.Value(u64), config.connections);
+        errdefer allocator.free(returned);
+        for (returned) |*value| value.* = .init(0);
         const disconnects = try allocator.alloc(std.atomic.Value(u32), config.connections);
         errdefer allocator.free(disconnects);
 
@@ -215,6 +221,7 @@ pub const Service = struct {
             .batch = batch,
             .pending_inputs = pending_inputs,
             .credit = credit,
+            .returned = returned,
             .disconnects = disconnects,
             .releases = releases,
             .departed = departed,
@@ -250,6 +257,7 @@ pub const Service = struct {
         self.allocator.free(self.releases);
         self.allocator.free(self.departed);
         self.allocator.free(self.credit);
+        self.allocator.free(self.returned);
         self.allocator.free(self.disconnects);
         self.allocator.free(self.events);
         self.allocator.free(self.recipient_marks);
@@ -927,8 +935,18 @@ pub const Service = struct {
 
         while (value >> 32 == handle.generation and value & active != 0) {
             assert((value & (active - 1)) + bytes <= self.config.buffer_bytes);
-            value = self.credit[handle.index].cmpxchgWeak(value, value + bytes, .acq_rel, .acquire) orelse return;
+            value = self.credit[handle.index].cmpxchgWeak(value, value + bytes, .acq_rel, .acquire) orelse {
+                _ = self.returned[handle.index].fetchAdd(bytes, .monotonic);
+                return;
+            };
         }
+    }
+
+    /// Credit a connection has had back from sent output, counted over its slot's life, so
+    /// two readings tell whether it sent anything between them.
+    pub fn returnedCredit(self: *const Service, handle: network.Handle) u64 {
+        if (handle.index >= self.returned.len) return 0;
+        return self.returned[handle.index].load(.monotonic);
     }
 
     /// The event must remain valid until unsubscribeOutput returns.
