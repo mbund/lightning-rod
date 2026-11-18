@@ -28,6 +28,15 @@ pub fn main(init: std.process.Init) !void {
     inline for (sizes) |size| {
         for (&streams, &ciphers, 0..) |*stream, *cipher, index| stream.* = .{ .cipher = cipher, .bytes = buffer[index * size ..][0..size] };
         const total = connections * size;
+        // Decryption, one stream after another, which a client does for everything it receives.
+        {
+            const ns = try measure(io, struct {
+                fn run(all: []const Cipher.Stream) void {
+                    for (all) |stream| stream.cipher.transform(.decrypt, stream.bytes, stream.bytes);
+                }
+            }.run, &streams, total);
+            report(size, "decrypt", total, ns);
+        }
         // One stream after another.
         {
             const ns = try measure(io, struct {
