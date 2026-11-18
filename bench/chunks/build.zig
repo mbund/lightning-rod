@@ -39,6 +39,15 @@ pub fn build(b: *std.Build) void {
     const run_fragments = b.addRunArtifact(fragments);
     run_fragments.addPassthruArgs();
     b.step("fragment-table", "Fit the shared fragment table to a world's cached fragments and write its source").dependOn(&run_fragments.step);
+    const cache_size = b.addExecutable(.{ .name = "cache-size", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/cache_size.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "chunks", .module = chunks }, .{ .name = "storage", .module = storage }, .{ .name = "metrics", .module = metrics }, .{ .name = "records", .module = records } },
+    }) });
+    const run_cache_size = b.addRunArtifact(cache_size);
+    run_cache_size.addPassthruArgs();
+    b.step("cache-size", "Split a world's derived cache into the parts its records hold").dependOn(&run_cache_size.step);
     const java = b.dependency("minecraft_java", .{ .target = target, .optimize = optimize }).module("minecraft_java");
     const codec = b.addExecutable(.{ .name = "streaming-codec-bench", .root_module = b.createModule(.{
         .root_source_file = b.path("src/codec.zig"),
