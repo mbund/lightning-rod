@@ -38,10 +38,15 @@ pub const BlockSynchronization = struct {
         life: u32 = 0,
         world: u32 = 0,
         pending: usize = 0,
+        /// Pending sections holding changes, which an acknowledgment follows, so the client
+        /// holds what its prediction became before it gives the prediction up. The rest only
+        /// disclose what was there all along, which nothing waits for.
+        changes: usize = 0,
         sequence: i32 = -1,
         cursor: usize = 0,
         pending_bits: []u64 = &.{},
         full_bits: []u64 = &.{},
+        change_bits: []u64 = &.{},
         nonempty: std.DynamicBitSetUnmanaged = .{},
         /// With hull replacement, the eye section and, per cell around it, the section whose true
         /// states were requested with the column delivery they correct.
@@ -51,6 +56,32 @@ pub const BlockSynchronization = struct {
         const Near = struct { section: chunks.Section = .{ .world = 0, .x = 0, .y = 0, .z = 0 }, delivery: u32 = 0, valid: bool = false };
 
         const Selection = struct { bit: ?usize = null, examined: usize = 0 };
+
+        /// Queues the sections of `bits` in `word`, as changes or as disclosures.
+        fn queue(self: *Observer, word: usize, bits: u64, change: bool) void {
+            self.pending += @popCount(bits & ~self.pending_bits[word]);
+            self.pending_bits[word] |= bits;
+            if (change) {
+                self.changes += @popCount(bits & ~self.change_bits[word]);
+                self.change_bits[word] |= bits;
+            }
+            if (bits != 0) self.nonempty.set(word);
+        }
+
+        /// Clears a sent or dropped section.
+        fn sent(self: *Observer, bit: usize) void {
+            const word = bit / 64;
+            const flag = @as(u64, 1) << @intCast(bit % 64);
+            assert(self.pending_bits[word] & flag != 0);
+            self.pending_bits[word] &= ~flag;
+            if (self.pending_bits[word] == 0) self.nonempty.unset(word);
+            self.full_bits[word] &= ~flag;
+            self.pending -= 1;
+            if (self.change_bits[word] & flag != 0) {
+                self.change_bits[word] &= ~flag;
+                self.changes -= 1;
+            }
+        }
 
         fn select(self: *const Observer, excluded: []const usize) Selection {
             var result: Selection = .{};
@@ -219,6 +250,8 @@ pub const BlockSynchronization = struct {
     observers: []Observer,
     pending: []u64,
     full: []u64,
+    /// Per observer, which pending sections hold changes, see `Observer.changes`.
+    changes: []u64,
     words: usize,
     side: i32,
     deltas: []CachedDelta,
@@ -263,6 +296,7 @@ pub const BlockSynchronization = struct {
         for (observers, deps.players.records) |*observer, player| observer.* = .{ .life = player.life, .nonempty = try .initEmpty(allocator, words) };
         const pending = try allocator.alloc(u64, words * observers.len);
         const full = try allocator.alloc(u64, pending.len);
+        const changes = try allocator.alloc(u64, pending.len);
         const deltas = try allocator.alloc(CachedDelta, config.delta_sections);
         for (deltas, 0..) |*delta, index| delta.* = .{ .next_free = if (index + 1 < deltas.len) index + 1 else null };
         var delta_index: std.AutoHashMapUnmanaged(chunks.Section, usize) = .empty;
@@ -298,6 +332,7 @@ pub const BlockSynchronization = struct {
             .observers = observers,
             .pending = pending,
             .full = full,
+            .changes = changes,
             .words = words,
             .side = side,
             .deltas = deltas,
@@ -458,9 +493,7 @@ pub const BlockSynchronization = struct {
         const bit = sectionBit(self.side, section);
         const word = bit / 64;
         const flag = @as(u64, 1) << @intCast(bit % 64);
-        observer.pending += @intFromBool(observer.pending_bits[word] & flag == 0);
-        observer.pending_bits[word] |= flag;
-        observer.nonempty.set(word);
+        observer.queue(word, flag, false);
         self.selections.row(0).insert(index);
     }
 
@@ -469,10 +502,8 @@ pub const BlockSynchronization = struct {
         assert(observer.generation != 0 and bit < self.words * 64);
         const word = bit / 64;
         const flag = @as(u64, 1) << @intCast(bit % 64);
-        observer.pending += @intFromBool(observer.pending_bits[word] & flag == 0);
-        observer.pending_bits[word] |= flag;
+        observer.queue(word, flag, false);
         observer.full_bits[word] |= flag;
-        observer.nonempty.set(word);
         self.selections.row(0).insert(index);
     }
 
@@ -496,10 +527,7 @@ pub const BlockSynchronization = struct {
             }
 
             assert(player.world == section.world);
-            const word = bit / 64;
-            observer.pending += @intFromBool(observer.pending_bits[word] & flag == 0);
-            observer.pending_bits[word] |= flag;
-            observer.nonempty.set(word);
+            observer.queue(bit / 64, flag, true);
             self.selections.row(0).insert(index);
             interested = true;
         }
@@ -643,9 +671,7 @@ pub const BlockSynchronization = struct {
             if (observer.generation != handle.generation or observer.life != view.life or observer.world != view.world) self.resetObserver(index, handle.generation, view.life, view.world);
             const word = at % self.words;
             const bits = self.incoming.full_bits[at];
-            observer.pending += @popCount(bits & ~observer.pending_bits[word]);
-            observer.pending_bits[word] |= bits;
-            if (bits != 0) observer.nonempty.set(word);
+            observer.queue(word, bits, true);
             observer.full_bits[word] |= bits;
             if (observer.pending != 0) self.selections.row(0).insert(index);
         }
@@ -733,10 +759,7 @@ pub const BlockSynchronization = struct {
             }
             if (!visible or !self.deps.streaming.sectionVisible(selected, section)) {
                 if (visible) self.deps.streaming.invalidateSection(selected, section);
-                observer.pending_bits[at / 64] &= ~flag;
-                if (observer.pending_bits[at / 64] == 0) observer.nonempty.unset(at / 64);
-                observer.full_bits[at / 64] &= ~flag;
-                observer.pending -= 1;
+                observer.sent(at);
                 if (observer.pending == 0) self.selections.row(0).remove(selected);
                 advanced = true;
                 completed += 1;
@@ -883,19 +906,13 @@ pub const BlockSynchronization = struct {
         for (plans[0..reserved], publications[0..reserved], admitted[0..reserved]) |plan, publication, count| {
             const accepted = publication.recipients[0..count];
             const at = plan.bit;
-            const flag = @as(u64, 1) << @intCast(at % 64);
             const section = plan.section;
             const full = plan.full;
             const slot = plan.slot;
             const changed_count = plan.changed;
             for (accepted) |handle| {
                 const other = &self.observers[handle.index];
-                const word = at / 64;
-                assert(other.pending_bits[word] & flag != 0);
-                other.pending_bits[word] &= ~flag;
-                if (other.pending_bits[word] == 0) other.nonempty.unset(word);
-                other.full_bits[word] &= ~flag;
-                other.pending -= 1;
+                other.sent(at);
                 if (other.pending == 0) self.selections.row(0).remove(handle.index);
             }
 
@@ -971,7 +988,7 @@ pub const BlockSynchronization = struct {
             }
             self.next_acknowledgment += 1;
             assert(observer.sequence >= 0);
-            if (observer.pending != 0) continue;
+            if (observer.changes != 0) continue;
             indices[count] = index;
             recipients[count] = .{view.handle.?};
             count += 1;
@@ -997,7 +1014,7 @@ pub const BlockSynchronization = struct {
         for (indices[0..reserved], accepted[0..reserved]) |index, admitted| {
             assert(admitted <= 1);
             if (admitted == 0) continue;
-            assert(self.observers[index].pending == 0);
+            assert(self.observers[index].changes == 0);
             self.observers[index].sequence = -1;
             self.pending_acknowledgments.remove(index);
             progressed = true;
@@ -1016,11 +1033,13 @@ pub const BlockSynchronization = struct {
         const count = if (generation == 0) 0 else self.words;
         const pending = self.pending[index * self.words ..][0..count];
         const full = self.full[index * self.words ..][0..count];
+        const changes = self.changes[index * self.words ..][0..count];
         @memset(pending, 0);
         @memset(full, 0);
+        @memset(changes, 0);
         var nonempty = self.observers[index].nonempty;
         nonempty.unsetAll();
-        self.observers[index] = .{ .generation = generation, .life = life, .world = world, .pending_bits = pending, .full_bits = full, .nonempty = nonempty };
+        self.observers[index] = .{ .generation = generation, .life = life, .world = world, .pending_bits = pending, .full_bits = full, .change_bits = changes, .nonempty = nonempty };
     }
 
     fn writeChanges(packet: wire_1_21_5.play.toClient.packet_multi_block_change.Writer, registry: packets.Registry, section: chunks.Section, view: chunks.View, mask: *const [64]u64) ![]u8 {
@@ -1083,6 +1102,38 @@ test "block acknowledgments coalesce within a player lifetime and discard aborte
     try std.testing.expectEqual(@as(u32, 2), changes.acknowledgments[0].state.generation);
     changes.clear();
     try std.testing.expect(changes.acknowledging.count == 0);
+}
+
+test "acknowledgments wait for pending changes but not for disclosures" {
+    var pending: [2]u64 = @splat(0);
+    var full: [2]u64 = @splat(0);
+    var changes: [2]u64 = @splat(0);
+    var observer: BlockSynchronization.Observer = .{
+        .pending_bits = &pending,
+        .full_bits = &full,
+        .change_bits = &changes,
+        .nonempty = try .initEmpty(std.testing.allocator, pending.len),
+    };
+    defer observer.nonempty.deinit(std.testing.allocator);
+    // Sections a moving player comes near, disclosed, then an edit in one of them and another.
+    observer.queue(0, 0b0111, false);
+    observer.queue(0, 0b0100, true);
+    observer.queue(1, 0b1, true);
+    try std.testing.expectEqual(@as(usize, 4), observer.pending);
+    try std.testing.expectEqual(@as(usize, 2), observer.changes);
+    // Queuing a change again counts it once.
+    observer.queue(1, 0b1, true);
+    try std.testing.expectEqual(@as(usize, 2), observer.changes);
+    observer.sent(64);
+    observer.sent(2);
+    // Only disclosures remain, which the acknowledgment does not wait for.
+    try std.testing.expectEqual(@as(usize, 0), observer.changes);
+    try std.testing.expectEqual(@as(usize, 2), observer.pending);
+    try std.testing.expect(!observer.nonempty.isSet(1));
+    observer.sent(0);
+    observer.sent(1);
+    try std.testing.expectEqual(@as(usize, 0), observer.pending);
+    try std.testing.expect(!observer.nonempty.isSet(0));
 }
 
 test "pending section selection wraps and excludes planned work across sparse words" {
