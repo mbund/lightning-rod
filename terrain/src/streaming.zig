@@ -66,6 +66,12 @@ pub const Streaming = struct {
     const GeometryChange = struct {
         section: chunks.Section,
         bounds: geometry_bounds.Box,
+        /// Whether an edit changed what a cell occludes, or whether it is air or stone, the only
+        /// things the visibility geometry holds. Other edits, as of a plant growing a stage,
+        /// still reach the players who hold the section, but nothing is learned again.
+        occlusion: bool,
+
+        const Extent = struct { bounds: geometry_bounds.Box, occlusion: bool };
 
         fn boundsFor(section: chunks.Section, edits: []const chunks.BlockEdit) ?geometry_bounds.Box {
             assert(edits.len > 0 and edits.len <= 4096);
@@ -341,7 +347,7 @@ pub const Streaming = struct {
         changed_views: lightning_rod.system.IndexSet,
         dirty_streams: lightning_rod.system.IndexSet,
         geometry_revision: u64 = 0,
-        geometry_changes: std.AutoHashMapUnmanaged(chunks.Section, geometry_bounds.Box) = .{},
+        geometry_changes: std.AutoHashMapUnmanaged(chunks.Section, GeometryChange.Extent) = .{},
         geometry_overflow: bool = false,
         epoch: u64 = 0,
         updated: bool = true,
@@ -673,7 +679,7 @@ pub const Streaming = struct {
         const light_receipts = try lighting.Receipts.init(allocator, occluded.len, deps.lighting.rules);
         const refresh_bits = try allocator.alloc(u64, sent.len);
         @memset(refresh_bits, 0);
-        var geometry_changes: std.AutoHashMapUnmanaged(chunks.Section, geometry_bounds.Box) = .{};
+        var geometry_changes: std.AutoHashMapUnmanaged(chunks.Section, GeometryChange.Extent) = .{};
         try geometry_changes.ensureTotalCapacity(allocator, geometry_change_capacity);
         const published = try allocator.create(Published);
         published.* = .{
@@ -1047,11 +1053,18 @@ pub const Streaming = struct {
             self.epoch = self.published.epoch;
             const geometry_overflow = self.published.geometry_overflow;
             var geometry_count: usize = 0;
+            // The changes that alter occlusion come first, and only they are learned again.
+            var occluding_count: usize = 0;
             if (self.geometry_revision != self.published.geometry_revision) {
                 self.geometry_revision = self.published.geometry_revision;
                 var changed_sections = self.published.geometry_changes.iterator();
                 while (changed_sections.next()) |entry| {
-                    self.geometry_changes[geometry_count] = .{ .section = entry.key_ptr.*, .bounds = entry.value_ptr.* };
+                    const change: GeometryChange = .{ .section = entry.key_ptr.*, .bounds = entry.value_ptr.bounds, .occlusion = entry.value_ptr.occlusion };
+                    self.geometry_changes[geometry_count] = change;
+                    if (change.occlusion) {
+                        std.mem.swap(GeometryChange, &self.geometry_changes[occluding_count], &self.geometry_changes[geometry_count]);
+                        occluding_count += 1;
+                    }
                     geometry_count += 1;
                 }
                 self.published.geometry_changes.clearRetainingCapacity();
@@ -1093,7 +1106,7 @@ pub const Streaming = struct {
                 const dimension = self.deps.worlds.get(section.world).?.dimension;
                 // With occlusion the section is learned again below, and only a change in what
                 // it occludes costs anyone a new sweep.
-                self.geometry.changed(section.world, dimension.minimumSection(), change.bounds, self.config.occlusion);
+                if (change.occlusion) self.geometry.changed(section.world, dimension.minimumSection(), change.bounds, self.config.occlusion);
                 const offset = section.y - dimension.minimumSection();
                 if (offset < 0 or offset >= dimension.sectionCount()) continue;
                 var nearby = self.observers_index.query(.{ .world = section.world, .x = section.x, .z = section.z }, self.deliveryRadius() + 1);
@@ -1124,13 +1137,13 @@ pub const Streaming = struct {
                     if (self.streams[index].setup == .streaming) self.refreshReady(index);
                 }
             }
-            if (self.config.occlusion and !geometry_overflow and geometry_count != 0) {
+            if (self.config.occlusion and !geometry_overflow and occluding_count != 0) {
                 var window = chunks.ReadWindow(section_visibility_world.World.batch_max).init(self.chunk_client);
                 defer window.deinit();
                 var views: [192]chunks.View = undefined;
                 var begin: usize = 0;
-                while (begin < geometry_count) {
-                    const count = @min(geometry_count - begin, views.len, self.chunk_client.budget());
+                while (begin < occluding_count) {
+                    const count = @min(occluding_count - begin, views.len, self.chunk_client.budget());
                     var sections: [192]chunks.Section = undefined;
                     for (self.geometry_changes[begin..][0..count], sections[0..count]) |change, *section| section.* = change.section;
                     try window.readMany(sections[0..count], views[0..count]);
@@ -1145,14 +1158,14 @@ pub const Streaming = struct {
             }
             // What could not be compared on relearn invalidates the views that may see it.
             self.geometry.settleChanges();
-            if (geometry_count != 0 or geometry_overflow) {
+            if (occluding_count != 0 or geometry_overflow) {
                 for (self.background_players.values()) |index| {
                     const view = self.views[index];
                     const source = &self.sources[index];
                     var source_changed = geometry_overflow;
                     if (source.origin) |origin| {
                         const bounds = origin.bounds();
-                        for (self.geometry_changes[0..geometry_count]) |change| {
+                        for (self.geometry_changes[0..occluding_count]) |change| {
                             if (change.section.world != view.world) continue;
                             var touches = true;
                             for (0..3) |axis| touches = touches and change.bounds.minimum[axis] < bounds.maximum[axis] and change.bounds.maximum[axis] > bounds.minimum[axis];
@@ -2158,16 +2171,23 @@ pub const Streaming = struct {
         const dimension = (self.deps.worlds.get(section.world) orelse return).dimension;
         if (section.y < dimension.minimumSection() or @as(i64, section.y) >= @as(i64, dimension.minimumSection()) + @as(i64, @intCast(dimension.sectionCount()))) return;
         const bounds = GeometryChange.boundsFor(section, edits) orelse return;
+        // The geometry's table of what each state occludes is fixed once it is built, so the
+        // simulation thread reads it as terrain does.
+        const properties = self.geometry.properties;
+        const occlusion = for (edits, previous) |edit, old| {
+            if (properties[edit.state] != properties[old]) break true;
+        } else false;
         self.published.mutex.lockUncancelable(self.native_io);
         self.published.geometry_revision += 1;
         if (self.published.geometry_changes.getPtr(section)) |known| {
             for (0..3) |axis| {
-                known.minimum[axis] = @min(known.minimum[axis], bounds.minimum[axis]);
-                known.maximum[axis] = @max(known.maximum[axis], bounds.maximum[axis]);
+                known.bounds.minimum[axis] = @min(known.bounds.minimum[axis], bounds.minimum[axis]);
+                known.bounds.maximum[axis] = @max(known.bounds.maximum[axis], bounds.maximum[axis]);
             }
+            known.occlusion = known.occlusion or occlusion;
         } else if (self.published.geometry_changes.count() == geometry_change_capacity) {
             self.published.geometry_overflow = true;
-        } else self.published.geometry_changes.putAssumeCapacityNoClobber(section, bounds);
+        } else self.published.geometry_changes.putAssumeCapacityNoClobber(section, .{ .bounds = bounds, .occlusion = occlusion });
         self.published.updated = true;
         self.published.mutex.unlock(self.native_io);
     }
