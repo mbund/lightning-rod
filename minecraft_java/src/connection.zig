@@ -218,6 +218,10 @@ pub fn Connection(comptime Protocol: type) type {
                         return switch (effect) {
                             .none => null,
                             .send => |response| response,
+                            .poll => {
+                                context.poll.wakeAt(context.now);
+                                return null;
+                            },
                         };
                     }
                     if (self.phase == .reconfiguration_ack) {
