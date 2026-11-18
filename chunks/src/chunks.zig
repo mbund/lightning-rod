@@ -36,6 +36,8 @@ const Backend = struct {
 const assert = std.debug.assert;
 /// Edits one section batch may carry, one for each of its cells.
 const edit_previous_max = 4096;
+/// Leases of at most this many sections take scratch of this size.
+const small_lease = 8;
 
 pub const World = u32;
 
@@ -855,14 +857,22 @@ pub const Chunks = struct {
         }
         self.generation.promote(sections);
         try self.collectGenerated();
+        // Scratch sized to the request, as safe builds fill all of it on every call.
+        if (sections.len <= small_lease) return self.leaseBatches(small_lease, client_index, sections, output);
+        return self.leaseBatches(192, client_index, sections, output);
+    }
+
+    /// Leases `sections` in batches of `batch`, reading or generating those not in memory.
+    fn leaseBatches(self: *Chunks, comptime batch: usize, client_index: u8, sections: []const Section, output: []Lease) !void {
+        const state = &self.clients[client_index];
         var done: usize = 0;
         errdefer {
             self.releaseLocked(output[0..done]);
             self.available.broadcast(self.io);
         }
-        var keys: [192][16]u8 = undefined;
-        var slices: [192][]const u8 = undefined;
-        var cached: [192]Cache.Lease = undefined;
+        var keys: [batch][16]u8 = undefined;
+        var slices: [batch][]const u8 = undefined;
+        var cached: [batch]Cache.Lease = undefined;
         while (done < sections.len) {
             const count = @min(keys.len, sections.len - done);
             for (sections[done..][0..count], 0..) |section, index| {
@@ -870,7 +880,7 @@ pub const Chunks = struct {
                 slices[index] = &keys[index];
             }
             while (true) {
-                var victims: [192]Cache.Lease = undefined;
+                var victims: [batch]Cache.Lease = undefined;
                 const reservation = try self.cache.reserveMany(slices[0..count], cached[0..count], &victims, self.cache.entries.len);
                 switch (reservation) {
                     .blocked => |shortfall| {
@@ -901,6 +911,11 @@ pub const Chunks = struct {
     }
 
     fn submitGenerated(self: *Chunks, sections: []const Section, leases: []const Cache.Lease, priority: GenerationPriority, owner: u8) void {
+        // Most leases are of sections in memory, which generate nothing, and the scratch below
+        // is filled where it is declared in safe builds.
+        for (leases) |lease| {
+            if (self.generating[lease.index] == null and lease.read() == null) break;
+        } else return;
         var requests: [192]Generation.Request = undefined;
         var held: [192]Cache.Fill = undefined;
         var count: usize = 0;
@@ -1533,6 +1548,8 @@ pub const Chunks = struct {
     }
 
     fn collectGenerated(self: *Chunks) !void {
+        // Nothing generating, nothing to collect, and no scratch to fill.
+        if (self.generating_count == 0) return;
         var changed = false;
         var completions: [32]Generation.Completion = undefined;
         while (true) {
