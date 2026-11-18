@@ -12,6 +12,7 @@
         .minecraft_packets = .{ .path = "../../minecraft_packets" },
         .players = .{ .path = "../../players" },
         .protocol_1_21_5 = .{ .path = "../../protocol_versions/v1_21_5" },
+        .protocol_1_21_9 = .{ .path = "../../protocol_versions/v1_21_9" },
         .records = .{ .path = "../../records" },
         .replication = .{ .path = "../../replication" },
         .sessions = .{ .path = "../../sessions" },

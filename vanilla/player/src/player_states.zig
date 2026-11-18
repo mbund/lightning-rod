@@ -5,6 +5,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const persistent_records = @import("records");
 const wire_1_21_5 = @import("wire_1_21_5");
+const wire_1_21_9 = @import("wire_1_21_9");
 const worlds = @import("worlds");
 const sessions = @import("sessions");
 const minecraft = @import("minecraft_model");
@@ -90,7 +91,7 @@ pub const PlayerStates = struct {
     };
 
     /// What the client still has to hear after it arrives somewhere.
-    const Sending = enum { done, border, health, selection };
+    const Sending = enum { done, border, spawn, health, selection };
 
     deps: Dependencies,
     config: Configuration,
@@ -250,8 +251,9 @@ pub const PlayerStates = struct {
             const state = &self.records[index];
             if (state.arrivals != player.arrivals) {
                 state.arrivals = player.arrivals;
-                // A client that joined, respawned or changed world has forgotten the border.
-                state.sending = if (state.life != player.life) .border else .health;
+                // A client that joined or respawned has forgotten the border, and one that changed
+                // world the spawn too, as vanilla sends both with every arrival in a world.
+                state.sending = if (state.life != player.life) .border else .spawn;
                 state.life = player.life;
             }
             while (state.sending != .done) {
@@ -260,6 +262,10 @@ pub const PlayerStates = struct {
                         if (self.config.world_border) |diameter| {
                             if (!players.sendPacket(writeBorder, player.protocol, handle, .{diameter})) break;
                         }
+                        state.sending = .spawn;
+                    },
+                    .spawn => {
+                        if (!try self.sendSpawn(player)) break;
                         state.sending = .health;
                     },
                     .health => {
@@ -307,6 +313,21 @@ pub const PlayerStates = struct {
         return true;
     }
 
+    /// Tells a client the world's spawn, which its compass points to: since 1.21.9 vanilla keeps
+    /// one for the whole server, in the overworld, whichever world the player is in.
+    fn sendSpawn(self: *PlayerStates, player: *const Player) !bool {
+        const overworld = self.deps.vanilla_worlds.overworld;
+        const world = self.deps.worlds.get(overworld) orelse return true;
+        const at: [3]i32, const angle: f32 = if (self.deps.spawn) |spawn| point: {
+            const definition = try spawn.get(overworld);
+            break :point .{ .{ definition.position.x, definition.position.y, definition.position.z }, definition.angle };
+        } else point: {
+            const position = self.deps.players.config.spawn orelse minecraft.Position{ .x = 0.5, .y = 65, .z = 0.5 };
+            break :point .{ .{ @intFromFloat(@floor(position.x)), @intFromFloat(@floor(position.y)), @intFromFloat(@floor(position.z)) }, 0 };
+        };
+        return self.deps.players.sendPacket(writeSpawn, player.protocol, player.handle.?, .{ world.name, at, angle });
+    }
+
     pub fn sendHealth(self: *PlayerStates, player: *const Player, health: f32) bool {
         return self.deps.players.sendPacket(writeHealth, player.protocol, player.handle.?, .{health});
     }
@@ -334,6 +355,26 @@ pub const PlayerStates = struct {
         done.finish() catch return error.InvalidPacket;
         const state = &self.records[handle.index];
         state.flying = state.gamemode == .spectator or (state.gamemode == .creative and flags & 2 != 0);
+    }
+
+    const writeSpawn = .{ writeSpawn_1_21_5, writeSpawn_1_21_9 };
+
+    fn writeSpawn_1_21_5(packet: wire_1_21_5.play.toClient.packet_spawn_position.Writer, _: []const u8, at: [3]i32, angle: f32) ![]u8 {
+        const located = try packet.location(.{ .x = at[0], .y = @intCast(at[1]), .z = at[2] });
+        return (try located.angle(angle)).finish();
+    }
+
+    /// Since 1.21.9 the spawn names its world and has a pitch beside the angle.
+    fn writeSpawn_1_21_9(packet: wire_1_21_9.play.toClient.packet_spawn_position.Writer, world: []const u8, at: [3]i32, angle: f32) ![]u8 {
+        var global = try packet.globalPos();
+        const located = try minecraft_packets.nested(.{writeGlobalPos}).write(try global.begin(), .{ world, at });
+        const placed = try global.advance(located);
+        return (try (try placed.yaw(angle)).pitch(0)).finish();
+    }
+
+    fn writeGlobalPos(packet: wire_1_21_9.GlobalPos.Writer, args: struct { []const u8, [3]i32 }) !wire_1_21_9.GlobalPos.Writer.Done {
+        const named = try packet.dimensionName(args[0]);
+        return named.location(.{ .x = args[1][0], .y = @intCast(args[1][1]), .z = args[1][2] });
     }
 
     fn writeSelectedSlot(packet: wire_1_21_5.play.toClient.packet_held_item_slot.Writer, slot: u4) ![]u8 {
