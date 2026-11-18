@@ -14,3 +14,5 @@ pub const Registries = registries.Registries;
 pub const Connection = connection.Connection;
 
 pub const RsaPrivateKey = rsa.PrivateKey;
+/// The AES-CFB8 stream each direction of an encrypted connection runs through.
+pub const Cipher = @import("cipher.zig").Cipher;
