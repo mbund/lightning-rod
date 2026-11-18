@@ -2,6 +2,13 @@ const std = @import("std");
 const networking = @import("networking");
 pub const headroom = 6;
 
+/// The bytes a packet of `length` takes in the pool: itself, the headroom before it its frame
+/// header goes in, and room to compress into, which incompressible bytes outgrow by a few bytes
+/// a block. A packet compresses in place of itself, as it waits there for every recipient.
+pub fn storedBytes(length: usize) usize {
+    return length + headroom + 16 + 5 * (length / 5000 + 1);
+}
+
 pub const PageId = u16;
 
 pub const Configuration = struct {
@@ -233,8 +240,9 @@ pub const Pool = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration) !Pool {
         if (config.pages == 0 or config.page_bytes == 0 or config.unit_bytes == 0 or config.recipients_per_page == 0) return error.InvalidConfiguration;
-        const unit_bytes = try std.math.add(usize, @min(config.page_bytes, config.unit_bytes), headroom);
-        const packet_bytes = try std.math.add(usize, config.page_bytes, headroom);
+        // A unit holds the largest packet that fits one, with room to compress.
+        const unit_bytes = storedBytes(@min(config.page_bytes, config.unit_bytes));
+        const packet_bytes = storedBytes(config.page_bytes);
         const per_packet = try std.math.divCeil(usize, packet_bytes, unit_bytes);
         const units = try std.math.mul(usize, config.pages, per_packet);
         if (units > std.math.maxInt(PageId)) return error.InvalidConfiguration;
@@ -493,7 +501,7 @@ pub const SharedPages = struct {
         var count: usize = 0;
         for (lengths) |len| {
             if (len == 0 or len > s.page_bytes) break;
-            const units = std.math.divCeil(usize, len + headroom, s.unit_bytes) catch unreachable;
+            const units = std.math.divCeil(usize, storedBytes(len), s.unit_bytes) catch unreachable;
             const first = s.place(trial, &cursors, units, small) orelse break;
             trial.setRangeValue(.{ .start = first, .end = first + units }, false);
             small += @intFromBool(units == 1);
@@ -529,7 +537,7 @@ pub const SharedPages = struct {
     /// start at the bottom. A small pool, or one whose every packet fits one unit, keeps
     /// a single region.
     fn smallStart(s: *const SharedPages) usize {
-        const per_page = std.math.divCeil(usize, s.page_bytes + headroom, s.unit_bytes) catch unreachable;
+        const per_page = std.math.divCeil(usize, storedBytes(s.page_bytes), s.unit_bytes) catch unreachable;
         if (s.pages.len < 64 or per_page == 1) return s.pages.len;
         return s.pages.len / per_page / 2 * per_page;
     }
@@ -566,7 +574,7 @@ pub const SharedPages = struct {
 
     fn reserveLocked(s: *SharedPages, len: usize) ?Reservation {
         if (len == 0 or len > s.page_bytes) return null;
-        const units = std.math.divCeil(usize, len + headroom, s.unit_bytes) catch unreachable;
+        const units = std.math.divCeil(usize, storedBytes(len), s.unit_bytes) catch unreachable;
         var cursors: Cursors = .{ .large = s.pool.cursor, .small = s.pool.small_cursor };
         const first = s.place(&s.pool.free_units, &cursors, units, s.pool.small_units) orelse return null;
         s.pool.cursor = cursors.large;
@@ -621,7 +629,7 @@ pub const SharedPages = struct {
         if (p.owner != s.owner or p.status.load(.acquire) != status(.reserved, r.generation) or r.bytes.ptr != s.pagePayload(r.page).ptr or r.bytes.len == 0 or r.bytes.len > @min(s.page_bytes, p.units * s.unit_bytes - headroom))
             return false;
 
-        const units = std.math.divCeil(usize, r.bytes.len + headroom, s.unit_bytes) catch unreachable;
+        const units = std.math.divCeil(usize, storedBytes(r.bytes.len), s.unit_bytes) catch unreachable;
         s.freeRange(@as(usize, r.page) + units, p.units - units);
         // Pack following reservations into the tail released by framing.
         if (units < p.units) s.pool.cursor = @as(usize, r.page) + units;
@@ -771,6 +779,12 @@ pub const SharedPages = struct {
 
     pub fn framingHeadroom(s: *SharedPages, id: PageId) []u8 {
         return s.pageStorage(id)[0..headroom];
+    }
+
+    /// All a taken packet's storage: the headroom, the packet, and the room after it to grow into.
+    pub fn packetStorage(s: *SharedPages, packet: RawPacket) []u8 {
+        std.debug.assert(s.pages[packet.page].status.load(.acquire) == status(.taken, packet.generation));
+        return s.pageStorage(packet.page);
     }
 
     pub fn framingStorage(s: *SharedPages, packet: RawPacket) []u8 {
@@ -1010,7 +1024,7 @@ test "audience reservations cancel and freeze without retaining writable views" 
     const audience = writer.finish();
     try std.testing.expect(!writer.active and writer.handles.len == 0);
     writer.cancel(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 0), output.pool.free_audiences.count());
+    try std.testing.expectEqual(output.pool.audiences.len - 1, output.pool.free_audiences.count());
     try std.testing.expectEqual(@as(usize, 1), output.pool.audiences[audience.index].length);
     audience.release(std.testing.io);
     try std.testing.expectEqual(output.pool.audiences.len, output.pool.free_audiences.count());

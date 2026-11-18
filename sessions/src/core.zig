@@ -41,10 +41,10 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
             /// Resident capacity for each input, decoded input, output, and control buffer.
             connection_bytes: usize = 8 * 1024,
             input_burst_slots: usize = 2,
-            output_burst_slots: usize = 8,
+            /// Each connection's ring of Play output, see `Engine.Configuration.output_bytes`.
+            output_bytes: usize = 64 * 1024,
             configuration_slots: usize = 8,
             decode_slots: usize = 2,
-            framing_slots: usize = 8,
             codec_workers: usize = 1,
             max_pending_wire_bytes: usize = 1024 * 1024,
             endpoints: []const EndpointConfiguration,
@@ -141,10 +141,9 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
                 .buffer_bytes = config.buffer_bytes,
                 .connection_bytes = config.connection_bytes,
                 .input_burst_slots = config.input_burst_slots,
-                .output_burst_slots = config.output_burst_slots,
+                .output_bytes = config.output_bytes,
                 .configuration_slots = config.configuration_slots,
                 .decode_slots = config.decode_slots,
-                .framing_slots = config.framing_slots,
                 .codec_workers = config.codec_workers,
                 .max_pending_wire_bytes = config.max_pending_wire_bytes,
                 .protocols = config.protocols,
@@ -162,9 +161,10 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
             const allocated = try options.metrics.gauge(.{ .namespace = id, .name = "owned_buffers", .description = "Preallocated endpoint, engine, codec, and protocol plugin buffers", .unit = .bytes });
             var buffer_bytes = self.hooks.memoryBytes() + self.output_pool.memoryBytes();
             for (endpoints) |endpoint| buffer_bytes += endpoint.memoryBytes();
-            for (self.worker.frames) |frame| buffer_bytes += frame.bytes.len;
-            const engine = self.worker.engine;
-            buffer_bytes += engine.input.len + engine.output.len + engine.decoded_storage.len + engine.decoded.memoryBytes() + engine.input_bursts.memoryBytes() + engine.output_bursts.memoryBytes() + engine.configurations.memoryBytes() + engine.control_raw.memoryBytes() + engine.scratch.len + engine.control_storage.len;
+            const worker = self.worker;
+            buffer_bytes += worker.compressed.len + worker.backlog_entries.len * @sizeOf(u32) + worker.packets.len * @sizeOf(@TypeOf(worker.packets[0]));
+            const engine = worker.engine;
+            buffer_bytes += engine.input.len + engine.output.len + engine.decoded_storage.len + engine.decoded.memoryBytes() + engine.input_bursts.memoryBytes() + engine.configurations.memoryBytes() + engine.control_raw.memoryBytes() + engine.scratch.len + engine.control_storage.len;
             buffer_bytes += engine.packet_bursts.memoryBytes() + engine.control_bursts.memoryBytes();
             buffer_bytes += engine.control_jobs.len * @sizeOf(@TypeOf(engine.control_jobs[0]));
             allocated.set(buffer_bytes);

@@ -6,7 +6,6 @@ const framing = @import("shared.zig");
 const Buffers = @import("buffers.zig").Buffers;
 const system = @import("system");
 const packet_codec = @import("codec.zig");
-const packet_output = @import("output.zig");
 const Readiness = @import("readiness.zig").Readiness;
 
 const assert = std.debug.assert;
@@ -14,12 +13,16 @@ const assert = std.debug.assert;
 pub const Instrumentation = struct {
     poll: metrics.Timer = .{},
     sent_bytes: metrics.Counter = .{},
+    seal: metrics.Timer = .{},
+    sealed_bytes: metrics.Counter = .{},
 
     pub fn init(registry: ?*metrics.Registry, namespace: []const u8) !Instrumentation {
         const owner = registry orelse return .{};
         return .{
             .poll = try owner.timer(.{ .namespace = namespace, .name = "poll", .description = "Poll transport events" }),
             .sent_bytes = try owner.counter(.{ .namespace = namespace, .name = "sent_bytes", .description = "Bytes sent through transport", .unit = .bytes }),
+            .seal = try owner.timer(.{ .namespace = namespace, .name = "seal", .description = "Encrypt every connection's new Play output and queue its send" }),
+            .sealed_bytes = try owner.counter(.{ .namespace = namespace, .name = "sealed_bytes", .description = "Play output encrypted", .unit = .bytes }),
         };
     }
 };
@@ -72,7 +75,9 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             buffer_bytes: usize = 128 * 1024,
             connection_bytes: usize = 8 * 1024,
             input_burst_slots: usize = 2,
-            output_burst_slots: usize = 8,
+            /// Each connection's ring of Play output: framed packets, encrypted in place before
+            /// they are sent. Producers can publish only what fits it, so it never fills.
+            output_bytes: usize = 64 * 1024,
             configuration_slots: usize = 8,
             decode_slots: usize = 2,
             max_packet: usize = 128 * 1024 - 3,
@@ -84,29 +89,18 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
         };
 
         pub const endpoint = Endpoint;
-        pub const Loan = packet_output.Loan;
         const control_bytes_max = 256;
-        const output_loans_max = network.send_vectors_max;
         const control_packets_max = Codec.control_batch_max * 2;
-        const SendLoan = struct { owner: *Loan, prefix: []const u8, bytes: []const u8 };
         const Span = struct {
             source: enum { handoff, spool } = .spool,
             offset: u64 = 0,
             length: usize = 0,
-        };
-        const ActiveGroup = struct {
-            source: usize,
-            first: framing.PageId,
-            generation: u64,
-            next: u8 = 0,
-            count: u8,
         };
         const absent = std.math.maxInt(usize);
         const Wait = enum { external, control, control_admitted, configuration, configuration_admitted, decoded, input };
         const Waiters = struct { head: usize = absent, tail: usize = absent, count: usize = 0 };
         const Connection = struct {
             handle: ?network.Handle = null,
-            group: ?ActiveGroup = null,
             protocol: ?*const Protocol = null,
             status: bool = false,
             state: protocol_api.State = .{},
@@ -117,9 +111,6 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             loan: std.atomic.Value(bool) = .init(false),
             decoded: ?Buffers.Lease = null,
             input_burst: ?Buffers.Lease = null,
-            output_burst: ?Buffers.Lease = null,
-            // Shared framing can outlive completion of the connection's codec task.
-            frame_targets: usize = 0,
             control_burst: ?Buffers.Lease = null,
             control_raw: ?Buffers.Lease = null,
             control_used: usize = 0,
@@ -138,7 +129,11 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             sending: bool = false,
             sending_bytes: usize = 0,
             vectors: [network.send_vectors_max]std.posix.iovec_const = undefined,
+            /// Positions in the Play ring, as counts of every byte through it: sent, encrypted,
+            /// written. Bytes are encrypted in a batch with other connections' just before they
+            /// are sent, so `output_sealed` trails `output_write` only within a pass.
             output_read: usize = 0,
+            output_sealed: usize = 0,
             output_write: usize = 0,
             active_previous: ?usize = null,
             active_next: ?usize = null,
@@ -173,10 +168,6 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             /// What the input lent to the observer holds while a tick has yet to take it, so input
             /// received meanwhile can join it rather than wait for it to come back.
             growing: ?Lent = null,
-            send_loan: ?*Loan = null,
-            output_loans: [output_loans_max]SendLoan = undefined,
-            loan_read: usize = 0,
-            loan_write: usize = 0,
         };
 
         /// Whether a connection's lent batch may grow: one of the small packets players send
@@ -209,7 +200,6 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
         workspaces: Endpoint.Workspaces,
         decoded: Buffers,
         input_bursts: Buffers,
-        output_bursts: Buffers,
         packet_bursts: *Buffers,
         control_bursts: *Buffers,
         configurations: Buffers,
@@ -233,16 +223,20 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
         resources_ready: bool = true,
         external_ready: bool = true,
         transport_waiting: system.IndexSet,
+        /// Connections with Play output written since it was last encrypted.
+        unsealed: system.IndexSet,
         // Transport and protocol progress invalidate blocked Play delivery attempts.
         delivery_ready: bool = true,
         active_head: ?usize = null,
         active_tail: ?usize = null,
         active_count: usize = 0,
-        output_pressure: bool = false,
         codec: ?*Codec = null,
 
         pub fn init(allocator: std.mem.Allocator, networking: network.Transport, config: Configuration) !*Self {
-            if (config.protocols.values.len == 0 or config.decode_slots == 0 or config.connection_bytes < 512 or config.input_burst_slots == 0 or config.output_burst_slots == 0 or config.configuration_slots == 0) return error.InvalidConfiguration;
+            if (config.protocols.values.len == 0 or config.decode_slots == 0 or config.connection_bytes < 512 or config.input_burst_slots == 0 or config.configuration_slots == 0) return error.InvalidConfiguration;
+            // The ring holds whole packets' frames only in part, a large one passing through it in
+            // pieces, but a pass must be able to move at least a send's worth.
+            if (config.output_bytes < 4096 or config.output_bytes > std.math.maxInt(u32) / 4) return error.InvalidConfiguration;
             if ((config.max_players orelse config.connections) == 0 or (config.max_players orelse config.connections) > config.connections)
                 return error.InvalidConfiguration;
             if (config.connections == 0 or config.buffer_bytes < 512 or config.buffer_bytes > std.math.maxInt(u32) / 4 or
@@ -267,9 +261,11 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             errdefer readiness.deinit(allocator);
             var transport_waiting = try system.IndexSet.init(allocator, config.connections);
             errdefer transport_waiting.deinit(allocator);
+            var unsealed = try system.IndexSet.init(allocator, config.connections);
+            errdefer unsealed.deinit(allocator);
             const input = try allocator.alignedAlloc(u8, .@"64", bytes);
             errdefer allocator.free(input);
-            const output = try allocator.alignedAlloc(u8, .@"64", bytes);
+            const output = try allocator.alignedAlloc(u8, .@"64", try std.math.mul(usize, config.connections, config.output_bytes));
             errdefer allocator.free(output);
             const decoded_storage = try allocator.alignedAlloc(u8, .@"64", bytes);
             errdefer allocator.free(decoded_storage);
@@ -277,8 +273,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             errdefer allocator.free(events);
             const decode_slots = if (Endpoint.needsDecoded(config.compression_threshold)) @min(config.decode_slots, config.connections) else 0;
             const input_slots = if (small == config.buffer_bytes) 0 else @min(config.input_burst_slots, config.connections);
-            const output_slots = if (small == config.buffer_bytes) 0 else @min(config.output_burst_slots, config.connections);
-            const packet_slots = @max(decode_slots, input_slots, output_slots);
+            const packet_slots = @max(decode_slots, input_slots);
             const control_slots = @min(config.configuration_slots, config.connections);
             const packet_bursts = try allocator.create(Buffers);
             errdefer allocator.destroy(packet_bursts);
@@ -294,8 +289,6 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             errdefer decoded.deinit(allocator);
             var input_bursts = try Buffers.init(allocator, .{ .slots = input_slots, .bytes = config.buffer_bytes, .guaranteed = @min(input_slots, 1), .overflow = packet_bursts });
             errdefer input_bursts.deinit(allocator);
-            var output_bursts = try Buffers.init(allocator, .{ .slots = output_slots, .bytes = config.buffer_bytes, .guaranteed = @min(output_slots, 1), .overflow = packet_bursts });
-            errdefer output_bursts.deinit(allocator);
             var configurations = try Buffers.init(allocator, .{ .slots = control_slots, .bytes = config.max_pending_wire_bytes, .guaranteed = control_guaranteed, .overflow = control_bursts });
             errdefer configurations.deinit(allocator);
             var control_raw = try Buffers.init(allocator, .{ .slots = control_slots, .bytes = config.max_pending_wire_bytes, .guaranteed = control_guaranteed, .overflow = control_bursts });
@@ -304,7 +297,6 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             try control_bursts.instrument(config.metrics, "session.buffers.control_shared");
             try decoded.instrument(config.metrics, "session.buffers.decoded");
             try input_bursts.instrument(config.metrics, "session.buffers.input_bursts");
-            try output_bursts.instrument(config.metrics, "session.buffers.output_bursts");
             try configurations.instrument(config.metrics, "session.buffers.configurations");
             try control_raw.instrument(config.metrics, "session.buffers.control_raw");
             const scratch = try allocator.alignedAlloc(u8, .@"64", config.buffer_bytes);
@@ -323,13 +315,13 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 .readiness = readiness,
                 .input = input,
                 .transport_waiting = transport_waiting,
+                .unsealed = unsealed,
                 .output = output,
                 .decoded_storage = decoded_storage,
                 .events = events,
                 .workspaces = try Endpoint.initWorkspaces(allocator),
                 .decoded = decoded,
                 .input_bursts = input_bursts,
-                .output_bursts = output_bursts,
                 .packet_bursts = packet_bursts,
                 .control_bursts = control_bursts,
                 .configurations = configurations,
@@ -354,13 +346,13 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             assert(self.admitted == 0 and self.identities.count() == 0);
 
             self.transport_waiting.deinit(self.allocator);
+            self.unsealed.deinit(self.allocator);
             self.identities.deinit(self.allocator);
             Endpoint.deinitWorkspaces(&self.workspaces);
             self.allocator.free(self.scratch);
             self.allocator.free(self.decoded_storage);
             self.decoded.deinit(self.allocator);
             self.input_bursts.deinit(self.allocator);
-            self.output_bursts.deinit(self.allocator);
             self.configurations.deinit(self.allocator);
             self.control_raw.deinit(self.allocator);
             self.packet_bursts.deinit(self.allocator);
@@ -486,7 +478,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             var ready = true;
             for (self.connections, 0..) |*connection, index| {
                 if (connection.handle == null) continue;
-                if (connection.closing or connection.receiving or connection.sending or connection.loan.load(.acquire) or connection.frame_targets != 0 or connection.codec.state.load(.acquire) != .idle or connection.control_building or connection.received != 0 or connection.receive_tail != 0 or connection.group != null) {
+                if (connection.closing or connection.receiving or connection.sending or connection.loan.load(.acquire) or connection.codec.state.load(.acquire) != .idle or connection.control_building or connection.received != 0 or connection.receive_tail != 0) {
                     ready = false;
                     continue;
                 }
@@ -539,7 +531,6 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             var count: u32 = 0;
 
             for (self.connections) |connection| if (connection.handle != null) {
-                assert(connection.group == null);
                 count += 1;
             };
 
@@ -573,14 +564,10 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                     }
                 }
                 try self.writeSpan(writer, connection.saved_output);
-                var loan_index = connection.loan_read;
-                while (loan_index != connection.loan_write) : (loan_index +%= 1) {
-                    const loan = connection.output_loans[loan_index % output_loans_max];
-                    try writer.writeAll(loan.prefix);
-                    try writer.writeAll(loan.bytes);
-                }
+                // Parking spilled and sealed the ring, so what is left in it is encrypted.
+                assert(connection.output_sealed == connection.output_write);
                 const ring = self.ringBuffer(index);
-                const queued = if (connection.loan_read == connection.loan_write) connection.output_write -% connection.output_read else 0;
+                const queued = connection.output_write -% connection.output_read;
                 const at = connection.output_read % ring.len;
                 const first = @min(queued, ring.len - at);
                 try writer.writeAll(ring[at..][0..first]);
@@ -664,12 +651,11 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
         /// The caller has stopped new Play output. Existing output and input loans must drain before
         /// changing the codec phase. Cipher streams stay intact.
         pub fn reconfigure(self: *Self, io: std.Io, handle: network.Handle) !bool {
-            if (self.connections[handle.index].frame_targets != 0) return false;
             if (self.connections[handle.index].codec.state.load(.acquire) != .idle or self.connections[handle.index].received != 0 or self.connections[handle.index].receive_tail != 0 or self.connections[handle.index].decoded_result != null) return false;
             const connection = &self.connections[handle.index];
             assert(connection.handle != null and std.meta.eql(connection.handle.?, handle));
             assert(connection.state.phase == .play and connection.attached);
-            if (connection.closing or connection.disconnect_deadline != null or self.stopping or connection.group != null) return false;
+            if (connection.closing or connection.disconnect_deadline != null or self.stopping) return false;
             if (connection.output.len != 0 or connection.saved_output.length != 0 or connection.sending or connection.output_read != connection.output_write or connection.loan.load(.acquire))
                 return false;
 
@@ -693,201 +679,108 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             transport.notify(io);
         }
 
-        pub const SendOptions = struct { sockets: ?*packet_output.SocketBudget = null };
-
-        pub fn canSendFramed(self: *Self, handle: network.Handle, length: usize, options: SendOptions) bool {
+        /// How many bytes of Play output a connection takes now, or null once it takes none: gone,
+        /// closing, stopping or out of Play. While a reload spools output, the spool takes what
+        /// the ring would.
+        pub fn playRoom(self: *Self, handle: network.Handle) ?usize {
+            if (handle.index >= self.connections.len) return null;
             const connection = &self.connections[handle.index];
-            if (connection.codec.state.load(.acquire) != .idle or connection.received != 0) return false;
+            if (connection.handle == null or !std.meta.eql(connection.handle.?, handle) or connection.closing or self.stopping or connection.disconnect_deadline != null or connection.state.phase != .play)
+                return null;
+            if (connection.spooling) return self.config.max_pending_wire_bytes - connection.saved_output.length;
             const used = connection.output_write -% connection.output_read;
-            if (length > self.config.buffer_bytes - used) return false;
-            if (!Endpoint.encrypted(&connection.lifecycle.?)) {
-                const borrowed = connection.loan_read != connection.loan_write;
-                if (options.sockets) |budget| if (budget.available() and (used == 0 or borrowed)) return connection.loan_write -% connection.loan_read < output_loans_max;
-                if (borrowed) return false;
-            }
-            const buffer = self.ringBuffer(handle.index);
-            if (self.output_pressure and connection.output_burst != null and used >= self.smallBytes()) return false;
-            return length <= buffer.len - used or (used == 0 and !connection.sending and !connection.output_control and self.output_bursts.available());
+            assert(used <= self.config.output_bytes);
+            return self.config.output_bytes - used;
         }
 
-        /// Full leaves the packet unconsumed so its shared reservation can be retried.
-        pub fn sendFramed(self: *Self, io: std.Io, handle: network.Handle, loan: *Loan, options: SendOptions) !void {
-            const packet = loan.fragments();
-            const length = packet.length();
-            assert(loan.references > 0);
-            if (length == 0) return error.InvalidPacket;
-            if (handle.index >= self.connections.len) return error.Closed;
-
+        /// Appends Play output as it goes on the wire, before encryption, no more than `playRoom`
+        /// allowed. It is encrypted with every other connection's in `sealPlay`.
+        pub fn writePlay(self: *Self, io: std.Io, handle: network.Handle, bytes: []const u8) void {
+            assert(bytes.len <= self.playRoom(handle).?);
+            if (bytes.len == 0) return;
             const connection = &self.connections[handle.index];
-            if (connection.handle == null or !std.meta.eql(connection.handle.?, handle) or connection.closing or ((self.stopping or connection.disconnect_deadline != null) and connection.group == null) or connection.state.phase != .play)
-                return error.Closed;
-            if (connection.codec.state.load(.acquire) != .idle or connection.received != 0) return error.Full;
-
-            defer self.readiness.signal(handle.index).notify();
-            const used = connection.output_write -% connection.output_read;
-            assert(used <= self.config.buffer_bytes and length <= self.config.buffer_bytes - used);
-            const encrypted = Endpoint.encrypted(&connection.lifecycle.?);
-            if (!encrypted) {
-                if (connection.spooling) return self.appendSpoolFragments(io, handle.index, packet);
-                const borrowed = connection.loan_read != connection.loan_write;
-                if (options.sockets) |budget| if ((used == 0 or borrowed) and connection.loan_write -% connection.loan_read < output_loans_max and loan.retainSocket(budget)) {
-                    assert(loan.sockets > 0 and loan.budget == budget);
-                    assert(budget.used <= budget.capacity);
-                    connection.output_loans[connection.loan_write % output_loans_max] = .{ .owner = loan, .prefix = packet.prefix, .bytes = packet.payload };
-                    connection.loan_write +%= 1;
-                    connection.output_write +%= length;
-                    return;
-                };
-                if (borrowed) return error.Full;
-            }
-            const target = try self.encryptedDestination(handle.index, length);
-            if (!encrypted) {
-                packet.copyTo(target.first, target.second);
-                connection.output_write +%= length;
-                return;
-            }
-
-            if (self.codec) |codec| {
-                loan.retain();
-                connection.send_loan = loan;
-                codec.submit(&connection.codec, .{ .send = .{ .connection = target.connection, .prefix = packet.prefix, .source = packet.payload, .first = target.first, .second = target.second } });
-                return;
-            }
-            Codec.encrypt(target.connection, packet.prefix, packet.payload, target.first, target.second);
             if (connection.spooling) {
-                try self.appendSpoolFragments(io, handle.index, .{ .prefix = target.first, .payload = target.second });
-            } else connection.output_write +%= length;
-        }
-
-        pub fn groupReady(self: *Self, handle: network.Handle, origin: usize, group: framing.Group) bool {
-            assert(group.count > 0 and group.index < group.count);
-            assert(group.count == 1 or group.protocol != null);
-            const connection = &self.connections[handle.index];
-            if (group.protocol) |number| assert(connection.protocol.?.number == number);
-            if (connection.group) |active| {
-                return group.count > 1 and active.source == origin and active.first == group.first and
-                    active.generation == group.generation and active.count == group.count and active.next == group.index;
+                // The ring went into the spool sealed, so the spool takes what follows encrypted.
+                assert(connection.output_write == connection.output_read);
+                var offset: usize = 0;
+                while (offset < bytes.len) {
+                    const length = @min(bytes.len - offset, self.scratch.len);
+                    const chunk = self.scratch[0..length];
+                    @memcpy(chunk, bytes[offset..][0..length]);
+                    if (Endpoint.encrypted(&connection.lifecycle.?)) Endpoint.send(&connection.lifecycle.?, chunk);
+                    self.appendSpool(io, handle.index, chunk) catch |err| {
+                        std.log.warn("event=session_spool_failed connection={d}:{d} reason={s}", .{ handle.index, handle.generation, @errorName(err) });
+                        markClosing(connection, .output_rejected);
+                        return;
+                    };
+                    offset += length;
+                }
+                return;
             }
-            return group.index == 0;
+            const ring = self.ringBuffer(handle.index);
+            const at = connection.output_write % ring.len;
+            const first = @min(bytes.len, ring.len - at);
+            @memcpy(ring[at..][0..first], bytes[0..first]);
+            @memcpy(ring[0 .. bytes.len - first], bytes[first..]);
+            connection.output_write +%= bytes.len;
+            self.unsealed.insert(handle.index);
         }
 
-        pub fn discardGroup(self: *Self, handle: network.Handle) bool {
-            const connection = &self.connections[handle.index];
-            return connection.closing or ((self.stopping or connection.disconnect_deadline != null) and connection.group == null);
-        }
+        /// Streams encrypted in one batch, beyond which the lanes are long since full.
+        const seal_batch = 128;
 
-        pub fn reserveGroupOutput(self: *Self, handle: network.Handle, group: framing.Group) error{Full}!void {
-            const connection = &self.connections[handle.index];
-            if (group.count == 1 or connection.group != null or !Endpoint.encrypted(&connection.lifecycle.?)) return;
-            assert(group.index == 0 and group.bytes <= self.config.buffer_bytes);
-            try self.reserveOutput(handle, group.bytes);
-        }
-
-        pub fn reserveOutput(self: *Self, handle: network.Handle, bytes: usize) error{Full}!void {
-            const connection = &self.connections[handle.index];
-            assert(bytes > 0 and bytes <= self.config.buffer_bytes);
-            if (connection.codec.state.load(.acquire) != .idle) return error.Full;
-            const buffer = self.ringBuffer(handle.index);
-            const used = connection.output_write -% connection.output_read;
-            if (bytes <= buffer.len - used) return;
-            if (used != 0 or connection.sending or connection.output_control) return error.Full;
-            assert(connection.output_burst == null);
-            connection.output_burst = self.output_bursts.acquire() orelse return error.Full;
-            connection.output_read = 0;
-            connection.output_write = 0;
-            connection.output = &.{};
-        }
-
-        pub fn claimGroup(self: *Self, handle: network.Handle, origin: usize, group: framing.Group) void {
-            assert(self.groupReady(handle, origin, group));
-            if (group.count == 1) return;
-            const connection = &self.connections[handle.index];
-            if (connection.group == null) connection.group = .{ .source = origin, .first = group.first, .generation = group.generation, .count = group.count };
-        }
-
-        pub fn completeGroupPacket(self: *Self, handle: network.Handle, origin: usize, group: framing.Group) void {
-            assert(self.groupReady(handle, origin, group));
-            if (group.count == 1) return;
-            const connection = &self.connections[handle.index];
-            const active = &connection.group.?;
-            active.next += 1;
-            self.delivery_ready = true;
-            if (active.next == active.count) {
-                connection.group = null;
-                self.readiness.signal(handle.index).notify();
-            }
-        }
-
-        pub fn prepareSend(self: *Self, handle: network.Handle) !Codec.SendTarget {
-            if (handle.index >= self.connections.len) return error.Closed;
-            const connection = &self.connections[handle.index];
-            if (connection.handle == null or !std.meta.eql(connection.handle.?, handle) or connection.closing or ((self.stopping or connection.disconnect_deadline != null) and connection.group == null) or connection.state.phase != .play) return error.Closed;
-            if (connection.codec.state.load(.acquire) != .idle or connection.received != 0) return error.Full;
-            assert(Endpoint.encrypted(&connection.lifecycle.?));
-            const buffer = self.ringBuffer(handle.index);
-            const used = connection.output_write -% connection.output_read;
-            assert(used <= buffer.len);
-            connection.codec.state.store(.queued, .release);
-            return .{
-                .task = &connection.codec,
-                .connection = &connection.lifecycle.?,
-                .bytes = buffer,
-                .used = used,
-                .offset = connection.output_write % buffer.len,
-                .overflow = if (used == 0 and !connection.sending and !connection.output_control and connection.output_burst == null) &self.output_bursts else null,
-            };
-        }
-
-        pub fn commitSend(self: *Self, io: std.Io, handle: network.Handle, count: usize, burst: ?Buffers.Lease) !void {
-            const index = handle.index;
-            const connection = &self.connections[index];
-            assert(std.meta.eql(connection.handle.?, handle));
-            assert(connection.codec.state.load(.acquire) == .idle);
-            if (connection.send_loan) |loan| loan.release();
-            connection.send_loan = null;
-            if (burst) |lease| {
-                assert(connection.output_burst == null and connection.output_write == connection.output_read and !connection.sending and !connection.output_control);
-                connection.output_burst = lease;
-                connection.output_read = 0;
-                connection.output_write = 0;
-                connection.output = &.{};
-            }
-            const capacity = self.ringBuffer(index).len;
-            const used = connection.output_write -% connection.output_read;
-            assert(used <= capacity and count <= capacity - used);
-            if (connection.spooling and count != 0) {
+        /// Encrypts every connection's new Play output, side by side, then sends it. A connection
+        /// whose control output is being built or sent waits, as that output took its cipher
+        /// first and goes out first.
+        pub fn sealPlay(self: *Self, io: std.Io) void {
+            if (self.unsealed.count == 0) return;
+            const timing = self.instruments.seal.start();
+            defer timing.end();
+            var streams: [seal_batch]Endpoint.Stream = undefined;
+            var wrapped: [seal_batch]Endpoint.Stream = undefined;
+            var sealed: [seal_batch]usize = undefined;
+            var count: usize = 0;
+            var wrapped_count: usize = 0;
+            var at: usize = 0;
+            while (at < self.unsealed.count) {
+                const index = self.unsealed.indices[at];
+                const connection = &self.connections[index];
+                if (connection.output_control or connection.control_building or connection.codec.state.load(.acquire) != .idle) {
+                    at += 1;
+                    continue;
+                }
+                self.unsealed.remove(index);
+                const length = connection.output_write -% connection.output_sealed;
+                if (length == 0) continue;
+                self.instruments.sealed_bytes.add(length);
                 const ring = self.ringBuffer(index);
-                const at = connection.output_write % ring.len;
-                const first = @min(count, ring.len - at);
-                try self.appendSpool(io, index, ring[at..][0..first]);
-                try self.appendSpool(io, index, ring[0 .. count - first]);
-            } else connection.output_write +%= count;
+                const start = connection.output_sealed % ring.len;
+                const first = @min(length, ring.len - start);
+                connection.output_sealed = connection.output_write;
+                if (Endpoint.encrypted(&connection.lifecycle.?)) {
+                    streams[count] = .{ .connection = &connection.lifecycle.?, .bytes = ring[start..][0..first] };
+                    // The part past the end of the ring continues the same stream, so it goes in
+                    // the batch after.
+                    if (first != length) {
+                        wrapped[wrapped_count] = .{ .connection = &connection.lifecycle.?, .bytes = ring[0 .. length - first] };
+                        wrapped_count += 1;
+                    }
+                } else streams[count] = .{ .connection = &connection.lifecycle.?, .bytes = &.{} };
+                sealed[count] = index;
+                count += 1;
+                if (count == seal_batch) {
+                    self.finishSeal(io, streams[0..count], wrapped[0..wrapped_count], sealed[0..count]);
+                    count = 0;
+                    wrapped_count = 0;
+                }
+            }
+            self.finishSeal(io, streams[0..count], wrapped[0..wrapped_count], sealed[0..count]);
         }
 
-        const SendBuffers = struct { connection: *Endpoint.Connection, first: []u8, second: []u8 };
-
-        fn encryptedDestination(self: *Self, index: usize, length: usize) !SendBuffers {
-            const connection = &self.connections[index];
-            const used = connection.output_write -% connection.output_read;
-            assert(used <= self.config.buffer_bytes and length <= self.config.buffer_bytes - used);
-            if (self.output_pressure and connection.output_burst != null and used >= self.smallBytes()) return error.Full;
-            var buffer = self.ringBuffer(index);
-            if (length > buffer.len - used) {
-                if (used != 0 or connection.sending or connection.output_control) return error.Full;
-                const lease = self.output_bursts.acquire() orelse {
-                    self.output_pressure = true;
-                    return error.Full;
-                };
-                assert(connection.output_burst == null);
-                connection.output_burst = lease;
-                connection.output_read = 0;
-                connection.output_write = 0;
-                connection.output = &.{};
-                buffer = self.ringBuffer(index);
-            }
-            const start = connection.output_write % buffer.len;
-            const first = @min(length, buffer.len - start);
-            return .{ .connection = &connection.lifecycle.?, .first = buffer[start..][0..first], .second = buffer[0 .. length - first] };
+        fn finishSeal(self: *Self, io: std.Io, streams: []const Endpoint.Stream, wrapped: []const Endpoint.Stream, sealed: []const usize) void {
+            Endpoint.encryptStreams(streams);
+            Endpoint.encryptStreams(wrapped);
+            for (sealed) |index| self.sendOutput(io, index);
         }
 
         pub fn receive(self: *Self, io: std.Io) !void {
@@ -981,14 +874,11 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             const handle = connection.handle orelse return;
             if (self.reloading or connection.closing or connection.closed or connection.state.phase == .parked) return;
             if (connection.state.phase == .play and connection.output.len == 0 and connection.saved_output.length == 0) {
-                const queued = connection.output_write -% connection.output_read;
+                const queued = connection.output_sealed -% connection.output_read;
                 const ring = self.ringBuffer(index);
                 const at = connection.output_read % ring.len;
                 // Equal byte quanta per ready connection, replenished on completion, not per tick.
-                connection.output = if (connection.loan_read != connection.loan_write)
-                    connection.output_loans[connection.loan_read % output_loans_max].bytes
-                else
-                    ring[at..][0..@min(queued, ring.len - at, 64 * 1024)];
+                connection.output = ring[at..][0..@min(queued, ring.len - at, 64 * 1024)];
             }
 
             if (connection.output.len != 0 and !connection.sending) {
@@ -1010,23 +900,10 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
         fn sendVectors(self: *Self, connection: *Connection) usize {
             var count: usize = 0;
             var bytes: usize = 0;
-            if (!connection.output_control and connection.loan_read != connection.loan_write) {
-                var index = connection.loan_read;
-                while (index != connection.loan_write and count < connection.vectors.len and bytes < 64 * 1024) : (index +%= 1) {
-                    const packet = connection.output_loans[index % output_loans_max];
-                    for ([_][]const u8{ packet.prefix, packet.bytes }) |part| {
-                        if (part.len == 0) continue;
-                        if (count == connection.vectors.len or bytes == 64 * 1024) break;
-                        const length = @min(part.len, 64 * 1024 - bytes);
-                        connection.vectors[count] = .{ .base = part.ptr, .len = length };
-                        count += 1;
-                        bytes += length;
-                    }
-                }
-            } else if (!connection.output_control) {
+            if (!connection.output_control) {
                 const ring = self.ringBuffer(connection.handle.?.index);
                 const at = connection.output_read % ring.len;
-                bytes = @min(connection.output_write -% connection.output_read, 64 * 1024);
+                bytes = @min(connection.output_sealed -% connection.output_read, 64 * 1024);
                 const first = @min(bytes, ring.len - at);
                 connection.vectors[0] = .{ .base = ring[at..].ptr, .len = first };
                 count = 1;
@@ -1057,25 +934,8 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             self.delivery_ready = true;
             const connection = &self.connections[handle.index];
             assert(count > 0 and count <= connection.sending_bytes);
-            if (!connection.output_control and connection.loan_read != connection.loan_write) {
-                var remaining = count;
-                while (remaining != 0) {
-                    const head = &connection.output_loans[connection.loan_read % output_loans_max];
-                    const prefix = @min(remaining, head.prefix.len);
-                    remaining -= prefix;
-                    head.prefix = head.prefix[prefix..];
-                    const length = @min(remaining, head.bytes.len);
-                    remaining -= length;
-                    head.bytes = head.bytes[length..];
-                    if (head.prefix.len == 0 and head.bytes.len == 0) {
-                        assert(head.owner.sockets > 0 and head.owner.references >= head.owner.sockets);
-                        head.owner.releaseSocket();
-                        connection.loan_read +%= 1;
-                    }
-                }
-                connection.output = if (connection.loan_read == connection.loan_write) &.{} else connection.output_loans[connection.loan_read % output_loans_max].bytes;
-            } else if (!connection.output_control) {
-                assert(count <= connection.output_write -% connection.output_read);
+            if (!connection.output_control) {
+                assert(count <= connection.output_sealed -% connection.output_read);
                 connection.output = &.{};
             } else {
                 var remaining = count;
@@ -1110,8 +970,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
         }
 
         fn ringBuffer(self: *Self, index: usize) []u8 {
-            if (self.connections[index].output_burst) |lease| return lease.bytes;
-            const stride = self.smallBytes();
+            const stride = self.config.output_bytes;
             return self.output[index * stride ..][0..stride];
         }
 
@@ -1135,23 +994,17 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
         pub fn releaseBuffers(self: *Self, index: usize) void {
             self.delivery_ready = true;
             const connection = &self.connections[index];
-            assert(connection.frame_targets == 0);
-            connection.group = null;
             assert(connection.codec.state.load(.acquire) == .idle);
             assert(!connection.receiving and !connection.sending and !connection.loan.load(.acquire));
             if (connection.input_burst) |lease| lease.release();
-            if (connection.output_burst) |lease| lease.release();
             if (connection.decoded) |lease| lease.release();
             connection.input_burst = null;
-            connection.output_burst = null;
             connection.decoded = null;
             connection.output = &.{};
-            while (connection.loan_read != connection.loan_write) {
-                const owner = connection.output_loans[connection.loan_read % output_loans_max].owner;
-                assert(owner.sockets > 0 and owner.references >= owner.sockets);
-                owner.releaseSocket();
-                connection.loan_read +%= 1;
-            }
+            connection.output_read = 0;
+            connection.output_sealed = 0;
+            connection.output_write = 0;
+            self.unsealed.remove(index);
             self.releaseControl(index);
         }
 
@@ -1252,11 +1105,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
         }
 
         fn appendSpool(self: *Self, io: std.Io, index: usize, bytes: []const u8) !void {
-            try self.appendSpoolFragments(io, index, .{ .payload = bytes });
-        }
-
-        fn appendSpoolFragments(self: *Self, io: std.Io, index: usize, packet: packet_output.Fragments) !void {
-            var parts = [_][]const u8{ packet.prefix, packet.payload };
+            var parts = [_][]const u8{bytes};
             try self.appendSpoolParts(io, index, &parts);
         }
 
@@ -1307,41 +1156,28 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                     const read = try self.readSpan(&previous, self.scratch);
                     try self.appendSpool(io, index, self.scratch[0..read]);
                 }
-                const borrowed = connection.loan_read != connection.loan_write;
-                var parts: [output_loans_max * 2][]const u8 = undefined;
-                var count: usize = 0;
-                var loan_index = connection.loan_read;
-                while (loan_index != connection.loan_write) : (loan_index +%= 1) {
-                    const head = connection.output_loans[loan_index % output_loans_max];
-                    assert(count + 2 <= parts.len);
-                    parts[count] = head.prefix;
-                    parts[count + 1] = head.bytes;
-                    count += 2;
-                }
-                try self.appendSpoolParts(io, index, parts[0..count]);
-                while (connection.loan_read != connection.loan_write) {
-                    const head = &connection.output_loans[connection.loan_read % output_loans_max];
-                    assert(head.owner.sockets > 0 and head.owner.references >= head.owner.sockets);
-                    head.owner.releaseSocket();
-                    connection.loan_read +%= 1;
-                }
+                // The ring goes after, what it holds not yet encrypted encrypted now, after the
+                // control output above, as it would have been sent.
+                self.unsealed.remove(index);
                 const ring = self.ringBuffer(index);
-                const queued = if (borrowed) 0 else connection.output_write -% connection.output_read;
+                const unsealed = connection.output_write -% connection.output_sealed;
+                if (unsealed != 0 and Endpoint.encrypted(&connection.lifecycle.?)) {
+                    const start = connection.output_sealed % ring.len;
+                    const part = @min(unsealed, ring.len - start);
+                    Endpoint.send(&connection.lifecycle.?, ring[start..][0..part]);
+                    Endpoint.send(&connection.lifecycle.?, ring[0 .. unsealed - part]);
+                }
+                connection.output_sealed = connection.output_write;
+                const queued = connection.output_write -% connection.output_read;
                 const at = connection.output_read % ring.len;
                 const first = @min(queued, ring.len - at);
                 try self.appendSpool(io, index, ring[at..][0..first]);
                 try self.appendSpool(io, index, ring[0 .. queued - first]);
                 connection.output_read = 0;
+                connection.output_sealed = 0;
                 connection.output_write = 0;
                 connection.output = &.{};
                 connection.output_control = false;
-                if (connection.group == null) {
-                    if (connection.output_burst) |lease| {
-                        lease.release();
-                        self.delivery_ready = true;
-                    }
-                    connection.output_burst = null;
-                }
                 self.releaseControl(index);
             }
         }
@@ -1426,7 +1262,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
 
         pub fn progress(self: *Self, io: std.Io) void {
             defer {
-                inline for (.{ "decoded", "input_bursts", "output_bursts", "configurations", "control_raw" }) |name| @field(self, name).publishUsage();
+                inline for (.{ "decoded", "input_bursts", "configurations", "control_raw" }) |name| @field(self, name).publishUsage();
                 self.packet_bursts.publishUsage();
                 self.control_bursts.publishUsage();
             }
@@ -1527,20 +1363,11 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                         connection.input_end = 0;
                     }
                 }
-                if (!connection.sending and connection.group == null) {
-                    const queued = connection.output_write -% connection.output_read;
-                    if (connection.output_burst) |lease| {
-                        if (queued == 0) {
-                            lease.release();
-                            connection.output_burst = null;
-                            connection.output_read = 0;
-                            connection.output_write = 0;
-                            if (!connection.output_control) connection.output = &.{};
-                        }
-                    } else if (connection.output.len == 0 and queued == 0) {
-                        connection.output_read = 0;
-                        connection.output_write = 0;
-                    }
+                // An empty ring starts again at its beginning, so output stays in one piece.
+                if (!connection.sending and connection.output.len == 0 and connection.output_write == connection.output_read) {
+                    connection.output_read = 0;
+                    connection.output_sealed = 0;
+                    connection.output_write = 0;
                 }
                 if (!connection.sending and connection.output.len == 0 and !connection.control_building) self.releaseControl(index);
                 if (!self.reloading and connection.output.len == 0 and connection.saved_output.length != 0) {
@@ -1566,8 +1393,6 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 if (stopping and !connection.closing) {
                     if (connection.state.phase != .play or now >= (connection.disconnect_deadline orelse self.stop_deadline)) {
                         markClosing(connection, .stopping);
-                    } else if (connection.group != null) {
-                        self.sendOutput(io, index);
                     } else if (connection.disconnecting) {
                         if (connection.output.len == 0) markClosing(connection, .disconnected);
                     } else if (connection.output.len == 0 and connection.output_read == connection.output_write) {
@@ -1596,8 +1421,8 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 if (connection.closing) {
                     if (!connection.closed) self.networking.close(io, handle, .local_close);
 
-                    if (connection.closed and !connection.loan.load(.acquire) and connection.frame_targets == 0) {
-                        if (!connection.attached or self.config.observer.detached(handle)) {
+                    if (connection.closed and !connection.loan.load(.acquire)) {
+                        if (!connection.attached or self.config.observer.detached(io, handle)) {
                             self.config.observer.closed(handle);
                             self.networking.release(io, handle);
 
@@ -1621,7 +1446,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 // A lent batch grows by what arrived since, until it comes back.
                 if (connection.loan.load(.acquire)) self.growLent(io, index) else connection.growing = null;
 
-                while (!stopping and connection.group == null and connection.state.phase != .parked and (connection.state.phase == .play or connection.output.len == 0) and !connection.loan.load(.acquire)) {
+                while (!stopping and connection.state.phase != .parked and (connection.state.phase == .play or connection.output.len == 0) and !connection.loan.load(.acquire)) {
                     if (connection.lifecycle != null and connection.output.len == 0 and connection.output_read == connection.output_write) {
                         if (!connection.status and !self.reserveControl(index)) break;
                         const response = self.advance(io, connection, .poll) catch |err| {
@@ -2117,7 +1942,6 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                             connection.receive_tail = connection.input_end - connection.input_start;
                         }
                     },
-                    .send => try self.commitSend(io, connection.handle.?, result.consumed, result.burst),
                     .receive => {
                         if (connection.receive_tail != 0) {
                             connection.receive_tail = 0;
@@ -2155,7 +1979,6 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                             connection.decode_large = true;
                         } else if (result.consumed != 0) connection.decoded_result = result;
                     },
-                    .frame, .frame_sequence => unreachable,
                 }
             }
             if (connection.closing) return true;

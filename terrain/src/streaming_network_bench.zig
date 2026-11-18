@@ -100,7 +100,6 @@ pub const Network = struct {
             .connections = count,
             .max_players = count,
             .buffer_bytes = endpoint.config.buffer_bytes,
-            .framing_slots = 8,
             .codec_workers = @max(workers, 1),
             .protocols = catalog,
             .hooks = &self.hooks,

@@ -7,7 +7,6 @@ const framing = @import("shared.zig");
 const routes = @import("router.zig");
 const packet_codec = @import("codec.zig");
 const Buffers = @import("buffers.zig").Buffers;
-const packet_output = @import("output.zig");
 
 const Gate = struct {
     started: std.Io.Event = .unset,
@@ -101,8 +100,18 @@ const Endpoint = struct {
     pub fn playBorrowed(_: *const Connection) bool {
         return true;
     }
-    pub fn decode(_: *Connection, _: *Workspaces, bytes: []const u8, _: []u8, _: ?usize) ![]const u8 {
+    pub fn decode(_: *Connection, workspaces: *Workspaces, bytes: []const u8, _: []u8, _: ?usize) ![]const u8 {
+        if (workspaces.gate) |gate| {
+            if (workspaces.gate_byte == null or bytes[0] == workspaces.gate_byte.?) {
+                gate.started.set(std.testing.io);
+                gate.release.waitUncancelable(std.testing.io);
+            }
+        }
         return bytes;
+    }
+    pub const Stream = struct { connection: *Connection, bytes: []u8 };
+    pub fn encryptStreams(streams: []const Stream) void {
+        for (streams) |stream| send(stream.connection, stream.bytes);
     }
     pub fn sharedFrame(_: i32, workspaces: *Workspaces, storage: []u8, length: usize, _: ?usize, _: []u8) ![]const u8 {
         if (workspaces.failure) |failure| return failure;
@@ -176,7 +185,7 @@ const Observer = struct {
         };
         return .borrowed;
     }
-    pub fn detached(_: *Observer, _: network.Handle) bool {
+    pub fn detached(_: *Observer, _: std.Io, _: network.Handle) bool {
         return true;
     }
     pub fn attached(_: *Observer, _: std.Io, _: protocol.Profile) bool {
@@ -263,7 +272,7 @@ test "closed play connections cannot enqueue disconnect work during shutdown" {
         var catalog: Endpoint.Protocols = .{};
         const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
         defer owner.deinit();
-        const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 1, .frames = 1 });
+        const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 1 });
         defer codec.deinit();
         try owner.attachCodec(codec);
         owner.setHandle(0, .{ .index = 0, .generation = 1 });
@@ -290,15 +299,14 @@ pub fn benchmarkSocketBatch() !void {
     const io = std.testing.io;
     var buffer: [1024]u8 = undefined;
     var output = std.Io.File.stdout().writer(io, &buffer);
-    try output.interface.writeAll("peers | packets per peer | queued sends | borrowed payload bytes\n");
+    try output.interface.writeAll("peers | packets per peer | queued sends | ring bytes\n");
+    const payload = "abcdefgh";
     for ([_]usize{ 1, 2 }) |peers| for ([_]usize{ 1, 8, 32 }) |packets| {
         var native: Native = .{};
         const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
         var observer: Observer = .{};
         var catalog: Endpoint.Protocols = .{};
-        const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = peers, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 8192, .protocols = &catalog, .observer = &observer });
-        var budget: packet_output.SocketBudget = .init(2);
-        var loan: Engine.Loan = .{ .payload = "abcdefgh", .references = 1 };
+        const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = peers, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 8192, .output_bytes = 4096, .protocols = &catalog, .observer = &observer });
         defer {
             for (owner.connections, 0..) |*connection, index| {
                 connection.receiving = false;
@@ -307,26 +315,24 @@ pub fn benchmarkSocketBatch() !void {
                 owner.setHandle(index, null);
             }
             owner.deinit();
-            std.debug.assert(loan.references == 1 and budget.used == 0);
         }
         for (owner.connections, 0..) |*connection, index| {
             owner.setHandle(index, .{ .index = @intCast(index), .generation = 1 });
             connection.protocol = &catalog.values[0];
             connection.lifecycle = 0xff;
             connection.state.phase = .play;
-            for (0..packets) |_| try owner.sendFramed(io, connection.handle.?, &loan, .{ .sockets = &budget });
+            for (0..packets) |_| owner.writePlay(io, connection.handle.?, payload);
         }
-        owner.progress(io);
-        var borrowed: usize = 0;
+        // Every packet a peer has goes out in one send of its ring.
+        owner.sealPlay(io);
+        var queued: usize = 0;
         for (native.send_vectors[0..peers]) |vectors| {
-            try std.testing.expectEqual(packets, vectors.len);
-            for (vectors) |vector| {
-                try std.testing.expect(vector.base == loan.payload.ptr and vector.len == loan.payload.len);
-                borrowed += vector.len;
-            }
+            try std.testing.expectEqual(@as(usize, 1), vectors.len);
+            queued += vectors[0].len;
         }
-        try std.testing.expectEqual(peers * packets * loan.payload.len, borrowed);
-        try output.interface.print("{d:5} | {d:16} | {d:12} | {d}\n", .{ peers, packets, native.send_calls, borrowed });
+        try std.testing.expectEqual(peers * packets * payload.len, queued);
+        try std.testing.expectEqual(peers, native.send_calls);
+        try output.interface.print("{d:5} | {d:16} | {d:12} | {d}\n", .{ peers, packets, native.send_calls, queued });
     };
     try output.interface.flush();
 }
@@ -371,9 +377,8 @@ pub fn benchmarkSpill() !void {
         const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
         var observer: Observer = .{};
         var catalog: Endpoint.Protocols = .{};
-        const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = peers, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 8192, .protocols = &catalog, .observer = &observer });
-        var budget: packet_output.SocketBudget = .init(2);
-        var loan: Engine.Loan = .{ .payload = "abcdefgh", .references = 1 };
+        const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = peers, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 8192, .output_bytes = 4096, .protocols = &catalog, .observer = &observer });
+        const payload = "abcdefgh";
         defer {
             for (owner.connections, 0..) |*connection, index| {
                 connection.receiving = false;
@@ -382,7 +387,6 @@ pub fn benchmarkSpill() !void {
                 owner.setHandle(index, null);
             }
             owner.deinit();
-            std.debug.assert(loan.references == 1 and budget.used == 0);
         }
         for (owner.connections, 0..) |*connection, index| {
             owner.setHandle(index, .{ .index = @intCast(index), .generation = 1 });
@@ -391,11 +395,11 @@ pub fn benchmarkSpill() !void {
             connection.state.phase = .play;
             if (control) {
                 connection.output_control = true;
-                connection.output = loan.payload;
+                connection.output = payload;
                 connection.control_write = packets;
-                @memset(connection.control_packets[0..packets], loan.payload);
+                @memset(connection.control_packets[0..packets], payload);
             } else {
-                for (0..packets) |_| try owner.sendFramed(io, connection.handle.?, &loan, .{ .sockets = &budget });
+                for (0..packets) |_| owner.writePlay(io, connection.handle.?, payload);
             }
         }
         owner.reloading = true;
@@ -404,15 +408,15 @@ pub fn benchmarkSpill() !void {
         for (owner.connections) |connection| {
             const span = connection.saved_output;
             var bytes: [256]u8 = undefined;
-            try std.testing.expectEqual(packets * loan.payload.len, span.length);
+            try std.testing.expectEqual(packets * payload.len, span.length);
             try std.testing.expectEqual(span.length, try owner.spool_file.?.readPositionalAll(io, bytes[0..span.length], span.offset));
-            for (0..packets) |index| try std.testing.expectEqualSlices(u8, loan.payload, bytes[index * loan.payload.len ..][0..loan.payload.len]);
+            for (0..packets) |index| try std.testing.expectEqualSlices(u8, payload, bytes[index * payload.len ..][0..payload.len]);
             spilled += span.length;
         }
-        try std.testing.expectEqual(@as(usize, 1), loan.references);
-        const writes = if (limit == 7) (packets * loan.payload.len + 6) / 7 else (packets + std.Io.Threaded.max_iovecs_len - 1) / std.Io.Threaded.max_iovecs_len;
+        // Control output spools as its packets, the ring in one piece.
+        const writes = if (limit == 7) (packets * payload.len + 6) / 7 else if (control) (packets + std.Io.Threaded.max_iovecs_len - 1) / std.Io.Threaded.max_iovecs_len else 1;
         try std.testing.expectEqual(peers * writes, probe.writes);
-        try output.interface.print("{s:7} | {d:12} | {d:16} | {d:11} | {d:17} | {d}\n", .{ if (control) "control" else "loan", peers, packets, limit, probe.writes, spilled });
+        try output.interface.print("{s:7} | {d:12} | {d:16} | {d:11} | {d:17} | {d}\n", .{ if (control) "control" else "ring", peers, packets, limit, probe.writes, spilled });
     };
     try output.interface.flush();
 }
@@ -436,7 +440,7 @@ fn configurationCounts(packets: usize, queued: bool) !ConfigurationCounts {
         owner.codec = null;
         owner.deinit();
     }
-    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2, .frames = 1 });
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2 });
     defer codec.deinit();
     if (queued) try owner.attachCodec(codec);
     const connection = &owner.connections[0];
@@ -512,7 +516,7 @@ test "status replies progress while the packet worker and shared buffers are occ
         defer decoded.release();
         const control = owner.configurations.acquire().?;
         defer control.release();
-        const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2, .frames = 1 });
+        const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2 });
         defer codec.deinit();
         var gate: Gate = .{};
         codec.workers[0].workspaces.gate = &gate;
@@ -522,6 +526,7 @@ test "status replies progress while the packet worker and shared buffers are occ
         var task: Codec.Task = .{};
         var bytes: [framing.headroom + 1]u8 = @splat(0);
         var output: [64]u8 = undefined;
+        var decoding: Endpoint.Connection = 0;
         const Verification = struct {
             gate: *Gate,
             caller: std.Thread.Id,
@@ -536,11 +541,11 @@ test "status replies progress while the packet worker and shared buffers are occ
         if (verify_login) {
             codec.submit(&task, .{ .verify = protocol.LoginVerification.init(&verification, Verification.run) });
         } else {
-            codec.submit(&task, .{ .frame = .{ .protocol = 772, .storage = &bytes, .length = 1, .threshold = null, .output = &output } });
+            codec.submit(&task, .{ .decode = .{ .connection = &decoding, .bytes = bytes[framing.headroom..], .output = &output, .threshold = null } });
         }
         try gate.started.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } });
         var queued: Codec.Task = .{};
-        codec.submit(&queued, .{ .frame = .{ .protocol = 772, .storage = &bytes, .length = 1, .threshold = null, .output = &output } });
+        codec.submit(&queued, .{ .decode = .{ .connection = &decoding, .bytes = bytes[framing.headroom..], .output = &output, .threshold = null } });
         try owner.attachCodec(codec);
         const connection = &owner.connections[0];
         owner.setHandle(0, .{ .index = 0, .generation = 1 });
@@ -566,40 +571,6 @@ test "status replies progress while the packet worker and shared buffers are occ
         try std.testing.expectEqual(@as(usize, 1), (try Codec.take(&queued).?).bytes.len);
     }
 }
-
-test "framing continues into recipient encryption without a networking reply" {
-    const Codec = packet_codec.Codec(Endpoint);
-    const io = std.testing.io;
-    var native: Native = .{};
-    const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
-    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 1, .frames = 1 });
-    defer codec.deinit();
-    var connections = [_]Endpoint.Connection{ 17, 33 };
-    var destinations: [2][5]u8 = undefined;
-    var sends: [2]Codec.Task = @splat(.{});
-    var targets: [2]Codec.SendTarget = undefined;
-    for (&targets, &connections, &destinations, &sends) |*target, *connection, *destination, *send| {
-        send.state.store(.queued, .release);
-        target.* = .{ .task = send, .connection = connection, .bytes = destination, .used = 0, .offset = 0 };
-    }
-    targets[0].next = &targets[1];
-    var storage: [framing.headroom + 5]u8 = @splat(0);
-    @memcpy(storage[framing.headroom..], "hello");
-    var output: [64]u8 = undefined;
-    var frame: Codec.Task = .{};
-    try codec.start();
-    defer codec.stop();
-    codec.submit(&frame, .{ .frame = .{ .protocol = 772, .storage = &storage, .length = 5, .threshold = null, .output = &output, .targets = &targets[0] } });
-    codec.stop();
-    try std.testing.expectEqual(storage[framing.headroom..].ptr, (try Codec.take(&frame).?).bytes.ptr);
-    for (&sends, destinations, connections, [_]u8{ 17, 33 }) |*send, destination, connection, initial| {
-        try std.testing.expectEqual(@as(usize, 5), (try Codec.take(send).?).consumed);
-        try std.testing.expectEqual(initial + 5, connection);
-        for (destination, "hello", 0..) |actual, source, offset| try std.testing.expectEqual(source ^ (initial + @as(u8, @intCast(offset))), actual);
-    }
-    try std.testing.expectEqualStrings("hello", storage[framing.headroom..]);
-}
-
 test "asynchronous control retains its output loan and advances the cipher once" {
     const Engine = engine.Engine(Endpoint, Observer);
     const Codec = packet_codec.Codec(Endpoint);
@@ -618,7 +589,7 @@ test "asynchronous control retains its output loan and advances the cipher once"
         owner.codec = null;
         owner.deinit();
     }
-    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2, .frames = 1 });
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2 });
     defer codec.deinit();
     try codec.start();
     defer codec.stop();
@@ -702,7 +673,7 @@ test "frozen session connection records read and write the established bytes" {
     try std.testing.expectEqualSlices(u8, frozen_connection, writer.buffered());
 }
 
-test "wire spill preserves full peers without waiting and restores beyond burst capacity" {
+test "wire spill seals ring output and spools later output encrypted, and restores both" {
     const Engine = engine.Engine(Endpoint, Observer);
     var native: Native = .{};
     const transport: network.Transport = .{ .context = &native, .vtable = undefined, .inheritance = network.Inheritance.init(Native, &native) };
@@ -715,7 +686,7 @@ test "wire spill preserves full peers without waiting and restores beyond burst 
         .max_packet = 4093,
         .max_pending_wire_bytes = 8192,
         .input_burst_slots = 1,
-        .output_burst_slots = 1,
+        .output_bytes = 4096,
         .configuration_slots = 1,
         .protocols = &catalog,
         .observer = &observer,
@@ -736,18 +707,21 @@ test "wire spill preserves full peers without waiting and restores beyond burst 
     }
     for (0..2) |index| owner.admit(index);
     const packet: [2048]u8 = @splat(42);
-    var loan: Engine.Loan = .{ .payload = &packet, .references = 1 };
-    try owner.sendFramed(std.testing.io, owner.connections[0].handle.?, &loan, .{});
-    try std.testing.expectError(error.Full, owner.sendFramed(std.testing.io, owner.connections[1].handle.?, &loan, .{}));
-    try std.testing.expectEqual(@as(u8, 7), owner.connections[1].lifecycle.?);
+    // Written before the spill, so still in the ring, not yet encrypted.
+    owner.writePlay(std.testing.io, owner.connections[0].handle.?, &packet);
+    try std.testing.expectEqual(@as(u8, 7), owner.connections[0].lifecycle.?);
     const input = owner.input_bursts.acquire().?;
     owner.connections[0].input_burst = input;
     owner.connections[0].input_end = 1024;
     @memset(input.bytes[0..1024], 99);
     owner.reloading = true;
     try owner.spill(std.testing.io);
-    try std.testing.expect(owner.connections[0].output_burst == null);
-    try owner.sendFramed(std.testing.io, owner.connections[1].handle.?, &loan, .{});
+    // The spill encrypted the ring into the spool.
+    try std.testing.expect(owner.connections[0].output_write == 0 and owner.unsealed.count == 0);
+    try std.testing.expectEqual(@as(u8, 7 +% @as(u8, @truncate(2048))), owner.connections[0].lifecycle.?);
+    // Written after, so straight into the spool, encrypted.
+    owner.writePlay(std.testing.io, owner.connections[1].handle.?, &packet);
+    try std.testing.expectEqual(@as(usize, 2048), owner.connections[1].saved_output.length);
     for (owner.connections) |*connection| connection.parked = true;
     var snapshot: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer snapshot.deinit();
@@ -774,7 +748,7 @@ test "wire spill preserves full peers without waiting and restores beyond burst 
     try std.testing.expectEqual(@as(usize, 1024), restored.connections[0].saved_input.length);
     for (restored.connections) |*connection| {
         try std.testing.expectEqual(@as(usize, 2048), connection.saved_output.length);
-        try std.testing.expect(connection.output_burst == null and connection.control_burst == null);
+        try std.testing.expect(connection.control_burst == null);
         connection.parked = true;
     }
     restored.reloading = true;
@@ -798,6 +772,7 @@ test "partial encrypted input waits for burst capacity and retains borrowed byte
         .connection_bytes = 512,
         .max_packet = 4093,
         .input_burst_slots = 1,
+        .output_bytes = 4096,
         .max_pending_wire_bytes = 8192,
         .protocols = &catalog,
         .observer = &observer,
@@ -857,75 +832,6 @@ test "partial encrypted input waits for burst capacity and retains borrowed byte
     try std.testing.expect(owner.connections[1].input_burst == null);
     try std.testing.expectEqual(assigned, fixed.end_index);
 }
-
-test "plaintext fanout lends the original bytes through partial sends cancellation and spill" {
-    const Engine = engine.Engine(Endpoint, Observer);
-    const io = std.testing.io;
-    var native: Native = .{};
-    const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native), .inheritance = network.Inheritance.init(Native, &native) };
-    var observer: Observer = .{};
-    var catalog: Endpoint.Protocols = .{};
-    const owner = try Engine.init(std.testing.allocator, transport, .{
-        .connections = 2,
-        .buffer_bytes = 4096,
-        .connection_bytes = 512,
-        .max_packet = 4093,
-        .max_pending_wire_bytes = 8192,
-        .protocols = &catalog,
-        .observer = &observer,
-    });
-    var budget: packet_output.SocketBudget = .init(3);
-    var first: Engine.Loan = .framed("Hfirst", "Hfirst"[1..]);
-    var second: Engine.Loan = .framed("JKsecond", "JKsecond"[2..]);
-    defer {
-        for (owner.connections, 0..) |*connection, index| {
-            connection.sending = false;
-            connection.receiving = false;
-            owner.releaseBuffers(index);
-            owner.setHandle(index, null);
-        }
-        owner.deinit();
-        std.debug.assert(first.references == 1 and second.references == 1);
-    }
-    for (owner.connections, 0..) |*connection, index| {
-        owner.setHandle(index, .{ .index = @intCast(index), .generation = 1 });
-        connection.protocol = &catalog.values[0];
-        connection.lifecycle = 0xff;
-        connection.state.phase = .play;
-        try owner.sendFramed(io, connection.handle.?, &first, .{ .sockets = &budget });
-        try owner.sendFramed(io, connection.handle.?, &second, .{ .sockets = &budget });
-    }
-    owner.progress(io);
-    for (owner.connections, 0..) |*connection, index| {
-        try std.testing.expect(native.sends[index].?.ptr == &first.header);
-        try std.testing.expect(connection.vectors[1].base == first.payload.ptr);
-        try std.testing.expectEqual(first.length() + second.length(), connection.sending_bytes);
-    }
-    try std.testing.expectEqual(@as(usize, 3), first.references);
-    native.events[0] = .{ .sent = .{ .handle = owner.connections[0].handle.?, .result = .{ .bytes = 7 } } };
-    native.events[1] = .{ .sent = .{ .handle = owner.connections[1].handle.?, .result = .{ .bytes = 0, .errno = @backingInt(std.posix.E.CANCELED) } } };
-    native.count = 2;
-    owner.reloading = true;
-    try owner.receive(io);
-    try std.testing.expectEqual(@as(usize, 2), first.references);
-    try std.testing.expectEqual(@as(usize, 3), second.references);
-    try std.testing.expectEqualStrings("K", owner.connections[0].output_loans[owner.connections[0].loan_read % network.send_vectors_max].prefix);
-    try std.testing.expectEqualStrings("second", owner.connections[0].output);
-    // A canceled send retains its entire original loan until spill consumes it.
-    for (owner.connections) |*connection| connection.receiving = false;
-    try owner.spill(io);
-    try std.testing.expectEqual(@as(usize, 1), first.references);
-    try std.testing.expectEqual(@as(usize, 1), second.references);
-    var bytes: [16]u8 = undefined;
-    const file = owner.spool_file.?;
-    const partial = owner.connections[0].saved_output;
-    try std.testing.expectEqual(@as(usize, 7), try file.readPositionalAll(io, bytes[0..partial.length], partial.offset));
-    try std.testing.expectEqualStrings("Ksecond", bytes[0..partial.length]);
-    const canceled = owner.connections[1].saved_output;
-    try std.testing.expectEqual(@as(usize, 14), try file.readPositionalAll(io, bytes[0..canceled.length], canceled.offset));
-    try std.testing.expectEqualStrings("HfirstJKsecond", bytes[0..canceled.length]);
-}
-
 test "decoding a plaintext batch borrows every input packet without changing either buffer" {
     const Codec = packet_codec.Codec(Endpoint);
     var workspaces: Endpoint.Workspaces = .{};
@@ -994,118 +900,6 @@ test "a fragmented packet outgrows the resident buffer and retains its burst unt
     try std.testing.expect(connection.input_burst == null);
     try std.testing.expect(native.receives[0].?.ptr == owner.input.ptr);
 }
-
-test "codec uses actual framed size and defers exhausted destinations without advancing ciphers" {
-    const Codec = packet_codec.Codec(Endpoint);
-    const io = std.testing.io;
-    var native: Native = .{};
-    const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
-    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 1, .frames = 1 });
-    defer codec.deinit();
-    codec.workers[0].workspaces.framed_length = 5;
-    var pool = try Buffers.init(std.testing.allocator, .{ .slots = 1, .bytes = 64 });
-    defer pool.deinit(std.testing.allocator);
-    var connections = [_]Endpoint.Connection{ 17, 33, 49, 65 };
-    var destinations: [4][8]u8 = @splat(@splat(0));
-    var sends: [4]Codec.Task = @splat(.{});
-    var targets: [4]Codec.SendTarget = undefined;
-    for (&targets, &connections, &destinations, &sends, 0..) |*target, *connection, *destination, *send, index| {
-        send.state.store(.queued, .release);
-        target.* = .{
-            .next = if (index + 1 < targets.len) &targets[index + 1] else null,
-            .task = send,
-            .connection = connection,
-            .bytes = if (index == 0) destination else destination[0..2],
-            .used = if (index == 0) 3 else 0,
-            .offset = if (index == 0) 6 else 0,
-            .overflow = if (index == 1 or index == 2) &pool else null,
-        };
-    }
-    var storage: [framing.headroom + 40]u8 = @splat(0);
-    @memcpy(storage[framing.headroom..][0..5], "hello");
-    var output: [64]u8 = undefined;
-    var frame: Codec.Task = .{};
-    try codec.start();
-    defer codec.stop();
-    codec.submit(&frame, .{ .frame = .{ .protocol = 772, .storage = &storage, .length = 40, .threshold = 1, .output = &output, .targets = &targets[0] } });
-    codec.stop();
-    try std.testing.expectEqualStrings("hello", (try Codec.take(&frame).?).bytes);
-    for (&sends, &targets, connections, [_]u8{ 17, 33, 49, 65 }, 0..) |*send, target, connection, initial, index| {
-        const result = try Codec.take(send).?;
-        defer if (result.burst) |lease| lease.release();
-        if (index < 2) {
-            try std.testing.expect(target.sent);
-            try std.testing.expectEqual(@as(usize, 5), result.consumed);
-            try std.testing.expectEqual(initial + 5, connection);
-            const bytes = if (result.burst) |lease| lease.bytes else target.bytes;
-            const offset = if (result.burst != null) 0 else target.offset;
-            for ("hello", 0..) |source, at| try std.testing.expectEqual(source ^ (initial + @as(u8, @intCast(at))), bytes[(offset + at) % bytes.len]);
-            try std.testing.expectEqual(index == 1, result.burst != null);
-        } else {
-            try std.testing.expect(!target.sent);
-            try std.testing.expectEqual(@as(usize, 0), result.consumed);
-            try std.testing.expectEqual(initial, connection);
-            try std.testing.expectEqual(null, result.burst);
-        }
-    }
-}
-
-test "engine commits codec destinations using actual output size" {
-    const Engine = engine.Engine(Endpoint, Observer);
-    const Codec = packet_codec.Codec(Endpoint);
-    const io = std.testing.io;
-    for ([_]usize{ 5, 700 }) |length| {
-        var native: Native = .{};
-        const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
-        var observer: Observer = .{};
-        var catalog: Endpoint.Protocols = .{};
-        const owner = try Engine.init(std.testing.allocator, transport, .{
-            .connections = 1,
-            .buffer_bytes = 4096,
-            .connection_bytes = 512,
-            .max_packet = 4093,
-            .max_pending_wire_bytes = 8192,
-            .output_burst_slots = 1,
-            .protocols = &catalog,
-            .observer = &observer,
-        });
-        defer {
-            owner.connections[0].receiving = false;
-            owner.connections[0].sending = false;
-            owner.releaseBuffers(0);
-            owner.setHandle(0, null);
-            owner.codec = null;
-            owner.deinit();
-        }
-        const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 1, .frames = 1 });
-        defer codec.deinit();
-        try owner.attachCodec(codec);
-        codec.workers[0].workspaces.framed_length = length;
-        const connection = &owner.connections[0];
-        const handle: network.Handle = .{ .index = 0, .generation = 1 };
-        owner.setHandle(handle.index, handle);
-        connection.protocol = &catalog.values[0];
-        connection.lifecycle = 7;
-        connection.state.phase = .play;
-        var target = try owner.prepareSend(handle);
-        try std.testing.expectEqual(null, connection.output_burst);
-        var storage: [framing.headroom + 1000]u8 = @splat(42);
-        var output: [1024]u8 = undefined;
-        var frame: Codec.Task = .{};
-        try codec.start();
-        defer codec.stop();
-        codec.submit(&frame, .{ .frame = .{ .protocol = 772, .storage = &storage, .length = 1000, .threshold = 1, .output = &output, .targets = &target } });
-        codec.stop();
-        try std.testing.expectEqual(length, (try Codec.take(&frame).?).bytes.len);
-        owner.progress(io);
-        try std.testing.expectEqual(length > 512, connection.output_burst != null);
-        try std.testing.expectEqual(length, connection.output_write);
-        try std.testing.expectEqual(length, native.sends[0].?.len);
-        try std.testing.expectEqual(.idle, connection.codec.state.load(.acquire));
-        for (native.sends[0].?, 0..) |byte, offset| try std.testing.expectEqual(@as(u8, 42) ^ (7 +% @as(u8, @truncate(offset))), byte);
-    }
-}
-
 test "committed output progresses while the same connection waits for the codec" {
     const Engine = engine.Engine(Endpoint, Observer);
     const Codec = packet_codec.Codec(Endpoint);
@@ -1124,7 +918,7 @@ test "committed output progresses while the same connection waits for the codec"
         owner.codec = null;
         owner.deinit();
     }
-    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 1, .frames = 1 });
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 1 });
     defer codec.deinit();
     try owner.attachCodec(codec);
     const connection = &owner.connections[0];
@@ -1133,6 +927,8 @@ test "committed output progresses while the same connection waits for the codec"
     connection.lifecycle = 7;
     connection.state.phase = .play;
     @memcpy(owner.output[0..5], "ready");
+    // Already encrypted, as sealed output is, so it goes out while the codec is busy.
+    connection.output_sealed = 5;
     connection.output_write = 5;
     connection.codec.state.store(.queued, .release);
     owner.progress(io);
@@ -1148,7 +944,7 @@ test "codec idle handoffs drain every submitted task before shutdown" {
     var wake: std.Io.Event = .unset;
     var native: Native = .{ .wake = &wake };
     const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
-    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 32, .frames = 1 });
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 32 });
     defer codec.deinit();
     var connection: Endpoint.Connection = 0;
     var tasks: [32]Codec.Task = @splat(.{});
@@ -1190,7 +986,7 @@ test "completed codec tasks notify before the rest of their batch finishes" {
     var wake: std.Io.Event = .unset;
     var native: Native = .{ .wake = &wake };
     const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
-    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2, .frames = 1 });
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2 });
     defer codec.deinit();
     var gate: Gate = .{};
     codec.workers[0].workspaces = .{ .gate = &gate, .gate_byte = 1 };
@@ -1198,7 +994,8 @@ test "completed codec tasks notify before the rest of their batch finishes" {
     storage[1][framing.headroom] = 1;
     var output: [2][64]u8 = undefined;
     var tasks: [2]Codec.Task = @splat(.{});
-    for (&tasks, &storage, &output) |*task, *bytes, *destination| codec.submit(task, .{ .frame = .{ .protocol = 772, .storage = bytes, .length = 1, .threshold = null, .output = destination } });
+    var connection: Endpoint.Connection = 0;
+    for (&tasks, &storage, &output) |*task, *bytes, *destination| codec.submit(task, .{ .decode = .{ .connection = &connection, .bytes = bytes[framing.headroom..], .output = destination, .threshold = null } });
     try codec.start();
     defer codec.stop();
     defer gate.release.set(io);
@@ -1233,7 +1030,6 @@ test "receive chaining decrypts only the new suffix and retains incomplete frame
     try std.testing.expectEqual(@as(usize, 0), partial.consumed);
     try std.testing.expectEqual(@as(usize, 0), partial.input.?.packets.len);
 }
-
 test "wrapped output submits both ring spans and resumes after a partial send" {
     const Engine = engine.Engine(Endpoint, Observer);
     const io = std.testing.io;
@@ -1241,7 +1037,7 @@ test "wrapped output submits both ring spans and resumes after a partial send" {
     const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
     var observer: Observer = .{};
     var catalog: Endpoint.Protocols = .{};
-    const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
+    const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .output_bytes = 4096, .protocols = &catalog, .observer = &observer });
     defer {
         owner.connections[0].receiving = false;
         owner.connections[0].sending = false;
@@ -1255,12 +1051,14 @@ test "wrapped output submits both ring spans and resumes after a partial send" {
     connection.protocol = &catalog.values[0];
     connection.lifecycle = 0xff;
     connection.state.phase = .play;
-    connection.output_read = 500;
-    connection.output_write = 500;
-    var loan: Engine.Loan = .{ .payload = "abcdefghijklmnopqrst", .references = 1 };
-    try owner.sendFramed(io, handle, &loan, .{});
-    try std.testing.expectEqual(@as(usize, 1), loan.references);
+    connection.output_read = 4084;
+    connection.output_sealed = 4084;
+    connection.output_write = 4084;
+    owner.writePlay(io, handle, "abcdefghijklmnopqrst");
+    // Nothing goes out before it is sealed.
     owner.progress(io);
+    try std.testing.expectEqual(@as(usize, 0), native.send_calls);
+    owner.sealPlay(io);
     try std.testing.expectEqual(@as(usize, 2), native.send_vectors[0].len);
     try std.testing.expectEqualSlices(u8, "abcdefghijkl", native.send_vectors[0][0].base[0..native.send_vectors[0][0].len]);
     try std.testing.expectEqualSlices(u8, "mnopqrst", native.send_vectors[0][1].base[0..native.send_vectors[0][1].len]);
@@ -1270,37 +1068,65 @@ test "wrapped output submits both ring spans and resumes after a partial send" {
     owner.progress(io);
     try std.testing.expectEqual(@as(usize, 1), native.send_vectors[0].len);
     try std.testing.expectEqualStrings("pqrst", native.sends[0].?);
-    try std.testing.expectEqual(@as(usize, 515), connection.output_read);
+    try std.testing.expectEqual(@as(usize, 4099), connection.output_read);
+    try std.testing.expectEqual(@as(usize, 15), observer.sent_bytes);
 }
 
-test "encryption preserves cipher order across owned headers and every ring wrap" {
-    const Codec = packet_codec.Codec(Endpoint);
-    const wire = "header-payload";
-    for (0..wire.len + 1) |header| {
-        var loan: packet_output.Loan = .framed(wire, wire[header..]);
-        for (0..wire.len + 1) |wrap| {
-            var expected: [wire.len]u8 = undefined;
-            var actual: [wire.len]u8 = undefined;
-            var continuous: Endpoint.Connection = 0;
-            var fragmented: Endpoint.Connection = 0;
-            Endpoint.encrypt(&continuous, wire, &expected);
-            const packet = loan.fragments();
-            Codec.encrypt(&fragmented, packet.prefix, packet.payload, actual[0..wrap], actual[wrap..]);
-            try std.testing.expectEqualSlices(u8, &expected, &actual);
-            try std.testing.expectEqual(continuous, fragmented);
+test "sealing encrypts every byte once, in order, wherever the ring wraps" {
+    const Engine = engine.Engine(Endpoint, Observer);
+    const io = std.testing.io;
+    const packets = [_][]const u8{ "header-", "payload", "-and-more" };
+    var plaintext: [packets[0].len + packets[1].len + packets[2].len]u8 = undefined;
+    var length: usize = 0;
+    for (packets) |packet| {
+        @memcpy(plaintext[length..][0..packet.len], packet);
+        length += packet.len;
+    }
+    var expected: [plaintext.len]u8 = undefined;
+    var continuous: Endpoint.Connection = 3;
+    Endpoint.encrypt(&continuous, &plaintext, &expected);
+    for (0..plaintext.len + 1) |wrap| {
+        var native: Native = .{};
+        const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
+        var observer: Observer = .{};
+        var catalog: Endpoint.Protocols = .{};
+        const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .output_bytes = 4096, .protocols = &catalog, .observer = &observer });
+        defer {
+            owner.connections[0].receiving = false;
+            owner.connections[0].sending = false;
+            owner.releaseBuffers(0);
+            owner.setHandle(0, null);
+            owner.deinit();
         }
+        const connection = &owner.connections[0];
+        const handle: network.Handle = .{ .index = 0, .generation = 1 };
+        owner.setHandle(handle.index, handle);
+        connection.protocol = &catalog.values[0];
+        connection.lifecycle = 3;
+        connection.state.phase = .play;
+        const start = 4096 - wrap;
+        connection.output_read = start;
+        connection.output_sealed = start;
+        connection.output_write = start;
+        for (packets) |packet| owner.writePlay(io, handle, packet);
+        owner.sealPlay(io);
+        var actual: [plaintext.len]u8 = undefined;
+        for (&actual, 0..) |*byte, offset| byte.* = owner.output[(start + offset) % 4096];
+        try std.testing.expectEqualSlices(u8, &expected, &actual);
+        try std.testing.expectEqual(continuous, connection.lifecycle.?);
+        try std.testing.expectEqual(connection.output_write, connection.output_sealed);
     }
 }
 
-test "owned headers survive source reuse through copying socket loans encryption and spool" {
+test "the ring and the spool keep their own copy of output whose source is reused" {
     const Engine = engine.Engine(Endpoint, Observer);
     const io = std.testing.io;
-    for ([_]enum { copy, loan, encrypted, spool }{ .copy, .loan, .encrypted, .spool }) |mode| {
+    for ([_]enum { plain, encrypted, spool }{ .plain, .encrypted, .spool }) |mode| {
         var native: Native = .{};
         var observer: Observer = .{};
         var catalog: Endpoint.Protocols = .{};
         const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
-        const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
+        const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .output_bytes = 4096, .protocols = &catalog, .observer = &observer });
         defer {
             owner.connections[0].sending = false;
             owner.connections[0].receiving = false;
@@ -1312,251 +1138,30 @@ test "owned headers survive source reuse through copying socket loans encryption
         const handle: network.Handle = .{ .index = 0, .generation = 1 };
         owner.setHandle(handle.index, handle);
         connection.protocol = &catalog.values[0];
-        connection.lifecycle = if (mode == .encrypted) 0 else 0xff;
+        connection.lifecycle = if (mode == .plain) 0xff else 0;
         connection.state.phase = .play;
-        connection.output_read = 508;
-        connection.output_write = 508;
         connection.spooling = mode == .spool;
         const expected = "HDpayload";
         var wire = expected.*;
-        var loan: packet_output.Loan = .framed(&wire, wire[2..]);
-        @memset(wire[0..2], 255);
-        var budget: packet_output.SocketBudget = .init(2);
-        try owner.sendFramed(io, handle, &loan, .{ .sockets = if (mode == .loan) &budget else null });
+        owner.writePlay(io, handle, &wire);
+        @memset(&wire, 255);
+        var encrypted: [expected.len]u8 = expected.*;
+        if (mode != .plain) {
+            var cipher: Endpoint.Connection = 0;
+            Endpoint.encrypt(&cipher, expected, &encrypted);
+        }
         var actual: [expected.len]u8 = undefined;
         switch (mode) {
-            .copy, .encrypted => {
-                @memcpy(actual[0..4], owner.output[508..512]);
-                @memcpy(actual[4..], owner.output[0..5]);
-                if (mode == .encrypted) {
-                    var cipher: Endpoint.Connection = 0;
-                    var encrypted: [expected.len]u8 = undefined;
-                    Endpoint.encrypt(&cipher, expected, &encrypted);
-                    try std.testing.expectEqualSlices(u8, &encrypted, &actual);
-                    try std.testing.expectEqual(cipher, connection.lifecycle.?);
-                    continue;
-                }
-            },
-            .loan => {
-                owner.progress(io);
-                var written: usize = 0;
-                for (native.send_vectors[0]) |vector| {
-                    @memcpy(actual[written..][0..vector.len], vector.base[0..vector.len]);
-                    written += vector.len;
-                }
-                try std.testing.expectEqual(actual.len, written);
-                try std.testing.expect(connection.output_loans[0].bytes.ptr == wire[2..].ptr);
+            .plain, .encrypted => {
+                owner.sealPlay(io);
+                @memcpy(&actual, owner.output[0..expected.len]);
             },
             .spool => {
                 try std.testing.expectEqual(expected.len, connection.saved_output.length);
                 try std.testing.expectEqual(actual.len, try owner.spool_file.?.readPositionalAll(io, &actual, connection.saved_output.offset));
             },
         }
-        try std.testing.expectEqualSlices(u8, expected, &actual);
-    }
-}
-
-test "an active group gates its connection while other status connections keep progressing" {
-    const Engine = engine.Engine(Endpoint, Observer);
-    const io = std.testing.io;
-    var native: Native = .{};
-    var observer: Observer = .{};
-    var catalog: Endpoint.Protocols = .{};
-    const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
-    const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 2, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
-    defer {
-        for (owner.connections, 0..) |*connection, index| {
-            connection.receiving = false;
-            connection.sending = false;
-            connection.loan.store(false, .release);
-            owner.releaseBuffers(index);
-            owner.setHandle(index, null);
-        }
-        owner.deinit();
-    }
-    const handle: network.Handle = .{ .index = 0, .generation = 1 };
-    const connection = &owner.connections[0];
-    owner.setHandle(handle.index, handle);
-    connection.protocol = &catalog.values[0];
-    connection.lifecycle = 0xff;
-    connection.state.phase = .play;
-    connection.attached = true;
-    var group: framing.Group = .{ .protocol = catalog.values[0].number, .first = 3, .generation = 7, .count = 3 };
-    try std.testing.expect(owner.groupReady(handle, 0, group));
-    owner.claimGroup(handle, 0, group);
-    try std.testing.expect(!owner.groupReady(handle, 1, group));
-    try std.testing.expect(!owner.groupReady(handle, 0, .{}));
-    try std.testing.expect(!try owner.reconfigure(io, handle));
-    owner.progress(io);
-    native.feed(0, "\x02\x01\x2a");
-    try owner.receive(io);
-    owner.progress(io);
-    try std.testing.expectEqual(@as(usize, 0), observer.payloads[0].len);
-    const status = &owner.connections[1];
-    owner.setHandle(1, .{ .index = 1, .generation = 1 });
-    status.protocol = &catalog.values[0];
-    status.lifecycle = 0xff;
-    status.status = true;
-    status.state.phase = .negotiating;
-    status.admission_deadline = std.Io.Clock.now(.awake, io).nanoseconds + std.time.ns_per_s;
-    owner.progress(io);
-    native.feed(1, "\x02\x01\x2b");
-    try owner.receive(io);
-    owner.progress(io);
-    try std.testing.expectEqualSlices(u8, "\x01\x2b", native.sends[1].?);
-    try std.testing.expectEqual(@as(usize, 0), observer.payloads[0].len);
-    for (0..3) |index| {
-        group.index = @intCast(index);
-        try std.testing.expect(owner.groupReady(handle, 0, group));
-        if (index != 2) {
-            var future = group;
-            future.index += 1;
-            try std.testing.expect(!owner.groupReady(handle, 0, future));
-        }
-        owner.completeGroupPacket(handle, 0, group);
-    }
-    try std.testing.expect(connection.group == null);
-    owner.progress(io);
-    try std.testing.expect(observer.payloads[0].len != 0);
-    owner.releaseInput(io, handle);
-    group.index = 0;
-    owner.claimGroup(handle, 0, group);
-    owner.beginShutdown(io);
-    try std.testing.expect(!owner.discardGroup(handle));
-    try std.testing.expect(owner.discardGroup(status.handle.?));
-}
-
-test "reload spools a partially emitted group and preserves its remaining packet order" {
-    for ([_]bool{ false, true }) |encrypted| {
-        const Engine = engine.Engine(Endpoint, Observer);
-        const io = std.testing.io;
-        var native: Native = .{};
-        var observer: Observer = .{};
-        var catalog: Endpoint.Protocols = .{};
-        const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
-        const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
-        defer {
-            owner.connections[0].receiving = false;
-            owner.connections[0].sending = false;
-            owner.releaseBuffers(0);
-            owner.setHandle(0, null);
-            owner.deinit();
-        }
-        const handle: network.Handle = .{ .index = 0, .generation = 1 };
-        const connection = &owner.connections[0];
-        owner.setHandle(handle.index, handle);
-        connection.protocol = &catalog.values[0];
-        connection.lifecycle = if (encrypted) 0 else 0xff;
-        connection.state.phase = .play;
-        var group: framing.Group = .{ .protocol = catalog.values[0].number, .first = 2, .generation = 9, .count = 3, .bytes = 3 };
-        owner.claimGroup(handle, 0, group);
-        var first = packet_output.Loan.framed("a", "a");
-        try owner.sendFramed(io, handle, &first, .{});
-        first.release();
-        owner.completeGroupPacket(handle, 0, group);
-        owner.reloading = true;
-        try owner.spill(io);
-        try std.testing.expect(connection.spooling and connection.group != null);
-        try std.testing.expectEqual(@as(usize, 1), connection.saved_output.length);
-        for ([_][]const u8{ "b", "c" }, 1..) |bytes, index| {
-            group.index = @intCast(index);
-            try std.testing.expect(owner.groupReady(handle, 0, group));
-            var loan = packet_output.Loan.framed(bytes, bytes);
-            try owner.sendFramed(io, handle, &loan, .{});
-            loan.release();
-            owner.completeGroupPacket(handle, 0, group);
-        }
-        try std.testing.expect(connection.group == null);
-        var bytes: [3]u8 = undefined;
-        try std.testing.expectEqual(bytes.len, try owner.spool_file.?.readPositionalAll(io, &bytes, connection.saved_output.offset));
-        try std.testing.expectEqualSlices(u8, if (encrypted) &.{ 'a', 'b' ^ 1, 'c' ^ 2 } else "abc", &bytes);
-    }
-}
-
-test "encrypted groups reserve output capacity before opening and retain it between packets" {
-    const Engine = engine.Engine(Endpoint, Observer);
-    const io = std.testing.io;
-    var native: Native = .{};
-    var observer: Observer = .{};
-    var catalog: Endpoint.Protocols = .{};
-    const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
-    const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 1, .buffer_bytes = 4096, .connection_bytes = 512, .max_packet = 4093, .max_pending_wire_bytes = 8192, .output_burst_slots = 1, .protocols = &catalog, .observer = &observer });
-    defer {
-        owner.connections[0].receiving = false;
-        owner.connections[0].sending = false;
-        owner.releaseBuffers(0);
-        owner.setHandle(0, null);
-        owner.deinit();
-    }
-    const handle: network.Handle = .{ .index = 0, .generation = 1 };
-    const connection = &owner.connections[0];
-    owner.setHandle(handle.index, handle);
-    connection.protocol = &catalog.values[0];
-    connection.lifecycle = 0;
-    connection.state.phase = .play;
-    const group: framing.Group = .{ .protocol = catalog.values[0].number, .first = 3, .generation = 1, .count = 3, .bytes = 2000 };
-    inline for (.{ .queued, .complete }) |state| {
-        connection.codec.state.store(state, .release);
-        try std.testing.expectError(error.Full, owner.reserveOutput(handle, 1));
-        try std.testing.expectError(error.Full, owner.reserveGroupOutput(handle, group));
-        try std.testing.expect(connection.group == null and connection.output_burst == null);
-        try std.testing.expectEqual(@as(usize, 0), connection.output_write);
-    }
-    connection.codec.state.store(.idle, .release);
-    const held = owner.output_bursts.acquire().?;
-    try std.testing.expectError(error.Full, owner.reserveGroupOutput(handle, group));
-    try std.testing.expect(connection.group == null and connection.output_burst == null);
-    held.release();
-    try owner.reserveGroupOutput(handle, group);
-    const reserved = connection.output_burst.?.bytes.ptr;
-    owner.claimGroup(handle, 0, group);
-    owner.progress(io);
-    try std.testing.expectEqual(reserved, connection.output_burst.?.bytes.ptr);
-    try std.testing.expect(connection.group != null);
-}
-
-test "one codec submission frames and encrypts a whole sequence into wrapped recipient buffers" {
-    const Codec = packet_codec.Codec(Endpoint);
-    for ([_]bool{ false, true }) |masked| {
-        var native: Native = .{};
-        const codec = try Codec.init(std.testing.allocator, std.testing.io, .{ .context = &native, .vtable = network.Transport.adapter(Native) }, .{ .tasks = 8, .frames = 1 });
-        defer codec.deinit();
-        var storage: [3][framing.headroom + 3]u8 = undefined;
-        const payloads = [_][]const u8{ "ab", "cde", "f" };
-        var scratch: [3][8]u8 = undefined;
-        var tasks: [3]Codec.Task = @splat(.{});
-        var frames: [3]Codec.Frame = undefined;
-        for (&frames, &tasks, &storage, &scratch, payloads, 0..) |*frame, *task, *bytes, *output, payload, index| {
-            @memcpy(bytes[framing.headroom..][0..payload.len], payload);
-            frame.* = .{ .task = task, .protocol = 772, .storage = bytes, .length = payload.len, .threshold = null, .output = output };
-            if (index != 0) {
-                tasks[index].state.store(.queued, .release);
-                frames[index - 1].next = frame;
-            }
-        }
-        var connections: [2]Endpoint.Connection = .{ 0, 40 };
-        var destinations: [2][12]u8 = @splat(@splat(0));
-        var sent: [2]Codec.Task = @splat(.{});
-        var targets: [2]Codec.SendTarget = undefined;
-        for (&targets, &sent, &connections, &destinations, 0..) |*target, *task, *connection, *output, index| {
-            task.state.store(.queued, .release);
-            target.* = .{ .task = task, .connection = connection, .bytes = output, .used = 0, .offset = 10, .packets = if (!masked) 0b111 else if (index == 0) 0b101 else 0b110 };
-            if (index != 0) targets[index - 1].next = target;
-        }
-        codec.submit(&tasks[0], .{ .frame_sequence = .{ .first = &frames[0], .targets = &targets[0] } });
-        try std.testing.expectEqual(@as(usize, 1), codec.workers[0].write.load(.acquire));
-        try codec.start();
-        codec.stop();
-        for (&tasks, payloads) |*task, payload| {
-            const result = try (Codec.take(task) orelse return error.MissingFrameCompletion);
-            try std.testing.expectEqualSlices(u8, payload, result.bytes);
-        }
-        for (&sent, destinations, 0..) |*task, output, index| {
-            const result = try (Codec.take(task) orelse return error.MissingSendCompletion);
-            const expected: []const u8 = if (!masked) "abcdef" else if (index == 0) "abf" else "cdef";
-            try std.testing.expectEqual(expected.len, result.consumed);
-            for (expected, 0..) |byte, offset| try std.testing.expectEqual(byte ^ @as(u8, @intCast(index * 40 + offset)), output[(10 + offset) % output.len]);
-        }
+        try std.testing.expectEqualSlices(u8, &encrypted, &actual);
     }
 }
 
@@ -1647,7 +1252,7 @@ test "multishot ciphertext arriving during a codec loan is consumed exactly once
     const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
     const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
     defer owner.deinit();
-    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2, .frames = 1 });
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2 });
     defer codec.deinit();
     try owner.attachCodec(codec);
     const connection = &owner.connections[0];
@@ -1717,7 +1322,7 @@ test "returned decode loans go to waiting peers before a busy peer can reacquire
     const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
     const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 2, .decode_slots = 1, .compression_threshold = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
     defer owner.deinit();
-    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2, .frames = 1 });
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2 });
     defer codec.deinit();
     try owner.attachCodec(codec);
     defer {
@@ -1776,7 +1381,7 @@ test "reload drains ciphertext without waiting for a gameplay decode buffer" {
     const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
     const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 1, .decode_slots = 1, .compression_threshold = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
     defer owner.deinit();
-    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2, .frames = 1 });
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2 });
     defer codec.deinit();
     try owner.attachCodec(codec);
     const held = owner.decoded.acquire().?;
@@ -1896,7 +1501,7 @@ test "exhausted decode pools retain waiters and wake only available capacity" {
     const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
     const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 64, .decode_slots = 1, .compression_threshold = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
     defer owner.deinit();
-    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 64, .frames = 1 });
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 64 });
     defer codec.deinit();
     try owner.attachCodec(codec);
     defer {
@@ -1943,7 +1548,7 @@ test "transport capacity wakes outbound delivery while inbound decoding stays bl
     const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
     const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 1, .decode_slots = 1, .compression_threshold = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
     defer owner.deinit();
-    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 1, .frames = 1 });
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 1 });
     defer codec.deinit();
     try owner.attachCodec(codec);
     defer {
@@ -1961,6 +1566,7 @@ test "transport capacity wakes outbound delivery while inbound decoding stays bl
     connection.state.phase = .play;
     connection.decode_large = true;
     connection.received = 1;
+    connection.output_sealed = 10;
     connection.output_write = 10;
     @memset(owner.output[0..10], 17);
     owner.progress(io);
@@ -1987,7 +1593,7 @@ test "resident decode capacity remains available when every shared decode buffer
     const transport: network.Transport = .{ .context = &native, .vtable = network.Transport.adapter(Native) };
     const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 2, .decode_slots = 1, .compression_threshold = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer });
     defer owner.deinit();
-    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2, .frames = 1 });
+    const codec = try Codec.init(std.testing.allocator, io, transport, .{ .tasks = 2 });
     defer codec.deinit();
     try owner.attachCodec(codec);
     defer {
@@ -2097,41 +1703,13 @@ test "coalesced handshake and login wait for both control leases before consumin
         try std.testing.expect(connection.sending and !connection.closing);
     }
 }
-
-test "stopping before codec startup returns every queued sequence loan" {
-    const Codec = packet_codec.Codec(Endpoint);
-    for ([_]usize{ 1, 4 }) |workers| {
-        var native: Native = .{};
-        const codec = try Codec.init(std.testing.allocator, std.testing.io, .{ .context = &native, .vtable = network.Transport.adapter(Native) }, .{ .tasks = 4, .frames = 1, .workers = workers });
-        defer codec.deinit();
-        var connection: Endpoint.Connection = 17;
-        var recipient: Codec.Task = .{};
-        recipient.state.store(.queued, .release);
-        var output: [8]u8 = @splat(0);
-        var target: Codec.SendTarget = .{ .task = &recipient, .connection = &connection, .bytes = &output, .used = 0, .offset = 0 };
-        var tasks: [2]Codec.Task = @splat(.{});
-        var storage: [2][framing.headroom + 1]u8 = @splat(@splat(0));
-        var frames: [2]Codec.Frame = undefined;
-        for (&frames, &tasks, &storage, 0..) |*frame, *task, *bytes, index| {
-            frame.* = .{ .task = task, .protocol = 772, .storage = bytes, .length = 1, .threshold = null, .output = &output, .next = if (index == 0) &frames[1] else null };
-            if (index != 0) task.begin(.{ .frame = .{ .protocol = 772, .storage = bytes, .length = 1, .threshold = null, .output = &output } });
-        }
-        codec.submit(&tasks[0], .{ .frame_sequence = .{ .first = &frames[0], .targets = &target } });
-        codec.stop();
-        for (&tasks) |*task| try std.testing.expectError(error.Canceled, Codec.take(task).?);
-        try std.testing.expectError(error.Canceled, Codec.take(&recipient).?);
-        try std.testing.expectEqual(@as(u8, 17), connection);
-        try std.testing.expectEqualSlices(u8, &@as([8]u8, @splat(0)), &output);
-    }
-}
-
 test "independent codec workers progress while every other workspace is blocked" {
     const Codec = packet_codec.Codec(Endpoint);
     const io = std.testing.io;
     for ([_]usize{ 1, 2, 4, 8 }) |count| {
         var native: Native = .{};
         var bounded = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-        const codec = try Codec.init(bounded.allocator(), io, .{ .context = &native, .vtable = network.Transport.adapter(Native) }, .{ .tasks = count, .frames = count, .workers = count });
+        const codec = try Codec.init(bounded.allocator(), io, .{ .context = &native, .vtable = network.Transport.adapter(Native) }, .{ .tasks = count, .workers = count });
         defer codec.deinit();
         bounded.fail_index = bounded.alloc_index;
         bounded.resize_fail_index = bounded.resize_index;
@@ -2140,7 +1718,8 @@ test "independent codec workers progress while every other workspace is blocked"
         var storage: [8][framing.headroom + 1]u8 = @splat(@splat(0));
         var output: [8][64]u8 = undefined;
         for (codec.workers, gates[0..count]) |*worker, *gate| worker.workspaces.gate = gate;
-        for (tasks[0..count], storage[0..count], output[0..count]) |*task, *bytes, *destination| codec.submit(task, .{ .frame = .{ .protocol = 772, .storage = bytes, .length = 1, .threshold = null, .output = destination } });
+        var connection: Endpoint.Connection = 0;
+        for (tasks[0..count], storage[0..count], output[0..count]) |*task, *bytes, *destination| codec.submit(task, .{ .decode = .{ .connection = &connection, .bytes = bytes[framing.headroom..], .output = destination, .threshold = null } });
         try codec.start();
         defer codec.stop();
         defer for (gates[0..count]) |*gate| gate.release.set(io);
@@ -2155,168 +1734,4 @@ test "independent codec workers progress while every other workspace is blocked"
         }
         try std.testing.expectEqual(bounded.fail_index, bounded.alloc_index);
     }
-}
-
-test "parallel frame sequences preserve each cipher stream and reuse bounded fanout reservations" {
-    const Codec = packet_codec.Codec(Endpoint);
-    const io = std.testing.io;
-    for ([_]usize{ 2, 4, 8 }) |workers| {
-        var wake: std.Io.Event = .unset;
-        var native: Native = .{ .wake = &wake };
-        var bounded = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-        const codec = try Codec.init(bounded.allocator(), io, .{ .context = &native, .vtable = network.Transport.adapter(Native) }, .{ .tasks = 36, .frames = 1, .workers = workers });
-        defer codec.deinit();
-        bounded.fail_index = bounded.alloc_index;
-        bounded.resize_fail_index = bounded.resize_index;
-        try codec.start();
-        defer codec.stop();
-        var connections: [32]Endpoint.Connection = undefined;
-        var tasks: [32]Codec.Task = @splat(.{});
-        var targets: [32]Codec.SendTarget = undefined;
-        var output: [32][16]u8 = undefined;
-        var expected: [32][16]u8 = undefined;
-        var storage: [4][framing.headroom + 3]u8 = @splat(@splat(0));
-        var frames: [4]Codec.Frame = undefined;
-        var frame_tasks: [4]Codec.Task = @splat(.{});
-        var framed_output: [4][32]u8 = undefined;
-        for (&connections, 0..) |*connection, index| connection.* = @intCast(index * 7);
-        for (0..32) |_| {
-            @memset(&output, @splat(0xcc));
-            expected = output;
-            for (&storage, 0..) |*bytes, index| @memset(bytes[framing.headroom..], @intCast(index + 1));
-            for (&targets, &tasks, &connections, &output, 0..) |*target, *task, *connection, *bytes, index| {
-                task.state.store(.queued, .release);
-                const selected: u32 = @intCast(index % 15 + 1);
-                target.* = .{ .connection = connection, .task = task, .bytes = bytes, .used = 0, .offset = 7, .packets = selected, .next = if (index + 1 < targets.len) &targets[index + 1] else null };
-                var value = connection.*;
-                var at: usize = 7;
-                for (0..frames.len) |packet| {
-                    if (selected & (@as(u32, 1) << @intCast(packet)) == 0) continue;
-                    for (0..3) |_| {
-                        expected[index][at % bytes.len] = @as(u8, @intCast(packet + 1)) ^ value;
-                        value +%= 1;
-                        at += 1;
-                    }
-                }
-            }
-            for (&frames, &frame_tasks, &storage, &framed_output, 0..) |*frame, *task, *bytes, *destination, index| {
-                frame.* = .{ .task = task, .protocol = 772, .storage = bytes, .length = 3, .threshold = null, .output = destination, .next = if (index + 1 < frames.len) &frames[index + 1] else null };
-                if (index != 0) task.begin(.{ .frame = .{ .protocol = 772, .storage = bytes, .length = 3, .threshold = null, .output = destination } });
-            }
-            codec.submit(&frame_tasks[0], .{ .frame_sequence = .{ .first = &frames[0], .targets = &targets[0] } });
-            while (true) {
-                _ = @atomicRmw(std.Io.Event, &wake, .Xchg, .unset, .acq_rel);
-                if (frame_tasks[0].state.load(.acquire) == .complete) break;
-                try waitSignal(&wake);
-            }
-            for (&frame_tasks) |*task| {
-                try std.testing.expectEqual(.complete, task.state.load(.acquire));
-                _ = try Codec.take(task).?;
-            }
-            for (&targets, &tasks, &output, &expected) |target, *task, *actual, *wanted| {
-                const sent = try Codec.take(task).?;
-                try std.testing.expectEqual(@as(usize, @popCount(target.packets) * 3), sent.consumed);
-                try std.testing.expectEqualSlices(u8, wanted, actual);
-            }
-        }
-        try std.testing.expectEqual(bounded.fail_index, bounded.alloc_index);
-    }
-}
-
-test "parallel compression failure returns every loan without advancing ciphers" {
-    const Codec = packet_codec.Codec(Endpoint);
-    const io = std.testing.io;
-    var wake: std.Io.Event = .unset;
-    var native: Native = .{ .wake = &wake };
-    const codec = try Codec.init(std.testing.allocator, io, .{ .context = &native, .vtable = network.Transport.adapter(Native) }, .{ .tasks = 6, .frames = 1, .workers = 4 });
-    defer codec.deinit();
-    try codec.start();
-    defer codec.stop();
-    var connections: [2]Endpoint.Connection = .{ 3, 7 };
-    var tasks: [2]Codec.Task = @splat(.{});
-    var targets: [2]Codec.SendTarget = undefined;
-    var storage: [4][framing.headroom + 1]u8 = @splat(@splat(1));
-    var output: [2][8]u8 = undefined;
-    var frame_output: [4][8]u8 = undefined;
-    var frames: [4]Codec.Frame = undefined;
-    var frame_tasks: [4]Codec.Task = @splat(.{});
-    for ([_]bool{ true, false }) |fail| {
-        for (codec.workers) |*worker| worker.workspaces.failure = if (fail) error.InjectedCompressionFailure else null;
-        @memset(&output, @splat(0xcc));
-        for (&targets, &tasks, &connections, &output, 0..) |*target, *task, *connection, *bytes, index| {
-            task.state.store(.queued, .release);
-            target.* = .{ .connection = connection, .task = task, .bytes = bytes, .used = 0, .offset = 0, .next = if (index == 0) &targets[1] else null };
-        }
-        for (&frames, &frame_tasks, &storage, &frame_output, 0..) |*frame, *task, *bytes, *destination, index| {
-            frame.* = .{ .task = task, .protocol = 772, .storage = bytes, .length = 1, .threshold = null, .output = destination, .next = if (index + 1 < frames.len) &frames[index + 1] else null };
-            if (index != 0) task.begin(.{ .frame = .{ .protocol = 772, .storage = bytes, .length = 1, .threshold = null, .output = destination } });
-        }
-        codec.submit(&frame_tasks[0], .{ .frame_sequence = .{ .first = &frames[0], .targets = &targets[0] } });
-        while (true) {
-            _ = @atomicRmw(std.Io.Event, &wake, .Xchg, .unset, .acq_rel);
-            var complete = true;
-            for (&frame_tasks) |*task| complete = complete and task.state.load(.acquire) == .complete;
-            if (complete) break;
-            try waitSignal(&wake);
-        }
-        for (&frame_tasks) |*task| {
-            const result = Codec.take(task).?;
-            if (fail) try std.testing.expectError(error.InjectedCompressionFailure, result) else _ = try result;
-        }
-        for (&tasks) |*task| {
-            const result = Codec.take(task).?;
-            if (fail) try std.testing.expectError(error.InjectedCompressionFailure, result) else try std.testing.expectEqual(@as(usize, frames.len), (try result).consumed);
-        }
-        try std.testing.expectEqualSlices(u8, if (fail) &.{ 3, 7 } else &.{ 7, 11 }, &connections);
-        if (fail) try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&output), 0xcc));
-    }
-}
-
-test "a recipient completes while an unrelated frame is still compressing" {
-    const Codec = packet_codec.Codec(Endpoint);
-    const io = std.testing.io;
-    var wake: std.Io.Event = .unset;
-    var native: Native = .{ .wake = &wake };
-    const codec = try Codec.init(std.testing.allocator, io, .{ .context = &native, .vtable = network.Transport.adapter(Native) }, .{ .tasks = 4, .frames = 1, .workers = 2 });
-    defer codec.deinit();
-    var gate: Gate = .{};
-    codec.workers[1].workspaces = .{ .gate = &gate, .gate_byte = 1 };
-    try codec.start();
-    defer codec.stop();
-    defer gate.release.set(io);
-    var connections: [2]Endpoint.Connection = @splat(0);
-    var tasks: [2]Codec.Task = @splat(.{});
-    var targets: [2]Codec.SendTarget = undefined;
-    var storage: [2][framing.headroom + 1]u8 = @splat(@splat(0));
-    storage[1][framing.headroom] = 1;
-    var output: [2][8]u8 = undefined;
-    var frame_output: [2][8]u8 = undefined;
-    var frames: [2]Codec.Frame = undefined;
-    var frame_tasks: [2]Codec.Task = @splat(.{});
-    for (&targets, &tasks, &connections, &output, 0..) |*target, *task, *connection, *bytes, index| {
-        task.state.store(.queued, .release);
-        target.* = .{ .connection = connection, .task = task, .bytes = bytes, .used = 0, .offset = 0, .packets = @as(u32, 1) << @intCast(index), .next = if (index == 0) &targets[1] else null };
-    }
-    for (&frames, &frame_tasks, &storage, &frame_output, 0..) |*frame, *task, *bytes, *destination, index| {
-        frame.* = .{ .task = task, .protocol = 772, .storage = bytes, .length = 1, .threshold = null, .output = destination, .next = if (index == 0) &frames[1] else null };
-        if (index != 0) task.begin(.{ .frame = .{ .protocol = 772, .storage = bytes, .length = 1, .threshold = null, .output = destination } });
-    }
-    codec.submit(&frame_tasks[0], .{ .frame_sequence = .{ .first = &frames[0], .targets = &targets[0] } });
-    try waitSignal(&gate.started);
-    while (true) {
-        _ = @atomicRmw(std.Io.Event, &wake, .Xchg, .unset, .acq_rel);
-        if (tasks[0].state.load(.acquire) == .complete) break;
-        try waitSignal(&wake);
-    }
-    try std.testing.expectEqual(@as(usize, 1), (try Codec.take(&tasks[0]).?).consumed);
-    try std.testing.expectEqual(.queued, tasks[1].state.load(.acquire));
-    try std.testing.expectEqual(.queued, frame_tasks[0].state.load(.acquire));
-    gate.release.set(io);
-    while (true) {
-        _ = @atomicRmw(std.Io.Event, &wake, .Xchg, .unset, .acq_rel);
-        if (frame_tasks[0].state.load(.acquire) == .complete and frame_tasks[1].state.load(.acquire) == .complete) break;
-        try waitSignal(&wake);
-    }
-    for (&frame_tasks) |*task| _ = try Codec.take(task).?;
-    try std.testing.expectEqual(@as(usize, 1), (try Codec.take(&tasks[1]).?).consumed);
 }

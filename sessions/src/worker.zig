@@ -8,7 +8,6 @@ const session_protocol_input = @import("input.zig");
 const Service = @import("service.zig").Service;
 const Event = @import("service.zig").Event;
 const shared = @import("shared.zig");
-const packet_output = @import("output.zig");
 const SingleSimulation = @import("router.zig").SingleSimulation;
 pub const Route = @import("router.zig").Route;
 
@@ -53,10 +52,10 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             buffer_bytes: usize = 512 * 1024,
             connection_bytes: usize = 8 * 1024,
             input_burst_slots: usize = 2,
-            output_burst_slots: usize = 8,
+            /// Each connection's ring of Play output, see `Engine.Configuration.output_bytes`.
+            output_bytes: usize = 64 * 1024,
             configuration_slots: usize = 8,
             decode_slots: usize = 2,
-            framing_slots: usize = 8,
             codec_workers: usize = 1,
             max_pending_wire_bytes: usize = 4 * 1024 * 1024,
             protocols: *const Endpoint.Protocols,
@@ -69,44 +68,25 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
 
         const Engine = engine.Engine(Endpoint, Self);
         const Codec = Engine.Codec;
-        comptime {
-            assert(Service.batch_max <= @bitSizeOf(@FieldType(Codec.SendTarget, "packets")));
-        }
-        const Pending = struct {
-            next: ?*Pending = null,
-            order: u64 = 0,
-            source: ?*Service = null,
-            packet: shared.RawPacket = undefined,
-            remaining: std.bit_set.DynamicBitSetUnmanaged,
-            remaining_count: usize = 0,
-            sizes: []usize,
-            frame: ?*Frame = null,
-            group: usize = 0,
-            loans: usize = 0,
 
-            fn complete(self: *Pending, recipient: usize) void {
-                assert(self.remaining.isSet(recipient) and self.remaining_count > 0);
-                self.remaining.unset(recipient);
-                self.remaining_count -= 1;
-            }
+        /// A packet a source published, from when this takes it until every recipient's ring
+        /// holds its bytes. Most go out in the pass that takes them. A recipient whose ring cannot
+        /// take one yet has it in its backlog, which the packet waits on.
+        const Packet = struct {
+            raw: shared.RawPacket = undefined,
+            source: ?usize = null,
+            /// The packet as it goes on the wire, framed and compressed in its own storage.
+            framed: []const u8 = &.{},
+            /// What publishing charged each recipient's credit, refunded but for the bytes sent.
+            charge: usize = 0,
+            /// Backlogs holding the packet.
+            waiting: u32 = 0,
         };
-        const Frame = struct {
-            task: Codec.Task = .{},
-            loan: Engine.Loan = .{},
-            ready: bool = false,
-            // A sequence child may complete before its parent can consume it.
-            completion_observed: bool = false,
-            packet: ?*Pending = null,
-            protocol: i32 = 0,
-            compressed: bool = false,
-            bytes: []u8,
-            targets: ?*Codec.SendTarget = null,
-            sequence: ?Codec.Frame = null,
-            sequence_count: usize = 1,
-            sequence_next: ?*Frame = null,
-            completion_owner: enum { network, sequence } = .network,
-        };
-        const Queue = struct { next_order: u64 = 1, pending_base: usize = 0, head: ?*Pending = null, tail: ?*Pending = null, next: ?usize = null };
+        /// Where a source's packets are among `packets`. Sources sharing a pool share the range.
+        const Source = struct { packet_base: usize = 0 };
+        /// A connection's packets its ring could not take yet, oldest first, the oldest in part
+        /// when `offset` is not zero.
+        const Backlog = struct { head: usize = 0, count: usize = 0, offset: usize = 0 };
         const Previous = struct {
             endpoint: *Service,
             handle: network.Handle,
@@ -125,13 +105,6 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             destination: usize,
         };
 
-        const SequenceCandidate = struct {
-            handle: network.Handle,
-            slot: usize,
-            packets: u32,
-            required: usize,
-        };
-
         allocator: std.mem.Allocator,
         config: Configuration,
         hooks: *Hooks,
@@ -141,39 +114,33 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
         owner_token: Service.Owner = .{},
         bindings: []?Binding,
         selected_routes: []?SelectedRoute,
-        pending: []Pending,
-        recipient_masks: []usize,
-        sequence_members: []SequenceCandidate,
-        // Packet-local recipient ordinals stay borrowed until their sequence completes.
-        sequence_slots: []usize,
-        sequence_candidates: system.IndexSet,
-        frame_sizes: []usize,
-        queues: []Queue,
-        blocked: std.DynamicBitSetUnmanaged,
-        blocked_words: system.IndexSet,
+        sources: []Source,
+        packets: []Packet,
+        backlogs: []Backlog,
+        /// Each connection's backlog: `backlog_capacity` packet indices.
+        backlog_entries: []u32,
+        backlog_capacity: usize,
+        /// Connections whose backlog is not empty.
+        backlogged: system.IndexSet,
+        /// Where packets compress before they go back into their own storage.
+        compressed: []u8,
+        /// Packets every recipient has, per source, returned to it a batch at a time.
+        recycled: [][Service.batch_max]shared.RawPacket,
+        recycled_counts: []usize,
         output_ready: []std.atomic.Value(usize),
         transfers_ready: []std.atomic.Value(usize),
         inputs_ready: []std.atomic.Value(usize),
         progress_ready: []usize,
-        // Delivery itself can unblock later packets without another transport event.
-        delivery_ready: bool = true,
-        active_head: ?usize = null,
-        active_tail: ?usize = null,
         stopping: std.atomic.Value(bool) = .init(false),
         reload_state: std.atomic.Value(enum(u8) { running, requested, parked }) = .init(.running),
         quiescing: bool = false,
         started: bool = false,
         reload_removed: [Endpoint.versions.len]bool = @splat(false),
         instruments: Instrumentation,
-        frames: []Frame = &.{},
-        socket_budget: packet_output.SocketBudget,
-        send_targets: []Codec.SendTarget,
-        target_free: []usize,
-        target_free_count: usize,
 
         pub fn initCodec(self: *Self, io: std.Io, registry: ?*metrics.Registry) !void {
             assert(self.engine.codec == null);
-            const codec = try Codec.init(self.allocator, io, self.engine.networking, .{ .tasks = self.config.connections + self.frames.len, .frames = self.frames.len, .workers = self.config.codec_workers, .metrics = registry });
+            const codec = try Codec.init(self.allocator, io, self.engine.networking, .{ .tasks = self.config.connections, .workers = self.config.codec_workers, .metrics = registry });
             errdefer codec.deinit();
             try self.engine.attachCodec(codec);
         }
@@ -206,23 +173,6 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                 maximum = @max(maximum, endpoint.framedBound(endpoint.config.page_bytes));
             }
 
-            if (config.framing_slots == 0 or config.framing_slots > 64) return error.InvalidCodecCapacity;
-            const frames = try allocator.alloc(Frame, config.framing_slots);
-            errdefer allocator.free(frames);
-            var frames_initialized: usize = 0;
-            errdefer for (frames[0..frames_initialized]) |frame| {
-                allocator.free(frame.bytes);
-            };
-            for (frames) |*frame| {
-                const bytes = try allocator.alloc(u8, maximum);
-                frame.* = .{ .bytes = bytes };
-                frames_initialized += 1;
-            }
-            const send_targets = try allocator.alloc(Codec.SendTarget, config.connections);
-            errdefer allocator.free(send_targets);
-            const target_free = try allocator.alloc(usize, config.connections);
-            errdefer allocator.free(target_free);
-            for (target_free, 0..) |*slot, i| slot.* = config.connections - i - 1;
             const instrumentation = try Instrumentation.init(config.metrics, "session.worker");
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
@@ -234,36 +184,41 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             const selected_routes = try allocator.alloc(?SelectedRoute, config.connections);
             errdefer allocator.free(selected_routes);
             @memset(selected_routes, null);
-            const queues = try allocator.alloc(Queue, endpoints.len);
-            errdefer allocator.free(queues);
-            @memset(queues, .{});
+            const sources = try allocator.alloc(Source, endpoints.len);
+            errdefer allocator.free(sources);
             var packet_capacity: usize = 0;
-            var recipient_capacity: usize = 0;
             for (endpoints, 0..) |endpoint, index| {
-                recipient_capacity = @max(recipient_capacity, endpoint.config.connections);
-                queues[index].pending_base = packet_capacity;
+                sources[index] = .{ .packet_base = packet_capacity };
                 for (endpoints[0..index], 0..) |previous, prior| {
                     if (previous.output.pool == endpoint.output.pool) {
-                        queues[index].pending_base = queues[prior].pending_base;
+                        sources[index].packet_base = sources[prior].packet_base;
                         break;
                     }
                 } else packet_capacity = try std.math.add(usize, packet_capacity, endpoint.output.pages.len);
             }
-            const pending = try allocator.alloc(Pending, packet_capacity);
-            errdefer allocator.free(pending);
-            const sequence_members = try allocator.alloc(SequenceCandidate, recipient_capacity);
-            errdefer allocator.free(sequence_members);
-            const sequence_slots = try allocator.alloc(usize, try std.math.mul(usize, config.connections, @min(config.framing_slots, Service.batch_max)));
-            errdefer allocator.free(sequence_slots);
-            var sequence_candidates = try system.IndexSet.init(allocator, recipient_capacity);
-            errdefer sequence_candidates.deinit(allocator);
-            const recipient_words = std.math.divCeil(usize, recipient_capacity, @bitSizeOf(usize)) catch unreachable;
-            const recipient_masks = try allocator.alloc(usize, try std.math.mul(usize, packet_capacity, recipient_words));
-            errdefer allocator.free(recipient_masks);
-            const groups = config.protocols.values.len * 2;
-            const frame_sizes = try allocator.alloc(usize, try std.math.mul(usize, packet_capacity, groups));
-            errdefer allocator.free(frame_sizes);
-            for (pending, 0..) |*packet, index| packet.* = .{ .remaining = .{ .bit_length = recipient_capacity, .masks = recipient_masks[index * recipient_words ..][0..recipient_words].ptr }, .sizes = frame_sizes[index * groups ..][0..groups] };
+            if (packet_capacity > std.math.maxInt(u32)) return error.InvalidConfiguration;
+            const packets = try allocator.alloc(Packet, packet_capacity);
+            errdefer allocator.free(packets);
+            @memset(packets, .{});
+            // Each packet published charges its recipient at least the bound of the smallest frame,
+            // refunded once its ring takes the packet, so credit bounds how many wait in a backlog.
+            var smallest: usize = std.math.maxInt(usize);
+            for (endpoints) |endpoint| smallest = @min(smallest, endpoint.framedBound(1));
+            const backlog_capacity = config.buffer_bytes / smallest;
+            const backlogs = try allocator.alloc(Backlog, config.connections);
+            errdefer allocator.free(backlogs);
+            @memset(backlogs, .{});
+            const backlog_entries = try allocator.alloc(u32, try std.math.mul(usize, config.connections, backlog_capacity));
+            errdefer allocator.free(backlog_entries);
+            var backlogged = try system.IndexSet.init(allocator, config.connections);
+            errdefer backlogged.deinit(allocator);
+            const compressed = try allocator.alloc(u8, maximum + shared.headroom);
+            errdefer allocator.free(compressed);
+            const recycled = try allocator.alloc([Service.batch_max]shared.RawPacket, endpoints.len);
+            errdefer allocator.free(recycled);
+            const recycled_counts = try allocator.alloc(usize, endpoints.len);
+            errdefer allocator.free(recycled_counts);
+            @memset(recycled_counts, 0);
             const words = std.math.divCeil(usize, endpoints.len, @bitSizeOf(usize)) catch unreachable;
             const output_ready = try allocator.alloc(std.atomic.Value(usize), words);
             errdefer allocator.free(output_ready);
@@ -279,10 +234,6 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                 output.* = .init(0);
                 transfers.* = .init(0);
             }
-            var blocked = try std.DynamicBitSetUnmanaged.initEmpty(allocator, config.connections);
-            errdefer blocked.deinit(allocator);
-            var blocked_words = try system.IndexSet.init(allocator, std.math.divCeil(usize, config.connections, @bitSizeOf(usize)) catch unreachable);
-            errdefer blocked_words.deinit(allocator);
             self.* = .{
                 .allocator = allocator,
                 .config = blk: {
@@ -296,34 +247,28 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                 .endpoints = endpoints,
                 .bindings = bindings,
                 .selected_routes = selected_routes,
-                .pending = pending,
-                .recipient_masks = recipient_masks,
-                .sequence_members = sequence_members,
-                .sequence_slots = sequence_slots,
-                .sequence_candidates = sequence_candidates,
-                .frame_sizes = frame_sizes,
-                .queues = queues,
+                .sources = sources,
+                .packets = packets,
+                .backlogs = backlogs,
+                .backlog_entries = backlog_entries,
+                .backlog_capacity = backlog_capacity,
+                .backlogged = backlogged,
+                .compressed = compressed,
+                .recycled = recycled,
+                .recycled_counts = recycled_counts,
                 .output_ready = output_ready,
                 .transfers_ready = transfers_ready,
                 .inputs_ready = inputs_ready,
                 .progress_ready = progress_ready,
-                .blocked = blocked,
-                .blocked_words = blocked_words,
-                .frames = frames,
-                .socket_budget = .init(frames.len),
-                .send_targets = send_targets,
-                .target_free = target_free,
-                .target_free_count = target_free.len,
                 .instruments = instrumentation,
             };
-            assert(self.socket_budget.capacity < self.frames.len);
             self.engine = try Engine.init(allocator, transport, .{
                 .connections = config.connections,
                 .max_players = config.max_players,
                 .buffer_bytes = config.buffer_bytes,
                 .connection_bytes = config.connection_bytes,
                 .input_burst_slots = config.input_burst_slots,
-                .output_burst_slots = config.output_burst_slots,
+                .output_bytes = config.output_bytes,
                 .configuration_slots = config.configuration_slots,
                 .decode_slots = config.decode_slots,
                 .max_packet = config.buffer_bytes - 3,
@@ -359,18 +304,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
 
         pub fn deinit(self: *Self) void {
             assert(self.drained());
-            assert(self.socket_budget.used == 0);
-            assert(self.active_head == null and self.active_tail == null);
-
             if (self.engine.codec) |codec| codec.deinit();
-            for (self.frames) |frame| {
-                assert(frame.packet == null);
-                self.allocator.free(frame.bytes);
-            }
-            self.allocator.free(self.frames);
-            assert(self.target_free_count == self.target_free.len);
-            self.allocator.free(self.send_targets);
-            self.allocator.free(self.target_free);
 
             for (self.bindings) |binding| assert(binding == null);
             self.engine.deinit();
@@ -379,20 +313,20 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                 endpoint.owner = null;
                 endpoint.readiness = null;
             }
-            for (self.pending) |packet| assert(packet.source == null);
-            self.allocator.free(self.pending);
-            self.allocator.free(self.recipient_masks);
-            self.allocator.free(self.sequence_members);
-            self.allocator.free(self.sequence_slots);
-            self.sequence_candidates.deinit(self.allocator);
-            self.allocator.free(self.frame_sizes);
+            for (self.packets) |packet| assert(packet.source == null);
+            assert(self.backlogged.count == 0);
+            self.allocator.free(self.packets);
+            self.allocator.free(self.backlogs);
+            self.allocator.free(self.backlog_entries);
+            self.backlogged.deinit(self.allocator);
+            self.allocator.free(self.compressed);
+            self.allocator.free(self.recycled);
+            self.allocator.free(self.recycled_counts);
             self.allocator.free(self.output_ready);
             self.allocator.free(self.inputs_ready);
             self.allocator.free(self.transfers_ready);
             self.allocator.free(self.progress_ready);
-            self.allocator.free(self.queues);
-            self.blocked_words.deinit(self.allocator);
-            self.blocked.deinit(self.allocator);
+            self.allocator.free(self.sources);
             self.allocator.free(self.selected_routes);
             self.allocator.free(self.bindings);
             self.allocator.free(self.config.destinations);
@@ -429,19 +363,13 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             if (self.engine.codec) |codec| assert(codec.stopped());
             for (self.endpoints) |endpoint| assert(!endpoint.tick_active);
             self.discardInputs();
+            while (self.backlogged.count != 0) self.dropBacklog(io, self.backlogged.indices[0]);
             for (self.engine.connections, 0..) |*connection, index| {
-                if (Codec.take(&connection.codec)) |result| {
-                    if (result) |value| {
-                        if (value.burst) |lease| lease.release();
-                    } else |_| {}
-                }
+                if (Codec.take(&connection.codec)) |_| {}
                 assert(connection.codec.state.load(.acquire) == .idle);
-                if (connection.send_loan) |loan| loan.release();
-                connection.send_loan = null;
                 connection.receiving = false;
                 connection.sending = false;
                 connection.loan.store(false, .release);
-                connection.frame_targets = 0;
                 if (connection.handle) |handle| {
                     self.closed(handle);
                     if (connection.lifecycle) |*lifecycle| Endpoint.clear(lifecycle);
@@ -451,48 +379,11 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                 }
             }
             assert(self.engine.admitted == 0);
-            for (self.frames) |*frame| {
-                if (Codec.take(&frame.task)) |_| {}
-                assert(frame.task.state.load(.acquire) == .idle);
-                assert(frame.loan.sockets == 0);
-                if (frame.loan.references != 0) {
-                    assert(frame.loan.references == 1);
-                    frame.loan.release();
-                }
-                frame.ready = false;
-                frame.packet = null;
-                frame.targets = null;
-                frame.completion_owner = .network;
-                frame.sequence_next = null;
-                frame.sequence_count = 1;
-                frame.sequence = null;
-            }
-            self.target_free_count = self.target_free.len;
-            for (self.target_free, 0..) |*slot, index| slot.* = index;
-            for (self.endpoints) |endpoint| {
-                var packets: [Service.batch_max]shared.RawPacket = undefined;
-                var count: usize = 0;
-                for (self.pending) |*pending| if (pending.source == endpoint) {
-                    packets[count] = pending.packet;
-                    count += 1;
-                    pending.source = null;
-                    pending.frame = null;
-                    pending.loans = 0;
-                    if (count == packets.len) {
-                        endpoint.recycle(io, &packets);
-                        count = 0;
-                    }
-                };
+            assert(self.backlogged.count == 0);
+            for (self.endpoints, 0..) |endpoint, index| {
                 var batch = endpoint.outputBatch();
-                while (batch.next()) |packet| {
-                    packets[count] = packet;
-                    count += 1;
-                    if (count == packets.len) {
-                        endpoint.recycle(io, &packets);
-                        count = 0;
-                    }
-                }
-                endpoint.recycle(io, packets[0..count]);
+                while (batch.next()) |packet| self.recycle(io, index, packet);
+                self.flushRecycled(io, index);
                 assert(endpoint.preparing.load(.acquire) == 0);
                 @memset(endpoint.routes, null);
                 for (endpoint.occupied) |*occupied| occupied.store(false, .release);
@@ -507,132 +398,9 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                 inputs.store(0, .release);
             }
             @memset(self.progress_ready, 0);
-            for (self.queues) |*queue| queue.* = .{ .pending_base = queue.pending_base };
-            self.active_head = null;
-            self.active_tail = null;
             @memset(self.bindings, null);
             @memset(self.selected_routes, null);
-            assert(self.drained() and self.socket_budget.used == 0);
-        }
-
-        fn prepareSequence(self: *Self, origin: usize, pending: *Pending) !bool {
-            const group = pending.packet.group;
-            if (group.index != 0 or group.count > self.frames.len) return false;
-            var frames: [Service.batch_max]*Frame = undefined;
-            var available: usize = 0;
-            for (self.frames) |*frame| if (frame.packet == null and available < frames.len) {
-                frames[available] = frame;
-                available += 1;
-            };
-            if (available < group.count) return false;
-            var members: [Service.batch_max]*Pending = undefined;
-            var next: ?*Pending = pending;
-            var count: usize = 0;
-            var charge: usize = 0;
-            while (count < (if (group.count > 1) group.count else available)) {
-                const entry = next orelse break;
-                if (group.count > 1) {
-                    assert(entry.packet.group.first == group.first and entry.packet.group.generation == group.generation and entry.packet.group.index == count);
-                    assert(entry.packet.group.count == group.count and entry.packet.recipients.len == pending.packet.recipients.len);
-                    assert(entry.packet.sameAudience(pending.packet));
-                } else {
-                    if (entry.packet.group.count != 1 or entry.packet.group.protocol != group.protocol) break;
-                }
-                if (entry.frame != null) break;
-                const bound = pending.source.?.framedBound(entry.packet.boundLength());
-                if (bound > self.config.buffer_bytes - charge) break;
-                charge += bound;
-                members[count] = entry;
-                count += 1;
-                next = entry.next;
-            }
-            if (count < 2 or (group.count > 1 and count != group.count)) return false;
-            const endpoint = pending.source.?;
-            var targets: ?*Codec.SendTarget = null;
-            var compressed: ?bool = null;
-            var protocol: ?i32 = group.protocol;
-            const stride = @min(self.frames.len, Service.batch_max);
-            self.sequence_candidates.clear();
-            for (members[0..count], 0..) |member, position| {
-                var remaining = member.remaining.iterator(.{});
-                while (remaining.next()) |recipient| {
-                    const handle = member.packet.recipients.at(recipient);
-                    if (!self.sequence_candidates.contains(handle.index)) {
-                        const credit = endpoint.credit[handle.index].load(.acquire);
-                        if (credit >> 32 != handle.generation or credit & Service.active == 0) continue;
-                        if (self.target_free_count == 0) continue;
-                        const native = endpoint.routes[handle.index] orelse continue;
-                        const connection = &self.engine.connections[native.index];
-                        if (self.blocked.isSet(native.index) or !self.engine.groupReady(native, origin, group) or connection.codec.state.load(.acquire) != .idle or connection.received != 0 or !Endpoint.encrypted(&connection.lifecycle.?)) continue;
-                        if (protocol) |number| if (connection.protocol.?.number != number) continue;
-                        self.target_free_count -= 1;
-                        self.sequence_members[handle.index] = .{ .handle = handle, .slot = self.target_free[self.target_free_count], .packets = 0, .required = 0 };
-                        self.sequence_candidates.insert(handle.index);
-                    }
-                    const candidate = &self.sequence_members[handle.index];
-                    if (candidate.handle.generation != handle.generation) continue;
-                    const bit = @as(u32, 1) << @intCast(position);
-                    assert(candidate.packets & bit == 0);
-                    candidate.packets |= bit;
-                    candidate.required += endpoint.framedBound(member.packet.boundLength());
-                    self.sequence_slots[candidate.slot * stride + position] = recipient;
-                }
-            }
-            for (self.sequence_candidates.values()) |index| {
-                const candidate = self.sequence_members[index];
-                var retained = false;
-                defer if (!retained) {
-                    self.target_free[self.target_free_count] = candidate.slot;
-                    self.target_free_count += 1;
-                };
-                if (group.count > 1 and @popCount(candidate.packets) != count) continue;
-                const native = endpoint.routes[index].?;
-                const connection = &self.engine.connections[native.index];
-                if (protocol) |number| if (connection.protocol.?.number != number) continue;
-                const compression = Endpoint.compressed(&connection.lifecycle.?);
-                if (compressed) |selected| if (selected != compression) continue;
-                self.engine.reserveOutput(native, candidate.required) catch continue;
-                const destination = self.engine.prepareSend(native) catch continue;
-                connection.frame_targets += 1;
-                self.engine.claimGroup(native, origin, group);
-                compressed = compression;
-                protocol = connection.protocol.?.number;
-                const target = &self.send_targets[candidate.slot];
-                target.* = destination;
-                target.index = candidate.slot;
-                target.recipient = index;
-                assert(@popCount(candidate.packets) > 0 and @popCount(candidate.packets) <= count);
-                target.packets = candidate.packets;
-                target.next = targets;
-                targets = target;
-                retained = true;
-            }
-            if (targets == null) return false;
-            for (frames[0..count], members[0..count], 0..) |frame, member, index| {
-                frame.completion_observed = false;
-                frame.packet = member;
-                member.frame = frame;
-                member.loans += 1;
-                frame.protocol = protocol.?;
-                frame.compressed = compressed.?;
-                frame.targets = if (index == 0) targets else null;
-                frame.sequence_count = if (index == 0) count else 1;
-                frame.sequence_next = if (index + 1 < count) frames[index + 1] else null;
-                frame.completion_owner = if (index == 0) .network else .sequence;
-                frame.sequence = .{ .task = &frame.task, .protocol = frame.protocol, .storage = endpoint.output.framingStorage(member.packet), .length = member.packet.bytes.len, .decoded_length = member.packet.decoded_length, .threshold = if (compressed.?) self.config.compression_threshold else null, .output = frame.bytes };
-                if (index != 0) {
-                    frame.task.begin(.{ .frame = .{ .protocol = frame.protocol, .storage = frame.sequence.?.storage, .length = frame.sequence.?.length, .threshold = frame.sequence.?.threshold, .output = frame.bytes } });
-                    frames[index - 1].sequence.?.next = &frame.sequence.?;
-                }
-            }
-            const operation: Codec.Operation = .{ .frame_sequence = .{ .first = &frames[0].sequence.?, .targets = targets.? } };
-            if (self.engine.codec) |codec| {
-                codec.submit(&frames[0].task, operation);
-            } else {
-                frames[0].task.begin(operation);
-                Codec.execute(&self.engine.workspaces, &frames[0].task);
-            }
-            return true;
+            assert(self.drained());
         }
 
         pub fn stop(self: *Self) void {
@@ -687,6 +455,10 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             for (self.endpoints) |endpoint| endpoint.discardInputs();
         }
 
+        /// Takes what every source published, frames each packet once and writes it into each
+        /// recipient's ring, then encrypts every ring's new bytes side by side and sends them.
+        /// Credit guarantees the rings room for what was published, but for packets larger than
+        /// a ring, which go out in pieces, and what waits behind them in a backlog.
         fn deliver(self: *Self, io: std.Io) !void {
             for (self.output_ready, 0..) |*word, word_index| {
                 var ready = word.swap(0, .acq_rel);
@@ -694,391 +466,160 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                     const index = word_index * @bitSizeOf(usize) + @ctz(ready);
                     ready &= ready - 1;
                     assert(index < self.endpoints.len);
-                    const endpoint = self.endpoints[index];
-                    const queue = &self.queues[index];
-                    const was_empty = queue.head == null;
-                    var batch = endpoint.outputBatch();
-                    while (batch.next()) |packet| {
-                        assert(packet.page < endpoint.output.pages.len);
-                        const pending = &self.pending[queue.pending_base + packet.page];
-                        assert(pending.source == null and pending.loans == 0);
-                        self.delivery_ready = true;
-                        pending.source = endpoint;
-                        pending.order = queue.next_order;
-                        queue.next_order += 1;
-                        if (queue.tail) |tail| assert(tail.order < pending.order);
-                        pending.packet = packet;
-                        pending.next = null;
-                        pending.frame = null;
-                        pending.group = 0;
-                        @memset(pending.sizes, 0);
-                        assert(packet.recipients.handles.len <= self.sequence_members.len);
-                        pending.remaining.bit_length = packet.recipients.handles.len;
-                        pending.remaining.unsetAll();
-                        if (packet.recipients.mask.len == 0) {
-                            pending.remaining.setRangeValue(.{ .start = 0, .end = packet.recipients.len }, true);
-                        } else {
-                            const words = (pending.remaining.bit_length + @bitSizeOf(usize) - 1) / @bitSizeOf(usize);
-                            assert(words == packet.recipients.mask.len);
-                            @memcpy(pending.remaining.masks[0..words], packet.recipients.mask[0..words]);
-                        }
-                        pending.remaining_count = packet.recipients.len;
-                        if (queue.tail) |tail| tail.next = pending else queue.head = pending;
-                        queue.tail = pending;
-                    }
-                    if (was_empty and queue.head != null) self.activate(index);
+                    var batch = self.endpoints[index].outputBatch();
+                    while (batch.next()) |packet| self.take(io, index, packet);
                 }
             }
-            try self.deliverFrames(io);
+            self.drainBacklogs(io);
+            for (self.endpoints, 0..) |_, index| self.flushRecycled(io, index);
+            self.engine.sealPlay(io);
         }
 
-        fn activate(self: *Self, index: usize) void {
-            const queue = &self.queues[index];
-            assert(queue.head != null and queue.next == null);
-            assert(queue.tail != null and queue.tail.?.next == null);
-            assert(self.active_head != index and self.active_tail != index);
-            if (self.active_tail) |tail| self.queues[tail].next = index else self.active_head = index;
-            self.active_tail = index;
-        }
-
-        fn block(self: *Self, index: usize) void {
-            assert(index < self.engine.connections.len);
-            self.blocked.set(index);
-            self.blocked_words.insert(index / @bitSizeOf(usize));
-        }
-
-        fn deliverFrames(self: *Self, io: std.Io) !void {
-            self.delivery_ready = self.delivery_ready or self.engine.delivery_ready;
-            self.engine.delivery_ready = false;
-            for (self.frames) |*frame| {
-                if (frame.task.state.load(.acquire) == .complete and !frame.completion_observed) {
-                    assert(frame.packet != null);
-                    frame.completion_observed = true;
-                    self.delivery_ready = true;
-                }
-                if (frame.packet) |pending| {
-                    if (pending.frame != frame and frame.loan.references == 0) {
-                        assert(frame.task.state.load(.acquire) == .idle);
-                        pending.loans -= 1;
-                        frame.packet = null;
-                        self.delivery_ready = true;
-                    }
-                }
-            }
-            if (!self.delivery_ready) return;
-            self.delivery_ready = false;
-            for (self.frames) |*frame| {
-                if (frame.packet == null or frame.task.state.load(.acquire) != .queued) break;
-                assert(!frame.ready);
-            } else return;
-            var capacity_waiting = false;
-            var prepared = false;
-            for (self.blocked_words.values()) |word| self.blocked.masks[word] = 0;
-            self.blocked_words.clear();
-            self.engine.output_pressure = false;
-            const last = self.active_tail;
-            while (self.active_head) |index| {
-                const queue = &self.queues[index];
-                assert(queue.head != null);
-                self.active_head = queue.next;
-                if (self.active_head == null) self.active_tail = null;
-                queue.next = null;
-                var recycled: [Service.batch_max]shared.RawPacket = undefined;
-                var recycled_count: usize = 0;
-                defer self.endpoints[index].recycle(io, recycled[0..recycled_count]);
-                var previous: ?*Pending = null;
-                var next = queue.head;
-                while (next) |pending| {
-                    assert(pending.order > 0);
-                    var available = false;
-                    var in_flight = false;
-                    for (self.frames) |frame| {
-                        const held = frame.packet orelse {
-                            available = true;
-                            break;
-                        };
-                        assert(held.source != null and held.order > 0);
-                        if (held.source == self.endpoints[index] and held.order >= pending.order) in_flight = true;
-                    }
-                    // Later completions must still be consumed when the framing pool is full.
-                    if (!available and !in_flight) {
-                        capacity_waiting = true;
-                        break;
-                    }
-                    prepared = true;
-                    const endpoint = pending.source.?;
-                    assert(endpoint == self.endpoints[index]);
-                    const packet = pending.packet;
-                    const charge = endpoint.framedBound(packet.boundLength());
-                    var checking = pending.remaining.iterator(.{});
-                    if (pending.frame == null or pending.frame.?.ready) {
-                        while (checking.next()) |recipient| {
-                            const handle = packet.recipients.at(recipient);
-                            const credit = endpoint.credit[handle.index].load(.acquire);
-                            if (credit >> 32 != handle.generation or credit & Service.active == 0) {
-                                pending.complete(recipient);
-                                self.delivery_ready = true;
-                                continue;
-                            }
-                            const native = endpoint.routes[handle.index] orelse unreachable;
-                            if (self.engine.discardGroup(native)) {
-                                endpoint.refund(handle, charge);
-                                pending.complete(recipient);
-                                self.delivery_ready = true;
-                            }
-                        }
-                    }
-                    const needs_frame = pending.remaining_count != 0;
-                    if (pending.frame == null and needs_frame) _ = try self.prepareSequence(index, pending);
-                    if (pending.frame == null and needs_frame) {
-                        const free = for (self.frames) |*frame| {
-                            if (frame.packet == null) break frame;
-                        } else null;
-                        if (free) |frame| {
-                            const known_protocol = if (packet.group.protocol) |number| selected: {
-                                for (self.config.protocols.values, 0..) |value, protocol_index|
-                                    if (value.number == number) break :selected protocol_index;
-                                unreachable;
-                            } else null;
-                            const groups = if (known_protocol != null) @as(usize, 2) else self.config.protocols.values.len * 2;
-                            for (0..groups) |offset| {
-                                const group = if (known_protocol) |protocol_index|
-                                    protocol_index * 2 + (pending.group + offset) % 2
-                                else
-                                    (pending.group + offset) % groups;
-                                const selected = self.config.protocols.values[group / 2];
-                                const compressed = group % 2 != 0;
-                                var eligible = false;
-                                assert(frame.targets == null);
-                                var selecting = pending.remaining.iterator(.{});
-                                while (selecting.next()) |recipient_index| {
-                                    const handle = packet.recipients.at(recipient_index);
-                                    const native = endpoint.routes[handle.index] orelse unreachable;
-                                    const connection = &self.engine.connections[native.index];
-                                    if (!self.engine.groupReady(native, index, packet.group)) continue;
-                                    if (self.blocked.isSet(native.index) or connection.codec.state.load(.acquire) != .idle or connection.received != 0) continue;
-                                    if (connection.protocol.?.number != selected.number or Endpoint.compressed(&connection.lifecycle.?) != compressed) continue;
-                                    if (pending.sizes[group] != 0 and !self.engine.canSendFramed(native, pending.sizes[group], .{ .sockets = &self.socket_budget })) continue;
-                                    if (Endpoint.encrypted(&connection.lifecycle.?)) {
-                                        if (self.target_free_count == 0) continue;
-                                        self.engine.reserveGroupOutput(native, packet.group) catch {
-                                            self.block(native.index);
-                                            continue;
-                                        };
-                                        self.engine.reserveOutput(native, if (pending.sizes[group] != 0) pending.sizes[group] else charge) catch {
-                                            self.block(native.index);
-                                            continue;
-                                        };
-                                        const target = self.engine.prepareSend(native) catch |err| switch (err) {
-                                            error.Full => {
-                                                self.block(native.index);
-                                                continue;
-                                            },
-                                            error.Closed => {
-                                                endpoint.refund(handle, charge);
-                                                pending.complete(recipient_index);
-                                                self.delivery_ready = true;
-                                                continue;
-                                            },
-                                        };
-                                        self.engine.claimGroup(native, index, packet.group);
-                                        connection.frame_targets += 1;
-                                        self.target_free_count -= 1;
-                                        const slot = self.target_free[self.target_free_count];
-                                        const destination = &self.send_targets[slot];
-                                        destination.* = target;
-                                        destination.index = slot;
-                                        destination.recipient = recipient_index;
-                                        destination.next = frame.targets;
-                                        frame.targets = destination;
-                                    }
-                                    eligible = true;
-                                }
-                                if (!eligible) continue;
-                                frame.sequence = null;
-                                frame.sequence_count = 1;
-                                frame.sequence_next = null;
-                                frame.completion_owner = .network;
-                                frame.completion_observed = false;
-                                frame.packet = pending;
-                                pending.loans += 1;
-                                frame.protocol = selected.number;
-                                frame.compressed = compressed;
-                                pending.frame = frame;
-                                pending.group = if (known_protocol != null) (group + 1) % 2 else (group + 1) % groups;
-                                const operation: Codec.Operation = .{ .frame = .{ .protocol = selected.number, .storage = endpoint.output.framingStorage(packet), .length = packet.bytes.len, .decoded_length = packet.decoded_length, .threshold = if (compressed) self.config.compression_threshold else null, .output = frame.bytes, .targets = frame.targets } };
-                                if (self.engine.codec) |codec| {
-                                    codec.submit(&frame.task, operation);
-                                } else {
-                                    frame.task.begin(operation);
-                                    Codec.execute(&self.engine.workspaces, &frame.task);
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    if (pending.frame) |frame| {
-                        if (!frame.ready and frame.completion_owner == .network) {
-                            if (Codec.take(&frame.task)) |result| {
-                                self.delivery_ready = true;
-                                var next_target = frame.targets;
-                                while (next_target) |target| {
-                                    next_target = target.next;
-                                    const recipient_index = if (frame.sequence != null) target.recipient else packet.recipients.at(target.recipient).index;
-                                    const native = endpoint.routes[recipient_index].?;
-                                    const connection = &self.engine.connections[native.index];
-                                    assert(connection.frame_targets > 0);
-                                    if (self.engine.codec == null) {
-                                        const completion = try (Codec.take(target.task) orelse unreachable);
-                                        assert(target.task.operation == .send);
-                                        try self.engine.commitSend(io, native, completion.consumed, completion.burst);
-                                    }
-                                    if (target.sent) {
-                                        if (frame.sequence != null) {
-                                            var member: ?*Frame = frame;
-                                            var position: usize = 0;
-                                            while (position < frame.sequence_count) : (position += 1) {
-                                                const entry = member.?.packet.?;
-                                                member = member.?.sequence_next;
-                                                if (target.packets & (@as(u32, 1) << @intCast(position)) == 0) continue;
-                                                const recipient = self.sequence_slots[target.index * @min(self.frames.len, Service.batch_max) + position];
-                                                assert(entry.packet.group.index == (if (packet.group.count > 1) position else 0) and entry.remaining.isSet(recipient));
-                                                const encoded = entry.frame.?.sequence.?.bytes;
-                                                const handle = entry.packet.recipients.at(recipient);
-                                                assert(handle.index == target.recipient);
-                                                entry.complete(recipient);
-                                                self.delivery_ready = true;
-                                                self.engine.completeGroupPacket(native, index, entry.packet.group);
-                                                endpoint.refund(handle, endpoint.framedBound(entry.packet.boundLength()) - encoded.len);
-                                                self.instruments.fanout_bytes.add(encoded.len);
-                                            }
-                                            assert(member == null);
-                                        } else {
-                                            assert(pending.remaining.isSet(target.recipient));
-                                            pending.complete(target.recipient);
-                                            self.delivery_ready = true;
-                                            self.engine.completeGroupPacket(native, index, packet.group);
-                                            const bytes = (try result).bytes;
-                                            endpoint.refund(packet.recipients.at(target.recipient), charge - bytes.len);
-                                            self.instruments.fanout_bytes.add(bytes.len);
-                                        }
-                                    }
-                                    connection.frame_targets -= 1;
-                                    self.engine.readiness.signal(native.index).notify();
-                                    self.target_free[self.target_free_count] = target.index;
-                                    self.target_free_count += 1;
-                                }
-                                frame.targets = null;
-                                var member = if (frame.sequence_count > 1) frame.sequence_next else null;
-                                while (member) |entry| {
-                                    assert(entry.completion_owner == .sequence and entry.packet != null);
-                                    entry.completion_owner = .network;
-                                    member = entry.sequence_next;
-                                }
-                                assert(frame.loan.references == 0 and frame.loan.sockets == 0);
-                                frame.loan = Engine.Loan.framed((try result).bytes, packet.bytes);
-                                frame.ready = true;
-                                self.instruments.encoded_packets.add(1);
-                                self.instruments.encoded_bytes.add(packet.bytes.len);
-                                self.instruments.framed_bytes.add(frame.loan.length());
-                            }
-                        }
-                        if (frame.ready) {
-                            const length = frame.loan.length();
-                            for (self.config.protocols.values, 0..) |selected, protocol_index| if (selected.number == frame.protocol) {
-                                pending.sizes[protocol_index * 2 + @intFromBool(frame.compressed)] = length;
-                            };
-                            const fanout = self.instruments.fanout.start();
-                            defer fanout.end();
-                            var sending = pending.remaining.iterator(.{});
-                            while (sending.next()) |recipient| {
-                                const handle = packet.recipients.at(recipient);
-                                // A send above can close a connection, which detaches its route. The next pass
-                                // finds the session gone and completes the recipient.
-                                const native = endpoint.routes[handle.index] orelse continue;
-                                if (!self.engine.groupReady(native, index, packet.group) or self.blocked.isSet(native.index)) continue;
-                                const connection = &self.engine.connections[native.index];
-                                if (connection.protocol.?.number != frame.protocol or Endpoint.compressed(&connection.lifecycle.?) != frame.compressed) continue;
-                                assert(frame.loan.references > frame.loan.sockets);
-                                assert(self.socket_budget.used < self.frames.len);
-                                self.engine.reserveGroupOutput(native, packet.group) catch {
-                                    self.block(native.index);
-                                    continue;
-                                };
-                                self.engine.claimGroup(native, index, packet.group);
-                                self.engine.sendFramed(io, native, &frame.loan, .{ .sockets = &self.socket_budget }) catch |err| switch (err) {
-                                    error.Full => {
-                                        self.block(native.index);
-                                        continue;
-                                    },
-                                    error.Closed => {
-                                        endpoint.refund(handle, charge);
-                                        pending.complete(recipient);
-                                        self.delivery_ready = true;
-                                        continue;
-                                    },
-                                    else => return err,
-                                };
-                                assert(frame.loan.references > frame.loan.sockets);
-                                assert(self.socket_budget.used < self.frames.len);
-                                pending.complete(recipient);
-                                self.delivery_ready = true;
-                                self.engine.completeGroupPacket(native, index, packet.group);
-                                endpoint.refund(handle, charge - length);
-                                self.instruments.fanout_bytes.add(length);
-                            }
-                            assert(frame.loan.references > frame.loan.sockets);
-                            frame.loan.release();
-                            assert(frame.loan.references >= frame.loan.sockets);
-                            frame.ready = false;
-                            pending.frame = null;
-                            if (frame.loan.references == 0) {
-                                assert(frame.completion_owner == .network);
-                                frame.packet = null;
-                                pending.loans -= 1;
-                            }
-                        }
-                    }
-                    if (pending.remaining_count == 0 and pending.frame == null and pending.loans == 0) {
-                        next = pending.next;
-                        if (previous) |before| before.next = next else queue.head = next;
-                        if (queue.tail == pending) queue.tail = previous;
-                        pending.source = null;
-                        recycled[recycled_count] = packet;
-                        recycled_count += 1;
-                        if (recycled_count == recycled.len) {
-                            endpoint.recycle(io, &recycled);
-                            recycled_count = 0;
-                        }
-                        continue;
-                    }
-                    var blocking = pending.remaining.iterator(.{});
-                    while (blocking.next()) |recipient| {
-                        const handle = packet.recipients.at(recipient);
-                        // Sending can have detached this recipient. The next pass completes it.
-                        const native = endpoint.routes[handle.index] orelse continue;
-                        if (self.engine.groupReady(native, index, packet.group)) self.block(native.index);
-                    }
-                    previous = pending;
-                    next = pending.next;
-                }
-                if (queue.head != null) self.activate(index);
-                if (index == last.?) break;
-            }
-            if (self.active_head) |first| if (self.active_tail.? != first) {
-                const queue = &self.queues[first];
-                self.active_head = queue.next;
-                queue.next = null;
-                self.activate(first);
+        fn take(self: *Self, io: std.Io, source: usize, raw: shared.RawPacket) void {
+            const endpoint = self.endpoints[source];
+            assert(raw.page < endpoint.output.pages.len);
+            const packet_index = self.sources[source].packet_base + raw.page;
+            const packet = &self.packets[packet_index];
+            assert(packet.source == null and packet.waiting == 0);
+            packet.* = .{ .raw = raw, .source = source, .charge = endpoint.framedBound(raw.boundLength()) };
+            packet.framed = self.frame(endpoint, raw) catch |err| {
+                std.log.warn("event=session_packet_unframed bytes={d} reason={s}", .{ raw.bytes.len, @errorName(err) });
+                var recipients = raw.recipients.iterator();
+                while (recipients.next()) |handle| endpoint.refund(handle, packet.charge);
+                self.recycle(io, source, raw);
+                packet.* = .{};
+                return;
             };
-            if (capacity_waiting) for (self.frames) |frame| {
-                if (frame.packet == null) {
-                    self.delivery_ready = true;
-                    self.engine.networking.notify(io);
-                    break;
+            self.instruments.encoded_packets.add(1);
+            self.instruments.encoded_bytes.add(raw.bytes.len);
+            self.instruments.framed_bytes.add(packet.framed.len);
+            const fanout = self.instruments.fanout.start();
+            defer fanout.end();
+            var recipients = raw.recipients.iterator();
+            while (recipients.next()) |handle| {
+                // A recipient gone since took its credit with it.
+                const credit = endpoint.credit[handle.index].load(.acquire);
+                if (credit >> 32 != handle.generation or credit & Service.active == 0) continue;
+                const native = endpoint.routes[handle.index] orelse continue;
+                const room = self.engine.playRoom(native) orelse {
+                    endpoint.refund(handle, packet.charge);
+                    continue;
+                };
+                const backlog = &self.backlogs[native.index];
+                if (backlog.count == 0 and room >= packet.framed.len) {
+                    self.engine.writePlay(io, native, packet.framed);
+                    endpoint.refund(handle, packet.charge - packet.framed.len);
+                    self.instruments.fanout_bytes.add(packet.framed.len);
+                    continue;
                 }
+                assert(backlog.count < self.backlog_capacity);
+                self.backlog_entries[native.index * self.backlog_capacity + (backlog.head + backlog.count) % self.backlog_capacity] = @intCast(packet_index);
+                backlog.count += 1;
+                packet.waiting += 1;
+                self.backlogged.insert(native.index);
+            }
+            if (packet.waiting == 0) {
+                self.recycle(io, source, raw);
+                packet.* = .{};
+            }
+        }
+
+        /// The packet as it goes on the wire: its frame length, and with compression on, its
+        /// decoded length, in the headroom before it, compressing it first when it reaches the
+        /// threshold. Compressed bytes go back into the packet's own storage, which publishing
+        /// reserved room for, as they wait there for every recipient.
+        fn frame(self: *Self, endpoint: *Service, raw: shared.RawPacket) ![]const u8 {
+            const storage = endpoint.output.packetStorage(raw);
+            const number = raw.group.protocol orelse endpoint.config.protocols[0].number;
+            const threshold = self.config.compression_threshold;
+            const compressing = self.instruments.compression.start();
+            defer compressing.end();
+            const framed = if (raw.decoded_length != 0)
+                try Endpoint.preparedFrame(number, &self.engine.workspaces, storage, raw.bytes.len, raw.decoded_length, threshold, self.compressed)
+            else
+                try Endpoint.sharedFrame(number, &self.engine.workspaces, storage, raw.bytes.len, threshold, self.compressed);
+            const start = @intFromPtr(storage.ptr);
+            if (@intFromPtr(framed.ptr) >= start and @intFromPtr(framed.ptr) < start + storage.len) return framed;
+            if (framed.len > storage.len) return error.FrameTooLarge;
+            @memcpy(storage[0..framed.len], framed);
+            return storage[0..framed.len];
+        }
+
+        fn drainBacklogs(self: *Self, io: std.Io) void {
+            var at: usize = 0;
+            while (at < self.backlogged.count) {
+                const index = self.backlogged.indices[at];
+                if (self.drain(io, index)) self.backlogged.remove(index) else at += 1;
+            }
+        }
+
+        /// Writes as much of a connection's backlog as its ring takes, true once it is empty.
+        fn drain(self: *Self, io: std.Io, index: usize) bool {
+            const backlog = &self.backlogs[index];
+            // A connection keeps its binding while anything published to it waits, since moving
+            // it waits for all of its credit back.
+            const binding = self.bindings[index] orelse {
+                self.dropBacklog(io, index);
+                return true;
             };
-            self.instruments.empty_preparations.add(@intFromBool(!prepared));
+            while (backlog.count != 0) {
+                const packet_index = self.backlog_entries[index * self.backlog_capacity + backlog.head];
+                const packet = &self.packets[packet_index];
+                const room = self.engine.playRoom(binding.native) orelse {
+                    self.dropBacklog(io, index);
+                    return true;
+                };
+                const rest = packet.framed[backlog.offset..];
+                const count = @min(room, rest.len);
+                if (count == 0) return false;
+                self.engine.writePlay(io, binding.native, rest[0..count]);
+                self.instruments.fanout_bytes.add(count);
+                backlog.offset += count;
+                if (backlog.offset < packet.framed.len) return false;
+                binding.endpoint.refund(binding.handle, packet.charge - packet.framed.len);
+                backlog.offset = 0;
+                backlog.head = (backlog.head + 1) % self.backlog_capacity;
+                backlog.count -= 1;
+                self.releasePacket(io, packet_index);
+            }
+            return true;
+        }
+
+        /// Gives up what a connection that takes no more output was waiting for.
+        fn dropBacklog(self: *Self, io: std.Io, index: usize) void {
+            const backlog = &self.backlogs[index];
+            const binding = self.bindings[index];
+            while (backlog.count != 0) {
+                const packet_index = self.backlog_entries[index * self.backlog_capacity + backlog.head];
+                if (binding) |bound| bound.endpoint.refund(bound.handle, self.packets[packet_index].charge);
+                backlog.head = (backlog.head + 1) % self.backlog_capacity;
+                backlog.count -= 1;
+                self.releasePacket(io, packet_index);
+            }
+            backlog.* = .{};
+            self.backlogged.remove(index);
+        }
+
+        fn releasePacket(self: *Self, io: std.Io, packet_index: u32) void {
+            const packet = &self.packets[packet_index];
+            assert(packet.waiting > 0);
+            packet.waiting -= 1;
+            if (packet.waiting != 0) return;
+            self.recycle(io, packet.source.?, packet.raw);
+            packet.* = .{};
+        }
+
+        fn recycle(self: *Self, io: std.Io, source: usize, raw: shared.RawPacket) void {
+            const count = &self.recycled_counts[source];
+            self.recycled[source][count.*] = raw;
+            count.* += 1;
+            if (count.* == Service.batch_max) self.flushRecycled(io, source);
+        }
+
+        fn flushRecycled(self: *Self, io: std.Io, source: usize) void {
+            const count = &self.recycled_counts[source];
+            self.endpoints[source].recycle(io, self.recycled[source][0..count.*]);
+            count.* = 0;
         }
 
         pub fn run(self: *Self, io: std.Io) !void {
@@ -1475,8 +1016,9 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             return error.UnsupportedProtocol;
         }
 
-        pub fn detached(self: *Self, handle: network.Handle) bool {
-            if (self.engine.connections[handle.index].frame_targets != 0) return false;
+        pub fn detached(self: *Self, io: std.Io, handle: network.Handle) bool {
+            // What waited for its ring goes back, refunded while its binding still holds.
+            self.dropBacklog(io, handle.index);
             const binding = self.bindings[handle.index].?;
             assert(std.meta.eql(binding.native, handle));
             _ = binding.endpoint.credit[binding.handle.index].fetchAnd(~Service.active, .acq_rel);
@@ -1556,6 +1098,13 @@ const TestEndpoint = struct {
     pub fn control(_: *Connection, _: *Workspaces, _: session_protocol.Packet, _: []u8, _: ?usize) anyerror!session_protocol.Fragments {
         unreachable;
     }
+    pub const Stream = struct { connection: *Connection, bytes: []u8 };
+    pub fn encryptStreams(streams: []const Stream) void {
+        for (streams) |stream| send(stream.connection, stream.bytes);
+    }
+    pub fn preparedFrame(_: i32, _: *Workspaces, storage: []u8, length: usize, _: usize, _: ?usize, _: []u8) ![]const u8 {
+        return storage[shared.headroom..][0..length];
+    }
     pub fn sharedFrame(number: i32, workspace: *Workspaces, storage: []u8, length: usize, _: ?usize, _: []u8) ![]const u8 {
         if (workspace.headers) {
             storage[shared.headroom - 2] = @intCast(number);
@@ -1567,6 +1116,7 @@ const TestEndpoint = struct {
 };
 const TestHooks = struct {
     notifications: usize = 0,
+    sends: usize = 0,
     events: []const network.Event = &.{},
     pub fn closed(_: *@This(), _: network.Handle) void {}
     pub fn notify(self: *@This(), _: std.Io) void {
@@ -1575,8 +1125,8 @@ const TestHooks = struct {
     pub fn queueReceive(_: *@This(), _: std.Io, _: network.Handle, _: []u8) network.QueueError!void {
         unreachable;
     }
-    pub fn queueSend(_: *@This(), _: std.Io, _: network.Handle, _: []const std.posix.iovec_const) network.QueueError!void {
-        unreachable;
+    pub fn queueSend(self: *@This(), _: std.Io, _: network.Handle, _: []const std.posix.iovec_const) network.QueueError!void {
+        self.sends += 1;
     }
     pub fn close(_: *@This(), _: std.Io, _: network.Handle, _: network.CloseReason) void {
         unreachable;
@@ -1595,380 +1145,6 @@ const TestHooks = struct {
         return count;
     }
 };
-
-test "framing and burst exhaustion preserve ordering and isolate slow recipients" {
-    const Hooks = TestHooks;
-    const Router = SingleSimulation;
-    const Owner = Worker(TestEndpoint, Hooks, Router);
-    var memory: [256 * 1024]u8 = undefined;
-    var fixed: std.heap.FixedBufferAllocator = .init(&memory);
-    const allocator = fixed.allocator();
-    var hooks: Hooks = .{};
-    var router: Router = .{};
-    var protocols: TestEndpoint.Protocols = .{};
-    const transport: network.Transport = .{ .context = &hooks, .vtable = network.Transport.adapter(Hooks) };
-    const endpoint = try Service.init(allocator, std.testing.io, transport, .{
-        .connections = 3,
-        .buffer_bytes = 4096,
-        .pages = 4,
-        .page_bytes = 1500,
-        .protocols = &protocols.values,
-    });
-    defer endpoint.deinit();
-    const owner = try Owner.init(allocator, transport, .{
-        .connections = 3,
-        .max_players = 3,
-        .buffer_bytes = 4096,
-        .connection_bytes = 512,
-        .output_burst_slots = 1,
-        .framing_slots = 2,
-        .max_pending_wire_bytes = 8192,
-        .compression_threshold = null,
-        .protocols = &protocols,
-        .hooks = &hooks,
-        .router = &router,
-        .destinations = &.{0},
-    }, &.{endpoint});
-    defer {
-        owner.abort(std.testing.io);
-        owner.deinit();
-    }
-    const assigned = fixed.end_index;
-    const handles = [_]network.Handle{ .{ .index = 0, .generation = 1 }, .{ .index = 1, .generation = 1 }, .{ .index = 2, .generation = 1 } };
-    for (handles) |handle| {
-        const connection = &owner.engine.connections[handle.index];
-        owner.engine.setHandle(handle.index, handle);
-        connection.protocol = &protocols.values[0];
-        connection.lifecycle = 0;
-        connection.state.phase = .play;
-        endpoint.routes[handle.index] = handle;
-        endpoint.credit[handle.index].store((@as(u64, 1) << 32) | Service.active | 4096, .release);
-    }
-    var first = try endpoint.reserve(1000);
-    @memset(first.bytes, 11);
-    try first.publish(1000, handles[0..2]);
-    var second = try endpoint.reserve(10);
-    @memset(second.bytes, 22);
-    try second.publish(10, handles[1..2]);
-    var third = try endpoint.reserve(10);
-    @memset(third.bytes, 33);
-    try third.publish(10, handles[2..3]);
-    var fourth = try endpoint.reserve(10);
-    @memset(fourth.bytes, 44);
-    try fourth.publish(10, handles[0..1]);
-    endpoint.flush();
-    try owner.deliver(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 2), endpoint.preparing.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 1010), owner.engine.connections[0].lifecycle.?);
-    try std.testing.expectEqual(@as(usize, 0), owner.engine.connections[1].lifecycle.?);
-    try std.testing.expectEqual(@as(usize, 10), owner.engine.connections[2].lifecycle.?);
-    for (0..2) |_| {
-        try owner.deliver(std.testing.io);
-        try std.testing.expect(owner.queues[0].head.?.frame == null);
-        try std.testing.expectEqual(@as(usize, 1010), owner.engine.connections[0].lifecycle.?);
-        try std.testing.expectEqual(@as(usize, 0), owner.engine.connections[1].lifecycle.?);
-    }
-    owner.engine.releaseBuffers(0);
-    owner.engine.connections[0].output_read = 0;
-    owner.engine.connections[0].output_write = 0;
-    for (0..4) |_| try owner.deliver(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 0), endpoint.preparing.load(.acquire));
-    const queued = owner.engine.connections[1].output_burst.?.bytes;
-    for (queued[0..1000]) |byte| try std.testing.expectEqual(@as(u8, 11), byte);
-    for (queued[1000..1010]) |byte| try std.testing.expectEqual(@as(u8, 22), byte);
-    try std.testing.expectEqual(@as(usize, 1010), owner.engine.connections[1].lifecycle.?);
-    for (owner.engine.connections, 0..) |*connection, index| {
-        owner.engine.releaseBuffers(index);
-        connection.output_read = 0;
-        connection.output_write = 0;
-        connection.lifecycle = std.math.maxInt(usize);
-        endpoint.credit[index].store((@as(u64, 1) << 32) | Service.active | 4096, .release);
-    }
-    for (0..owner.frames.len - 1) |_| {
-        var packet = try endpoint.reserve(10);
-        @memset(packet.bytes, 55);
-        try packet.publish(10, handles[1..2]);
-        endpoint.flush();
-        try owner.deliver(std.testing.io);
-    }
-    try std.testing.expectEqual(owner.frames.len - 1, owner.engine.connections[1].loan_write);
-    for ([_]u8{ 77, 88 }, 0..) |value, index| {
-        var packet = try endpoint.reserve(10);
-        @memset(packet.bytes, value);
-        try packet.publish(10, handles[0..1]);
-        endpoint.flush();
-        try owner.deliver(std.testing.io);
-        try std.testing.expectEqual(@as(usize, 0), owner.engine.connections[0].loan_write - owner.engine.connections[0].loan_read);
-        try std.testing.expectEqual((index + 1) * 10, owner.engine.connections[0].output_write);
-        try std.testing.expect(std.mem.allEqual(u8, owner.engine.output[index * 10 ..][0..10], value));
-    }
-    owner.engine.releaseBuffers(1);
-    try owner.deliver(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 0), endpoint.preparing.load(.acquire));
-    for (owner.engine.connections, 0..) |*connection, index| {
-        owner.engine.releaseBuffers(index);
-        connection.output_read = 0;
-        connection.output_write = 0;
-        endpoint.credit[index].store((@as(u64, 1) << 32) | Service.active | 4096, .release);
-    }
-    owner.engine.connections[1].protocol = &protocols.values[1];
-    owner.engine.connections[1].lifecycle = 0;
-    owner.engine.connections[1].output_write = 500;
-    var broadcast = try endpoint.reserve(1000);
-    @memset(broadcast.bytes, 66);
-    try broadcast.publish(1000, handles[0..2]);
-    var independent = try endpoint.reserve(20);
-    @memset(independent.bytes, 99);
-    try independent.publish(20, handles[0..1]);
-    endpoint.flush();
-    try owner.deliver(std.testing.io);
-    owner.engine.releaseBuffers(0);
-    owner.engine.connections[0].output_read = 0;
-    owner.engine.connections[0].output_write = 0;
-    for (0..3) |_| try owner.deliver(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 500), owner.engine.connections[1].output_write);
-    try std.testing.expectEqual(@as(usize, 20), owner.engine.connections[0].output_write);
-    const fast = owner.engine.connections[0].output_loans[owner.engine.connections[0].loan_read % network.send_vectors_max];
-    try std.testing.expect(std.mem.allEqual(u8, fast.bytes, 99));
-    owner.engine.releaseBuffers(0);
-    owner.engine.connections[1].output_read = 0;
-    owner.engine.connections[1].output_write = 0;
-    for (0..3) |_| try owner.deliver(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 0), endpoint.preparing.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), owner.socket_budget.used);
-    for (owner.engine.connections, 0..) |*connection, index| {
-        owner.engine.releaseBuffers(index);
-        connection.output_read = 0;
-        connection.output_write = 0;
-        connection.lifecycle = std.math.maxInt(usize);
-        endpoint.credit[index].store((@as(u64, 1) << 32) | Service.active | 4096, .release);
-    }
-    owner.engine.workspaces.headers = true;
-    var mixed = try endpoint.reserve(10);
-    @memset(mixed.bytes, 42);
-    const payload = mixed.bytes.ptr;
-    try mixed.publish(10, handles[0..2]);
-    endpoint.flush();
-    try owner.deliver(std.testing.io);
-    const slow = owner.engine.connections[0].output_loans[owner.engine.connections[0].loan_read % network.send_vectors_max];
-    try std.testing.expect(slow.bytes.ptr == payload);
-    try std.testing.expectEqualSlices(u8, &.{ 1, 10 }, slow.prefix);
-    for (0..3) |_| try owner.deliver(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 12), owner.engine.connections[1].output_write);
-    const fast_bytes = owner.engine.output[owner.config.connection_bytes..][0..12];
-    try std.testing.expectEqualSlices(u8, &.{ 2, 10 }, fast_bytes[0..2]);
-    try std.testing.expect(std.mem.allEqual(u8, fast_bytes[2..], 42));
-    try std.testing.expectEqualSlices(u8, &.{ 1, 10 }, slow.prefix);
-    try std.testing.expect(std.mem.allEqual(u8, slow.bytes, 42));
-    owner.engine.releaseBuffers(0);
-    owner.engine.releaseBuffers(1);
-    try owner.deliver(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 0), endpoint.preparing.load(.acquire));
-    try std.testing.expectEqual(assigned, fixed.end_index);
-    owner.engine.workspaces.headers = false;
-    for (owner.engine.connections, 0..) |*connection, index| {
-        owner.engine.releaseBuffers(index);
-        connection.output_read = 0;
-        connection.output_write = 0;
-        connection.protocol = &protocols.values[0];
-        connection.lifecycle = std.math.maxInt(usize);
-        endpoint.credit[index].store((@as(u64, 1) << 32) | Service.active | 4096, .release);
-    }
-    const Version = struct {
-        pub const protocol_number: i32 = 1;
-    };
-    const GroupEncoder = struct {
-        pub fn writeGroup(comptime _: type, buffers: []const []u8, lengths: []usize, _: void) !void {
-            for (buffers, lengths, 0..) |buffer, *length, index| {
-                @memset(buffer, @intCast(index + 1));
-                length.* = 1000;
-            }
-        }
-    };
-    var delivered: [1]Service.Delivery = undefined;
-    try endpoint.fanout(.{Version}, GroupEncoder, &.{.{ .handle = handles[0], .protocol = 1 }}, {}, &.{ 1000, 1000 }, &delivered);
-    try std.testing.expectEqual(Service.Delivery.queued, delivered[0]);
-    var outside = try endpoint.reserve(20);
-    @memset(outside.bytes, 99);
-    try outside.publish(20, handles[0..2]);
-    endpoint.flush();
-    try owner.deliver(std.testing.io);
-    try std.testing.expect(owner.engine.connections[0].group != null);
-    try std.testing.expectEqual(@as(u8, 1), owner.engine.connections[0].group.?.next);
-    try std.testing.expectEqual(@as(usize, 20), owner.engine.connections[1].output_write);
-    try std.testing.expect(std.mem.allEqual(u8, owner.engine.output[owner.config.connection_bytes..][0..20], 99));
-    const Drain = struct {
-        fn run(worker: *Owner) void {
-            const connection = &worker.engine.connections[0];
-            while (connection.loan_read != connection.loan_write) {
-                connection.output_loans[connection.loan_read % network.send_vectors_max].owner.releaseSocket();
-                connection.loan_read +%= 1;
-            }
-            connection.output_read = connection.output_write;
-        }
-    };
-    Drain.run(owner);
-    try owner.deliver(std.testing.io);
-    try std.testing.expect(owner.engine.connections[0].group == null);
-    const tail = owner.engine.connections[0].output_loans[owner.engine.connections[0].loan_read % network.send_vectors_max];
-    try std.testing.expect(std.mem.allEqual(u8, tail.bytes, 2));
-    Drain.run(owner);
-    try owner.deliver(std.testing.io);
-    const outside_loan = owner.engine.connections[0].output_loans[owner.engine.connections[0].loan_read % network.send_vectors_max];
-    try std.testing.expect(std.mem.allEqual(u8, outside_loan.bytes, 99));
-    Drain.run(owner);
-    try owner.deliver(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 0), endpoint.preparing.load(.acquire));
-    try std.testing.expectEqual(assigned, fixed.end_index);
-    var abandoned = try endpoint.reserve(10);
-    @memset(abandoned.bytes, 42);
-    try abandoned.publish(10, handles[0..1]);
-    endpoint.flush();
-    try owner.deliver(std.testing.io);
-    var queued_packet = try endpoint.reserve(10);
-    @memset(queued_packet.bytes, 43);
-    try queued_packet.publish(10, handles[0..1]);
-    endpoint.flush();
-    owner.abort(std.testing.io);
-    try owner.initCodec(std.testing.io, null);
-    const codec = owner.engine.codec.?;
-    defer {
-        codec.workers[0].read.store(codec.workers[0].write.load(.acquire), .release);
-        for (owner.frames) |*frame| if (frame.task.state.load(.acquire) == .queued) {
-            frame.task.result = error.TestStopped;
-            frame.task.state.store(.complete, .release);
-        };
-        for (owner.engine.connections) |*connection| if (connection.codec.state.load(.acquire) == .queued) {
-            connection.codec.complete(error.TestStopped);
-        };
-    }
-    for (handles[0..2]) |handle| {
-        const connection = &owner.engine.connections[handle.index];
-        owner.engine.setHandle(handle.index, handle);
-        connection.protocol = &protocols.values[0];
-        connection.lifecycle = 0;
-        connection.state.phase = .play;
-        connection.output_read = 0;
-        connection.output_write = 0;
-        endpoint.routes[handle.index] = handle;
-        endpoint.credit[handle.index].store((@as(u64, 1) << 32) | Service.active | 4096, .release);
-    }
-    for (0..4) |index| {
-        var packet = try endpoint.reserve(10);
-        @memset(packet.bytes, @intCast(index + 1));
-        try packet.publish(10, handles[index % 2 ..][0..1]);
-    }
-    endpoint.flush();
-    try owner.deliver(std.testing.io);
-    try std.testing.expectEqual(@as(u64, 1), codec.workers[0].write.load(.acquire) - codec.workers[0].read.load(.acquire));
-    const sequence = owner.queues[0].head.?;
-    try std.testing.expectEqual(@as(usize, 2), sequence.frame.?.sequence_count);
-    try std.testing.expectEqual(@as(u8, 1), sequence.packet.group.count);
-    try std.testing.expectEqual(@as(u8, 1), sequence.next.?.packet.group.count);
-    try std.testing.expectEqual(sequence.next.?, sequence.frame.?.sequence_next.?.packet.?);
-    const member = sequence.frame.?.sequence_next.?;
-    member.task.result = .{ .bytes = "framed" };
-    member.task.state.store(.complete, .release);
-    try owner.deliver(std.testing.io);
-    try std.testing.expectEqual(@as(@TypeOf(member.completion_owner), .sequence), member.completion_owner);
-    try std.testing.expect(member.packet != null and sequence.frame.?.task.state.load(.acquire) == .queued);
-}
-
-test "pending retries visit only unfinished recipients across bitmap words" {
-    const Hooks = TestHooks;
-    const Router = SingleSimulation;
-    const Owner = Worker(TestEndpoint, Hooks, Router);
-    for ([_]usize{ 8, 64, 256 }) |audience_size| for ([_]usize{ 32, 256 }) |packet_count| {
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        const allocator = arena.allocator();
-        var hooks: Hooks = .{};
-        var router: Router = .{};
-        var protocols: TestEndpoint.Protocols = .{};
-        const transport: network.Transport = .{ .context = &hooks, .vtable = network.Transport.adapter(Hooks) };
-        const endpoint = try Service.init(allocator, std.testing.io, transport, .{ .connections = audience_size, .buffer_bytes = 128 * 1024, .pages = packet_count, .page_bytes = 1500, .protocols = &protocols.values });
-        defer endpoint.deinit();
-        const owner = try Owner.init(allocator, transport, .{ .connections = audience_size, .max_players = audience_size, .buffer_bytes = 128 * 1024, .connection_bytes = 512, .framing_slots = 2, .max_pending_wire_bytes = 256 * 1024, .compression_threshold = null, .protocols = &protocols, .hooks = &hooks, .router = &router, .destinations = &.{0} }, &.{endpoint});
-        defer {
-            owner.abort(std.testing.io);
-            owner.deinit();
-        }
-        const handles = try allocator.alloc(network.Handle, audience_size);
-        for (handles, endpoint.credit, 0..) |*handle, *credit, index| {
-            handle.* = .{ .index = @intCast(index), .generation = 1 };
-            credit.store(@as(u64, 1) << 32 | Service.active | endpoint.config.buffer_bytes, .release);
-        }
-        const raw = try allocator.alloc(shared.RawPacket, packet_count);
-        const retired = try allocator.dupe(network.Handle, handles);
-        // Completed recipients are poisoned to catch retries that revisit them.
-        for (retired[1..]) |*handle| handle.index = std.math.maxInt(@TypeOf(handle.index));
-
-        endpoint.routes[0] = handles[0];
-        owner.engine.setHandle(0, handles[0]);
-        owner.engine.connections[0].protocol = &protocols.values[0];
-        owner.engine.connections[0].lifecycle = 0;
-        owner.engine.connections[0].state.phase = .play;
-        for (raw, 0..) |*saved, index| {
-            var packet = try endpoint.reserve(1);
-            packet.bytes[0] = 1;
-            try packet.publish(1, handles);
-            endpoint.flush();
-            saved.* = endpoint.output.takeReady().?;
-            const pending = &owner.pending[saved.page];
-            pending.source = endpoint;
-            pending.order = index + 1;
-            pending.packet = saved.*;
-            pending.packet.recipients = shared.Recipients.all(retired);
-            pending.next = null;
-            pending.frame = null;
-            pending.loans = 0;
-            pending.remaining.unsetAll();
-            pending.remaining.set(0);
-            pending.remaining_count = 1;
-            @memset(pending.sizes, 0);
-            if (index > 0) owner.pending[raw[index - 1].page].next = pending;
-            for (handles[1..]) |handle| endpoint.refund(handle, endpoint.framedBound(1));
-        }
-        owner.queues[0].head = &owner.pending[raw[0].page];
-        owner.queues[0].tail = &owner.pending[raw[packet_count - 1].page];
-        owner.activate(0);
-        for (owner.frames) |*frame| {
-            frame.packet = &owner.pending[raw[0].page];
-            frame.loan.references = 1;
-        }
-        owner.pending[raw[0].page].frame = &owner.frames[0];
-        owner.pending[raw[0].page].loans = owner.frames.len;
-        const waiting = try allocator.dupe(network.Handle, retired);
-        waiting[0].index = std.math.maxInt(@TypeOf(waiting[0].index));
-        for (raw[1..]) |packet| owner.pending[packet.page].packet.recipients = shared.Recipients.all(waiting);
-        for (0..64) |_| try owner.deliverFrames(std.testing.io);
-        for (raw) |packet| {
-            const pending = &owner.pending[packet.page];
-            try std.testing.expectEqual(@as(usize, 1), pending.remaining_count);
-            var remaining = pending.remaining.iterator(.{});
-            try std.testing.expectEqual(@as(?usize, 0), remaining.next());
-            try std.testing.expectEqual(null, remaining.next());
-        }
-        for (owner.frames) |*frame| {
-            frame.packet = null;
-            frame.loan.references = 0;
-        }
-        for (raw) |packet| {
-            const pending = &owner.pending[packet.page];
-            pending.source = null;
-            pending.frame = null;
-            pending.loans = 0;
-        }
-        owner.queues[0].head = null;
-        owner.queues[0].tail = null;
-        owner.active_head = null;
-        owner.active_tail = null;
-        endpoint.recycle(std.testing.io, raw);
-        endpoint.routes[0] = null;
-        owner.engine.setHandle(0, null);
-    };
-}
-
 test "background publication retry covers both sides of the tick boundary" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1998,401 +1174,169 @@ test "background publication retry covers both sides of the tick boundary" {
     try std.testing.expect(!changed.isSet());
 }
 
-test "queued codec work does not revisit borrowed recipient tables" {
+/// One source and three connections in Play, each bound and with all its credit, to publish to
+/// and deliver.
+const DeliveryTest = struct {
     const Owner = Worker(TestEndpoint, TestHooks, SingleSimulation);
-    const audience = 32;
-    const packet_count = 32;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    var hooks: TestHooks = .{};
-    var router: SingleSimulation = .{};
-    var protocols: TestEndpoint.Protocols = .{};
-    const transport: network.Transport = .{ .context = &hooks, .vtable = network.Transport.adapter(TestHooks) };
-    const endpoint = try Service.init(allocator, std.testing.io, transport, .{ .connections = audience, .buffer_bytes = 512 * 1024, .pages = packet_count, .page_bytes = 1500, .protocols = &protocols.values });
-    defer endpoint.deinit();
-    const owner = try Owner.init(allocator, transport, .{ .connections = audience, .max_players = audience, .buffer_bytes = 512 * 1024, .connection_bytes = 8192, .framing_slots = 8, .max_pending_wire_bytes = 1024 * 1024, .compression_threshold = null, .protocols = &protocols, .hooks = &hooks, .router = &router, .destinations = &.{0} }, &.{endpoint});
-    defer {
-        owner.abort(std.testing.io);
-        owner.deinit();
-    }
-    try owner.initCodec(std.testing.io, null);
-    const codec = owner.engine.codec.?;
-    defer {
-        codec.workers[0].read.store(codec.workers[0].write.load(.acquire), .release);
-        for (owner.frames) |*frame| if (frame.task.state.load(.acquire) == .queued) {
-            frame.task.result = error.TestStopped;
-            frame.task.state.store(.complete, .release);
-        };
-        for (owner.engine.connections) |*connection| if (connection.codec.state.load(.acquire) == .queued) connection.codec.complete(error.TestStopped);
-    }
-    const handles = try allocator.alloc(network.Handle, audience);
-    for (handles, 0..) |*handle, i| {
-        handle.* = .{ .index = @intCast(i), .generation = 1 };
-        endpoint.routes[i] = handle.*;
-        endpoint.credit[i].store((@as(u64, 1) << 32) | Service.active | endpoint.config.buffer_bytes, .release);
-        owner.engine.setHandle(i, handle.*);
-        const connection = &owner.engine.connections[i];
-        connection.protocol = &protocols.values[0];
-        connection.lifecycle = 0;
-        connection.state.phase = .play;
-    }
-    for (0..packet_count) |_| {
-        var packet = try endpoint.reserve(10);
-        @memset(packet.bytes, 1);
-        try packet.publish(10, handles);
-    }
-    endpoint.flush();
-    try owner.deliver(std.testing.io);
-    const queued = codec.workers[0].write.load(.acquire) - codec.workers[0].read.load(.acquire);
-    try std.testing.expect(queued > 0);
+    const buffer_bytes = 16 * 1024;
+    hooks: TestHooks = .{},
+    router: SingleSimulation = .{},
+    protocols: TestEndpoint.Protocols = .{},
+    endpoints: [1]*Service = undefined,
+    owner: *Owner = undefined,
+    handles: [3]network.Handle = .{ .{ .index = 0, .generation = 1 }, .{ .index = 1, .generation = 1 }, .{ .index = 2, .generation = 1 } },
+    events: [1]network.Event = undefined,
 
-    for (owner.frames) |*frame| try std.testing.expect(frame.packet != null and frame.task.state.load(.acquire) == .queued);
-    const invalid = [_]network.Handle{.{ .index = std.math.maxInt(u16), .generation = 1 }};
-    for (owner.pending) |*pending| if (pending.source != null) {
-        pending.packet.recipients = shared.Recipients.all(&invalid);
-    };
-    defer for (owner.pending) |*pending| if (pending.source != null) {
-        pending.packet.recipients = shared.Recipients.all(handles);
-    };
-    for (0..64) |_| try owner.deliverFrames(std.testing.io);
-    try std.testing.expectEqual(queued, codec.workers[0].write.load(.acquire) - codec.workers[0].read.load(.acquire));
-    for (owner.engine.connections) |connection| try std.testing.expectEqual(@as(usize, 0), connection.output_write);
-}
-
-test "capacity released by a later endpoint wakes an earlier waiting endpoint" {
-    const Owner = Worker(TestEndpoint, TestHooks, SingleSimulation);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    var hooks: TestHooks = .{};
-    var router: SingleSimulation = .{};
-    var protocols: TestEndpoint.Protocols = .{};
-    const transport: network.Transport = .{ .context = &hooks, .vtable = network.Transport.adapter(TestHooks) };
-    var endpoints: [2]*Service = undefined;
-    for (&endpoints) |*endpoint| endpoint.* = try Service.init(allocator, std.testing.io, transport, .{ .connections = 1, .buffer_bytes = 4096, .pages = 2, .page_bytes = 1500, .protocols = &protocols.values });
-    defer for (endpoints) |endpoint| endpoint.deinit();
-    const owner = try Owner.init(allocator, transport, .{ .connections = 2, .max_players = 2, .buffer_bytes = 4096, .connection_bytes = 512, .framing_slots = 2, .max_pending_wire_bytes = 8192, .compression_threshold = null, .protocols = &protocols, .hooks = &hooks, .router = &router, .destinations = &.{ 0, 1 } }, &endpoints);
-    defer {
-        owner.abort(std.testing.io);
-        owner.deinit();
-    }
-    const local: network.Handle = .{ .index = 0, .generation = 1 };
-    for (endpoints, 0..) |endpoint, index| {
-        const native: network.Handle = .{ .index = @intCast(index), .generation = 1 };
-        endpoint.routes[0] = native;
-        endpoint.credit[0].store((@as(u64, 1) << 32) | Service.active | endpoint.config.buffer_bytes, .release);
-        owner.engine.setHandle(index, native);
-        owner.engine.connections[index].protocol = &protocols.values[0];
-        owner.engine.connections[index].lifecycle = 0;
-        owner.engine.connections[index].state.phase = .play;
-        for (0..index + 1) |number| {
-            var packet = try endpoint.reserve(1);
-            packet.bytes[0] = 1;
-            try packet.publish(1, &.{local});
-            endpoint.flush();
-            const raw = endpoint.output.takeReady().?;
-            const pending = &owner.pending[owner.queues[index].pending_base + raw.page];
-            pending.source = endpoint;
-            pending.order = number + 1;
-            pending.packet = raw;
-            pending.remaining.unsetAll();
-            pending.remaining.set(0);
-            pending.remaining_count = 1;
-            @memset(pending.sizes, 0);
-            if (owner.queues[index].tail) |tail| tail.next = pending else owner.queues[index].head = pending;
-            owner.queues[index].tail = pending;
-            if (index == 1) {
-                const frame = &owner.frames[number];
-                pending.frame = frame;
-                pending.loans = 1;
-                frame.packet = pending;
-                frame.loan = Owner.Engine.Loan.framed(raw.bytes, raw.bytes);
-                frame.protocol = 1;
-                frame.ready = true;
-            }
-        }
-        owner.activate(index);
-    }
-    hooks.notifications = 0;
-    try owner.deliverFrames(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 1), hooks.notifications);
-    try std.testing.expect(owner.queues[0].head != null and owner.queues[1].head == null);
-    try owner.deliverFrames(std.testing.io);
-    try std.testing.expect(owner.queues[0].head == null);
-    try std.testing.expectEqual(@as(usize, 1), owner.engine.connections[0].output_write);
-    try std.testing.expectEqual(@as(usize, 2), owner.engine.connections[1].output_write);
-}
-
-test "encrypted sequences batch rotating exclusions and retain closing recipients until completion" {
-    for ([_]usize{ 0, 1, 4 }) |codec_workers| {
-        const threaded = codec_workers != 0;
-        for ([_]bool{ false, true }) |compact| {
-            for ([_]bool{ false, true }) |exclude_self| {
-                const Owner = Worker(TestEndpoint, TestHooks, SingleSimulation);
-                const audience = 32;
-                const packet_count = 8;
-                var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-                defer arena.deinit();
-                const allocator = arena.allocator();
-                var hooks: TestHooks = .{};
-                var router: SingleSimulation = .{};
-                var protocols: TestEndpoint.Protocols = .{};
-                const transport: network.Transport = .{ .context = &hooks, .vtable = network.Transport.adapter(TestHooks) };
-                const endpoint = try Service.init(allocator, std.testing.io, transport, .{ .connections = audience, .buffer_bytes = 512 * 1024, .pages = packet_count, .page_bytes = 1500, .protocols = &protocols.values });
-                defer endpoint.deinit();
-                const owner = try Owner.init(allocator, transport, .{ .connections = audience, .max_players = audience, .buffer_bytes = 512 * 1024, .connection_bytes = 8192, .framing_slots = 8, .codec_workers = @max(1, codec_workers), .max_pending_wire_bytes = 1024 * 1024, .compression_threshold = null, .protocols = &protocols, .hooks = &hooks, .router = &router, .destinations = &.{0} }, &.{endpoint});
-                defer {
-                    owner.abort(std.testing.io);
-                    owner.deinit();
-                }
-                if (threaded) try owner.initCodec(std.testing.io, null);
-                defer if (owner.engine.codec) |codec| codec.stop();
-                const handles = try allocator.alloc(network.Handle, audience);
-                for (handles, 0..) |*handle, i| {
-                    handle.* = .{ .index = @intCast(i), .generation = 1 };
-                    endpoint.routes[i] = handle.*;
-                    endpoint.credit[i].store((@as(u64, 1) << 32) | Service.active | endpoint.config.buffer_bytes, .release);
-                    owner.engine.setHandle(i, handle.*);
-                    const connection = &owner.engine.connections[i];
-                    connection.protocol = &protocols.values[0];
-                    connection.lifecycle = 0;
-                    connection.state.phase = .play;
-                }
-                const Version = struct {
-                    pub const protocol_number = 1;
-                };
-                const Encoder = struct {
-                    pub fn writeGroup(comptime _: type, buffers: []const []u8, lengths: []usize, value: u8) !void {
-                        for (buffers, lengths) |buffer, *length| {
-                            @memset(buffer[0..10], value);
-                            length.* = 10;
-                        }
-                    }
-                };
-                var broadcast = try Service.Broadcast.init(allocator, endpoint, packet_count);
-                defer broadcast.deinit();
-                const targets = try allocator.alloc(Service.Target, audience);
-                for (handles, targets) |handle, *target| target.* = .{ .handle = handle, .protocol = 1 };
-                if (compact) {
-                    var delivered: [audience]Service.Delivery = undefined;
-                    for (0..packet_count) |packet_index| {
-                        var selected: usize = 0;
-                        for (0..audience) |offset| {
-                            const index = (offset + packet_index) % audience;
-                            if (exclude_self and index == packet_index) continue;
-                            targets[selected] = .{ .handle = handles[index], .protocol = 1 };
-                            selected += 1;
-                        }
-                        try endpoint.fanout(.{Version}, Encoder, targets[0..selected], @as(u8, @intCast(packet_index)), &.{10}, delivered[0..selected]);
-                        for (delivered[0..selected]) |delivery| try std.testing.expectEqual(Service.Delivery.queued, delivery);
-                    }
-                } else {
-                    try broadcast.begin(targets);
-                    for (0..packet_count) |packet_index| {
-                        _ = try broadcast.write(.{Version}, Encoder, if (exclude_self) handles[packet_index % audience] else null, null, @as(u8, @intCast(packet_index)), 10);
-                    }
-                    broadcast.finish();
-                }
-                endpoint.flush();
-                try owner.deliver(std.testing.io);
-                if (owner.engine.codec) |codec| {
-                    const queued = codec.workers[0].write.load(.acquire) - codec.workers[0].read.load(.acquire);
-                    var framed: usize = 0;
-                    for (owner.frames) |frame| framed += @intFromBool(frame.packet != null);
-                    try std.testing.expectEqual(@as(u64, 1), queued);
-                    try std.testing.expectEqual(owner.frames.len, framed);
-                    const first = owner.queues[0].head.?.frame.?;
-                    try std.testing.expectEqual(owner.frames.len, first.sequence_count);
-                    var target = first.targets;
-                    while (target) |destination| : (target = destination.next) {
-                        const count = @popCount(destination.packets);
-                        try std.testing.expectEqual(owner.frames.len - @intFromBool(exclude_self and destination.recipient < owner.frames.len), count);
-                    }
-                    try codec.start();
-                    codec.stop();
-                    owner.engine.connections[0].closing = true;
-                    try std.testing.expectEqual(@as(usize, 1), owner.engine.connections[0].frame_targets);
-                    try std.testing.expect(!owner.detached(handles[0]));
-                }
-                for (owner.engine.connections, 0..) |*connection, recipient| {
-                    const consumed = if (threaded)
-                        (try (Owner.Codec.take(&connection.codec) orelse return error.MissingSendCompletion)).consumed
-                    else
-                        connection.output_write;
-                    var offset: usize = 0;
-                    const bytes = owner.engine.output[recipient * owner.config.connection_bytes ..][0..owner.config.connection_bytes];
-                    for (0..packet_count) |packet_index| {
-                        if (exclude_self and recipient == packet_index) continue;
-                        try std.testing.expect(std.mem.allEqual(u8, bytes[offset..][0..10], @intCast(packet_index)));
-                        offset += 10;
-                    }
-                    try std.testing.expectEqual(offset, consumed);
-                    try std.testing.expectEqual(@as(usize, offset), connection.lifecycle.?);
-                    try std.testing.expectEqual(.idle, connection.codec.state.load(.acquire));
-                }
-                try owner.deliver(std.testing.io);
-                try owner.deliver(std.testing.io);
-                try std.testing.expectEqual(@as(usize, 0), endpoint.preparing.load(.acquire));
-                try std.testing.expect(owner.queues[0].head == null);
-                for (owner.engine.connections) |connection| try std.testing.expectEqual(@as(usize, 0), connection.frame_targets);
-            }
-        }
-    }
-}
-
-test "worker recipient masks and blocked cleanup follow active spans" {
-    const Owner = Worker(TestEndpoint, TestHooks, SingleSimulation);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    var hooks: TestHooks = .{};
-    var router: SingleSimulation = .{};
-    var protocols: TestEndpoint.Protocols = .{};
-    const transport: network.Transport = .{ .context = &hooks, .vtable = network.Transport.adapter(TestHooks) };
-    const endpoint = try Service.init(allocator, std.testing.io, transport, .{ .connections = 129, .buffer_bytes = 512, .pages = 2, .page_bytes = 64, .protocols = &protocols.values });
-    defer endpoint.deinit();
-    const owner = try Owner.init(allocator, transport, .{
-        .connections = 2,
-        .max_players = 2,
-        .buffer_bytes = 512,
-        .connection_bytes = 512,
-        .framing_slots = 2,
-        .max_pending_wire_bytes = 1024,
-        .compression_threshold = null,
-        .protocols = &protocols,
-        .hooks = &hooks,
-        .router = &router,
-        .destinations = &.{0},
-    }, &.{endpoint});
-    defer {
-        owner.abort(std.testing.io);
-        owner.deinit();
-    }
-    owner.block(0);
-    owner.block(1);
-    try std.testing.expectEqual(@as(usize, 1), owner.blocked_words.count);
-    try owner.deliver(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 0), owner.blocked_words.count);
-    try std.testing.expectEqual(@as(usize, 0), owner.blocked.count());
-    const handles = [_]network.Handle{ .{ .index = 128, .generation = 1 }, .{ .index = 3, .generation = 1 } };
-    for (handles, 0..) |handle, index| {
-        const native: network.Handle = .{ .index = index, .generation = 1 };
-        owner.engine.setHandle(index, native);
-        owner.engine.connections[index].protocol = &protocols.values[0];
-        owner.engine.connections[index].lifecycle = 0;
-        owner.engine.connections[index].state.phase = .play;
-        endpoint.routes[handle.index] = native;
-        endpoint.credit[handle.index].store((@as(u64, 1) << 32) | Service.active | 512, .release);
-    }
-    @memset(owner.recipient_masks, 42);
-    var packet = try endpoint.reserve(2);
-    const page = packet.reservation.?.page;
-    packet.bytes[0..2].* = .{ 11, 22 };
-    try packet.publish(2, &handles);
-    endpoint.flush();
-    try owner.deliver(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 2), owner.pending[page].remaining.bit_length);
-    var written: usize = 0;
-    for (owner.recipient_masks) |word| written += @intFromBool(word != 42);
-    try std.testing.expectEqual(@as(usize, 1), written);
-    try std.testing.expectEqual(@as(usize, 0), endpoint.preparing.load(.acquire));
-    for (owner.engine.connections, 0..) |connection, index| {
-        try std.testing.expectEqual(@as(usize, 2), connection.lifecycle.?);
-        try std.testing.expectEqualSlices(u8, &.{ 11, 22 }, owner.engine.output[index * owner.config.connection_bytes ..][0..2]);
-    }
-}
-
-test "blocked delivery sleeps until capacity changes and preserves new output ordering" {
-    const Owner = Worker(TestEndpoint, TestHooks, SingleSimulation);
-    for ([_]usize{ 2, 64 }) |clients| {
-        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-        defer arena.deinit();
-        const allocator = arena.allocator();
-        var hooks: TestHooks = .{};
-        var router: SingleSimulation = .{};
-        var protocols: TestEndpoint.Protocols = .{};
-        const transport: network.Transport = .{ .context = &hooks, .vtable = network.Transport.adapter(TestHooks) };
-        const endpoint = try Service.init(allocator, std.testing.io, transport, .{
-            .connections = clients,
-            .buffer_bytes = 128 * 1024,
-            .pages = 33,
-            .page_bytes = 1500,
-            .protocols = &protocols.values,
-        });
-        defer endpoint.deinit();
-        const owner = try Owner.init(allocator, transport, .{
-            .connections = clients,
-            .max_players = clients,
-            .buffer_bytes = 128 * 1024,
+    fn init(self: *DeliveryTest, output_bytes: usize) !void {
+        const transport: network.Transport = .{ .context = &self.hooks, .vtable = network.Transport.adapter(TestHooks) };
+        self.endpoints[0] = try Service.init(std.testing.allocator, std.testing.io, transport, .{ .connections = 3, .buffer_bytes = buffer_bytes, .pages = 8, .page_bytes = 6000, .protocols = &self.protocols.values });
+        errdefer self.endpoints[0].deinit();
+        self.owner = try Owner.init(std.testing.allocator, transport, .{
+            .connections = 3,
+            .max_players = 3,
+            .buffer_bytes = buffer_bytes,
             .connection_bytes = 512,
-            .output_burst_slots = 1,
-            .framing_slots = 2,
-            .max_pending_wire_bytes = 256 * 1024,
+            .output_bytes = output_bytes,
+            .max_pending_wire_bytes = 32 * 1024,
             .compression_threshold = null,
-            .protocols = &protocols,
-            .hooks = &hooks,
-            .router = &router,
+            .protocols = &self.protocols,
+            .hooks = &self.hooks,
+            .router = &self.router,
             .destinations = &.{0},
-        }, &.{endpoint});
-        defer {
-            owner.abort(std.testing.io);
-            owner.deinit();
-        }
-        const held_burst = owner.engine.output_bursts.acquire().?;
-        defer held_burst.release();
-        const handles = try allocator.alloc(network.Handle, clients);
-        for (handles, 0..) |*handle, index| {
-            handle.* = .{ .index = index, .generation = 1 };
-            owner.engine.setHandle(index, handle.*);
-            const connection = &owner.engine.connections[index];
-            connection.protocol = &protocols.values[0];
+        }, &self.endpoints);
+        for (self.handles) |handle| {
+            const connection = &self.owner.engine.connections[handle.index];
+            self.owner.engine.setHandle(handle.index, handle);
+            connection.protocol = &self.protocols.values[0];
             connection.lifecycle = 0;
             connection.state.phase = .play;
-            connection.output_write = 512;
-            endpoint.routes[index] = handle.*;
-            endpoint.occupied[index].store(true, .release);
-            endpoint.credit[index].store((@as(u64, 1) << 32) | Service.active | (endpoint.config.buffer_bytes - 512), .release);
-            owner.bindings[index] = .{ .native = handle.*, .endpoint = endpoint, .handle = handle.* };
+            self.endpoints[0].routes[handle.index] = handle;
+            self.endpoints[0].credit[handle.index].store((@as(u64, 1) << 32) | Service.active | buffer_bytes, .release);
+            self.owner.bindings[handle.index] = .{ .endpoint = self.endpoints[0], .handle = handle, .native = handle };
         }
-        for (0..32) |_| {
-            var packet = try endpoint.reserve(10);
-            @memset(packet.bytes, 17);
-            try packet.publish(10, handles);
-        }
-        endpoint.flush();
-        try owner.deliver(std.testing.io);
-        const notifications = hooks.notifications;
-        for (0..64) |_| {
-            try owner.deliver(std.testing.io);
-            try std.testing.expect(!owner.delivery_ready and !owner.engine.delivery_ready);
-        }
-        try std.testing.expectEqual(notifications, hooks.notifications);
-        for (owner.pending) |pending| if (pending.source != null) {
-            try std.testing.expectEqual(clients, pending.remaining_count);
-        };
-
-        const healthy = clients - 1;
-        owner.engine.connections[healthy].sending = true;
-        owner.engine.connections[healthy].sending_bytes = 512;
-        hooks.events = &.{.{ .sent = .{ .handle = handles[healthy], .result = .{ .bytes = 512 } } }};
-        try owner.engine.receive(std.testing.io);
-        try std.testing.expect(owner.engine.delivery_ready);
-        var new = try endpoint.reserve(10);
-        @memset(new.bytes, 99);
-        try new.publish(10, handles[healthy..]);
-        endpoint.flush();
-        try owner.deliver(std.testing.io);
-        try owner.deliver(std.testing.io);
-        try owner.deliver(std.testing.io);
-        try std.testing.expect(!owner.delivery_ready and !owner.engine.delivery_ready);
-        const connection = &owner.engine.connections[healthy];
-        try std.testing.expectEqual(@as(usize, 330), connection.lifecycle.?);
-        const output = owner.engine.output[healthy * 512 ..][0..330];
-        try std.testing.expect(std.mem.allEqual(u8, output[0..320], 17));
-        try std.testing.expect(std.mem.allEqual(u8, output[320..], 99));
-        for (owner.pending) |pending| if (pending.source != null) {
-            try std.testing.expectEqual(clients - 1, pending.remaining_count);
-        };
     }
+
+    fn deinit(self: *DeliveryTest) void {
+        for (self.owner.engine.connections) |*connection| connection.sending = false;
+        self.owner.abort(std.testing.io);
+        self.owner.deinit();
+        self.endpoints[0].deinit();
+    }
+
+    fn publish(self: *DeliveryTest, value: u8, length: usize, recipients: []const network.Handle) !void {
+        var packet = try self.endpoints[0].reserve(length);
+        @memset(packet.bytes, value);
+        try packet.publish(length, recipients);
+        self.endpoints[0].flush();
+    }
+
+    fn deliver(self: *DeliveryTest) !void {
+        try self.owner.deliver(std.testing.io);
+    }
+
+    /// The send in flight to a connection completes, all of it.
+    fn sent(self: *DeliveryTest, index: usize) !void {
+        const connection = &self.owner.engine.connections[index];
+        assert(connection.sending);
+        self.events[0] = .{ .sent = .{ .handle = self.handles[index], .result = .{ .bytes = connection.sending_bytes } } };
+        self.hooks.events = &self.events;
+        try self.owner.engine.receive(std.testing.io);
+    }
+
+    fn ring(self: *DeliveryTest, index: usize) []const u8 {
+        const connection = &self.owner.engine.connections[index];
+        const bytes = self.owner.engine.output[index * self.owner.config.output_bytes ..][0..self.owner.config.output_bytes];
+        return bytes[connection.output_read % bytes.len ..][0 .. connection.output_write - connection.output_read];
+    }
+
+    fn credit(self: *DeliveryTest, index: usize) usize {
+        return @intCast(self.endpoints[0].credit[index].load(.acquire) & (Service.active - 1));
+    }
+
+    fn preparing(self: *DeliveryTest) usize {
+        return self.endpoints[0].preparing.load(.acquire);
+    }
+};
+
+test "fan-out writes each packet into every recipient's ring once, in publication order" {
+    var delivery: DeliveryTest = .{};
+    try delivery.init(4096);
+    defer delivery.deinit();
+    const handles = delivery.handles;
+    try delivery.publish(11, 100, handles[0..2]);
+    try delivery.publish(22, 10, handles[1..2]);
+    try delivery.publish(33, 10, handles[2..3]);
+    try delivery.publish(44, 10, handles[0..1]);
+    try delivery.deliver();
+    // Every packet reached every recipient in the pass that took it, and went back to the pool.
+    try std.testing.expectEqual(@as(usize, 0), delivery.preparing());
+    const rings = [_][]const u8{ delivery.ring(0), delivery.ring(1), delivery.ring(2) };
+    try std.testing.expect(std.mem.allEqual(u8, rings[0][0..100], 11) and std.mem.allEqual(u8, rings[0][100..], 44) and rings[0].len == 110);
+    try std.testing.expect(std.mem.allEqual(u8, rings[1][0..100], 11) and std.mem.allEqual(u8, rings[1][100..], 22) and rings[1].len == 110);
+    try std.testing.expect(std.mem.allEqual(u8, rings[2], 33) and rings[2].len == 10);
+    // Each ring was encrypted once, in one batch, and sent in one send.
+    for ([_]usize{ 110, 110, 10 }, 0..) |length, index| {
+        try std.testing.expectEqual(length, delivery.owner.engine.connections[index].lifecycle.?);
+        // Credit stays out for exactly what waits to be sent.
+        try std.testing.expectEqual(DeliveryTest.buffer_bytes - length, delivery.credit(index));
+    }
+    try std.testing.expectEqual(@as(usize, 3), delivery.hooks.sends);
+    try delivery.sent(0);
+    try std.testing.expectEqual(DeliveryTest.buffer_bytes, delivery.credit(0));
+}
+
+test "a full ring backlogs only its own recipient, which drains in order as its sends complete" {
+    var delivery: DeliveryTest = .{};
+    try delivery.init(4096);
+    defer delivery.deinit();
+    const handles = delivery.handles;
+    try delivery.publish(11, 1500, handles[0..1]);
+    try delivery.publish(22, 1500, handles[0..1]);
+    try delivery.publish(33, 1500, handles[0..1]);
+    try delivery.publish(55, 10, handles[0..2]);
+    try delivery.deliver();
+    // The third packet went in as far as the ring had room, and the last waits behind it.
+    const first = delivery.ring(0);
+    try std.testing.expectEqual(@as(usize, 4096), first.len);
+    try std.testing.expect(std.mem.allEqual(u8, first[0..1500], 11) and std.mem.allEqual(u8, first[1500..3000], 22) and std.mem.allEqual(u8, first[3000..], 33));
+    // The other recipient was not held back.
+    try std.testing.expect(std.mem.allEqual(u8, delivery.ring(1), 55) and delivery.ring(1).len == 10);
+    try std.testing.expectEqual(@as(usize, 2), delivery.preparing());
+    try delivery.sent(0);
+    try delivery.deliver();
+    const rest = delivery.ring(0);
+    try std.testing.expectEqual(@as(usize, 414), rest.len);
+    try std.testing.expect(std.mem.allEqual(u8, rest[0..404], 33) and std.mem.allEqual(u8, rest[404..], 55));
+    try std.testing.expectEqual(@as(usize, 0), delivery.preparing());
+    try std.testing.expectEqual(@as(usize, 4096 + 414), delivery.owner.engine.connections[0].lifecycle.?);
+    try std.testing.expectEqual(DeliveryTest.buffer_bytes - 414, delivery.credit(0));
+}
+
+test "a packet larger than the ring goes out in pieces" {
+    var delivery: DeliveryTest = .{};
+    try delivery.init(4096);
+    defer delivery.deinit();
+    try delivery.publish(77, 6000, delivery.handles[0..1]);
+    try delivery.deliver();
+    try std.testing.expectEqual(@as(usize, 4096), delivery.ring(0).len);
+    try std.testing.expectEqual(@as(usize, 1), delivery.preparing());
+    try delivery.sent(0);
+    try delivery.deliver();
+    try std.testing.expectEqual(@as(usize, 6000 - 4096), delivery.ring(0).len);
+    try std.testing.expect(std.mem.allEqual(u8, delivery.ring(0), 77));
+    try std.testing.expectEqual(@as(usize, 0), delivery.preparing());
+}
+
+test "a connection that takes no more output gives its backlog back" {
+    var delivery: DeliveryTest = .{};
+    try delivery.init(4096);
+    defer delivery.deinit();
+    try delivery.publish(11, 5000, delivery.handles[0..1]);
+    try delivery.publish(22, 100, delivery.handles[0..2]);
+    try delivery.deliver();
+    try std.testing.expectEqual(@as(usize, 2), delivery.preparing());
+    delivery.owner.engine.connections[0].closing = true;
+    try delivery.deliver();
+    try std.testing.expectEqual(@as(usize, 0), delivery.preparing());
+    try std.testing.expectEqual(@as(usize, 0), delivery.owner.backlogged.count);
 }

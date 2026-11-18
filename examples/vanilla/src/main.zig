@@ -28,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
     var compression: ?usize = 256;
     var max_players: usize = 32;
     var codec_workers: usize = 4;
-    var output_burst_slots: usize = 8;
+    var output_bytes: usize = 64 * 1024;
     var input_burst_slots: usize = 2;
     var storage_batch_groups: usize = 8;
     var encryption_key_path: ?[]const u8 = null;
@@ -52,9 +52,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.startsWith(u8, argument, "--codec-workers=")) {
             codec_workers = try std.fmt.parseInt(usize, argument["--codec-workers=".len..], 10);
             if (codec_workers == 0) return error.InvalidCodecCapacity;
-        } else if (std.mem.startsWith(u8, argument, "--output-burst-slots=")) {
-            output_burst_slots = try std.fmt.parseInt(usize, argument["--output-burst-slots=".len..], 10);
-            if (output_burst_slots == 0 or output_burst_slots > 64) return error.InvalidBurstCapacity;
+        } else if (std.mem.startsWith(u8, argument, "--output-bytes=")) {
+            output_bytes = try std.fmt.parseInt(usize, argument["--output-bytes=".len..], 10);
         } else if (std.mem.startsWith(u8, argument, "--storage-batch-groups=")) {
             storage_batch_groups = try std.fmt.parseInt(usize, argument["--storage-batch-groups=".len..], 10);
             if (storage_batch_groups == 0 or storage_batch_groups > 192) return error.InvalidStorageBatchCapacity;
@@ -129,7 +128,7 @@ pub fn main(init: std.process.Init) !void {
             .max_players = max_players,
             .codec_workers = codec_workers,
             .input_burst_slots = input_burst_slots,
-            .output_burst_slots = output_burst_slots,
+            .output_bytes = output_bytes,
             .decode_slots = input_burst_slots,
             .endpoints = &.{.{ .id = 0, .connections = max_players }},
             .compression_threshold = compression,

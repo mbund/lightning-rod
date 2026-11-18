@@ -982,11 +982,11 @@ test "pending descriptors follow pool identity across shared endpoints and abort
         .destinations = &.{ 0, 1, 2 },
     }, &endpoints);
     defer worker.deinit();
-    try std.testing.expectEqual(@as(usize, 8), worker.pending.len);
+    try std.testing.expectEqual(@as(usize, 8), worker.packets.len);
     for (0..2) |_| {
-        try std.testing.expectEqual(@as(usize, 0), worker.queues[0].pending_base);
-        try std.testing.expectEqual(@as(usize, 4), worker.queues[1].pending_base);
-        try std.testing.expectEqual(@as(usize, 0), worker.queues[2].pending_base);
+        try std.testing.expectEqual(@as(usize, 0), worker.sources[0].packet_base);
+        try std.testing.expectEqual(@as(usize, 4), worker.sources[1].packet_base);
+        try std.testing.expectEqual(@as(usize, 0), worker.sources[2].packet_base);
         worker.abort(std.testing.io);
     }
 }

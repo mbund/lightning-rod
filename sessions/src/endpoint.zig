@@ -218,6 +218,35 @@ pub fn Endpoint(comptime implementations: anytype, comptime bootstrap: type, com
             unreachable;
         }
 
+        /// One connection's new output, encrypted in place as its send stream continues.
+        pub const Stream = struct { connection: *Connection, bytes: []u8 };
+
+        /// Encrypts each stream as `send` would alone, side by side where a protocol's cipher can,
+        /// as one stream leaves the AES units waiting on each byte before.
+        pub fn encryptStreams(streams: []const Stream) void {
+            inline for (implementations, 0..) |Implementation, index| {
+                const ConnectionType = connection_types[index];
+                const tag = comptime std.fmt.comptimePrint("{d}", .{Implementation.protocol_number});
+                const active = @field(std.meta.Tag(Connection), tag);
+                if (comptime @hasDecl(ConnectionType.Wire, "encryptStreams")) {
+                    var batch: [64]ConnectionType.Wire.Stream = undefined;
+                    var count: usize = 0;
+                    for (streams) |stream| {
+                        if (stream.bytes.len == 0 or std.meta.activeTag(stream.connection.*) != active) continue;
+                        batch[count] = @field(stream.connection.*, tag).sendStream(stream.bytes) orelse continue;
+                        count += 1;
+                        if (count == batch.len) {
+                            ConnectionType.Wire.encryptStreams(&batch);
+                            count = 0;
+                        }
+                    }
+                    ConnectionType.Wire.encryptStreams(batch[0..count]);
+                } else for (streams) |stream| {
+                    if (stream.bytes.len != 0 and std.meta.activeTag(stream.connection.*) == active) @field(stream.connection.*, tag).send(stream.bytes);
+                }
+            }
+        }
+
         pub fn clear(connection: *Connection) void {
             switch (connection.*) {
                 inline else => |*state| state.clear(),

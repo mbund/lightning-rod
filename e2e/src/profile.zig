@@ -100,7 +100,6 @@ pub fn run(init: std.process.Init, selections: anytype, config: Configuration) !
             .max_players = selections[players_index].configuration.maximum,
             .decode_slots = 1,
             .input_burst_slots = 1,
-            .output_burst_slots = 1,
             .configuration_slots = 2,
             .endpoints = &.{.{ .id = 0, .connections = selections[players_index].configuration.maximum }},
             .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = args.port } },

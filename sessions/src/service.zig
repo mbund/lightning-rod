@@ -936,6 +936,9 @@ pub const Service = struct {
         return @min(self.config.buffer_bytes / 8, self.config.buffer_bytes - self.framedBound(self.config.page_bytes));
     }
 
+    /// What publishing a packet of `length` bytes charges each recipient until it is delivered:
+    /// the most its frame can take on the wire. Even the smallest packet charges the bound's
+    /// overhead, so credit bounds how many packets a recipient can have waiting.
     pub fn framedBound(self: *const Service, length: usize) usize {
         return frameBound(self.config.protocols, length);
     }
