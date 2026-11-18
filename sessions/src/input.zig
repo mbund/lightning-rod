@@ -51,6 +51,9 @@ pub const ConfigurationEffect = union(enum) {
 pub const PlayEffect = union(enum) {
     none,
     send: []const u8,
+    /// The plugin has output for its next play poll, which comes at once, after what the
+    /// connection is already sending.
+    poll,
 };
 
 pub fn Effect(comptime phase: Phase) type {
