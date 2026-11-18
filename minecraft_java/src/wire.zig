@@ -37,6 +37,15 @@ pub const Wire = struct {
         self.send_cipher.?.transform(.encrypt, source, destination);
     }
 
+    pub const Stream = Cipher.Stream;
+    pub const encryptStreams = Cipher.encryptStreams;
+
+    /// Bytes to encrypt in place as the send stream continues, unless sends are not encrypted.
+    pub fn sendStream(self: *Wire, bytes: []u8) ?Stream {
+        const cipher = if (self.send_cipher) |*value| value else return null;
+        return .{ .cipher = cipher, .bytes = bytes };
+    }
+
     pub fn encryption(self: *Wire, first: []u8, second: []u8) Encryption {
         return .{ .cipher = &self.send_cipher.?, .first = first, .second = second };
     }

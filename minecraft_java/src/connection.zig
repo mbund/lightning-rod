@@ -70,6 +70,10 @@ pub fn Connection(comptime Protocol: type) type {
             self.wire.encrypt(source, destination);
         }
 
+        pub fn sendStream(self: *Self, bytes: []u8) ?Wire.Stream {
+            return self.wire.sendStream(bytes);
+        }
+
         pub fn encryption(self: *Self, first: []u8, second: []u8) Wire.Encryption {
             return self.wire.encryption(first, second);
         }
