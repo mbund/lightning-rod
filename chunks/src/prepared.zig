@@ -488,7 +488,7 @@ pub const Baker = struct {
     }
 };
 
-fn wordBytes(bits: u8) u32 {
+pub fn wordBytes(bits: u8) u32 {
     if (bits == 16) return 8192;
     assert(bits >= 4 and bits <= 8);
     const per_word: u32 = 64 / @as(u32, bits);

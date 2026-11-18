@@ -1616,12 +1616,13 @@ pub const Streaming = struct {
         }
         var reservation_sizes: [batch_max]usize = undefined;
         for (pending[0..count], reservation_sizes[0..count]) |item, *size| {
-            // A record declares the bound of the saved blocks it was compiled from. A column
+            // A stored frame declares the bound of the saved blocks it was baked from. A column
             // built from live sections can be larger, and its packet is stored nowhere, so
             // a retry would read the same bound again. It gets a whole page.
             const stored = self.deps.lighting.deliveryStored(item.world, item.at.x, item.at.z);
-            const record = if (stored) try self.delivery.packetBound(.{ .world = item.world, .x = item.at.x, .z = item.at.z }, item.protocol) else null;
-            // Records bound what they hold without light, which changes after they are kept, so
+            const frame = if (stored) self.delivery.storedFrame(.{ .world = item.world, .x = item.at.x, .z = item.at.z }) else null;
+            const record = if (frame) |bytes| self.encoding.frameBound(bytes) else null;
+            // Frames bound their terrain without light, which changes after they are kept, so
             // the reservation adds the most light a column of this height carries.
             const sections = self.deps.worlds.get(item.world).?.dimension.sectionCount();
             const declared = if (record) |bound| bound + lighting.Data.maximumEncodedSize(@intCast(sections)) else null;
@@ -2032,7 +2033,7 @@ pub const Streaming = struct {
         const column: chunks.Light.Column = .{ .world = cold.world, .x = cold.at.x, .z = cold.at.z };
         const requests = [1]delivery_cache.Request{.{ .column = column, .protocol = cold.protocol }};
         _ = try self.delivery.begin(&self.delivery_catalog, &requests);
-        self.encoding.compileFrame(self.delivery, column, &frame, cold.protocol, @intCast(self.config.fallback_biome)) catch |err| switch (err) {
+        self.encoding.storeFrame(self.delivery, column, &frame, @intCast(self.config.fallback_biome)) catch |err| switch (err) {
             error.DeliveryDeferred => {
                 self.delivery.cancel();
                 return true;

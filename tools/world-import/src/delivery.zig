@@ -6,6 +6,7 @@ const chunk_encoding = @import("terrain").chunk_encoding;
 const protocols = @import("protocols");
 const assert = std.debug.assert;
 
+/// Stores baked frames in batches. Every protocol delivers from the frame as it stands.
 pub const Compiler = struct {
     workspace: *chunk_delivery.Workspace,
     catalog: chunk_delivery.Catalog,
@@ -17,8 +18,6 @@ pub const Compiler = struct {
         var catalog = try chunk_encoding.Workspace.initDeliveryCatalog(allocator, &selected.values);
         _ = try catalog.index(selected.values[0].number);
         const workspace = try chunk_delivery.Workspace.init(allocator, selected.values.len);
-        // A prewarm prepares every format the server accepts, not only the one asked for first.
-        workspace.eager = true;
         return .{ .workspace = workspace, .catalog = catalog, .encoder = try .init(allocator, 1 << 20, &selected.values, blocks) };
     }
 
@@ -41,19 +40,15 @@ pub const Compiler = struct {
     }
 
     pub fn compile(self: *Compiler, terrain: *chunks.Chunks, column: chunks.Light.Column, frame: *const chunks.Light.View) !void {
-        // The first format a column lacks compiles every missing one into a single bundle.
-        // The rest of the pass finds theirs present, or compiles what did not fit.
-        for (self.catalog.variants) |variant| {
-            self.encoder.compileFrame(self.workspace, column, frame, variant.codec.number, null) catch |err| switch (err) {
-                error.DeliveryDeferred => {
-                    if (self.workspace.used == 0) return error.DeliveryRecordTooLarge;
-                    try self.finish(terrain);
-                    try self.restart();
-                    try self.encoder.compileFrame(self.workspace, column, frame, variant.codec.number, null);
-                },
-                else => return err,
-            };
-        }
+        self.encoder.storeFrame(self.workspace, column, frame, null) catch |err| switch (err) {
+            error.DeliveryDeferred => {
+                if (self.workspace.used == 0) return error.DeliveryRecordTooLarge;
+                try self.finish(terrain);
+                try self.restart();
+                try self.encoder.storeFrame(self.workspace, column, frame, null);
+            },
+            else => return err,
+        };
     }
 
     pub fn finish(self: *Compiler, terrain: *chunks.Chunks) !void {

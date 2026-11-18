@@ -36,12 +36,22 @@ pub const Workspace = struct {
         number: i32,
         biomes: [game_data.registry.biome_names.len]i32 = @splat(-1),
         biome_bits: ?u8 = null,
+        block_entities: [256]i32 = @splat(-1),
 
         fn biome(self: *Mapping, protocol: *const sessions.Protocol, value: u16) !i32 {
             assert(self.number == protocol.number);
             if (value >= self.biomes.len) return error.UnsupportedBiome;
             const cached = &self.biomes[value];
             if (cached.* < 0) cached.* = try protocol.registryId("minecraft:worldgen/biome", game_data.registry.biome_names[value]);
+            return cached.*;
+        }
+
+        /// The wire type of the block entity a state carries.
+        fn blockEntity(self: *Mapping, protocol: *const sessions.Protocol, blocks: *const BlockProperties, state: u16) !i32 {
+            assert(self.number == protocol.number);
+            const index = blocks.entities[state] orelse return error.UnsupportedBlockEntity;
+            const cached = &self.block_entities[index];
+            if (cached.* < 0) cached.* = try protocol.registryId("minecraft:block_entity_type", blocks.entity_types[index]);
             return cached.*;
         }
     };
@@ -165,17 +175,13 @@ pub const Workspace = struct {
         };
         const persistent = chunk.sections == .baked;
         const column: chunks.Light.Column = .{ .world = chunk.world, .x = chunk.x, .z = chunk.z };
+        // A baked column is written from its frame, for every protocol alike. Live sections
+        // compile a record for this delivery only.
         var needs_record = false;
-        var selected = chunk.disclosure & ~chunk.frontier & @as(u32, @truncate((@as(u64, 1) << @intCast(source.count)) - 1));
+        var selected = if (persistent) 0 else chunk.disclosure & ~chunk.frontier & @as(u32, @truncate((@as(u64, 1) << @intCast(source.count)) - 1));
         while (selected != 0) : (selected &= selected - 1) {
-            const index = @ctz(selected);
-            if (chunk.sections == .baked) {
-                const frame = chunk.sections.baked.view;
-                if (frame.header.uniform & (@as(u32, 1) << @intCast(index)) == 0 or self.blocks.entityName(frame.header.states[index]) != null) needs_record = true;
-            } else {
-                const view = chunk.sections.loaded[index].view;
-                if (view != .uniform or self.blocks.entityName(view.uniform) != null) needs_record = true;
-            }
+            const view = chunk.sections.loaded[@ctz(selected)].view;
+            if (view != .uniform or self.blocks.entityName(view.uniform) != null) needs_record = true;
         }
         if (!needs_record and !persistent) cache.catalog.metrics.unbaked_uniform.add(1);
         const record: ?chunks.Delivery.View = if (!needs_record) null else switch (try cache.lookup(column, protocol, source, persistent)) {
@@ -183,7 +189,7 @@ pub const Workspace = struct {
             .deferred => return error.DeliveryDeferred,
             .missing => |slot| compiled: {
                 if (!persistent) cache.catalog.metrics.transient_compiles.add(1);
-                break :compiled try self.compileDelivery(cache, slot, chunk, source, persistent, protocol);
+                break :compiled try self.compileDelivery(cache, slot, chunk, source, protocol);
             },
         };
         self.baked = if (chunk.sections == .baked) chunk.sections.baked.view else null;
@@ -198,73 +204,35 @@ pub const Workspace = struct {
         var light = chunk.light;
         light.disclosure &= chunk.disclosure;
         const maximum_size = if (record) |value| value.maximum_size + light.encodedSize() else self.maximumSize(chunk, sections.len);
-        return .{ .packet = .{ .chunk = chunk, .sections = sections, .maximum_size = maximum_size, .preparation = self.preparation }, .encoding = if (record) |value| .{ .record = value } else .uniform, .owner = cache, .generation = cache.generation };
+        return .{ .packet = .{ .chunk = chunk, .sections = sections, .maximum_size = maximum_size, .preparation = self.preparation }, .encoding = if (record) |value| .{ .record = value } else .sections, .owner = cache, .generation = cache.generation };
     }
 
-    /// A column whose neighbourhood stores no biomes, as in terrain generated without any,
-    /// shows the fallback biome, and cannot be compiled without one.
-    pub fn compileFrame(self: *Workspace, cache: *delivery_cache.Workspace, column: chunks.Light.Column, frame: *const chunks.Light.View, protocol: i32, fallback_biome: ?u16) !void {
+    /// Stores a baked frame, which every protocol encodes from as it stands. A column whose
+    /// neighbourhood stores no biomes, as in terrain generated without any, shows the fallback
+    /// biome, and cannot be stored without one.
+    pub fn storeFrame(self: *Workspace, cache: *delivery_cache.Workspace, column: chunks.Light.Column, frame: *const chunks.Light.View, fallback_biome: ?u16) !void {
+        _ = self;
         if (frame.header.count > section_views.maximum_sections) return error.UnsupportedLightingHeight;
         const neighborhood: BiomeNeighborhood = .{ .source = .{ .baked = frame }, .count = frame.header.count, .disclosed = frame.header.biomes };
-        const biome = neighborhood.first() orelse fallback_biome orelse return error.MissingBiomeData;
-        const chunk: Chunk = .{
-            .world = column.world,
-            .x = column.x,
-            .z = column.z,
-            .minimum_section = frame.header.minimum,
-            .sections = .{ .baked = .{ .view = frame } },
-            .biome = biome,
-            .workspace = self,
-            .light = .{ .source = .{ .stored = frame }, .count = @as(usize, frame.header.count) + 2, .masks = .{ @intCast(frame.masks[0]), @intCast(frame.masks[1]) }, .coverage = frame.header.coverage },
-        };
-        const delivery = try self.prepareDelivery(cache, chunk, protocol);
-        // Uniform sections need no compiled record. Their frame is stored alone, so the column
-        // reads back as stored instead of being solved again for every delivery.
-        if (delivery.encoding == .uniform) {
-            const slot = cache.slotOf(column);
-            if (cache.compiled[slot]) return;
-            var bundle = chunks.Delivery.Column.Builder.begin(cache.destination(), column, frame.bytes, cache.catalog.variants.len) catch return deliverySpace(cache);
-            cache.commit(slot, bundle.finish(), true);
-        }
+        _ = neighborhood.first() orelse fallback_biome orelse return error.MissingBiomeData;
+        const slot = cache.slotOf(column);
+        if (cache.compiled[slot]) return;
+        var bundle = chunks.Delivery.Column.Builder.begin(cache.destination(), column, frame.bytes, 0) catch return deliverySpace(cache);
+        cache.commit(slot, bundle.finish(), true);
     }
 
-    fn compileDelivery(self: *Workspace, cache: *delivery_cache.Workspace, slot: usize, chunk: Chunk, source: chunks.Delivery.Source, persistent: bool, protocol: i32) !chunks.Delivery.View {
+    /// Live sections are compiled for one delivery and kept nowhere.
+    fn compileDelivery(self: *Workspace, cache: *delivery_cache.Workspace, slot: usize, chunk: Chunk, source: chunks.Delivery.Source, protocol: i32) !chunks.Delivery.View {
+        assert(chunk.sections != .baked);
         const timing = cache.catalog.metrics.compilation.start();
         defer timing.end();
-        const frame = if (chunk.sections == .baked) chunk.sections.baked.view.bytes else &.{};
         const at: chunks.Light.Column = .{ .world = chunk.world, .x = chunk.x, .z = chunk.z };
-        var column = chunks.Delivery.Column.Builder.begin(cache.destination(), at, frame, cache.catalog.variants.len) catch return deliverySpace(cache);
-        const selected = try cache.catalog.index(protocol);
-        const requested = cache.catalog.variants[selected];
-        const first = try self.compileVariant(cache, chunk, source, requested, column.destination());
-        column.append(requested.identity, first);
-        const result = try chunks.Delivery.View.read(first, source);
-        // Other protocol formats keep their stored records when still current, so serving a
-        // second protocol never evicts the first. A format with no current record compiles
-        // when a client first requests it, or here when the cache fills eagerly.
-        const stored: ?chunks.Delivery.Column = if (cache.storedBundle(slot)) |bundle| (if (std.meta.eql(bundle.column, at)) bundle else null) else null;
-        for (cache.catalog.variants, 0..) |variant, index| {
-            if (index == selected) continue;
-            const current: ?[]const u8 = if (stored) |bundle| current: {
-                const record = bundle.find(variant.identity) orelse break :current null;
-                _ = chunks.Delivery.View.read(record, source) catch break :current null;
-                break :current record;
-            } else null;
-            if (current) |record| {
-                const destination = column.destination();
-                if (record.len > destination.len) break;
-                @memcpy(destination[0..record.len], record);
-                column.append(variant.identity, destination[0..record.len]);
-            } else if (cache.eager) {
-                // The requested format is in. One that does not fit compiles on a later pass.
-                const record = self.compileVariant(cache, chunk, source, variant, column.destination()) catch |err| switch (err) {
-                    error.DeliveryDeferred, error.DeliveryRecordTooLarge => break,
-                    else => return err,
-                };
-                column.append(variant.identity, record);
-            }
-        }
-        cache.commit(slot, column.finish(), persistent);
+        var column = chunks.Delivery.Column.Builder.begin(cache.destination(), at, &.{}, 1) catch return deliverySpace(cache);
+        const requested = cache.catalog.variants[try cache.catalog.index(protocol)];
+        const record = try self.compileVariant(cache, chunk, source, requested, column.destination());
+        column.append(requested.identity, record);
+        const result = try chunks.Delivery.View.read(record, source);
+        cache.commit(slot, column.finish(), false);
         return result;
     }
 
@@ -341,6 +309,25 @@ pub const Workspace = struct {
             length += @as(usize, summary.block_entities) * (1 + 2 + 5 + 2);
         }
         return length;
+    }
+
+    /// The packet bound of a stored frame without its light, as a fully disclosed column of
+    /// any protocol encodes, read before the frame is decoded so output can be reserved.
+    pub fn frameBound(self: *const Workspace, frame: []const u8) ?usize {
+        const bound = chunks.Light.Bound.read(frame) catch return null;
+        const count: usize = bound.count;
+        var length: usize = 5 + 8 + 2 * (5 + 5 + chunks.Prepared.Heightmap.wordCount(count) * 8) + 3 + 5 + bound.terrain;
+        for (0..count) |index| {
+            length += 4 + 1 + 1 + 5 + 64 * 4 + 64;
+            if (bound.uniform & (@as(u32, 1) << @intCast(index)) == 0) {
+                // The palette length, and the word count of a direct section.
+                length += 5 + 3;
+            } else {
+                length += 5;
+                if (self.blocks.entityName(bound.states[index]) != null) length += 4096 * (1 + 2 + 5 + 2);
+            }
+        }
+        return @min((1 << 21) - 1, length + 64);
     }
 
     fn representation(self: *Workspace, chunk: Chunk) []const section_views.Section {
@@ -1007,7 +994,9 @@ pub const Prepared = struct {
 /// Source frames and encoding workspaces remain borrowed until this packet is encoded.
 pub const Delivery = struct {
     packet: Prepared,
-    encoding: union(enum) { uniform, record: chunks.Delivery.View },
+    /// Sections are written as they stand, from a frame or uniform states, or from a record
+    /// compiled for live sections.
+    encoding: union(enum) { sections, record: chunks.Delivery.View },
     owner: *delivery_cache.Workspace,
     generation: u64,
 
@@ -1068,7 +1057,7 @@ fn storedHeightmap(chunk: Chunk) ?chunks.Light.Heightmap {
     return heightmap;
 }
 
-const write_delivery = .{ writeLegacyDelivery, writeFluidDelivery };
+pub const write_delivery = .{ writeLegacyDelivery, writeFluidDelivery };
 
 fn writeLegacyDelivery(packet: wire_1_21_5.play.toClient.packet_map_chunk.Writer, registry: packets.Registry, prepared: *const Delivery, protocol: *const sessions.Protocol) ![]u8 {
     return encodeDelivery(packet._cursor, registry, prepared, protocol, false);
@@ -1085,7 +1074,7 @@ fn encodeDelivery(cursor: support.cursor.State(.write), registry: packets.Regist
     const workspace = chunk.workspace;
     assert(workspace.preparation == prepared.preparation);
     const record: ?chunks.Delivery.View = switch (delivery.encoding) {
-        .uniform => null,
+        .sections => null,
         .record => |value| value,
     };
     if (record) |value| assert(value.count == prepared.sections.len);
@@ -1116,12 +1105,14 @@ fn encodeDelivery(cursor: support.cursor.State(.write), registry: packets.Regist
     const start = stream.count();
     try writeSections(stream, registry, prepared, record, mapping, protocol, fluids);
     assert(stream.count() - start == length);
-    var entity_sections = (if (record) |value| value.entity_sections else 0) & chunk.disclosure & ~chunk.frontier;
-    var entity_count: i32 = 0;
-    var remaining = entity_sections;
-    while (remaining != 0) : (remaining &= remaining - 1) entity_count += record.?.section(@ctz(remaining)).entity_count;
-    try varint(writer, entity_count);
-    while (entity_sections != 0) : (entity_sections &= entity_sections - 1) try writer.writeAll(record.?.section(@ctz(entity_sections)).entities);
+    if (record) |value| {
+        var entity_sections = value.entity_sections & chunk.disclosure & ~chunk.frontier;
+        var entity_count: i32 = 0;
+        var remaining = entity_sections;
+        while (remaining != 0) : (remaining &= remaining - 1) entity_count += value.section(@ctz(remaining)).entity_count;
+        try varint(writer, entity_count);
+        while (entity_sections != 0) : (entity_sections &= entity_sections - 1) try writer.writeAll(value.section(@ctz(entity_sections)).entities);
+    } else try writeSectionEntities(writer, prepared, protocol, mapping);
     var light = chunk.light;
     light.disclosure &= chunk.disclosure;
     try light.writeFragments(stream, workspace.uniform_light);
@@ -1165,6 +1156,8 @@ fn writeSections(stream: *deflate.fragments.Stream, registry: packets.Registry, 
         if (section.view == .uniform) {
             const state = section.view.uniform;
             try writeUniformBlock(writer, registry, state, fluids);
+        } else if (selected_record == null) {
+            try writeBakedSection(stream, registry, workspace, workspace.summaryAt(index), fluids);
         } else {
             const selected_record_value = selected_record.?;
             var fragments: [3]deflate.fragments.Fragment = undefined;
@@ -1196,6 +1189,75 @@ fn writeSections(stream: *deflate.fragments.Stream, registry: packets.Registry, 
             try varint(writer, try mapping.biome(protocol, @intCast(chunk.biome)));
         }
     }
+}
+
+/// The block entities of the disclosed sections, from their summaries.
+fn writeSectionEntities(writer: *std.Io.Writer, prepared: *const Prepared, protocol: *const sessions.Protocol, mapping: *Workspace.Mapping) !void {
+    const chunk = prepared.chunk;
+    const workspace = chunk.workspace;
+    const all: u32 = @truncate((@as(u64, 1) << @intCast(prepared.sections.len)) - 1);
+    const selection = chunk.disclosure & ~chunk.frontier & all;
+    var count: i32 = 0;
+    var remaining = selection;
+    while (remaining != 0) : (remaining &= remaining - 1) count += workspace.summaryAt(@ctz(remaining)).state.block_entities;
+    try varint(writer, count);
+    remaining = selection;
+    while (remaining != 0) : (remaining &= remaining - 1) {
+        const index = @ctz(remaining);
+        const summary = workspace.summaryAt(index);
+        if (summary.state.block_entities == 0) continue;
+        const base = (chunk.minimum_section + @as(i32, @intCast(index))) * 16;
+        if (summary.baked) |baked| {
+            for (0..baked.entities.len / 4) |entity| {
+                const cell = std.mem.readInt(u16, baked.entities[entity * 4 ..][0..2], .little);
+                const state = std.mem.readInt(u16, baked.entities[entity * 4 + 2 ..][0..2], .little);
+                try writeEntity(writer, cell, base, try mapping.blockEntity(protocol, workspace.blocks, state));
+            }
+        } else {
+            // A section filled with one state that carries a block entity.
+            const state = prepared.sections[index].view.uniform;
+            const kind = try mapping.blockEntity(protocol, workspace.blocks, state);
+            for (0..4096) |cell| try writeEntity(writer, @intCast(cell), base, kind);
+        }
+    }
+}
+
+fn writeEntity(writer: *std.Io.Writer, cell: u16, base: i32, kind: i32) !void {
+    try writer.writeByte(@intCast(((cell % 16) << 4) | ((cell / 16) % 16)));
+    try writer.writeInt(i16, @intCast(base + @as(i32, cell / 256)), .big);
+    try varint(writer, kind);
+    try writer.writeAll(&.{ 10, 0 });
+}
+
+/// A baked section as every protocol sends it: the header coded as it is written, then the
+/// words as the frame holds them. Only a direct section writes words of its own, since they
+/// carry the protocol's state numbers.
+fn writeBakedSection(stream: *deflate.fragments.Stream, registry: packets.Registry, workspace: *Workspace, summary: *const Workspace.Summary, comptime fluids: bool) !void {
+    const writer = &stream.writer;
+    const baked = summary.baked.?;
+    try writer.writeInt(u16, summary.state.count, .big);
+    if (fluids) try writer.writeInt(u16, summary.state.fluid_count, .big);
+    if (baked.bits == 16) {
+        const bits = registry.block_state_bits;
+        try writer.writeByte(bits);
+        _ = try workspace.word_decoder.decode(baked.words, &workspace.direct_words);
+        const per_word: usize = 64 / bits;
+        for (0..(4096 + per_word - 1) / per_word) |word| {
+            var value: u64 = 0;
+            for (0..per_word) |lane| {
+                const cell = word * per_word + lane;
+                if (cell >= 4096) break;
+                const state = std.mem.readInt(u16, workspace.direct_words[cell * 2 ..][0..2], .big);
+                value |= @as(u64, @intCast(try registry.blockState(state))) << @intCast(lane * bits);
+            }
+            try writer.writeInt(u64, value, .big);
+        }
+        return;
+    }
+    try writer.writeByte(baked.bits);
+    try varint(writer, @intCast(summary.state.palette_len));
+    for (0..summary.state.palette_len) |rank| try varint(writer, try registry.blockState(baked.state(rank)));
+    try stream.append(baked.words);
 }
 
 fn writeUniformBlock(writer: *std.Io.Writer, registry: packets.Registry, state: u16, comptime fluids: bool) !void {
@@ -1738,7 +1800,7 @@ test "baked terrain produces identical packets through both section layouts and 
         const view = try column_codec.decode(try column_codec.finish());
         for (caches, &catalogs) |cache, *catalog| {
             _ = try cache.begin(catalog, &.{.{ .column = .{ .world = 0, .x = -17, .z = 33 }, .protocol = 0 }});
-            try baked_workspace.compileFrame(cache, .{ .world = 0, .x = -17, .z = 33 }, &view, 0, null);
+            try baked_workspace.storeFrame(cache, .{ .world = 0, .x = -17, .z = 33 }, &view, null);
         }
         inline for (.{ false, true }) |fluids| for ([_]u32{ 0, 1 }) |disclosure| for ([_]u32{ 0, disclosure }) |frontier| {
             var chunk: Chunk = .{ .x = -17, .z = 33, .sections = .{ .loaded = &loaded }, .biome = biome, .minimum_section = 0, .workspace = native_workspace, .light = .{ .source = .{ .stored = &view }, .count = 3, .masks = .{ @intCast(view.masks[0]), @intCast(view.masks[1]) }, .coverage = 1 }, .disclosure = disclosure, .biome_disclosure = disclosure, .frontier = frontier };
@@ -2330,7 +2392,7 @@ test "concealed biome height intervals preserve exhaustive nearest cells across 
     }
 }
 
-test "compiled delivery matches canonical encoding through every selected protocol" {
+test "deliveries from a stored frame match canonical encoding through every selected protocol" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2387,53 +2449,22 @@ test "compiled delivery matches canonical encoding through every selected protoc
             chunk.sections = .{ .baked = .{ .view = &view } };
             chunk.workspace = compiled;
             const prepared = try compiled.prepareDelivery(cache, chunk, Version.protocol_number);
+            // Output is reserved from the stored frame before it is decoded.
+            try std.testing.expect(compiled.frameBound(view.bytes).? + lighting.Data.maximumEncodedSize(view.header.count) >= prepared.maximumSize());
             const wire_bytes = try sessions.packet_api.encode(Version, write_delivery, output, .{ registry, &prepared, definition });
             try std.testing.expectEqualSlices(u8, reference, try decoder.decode(wire_bytes, inflated));
         }
     }
+    // Every protocol encoded from the frame, so nothing was compiled or written.
     try std.testing.expectEqual(@as(usize, 1), cache.count);
+    try std.testing.expectEqual(@as(usize, 0), cache.write_count);
+    try std.testing.expectEqual(@as(usize, 0), cache.used);
+    // Storing the frame keeps it alone, once, however many protocols ask.
+    for (selected.values) |_| try compiled.storeFrame(cache, requests[0].column, &view, null);
+    try std.testing.expectEqual(@as(usize, 1), cache.write_count);
     const column = try chunks.Delivery.Column.read(cache.values[0].?);
     try std.testing.expectEqualSlices(u8, view.bytes, column.frame);
-    try std.testing.expectEqual(catalog.variants.len, column.variants);
-    for (catalog.variants) |variant| try std.testing.expect(column.find(variant.identity) != null);
-    // Each protocol's compile superseded the column's pending bundle, so one write stores
-    // the last and fullest.
-    try std.testing.expectEqual(@as(usize, 1), cache.write_count);
-    try std.testing.expectEqual(cache.values[0].?.ptr, cache.writes[0].value.?.ptr);
-    const bank = cache.write_bank;
-    if (catalog.variants.len > 1) {
-        const variant = catalog.variants[0];
-        const reference = try allocator.dupe(u8, column.find(variant.identity).?);
-        // The writer lays out one full entry per section before packing the unique ones, so
-        // compiling a record takes that much room beyond its finished length.
-        const working = @as(usize, view.header.count) * chunks.Delivery.work_entry_bytes;
-        const limit = chunks.Delivery.Column.header_size + view.bytes.len + catalog.variants.len * chunks.Delivery.Column.entry_size + reference.len + working;
-        cache.cancel();
-        cache.write_bank = cache.write_bank[0..limit];
-        _ = try cache.begin(&catalog, &requests);
-        try compiled.compileFrame(cache, requests[0].column, &view, variant.codec.number, null);
-        const bounded = try chunks.Delivery.Column.read(cache.values[0].?);
-        try std.testing.expectEqual(@as(usize, 1), bounded.variants);
-        try std.testing.expectEqual(catalog.variants.len, bounded.slots);
-        try std.testing.expectEqualSlices(u8, reference, bounded.find(variant.identity).?);
-    }
-    // Each protocol compiling its own format on request and an eager cache compiling them
-    // all on the first request must store the same records.
-    cache.cancel();
-    cache.write_bank = bank;
-    _ = try cache.begin(&catalog, &requests);
-    for (selected.values) |definition| try compiled.compileFrame(cache, requests[0].column, &view, definition.number, null);
-    try std.testing.expectEqual(@as(usize, 1), cache.write_count);
-    const lazy = try chunks.Delivery.Column.read(try allocator.dupe(u8, cache.values[0].?));
-    try std.testing.expectEqual(catalog.variants.len, lazy.variants);
-    cache.cancel();
-    cache.eager = true;
-    _ = try cache.begin(&catalog, &requests);
-    try compiled.compileFrame(cache, requests[0].column, &view, catalog.variants[catalog.variants.len - 1].codec.number, null);
-    try std.testing.expectEqual(@as(usize, 1), cache.write_count);
-    const eager = try chunks.Delivery.Column.read(cache.values[0].?);
-    try std.testing.expectEqual(catalog.variants.len, eager.variants);
-    for (catalog.variants) |variant| try std.testing.expectEqualSlices(u8, lazy.find(variant.identity).?, eager.find(variant.identity).?);
+    try std.testing.expectEqual(@as(usize, 0), column.variants);
 }
 
 test "uniform columns store their frame without a compiled record" {
@@ -2465,7 +2496,7 @@ test "uniform columns store their frame without a compiled record" {
     }
     const view = try frame_writer.decode(try frame_writer.finish());
     // Every protocol compiles the same column. Only the first stores the frame.
-    for (selected.values) |definition| try compiled.compileFrame(cache, column, &view, definition.number, null);
+    for (selected.values) |_| try compiled.storeFrame(cache, column, &view, null);
     try std.testing.expectEqual(@as(usize, 1), cache.write_count);
     const stored = try chunks.Delivery.Column.read(cache.values[0].?);
     try std.testing.expectEqualSlices(u8, view.bytes, stored.frame);
@@ -2498,12 +2529,12 @@ test "a column with no stored biomes around it shows the fallback biome" {
     }
     const view = try frame_writer.decode(try frame_writer.finish());
     _ = try cache.begin(&catalog, &requests);
-    try std.testing.expectError(error.MissingBiomeData, compiled.compileFrame(cache, column, &view, selected.values[0].number, null));
+    try std.testing.expectError(error.MissingBiomeData, compiled.storeFrame(cache, column, &view, null));
     cache.cancel();
     _ = try cache.begin(&catalog, &requests);
     defer cache.cancel();
     const void_biome: u16 = @intCast(game_data.registry.biomeId("minecraft:the_void").?);
-    try compiled.compileFrame(cache, column, &view, selected.values[0].number, void_biome);
+    try compiled.storeFrame(cache, column, &view, void_biome);
     try std.testing.expectEqual(@as(usize, 1), cache.write_count);
 }
 

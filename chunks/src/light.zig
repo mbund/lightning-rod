@@ -7,7 +7,7 @@ const assert = std.debug.assert;
 
 pub const maximum_sections = prepared.Heightmap.maximum_sections;
 pub const layer_bytes = 2048;
-pub const header_bytes = 224;
+pub const header_bytes = 228;
 pub const prefix_bytes = 44;
 pub const maximum_metadata = classification.Header.maximum_size;
 comptime {
@@ -240,7 +240,7 @@ pub const Prefix = struct {
 
     pub fn read(bytes: []const u8) !Prefix {
         if (bytes.len < 4) return error.Corrupt;
-        if (!std.mem.eql(u8, bytes[0..4], "LRL8")) return error.Outdated;
+        if (!std.mem.eql(u8, bytes[0..4], "LRL9")) return error.Outdated;
         if (bytes.len < prefix_bytes or bytes[40] == 0 or bytes[40] > maximum_sections or bytes[41] > 1) return error.Corrupt;
         const length = std.mem.readInt(u16, bytes[42..44], .little);
         if (length > maximum_metadata or (length != 0 and bytes.len - prefix_bytes < 32 + @as(usize, length))) return error.Corrupt;
@@ -250,6 +250,26 @@ pub const Prefix = struct {
             .count = bytes[40],
             .metadata = if (length == 0) null else .{ .identity = bytes[prefix_bytes..][0..32].*, .bytes = bytes[prefix_bytes + 32 ..][0..length] },
         };
+    }
+};
+
+/// What a packet bound needs from a frame, read without decoding the rest of it. `terrain`
+/// sums, over the sections that are not uniform, five bytes per palette entry, the decoded
+/// word bytes and ten bytes per block entity.
+pub const Bound = struct {
+    count: u8,
+    uniform: u32,
+    states: [maximum_sections]u16,
+    terrain: u32,
+
+    pub fn read(raw: []const u8) !Bound {
+        const prefix = try Prefix.read(raw);
+        const metadata_bytes = if (prefix.metadata) |value| 32 + value.bytes.len else @as(usize, 0);
+        if (raw.len < header_bytes + metadata_bytes) return error.Corrupt;
+        const fields = raw[prefix_bytes + metadata_bytes ..][0 .. header_bytes - prefix_bytes];
+        var result: Bound = .{ .count = prefix.count, .uniform = std.mem.readInt(u32, fields[112..116], .little), .states = undefined, .terrain = std.mem.readInt(u32, fields[180..184], .little) };
+        for (&result.states, 0..) |*state, index| state.* = std.mem.readInt(u16, fields[116 + index * 2 ..][0..2], .little);
+        return result;
     }
 };
 
@@ -342,7 +362,7 @@ pub const Workspace = struct {
     pub fn begin(self: *Workspace, header: Header) void {
         assert(header.count > 0 and header.count <= maximum_sections);
         assert(header.count == 32 or header.coverage >> @intCast(header.count) == 0);
-        @memcpy(self.raw[0..4], "LRL8");
+        @memcpy(self.raw[0..4], "LRL9");
         @memcpy(self.raw[4..36], &header.rules);
         std.mem.writeInt(i32, self.raw[36..40], header.minimum, .little);
         self.raw[40] = header.count;
@@ -359,6 +379,7 @@ pub const Workspace = struct {
         assert(header.count == 32 or header.uniform >> @intCast(header.count) == 0);
         std.mem.writeInt(u32, self.raw[156..160], header.uniform, .little);
         for (header.states, 0..) |state, index| std.mem.writeInt(u16, self.raw[160 + index * 2 ..][0..2], state, .little);
+        std.mem.writeInt(u32, self.raw[224..228], 0, .little);
         self.header_offset = prefix_bytes;
         @memset(&self.buckets, std.math.maxInt(u16));
         self.dictionary_count = 0;
@@ -474,6 +495,12 @@ pub const Workspace = struct {
 
     pub fn commitTerrain(self: *Workspace, length: usize) void {
         assert(self.reserved and self.written == 0 and length <= prepared.maximum_bytes);
+        // Each section adds what its packet form can take, so a packet bound is read before
+        // the frame is decoded.
+        const encoded = self.raw[self.cursor + 2 ..][0..length];
+        const term = @as(u32, std.mem.readInt(u16, encoded[2..4], .little)) * 5 + prepared.wordBytes(encoded[0]) + @as(u32, std.mem.readInt(u16, encoded[8..10], .little)) * 10;
+        const bound = self.raw[self.header_offset + header_bytes - prefix_bytes - 4 ..][0..4];
+        std.mem.writeInt(u32, bound, std.mem.readInt(u32, bound, .little) + term, .little);
         std.mem.writeInt(u16, self.raw[self.cursor..][0..2], @intCast(length), .little);
         self.cursor += 2 + length;
         self.terrain_written += 1;
@@ -803,7 +830,7 @@ test "stored lighting rejects invalid dimensions truncated planes and trailing d
                 workspace.raw[workspace.cursor] = 0;
                 workspace.cursor += 1;
             },
-            4 => @memcpy(workspace.raw[0..4], "LRL9"),
+            4 => @memcpy(workspace.raw[0..4], "LRL8"),
             5 => std.mem.writeInt(u32, workspace.raw[156..160], 2, .little),
             else => unreachable,
         }
@@ -959,4 +986,38 @@ test "delivery identity changes when a nonmaximum neighbor stamp changes" {
     const previous = header.revision();
     header.revisions[1] = 1;
     try std.testing.expect(previous != header.revision());
+}
+
+test "frames bound the packet form of their sections before they are decoded" {
+    const allocator = std.testing.allocator;
+    var workspace = try Workspace.init(allocator);
+    defer workspace.deinit();
+    const baker = try prepared.Baker.init(allocator);
+    defer baker.deinit();
+    var properties: [4096]u8 = @splat(0);
+    properties[0] = 1;
+    properties[2] = 4;
+    for (&baker.states, 0..) |*state, cell| state.* = @intCast(cell % 3);
+    for ([_]bool{ false, true }) |described| {
+        workspace.begin(.{ .rules = @splat(1), .minimum = 0, .count = 2, .skylight = false, .coverage = 0, .revisions = @splat(0), .biomes = @splat(0), .uniform = 2 });
+        // Metadata moves the fields the bound is kept in.
+        if (described) workspace.metadata(@splat(9), "metadata");
+        const result = try baker.encode(&properties, workspace.terrainSection());
+        workspace.commitTerrain(result.section.len);
+        _ = workspace.terrainSection();
+        workspace.commitUniformTerrain(7);
+        for (0..8) |_| {
+            @memset(workspace.section(), 0);
+            try workspace.commitSection();
+        }
+        const frame = try workspace.finish();
+        const section = try prepared.Section.read(result.section);
+        const bound = try Bound.read(frame);
+        try std.testing.expectEqual(@as(u32, @intCast(section.palette.len / 2 * 5 + prepared.wordBytes(section.bits) + section.entities.len / 4 * 10)), bound.terrain);
+        try std.testing.expect(section.entities.len != 0);
+        try std.testing.expectEqual(@as(u8, 2), bound.count);
+        try std.testing.expectEqual(@as(u32, 2), bound.uniform);
+        try std.testing.expectEqual(@as(u16, 7), bound.states[1]);
+        _ = try workspace.decode(frame);
+    }
 }

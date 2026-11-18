@@ -116,9 +116,6 @@ pub const Workspace = struct {
     output: records.PackedRead = undefined,
     batch: chunks.Delivery.ReadBatch = undefined,
     active: bool = false,
-    /// Compile every encoding a column lacks along with the requested one. Prewarming sets
-    /// this. Serving leaves each encoding for its first client.
-    eager: bool = false,
     generation: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, protocols: usize) !*Workspace {
@@ -209,20 +206,16 @@ pub const Workspace = struct {
         return parsed;
     }
 
-    /// The packet bound a stored record declares for this column and protocol, or null when
-    /// the batch read found none. Call after the batch read completes.
-    pub fn packetBound(self: *Workspace, column: chunks.Light.Column, protocol: i32) !?usize {
+    /// The frame stored for this column, or null when the batch read found none. Call after
+    /// the batch read completes.
+    pub fn storedFrame(self: *Workspace, column: chunks.Light.Column) ?[]const u8 {
         assert(self.active);
-        const variant = try self.catalog.index(protocol);
         for (self.columns[0..self.count], 0..) |selected, slot| {
             if (!std.meta.eql(selected, column)) continue;
             if (!self.complete[slot]) return null;
             const stored = self.storedBundle(slot) orelse return null;
             if (!std.meta.eql(stored.column, column)) return null;
-            const identity = self.catalog.variants[variant].identity;
-            const record = stored.find(identity) orelse return null;
-            const maximum = chunks.Delivery.View.declaredMaximum(record) orelse return null;
-            return maximum;
+            return stored.frame;
         }
         return null;
     }
