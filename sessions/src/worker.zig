@@ -1384,6 +1384,16 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             return if (binding.endpoint.push(.{ .input = .{ .handle = binding.handle, .protocol = protocol, .packets = packets } })) .borrowed else .blocked;
         }
 
+        /// Grows the input a connection lent, before a tick takes it, to `packets`: the same input
+        /// from the same start with more placed after it. False once a tick took it.
+        pub fn extend(self: *Self, handle: network.Handle, packets: session_protocol.Packets) bool {
+            if (self.reload_state.load(.acquire) != .running) return false;
+            const binding = self.bindings[handle.index] orelse return false;
+            assert(std.meta.eql(binding.native, handle));
+            if (binding.endpoint.moves[binding.handle.index].state.load(.acquire) == .committed) return false;
+            return binding.endpoint.extendInput(binding.handle.index, packets.units());
+        }
+
         pub fn status(self: *Self, protocol: i32, packet: []const u8, output: []u8) !?[]const u8 {
             const request: session_protocol.StatusRequest = .{
                 .protocol = protocol,

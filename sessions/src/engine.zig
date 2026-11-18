@@ -170,10 +170,25 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             decoded_result: ?Codec.Result = null,
             decode_large: bool = false,
             input_packets: [128][]const u8 = undefined,
+            /// What the input lent to the observer holds while a tick has yet to take it, so input
+            /// received meanwhile can join it rather than wait for it to come back.
+            growing: ?Lent = null,
             send_loan: ?*Loan = null,
             output_loans: [output_loans_max]SendLoan = undefined,
             loan_read: usize = 0,
             loan_write: usize = 0,
+        };
+
+        /// Whether a connection's lent batch may grow: one of the small packets players send
+        /// every tick, while its input sits in its resident buffer, not one that outgrew it.
+        fn canGrow(connection: *const Connection) bool {
+            return @hasDecl(Observer, "extend") and connection.growing != null and connection.input_burst == null;
+        }
+
+        /// What a lent batch of input holds, which grows in place until a tick takes it.
+        const Lent = union(enum) {
+            packets: struct { count: usize, decoded: usize },
+            framed: struct { start: usize, end: usize },
         };
 
         /// Marks a connection closing, keeping the first reason it was given.
@@ -477,6 +492,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 }
                 if (connection.parked) continue;
                 connection.decoded_result = null;
+                connection.growing = null;
                 if (connection.decoded) |lease| lease.release();
                 connection.decoded = null;
                 if (!self.reserveControl(index)) {
@@ -1602,6 +1618,9 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                     continue;
                 }
 
+                // A lent batch grows by what arrived since, until it comes back.
+                if (connection.loan.load(.acquire)) self.growLent(io, index) else connection.growing = null;
+
                 while (!stopping and connection.group == null and connection.state.phase != .parked and (connection.state.phase == .play or connection.output.len == 0) and !connection.loan.load(.acquire)) {
                     if (connection.lifecycle != null and connection.output.len == 0 and connection.output_read == connection.output_write) {
                         if (!connection.status and !self.reserveControl(index)) break;
@@ -1727,7 +1746,10 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                                 }
                                 connection.decoded_result = null;
                                 connection.input_start += result.consumed;
-                                if (disposition == .borrowed) break;
+                                if (disposition == .borrowed) {
+                                    connection.growing = self.lentPackets(index, connection, result.input.?.packets);
+                                    break;
+                                }
                                 continue;
                             }
                             body = result.bytes;
@@ -1777,7 +1799,10 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                                 break;
                             }
                             connection.input_start += result.consumed;
-                            if (disposition == .borrowed) break;
+                            if (disposition == .borrowed) {
+                                connection.growing = self.lentPackets(index, connection, result.input.?.packets);
+                                break;
+                            }
                             continue;
                         }
 
@@ -1810,6 +1835,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                             decode_blocked = true;
                             break;
                         }
+                        if (disposition == .borrowed) connection.growing = .{ .framed = .{ .start = connection.input_start, .end = batch_end } };
                         connection.input_start = batch_end;
                         if (disposition == .borrowed) break;
                         continue;
@@ -1859,9 +1885,14 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 if (connection.closing) continue;
 
                 if (decode_blocked) self.wait(index);
-                if (decode_blocked or stopping or connection.state.phase == .parked or connection.receiving or connection.loan.load(.acquire)) continue;
+                // While a batch that can still grow is lent, input is received after it, so the batch
+                // can grow, but nothing moves, as the batch points into the buffer: with no room
+                // left, receiving waits for the batch to come back.
+                const lent = connection.loan.load(.acquire);
+                if (decode_blocked or stopping or connection.state.phase == .parked or connection.receiving or (lent and !canGrow(connection))) continue;
+                if (lent and connection.input_end == input.len) continue;
 
-                if (connection.input_start == connection.input_end) {
+                if (connection.input_start == connection.input_end and !lent) {
                     connection.input_start = 0;
                     connection.input_end = 0;
                 }
@@ -2225,6 +2256,105 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 if (response != null) return false;
             }
             return true;
+        }
+
+        fn extendLent(self: *Self, handle: network.Handle, packets: protocol_api.Packets) bool {
+            if (comptime @hasDecl(Observer, "extend")) return self.config.observer.extend(handle, packets);
+            return false;
+        }
+
+        fn decodedBuffer(self: *Self, index: usize, connection: *const Connection) []u8 {
+            const small = @min(self.config.connection_bytes, self.config.buffer_bytes);
+            return if (connection.decoded) |lease| lease.bytes else self.decoded_storage[index * small ..][0..small];
+        }
+
+        /// What a lent batch of decoded packets holds: those first of `input_packets`, and the
+        /// decoded buffer up to the end of the last it decompressed there. Packets sent
+        /// uncompressed lie in the input buffer instead.
+        fn lentPackets(self: *Self, index: usize, connection: *const Connection, packets: []const []const u8) Lent {
+            assert(packets.ptr == @as([*]const []const u8, &connection.input_packets));
+            const decoded = self.decodedBuffer(index, connection);
+            const base = @intFromPtr(decoded.ptr);
+            var end: usize = 0;
+            for (packets) |packet| {
+                const at = @intFromPtr(packet.ptr);
+                if (at >= base and at < base + decoded.len) end = @max(end, at - base + packet.len);
+            }
+            return .{ .packets = .{ .count = packets.len, .decoded = end } };
+        }
+
+        /// Adds input received while a batch is lent to that batch, if no tick took it yet, so the
+        /// input runs in the next tick rather than the one after the batch comes back. The batch
+        /// grows in place, after what it holds, so nothing it holds moves. Session plugins see the
+        /// added packets only once the batch holds them, and if a tick took the batch first, the
+        /// packets are decoded again once it comes back, so none is handled twice.
+        fn growLent(self: *Self, io: std.Io, index: usize) void {
+            const connection = &self.connections[index];
+            if (!canGrow(connection)) return;
+            const lent = connection.growing.?;
+            if (connection.closing or connection.state.phase != .play or connection.lifecycle == null or connection.input_start >= connection.input_end) return;
+            if (connection.received != 0 or connection.receive_tail != 0 or connection.decoded_result != null or connection.codec.state.load(.acquire) != .idle) return;
+            const handle = connection.handle orelse return;
+            const input = self.inputBuffer(index);
+            // Nothing is decoded for a batch a tick already took.
+            const current: protocol_api.Packets = switch (lent) {
+                .packets => |packets| .{ .packets = connection.input_packets[0..packets.count] },
+                .framed => |framed| .{ .framed = input[framed.start..framed.end] },
+            };
+            if (!self.extendLent(handle, current)) {
+                connection.growing = null;
+                return;
+            }
+            switch (lent) {
+                .packets => |held| {
+                    if (held.count == connection.input_packets.len) return;
+                    const decoded = self.decodedBuffer(index, connection);
+                    const result = Codec.decodeBatch(&self.workspaces, .{
+                        .connection = &connection.lifecycle.?,
+                        .bytes = input[connection.input_start..connection.input_end],
+                        .output = decoded[held.decoded..],
+                        .packets = connection.input_packets[held.count..],
+                        .threshold = self.config.compression_threshold,
+                        .maximum = self.config.max_packet,
+                    }) catch {
+                        // Left for the batch after this one, which rejects it.
+                        connection.growing = null;
+                        return;
+                    };
+                    if (result.needs_output) {
+                        connection.growing = null;
+                        return;
+                    }
+                    const added = (result.input orelse return).packets;
+                    if (added.len == 0) return;
+                    const grown = connection.input_packets[0 .. held.count + added.len];
+                    if (!self.extendLent(handle, .{ .packets = grown })) {
+                        connection.growing = null;
+                        return;
+                    }
+                    connection.input_start += result.consumed;
+                    connection.growing = self.lentPackets(index, connection, grown);
+                    if (!self.observePlayPackets(io, connection, .{ .packets = added })) markClosing(connection, .input_rejected);
+                },
+                .framed => |held| {
+                    assert(held.end == connection.input_start);
+                    var end = connection.input_start;
+                    while (end < connection.input_end) {
+                        const next = Endpoint.frame(&connection.lifecycle.?, input[end..connection.input_end], self.config.max_packet) catch break;
+                        if (next.body.len == 0 or next.body.len > self.config.max_packet) break;
+                        end += next.length;
+                    }
+                    if (end == connection.input_start) return;
+                    if (!self.extendLent(handle, .{ .framed = input[held.start..end] })) {
+                        connection.growing = null;
+                        return;
+                    }
+                    const added = input[connection.input_start..end];
+                    connection.input_start = end;
+                    connection.growing = .{ .framed = .{ .start = held.start, .end = end } };
+                    if (!self.observePlayPackets(io, connection, .{ .framed = added })) markClosing(connection, .input_rejected);
+                },
+            }
         }
     };
 }

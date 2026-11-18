@@ -1451,3 +1451,28 @@ test "prepared publications charge decoded capacity through cancellation batchin
         try std.testing.expectEqual(@as(usize, 512), endpoint.outputCredit(handle));
     }
 }
+
+test "input lent before a tick grows until the tick takes it" {
+    var hooks: Hooks = .{};
+    const endpoint = try createEndpoint(std.testing.allocator, &hooks);
+    defer endpoint.deinit();
+    const packets = [_][]const u8{ "move", "end", "use", "late" };
+    try std.testing.expect(endpoint.push(.{ .input = .{ .handle = .{ .index = 0, .generation = 1 }, .protocol = 1, .packets = .{ .packets = packets[0..2] } } }));
+    // An action arriving before the tick joins the batch already waiting.
+    try std.testing.expect(endpoint.extendInput(0, 3));
+    endpoint.beginTick();
+    // Once the tick holds the batch, it grows no more: what comes next waits for it.
+    try std.testing.expect(!endpoint.extendInput(0, 4));
+    var seen: usize = 0;
+    for (endpoint.input_events) |event| {
+        var incoming = event.input.packets;
+        while (try incoming.next()) |packet| {
+            try std.testing.expectEqual(packets[seen].ptr, packet.ptr);
+            seen += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), seen);
+    endpoint.endTick(true);
+    try std.testing.expectEqual(@as(u32, 1), endpoint.releases[0].swap(0, .acquire));
+    try std.testing.expect(!endpoint.extendInput(0, 4));
+}

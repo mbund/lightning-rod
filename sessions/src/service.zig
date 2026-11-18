@@ -126,6 +126,11 @@ pub const Service = struct {
     activity: []std.atomic.Value(usize),
     instruments: Instrumentation,
     pending_inputs: []PendingInput,
+    /// Each connection's batch of input waiting for a tick, which may still grow by the input the
+    /// connection receives meanwhile: its length, with `open_input` set, until the tick takes it.
+    /// Input arriving before a tick then runs in that tick, rather than waiting for the batch
+    /// ahead of it to come back.
+    open_inputs: []std.atomic.Value(u64),
     input_head: ?usize = null,
     input_tail: ?usize = null,
     pending_input_count: usize = 0,
@@ -173,6 +178,9 @@ pub const Service = struct {
         const pending_inputs = try allocator.alloc(PendingInput, config.connections);
         errdefer allocator.free(pending_inputs);
         @memset(pending_inputs, .{});
+        const open_inputs = try allocator.alloc(std.atomic.Value(u64), config.connections);
+        errdefer allocator.free(open_inputs);
+        for (open_inputs) |*value| value.* = .init(0);
         const credit = try allocator.alloc(std.atomic.Value(u64), config.connections);
         errdefer allocator.free(credit);
 
@@ -220,6 +228,7 @@ pub const Service = struct {
             .recipient_marks = recipient_marks,
             .batch = batch,
             .pending_inputs = pending_inputs,
+            .open_inputs = open_inputs,
             .credit = credit,
             .returned = returned,
             .disconnects = disconnects,
@@ -263,6 +272,7 @@ pub const Service = struct {
         self.allocator.free(self.recipient_marks);
         self.allocator.free(self.batch);
         self.allocator.free(self.pending_inputs);
+        self.allocator.free(self.open_inputs);
         self.allocator.destroy(self);
     }
 
@@ -1064,6 +1074,7 @@ pub const Service = struct {
         while (events < self.events.len) : (events += 1) {
             const event = self.next() orelse break;
             if (event == .input and self.moves[event.input.handle.index].state.load(.acquire) == .committed) {
+                _ = self.sealInput(event.input);
                 self.release(event.input.handle);
                 continue;
             }
@@ -1071,7 +1082,9 @@ pub const Service = struct {
                 const input = event.input;
                 const pending = &self.pending_inputs[input.handle.index];
                 assert(pending.handle == null and !input.packets.empty());
-                pending.* = .{ .handle = input.handle, .protocol = input.protocol, .original = input.packets, .remaining = input.packets };
+                // From here the tick reads the batch, so it grows no more.
+                const packets = self.sealInput(input);
+                pending.* = .{ .handle = input.handle, .protocol = input.protocol, .original = packets, .remaining = packets };
                 self.appendInput(input.handle.index);
                 continue;
             }
@@ -1172,6 +1185,7 @@ pub const Service = struct {
             notify = true;
         }
         while (self.next()) |event| if (event == .input) {
+            _ = self.sealInput(event.input);
             self.releaseInput(event.input.handle);
             notify = true;
         };
@@ -1259,9 +1273,30 @@ pub const Service = struct {
     pub fn push(self: *Service, event: Event) bool {
         const write = self.event_write.load(.monotonic);
         if (write -% self.event_read.load(.acquire) == self.events.len) return false;
+        if (event == .input) self.open_inputs[event.input.handle.index].store(open_input | event.input.packets.units(), .release);
         self.events[write % self.events.len] = event;
         self.event_write.store(write +% 1, .release);
         return true;
+    }
+
+    const open_input: u64 = 1 << 63;
+
+    /// Grows a connection's batch of input waiting for a tick to `units`, by input placed right
+    /// after it, if no tick took the batch yet. The input must be in place before the call.
+    pub fn extendInput(self: *Service, index: usize, units: usize) bool {
+        var value = self.open_inputs[index].load(.acquire);
+        while (value & open_input != 0) {
+            assert(units >= value & ~open_input and units < open_input);
+            value = self.open_inputs[index].cmpxchgWeak(value, open_input | units, .acq_rel, .acquire) orelse return true;
+        }
+        return false;
+    }
+
+    /// Closes a connection's batch of input to growing, giving how long it grew.
+    fn sealInput(self: *Service, input: anytype) protocol_api.Packets {
+        const value = self.open_inputs[input.handle.index].swap(0, .acq_rel);
+        if (value & open_input == 0) return input.packets;
+        return input.packets.grownTo(@intCast(value & ~open_input));
     }
 };
 

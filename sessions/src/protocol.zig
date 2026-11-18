@@ -17,6 +17,24 @@ pub const Packets = union(enum) {
         };
     }
 
+    /// How long the packets are: the bytes of their frames, or how many there are.
+    pub fn units(self: Packets) usize {
+        return switch (self) {
+            .framed => |bytes| bytes.len,
+            .packets => |values| values.len,
+        };
+    }
+
+    /// The same packets from the same start, grown to `count` units by packets the connection
+    /// placed right after them.
+    pub fn grownTo(self: Packets, count: usize) Packets {
+        std.debug.assert(count >= self.units());
+        return switch (self) {
+            .framed => |bytes| .{ .framed = bytes.ptr[0..count] },
+            .packets => |values| .{ .packets = values.ptr[0..count] },
+        };
+    }
+
     pub fn before(self: Packets, rest: Packets) Packets {
         return switch (self) {
             .framed => |bytes| prefix: {
