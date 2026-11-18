@@ -1,5 +1,6 @@
 const std = @import("std");
 const plugin = @import("plugin.zig");
+const TickRate = @import("tick_rate.zig").TickRate;
 const runtime = @import("plugin_runtime.zig");
 const PluginAllocator = @import("plugin_allocator.zig").PluginAllocator;
 const metrics = @import("metrics");
@@ -175,6 +176,13 @@ pub fn Simulation(comptime Selections: type) type {
         pub fn get(self: *const Self, comptime Plugin: type) *Plugin {
             assert(self.state != .closed);
             return self.instances.get(Plugin);
+        }
+
+        /// Whether the host should start the next tick at once, for a sprint the tick rate plugin
+        /// runs. Without that plugin selected, never.
+        pub fn sprinting(self: *const Self) bool {
+            if (comptime plugin.indexOfId(Selections, TickRate.id) == null) return false;
+            return self.get(TickRate).sprinting();
         }
 
         pub fn poll(self: *Self) !void {

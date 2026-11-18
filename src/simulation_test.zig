@@ -385,3 +385,27 @@ test "framework metric capacity follows the composition without consuming the pl
     try std.testing.expectEqual(simulation.metrics.records.len, simulation.metrics.count);
     try std.testing.expect(simulation.metrics.count > 0);
 }
+
+test "a simulation sprints while its tick rate plugin asks, and never without it" {
+    var database = try Database.init();
+    defer database.deinit();
+    const plugins = .{ lightning_rod.plugin.configured(lightning_rod.TickRate, .{}), lightning_rod.plugin.configured(Probe, .{}) };
+    const simulation = try lightning_rod.Simulation(@TypeOf(plugins)).init(std.testing.allocator, std.testing.io, &database.store, .{ .memory_bytes = 16 * 1024, .temporary_bytes = 1024, .metrics = .{ .enabled = false }, .autosave = .{ .ticks = null } });
+    defer simulation.deinit(std.testing.allocator);
+    try simulation.initialize(plugins, .{});
+    try std.testing.expect(!simulation.sprinting());
+    simulation.get(lightning_rod.TickRate).sprint(2);
+    var ran: usize = 0;
+    while (simulation.sprinting()) : (ran += 1) try simulation.tick();
+    try std.testing.expectEqual(@as(usize, 2), ran);
+    try simulation.close(deadline());
+
+    var other = try Database.init();
+    defer other.deinit();
+    const without = .{lightning_rod.plugin.configured(Probe, .{})};
+    const plain = try lightning_rod.Simulation(@TypeOf(without)).init(std.testing.allocator, std.testing.io, &other.store, .{ .memory_bytes = 16 * 1024, .temporary_bytes = 1024, .metrics = .{ .enabled = false }, .autosave = .{ .ticks = null } });
+    defer plain.deinit(std.testing.allocator);
+    try plain.initialize(without, .{});
+    try std.testing.expect(!plain.sprinting());
+    try plain.close(deadline());
+}

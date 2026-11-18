@@ -41,6 +41,13 @@ pub fn build(b: *std.Build) void {
     }) }));
     test_step.dependOn(&cache_tests.step);
     core_test_step.dependOn(&cache_tests.step);
+    const tick_rate_tests = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tick_rate.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) }));
+    test_step.dependOn(&tick_rate_tests.step);
+    core_test_step.dependOn(&tick_rate_tests.step);
     const runtime_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/runtime/memset.zig"),
         .target = target,

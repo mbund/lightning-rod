@@ -109,7 +109,14 @@ pub fn Server(comptime Plugins: type, comptime Endpoint: type, comptime SessionP
                 }
                 try simulation.poll();
                 if (process.exporter) |*value| try value.poll(init.io);
-                deadline = host.timing.nextTick(deadline, std.Io.Clock.now(.awake, init.io).nanoseconds);
+                const moment = std.Io.Clock.now(.awake, init.io).nanoseconds;
+                // A sprint starts the next tick at once, after the network and background work
+                // had their turn, as vanilla's does between its ticks.
+                if (simulation.sprinting()) {
+                    deadline = moment;
+                    continue;
+                }
+                deadline = host.timing.nextTick(deadline, moment);
                 if (!process.interrupted.requested()) try std.Io.Timeout.sleep(.{ .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = deadline } } }, init.io);
             }
         }

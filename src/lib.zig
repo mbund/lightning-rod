@@ -11,4 +11,5 @@ pub const system = @import("system");
 pub const Memory = system.Memory;
 pub const Checkpoint = @import("checkpoint.zig").Checkpoint;
 pub const Autosave = @import("simulation.zig").Autosave;
+pub const TickRate = @import("tick_rate.zig").TickRate;
 pub const Resume = struct { reader: *std.Io.Reader, file_reader: ?*std.Io.File.Reader = null };

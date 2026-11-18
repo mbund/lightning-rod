@@ -73,7 +73,19 @@ pub fn Server(comptime Plugins: type, comptime Endpoint: type, comptime SessionP
                 _ = try process.store.pollMaintenance(process.store.maintenanceBudget());
                 try simulation.poll();
                 if (process.exporter) |*value| try value.poll(init.io);
-                deadline = host.timing.nextTick(deadline, std.Io.Clock.now(.awake, init.io).nanoseconds);
+                const moment = std.Io.Clock.now(.awake, init.io).nanoseconds;
+                // A sprint starts the next tick at once, after terrain had one turn, as it has no
+                // gap before the next tick to work in.
+                if (simulation.sprinting()) {
+                    if (terrain.chunks.ready().isSet()) {
+                        terrain.chunks.ready().reset();
+                        try terrain.poll();
+                        try network.poll();
+                    }
+                    deadline = moment;
+                    continue;
+                }
+                deadline = host.timing.nextTick(deadline, moment);
                 while (terrain.chunks.ready().isSet() and std.Io.Clock.now(.awake, init.io).nanoseconds < deadline) {
                     terrain.chunks.ready().reset();
                     try terrain.poll();
