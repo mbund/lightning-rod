@@ -22,7 +22,7 @@ const item_data = @import("vanilla_items").item_data;
 const BlockLoot = @import("block_loot.zig").BlockLoot;
 const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
 const Players = @import("players").players.Players;
-const Effects = @import("world_effects.zig").Effects;
+const Effects = @import("vanilla_world").world_effects.Effects;
 
 const assert = std.debug.assert;
 const registry = game_data.registry;

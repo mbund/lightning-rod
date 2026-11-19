@@ -17,7 +17,7 @@ const ItemActions = @import("vanilla_items").item_actions.ItemActions;
 const item_actions = @import("vanilla_items").item_actions;
 const fluids = @import("fluids.zig");
 const replaceable = @import("replaceable.zig");
-const Effects = @import("world_effects.zig").Effects;
+const Effects = @import("vanilla_world").world_effects.Effects;
 const raycast = @import("raycast.zig");
 
 const assert = std.debug.assert;
