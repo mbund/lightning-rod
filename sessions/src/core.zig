@@ -198,6 +198,15 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
             if (self.transport.aborted) self.worker.abort(io);
             if (self.worker.started) self.worker.deinit() else self.worker.deinitUnstarted();
             self.hooks.deinit(io);
+            // What output took at its peak against what it was given, which sizes it.
+            const pool = &self.output_pool;
+            var peak_recipients: usize = 0;
+            var ring_handles: usize = 0;
+            for (self.routing.endpoints) |endpoint| {
+                peak_recipients += endpoint.output.peak_recipients;
+                ring_handles += endpoint.output.recipient_ring.len;
+            }
+            std.log.info("event=output_peaks units={d} of={d} unit_bytes={d} payload_bytes={d} largest_reservation={d} audiences={d} of={d} recipients={d} of={d}", .{ pool.peak_units, pool.pages.len, pool.unit_bytes, pool.peak_payload_bytes, pool.largest_reservation, pool.peak_audiences, pool.audiences.len, peak_recipients, ring_handles });
             for (self.routing.endpoints) |endpoint| endpoint.deinit();
             self.output_pool.deinit();
             self.transport.deinit(io);

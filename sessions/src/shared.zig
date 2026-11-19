@@ -182,6 +182,7 @@ pub const Audience = struct {
         defer self.pool.mutex.unlock(io);
         std.debug.assert(!self.pool.free_audiences.isSet(self.index));
         self.pool.free_audiences.set(self.index);
+        self.pool.audiences_in_use -= 1;
     }
 };
 
@@ -237,6 +238,9 @@ pub const Pool = struct {
     largest_reservation: usize = 0,
     payload_bytes: usize = 0,
     peak_payload_bytes: usize = 0,
+    /// Audiences held at once, by producers and the packets selecting from them.
+    audiences_in_use: usize = 0,
+    peak_audiences: usize = 0,
 
     const AudienceSlot = struct {
         references: std.atomic.Value(usize) = .init(0),
@@ -337,6 +341,8 @@ pub const Pool = struct {
         slot.generation += 1;
         slot.length = 0;
         slot.references.store(1, .release);
+        self.audiences_in_use += 1;
+        self.peak_audiences = @max(self.peak_audiences, self.audiences_in_use);
         return .{ .audience = .{ .pool = self, .index = index, .generation = slot.generation }, .handles = self.audience_handles[index * self.recipients_per_page ..][0..length] };
     }
 
@@ -381,6 +387,8 @@ pub const SharedPages = struct {
     recipient_ring: []networking.Handle,
     recipient_tail: usize = 0,
     recipient_head: std.atomic.Value(usize) = .init(0),
+    /// The most of the ring publications held at once.
+    peak_recipients: usize = 0,
     ready: Ring,
 
     const State = enum(u8) { free, reserved, published, taken };
@@ -683,6 +691,7 @@ pub const SharedPages = struct {
             @memcpy(s.recipient_ring[recipient_start % capacity ..][0..to.len], to);
             s.recipient_tail = recipient_start + to.len;
             p.recipient_start = recipient_start % capacity;
+            s.peak_recipients = @max(s.peak_recipients, s.recipient_tail - s.recipient_head.load(.monotonic));
         }
         p.recipient_end = s.recipient_tail;
         std.debug.assert(group.count > 0 and group.index < group.count);
@@ -777,6 +786,7 @@ pub const SharedPages = struct {
             if (previous == 1) {
                 std.debug.assert(!s.pool.free_audiences.isSet(audience.index));
                 s.pool.free_audiences.set(audience.index);
+                s.pool.audiences_in_use -= 1;
             }
             s.pages[id].audience = null;
         }
