@@ -980,7 +980,7 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
     }
     for (player_records, 0..) |*player, index| {
         player.* = .{ .handle = .{ .index = index, .generation = 1 }, .uuid = index + 1, .world = world, .stage = .ready, .loaded = true, .position = .{ .x = 8.5, .y = 65, .z = 8.5 }, .protocol = workload.protocol orelse catalog.values[index % catalog.values.len].number };
-        service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+        service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
     }
     var players: Players = .{ .deps = undefined, .config = .{ .maximum = count, .render_distance = radius }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
@@ -1006,9 +1006,11 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
         if (parts.next() != null) return error.InvalidPosition;
         surface_found = true;
     }
+    // The searches for the surface and a cave read one section at a time.
+    const position_reader = try terrain.client(.{ .name = "position search", .sections = 1 });
     while (section_y > dimension.minimumSection() and !surface_found) {
         section_y -= 1;
-        const lease = try terrain.acquire(.{ .world = world, .x = 0, .y = section_y, .z = 0 });
+        const lease = try position_reader.acquire(.{ .world = world, .x = 0, .y = section_y, .z = 0 });
         defer lease.release();
         var local_y: usize = 16;
         while (local_y != 0) {
@@ -1025,7 +1027,7 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
         var found = false;
         section_y = dimension.minimumSection();
         search: while (section_y * 16 < surface - 16) : (section_y += 1) {
-            const lease = try terrain.acquire(.{ .world = world, .x = 0, .y = section_y, .z = 0 });
+            const lease = try position_reader.acquire(.{ .world = world, .x = 0, .y = section_y, .z = 0 });
             defer lease.release();
             for (1..14) |y| for (0..16) |z| for (0..16) |x| {
                 const index = y * 256 + z * 16 + x;
@@ -1052,7 +1054,7 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
         var found = false;
         while (y > dimension.minimumSection() and !found) {
             y -= 1;
-            const lease = try terrain.acquire(.{ .world = world, .x = @divFloor(x, 16), .y = y, .z = @divFloor(z, 16) });
+            const lease = try position_reader.acquire(.{ .world = world, .x = @divFloor(x, 16), .y = y, .z = @divFloor(z, 16) });
             defer lease.release();
             var local_y: usize = 16;
             while (local_y != 0) {
@@ -1201,7 +1203,7 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
     }
     for (streaming.streams, player_records) |stream, player| {
         try std.testing.expectEqual(target, stream.delivered);
-        try std.testing.expectEqual(service.config.buffer_bytes, service.outputCredit(player.handle.?));
+        try std.testing.expectEqual(service.config.credit_bytes, service.outputCredit(player.handle.?));
     }
     const snapshot_samples = 1024;
     const snapshot_start = std.Io.Clock.now(.cpu_thread, io).nanoseconds;
