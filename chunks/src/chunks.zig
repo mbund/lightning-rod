@@ -467,6 +467,11 @@ pub const Chunks = struct {
     edit_scratch: [encoding.maximum_decoded_bytes]u8 = undefined,
     /// States the cells of one applied batch held before it, kept for its notifications.
     edit_previous: [edit_previous_max]u16 = undefined,
+    /// What a batch of edits leases, kept here rather than on the stack, as safe builds fill
+    /// stack scratch on every call. Edits come from the simulation thread alone.
+    edit_positions: [192]Section = undefined,
+    edit_leases: [192]Lease = undefined,
+    edit_indices: [192]usize = undefined,
     /// Counts batches of edits. The batch being announced has this stamp.
     edit_stamp: u64 = 0,
     /// By cache entry, the stamp of the edit batch that made a dirty section dirty.
@@ -781,13 +786,13 @@ pub const Chunks = struct {
 
     fn applySections(self: *Chunks, sections: []const SectionEdits, changed: []bool, previous: []u16) !void {
         assert(sections.len <= 192 and sections.len == changed.len);
-        var positions: [192]Section = undefined;
-        var leases: [192]Lease = undefined;
+        const positions = &self.edit_positions;
+        const leases = &self.edit_leases;
         for (sections, positions[0..sections.len]) |section, *position| {
             assert(section.edits.len <= edit_previous_max);
             position.* = section.section;
         }
-        var indices: [192]usize = undefined;
+        const indices = &self.edit_indices;
         while (true) {
             try self.acquireLocked(edits_client, positions[0..sections.len], leases[0..sections.len], null);
             for (leases[0..sections.len], indices[0..sections.len]) |lease, *index| index.* = lease.record.index;
