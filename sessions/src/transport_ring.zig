@@ -514,6 +514,13 @@ pub const Ring = struct {
         const more = cqe.flags & linux.IORING_CQE_F_MORE != 0;
         assert(!more or op.kind == .receive);
         op.submitted = more;
+        // A signal, as a profiler attaching sends, or a socket not ready yet stops an operation
+        // without failing it, so it goes again as it was rather than closing the connection.
+        const interrupted = cqe.res == -@as(i32, @intFromEnum(linux.E.INTR)) or cqe.res == -@as(i32, @intFromEnum(linux.E.AGAIN));
+        if (interrupted and !more and !op.cancel) {
+            self.schedule(i);
+            return;
+        }
         const bytes: usize = if (cqe.res > 0) @intCast(cqe.res) else 0;
         assert(bytes <= op.length - op.received);
         if (op.kind == .receive) {
@@ -809,4 +816,32 @@ test "completion removes a cancellation that has not been submitted" {
     transport.close(std.testing.io, handle, .peer_closed);
     try std.testing.expectEqual(transport.operations.len, transport.free_operations);
     try std.testing.expect(transport.pending_head == null and transport.pending_tail == null);
+}
+
+test "an interrupted operation goes again instead of closing its connection" {
+    var sockets: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &sockets)));
+    defer fdClose(sockets[1]);
+    var transport = try Ring.init(std.testing.allocator, std.testing.io, .{ .connections = 1, .address = .{ .ip4 = .loopback(0) } });
+    defer transport.deinit(std.testing.io);
+    const handle = try transport.adopt(sockets[0]);
+    var input: [1]u8 = undefined;
+    const output = "x";
+    const vectors = [_]posix.iovec_const{.{ .base = output.ptr, .len = output.len }};
+    try transport.queueReceive(std.testing.io, handle, &input);
+    try transport.queueSend(std.testing.io, handle, &vectors);
+    const receiving = transport.connections[handle.index].recv.?;
+    const sending = transport.connections[handle.index].send.?;
+    for ([_]usize{ receiving, sending }, [_]linux.E{ .INTR, .AGAIN }) |index, errno| {
+        transport.unschedule(index);
+        transport.operations[index].submitted = true;
+        transport.complete(.{ .user_data = index, .res = -@as(i32, @intFromEnum(errno)), .flags = 0 });
+        // Queued to go again, still the connection's, and nothing reported.
+        try std.testing.expect(transport.operations[index].used and transport.operations[index].queued);
+    }
+    try std.testing.expectEqual(@as(?usize, receiving), transport.connections[handle.index].recv);
+    try std.testing.expectEqual(@as(?usize, sending), transport.connections[handle.index].send);
+    try std.testing.expect(transport.conn(handle) != null);
+    transport.close(std.testing.io, handle, .peer_closed);
+    try std.testing.expectEqual(transport.operations.len, transport.free_operations);
 }
