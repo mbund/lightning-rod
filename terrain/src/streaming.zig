@@ -4206,7 +4206,18 @@ test "teleports wait for the matching destination terrain without waiting for co
     try std.testing.expect(!Streaming.View.capture(player).ready);
 }
 
+/// Whether the build selected every one of these protocols, which a single release does not.
+fn selectsProtocols(numbers: []const i32) bool {
+    for (numbers) |number| {
+        for (Streaming.protocol_wires) |wire| {
+            if (wire.number == number) break;
+        } else return false;
+    }
+    return true;
+}
+
 test "releases whose chunk and light packets come out alike share a family" {
+    if (!selectsProtocols(&.{ 771, 772, 773, 774, 775, 776 })) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var selected = try packets.protocols.Default.init(arena.allocator());
@@ -4281,16 +4292,18 @@ test "chunk audiences respect source readiness retained state and initial center
     try std.testing.expectEqualSlices(usize, &.{ 2, 1, 1 }, &counts);
     // A player on another release whose chunk packets come out alike shares the packet, and
     // one whose do not gets its own.
-    var selected = try packets.protocols.Default.init(arena.allocator());
-    streaming.delivery_catalog = try chunk_encoding.Workspace.initDeliveryCatalog(arena.allocator(), &selected.values);
-    streaming.families = @splat(null);
-    views[1].protocol = 771;
-    streaming.planRecipients(pending[0..1], counts[0..1]);
-    try std.testing.expectEqual(@as(usize, 2), counts[0]);
-    views[1].protocol = 773;
-    streaming.planRecipients(pending[0..1], counts[0..1]);
-    try std.testing.expectEqual(@as(usize, 1), counts[0]);
-    views[1].protocol = 772;
+    if (selectsProtocols(&.{ 771, 772, 773 })) {
+        var selected = try packets.protocols.Default.init(arena.allocator());
+        streaming.delivery_catalog = try chunk_encoding.Workspace.initDeliveryCatalog(arena.allocator(), &selected.values);
+        streaming.families = @splat(null);
+        views[1].protocol = 771;
+        streaming.planRecipients(pending[0..1], counts[0..1]);
+        try std.testing.expectEqual(@as(usize, 2), counts[0]);
+        views[1].protocol = 773;
+        streaming.planRecipients(pending[0..1], counts[0..1]);
+        try std.testing.expectEqual(@as(usize, 1), counts[0]);
+        views[1].protocol = 772;
+    }
     streaming.planRecipients(&pending, &counts);
     sources[0] = sources[1];
     setVisibilitySnapshot(&streaming.geometry, 0, &origin, -4, 24, 1, 1 << 4);
