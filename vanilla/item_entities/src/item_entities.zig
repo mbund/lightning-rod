@@ -33,12 +33,14 @@ pub const ItemEntities = struct {
     };
 
     pub const Metadata = struct {
-        pub const encoded_size = 54;
+        /// Version 2. Version 1 records, without fire, frost or what holds the item, are 54.
+        pub const encoded_size = 61;
+        const version_1_size = 54;
         pub fn encode(value: Metadata, output: []u8) void {
             assert(output.len == encoded_size);
             assert(value.pickup_delay <= 32767);
             var writer = std.Io.Writer.fixed(output);
-            writer.writeByte(1) catch unreachable;
+            writer.writeByte(2) catch unreachable;
             writer.writeInt(u32, value.ticks, .little) catch unreachable;
             writer.writeInt(i32, value.age, .little) catch unreachable;
             writer.writeInt(u16, value.pickup_delay, .little) catch unreachable;
@@ -51,6 +53,9 @@ pub const ItemEntities = struct {
             writer.writeInt(i32, value.collector, .little) catch unreachable;
             writer.writeInt(u16, value.collected, .little) catch unreachable;
             writer.writeInt(u64, value.collection, .little) catch unreachable;
+            writer.writeInt(i32, value.fire_ticks, .little) catch unreachable;
+            writer.writeInt(i16, value.ticks_frozen, .little) catch unreachable;
+            writer.writeByte(@intFromEnum(value.stuck)) catch unreachable;
             assert(writer.end == output.len);
         }
 
@@ -65,6 +70,35 @@ pub const ItemEntities = struct {
         collector: i32 = 0,
         collected: u16 = 0,
         collection: u64 = 0,
+        /// Entity.remainingFireTicks: burning while above zero.
+        fire_ticks: i32 = 0,
+        /// Entity.ticksFrozen, which only powder snow raises for an item and nothing lowers.
+        ticks_frozen: i16 = 0,
+        /// Entity.stuckSpeedMultiplier, which the next move takes and clears.
+        stuck: Stuck = .none,
+    };
+
+    /// What can hold back an item's next move: the blocks whose makeStuckInBlock reaches what
+    /// is not living.
+    pub const Stuck = enum(u8) {
+        none,
+        cobweb,
+        powder_snow,
+
+        pub fn multiplier(self: Stuck) [3]f64 {
+            return switch (self) {
+                .none => .{ 0, 0, 0 },
+                .cobweb => .{ 0.25, @as(f32, 0.05), 0.25 },
+                .powder_snow => .{ @as(f32, 0.9), 1.5, @as(f32, 0.9) },
+            };
+        }
+
+        pub fn of(multiplier_value: [3]f64) Stuck {
+            inline for (.{ Stuck.none, Stuck.cobweb, Stuck.powder_snow }) |kind| {
+                if (std.meta.eql(multiplier_value, kind.multiplier())) return kind;
+            }
+            unreachable;
+        }
     };
 
     pub const Row = struct {
@@ -714,7 +748,11 @@ fn keyFor(entity: entities.Id) [9]u8 {
 }
 
 fn decode(bytes: []const u8) !ItemEntities.Metadata {
-    if (bytes.len != ItemEntities.Metadata.encoded_size or bytes[0] != 1 or bytes[13] > 1 or bytes[14] > 1 or bytes[39] > 1) return error.Corrupt;
+    const version_1 = bytes.len == ItemEntities.Metadata.version_1_size and bytes[0] == 1;
+    const version_2 = bytes.len == ItemEntities.Metadata.encoded_size and bytes[0] == 2;
+    if (!version_1 and !version_2) return error.Corrupt;
+    if (bytes[13] > 1 or bytes[14] > 1 or bytes[39] > 1) return error.Corrupt;
+    if (version_2 and bytes[60] > @intFromEnum(ItemEntities.Stuck.powder_snow)) return error.Corrupt;
 
     const value: ItemEntities.Metadata = .{
         .ticks = std.mem.readInt(u32, bytes[1..5], .little),
@@ -728,6 +766,9 @@ fn decode(bytes: []const u8) !ItemEntities.Metadata {
         .collector = std.mem.readInt(i32, bytes[40..44], .little),
         .collected = std.mem.readInt(u16, bytes[44..46], .little),
         .collection = std.mem.readInt(u64, bytes[46..54], .little),
+        .fire_ticks = if (version_2) std.mem.readInt(i32, bytes[54..58], .little) else 0,
+        .ticks_frozen = if (version_2) std.mem.readInt(i16, bytes[58..60], .little) else 0,
+        .stuck = if (version_2) @enumFromInt(bytes[60]) else .none,
     };
     if (value.pickup_delay > 32767 or value.revision == 0) return error.Corrupt;
     return value;
@@ -845,4 +886,20 @@ test "item wire IDs stay disjoint from positive player IDs beyond the old slot b
         try std.testing.expect(wire_id < 0);
         for (ids[0..index]) |previous| try std.testing.expect(wire_id != ItemEntities.networkId(previous));
     }
+}
+
+test "item records written before fire was kept read as not burning, and new ones round trip" {
+    const value: ItemEntities.Metadata = .{ .ticks = 7, .age = 40, .health = 3, .owner = 9, .revision = 5, .fire_ticks = 298, .ticks_frozen = 2, .stuck = .cobweb };
+    var bytes: [ItemEntities.Metadata.encoded_size]u8 = undefined;
+    ItemEntities.Metadata.encode(value, &bytes);
+    try std.testing.expectEqual(value, try decode(&bytes));
+    // Version 1 was the same fields up to the collection, under its own version byte.
+    var old = bytes[0..ItemEntities.Metadata.version_1_size].*;
+    old[0] = 1;
+    var expected = value;
+    expected.fire_ticks = 0;
+    expected.ticks_frozen = 0;
+    expected.stuck = .none;
+    try std.testing.expectEqual(expected, try decode(&old));
+    try std.testing.expectError(error.Corrupt, decode(bytes[0 .. bytes.len - 1]));
 }
