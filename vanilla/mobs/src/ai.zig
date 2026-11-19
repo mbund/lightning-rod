@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const game_data = @import("game_data");
-const mth = @import("mth.zig");
+const mth = @import("vanilla_bodies").mth;
 const living = @import("living.zig");
 const goals = @import("goals.zig");
 const navigation = @import("navigation.zig");
@@ -80,7 +80,7 @@ fn moveControl(mobs: *Mobs, mob: *Mob) !void {
             // LivingEntity.maxUpStep is a float.
             const step: f64 = @as(f32, @floatCast(mobs.traits(mob.species).attribute(.step_height)));
             // BlockState.getCollisionShape with no entity, as the move control asks.
-            const boxes = @import("body.zig").contextFreeBoxes(state, at[0], at[2]);
+            const boxes = @import("vanilla_bodies").body.contextFreeBoxes(state, at[0], at[2]);
             var top: f64 = 0;
             for (0..boxes.count) |index| top = @max(top, boxes.get(index)[4]);
             const climb = dy > step and dx * dx + dz * dz < @as(f64, @max(@as(f32, 1.0), living.width(mobs, mob)));

@@ -3,15 +3,15 @@
 //! fixed array by the Mobs plugin.
 
 const std = @import("std");
-const body = @import("body.zig");
-const mob_blocks = @import("mob_blocks.zig");
-const JavaRandom = @import("java_random.zig").JavaRandom;
+const body = @import("vanilla_bodies").body;
+const mob_blocks = @import("vanilla_bodies").mob_blocks;
+const JavaRandom = @import("vanilla_bodies").java_random.JavaRandom;
 
 /// Mob types this server simulates.
 pub const Species = enum(u8) { cow };
 
 /// One stretch of movement in a tick, which block effects trace (Entity.Movement).
-pub const Movement = struct { from: [3]f64, to: [3]f64, axis_independent: bool };
+pub const Movement = @import("vanilla_bodies").block_effects.Movement;
 
 /// Damage types mobs take, by what vanilla names them. The panic_causes tag decides which make
 /// a cow panic, and the registry decides the rest.

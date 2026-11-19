@@ -1,11 +1,11 @@
 //! Mobs: vanilla's mob bodies, pathfinding, goals and the cow.
 const std = @import("std");
 
-pub const mth = @import("mth.zig");
-pub const java_random = @import("java_random.zig");
-pub const mob_blocks = @import("mob_blocks.zig");
-pub const shape_classes = @import("shape_classes.zig");
-pub const body = @import("body.zig");
+pub const mth = @import("vanilla_bodies").mth;
+pub const java_random = @import("vanilla_bodies").java_random;
+pub const mob_blocks = @import("vanilla_bodies").mob_blocks;
+pub const shape_classes = @import("vanilla_bodies").shape_classes;
+pub const body = @import("vanilla_bodies").body;
 pub const mob = @import("mob.zig");
 pub const species = @import("species.zig");
 pub const living = @import("living.zig");

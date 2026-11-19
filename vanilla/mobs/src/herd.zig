@@ -11,9 +11,9 @@
 
 const std = @import("std");
 const mob_state = @import("mob.zig");
-const JavaRandom = @import("java_random.zig").JavaRandom;
+const JavaRandom = @import("vanilla_bodies").java_random.JavaRandom;
 const ai = @import("ai.zig");
-const mth = @import("mth.zig");
+const mth = @import("vanilla_bodies").mth;
 const mob_tick = @import("mob_tick.zig");
 const Mobs = @import("mobs.zig").Mobs;
 

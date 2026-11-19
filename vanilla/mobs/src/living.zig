@@ -6,9 +6,9 @@
 
 const std = @import("std");
 const game_data = @import("game_data");
-const mth = @import("mth.zig");
-const body = @import("body.zig");
-const mob_blocks = @import("mob_blocks.zig");
+const mth = @import("vanilla_bodies").mth;
+const body = @import("vanilla_bodies").body;
+const mob_blocks = @import("vanilla_bodies").mob_blocks;
 const Mob = @import("mob.zig").Mob;
 const Movement = @import("mob.zig").Movement;
 const DamageType = @import("mob.zig").DamageType;

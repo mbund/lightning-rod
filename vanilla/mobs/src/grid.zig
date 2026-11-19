@@ -4,8 +4,8 @@
 //! with `before`.
 
 const std = @import("std");
-const mth = @import("mth.zig");
-const Box = @import("body.zig").Box;
+const mth = @import("vanilla_bodies").mth;
+const Box = @import("vanilla_bodies").body.Box;
 
 const assert = std.debug.assert;
 

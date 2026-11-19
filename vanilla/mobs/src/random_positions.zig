@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const game_data = @import("game_data");
-const mth = @import("mth.zig");
+const mth = @import("vanilla_bodies").mth;
 const navigation = @import("navigation.zig");
 const pathfinding = @import("pathfinding.zig");
 const mob_state = @import("mob.zig");

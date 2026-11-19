@@ -4,8 +4,8 @@
 
 const std = @import("std");
 const game_data = @import("game_data");
-const mth = @import("mth.zig");
-const body = @import("body.zig");
+const mth = @import("vanilla_bodies").mth;
+const body = @import("vanilla_bodies").body;
 const living = @import("living.zig");
 const ai = @import("ai.zig");
 const navigation = @import("navigation.zig");

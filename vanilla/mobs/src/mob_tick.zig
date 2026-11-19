@@ -10,7 +10,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const game_data = @import("game_data");
-const mth = @import("mth.zig");
+const mth = @import("vanilla_bodies").mth;
 const living = @import("living.zig");
 const ai = @import("ai.zig");
 const effects = @import("block_effects.zig");
@@ -187,7 +187,7 @@ fn inWall(mobs: *Mobs, mob: *const Mob) !bool {
     const level = mobs.level(mob.world);
     const size: f64 = living.width(mobs, mob) * 0.8;
     const eye = living.eyeY(mobs, mob);
-    const probe: @import("body.zig").Box = .{
+    const probe: @import("vanilla_bodies").body.Box = .{
         .min = .{ mob.position[0] - size / 2, eye - 1.0e-6 / 2.0, mob.position[2] - size / 2 },
         .max = .{ mob.position[0] + size / 2, eye + 1.0e-6 / 2.0, mob.position[2] + size / 2 },
     };
@@ -203,7 +203,7 @@ fn inWall(mobs: *Mobs, mob: *const Mob) !bool {
                 const boxes = game_data.physics.spawnCollision(state, x, 0, z);
                 for (0..boxes.count) |index| {
                     const value = boxes.get(index);
-                    const shape: @import("body.zig").Box = .{
+                    const shape: @import("vanilla_bodies").body.Box = .{
                         .min = .{ @as(f64, @floatFromInt(x)) + value[0], @as(f64, @floatFromInt(y)) + value[1], @as(f64, @floatFromInt(z)) + value[2] },
                         .max = .{ @as(f64, @floatFromInt(x)) + value[3], @as(f64, @floatFromInt(y)) + value[4], @as(f64, @floatFromInt(z)) + value[5] },
                     };

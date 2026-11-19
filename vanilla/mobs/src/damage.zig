@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const game_data = @import("game_data");
-const mth = @import("mth.zig");
+const mth = @import("vanilla_bodies").mth;
 const living = @import("living.zig");
 const mob_state = @import("mob.zig");
 const Mobs = @import("mobs.zig").Mobs;

@@ -32,6 +32,7 @@
         .storage = .{ .path = "../storage" },
         .terrain = .{ .path = "../terrain" },
         .vanilla_blocks = .{ .path = "blocks" },
+        .vanilla_bodies = .{ .path = "bodies" },
         .vanilla_containers = .{ .path = "containers" },
         .vanilla_content = .{ .path = "content" },
         .vanilla_crafting = .{ .path = "crafting" },
