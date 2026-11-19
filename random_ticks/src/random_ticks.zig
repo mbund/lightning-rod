@@ -195,6 +195,9 @@ pub const RandomTicks = struct {
         queued: bool = false,
         /// An edit reached the column after it was asked for, so the answer is out of date.
         answer_stale: bool = false,
+        /// Sections an edit may have changed what acts in, counted again on this thread before
+        /// the next hit.
+        recount: u32 = 0,
         live: bool = false,
         next_free: u32 = none,
     };
@@ -225,6 +228,12 @@ pub const RandomTicks = struct {
     /// Columns to ask for, each at most once.
     unasked: []u32,
     unasked_count: u32 = 0,
+    /// Columns with sections to count again, each at most once.
+    recounting: []u32,
+    recounting_count: u32 = 0,
+    /// Counts a section's acting cells here, as terrain does for a whole column.
+    workspace: *layer.Workspace,
+    recount_mask: chunks.topology.Mask = undefined,
     /// The masks of the answer being taken.
     answer_masks: *[sections_max]chunks.topology.Mask,
     /// The sections around the section being hit, by `layer.neighbour`. The section itself is
@@ -267,6 +276,8 @@ pub const RandomTicks = struct {
             .slots = slots,
             .heap = try allocator.alloc(u32, config.sections),
             .unasked = try allocator.alloc(u32, columns),
+            .recounting = try allocator.alloc(u32, columns),
+            .workspace = try allocator.create(layer.Workspace),
             .answer_masks = try allocator.create([sections_max]chunks.topology.Mask),
         };
         try deps.domains.observe(.init(RandomTicks, self, domainChanged));
@@ -323,9 +334,10 @@ pub const RandomTicks = struct {
         if (high[0] < 0) return;
         const influence = self.deps.registry.layer.influence;
         // A cell reads cells up to `influence` away, so an edit reaches cells that far back.
-        // Columns hold every section, so only x and z pick the columns asked for again.
         const from_x = @divFloor(low[0] - influence.high[0], 16);
         const to_x = @divFloor(high[0] - influence.low[0], 16);
+        const from_y = @divFloor(low[1] - influence.high[1], 16);
+        const to_y = @divFloor(high[1] - influence.low[1], 16);
         const from_z = @divFloor(low[2] - influence.high[2], 16);
         const to_z = @divFloor(high[2] - influence.low[2], 16);
         var z = from_z;
@@ -335,12 +347,14 @@ pub const RandomTicks = struct {
                 // Columns past the edge of the coordinate range do not exist.
                 const column_x = std.math.add(i32, section.x, x) catch continue;
                 const column_z = std.math.add(i32, section.z, z) catch continue;
-                self.askAgain(section.world, column_x, column_z);
+                self.markRecount(section.world, column_x, column_z, section.y + from_y, section.y + to_y);
             }
         }
     }
 
-    fn askAgain(self: *RandomTicks, world: u32, x: i32, z: i32) void {
+    /// Marks the sections from `from` to `to` of a column to count again here. A column still
+    /// waiting for its first count is asked for again instead, as that answer may miss the edit.
+    fn markRecount(self: *RandomTicks, world: u32, x: i32, z: i32, from: i32, to: i32) void {
         const at = self.find(world, x, z) orelse return;
         const index = self.by_column[at];
         const state = &self.column_states[index];
@@ -348,13 +362,74 @@ pub const RandomTicks = struct {
             state.answer_stale = true;
             return;
         }
-        state.asking = true;
-        self.pushUnasked(index);
+        const bottom = @max(from, state.minimum);
+        const top = @min(to, state.minimum + @as(i32, state.count) - 1);
+        if (bottom > top) return;
+        const was = state.recount;
+        var y = bottom;
+        while (y <= top) : (y += 1) state.recount |= @as(u32, 1) << @intCast(y - state.minimum);
+        if (was != 0) return;
+        // Every column is listed at most once, and there are no more columns.
+        assert(self.recounting_count < self.recounting.len);
+        self.recounting[self.recounting_count] = index;
+        self.recounting_count += 1;
+    }
+
+    /// Counts again the sections edits marked, on this thread, so a hit never waits for terrain.
+    /// A section with a neighbour memory does not hold, which may be on disk, has its column
+    /// counted by terrain instead.
+    fn recount(self: *RandomTicks) !void {
+        while (self.recounting_count != 0) {
+            self.recounting_count -= 1;
+            const index = self.recounting[self.recounting_count];
+            const state = &self.column_states[index];
+            var pending = state.recount;
+            state.recount = 0;
+            if (!state.live or state.asking) continue;
+            while (pending != 0) : (pending &= pending - 1) {
+                if (try self.recountSection(index, @intCast(@ctz(pending)))) continue;
+                state.asking = true;
+                self.pushUnasked(index);
+                break;
+            }
+        }
+    }
+
+    fn recountSection(self: *RandomTicks, index: u32, offset: u8) !bool {
+        const state = self.column_states[index];
+        const center: chunks.Section = .{ .world = state.world, .x = state.x, .z = state.z, .y = state.minimum + offset };
+        try self.leaseAround(center, state.minimum, state.count);
+        defer self.releaseAround();
+        const middle = layer.neighbour(0, 0, 0);
+        var sections: layer.Neighbourhood = @splat(null);
+        // A section with no stored record holds air, as terrain reads it.
+        sections[middle] = self.around[middle].?.record.bytes;
+        const registry_layer = &self.deps.registry.layer;
+        const wanted = try registry_layer.candidates(sections[middle]);
+        if (wanted.neighbours) for (0..27) |at| {
+            if (at == middle) continue;
+            const y = center.y + @as(i32, @intCast(at / 9)) - 1;
+            // Past the world's height and the coordinate range there is only air.
+            if (y < state.minimum or y >= state.minimum + @as(i32, state.count)) continue;
+            _ = std.math.add(i32, center.x, @as(i32, @intCast(at % 3)) - 1) catch continue;
+            _ = std.math.add(i32, center.z, @as(i32, @intCast(at / 3 % 3)) - 1) catch continue;
+            const lease = self.around[at] orelse return false;
+            sections[at] = lease.record.bytes;
+        };
+        const count = try registry_layer.evaluate(self.workspace, &sections, &self.recount_mask);
+        self.setCount(index, offset, count, self.cursor);
+        if (count != 0) {
+            const slot = self.column_states[index].slots[offset];
+            if (slot != none) self.slots[slot].mask = self.recount_mask;
+        }
+        return true;
     }
 
     pub fn tick(self: *RandomTicks) !void {
         if (self.overflow) return error.RandomTickCapacity;
         self.collect();
+        // Edits since the last tick, by anyone, before the first hit.
+        try self.recount();
         const start = self.tick_count * self.config.speed;
         const end = start + self.config.speed;
         self.cursor = @max(self.cursor, start);
@@ -483,6 +558,8 @@ pub const RandomTicks = struct {
                 leased = false;
                 try self.applyWrites(state.world);
                 self.edited = false;
+                // What the writes changed acts, or stops, from the next hit on.
+                try self.recount();
             }
         }
     }
@@ -519,6 +596,12 @@ pub const RandomTicks = struct {
             self.unasked_count -= 1;
             break;
         };
+        if (state.recount != 0) for (self.recounting[0..self.recounting_count], 0..) |listed, position| if (listed == index) {
+            self.recounting[position] = self.recounting[self.recounting_count - 1];
+            self.recounting_count -= 1;
+            break;
+        };
+        state.recount = 0;
         self.removeIndex(at);
         state.live = false;
         state.next_free = self.column_free;

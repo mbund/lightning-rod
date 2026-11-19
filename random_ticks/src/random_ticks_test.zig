@@ -27,11 +27,16 @@ const Source = struct {
 const Counter = struct {
     hits: usize = 0,
     misplaced: usize = 0,
+    /// Section 1 of the centre column may act once an edit gives it work.
+    upper_allowed: bool = false,
+    upper: usize = 0,
 
     fn run(self: *Counter, hit: Hit) !void {
         self.hits += 1;
         const cell = chunks.localIndex(hit.position);
-        if (hit.state != 1 or cell % 2 != 0 or hit.position.y >= 16 or hit.position.x < -16 or hit.position.x >= 32) self.misplaced += 1;
+        if (hit.position.y >= 16) self.upper += 1;
+        const upper_ok = hit.position.y < 16 or (self.upper_allowed and hit.position.x >= 0 and hit.position.x < 16 and hit.position.z >= 0 and hit.position.z < 16);
+        if (hit.state != 1 or cell % 2 != 0 or !upper_ok or hit.position.x < -16 or hit.position.x >= 32) self.misplaced += 1;
     }
 };
 
@@ -91,19 +96,33 @@ test "hits land on tickable cells at vanilla's rate, follow edits and read count
     try std.testing.expect(@abs(hits - expected) < 6 * deviation + 9 * 3 * 2);
     try std.testing.expectEqual(@as(usize, 0), counter.misplaced);
 
-    // Clearing the centre column's section stops its hits at once.
+    // Clearing the centre column's section stops its hits at once. Its count is taken again on
+    // the simulation thread, so terrain, which answers topology requests, is not polled.
     var edits: [2048]chunks.BlockEdit = undefined;
     for (&edits, 0..) |*edit, index| edit.* = .{ .index = @intCast(index * 2), .state = 0 };
     try terrain.setBlocks(.{ .world = world, .x = 0, .y = 0, .z = 0 }, &edits);
     const before = counter.hits;
     for (0..ticks) |_| {
         domains.tick();
-        try terrain.poll();
         try random.tick();
     }
     const after: f64 = @floatFromInt(counter.hits - before);
     const remaining = expected * 8 / 9;
     try std.testing.expect(@abs(after - remaining) < 6 * @sqrt(remaining) + 8 * 3 * 2);
+    try std.testing.expectEqual(@as(usize, 0), counter.misplaced);
+
+    // Giving the empty section above work makes it act from the next tick, still with terrain
+    // silent: it had no acting cells, so only a count taken on this thread finds them.
+    counter.upper_allowed = true;
+    for (&edits) |*edit| edit.state = 1;
+    try terrain.setBlocks(.{ .world = world, .x = 0, .y = 1, .z = 0 }, &edits);
+    for (0..ticks) |_| {
+        domains.tick();
+        try random.tick();
+    }
+    const upper_expected: f64 = ticks * 2048 * 3.0 / 4096.0;
+    const upper: f64 = @floatFromInt(counter.upper);
+    try std.testing.expect(@abs(upper - upper_expected) < 6 * @sqrt(upper_expected) + 3 * 2);
     try std.testing.expectEqual(@as(usize, 0), counter.misplaced);
 }
 
