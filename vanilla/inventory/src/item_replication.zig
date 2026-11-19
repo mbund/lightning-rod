@@ -65,6 +65,8 @@ pub const ItemReplication = struct {
         contents: inventories.Contents = .{},
         interested: audience_storage.Row = .{},
         collecting: bool = false,
+        /// Whether viewers were last shown it burning.
+        burning: bool = false,
         stacks: audience_storage.Row = .{},
         pending: audience_storage.Row = .{},
     };
@@ -374,7 +376,9 @@ pub const ItemReplication = struct {
                     spawned.subtract(spawned.view(), reset.view());
                     const missing = self.selections.row(9);
                     missing.subtract(interests[index].view(), spawned.view());
-                    if (!presentation_changed and held.revision == view.inventory_revision and
+                    // A fire lit or put out sends the stack again with the flags.
+                    const burning = (try record.read()).fire_ticks > 0;
+                    if (!presentation_changed and held.revision == view.inventory_revision and burning == view.burning and
                         !view.stacks.view().intersects(interests[index].view()) and !missing.view().any()) continue;
                     const stack = held.stack orelse return error.Corrupt;
                     definition_stacks[definition_count] = stack;
@@ -415,6 +419,12 @@ pub const ItemReplication = struct {
 
                     if (presentation_changed or held.revision != view.inventory_revision) {
                         view.inventory_revision = held.revision;
+                        view.stacks.unite(view.stacks.view(), view.spawned.view());
+                    }
+                    // The flags go with the stack, so a fire lit or put out sends both again.
+                    const burning = row.metadata.fire_ticks > 0;
+                    if (burning != view.burning) {
+                        view.burning = burning;
                         view.stacks.unite(view.stacks.view(), view.spawned.view());
                     }
 
@@ -491,9 +501,9 @@ pub const ItemReplication = struct {
                                         .position = .{ .x = body.?.position[0], .y = body.?.position[1], .z = body.?.position[2] },
                                         .velocity = body.?.velocity,
                                     }},
-                                    .{ self.deps.items, entity_id, held.stack, recipient, definition_views[record_index] },
+                                    .{ self.deps.items, entity_id, held.stack, recipient, definition_views[record_index], row.metadata.fire_ticks > 0 },
                                 }, &.{ 128, capacity }),
-                                .stack => try self.deps.packets.broadcastGroup(&self.broadcast, .{writeItemStack}, null, null, .{.{ self.deps.items, entity_id, held.stack, recipient, definition_views[record_index] }}, &.{capacity}),
+                                .stack => try self.deps.packets.broadcastGroup(&self.broadcast, .{writeItemStack}, null, null, .{.{ self.deps.items, entity_id, held.stack, recipient, definition_views[record_index], row.metadata.fire_ticks > 0 }}, &.{capacity}),
                                 .position => try self.deps.packets.broadcast(&self.broadcast, writePosition, null, null, .{
                                     entity_id,
                                     minecraft.Position{ .x = body.?.position[0], .y = body.?.position[1], .z = body.?.position[2] },
@@ -653,17 +663,27 @@ pub const ItemReplication = struct {
         return (try collector.pickupItemCount(count)).finish();
     }
 
-    pub fn writeItemStack(packet: wire_1_21_5.play.toClient.packet_entity_metadata.Writer, registry: packets.Registry, store: *Items, entity: i32, stack: ?inventories.Stack, recipient: u128, view: ?Items.View) ![]u8 {
+    /// The item's stack, and its entity flags, which show it burning.
+    pub fn writeItemStack(packet: wire_1_21_5.play.toClient.packet_entity_metadata.Writer, registry: packets.Registry, store: *Items, entity: i32, stack: ?inventories.Stack, recipient: u128, view: ?Items.View, burning: bool) ![]u8 {
         var metadata = try (try packet.entityId(entity)).metadata();
-        const done = try packets.nested(.{writeStackMetadata}).write(try metadata.begin(), .{ .registry = registry, .items = store, .stack = stack, .recipient = recipient, .view = view });
+        const done = try packets.nested(.{writeStackMetadata}).write(try metadata.begin(), StackMetadata{ .slot = .{ .registry = registry, .items = store, .stack = stack, .recipient = recipient, .view = view }, .burning = burning });
         return (try metadata.advance(done)).finish();
     }
 
-    fn writeStackMetadata(packet: wire_1_21_5.entityMetadata.Writer, args: item_packets.SlotArguments) !wire_1_21_5.entityMetadata.Writer.Done {
-        var entries = try packet.value(1);
-        const entry = (try entries.next()).?;
-        try entries.advance(try packets.nested(.{writeStackEntry}).write(entry, args));
+    const StackMetadata = struct { slot: item_packets.SlotArguments, burning: bool };
+
+    fn writeStackMetadata(packet: wire_1_21_5.entityMetadata.Writer, args: StackMetadata) !wire_1_21_5.entityMetadata.Writer.Done {
+        var entries = try packet.value(2);
+        try entries.advance(try packets.nested(.{writeFlags}).write((try entries.next()).?, args.burning));
+        try entries.advance(try packets.nested(.{writeStackEntry}).write((try entries.next()).?, args.slot));
         return entries.finish();
+    }
+
+    const FlagsEntry = wire_1_21_5.entityMetadataEntry.cases.value.byte.Writer;
+
+    /// Entity.DATA_SHARED_FLAGS_ID, whose lowest bit is on fire.
+    fn writeFlags(packet: FlagsEntry, burning: bool) !FlagsEntry.Done {
+        return (try (try packet.key(0)).type()).value(if (burning) 1 else 0);
     }
 
     const StackEntry = wire_1_21_5.entityMetadataEntry.cases.value.item_stack.Writer;
