@@ -1892,6 +1892,15 @@ pub fn benchmarkTerrainBackpressure() !void {
             held += 1;
         }
         try std.testing.expectEqual(service.config.pages, held);
+        // Block updates are small enough that the freed page would take them all. A filler
+        // leaves room for three, so only part of them goes out.
+        var filler: ?sessions.Service.Packet = null;
+        defer if (filler) |*packet| packet.cancel();
+        if (mode == .blocks) {
+            var length = service.config.page_bytes;
+            while (service.output.unitsFor(length) > service.output.pool.packet_units - 3) length -= 1;
+            filler = try service.reserve(length);
+        }
         const ready_acquired = terrain.cache.metrics.acquired.value();
         var progressed = false;
         var attempts: usize = 0;
@@ -1901,7 +1910,8 @@ pub fn benchmarkTerrainBackpressure() !void {
             progressed = try if (mode == .streaming) streaming.poll(io) else blocks.poll(io);
             if (progressed) break;
             try std.testing.expectEqual(@as(usize, 0), terrain.borrowed_count);
-            var unused = try service.reserve(service.config.page_bytes);
+            // What was freed is still free: a page, or beside the filler, room for a small packet.
+            var unused = try service.reserve(if (filler == null) service.config.page_bytes else 1);
             unused.cancel();
             while (try terrain.generation.processOne(io)) {}
             try terrain.poll();
@@ -1922,6 +1932,8 @@ pub fn benchmarkTerrainBackpressure() !void {
         if (mode == .blocks) try std.testing.expectEqual(partial_packets * @as(u64, if (generating) 2 else 1), sections);
         service.recycle(io, retained[1..held]);
         held = 1;
+        if (filler) |*packet| packet.cancel();
+        filler = null;
         progressed = false;
         for (0..256) |_| {
             if (mode == .streaming) streaming.pending = true;

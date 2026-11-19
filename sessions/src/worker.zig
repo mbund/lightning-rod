@@ -198,7 +198,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                         sources[index].packet_base = sources[prior].packet_base;
                         break;
                     }
-                } else packet_capacity = try std.math.add(usize, packet_capacity, endpoint.output.pages.len);
+                } else packet_capacity = try std.math.add(usize, packet_capacity, endpoint.output.slots.len);
             }
             if (packet_capacity > std.math.maxInt(u32)) return error.InvalidConfiguration;
             const packets = try allocator.alloc(Packet, packet_capacity);
@@ -486,7 +486,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             const endpoint = self.endpoints[source];
             // Nothing reads its recipients once it is taken, so their room is reused.
             defer endpoint.output.releaseRecipients(raw);
-            assert(raw.page < endpoint.output.pages.len);
+            assert(raw.page < endpoint.output.slots.len);
             const packet_index = self.sources[source].packet_base + raw.page;
             const packet = &self.packets[packet_index];
             assert(packet.source == null and packet.waiting == 0);

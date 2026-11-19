@@ -5,6 +5,7 @@ const metrics = @import("metrics");
 const reload = @import("reload");
 const sessions = @import("sessions.zig");
 const handoff = @import("handoff.zig");
+const shared = @import("shared.zig");
 const Transport = @import("transport.zig").Transport;
 const Runtime = @import("plugins.zig").Runtime;
 
@@ -48,11 +49,15 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
             codec_workers: usize = 1,
             max_pending_wire_bytes: usize = 1024 * 1024,
             endpoints: []const EndpointConfiguration,
-            /// Pages of the output pool every endpoint shares. Null takes one page for each
-            /// player slot and no fewer than 32, which keeps the pool in step with the
-            /// output credit the connections can hold between them.
-            output_pages: ?usize = null,
-            output_unit_bytes: usize = 16 * 1024,
+            /// Bytes of the output pool every endpoint shares. Without them, every connection's
+            /// play ring together: credit is the room in a connection's ring, and each packet
+            /// waiting to be taken charges every recipient at least what it takes in the pool.
+            output_pool_bytes: ?usize = null,
+            /// Packets the output pool holds at once. Without a count, sixteen for each player
+            /// slot and no fewer than 1024: at 512 players, wander and explore held about
+            /// 2,300 at most.
+            output_slots: ?usize = null,
+            output_unit_bytes: usize = 128,
             plugin_memory_bytes: usize = 64 * 1024,
             metrics: metrics.Registry.Configuration = .{},
         };
@@ -89,11 +94,12 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
                 maximum_packet = @max(maximum_packet, endpoint.page_bytes);
                 maximum_recipients = @max(maximum_recipients, endpoint.connections);
             }
-            const output_pages = config.output_pages orelse @max(32, config.max_players);
+            const output_bytes = config.output_pool_bytes orelse try std.math.mul(usize, connections, config.output_bytes);
+            const output_slots = config.output_slots orelse @min(std.math.maxInt(shared.SlotId), @max(1024, 16 * config.max_players));
             // Broadcasts hold an audience each until the worker takes their packets: at 512
             // players, wander held 281 at once at most.
             const audiences = @max(64, 2 * config.max_players);
-            self.output_pool = try sessions.OutputPool.init(owned, .{ .pages = output_pages, .page_bytes = maximum_packet, .unit_bytes = config.output_unit_bytes, .recipients_per_page = maximum_recipients, .audiences = audiences });
+            self.output_pool = try sessions.OutputPool.init(owned, .{ .pages = 1, .arena_bytes = @max(output_bytes, shared.storedBytes(maximum_packet)), .slots = output_slots, .page_bytes = maximum_packet, .unit_bytes = config.output_unit_bytes, .recipients_per_page = maximum_recipients, .audiences = audiences });
             errdefer self.output_pool.deinit();
             var inherited: ?i32 = null;
             errdefer if (inherited) |descriptor| {
@@ -129,7 +135,7 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
                     .max_input_bytes = config.buffer_bytes - 3,
                     .metrics = options.metrics,
                     .protocols = &config.protocols.values,
-                    .pages = output_pages,
+                    .pages = output_slots,
                     .output_pool = &self.output_pool,
                     .page_bytes = endpoint_config.page_bytes,
                     .compression_threshold = compression,
@@ -209,7 +215,7 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
                 peak_recipients += endpoint.output.peak_recipients;
                 ring_handles += endpoint.output.recipient_ring.len;
             }
-            std.log.info("event=output_peaks units={d} of={d} unit_bytes={d} payload_bytes={d} largest_reservation={d} audiences={d} of={d} recipients={d} of={d}", .{ pool.peak_units, pool.pages.len, pool.unit_bytes, pool.peak_payload_bytes, pool.largest_reservation, pool.peak_audiences, pool.audiences.len, peak_recipients, ring_handles });
+            std.log.info("event=output_peaks units={d} small_at_peak={d} of={d} unit_bytes={d} slots={d} of={d} payload_bytes={d} largest_reservation={d} audiences={d} of={d} recipients={d} of={d}", .{ pool.peak_units, pool.small_at_peak, pool.units(), pool.unit_bytes, pool.peak_slots, pool.slots.len, pool.peak_payload_bytes, pool.largest_reservation, pool.peak_audiences, pool.audiences.len, peak_recipients, ring_handles });
             for (self.routing.endpoints) |endpoint| endpoint.deinit();
             self.output_pool.deinit();
             self.transport.deinit(io);

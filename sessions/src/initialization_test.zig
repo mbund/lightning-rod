@@ -255,13 +255,16 @@ test "gameplay output becomes visible as one batch after the tick" {
 
 test "buffer pressure publishes the accumulated batch during a tick" {
     var hooks: Hooks = .{};
-    const endpoint = try createEndpoint(std.testing.allocator, &hooks);
+    // Credit enough that the pool, not credit, is what fills.
+    const endpoint = try service_module.Service.init(std.testing.allocator, std.testing.io, transport(&hooks), .{ .connections = 2, .credit_bytes = 4096, .pages = 4, .page_bytes = 128, .protocols = &protocols.values, .max_input_bytes = 509 });
     defer endpoint.deinit();
     const handles = [_]network.Handle{ .{ .index = 0, .generation = 1 }, .{ .index = 1, .generation = 1 } };
-    for (endpoint.credit) |*credit| credit.store((@as(u64, 1) << 32) | service_module.Service.active | 512, .release);
+    for (endpoint.credit) |*credit| credit.store((@as(u64, 1) << 32) | service_module.Service.active | 4096, .release);
     endpoint.beginTick();
-    for (0..endpoint.config.pages) |i| {
-        var packet = try endpoint.reserve(128);
+    // A packet of one byte keeps one unit of what it reserved, so the pool holds one for each.
+    const capacity = endpoint.output.pool.units();
+    for (0..capacity) |i| {
+        var packet = try endpoint.reserve(if (i + 1 == capacity) 1 else 128);
         defer packet.cancel();
         packet.bytes[0] = @intCast(i);
         try packet.publish(1, handles[i % handles.len ..][0..1]);
@@ -271,7 +274,7 @@ test "buffer pressure publishes the accumulated batch during a tick" {
     try std.testing.expectError(error.Backpressured, endpoint.reserve(128));
     try std.testing.expectEqual(@as(usize, 1), hooks.notifications);
     var batch = endpoint.outputBatch();
-    for (0..endpoint.config.pages) |i| {
+    for (0..capacity) |i| {
         const packet = batch.next().?;
         try std.testing.expectEqual(@as(u8, @intCast(i)), packet.bytes[0]);
         try std.testing.expect(endpoint.output.releaseReady(packet.page, packet.generation));
@@ -457,7 +460,7 @@ test "recipient reservations survive backpressure and return credit on every exi
         try std.testing.expectEqual(@as(usize, if (mode == .shutdown) 0 else 512), endpoint.outputCredit(handles[1]));
         try std.testing.expect(endpoint.output.takeReady() == null);
         try std.testing.expectEqual(@as(usize, 0), endpoint.preparing.load(.acquire));
-        try std.testing.expectEqual(endpoint.output.pages.len, endpoint.output.pool.free_units.count());
+        try std.testing.expectEqual(endpoint.output.pool.units(), endpoint.output.pool.free_units.count());
     }
 }
 
@@ -506,7 +509,7 @@ test "a recipient batch shares reserved credit across actual packet lengths" {
     try std.testing.expectEqual(available, endpoint.outputCredit(handle));
     try std.testing.expect(endpoint.output.takeReady() == null);
     try std.testing.expectEqual(@as(usize, 0), endpoint.preparing.load(.acquire));
-    try std.testing.expectEqual(endpoint.output.pages.len, endpoint.output.pool.free_units.count());
+    try std.testing.expectEqual(endpoint.output.pool.units(), endpoint.output.pool.free_units.count());
 }
 
 test "a packet too large for the room above the floor goes once its connection is idle" {
@@ -563,7 +566,7 @@ test "publication batches consume rejected reservations without charging their p
         try std.testing.expect(endpoint.output.takeReady() == null);
         endpoint.recycle(std.testing.io, &.{packet});
         try std.testing.expectEqual(@as(usize, 0), endpoint.preparing.load(.acquire));
-        try std.testing.expectEqual(endpoint.output.pages.len, endpoint.output.pool.free_units.count());
+        try std.testing.expectEqual(endpoint.output.pool.units(), endpoint.output.pool.free_units.count());
     }
 }
 
@@ -866,12 +869,14 @@ test "groups that cannot fit the configured memory or credit fail without public
         defer endpoint.deinit();
         endpoint.credit[0].store(@as(u64, 1) << 32 | Service.active | 512, .release);
         var delivered: [1]Service.Delivery = undefined;
-        const size: usize = if (pages == 1) 8 else 256;
+        // Two packets the size of a page: more than one page of memory holds, and more than
+        // four pages of credit allows.
+        const size: usize = 256;
         try std.testing.expectError(error.GroupTooLarge, endpoint.fanout(.{Version}, Encoder, &.{.{ .handle = .{ .index = 0, .generation = 1 }, .protocol = 1 }}, size, &.{ size, size }, &delivered));
         try std.testing.expect(endpoint.output.takeReady() == null);
         try std.testing.expectEqual(@as(usize, 0), endpoint.preparing.load(.acquire));
         try std.testing.expectEqual(@as(usize, 512), endpoint.outputCredit(.{ .index = 0, .generation = 1 }));
-        try std.testing.expectEqual(endpoint.output.pages.len, endpoint.output.pool.free_units.count());
+        try std.testing.expectEqual(endpoint.output.pool.units(), endpoint.output.pool.free_units.count());
     }
 }
 
@@ -1009,10 +1014,11 @@ test "pending descriptors follow pool identity across shared endpoints and abort
         .destinations = &.{ 0, 1, 2 },
     }, &endpoints);
     defer worker.deinit();
-    try std.testing.expectEqual(@as(usize, 8), worker.packets.len);
+    // A packet for each slot of each distinct pool.
+    try std.testing.expectEqual(pool.slots.len + endpoints[1].output.slots.len, worker.packets.len);
     for (0..2) |_| {
         try std.testing.expectEqual(@as(usize, 0), worker.sources[0].packet_base);
-        try std.testing.expectEqual(@as(usize, 4), worker.sources[1].packet_base);
+        try std.testing.expectEqual(pool.slots.len, worker.sources[1].packet_base);
         try std.testing.expectEqual(@as(usize, 0), worker.sources[2].packet_base);
         worker.abort(std.testing.io);
     }

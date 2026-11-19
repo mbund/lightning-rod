@@ -853,9 +853,9 @@ pub const Service = struct {
         var units: usize = 0;
         for (capacities) |capacity| {
             if (capacity == 0 or capacity > self.config.page_bytes) return error.InvalidPacketSize;
-            units += std.math.divCeil(usize, capacity + shared.headroom, self.output.unit_bytes) catch unreachable;
+            units += self.output.unitsFor(capacity);
         }
-        if (units > self.output.pages.len) return error.GroupTooLarge;
+        if (units > self.output.pool.units() or capacities.len > self.output.slots.len) return error.GroupTooLarge;
         for (targets) |target| {
             var supported = false;
             inline for (implementations) |Version| supported = supported or Version.protocol_number == target.protocol;

@@ -1229,8 +1229,8 @@ test "movement fanout preserves independent admission and observer baselines" {
     replication.deps.visibility.tick();
     replication.tick();
     _ = try Drain.run(service, 0);
-    var statuses: [128]u64 = undefined;
-    for (service.output.pages, &statuses) |*page, *status| status.* = page.status.load(.acquire);
+    const statuses = try allocator.alloc(u64, service.output.slots.len);
+    for (service.output.slots, statuses) |*slot, *status| status.* = slot.status.load(.acquire);
     for (0..3) |i| service.credit[i].store(@as(u64, 1) << 32 | sessions.Service.active, .release);
     for (0..64) |_| {
         records[0].position.x += 0.01;
@@ -1239,7 +1239,7 @@ test "movement fanout preserves independent admission and observer baselines" {
         replication.tick();
         try std.testing.expectEqual(@as(usize, 0), try Drain.run(service, 0));
     }
-    for (service.output.pages, statuses) |*page, status| try std.testing.expectEqual(status, page.status.load(.acquire));
+    for (service.output.slots, statuses) |*slot, status| try std.testing.expectEqual(status, slot.status.load(.acquire));
     for (0..3) |i| service.credit[i].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     replication.deps.visibility.tick();
     replication.tick();
@@ -1334,13 +1334,13 @@ test "movement fanout preserves independent admission and observer baselines" {
     try std.testing.expectEqual(@as(usize, 6), replication.viewers(0).words[0]);
     try std.testing.expectEqual(@as(usize, 5), replication.viewers(1).words[0]);
     try std.testing.expectEqual(@as(usize, 3), replication.viewers(2).words[0]);
-    for (service.output.pages, &statuses) |*page, *status| status.* = page.status.load(.acquire);
+    for (service.output.slots, statuses) |*slot, *status| status.* = slot.status.load(.acquire);
     for (0..64) |_| {
         replication.deps.visibility.tick();
         replication.tick();
         try std.testing.expectEqual(@as(usize, 0), try Drain.run(service, 0));
     }
-    for (service.output.pages, statuses) |*page, status| try std.testing.expectEqual(status, page.status.load(.acquire));
+    for (service.output.slots, statuses) |*slot, status| try std.testing.expectEqual(status, slot.status.load(.acquire));
 
     records[2].handle = null;
     players.rebuildIndexes();
