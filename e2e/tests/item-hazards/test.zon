@@ -1,0 +1,1 @@
+.{ .client = "ItemHazardsFixture", .scenarios = .{.{ .name = "item-hazards", .peers = .{"alice"} }} }
