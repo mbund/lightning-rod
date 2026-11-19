@@ -723,7 +723,9 @@ pub const SharedPages = struct {
         const generation = p.status.load(.acquire) >> 8;
         const previous = p.status.cmpxchgStrong(status(.published, generation), status(.taken, generation), .acq_rel, .acquire);
         std.debug.assert(previous == null);
-        var result: RawPacket = .{ .page = id, .units = p.units, .generation = generation, .bytes = s.pagePayload(id)[0..p.len], .decoded_length = p.decoded_length, .recipients = Recipients.all(s.recipient_ring[p.recipient_start..][0..p.recipient_count]), .recipient_end = p.recipient_end, .group = p.group };
+        var result: RawPacket = .{ .page = id, .units = p.units, .generation = generation, .bytes = s.pagePayload(id)[0..p.len], .decoded_length = p.decoded_length, .recipients = undefined, .recipient_end = p.recipient_end, .group = p.group };
+        // A packet selecting from an audience has no recipients in the ring.
+        if (p.audience == null) result.recipients = Recipients.all(s.recipient_ring[p.recipient_start..][0..p.recipient_count]);
         if (p.audience) |audience| {
             const slot = &s.pool.audiences[audience.index];
             std.debug.assert(slot.generation == audience.generation);
@@ -1104,4 +1106,31 @@ test "small packets take a page freed among full ones and the split keeps whole 
     for (pages[1..]) |page| pool.cancel(page);
     try std.testing.expectEqual(@as(usize, 0), pool.pool.active_units);
     try std.testing.expectEqual(@as(usize, 0), pool.pool.small_units);
+}
+
+test "a page reused for an audience packet reads no recipients from the ring" {
+    // One unit and a ring of four recipients, so every packet uses the same page, and a plain
+    // publication can leave the page's place in the ring near its end.
+    var output = try SharedPages.init(std.testing.allocator, std.testing.io, .{ .pages = 1, .page_bytes = 64, .recipients_per_page = 4 });
+    defer output.deinit();
+    const handles = [_]networking.Handle{ .{ .index = 0, .generation = 1 }, .{ .index = 1, .generation = 1 }, .{ .index = 2, .generation = 1 }, .{ .index = 3, .generation = 1 } };
+    for ([_]usize{ 1, 2 }) |count| {
+        const reservation = output.reserve(1).?;
+        try std.testing.expect(output.publish(reservation, handles[0..count]));
+        const packet = output.takeReady().?;
+        try std.testing.expect(packet.recipients.eqlSlice(handles[0..count]));
+        output.releaseRecipients(packet);
+        try std.testing.expect(output.releaseReady(packet.page, packet.generation));
+    }
+    // The page's last plain publication started at the ring's second place, and this one
+    // selects all four of its audience.
+    var writer = output.pool.reserveAudience(std.testing.io, handles.len).?;
+    @memcpy(writer.handles, &handles);
+    const audience = writer.finish();
+    const reservation = output.reserve(1).?;
+    output.publishMany(&.{.{ .reservation = reservation, .audience = audience, .mask = &.{0b1111} }});
+    audience.release(std.testing.io);
+    const packet = output.takeReady().?;
+    try std.testing.expect(packet.recipients.eqlSlice(&handles));
+    try std.testing.expect(output.releaseReady(packet.page, packet.generation));
 }
