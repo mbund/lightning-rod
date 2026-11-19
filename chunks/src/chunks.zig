@@ -389,6 +389,7 @@ pub const Chunks = struct {
 
         /// Reads one block, from storage if the section is not in memory.
         pub fn getBlock(self: Client, world: World, pos: Position) !u16 {
+            if (self.chunks.readResident(sectionAt(world, pos), localIndex(pos))) |state| return state;
             const lease = try self.acquire(sectionAt(world, pos));
             defer lease.release();
             return lease.get(localIndex(pos));
@@ -845,6 +846,27 @@ pub const Chunks = struct {
         self.releaseLocked(retention.leases[keep..]);
         retention.leases = retention.leases[0..keep];
         self.available.broadcast(self.io);
+    }
+
+    /// One block of a section memory holds, read under the store's lock, which eviction also
+    /// takes, so it needs no lease or budget. It counts as an acquisition and a hit, as a lease
+    /// of it would. Null when the section must be leased: not in memory, loading, generating,
+    /// or the cache failed, which leasing reports.
+    fn readResident(self: *Chunks, section: Section, index: u12) ?u16 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.cache.failed) return null;
+        const key = encodeKey(section);
+        const slot = self.cache.lookup.get(&key) orelse return null;
+        const entry = &self.cache.entries[slot];
+        if (!entry.loaded or entry.filling or self.generating[slot] != null) return null;
+        const lease = self.cache.pin(slot);
+        defer lease.release();
+        // Read like any lease, so it is the last to be evicted.
+        entry.referenced = true;
+        self.cache.metrics.acquired.add(1);
+        self.cache.metrics.hits.add(1);
+        return View.fromBytes(lease.read()).get(index);
     }
 
     fn acquireLocked(self: *Chunks, client_index: u8, sections: []const Section, output: []Lease, retention: ?*Retention) !void {
