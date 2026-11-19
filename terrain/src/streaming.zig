@@ -456,6 +456,67 @@ pub const Streaming = struct {
         }
     };
 
+    /// Protocols in a family take the same packet, byte for byte, for the same column or light:
+    /// the same packet id and layout, the same writer and, for chunks, the same delivery
+    /// variant. One encoding serves every player of a family. A family is named by its first
+    /// protocol implementation.
+    const Family = struct { chunk: u8, light: u8 };
+
+    /// What decides a protocol's chunk and light packets beyond the delivery variant.
+    const ProtocolWire = struct {
+        number: i32,
+        chunk_id: i32,
+        chunk_layout: [32]u8,
+        chunk_writer: usize,
+        light_id: i32,
+        light_layout: [32]u8,
+    };
+
+    const protocol_wires = wires: {
+        const implementations = packets.protocols.implementations;
+        var result: [implementations.len]ProtocolWire = undefined;
+        for (implementations, &result) |Version, *wire| {
+            const Clientbound = Version.Protocol.play.toClient;
+            wire.* = .{
+                .number = Version.protocol_number,
+                .chunk_id = Clientbound.packetId(.map_chunk),
+                .chunk_layout = Clientbound.PacketBody(.map_chunk).layout_fingerprint,
+                .chunk_writer = sessions.packet_api.select(Version, chunk_encoding.write_delivery),
+                .light_id = Clientbound.packetId(.update_light),
+                .light_layout = Clientbound.PacketBody(.update_light).layout_fingerprint,
+            };
+        }
+        break :wires result;
+    };
+
+    fn family(self: *Streaming, protocol: i32) Family {
+        const at = for (protocol_wires, 0..) |wire, index| {
+            if (wire.number == protocol) break index;
+        } else unreachable;
+        if (self.families[at]) |known| return known;
+        const own = protocol_wires[at];
+        const variant = self.delivery_catalog.index(protocol) catch unreachable;
+        var found: Family = .{ .chunk = @intCast(at), .light = @intCast(at) };
+        // The first implementation alike names the family, so every member finds the same.
+        for (protocol_wires[0..at], 0..) |wire, index| {
+            if (wire.light_id == own.light_id and std.mem.eql(u8, &wire.light_layout, &own.light_layout) and found.light == at) found.light = @intCast(index);
+            const other = self.delivery_catalog.index(wire.number) catch continue;
+            if (other == variant and wire.chunk_id == own.chunk_id and wire.chunk_writer == own.chunk_writer and std.mem.eql(u8, &wire.chunk_layout, &own.chunk_layout) and found.chunk == at) found.chunk = @intCast(index);
+        }
+        self.families[at] = found;
+        return found;
+    }
+
+    /// Whether players on these protocols take the same chunk packet for a column.
+    fn sameChunkFamily(self: *Streaming, a: i32, b: i32) bool {
+        return a == b or self.family(a).chunk == self.family(b).chunk;
+    }
+
+    /// Whether players on these protocols take the same light update.
+    fn sameLightFamily(self: *Streaming, a: i32, b: i32) bool {
+        return a == b or self.family(a).light == self.family(b).light;
+    }
+
     const Pending = struct {
         at: Position,
         world: u32,
@@ -613,6 +674,9 @@ pub const Streaming = struct {
     encoding: *chunk_encoding.Workspace,
     delivery: *delivery_cache.Workspace,
     delivery_catalog: delivery_cache.Catalog,
+    /// By protocol implementation, the families it falls in, found when first asked, as the
+    /// catalog only knows its variants once configuration completes.
+    families: [protocol_wires.len]?Family = @splat(null),
     light_pending: LightChanges,
     /// Patched light being sent. Only the streaming thread touches it.
     light_mail: *LightMail,
@@ -1407,7 +1471,7 @@ pub const Streaming = struct {
                     const candidate_state = self.disclosureState(index, first.at);
                     var duplicate = false;
                     for (pending[0..count], planned_states[0..count]) |item, *state| {
-                        if (item.protocol != player.protocol) continue;
+                        if (!self.sameChunkFamily(item.protocol, player.protocol)) continue;
                         if (state.* == null) state.* = self.disclosureState(item.owner, first.at);
                         if (std.meta.eql(state.*.?, candidate_state)) {
                             duplicate = true;
@@ -1442,7 +1506,7 @@ pub const Streaming = struct {
                 if (!self.canDeliverColumn(index, column)) continue;
                 const candidate: Pending = .{ .at = column.at, .world = column.world, .protocol = self.views[index].protocol, .owner = index };
                 var duplicate = false;
-                for (pending[0..count]) |item| duplicate = duplicate or (item.world == candidate.world and item.protocol == candidate.protocol and std.meta.eql(item.at, candidate.at) and self.sameDisclosure(item.owner, candidate.owner, candidate.at));
+                for (pending[0..count]) |item| duplicate = duplicate or (item.world == candidate.world and self.sameChunkFamily(item.protocol, candidate.protocol) and std.meta.eql(item.at, candidate.at) and self.sameDisclosure(item.owner, candidate.owner, candidate.at));
                 if (duplicate) continue;
                 pending[count] = candidate;
                 count += 1;
@@ -1480,7 +1544,7 @@ pub const Streaming = struct {
                             const candidate: Pending = .{ .world = self.views[index].world, .at = at, .owner = index, .protocol = self.views[index].protocol };
                             var duplicate = false;
                             for (pending[0..count]) |item| {
-                                if (item.world != candidate.world or item.protocol != candidate.protocol or !std.meta.eql(item.at, at)) continue;
+                                if (item.world != candidate.world or !self.sameChunkFamily(item.protocol, candidate.protocol) or !std.meta.eql(item.at, at)) continue;
                                 if (self.sameDisclosure(item.owner, index, at)) duplicate = true;
                             }
                             if (duplicate or !self.canDeliverColumn(index, .{ .world = candidate.world, .at = at })) continue;
@@ -2140,7 +2204,7 @@ pub const Streaming = struct {
                 const player = &self.views[index];
                 const stream = &self.streams[index];
                 const recipient = player.handle orelse continue;
-                if (player.world != item.world or !player.ready or player.protocol != item.protocol or stream.setup != .streaming or stream.generation != recipient.generation)
+                if (player.world != item.world or !player.ready or !self.sameChunkFamily(player.protocol, item.protocol) or stream.setup != .streaming or stream.generation != recipient.generation)
                     continue;
                 if (!chunk_horizon.contains(radius, stream.center, item.at) or (self.hasSent(index, item.at) and !self.needsRefresh(index, item.at))) continue;
                 if (stream.delivered == 0 and !std.meta.eql(item.at, stream.center)) continue;
@@ -2346,7 +2410,7 @@ pub const Streaming = struct {
                 count += 1;
                 var others = self.visibleObservers(self.views, delta.world, at.x, at.z);
                 while (others.next()) |other| {
-                    if (!self.light_fresh[other] or self.views[other].protocol != view.protocol or self.occludedMask(other, at) != occluded or !self.visibilityReady(other, at)) continue;
+                    if (!self.light_fresh[other] or !self.sameLightFamily(self.views[other].protocol, view.protocol) or self.occludedMask(other, at) != occluded or !self.visibilityReady(other, at)) continue;
                     self.light_fresh[other] = false;
                     recipients[count] = self.views[other].handle.?;
                     count += 1;
@@ -2517,7 +2581,7 @@ pub const Streaming = struct {
                 continue;
             }
             var duplicate = false;
-            for (plans[0..planned]) |plan| duplicate = duplicate or (plan.world == view.world and plan.protocol == view.protocol and std.meta.eql(plan.at, at) and plan.occluded == self.occludedMask(index, at));
+            for (plans[0..planned]) |plan| duplicate = duplicate or (plan.world == view.world and self.sameLightFamily(plan.protocol, view.protocol) and std.meta.eql(plan.at, at) and plan.occluded == self.occludedMask(index, at));
             if (duplicate) {
                 cursor += 1;
                 continue;
@@ -2527,7 +2591,7 @@ pub const Streaming = struct {
             const recipients = self.recipients[planned * self.views.len ..][0..self.views.len];
             var nearby = self.visibleObservers(self.views, view.world, at.x, at.z);
             while (nearby.next()) |recipient| {
-                if (self.views[recipient].protocol != view.protocol or self.occludedMask(recipient, at) != self.occludedMask(index, at)) continue;
+                if (!self.sameLightFamily(self.views[recipient].protocol, view.protocol) or self.occludedMask(recipient, at) != self.occludedMask(index, at)) continue;
                 if (!self.visibilityReady(recipient, at)) continue;
                 const other = self.sentIndex(recipient, at);
                 if (self.light_pending.bits[other.word] & other.mask == 0) continue;
@@ -4142,6 +4206,30 @@ test "teleports wait for the matching destination terrain without waiting for co
     try std.testing.expect(!Streaming.View.capture(player).ready);
 }
 
+test "releases whose chunk and light packets come out alike share a family" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var selected = try packets.protocols.Default.init(arena.allocator());
+    var streaming: Streaming = undefined;
+    streaming.delivery_catalog = try chunk_encoding.Workspace.initDeliveryCatalog(arena.allocator(), &selected.values);
+    streaming.families = @splat(null);
+    // 1.21.6 and 1.21.8 number blocks alike, as do 1.21.9 and 1.21.11; 26.1 adds fluid counts
+    // and 26.2 new blocks.
+    try std.testing.expect(streaming.sameChunkFamily(771, 772));
+    try std.testing.expect(streaming.sameChunkFamily(773, 774));
+    try std.testing.expect(!streaming.sameChunkFamily(772, 773));
+    try std.testing.expect(!streaming.sameChunkFamily(774, 775));
+    try std.testing.expect(!streaming.sameChunkFamily(775, 776));
+    // A family is the same whichever member asks first.
+    streaming.families = @splat(null);
+    try std.testing.expectEqual(streaming.family(774).chunk, streaming.family(773).chunk);
+    // Light carries no block numbers, so it only parts where the packet itself does.
+    for (Streaming.protocol_wires) |a| for (Streaming.protocol_wires) |b| {
+        const alike = a.light_id == b.light_id and std.mem.eql(u8, &a.light_layout, &b.light_layout);
+        try std.testing.expectEqual(alike, streaming.sameLightFamily(a.number, b.number));
+    };
+}
+
 test "chunk audiences respect source readiness retained state and initial center delivery" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4191,6 +4279,19 @@ test "chunk audiences respect source readiness retained state and initial center
     var counts: [pending.len]usize = undefined;
     streaming.planRecipients(&pending, &counts);
     try std.testing.expectEqualSlices(usize, &.{ 2, 1, 1 }, &counts);
+    // A player on another release whose chunk packets come out alike shares the packet, and
+    // one whose do not gets its own.
+    var selected = try packets.protocols.Default.init(arena.allocator());
+    streaming.delivery_catalog = try chunk_encoding.Workspace.initDeliveryCatalog(arena.allocator(), &selected.values);
+    streaming.families = @splat(null);
+    views[1].protocol = 771;
+    streaming.planRecipients(pending[0..1], counts[0..1]);
+    try std.testing.expectEqual(@as(usize, 2), counts[0]);
+    views[1].protocol = 773;
+    streaming.planRecipients(pending[0..1], counts[0..1]);
+    try std.testing.expectEqual(@as(usize, 1), counts[0]);
+    views[1].protocol = 772;
+    streaming.planRecipients(&pending, &counts);
     sources[0] = sources[1];
     setVisibilitySnapshot(&streaming.geometry, 0, &origin, -4, 24, 1, 1 << 4);
     try std.testing.expect(streaming.canConceal(0) and streaming.canConceal(1));
