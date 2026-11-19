@@ -358,7 +358,7 @@ pub const Mobs = struct {
         if (self.free_count == 0) return error.MobCapacity;
         const entity = try self.deps.entities.reserveIds(1);
         if (entity > std.math.maxInt(i32)) return error.IdExhausted;
-        var random = JavaRandom.init(@bitCast(self.seeds.next()));
+        var random = entityRandom(self.config.seed, entity);
         const traits_entry = self.traits(request.species);
         var created: Mob = .{
             .id = entity,
@@ -386,6 +386,13 @@ pub const Mobs = struct {
         }
         if (request.baby) created.age = -24000;
         return self.insert(created);
+    }
+
+    /// Entity.random, which vanilla seeds anew for each entity. Seeded by the entity id, which
+    /// no two mobs share across restarts, it draws each a UUID of its own, as clients keep only
+    /// the first entity with a UUID.
+    fn entityRandom(seed: u64, entity: u64) JavaRandom {
+        return .init(@bitCast(std.hash.int(seed ^ entity)));
     }
 
     fn randomUuid(random: *JavaRandom) u128 {
@@ -1352,6 +1359,32 @@ pub const Mobs = struct {
             }
             if (!batch.more) break;
         }
+        separateUuids(self.mobs, self.nearby[0..self.active.values().len], self.active.values(), self.config.seed);
+    }
+
+    /// Mobs saved before UUIDs came from entity ids may share one, as each start drew the same
+    /// first UUIDs, and clients show only the first mob with a UUID. Every other mob holding a
+    /// UUID already taken draws its own, by UUID order in the neighbour scratch, unused until the
+    /// first tick.
+    fn separateUuids(mobs: []Mob, order: []u32, active: []const usize, seed: u64) void {
+        for (order, active) |*slot, index| slot.* = @intCast(index);
+        std.mem.sort(u32, order, @as([]const Mob, mobs), struct {
+            fn less(all: []const Mob, a: u32, b: u32) bool {
+                if (all[a].uuid != all[b].uuid) return all[a].uuid < all[b].uuid;
+                return all[a].id < all[b].id;
+            }
+        }.less);
+        if (order.len == 0) return;
+        var last = mobs[order[0]].uuid;
+        for (order[1..]) |index| {
+            const mob = &mobs[index];
+            if (mob.uuid != last) {
+                last = mob.uuid;
+                continue;
+            }
+            var random = entityRandom(seed, mob.id);
+            mob.uuid = randomUuid(&random);
+        }
     }
 
     pub fn checkpoint(self: *Mobs, space: storage.Space) !void {
@@ -1417,6 +1450,29 @@ test "mob records round trip" {
     try std.testing.expectEqual(original.health, decoded.health);
     try std.testing.expectEqual(original.love_cause, decoded.love_cause);
     try std.testing.expectEqual(original.random.state(), decoded.random.state());
+}
+
+test "mobs draw UUIDs of their own across restarts, and saved mobs sharing one are told apart" {
+    // Each start used to draw the same first UUIDs from a fixed seed; ids never repeat.
+    var seen: [256]u128 = undefined;
+    for (&seen, 0..) |*uuid, entity| {
+        var random = Mobs.entityRandom(0x6d6f6273, 12000 + entity);
+        uuid.* = Mobs.randomUuid(&random);
+    }
+    std.mem.sort(u128, &seen, {}, std.sort.asc(u128));
+    for (seen[1..], seen[0 .. seen.len - 1]) |uuid, previous| try std.testing.expect(uuid != previous);
+
+    const shared: u128 = 0x4b41e369_565a_4963_88e5_f3d9fc4a498a;
+    const template: Mob = .{ .id = 0, .uuid = shared, .species = .cow, .world = 0, .position = .{ 0, 64, 0 }, .old_position = .{ 0, 64, 0 }, .random = JavaRandom.init(1), .health = 10 };
+    var mobs: [4]Mob = .{ template, template, template, template };
+    for (&mobs, [_]u64{ 13212, 12124, 13887, 12875 }) |*mob, id| mob.id = id;
+    mobs[3].uuid = 7;
+    var order: [4]u32 = undefined;
+    Mobs.separateUuids(&mobs, &order, &.{ 0, 1, 2, 3 }, 0x6d6f6273);
+    // The first saved keeps its UUID, as clients showed it.
+    try std.testing.expectEqual(shared, mobs[1].uuid);
+    try std.testing.expectEqual(@as(u128, 7), mobs[3].uuid);
+    for (mobs, 0..) |mob, at| for (mobs[at + 1 ..]) |other| try std.testing.expect(mob.uuid != other.uuid);
 }
 
 fn mth_floor(value: f64) i32 {
