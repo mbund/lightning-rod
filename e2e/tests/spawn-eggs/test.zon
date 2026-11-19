@@ -1,0 +1,4 @@
+.{ .client = "SpawnEggsFixture", .scenarios = .{
+    .{ .name = "spawn-eggs", .prepare = "spawn-eggs-seed" },
+    .{ .name = "spawn-eggs-seed", .internal = true },
+} }
