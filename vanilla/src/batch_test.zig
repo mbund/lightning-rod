@@ -56,7 +56,7 @@ fn itemPhysicsProbe(output: *std.Io.Writer) !void {
         var neighborhood = physics.readWindow();
         defer neighborhood.deinit();
         for (0..count) |index| {
-            const result = try physics.advance(&neighborhood, @intCast(index + 1), 1, body, false);
+            const result = try physics.advance(&neighborhood, @intCast(index + 1), 1, body, false, false);
             try std.testing.expectApproxEqAbs(@as(f64, 8.1), result.body.position[0], 0.000001);
             try std.testing.expectApproxEqAbs(@as(f64, 69.96), result.body.position[1], 0.000001);
             try std.testing.expectApproxEqAbs(@as(f64, 8.1), result.body.position[2], 0.000001);
@@ -72,19 +72,19 @@ fn itemPhysicsProbe(output: *std.Io.Writer) !void {
     defer neighborhood.deinit();
     var moving = body;
     moving.velocity[0] = 1;
-    const collision = try physics.advance(&neighborhood, 1, 1, moving, false);
+    const collision = try physics.advance(&neighborhood, 1, 1, moving, false, false);
     try std.testing.expect(collision.on_ground);
     try std.testing.expectApproxEqAbs(@as(f64, 8.875), collision.body.position[0], 0.000001);
     try std.testing.expectApproxEqAbs(@as(f64, 70), collision.body.position[1], 0.000001);
     try std.testing.expectEqual(@as(f64, 0), collision.body.velocity[0]);
     moving.position = .{ -8, 70, -8 };
     moving.velocity = .{ -0.1, 0, -0.1 };
-    const negative = try physics.advance(&neighborhood, 1, 1, moving, false);
+    const negative = try physics.advance(&neighborhood, 1, 1, moving, false, false);
     try std.testing.expectApproxEqAbs(@as(f64, -8.1), negative.body.position[0], 0.000001);
     try std.testing.expectApproxEqAbs(@as(f64, -8.1), negative.body.position[2], 0.000001);
     moving.position = .{ 15.8, 70, 8 };
     moving.velocity = .{ 0.4, 0, 0 };
-    const crossing = try physics.advance(&neighborhood, 1, 1, moving, false);
+    const crossing = try physics.advance(&neighborhood, 1, 1, moving, false, false);
     try std.testing.expectApproxEqAbs(@as(f64, 16.2), crossing.body.position[0], 0.000001);
     neighborhood.deinit();
     try std.testing.expectEqual(@as(usize, 0), terrain.borrowed_count);
@@ -113,12 +113,12 @@ fn itemPhysicsProbe(output: *std.Io.Writer) !void {
         var translated = falling;
         translated.position[0] += 16;
         if (state == std.math.maxInt(u16)) {
-            try std.testing.expectError(error.Corrupt, physics.advance(&uniform_window, 1, 1, falling, false));
-            try std.testing.expectError(error.Corrupt, physics.advance(&dense_window, 1, 1, translated, false));
+            try std.testing.expectError(error.Corrupt, physics.advance(&uniform_window, 1, 1, falling, false, false));
+            try std.testing.expectError(error.Corrupt, physics.advance(&dense_window, 1, 1, translated, false, false));
             continue;
         }
-        const compact = try physics.advance(&uniform_window, 1, 1, falling, false);
-        const expanded = try physics.advance(&dense_window, 1, 1, translated, false);
+        const compact = try physics.advance(&uniform_window, 1, 1, falling, false, false);
+        const expanded = try physics.advance(&dense_window, 1, 1, translated, false, false);
         for (compact.body.position, expanded.body.position, 0..) |first, second, axis| try std.testing.expectApproxEqAbs(first, second - @as(f64, if (axis == 0) 16 else 0), 0.000000001);
         try std.testing.expectEqualSlices(f64, &compact.body.velocity, &expanded.body.velocity);
         try std.testing.expectEqual(compact.crossed_block, expanded.crossed_block);
@@ -445,7 +445,7 @@ pub fn benchmarkItemPhysicsWindow() !void {
     {
         var window = physics.readWindow();
         defer window.deinit();
-        _ = try physics.advance(&window, 1, 1, body, true);
+        _ = try physics.advance(&window, 1, 1, body, true, false);
     }
     var buffer: [1024]u8 = undefined;
     var output = std.Io.File.stdout().writer(io, &buffer);
@@ -457,7 +457,7 @@ pub fn benchmarkItemPhysicsWindow() !void {
         const generated = source.generated;
         var window = physics.readWindow();
         for (0..count) |at| {
-            const result = try physics.advance(&window, @intCast(at + 1), 1, body, true);
+            const result = try physics.advance(&window, @intCast(at + 1), 1, body, true, false);
             try std.testing.expect(result.on_ground);
             try std.testing.expectApproxEqAbs(@as(f64, 15.975), result.body.position[0], 0.000001);
             try std.testing.expectApproxEqAbs(@as(f64, 65), result.body.position[1], 0.000001);

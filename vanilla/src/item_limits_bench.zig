@@ -89,7 +89,7 @@ pub fn benchmark() !void {
         var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .position = .{ .x = 32, .y = 65, .z = 32 } }};
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        const tick = try tick_module.ItemTick.init(allocator, .{ .merge_work = .{ .guaranteed = .{ .operations = 1 }, .burst = .{ .operations = count * 128 } } }, .{ .dropped = dropped, .physics = physics, .merging = merging, .pickup = undefined, .players = &players, .entities = bodies, .inventories = ownership, .items = items, .worlds = dimensions });
+        const tick = try tick_module.ItemTick.init(allocator, .{ .merge_work = .{ .guaranteed = .{ .operations = 1 }, .burst = .{ .operations = count * 128 } } }, .{ .dropped = dropped, .physics = physics, .merging = merging, .pickup = undefined, .players = &players, .entities = bodies, .inventories = ownership, .items = items, .worlds = dimensions, .dimensions = gameplay_definitions.dimensions });
 
         players.rebuildIndexes();
 

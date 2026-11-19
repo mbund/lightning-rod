@@ -29,6 +29,7 @@ const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
 const InventoryCapacity = @import("vanilla_inventory").inventory_capacity.InventoryCapacity;
 const records = @import("records");
 const chunks = @import("chunks");
+const entities = @import("entities");
 const BlockActions = @import("vanilla_blocks").block_actions.BlockActions;
 const Containers = @import("vanilla_containers").containers.Containers;
 const ContainerKey = @import("vanilla_containers").containers.Key;
@@ -1740,4 +1741,54 @@ test "fuel callbacks receive actor position and NBT and preserve plugin provenan
             try std.testing.expectEqualStrings("00000000000000000000000000000001", (try data.getString("actor", scratch.allocator())).?);
         }
     }
+}
+
+test "items drift with water currents and float in water and lava, as vanilla's do" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/item-currents", .{directory.sub_path});
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
+    defer store.deinit();
+    var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
+    defer registry.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
+    const fixture = try InventoryFixture.init(arena.allocator(), &store, &registry, &selected);
+    defer fixture.service.deinit();
+    const containers = try blockContainers(arena.allocator(), &store, &registry, fixture);
+    const terrain = containers.deps.chunks;
+    const physics = containers.deps.experience.deps.physics;
+    const world = fixture.players.records[0].world;
+    const stone: u16 = @intCast(game_data.registry.blockStateId("minecraft:stone").?);
+    // A source walled on three sides and flowing east into water four levels down.
+    try terrain.setBlock(world, .{ .x = 4, .y = 8, .z = 4 }, @intCast(game_data.registry.blockStateId("minecraft:water[level=0]").?));
+    for ([_]chunks.Position{ .{ .x = 3, .y = 8, .z = 4 }, .{ .x = 4, .y = 8, .z = 3 }, .{ .x = 4, .y = 8, .z = 5 } }) |position| try terrain.setBlock(world, position, stone);
+    try terrain.setBlock(world, .{ .x = 5, .y = 8, .z = 4 }, @intCast(game_data.registry.blockStateId("minecraft:water[level=4]").?));
+    try terrain.setBlock(world, .{ .x = 10, .y = 8, .z = 4 }, @intCast(game_data.registry.blockStateId("minecraft:lava[level=0]").?));
+    var window = physics.readWindow();
+    defer window.deinit();
+    const resting: entities.State = .{ .uuid = 1, .kind = 1, .world = world, .position = .{ 4.5, 8, 4.5 }, .velocity = .{ 0, 0, 0 } };
+    const drag: f64 = @as(f32, 0.98);
+    const lift: f64 = @as(f32, 5.0e-4);
+
+    // Pushed east at the current's strength, then afloat: slowed across and lifted.
+    const drifting = try physics.advance(&window, 1, 1, resting, false, false);
+    try std.testing.expectEqual(0.014 * @as(f64, @as(f32, 0.99)) * drag, drifting.body.velocity[0]);
+    try std.testing.expectEqual(lift * 0.98, drifting.body.velocity[1]);
+    try std.testing.expectEqual(@as(f64, 0), drifting.body.velocity[2]);
+    try std.testing.expect(drifting.body.position[0] > resting.position[0]);
+
+    // Still lava pushes nothing but floats an item as water does.
+    var in_lava = resting;
+    in_lava.position = .{ 10.5, 8, 4.5 };
+    const floating = try physics.advance(&window, 1, 1, in_lava, false, false);
+    try std.testing.expectEqual(@as([3]f64, .{ 0, lift * 0.98, 0 }), floating.body.velocity);
+
+    // Out of any fluid it falls.
+    var dry = resting;
+    dry.position = .{ 20.5, 8, 4.5 };
+    const falling = try physics.advance(&window, 1, 1, dry, false, false);
+    try std.testing.expectEqual(@as([3]f64, .{ 0, -0.04 * 0.98, 0 }), falling.body.velocity);
 }

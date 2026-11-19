@@ -16,6 +16,7 @@
         .records = .{ .path = "../../records" },
         .sessions = .{ .path = "../../sessions" },
         .terrain = .{ .path = "../../terrain" },
+        .vanilla_content = .{ .path = "../content" },
         .vanilla_crafting = .{ .path = "../crafting" },
         .vanilla_item_entities = .{ .path = "../item_entities" },
         .vanilla_items = .{ .path = "../items" },

@@ -36,8 +36,20 @@ pub const ItemPhysics = struct {
         return Window.init(self.chunk_client);
     }
 
-    pub fn advance(self: *ItemPhysics, neighborhood: *Window, entity_id: u32, ticks: u32, body: entities.State, on_ground: bool) !Result {
-        return self.advanceBody(false, neighborhood, entity_id, ticks, body, on_ground, .{ 0, 0, 0 });
+    /// ItemEntity.tick's movement: pushed by the currents it is in, as Entity.baseTick does
+    /// first, then afloat in water or lava over a tenth deep and falling otherwise.
+    pub fn advance(self: *ItemPhysics, neighborhood: *Window, entity_id: u32, ticks: u32, body: entities.State, on_ground: bool, ultrawarm: bool) !Result {
+        assert(entity_id > 0);
+        try readAround(neighborhood, body);
+        var pushed = body;
+        const fluids = try self.pushFluids(neighborhood, &pushed, 0.25, 0.25, ultrawarm);
+        // ItemEntity.setUnderwaterMovement and setUnderLavaMovement in place of gravity.
+        if (fluids.water > @as(f32, 0.1)) {
+            buoy(&pushed.velocity, @as(f32, 0.99));
+        } else if (fluids.lava > @as(f32, 0.1)) {
+            buoy(&pushed.velocity, @as(f32, 0.95));
+        } else pushed.velocity[1] -= 0.04;
+        return self.advanceBody(false, neighborhood, entity_id, ticks, pushed, on_ground, .{ 0, 0, 0 });
     }
 
     pub fn advanceOrb(self: *ItemPhysics, neighborhood: *Window, entity_id: u32, ticks: u32, body: entities.State, on_ground: bool, stuck: [3]f64) !Result {
@@ -108,9 +120,55 @@ pub const ItemPhysics = struct {
     }
 
     pub fn pushOrb(self: *ItemPhysics, window: *Window, body: *entities.State, ultrawarm: bool) !void {
+        _ = try self.pushFluids(window, body, 0.5, 0.5, ultrawarm);
+    }
+
+    /// Reads in one batch every section an item's tick can touch: the blocks its currents are
+    /// read from, which are within a block of it, and those it can move through, as far as its
+    /// velocity reaches once currents and gravity changed it, at most 0.06 a tick.
+    fn readAround(window: *Window, body: entities.State) !void {
+        // The item's box, a quarter block wide and tall, from its feet.
+        const low: [3]f64 = .{ body.position[0] - 0.125, body.position[1], body.position[2] - 0.125 };
+        const high: [3]f64 = .{ body.position[0] + 0.125, body.position[1] + 0.25, body.position[2] + 0.125 };
+        var first: [3]i32 = undefined;
+        var last: [3]i32 = undefined;
+        for (0..3) |axis| {
+            const velocity = body.velocity[axis];
+            first[axis] = @divFloor(@as(i32, @intFromFloat(@floor(low[axis] + @min(velocity, 0) - 0.06))) - 1, 16);
+            last[axis] = @divFloor(@as(i32, @intFromFloat(@floor(high[axis] + @max(velocity, 0) + 0.06))) + 1, 16);
+        }
+        var sections: [8]chunks.Section = undefined;
+        var count: usize = 0;
+        var y = first[1];
+        while (y <= last[1]) : (y += 1) {
+            var z = first[2];
+            while (z <= last[2]) : (z += 1) {
+                var x = first[0];
+                while (x <= last[0]) : (x += 1) {
+                    // A body too fast for the window reads in the batches its move takes.
+                    if (count == sections.len) return;
+                    sections[count] = .{ .world = body.world, .x = x, .y = y, .z = z };
+                    count += 1;
+                }
+            }
+        }
+        var views: [8]chunks.View = undefined;
+        try window.readMany(sections[0..count], views[0..count]);
+    }
+
+    /// How deep a body is in water and in lava: from its bottom to the top of the fluid.
+    pub const Fluids = struct { water: f64 = 0, lava: f64 = 0 };
+
+    /// Entity.updateInWaterStateAndDoFluidPushing for a body `width` wide and `height` tall:
+    /// pushed by the water around it, then by the lava, as Entity.updateFluidHeightAndDoFluidPushing
+    /// does with each.
+    fn pushFluids(self: *ItemPhysics, window: *Window, body: *entities.State, comptime width: f32, comptime tall: f32, ultrawarm: bool) !Fluids {
+        var fluids: Fluids = .{};
         inline for (.{ game_data.physics_data.Fluid.water, game_data.physics_data.Fluid.lava }) |kind| {
-            const low: [3]f64 = .{ body.position[0] - 0.249, body.position[1] + 0.001, body.position[2] - 0.249 };
-            const high: [3]f64 = .{ body.position[0] + 0.249, body.position[1] + 0.499, body.position[2] + 0.249 };
+            // EntityDimensions.makeBoundingBox, then AABB.deflate(0.001).
+            const half: f64 = width / 2;
+            const low: [3]f64 = .{ body.position[0] - half + 0.001, body.position[1] + 0.001, body.position[2] - half + 0.001 };
+            const high: [3]f64 = .{ body.position[0] + half - 0.001, body.position[1] + @as(f64, tall) - 0.001, body.position[2] + half - 0.001 };
             var total: [3]f64 = .{ 0, 0, 0 };
             var count: usize = 0;
             var depth: f64 = 0;
@@ -124,6 +182,7 @@ pub const ItemPhysics = struct {
                         const state = self.deps.blocks.get(try self.blockState(window, body.world, position));
                         if (state.fluid != kind) continue;
                         const above = self.deps.blocks.get(try self.blockState(window, body.world, .{ .x = x, .y = y + 1, .z = z }));
+                        // Added as floats, as vanilla does.
                         const height = @as(f64, @as(f32, @floatFromInt(y)) + (if (above.fluid == kind) @as(f32, 1) else state.height()));
                         if (height < low[1]) continue;
                         depth = @max(depth, height - low[1]);
@@ -133,18 +192,16 @@ pub const ItemPhysics = struct {
                     }
                 }
             }
-            const squared = total[0] * total[0] + total[1] * total[1] + total[2] * total[2];
-            if (squared > 0) {
-                for (&total) |*component| component.* /= @as(f64, @floatFromInt(count));
-                var direction = normalized(total);
+            if (kind == .water) fluids.water = depth else fluids.lava = depth;
+            if (length(total) > 0) {
+                if (count > 0) total = scaled(total, 1.0 / @as(f64, @floatFromInt(count)));
                 const strength: f64 = if (kind == .water) 0.014 else if (ultrawarm) 0.007 else 0.0023333333333333335;
-                const scale: f64 = if (@abs(body.velocity[0]) < 0.003 and @abs(body.velocity[2]) < 0.003 and strength < 0.0045000000000000005) 0.0045000000000000005 else strength;
-                for (&direction, &body.velocity) |*component, *velocity| {
-                    component.* *= scale;
-                    velocity.* += component.*;
-                }
+                var push = scaled(normalized(total), strength);
+                if (@abs(body.velocity[0]) < 0.003 and @abs(body.velocity[2]) < 0.003 and length(push) < 0.0045000000000000005) push = scaled(normalized(push), 0.0045000000000000005);
+                for (&body.velocity, push) |*velocity, component| velocity.* += component;
             }
         }
+        return fluids;
     }
 
     fn flow(self: *ItemPhysics, window: *Window, world: u32, position: chunks.Position, state: game_data.physics_data.State) ![3]f64 {
@@ -313,7 +370,6 @@ pub const ItemPhysics = struct {
         var next = body;
 
         for (body.position ++ body.velocity) |value| assert(std.math.isFinite(value));
-        if (!orb) next.velocity[1] -= 0.04;
         const vertical_velocity = next.velocity[1];
         var motion = next.velocity;
         if (orb and stuck[0] * stuck[0] + stuck[1] * stuck[1] + stuck[2] * stuck[2] > 1e-7) {
@@ -466,8 +522,24 @@ pub const ItemPhysics = struct {
     }
 };
 
+/// Vec3.normalize: zero below a float's 1e-5 long.
 fn normalized(vector: [3]f64) [3]f64 {
-    const length = @sqrt(vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]);
-    if (length < 1e-4) return .{ 0, 0, 0 };
-    return .{ vector[0] / length, vector[1] / length, vector[2] / length };
+    const size = length(vector);
+    if (size < @as(f32, 1.0e-5)) return .{ 0, 0, 0 };
+    return .{ vector[0] / size, vector[1] / size, vector[2] / size };
+}
+
+fn length(vector: [3]f64) f64 {
+    return @sqrt(vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]);
+}
+
+fn scaled(vector: [3]f64, factor: f64) [3]f64 {
+    return .{ vector[0] * factor, vector[1] * factor, vector[2] * factor };
+}
+
+/// ItemEntity.setFluidMovement: slowed across, and lifted while sinking or rising slowly.
+fn buoy(velocity: *[3]f64, comptime drag: f32) void {
+    velocity[0] *= drag;
+    velocity[1] += if (velocity[1] < @as(f32, 0.06)) @as(f64, @as(f32, 5.0e-4)) else 0;
+    velocity[2] *= drag;
 }

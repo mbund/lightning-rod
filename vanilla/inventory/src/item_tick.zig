@@ -8,6 +8,7 @@ const ItemMerging = @import("vanilla_item_entities").item_merging.ItemMerging;
 const ItemPickup = @import("item_pickup.zig").ItemPickup;
 const Players = @import("players").players.Players;
 const Items = @import("vanilla_items").items.Items;
+const Dimensions = @import("vanilla_content").dimensions.Dimensions;
 const work = @import("lightning_rod").system.work;
 
 const assert = std.debug.assert;
@@ -27,6 +28,7 @@ pub const ItemTick = struct {
         inventories: *inventories.Inventories,
         items: *Items,
         worlds: *worlds.Worlds,
+        dimensions: *Dimensions,
     };
 
     deps: Dependencies,
@@ -34,6 +36,10 @@ pub const ItemTick = struct {
     merged: u64 = 0,
     merge_work: work.Limits,
     merge_after: entities.Id = 0,
+    /// The world the last item was in and whether its dimension is ultrawarm, as items come in
+    /// runs of one world.
+    last_world: ?u32 = null,
+    last_ultrawarm: bool = false,
     query: ItemEntities.Query,
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*ItemTick {
@@ -42,6 +48,16 @@ pub const ItemTick = struct {
         const self = try allocator.create(ItemTick);
         self.* = .{ .deps = deps, .merge_work = config.merge_work, .query = try ItemEntities.Query.init(allocator, deps.dropped, deps.players) };
         return self;
+    }
+
+    /// Whether lava flows strongly in the world, as in the nether, which pushes items harder.
+    fn ultrawarm(self: *ItemTick, world: u32) !bool {
+        if (self.last_world != world) {
+            const entry = self.deps.worlds.get(world) orelse return error.Corrupt;
+            self.last_ultrawarm = if (self.deps.dimensions.get(entry.dimension.name)) |dimension| dimension.ultrawarm else false;
+            self.last_world = world;
+        }
+        return self.last_ultrawarm;
     }
 
     pub fn tick(self: *ItemTick) !void {
@@ -69,7 +85,7 @@ pub const ItemTick = struct {
             metadata.ticks +%= 1;
 
             if (metadata.pickup_delay > 0 and metadata.pickup_delay != 32767) metadata.pickup_delay -= 1;
-            const advanced = try self.deps.physics.advance(&neighborhood, @intCast(entity), metadata.ticks, body, metadata.on_ground);
+            const advanced = try self.deps.physics.advance(&neighborhood, @intCast(entity), metadata.ticks, body, metadata.on_ground, try self.ultrawarm(body.world));
             metadata.on_ground = advanced.on_ground;
 
             if (!std.meta.eql(body, advanced.body)) {
