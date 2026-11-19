@@ -1228,6 +1228,11 @@ pub const World = struct {
         return &self.tiles[slot];
     }
 
+    /// Whether a tile holds the column, without making one.
+    pub fn holds(self: *const World, column: Column) bool {
+        return self.lookup.contains(column);
+    }
+
     pub fn learnSection(self: *World, column: Column, count: usize, offset: usize, view: section_views.Section.View) void {
         assert(offset < count and view != .unavailable);
         const tile = self.acquire(column, count) orelse return;

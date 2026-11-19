@@ -1145,15 +1145,24 @@ pub const Streaming = struct {
                 while (begin < occluding_count) {
                     const count = @min(occluding_count - begin, views.len, self.chunk_client.budget());
                     var sections: [192]chunks.Section = undefined;
-                    for (self.geometry_changes[begin..][0..count], sections[0..count]) |change, *section| section.* = change.section;
-                    try window.readMany(sections[0..count], views[0..count]);
-                    for (sections[0..count], views[0..count]) |section, view| {
+                    // A column the geometry holds no tile for is learned when a view needs it,
+                    // from the blocks as they are then, so learning it now would be wasted.
+                    var held: usize = 0;
+                    for (self.geometry_changes[begin..][0..count]) |change| {
+                        const minimum = self.deps.worlds.get(change.section.world).?.dimension.minimumSection();
+                        if (!self.geometry.holds(.{ .world = change.section.world, .x = change.section.x, .z = change.section.z, .minimum = minimum })) continue;
+                        sections[held] = change.section;
+                        held += 1;
+                    }
+                    begin += count;
+                    if (held == 0) continue;
+                    try window.readMany(sections[0..held], views[0..held]);
+                    for (sections[0..held], views[0..held]) |section, view| {
                         const dimension = self.deps.worlds.get(section.world).?.dimension;
                         const offset = section.y - dimension.minimumSection();
                         if (offset < 0 or offset >= dimension.sectionCount()) continue;
                         self.geometry.learnSection(.{ .world = section.world, .x = section.x, .z = section.z, .minimum = dimension.minimumSection() }, dimension.sectionCount(), @intCast(offset), .fromChunk(view));
                     }
-                    begin += count;
                 }
             }
             // What could not be compared on relearn invalidates the views that may see it.
