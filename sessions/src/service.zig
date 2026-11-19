@@ -179,6 +179,7 @@ pub const Service = struct {
             // slot may have two credits' worth waiting.
             .recipient_handles = try std.math.mul(usize, 2 * config.connections, config.credit_bytes / frameBound(config.protocols, 1)),
             .pool = config.output_pool,
+            .compression_threshold = config.compression_threshold,
         });
         errdefer output.deinit();
         const events = try allocator.alloc(Event, try std.math.ceilPowerOfTwo(usize, config.connections * 3));

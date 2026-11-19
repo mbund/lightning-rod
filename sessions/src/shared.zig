@@ -33,6 +33,9 @@ pub const Configuration = struct {
     /// one for every slot.
     audiences: usize = 0,
     pool: ?*Pool = null,
+    /// Prepared packets of this source go out decoded below it, or always without one, so they
+    /// keep room to be decoded into.
+    compression_threshold: ?usize = null,
 };
 
 pub const Frame = struct {
@@ -428,6 +431,7 @@ pub const SharedPages = struct {
     recipients_per_page: usize,
     bytes: []align(64) u8,
     slots: []Slot,
+    compression_threshold: ?usize,
     /// The recipients of every publication not yet taken, in publication order, which the
     /// worker takes them in, so they are released from the front as they are appended at the
     /// back. A list never wraps: one that would starts at the beginning, past the end left
@@ -519,6 +523,7 @@ pub const SharedPages = struct {
             .producer_io = io,
             .page_bytes = c.page_bytes,
             .unit_bytes = pool.unit_bytes,
+            .compression_threshold = c.compression_threshold,
             .recipients_per_page = pool.recipients_per_page,
             .bytes = pool.bytes,
             .slots = pool.slots,
@@ -542,6 +547,14 @@ pub const SharedPages = struct {
 
     pub fn memoryBytes(s: *const SharedPages) usize {
         return @sizeOf(SharedPages) + s.ready.slots.len * @sizeOf(SlotId) + s.recipient_ring.len * @sizeOf(networking.Handle) + if (s.owns_pool) s.pool.memoryBytes() else @as(usize, 0);
+    }
+
+    /// The bytes a packet takes before framing: as stored, or decoded when a prepared packet
+    /// goes out decoded, below the compression threshold or without one. As `Service.chargedLength`.
+    fn framedLength(s: *const SharedPages, length: usize, decoded_length: usize) usize {
+        if (decoded_length == 0) return length;
+        if (s.compression_threshold) |threshold| if (decoded_length >= threshold) return length;
+        return @max(length, decoded_length);
     }
 
     /// Units a packet of `len` bytes takes.
@@ -721,9 +734,9 @@ pub const SharedPages = struct {
             if (recipient_start % capacity + to.len > capacity) recipient_start += capacity - recipient_start % capacity;
             if (recipient_start + to.len - s.recipient_head.load(.acquire) > capacity) return false;
         }
-        // What the packet did not use goes back, and following reservations pack into it.
-        const units = s.unitsFor(r.bytes.len);
-        std.debug.assert(units <= p.units);
+        // What the packet did not use goes back, and following reservations pack into it. A
+        // prepared packet the worker sends decoded keeps room to be decoded into.
+        const units = @min(p.units, s.unitsFor(s.framedLength(r.bytes.len, r.decoded_length)));
         s.freeUnits(p.first + units, p.units - units, p.small);
         if (units < p.units and !p.small) s.pool.cursor = p.first + units;
         p.units = @intCast(units);
@@ -1253,4 +1266,22 @@ test "a slot reused for an audience packet reads no recipients from the ring" {
     const packet = output.takeReady().?;
     try std.testing.expect(packet.recipients.eqlSlice(&handles));
     try std.testing.expect(output.releaseReady(packet.page, packet.generation));
+}
+
+test "a prepared packet sent decoded keeps room to be decoded into" {
+    for ([_]?usize{ null, 256 }) |threshold| {
+        var pool = try SharedPages.init(std.testing.allocator, std.testing.io, .{ .pages = 1, .page_bytes = 4096, .recipients_per_page = 1, .compression_threshold = threshold });
+        defer pool.deinit();
+        var reservation = pool.reserve(4096).?;
+        // Stored compressed in 100 bytes, 3000 decoded.
+        reservation.bytes = reservation.bytes[0..100];
+        reservation.decoded_length = 3000;
+        try std.testing.expect(pool.publish(reservation, &.{.{ .index = 0, .generation = 1 }}));
+        const packet = pool.takeReady().?;
+        // Without compression the worker frames it decoded, in its own storage.
+        const kept: usize = if (threshold == null) 3000 else 100;
+        try std.testing.expectEqual(pool.unitsFor(kept), packet.units);
+        try std.testing.expect(pool.packetStorage(packet).len >= storedBytes(kept));
+        try std.testing.expect(pool.releaseReady(packet.page, packet.generation));
+    }
 }
