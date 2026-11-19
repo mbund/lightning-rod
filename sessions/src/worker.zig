@@ -86,7 +86,10 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
         const Source = struct { packet_base: usize = 0 };
         /// A connection's packets its ring could not take yet, oldest first, the oldest in part
         /// when `offset` is not zero.
-        const Backlog = struct { head: usize = 0, count: usize = 0, offset: usize = 0 };
+        /// What a connection waits to write: a packet larger than its ring, in pieces, and what
+        /// was published behind it. `absorb` is how much more such a packet takes on the wire
+        /// than it charged, which its sent bytes pay back before any credit returns.
+        const Backlog = struct { head: usize = 0, count: usize = 0, offset: usize = 0, absorb: usize = 0 };
         const Previous = struct {
             endpoint: *Service,
             handle: network.Handle,
@@ -160,7 +163,8 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             for (endpoints, 0..) |endpoint, i| {
                 if (endpoint.owner != null) return error.InvalidConfiguration;
                 assert(endpoint.readiness == null);
-                if (endpoint.config.buffer_bytes != config.buffer_bytes) return error.InvalidConfiguration;
+                // Credit is no more than the ring's room, so what is published always fits it.
+                if (endpoint.config.credit_bytes > config.output_bytes) return error.InvalidConfiguration;
 
                 for (endpoint.config.protocols) |selected| {
                     var found = false;
@@ -200,11 +204,11 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             const packets = try allocator.alloc(Packet, packet_capacity);
             errdefer allocator.free(packets);
             @memset(packets, .{});
-            // Each packet published charges its recipient at least the bound of the smallest frame,
-            // refunded once its ring takes the packet, so credit bounds how many wait in a backlog.
+            // Only a packet larger than its ring and what was published behind it wait, and each
+            // charges at least the bound of the smallest frame, so credit bounds how many.
             var smallest: usize = std.math.maxInt(usize);
             for (endpoints) |endpoint| smallest = @min(smallest, endpoint.framedBound(1));
-            const backlog_capacity = config.buffer_bytes / smallest;
+            const backlog_capacity = config.output_bytes / smallest + 1;
             const backlogs = try allocator.alloc(Backlog, config.connections);
             errdefer allocator.free(backlogs);
             @memset(backlogs, .{});
@@ -481,7 +485,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             const packet_index = self.sources[source].packet_base + raw.page;
             const packet = &self.packets[packet_index];
             assert(packet.source == null and packet.waiting == 0);
-            packet.* = .{ .raw = raw, .source = source, .charge = endpoint.framedBound(endpoint.chargedLength(raw.bytes.len, raw.decoded_length)) };
+            packet.* = .{ .raw = raw, .source = source, .charge = endpoint.creditCharge(endpoint.chargedLength(raw.bytes.len, raw.decoded_length)) };
             packet.framed = self.frame(endpoint, raw) catch |err| {
                 std.log.warn("event=session_packet_unframed bytes={d} reason={s}", .{ raw.bytes.len, @errorName(err) });
                 var recipients = raw.recipients.iterator();
@@ -513,6 +517,8 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                     continue;
                 }
                 assert(backlog.count < self.backlog_capacity);
+                // A packet larger than its charge is paid back from its own sent bytes.
+                backlog.absorb += packet.framed.len -| packet.charge;
                 self.backlog_entries[native.index * self.backlog_capacity + (backlog.head + backlog.count) % self.backlog_capacity] = @intCast(packet_index);
                 backlog.count += 1;
                 packet.waiting += 1;
@@ -576,7 +582,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                 self.instruments.fanout_bytes.add(count);
                 backlog.offset += count;
                 if (backlog.offset < packet.framed.len) return false;
-                binding.endpoint.refund(binding.handle, packet.charge - packet.framed.len);
+                binding.endpoint.refund(binding.handle, packet.charge -| packet.framed.len);
                 backlog.offset = 0;
                 backlog.head = (backlog.head + 1) % self.backlog_capacity;
                 backlog.count -= 1;
@@ -596,6 +602,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                 backlog.count -= 1;
                 self.releasePacket(io, packet_index);
             }
+            // What was to be absorbed went with the packets.
             backlog.* = .{};
             self.backlogged.remove(index);
         }
@@ -717,7 +724,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                                 }
 
                                 const consumed = source.output.ready.head.load(.acquire);
-                                if (consumed -% move.boundary > std.math.maxInt(usize) / 2 or credit & (Service.active - 1) != source.config.buffer_bytes) continue;
+                                if (consumed -% move.boundary > std.math.maxInt(usize) / 2 or credit & (Service.active - 1) != source.config.credit_bytes) continue;
                                 if (source.event_write.load(.monotonic) -% source.event_read.load(.acquire) == source.events.len) continue;
 
                                 const native = source.routes[index].?;
@@ -806,7 +813,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                 assert(binding.configuring and std.meta.eql(binding.native, profile.connection));
                 if (binding.previous == null) {
                     const endpoint = binding.endpoint;
-                    endpoint.credit[binding.handle.index].store((@as(u64, binding.handle.generation) << 32) | Service.active | endpoint.config.buffer_bytes, .release);
+                    endpoint.credit[binding.handle.index].store((@as(u64, binding.handle.generation) << 32) | Service.active | endpoint.config.credit_bytes, .release);
                     if (!endpoint.push(.{ .ready = binding.handle })) {
                         _ = endpoint.credit[binding.handle.index].fetchAnd(~Service.active, .acq_rel);
                         return false;
@@ -827,7 +834,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                     .cause = .transfer,
                 } };
                 @memcpy(event.joined.name[0..profile.name.len], profile.name);
-                endpoint.credit[binding.handle.index].store((@as(u64, binding.handle.generation) << 32) | Service.active | endpoint.config.buffer_bytes, .release);
+                endpoint.credit[binding.handle.index].store((@as(u64, binding.handle.generation) << 32) | Service.active | endpoint.config.credit_bytes, .release);
                 if (!endpoint.push(event)) {
                     _ = endpoint.credit[binding.handle.index].fetchAnd(~Service.active, .acq_rel);
                     return false;
@@ -900,7 +907,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                 @memcpy(event.joined.name[0..profile.name.len], profile.name);
                 route.* = profile.connection;
                 self.bindings[profile.connection.index] = .{ .endpoint = endpoint, .handle = handle, .native = profile.connection, .configuring = readiness == .configuring };
-                endpoint.credit[index].store((generation << 32) | (if (readiness == .play) Service.active | endpoint.config.buffer_bytes else @as(u64, 0)), .release);
+                endpoint.credit[index].store((generation << 32) | (if (readiness == .play) Service.active | endpoint.config.credit_bytes else @as(u64, 0)), .release);
                 if (endpoint.push(event)) {
                     std.log.info("event=session_routed endpoint={d} local={d}:{d} connection={d}:{d}", .{ selected, handle.index, handle.generation, profile.connection.index, profile.connection.generation });
                     return true;
@@ -1040,7 +1047,11 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
         pub fn sent(self: *Self, _: std.Io, handle: network.Handle, bytes: usize) void {
             const binding = self.bindings[handle.index].?;
             assert(std.meta.eql(binding.native, handle));
-            binding.endpoint.refund(binding.handle, bytes);
+            // Bytes of a packet larger than its charge pay back what it took beyond it first.
+            const backlog = &self.backlogs[handle.index];
+            const absorbed = @min(bytes, backlog.absorb);
+            backlog.absorb -= absorbed;
+            if (bytes > absorbed) binding.endpoint.refund(binding.handle, bytes - absorbed);
             const ready = binding.endpoint.readiness.?;
             ready.progress.* |= ready.mask;
         }
@@ -1150,7 +1161,7 @@ test "background publication retry covers both sides of the tick boundary" {
     defer arena.deinit();
     var hooks: TestHooks = .{};
     var protocols: TestEndpoint.Protocols = .{};
-    const service = try Service.init(arena.allocator(), std.testing.io, .{ .context = &hooks, .vtable = network.Transport.adapter(TestHooks) }, .{ .connections = 1, .pages = 2, .page_bytes = 1500, .buffer_bytes = 4096, .protocols = &protocols.values });
+    const service = try Service.init(arena.allocator(), std.testing.io, .{ .context = &hooks, .vtable = network.Transport.adapter(TestHooks) }, .{ .connections = 1, .pages = 2, .page_bytes = 1500, .credit_bytes = 4096, .protocols = &protocols.values });
     defer service.deinit();
     var changed: std.Io.Event = .unset;
     try service.subscribeOutput(&changed);
@@ -1175,26 +1186,27 @@ test "background publication retry covers both sides of the tick boundary" {
 }
 
 /// One source and three connections in Play, each bound and with all its credit, to publish to
-/// and deliver.
+/// and deliver. Credit is the ring's room, as `Core` gives it.
 const DeliveryTest = struct {
     const Owner = Worker(TestEndpoint, TestHooks, SingleSimulation);
-    const buffer_bytes = 16 * 1024;
     hooks: TestHooks = .{},
     router: SingleSimulation = .{},
     protocols: TestEndpoint.Protocols = .{},
     endpoints: [1]*Service = undefined,
     owner: *Owner = undefined,
+    credit_bytes: usize = 0,
     handles: [3]network.Handle = .{ .{ .index = 0, .generation = 1 }, .{ .index = 1, .generation = 1 }, .{ .index = 2, .generation = 1 } },
     events: [1]network.Event = undefined,
 
     fn init(self: *DeliveryTest, output_bytes: usize) !void {
         const transport: network.Transport = .{ .context = &self.hooks, .vtable = network.Transport.adapter(TestHooks) };
-        self.endpoints[0] = try Service.init(std.testing.allocator, std.testing.io, transport, .{ .connections = 3, .buffer_bytes = buffer_bytes, .pages = 8, .page_bytes = 6000, .protocols = &self.protocols.values });
+        self.credit_bytes = output_bytes;
+        self.endpoints[0] = try Service.init(std.testing.allocator, std.testing.io, transport, .{ .connections = 3, .credit_bytes = output_bytes, .pages = 8, .page_bytes = 6000, .protocols = &self.protocols.values });
         errdefer self.endpoints[0].deinit();
         self.owner = try Owner.init(std.testing.allocator, transport, .{
             .connections = 3,
             .max_players = 3,
-            .buffer_bytes = buffer_bytes,
+            .buffer_bytes = 16 * 1024,
             .connection_bytes = 512,
             .output_bytes = output_bytes,
             .max_pending_wire_bytes = 32 * 1024,
@@ -1211,7 +1223,7 @@ const DeliveryTest = struct {
             connection.lifecycle = 0;
             connection.state.phase = .play;
             self.endpoints[0].routes[handle.index] = handle;
-            self.endpoints[0].credit[handle.index].store((@as(u64, 1) << 32) | Service.active | buffer_bytes, .release);
+            self.endpoints[0].credit[handle.index].store((@as(u64, 1) << 32) | Service.active | output_bytes, .release);
             self.owner.bindings[handle.index] = .{ .endpoint = self.endpoints[0], .handle = handle, .native = handle };
         }
     }
@@ -1278,53 +1290,62 @@ test "fan-out writes each packet into every recipient's ring once, in publicatio
     for ([_]usize{ 110, 110, 10 }, 0..) |length, index| {
         try std.testing.expectEqual(length, delivery.owner.engine.connections[index].lifecycle.?);
         // Credit stays out for exactly what waits to be sent.
-        try std.testing.expectEqual(DeliveryTest.buffer_bytes - length, delivery.credit(index));
+        try std.testing.expectEqual(delivery.credit_bytes - length, delivery.credit(index));
     }
     try std.testing.expectEqual(@as(usize, 3), delivery.hooks.sends);
     try delivery.sent(0);
-    try std.testing.expectEqual(DeliveryTest.buffer_bytes, delivery.credit(0));
+    try std.testing.expectEqual(delivery.credit_bytes, delivery.credit(0));
 }
 
-test "a full ring backlogs only its own recipient, which drains in order as its sends complete" {
+test "credit refuses what a ring could not hold, and everything taken fits it at once" {
     var delivery: DeliveryTest = .{};
     try delivery.init(4096);
     defer delivery.deinit();
     const handles = delivery.handles;
     try delivery.publish(11, 1500, handles[0..1]);
     try delivery.publish(22, 1500, handles[0..1]);
-    try delivery.publish(33, 1500, handles[0..1]);
-    try delivery.publish(55, 10, handles[0..2]);
+    // A third would charge more than the ring has room for, so it is refused, not queued.
+    try std.testing.expectError(error.Backpressured, delivery.publish(33, 1500, handles[0..1]));
+    // The other recipient is not held back.
+    try delivery.publish(55, 10, handles[1..2]);
     try delivery.deliver();
-    // The third packet went in as far as the ring had room, and the last waits behind it.
     const first = delivery.ring(0);
-    try std.testing.expectEqual(@as(usize, 4096), first.len);
-    try std.testing.expect(std.mem.allEqual(u8, first[0..1500], 11) and std.mem.allEqual(u8, first[1500..3000], 22) and std.mem.allEqual(u8, first[3000..], 33));
-    // The other recipient was not held back.
+    try std.testing.expectEqual(@as(usize, 3000), first.len);
+    try std.testing.expect(std.mem.allEqual(u8, first[0..1500], 11) and std.mem.allEqual(u8, first[1500..], 22));
     try std.testing.expect(std.mem.allEqual(u8, delivery.ring(1), 55) and delivery.ring(1).len == 10);
-    try std.testing.expectEqual(@as(usize, 2), delivery.preparing());
-    try delivery.sent(0);
-    try delivery.deliver();
-    const rest = delivery.ring(0);
-    try std.testing.expectEqual(@as(usize, 414), rest.len);
-    try std.testing.expect(std.mem.allEqual(u8, rest[0..404], 33) and std.mem.allEqual(u8, rest[404..], 55));
+    // Nothing waits: every packet was in its ring in the pass that took it.
     try std.testing.expectEqual(@as(usize, 0), delivery.preparing());
-    try std.testing.expectEqual(@as(usize, 4096 + 414), delivery.owner.engine.connections[0].lifecycle.?);
-    try std.testing.expectEqual(DeliveryTest.buffer_bytes - 414, delivery.credit(0));
+    try std.testing.expectEqual(@as(usize, 0), delivery.owner.backlogged.count);
+    try delivery.sent(0);
+    try std.testing.expectEqual(delivery.credit_bytes, delivery.credit(0));
 }
 
-test "a packet larger than the ring goes out in pieces" {
+test "a packet larger than the ring takes all its credit and goes out in pieces, in order" {
     var delivery: DeliveryTest = .{};
     try delivery.init(4096);
     defer delivery.deinit();
-    try delivery.publish(77, 6000, delivery.handles[0..1]);
+    const handles = delivery.handles;
+    try delivery.publish(77, 6000, handles[0..1]);
+    try std.testing.expectEqual(@as(usize, 0), delivery.credit(0));
+    // Nothing more goes to its recipient meanwhile, while the others are not held back.
+    try std.testing.expectError(error.Backpressured, delivery.publish(88, 10, handles[0..1]));
+    try delivery.publish(99, 10, handles[1..2]);
     try delivery.deliver();
     try std.testing.expectEqual(@as(usize, 4096), delivery.ring(0).len);
     try std.testing.expectEqual(@as(usize, 1), delivery.preparing());
+    // Its first piece sent pays back first what the packet took beyond its charge.
     try delivery.sent(0);
+    try std.testing.expectEqual(@as(usize, 4096 - (6000 - 4096)), delivery.credit(0));
+    // What is published now waits behind the rest of it.
+    try delivery.publish(88, 10, handles[0..1]);
     try delivery.deliver();
-    try std.testing.expectEqual(@as(usize, 6000 - 4096), delivery.ring(0).len);
-    try std.testing.expect(std.mem.allEqual(u8, delivery.ring(0), 77));
+    const rest = delivery.ring(0);
+    try std.testing.expectEqual(@as(usize, 6000 - 4096 + 10), rest.len);
+    try std.testing.expect(std.mem.allEqual(u8, rest[0 .. 6000 - 4096], 77) and std.mem.allEqual(u8, rest[6000 - 4096 ..], 88));
     try std.testing.expectEqual(@as(usize, 0), delivery.preparing());
+    // Once all of it is sent, the connection has exactly its credit back.
+    try delivery.sent(0);
+    try std.testing.expectEqual(delivery.credit_bytes, delivery.credit(0));
 }
 
 test "a connection that takes no more output gives its backlog back" {
@@ -1332,9 +1353,9 @@ test "a connection that takes no more output gives its backlog back" {
     try delivery.init(4096);
     defer delivery.deinit();
     try delivery.publish(11, 5000, delivery.handles[0..1]);
-    try delivery.publish(22, 100, delivery.handles[0..2]);
+    try delivery.publish(22, 100, delivery.handles[1..2]);
     try delivery.deliver();
-    try std.testing.expectEqual(@as(usize, 2), delivery.preparing());
+    try std.testing.expectEqual(@as(usize, 1), delivery.preparing());
     delivery.owner.engine.connections[0].closing = true;
     try delivery.deliver();
     try std.testing.expectEqual(@as(usize, 0), delivery.preparing());

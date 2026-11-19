@@ -34,7 +34,10 @@ pub const Instrumentation = struct {
 
 pub const Configuration = struct {
     connections: usize = 32,
-    buffer_bytes: usize = 512 * 1024,
+    /// Output credit of each connection: the bytes of its ring of Play output, so what is
+    /// published to it always fits there when the worker takes it, but for a packet larger
+    /// than the ring, which takes all of it.
+    credit_bytes: usize = 64 * 1024,
     pages: usize = 32,
     page_bytes: usize = 384 * 1024,
     output_pool: ?*shared.Pool = null,
@@ -156,7 +159,7 @@ pub const Service = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, transport: network.Transport, config: Configuration) !*Service {
-        if (config.page_bytes == 0 or config.protocols.len == 0 or config.buffer_bytes < frameBound(config.protocols, config.page_bytes) or config.buffer_bytes >= active or config.connections == 0)
+        if (config.page_bytes == 0 or config.protocols.len == 0 or config.credit_bytes < 2 * frameBound(config.protocols, 1) or config.credit_bytes >= active or config.connections == 0)
             return error.InvalidConfiguration;
         if (config.max_input_bytes == 0) return error.InvalidConfiguration;
         try config.input_work.validate(config.connections, .{ .operations = 1, .bytes = config.max_input_bytes });
@@ -506,15 +509,15 @@ pub const Service = struct {
         pub fn canWrite(self: *const RecipientReservation, packet: *const Packet, handle: network.Handle) bool {
             assert(packet.owner == self.owner and packet.reservation != null and packet.credit == null);
             if (packet.epoch) |epoch| if (epoch & 1 != 0 or self.owner.epoch.load(.acquire) != epoch) return false;
-            return self.available(handle) >= self.owner.framedBound(packet.bytes.len);
+            return self.available(handle) >= self.owner.creditCharge(packet.bytes.len);
         }
 
         pub fn finish(self: *RecipientReservation, packet: *Packet, handle: network.Handle, length: usize) void {
             assert(packet.owner == self.owner and packet.reservation != null and packet.credit == null);
             assert(length > 0 and length <= packet.bytes.len);
-            const bytes = self.owner.framedBound(packet.boundLength(length));
+            const bytes = self.owner.creditCharge(packet.boundLength(length));
             for (self.credits[0..self.count]) |*held| if (std.meta.eql(held.handle, handle)) {
-                assert(held.bytes >= self.owner.framedBound(packet.bytes.len));
+                assert(held.bytes >= self.owner.creditCharge(packet.bytes.len));
                 held.bytes -= bytes;
                 packet.credit = .{ .handle = handle, .bytes = bytes };
                 return;
@@ -541,11 +544,12 @@ pub const Service = struct {
             if (duplicate) continue;
             var maximum: usize = 0;
             for (packets[index..], recipients[index..]) |candidate, recipient| {
-                if (std.meta.eql(recipient, handle)) maximum = @min(self.config.buffer_bytes, maximum + self.framedBound(candidate.bytes.len));
+                if (std.meta.eql(recipient, handle)) maximum = @min(self.config.credit_bytes, maximum + self.creditCharge(candidate.bytes.len));
             }
             // Whatever is held here is out of reach of the simulation until the batch
-            // ends, so the floor stays where it is.
-            const bytes = @min(maximum, self.outputCredit(handle) -| self.backgroundFloor());
+            // ends, so the floor stays where it is, but for a packet that takes all of a
+            // connection's credit, which only an idle connection has.
+            const bytes = @min(maximum, self.backgroundRoom(handle, maximum));
             if (bytes == 0) continue;
             self.chargeRecipients(bytes, &.{handle}) catch continue;
             reservation.credits[reservation.count] = .{ .handle = handle, .bytes = bytes };
@@ -580,10 +584,10 @@ pub const Service = struct {
                 assert(entry.packet.epoch == packets[0].packet.epoch);
                 assert(entry.packet.owner == self and entry.packet.credit == null and entry.length > 0 and entry.length <= entry.packet.bytes.len);
                 if (entry.packet.epoch) |epoch| stale = stale or epoch & 1 != 0 or self.epoch.load(.acquire) != epoch;
-                charge += self.framedBound(entry.packet.boundLength(entry.length));
+                charge += self.creditCharge(entry.packet.boundLength(entry.length));
             }
             if (stale) continue;
-            assert(charge <= self.config.buffer_bytes);
+            assert(charge <= self.config.credit_bytes);
             const first = packets[0].packet.reservation.?;
             const recipients = self.output.recipientBuffer(first);
             var count: usize = 0;
@@ -712,7 +716,7 @@ pub const Service = struct {
     }
 
     fn admitPacket(self: *Service, packet: *Packet, length: usize, recipients: []const network.Handle) SendError!void {
-        const bytes = self.framedBound(packet.boundLength(length));
+        const bytes = self.creditCharge(packet.boundLength(length));
         if (packet.credit) |held| {
             assert(bytes <= held.bytes);
             var found: usize = 0;
@@ -899,8 +903,8 @@ pub const Service = struct {
                     continue;
                 }
                 var charge: usize = 0;
-                for (lengths[0..selected.len]) |length| charge += self.framedBound(length);
-                if (charge > self.config.buffer_bytes) return error.GroupTooLarge;
+                for (lengths[0..selected.len]) |length| charge += self.creditCharge(length);
+                if (charge > self.config.credit_bytes) return error.GroupTooLarge;
                 const entries = members[first..][0..selected.len];
                 for (selected, lengths[0..selected.len], entries) |*packet, length, *entry| entry.* = .{ .packet = packet, .length = length };
                 publications[ready] = .{ .packets = entries, .protocol = protocol.number, .targets = targets, .delivered = delivered };
@@ -921,22 +925,31 @@ pub const Service = struct {
     }
 
     pub fn canSend(self: *Service, handle: network.Handle, length: usize) bool {
-        return length <= self.config.page_bytes and self.outputCredit(handle) >= self.framedBound(length);
+        return length <= self.config.page_bytes and self.outputCredit(handle) >= self.creditCharge(length);
     }
 
     /// How many packets of this size background work may still send a connection.
     pub fn packetCapacity(self: *Service, handle: network.Handle, maximum_bytes: usize) usize {
         if (maximum_bytes > self.config.page_bytes) return 0;
-        return (self.outputCredit(handle) -| self.backgroundFloor()) / self.framedBound(maximum_bytes);
+        const each = self.creditCharge(maximum_bytes);
+        return self.backgroundRoom(handle, each) / each;
     }
 
-    /// Output credit of each connection that background work leaves alone: an eighth
-    /// of it, as far as a packet of the largest size still fits beside it. Terrain is
-    /// prepared on another thread and holds the credit of its players while it is. A
-    /// player whose whole credit was held then looked hopelessly behind to whatever the
+    /// The credit background work may take of a connection for packets charged `wanted`
+    /// between them: what is above the floor, or all of it for a packet that takes all of it
+    /// once the connection is idle, as nothing else then waits for it.
+    fn backgroundRoom(self: *Service, handle: network.Handle, wanted: usize) usize {
+        const credit = self.outputCredit(handle);
+        if (wanted >= self.config.credit_bytes and credit == self.config.credit_bytes) return credit;
+        return credit -| self.backgroundFloor();
+    }
+
+    /// Output credit of each connection that background work leaves alone: an eighth of it.
+    /// Terrain is prepared on another thread and holds the credit of its players while it is.
+    /// A player whose whole credit was held then looked hopelessly behind to whatever the
     /// simulation sent at that moment, and chat disconnected them for it.
     pub fn backgroundFloor(self: *const Service) usize {
-        return @min(self.config.buffer_bytes / 8, self.config.buffer_bytes - self.framedBound(self.config.page_bytes));
+        return self.config.credit_bytes / 8;
     }
 
     /// The bytes a packet of `length` stored bytes goes out as before framing. A prepared packet,
@@ -946,6 +959,13 @@ pub const Service = struct {
         if (decoded_length == 0) return length;
         if (self.config.compression_threshold) |threshold| if (decoded_length >= threshold) return length;
         return @max(length, decoded_length);
+    }
+
+    /// The credit a packet of `length` bytes takes of each recipient: its frame's bound, or all
+    /// of the credit for a packet larger than it, which goes out in pieces while nothing else
+    /// can be published to the connection.
+    pub fn creditCharge(self: *const Service, length: usize) usize {
+        return @min(self.framedBound(length), self.config.credit_bytes);
     }
 
     /// What publishing a packet of `length` bytes charges each recipient until it is delivered:
@@ -959,7 +979,7 @@ pub const Service = struct {
         var value = self.credit[handle.index].load(.acquire);
 
         while (value >> 32 == handle.generation and value & active != 0) {
-            assert((value & (active - 1)) + bytes <= self.config.buffer_bytes);
+            assert((value & (active - 1)) + bytes <= self.config.credit_bytes);
             value = self.credit[handle.index].cmpxchgWeak(value, value + bytes, .acq_rel, .acquire) orelse {
                 _ = self.returned[handle.index].fetchAdd(bytes, .monotonic);
                 return;

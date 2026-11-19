@@ -1182,7 +1182,7 @@ test "movement fanout preserves independent admission and observer baselines" {
         .connections = 3,
         .pages = 128,
         .page_bytes = 4096,
-        .buffer_bytes = 32768,
+        .credit_bytes = 32768,
         .protocols = &selected,
     });
     const packet_service = try packets.Packets.init(allocator, .{ .sessions = service });
@@ -1190,7 +1190,7 @@ test "movement fanout preserves independent admission and observer baselines" {
     for (&records, 0..) |*player, i| {
         player.* = .{ .handle = .{ .index = @intCast(i), .generation = 1 }, .uuid = i + 1, .protocol = selected[0].number, .name = @splat(0), .name_len = 1, .stage = .ready };
         player.name[0] = @intCast('a' + i);
-        service.credit[i].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+        service.credit[i].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     }
     var players: Players = .{
         .deps = .{ .sessions = service, .packets = packet_service, .input = undefined, .storage = undefined, .worlds = undefined, .record_workspaces = undefined },
@@ -1240,7 +1240,7 @@ test "movement fanout preserves independent admission and observer baselines" {
         try std.testing.expectEqual(@as(usize, 0), try Drain.run(service, 0));
     }
     for (service.output.pages, statuses) |*page, status| try std.testing.expectEqual(status, page.status.load(.acquire));
-    for (0..3) |i| service.credit[i].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+    for (0..3) |i| service.credit[i].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     replication.deps.visibility.tick();
     replication.tick();
     try std.testing.expectEqual(@as(usize, 1), try Drain.run(service, 2));
@@ -1253,7 +1253,7 @@ test "movement fanout preserves independent admission and observer baselines" {
     try std.testing.expect(replication.observed(0, 1).value.position[0] != replication.observed(0, 2).value.position[0]);
     @memset(replication.baselines, .{});
     try std.testing.expectEqual(@as(u3, 0), replication.observed(0, 2).known & 1);
-    service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+    service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     records[0].position.x += 1;
     players.rebuildIndexes();
     replication.deps.visibility.tick();
@@ -1296,7 +1296,7 @@ test "movement fanout preserves independent admission and observer baselines" {
     replication.tick();
     try std.testing.expectEqual(@as(usize, 3), try Drain.run(service, 1));
     try std.testing.expectEqual(@as(usize, 4), replication.pending_updates.row(0).view().wordAt(0));
-    service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+    service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     replication.deps.visibility.tick();
     replication.tick();
     try std.testing.expectEqual(@as(usize, 3), try Drain.run(service, 1));
@@ -1310,7 +1310,7 @@ test "movement fanout preserves independent admission and observer baselines" {
     replication.tick();
     _ = try Drain.run(service, 0);
     try std.testing.expectEqual(@as(usize, 3), replication.observers[2].pending.view().wordAt(0));
-    service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+    service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     replication.deps.visibility.tick();
     replication.tick();
     try std.testing.expectEqual(@as(usize, 2), try Drain.run(service, 1));
@@ -1326,7 +1326,7 @@ test "movement fanout preserves independent admission and observer baselines" {
     replication.tick();
     _ = try Drain.run(service, 0);
     try std.testing.expectEqual(@as(usize, 3), replication.observers[2].pending.view().wordAt(0));
-    service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+    service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     replication.deps.visibility.tick();
     replication.tick();
     _ = try Drain.run(service, 0);
@@ -1352,7 +1352,7 @@ test "movement fanout preserves independent admission and observer baselines" {
     try std.testing.expectEqual(@as(usize, 0), replication.viewers(2).words[0]);
     records[2].handle = .{ .index = 2, .generation = 2 };
     players.rebuildIndexes();
-    service.credit[2].store(@as(u64, 2) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+    service.credit[2].store(@as(u64, 2) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     replication.deps.visibility.tick();
     replication.tick();
     _ = try Drain.run(service, 0);
@@ -1413,7 +1413,7 @@ test "operation counts for shared player neighborhoods and local spatial invalid
             for (protocols.implementations, 0..) |Version, i| result[i] = .{ .number = Version.protocol_number };
             break :definitions result;
         };
-        const endpoint = try sessions.Service.init(allocator, std.testing.io, undefined, .{ .connections = count, .pages = 16 * count, .page_bytes = 4096, .buffer_bytes = 1024 * 1024, .protocols = &selected });
+        const endpoint = try sessions.Service.init(allocator, std.testing.io, undefined, .{ .connections = count, .pages = 16 * count, .page_bytes = 4096, .credit_bytes = 1024 * 1024, .protocols = &selected });
         const encoding = try packets.Packets.init(allocator, .{ .sessions = endpoint });
         const rows = try allocator.alloc(Players.Player, count);
         for (rows, 0..) |*player, index| player.* = .{ .handle = .{ .index = index, .generation = 1 }, .uuid = index + 1, .protocol = selected[0].number, .name = @splat('a'), .name_len = 1, .stage = .ready, .loaded = true, .on_ground = true, .position = .{ .x = (if (clustered) 0 else @as(f64, @floatFromInt(index * 128))) + 15.9, .y = 65, .z = 8 } };
@@ -1424,7 +1424,7 @@ test "operation counts for shared player neighborhoods and local spatial invalid
         const replication = try Replication.init(allocator, .{ .update_interval = 1 }, .{ .players = &players, .visibility = visibility });
         failing.fail_index = failing.alloc_index;
         for (0..3) |_| {
-            for (endpoint.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | endpoint.config.buffer_bytes, .release);
+            for (endpoint.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | endpoint.config.credit_bytes, .release);
             visibility.tick();
             replication.tick();
             while (endpoint.output.takeReady()) |packet| {
@@ -1432,7 +1432,7 @@ test "operation counts for shared player neighborhoods and local spatial invalid
                 _ = endpoint.preparing.fetchSub(1, .release);
             }
         }
-        for (endpoint.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | endpoint.config.buffer_bytes, .release);
+        for (endpoint.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | endpoint.config.credit_bytes, .release);
         for (rows[0..moving]) |*row| row.position.x += 0.2;
         players.rebuildIndexes();
 
@@ -1485,7 +1485,7 @@ test "operation counts for shared player neighborhoods and local spatial invalid
                     else => unreachable,
                 };
                 players.rebuildIndexes();
-                for (rows, endpoint.credit) |row, *credit| credit.store((@as(u64, if (row.handle) |handle| handle.generation else 0) << 32) | sessions.Service.active | endpoint.config.buffer_bytes, .release);
+                for (rows, endpoint.credit) |row, *credit| credit.store((@as(u64, if (row.handle) |handle| handle.generation else 0) << 32) | sessions.Service.active | endpoint.config.credit_bytes, .release);
                 visibility.tick();
                 replication.tick();
                 while (endpoint.output.takeReady()) |packet| {
@@ -1516,13 +1516,13 @@ test "players update every second tick with the movement that changed" {
         for (protocols.implementations, 0..) |Version, i| result[i] = .{ .number = Version.protocol_number };
         break :definitions result;
     };
-    const service = try sessions.Service.init(allocator, std.testing.io, undefined, .{ .connections = 2, .pages = 64, .page_bytes = 4096, .buffer_bytes = 32768, .protocols = &selected });
+    const service = try sessions.Service.init(allocator, std.testing.io, undefined, .{ .connections = 2, .pages = 64, .page_bytes = 4096, .credit_bytes = 32768, .protocols = &selected });
     const packet_service = try packets.Packets.init(allocator, .{ .sessions = service });
     var records: [2]Players.Player = undefined;
     for (&records, 0..) |*player, i| {
         player.* = .{ .handle = .{ .index = @intCast(i), .generation = 1 }, .uuid = i + 1, .protocol = selected[0].number, .name = @splat(0), .name_len = 1, .stage = .ready };
         player.name[0] = @intCast('a' + i);
-        service.credit[i].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+        service.credit[i].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     }
     var players: Players = .{
         .deps = .{ .sessions = service, .packets = packet_service, .input = undefined, .storage = undefined, .worlds = undefined, .record_workspaces = undefined },

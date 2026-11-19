@@ -146,12 +146,12 @@ test "cold lighting streams do not block a ready player behind a paused generato
         var catalog = try protocols.Default.init(allocator);
         defer catalog.deinit(allocator);
         var sink: Sink = .{};
-        const service = try sessions.Service.init(allocator, io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = 2, .pages = pages, .page_bytes = 128 * 1024, .buffer_bytes = 1024 * 1024, .protocols = &catalog.values });
+        const service = try sessions.Service.init(allocator, io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = 2, .pages = pages, .page_bytes = 128 * 1024, .credit_bytes = 1024 * 1024, .protocols = &catalog.values });
         defer service.deinit();
         var player_records: [2]Players.Player = undefined;
         for (&player_records, 0..) |*player, index| {
             player.* = .{ .handle = .{ .index = index, .generation = 1 }, .uuid = index + 1, .world = @intCast(index), .stage = .ready, .loaded = true, .position = .{ .x = 0.5, .y = 8, .z = 0.5 }, .protocol = catalog.values[0].number };
-            service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+            service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
         }
         var players: Players = .{ .deps = undefined, .config = .{ .maximum = player_records.len, .render_distance = 1 }, .spawn_world = 0, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
@@ -204,7 +204,7 @@ test "cold lighting streams do not block a ready player behind a paused generato
             try std.testing.expectEqual(if (phase == 0) @as(usize, 0) else Streaming.Horizon.count(players.config.render_distance), deliveries[0]);
             try std.testing.expectEqual(Streaming.Horizon.count(players.config.render_distance), deliveries[1]);
             try std.testing.expectEqual(@as(usize, 0), terrain.borrowed_count);
-            try std.testing.expectEqual(service.config.buffer_bytes, service.outputCredit(player_records[1].handle.?));
+            try std.testing.expectEqual(service.config.credit_bytes, service.outputCredit(player_records[1].handle.?));
             if (phase == 0) try std.testing.expect(terrain.generation.queued_count > 0);
         }
         try std.testing.expect(!bounded.has_induced_failure);
@@ -236,7 +236,7 @@ fn lightingLoad(scenario: LightingLoad, output: *std.Io.Writer) !void {
     var catalog = try protocols.Default.init(allocator);
     defer catalog.deinit(allocator);
     var sink: Sink = .{};
-    const service = try sessions.Service.init(allocator, io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = count, .pages = 32, .page_bytes = 128 * 1024, .buffer_bytes = 1024 * 1024, .protocols = &catalog.values });
+    const service = try sessions.Service.init(allocator, io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = count, .pages = 32, .page_bytes = 128 * 1024, .credit_bytes = 1024 * 1024, .protocols = &catalog.values });
     defer {
         if (service.tick_active) service.endTick(false);
         service.deinit();
@@ -246,7 +246,7 @@ fn lightingLoad(scenario: LightingLoad, output: *std.Io.Writer) !void {
     for (player_records, 0..) |*player, index| {
         const group = if (spread) index % 4 else 0;
         player.* = .{ .handle = .{ .index = index, .generation = 1 }, .uuid = index + 1, .world = world, .stage = .ready, .loaded = true, .position = .{ .x = @as(f64, @floatFromInt(group * 256)), .y = 65, .z = 0 }, .protocol = catalog.values[index % catalog.values.len].number };
-        service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+        service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
     }
     var players: Players = .{ .deps = undefined, .config = .{ .maximum = count, .render_distance = 2 }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
@@ -331,7 +331,7 @@ fn lightingLoad(scenario: LightingLoad, output: *std.Io.Writer) !void {
         if (settled) break;
     }
     try std.testing.expect(settled);
-    for (player_records) |player| try std.testing.expectEqual(service.config.buffer_bytes, service.outputCredit(player.handle.?));
+    for (player_records) |player| try std.testing.expectEqual(service.config.credit_bytes, service.outputCredit(player.handle.?));
     try std.testing.expectEqual(@as(usize, 0), terrain.borrowed_count);
     const elapsed = std.Io.Clock.now(.cpu_thread, io).nanoseconds - started;
     const work = streaming.deps.lighting.background.work;
@@ -394,7 +394,7 @@ test "edited light reaches every holder exactly and only where it changed" {
     var catalog = try protocols.Default.init(allocator);
     defer catalog.deinit(allocator);
     var sink: Sink = .{};
-    const service = try sessions.Service.init(allocator, io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = count, .pages = 32, .page_bytes = 128 * 1024, .buffer_bytes = 1024 * 1024, .protocols = &catalog.values });
+    const service = try sessions.Service.init(allocator, io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = count, .pages = 32, .page_bytes = 128 * 1024, .credit_bytes = 1024 * 1024, .protocols = &catalog.values });
     defer {
         if (service.tick_active) service.endTick(false);
         service.deinit();
@@ -403,7 +403,7 @@ test "edited light reaches every holder exactly and only where it changed" {
     const player_records = try allocator.alloc(Players.Player, count);
     for (player_records, 0..) |*player, index| {
         player.* = .{ .handle = .{ .index = index, .generation = 1 }, .uuid = index + 1, .world = world, .stage = .ready, .loaded = true, .position = .{ .x = 8, .y = 70, .z = 8 }, .protocol = catalog.values[0].number };
-        service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+        service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
     }
     var players: Players = .{ .deps = undefined, .config = .{ .maximum = count, .render_distance = radius }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
@@ -628,7 +628,7 @@ test "streaming movement preserves planned owners while delivery catches up" {
     var catalog = try protocols.Default.init(allocator);
     defer catalog.deinit(allocator);
     var sink: Sink = .{};
-    const service = try sessions.Service.init(allocator, io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = 2, .pages = 16, .page_bytes = 128 * 1024, .buffer_bytes = 1024 * 1024, .protocols = &catalog.values });
+    const service = try sessions.Service.init(allocator, io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = 2, .pages = 16, .page_bytes = 128 * 1024, .credit_bytes = 1024 * 1024, .protocols = &catalog.values });
     defer {
         if (service.tick_active) service.endTick(false);
         var remaining = service.outputBatch();
@@ -642,7 +642,7 @@ test "streaming movement preserves planned owners while delivery catches up" {
     var player_records: [2]Players.Player = undefined;
     for (&player_records, 0..) |*player, index| {
         player.* = .{ .handle = .{ .index = index, .generation = 1 }, .uuid = index + 1, .world = world, .stage = .ready, .loaded = true, .position = .{ .x = 0.5, .y = 65, .z = 0.5 }, .protocol = catalog.values[0].number };
-        service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+        service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
     }
     var players: Players = .{ .deps = undefined, .config = .{ .maximum = player_records.len, .render_distance = render_distance }, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
@@ -704,7 +704,7 @@ test "streaming movement preserves planned owners while delivery catches up" {
         } else if (paused) {
             try std.testing.expectEqual(@as(usize, 0), service.outputCredit(player_records[1].handle.?));
             try std.testing.expect(streaming.streams[0].center.x != 0 or streaming.streams[0].center.z != 0);
-            service.credit[1].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+            service.credit[1].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
             paused = false;
         }
         service.beginTick();
@@ -746,7 +746,7 @@ test "streaming movement preserves planned owners while delivery catches up" {
     } else return error.MovingStreamDidNotSettle;
     try std.testing.expectEqual(@as(usize, movement_ticks), movements);
     try std.testing.expect(delivered > columns * player_records.len);
-    for (player_records) |player| try std.testing.expectEqual(service.config.buffer_bytes, service.outputCredit(player.handle.?));
+    for (player_records) |player| try std.testing.expectEqual(service.config.credit_bytes, service.outputCredit(player.handle.?));
 }
 
 fn observerOffset(count: usize, index: usize, spacing: usize) [2]f64 {

@@ -332,7 +332,7 @@ test "attribute synchronization sends configured bases updates changes and skips
     const fixture = context.fixture;
     fixture.players.deps.packets = try packets.Packets.init(arena.allocator(), .{ .sessions = fixture.service });
     fixture.players.records[0].protocol = protocols.implementations[0].protocol_number;
-    fixture.service.credit[0].store(@as(u64, 1) << 32 | sessions.Service.active | fixture.service.config.buffer_bytes, .release);
+    fixture.service.credit[0].store(@as(u64, 1) << 32 | sessions.Service.active | fixture.service.config.credit_bytes, .release);
     const attributes = try EquipmentAttributes.init(arena.allocator(), .{ .bases = &.{.{ .name = "minecraft:mining_efficiency", .value = 5 }} }, .{ .players = fixture.players, .player_states = fixture.player_states, .items = fixture.items, .enchantments = fixture.definitions.enchantments, .client = fixture.definitions.client });
     try attributes.tick();
     try std.testing.expectEqual(@as(usize, 1), drain(fixture.service));

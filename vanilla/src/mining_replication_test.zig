@@ -72,7 +72,7 @@ const Fixture = struct {
     fn init(allocator: std.mem.Allocator, store: *storage.Store, registry: *metrics.Registry, count: usize) !Fixture {
         const sink = try allocator.create(Sink);
         sink.* = .{};
-        const service = try sessions.Service.init(allocator, std.testing.io, .{ .context = sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = count, .pages = @max(1024, count * 4), .page_bytes = 32768, .buffer_bytes = 128 * 1024, .protocols = &selected_protocols });
+        const service = try sessions.Service.init(allocator, std.testing.io, .{ .context = sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = count, .pages = @max(1024, count * 4), .page_bytes = 32768, .credit_bytes = 128 * 1024, .protocols = &selected_protocols });
         errdefer service.deinit();
         const input = try Input.init(allocator, .{ .sessions = service });
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
@@ -132,7 +132,7 @@ const Fixture = struct {
     }
 
     fn grantAll(self: *Fixture) void {
-        for (self.mining.deps.players.records, 0..) |player, at| if (player.handle != null) self.grant(at, self.service.config.buffer_bytes);
+        for (self.mining.deps.players.records, 0..) |player, at| if (player.handle != null) self.grant(at, self.service.config.credit_bytes);
     }
 
     fn dig(self: *Fixture, index: usize, status: i32, at: minecraft.BlockPosition) !void {

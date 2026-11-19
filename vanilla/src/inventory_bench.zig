@@ -94,7 +94,7 @@ pub fn benchmark() !void {
         defer catalog.deinit(allocator);
         var sink: Sink = .{};
         const transport: network.Transport = .{ .context = &sink, .vtable = network.Transport.adapter(Sink) };
-        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = 1, .pages = 4, .page_bytes = 64 * 1024, .buffer_bytes = 256 * 1024, .protocols = &catalog.values });
+        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = 1, .pages = 4, .page_bytes = 64 * 1024, .credit_bytes = 256 * 1024, .protocols = &catalog.values });
         defer service.deinit();
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
         const handle: sessions.Handle = .{ .index = 0, .generation = 1 };
@@ -130,7 +130,7 @@ pub fn benchmark() !void {
                 else => @as(u64, 1) << 36,
             };
             const dirty_before = menu.states[0].dirty;
-            const credit = if (available) service.config.buffer_bytes else 0;
+            const credit = if (available) service.config.credit_bytes else 0;
             service.credit[0].store((@as(u64, handle.generation) << 32) | sessions.Service.active | credit, .release);
             var slots: [47]inventories.Slot = undefined;
             var contents: [47]inventories.Contents = undefined;
@@ -214,7 +214,7 @@ pub fn benchmarkEquipment() !void {
         defer catalog.deinit(allocator);
         var sink: Sink = .{};
         const transport: network.Transport = .{ .context = &sink, .vtable = network.Transport.adapter(Sink) };
-        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = count, .pages = 16, .page_bytes = 64 * 1024, .buffer_bytes = 256 * 1024, .protocols = &catalog.values });
+        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = count, .pages = 16, .page_bytes = 64 * 1024, .credit_bytes = 256 * 1024, .protocols = &catalog.values });
         defer service.deinit();
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
         const player_records = try allocator.alloc(Players.Player, count);
@@ -223,7 +223,7 @@ pub fn benchmarkEquipment() !void {
         players.deps.sessions = service;
         for (player_records, service.credit, 0..) |*player, *credit, index| {
             player.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 }, .uuid = index + 1, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number };
-            credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+            credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
             var edits: [6]inventories.Edit = undefined;
             for (&edits, stacks, [_]u16{ 36, 45, 8, 7, 6, 5 }) |*edit, stack, slot| edit.* = .{ .slot = .{ .owner = player.uuid, .index = slot }, .revision = 0, .stack = stack };
             try std.testing.expect(try ownership.editMany(&edits));
@@ -255,7 +255,7 @@ pub fn benchmarkEquipment() !void {
             const recipient = &player_records[1];
             if (mode == .viewer_reconnect) recipient.handle.?.generation += 1;
             if (mode == .viewer_respawn) recipient.life += 1;
-            service.credit[1].store((@as(u64, recipient.handle.?.generation) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+            service.credit[1].store((@as(u64, recipient.handle.?.generation) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
             switch (mode) {
                 .inventory_edit => {
                     const old = try ownership.get(.{ .owner = 1, .index = 36 });
@@ -508,7 +508,7 @@ pub fn benchmarkItemReplication() !void {
         defer catalog.deinit(allocator);
         var sink: Sink = .{};
         const transport: network.Transport = .{ .context = &sink, .vtable = network.Transport.adapter(Sink) };
-        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = 1, .pages = 512, .page_bytes = 4096, .buffer_bytes = 1024 * 1024, .protocols = &catalog.values });
+        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = 1, .pages = 512, .page_bytes = 4096, .credit_bytes = 1024 * 1024, .protocols = &catalog.values });
         defer service.deinit();
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
         var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number }};
@@ -591,7 +591,7 @@ pub fn benchmarkItemReplication() !void {
             }
             const metadata_before = dropped.cache.metrics.acquired.value();
             const bodies_before = bodies.cache.metrics.acquired.value();
-            service.credit[0].store((@as(u64, 1) << 32) | sessions.Service.active | @as(u64, if (blocked) 0 else service.config.buffer_bytes), .release);
+            service.credit[0].store((@as(u64, 1) << 32) | sessions.Service.active | @as(u64, if (blocked) 0 else service.config.credit_bytes), .release);
             const slots_before = ownership.cache.metrics.acquired.value();
             const definitions_before = ownership.items.metrics.acquired.value();
             service.beginTick();
@@ -644,13 +644,13 @@ pub fn benchmarkBossbars() !void {
     var catalog = try protocols.Default.init(allocator);
     defer catalog.deinit(allocator);
     var sink: Sink = .{};
-    const service = try sessions.Service.init(allocator, std.testing.io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = 2, .pages = 16, .page_bytes = 4096, .buffer_bytes = 256 * 1024, .protocols = &catalog.values });
+    const service = try sessions.Service.init(allocator, std.testing.io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = 2, .pages = 16, .page_bytes = 4096, .credit_bytes = 256 * 1024, .protocols = &catalog.values });
     defer service.deinit();
     const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
     var player_records: [2]Players.Player = undefined;
     for (&player_records, 0..) |*player, index| {
         player.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 }, .uuid = index + 1, .stage = .ready, .protocol = catalog.values[0].number };
-        service.credit[index].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+        service.credit[index].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     }
     player_records[1].stage = .login;
     var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &player_records, .dig_handlers = &.{} };
@@ -686,7 +686,7 @@ pub fn benchmarkBossbars() !void {
     try bars.update(first, .{ .title = "latest", .progress = 0.5 });
     try bars.tick();
     try Drain.expect(service, .{ 2, 0 });
-    service.credit[1].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+    service.credit[1].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     try bars.tick();
     try Drain.expect(service, .{ 0, 2 });
     try std.testing.expectEqual(@as(u64, 0), bars.pending);
@@ -706,7 +706,7 @@ pub fn benchmarkBossbars() !void {
     try Drain.expect(service, .{ 0, 0 });
     try std.testing.expectEqual(@as(u64, 0), bars.pending);
     player_records[1].handle = .{ .index = 1, .generation = 2 };
-    service.credit[1].store(@as(u64, 2) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+    service.credit[1].store(@as(u64, 2) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     try bars.tick();
     try Drain.expect(service, .{ 0, 0 });
     const reused = try bars.create(.{ .title = "", .progress = 0 });
@@ -859,7 +859,7 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
     defer catalog.deinit(allocator);
     var sink: Sink = .{};
     const transport: network.Transport = .{ .context = &sink, .vtable = network.Transport.adapter(Sink) };
-    const service = try sessions.Service.init(allocator, io, transport, .{ .connections = capacity, .pages = if (capacity == 1) 8192 else 128, .page_bytes = 4096, .buffer_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
+    const service = try sessions.Service.init(allocator, io, transport, .{ .connections = capacity, .pages = if (capacity == 1) 8192 else 128, .page_bytes = 4096, .credit_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
     defer service.deinit();
     const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
     const connection = capacity - 1;
@@ -913,7 +913,7 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
         const metadata_before = dropped.cache.metrics.acquired.value();
         const bodies_before = bodies.cache.metrics.acquired.value();
         const reads_before = dropped.cache.metrics.reads.value() + bodies.cache.metrics.reads.value();
-        service.credit[connection].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+        service.credit[connection].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
         service.beginTick();
         streaming.tick();
         try replication.tick();
@@ -988,7 +988,7 @@ pub fn benchmarkItemVisibility() !void {
         defer catalog.deinit(allocator);
         var sink: Sink = .{};
         const transport: network.Transport = .{ .context = &sink, .vtable = network.Transport.adapter(Sink) };
-        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = 2, .pages = 8192, .page_bytes = 4096, .buffer_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
+        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = 2, .pages = 8192, .page_bytes = 4096, .credit_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
         defer service.deinit();
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
         var player_records: [2]Players.Player = .{ .{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number }, .{ .handle = .{ .index = 1, .generation = 1 }, .uuid = 2, .world = world, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number, .position = .{ .x = 10000, .y = 65, .z = 10000 } } };
@@ -1037,7 +1037,7 @@ pub fn benchmarkItemVisibility() !void {
             const metadata_before = dropped.cache.metrics.acquired.value();
             const bodies_before = bodies.cache.metrics.acquired.value();
             const reads_before = dropped.cache.metrics.reads.value() + bodies.cache.metrics.reads.value();
-            for (0..2) |i| service.credit[i].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+            for (0..2) |i| service.credit[i].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
             service.beginTick();
             streaming.tick();
             try replication.tick();
@@ -1228,7 +1228,7 @@ pub fn benchmarkIdleTerrain() !void {
         defer catalog.deinit(allocator);
         var sink: Sink = .{};
         const transport: network.Transport = .{ .context = &sink, .vtable = network.Transport.adapter(Sink) };
-        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = count, .pages = 128, .page_bytes = 32768, .buffer_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
+        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = count, .pages = 128, .page_bytes = 32768, .credit_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
         defer service.deinit();
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
         const player_records = try allocator.alloc(Players.Player, count);
@@ -1254,7 +1254,7 @@ pub fn benchmarkIdleTerrain() !void {
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
             stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .announced = true, .cursor = side * side, .delivered = side * side };
             streaming.published.setStream(index, stream.snapshot());
-            service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+            service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
         }
         @memset(streaming.sent, std.math.maxInt(u64));
         @memset(streaming.occluded, 0);
@@ -1349,7 +1349,7 @@ pub fn benchmarkItemBroadcast() !void {
         defer catalog.deinit(allocator);
         var sink: Sink = .{};
         const transport: network.Transport = .{ .context = &sink, .vtable = network.Transport.adapter(Sink) };
-        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = viewers, .pages = @max(2048, count * 5 * @min(viewers, catalog.values.len)), .page_bytes = 4096, .buffer_bytes = 1024 * 1024, .metrics = &registry, .protocols = &catalog.values });
+        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = viewers, .pages = @max(2048, count * 5 * @min(viewers, catalog.values.len)), .page_bytes = 4096, .credit_bytes = 1024 * 1024, .metrics = &registry, .protocols = &catalog.values });
         defer service.deinit();
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
         var player_records: [64]Players.Player = undefined;
@@ -1377,7 +1377,7 @@ pub fn benchmarkItemBroadcast() !void {
 
         const expected_viewers = viewers;
         for (0..2) |_| {
-            for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+            for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
             service.beginTick();
             streaming.tick();
             try replication.tick();
@@ -1406,7 +1406,7 @@ pub fn benchmarkItemBroadcast() !void {
                 held[0].write(metadata);
             }
             for (service.credit, 0..) |*credit, index| {
-                const bytes = if (limited and index == 0) service.framedBound(128) * 2 else service.config.buffer_bytes;
+                const bytes = if (limited and index == 0) service.framedBound(128) * 2 else service.config.credit_bytes;
                 credit.store((@as(u64, 1) << 32) | sessions.Service.active | bytes, .release);
             }
             const reservations = service.instruments.broadcast_reservations.value();
@@ -1464,7 +1464,7 @@ pub fn benchmarkItemBroadcast() !void {
                 }
             }
             if (limited) {
-                for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+                for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
                 service.beginTick();
                 streaming.tick();
                 try replication.tick();
@@ -1514,7 +1514,7 @@ pub fn benchmarkBlockPlanning() !void {
         defer catalog.deinit(allocator);
         var sink: Sink = .{};
         const transport: network.Transport = .{ .context = &sink, .vtable = network.Transport.adapter(Sink) };
-        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = count, .pages = 128, .page_bytes = 32768, .buffer_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
+        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = count, .pages = 128, .page_bytes = 32768, .credit_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
         defer service.deinit();
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
         const player_records = try allocator.alloc(Players.Player, count);
@@ -1540,7 +1540,7 @@ pub fn benchmarkBlockPlanning() !void {
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
             stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .announced = true, .cursor = side * side, .delivered = side * side, .minimum_section = 0, .section_count = 16 };
             streaming.published.setStream(index, stream.snapshot());
-            service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+            service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
         }
         @memset(streaming.sent, std.math.maxInt(u64));
         @memset(streaming.occluded, 0);
@@ -1582,7 +1582,7 @@ pub fn benchmarkBlockPlanning() !void {
         for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active, .release);
         try std.testing.expect(!try blocks.poll(io));
         for (blocks.observers) |observer| try std.testing.expectEqual(@as(usize, 1), observer.pending);
-        service.credit[0].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+        service.credit[0].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
         try std.testing.expect(try blocks.poll(io));
         var retry = service.outputBatch();
         const packet = retry.next().?;
@@ -1601,7 +1601,7 @@ pub fn benchmarkBlockPlanning() !void {
         service.recycle(io, &.{acknowledgment});
         try std.testing.expectEqual(null, retry.next());
         for (blocks.observers, 0..) |observer, index| try std.testing.expectEqual(@as(usize, @intFromBool(index != 0)), observer.pending);
-        for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+        for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
         if (count > 1) {
             try std.testing.expect(try blocks.poll(io));
             var rest = service.outputBatch();
@@ -1623,7 +1623,7 @@ pub fn benchmarkBlockPlanning() !void {
             streaming.epoch = service.backgroundEpoch();
             blocks.next_acknowledgment = 0;
             for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active, .release);
-            service.credit[count - 1].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+            service.credit[count - 1].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
             for (0..std.math.divCeil(usize, count, 8) catch unreachable) |_| _ = try blocks.poll(io);
             var independent = service.outputBatch();
             const last = independent.next().?;
@@ -1634,7 +1634,7 @@ pub fn benchmarkBlockPlanning() !void {
             service.recycle(io, &.{last});
             try std.testing.expectEqual(null, independent.next());
             try std.testing.expectEqual(@as(i32, -1), blocks.observers[count - 1].sequence);
-            for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+            for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
             var attempts: usize = 0;
             while (blocks.pending_acknowledgments.count != 0) {
                 try std.testing.expect(attempts < count);
@@ -1723,7 +1723,7 @@ pub fn benchmarkItemBoundaries() !void {
         defer catalog.deinit(allocator);
         var sink: Sink = .{};
         const transport: network.Transport = .{ .context = &sink, .vtable = network.Transport.adapter(Sink) };
-        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = viewers, .pages = 8192, .page_bytes = 4096, .buffer_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
+        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = viewers, .pages = 8192, .page_bytes = 4096, .credit_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
         defer service.deinit();
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
         const player_records = try allocator.alloc(Players.Player, viewers);
@@ -1757,7 +1757,7 @@ pub fn benchmarkItemBoundaries() !void {
             const metadata_before = dropped.cache.metrics.acquired.value();
             const bodies_before = bodies.cache.metrics.acquired.value();
             const reads_before = dropped.cache.metrics.reads.value() + bodies.cache.metrics.reads.value();
-            for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+            for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
             service.beginTick();
             streaming.tick();
             try replication.tick();
@@ -1823,7 +1823,7 @@ pub fn benchmarkTerrainBackpressure() !void {
         defer catalog.deinit(allocator);
         var sink: Sink = .{};
         const transport: network.Transport = .{ .context = &sink, .vtable = network.Transport.adapter(Sink) };
-        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = count, .pages = 128, .page_bytes = 32768, .buffer_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
+        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = count, .pages = 128, .page_bytes = 32768, .credit_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
         defer service.deinit();
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
         const player_records = try allocator.alloc(Players.Player, count);
@@ -1847,7 +1847,7 @@ pub fn benchmarkTerrainBackpressure() !void {
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
             stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .announced = true, .cursor = if (mode == .blocks) side * side else 0, .delivered = if (mode == .blocks) side * side else 0 };
             streaming.published.setStream(index, stream.snapshot());
-            service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+            service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
         }
         @memset(streaming.sent, if (mode == .blocks) std.math.maxInt(u64) else 0);
         if (mode == .blocks) {
@@ -1964,13 +1964,13 @@ test "operation counts for audience overflow preserve unrelated connections" {
     const allocator = arena.allocator();
     var sink: Sink = .{};
     const protocols_selected = [_]sessions.Protocol{.{ .number = 1 }};
-    const service = try sessions.Service.init(allocator, std.testing.io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = capacity, .pages = 2, .page_bytes = 64, .buffer_bytes = 1024, .protocols = &protocols_selected });
+    const service = try sessions.Service.init(allocator, std.testing.io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = capacity, .pages = 2, .page_bytes = 64, .credit_bytes = 1024, .protocols = &protocols_selected });
     defer service.deinit();
     const player_records = try allocator.alloc(Players.Player, capacity);
     @memset(player_records, .{});
     for ([_]usize{ 0, 64, 100 }) |index| {
         player_records[index].handle = .{ .index = index, .generation = 1 };
-        service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+        service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
     }
     var players: Players = .{ .deps = .{ .sessions = service, .packets = undefined, .input = undefined, .storage = undefined, .worlds = undefined, .record_workspaces = undefined }, .config = .{}, .spawn_world = 0, .records = player_records, .dig_handlers = &.{} };
     const matrix = try audience_storage.Matrix.init(allocator, &players, 101, 0, .recipients);
@@ -1984,7 +1984,7 @@ test "operation counts for audience overflow preserve unrelated connections" {
     try std.testing.expectEqual(@as(u32, 0), service.disconnects[100].load(.acquire));
     for ([_]usize{ 0, 64, 100 }) |index| {
         service.disconnects[index].store(0, .release);
-        service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+        service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
     }
     const owned = try audience_storage.Matrix.init(allocator, &players, 101, 0, .{ .subjects = 1 });
     owned.row(100).copy(selected.row(0).view());
@@ -2018,7 +2018,7 @@ pub fn benchmarkSparseTerrainStreaming() !void {
         defer catalog.deinit(allocator);
         var sink: Sink = .{};
         const transport: network.Transport = .{ .context = &sink, .vtable = network.Transport.adapter(Sink) };
-        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = count, .pages = 128, .page_bytes = 32768, .buffer_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
+        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = count, .pages = 128, .page_bytes = 32768, .credit_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
         defer service.deinit();
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
         const player_records = try allocator.alloc(Players.Player, count);
@@ -2052,7 +2052,7 @@ pub fn benchmarkSparseTerrainStreaming() !void {
         streaming.streams[0] = .{ .generation = 1, .life = player_records[0].life, .setup = .streaming, .announced = true, .cursor = 0, .delivered = side * side - 1 };
         @memset(streaming.sent, std.math.maxInt(u64));
         streaming.sent[0] &= ~@as(u64, 1);
-        service.credit[0].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+        service.credit[0].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
         service.beginTick();
         streaming.endTick(true);
         service.endTick(true);
@@ -2134,7 +2134,7 @@ pub fn benchmarkSparseBlockPlanning() !void {
         defer catalog.deinit(allocator);
         var sink: Sink = .{};
         const transport: network.Transport = .{ .context = &sink, .vtable = network.Transport.adapter(Sink) };
-        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = count, .pages = 128, .page_bytes = 32768, .buffer_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
+        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = count, .pages = 128, .page_bytes = 32768, .credit_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
         defer service.deinit();
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
         const player_records = try allocator.alloc(Players.Player, count);
@@ -2160,7 +2160,7 @@ pub fn benchmarkSparseBlockPlanning() !void {
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
             stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .announced = true, .minimum_section = 0, .section_count = 16, .cursor = side * side, .delivered = side * side, .center = .{ .x = @intCast(index * 64), .z = 0 }, .target = .{ .x = @intCast(index * 64), .z = 0 } };
             streaming.published.setStream(index, stream.snapshot());
-            service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+            service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
         }
         @memset(streaming.sent, std.math.maxInt(u64));
         @memset(streaming.occluded, 0);
@@ -2177,7 +2177,7 @@ pub fn benchmarkSparseBlockPlanning() !void {
             try std.testing.expect(!try blocks.poll(io));
             try std.testing.expectEqual(@as(usize, 1), blocks.selections.row(0).view().count());
         }
-        service.credit[0].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+        service.credit[0].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
         try std.testing.expect(try blocks.poll(io));
         var batch = service.outputBatch();
         const packet = batch.next().?;
@@ -2246,7 +2246,7 @@ pub fn verifyBlockBatchRetirement() !void {
         if (mode == .protocols and catalog.values.len < 2) continue;
         var sink: Sink = .{};
         const transport: network.Transport = .{ .context = &sink, .vtable = network.Transport.adapter(Sink) };
-        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = count, .pages = 128, .page_bytes = 32768, .buffer_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
+        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = count, .pages = 128, .page_bytes = 32768, .credit_bytes = 16 * 1024 * 1024, .protocols = &catalog.values });
         defer service.deinit();
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
         const player_records = try allocator.alloc(Players.Player, count);
@@ -2272,7 +2272,7 @@ pub fn verifyBlockBatchRetirement() !void {
         for (streaming.streams, player_records, 0..) |*stream, player, index| {
             stream.* = .{ .generation = 1, .life = player.life, .setup = .streaming, .announced = true, .minimum_section = 0, .section_count = 16, .cursor = side * side, .delivered = side * side };
             streaming.published.setStream(index, stream.snapshot());
-            service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+            service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
         }
         @memset(streaming.sent, std.math.maxInt(u64));
         @memset(streaming.occluded, 0);
@@ -2294,7 +2294,7 @@ pub fn verifyBlockBatchRetirement() !void {
                 var words = observer.nonempty.iterator(.{});
                 while (words.next()) |word| observer.full_bits[word] |= observer.pending_bits[word];
             }
-            for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+            for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
             try std.testing.expect(try blocks.poll(io));
             var batch = service.outputBatch();
             var delivered: usize = 0;
@@ -2373,7 +2373,7 @@ pub fn itemPositionInterval() !void {
         defer catalog.deinit(allocator);
         var sink: Sink = .{};
         const transport: network.Transport = .{ .context = &sink, .vtable = network.Transport.adapter(Sink) };
-        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = 1, .pages = 512, .page_bytes = 4096, .buffer_bytes = 1024 * 1024, .protocols = &catalog.values });
+        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = 1, .pages = 512, .page_bytes = 4096, .credit_bytes = 1024 * 1024, .protocols = &catalog.values });
         defer service.deinit();
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
         var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number }};
@@ -2404,7 +2404,7 @@ pub fn itemPositionInterval() !void {
                 metadata.revision += 1;
                 held[0].write(metadata);
             }
-            service.credit[0].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+            service.credit[0].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
             service.beginTick();
             streaming.tick();
             try replication.tick();

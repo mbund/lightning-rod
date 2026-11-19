@@ -121,7 +121,7 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
             for (config.endpoints, endpoints) |endpoint_config, *endpoint| {
                 endpoint.* = try sessions.Service.init(owned, io, self.transport.transport(), .{
                     .connections = endpoint_config.connections,
-                    .buffer_bytes = config.buffer_bytes,
+                    .credit_bytes = config.output_bytes,
                     .input_work = config.input_work,
                     .max_input_bytes = config.buffer_bytes - 3,
                     .metrics = options.metrics,

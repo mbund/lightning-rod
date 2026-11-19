@@ -41,7 +41,7 @@ const Fixture = struct {
 
     fn init(allocator: std.mem.Allocator, store: *storage.Store, registry: *metrics.Registry) !Fixture {
         const io = std.testing.io;
-        const service = try sessions.Service.init(allocator, io, undefined, .{ .connections = 2, .pages = 2, .page_bytes = 64 * 1024, .buffer_bytes = 128 * 1024, .protocols = &selected_protocols });
+        const service = try sessions.Service.init(allocator, io, undefined, .{ .connections = 2, .pages = 2, .page_bytes = 64 * 1024, .credit_bytes = 128 * 1024, .protocols = &selected_protocols });
         const input = try Input.init(allocator, .{ .sessions = service });
         const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
         const workspaces = try records.Workspaces.init(allocator, io, .{});

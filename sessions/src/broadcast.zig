@@ -247,8 +247,8 @@ pub const Broadcast = struct {
                         return err;
                     };
                     var charge: usize = 0;
-                    for (lengths[0..reserved]) |length| charge += self.owner.framedBound(length);
-                    if (charge > self.owner.config.buffer_bytes) return error.GroupTooLarge;
+                    for (lengths[0..reserved]) |length| charge += self.owner.creditCharge(length);
+                    if (charge > self.owner.config.credit_bytes) return error.GroupTooLarge;
                     const dependency = if (required) |receipt| dependency: {
                         for (self.entries[receipt.first..][0..receipt.count], receipt.first..) |entry, index| if (entry.protocol == protocol and entry.group.index == 0) break :dependency index;
                         break :dependency std.math.maxInt(usize);

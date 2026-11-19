@@ -223,7 +223,7 @@ test "markers catch up after readiness backpressure and connection reuse" {
         .connections = 2,
         .pages = 64,
         .page_bytes = 512,
-        .buffer_bytes = 8192,
+        .credit_bytes = 8192,
         .protocols = &.{.{ .number = protocol }},
     });
     defer {

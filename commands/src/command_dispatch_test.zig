@@ -37,12 +37,12 @@ test "command visibility caches policy decisions and retries publication without
         _ = try leaf.add(&probe, commands.leaf(Probe, Probe.Args, .{ .name = "run", .description = "Test command", .handler = Probe.execute, .arguments = .{} }));
     }
     const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
-    const service = try sessions.Service.init(allocator, std.testing.io, undefined, .{ .connections = 64, .pages = 128, .page_bytes = 65536, .buffer_bytes = 1024 * 1024, .protocols = &selected });
+    const service = try sessions.Service.init(allocator, std.testing.io, undefined, .{ .connections = 64, .pages = 128, .page_bytes = 65536, .credit_bytes = 1024 * 1024, .protocols = &selected });
     const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
     var records: [64]Players.Player = undefined;
     for (&records, 0..) |*player, i| {
         player.* = .{ .handle = .{ .index = @intCast(i), .generation = 1 }, .uuid = i + 1, .protocol = selected[0].number, .stage = .ready };
-        service.credit[i].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+        service.credit[i].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     }
     var players: Players = .{ .deps = undefined, .config = .{ .maximum = 64 }, .spawn_world = 0, .records = &records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
@@ -89,14 +89,14 @@ test "command visibility caches policy decisions and retries publication without
     probe.calls = 0;
     for (0..64) |_| try plugin.tick();
     try std.testing.expectEqual(@as(usize, 0), probe.calls);
-    for (service.credit) |*credit| credit.store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+    for (service.credit) |*credit| credit.store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     try plugin.tick();
     try std.testing.expectEqual(@as(usize, 0), probe.calls);
     try std.testing.expectEqual(@as(usize, 1), try Drain.run(service));
     try tree.execute(context, "root leaf0 run");
     try std.testing.expectEqual(@as(usize, 1), probe.executions);
     records[0].handle.?.generation += 1;
-    service.credit[0].store(@as(u64, 2) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+    service.credit[0].store(@as(u64, 2) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     probe.calls = 0;
     try plugin.tick();
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
@@ -128,7 +128,7 @@ test "command visibility caches policy decisions and retries publication without
     try std.testing.expectEqual(@as(usize, 1), try Drain.run(service));
     try std.testing.expect(!plugin.states[0].sent);
     for (plugin.states[1..]) |state| try std.testing.expect(state.sent);
-    service.credit[0].store(@as(u64, 2) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+    service.credit[0].store(@as(u64, 2) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     probe.calls = 0;
     try plugin.tick();
     try std.testing.expectEqual(@as(usize, 0), probe.calls);
@@ -141,7 +141,7 @@ test "input rejection cleanup visits only consumed inputs" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
-    const service = try sessions.Service.init(allocator, std.testing.io, undefined, .{ .connections = 4096, .pages = 2, .page_bytes = 64, .buffer_bytes = 1024, .protocols = &selected });
+    const service = try sessions.Service.init(allocator, std.testing.io, undefined, .{ .connections = 4096, .pages = 2, .page_bytes = 64, .credit_bytes = 1024, .protocols = &selected });
     defer service.deinit();
     const input = try Input.init(allocator, .{ .sessions = service });
     for (input.rejected) |generation| try std.testing.expectEqual(@as(u32, 0), generation);

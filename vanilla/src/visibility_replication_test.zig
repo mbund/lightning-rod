@@ -97,13 +97,13 @@ test "visibility independently reconciles profiles tab listing and entities unde
     var failing = std.testing.FailingAllocator.init(arena.allocator(), .{});
     const allocator = failing.allocator();
     const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
-    const service = try sessions.Service.init(allocator, std.testing.io, undefined, .{ .connections = 3, .pages = 128, .page_bytes = 4096, .buffer_bytes = 32768, .protocols = &selected });
+    const service = try sessions.Service.init(allocator, std.testing.io, undefined, .{ .connections = 3, .pages = 128, .page_bytes = 4096, .credit_bytes = 32768, .protocols = &selected });
     const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
     var records: [3]Players.Player = undefined;
     for (&records, 0..) |*player, index| {
         player.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 }, .uuid = index + 1, .name_len = 1, .stage = .ready, .protocol = selected[0].number };
         player.name[0] = @intCast('a' + index);
-        service.credit[index].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+        service.credit[index].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     }
     var players: Players = .{ .deps = .{ .sessions = service, .packets = encoding, .input = undefined, .storage = undefined, .worlds = undefined, .record_workspaces = undefined }, .config = .{ .maximum = 3, .render_distance = 2 }, .spawn_world = 0, .records = &records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
@@ -135,7 +135,7 @@ test "visibility independently reconciles profiles tab listing and entities unde
     try vanish.updateMany(&.{.{ .subjects = &.{subject}, .observers = .{ .players = .{ .words = &.{6}, .capacity = records.len } }, .channels = &.{ visibility.player_entity, visibility.tab_list }, .excluded = false }});
     try wire.tick(replication);
     try std.testing.expect(!wire.clients[2][0].spawned and wire.clients[2][0].listed);
-    service.credit[1].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+    service.credit[1].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     try minigame.updateMany(&.{.{ .subjects = &.{subject}, .observers = .{ .players = .{ .words = &.{6}, .capacity = records.len } }, .channels = &.{visibility.player_entity}, .excluded = false }});
     try wire.tick(replication);
     try std.testing.expectEqual(View{ .known = true, .listed = true, .spawned = true }, wire.clients[1][0]);
@@ -149,7 +149,7 @@ test "visibility independently reconciles profiles tab listing and entities unde
     players.rebuildIndexes();
     try wire.tick(replication);
     try std.testing.expectEqual(@as(usize, 0), wire.packets);
-    service.credit[1].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+    service.credit[1].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     try wire.tick(replication);
     try std.testing.expectEqual(View{}, wire.clients[1][0]);
     try vanish.updateMany(&.{.{ .subjects = &.{subject}, .observers = .{ .players = .{ .words = &.{6}, .capacity = records.len } }, .channels = &.{visibility.tab_list}, .excluded = false }});
@@ -194,13 +194,13 @@ test "announcements capture independent audiences and do not fabricate events on
     defer arena.deinit();
     const allocator = arena.allocator();
     const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
-    const service = try sessions.Service.init(allocator, std.testing.io, undefined, .{ .connections = 3, .pages = 32, .page_bytes = 4096, .buffer_bytes = 32768, .protocols = &selected });
+    const service = try sessions.Service.init(allocator, std.testing.io, undefined, .{ .connections = 3, .pages = 32, .page_bytes = 4096, .credit_bytes = 32768, .protocols = &selected });
     const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
     var records: [3]Players.Player = undefined;
     for (&records, 0..) |*player, index| {
         player.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 }, .uuid = index + 1, .name_len = 1, .stage = .ready, .protocol = selected[0].number };
         player.name[0] = @intCast('a' + index);
-        service.credit[index].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+        service.credit[index].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     }
     var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);

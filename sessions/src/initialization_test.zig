@@ -66,7 +66,7 @@ fn createEndpoint(allocator: std.mem.Allocator, hooks: *Hooks) !*service_module.
 fn createEndpointWithInputWork(allocator: std.mem.Allocator, hooks: *Hooks, input_work: system.work.Limits) !*service_module.Service {
     return service_module.Service.init(allocator, std.testing.io, transport(hooks), .{
         .connections = 2,
-        .buffer_bytes = 512,
+        .credit_bytes = 512,
         .pages = 4,
         .page_bytes = 128,
         .protocols = &protocols.values,
@@ -470,7 +470,7 @@ test "a recipient batch shares reserved credit across actual packet lengths" {
     const floor = endpoint.backgroundFloor();
     try std.testing.expect(floor != 0);
     const available = floor + endpoint.framedBound(8) + 2 * endpoint.framedBound(1);
-    try std.testing.expect(available <= endpoint.config.buffer_bytes);
+    try std.testing.expect(available <= endpoint.config.credit_bytes);
     const active_credit = (@as(u64, 1) << 32) | service_module.Service.active;
     endpoint.credit[0].store(active_credit | available, .release);
     var packets: [3]service_module.Service.Packet = undefined;
@@ -634,7 +634,7 @@ test "fanout batches protocols while preserving independent target admission" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const endpoint = try service_module.Service.init(failing.allocator(), std.testing.io, transport(&hooks), .{
         .connections = 3,
-        .buffer_bytes = 512,
+        .credit_bytes = 512,
         .pages = 4,
         .page_bytes = 128,
         .protocols = &.{ .{ .number = 1 }, .{ .number = 2 } },
@@ -669,7 +669,7 @@ test "ordered packet groups reserve all credit before publishing any member" {
     var catalog: Endpoint.Protocols = .{};
     const endpoint = try service_module.Service.init(std.testing.allocator, io, transport(&hooks), .{
         .connections = 2,
-        .buffer_bytes = 4096,
+        .credit_bytes = 4096,
         .pages = 8,
         .page_bytes = 128,
         .protocols = &catalog.values,
@@ -724,7 +724,7 @@ test "concurrent group producers keep recipient storage and admitted results pri
     var hooks: Hooks = .{};
     const endpoint = try Service.init(std.testing.allocator, io, transport(&hooks), .{
         .connections = 2,
-        .buffer_bytes = 4096,
+        .credit_bytes = 4096,
         .pages = 16,
         .page_bytes = 128,
         .protocols = &.{.{ .number = 1 }},
@@ -831,7 +831,7 @@ test "groups that cannot fit the configured memory or credit fail without public
         var hooks: Hooks = .{};
         const endpoint = try Service.init(std.testing.allocator, std.testing.io, transport(&hooks), .{
             .connections = 1,
-            .buffer_bytes = 512,
+            .credit_bytes = 512,
             .pages = pages,
             .page_bytes = 256,
             .protocols = &.{.{ .number = 1 }},
@@ -963,7 +963,7 @@ test "pending descriptors follow pool identity across shared endpoints and abort
     var endpoints: [3]*service_module.Service = undefined;
     for (&endpoints, 0..) |*endpoint, index| endpoint.* = try service_module.Service.init(std.testing.allocator, std.testing.io, transport(&hooks), .{
         .connections = 2,
-        .buffer_bytes = 512,
+        .credit_bytes = 512,
         .pages = 4,
         .page_bytes = 128,
         .protocols = &protocols.values,
@@ -1009,12 +1009,12 @@ test "broadcast batches preserve exclusions dependencies credits and audience ow
         var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .capacity = 16 });
         defer registry.deinit();
         var hooks: Hooks = .{};
-        const endpoint = try service_module.Service.init(allocator, std.testing.io, transport(&hooks), .{ .metrics = &registry, .connections = connections, .pages = connections * 4, .page_bytes = 64, .buffer_bytes = 128 * 1024, .protocols = &protocols.values });
+        const endpoint = try service_module.Service.init(allocator, std.testing.io, transport(&hooks), .{ .metrics = &registry, .connections = connections, .pages = connections * 4, .page_bytes = 64, .credit_bytes = 128 * 1024, .protocols = &protocols.values });
         defer endpoint.deinit();
         var batch = try service_module.Service.Broadcast.init(allocator, endpoint, connections * 2);
         defer batch.deinit();
         var targets: [connections]service_module.Service.Target = undefined;
-        var remaining: [connections]usize = @splat(endpoint.config.buffer_bytes);
+        var remaining: [connections]usize = @splat(endpoint.config.credit_bytes);
         if (mode == 1) remaining[0] = 0;
         if (mode == 2) remaining[0] = 300;
         if (mode == 3) for (&remaining, 0..) |*value, index| {
@@ -1089,14 +1089,14 @@ test "broadcast groups retain independent protocol admission across audience reu
     const allocator = arena.allocator();
     var hooks: Hooks = .{};
     const selected = [_]protocol.Protocol{ .{ .number = 1 }, .{ .number = 2 } };
-    const endpoint = try service_module.Service.init(allocator, std.testing.io, transport(&hooks), .{ .connections = 4, .pages = 16, .page_bytes = 64, .buffer_bytes = 4096, .protocols = &selected });
+    const endpoint = try service_module.Service.init(allocator, std.testing.io, transport(&hooks), .{ .connections = 4, .pages = 16, .page_bytes = 64, .credit_bytes = 4096, .protocols = &selected });
     defer endpoint.deinit();
     var batch = try service_module.Service.Broadcast.init(allocator, endpoint, 16);
     defer batch.deinit();
     var targets: [4]service_module.Service.Target = undefined;
     for (&targets, 0..) |*target, index| {
         target.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 }, .protocol = 1 + @as(i32, @intCast(index % 2)) };
-        const credit = if (index == 2) 2 * endpoint.framedBound(1) - 1 else endpoint.config.buffer_bytes;
+        const credit = if (index == 2) 2 * endpoint.framedBound(1) - 1 else endpoint.config.credit_bytes;
         endpoint.credit[index].store(@as(u64, 1) << 32 | service_module.Service.active | credit, .release);
     }
     try batch.begin(&targets);
@@ -1107,7 +1107,7 @@ test "broadcast groups retain independent protocol admission across audience reu
     batch.finish();
     try std.testing.expectEqual(@as(usize, 8), batch.accepted(dependent).words[0]);
     targets[1].handle.generation = 2;
-    endpoint.credit[1].store(@as(u64, 2) << 32 | service_module.Service.active | endpoint.config.buffer_bytes, .release);
+    endpoint.credit[1].store(@as(u64, 2) << 32 | service_module.Service.active | endpoint.config.credit_bytes, .release);
     try batch.begin(targets[1..2]);
     const next = try batch.write(.{ One, Two }, Encoder, null, null, {}, 8);
     batch.finish();
@@ -1143,7 +1143,7 @@ test "broadcast rejects stale epochs generations transfers and unsupported encod
     };
     for (0..4) |mode| {
         var hooks: Hooks = .{};
-        const endpoint = try service_module.Service.init(std.testing.allocator, std.testing.io, transport(&hooks), .{ .connections = 2, .pages = 2, .page_bytes = 64, .buffer_bytes = 1024, .protocols = &protocols.values });
+        const endpoint = try service_module.Service.init(std.testing.allocator, std.testing.io, transport(&hooks), .{ .connections = 2, .pages = 2, .page_bytes = 64, .credit_bytes = 1024, .protocols = &protocols.values });
         defer endpoint.deinit();
         var batch = try service_module.Service.Broadcast.init(std.testing.allocator, endpoint, 2);
         defer batch.deinit();
@@ -1189,7 +1189,7 @@ test "broadcast pressure commits complete packets without waiting or publishing 
         }
     };
     var hooks: Hooks = .{};
-    const endpoint = try service_module.Service.init(std.testing.allocator, std.testing.io, transport(&hooks), .{ .connections = 1, .pages = 1, .page_bytes = 64, .buffer_bytes = 1024, .protocols = &protocols.values });
+    const endpoint = try service_module.Service.init(std.testing.allocator, std.testing.io, transport(&hooks), .{ .connections = 1, .pages = 1, .page_bytes = 64, .credit_bytes = 1024, .protocols = &protocols.values });
     defer endpoint.deinit();
     var batch = try service_module.Service.Broadcast.init(std.testing.allocator, endpoint, 4);
     defer batch.deinit();
@@ -1225,7 +1225,7 @@ test "broadcast admission and delivery retain connection indexes beyond sixteen 
     defer arena.deinit();
     const allocator = arena.allocator();
     var hooks: Hooks = .{};
-    const endpoint = try service_module.Service.init(allocator, std.testing.io, transport(&hooks), .{ .connections = 65_537, .pages = 2, .page_bytes = 64, .buffer_bytes = 1024, .protocols = &protocols.values });
+    const endpoint = try service_module.Service.init(allocator, std.testing.io, transport(&hooks), .{ .connections = 65_537, .pages = 2, .page_bytes = 64, .credit_bytes = 1024, .protocols = &protocols.values });
     defer endpoint.deinit();
     var batch = try service_module.Service.Broadcast.init(allocator, endpoint, 1);
     defer batch.deinit();
@@ -1254,7 +1254,7 @@ test "broadcast mask history exhaustion refunds credits and preserves earlier re
         }
     };
     var hooks: Hooks = .{};
-    const endpoint = try service_module.Service.init(std.testing.allocator, std.testing.io, transport(&hooks), .{ .connections = 3, .pages = 2, .page_bytes = 64, .buffer_bytes = 1024, .protocols = &protocols.values });
+    const endpoint = try service_module.Service.init(std.testing.allocator, std.testing.io, transport(&hooks), .{ .connections = 3, .pages = 2, .page_bytes = 64, .credit_bytes = 1024, .protocols = &protocols.values });
     defer endpoint.deinit();
     var batch = try service_module.Service.Broadcast.init(std.testing.allocator, endpoint, 4);
     defer batch.deinit();
@@ -1311,7 +1311,7 @@ test "compact broadcasts retain sparse handles generations and receipt coordinat
     const allocator = failing.allocator();
     var hooks: Hooks = .{};
     const selected = [_]protocol.Protocol{ .{ .number = 1 }, .{ .number = 2 } };
-    const endpoint = try service_module.Service.init(allocator, std.testing.io, transport(&hooks), .{ .connections = 65_537, .pages = 10, .page_bytes = 64, .buffer_bytes = 4096, .protocols = &selected });
+    const endpoint = try service_module.Service.init(allocator, std.testing.io, transport(&hooks), .{ .connections = 65_537, .pages = 10, .page_bytes = 64, .credit_bytes = 4096, .protocols = &selected });
     defer endpoint.deinit();
     var batch = try service_module.Service.Broadcast.init(allocator, endpoint, 8);
     defer batch.deinit();

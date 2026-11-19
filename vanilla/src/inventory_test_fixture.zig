@@ -45,7 +45,7 @@ pub const InventoryFixture = struct {
     pub fn init(allocator: std.mem.Allocator, store: *storage.Store, registry: *metrics.Registry, selected: []const sessions.Protocol) !InventoryFixture {
         const io = std.testing.io;
         const workspaces = try records.Workspaces.init(allocator, io, .{});
-        const service = try sessions.Service.init(allocator, io, undefined, .{ .connections = 2, .pages = 2, .page_bytes = 65536, .buffer_bytes = 128 * 1024, .protocols = selected });
+        const service = try sessions.Service.init(allocator, io, undefined, .{ .connections = 2, .pages = 2, .page_bytes = 65536, .credit_bytes = 128 * 1024, .protocols = selected });
         errdefer service.deinit();
         const input = try Input.init(allocator, .{ .sessions = service });
         const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
