@@ -236,7 +236,7 @@ test "markers catch up after readiness backpressure and connection reuse" {
     const alice: sessions.Handle = .{ .index = 0, .generation = 1 };
     const bob: sessions.Handle = .{ .index = 1, .generation = 1 };
     for ([_]sessions.Handle{ alice, bob }) |handle|
-        service.credit[handle.index].store((@as(u64, handle.generation) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+        service.credit[handle.index].store((@as(u64, handle.generation) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
 
     var records: [2]Players.Player = .{
         .{ .handle = alice, .protocol = protocol, .stage = .ready },
@@ -274,13 +274,13 @@ test "markers catch up after readiness backpressure and connection reuse" {
     try control.tick();
     try std.testing.expectEqual(@as(usize, 2), control.cursors[0].next);
     try std.testing.expectEqual(@as(usize, 1), control.cursors[1].next);
-    service.credit[1].store((@as(u64, bob.generation) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+    service.credit[1].store((@as(u64, bob.generation) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
     try control.tick();
     try std.testing.expectEqual(@as(usize, 2), control.cursors[1].next);
 
     const reconnected: sessions.Handle = .{ .index = 1, .generation = 2 };
     records[1].handle = reconnected;
-    service.credit[1].store((@as(u64, reconnected.generation) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
+    service.credit[1].store((@as(u64, reconnected.generation) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
     try control.tick();
     try std.testing.expectEqual(reconnected.generation, control.cursors[1].generation);
     try std.testing.expectEqual(@as(usize, 2), control.cursors[1].next);
