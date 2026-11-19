@@ -33,17 +33,11 @@ fn Driver(comptime Core: type) type {
                 self.core.deinit(io);
                 allocator.destroy(self.core);
             }
-            const before = options.memory.assigned_bytes;
-            try self.core.worker.initCodec(io, options.metrics);
-            self.core.owned_bytes += options.memory.assigned_bytes - before;
-            self.core.owned_buffers.set(self.core.owned_bytes);
             return self;
         }
 
         pub fn start(self: *Self) !void {
             std.debug.assert(self.thread == null and !self.closing.load(.acquire));
-            try self.core.worker.engine.codec.?.start();
-            errdefer self.core.worker.engine.codec.?.stop();
             // Unoptimized builds keep a frame per protocol state, which outgrew 256 KiB for a
             // debug server on a baseline CPU.
             self.thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, execute, .{self});
@@ -92,7 +86,6 @@ fn Driver(comptime Core: type) type {
                 self.resume_requested.set(self.io);
                 thread.join();
                 self.thread = null;
-                self.core.worker.engine.codec.?.stop();
                 if (self.failure != null) self.core.abort(self.io);
             }
         }
@@ -107,17 +100,7 @@ fn Driver(comptime Core: type) type {
 }
 
 test "terminal network failure is joined without retrying normal drain" {
-    const TestCodec = struct {
-        started: bool = false,
-        fn start(self: *@This()) !void {
-            self.started = true;
-        }
-        fn stop(self: *@This()) void {
-            self.started = false;
-        }
-    };
     const TestWorker = struct {
-        engine: struct { codec: ?*TestCodec },
         is_drained: bool = false,
         fn drained(self: *const @This()) bool {
             return self.is_drained;
@@ -141,12 +124,10 @@ test "terminal network failure is joined without retrying normal drain" {
             return error.InjectedFailure;
         }
         fn abort(self: *@This(), _: std.Io) void {
-            std.debug.assert(!self.worker.engine.codec.?.started);
             self.aborted = true;
         }
     };
-    var codec: TestCodec = .{};
-    var worker: TestWorker = .{ .engine = .{ .codec = &codec } };
+    var worker: TestWorker = .{};
     var core: TestCore = .{ .worker = &worker };
     var driver: Driver(TestCore) = .{ .core = &core, .allocator = std.testing.allocator, .io = std.testing.io };
     try driver.start();
