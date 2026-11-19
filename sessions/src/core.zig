@@ -129,6 +129,7 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
                     .pages = output_pages,
                     .output_pool = &self.output_pool,
                     .page_bytes = endpoint_config.page_bytes,
+                    .compression_threshold = compression,
                 });
                 initialized += 1;
             }

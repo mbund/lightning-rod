@@ -481,7 +481,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             const packet_index = self.sources[source].packet_base + raw.page;
             const packet = &self.packets[packet_index];
             assert(packet.source == null and packet.waiting == 0);
-            packet.* = .{ .raw = raw, .source = source, .charge = endpoint.framedBound(raw.boundLength()) };
+            packet.* = .{ .raw = raw, .source = source, .charge = endpoint.framedBound(endpoint.chargedLength(raw.bytes.len, raw.decoded_length)) };
             packet.framed = self.frame(endpoint, raw) catch |err| {
                 std.log.warn("event=session_packet_unframed bytes={d} reason={s}", .{ raw.bytes.len, @errorName(err) });
                 var recipients = raw.recipients.iterator();

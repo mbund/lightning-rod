@@ -1476,3 +1476,16 @@ test "input lent before a tick grows until the tick takes it" {
     try std.testing.expectEqual(@as(u32, 1), endpoint.releases[0].swap(0, .acquire));
     try std.testing.expect(!endpoint.extendInput(0, 4));
 }
+
+test "a prepared packet is charged the frame it goes out as" {
+    var endpoint: service_module.Service = undefined;
+    endpoint.config = .{ .protocols = &.{}, .compression_threshold = 256 };
+    // Compressed at its size, a prepared packet goes out as stored.
+    try std.testing.expectEqual(@as(usize, 300), endpoint.chargedLength(300, 4000));
+    // Below the threshold, or with compression off, it goes out decoded.
+    try std.testing.expectEqual(@as(usize, 200), endpoint.chargedLength(100, 200));
+    endpoint.config.compression_threshold = null;
+    try std.testing.expectEqual(@as(usize, 4000), endpoint.chargedLength(300, 4000));
+    // A packet that is not prepared goes out as its bytes, compressed or not.
+    try std.testing.expectEqual(@as(usize, 300), endpoint.chargedLength(300, 0));
+}

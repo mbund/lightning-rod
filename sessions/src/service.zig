@@ -42,6 +42,9 @@ pub const Configuration = struct {
     input_work: system.work.Limits = Service.default_input_work,
     protocols: []const engine.Protocol,
     metrics: ?*metrics.Registry = null,
+    /// The threshold the worker compresses output at, which decides how a prepared packet goes
+    /// out: as stored when compressed, otherwise decoded.
+    compression_threshold: ?usize = null,
 };
 
 pub const Event = union(enum) {
@@ -372,7 +375,7 @@ pub const Service = struct {
         }
 
         fn boundLength(self: *const Packet, length: usize) usize {
-            return @max(length, self.reservation.?.decoded_length);
+            return self.owner.chargedLength(length, self.reservation.?.decoded_length);
         }
 
         pub fn cancel(self: *Packet) void {
@@ -934,6 +937,15 @@ pub const Service = struct {
     /// simulation sent at that moment, and chat disconnected them for it.
     pub fn backgroundFloor(self: *const Service) usize {
         return @min(self.config.buffer_bytes / 8, self.config.buffer_bytes - self.framedBound(self.config.page_bytes));
+    }
+
+    /// The bytes a packet of `length` stored bytes goes out as before framing. A prepared packet,
+    /// stored compressed and `decoded_length` long decoded, goes out as stored when the worker
+    /// compresses packets of its size, otherwise decoded.
+    pub fn chargedLength(self: *const Service, length: usize, decoded_length: usize) usize {
+        if (decoded_length == 0) return length;
+        if (self.config.compression_threshold) |threshold| if (decoded_length >= threshold) return length;
+        return @max(length, decoded_length);
     }
 
     /// What publishing a packet of `length` bytes charges each recipient until it is delivered:
