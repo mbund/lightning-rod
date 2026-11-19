@@ -14,6 +14,9 @@ pub const lighting_data = @import("lighting.zig");
 pub const lighting = lighting_data.Data(registry.block_state_names.len, @embedFile("lighting_snapshot"));
 pub const physics_data = @import("physics.zig");
 pub const physics = physics_data.Data(registry.block_state_names.len, registry.blocks.len, @embedFile("physics_snapshot"));
+comptime {
+    if (physics.item_count != registry.items.len) @compileError("the physics snapshot lists other items than the registry");
+}
 
 pub const fuel_data = @import("fuels.zig");
 pub const fuels = fuel_data.Data(registry.items.len, @embedFile("fuel_snapshot"));

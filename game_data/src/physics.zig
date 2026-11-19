@@ -114,8 +114,22 @@ pub fn Data(comptime expected_states: usize, comptime expected_blocks: usize, co
     const egg_count = std.mem.readInt(u32, bytes[layout.eggs..][0..4], .big);
     const sine_offset = layout.eggs + 4 + egg_count * 8;
     const arcsine_offset = sine_offset + 65536 * 4;
-    std.debug.assert(bytes.len == arcsine_offset + 257 * 16);
-    std.debug.assert(std.mem.eql(u8, bytes[0..8], "LRPHYS07"));
+    const items = comptime items: {
+        @setEvalBranchQuota(100_000);
+        var at: usize = arcsine_offset + 257 * 16;
+        const tag_count = std.mem.readInt(u32, bytes[at..][0..4], .big);
+        at += 4;
+        var tags: [tag_count][]const u8 = undefined;
+        for (&tags) |*tag| {
+            const length = std.mem.readInt(u16, bytes[at..][0..2], .big);
+            tag.* = bytes[at + 2 ..][0..length];
+            at += 2 + length;
+        }
+        const count = std.mem.readInt(u32, bytes[at..][0..4], .big);
+        break :items .{ .tags = tags, .count = count, .offset = at + 4 };
+    };
+    std.debug.assert(bytes.len == items.offset + items.count);
+    std.debug.assert(std.mem.eql(u8, bytes[0..8], "LRPHYS08"));
     std.debug.assert(std.mem.readInt(u32, bytes[8..12], .big) == expected_states);
     std.debug.assert(std.mem.readInt(u32, bytes[experience_offset..][0..4], .big) == expected_blocks);
     std.debug.assert(std.mem.readInt(u32, bytes[mob_states_offset..][0..4], .big) == expected_states);
@@ -156,6 +170,17 @@ pub fn Data(comptime expected_states: usize, comptime expected_blocks: usize, co
                 .jump_factor = @bitCast(std.mem.readInt(u32, entry[2..6], .little)),
                 .vanilla_path_type = entry[6],
             };
+        }
+
+        pub const item_count = items.count;
+
+        /// The damage type tag an item resists by default, as its damage_resistant component
+        /// names it.
+        pub fn itemResistance(item: u32) ?[]const u8 {
+            std.debug.assert(item < items.count);
+            const index = bytes[items.offset + item];
+            if (index == 0) return null;
+            return items.tags[index - 1];
         }
 
         pub fn entityType(kind: u32) EntityType {
