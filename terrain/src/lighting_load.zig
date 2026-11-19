@@ -23,7 +23,6 @@ const load_budget = 24;
 /// The default edit and simulation budgets, streaming, the solver and block sync, and one
 /// column more that nothing holds.
 const load_cache = 24 + 64 + 2 * load_budget + 8 + 24;
-const BenchmarkNetwork = @import("streaming_network_bench.zig").Network;
 const wire = @import("wire_1_21_5");
 
 const FlightPacket = enum { new_column, replacement, biomes, light, other };
@@ -838,23 +837,6 @@ test "imported world fixture" {
 }
 
 test "imported world streaming" {
-    if (streaming_options.codec_workers) |counts| {
-        var reference: [2]?u64 = @splat(null);
-        var selected = std.mem.splitScalar(u8, counts, ',');
-        while (selected.next()) |value| {
-            const workers = try std.fmt.parseInt(usize, value, 10);
-            for ([_]bool{ false, true }) |concealment| {
-                if (streaming_options.occlusion) |enabled| if (concealment != enabled) continue;
-                const result = try streamPlayers(.{ .occlusion = concealment, .players = streaming_options.players, .spacing = streaming_options.spacing, .codec_workers = workers });
-                const hash = result.packet_hash;
-                const previous = &reference[@intFromBool(concealment)];
-                if (streaming_options.validate_output) {
-                    if (previous.*) |expected| try std.testing.expectEqual(expected, hash) else previous.* = hash;
-                }
-            }
-        }
-        return;
-    }
     if (streaming_options.corpus != null and (streaming_options.occlusion == null or streaming_options.lighting_comparison)) return error.CorpusRequiresSingleStreamingMode;
     if (streaming_options.lighting_comparison) {
         const concealment = streaming_options.occlusion orelse true;
@@ -912,7 +894,6 @@ const StreamingCase = struct {
     visibility_columns: ?usize = null,
     protocol: ?i32 = null,
     encryption: bool = streaming_options.encryption,
-    codec_workers: ?usize = null,
 };
 
 test "imported world horizon scaling" {
@@ -929,7 +910,6 @@ test "imported world horizon scaling" {
 }
 
 fn streamPlayers(workload: StreamingCase) !StreamingResult {
-    if (workload.codec_workers != null and (workload.flight or streaming_options.corpus != null)) return error.UnsupportedBenchmarkCombination;
     const concealment = workload.occlusion;
     const cave = workload.cave;
     const retain_lighting = workload.retain_lighting;
@@ -948,12 +928,12 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
     defer arena.deinit();
     var bounded = std.testing.FailingAllocator.init(arena.allocator(), .{});
     const allocator = bounded.allocator();
-    var compression: ?minecraft_java.Wire.Workspace = if (workload.codec_workers == null) try minecraft_java.Wire.Workspace.init(allocator) else null;
+    var compression: ?minecraft_java.Wire.Workspace = try minecraft_java.Wire.Workspace.init(allocator);
     defer if (compression) |*workspace| workspace.deinit();
-    const compressed = try allocator.alloc(u8, if (workload.codec_workers == null) (1 << 21) + sessions.shared_headroom else 0);
+    const compressed = try allocator.alloc(u8, (1 << 21) + sessions.shared_headroom);
     const decoded = try allocator.alloc(u8, compressed.len);
-    const encrypted = try allocator.alloc(u8, if (workload.encryption and workload.codec_workers == null) compressed.len * @min(count, minecraft_java.Wire.encryption_batch_size) else 0);
-    const ciphers = try allocator.alloc(minecraft_java.Wire, if (workload.encryption and workload.codec_workers == null) count else 0);
+    const encrypted = try allocator.alloc(u8, if (workload.encryption) compressed.len * @min(count, minecraft_java.Wire.encryption_batch_size) else 0);
+    const ciphers = try allocator.alloc(minecraft_java.Wire, if (workload.encryption) count else 0);
     for (ciphers, 0..) |*cipher, index| {
         cipher.* = .{};
         var secret: [16]u8 = @splat(0x37);
@@ -1002,8 +982,6 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
         player.* = .{ .handle = .{ .index = index, .generation = 1 }, .uuid = index + 1, .world = world, .stage = .ready, .loaded = true, .position = .{ .x = 8.5, .y = 65, .z = 8.5 }, .protocol = workload.protocol orelse catalog.values[index % catalog.values.len].number };
         service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.buffer_bytes, .release);
     }
-    const benchmark_network: ?*BenchmarkNetwork = if (workload.codec_workers) |workers| try BenchmarkNetwork.init(allocator, io, service, &catalog, &registry, workers, workload.encryption, radius, streaming_options.validate_output) else null;
-    defer if (benchmark_network) |owner| owner.stop() catch |err| std.debug.panic("Benchmark network failed: {s}", .{@errorName(err)});
     var players: Players = .{ .deps = undefined, .config = .{ .maximum = count, .render_distance = radius }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
     players.rebuildIndexes();
@@ -1127,7 +1105,6 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
     }
     background.start();
     defer background.stop();
-    if (benchmark_network) |owner| try owner.start(terrain.ready());
     registry.seal();
     storage_metrics.seal();
     bounded.fail_index = bounded.alloc_index;
@@ -1138,8 +1115,6 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
     service.endTick(true);
     const started = std.Io.Clock.now(.awake, io).nanoseconds;
     const cpu = std.Io.Clock.now(.cpu_thread, io).nanoseconds;
-    const process_cpu = std.Io.Clock.now(.cpu_process, io).nanoseconds;
-    if (benchmark_network) |owner| owner.begin();
     var passes: usize = 0;
     var bytes: usize = 0;
     var wire_bytes: usize = 0;
@@ -1150,9 +1125,6 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
     var complete = false;
     var maximum_lead: usize = 0;
     while (!complete) {
-        if (benchmark_network != null) {
-            terrain.ready().reset();
-        }
         passes += 1;
         if (passes > 100000 * count) return error.StreamingStalled;
         if (!retain_lighting) streaming.deps.lighting.background.solved = null;
@@ -1163,9 +1135,7 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
         }
         const output_timing = output_cpu.start();
         defer output_timing.end();
-        if (benchmark_network) |owner| {
-            try owner.pollInline();
-        } else {
+        {
             var batch = service.outputBatch();
             while (batch.next()) |packet| {
                 defer service.recycle(io, &.{packet});
@@ -1220,27 +1190,9 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
             }
         }
         maximum_lead = @max(maximum_lead, maximum_delivered - minimum_delivered);
-        if (!complete) if (benchmark_network) |owner| {
-            if (!terrain.ready().isSet()) try owner.wait();
-        };
-    }
-    if (benchmark_network) |owner| {
-        try owner.drain();
-        for (owner.hashes, owner.bytes, progress) |*hash, sent, *player_progress| {
-            var value: [8]u8 = undefined;
-            std.mem.writeInt(u64, &value, hash.final(), .little);
-            encrypted_digest.update(&value);
-            recipient_bytes += sent;
-            player_progress.wire_bytes = sent;
-        }
-        bytes = owner.worker.instruments.encoded_bytes.value();
-        wire_bytes = recipient_bytes;
-        deliveries = owner.worker.instruments.encoded_packets.value();
     }
     const elapsed_cpu = std.Io.Clock.now(.cpu_thread, io).nanoseconds - cpu;
     const elapsed_wall = std.Io.Clock.now(.awake, io).nanoseconds - started;
-    const elapsed_process_cpu = std.Io.Clock.now(.cpu_process, io).nanoseconds - process_cpu;
-    const network_hash = if (benchmark_network != null) encrypted_digest.final() else 0;
     if (corpus_writer) |*writer| {
         try writer.interface.writeInt(u32, 0, .little);
         try writer.interface.writeInt(u64, digest.final(), .little);
@@ -1281,10 +1233,9 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
     };
     var output_buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writerStreaming(io, &output_buffer);
-    if (workload.codec_workers) |workers| try output.interface.print("Production pipeline: codec_workers={d} validated={} detailed_timers={} wall_ms={d:.2} process_CPU_ms={d:.2} terrain_thread_CPU_ms={d:.2} validation_CPU_ms={d:.2} server_CPU_ms={d:.2} terrain_hash={x} biome_hash={x}\n", .{ workers, streaming_options.validate_output, streaming_options.detailed_timers, @as(f64, @floatFromInt(elapsed_wall)) / std.time.ns_per_ms, @as(f64, @floatFromInt(elapsed_process_cpu)) / std.time.ns_per_ms, @as(f64, @floatFromInt(elapsed_cpu)) / std.time.ns_per_ms, @as(f64, @floatFromInt(benchmark_network.?.validation_cpu_ns)) / std.time.ns_per_ms, @as(f64, @floatFromInt(elapsed_process_cpu - benchmark_network.?.validation_cpu_ns)) / std.time.ns_per_ms, benchmark_network.?.terrainHash(), benchmark_network.?.biomeHash() });
     if (streaming_options.corpus) |output_path| try output.interface.print("Packet corpus: {s}. Capture I/O is included in pipeline timings.\n", .{output_path});
     try output.interface.writeAll("Native world streaming with protocol compression, excluding sockets and client rendering\nocclusion chunks   CPU_ms   wall_ms  packet_MiB wire_MiB  pipeline_MiB  decoded  batches  relights  visits  sweep_batches columns sweeps occluded section_builds change_lookups packet_hash\n");
-    try output.interface.print("players={d} spacing_chunks={d} encryption={} {s}={d} recipient_wire_MiB={d:.2} reserved_MiB={d:.2} runtime_allocations=0 encrypted_hash={x}\n", .{ count, spacing, workload.encryption, if (benchmark_network != null) "framing_operations" else "deliveries", deliveries, @as(f64, @floatFromInt(recipient_bytes)) / (1024 * 1024), @as(f64, @floatFromInt(reserved_bytes)) / (1024 * 1024), if (benchmark_network != null) network_hash else encrypted_digest.final() });
+    try output.interface.print("players={d} spacing_chunks={d} encryption={} {s}={d} recipient_wire_MiB={d:.2} reserved_MiB={d:.2} runtime_allocations=0 encrypted_hash={x}\n", .{ count, spacing, workload.encryption, "deliveries", deliveries, @as(f64, @floatFromInt(recipient_bytes)) / (1024 * 1024), @as(f64, @floatFromInt(reserved_bytes)) / (1024 * 1024), encrypted_digest.final() });
     try output.interface.print("Observer horizons: radius_chunks={d} columns_per_player={d} minimum_separation_chunks={d} overlapping_pairs={d} overlapping_light_halos={d}\n", .{ delivery_radius, target, minimum_separation, overlapping_horizons, overlapping_light_halos });
     try output.interface.print("Benchmark codec output buffers included above: compression_MiB={d:.2} encryption_MiB={d:.2}\n", .{ @as(f64, @floatFromInt(compressed.len)) / (1024 * 1024), @as(f64, @floatFromInt(encrypted.len)) / (1024 * 1024) });
     try output.interface.print("Streaming fairness: maximum_column_lead={d}\nplayer first_column_CPU_ms halfway_CPU_ms complete_CPU_ms wire_MiB\n", .{maximum_lead});
@@ -1320,7 +1271,7 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
         streaming.concealed_sections.value(),
         streaming.geometry.builds,
         streaming.geometry.change_lookups,
-        if (benchmark_network != null) network_hash else digest.final(),
+        digest.final(),
     });
     try output.interface.writeAll("Stage timings include nested stages. Do not sum parent and child totals.\nStage                                      clock       count     total_ms      max_ms\n");
     for ([_]*metrics.Registry{ &registry, &storage_metrics }) |owner| for (0..owner.count) |index| {
@@ -1502,5 +1453,5 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
             try std.testing.expectEqual(@as(usize, flight_ticks), settled_ticks);
         }
     }
-    return .{ .packet_hash = if (benchmark_network) |owner| owner.terrainHash() else digest.final(), .cpu_ns = @intCast(elapsed_cpu), .wire_bytes = recipient_bytes };
+    return .{ .packet_hash = digest.final(), .cpu_ns = @intCast(elapsed_cpu), .wire_bytes = recipient_bytes };
 }

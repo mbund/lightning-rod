@@ -54,8 +54,6 @@ pub fn build(b: *std.Build) void {
     streaming_options.addOption(usize, "flight_ticks", b.option(usize, "streaming-flight-ticks", "Flight duration in ticks, zero measures initial loading only") orelse 600);
     streaming_options.addOption(usize, "spacing", b.option(usize, "streaming-spacing", "Chunk spacing between surface observers, zero shares the same source") orelse 0);
     streaming_options.addOption(bool, "encryption", b.option(bool, "streaming-encryption", "Encrypt each recipient's stream with the production cipher") orelse false);
-    streaming_options.addOption(?[]const u8, "codec_workers", b.option([]const u8, "streaming-codec-workers", "Comma separated production codec worker counts, zero runs inline"));
-    streaming_options.addOption(bool, "validate_output", b.option(bool, "streaming-validate-output", "Decode production output and compare final terrain between worker counts") orelse false);
     streaming_options.addOption(bool, "detailed_timers", b.option(bool, "streaming-detailed-timers", "Collect per-stage CPU timings instead of measuring normal production throughput") orelse false);
     streaming_options.addOption(bool, "stored_lighting", b.option(bool, "streaming-stored-lighting", "Use lighting baked into the chunk store") orelse true);
     streaming_options.addOption(?bool, "occlusion", b.option(bool, "streaming-occlusion", "Run only the selected occlusion mode"));
