@@ -509,6 +509,33 @@ test "a recipient batch shares reserved credit across actual packet lengths" {
     try std.testing.expectEqual(endpoint.output.pages.len, endpoint.output.pool.free_units.count());
 }
 
+test "a packet too large for the room above the floor goes once its connection is idle" {
+    var hooks: Hooks = .{};
+    // Pages larger than the credit, as a server's are, so a chunk can be charged that much.
+    const endpoint = try service_module.Service.init(std.testing.allocator, std.testing.io, transport(&hooks), .{
+        .connections = 2,
+        .credit_bytes = 512,
+        .pages = 4,
+        .page_bytes = 1024,
+        .protocols = &protocols.values,
+        .max_input_bytes = 509,
+    });
+    defer endpoint.deinit();
+    const handle: network.Handle = .{ .index = 0, .generation = 1 };
+    const credit = endpoint.config.credit_bytes;
+    const room = credit - endpoint.backgroundFloor();
+    // A packet charged more than the room above the floor but less than the whole credit.
+    var length: usize = 1;
+    while (length <= endpoint.config.page_bytes and endpoint.framedBound(length) <= room) length += 1;
+    try std.testing.expect(length <= endpoint.config.page_bytes and endpoint.framedBound(length) < credit);
+    const active_credit = (@as(u64, 1) << 32) | service_module.Service.active;
+    endpoint.credit[0].store(active_credit | credit, .release);
+    try std.testing.expectEqual(@as(usize, 1), endpoint.packetCapacity(handle, length));
+    // Once anything of the connection is out, it waits, as the simulation may need the floor.
+    endpoint.credit[0].store(active_credit | (credit - 1), .release);
+    try std.testing.expectEqual(@as(usize, 0), endpoint.packetCapacity(handle, length));
+}
+
 test "publication batches consume rejected reservations without charging their peers" {
     for ([_]bool{ false, true }) |stale| {
         var hooks: Hooks = .{};

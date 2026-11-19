@@ -558,8 +558,8 @@ pub const Service = struct {
                 if (std.meta.eql(recipient, handle)) maximum = @min(self.config.credit_bytes, maximum + self.creditCharge(candidate.bytes.len));
             }
             // Whatever is held here is out of reach of the simulation until the batch
-            // ends, so the floor stays where it is, but for a packet that takes all of a
-            // connection's credit, which only an idle connection has.
+            // ends, so the floor stays where it is, but for packets too large to fit above
+            // it, which only an idle connection takes.
             const bytes = @min(maximum, self.backgroundRoom(handle, maximum));
             if (bytes == 0) continue;
             self.chargeRecipients(bytes, &.{handle}) catch continue;
@@ -949,12 +949,14 @@ pub const Service = struct {
     }
 
     /// The credit background work may take of a connection for packets charged `wanted`
-    /// between them: what is above the floor, or all of it for a packet that takes all of it
-    /// once the connection is idle, as nothing else then waits for it.
+    /// between them: what is above the floor, or all of it for packets too large to fit above
+    /// the floor once the connection is idle, as nothing else then waits for it. Otherwise a
+    /// packet charged between the floor's room and the whole credit would never go.
     fn backgroundRoom(self: *Service, handle: network.Handle, wanted: usize) usize {
         const credit = self.outputCredit(handle);
-        if (wanted >= self.config.credit_bytes and credit == self.config.credit_bytes) return credit;
-        return credit -| self.backgroundFloor();
+        const floor = self.backgroundFloor();
+        if (wanted > self.config.credit_bytes - floor and credit == self.config.credit_bytes) return credit;
+        return credit -| floor;
     }
 
     /// Output credit of each connection that background work leaves alone: an eighth of it.
