@@ -16,6 +16,10 @@ pub const Configuration = struct {
     page_bytes: usize,
     unit_bytes: usize = 16 * 1024,
     recipients_per_page: usize,
+    /// Recipients the publications of this source hold between them until the worker takes
+    /// them. Each recipient of each packet charges at least the bound of the smallest frame,
+    /// so credit bounds them: see `Service`.
+    recipient_handles: usize = 0,
     pool: ?*Pool = null,
 };
 
@@ -133,6 +137,9 @@ pub const RawPacket = struct {
     generation: u64,
     bytes: []const u8,
     recipients: Recipients,
+    /// Where its source's ring of recipients ends after this packet's, which the worker
+    /// releases once it took the packet.
+    recipient_end: usize = 0,
     group: Group = .{},
     // Mask storage belongs to this packet's page until it is recycled.
     selection: ?struct { pool: *const Pool, audience: usize, generation: u64, mask: []const usize } = null,
@@ -215,7 +222,6 @@ pub const Pool = struct {
     free_units: std.DynamicBitSetUnmanaged,
     /// A copy of the free units on which `fit` tries reservations without making them.
     trial_units: std.DynamicBitSetUnmanaged,
-    recipients: []networking.Handle,
     audiences: []AudienceSlot,
     audience_handles: []networking.Handle,
     recipient_masks: []usize,
@@ -250,11 +256,9 @@ pub const Pool = struct {
         errdefer allocator.free(bytes);
         const pages = try allocator.alloc(SharedPages.Page, units);
         errdefer allocator.free(pages);
-        const recipients = try allocator.alloc(networking.Handle, try std.math.mul(usize, units, config.recipients_per_page));
-        errdefer allocator.free(recipients);
         const audiences = try allocator.alloc(AudienceSlot, units);
         errdefer allocator.free(audiences);
-        const audience_handles = try allocator.alloc(networking.Handle, recipients.len);
+        const audience_handles = try allocator.alloc(networking.Handle, try std.math.mul(usize, units, config.recipients_per_page));
         errdefer allocator.free(audience_handles);
         const words = try std.math.divCeil(usize, config.recipients_per_page, @bitSizeOf(usize));
         const recipient_masks = try allocator.alloc(usize, units * words);
@@ -266,7 +270,7 @@ pub const Pool = struct {
         const trial_units = try std.DynamicBitSetUnmanaged.initFull(allocator, units);
         for (audiences) |*slot| slot.* = .{};
         for (pages) |*page| page.* = .{};
-        return .{ .allocator = allocator, .unit_bytes = unit_bytes, .recipients_per_page = config.recipients_per_page, .bytes = bytes, .pages = pages, .recipients = recipients, .free_units = free_units, .trial_units = trial_units, .audiences = audiences, .audience_handles = audience_handles, .recipient_masks = recipient_masks, .free_audiences = free_audiences };
+        return .{ .allocator = allocator, .unit_bytes = unit_bytes, .recipients_per_page = config.recipients_per_page, .bytes = bytes, .pages = pages, .free_units = free_units, .trial_units = trial_units, .audiences = audiences, .audience_handles = audience_handles, .recipient_masks = recipient_masks, .free_audiences = free_audiences };
     }
 
     fn findRun(self: *const Pool, start: usize, end: usize, units: usize) ?usize {
@@ -344,7 +348,6 @@ pub const Pool = struct {
         self.allocator.free(self.recipient_masks);
         self.allocator.free(self.audience_handles);
         self.allocator.free(self.audiences);
-        self.allocator.free(self.recipients);
         self.free_units.deinit(self.allocator);
         self.trial_units.deinit(self.allocator);
         self.allocator.free(self.pages);
@@ -354,7 +357,7 @@ pub const Pool = struct {
 
     pub fn memoryBytes(self: *const Pool) usize {
         const masks = std.math.divCeil(usize, self.pages.len, @bitSizeOf(usize)) catch unreachable;
-        return @sizeOf(Pool) + self.bytes.len + self.pages.len * @sizeOf(SharedPages.Page) + (self.recipients.len + self.audience_handles.len) * @sizeOf(networking.Handle) +
+        return @sizeOf(Pool) + self.bytes.len + self.pages.len * @sizeOf(SharedPages.Page) + self.audience_handles.len * @sizeOf(networking.Handle) +
             self.audiences.len * @sizeOf(AudienceSlot) + self.recipient_masks.len * @sizeOf(usize) + 2 * (masks + 1) * @sizeOf(usize);
     }
 };
@@ -371,7 +374,13 @@ pub const SharedPages = struct {
     recipients_per_page: usize,
     bytes: []align(64) u8,
     pages: []Page,
-    recipients: []networking.Handle,
+    /// The recipients of every publication not yet taken, in publication order, which the
+    /// worker takes them in, so they are released from the front as they are appended at the
+    /// back. A list never wraps: one that would starts at the beginning, past the end left
+    /// unused. `recipient_tail` moves under the producer lock, `recipient_head` on the worker.
+    recipient_ring: []networking.Handle,
+    recipient_tail: usize = 0,
+    recipient_head: std.atomic.Value(usize) = .init(0),
     ready: Ring,
 
     const State = enum(u8) { free, reserved, published, taken };
@@ -382,6 +391,9 @@ pub const SharedPages = struct {
         len: usize = 0,
         decoded_length: usize = 0,
         recipient_count: usize = 0,
+        /// Where its recipients start in the ring, and where the ring ends after them.
+        recipient_start: usize = 0,
+        recipient_end: usize = 0,
         owner: u32 = 0,
         group: Group = .{},
         audience: ?Audience = null,
@@ -434,6 +446,11 @@ pub const SharedPages = struct {
         const ring_capacity = try std.math.ceilPowerOfTwo(usize, pool.pages.len);
         const ready = try a.alloc(PageId, ring_capacity);
         errdefer a.free(ready);
+        // What credit bounds, and one more list for the end of the ring a list skips. Without
+        // a bound, every unit holding a packet with every recipient.
+        const handles = if (c.recipient_handles != 0) try std.math.add(usize, c.recipient_handles, c.recipients_per_page) else try std.math.mul(usize, pool.pages.len, c.recipients_per_page);
+        const recipient_ring = try a.alloc(networking.Handle, handles);
+        errdefer a.free(recipient_ring);
 
         return .{
             .allocator = a,
@@ -447,7 +464,7 @@ pub const SharedPages = struct {
             .recipients_per_page = pool.recipients_per_page,
             .bytes = pool.bytes,
             .pages = pool.pages,
-            .recipients = pool.recipients,
+            .recipient_ring = recipient_ring,
             .ready = .{ .slots = ready },
         };
     }
@@ -457,6 +474,7 @@ pub const SharedPages = struct {
         for (s.pages) |*page| if (page.owner == s.owner) std.debug.assert(page.status.load(.acquire) & 255 == @backingInt(State.free));
         s.producer.unlock(s.producer_io);
         s.allocator.free(s.ready.slots);
+        s.allocator.free(s.recipient_ring);
         if (s.owns_pool) {
             s.pool.deinit();
             s.allocator.destroy(s.pool);
@@ -465,7 +483,7 @@ pub const SharedPages = struct {
     }
 
     pub fn memoryBytes(s: *const SharedPages) usize {
-        return @sizeOf(SharedPages) + s.ready.slots.len * @sizeOf(PageId) + if (s.owns_pool) s.pool.memoryBytes() else @as(usize, 0);
+        return @sizeOf(SharedPages) + s.ready.slots.len * @sizeOf(PageId) + s.recipient_ring.len * @sizeOf(networking.Handle) + if (s.owns_pool) s.pool.memoryBytes() else @as(usize, 0);
     }
 
     pub fn reserve(s: *SharedPages, len: usize) ?Reservation {
@@ -520,13 +538,6 @@ pub const SharedPages = struct {
             count += 1;
         }
         return count;
-    }
-
-    pub fn recipientBuffer(s: *SharedPages, reservation: Reservation) []networking.Handle {
-        const p = &s.pages[reservation.page];
-        std.debug.assert(p.owner == s.owner and p.status.load(.acquire) == status(.reserved, reservation.generation));
-        const base = @as(usize, reservation.page) * s.recipients_per_page;
-        return s.recipients[base..][0..s.recipients_per_page];
     }
 
     const Cursors = struct { large: usize, small: usize };
@@ -629,6 +640,14 @@ pub const SharedPages = struct {
         if (p.owner != s.owner or p.status.load(.acquire) != status(.reserved, r.generation) or r.bytes.ptr != s.pagePayload(r.page).ptr or r.bytes.len == 0 or r.bytes.len > @min(s.page_bytes, p.units * s.unit_bytes - headroom))
             return false;
 
+        // Where its recipients go in the ring, checked before anything changes. Credit bounds
+        // what waits to be taken, so the ring always has room.
+        var recipient_start = s.recipient_tail;
+        if (selected == null) {
+            const capacity = s.recipient_ring.len;
+            if (recipient_start % capacity + to.len > capacity) recipient_start += capacity - recipient_start % capacity;
+            if (recipient_start + to.len - s.recipient_head.load(.acquire) > capacity) return false;
+        }
         const units = std.math.divCeil(usize, storedBytes(r.bytes.len), s.unit_bytes) catch unreachable;
         s.freeRange(@as(usize, r.page) + units, p.units - units);
         // Pack following reservations into the tail released by framing.
@@ -660,10 +679,12 @@ pub const SharedPages = struct {
             }
             std.debug.assert(recipient_count > 0 and recipient_count <= slot.length);
         } else {
-            const base = @as(usize, r.page) * s.recipients_per_page;
-            const recipients = s.recipients[base..][0..to.len];
-            if (recipients.ptr != to.ptr) @memcpy(recipients, to);
+            const capacity = s.recipient_ring.len;
+            @memcpy(s.recipient_ring[recipient_start % capacity ..][0..to.len], to);
+            s.recipient_tail = recipient_start + to.len;
+            p.recipient_start = recipient_start % capacity;
         }
+        p.recipient_end = s.recipient_tail;
         std.debug.assert(group.count > 0 and group.index < group.count);
         std.debug.assert(group.count == 1 or (group.protocol != null and group.bytes > 0));
         p.group = group;
@@ -702,8 +723,7 @@ pub const SharedPages = struct {
         const generation = p.status.load(.acquire) >> 8;
         const previous = p.status.cmpxchgStrong(status(.published, generation), status(.taken, generation), .acq_rel, .acquire);
         std.debug.assert(previous == null);
-        const base = @as(usize, id) * s.recipients_per_page;
-        var result: RawPacket = .{ .page = id, .units = p.units, .generation = generation, .bytes = s.pagePayload(id)[0..p.len], .decoded_length = p.decoded_length, .recipients = Recipients.all(s.recipients[base..][0..p.recipient_count]), .group = p.group };
+        var result: RawPacket = .{ .page = id, .units = p.units, .generation = generation, .bytes = s.pagePayload(id)[0..p.len], .decoded_length = p.decoded_length, .recipients = Recipients.all(s.recipient_ring[p.recipient_start..][0..p.recipient_count]), .recipient_end = p.recipient_end, .group = p.group };
         if (p.audience) |audience| {
             const slot = &s.pool.audiences[audience.index];
             std.debug.assert(slot.generation == audience.generation);
@@ -717,6 +737,14 @@ pub const SharedPages = struct {
         std.debug.assert(p.len > 0 and p.len <= s.page_bytes);
         std.debug.assert(p.recipient_count > 0 and p.recipient_count <= s.recipients_per_page);
         return result;
+    }
+
+    /// Lets the ring reuse the recipients of a packet the worker took and everything before
+    /// it, as packets are taken in the order they were published. A packet released again,
+    /// as it is when it goes back to the pool, or late, after one taken since, moves nothing.
+    /// Only the thread that takes packets calls this.
+    pub fn releaseRecipients(s: *SharedPages, packet: RawPacket) void {
+        if (packet.recipient_end > s.recipient_head.load(.monotonic)) s.recipient_head.store(packet.recipient_end, .release);
     }
 
     pub fn releaseReady(s: *SharedPages, id: PageId, generation: u64) bool {
@@ -750,6 +778,8 @@ pub const SharedPages = struct {
             }
             s.pages[id].audience = null;
         }
+        // Its recipients were released when it was taken, unless it went back unread.
+        if (s.pages[id].recipient_end > s.recipient_head.load(.monotonic)) s.recipient_head.store(s.pages[id].recipient_end, .release);
         s.endSmall(id);
         s.freeRange(id, s.pages[id].units);
         return true;
@@ -983,7 +1013,7 @@ test "masked packets retain audience loans without materializing recipients" {
         @memcpy(writer.handles, handles);
         const audience = writer.finish();
         const retained = output.pool.audience_handles[audience.index * output.recipients_per_page ..].ptr;
-        @memset(output.pool.recipients, .{ .index = std.math.maxInt(usize), .generation = 0 });
+        @memset(output.recipient_ring, .{ .index = std.math.maxInt(usize), .generation = 0 });
         const words = try allocator.alloc(usize, (players + 63) / 64);
         @memset(words, std.math.maxInt(usize));
         if (players % 64 != 0) words[words.len - 1] = (@as(usize, 1) << @intCast(players % 64)) - 1;
@@ -1009,7 +1039,7 @@ test "masked packets retain audience loans without materializing recipients" {
         }
         try std.testing.expectEqual(players * 2, consumed);
         try std.testing.expect(output.pool.free_audiences.isSet(audience.index));
-        for (output.pool.recipients) |handle| try std.testing.expectEqual(@as(u32, 0), handle.generation);
+        for (output.recipient_ring) |handle| try std.testing.expectEqual(@as(u32, 0), handle.generation);
     }
 }
 

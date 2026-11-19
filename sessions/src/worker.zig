@@ -386,7 +386,10 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             assert(self.backlogged.count == 0);
             for (self.endpoints, 0..) |endpoint, index| {
                 var batch = endpoint.outputBatch();
-                while (batch.next()) |packet| self.recycle(io, index, packet);
+                while (batch.next()) |packet| {
+                    endpoint.output.releaseRecipients(packet);
+                    self.recycle(io, index, packet);
+                }
                 self.flushRecycled(io, index);
                 assert(endpoint.preparing.load(.acquire) == 0);
                 @memset(endpoint.routes, null);
@@ -481,6 +484,8 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
 
         fn take(self: *Self, io: std.Io, source: usize, raw: shared.RawPacket) void {
             const endpoint = self.endpoints[source];
+            // Nothing reads its recipients once it is taken, so their room is reused.
+            defer endpoint.output.releaseRecipients(raw);
             assert(raw.page < endpoint.output.pages.len);
             const packet_index = self.sources[source].packet_base + raw.page;
             const packet = &self.packets[packet_index];

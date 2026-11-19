@@ -99,6 +99,8 @@ pub const Service = struct {
     output: shared.SharedPages,
     events: []Event,
     recipient_marks: []u64,
+    /// The recipients a group of packets is published to, gathered before it is.
+    group_recipients: []network.Handle,
     publication_sequence: u64 = 0,
     batch: []Event,
     input_events: []const Event = &.{},
@@ -171,6 +173,11 @@ pub const Service = struct {
             .pages = config.pages,
             .page_bytes = config.page_bytes,
             .recipients_per_page = config.connections,
+            // Every recipient of every packet not yet taken charges at least the smallest
+            // frame's bound of its connection's credit. A connection gone before what was
+            // published to it is taken leaves its slot to one with all its credit again, so a
+            // slot may have two credits' worth waiting.
+            .recipient_handles = try std.math.mul(usize, 2 * config.connections, config.credit_bytes / frameBound(config.protocols, 1)),
             .pool = config.output_pool,
         });
         errdefer output.deinit();
@@ -179,6 +186,8 @@ pub const Service = struct {
         const recipient_marks = try allocator.alloc(u64, config.connections);
         errdefer allocator.free(recipient_marks);
         @memset(recipient_marks, 0);
+        const group_recipients = try allocator.alloc(network.Handle, config.connections);
+        errdefer allocator.free(group_recipients);
         const batch = try allocator.alloc(Event, try std.math.add(usize, events.len, config.connections));
         errdefer allocator.free(batch);
         const pending_inputs = try allocator.alloc(PendingInput, config.connections);
@@ -232,6 +241,7 @@ pub const Service = struct {
             .output = output,
             .events = events,
             .recipient_marks = recipient_marks,
+            .group_recipients = group_recipients,
             .batch = batch,
             .pending_inputs = pending_inputs,
             .open_inputs = open_inputs,
@@ -276,6 +286,7 @@ pub const Service = struct {
         self.allocator.free(self.disconnects);
         self.allocator.free(self.events);
         self.allocator.free(self.recipient_marks);
+        self.allocator.free(self.group_recipients);
         self.allocator.free(self.batch);
         self.allocator.free(self.pending_inputs);
         self.allocator.free(self.open_inputs);
@@ -287,7 +298,7 @@ pub const Service = struct {
     pub fn memoryBytes(self: *const Service) usize {
         return @sizeOf(Service) - @sizeOf(shared.SharedPages) + self.output.memoryBytes() +
             (self.events.len + self.batch.len) * @sizeOf(Event) + self.pending_inputs.len * @sizeOf(PendingInput) +
-            self.recipient_marks.len * @sizeOf(u64) +
+            (self.recipient_marks.len + self.group_recipients.len) * @sizeOf(u64) +
             self.credit.len * @sizeOf(std.atomic.Value(u64)) + (self.disconnects.len + self.releases.len + self.departed.len) * @sizeOf(std.atomic.Value(u32)) +
             self.routes.len * @sizeOf(?network.Handle) + self.occupied.len * @sizeOf(std.atomic.Value(bool)) + self.moves.len * @sizeOf(Move) + (self.committed_moves.len + self.activity.len) * @sizeOf(std.atomic.Value(usize));
     }
@@ -589,7 +600,7 @@ pub const Service = struct {
             if (stale) continue;
             assert(charge <= self.config.credit_bytes);
             const first = packets[0].packet.reservation.?;
-            const recipients = self.output.recipientBuffer(first);
+            const recipients = self.group_recipients;
             var count: usize = 0;
             for (group.targets, group.delivered) |target, *result| {
                 if (target.protocol != group.protocol) continue;
@@ -617,7 +628,7 @@ pub const Service = struct {
                 }
             }
             assert(at == count);
-            for (packets, pending[published..][0..packets.len], 0..) |entry, *publication, index| {
+            for (packets, pending[0..packets.len], 0..) |entry, *publication, index| {
                 var reservation = entry.packet.reservation.?;
                 reservation.bytes = reservation.bytes[0..entry.length];
                 publication.* = .{ .reservation = reservation, .recipients = recipients[0..count], .group = .{
@@ -631,11 +642,13 @@ pub const Service = struct {
                 entry.packet.reservation = null;
                 entry.packet.bytes = &.{};
             }
+            // Each group goes out as it is admitted, as the next one gathers its recipients in
+            // the same place.
+            _ = self.preparing.fetchAdd(packets.len, .release);
+            self.output.publishMany(pending[0..packets.len]);
             published += packets.len;
         }
         if (published == 0) return;
-        _ = self.preparing.fetchAdd(published, .release);
-        self.output.publishMany(pending[0..published]);
         _ = self.published_since_flush.fetchAdd(published, .release);
     }
 
