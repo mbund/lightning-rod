@@ -20,6 +20,10 @@ pub const Configuration = struct {
     /// them. Each recipient of each packet charges at least the bound of the smallest frame,
     /// so credit bounds them: see `Service`.
     recipient_handles: usize = 0,
+    /// Audiences held at once, by broadcasts and the packets selecting from them until the
+    /// worker takes them. A broadcast that finds none free is backpressured. Without a count,
+    /// one for every unit.
+    audiences: usize = 0,
     pool: ?*Pool = null,
 };
 
@@ -260,14 +264,15 @@ pub const Pool = struct {
         errdefer allocator.free(bytes);
         const pages = try allocator.alloc(SharedPages.Page, units);
         errdefer allocator.free(pages);
-        const audiences = try allocator.alloc(AudienceSlot, units);
+        const audience_count = if (config.audiences != 0) config.audiences else units;
+        const audiences = try allocator.alloc(AudienceSlot, audience_count);
         errdefer allocator.free(audiences);
-        const audience_handles = try allocator.alloc(networking.Handle, try std.math.mul(usize, units, config.recipients_per_page));
+        const audience_handles = try allocator.alloc(networking.Handle, try std.math.mul(usize, audience_count, config.recipients_per_page));
         errdefer allocator.free(audience_handles);
         const words = try std.math.divCeil(usize, config.recipients_per_page, @bitSizeOf(usize));
         const recipient_masks = try allocator.alloc(usize, units * words);
         errdefer allocator.free(recipient_masks);
-        var free_audiences = try std.DynamicBitSetUnmanaged.initFull(allocator, units);
+        var free_audiences = try std.DynamicBitSetUnmanaged.initFull(allocator, audience_count);
         errdefer free_audiences.deinit(allocator);
         var free_units = try std.DynamicBitSetUnmanaged.initFull(allocator, units);
         errdefer free_units.deinit(allocator);

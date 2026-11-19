@@ -90,7 +90,10 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
                 maximum_recipients = @max(maximum_recipients, endpoint.connections);
             }
             const output_pages = config.output_pages orelse @max(32, config.max_players);
-            self.output_pool = try sessions.OutputPool.init(owned, .{ .pages = output_pages, .page_bytes = maximum_packet, .unit_bytes = config.output_unit_bytes, .recipients_per_page = maximum_recipients });
+            // Broadcasts hold an audience each until the worker takes their packets: at 512
+            // players, wander held 281 at once at most.
+            const audiences = @max(64, 2 * config.max_players);
+            self.output_pool = try sessions.OutputPool.init(owned, .{ .pages = output_pages, .page_bytes = maximum_packet, .unit_bytes = config.output_unit_bytes, .recipients_per_page = maximum_recipients, .audiences = audiences });
             errdefer self.output_pool.deinit();
             var inherited: ?i32 = null;
             errdefer if (inherited) |descriptor| {
