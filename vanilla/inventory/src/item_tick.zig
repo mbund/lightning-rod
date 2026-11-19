@@ -9,6 +9,8 @@ const ItemPickup = @import("item_pickup.zig").ItemPickup;
 const Players = @import("players").players.Players;
 const Items = @import("vanilla_items").items.Items;
 const Dimensions = @import("vanilla_content").dimensions.Dimensions;
+const ClientRegistries = @import("vanilla_content").client_registries.ClientRegistries;
+const hazards_module = @import("item_hazards.zig");
 const work = @import("lightning_rod").system.work;
 
 const assert = std.debug.assert;
@@ -29,6 +31,7 @@ pub const ItemTick = struct {
         items: *Items,
         worlds: *worlds.Worlds,
         dimensions: *Dimensions,
+        client: *ClientRegistries,
     };
 
     deps: Dependencies,
@@ -41,12 +44,26 @@ pub const ItemTick = struct {
     last_world: ?u32 = null,
     last_ultrawarm: bool = false,
     query: ItemEntities.Query,
+    hazards: hazards_module.Hazards,
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*ItemTick {
         try config.merge_work.validate(deps.dropped.residents.len, .{ .operations = 1 });
         if ((try config.merge_work.maximum(1)).bytes != 0) return error.InvalidWorkLimits;
         const self = try allocator.create(ItemTick);
-        self.* = .{ .deps = deps, .merge_work = config.merge_work, .query = try ItemEntities.Query.init(allocator, deps.dropped, deps.players) };
+        self.* = .{
+            .deps = deps,
+            .merge_work = config.merge_work,
+            .query = try ItemEntities.Query.init(allocator, deps.dropped, deps.players),
+            .hazards = try .init(allocator, .{
+                .chunks = deps.physics.deps.chunks,
+                .blocks = deps.physics.deps.blocks,
+                .items = deps.items,
+                .client = deps.client,
+                .players = deps.players,
+                .worlds = deps.worlds,
+                .inventories = deps.inventories,
+            }),
+        };
         return self;
     }
 
@@ -73,6 +90,9 @@ pub const ItemTick = struct {
         // Start after the last merge candidate so dense, unmergeable piles cannot starve others.
         var neighborhood = self.deps.physics.readWindow();
         defer neighborhood.deinit();
+        self.hazards.window = &neighborhood;
+        defer self.hazards.window = null;
+        defer self.hazards.endTick();
         var iterator = dropped.iterate(active);
         defer iterator.deinit();
         iterator.start = start_low;
@@ -84,14 +104,50 @@ pub const ItemTick = struct {
             var body = (try record.body.read()) orelse return error.Corrupt;
             metadata.ticks +%= 1;
 
-            if (metadata.pickup_delay > 0 and metadata.pickup_delay != 32767) metadata.pickup_delay -= 1;
-            const advanced = try self.deps.physics.advance(&neighborhood, @intCast(entity), metadata.ticks, body, metadata.on_ground, try self.ultrawarm(body.world));
+            // Entity.baseTick: pushed by currents, then burning down.
+            var pushed = body;
+            const fluids = try self.deps.physics.push(&neighborhood, &pushed, try self.ultrawarm(body.world));
+            var subject: hazards_module.Subject = .{
+                .world = body.world,
+                .position = body.position,
+                .old_position = body.position,
+                .velocity = pushed.velocity,
+                .on_ground = metadata.on_ground,
+                .fire_ticks = metadata.fire_ticks,
+                .ticks_frozen = metadata.ticks_frozen,
+                .health = metadata.health,
+                .slot = ItemEntities.slot(body),
+            };
+            const was_burning = metadata.fire_ticks > 0;
+            // Entity.isInLava, which is false on an entity's first tick.
+            try self.hazards.burn(&subject, metadata.ticks > 1 and fluids.lava > 0);
+            var advanced: ItemPhysics.Result = .{ .body = pushed, .on_ground = metadata.on_ground, .crossed_block = false };
+            if (!subject.removed) {
+                if (metadata.pickup_delay > 0 and metadata.pickup_delay != 32767) metadata.pickup_delay -= 1;
+                advanced = try self.deps.physics.advance(&neighborhood, @intCast(entity), metadata.ticks, pushed, metadata.on_ground, fluids, metadata.stuck.multiplier(), hazards_module.Hook{ .hazards = &self.hazards, .subject = &subject });
+                if (advanced.moved) metadata.stuck = ItemEntities.Stuck.of(subject.stuck);
+            }
             metadata.on_ground = advanced.on_ground;
+            metadata.fire_ticks = subject.fire_ticks;
+            metadata.ticks_frozen = @intCast(subject.ticks_frozen);
+            metadata.health = subject.health;
+            // Burning shows on the item, and a hurt item sends its velocity again.
+            if (subject.hurt or was_burning != (metadata.fire_ticks > 0)) metadata.revision += 1;
 
             if (!std.meta.eql(body, advanced.body)) {
                 try dropped.move(record, body, advanced.body);
                 metadata.revision += 1;
                 body = advanced.body;
+            }
+
+            if (subject.removed) {
+                // ItemEntity.hurtServer: an item with no health left is destroyed.
+                const held = try self.deps.inventories.get(ItemEntities.slot(body));
+                const removed = try self.deps.inventories.set(ItemEntities.slot(body), held.revision, null);
+                assert(removed);
+                try dropped.retire(entity, body, &metadata);
+                record.write(metadata);
+                continue;
             }
 
             self.stepped += 1;

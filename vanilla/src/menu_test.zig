@@ -1774,7 +1774,7 @@ test "items drift with water currents and float in water and lava, as vanilla's 
     const lift: f64 = @as(f32, 5.0e-4);
 
     // Pushed east at the current's strength, then afloat: slowed across and lifted.
-    const drifting = try physics.advance(&window, 1, 1, resting, false, false);
+    const drifting = try physics.step(&window, 1, 1, resting, false, false);
     try std.testing.expectEqual(0.014 * @as(f64, @as(f32, 0.99)) * drag, drifting.body.velocity[0]);
     try std.testing.expectEqual(lift * 0.98, drifting.body.velocity[1]);
     try std.testing.expectEqual(@as(f64, 0), drifting.body.velocity[2]);
@@ -1783,12 +1783,12 @@ test "items drift with water currents and float in water and lava, as vanilla's 
     // Still lava pushes nothing but floats an item as water does.
     var in_lava = resting;
     in_lava.position = .{ 10.5, 8, 4.5 };
-    const floating = try physics.advance(&window, 1, 1, in_lava, false, false);
+    const floating = try physics.step(&window, 1, 1, in_lava, false, false);
     try std.testing.expectEqual(@as([3]f64, .{ 0, lift * 0.98, 0 }), floating.body.velocity);
 
     // Out of any fluid it falls.
     var dry = resting;
     dry.position = .{ 20.5, 8, 4.5 };
-    const falling = try physics.advance(&window, 1, 1, dry, false, false);
+    const falling = try physics.step(&window, 1, 1, dry, false, false);
     try std.testing.expectEqual(@as([3]f64, .{ 0, -0.04 * 0.98, 0 }), falling.body.velocity);
 }

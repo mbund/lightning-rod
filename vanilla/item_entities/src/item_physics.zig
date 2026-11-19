@@ -19,6 +19,8 @@ pub const ItemPhysics = struct {
         body: entities.State,
         on_ground: bool,
         crossed_block: bool,
+        /// Whether it moved this tick, which takes what held it back.
+        moved: bool = false,
         effects: OrbEffects = .{},
     };
 
@@ -36,24 +38,40 @@ pub const ItemPhysics = struct {
         return Window.init(self.chunk_client);
     }
 
-    /// ItemEntity.tick's movement: pushed by the currents it is in, as Entity.baseTick does
-    /// first, then afloat in water or lava over a tenth deep and falling otherwise.
-    pub fn advance(self: *ItemPhysics, neighborhood: *Window, entity_id: u32, ticks: u32, body: entities.State, on_ground: bool, ultrawarm: bool) !Result {
+    /// The start of an item's Entity.baseTick: pushed by the currents it is in. How deep it is
+    /// in each fluid decides what it does next.
+    pub fn push(self: *ItemPhysics, neighborhood: *Window, body: *entities.State, ultrawarm: bool) !Fluids {
+        try readAround(neighborhood, body.*);
+        return self.pushFluids(neighborhood, body, 0.25, 0.25, ultrawarm);
+    }
+
+    /// The rest of ItemEntity.tick's movement, after `push`: afloat in water or lava over a
+    /// tenth deep and falling otherwise, then moved, held back by what `stuck` holds it in, and
+    /// slowed. Moving, it goes through `effects.apply(body, on_ground, from)`, which does what
+    /// the blocks it crossed do to it, as Entity.applyEffectsFromBlocks, unless `effects` is
+    /// void. A stuck item stays stuck until it moves.
+    pub fn advance(self: *ItemPhysics, neighborhood: *Window, entity_id: u32, ticks: u32, pushed: entities.State, on_ground: bool, fluids: Fluids, stuck: [3]f64, effects: anytype) !Result {
         assert(entity_id > 0);
-        try readAround(neighborhood, body);
-        var pushed = body;
-        const fluids = try self.pushFluids(neighborhood, &pushed, 0.25, 0.25, ultrawarm);
+        var body = pushed;
         // ItemEntity.setUnderwaterMovement and setUnderLavaMovement in place of gravity.
         if (fluids.water > @as(f32, 0.1)) {
-            buoy(&pushed.velocity, @as(f32, 0.99));
+            buoy(&body.velocity, @as(f32, 0.99));
         } else if (fluids.lava > @as(f32, 0.1)) {
-            buoy(&pushed.velocity, @as(f32, 0.95));
-        } else pushed.velocity[1] -= 0.04;
-        return self.advanceBody(false, neighborhood, entity_id, ticks, pushed, on_ground, .{ 0, 0, 0 });
+            buoy(&body.velocity, @as(f32, 0.95));
+        } else body.velocity[1] -= 0.04;
+        return self.advanceBody(false, neighborhood, entity_id, ticks, body, on_ground, stuck, effects);
+    }
+
+    /// An item's movement alone, `push` then `advance`, with nothing holding it back and no
+    /// block effects.
+    pub fn step(self: *ItemPhysics, neighborhood: *Window, entity_id: u32, ticks: u32, body: entities.State, on_ground: bool, ultrawarm: bool) !Result {
+        var pushed = body;
+        const fluids = try self.push(neighborhood, &pushed, ultrawarm);
+        return self.advance(neighborhood, entity_id, ticks, pushed, on_ground, fluids, .{ 0, 0, 0 }, {});
     }
 
     pub fn advanceOrb(self: *ItemPhysics, neighborhood: *Window, entity_id: u32, ticks: u32, body: entities.State, on_ground: bool, stuck: [3]f64) !Result {
-        return self.advanceBody(true, neighborhood, entity_id, ticks, body, on_ground, stuck);
+        return self.advanceBody(true, neighborhood, entity_id, ticks, body, on_ground, stuck, {});
     }
 
     pub const OrbEnvironment = struct { solid: bool, water: bool, lava: bool };
@@ -196,9 +214,9 @@ pub const ItemPhysics = struct {
             if (length(total) > 0) {
                 if (count > 0) total = scaled(total, 1.0 / @as(f64, @floatFromInt(count)));
                 const strength: f64 = if (kind == .water) 0.014 else if (ultrawarm) 0.007 else 0.0023333333333333335;
-                var push = scaled(normalized(total), strength);
-                if (@abs(body.velocity[0]) < 0.003 and @abs(body.velocity[2]) < 0.003 and length(push) < 0.0045000000000000005) push = scaled(normalized(push), 0.0045000000000000005);
-                for (&body.velocity, push) |*velocity, component| velocity.* += component;
+                var current = scaled(normalized(total), strength);
+                if (@abs(body.velocity[0]) < 0.003 and @abs(body.velocity[2]) < 0.003 and length(current) < 0.0045000000000000005) current = scaled(normalized(current), 0.0045000000000000005);
+                for (&body.velocity, current) |*velocity, component| velocity.* += component;
             }
         }
         return fluids;
@@ -365,22 +383,25 @@ pub const ItemPhysics = struct {
         body.position = .{ destination[0], destination[1] - 0.25, destination[2] };
     }
 
-    fn advanceBody(self: *ItemPhysics, comptime orb: bool, neighborhood: *Window, entity_id: u32, ticks: u32, body: entities.State, on_ground: bool, stuck: [3]f64) !Result {
+    fn advanceBody(self: *ItemPhysics, comptime orb: bool, neighborhood: *Window, entity_id: u32, ticks: u32, body: entities.State, on_ground: bool, stuck: [3]f64, effects: anytype) !Result {
         assert(entity_id > 0 and neighborhood.client.index == self.chunk_client.index);
         var next = body;
 
         for (body.position ++ body.velocity) |value| assert(std.math.isFinite(value));
         const vertical_velocity = next.velocity[1];
         var motion = next.velocity;
-        if (orb and stuck[0] * stuck[0] + stuck[1] * stuck[1] + stuck[2] * stuck[2] > 1e-7) {
-            for (&motion, stuck) |*component, multiplier| component.* *= multiplier;
-            next.velocity = .{ 0, 0, 0 };
-        }
-        var effects: OrbEffects = .{};
+        var orb_effects: OrbEffects = .{};
         var grounded = on_ground;
+        var moved = false;
         if (orb or !on_ground or next.velocity[0] * next.velocity[0] + next.velocity[2] * next.velocity[2] > @as(f64, @as(f32, 0.00001)) or
             (ticks +% entity_id) % 4 == 0)
         {
+            moved = true;
+            // Entity.move: what holds the body back takes its motion and is spent.
+            if (stuck[0] * stuck[0] + stuck[1] * stuck[1] + stuck[2] * stuck[2] > 1e-7) {
+                for (&motion, stuck) |*component, multiplier| component.* *= multiplier;
+                next.velocity = .{ 0, 0, 0 };
+            }
             const order: [3]usize = if (@abs(motion[0]) < @abs(motion[2])) .{ 1, 2, 0 } else .{ 1, 0, 2 };
 
             for (order) |axis| {
@@ -474,7 +495,8 @@ pub const ItemPhysics = struct {
 
             var below: ?u16 = null;
             const below_position: chunks.Position = .{ .x = @intFromFloat(@floor(next.position[0])), .y = @intFromFloat(@floor(next.position[1] - @as(f64, @as(f32, 0.999999)))), .z = @intFromFloat(@floor(next.position[2])) };
-            if (orb) {
+            // Entity.getBlockSpeedFactor, which slows every body on soul sand and honey.
+            {
                 const base = self.deps.blocks.get(try self.blockState(neighborhood, body.world, .{ .x = @intFromFloat(@floor(next.position[0])), .y = @intFromFloat(@floor(next.position[1])), .z = @intFromFloat(@floor(next.position[2])) }));
                 var speed = base.speed;
                 if (speed == 1 and !base.water_block) {
@@ -483,8 +505,12 @@ pub const ItemPhysics = struct {
                 }
                 next.velocity[0] *= speed;
                 next.velocity[2] *= speed;
-                effects = try self.orbEffects(neighborhood, next);
-                if (effects.honey and !grounded) {
+            }
+            if (@TypeOf(effects) != void) try effects.apply(&next, grounded, body.position);
+            if (orb) {
+                orb_effects = try self.orbEffects(neighborhood, next);
+                const effects_found = orb_effects;
+                if (effects_found.honey and !grounded) {
                     // Vanilla applies its living-entity gravity transform to every honey slider.
                     const previous = next.velocity[1] / @as(f64, @as(f32, 0.98)) + 0.08;
                     if (previous < -0.08) {
@@ -495,7 +521,7 @@ pub const ItemPhysics = struct {
                         next.velocity[1] = (-0.05 - 0.08) * @as(f64, @as(f32, 0.98));
                     }
                 }
-                if (effects.bubble) |bubble| {
+                if (effects_found.bubble) |bubble| {
                     next.velocity[1] = if (bubble.drag) @max(if (bubble.surface) @as(f64, -0.9) else -0.3, next.velocity[1] - 0.03) else @min(if (bubble.surface) @as(f64, 1.8) else 0.7, next.velocity[1] + (if (bubble.surface) @as(f64, 0.1) else 0.06));
                 }
             }
@@ -518,7 +544,7 @@ pub const ItemPhysics = struct {
         var crossed = false;
 
         for (body.position, next.position) |before, after| crossed = crossed or @floor(before) != @floor(after);
-        return .{ .body = next, .on_ground = grounded, .crossed_block = crossed, .effects = effects };
+        return .{ .body = next, .on_ground = grounded, .crossed_block = crossed, .moved = moved, .effects = orb_effects };
     }
 };
 
