@@ -427,7 +427,7 @@ fn fluidHeightAndPush(mobs: *Mobs, mob: *Mob, fluid: game_data.physics_data.Flui
             while (z < last[2]) : (z += 1) {
                 const physics = try level.fluid(x, y, z);
                 if (physics.fluid != fluid) continue;
-                const top = @as(f64, @floatFromInt(y)) + try fluidHeight(&level, x, y, z, physics);
+                const top = try fluidTop(&level, x, y, z, physics);
                 if (top < current.min[1]) continue;
                 touching = true;
                 deepest = @max(top - current.min[1], deepest);
@@ -458,14 +458,17 @@ fn fluidHeightAndPush(mobs: *Mobs, mob: *Mob, fluid: game_data.physics_data.Flui
 
 pub fn normalize(vector: [3]f64) [3]f64 {
     const length = @sqrt(lengthSquared(vector));
-    if (length < 1.0e-5) return .{ 0, 0, 0 };
+    // A float's 1e-5, as Vec3.normalize compares.
+    if (length < @as(f32, 1.0e-5)) return .{ 0, 0, 0 };
     return .{ vector[0] / length, vector[1] / length, vector[2] / length };
 }
 
-/// FluidState.getHeight: a full block under the same fluid, its own height otherwise.
-fn fluidHeight(level: *const body.Level, x: i32, y: i32, z: i32, physics: game_data.physics_data.State) !f64 {
+/// The top of a fluid block: its y and FluidState.getHeight, a full block under the same fluid
+/// and its own height otherwise, added as floats as vanilla does.
+fn fluidTop(level: *const body.Level, x: i32, y: i32, z: i32, physics: game_data.physics_data.State) !f64 {
     const above = try level.fluid(x, y + 1, z);
-    return if (above.fluid == physics.fluid) 1.0 else physics.height();
+    const own: f32 = if (above.fluid == physics.fluid) 1.0 else physics.height();
+    return @as(f32, @floatFromInt(y)) + own;
 }
 
 /// FlowingFluid.getFlow.
@@ -548,7 +551,7 @@ pub fn updateEyes(mobs: *Mobs, mob: *Mob) !void {
         mob.eye_in_water = false;
         return;
     }
-    const top = @as(f64, @floatFromInt(at[1])) + try fluidHeight(&level, at[0], at[1], at[2], physics);
+    const top = try fluidTop(&level, at[0], at[1], at[2], physics);
     mob.eye_in_water = top > eye and physics.fluid == .water;
 }
 
