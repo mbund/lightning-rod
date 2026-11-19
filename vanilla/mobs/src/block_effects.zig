@@ -22,7 +22,7 @@ pub fn applyEffectsFromBlocks(mobs: *Mobs, mob: *Mob) !bool {
 
 /// Entity.isOnFire on the server.
 pub fn onFire(mobs: *Mobs, mob: *const Mob) bool {
-    return generic.onFire(Host{ .mobs = mobs }, mob);
+    return generic.onFire(Host{ .mobs = mobs }, mob) catch unreachable;
 }
 
 const Host = struct {
@@ -44,7 +44,7 @@ const Host = struct {
     pub fn alive(_: Host, mob: *const Mob) bool {
         return mob.alive();
     }
-    pub fn fireImmune(self: Host, mob: *const Mob) bool {
+    pub fn fireImmune(self: Host, mob: *const Mob) error{}!bool {
         return self.mobs.traits(mob.species).fire_immune;
     }
     pub fn onPosition(self: Host, mob: *const Mob, depth: f32) ![3]i32 {

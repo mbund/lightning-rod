@@ -9,7 +9,7 @@
 //!   living: bool, a declaration: whether subjects are living entities, which some blocks
 //!     act on alone
 //!   level(world) body.Level, scratch() *Scratch
-//!   width(subject) f32, height(subject) f32, alive(subject) bool, fireImmune(subject) bool
+//!   width(subject) f32, height(subject) f32, alive(subject) bool, fireImmune(subject) !bool
 //!   onPosition(subject, depth: f32) ![3]i32, Entity.getOnPos
 //!   hurt(subject, Damage, amount: f32) !bool
 //!   playSound(subject, Sound, volume: f32, pitch: f32) void, random(subject) *JavaRandom
@@ -152,7 +152,7 @@ pub fn apply(host: anytype, subject: anytype, recorded: []const Movement) !bool 
     if (subject.removed) return true;
     var acted = false;
     if (subject.on_ground) acted = try stepOn(host, subject);
-    const burning = onFire(host, subject);
+    const burning = try onFire(host, subject);
     const freezing = subject.ticks_frozen > 0;
     const fire_before = subject.fire_ticks;
     const collector = &host.scratch().collector;
@@ -167,20 +167,20 @@ pub fn apply(host: anytype, subject: anytype, recorded: []const Movement) !bool 
         if (!host.alive(subject)) break;
         try run(host, subject, action);
     }
-    if ((burning and !onFire(host, subject)) or (freezing and subject.ticks_frozen <= 0)) {
+    if ((burning and !try onFire(host, subject)) or (freezing and subject.ticks_frozen <= 0)) {
         // Entity.playEntityOnFireExtinguishedSound.
         const random = host.random(subject);
         const pitch = 1.6 + (random.nextFloat() - random.nextFloat()) * 0.4;
         host.playSound(subject, .generic_extinguish_fire, 0.7, pitch);
     }
     const ignited = subject.fire_ticks > fire_before;
-    if (!onFire(host, subject) and !ignited) subject.fire_ticks = 0;
+    if (!try onFire(host, subject) and !ignited) subject.fire_ticks = 0;
     return acted or collector.acted;
 }
 
 /// Entity.isOnFire on the server.
-pub fn onFire(host: anytype, subject: anytype) bool {
-    return !host.fireImmune(subject) and subject.fire_ticks > 0;
+pub fn onFire(host: anytype, subject: anytype) !bool {
+    return subject.fire_ticks > 0 and !try host.fireImmune(subject);
 }
 
 /// Block.stepOn for the block under the subject, and whether that block does anything.
@@ -594,7 +594,6 @@ fn honeySlide(host: anytype, subject: anytype, position: [3]i32) !void {
 }
 
 fn run(host: anytype, subject: anytype, action: Action) !void {
-    const fire_immune = host.fireImmune(subject);
     switch (action) {
         .effect => |effect| switch (effect) {
             .freeze => {
@@ -602,21 +601,21 @@ fn run(host: anytype, subject: anytype, action: Action) !void {
                 subject.ticks_frozen = @min(140, subject.ticks_frozen + 1);
             },
             // BaseFireBlock.fireIgnite.
-            .fire_ignite => if (!fire_immune) {
+            .fire_ignite => if (!try host.fireImmune(subject)) {
                 if (subject.fire_ticks < 0) subject.fire_ticks += 1;
                 if (subject.fire_ticks >= 0) ignite(subject, 160);
             },
             // Entity.lavaIgnite.
-            .lava_ignite => if (!fire_immune) ignite(subject, 300),
+            .lava_ignite => if (!try host.fireImmune(subject)) ignite(subject, 300),
             .extinguish => subject.fire_ticks = 0,
         },
         .fire_hurt => |amount| _ = try host.hurt(subject, .in_fire, amount),
         // Entity.lavaHurt, with its sound when it hurts.
-        .lava_hurt => if (!fire_immune) {
+        .lava_hurt => if (!try host.fireImmune(subject)) {
             if (try host.hurt(subject, .lava, 4.0)) host.playSound(subject, .generic_burn, 0.4, 2.0 + host.random(subject).nextFloat() * 0.4);
         },
-        .melt_powder_snow => |position| if (onFire(host, subject) and host.mobGriefing()) try host.destroyBlock(subject.world, position),
-        .lower_cauldron => |position| if (onFire(host, subject)) try host.lowerCauldron(subject.world, position),
+        .melt_powder_snow => |position| if (try onFire(host, subject) and host.mobGriefing()) try host.destroyBlock(subject.world, position),
+        .lower_cauldron => |position| if (try onFire(host, subject)) try host.lowerCauldron(subject.world, position),
     }
 }
 
