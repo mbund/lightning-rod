@@ -46,7 +46,6 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
             output_bytes: usize = 64 * 1024,
             configuration_slots: usize = 8,
             decode_slots: usize = 2,
-            codec_workers: usize = 1,
             max_pending_wire_bytes: usize = 1024 * 1024,
             endpoints: []const EndpointConfiguration,
             /// Bytes of the output pool every endpoint shares. Without them, every connection's
@@ -154,7 +153,6 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
                 .output_bytes = config.output_bytes,
                 .configuration_slots = config.configuration_slots,
                 .decode_slots = config.decode_slots,
-                .codec_workers = config.codec_workers,
                 .max_pending_wire_bytes = config.max_pending_wire_bytes,
                 .protocols = config.protocols,
                 .hooks = self.hooks,
@@ -168,7 +166,7 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
                 try self.worker.engine.readResume(io, incoming.reader, incoming.file_reader);
                 try self.worker.restorePlayers(io);
             }
-            const allocated = try options.metrics.gauge(.{ .namespace = id, .name = "owned_buffers", .description = "Preallocated endpoint, engine, codec, and protocol plugin buffers", .unit = .bytes });
+            const allocated = try options.metrics.gauge(.{ .namespace = id, .name = "owned_buffers", .description = "Preallocated endpoint, engine, and protocol plugin buffers", .unit = .bytes });
             var buffer_bytes = self.hooks.memoryBytes() + self.output_pool.memoryBytes();
             for (endpoints) |endpoint| buffer_bytes += endpoint.memoryBytes();
             const worker = self.worker;
@@ -176,7 +174,6 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
             const engine = worker.engine;
             buffer_bytes += engine.input.len + engine.output.len + engine.decoded_storage.len + engine.decoded.memoryBytes() + engine.input_bursts.memoryBytes() + engine.configurations.memoryBytes() + engine.control_raw.memoryBytes() + engine.scratch.len + engine.control_storage.len;
             buffer_bytes += engine.packet_bursts.memoryBytes() + engine.control_bursts.memoryBytes();
-            buffer_bytes += engine.control_jobs.len * @sizeOf(@TypeOf(engine.control_jobs[0]));
             allocated.set(buffer_bytes);
             self.owned_buffers = allocated;
             self.owned_bytes = buffer_bytes;

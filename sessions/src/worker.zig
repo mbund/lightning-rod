@@ -56,7 +56,6 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             output_bytes: usize = 64 * 1024,
             configuration_slots: usize = 8,
             decode_slots: usize = 2,
-            codec_workers: usize = 1,
             max_pending_wire_bytes: usize = 4 * 1024 * 1024,
             protocols: *const Endpoint.Protocols,
             compression_threshold: ?usize = 256,
@@ -67,7 +66,6 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
         };
 
         const Engine = engine.Engine(Endpoint, Self);
-        const Codec = Engine.Codec;
 
         /// A packet a source published, from when this takes it until every recipient's ring
         /// holds its bytes. Most go out in the pass that takes them. A recipient whose ring cannot
@@ -140,13 +138,6 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
         started: bool = false,
         reload_removed: [Endpoint.versions.len]bool = @splat(false),
         instruments: Instrumentation,
-
-        pub fn initCodec(self: *Self, io: std.Io, registry: ?*metrics.Registry) !void {
-            assert(self.engine.codec == null);
-            const codec = try Codec.init(self.allocator, io, self.engine.networking, .{ .tasks = self.config.connections, .workers = self.config.codec_workers, .metrics = registry });
-            errdefer codec.deinit();
-            try self.engine.attachCodec(codec);
-        }
 
         pub fn init(allocator: std.mem.Allocator, transport: network.Transport, config: Configuration, endpoints: []const *Service) !*Self {
             if (endpoints.len == 0 or config.connections == 0 or config.max_players == 0 or config.max_players > config.connections)
@@ -308,8 +299,6 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
 
         pub fn deinit(self: *Self) void {
             assert(self.drained());
-            if (self.engine.codec) |codec| codec.deinit();
-
             for (self.bindings) |binding| assert(binding == null);
             self.engine.deinit();
 
@@ -364,13 +353,10 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
 
         /// Producers, packet work, and kernel operations must be stopped before abandoning loans.
         pub fn abort(self: *Self, io: std.Io) void {
-            if (self.engine.codec) |codec| assert(codec.stopped());
             for (self.endpoints) |endpoint| assert(!endpoint.tick_active);
             self.discardInputs();
             while (self.backlogged.count != 0) self.dropBacklog(io, self.backlogged.indices[0]);
             for (self.engine.connections, 0..) |*connection, index| {
-                if (Codec.take(&connection.codec)) |_| {}
-                assert(connection.codec.state.load(.acquire) == .idle);
                 connection.receiving = false;
                 connection.sending = false;
                 connection.loan.store(false, .release);

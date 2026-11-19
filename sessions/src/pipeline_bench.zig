@@ -1,10 +1,6 @@
 const fixtures = @import("handoff_test.zig");
 const initialization = @import("initialization_test.zig");
 
-test "operation counts for configuration production and codec handoffs" {
-    try fixtures.benchmarkConfiguration();
-}
-
 test "operation counts for protocol fanout and tick publication" {
     try initialization.benchmarkFanout();
 }
