@@ -62,6 +62,8 @@ pub const Streaming = struct {
     };
 
     const batch_max = lighting.Lighting.delivery_batch_max;
+    /// A light update before its light: its packet id and the column's x and z, each a varint.
+    const light_update_header = 15;
 
     const GeometryChange = struct {
         section: chunks.Section,
@@ -2287,11 +2289,11 @@ pub const Streaming = struct {
         const mail = self.light_mail;
         if (mail.empty()) return false;
         if (mail.next == mail.count) return self.markLostLight();
+        // Each packet is reserved once it is planned, at the size its light takes, as reserving
+        // a whole column's for every packet of the batch held the pool's room for nothing.
         var output: [batch_max]sessions.Service.Packet = undefined;
-        const reserved = self.deps.sessions.reserveMany(@min(lighting.Data.capacity, self.deps.sessions.config.page_bytes), &output) catch |err| switch (err) {
-            error.Closed => return false,
-            else => return err,
-        };
+        var reserved: usize = 0;
+        var full = false;
         defer for (output[0..reserved]) |*packet| packet.cancel();
         var publications: [batch_max]sessions.Service.Publication = undefined;
         var admitted: [batch_max]usize = undefined;
@@ -2299,7 +2301,7 @@ pub const Streaming = struct {
         var plans: [batch_max]Plan = undefined;
         var planned: usize = 0;
         var sections: light_store.Sections = undefined;
-        pass: while (mail.next < mail.count and planned < reserved) {
+        pass: while (mail.next < mail.count and planned < output.len and !full) {
             const delta = &mail.deltas[mail.next];
             const at = delta.at;
             // A later patch of a column waits until the packets of the earlier one are
@@ -2335,7 +2337,7 @@ pub const Streaming = struct {
             while (holders.next()) |index| {
                 if (!self.light_fresh[index]) continue;
                 self.light_fresh[index] = false;
-                if (planned == reserved or !self.visibilityReady(index, at)) continue;
+                if (full or planned == output.len or !self.visibilityReady(index, at)) continue;
                 const view = self.views[index];
                 const occluded = self.occludedMask(index, at);
                 var count: usize = 0;
@@ -2362,6 +2364,16 @@ pub const Streaming = struct {
                 var light: lighting.Data = .{ .source = .{ .patched = &sections }, .count = light_count, .masks = masks };
                 light.disclosure = ~occluded;
                 light.selection = selection;
+                output[planned] = self.deps.sessions.reserve(light_update_header + light.encodedSize()) catch |err| switch (err) {
+                    // The group keeps its pending update for a later pass.
+                    error.Backpressured => {
+                        full = true;
+                        continue;
+                    },
+                    error.Closed => return false,
+                    else => return err,
+                };
+                reserved += 1;
                 var update = self.retainLight(at, recipients[0..count], &light);
                 for (&light.retained, &update.selected, delta.sections) |*retained, *selected, layer| {
                     // A section only the other layer changed in keeps the client's copy of this one.
@@ -2463,11 +2475,9 @@ pub const Streaming = struct {
         if (self.epoch & 1 != 0 or self.epoch != self.deps.sessions.backgroundEpoch()) return stored;
         const patched = (try self.sendLightDeltas()) or stored;
         if (self.light_pending.words.count == 0) return (try self.solveWanted()) or patched;
+        // As for deltas, each packet is reserved at the size of the light it was solved for.
         var output: [batch_max]sessions.Service.Packet = undefined;
-        const reserved = self.deps.sessions.reserveMany(@min(lighting.Data.capacity, self.deps.sessions.config.page_bytes), &output) catch |err| switch (err) {
-            error.Closed => return false,
-            else => return err,
-        };
+        var reserved: usize = 0;
         defer for (output[0..reserved]) |*packet| packet.cancel();
         var publications: [batch_max]sessions.Service.Publication = undefined;
         var admitted: [batch_max]usize = undefined;
@@ -2476,7 +2486,7 @@ pub const Streaming = struct {
         var planned: usize = 0;
         var attempts: usize = 0;
         var cursor: usize = 0;
-        while (attempts < reserved) {
+        while (attempts < output.len) {
             if (cursor >= self.light_pending.words.count) break;
             const word = self.light_pending.words.indices[cursor];
             const index = word / self.grid.words;
@@ -2530,6 +2540,9 @@ pub const Streaming = struct {
             const light_count = dimension.sectionCount() + 2;
             const selection = (disclosure << 1 | 1 | (@as(u32, 1) << @intCast(light_count - 1))) & ((@as(u32, 1) << @intCast(light_count)) - 1);
             if (planned != 0 and !self.deps.lighting.background.current(self.deps.chunks, view.world, at.x, at.z, dimension)) break;
+            // Room for the column's light is asked for before it is solved, so no solve is
+            // wasted on a packet that cannot be reserved.
+            if (self.deps.sessions.outputFit(&.{light_update_header + lighting.Data.maximumEncodedSize(dimension.sectionCount())}) == 0) break;
             // The light store lost this column to an edit no patch could follow. One
             // solve of the whole column serves the players and lights the store again.
             const lost = self.light_resolves.find(view.world, at);
@@ -2550,10 +2563,16 @@ pub const Streaming = struct {
             }
             var light = self.deps.lighting.background.data();
             assert(light.count == light_count);
-            const packet = &output[planned];
-            packet.epoch = self.epoch;
             light.disclosure = disclosure;
             light.selection = selection;
+            output[planned] = self.deps.sessions.reserve(light_update_header + light.encodedSize()) catch |err| switch (err) {
+                error.Backpressured => break,
+                error.Closed => return false,
+                else => return err,
+            };
+            reserved += 1;
+            const packet = &output[planned];
+            packet.epoch = self.epoch;
             const update = self.retainLight(at, recipients[0..count], &light);
             const bytes = try self.deps.packets.writePacket(lighting.writeUpdate, view.protocol, packet.bytes, .{ at.x, at.z, light });
             publications[planned] = .{ .packet = packet, .length = bytes.len, .recipients = recipients[0..count] };
