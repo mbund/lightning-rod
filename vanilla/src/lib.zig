@@ -26,6 +26,7 @@ const PlayerChat = @import("chat").player_chat.PlayerChat;
 const Operators = commands.operators.Operators;
 const ReloadCommands = commands.reload_commands.ReloadCommands;
 const CommandDispatch = commands.dispatch.CommandDispatch;
+const ChatCommands = commands.chat_commands.ChatCommands;
 const Lighting = @import("terrain").lighting.Lighting;
 const Streaming = @import("terrain").streaming.Streaming;
 const BlockSynchronization = @import("terrain").block_sync.BlockSynchronization;
@@ -157,6 +158,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Reload, Reload.Configuration{}),
     lightning_rod.plugin.configured(ReloadCommands, ReloadCommands.Configuration{}),
     lightning_rod.plugin.configured(CommandDispatch, CommandDispatch.Configuration{}),
+    lightning_rod.plugin.configured(ChatCommands, ChatCommands.Configuration{}),
     lightning_rod.plugin.configured(Entities, Entities.Configuration{}),
     lightning_rod.plugin.configured(InventoryCapacity, .{}),
     lightning_rod.plugin.configured(Inventories, Inventories.Configuration{ .cache_items = crafting.maximum_inputs + 1 }),

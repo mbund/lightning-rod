@@ -1,5 +1,6 @@
 const std = @import("std");
 pub const wire = @import("wire.zig");
+pub const chat_commands = @import("chat_commands.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const operators = @import("operators.zig");
 pub const reload_commands = @import("reload_commands.zig");
@@ -167,11 +168,18 @@ pub const Kind = enum {
     word,
     players,
     greedy,
+    /// The rest of the input, as `greedy`, which clients sign, as vanilla's message arguments.
+    message,
     boolean,
     integer,
     long,
     float,
     double,
+
+    /// Whether the argument takes the rest of the input.
+    pub fn rest(kind: Kind) bool {
+        return kind == .greedy or kind == .message;
+    }
 };
 
 pub const SuggestVTable = struct {
@@ -293,7 +301,7 @@ pub fn leaf(comptime Owner: type, comptime Args: type, comptime definition: Leaf
 
             optional = @typeInfo(Field) == .optional;
 
-            if (spec.greedy and index + 1 != fields.len)
+            if ((spec.greedy or spec.kind == .message) and index + 1 != fields.len)
                 @compileError("greedy argument must be last");
 
             const AdapterSuggest = struct {
@@ -522,16 +530,18 @@ pub const Commands = struct {
         return true;
     }
 
-    pub fn execute(self: *Commands, context: Context, input: []const u8) !void {
-        self.sealed = true;
-        if (input.len > max_input) {
-            context.reply("Command is too long.");
-            return;
-        }
+    /// Where input leads in the tree: the node it ends at, and each argument's text and node.
+    const Resolved = struct {
+        node: usize,
+        words: [max_arguments][]const u8 = undefined,
+        arguments: [max_arguments]usize = undefined,
+        count: usize = 0,
+    };
 
-        var words: [max_arguments][]const u8 = undefined;
-        var count: usize = 0;
-        var node: usize = 0;
+    /// Follows input through the tree, as the sender is allowed to, or names why it cannot.
+    fn resolve(self: *const Commands, sender: u128, input: []const u8) union(enum) { resolved: Resolved, refused: []const u8 } {
+        if (input.len > max_input) return .{ .refused = "Command is too long." };
+        var resolved: Resolved = .{ .node = 0 };
         var cursor: usize = 0;
 
         while (cursor < input.len) {
@@ -548,10 +558,10 @@ pub const Commands = struct {
 
             var found: ?usize = null;
             var argument: ?usize = null;
-            var child_iterator = self.children(@intCast(node));
+            var child_iterator = self.children(@intCast(resolved.node));
             while (child_iterator.next()) |index| {
                 const child = self.nodes[index];
-                if (!self.allowed(context.sender, index))
+                if (!self.allowed(sender, index))
                     continue;
 
                 if (child.argument != null) {
@@ -561,22 +571,49 @@ pub const Commands = struct {
                 }
             }
 
-            node = found orelse argument orelse {
-                context.reply("Unknown command or insufficient permission. Use /help.");
-                return;
-            };
-            if (self.nodes[node].argument) |spec| {
-                if (count == words.len) {
-                    context.reply("Too many arguments.");
-                    return;
-                }
+            resolved.node = found orelse argument orelse return .{ .refused = "Unknown command or insufficient permission. Use /help." };
+            if (self.nodes[resolved.node].argument) |spec| {
+                if (resolved.count == resolved.words.len) return .{ .refused = "Too many arguments." };
 
-                if (spec.kind == .greedy)
+                if (spec.kind.rest())
                     cursor = input.len;
-                words[count] = input[start..cursor];
-                count += 1;
+                resolved.words[resolved.count] = input[start..cursor];
+                resolved.arguments[resolved.count] = resolved.node;
+                resolved.count += 1;
             }
         }
+        return .{ .resolved = resolved };
+    }
+
+    /// A message argument in a command's input, which a client signs before sending it.
+    pub const Signable = struct { name: []const u8, value: []const u8 };
+
+    /// The message arguments of the command input leads to, in order, as vanilla's
+    /// SignableCommand collects them. None when the input leads nowhere.
+    pub fn signable(self: *const Commands, sender: u128, input: []const u8, output: *[max_arguments]Signable) []const Signable {
+        const resolved = switch (self.resolve(sender, input)) {
+            .resolved => |value| value,
+            .refused => return output[0..0],
+        };
+        var count: usize = 0;
+        for (resolved.words[0..resolved.count], resolved.arguments[0..resolved.count]) |word, node| {
+            if (self.nodes[node].argument.?.kind != .message) continue;
+            output[count] = .{ .name = self.nodes[node].name, .value = word };
+            count += 1;
+        }
+        return output[0..count];
+    }
+
+    pub fn execute(self: *Commands, context: Context, input: []const u8) !void {
+        self.sealed = true;
+        const resolved = switch (self.resolve(context.sender, input)) {
+            .resolved => |value| value,
+            .refused => |reason| {
+                context.reply(reason);
+                return;
+            },
+        };
+        const node = resolved.node;
 
         const vtable = self.nodes[node].vtable orelse {
             context.reply("Missing arguments. Use /help.");
@@ -587,7 +624,7 @@ pub const Commands = struct {
             return;
         }
 
-        vtable.invoke(self.nodes[node].context, context, words[0..count]) catch |err| switch (err) {
+        vtable.invoke(self.nodes[node].context, context, resolved.words[0..resolved.count]) catch |err| switch (err) {
             error.InvalidArgument => context.reply("Invalid argument. Use /help for usage."),
             else => return err,
         };
@@ -682,7 +719,7 @@ pub const Commands = struct {
 
             node = found orelse argument orelse return;
             if (self.nodes[node].argument) |spec| {
-                if (spec.kind == .greedy) {
+                if (spec.kind.rest()) {
                     output.start = start;
                     output.length = input.len - start;
 
@@ -903,6 +940,7 @@ pub const Branch = struct {
 };
 
 test {
+    _ = chat_commands;
     _ = dispatch;
     _ = operators;
     _ = reload_commands;

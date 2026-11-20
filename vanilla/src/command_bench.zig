@@ -52,7 +52,7 @@ pub fn benchmark() !void {
         tree.visibility(1, actual[0..tree.count]);
         var packet: [16 * 1024]u8 = undefined;
         const capacity = packet[0..tree.packet_capacity];
-        _ = try commands.wire.treePacket(.{ ._cursor = .{ .buffer = capacity, .rest = capacity } }, tree, actual[0..tree.count]);
+        _ = try commands.wire.treePacket(.{ ._cursor = .{ .buffer = capacity, .rest = capacity } }, tree, actual[0..tree.count], 20);
         const current = probe.calls;
         probe.calls = 0;
         var expected: [1024]bool = undefined;

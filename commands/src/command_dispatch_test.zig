@@ -5,6 +5,7 @@ const protocols = @import("minecraft_packets").protocols;
 const packets = @import("minecraft_packets");
 const Players = @import("players").players.Players;
 const Chat = @import("chat").chat.Chat;
+const PlayerChat = @import("chat").player_chat.PlayerChat;
 const Input = @import("players").input.Input;
 const dispatch = @import("dispatch.zig");
 const Probe = struct {
@@ -49,7 +50,8 @@ test "command visibility caches policy decisions and retries publication without
     players.rebuildIndexes();
     const chat = try Chat.init(allocator, .{ .players = &players, .sessions = service, .packets = encoding }, .{});
     const input = try Input.init(allocator, .{ .sessions = service });
-    const plugin = try dispatch.CommandDispatch.init(allocator, .{ .commands = tree, .players = &players, .chat = chat, .input = input, .sessions = service, .packets = encoding }, .{});
+    const player_chat = try PlayerChat.init(allocator, std.testing.io, .{}, .{ .players = &players, .input = input, .sessions = service, .packets = encoding, .chat = chat });
+    const plugin = try dispatch.CommandDispatch.init(allocator, .{ .commands = tree, .players = &players, .chat = chat, .player_chat = player_chat, .input = input, .sessions = service, .packets = encoding }, .{});
     const Drain = struct {
         fn run(endpoint: *sessions.Service) !usize {
             var count: usize = 0;

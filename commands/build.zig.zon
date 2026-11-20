@@ -11,6 +11,8 @@
         .players = .{ .path = "../players" },
         .protocol_1_21_5 = .{ .path = "../protocol_versions/v1_21_5" },
         .protocol_1_21_6 = .{ .path = "../protocol_versions/v1_21_6" },
+        .protocol_1_21_11 = .{ .path = "../protocol_versions/v1_21_11" },
+        .protocol_26_1 = .{ .path = "../protocol_versions/v26_1" },
         .reload = .{ .path = "../reload" },
         .sessions = .{ .path = "../sessions" },
         .protocols = .{ .path = "../protocols", .lazy = true },

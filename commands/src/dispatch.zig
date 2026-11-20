@@ -2,11 +2,15 @@ const BatchIndex = @import("lightning_rod").system.BatchIndex;
 const std = @import("std");
 const wire_1_21_6 = @import("wire_1_21_6");
 const wire_1_21_5 = @import("wire_1_21_5");
+const wire_1_21_11 = @import("wire_1_21_11");
+const wire_26_1 = @import("wire_26_1");
 const commands = @import("commands.zig");
 const sessions = @import("sessions");
 const packets = @import("minecraft_packets");
 const Players = @import("players").players.Players;
 const Chat = @import("chat").chat.Chat;
+const player_chat = @import("chat").player_chat;
+const PlayerChat = player_chat.PlayerChat;
 const Input = @import("players").input.Input;
 
 pub const CommandDispatch = struct {
@@ -18,6 +22,7 @@ pub const CommandDispatch = struct {
         commands: *commands.Commands,
         players: *Players,
         chat: *Chat,
+        player_chat: *PlayerChat,
         input: *Input,
         sessions: *sessions.Service,
         packets: *packets.Packets,
@@ -68,6 +73,7 @@ pub const CommandDispatch = struct {
         @memset(visible, false);
         self.* = .{ .groups = try .init(allocator, states.len), .heads = try allocator.alloc(usize, states.len), .tails = try allocator.alloc(usize, states.len), .next = try allocator.alloc(?usize, states.len), .targets = try allocator.alloc(sessions.Service.Target, states.len), .delivered = try allocator.alloc(sessions.Service.Delivery, states.len), .deps = deps, .states = states, .visible = visible, .listeners = try allocator.alloc(Listener, config.command_observers) };
         try deps.input.on(.chat_command, self, onCommand);
+        try deps.input.on(.chat_command_signed, self, .{ onSignedCommand_1_21_5, onSignedCommand_1_21_11, onSignedCommand_26_1 });
         try deps.input.on(.tab_complete, self, onCompletion);
         return self;
     }
@@ -161,6 +167,86 @@ pub const CommandDispatch = struct {
         done.finish() catch return error.InvalidPacket;
         const player = self.deps.players.records[handle.index];
         if (!player.inPlay()) return;
+        // A client with a key signs every command with message arguments; one sent unsigned
+        // carries messages no one can check, which vanilla refuses to run when chat is signed.
+        var arguments: [commands.max_arguments]commands.Commands.Signable = undefined;
+        const signable = self.deps.commands.signable(player.uuid, value, &arguments);
+        if (signable.len != 0 and self.deps.players.securesChat(handle))
+            return self.deps.player_chat.notify(handle, "chat.disabled.invalid_command_signature");
+        try self.run(handle, value, signable, &.{}, 0, 0, &.{});
+    }
+
+    fn onSignedCommand_1_21_5(self: *CommandDispatch, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_chat_command_signed.Reader) !void {
+        return self.onSignedCommand(handle, body);
+    }
+
+    // 1.21.11 reads the checksum as a signed byte, and 26.1 as unsigned again.
+    fn onSignedCommand_1_21_11(self: *CommandDispatch, handle: sessions.Handle, body: wire_1_21_11.play.toServer.packet_chat_command_signed.Reader) !void {
+        return self.onSignedCommand(handle, body);
+    }
+
+    fn onSignedCommand_26_1(self: *CommandDispatch, handle: sessions.Handle, body: wire_26_1.play.toServer.packet_chat_command_signed.Reader) !void {
+        return self.onSignedCommand(handle, body);
+    }
+
+    /// A command whose message arguments the client signed, as vanilla's
+    /// handleSignedChatCommand takes it.
+    fn onSignedCommand(self: *CommandDispatch, handle: sessions.Handle, body: anytype) !void {
+        const value, const a = body.command() catch return error.InvalidPacket;
+        const timestamp, const b = a.timestamp() catch return error.InvalidPacket;
+        const salt, const c = b.salt() catch return error.InvalidPacket;
+        var list = c.argumentSignatures() catch return error.InvalidPacket;
+        var names: [PlayerChat.command_arguments_max][]const u8 = undefined;
+        var signatures: [PlayerChat.command_arguments_max]player_chat.Signature = undefined;
+        var count: usize = 0;
+        while (list.next() catch return error.InvalidPacket) |entry| {
+            if (count == names.len) return error.InvalidPacket;
+            const name, const named = entry.argumentName() catch return error.InvalidPacket;
+            const signature, const signed = named.signature() catch return error.InvalidPacket;
+            if (name.len > 16 or signature.len != player_chat.signature_bytes) return error.InvalidPacket;
+            names[count] = name;
+            signatures[count] = signature[0..player_chat.signature_bytes].*;
+            count += 1;
+            list.advance(signed) catch return error.InvalidPacket;
+        }
+        const d = list.finish() catch return error.InvalidPacket;
+        const offset, const e = d.messageCount() catch return error.InvalidPacket;
+        const acknowledged, const f = e.acknowledged() catch return error.InvalidPacket;
+        const checksum, _ = f.checksum() catch return error.InvalidPacket;
+        if (acknowledged.len != 3) return error.InvalidPacket;
+
+        var seen: [player_chat.last_seen_max]u32 = undefined;
+        const seen_count = try self.deps.player_chat.acknowledge(handle, offset, acknowledged[0..3], @bitCast(checksum), &seen) orelse return;
+        if (!validCommand(value))
+            return self.deps.players.refuse(&self.deps.players.records[handle.index], "multiplayer.disconnect.illegal_characters");
+        const player = self.deps.players.records[handle.index];
+        var arguments: [commands.max_arguments]commands.Commands.Signable = undefined;
+        const signable = self.deps.commands.signable(player.uuid, value, &arguments);
+        var given: [PlayerChat.command_arguments_max]PlayerChat.ArgumentSignature = undefined;
+        for (names[0..count], signatures[0..count], given[0..count]) |name, *signature, *entry| entry.* = .{ .name = name, .signature = signature };
+        try self.run(handle, value, signable, given[0..count], timestamp, salt, seen[0..seen_count]);
+    }
+
+    /// Vanilla's illegal characters in a command: the section sign, control characters and delete.
+    fn validCommand(value: []const u8) bool {
+        if (!std.unicode.utf8ValidateSlice(value)) return false;
+        var view = std.unicode.Utf8View.initUnchecked(value).iterator();
+        while (view.nextCodepoint()) |codepoint| {
+            if (codepoint == 0xa7 or codepoint < 32 or codepoint == 127) return false;
+        }
+        return true;
+    }
+
+    /// Checks a command's messages, then runs it, as vanilla does: a message failing its checks
+    /// keeps the command from running.
+    fn run(self: *CommandDispatch, handle: sessions.Handle, value: []const u8, signable: []const commands.Commands.Signable, signatures: []const PlayerChat.ArgumentSignature, timestamp: i64, salt: i64, seen: []const u32) !void {
+        const player = self.deps.players.records[handle.index];
+        if (!player.inPlay()) return;
+        if (signable.len > PlayerChat.command_arguments_max) return error.InvalidPacket;
+        var arguments: [PlayerChat.command_arguments_max]PlayerChat.CommandArgument = undefined;
+        for (signable, arguments[0..signable.len]) |argument, *entry| entry.* = .{ .name = argument.name, .value = argument.value };
+        if (!self.deps.player_chat.beginCommand(handle, arguments[0..signable.len], signatures, timestamp, salt, seen)) return;
+        defer self.deps.player_chat.endCommand();
         var reply: Reply = .{ .chat = self.deps.chat, .handle = handle };
         try self.deps.commands.execute(.{ .sender = player.uuid, .output = commands.Reply.init(&reply, writeReply) }, value);
         for (self.listeners[0..self.listener_count]) |listener|
@@ -209,16 +295,13 @@ pub const CommandDispatch = struct {
 
     const writeTree = .{ writeTree_1_21_5, writeTree_1_21_6 };
 
+    // 1.21.6 added minecraft:hex_color ahead of minecraft:message, which moved it from 19 to 20.
     fn writeTree_1_21_5(packet: wire_1_21_5.play.toClient.packet_declare_commands.Writer, tree: *const commands.Commands, visible: []const bool) ![]u8 {
-        return writeTreeBody(packet, tree, visible);
+        return commands.wire.treePacket(packet, tree, visible, 19);
     }
 
     fn writeTree_1_21_6(packet: wire_1_21_6.play.toClient.packet_declare_commands.Writer, tree: *const commands.Commands, visible: []const bool) ![]u8 {
-        return writeTreeBody(packet, tree, visible);
-    }
-
-    fn writeTreeBody(packet: anytype, tree: *const commands.Commands, visible: []const bool) ![]u8 {
-        return commands.wire.treePacket(packet, tree, visible);
+        return commands.wire.treePacket(packet, tree, visible, 20);
     }
 
     fn writeCompletions(packet: wire_1_21_5.play.toClient.packet_tab_complete.Writer, request_id: i32, input: []const u8, suggestions: *const commands.Suggestions) ![]u8 {

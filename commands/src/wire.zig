@@ -17,7 +17,9 @@ pub fn nodeCapacity(node: commands.Commands.Node) usize {
     return size;
 }
 
-pub fn treePacket(packet: anytype, tree: *const commands.Commands, visible: []const bool) ![]u8 {
+/// The command tree, with `message_parser` the id of minecraft:message among argument types in the
+/// release the packet is for.
+pub fn treePacket(packet: anytype, tree: *const commands.Commands, visible: []const bool, message_parser: u32) ![]u8 {
     std.debug.assert(tree.count > 0 and tree.count <= 1024 and visible.len == tree.count);
     var mapping: [1024]u16 = undefined;
     var count: u16 = 0;
@@ -57,6 +59,7 @@ pub fn treePacket(packet: anytype, tree: *const commands.Commands, visible: []co
                 .integer => 3,
                 .long => 4,
                 .players => 6,
+                .message => message_parser,
                 else => 5,
             };
             try writer.writeUleb128(parser);
@@ -72,6 +75,7 @@ pub fn treePacket(packet: anytype, tree: *const commands.Commands, visible: []co
                 .float, .double => try writer.writeByte(0),
                 .boolean => {},
                 .players => try writer.writeByte(2),
+                .message => {},
                 else => try writer.writeUleb128(@as(u32, if (spec.kind == .greedy) 2 else 0)),
             }
 

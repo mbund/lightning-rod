@@ -3,6 +3,7 @@ const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
 const BlockSynchronization = @import("terrain").block_sync.BlockSynchronization;
 const PlayerChat = @import("chat").player_chat.PlayerChat;
+const ChatCommands = @import("commands").chat_commands.ChatCommands;
 const Chunks = @import("chunks").Chunks;
 const Inventories = @import("inventories").Inventories;
 const Operators = @import("commands").operators.Operators;
@@ -30,7 +31,14 @@ const operators = blk: {
     break :blk [_]u128{std.mem.readInt(u128, &digest, .big)};
 };
 
-const defaults = lightning_rod.plugin.remove(lightning_rod.plugin.replace(lightning_rod.plugin.remove(lightning_rod.plugin.remove(vanilla.plugins(), PlayerChat), vanilla.JoinLeaveMessages), .{lightning_rod.plugin.configured(Terrain, .{ .kind = .island })}), vanilla.Vanilla);
+/// Commands check their message arguments with player chat, which the island keeps; what players
+/// say goes to its global chat instead, unsigned for now.
+const skyblock_chat = lightning_rod.plugin.configured(PlayerChat, PlayerChat.Configuration{ .chat_input = false });
+const defaults = defaults: {
+    // Removing plugins far down the list takes more comptime branches than the default allows.
+    @setEvalBranchQuota(4000);
+    break :defaults lightning_rod.plugin.remove(lightning_rod.plugin.replace(lightning_rod.plugin.remove(lightning_rod.plugin.remove(vanilla.plugins(), ChatCommands), vanilla.JoinLeaveMessages), .{ lightning_rod.plugin.configured(Terrain, .{ .kind = .island }), skyblock_chat }), vanilla.Vanilla);
+};
 const Selections = lightning_rod.plugin.Compose(@Tuple(&.{ @TypeOf(defaults), lightning_rod.plugin.Selection(IslandCommands), lightning_rod.plugin.Selection(global_chat.GlobalChat) }));
 const Simulation = lightning_rod.Simulation(Selections);
 /// Sections streaming and the lighting solver of one island each read at once.

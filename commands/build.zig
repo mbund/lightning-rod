@@ -9,6 +9,8 @@ pub fn build(b: *std.Build) void {
         module.addImport(name, b.dependency(name, .{ .target = target, .optimize = optimize }).module(name));
     module.addImport("wire_1_21_5", b.dependency("protocol_1_21_5", .{ .target = target, .optimize = optimize }).module("wire"));
     module.addImport("wire_1_21_6", b.dependency("protocol_1_21_6", .{ .target = target, .optimize = optimize }).module("wire"));
+    module.addImport("wire_1_21_11", b.dependency("protocol_1_21_11", .{ .target = target, .optimize = optimize }).module("wire"));
+    module.addImport("wire_26_1", b.dependency("protocol_26_1", .{ .target = target, .optimize = optimize }).module("wire"));
 
     // Standalone development selects every supported release, as a server does by default,
     // so encodings that differ between releases are always compiled and tested. Consumers
