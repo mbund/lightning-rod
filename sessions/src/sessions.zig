@@ -33,6 +33,8 @@ pub const profiles = @import("profiles.zig");
 pub const PlayerProfile = profiles.PlayerProfile;
 pub const Profiles = profiles.Profiles;
 pub const Textures = profiles.Textures;
+/// Tagged fields, the encoding a reload hands state on in.
+pub const fields = @import("reload").fields;
 pub const Wake = @import("wake.zig").Wake;
 pub const Frame = shared.Frame;
 pub const frame = shared.frame;

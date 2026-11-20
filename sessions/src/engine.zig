@@ -8,6 +8,7 @@ const system = @import("system");
 const input_decoding = @import("decoding.zig");
 const Readiness = @import("readiness.zig").Readiness;
 const profiles_api = @import("profiles.zig");
+const fields = @import("reload").fields;
 
 const assert = std.debug.assert;
 
@@ -503,17 +504,25 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             }
         }
 
+        // Released tags of a reload's connections list and of each connection in it; never change
+        // what one holds, add a new one.
+        const connection_tag: fields.Tag = 1;
+        /// First in a connection: the input and output that follow are placed by its slot.
+        const descriptor_tag: fields.Tag = 1;
+        const protocol_tag: fields.Tag = 2;
+        const codec_format_tag: fields.Tag = 3;
+        const codec_state_tag: fields.Tag = 4;
+        const uuid_tag: fields.Tag = 5;
+        const name_tag: fields.Tag = 6;
+        const input_tag: fields.Tag = 7;
+        const output_tag: fields.Tag = 8;
+        const profile_tag: fields.Tag = 9;
+        /// Room for a protocol's saved connection state.
+        const codec_state_max = 512;
+
         pub fn writeResume(self: *Self, writer: *std.Io.Writer) !void {
             assert(self.reloading);
             const native = self.networking.inheritance.?;
-            var count: u32 = 0;
-
-            for (self.connections) |connection| if (connection.handle != null) {
-                count += 1;
-            };
-
-            try writer.writeInt(u32, count, .little);
-
             for (self.connections, 0..) |*connection, index| {
                 const handle = connection.handle orelse continue;
                 assert(connection.parked and !connection.receiving and !connection.sending and !connection.loan.load(.acquire));
@@ -521,119 +530,155 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 const input_len = input.len + connection.saved_input.length;
                 const output_len = self.queuedOutput(connection);
                 const codec = try Endpoint.save(&connection.lifecycle.?, self.scratch);
+                if (codec.len > codec_state_max) return error.InvalidResume;
                 const profile = if (self.config.profiles) |profiles| profiles.get(handle) else profiles_api.PlayerProfile{};
-                try writer.writeInt(i32, native.descriptor(handle), .little);
-                try writer.writeInt(u32, 2, .little);
-                try writer.writeInt(u32, @intCast(57 + codec.len + input_len + output_len + savedProfileBytes(&profile)), .little);
-                try writer.writeInt(i32, connection.protocol.?.number, .little);
-                try writer.writeInt(u64, Endpoint.resumeFormat(&connection.lifecycle.?), .little);
-                try writer.writeInt(u32, @intCast(codec.len), .little);
-                try writer.writeAll(codec);
-                try writer.writeInt(u128, connection.state.uuid, .little);
-                try writer.writeByte(@intCast(connection.state.name_len));
-                try writer.writeAll(&connection.state.name);
-                try writer.writeInt(u32, @intCast(input_len), .little);
-                try writer.writeAll(input);
-                try self.writeSpan(writer, connection.saved_input);
-                try writer.writeInt(u32, @intCast(output_len), .little);
-                if (connection.output_control) {
-                    try writer.writeAll(connection.output);
-                    if (connection.control_read < connection.control_write) {
-                        for (connection.control_packets[connection.control_read + 1 .. connection.control_write]) |packet| try writer.writeAll(packet);
-                    }
+                const profile_len = profile.listBytes();
+                const name = connection.state.name[0..connection.state.name_len];
+
+                var record_len: usize = fields.intBytes(i32) + fields.intBytes(i32) + fields.intBytes(u64) + fields.fieldBytes(codec.len) +
+                    fields.intBytes(u128) + fields.fieldBytes(name.len) + fields.end_bytes;
+                if (input_len != 0) record_len += fields.fieldBytes(input_len);
+                if (output_len != 0) record_len += fields.fieldBytes(output_len);
+                if (profile_len != fields.end_bytes) record_len += fields.fieldBytes(profile_len);
+
+                try fields.writeHeader(writer, connection_tag, record_len);
+                try fields.writeInt(writer, descriptor_tag, i32, native.descriptor(handle));
+                try fields.writeInt(writer, protocol_tag, i32, connection.protocol.?.number);
+                try fields.writeInt(writer, codec_format_tag, u64, Endpoint.resumeFormat(&connection.lifecycle.?));
+                // The codec state is written before the spans below reuse the scratch it is in.
+                try fields.writeBytes(writer, codec_state_tag, codec);
+                try fields.writeInt(writer, uuid_tag, u128, connection.state.uuid);
+                try fields.writeBytes(writer, name_tag, name);
+                if (input_len != 0) {
+                    try fields.writeHeader(writer, input_tag, input_len);
+                    try writer.writeAll(input);
+                    try self.writeSpan(writer, connection.saved_input);
                 }
-                try self.writeSpan(writer, connection.saved_output);
-                // Parking spilled and sealed the ring, so what is left in it is encrypted.
-                assert(connection.output_sealed == connection.output_write);
-                const ring = self.ringBuffer(index);
-                const queued = connection.output_write -% connection.output_read;
-                const at = connection.output_read % ring.len;
-                const first = @min(queued, ring.len - at);
-                try writer.writeAll(ring[at..][0..first]);
-                try writer.writeAll(ring[0 .. queued - first]);
-                try writeProfile(writer, &profile);
+                if (output_len != 0) {
+                    try fields.writeHeader(writer, output_tag, output_len);
+                    if (connection.output_control) {
+                        try writer.writeAll(connection.output);
+                        if (connection.control_read < connection.control_write) {
+                            for (connection.control_packets[connection.control_read + 1 .. connection.control_write]) |packet| try writer.writeAll(packet);
+                        }
+                    }
+                    try self.writeSpan(writer, connection.saved_output);
+                    // Parking spilled and sealed the ring, so what is left in it is encrypted.
+                    assert(connection.output_sealed == connection.output_write);
+                    const ring = self.ringBuffer(index);
+                    const queued = connection.output_write -% connection.output_read;
+                    const at = connection.output_read % ring.len;
+                    const first = @min(queued, ring.len - at);
+                    try writer.writeAll(ring[at..][0..first]);
+                    try writer.writeAll(ring[0 .. queued - first]);
+                }
+                if (profile_len != fields.end_bytes) {
+                    try fields.writeHeader(writer, profile_tag, profile_len);
+                    try profile.writeList(writer);
+                }
+                try fields.writeEnd(writer);
 
                 if (input.len != 0) std.log.info("event=reload_input_saved bytes={d} encrypted={}", .{ input.len, Endpoint.encrypted(&connection.lifecycle.?) });
             }
+            try fields.writeEnd(writer);
         }
 
         pub fn readResume(self: *Self, io: std.Io, reader: *std.Io.Reader, file_reader: ?*std.Io.File.Reader) !void {
             assert(self.admitted == 0);
             const native = self.networking.inheritance orelse return error.InheritanceUnavailable;
             self.file_io = io;
-            const count = try reader.takeInt(u32, .little);
-            if (count > (self.config.max_players orelse self.connections.len)) return error.ResumeCapacity;
+            var list: fields.Reader = .init(reader);
+            var count: usize = 0;
+            while (try list.next()) |field| switch (field.tag) {
+                connection_tag => {
+                    count += 1;
+                    if (count > (self.config.max_players orelse self.connections.len)) return error.ResumeCapacity;
+                    var connection = list.nested(field);
+                    try self.readConnection(io, &connection, file_reader, native);
+                },
+                else => try list.skip(field),
+            };
+        }
 
-            for (0..count) |_| {
-                const fd = try reader.takeInt(i32, .little);
-                if (fd < 3) return error.InvalidResume;
-                const handle = try native.adopt(fd);
-                if (handle.index >= self.connections.len or self.connections[handle.index].handle != null) return error.InvalidResume;
-                const kind = try reader.takeInt(u32, .little);
-                const length = try reader.takeInt(u32, .little);
-                // Kind 1 records come from images that kept no profiles; kind 2 ends with one.
-                if ((kind != 1 and kind != 2) or length < 57 or length - 57 > self.config.buffer_bytes + self.config.max_pending_wire_bytes + self.scratch.len + profile_bytes_max) return error.InvalidResume;
-
-                var connection: Connection = .{ .resumed = true };
-                errdefer {
-                    self.config.observer.closed(handle);
-                    if (connection.lifecycle) |*lifecycle| Endpoint.clear(lifecycle);
-                }
-                const number = try reader.takeInt(i32, .little);
-                const format = try reader.takeInt(u64, .little);
-                const codec_len = try reader.takeInt(u32, .little);
-                if (codec_len > self.scratch.len or codec_len > length - 57) return error.InvalidResume;
-                try reader.readSliceAll(self.scratch[0..codec_len]);
-
-                for (&self.config.protocols.values) |*protocol| if (protocol.number == number) {
-                    connection.protocol = protocol;
-                    break;
-                };
-
-                if (connection.protocol == null) return error.UnsupportedProtocol;
-                connection.lifecycle = try Endpoint.restore(number, format, self.scratch[0..codec_len]);
-                connection.state.phase = .parked;
-                connection.state.uuid = try reader.takeInt(u128, .little);
-
-                if (self.identities.contains(connection.state.uuid)) return error.InvalidResume;
-
-                connection.state.name_len = try reader.takeByte();
-                try reader.readSliceAll(&connection.state.name);
-                if (connection.state.name_len == 0 or connection.state.name_len > 16)
-                    return error.InvalidResume;
-
-                const input_len = try reader.takeInt(u32, .little);
-                if (input_len > self.config.buffer_bytes or input_len > length - 57 - codec_len) return error.InvalidResume;
-
-                connection.control_output = self.connections[handle.index].control_output;
-                connection.handle = handle;
-                connection.admission_deadline = std.Io.Clock.now(.awake, io).nanoseconds + 30 * std.time.ns_per_s;
-                if (input_len <= self.smallBytes()) {
-                    try reader.readSliceAll(self.inputBuffer(handle.index)[0..input_len]);
-                    connection.input_end = input_len;
-                } else connection.saved_input = try self.captureSpan(io, reader, file_reader, self.spoolBase(handle.index) + self.config.max_pending_wire_bytes, input_len);
-                const output_len = try reader.takeInt(u32, .little);
-                const remaining = length - 57 - codec_len - input_len;
-                if (output_len > self.config.max_pending_wire_bytes or (if (kind == 1) output_len != remaining else output_len > remaining)) return error.InvalidResume;
-                if (output_len <= connection.control_output.capacity) {
-                    connection.control_output.items.len = output_len;
-                    try reader.readSliceAll(connection.control_output.items);
-                    connection.output = connection.control_output.items;
-                    connection.output_control = true;
-                } else connection.saved_output = try self.captureSpan(io, reader, file_reader, self.spoolBase(handle.index), output_len);
-                var profile: profiles_api.PlayerProfile = .{};
-                if (kind == 2) {
-                    try readProfile(reader, &profile);
-                    if (savedProfileBytes(&profile) != remaining - output_len) return error.InvalidResume;
-                }
-                if (!connection.closing) _ = try self.advance(io, &connection, .restore);
-
-                if (input_len != 0) std.log.info("event=reload_input_restored bytes={d} encrypted={}", .{ input_len, Endpoint.encrypted(&connection.lifecycle.?) });
-                self.connections[handle.index] = connection;
-                self.setHandle(handle.index, handle);
-                if (self.config.profiles) |profiles| profiles.of(handle).* = profile;
-                self.admit(handle.index);
+        fn readConnection(self: *Self, io: std.Io, list: *fields.Reader, file_reader: ?*std.Io.File.Reader, native: anytype) !void {
+            var connection: Connection = .{ .resumed = true };
+            var adopted: ?network.Handle = null;
+            errdefer {
+                if (adopted) |handle| self.config.observer.closed(handle);
+                if (connection.lifecycle) |*lifecycle| Endpoint.clear(lifecycle);
             }
+            var number: ?i32 = null;
+            var format: ?u64 = null;
+            var codec_buffer: [codec_state_max]u8 = undefined;
+            var codec: ?[]const u8 = null;
+            var uuid: ?u128 = null;
+            var has_input = false;
+            var has_output = false;
+            var profile: profiles_api.PlayerProfile = .{};
+
+            while (try list.next()) |field| switch (field.tag) {
+                descriptor_tag => {
+                    if (adopted != null) return error.InvalidResume;
+                    const fd = try list.int(field, i32);
+                    if (fd < 3) return error.InvalidResume;
+                    const handle = try native.adopt(fd);
+                    if (handle.index >= self.connections.len or self.connections[handle.index].handle != null) return error.InvalidResume;
+                    adopted = handle;
+                    connection.control_output = self.connections[handle.index].control_output;
+                    connection.handle = handle;
+                    connection.admission_deadline = std.Io.Clock.now(.awake, io).nanoseconds + 30 * std.time.ns_per_s;
+                },
+                protocol_tag => number = try list.int(field, i32),
+                codec_format_tag => format = try list.int(field, u64),
+                codec_state_tag => codec = try list.bytes(field, &codec_buffer),
+                uuid_tag => uuid = try list.int(field, u128),
+                name_tag => connection.state.name_len = @intCast((try list.bytes(field, &connection.state.name)).len),
+                input_tag => {
+                    const handle = adopted orelse return error.InvalidResume;
+                    if (has_input or field.len > self.config.buffer_bytes) return error.InvalidResume;
+                    has_input = true;
+                    if (field.len <= self.smallBytes()) {
+                        try list.in.readSliceAll(self.inputBuffer(handle.index)[0..field.len]);
+                        connection.input_end = field.len;
+                    } else connection.saved_input = try self.captureSpan(io, list.in, file_reader, self.spoolBase(handle.index) + self.config.max_pending_wire_bytes, field.len);
+                    std.log.info("event=reload_input_restored bytes={d}", .{field.len});
+                },
+                output_tag => {
+                    const handle = adopted orelse return error.InvalidResume;
+                    if (has_output or field.len > self.config.max_pending_wire_bytes) return error.InvalidResume;
+                    has_output = true;
+                    if (field.len <= connection.control_output.capacity) {
+                        connection.control_output.items.len = field.len;
+                        try list.in.readSliceAll(connection.control_output.items);
+                        connection.output = connection.control_output.items;
+                        connection.output_control = true;
+                    } else connection.saved_output = try self.captureSpan(io, list.in, file_reader, self.spoolBase(handle.index), field.len);
+                },
+                profile_tag => {
+                    var nested = list.nested(field);
+                    profile = try profiles_api.PlayerProfile.readList(&nested);
+                },
+                else => try list.skip(field),
+            };
+
+            const handle = adopted orelse return error.InvalidResume;
+            const protocol_number = number orelse return error.InvalidResume;
+            for (&self.config.protocols.values) |*protocol| if (protocol.number == protocol_number) {
+                connection.protocol = protocol;
+                break;
+            };
+            if (connection.protocol == null) return error.UnsupportedProtocol;
+            connection.lifecycle = try Endpoint.restore(protocol_number, format orelse return error.InvalidResume, codec orelse return error.InvalidResume);
+            connection.state.phase = .parked;
+            connection.state.uuid = uuid orelse return error.InvalidResume;
+            if (self.identities.contains(connection.state.uuid)) return error.InvalidResume;
+            if (connection.state.name_len == 0) return error.InvalidResume;
+            if (!connection.closing) _ = try self.advance(io, &connection, .restore);
+
+            self.connections[handle.index] = connection;
+            self.setHandle(handle.index, handle);
+            if (self.config.profiles) |profiles| profiles.of(handle).* = profile;
+            self.admit(handle.index);
         }
 
         /// The caller has stopped new Play output. Existing output and input loans must drain before
@@ -1985,31 +2030,4 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             }
         }
     };
-}
-
-/// A saved profile: skin layers, then the textures value and signature, each after its length.
-const profile_bytes_max = 1 + 2 + profiles_api.PlayerProfile.value_max + 2 + profiles_api.PlayerProfile.signature_max;
-
-fn savedProfileBytes(profile: *const profiles_api.PlayerProfile) usize {
-    return 1 + 2 + profile.textures_value_len + 2 + profile.textures_signature_len;
-}
-
-fn writeProfile(writer: *std.Io.Writer, profile: *const profiles_api.PlayerProfile) !void {
-    try writer.writeByte(profile.skin_parts);
-    try writer.writeInt(u16, profile.textures_value_len, .little);
-    try writer.writeAll(profile.textures_value[0..profile.textures_value_len]);
-    try writer.writeInt(u16, profile.textures_signature_len, .little);
-    try writer.writeAll(profile.textures_signature[0..profile.textures_signature_len]);
-}
-
-fn readProfile(reader: *std.Io.Reader, profile: *profiles_api.PlayerProfile) !void {
-    profile.skin_parts = try reader.takeByte();
-    const value_len = try reader.takeInt(u16, .little);
-    if (value_len > profile.textures_value.len) return error.InvalidResume;
-    try reader.readSliceAll(profile.textures_value[0..value_len]);
-    profile.textures_value_len = value_len;
-    const signature_len = try reader.takeInt(u16, .little);
-    if (signature_len > profile.textures_signature.len or (value_len == 0 and signature_len != 0)) return error.InvalidResume;
-    try reader.readSliceAll(profile.textures_signature[0..signature_len]);
-    profile.textures_signature_len = signature_len;
 }

@@ -1,5 +1,6 @@
 const std = @import("std");
 pub const handoff = @import("handoff.zig");
+pub const fields = @import("fields.zig");
 
 pub const Compatibility = struct {
     pub const capacity = 256;
@@ -69,3 +70,7 @@ pub const Reload = struct {
         try self.request.?.stage(reply_token);
     }
 };
+
+test {
+    _ = fields;
+}

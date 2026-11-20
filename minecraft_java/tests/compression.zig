@@ -212,7 +212,7 @@ test "batched encryption preserves independent keys wrapped destinations and res
                 try std.testing.expectEqualSlices(u8, expected[index][split..length], job.second);
                 try std.testing.expectEqual(reference.send_cipher.?.feedback, wire.send_cipher.?.feedback);
                 try std.testing.expect(std.mem.allEqual(u8, actual[index][length..], 0xcc));
-                var saved: [50]u8 = undefined;
+                var saved: [Wire.saved_max]u8 = undefined;
                 wire.* = try Wire.restore(try wire.save(&saved));
             }
         }
@@ -320,7 +320,7 @@ test "receive batches preserve in-place tails and resumed cipher streams" {
             const length = @min(received.len - offset, random.random().intRangeAtMost(usize, 1, 79));
             receiver.receive(received[offset..][0..length]);
             receiver.receive(received[offset..][0..0]);
-            var saved: [50]u8 = undefined;
+            var saved: [Wire.saved_max]u8 = undefined;
             receiver = try Wire.restore(try receiver.save(&saved));
             offset += length;
         }

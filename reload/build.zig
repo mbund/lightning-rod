@@ -14,5 +14,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "reload", .module = module }},
     }) });
-    b.step("test", "Verify the frozen reload handoff").dependOn(&b.addRunArtifact(tests).step);
+    const step = b.step("test", "Verify the frozen reload handoff");
+    step.dependOn(&b.addRunArtifact(tests).step);
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
 }

@@ -9,28 +9,33 @@ const decoding = @import("decoding.zig");
 const Buffers = @import("buffers.zig").Buffers;
 const Profiles = @import("profiles.zig").Profiles;
 
-const frozen_connection = "\x01\x00\x00\x00" ++
-    "\x64\x00\x00\x00\x01\x00\x00\x00\x3f\x00\x00\x00" ++
-    "\x04\x03\x00\x00\x08\x07\x06\x05\x04\x03\x02\x01\x01\x00\x00\x00\xcc" ++
-    "\x00\xff\xee\xdd\xcc\xbb\xaa\x99\x88\x77\x66\x55\x44\x33\x22\x11" ++
-    "\x05alice\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++
-    "\x02\x00\x00\x00in\x03\x00\x00\x00out";
+// The released encoding of a connection in a reload's connections list: each field is its tag,
+// its length and its value, and a list ends with tag 0. New state is a new tag, so these bytes stay
+// valid for every later build.
+const frozen_fields =
+    "\x01\x00\x04\x00\x00\x00" ++ "\x64\x00\x00\x00" ++ // descriptor 100
+    "\x02\x00\x04\x00\x00\x00" ++ "\x04\x03\x00\x00" ++ // protocol 772
+    "\x03\x00\x08\x00\x00\x00" ++ "\x08\x07\x06\x05\x04\x03\x02\x01" ++ // codec format
+    "\x04\x00\x01\x00\x00\x00" ++ "\xcc" ++ // codec state
+    "\x05\x00\x10\x00\x00\x00" ++ "\x00\xff\xee\xdd\xcc\xbb\xaa\x99\x88\x77\x66\x55\x44\x33\x22\x11" ++ // uuid
+    "\x06\x00\x05\x00\x00\x00" ++ "alice" ++
+    "\x07\x00\x02\x00\x00\x00" ++ "in" ++
+    "\x08\x00\x03\x00\x00\x00" ++ "out";
+const frozen_end = "\x00\x00\x00\x00\x00\x00";
+const frozen_profile =
+    "\x01\x00\x01\x00\x00\x00" ++ "\x7f" ++ // skin parts
+    "\x02\x00\x03\x00\x00\x00" ++ "tex" ++
+    "\x03\x00\x02\x00\x00\x00" ++ "sg" ++
+    "\x04\x00\x01\x00\x00\x00" ++ "\x0c" ++ // view distance
+    frozen_end;
 
-// The same connection as an image that keeps profiles writes it: kind 2, ending with skin layers
-// and the textures value and signature, each after its length.
-const frozen_profiled_connection = "\x01\x00\x00\x00" ++
-    "\x64\x00\x00\x00\x02\x00\x00\x00\x49\x00\x00\x00" ++
-    "\x04\x03\x00\x00\x08\x07\x06\x05\x04\x03\x02\x01\x01\x00\x00\x00\xcc" ++
-    "\x00\xff\xee\xdd\xcc\xbb\xaa\x99\x88\x77\x66\x55\x44\x33\x22\x11" ++
-    "\x05alice\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++
-    "\x02\x00\x00\x00in\x03\x00\x00\x00out" ++
-    "\x7f\x03\x00tex\x02\x00sg";
+/// A connections list holding one connection of these fields.
+fn connections(comptime record: []const u8) []const u8 {
+    return "\x01\x00" ++ std.mem.toBytes(std.mem.nativeToLittle(u32, record.len)) ++ record ++ frozen_end;
+}
 
-// The kind 1 record as this image writes it back, with an empty profile.
-const upgraded = "\x01\x00\x00\x00" ++
-    "\x64\x00\x00\x00\x02\x00\x00\x00\x44\x00\x00\x00" ++
-    frozen_connection[16..] ++
-    "\x00\x00\x00\x00\x00";
+const frozen_connection = connections(frozen_fields ++ frozen_end);
+const frozen_profiled_connection = connections(frozen_fields ++ "\x09\x00\x25\x00\x00\x00" ++ frozen_profile ++ frozen_end);
 
 const Endpoint = struct {
     pub const Connection = u8;
@@ -436,28 +441,67 @@ test "control output goes out from its raw buffer and advances the cipher once" 
 }
 
 test "frozen sessions header preserves listener and compression encodings" {
-    const cases = [_]struct { threshold: ?usize, bytes: []const u8 }{
-        .{ .threshold = 256, .bytes = "\x63\x00\x00\x00\x00\x01\x00\x00" },
-        .{ .threshold = null, .bytes = "\x63\x00\x00\x00\xff\xff\xff\xff" },
+    const listener = "\x01\x00\x04\x00\x00\x00" ++ "\x63\x00\x00\x00";
+    const cases = comptime [_]struct { threshold: ?usize, bytes: []const u8 }{
+        .{ .threshold = 256, .bytes = listener ++ "\x02\x00\x04\x00\x00\x00" ++ "\x00\x01\x00\x00" ++ frozen_end },
+        // Uncompressed connections leave the threshold out.
+        .{ .threshold = null, .bytes = listener ++ frozen_end },
     };
-    for (cases) |case| {
+    inline for (cases) |case| {
         const header: handoff.Header = .{ .listener = 99, .compression_threshold = case.threshold };
-        var buffer: [8]u8 = undefined;
+        var buffer: [64]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buffer);
         try header.write(&writer);
         try std.testing.expectEqualSlices(u8, case.bytes, writer.buffered());
-        var reader: std.Io.Reader = .fixed(case.bytes);
+        var reader: std.Io.Reader = .fixed(case.bytes ++ "connections");
         const restored = try handoff.Header.read(&reader);
         try std.testing.expectEqual(header.listener, restored.listener);
         try std.testing.expectEqual(header.compression_threshold, restored.compression_threshold);
-        try std.testing.expectEqual(@as(usize, 8), reader.seek);
+        try std.testing.expectEqual(case.bytes.len, reader.seek);
     }
+    // A field from a newer build is skipped; a header without a listener is refused.
+    var reader: std.Io.Reader = .fixed("\x63\x00\x02\x00\x00\x00ab" ++ listener ++ frozen_end);
+    try std.testing.expectEqual(@as(i32, 99), (try handoff.Header.read(&reader)).listener);
+    reader = .fixed(frozen_end);
+    try std.testing.expectError(error.InvalidResume, handoff.Header.read(&reader));
 }
 
 test "frozen session connection records read and write the established bytes" {
-    // Images before profiles wrote kind 1 records; this one reads them and writes kind 2.
     try expectFrozenRecord(frozen_connection, false);
     try expectFrozenRecord(frozen_profiled_connection, true);
+}
+
+test "connection records skip fields from newer builds and require their identity" {
+    const Engine = engine.Engine(Endpoint, Observer);
+    const unknown = "\x63\x00\x05\x00\x00\x00" ++ "later";
+    const cases = comptime [_]struct { bytes: []const u8, valid: bool }{
+        // Unknown fields in the list, in the connection and in its profile.
+        .{ .bytes = unknown ++ connections(frozen_fields ++ unknown ++ "\x09\x00\x18\x00\x00\x00" ++ unknown ++ "\x01\x00\x01\x00\x00\x00\x7f" ++ frozen_end ++ frozen_end), .valid = true },
+        // Without the uuid.
+        .{ .bytes = connections(frozen_fields[0..41] ++ frozen_fields[63..] ++ frozen_end), .valid = false },
+    };
+    inline for (cases) |case| {
+        var profiles = try Profiles.init(std.testing.allocator, 1);
+        defer profiles.deinit(std.testing.allocator);
+        var native: Native = .{};
+        const transport: network.Transport = .{ .context = &native, .vtable = undefined, .inheritance = network.Inheritance.init(Native, &native) };
+        var observer: Observer = .{};
+        var catalog: Endpoint.Protocols = .{};
+        const owner = try Engine.init(std.testing.allocator, transport, .{ .connections = 1, .buffer_bytes = 512, .max_packet = 509, .max_pending_wire_bytes = 1024, .protocols = &catalog, .observer = &observer, .profiles = &profiles });
+        defer {
+            owner.setHandle(0, null);
+            owner.deinit();
+        }
+        var reader: std.Io.Reader = .fixed(case.bytes);
+        if (!case.valid) {
+            try std.testing.expectError(error.InvalidResume, owner.readResume(std.testing.io, &reader, null));
+            continue;
+        }
+        try owner.readResume(std.testing.io, &reader, null);
+        try std.testing.expectEqual(case.bytes.len, reader.seek);
+        try std.testing.expectEqualSlices(u8, "alice", owner.connections[0].state.name[0..owner.connections[0].state.name_len]);
+        try std.testing.expectEqual(@as(u8, 0x7f), profiles.get(owner.connections[0].handle.?).skin_parts);
+    }
 }
 
 fn expectFrozenRecord(comptime frozen: []const u8, comptime profiled: bool) !void {
@@ -499,15 +543,16 @@ fn expectFrozenRecord(comptime frozen: []const u8, comptime profiled: bool) !voi
         try std.testing.expectEqual(@as(u8, 0x7f), restored.skin_parts);
         try std.testing.expectEqualStrings("tex", restored.textures().?.value);
         try std.testing.expectEqualStrings("sg", restored.textures().?.signature);
+        try std.testing.expectEqual(@as(u8, 12), restored.view_distance);
     } else try std.testing.expect(profiles.get(connection.handle.?).textures() == null);
 
     owner.reloading = true;
     connection.parked = true;
-    const expected = if (profiled) frozen_profiled_connection else upgraded;
-    var buffer: [expected.len]u8 = undefined;
+    // What was read is written back byte for byte.
+    var buffer: [frozen.len]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     try owner.writeResume(&writer);
-    try std.testing.expectEqualSlices(u8, expected, writer.buffered());
+    try std.testing.expectEqualSlices(u8, frozen, writer.buffered());
 }
 
 test "wire spill seals ring output and spools later output encrypted, and restores both" {
@@ -1107,13 +1152,10 @@ test "resume rejects duplicate identities and preserves ownership of preceding r
         }
         owner.deinit();
     }
-    var bytes: [4 + (frozen_connection.len - 4) * 2]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&bytes);
-    try writer.writeInt(u32, 2, .little);
-    try writer.writeAll(frozen_connection[4..]);
-    try writer.writeInt(i32, 101, .little);
-    try writer.writeAll(frozen_connection[8..]);
-    var reader: std.Io.Reader = .fixed(writer.buffered());
+    // Two connections with the same uuid on different sockets.
+    const first = comptime connections(frozen_fields ++ frozen_end);
+    const second = comptime connections("\x01\x00\x04\x00\x00\x00" ++ "\x65\x00\x00\x00" ++ frozen_fields[10..] ++ frozen_end);
+    var reader: std.Io.Reader = .fixed(first[0 .. first.len - frozen_end.len] ++ second);
     try std.testing.expectError(error.InvalidResume, owner.readResume(std.testing.io, &reader, null));
     try std.testing.expectEqual(@as(usize, 1), owner.admitted);
     try std.testing.expectEqual(@as(usize, 1), owner.identities.count());

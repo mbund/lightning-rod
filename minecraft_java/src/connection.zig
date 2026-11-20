@@ -1,7 +1,11 @@
 const std = @import("std");
 const sessions = @import("sessions");
 const JavaWire = @import("wire.zig").Wire;
+const fields = sessions.fields;
 const assert = std.debug.assert;
+
+// Released tag of the connection's phase in its saved list; the wire's tags follow it.
+const phase_tag: fields.Tag = 1;
 
 const ResumePhase = enum(u8) {
     configuration_ready = 0,
@@ -13,7 +17,7 @@ pub fn Connection(comptime Protocol: type) type {
     return struct {
         const Self = @This();
         pub const Wire = JavaWire;
-        pub const resume_format = std.hash.Wyhash.hash(0, "minecraft_java:queued-configuration:2");
+        pub const resume_format = std.hash.Wyhash.hash(0, "minecraft_java:connection:1");
         const Phase = enum { status, plugin_login, before_ack, plugin_configuration, configuration_ack, await_attach, play, reconfiguration_ack, restart_finish_ack };
 
         phase: Phase,
@@ -24,6 +28,8 @@ pub fn Connection(comptime Protocol: type) type {
             return .{ .phase = if (intent == .status) .status else .plugin_login };
         }
 
+        /// The connection as a reload hands it on: its phase as a tagged list, with the wire's own
+        /// fields in the same list.
         pub fn save(self: *const Self, bytes: []u8) ![]const u8 {
             const phase: ResumePhase = switch (self.phase) {
                 .before_ack => .configuration_ready,
@@ -31,22 +37,30 @@ pub fn Connection(comptime Protocol: type) type {
                 .restart_finish_ack => .awaiting_finish_ack,
                 else => return error.InvalidResume,
             };
-            if (bytes.len < 1) return error.BufferTooSmall;
-            bytes[0] = @backingInt(phase);
-            const wire = try self.wire.save(bytes[1..]);
-            return bytes[0 .. 1 + wire.len];
+            var writer: std.Io.Writer = .fixed(bytes);
+            fields.writeInt(&writer, phase_tag, u8, @backingInt(phase)) catch return error.BufferTooSmall;
+            self.wire.writeFields(&writer) catch return error.BufferTooSmall;
+            fields.writeEnd(&writer) catch return error.BufferTooSmall;
+            return writer.buffered();
         }
 
         pub fn restore(bytes: []const u8) !Self {
-            if (bytes.len < 1) return error.InvalidResume;
-            const phase = std.enums.fromInt(ResumePhase, bytes[0]) orelse return error.InvalidResume;
+            var reader: std.Io.Reader = .fixed(bytes);
+            var list: fields.Reader = .init(&reader);
+            var phase: ?ResumePhase = null;
+            var wire: Wire.Saved = .{};
+            while (try list.next()) |field| switch (field.tag) {
+                phase_tag => phase = std.enums.fromInt(ResumePhase, try list.int(field, u8)) orelse return error.InvalidResume,
+                else => if (!try wire.read(&list, field)) try list.skip(field),
+            };
+            if (reader.seek != bytes.len) return error.InvalidResume;
             return .{
-                .phase = switch (phase) {
+                .phase = switch (phase orelse return error.InvalidResume) {
                     .configuration_ready => .before_ack,
                     .awaiting_start_ack => .reconfiguration_ack,
                     .awaiting_finish_ack => .restart_finish_ack,
                 },
-                .wire = try Wire.restore(bytes[1..]),
+                .wire = try wire.restore(),
             };
         }
 

@@ -118,10 +118,9 @@ fn pendingOutput(comptime Version: type) !void {
     var handoff = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer handoff.deinit();
     try old.writeResume(&handoff.writer);
-    // The queued output ends the record, ahead of the connection's profile, here empty.
-    const profile_bytes = 5;
-    try std.testing.expectEqualSlices(u8, pending, handoff.written()[handoff.written().len - profile_bytes - queued ..][0..pending.len]);
-    try std.testing.expectEqual(@as(u32, 51), std.mem.readInt(u32, handoff.written()[28..32], .little));
+    // The queued output is the connection's last field, ahead of the end of it and of the list.
+    const list_ends = 2 * sessions.fields.end_bytes;
+    try std.testing.expectEqualSlices(u8, pending, handoff.written()[handoff.written().len - list_ends - queued ..][0..pending.len]);
     const restored = try Engine.init(std.testing.allocator, transport, config);
     defer {
         restored.setHandle(0, null);
@@ -168,33 +167,39 @@ test "reload retains encrypted partial output and restarts configuration without
 test "handoff phase tags have fixed encodings independent of internal enum order" {
     inline for (protocols.implementations) |Version| {
         const Connection = Version.Connection;
-        try std.testing.expectEqual(@as(u64, 0x07e23a42aaa36cdd), Connection.resume_format);
+        try std.testing.expectEqual(@as(u64, 0xeb51a9d64068a63c), Connection.resume_format);
         const cases = [_]struct { phase: @FieldType(Connection, "phase"), tag: u8 }{
             .{ .phase = .before_ack, .tag = 0 },
             .{ .phase = .reconfiguration_ack, .tag = 1 },
             .{ .phase = .restart_finish_ack, .tag = 2 },
         };
+        const end = "\x00\x00\x00\x00\x00\x00";
         for (cases) |case| {
             var connection = Connection.init(.login);
             connection.phase = case.phase;
-            var output: [51]u8 = undefined;
+            var output: [128]u8 = undefined;
             const encoded = try connection.save(&output);
-            var expected: [51]u8 = @splat(0);
-            expected[0] = case.tag;
-            try std.testing.expectEqualSlices(u8, &expected, encoded);
-            const restored = try Connection.restore(&expected);
+            // The phase alone: uncompressed and unencrypted leave their fields out.
+            const expected = "\x01\x00\x01\x00\x00\x00" ++ [_]u8{case.tag} ++ end;
+            try std.testing.expectEqualSlices(u8, expected, encoded);
+            const restored = try Connection.restore(expected);
             try std.testing.expectEqual(case.phase, restored.phase);
         }
-        var invalid: [51]u8 = @splat(0);
-        invalid[0] = 255;
-        try std.testing.expectError(error.InvalidResume, Connection.restore(&invalid));
+        try std.testing.expectError(error.InvalidResume, Connection.restore("\x01\x00\x01\x00\x00\x00\xff" ++ end));
+        try std.testing.expectError(error.InvalidResume, Connection.restore(end));
+        var output: [128]u8 = undefined;
         var connection = Connection.init(.login);
-        try std.testing.expectError(error.InvalidResume, connection.save(&invalid));
+        try std.testing.expectError(error.InvalidResume, connection.save(&output));
     }
 }
 
 test "frozen Minecraft handoff retains compression and independent cipher feedback" {
-    const frozen = "\x02\x01\x01" ++ @as([16]u8, @splat(0x11)) ++ @as([16]u8, @splat(0x22)) ++ @as([16]u8, @splat(0x33));
+    // Phase, compression, secret, then each direction's place in its cipher stream, each a tagged field.
+    const frozen = "\x01\x00\x01\x00\x00\x00\x02" ++ "\x02\x00\x01\x00\x00\x00\x01" ++
+        "\x03\x00\x10\x00\x00\x00" ++ @as([16]u8, @splat(0x11)) ++
+        "\x04\x00\x10\x00\x00\x00" ++ @as([16]u8, @splat(0x22)) ++
+        "\x05\x00\x10\x00\x00\x00" ++ @as([16]u8, @splat(0x33)) ++
+        "\x00\x00\x00\x00\x00\x00";
     inline for (protocols.implementations) |Version| {
         var connection = Version.Connection.init(.login);
         connection.phase = .restart_finish_ack;
@@ -202,7 +207,7 @@ test "frozen Minecraft handoff retains compression and independent cipher feedba
         connection.wire.install(@splat(0x11));
         connection.wire.receive_cipher.?.feedback = @splat(0x22);
         connection.wire.send_cipher.?.feedback = @splat(0x33);
-        var buffer: [51]u8 = undefined;
+        var buffer: [128]u8 = undefined;
         try std.testing.expectEqualSlices(u8, frozen, try connection.save(&buffer));
         const restored = try Version.Connection.restore(frozen);
         try std.testing.expectEqual(connection.phase, restored.phase);

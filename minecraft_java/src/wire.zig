@@ -2,6 +2,7 @@ const std = @import("std");
 const sessions = @import("sessions");
 const Cipher = @import("cipher.zig").Cipher;
 const compression = @import("compression.zig");
+const fields = sessions.fields;
 
 pub const Wire = struct {
     pub const Workspace = compression.Workspace;
@@ -50,27 +51,82 @@ pub const Wire = struct {
         return .{ .cipher = &self.send_cipher.?, .first = first, .second = second };
     }
 
-    pub fn save(self: *const Wire, bytes: []u8) ![]const u8 {
-        if (bytes.len < 50) return error.BufferTooSmall;
-        bytes[0] = @intFromBool(self.compressed);
-        bytes[1] = @intFromBool(self.encrypted());
+    // Released tags of the wire in a saved connection; the connection's phase is tag 1.
+    const compressed_tag: fields.Tag = 2;
+    const secret_tag: fields.Tag = 3;
+    const receive_feedback_tag: fields.Tag = 4;
+    const send_feedback_tag: fields.Tag = 5;
+
+    /// Compression, and for an encrypted wire the shared secret and where each direction's cipher
+    /// stream stands, which the next process must continue from exactly.
+    pub fn writeFields(self: *const Wire, writer: *std.Io.Writer) !void {
+        if (self.compressed) try fields.writeInt(writer, compressed_tag, u8, 1);
         if (self.receive_cipher) |cipher| {
-            @memcpy(bytes[2..18], &cipher.secret);
-            @memcpy(bytes[18..34], &cipher.feedback);
-            @memcpy(bytes[34..50], &self.send_cipher.?.feedback);
-        } else @memset(bytes[2..50], 0);
-        return bytes[0..50];
+            try fields.writeBytes(writer, secret_tag, &cipher.secret);
+            try fields.writeBytes(writer, receive_feedback_tag, &cipher.feedback);
+            try fields.writeBytes(writer, send_feedback_tag, &self.send_cipher.?.feedback);
+        }
+    }
+
+    /// A wire's fields as they are read, in whatever list holds them.
+    pub const Saved = struct {
+        compressed: bool = false,
+        secret: ?[16]u8 = null,
+        receive_feedback: ?[16]u8 = null,
+        send_feedback: ?[16]u8 = null,
+
+        /// Whether the field was the wire's, and so read.
+        pub fn read(self: *Saved, list: *fields.Reader, field: fields.Field) !bool {
+            switch (field.tag) {
+                compressed_tag => self.compressed = switch (try list.int(field, u8)) {
+                    0 => false,
+                    1 => true,
+                    else => return error.InvalidResume,
+                },
+                secret_tag => self.secret = try block(list, field),
+                receive_feedback_tag => self.receive_feedback = try block(list, field),
+                send_feedback_tag => self.send_feedback = try block(list, field),
+                else => return false,
+            }
+            return true;
+        }
+
+        fn block(list: *fields.Reader, field: fields.Field) ![16]u8 {
+            var value: [16]u8 = undefined;
+            if (field.len != value.len) return error.InvalidResume;
+            _ = try list.bytes(field, &value);
+            return value;
+        }
+
+        pub fn restore(self: Saved) !Wire {
+            var wire: Wire = .{ .compressed = self.compressed };
+            if (self.secret) |secret| {
+                wire.install(secret);
+                wire.receive_cipher.?.feedback = self.receive_feedback orelse return error.InvalidResume;
+                wire.send_cipher.?.feedback = self.send_feedback orelse return error.InvalidResume;
+            } else if (self.receive_feedback != null or self.send_feedback != null) return error.InvalidResume;
+            return wire;
+        }
+    };
+
+    /// The most `save` writes.
+    pub const saved_max = fields.intBytes(u8) + 3 * fields.fieldBytes(16) + fields.end_bytes;
+
+    /// The wire on its own as a tagged list.
+    pub fn save(self: *const Wire, bytes: []u8) ![]const u8 {
+        var writer: std.Io.Writer = .fixed(bytes);
+        self.writeFields(&writer) catch return error.BufferTooSmall;
+        fields.writeEnd(&writer) catch return error.BufferTooSmall;
+        return writer.buffered();
     }
 
     pub fn restore(bytes: []const u8) !Wire {
-        if (bytes.len != 50 or bytes[0] > 1 or bytes[1] > 1) return error.InvalidResume;
-        var wire: Wire = .{ .compressed = bytes[0] == 1 };
-        if (bytes[1] == 1) {
-            wire.install(bytes[2..18].*);
-            wire.receive_cipher.?.feedback = bytes[18..34].*;
-            wire.send_cipher.?.feedback = bytes[34..50].*;
-        } else if (!std.mem.allEqual(u8, bytes[2..50], 0)) return error.InvalidResume;
-        return wire;
+        var reader: std.Io.Reader = .fixed(bytes);
+        var list: fields.Reader = .init(&reader);
+        var saved: Saved = .{};
+        while (try list.next()) |field| if (!try saved.read(&list, field)) try list.skip(field);
+        if (reader.seek != bytes.len) return error.InvalidResume;
+        return saved.restore();
     }
 
     pub fn clear(self: *Wire) void {

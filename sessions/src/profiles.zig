@@ -1,5 +1,6 @@
 const std = @import("std");
 const network = @import("networking");
+const fields = @import("reload").fields;
 
 /// What a player brings beyond a name and UUID: the textures of their skin and cape as their
 /// account's profile signed them, and how their client shows the skin.
@@ -16,6 +17,9 @@ pub const PlayerProfile = struct {
     /// The skin layers the client shows, as its settings name them: cape, jacket, sleeves,
     /// trousers and hat, one bit each. Nothing until the client says.
     skin_parts: u8 = 0,
+    /// How many chunks around them the client asks to see, as its settings say. Nothing until the
+    /// client says.
+    view_distance: u8 = 0,
     /// What an online-mode client tells Mojang it joined this server with: SHA-1 over the server
     /// id, the shared secret and the server's public key. Login reads it once encryption is on.
     server_hash: ?[20]u8 = null,
@@ -31,6 +35,45 @@ pub const PlayerProfile = struct {
         self.textures_value_len = @intCast(value.len);
         @memcpy(self.textures_signature[0..signature.len], signature);
         self.textures_signature_len = @intCast(signature.len);
+    }
+
+    // Released tags of the profile a reload hands on; never change what one holds, add a new one.
+    const skin_parts_tag: fields.Tag = 1;
+    const textures_value_tag: fields.Tag = 2;
+    const textures_signature_tag: fields.Tag = 3;
+    const view_distance_tag: fields.Tag = 4;
+
+    /// What `writeList` writes: only what was set, the rest left to the defaults.
+    pub fn listBytes(self: *const PlayerProfile) usize {
+        var total: usize = fields.end_bytes;
+        if (self.skin_parts != 0) total += fields.intBytes(u8);
+        if (self.textures_value_len != 0) total += fields.fieldBytes(self.textures_value_len) + fields.fieldBytes(self.textures_signature_len);
+        if (self.view_distance != 0) total += fields.intBytes(u8);
+        return total;
+    }
+
+    pub fn writeList(self: *const PlayerProfile, writer: *std.Io.Writer) !void {
+        if (self.skin_parts != 0) try fields.writeInt(writer, skin_parts_tag, u8, self.skin_parts);
+        if (self.textures()) |value| {
+            try fields.writeBytes(writer, textures_value_tag, value.value);
+            try fields.writeBytes(writer, textures_signature_tag, value.signature);
+        }
+        if (self.view_distance != 0) try fields.writeInt(writer, view_distance_tag, u8, self.view_distance);
+        try fields.writeEnd(writer);
+    }
+
+    pub fn readList(list: *fields.Reader) !PlayerProfile {
+        var profile: PlayerProfile = .{};
+        while (try list.next()) |field| switch (field.tag) {
+            skin_parts_tag => profile.skin_parts = try list.int(field, u8),
+            textures_value_tag => profile.textures_value_len = @intCast((try list.bytes(field, &profile.textures_value)).len),
+            textures_signature_tag => profile.textures_signature_len = @intCast((try list.bytes(field, &profile.textures_signature)).len),
+            view_distance_tag => profile.view_distance = try list.int(field, u8),
+            else => try list.skip(field),
+        };
+        // A signature belongs to a value.
+        if (profile.textures_value_len == 0 and profile.textures_signature_len != 0) return error.InvalidResume;
+        return profile;
     }
 };
 

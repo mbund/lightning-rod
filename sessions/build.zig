@@ -35,14 +35,14 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/handoff_test.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "networking", .module = networking }, .{ .name = "metrics", .module = metrics }, .{ .name = "system", .module = system } },
+        .imports = &.{ .{ .name = "networking", .module = networking }, .{ .name = "metrics", .module = metrics }, .{ .name = "system", .module = system }, .{ .name = "reload", .module = reload } },
     }) });
     test_step.dependOn(&b.addRunArtifact(handoff_tests).step);
     const pipeline_bench = b.addTest(.{ .filters = &.{"operation counts"}, .root_module = b.createModule(.{
         .root_source_file = b.path("src/pipeline_bench.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "networking", .module = networking }, .{ .name = "metrics", .module = metrics }, .{ .name = "system", .module = system } },
+        .imports = &.{ .{ .name = "networking", .module = networking }, .{ .name = "metrics", .module = metrics }, .{ .name = "system", .module = system }, .{ .name = "reload", .module = reload } },
     }) });
     const run_pipeline = std.Build.Step.Run.create(b, "session pipeline operations");
     run_pipeline.addArtifactArg(pipeline_bench);
@@ -54,7 +54,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/initialization_test.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "networking", .module = networking }, .{ .name = "metrics", .module = metrics }, .{ .name = "system", .module = system } },
+        .imports = &.{ .{ .name = "networking", .module = networking }, .{ .name = "metrics", .module = metrics }, .{ .name = "system", .module = system }, .{ .name = "reload", .module = reload } },
     }) });
     test_step.dependOn(&b.addRunArtifact(initialization_tests).step);
     const plugin_tests = b.addTest(.{ .root_module = b.createModule(.{
@@ -69,7 +69,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/threaded.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "networking", .module = networking }, .{ .name = "metrics", .module = metrics }, .{ .name = "system", .module = system } },
+        .imports = &.{ .{ .name = "networking", .module = networking }, .{ .name = "metrics", .module = metrics }, .{ .name = "system", .module = system }, .{ .name = "reload", .module = reload } },
     }) });
     test_step.dependOn(&b.addRunArtifact(threaded_tests).step);
     const endpoint_tests = b.addTest(.{ .root_module = b.createModule(.{

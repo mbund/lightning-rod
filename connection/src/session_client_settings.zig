@@ -3,8 +3,9 @@ const wire_1_21_5 = @import("wire_1_21_5");
 const sessions = @import("sessions");
 const protocols = @import("minecraft_packets").protocols;
 
-/// Keeps the skin layers the client says it shows. Configuration settings come before the game
-/// knows the player; play changes reach the game too, and are kept here so a reload restores them.
+/// Keeps what the client's settings say the server needs of them: the skin layers it shows and how
+/// far it asks to see. Configuration settings come before the game knows the player; play changes
+/// reach the game too, and are kept here so a reload restores them.
 pub const ClientSettings = struct {
     pub const id = "minecraft:client_settings";
     pub const Configuration = struct {};
@@ -24,21 +25,24 @@ pub const ClientSettings = struct {
     }
 
     fn onSettings(self: *ClientSettings, scope: sessions.InputScope, _: *SessionConfigurationState, packet: wire_1_21_5.configuration.toServer.packet_common_settings.Reader, _: []u8) !sessions.ConfigurationInputEffect {
-        self.profiles.of(scope.profile.connection).skin_parts = try skinParts(packet);
+        try self.remember(scope.profile.connection, packet);
         return .none;
     }
 
     fn onPlaySettings(self: *ClientSettings, scope: sessions.InputScope, _: *SessionPlayState, packet: wire_1_21_5.play.toServer.packet_common_settings.Reader, _: []u8) !sessions.PlayInputEffect {
-        self.profiles.of(scope.profile.connection).skin_parts = try skinParts(packet);
+        try self.remember(scope.profile.connection, packet);
         return .none;
     }
 
-    fn skinParts(packet: anytype) !u8 {
+    fn remember(self: *ClientSettings, connection: sessions.Handle, packet: anytype) !void {
         _, const a = try packet.locale();
-        _, const b = try a.viewDistance();
+        const view_distance, const b = try a.viewDistance();
         _, const c = try b.chatFlags();
         _, const d = try c.chatColors();
         const skin_parts, _ = try d.skinParts();
-        return @bitCast(skin_parts);
+        const profile = self.profiles.of(connection);
+        profile.skin_parts = @bitCast(skin_parts);
+        // Anything but a positive distance is no distance, as if the client had not said.
+        profile.view_distance = std.math.cast(u8, view_distance) orelse 0;
     }
 };
