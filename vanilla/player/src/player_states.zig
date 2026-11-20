@@ -39,8 +39,12 @@ pub const PlayerStates = struct {
         spawn: ?*Spawn = null,
     };
 
-    /// Version, health, game mode and selected slot.
-    pub const encoded_size = 7;
+    /// Version, health, game mode, selected slot and whether the player flies.
+    pub const encoded_size = 8;
+    /// The format this build writes. Version 1, written before flight was kept, lacks the last
+    /// byte and reads as not flying.
+    const encoded_version = 2;
+    const encoded_size_1 = 7;
 
     pub const State = struct {
         /// Kept here because the engine record is empty by the time a departure is heard.
@@ -65,28 +69,44 @@ pub const PlayerStates = struct {
             assert(state.selected_slot <= 8);
             var bytes: [encoded_size]u8 = undefined;
             var writer = std.Io.Writer.fixed(&bytes);
-            writer.writeByte(1) catch unreachable;
+            writer.writeByte(encoded_version) catch unreachable;
             writer.writeInt(u32, @bitCast(state.health), .little) catch unreachable;
             writer.writeByte(@intCast(@backingInt(state.gamemode))) catch unreachable;
             writer.writeByte(state.selected_slot) catch unreachable;
+            writer.writeByte(@intFromBool(state.flying)) catch unreachable;
             assert(writer.end == bytes.len);
             return bytes;
         }
 
         fn decode(state: *State, bytes: []const u8) !void {
-            if (bytes.len != encoded_size) return error.CorruptPlayer;
             var reader = std.Io.Reader.fixed(bytes);
-            if (try reader.takeByte() != 1) return error.CorruptPlayer;
+            const version = try reader.takeByte();
+            const expected_size: usize = switch (version) {
+                1 => encoded_size_1,
+                encoded_version => encoded_size,
+                else => return error.CorruptPlayer,
+            };
+            if (bytes.len != expected_size) return error.CorruptPlayer;
             const health: f32 = @bitCast(try reader.takeInt(u32, .little));
             if (!std.math.isFinite(health) or health < 0 or health > 20) return error.CorruptPlayer;
             const gamemode = std.enums.fromInt(minecraft.GameMode, try reader.takeByte()) orelse return error.CorruptPlayer;
             const selected_slot = try reader.takeByte();
             if (selected_slot > 8) return error.CorruptPlayer;
+            const flying = if (version == 1) false else switch (try reader.takeByte()) {
+                0 => false,
+                1 => true,
+                else => return error.CorruptPlayer,
+            };
+            assert(reader.seek == bytes.len);
             state.health = health;
             state.health_sent = health;
             state.gamemode = gamemode;
             state.selected_slot = @intCast(selected_slot);
-            @memcpy(&state.saved, bytes);
+            // Game mode rules still apply once the player is in play: only creative players and
+            // spectators fly.
+            state.flying = flying;
+            // An older record is written again in this format only once something changes.
+            state.saved = state.encode();
         }
     };
 
@@ -466,6 +486,8 @@ test "vanilla player state survives leaving, checkpoints and restarts, and corru
     states[0].selected_slot = 4;
     states[0].experience.points(50);
     const points = states[0].experience;
+    try std.testing.expect(player_states.setGameMode(&rows[0], .creative));
+    states[0].flying = true;
     try std.testing.expect(player_states.setGameMode(&rows[1], .spectator));
 
     try players.onLifecycle(&departures);
@@ -474,16 +496,20 @@ test "vanilla player state survives leaving, checkpoints and restarts, and corru
     try std.testing.expectEqual(@as(f32, 7), states[0].health);
     try std.testing.expectEqual(@as(u4, 4), states[0].selected_slot);
     try std.testing.expectEqualDeep(points, states[0].experience);
+    // A creative player flying when it left flies when it comes back.
+    try std.testing.expect(states[0].flying);
     try std.testing.expectEqual(minecraft.GameMode.spectator, states[1].gamemode);
     try std.testing.expect(!rows[1].occluded);
 
-    // A restart keeps what the last checkpoint wrote, as nobody left.
+    // A restart keeps what the last checkpoint wrote, as nobody left, as a reload does.
     states[0].health = 3;
+    states[0].flying = false;
     try player_states.checkpoint(space);
     rows = @splat(.{});
     states = @splat(.{});
     try players.onLifecycle(&joins);
     try std.testing.expectEqual(@as(f32, 3), states[0].health);
+    try std.testing.expect(!states[0].flying);
 
     var key: [16]u8 = undefined;
     std.mem.writeInt(u128, &key, 1, .little);
@@ -493,4 +519,33 @@ test "vanilla player state survives leaving, checkpoints and restarts, and corru
     rows = @splat(.{});
     states = @splat(.{});
     try std.testing.expectError(error.CorruptPlayer, players.onLifecycle(joins[0..1]));
+}
+
+test "player state records of the first format read as not flying, and malformed ones are refused" {
+    // Version 1: health 12.5, creative, slot 3, from before flight was kept.
+    var first: [PlayerStates.encoded_size_1]u8 = .{ 1, 0, 0, 0, 0, 1, 3 };
+    std.mem.writeInt(u32, first[1..5], @bitCast(@as(f32, 12.5)), .little);
+    var state: PlayerStates.State = .{};
+    try state.decode(&first);
+    try std.testing.expectEqual(@as(f32, 12.5), state.health);
+    try std.testing.expectEqual(minecraft.GameMode.creative, state.gamemode);
+    try std.testing.expectEqual(@as(u4, 3), state.selected_slot);
+    try std.testing.expect(!state.flying);
+    // Nothing changed, so nothing is written until something does.
+    try std.testing.expectEqualSlices(u8, &state.encode(), &state.saved);
+
+    state.flying = true;
+    const second = state.encode();
+    var read: PlayerStates.State = .{};
+    try read.decode(&second);
+    try std.testing.expect(read.flying);
+
+    var bad = second;
+    bad[bad.len - 1] = 2;
+    try std.testing.expectError(error.CorruptPlayer, read.decode(&bad));
+    try std.testing.expectError(error.CorruptPlayer, read.decode(second[0 .. second.len - 1]));
+    try std.testing.expectError(error.CorruptPlayer, read.decode(first[0 .. first.len - 1]));
+    var unknown = second;
+    unknown[0] = 3;
+    try std.testing.expectError(error.CorruptPlayer, read.decode(&unknown));
 }
