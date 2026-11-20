@@ -70,6 +70,8 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
         router: Router,
         worker: *Worker,
         output_pool: sessions.OutputPool,
+        /// Every connection's profile while login and configuration fill it in.
+        profiles: sessions.Profiles,
         routing: Routing,
         config: Configuration,
         registry: metrics.Registry,
@@ -84,7 +86,7 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
             const owned = options.memory.allocator(id);
-            self.* = .{ .previous = try owned.alloc(Previous, connections), .allocator = owned, .transport = undefined, .hooks = undefined, .router = config.router, .worker = undefined, .output_pool = undefined, .routing = undefined, .config = config, .registry = try metrics.Registry.init(owned, io, config.metrics) };
+            self.* = .{ .previous = try owned.alloc(Previous, connections), .allocator = owned, .transport = undefined, .hooks = undefined, .router = config.router, .worker = undefined, .output_pool = undefined, .profiles = undefined, .routing = undefined, .config = config, .registry = try metrics.Registry.init(owned, io, config.metrics) };
             errdefer self.registry.deinit();
             try self.registry.attach(options.metrics);
             var maximum_packet: usize = 0;
@@ -100,6 +102,7 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
             const audiences = @max(64, 2 * config.max_players);
             self.output_pool = try sessions.OutputPool.init(owned, .{ .pages = 1, .arena_bytes = @max(output_bytes, shared.storedBytes(maximum_packet)), .slots = output_slots, .page_bytes = maximum_packet, .unit_bytes = config.output_unit_bytes, .recipients_per_page = maximum_recipients, .audiences = audiences });
             errdefer self.output_pool.deinit();
+            self.profiles = try sessions.Profiles.init(owned, connections);
             var inherited: ?i32 = null;
             errdefer if (inherited) |descriptor| {
                 const file: std.Io.File = .{ .handle = descriptor, .flags = .{ .nonblocking = false } };
@@ -142,7 +145,7 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
                 initialized += 1;
             }
             self.routing = .{ .endpoints = endpoints };
-            self.hooks = try Hooks.init(owned, io, config.plugins, .{ .sessions = endpoints[0], .endpoints = endpoints, .metrics = &self.registry }, config.plugin_memory_bytes, connections);
+            self.hooks = try Hooks.init(owned, io, config.plugins, .{ .sessions = endpoints[0], .endpoints = endpoints, .metrics = &self.registry, .profiles = &self.profiles }, config.plugin_memory_bytes, connections);
             errdefer self.hooks.deinit(io);
             self.worker = try Worker.init(owned, self.transport.transport(), .{
                 .connections = connections,
@@ -160,6 +163,7 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
                 .destinations = destinations,
                 .compression_threshold = compression,
                 .metrics = &self.registry,
+                .profiles = &self.profiles,
             }, endpoints);
             errdefer self.worker.deinitUnstarted();
             if (options.handoff) |incoming| {
@@ -167,7 +171,7 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
                 try self.worker.restorePlayers(io);
             }
             const allocated = try options.metrics.gauge(.{ .namespace = id, .name = "owned_buffers", .description = "Preallocated endpoint, engine, and protocol plugin buffers", .unit = .bytes });
-            var buffer_bytes = self.hooks.memoryBytes() + self.output_pool.memoryBytes();
+            var buffer_bytes = self.hooks.memoryBytes() + self.output_pool.memoryBytes() + self.profiles.memoryBytes();
             for (endpoints) |endpoint| buffer_bytes += endpoint.memoryBytes();
             const worker = self.worker;
             buffer_bytes += worker.compressed.len + worker.backlog_entries.len * @sizeOf(u32) + worker.packets.len * @sizeOf(@TypeOf(worker.packets[0]));
@@ -215,6 +219,7 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
             std.log.info("event=output_peaks units={d} small_at_peak={d} of={d} unit_bytes={d} slots={d} of={d} payload_bytes={d} largest_reservation={d} audiences={d} of={d} recipients={d} of={d}", .{ pool.peak_units, pool.small_at_peak, pool.units(), pool.unit_bytes, pool.peak_slots, pool.slots.len, pool.peak_payload_bytes, pool.largest_reservation, pool.peak_audiences, pool.audiences.len, peak_recipients, ring_handles });
             for (self.routing.endpoints) |endpoint| endpoint.deinit();
             self.output_pool.deinit();
+            self.profiles.deinit(self.allocator);
             self.transport.deinit(io);
             self.allocator.free(self.routing.endpoints);
             self.allocator.free(self.previous);

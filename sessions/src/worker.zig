@@ -8,6 +8,7 @@ const session_protocol_input = @import("input.zig");
 const Service = @import("service.zig").Service;
 const Event = @import("service.zig").Event;
 const shared = @import("shared.zig");
+const Profiles = @import("profiles.zig").Profiles;
 const SingleSimulation = @import("router.zig").SingleSimulation;
 pub const Route = @import("router.zig").Route;
 
@@ -59,6 +60,8 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             max_pending_wire_bytes: usize = 4 * 1024 * 1024,
             protocols: *const Endpoint.Protocols,
             compression_threshold: ?usize = 256,
+            /// Profiles the session plugins fill in, handed to the endpoint a player joins.
+            profiles: ?*Profiles = null,
             metrics: ?*metrics.Registry = null,
             hooks: *Hooks,
             router: *Router,
@@ -799,11 +802,19 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             return true;
         }
 
+        /// Gives the endpoint the profile the connection's login and configuration filled in, ahead
+        /// of the event that tells the game about the player, which its queue orders after it.
+        fn handOverProfile(self: *Self, endpoint: *Service, handle: network.Handle, native: network.Handle) void {
+            const profiles = self.config.profiles orelse return;
+            endpoint.profiles[handle.index] = profiles.get(native);
+        }
+
         pub fn attached(self: *Self, io: std.Io, profile: engine.Profile) bool {
             if (self.bindings[profile.connection.index]) |*binding| {
                 assert(binding.configuring and std.meta.eql(binding.native, profile.connection));
                 if (binding.previous == null) {
                     const endpoint = binding.endpoint;
+                    self.handOverProfile(endpoint, binding.handle, profile.connection);
                     endpoint.credit[binding.handle.index].store((@as(u64, binding.handle.generation) << 32) | Service.active | endpoint.config.credit_bytes, .release);
                     if (!endpoint.push(.{ .ready = binding.handle })) {
                         _ = endpoint.credit[binding.handle.index].fetchAnd(~Service.active, .acq_rel);
@@ -825,6 +836,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                     .cause = .transfer,
                 } };
                 @memcpy(event.joined.name[0..profile.name.len], profile.name);
+                self.handOverProfile(endpoint, binding.handle, profile.connection);
                 endpoint.credit[binding.handle.index].store((@as(u64, binding.handle.generation) << 32) | Service.active | endpoint.config.credit_bytes, .release);
                 if (!endpoint.push(event)) {
                     _ = endpoint.credit[binding.handle.index].fetchAnd(~Service.active, .acq_rel);
@@ -897,6 +909,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                 if (self.engine.connections[profile.connection.index].resumed) event.joined.cause = .reload;
                 @memcpy(event.joined.name[0..profile.name.len], profile.name);
                 route.* = profile.connection;
+                self.handOverProfile(endpoint, handle, profile.connection);
                 self.bindings[profile.connection.index] = .{ .endpoint = endpoint, .handle = handle, .native = profile.connection, .configuring = readiness == .configuring };
                 endpoint.credit[index].store((generation << 32) | (if (readiness == .play) Service.active | endpoint.config.credit_bytes else @as(u64, 0)), .release);
                 if (endpoint.push(event)) {

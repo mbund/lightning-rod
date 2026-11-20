@@ -6,6 +6,7 @@ const shared = @import("shared.zig");
 const protocol_api = @import("protocol.zig");
 const metrics = @import("metrics");
 const broadcast = @import("broadcast.zig");
+const PlayerProfile = @import("profiles.zig").PlayerProfile;
 
 const assert = std.debug.assert;
 
@@ -99,6 +100,10 @@ pub const Service = struct {
     output: shared.SharedPages,
     events: []Event,
     recipient_marks: []u64,
+    /// By player slot, what the player's login and client settings said: their skin and cape,
+    /// and the skin layers shown. The worker writes a slot before the event that tells the game
+    /// the player joined or is ready, so the game reads it after that event.
+    profiles: []PlayerProfile,
     /// The recipients a group of packets is published to, gathered before it is.
     group_recipients: []network.Handle,
     publication_sequence: u64 = 0,
@@ -186,6 +191,9 @@ pub const Service = struct {
         errdefer allocator.free(events);
         const recipient_marks = try allocator.alloc(u64, config.connections);
         errdefer allocator.free(recipient_marks);
+        const profiles = try allocator.alloc(PlayerProfile, config.connections);
+        errdefer allocator.free(profiles);
+        @memset(profiles, .{});
         @memset(recipient_marks, 0);
         const group_recipients = try allocator.alloc(network.Handle, config.connections);
         errdefer allocator.free(group_recipients);
@@ -242,6 +250,7 @@ pub const Service = struct {
             .output = output,
             .events = events,
             .recipient_marks = recipient_marks,
+            .profiles = profiles,
             .group_recipients = group_recipients,
             .batch = batch,
             .pending_inputs = pending_inputs,
@@ -287,6 +296,7 @@ pub const Service = struct {
         self.allocator.free(self.disconnects);
         self.allocator.free(self.events);
         self.allocator.free(self.recipient_marks);
+        self.allocator.free(self.profiles);
         self.allocator.free(self.group_recipients);
         self.allocator.free(self.batch);
         self.allocator.free(self.pending_inputs);
@@ -301,8 +311,18 @@ pub const Service = struct {
             (self.events.len + self.batch.len) * @sizeOf(Event) + self.pending_inputs.len * @sizeOf(PendingInput) +
             (self.recipient_marks.len + self.group_recipients.len) * @sizeOf(u64) +
             self.credit.len * @sizeOf(std.atomic.Value(u64)) + (self.disconnects.len + self.releases.len + self.departed.len) * @sizeOf(std.atomic.Value(u32)) +
-            self.routes.len * @sizeOf(?network.Handle) + self.occupied.len * @sizeOf(std.atomic.Value(bool)) + self.moves.len * @sizeOf(Move) + (self.committed_moves.len + self.activity.len) * @sizeOf(std.atomic.Value(usize));
+            self.routes.len * @sizeOf(?network.Handle) + self.occupied.len * @sizeOf(std.atomic.Value(bool)) + self.moves.len * @sizeOf(Move) + (self.committed_moves.len + self.activity.len) * @sizeOf(std.atomic.Value(usize)) +
+            self.profiles.len * @sizeOf(PlayerProfile);
     }
+
+    /// What a player's login and client settings said, from the event that announced them on.
+    /// A slot past what the service holds, as a test's service may be, says nothing.
+    pub fn profile(self: *const Service, handle: network.Handle) *const PlayerProfile {
+        if (handle.index >= self.profiles.len) return &no_profile;
+        return &self.profiles[handle.index];
+    }
+
+    const no_profile: PlayerProfile = .{};
 
     pub fn hasConnections(self: *const Service) bool {
         for (self.occupied) |*slot| if (slot.load(.acquire)) return true;
