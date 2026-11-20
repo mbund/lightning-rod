@@ -92,6 +92,7 @@ fn one(owner: *world_import.Import, scratch: std.mem.Allocator, doc: nbt.Documen
     player.flags.glowing = try fields.optionalInt(doc, root, "Glowing", 0) != 0;
     player.flags.gliding = try fields.optionalInt(doc, root, "FallFlying", 0) != 0;
     var state: vanilla.PlayerStates.State = .{ .uuid = uuid, .gamemode = @fromBackingInt(@intCast(mode)), .selected_slot = @intCast(slot), .health = health };
+    if (root.childNamed(doc.nodes, "abilities")) |abilities| state.flying = try fields.optionalInt(doc, abilities, "flying", 0) != 0;
     if (root.childNamed(doc.nodes, "XpP")) |value| state.experience.progress = @floatCast(try fields.number(value));
     state.experience.level = std.math.cast(i32, try fields.optionalInt(doc, root, "XpLevel", 0)) orelse return error.InvalidExperience;
     state.experience.total = std.math.cast(i32, try fields.optionalInt(doc, root, "XpTotal", 0)) orelse return error.InvalidExperience;

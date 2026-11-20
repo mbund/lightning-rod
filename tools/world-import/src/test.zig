@@ -126,6 +126,9 @@ fn player(directory: std.Io.Dir, io: std.Io, unsupported: bool) !void {
     try writer.endList();
     try writer.putInt("playerGameType", 1);
     try writer.putInt("SelectedItemSlot", 6);
+    try writer.beginNamedCompound("abilities");
+    try writer.putByte("flying", 1);
+    try writer.endCompound();
     try writer.putFloat("Health", 18);
     try writer.putInt("XpLevel", 5);
     try writer.putFloat("XpP", 0.25);
@@ -306,7 +309,7 @@ test "Java world import reopens terrain players containers items and orbs throug
     try std.testing.expectEqualSlices(u8, &expected.encode(), &saved);
     var state_saved: [vanilla.PlayerStates.encoded_size]u8 = undefined;
     try std.testing.expectEqual(@as(?usize, state_saved.len), try native.player_states.get(&key, &state_saved));
-    const expected_state: vanilla.PlayerStates.State = .{ .health = 18, .gamemode = .creative, .selected_slot = 6 };
+    const expected_state: vanilla.PlayerStates.State = .{ .health = 18, .gamemode = .creative, .selected_slot = 6, .flying = true };
     try std.testing.expectEqualSlices(u8, &expected_state.encode(), &state_saved);
     var points: [16]u8 = undefined;
     try std.testing.expectEqual(@as(?usize, 16), try native.player_states.get(&vanilla.PlayerStates.experienceKey(mapped), &points));
