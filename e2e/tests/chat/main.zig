@@ -1,6 +1,7 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const Chat = @import("chat").chat.Chat;
+const PlayerChat = @import("chat").player_chat.PlayerChat;
 const Players = @import("players").players.Players;
 const e2e = @import("e2e");
 const sessions = @import("sessions");
@@ -13,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
 const Probe = struct {
     pub const id = "e2e:chat";
     pub const Configuration = struct {};
-    pub const Dependencies = struct { control: *e2e.Control, chat: *Chat, players: *Players };
+    pub const Dependencies = struct { control: *e2e.Control, chat: *Chat, player_chat: *PlayerChat, players: *Players };
     deps: Dependencies,
     pending: []?sessions.Handle,
 
@@ -33,7 +34,8 @@ const Probe = struct {
 
     pub fn tick(self: *Probe) !void {
         try self.deps.chat.flush();
-        if (self.deps.chat.read != self.deps.chat.write) return;
+        try self.deps.player_chat.flush();
+        if (self.deps.chat.read != self.deps.chat.write or self.deps.player_chat.read != self.deps.player_chat.write) return;
         for (self.pending) |*pending| {
             const handle = pending.* orelse continue;
             if (std.meta.eql(self.deps.players.records[handle.index].handle, handle))

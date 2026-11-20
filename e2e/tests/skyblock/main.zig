@@ -2,7 +2,7 @@ const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const sessions = @import("sessions");
 const vanilla = @import("vanilla");
-const ChatInput = @import("commands").chat_input.ChatInput;
+const PlayerChat = @import("chat").player_chat.PlayerChat;
 const Players = @import("players").players.Players;
 const skyblock = @import("skyblock");
 const e2e = @import("e2e");
@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init) !void {
     var endpoints: [3]*sessions.Service = undefined;
     var routing: sessions.Routing = .{ .endpoints = &endpoints };
     const hub = lightning_rod.plugin.compose(.{
-        lightning_rod.plugin.replace(lightning_rod.plugin.remove(lightning_rod.plugin.remove(e2e.profile.plugins(), ChatInput), vanilla.JoinLeaveMessages), .{
+        lightning_rod.plugin.replace(lightning_rod.plugin.remove(lightning_rod.plugin.remove(e2e.profile.plugins(), PlayerChat), vanilla.JoinLeaveMessages), .{
             lightning_rod.plugin.configured(Players, .{ .spawn_for_player = spawn, .spawn = .{ .x = 0.5, .y = 65, .z = 0.5 } }),
             lightning_rod.plugin.configured(vanilla.PlayerStates, .{ .world_border = 512 }),
             lightning_rod.plugin.configured(skyblock.Terrain, .{ .kind = .hub }),

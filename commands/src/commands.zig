@@ -2,7 +2,6 @@ const std = @import("std");
 pub const wire = @import("wire.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const operators = @import("operators.zig");
-pub const chat_input = @import("chat_input.zig");
 pub const reload_commands = @import("reload_commands.zig");
 
 const assert = std.debug.assert;
@@ -906,7 +905,6 @@ pub const Branch = struct {
 test {
     _ = dispatch;
     _ = operators;
-    _ = chat_input;
     _ = reload_commands;
     _ = @import("command_dispatch_test.zig");
 }

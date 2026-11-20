@@ -2,7 +2,7 @@ const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 const vanilla = @import("vanilla");
 const BlockSynchronization = @import("terrain").block_sync.BlockSynchronization;
-const ChatInput = @import("commands").chat_input.ChatInput;
+const PlayerChat = @import("chat").player_chat.PlayerChat;
 const Chunks = @import("chunks").Chunks;
 const Inventories = @import("inventories").Inventories;
 const Operators = @import("commands").operators.Operators;
@@ -30,7 +30,7 @@ const operators = blk: {
     break :blk [_]u128{std.mem.readInt(u128, &digest, .big)};
 };
 
-const defaults = lightning_rod.plugin.remove(lightning_rod.plugin.replace(lightning_rod.plugin.remove(lightning_rod.plugin.remove(vanilla.plugins(), ChatInput), vanilla.JoinLeaveMessages), .{lightning_rod.plugin.configured(Terrain, .{ .kind = .island })}), vanilla.Vanilla);
+const defaults = lightning_rod.plugin.remove(lightning_rod.plugin.replace(lightning_rod.plugin.remove(lightning_rod.plugin.remove(vanilla.plugins(), PlayerChat), vanilla.JoinLeaveMessages), .{lightning_rod.plugin.configured(Terrain, .{ .kind = .island })}), vanilla.Vanilla);
 const Selections = lightning_rod.plugin.Compose(@Tuple(&.{ @TypeOf(defaults), lightning_rod.plugin.Selection(IslandCommands), lightning_rod.plugin.Selection(global_chat.GlobalChat) }));
 const Simulation = lightning_rod.Simulation(Selections);
 /// Sections streaming and the lighting solver of one island each read at once.

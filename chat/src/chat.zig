@@ -158,6 +158,24 @@ pub const Chat = struct {
         self.systemMessages(&.{handle}, text, action);
     }
 
+    /// A system message of any text component, given as its network NBT.
+    pub fn systemComponent(self: *Chat, handle: sessions.Handle, nbt: []const u8) void {
+        std.debug.assert(nbt.len <= @typeInfo(@FieldType(Message, "bytes")).array.len);
+        if (self.write - self.read == self.messages.len) {
+            self.deps.sessions.disconnect(handle);
+            return;
+        }
+        if (handle.index >= self.deps.players.records.len) return;
+        const player = self.deps.players.records[handle.index];
+        if (player.handle == null or !std.meta.eql(player.handle.?, handle)) return;
+        const message = &self.messages[self.write % self.messages.len];
+        message.recipients[0] = .{ .handle = handle, .protocol = player.protocol };
+        message.count = 1;
+        @memcpy(message.bytes[0..nbt.len], nbt);
+        message.length = nbt.len;
+        self.write += 1;
+    }
+
     fn systemMessages(self: *Chat, handles: []const sessions.Handle, text: []const u8, action: ?Action) void {
         std.debug.assert(text.len <= 1096);
         if (self.write - self.read == self.messages.len) {

@@ -8,6 +8,8 @@ pub fn build(b: *std.Build) void {
     inline for (.{ "lightning_rod", "minecraft_packets", "players", "sessions" }) |name|
         module.addImport(name, b.dependency(name, .{ .target = target, .optimize = optimize }).module(name));
     module.addImport("wire_1_21_5", b.dependency("protocol_1_21_5", .{ .target = target, .optimize = optimize }).module("wire"));
+    // The tests stand in a transport, of the network types sessions is built on.
+    module.addImport("networking", b.dependency("sessions", .{ .target = target, .optimize = optimize }).module("sessions").import_table.get("networking").?);
 
     // Standalone development selects every supported release, as a server does by default,
     // so encodings that differ between releases are always compiled and tested. Consumers

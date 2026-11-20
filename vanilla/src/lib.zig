@@ -22,7 +22,7 @@ const Visibility = @import("replication").visibility.Visibility;
 const Replication = @import("replication").replication.Replication;
 const Bossbars = @import("bossbars").bossbars.Bossbars;
 const Chat = @import("chat").chat.Chat;
-const ChatInput = commands.chat_input.ChatInput;
+const PlayerChat = @import("chat").player_chat.PlayerChat;
 const Operators = commands.operators.Operators;
 const ReloadCommands = commands.reload_commands.ReloadCommands;
 const CommandDispatch = commands.dispatch.CommandDispatch;
@@ -147,7 +147,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Weather, Weather.Configuration{}),
     lightning_rod.plugin.configured(Environment, Environment.Configuration{}),
     lightning_rod.plugin.configured(Chat, Chat.Configuration{}),
-    lightning_rod.plugin.configured(ChatInput, ChatInput.Configuration{}),
+    lightning_rod.plugin.configured(PlayerChat, PlayerChat.Configuration{}),
     lightning_rod.plugin.configured(JoinLeaveMessages, JoinLeaveMessages.Configuration{}),
     lightning_rod.plugin.configured(commands.Commands, commands.Commands.Configuration{}),
     lightning_rod.plugin.configured(Operators, Operators.Configuration{}),
