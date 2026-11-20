@@ -15,11 +15,11 @@ pub const Authentication = struct {
         online: bool = false,
         session_host: []const u8 = "https://sessionserver.mojang.com",
         /// Mojang questions asked at once; logins past this wait their turn.
-        workers: u16 = 16,
+        questions: u16 = 4,
         timeout: std.Io.Duration = .fromSeconds(10),
 
         fn options(self: Configuration) mojang_sessions.Options {
-            return .{ .session_host = self.session_host, .workers = self.workers, .timeout = self.timeout };
+            return .{ .session_host = self.session_host, .questions = self.questions, .timeout = self.timeout };
         }
     };
     pub const Dependencies = struct {

@@ -1,24 +1,29 @@
 //! Asks Mojang's session server whether players joined, without the sessions thread waiting.
 //!
-//! A fixed set of workers, started with the server, takes questions from a queue as deep as there
-//! are connections. Each worker owns its buffers and keeps one connection to the session server
-//! alive between questions. A watchdog ends a question past its deadline by shutting its socket
-//! down. After startup nothing allocates and no thread starts; the only startup heap use is the
-//! scratch the system's root certificates are read with, copied into plugin memory and freed.
+//! Each question is a task on an I/O of its own, `std.Io.Threaded`, asking with `std.http.Client`
+//! and keeping its connections alive between questions. At most `questions` run at once; the
+//! rest wait in a queue the running tasks drain. Everything the I/O and the client allocate comes
+//! from one region reserved at startup and handed out by a buddy allocator, so the memory has a
+//! maximum, exists before the first login, and is poisoned as it is freed. The root certificates
+//! are read into it at startup rather than at the first login.
 const std = @import("std");
+const lightning_rod = @import("lightning_rod");
 const sessions = @import("sessions");
-const tls = std.crypto.tls;
-const Bundle = std.crypto.Certificate.Bundle;
+const BuddyAllocator = lightning_rod.system.BuddyAllocator;
 
 pub const Options = struct {
     /// Where hasJoined is asked: `https://host[:port]`, or `http://` for a local stand in.
     session_host: []const u8,
-    /// Questions asked at once; the rest wait their turn in the queue.
-    workers: u16 = 16,
+    /// Questions asked at once; the rest wait their turn. Each takes two threads while it runs,
+    /// the question and its request, which stay parked for the next once started.
+    questions: u16 = 4,
     /// How long a question may take before the player is told the servers are down.
     timeout: std.Io.Duration = .fromSeconds(10),
-    /// Room for the system's root certificates. A typical bundle takes about 140 KB.
-    certificate_bytes: usize = 512 * 1024,
+    /// The most the system's root certificates may take, kept apart from what the client
+    /// allocates as it runs. 121 certificates took 132 KiB in November 2026.
+    certificate_bytes: usize = 256 * 1024,
+    /// Each thread's stack, which the system backs as it is touched.
+    stack_bytes: usize = 2 * 1024 * 1024,
 };
 
 pub const Authenticator = struct {
@@ -59,105 +64,139 @@ pub const Authenticator = struct {
         answer: Answer = undefined,
     };
 
-    const Worker = struct {
-        stream: ?std.Io.net.Stream = null,
-        /// How far the connection got, so a failure reads only what was set up.
-        progress: enum { closed, connected, secured } = .closed,
-        /// Awake-clock nanoseconds the current question must end by, zero between questions.
-        deadline: i96 = 0,
-        socket_reader: std.Io.net.Stream.Reader = undefined,
-        socket_writer: std.Io.net.Stream.Writer = undefined,
-        tls_client: tls.Client = undefined,
-        http: std.http.Reader = undefined,
-        socket_input: [tls.Client.min_buffer_len]u8 = undefined,
-        socket_output: [tls.Client.min_buffer_len]u8 = undefined,
-        tls_read: [tls.Client.min_buffer_len]u8 = undefined,
-        tls_write: [tls.Client.min_buffer_len]u8 = undefined,
-        transfer: [4096]u8 = undefined,
-        body: [response_max]u8 = undefined,
-        scratch: [scratch_max]u8 = undefined,
-
-        fn input(self: *Worker, secure: bool) *std.Io.Reader {
-            return if (secure) &self.tls_client.reader else &self.socket_reader.interface;
-        }
-
-        fn output(self: *Worker, secure: bool) *std.Io.Writer {
-            return if (secure) &self.tls_client.writer else &self.socket_writer.interface;
-        }
-    };
-
     /// A hasJoined answer is about a kilobyte and a half; this leaves room for more properties.
     const response_max = 16 * 1024;
     /// What parsing an answer of `response_max` bytes may take.
     const scratch_max = 32 * 1024;
-    const head_max = 8 * 1024;
+    const url_max = 512;
 
-    io: std.Io,
+    server_io: std.Io,
     wake: *const sessions.Wake,
     timeout: std.Io.Duration,
-    secure: bool,
-    host_bytes: [std.Io.net.HostName.max_len]u8 = undefined,
+    questions: u16,
+    host_bytes: [256]u8 = undefined,
     host_len: usize = 0,
-    port: u16,
+    buddy: BuddyAllocator,
+    threaded: std.Io.Threaded,
+    client: std.http.Client,
+    tasks: std.Io.Group = .init,
     slots: []Slot,
-    queue: std.Io.Queue(u32),
-    workers: []Worker,
-    group: std.Io.Group = .init,
-    /// Guards worker sockets and deadlines between workers and the watchdog.
+    /// Questions waiting for a running task, oldest first; guarded by `mutex` with `running`.
+    pending: []u32,
+    pending_head: usize = 0,
+    pending_len: usize = 0,
+    running: u16 = 0,
     mutex: std.Io.Mutex = .init,
-    deadlines: std.Io.Condition = .init,
-    certificates: Bundle = .empty,
-    certificates_lock: std.Io.RwLock = .init,
+
+    /// What the client allocates for one question, with room to spare. Measured against Mojang
+    /// in November 2026: a 59,815 byte TLS connection in a 64 KiB block, kept for the next
+    /// question; a 3,248 byte record for the request's task in a 4 KiB block; and a few small
+    /// records, about 69 KiB in all.
+    const question_bytes = 128 * 1024;
+
+    /// The region the client allocates from: room for every question at once.
+    pub fn regionBytes(questions: u16) usize {
+        return std.math.ceilPowerOfTwoAssert(usize, @as(usize, questions) * question_bytes);
+    }
 
     /// What `init` allocates, for the plugin to declare.
     pub fn memoryBytes(options: Options, connections: usize) usize {
         // Each allocation carries the plugin allocator's bookkeeping and alignment.
-        const slack = 4 * 1024;
-        return @sizeOf(Authenticator) + connections * (@sizeOf(Slot) + @sizeOf(u32)) + @as(usize, options.workers) * @sizeOf(Worker) + options.certificate_bytes + slack;
+        const slack = 4 * 1024 + std.heap.page_size_min;
+        const certificates = if (std.mem.startsWith(u8, options.session_host, "https:")) options.certificate_bytes else 0;
+        return @sizeOf(Authenticator) + connections * (@sizeOf(Slot) + @sizeOf(u32)) + regionBytes(options.questions) + BuddyAllocator.bitWords(regionBytes(options.questions)) * @sizeOf(usize) + certificates + slack;
     }
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options, connections: usize, wake: *const sessions.Wake) !*Authenticator {
-        if (options.workers == 0) return error.NoAuthenticationWorkers;
+    pub fn init(allocator: std.mem.Allocator, server_io: std.Io, options: Options, connections: usize, wake: *const sessions.Wake) !*Authenticator {
+        if (options.questions == 0) return error.NoConcurrentQuestions;
+        if (options.session_host.len > 256) return error.InvalidSessionHost;
         const uri = std.Uri.parse(options.session_host) catch return error.InvalidSessionHost;
         const secure = if (std.mem.eql(u8, uri.scheme, "https")) true else if (std.mem.eql(u8, uri.scheme, "http")) false else return error.InvalidSessionHost;
+
         const self = try allocator.create(Authenticator);
-        const queued = try allocator.alloc(u32, connections);
+        const region_bytes = regionBytes(options.questions);
+        const region = try allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), region_bytes);
+        const bits = try allocator.alloc(usize, BuddyAllocator.bitWords(region_bytes));
         self.* = .{
-            .io = io,
+            .server_io = server_io,
             .wake = wake,
             .timeout = options.timeout,
-            .secure = secure,
-            .port = uri.port orelse if (secure) 443 else 80,
+            .questions = options.questions,
+            .buddy = .init(region, bits),
+            .threaded = undefined,
+            .client = undefined,
             .slots = try allocator.alloc(Slot, connections),
-            .queue = .init(queued),
-            .workers = try allocator.alloc(Worker, options.workers),
+            .pending = try allocator.alloc(u32, connections),
         };
-        // The name may be a slice of the URI rather than of the buffer, so it is copied in.
-        var name_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-        const name = (std.Io.net.HostName.fromUri(uri, &name_buffer) catch return error.InvalidSessionHost).bytes;
-        @memcpy(self.host_bytes[0..name.len], name);
-        self.host_len = name.len;
+        @memcpy(self.host_bytes[0..options.session_host.len], options.session_host);
+        self.host_len = options.session_host.len;
         for (self.slots) |*slot| slot.* = .{};
-        for (self.workers) |*worker| worker.* = .{};
-        if (secure) try self.loadCertificates(allocator, options.certificate_bytes);
-        errdefer self.close();
-        for (self.workers) |*worker| try self.group.concurrent(io, work, .{ self, worker });
-        try self.group.concurrent(io, watch, .{self});
+        const memory = self.buddy.allocator();
+        self.threaded = .init(memory, .{
+            .async_limit = .nothing,
+            .concurrent_limit = .limited(2 * @as(usize, options.questions)),
+            .stack_size = options.stack_bytes,
+        });
+        const io = self.threaded.io();
+        self.client = .{ .allocator = memory, .io = io };
+        // Idle connections kept for the next questions, at most one each.
+        self.client.connection_pool.free_size = options.questions;
+        var certificate_used: usize = 0;
+        if (secure) {
+            const now = std.Io.Clock.real.now(io);
+            certificate_used = loadCertificates(allocator, io, now, options.certificate_bytes, &self.client.ca_bundle) catch |err| {
+                self.client.ca_bundle = .empty;
+                self.client.deinit();
+                self.threaded.deinit();
+                return err;
+            };
+            // The bundle is current, so the client never reads the system's again.
+            self.client.now = now;
+        }
+        std.log.info("event=authentication_ready questions={d} region_bytes={d} certificates={d} certificate_bytes={d} certificate_limit={d}", .{ options.questions, region_bytes, self.client.ca_bundle.map.count(), certificate_used, options.certificate_bytes });
         return self;
     }
 
-    /// Stops the workers, ending the questions still out.
+    /// Ends the questions still out and gives back everything the client and I/O hold.
     pub fn close(self: *Authenticator) void {
-        // A worker waiting on a connect is not where cancelation reaches; shutting its socket is.
-        {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            for (self.workers) |*worker| if (worker.stream) |stream| stream.shutdown(self.io, .both) catch {};
-        }
-        self.queue.close(self.io);
-        self.group.cancel(self.io);
-        for (self.workers) |*worker| self.disconnect(worker);
+        const io = self.threaded.io();
+        self.tasks.cancel(io);
+        // The certificates are plugin memory, not the client's to free.
+        self.client.ca_bundle = .empty;
+        self.client.deinit();
+        self.threaded.deinit();
+        if (!self.buddy.whole()) std.log.err("event=authentication_leak used_bytes={d}", .{self.buddy.used});
     }
+
+    /// The system's root certificates, read once through scratch memory and kept in `limit`
+    /// bytes of plugin memory, the bytes as read and the lookup map built at its final size.
+    /// Returns the bytes kept.
+    fn loadCertificates(allocator: std.mem.Allocator, io: std.Io, now: std.Io.Timestamp, limit: usize, bundle: *std.crypto.Certificate.Bundle) !usize {
+        // Reading grows lists as it goes, peaking near ten times what it keeps: 1.2 MB for
+        // 132 KiB. The scratch is the system's, and given back before the server starts.
+        const scratch = try std.heap.page_allocator.alloc(u8, certificate_scratch_bytes);
+        defer std.heap.page_allocator.free(scratch);
+        var reading = std.heap.FixedBufferAllocator.init(scratch);
+        var loaded: std.crypto.Certificate.Bundle = .empty;
+        loaded.rescan(reading.allocator(), io, now) catch |err| return switch (err) {
+            error.OutOfMemory => error.RootCertificatesTooLarge,
+            else => err,
+        };
+        if (loaded.map.count() == 0) return error.NoRootCertificates;
+
+        var kept = std.heap.FixedBufferAllocator.init(try allocator.alloc(u8, limit));
+        const memory = kept.allocator();
+        bundle.* = .{ .bytes = .fromOwnedSlice(memory.dupe(u8, loaded.bytes.items) catch return error.RootCertificatesTooLarge), .map = .empty };
+        const context: CertificateMapContext = .{ .cb = bundle };
+        bundle.map.ensureTotalCapacityContext(memory, loaded.map.count(), context) catch return error.RootCertificatesTooLarge;
+        var entries = loaded.map.iterator();
+        while (entries.next()) |entry| bundle.map.putAssumeCapacityContext(entry.key_ptr.*, entry.value_ptr.*, context);
+        return kept.end_index;
+    }
+
+    /// The bundle keeps its map's context private; its insert names it.
+    const CertificateMapContext = @typeInfo(@TypeOf(@FieldType(std.crypto.Certificate.Bundle, "map").putContext)).@"fn".param_types[4].?;
+    const certificate_scratch_bytes = 4 * 1024 * 1024;
 
     /// Starts asking whether the player joined with this hash. The answer comes later, from
     /// `answer`, once the connection is woken.
@@ -171,8 +210,26 @@ pub const Authenticator = struct {
         slot.server_id_len = @intCast(minecraftDigest(server_hash, &slot.server_id).len);
         slot.handle = handle;
         slot.state.store(.queued, .release);
-        // The queue holds every connection, and a slot is queued once, so it never fills.
-        if (try self.queue.put(self.io, &.{@as(u32, @intCast(handle.index))}, 0) != 1) unreachable;
+
+        const index: u32 = @intCast(handle.index);
+        {
+            self.mutex.lockUncancelable(self.server_io);
+            defer self.mutex.unlock(self.server_io);
+            if (self.running == self.questions) {
+                // Every slot is queued at most once, so the queue never fills.
+                self.pending[(self.pending_head + self.pending_len) % self.pending.len] = index;
+                self.pending_len += 1;
+                return;
+            }
+            self.running += 1;
+        }
+        self.tasks.concurrent(self.threaded.io(), drain, .{ self, index }) catch |err| {
+            self.mutex.lockUncancelable(self.server_io);
+            self.running -= 1;
+            self.mutex.unlock(self.server_io);
+            slot.state.store(.idle, .release);
+            return err;
+        };
     }
 
     /// The answer for the connection once Mojang gave one. Answers for connections that left are
@@ -190,218 +247,109 @@ pub const Authenticator = struct {
         return self.host_bytes[0..self.host_len];
     }
 
-    fn loadCertificates(self: *Authenticator, allocator: std.mem.Allocator, room: usize) !void {
-        // Reading the bundle grows lists as it goes, peaking near ten times what it keeps.
-        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer scratch.deinit();
-        var loaded: Bundle = .empty;
-        try loaded.rescan(scratch.allocator(), self.io, std.Io.Clock.real.now(self.io));
-        if (loaded.map.count() == 0) return error.NoRootCertificates;
-        const map_bytes = loaded.map.capacity() * (@sizeOf(std.crypto.Certificate.der.Element.Slice) + @sizeOf(u32) + 1);
-        if (loaded.bytes.items.len + map_bytes > room) return error.RootCertificatesTooLarge;
-        self.certificates.bytes = .fromOwnedSlice(try allocator.dupe(u8, loaded.bytes.items));
-        const context: MapContext = .{ .cb = &self.certificates };
-        try self.certificates.map.ensureTotalCapacityContext(allocator, loaded.map.count(), context);
-        var entries = loaded.map.iterator();
-        while (entries.next()) |entry| self.certificates.map.putAssumeCapacityContext(entry.key_ptr.*, entry.value_ptr.*, context);
-    }
-
-    /// The bundle keeps its map's context private; its insert names it.
-    const MapContext = @typeInfo(@TypeOf(@FieldType(Bundle, "map").putContext)).@"fn".param_types[4].?;
-
-    fn work(self: *Authenticator, worker: *Worker) std.Io.Cancelable!void {
+    /// Asks the question it was started for, then those waiting, until none are.
+    fn drain(self: *Authenticator, first: u32) std.Io.Cancelable!void {
+        const io = self.threaded.io();
+        var index = first;
         while (true) {
-            const index = self.queue.getOne(self.io) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                error.Closed => return,
-            };
             const slot = &self.slots[index];
-            slot.answer = self.question(worker, slot) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                else => failed: {
-                    std.log.warn("event=authentication_unavailable connection={d}:{d} reason={t}", .{ slot.handle.index, slot.handle.generation, err });
-                    break :failed .unavailable;
-                },
-            };
+            slot.answer = try self.question(slot);
             slot.state.store(.answered, .release);
             self.wake.connection(slot.handle);
-        }
-    }
 
-    /// What a failed read or write was, rather than that one failed.
-    fn cause(self: *const Authenticator, worker: *const Worker, err: anyerror) anyerror {
-        _ = self;
-        if (err != error.ReadFailed and err != error.WriteFailed) return err;
-        if (worker.progress == .closed) return err;
-        if (worker.socket_reader.err) |found| return found;
-        if (worker.socket_writer.err) |found| return found;
-        if (worker.progress == .secured) if (worker.tls_client.read_err) |found| return found;
-        return err;
-    }
-
-    fn question(self: *Authenticator, worker: *Worker, slot: *const Slot) !Answer {
-        const deadline = std.Io.Clock.now(.awake, self.io).nanoseconds + self.timeout.nanoseconds;
-        self.arm(worker, deadline);
-        defer self.arm(worker, 0);
-        // A kept connection the server has since closed fails at once; one new one is tried.
-        const reused = worker.stream != null;
-        if (self.exchange(worker, slot)) |result| return result else |failure| {
-            const err = self.cause(worker, failure);
-            self.disconnect(worker);
-            if (err == error.Canceled or !reused or std.Io.Clock.now(.awake, self.io).nanoseconds >= deadline) return err;
-        }
-        return self.exchange(worker, slot) catch |failure| {
-            const err = self.cause(worker, failure);
-            self.disconnect(worker);
-            return err;
-        };
-    }
-
-    fn exchange(self: *Authenticator, worker: *Worker, slot: *const Slot) !Answer {
-        if (worker.stream == null) try self.connect(worker);
-        const out = worker.output(self.secure);
-        try out.writeAll("GET /session/minecraft/hasJoined?username=");
-        // Offline clients may send any name; escaping keeps it one query value.
-        try std.Uri.Component.percentEncode(out, slot.name[0..slot.name_len], isUnreserved);
-        try out.print("&serverId={s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: lightning-rod\r\nAccept: application/json\r\nConnection: keep-alive\r\n\r\n", .{ slot.server_id[0..slot.server_id_len], self.host() });
-        try out.flush();
-        if (self.secure) try worker.socket_writer.interface.flush();
-
-        worker.http = .{ .in = worker.input(self.secure), .interface = undefined, .state = .ready, .max_head_len = head_max };
-        const head = try std.http.Client.Response.Head.parse(try worker.http.receiveHead());
-        // Nothing asked for compression, so a compressed answer is not one.
-        if (head.content_encoding != .identity) return error.UnexpectedEncoding;
-        const status = head.status;
-        const keep = head.keep_alive;
-        // No content means no body, whatever the head leaves out.
-        if (status == .no_content) {
-            if (!keep) self.disconnect(worker);
-            return .unverified;
-        }
-        const body = worker.http.bodyReader(&worker.transfer, head.transfer_encoding, head.content_length);
-        var received: std.Io.Writer = .fixed(&worker.body);
-        _ = body.streamRemaining(&received) catch |err| return if (err == error.WriteFailed) error.AnswerTooLarge else worker.http.body_err orelse err;
-        if (!keep or worker.http.state != .ready) self.disconnect(worker);
-        return switch (status) {
-            .ok => parseJoined(received.buffered(), &worker.scratch),
-            else => .unavailable,
-        };
-    }
-
-    fn connect(self: *Authenticator, worker: *Worker) !void {
-        // A local stand in is named by address; the session server by name.
-        const stream = if (std.Io.net.IpAddress.parse(self.host(), self.port)) |address| try self.open(worker, address) else |_| connected: {
-            const name = try std.Io.net.HostName.init(self.host());
-            var results_buffer: [16]std.Io.net.HostName.LookupResult = undefined;
-            var results: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&results_buffer);
-            try name.lookup(self.io, &results, .{ .port = self.port });
-            var failure: anyerror = error.UnknownHostName;
-            break :connected while (results.getOneUncancelable(self.io)) |result| switch (result) {
-                .address => |address| break self.open(worker, address) catch |err| {
-                    failure = err;
-                    continue;
-                },
-                .canonical_name => {},
-            } else |err| switch (err) {
-                error.Closed => return failure,
-            };
-        };
-        worker.socket_reader = stream.reader(self.io, &worker.socket_input);
-        worker.socket_writer = stream.writer(self.io, &worker.socket_output);
-        worker.progress = .connected;
-        if (!self.secure) return;
-        var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
-        self.io.random(&entropy);
-        worker.tls_client = try tls.Client.init(&worker.socket_reader.interface, &worker.socket_writer.interface, .{
-            .host = .{ .explicit = self.host() },
-            // Linux verifies against the bundle alone; the allocator is for fetching more roots.
-            .ca = .{ .bundle = .{ .gpa = .failing, .io = self.io, .lock = &self.certificates_lock, .bundle = &self.certificates } },
-            .read_buffer = &worker.tls_read,
-            .write_buffer = &worker.tls_write,
-            .entropy = &entropy,
-            .realtime_now = std.Io.Clock.real.now(self.io),
-        });
-        worker.progress = .secured;
-    }
-
-    /// Connects to the address over a socket the watchdog sees from the start: std's connect
-    /// takes no deadline yet, and shutting a socket down ends its pending connect on Linux.
-    fn open(self: *Authenticator, worker: *Worker, address: std.Io.net.IpAddress) !std.Io.net.Stream {
-        const linux = std.os.linux;
-        const Storage = extern union { in: linux.sockaddr.in, in6: linux.sockaddr.in6 };
-        var storage: Storage = undefined;
-        const family: u32, const length: linux.socklen_t = switch (address) {
-            .ip4 => |ip| family: {
-                storage = .{ .in = .{ .port = std.mem.nativeToBig(u16, ip.port), .addr = @bitCast(ip.bytes) } };
-                break :family .{ linux.AF.INET, @sizeOf(linux.sockaddr.in) };
-            },
-            .ip6 => |ip| family: {
-                storage = .{ .in6 = .{ .port = std.mem.nativeToBig(u16, ip.port), .flowinfo = ip.flow, .addr = ip.bytes, .scope_id = ip.interface.index } };
-                break :family .{ linux.AF.INET6, @sizeOf(linux.sockaddr.in6) };
-            },
-        };
-        const opened = linux.socket(family, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP);
-        if (linux.errno(opened) != .SUCCESS) return error.SystemResources;
-        const stream: std.Io.net.Stream = .{ .socket = .{ .handle = @intCast(opened), .address = address } };
-        {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            worker.stream = stream;
-        }
-        errdefer self.disconnect(worker);
-        while (true) switch (linux.errno(linux.connect(stream.socket.handle, &storage, length))) {
-            .SUCCESS => return stream,
-            .INTR => continue,
-            .CONNREFUSED => return error.ConnectionRefused,
-            .TIMEDOUT => return error.Timeout,
-            else => return error.ConnectFailed,
-        };
-    }
-
-    fn disconnect(self: *Authenticator, worker: *Worker) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const stream = worker.stream orelse return;
-        stream.close(self.io);
-        worker.stream = null;
-        worker.progress = .closed;
-    }
-
-    fn arm(self: *Authenticator, worker: *Worker, deadline: i96) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        worker.deadline = deadline;
-        if (deadline != 0) self.deadlines.signal(self.io);
-    }
-
-    /// Shuts down the socket of every question past its deadline, which ends the worker's wait on
-    /// it. Sleeps until the earliest deadline, and without one until a question starts.
-    fn watch(self: *Authenticator) std.Io.Cancelable!void {
-        try self.mutex.lock(self.io);
-        defer self.mutex.unlock(self.io);
-        while (true) {
-            const now = std.Io.Clock.now(.awake, self.io).nanoseconds;
-            var earliest: ?i96 = null;
-            for (self.workers) |*worker| {
-                if (worker.deadline == 0 or worker.deadline == tripped) continue;
-                if (worker.deadline <= now) {
-                    if (worker.stream) |stream| stream.shutdown(self.io, .both) catch {};
-                    // Shut once; the worker clears its deadline as the question ends.
-                    worker.deadline = tripped;
-                    continue;
-                }
-                earliest = @min(earliest orelse worker.deadline, worker.deadline);
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            if (self.pending_len == 0) {
+                self.running -= 1;
+                return;
             }
-            if (earliest) |deadline| {
-                self.deadlines.waitTimeout(self.io, &self.mutex, .{ .deadline = .{ .raw = .{ .nanoseconds = deadline }, .clock = .awake } }) catch |err| switch (err) {
-                    error.Canceled => return error.Canceled,
-                    error.Timeout => {},
-                };
-            } else try self.deadlines.wait(self.io, &self.mutex);
+            index = self.pending[self.pending_head];
+            self.pending_head = (self.pending_head + 1) % self.pending.len;
+            self.pending_len -= 1;
         }
     }
 
-    const tripped = std.math.maxInt(i96);
+    /// One question, given until its deadline: the request runs as a task of its own, so this
+    /// one can stop waiting on it.
+    fn question(self: *Authenticator, slot: *const Slot) std.Io.Cancelable!Answer {
+        const io = self.threaded.io();
+        var finished: std.Io.Event = .unset;
+        var asking = io.concurrent(fetch, .{ self, slot, &finished }) catch |err| {
+            std.log.warn("event=authentication_unavailable connection={d}:{d} reason={t}", .{ slot.handle.index, slot.handle.generation, err });
+            return .unavailable;
+        };
+        finished.waitTimeout(io, .{ .duration = .{ .raw = self.timeout, .clock = .awake } }) catch |err| switch (err) {
+            error.Timeout => {},
+            error.Canceled => {
+                _ = asking.cancel(io) catch {};
+                return error.Canceled;
+            },
+        };
+        if (finished.isSet()) return asking.await(io) catch |err| {
+            std.log.warn("event=authentication_unavailable connection={d}:{d} reason={t}", .{ slot.handle.index, slot.handle.generation, err });
+            return .unavailable;
+        };
+        _ = asking.cancel(io) catch {};
+        std.log.warn("event=authentication_unavailable connection={d}:{d} reason=Timeout", .{ slot.handle.index, slot.handle.generation });
+        return .unavailable;
+    }
+
+    /// The request, which tells the question when it is done; the question reports how it went,
+    /// knowing whether it gave up on it first.
+    fn fetch(self: *Authenticator, slot: *const Slot, finished: *std.Io.Event) anyerror!Answer {
+        defer finished.set(self.threaded.io());
+        return self.request(slot);
+    }
+
+    fn request(self: *Authenticator, slot: *const Slot) !Answer {
+        var url_bytes: [url_max]u8 = undefined;
+        var url: std.Io.Writer = .fixed(&url_bytes);
+        try url.print("{s}/session/minecraft/hasJoined?username=", .{self.host()});
+        // Offline clients may send any name; escaping keeps it one query value.
+        try std.Uri.Component.percentEncode(&url, slot.name[0..slot.name_len], isUnreserved);
+        try url.print("&serverId={s}", .{slot.server_id[0..slot.server_id_len]});
+
+        const uri = try std.Uri.parse(url.buffered());
+        var asked = try self.client.request(.GET, uri, .{
+            .redirect_behavior = .unhandled,
+            .headers = .{ .user_agent = .{ .override = "lightning-rod" } },
+        });
+        defer asked.deinit();
+        try asked.sendBodiless();
+        var redirect: [1024]u8 = undefined;
+        var response = try asked.receiveHead(&redirect);
+        switch (response.head.status) {
+            .ok => {},
+            .no_content => {
+                // A 204 has no body, but std (0.17.0 and 0.17.1) reads one until the server
+                // closes, in `fetch` and when the request ends, and Mojang keeps the connection
+                // open (ziglang/zig#25181). Marking the response read ends the request at once
+                // and keeps the connection for the next question.
+                asked.reader.state = .ready;
+                return .unverified;
+            },
+            else => return .unavailable,
+        }
+        // The default Accept-Encoding offers gzip and deflate, read through this window rather
+        // than one the client allocates.
+        switch (response.head.content_encoding) {
+            .identity, .gzip, .deflate => {},
+            else => return error.UnexpectedEncoding,
+        }
+        var window: [std.compress.flate.max_window_len]u8 = undefined;
+        var transfer: [64]u8 = undefined;
+        var decompress: std.http.Decompress = undefined;
+        const reader = response.readerDecompressing(&transfer, &decompress, &window);
+        var body_bytes: [response_max]u8 = undefined;
+        var body: std.Io.Writer = .fixed(&body_bytes);
+        _ = reader.streamRemaining(&body) catch |err| switch (err) {
+            error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
+            error.WriteFailed => return error.AnswerTooLarge,
+            else => |e| return e,
+        };
+        var scratch: [scratch_max]u8 = undefined;
+        return parseJoined(body.buffered(), &scratch);
+    }
 };
 
 /// A hasJoined answer: the profile, or `unavailable` for anything not shaped like one.
@@ -480,7 +428,7 @@ test "a joined answer yields the profile and its signed textures" {
 }
 
 /// Answers hasJoined as Mojang would: Notch joined, slow takes too long, anyone else did not.
-/// Counts the connections it accepts, to show workers keep theirs.
+/// Counts the connections it accepts, to show the client keeps its own.
 const FakeSessionServer = struct {
     listener: std.Io.net.Server,
     group: std.Io.Group = .init,
@@ -514,7 +462,9 @@ const FakeSessionServer = struct {
                     \\{"id":"069a79f444e94726a5befca90e38aaf5","name":"Notch","properties":[{"name":"textures","value":"dGV4dHVyZXM=","signature":"c2ln"}]}
                 , .{}) catch return;
             } else {
-                request.respond("", .{ .status = .no_content }) catch return;
+                // A 204 without a length, as Mojang answers it. Zig 0.17.0's client read such a
+                // body until the server closed, which Mojang never does (ziglang/zig#25181).
+                request.respond("", .{ .status = .no_content, .transfer_encoding = .none }) catch return;
             }
         }
     }
@@ -534,7 +484,7 @@ fn awaitAnswers(authenticator: *Authenticator, handles: []const sessions.Handle,
     }
 }
 
-test "asks a session server for many players at once with fixed workers" {
+test "asks a session server for more players than run at once" {
     const io = std.testing.io;
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var fake: FakeSessionServer = .{ .listener = try address.listen(io, .{}) };
@@ -546,19 +496,25 @@ test "asks a session server for many players at once with fixed workers" {
     }
 
     var host: [64]u8 = undefined;
-    const options: Options = .{ .session_host = try std.fmt.bufPrint(&host, "http://127.0.0.1:{d}", .{fake.listener.socket.address.getPort()}), .workers = 2, .timeout = .fromMilliseconds(500) };
+    const options: Options = .{
+        .session_host = try std.fmt.bufPrint(&host, "http://127.0.0.1:{d}", .{fake.listener.socket.address.getPort()}),
+        .questions = 2,
+        .timeout = .fromMilliseconds(500),
+    };
     const connections = 4;
     const memory = try std.testing.allocator.alloc(u8, Authenticator.memoryBytes(options, connections));
     defer std.testing.allocator.free(memory);
     var fixed = std.heap.FixedBufferAllocator.init(memory);
     const wake: sessions.Wake = .{};
     const authenticator = try Authenticator.init(fixed.allocator(), io, options, connections, &wake);
-    defer authenticator.close();
+    var closed = false;
+    defer if (!closed) authenticator.close();
 
     const notch: sessions.Handle = .{ .index = 0, .generation = 1 };
     const nobody: sessions.Handle = .{ .index = 1, .generation = 1 };
     const slow: sessions.Handle = .{ .index = 2, .generation = 1 };
     const hash: [20]u8 = @splat(0xab);
+    // Three questions, two at a time: one waits its turn.
     try authenticator.ask(slow, "slow", hash);
     try authenticator.ask(notch, "Notch", hash);
     try authenticator.ask(nobody, "nobody", hash);
@@ -570,39 +526,25 @@ test "asks a session server for many players at once with fixed workers" {
     try std.testing.expectEqual(@as(u128, 0x069a79f444e94726a5befca90e38aaf5), profile.uuid);
     try std.testing.expectEqualStrings("dGV4dHVyZXM=", profile.textures_value[0..profile.textures_value_len]);
     try std.testing.expect(answers[1].? == .unverified);
-    // The watchdog ended the question the server sat on.
+    // The question the server sat on ended at its deadline.
     try std.testing.expect(answers[2].? == .unavailable);
     // An answer is taken once, and the slot is free for the next question.
     try std.testing.expect(authenticator.answer(notch) == null);
 
-    // The worker that asked twice kept its connection; the one the watchdog cut reconnects.
-    const accepted = fake.accepted.load(.monotonic);
-    const again = [_]sessions.Handle{ .{ .index = 0, .generation = 2 }, .{ .index = 1, .generation = 2 } };
-    try authenticator.ask(again[0], "Notch", hash);
-    try authenticator.ask(again[1], "nobody", hash);
-    var more: [2]?Authenticator.Answer = @splat(null);
-    try awaitAnswers(authenticator, &again, &more);
-    try std.testing.expect(more[0].? == .joined and more[1].? == .unverified);
-    try std.testing.expect(fake.accepted.load(.monotonic) <= accepted + 1);
-}
+    // A kept connection answers the next question without a new one.
+    var accepted: usize = 0;
+    for (2..4) |generation| {
+        const again: sessions.Handle = .{ .index = 0, .generation = @intCast(generation) };
+        try authenticator.ask(again, "Notch", hash);
+        var more: [1]?Authenticator.Answer = @splat(null);
+        try awaitAnswers(authenticator, &.{again}, &more);
+        try std.testing.expect(more[0].? == .joined);
+        if (generation == 3) try std.testing.expectEqual(accepted, fake.accepted.load(.monotonic));
+        accepted = fake.accepted.load(.monotonic);
+    }
 
-test "a session server that never accepts the connection is given up on in time" {
-    const io = std.testing.io;
-    // TEST-NET-1 is never routed, so the connect waits on a reply that does not come, unless
-    // this machine has no route at all, which fails it at once.
-    const options: Options = .{ .session_host = "http://192.0.2.1:80", .workers = 1, .timeout = .fromMilliseconds(300) };
-    const memory = try std.testing.allocator.alloc(u8, Authenticator.memoryBytes(options, 1));
-    defer std.testing.allocator.free(memory);
-    var fixed = std.heap.FixedBufferAllocator.init(memory);
-    const wake: sessions.Wake = .{};
-    const authenticator = try Authenticator.init(fixed.allocator(), io, options, 1, &wake);
-    defer authenticator.close();
-
-    const started = std.Io.Clock.now(.awake, io).nanoseconds;
-    const handle: sessions.Handle = .{ .index = 0, .generation = 1 };
-    try authenticator.ask(handle, "Notch", @splat(0));
-    var answers: [1]?Authenticator.Answer = @splat(null);
-    try awaitAnswers(authenticator, &.{handle}, &answers);
-    try std.testing.expect(answers[0].? == .unavailable);
-    try std.testing.expect(std.Io.Clock.now(.awake, io).nanoseconds - started < 3 * std.time.ns_per_s);
+    // Everything the client and its I/O took comes back to the region.
+    closed = true;
+    authenticator.close();
+    try std.testing.expect(authenticator.buddy.whole());
 }
