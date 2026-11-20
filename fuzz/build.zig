@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
     const records = b.dependency("records", .{ .target = target, .optimize = optimize });
     const chunks = b.dependency("chunks", .{ .target = target, .optimize = optimize });
     const metrics = b.dependency("metrics", .{ .target = target, .optimize = optimize }).module("metrics");
+    const system = b.dependency("system", .{ .target = target, .optimize = optimize }).module("system");
     const storage_testing = b.createModule(.{ .root_source_file = storage.path("src/testing.zig"), .target = target, .optimize = optimize });
     const model = b.createModule(.{
         .root_source_file = records.path("src/model_test.zig"),
@@ -44,6 +45,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "storage_testing", .module = storage_testing },
                     .{ .name = "model", .module = model },
                     .{ .name = "encoding", .module = encoding },
+                    .{ .name = "system", .module = system },
                 },
             }),
             .filters = &.{"fuzz"},
@@ -60,7 +62,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/environment_test.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "storage", .module = storage.module("storage") }},
+            .imports = &.{ .{ .name = "storage", .module = storage.module("storage") }, .{ .name = "system", .module = system } },
         }),
         .test_runner = .{ .path = runner, .mode = .server },
     });
@@ -84,6 +86,6 @@ fn fuzzRunner(b: *std.Build, seed: u32) std.Build.LazyPath {
     prepare.addArg(b.fmt("{d}", .{seed}));
     const source = prepare.addOutputFileArg("test_runner.zig");
     const files = b.addWriteFiles();
-    _ = files.addCopyFile(b.path("src/environment.zig"), "environment.zig");
+    _ = files.addCopyFile(b.path("src/single_thread.zig"), "single_thread.zig");
     return files.addCopyFile(source, "test_runner.zig");
 }

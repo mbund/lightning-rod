@@ -14,8 +14,8 @@ pub fn main(init: std.process.Init) !void {
 
 fn prepare(allocator: std.mem.Allocator, source: []const u8, seed: u32) ![]const u8 {
     var runner = source;
-    runner = replace(allocator, runner, "const fuzz_abi = std.Build.abi.fuzz;", "const fuzz_abi = std.Build.abi.fuzz;\nconst environment = @import(\"environment.zig\");");
-    runner = replace(allocator, runner, "pub fn main(init: std.process.Init.Minimal) void {\n    @disableInstrumentation();", "pub fn main(init: std.process.Init.Minimal) void {\n    @disableInstrumentation();\n    environment.initialize();");
+    runner = replace(allocator, runner, "const fuzz_abi = std.Build.abi.fuzz;", "const fuzz_abi = std.Build.abi.fuzz;\nconst single_thread = @import(\"single_thread.zig\");");
+    runner = replace(allocator, runner, "pub fn main(init: std.process.Init.Minimal) void {\n    @disableInstrumentation();", "pub fn main(init: std.process.Init.Minimal) void {\n    @disableInstrumentation();\n    single_thread.initialize();");
     runner = replace(allocator, runner, "                const n_tests: u32 = try server.receiveBody_u32();", "                const n_tests: u32 = try server.receiveBody_u32();\n                assert(n_tests == 1);");
     // Coverage uses TLS startup. The I/O limits and seccomp filter forbid threads.
     const limits = "                    .async_limit = .nothing,\n                    .concurrent_limit = .nothing,\n";

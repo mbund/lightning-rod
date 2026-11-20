@@ -9,6 +9,7 @@
         .records = .{ .path = "../records" },
         .chunks = .{ .path = "../chunks" },
         .metrics = .{ .path = "../metrics" },
+        .system = .{ .path = "../system" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

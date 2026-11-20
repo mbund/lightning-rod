@@ -1,8 +1,8 @@
 const std = @import("std");
-const environment = @import("environment.zig");
+const single_thread = @import("single_thread.zig");
 
 pub fn main() !void {
-    environment.initialize();
+    single_thread.initialize();
     const thread = try std.Thread.spawn(.{}, run, .{});
     thread.join();
     return error.ThreadCreationWasAllowed;
