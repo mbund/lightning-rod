@@ -7,6 +7,7 @@ const profile = @import("e2e_profile");
 const sessions = @import("sessions");
 const vanilla = @import("vanilla");
 const LoginEncryption = @import("connection").session_encryption.LoginEncryption;
+const Authentication = @import("connection").authentication.Authentication;
 const Players = @import("players").players.Players;
 const Reload = @import("reload").Reload;
 const Status = @import("connection").session_status.Status;
@@ -77,6 +78,8 @@ pub fn run(init: std.process.Init, selections: anytype, config: Configuration) !
     var selected = try protocols.Default.init(allocator);
     defer selected.deinit(allocator);
     protocols_started.end();
+    // Online scenarios name the session server the runner hosts for them.
+    const session_host = init.environ_map.get("LIGHTNING_ROD_E2E_SESSION_HOST");
     const encryption_started = encryption_timer.start();
     var key: ?java.RsaPrivateKey = if (config.plaintext) null else try java.RsaPrivateKey.read(init.io, init.environ_map.get("LIGHTNING_ROD_E2E_KEY") orelse return error.MissingEncryptionKey);
     defer if (key) |*value| value.deinit();
@@ -84,7 +87,8 @@ pub fn run(init: std.process.Init, selections: anytype, config: Configuration) !
     const session_plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.configured(protocols.Handshake, protocols.Handshake.Configuration{}),
         lightning_rod.plugin.replace(connection_plugins(&selected), .{
-            lightning_rod.plugin.configured(LoginEncryption, LoginEncryption.Configuration{ .key = if (key) |*value| value else null }),
+            lightning_rod.plugin.configured(LoginEncryption, LoginEncryption.Configuration{ .key = if (key) |*value| value else null, .authenticate = session_host != null }),
+            lightning_rod.plugin.configured(Authentication, if (session_host) |host| Authentication.Configuration{ .online = true, .session_host = host } else Authentication.Configuration{}),
             lightning_rod.plugin.configured(Status, Status.Configuration{ .description = "E2E Vanilla Status" }),
         }),
     });

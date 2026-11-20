@@ -31,6 +31,9 @@ pub const Scenario = struct {
     /// The runner starts the previous revision's server and upgrades it in place.
     upgrade: bool = false,
     protocol_mismatch: bool = false,
+    /// The server runs in online mode against a session server the runner hosts, which clients
+    /// join through.
+    session_server: bool = false,
 };
 
 pub const Manifest = struct {

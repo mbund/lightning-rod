@@ -79,7 +79,7 @@ pub fn build(b: *std.Build) void {
     }) });
     b.step("test-performance", "Test performance budget accumulation and statistics").dependOn(&b.addRunArtifact(performance_tests).step);
     const test_harness = b.step("test-harness", "Verify E2E manifests, version selection, client launches and shutdown outcomes");
-    for ([_][]const u8{ "child", "listener", "process_cleanup", "scheduling", "manifest", "client_bundle" }) |name| {
+    for ([_][]const u8{ "child", "listener", "process_cleanup", "scheduling", "manifest", "client_bundle", "session_server" }) |name| {
         const tests = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(b.fmt("src/{s}.zig", .{name})),
             .target = target,

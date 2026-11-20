@@ -1,0 +1,5 @@
+.{ .client = "OnlineModeFixture", .scenarios = .{.{
+    .name = "online-mode",
+    .peers = .{ "alice", "mallory" },
+    .session_server = true,
+}} }

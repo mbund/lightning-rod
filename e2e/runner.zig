@@ -12,6 +12,7 @@ const UpgradeTest = @import("src/upgrade.zig").Test;
 const ManagedChild = @import("src/child.zig").ManagedChild;
 const Listener = @import("src/listener.zig").Listener;
 const client_bundle = @import("src/client_bundle.zig");
+const SessionServer = @import("src/session_server.zig").SessionServer;
 
 const max_processes = manifest.maximum_peers + 2;
 const max_clients = manifest.maximum_peers;
@@ -156,6 +157,22 @@ fn runScenario(init: std.process.Init, arguments: Arguments, test_case: manifest
     const port = try std.fmt.allocPrint(init.gpa, "--port={s}", .{address[(std.mem.lastIndexOfScalar(u8, address, ':') orelse return error.InvalidAddress) + 1 ..]});
     defer init.gpa.free(port);
     try init.environ_map.put("LIGHTNING_ROD_PORT", port[7..]);
+    // Online scenarios point the server and every client at a session server of their own.
+    var session_server: SessionServer = undefined;
+    var session_properties: [3][]const u8 = undefined;
+    var client_properties: []const []const u8 = &.{};
+    if (test_case.session_server) {
+        try session_server.start(init.io);
+        const host = session_server.host();
+        try init.environ_map.put("LIGHTNING_ROD_E2E_SESSION_HOST", host);
+        for (&session_properties, [_][]const u8{ "session", "services", "profiles" }) |*property, service|
+            property.* = try std.fmt.allocPrint(init.arena.allocator(), "-Dminecraft.api.{s}.host={s}", .{ service, host });
+        client_properties = &session_properties;
+    }
+    defer if (test_case.session_server) {
+        session_server.stop();
+        _ = init.environ_map.swapRemove("LIGHTNING_ROD_E2E_SESSION_HOST");
+    };
     const fixture = test_case.fixture;
     const fixture_arg = if (fixture) |name| try std.fmt.allocPrint(init.gpa, "--fixture={s}", .{name}) else null;
     defer if (fixture_arg) |arg| init.gpa.free(arg);
@@ -216,7 +233,7 @@ fn runScenario(init: std.process.Init, arguments: Arguments, test_case: manifest
     for (peers) |peer| {
         const connect_tick: usize = if (count + 1 == peers.len) test_case.last_peer_connect_tick else 40;
         const peer_version = if (peer_versions.len == 0) primary_version else peer_versions[count];
-        clients[count] = try spawnClient(init, arguments, artifacts, scenario, peer, peers, connect_tick, address, peer_version, display);
+        clients[count] = try spawnClient(init, arguments, artifacts, scenario, peer, peers, connect_tick, address, peer_version, display, client_properties);
         process_groups[count + 2].store(clients[count].group, .release);
         count += 1;
         const startup_deadline = std.Io.Clock.Timestamp.now(init.io, .awake).raw.nanoseconds + 120 * std.time.ns_per_s;
@@ -311,7 +328,7 @@ fn waitForDisplay(init: std.process.Init, artifacts: []const u8) ![]const u8 {
     return error.DisplayStartupTimeout;
 }
 
-fn spawnClient(init: std.process.Init, arguments: Arguments, artifacts: []const u8, scenario: []const u8, peer: []const u8, peers: []const []const u8, connect_tick: usize, address: []const u8, client_version: []const u8, display: []const u8) !ManagedChild {
+fn spawnClient(init: std.process.Init, arguments: Arguments, artifacts: []const u8, scenario: []const u8, peer: []const u8, peers: []const []const u8, connect_tick: usize, address: []const u8, client_version: []const u8, display: []const u8, extra_properties: []const []const u8) !ManagedChild {
     const allocator = init.gpa;
     const version = try std.fmt.allocPrint(allocator, "-Dmcc.version={s}", .{client_version});
     defer allocator.free(version);
@@ -343,7 +360,9 @@ fn spawnClient(init: std.process.Init, arguments: Arguments, artifacts: []const 
     try environment.put("DISPLAY", display);
     try environment.put("LP_NUM_THREADS", "2");
     const bundle = try client_bundle.Bundle.open(init, client.bundle, client_version);
-    const command = try bundle.command(init, run_dir, &.{ version, address_arg, events, output, peer_arg, expected, scenario_arg, connect_arg, fixture_arg }, &.{ "--username", peer, "--gameDir", run_dir }, .{ .fixtures = client.fixtures });
+    const base_properties = [_][]const u8{ version, address_arg, events, output, peer_arg, expected, scenario_arg, connect_arg, fixture_arg };
+    const properties = try std.mem.concat(init.arena.allocator(), []const u8, &.{ &base_properties, extra_properties });
+    const command = try bundle.command(init, run_dir, properties, &.{ "--username", peer, "--gameDir", run_dir }, .{ .fixtures = client.fixtures });
     const log_path = try std.fmt.allocPrint(allocator, "{s}/{s}.log", .{ artifacts, peer });
     defer allocator.free(log_path);
     const log = try std.Io.Dir.cwd().createFile(init.io, log_path, .{});
