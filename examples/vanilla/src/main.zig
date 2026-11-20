@@ -7,6 +7,7 @@ const sessions = @import("sessions");
 const vanilla = @import("lightning_rod_vanilla_1_21_6");
 const Chunks = @import("chunks").Chunks;
 const LoginEncryption = @import("connection").session_encryption.LoginEncryption;
+const Authentication = @import("connection").authentication.Authentication;
 const Operators = @import("commands").operators.Operators;
 const Players = @import("players").players.Players;
 const RegionDebug = @import("replication").region_debug.RegionDebug;
@@ -34,6 +35,9 @@ pub fn main(init: std.process.Init) !void {
     var metrics_export: ?lightning_rod.metrics.Exporter.Configuration = null;
     var storage_path: []const u8 = "lightning-rod-data/world";
     var hull = true;
+    // Players prove to Mojang who they are, as vanilla's online mode. Off by default: an existing
+    // world's players are saved under the UUIDs offline mode gives their names.
+    var online_mode = false;
     // One column past the view, the ring vanilla sends so every column in view has its neighbours.
     var prefetch: u2 = 1;
     var tps_bar = true;
@@ -77,6 +81,8 @@ pub fn main(init: std.process.Init) !void {
             prefetch = try std.fmt.parseInt(u2, argument["--prefetch=".len..], 10);
         } else if (std.mem.eql(u8, argument, "--no-tps-bar")) {
             tps_bar = false;
+        } else if (std.mem.eql(u8, argument, "--online-mode")) {
+            online_mode = true;
         } else if (std.mem.eql(u8, argument, "--no-hull")) {
             hull = false;
         } else if (std.mem.eql(u8, argument, "--startup-report")) {
@@ -106,12 +112,15 @@ pub fn main(init: std.process.Init) !void {
     });
     var protocols = try protocol_set.Default.init(allocator);
     defer protocols.deinit(allocator);
+    // Online mode asks clients to prove who they are over an encrypted login.
+    if (online_mode and encryption_key_path == null) return error.OnlineModeNeedsEncryptionKey;
     var key: ?java.RsaPrivateKey = if (encryption_key_path) |path| try java.RsaPrivateKey.read(init.io, path) else null;
     defer if (key) |*private_key| private_key.deinit();
     const session_plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.configured(protocol_set.Handshake, protocol_set.Handshake.Configuration{}),
         lightning_rod.plugin.replace(connection_plugins(&protocols), .{
-            lightning_rod.plugin.configured(LoginEncryption, .{ .key = if (key) |*value| value else null }),
+            lightning_rod.plugin.configured(LoginEncryption, .{ .key = if (key) |*value| value else null, .authenticate = online_mode }),
+            lightning_rod.plugin.configured(Authentication, .{ .online = online_mode }),
         }),
     });
     std.log.info("Starting Lightning Rod", .{});
