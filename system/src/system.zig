@@ -8,6 +8,8 @@ pub const sparse_sets = @import("sparse_sets.zig");
 pub const bit_sets = @import("bit_sets.zig");
 pub const Mailbox = @import("mailbox.zig").Mailbox;
 pub const BuddyAllocator = @import("buddy_allocator.zig").BuddyAllocator;
+/// A std.Io for tests, with virtual time and seeded randomness.
+pub const DeterministicIo = @import("deterministic_io.zig").DeterministicIo;
 
 test {
     _ = @import("work.zig");
@@ -15,6 +17,7 @@ test {
     _ = @import("batch_index.zig");
     _ = @import("mailbox.zig");
     _ = @import("buddy_allocator.zig");
+    _ = @import("deterministic_io.zig");
     _ = @import("index_set.zig");
     _ = @import("bit_sets.zig");
     _ = @import("sparse_sets.zig");
