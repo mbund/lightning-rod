@@ -1,0 +1,6 @@
+.{ .client = "FlightFixture", .scenarios = .{.{
+    .name = "flight",
+    .peers = .{"alice"},
+    .reload = true,
+    .reload_once = true,
+}} }
