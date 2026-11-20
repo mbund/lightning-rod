@@ -234,6 +234,9 @@ pub const Emitter = struct {
                 for (packet.fingerprint) |byte| try self.out.print("{},", .{byte});
                 try self.out.writeAll("};\n");
                 try self.out.writeAll("pub fn protocolNumber(self: @This()) i32 { return self._cursor.protocol_number; }\n");
+                // The release whose layout this packet has, for a protocol a custom endpoint negotiates
+                // under a number of its own.
+                try self.out.writeAll("pub fn layoutProtocol(self: @This()) i32 { return self._cursor.layout_protocol orelse self._cursor.protocol_number; }\n");
             };
 
             if (step == 0) try self.out.print("pub const Done = c.End(@This(), .{s});\n", .{mode});

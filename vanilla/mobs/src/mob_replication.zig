@@ -558,7 +558,7 @@ const Metadata = struct {
 
     fn write(packet: wire.play.toClient.packet_entity_metadata.Writer, id_value: i32, data: Data, changes: Changes) ![]u8 {
         var metadata = try (try packet.entityId(id_value)).metadata();
-        const variant_key: u8 = if (packet.protocolNumber() >= 775) 18 else 17;
+        const variant_key: u8 = if (packet.layoutProtocol() >= 775) 18 else 17;
         const done = try packets.nested(.{entries}).write(try metadata.begin(), .{ .data = data, .changes = changes, .variant_key = variant_key });
         return (try metadata.advance(done)).finish();
     }

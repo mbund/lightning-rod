@@ -1118,7 +1118,7 @@ pub const Replication = struct {
         var metadata = try entity.metadata();
         // 1.21.9 put Avatar between living entities and players, whose main hand and skin
         // layers come first, which moved the skin layers from 17 to 16.
-        const skin_key: u8 = if (packet.protocolNumber() >= 773) 16 else 17;
+        const skin_key: u8 = if (packet.layoutProtocol() >= 773) 16 else 17;
         return (try metadata.advance(try packets.nested(.{writeFlagMetadata}).write(try metadata.begin(), .{ .appearance = appearance, .skin_key = skin_key }))).finish();
     }
 
