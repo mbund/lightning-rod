@@ -121,3 +121,54 @@ test "RSA destruction erases the private key" {
     key.deinit();
     for (std.mem.asBytes(&key)) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
+
+const PublicKey = java.RsaPublicKey;
+
+test "RSA public keys check Java SHA256withRSA signatures" {
+    var buffer: [4096]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buffer);
+    var private = try PrivateKey.init(try readKey(&buffer));
+    defer private.deinit();
+    const key = try PublicKey.init(private.publicKey());
+
+    // Signed independently with Java's SHA256withRSA signature and the fixture key.
+    const vectors = .{
+        .{ "lightning rod", "acfe978ad97ed5ad19d2b765c3c6b3296c7855f97ae6a414a037c88f25cf71c98fb513537e70ee7526462c5da9709a55506c556477d5a38c9d02616309dff752e18128f8f58d17a2b5875d6c407bc4aeb9056e1f3953f3b49044e8c679e92422c7fe770e42d2b8f0f9246ca61d3e72401453da5c8116f8fd90f792c144bc906b100ac1b6a0dec3bfa866a6f1538d96ec1c910986e904fe5b9fd8cf3b59b333de83fee4ffee957d68786ecd25a33d72ad4af11d37ab20ac3109e200065eddb7b614903e6873686b10ea83bfc665b39014eb63c77f3e444874576afebcf762569c6ecaf64b8d751f67a1b2ad25b8d36311bc5d3ad16333d117b464f5e163a5bae6" },
+        .{ "", "7b19677a23af227527ad24baf6895dd335670f6c7530fd09b9123a8c3dc044b83539049f923444cee0788792b2e5500b4265567ace325f5aa28e54f22053085590b656f6e7e066c526ad1910a7ca0b2558bd66ae342a090ff574277e975bf98fe6db61c4b024ccebb2ee160b6c5127802c5b0dbe2bce784271a72e4f3dbdb916b8df2a27beabb97b68f9975975e869aa5c2bb7aff42a8ac51556e5ea8a7e5f4703a7f7b813ed4254184b6f953abe9a46a4c8158dfd3e278c6d4870657ce55f7ab9fd20a2a895dda05410a2399f7a6e4fd43b29cf2c57b5626dce4d13a47c23e66b84b52500be5a8de7d53e6bb60937293297cd0c724b2c8e85f591ed1eef24cf" },
+    };
+    inline for (vectors) |vector| {
+        var signature: [PublicKey.signature_bytes]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&signature, vector[1]);
+        try std.testing.expect(key.verify(&signature, &.{vector[0]}));
+        // The signature covers the bytes, however they are split into parts.
+        if (vector[0].len > 1) try std.testing.expect(key.verify(&signature, &.{ vector[0][0..1], "", vector[0][1..] }));
+        try std.testing.expect(!key.verify(&signature, &.{"lightning rods"}));
+        for (0..signature.len) |index| {
+            signature[index] ^= 0x01;
+            try std.testing.expect(!key.verify(&signature, &.{vector[0]}));
+            signature[index] ^= 0x01;
+        }
+    }
+    // A signature at or past the modulus is not a number the key could have made.
+    const too_large: [PublicKey.signature_bytes]u8 = @splat(0xff);
+    try std.testing.expect(!key.verify(&too_large, &.{"lightning rod"}));
+}
+
+test "RSA public keys refuse encodings Mojang does not issue" {
+    var buffer: [4096]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buffer);
+    var private = try PrivateKey.init(try readKey(&buffer));
+    defer private.deinit();
+    const encoded = private.publicKey();
+    var copy: [PublicKey.encoded_bytes + 1]u8 = undefined;
+    @memcpy(copy[0..encoded.len], encoded);
+    for (0..encoded.len) |length| try std.testing.expectError(error.InvalidPublicKey, PublicKey.init(encoded[0..length]));
+    copy[encoded.len] = 0;
+    try std.testing.expectError(error.InvalidPublicKey, PublicKey.init(&copy));
+    // Another exponent, another algorithm, or a modulus short of 2048 bits (its top bit is at 33).
+    for ([_]usize{ encoded.len - 1, 8, 33 }) |index| {
+        @memcpy(copy[0..encoded.len], encoded);
+        copy[index] ^= 0x80;
+        try std.testing.expectError(error.InvalidPublicKey, PublicKey.init(copy[0..encoded.len]));
+    }
+}

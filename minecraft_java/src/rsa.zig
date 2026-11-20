@@ -130,6 +130,48 @@ pub const PrivateKey = struct {
     }
 };
 
+/// A player's chat key, as the client sends it: a SubjectPublicKeyInfo for a 2048-bit RSA modulus
+/// and exponent 65537, the only kind Mojang issues. It checks SHA256withRSA signatures, the ones
+/// on chat messages.
+pub const PublicKey = struct {
+    pub const signature_bytes = modulus_bits / 8;
+    pub const encoded_bytes = public_key_prefix.len + signature_bytes + 1 + public_key_suffix.len;
+
+    modulus: Modulus,
+
+    pub fn init(encoded: []const u8) error{InvalidPublicKey}!PublicKey {
+        // Mojang's keys are encoded the one way DER allows, so anything else is not one of them.
+        if (encoded.len != encoded_bytes) return error.InvalidPublicKey;
+        if (!std.mem.eql(u8, encoded[0..public_key_prefix.len], public_key_prefix)) return error.InvalidPublicKey;
+        if (!std.mem.eql(u8, encoded[encoded.len - public_key_suffix.len ..], public_key_suffix)) return error.InvalidPublicKey;
+        const n = encoded[public_key_prefix.len..][0 .. signature_bytes + 1];
+        if (n[0] != 0 or n[1] & 0x80 == 0) return error.InvalidPublicKey;
+        return .{ .modulus = Modulus.fromBytes(n[1..], .big) catch return error.InvalidPublicKey };
+    }
+
+    /// Whether `signature` is this key's SHA256withRSA signature over the parts, in order.
+    pub fn verify(self: *const PublicKey, signature: *const [signature_bytes]u8, parts: []const []const u8) bool {
+        const value = Modulus.Fe.fromBytes(self.modulus, signature, .big) catch return false;
+        const decrypted = self.modulus.powWithEncodedPublicExponent(value, public_exponent, .big) catch return false;
+        var block: [signature_bytes]u8 = undefined;
+        decrypted.toBytes(&block, .big) catch return false;
+
+        // EMSA-PKCS1-v1_5: 00 01, padding of ff, 00, the SHA-256 DigestInfo and the digest.
+        const digest_info = "\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20";
+        const Sha256 = std.crypto.hash.sha2.Sha256;
+        var expected: [signature_bytes]u8 = @splat(0xff);
+        expected[0] = 0;
+        expected[1] = 1;
+        const tail = expected.len - Sha256.digest_length - digest_info.len;
+        expected[tail - 1] = 0;
+        @memcpy(expected[tail..][0..digest_info.len], digest_info);
+        var hash: Sha256 = .init(.{});
+        for (parts) |part| hash.update(part);
+        hash.final(expected[expected.len - Sha256.digest_length ..]);
+        return std.mem.eql(u8, &block, &expected);
+    }
+};
+
 fn element(decoder: *std.crypto.codecs.asn1.der.Decoder, tag: std.crypto.codecs.asn1.Tag.Number) ![]const u8 {
     const value = try decoder.element(.init(tag, tag == .sequence, .universal));
     decoder.index = value.slice.end;
