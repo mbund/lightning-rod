@@ -275,6 +275,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                 .compression_threshold = config.compression_threshold,
                 .metrics = config.metrics,
                 .observer = self,
+                .profiles = config.profiles,
             });
 
             for (endpoints, 0..) |endpoint, index| {

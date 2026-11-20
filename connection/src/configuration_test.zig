@@ -118,7 +118,9 @@ fn pendingOutput(comptime Version: type) !void {
     var handoff = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer handoff.deinit();
     try old.writeResume(&handoff.writer);
-    try std.testing.expectEqualSlices(u8, pending, handoff.written()[handoff.written().len - queued ..][0..pending.len]);
+    // The queued output ends the record, ahead of the connection's profile, here empty.
+    const profile_bytes = 5;
+    try std.testing.expectEqualSlices(u8, pending, handoff.written()[handoff.written().len - profile_bytes - queued ..][0..pending.len]);
     try std.testing.expectEqual(@as(u32, 51), std.mem.readInt(u32, handoff.written()[28..32], .little));
     const restored = try Engine.init(std.testing.allocator, transport, config);
     defer {

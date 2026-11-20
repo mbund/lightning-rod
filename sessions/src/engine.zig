@@ -7,6 +7,7 @@ const Buffers = @import("buffers.zig").Buffers;
 const system = @import("system");
 const input_decoding = @import("decoding.zig");
 const Readiness = @import("readiness.zig").Readiness;
+const profiles_api = @import("profiles.zig");
 
 const assert = std.debug.assert;
 
@@ -84,6 +85,8 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             max_pending_wire_bytes: usize = 4 * 1024 * 1024,
             protocols: *const Endpoint.Protocols,
             observer: *Observer,
+            /// What login and configuration said of each player, carried across a reload.
+            profiles: ?*profiles_api.Profiles = null,
             compression_threshold: ?usize = null,
             metrics: ?*metrics.Registry = null,
         };
@@ -518,9 +521,10 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 const input_len = input.len + connection.saved_input.length;
                 const output_len = self.queuedOutput(connection);
                 const codec = try Endpoint.save(&connection.lifecycle.?, self.scratch);
+                const profile = if (self.config.profiles) |profiles| profiles.get(handle) else profiles_api.PlayerProfile{};
                 try writer.writeInt(i32, native.descriptor(handle), .little);
-                try writer.writeInt(u32, 1, .little);
-                try writer.writeInt(u32, @intCast(57 + codec.len + input_len + output_len), .little);
+                try writer.writeInt(u32, 2, .little);
+                try writer.writeInt(u32, @intCast(57 + codec.len + input_len + output_len + savedProfileBytes(&profile)), .little);
                 try writer.writeInt(i32, connection.protocol.?.number, .little);
                 try writer.writeInt(u64, Endpoint.resumeFormat(&connection.lifecycle.?), .little);
                 try writer.writeInt(u32, @intCast(codec.len), .little);
@@ -547,6 +551,7 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 const first = @min(queued, ring.len - at);
                 try writer.writeAll(ring[at..][0..first]);
                 try writer.writeAll(ring[0 .. queued - first]);
+                try writeProfile(writer, &profile);
 
                 if (input.len != 0) std.log.info("event=reload_input_saved bytes={d} encrypted={}", .{ input.len, Endpoint.encrypted(&connection.lifecycle.?) });
             }
@@ -566,7 +571,8 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                 if (handle.index >= self.connections.len or self.connections[handle.index].handle != null) return error.InvalidResume;
                 const kind = try reader.takeInt(u32, .little);
                 const length = try reader.takeInt(u32, .little);
-                if (kind != 1 or length < 57 or length - 57 > self.config.buffer_bytes + self.config.max_pending_wire_bytes + self.scratch.len) return error.InvalidResume;
+                // Kind 1 records come from images that kept no profiles; kind 2 ends with one.
+                if ((kind != 1 and kind != 2) or length < 57 or length - 57 > self.config.buffer_bytes + self.config.max_pending_wire_bytes + self.scratch.len + profile_bytes_max) return error.InvalidResume;
 
                 var connection: Connection = .{ .resumed = true };
                 errdefer {
@@ -607,18 +613,25 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
                     connection.input_end = input_len;
                 } else connection.saved_input = try self.captureSpan(io, reader, file_reader, self.spoolBase(handle.index) + self.config.max_pending_wire_bytes, input_len);
                 const output_len = try reader.takeInt(u32, .little);
-                if (output_len > self.config.max_pending_wire_bytes or output_len != length - 57 - codec_len - input_len) return error.InvalidResume;
+                const remaining = length - 57 - codec_len - input_len;
+                if (output_len > self.config.max_pending_wire_bytes or (if (kind == 1) output_len != remaining else output_len > remaining)) return error.InvalidResume;
                 if (output_len <= connection.control_output.capacity) {
                     connection.control_output.items.len = output_len;
                     try reader.readSliceAll(connection.control_output.items);
                     connection.output = connection.control_output.items;
                     connection.output_control = true;
                 } else connection.saved_output = try self.captureSpan(io, reader, file_reader, self.spoolBase(handle.index), output_len);
+                var profile: profiles_api.PlayerProfile = .{};
+                if (kind == 2) {
+                    try readProfile(reader, &profile);
+                    if (savedProfileBytes(&profile) != remaining - output_len) return error.InvalidResume;
+                }
                 if (!connection.closing) _ = try self.advance(io, &connection, .restore);
 
                 if (input_len != 0) std.log.info("event=reload_input_restored bytes={d} encrypted={}", .{ input_len, Endpoint.encrypted(&connection.lifecycle.?) });
                 self.connections[handle.index] = connection;
                 self.setHandle(handle.index, handle);
+                if (self.config.profiles) |profiles| profiles.of(handle).* = profile;
                 self.admit(handle.index);
             }
         }
@@ -1972,4 +1985,31 @@ pub fn Engine(comptime Endpoint: type, comptime Observer: type) type {
             }
         }
     };
+}
+
+/// A saved profile: skin layers, then the textures value and signature, each after its length.
+const profile_bytes_max = 1 + 2 + profiles_api.PlayerProfile.value_max + 2 + profiles_api.PlayerProfile.signature_max;
+
+fn savedProfileBytes(profile: *const profiles_api.PlayerProfile) usize {
+    return 1 + 2 + profile.textures_value_len + 2 + profile.textures_signature_len;
+}
+
+fn writeProfile(writer: *std.Io.Writer, profile: *const profiles_api.PlayerProfile) !void {
+    try writer.writeByte(profile.skin_parts);
+    try writer.writeInt(u16, profile.textures_value_len, .little);
+    try writer.writeAll(profile.textures_value[0..profile.textures_value_len]);
+    try writer.writeInt(u16, profile.textures_signature_len, .little);
+    try writer.writeAll(profile.textures_signature[0..profile.textures_signature_len]);
+}
+
+fn readProfile(reader: *std.Io.Reader, profile: *profiles_api.PlayerProfile) !void {
+    profile.skin_parts = try reader.takeByte();
+    const value_len = try reader.takeInt(u16, .little);
+    if (value_len > profile.textures_value.len) return error.InvalidResume;
+    try reader.readSliceAll(profile.textures_value[0..value_len]);
+    profile.textures_value_len = value_len;
+    const signature_len = try reader.takeInt(u16, .little);
+    if (signature_len > profile.textures_signature.len or (value_len == 0 and signature_len != 0)) return error.InvalidResume;
+    try reader.readSliceAll(profile.textures_signature[0..signature_len]);
+    profile.textures_signature_len = signature_len;
 }

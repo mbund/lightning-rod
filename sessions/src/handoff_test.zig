@@ -7,6 +7,7 @@ const framing = @import("shared.zig");
 const routes = @import("router.zig");
 const decoding = @import("decoding.zig");
 const Buffers = @import("buffers.zig").Buffers;
+const Profiles = @import("profiles.zig").Profiles;
 
 const frozen_connection = "\x01\x00\x00\x00" ++
     "\x64\x00\x00\x00\x01\x00\x00\x00\x3f\x00\x00\x00" ++
@@ -14,6 +15,22 @@ const frozen_connection = "\x01\x00\x00\x00" ++
     "\x00\xff\xee\xdd\xcc\xbb\xaa\x99\x88\x77\x66\x55\x44\x33\x22\x11" ++
     "\x05alice\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++
     "\x02\x00\x00\x00in\x03\x00\x00\x00out";
+
+// The same connection as an image that keeps profiles writes it: kind 2, ending with skin layers
+// and the textures value and signature, each after its length.
+const frozen_profiled_connection = "\x01\x00\x00\x00" ++
+    "\x64\x00\x00\x00\x02\x00\x00\x00\x49\x00\x00\x00" ++
+    "\x04\x03\x00\x00\x08\x07\x06\x05\x04\x03\x02\x01\x01\x00\x00\x00\xcc" ++
+    "\x00\xff\xee\xdd\xcc\xbb\xaa\x99\x88\x77\x66\x55\x44\x33\x22\x11" ++
+    "\x05alice\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++
+    "\x02\x00\x00\x00in\x03\x00\x00\x00out" ++
+    "\x7f\x03\x00tex\x02\x00sg";
+
+// The kind 1 record as this image writes it back, with an empty profile.
+const upgraded = "\x01\x00\x00\x00" ++
+    "\x64\x00\x00\x00\x02\x00\x00\x00\x44\x00\x00\x00" ++
+    frozen_connection[16..] ++
+    "\x00\x00\x00\x00\x00";
 
 const Endpoint = struct {
     pub const Connection = u8;
@@ -438,7 +455,15 @@ test "frozen sessions header preserves listener and compression encodings" {
 }
 
 test "frozen session connection records read and write the established bytes" {
+    // Images before profiles wrote kind 1 records; this one reads them and writes kind 2.
+    try expectFrozenRecord(frozen_connection, false);
+    try expectFrozenRecord(frozen_profiled_connection, true);
+}
+
+fn expectFrozenRecord(comptime frozen: []const u8, comptime profiled: bool) !void {
     const Engine = engine.Engine(Endpoint, Observer);
+    var profiles = try Profiles.init(std.testing.allocator, 1);
+    defer profiles.deinit(std.testing.allocator);
     var native: Native = .{};
     const transport: network.Transport = .{ .context = &native, .vtable = undefined, .inheritance = network.Inheritance.init(Native, &native) };
     var observer: Observer = .{};
@@ -450,15 +475,16 @@ test "frozen session connection records read and write the established bytes" {
         .max_pending_wire_bytes = 1024,
         .protocols = &catalog,
         .observer = &observer,
+        .profiles = &profiles,
     });
     defer {
         owner.setHandle(0, null);
         owner.deinit();
     }
 
-    var reader: std.Io.Reader = .fixed(frozen_connection);
+    var reader: std.Io.Reader = .fixed(frozen);
     try owner.readResume(std.testing.io, &reader, null);
-    try std.testing.expectEqual(frozen_connection.len, reader.seek);
+    try std.testing.expectEqual(frozen.len, reader.seek);
     try std.testing.expectEqual(@as(usize, 1), observer.restored);
     const connection = &owner.connections[0];
     try std.testing.expectEqual(@as(i32, 772), connection.protocol.?.number);
@@ -468,12 +494,20 @@ test "frozen session connection records read and write the established bytes" {
     try std.testing.expectEqualSlices(u8, "in", owner.input[0..connection.input_end]);
     try std.testing.expectEqualSlices(u8, "out", connection.output);
 
+    if (profiled) {
+        const restored = profiles.get(connection.handle.?);
+        try std.testing.expectEqual(@as(u8, 0x7f), restored.skin_parts);
+        try std.testing.expectEqualStrings("tex", restored.textures().?.value);
+        try std.testing.expectEqualStrings("sg", restored.textures().?.signature);
+    } else try std.testing.expect(profiles.get(connection.handle.?).textures() == null);
+
     owner.reloading = true;
     connection.parked = true;
-    var buffer: [frozen_connection.len]u8 = undefined;
+    const expected = if (profiled) frozen_profiled_connection else upgraded;
+    var buffer: [expected.len]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     try owner.writeResume(&writer);
-    try std.testing.expectEqualSlices(u8, frozen_connection, writer.buffered());
+    try std.testing.expectEqualSlices(u8, expected, writer.buffered());
 }
 
 test "wire spill seals ring output and spools later output encrypted, and restores both" {
