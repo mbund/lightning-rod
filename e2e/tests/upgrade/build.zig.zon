@@ -2,7 +2,7 @@
     .name = .e2e_upgrade,
     .fingerprint = 0x96fa5776fb59fab1,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .lightning_rod_e2e = .{ .path = "../.." },
         .vanilla_server = .{ .path = "../../../examples/vanilla" },

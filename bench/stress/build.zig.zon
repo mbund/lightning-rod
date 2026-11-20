@@ -2,7 +2,7 @@
     .name = .bench_stress,
     .version = "0.1.0",
     .fingerprint = 0x21bcf77f475c52d0,
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .lightning_rod = .{ .path = "../.." },
         .vanilla = .{ .path = "../../vanilla" },

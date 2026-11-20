@@ -2,7 +2,7 @@
     .name = .deflate,
     .fingerprint = 0xe2b06b05d4cf03c3,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .source = .{ .url = "https://github.com/ebiggers/libdeflate/archive/refs/tags/v1.25.tar.gz", .hash = "N-V-__8AACODCwCL9flGfJkJ2IlkP36ExXwOhPuIUgIFfB8l" },
     },

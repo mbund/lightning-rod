@@ -2,7 +2,7 @@
     .name = .e2e_mining_experience,
     .fingerprint = 0x0589b1f7ba95b434,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .lightning_rod_e2e = .{ .path = "../.." },
     },

@@ -2,7 +2,7 @@
     .name = .vanilla_inventory,
     .fingerprint = 0x27f031a622bb3075,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .chunks = .{ .path = "../../chunks" },
         .entities = .{ .path = "../../entities" },

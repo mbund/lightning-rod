@@ -2,7 +2,7 @@
     .name = .vanilla_bodies,
     .fingerprint = 0x3e435b230bb4b6ad,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .chunks = .{ .path = "../../chunks" },
         .game_data = .{ .path = "../../game_data" },

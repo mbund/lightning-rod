@@ -2,7 +2,7 @@
     .name = .world_import,
     .fingerprint = 0x0d70b35ee8a40e61,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .entities = .{ .path = "../../entities" },
         .chunks = .{ .path = "../../chunks" },

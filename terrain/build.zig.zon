@@ -2,7 +2,7 @@
     .name = .terrain,
     .fingerprint = 0xc87653b1c4e5a545,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .block_properties = .{ .path = "../block_properties" },
         .chunks = .{ .path = "../chunks" },

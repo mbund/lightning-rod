@@ -2,7 +2,7 @@
     .fingerprint = 0x5815cd35bbe66d2c,
     .name = .lightning_rod_vanilla_1_21_6,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .block_properties = .{ .path = "../block_properties" },
         .bossbars = .{ .path = "../bossbars" },

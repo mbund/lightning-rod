@@ -2,7 +2,7 @@
     .name = .bench_cipher,
     .fingerprint = 0x7354784eb53b96cc,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .minecraft_java = .{ .path = "../../minecraft_java" },
     },

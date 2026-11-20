@@ -2,7 +2,7 @@
     .name = .e2e_player_sync,
     .fingerprint = 0x5457c0033b4c5dda,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .lightning_rod_e2e = .{ .path = "../.." },
     },

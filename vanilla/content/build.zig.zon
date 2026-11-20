@@ -2,7 +2,7 @@
     .name = .vanilla_content,
     .fingerprint = 0x96eb98caf91bf16e,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .block_properties = .{ .path = "../../block_properties" },
         .chunks = .{ .path = "../../chunks" },

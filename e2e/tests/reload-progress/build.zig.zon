@@ -2,7 +2,7 @@
     .name = .e2e_reload_progress,
     .fingerprint = 0xf3721141b5108b97,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .lightning_rod_e2e = .{ .path = "../.." },
     },

@@ -2,7 +2,7 @@
     .name = .random_ticks,
     .fingerprint = 0xbdc5489264f72cb8,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .domains = .{ .path = "../domains" },
         .game_data = .{ .path = "../game_data" },

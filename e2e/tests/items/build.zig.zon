@@ -2,7 +2,7 @@
     .name = .e2e_items,
     .fingerprint = 0x347f4375b5b6f596,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .lightning_rod_e2e = .{ .path = "../.." },
     },

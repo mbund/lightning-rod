@@ -2,7 +2,7 @@
     .name = .e2e_growth,
     .fingerprint = 0x353738c20f0648ae,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .lightning_rod_e2e = .{ .path = "../.." },
     },

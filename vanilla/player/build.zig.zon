@@ -2,7 +2,7 @@
     .name = .vanilla_player,
     .fingerprint = 0x6b02e1b7e06618ba,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .chat = .{ .path = "../../chat" },
         .commands = .{ .path = "../../commands" },

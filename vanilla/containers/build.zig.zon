@@ -2,7 +2,7 @@
     .name = .vanilla_containers,
     .fingerprint = 0x6135ea34bb8d6d35,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .chunks = .{ .path = "../../chunks" },
         .commands = .{ .path = "../../commands" },

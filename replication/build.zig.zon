@@ -2,7 +2,7 @@
     .name = .replication,
     .fingerprint = 0x52c835a733529670,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .commands = .{ .path = "../commands" },
         .entities = .{ .path = "../entities" },

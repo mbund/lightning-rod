@@ -2,7 +2,7 @@
     .name = .vanilla_items,
     .fingerprint = 0x43f4735fcf040d33,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .game_data = .{ .path = "../../game_data" },
         .inventories = .{ .path = "../../inventories" },

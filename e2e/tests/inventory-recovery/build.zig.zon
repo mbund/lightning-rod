@@ -2,7 +2,7 @@
     .name = .e2e_inventory_recovery,
     .fingerprint = 0xa0d0469686302b47,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .lightning_rod_e2e = .{ .path = "../.." },
     },

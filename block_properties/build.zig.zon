@@ -2,7 +2,7 @@
     .name = .block_properties,
     .fingerprint = 0xea2e3aacdea82d87,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .lighting = .{ .path = "../lighting" },
     },

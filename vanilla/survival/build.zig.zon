@@ -2,7 +2,7 @@
     .name = .vanilla_survival,
     .fingerprint = 0x33b6ca87d902fa3c,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .entities = .{ .path = "../../entities" },
         .game_data = .{ .path = "../../game_data" },

@@ -2,7 +2,7 @@
     .name = .players,
     .fingerprint = 0x264e43a66db127ce,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .game_data = .{ .path = "../game_data" },
         .lightning_rod = .{ .path = ".." },
