@@ -8,7 +8,8 @@ const vanilla = @import("lightning_rod_vanilla_1_21_6");
 const Chunks = @import("chunks").Chunks;
 const LoginEncryption = @import("connection").session_encryption.LoginEncryption;
 const Authentication = @import("connection").authentication.Authentication;
-const Operators = @import("commands").operators.Operators;
+const commands = @import("commands");
+const Operators = commands.operators.Operators;
 const Players = @import("players").players.Players;
 const RegionDebug = @import("replication").region_debug.RegionDebug;
 const Streaming = @import("terrain").streaming.Streaming;
@@ -90,23 +91,16 @@ pub fn main(init: std.process.Init) !void {
         } else return error.UnknownArgument;
     }
 
-    var digest: [16]u8 = undefined;
-    std.crypto.hash.Md5.hash("OfflinePlayer:CMakeLists_txt", &digest, .{});
-    digest[6] = (digest[6] & 15) | 0x30;
-    digest[8] = (digest[8] & 63) | 0x80;
-    const operators = [_]u128{std.mem.readInt(u128, &digest, .big)};
-
     var chunk_configuration = Chunks.Configuration.forPlayers(max_players);
     chunk_configuration.storage_batch_groups = storage_batch_groups;
     const gameplay_plugins = lightning_rod.plugin.compose(.{
-        lightning_rod.plugin.replace(vanilla.plugins(), .{
+        // Every player is an operator here, instead of those vanilla's plugin lists.
+        lightning_rod.plugin.replace(lightning_rod.plugin.remove(vanilla.plugins(), Operators), .{
             lightning_rod.plugin.configured(Streaming, .{ .prefetch = prefetch, .hull = hull }),
             lightning_rod.plugin.configured(Players, Players.Configuration{ .maximum = max_players, .render_distance = render_distance, .simulation_distance = simulation_distance }),
             lightning_rod.plugin.configured(Chunks, chunk_configuration),
-            lightning_rod.plugin.configured(Operators, Operators.Configuration{
-                .operators = &operators,
-            }),
         }),
+        lightning_rod.plugin.configured(AllOperators, .{}),
         lightning_rod.plugin.configured(tps.Tps, .{ .shown = tps_bar }),
         lightning_rod.plugin.configured(RegionDebug, .{}),
     });
@@ -143,3 +137,22 @@ pub fn main(init: std.process.Init) !void {
         .storage_path = storage_path,
     }, .{});
 }
+
+/// Lets every player use every command, so trying the example server needs no list of operators,
+/// in offline or online mode alike. It takes the place of `minecraft:operators`.
+const AllOperators = struct {
+    pub const id = "example:all_operators";
+    pub const Configuration = struct {};
+    pub const Dependencies = struct { commands: *commands.Commands };
+
+    pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*AllOperators {
+        const self = try allocator.create(AllOperators);
+        self.* = .{};
+        deps.commands.installPolicyIfUnset(commands.Policy.init(self, allows));
+        return self;
+    }
+
+    fn allows(_: *const AllOperators, _: u128, _: *const commands.Permission) bool {
+        return true;
+    }
+};
