@@ -32,6 +32,7 @@ pub const Recipients = shared.Recipients;
 pub const profiles = @import("profiles.zig");
 pub const PlayerProfile = profiles.PlayerProfile;
 pub const Profiles = profiles.Profiles;
+pub const Wake = @import("wake.zig").Wake;
 pub const Frame = shared.Frame;
 pub const frame = shared.frame;
 pub const Engine = engine.Engine;

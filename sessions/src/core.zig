@@ -72,6 +72,8 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
         output_pool: sessions.OutputPool,
         /// Every connection's profile while login and configuration fill it in.
         profiles: sessions.Profiles,
+        /// Wakes a connection for session plugins whose work finishes on another thread.
+        wake: sessions.Wake = .{},
         routing: Routing,
         config: Configuration,
         registry: metrics.Registry,
@@ -145,7 +147,7 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
                 initialized += 1;
             }
             self.routing = .{ .endpoints = endpoints };
-            self.hooks = try Hooks.init(owned, io, config.plugins, .{ .sessions = endpoints[0], .endpoints = endpoints, .metrics = &self.registry, .profiles = &self.profiles }, config.plugin_memory_bytes, connections);
+            self.hooks = try Hooks.init(owned, io, config.plugins, .{ .sessions = endpoints[0], .endpoints = endpoints, .metrics = &self.registry, .profiles = &self.profiles, .wake = &self.wake }, config.plugin_memory_bytes, connections);
             errdefer self.hooks.deinit(io);
             self.worker = try Worker.init(owned, self.transport.transport(), .{
                 .connections = connections,
@@ -166,6 +168,7 @@ pub fn Core(comptime Endpoint: type, comptime Plugins: type, comptime Router: ty
                 .profiles = &self.profiles,
             }, endpoints);
             errdefer self.worker.deinitUnstarted();
+            self.wake = .{ .readiness = &self.worker.engine.readiness, .transport = self.transport.transport(), .io = io };
             if (options.handoff) |incoming| {
                 try self.worker.engine.readResume(io, incoming.reader, incoming.file_reader);
                 try self.worker.restorePlayers(io);
