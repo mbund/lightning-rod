@@ -42,6 +42,8 @@ abstract class Fixture {
     abstract void tick(Minecraft game, int loaded, int missing);
     void message(String text) {}
     void chat(String text) { r.receivedChat.add(text); }
+    /// A player's message, with the trust the client gives it: SECURE, MODIFIED or NOT_SECURE.
+    void playerChat(String text, String trust) { chat(text); }
     void chatAction(String text, String command, String hover) {}
     void blockBreaking(BlockPos position, int stage) {}
     void entitySpawned(ClientboundAddEntityPacket packet) {}

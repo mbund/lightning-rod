@@ -6,6 +6,7 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientConfigurationConnectionEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
+import net.minecraft.client.multiplayer.chat.ChatTrustLevel;
 import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.HoverEvent;
 
@@ -20,6 +21,11 @@ public final class RecorderClient implements ClientModInitializer {
                 String hover = message.getStyle().getHoverEvent() instanceof HoverEvent.ShowText tooltip ? tooltip.value().getString() : null;
                 recorder.fixture.chatAction(message.getString(), action.command(), hover);
             }
+        });
+        // Player chat, with the trust the client shows it with, as ChatListener judges it.
+        ClientReceiveMessageEvents.CHAT.register((message, signed, sender, type, received) -> {
+            String trust = signed == null ? "NOT_SECURE" : ChatTrustLevel.evaluate(signed, message, received).name();
+            Recorder.instance().playerChatReceived(message.getString(), trust);
         });
         ClientConfigurationConnectionEvents.START.register((handler, client) -> Recorder.instance().configurationStarted());
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {

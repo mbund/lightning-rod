@@ -297,6 +297,12 @@ public final class Recorder {
         fixture.chat(text);
     }
 
+    public synchronized void playerChatReceived(String text, String trust) {
+        if (!enabled || resultPublished) return;
+        event("player_message", "text", text, "trust", trust);
+        fixture.playerChat(text, trust);
+    }
+
     void pass(String reason) {
         if (completed) return;
         completed = true;

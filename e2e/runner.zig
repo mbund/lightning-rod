@@ -233,7 +233,7 @@ fn runScenario(init: std.process.Init, arguments: Arguments, test_case: manifest
     for (peers) |peer| {
         const connect_tick: usize = if (count + 1 == peers.len) test_case.last_peer_connect_tick else 40;
         const peer_version = if (peer_versions.len == 0) primary_version else peer_versions[count];
-        clients[count] = try spawnClient(init, arguments, artifacts, scenario, peer, peers, connect_tick, address, peer_version, display, client_properties);
+        clients[count] = try spawnClient(init, arguments, artifacts, scenario, peer, peers, connect_tick, address, peer_version, display, client_properties, test_case.session_server);
         process_groups[count + 2].store(clients[count].group, .release);
         count += 1;
         const startup_deadline = std.Io.Clock.Timestamp.now(init.io, .awake).raw.nanoseconds + 120 * std.time.ns_per_s;
@@ -255,7 +255,7 @@ fn runScenario(init: std.process.Init, arguments: Arguments, test_case: manifest
     });
     try std.Io.Dir.cwd().rename(pending_path, .cwd(), start_path, init.io);
 
-    try waitForResults(init, artifacts, peers, if (test_case.reload) .{ .world = world, .executable = server_path, .protocol_mismatch = test_case.protocol_mismatch } else null, if (upgrade) |*coordinator| coordinator else null, server.group);
+    try waitForResults(init, artifacts, peers, if (test_case.reload) .{ .world = world, .executable = server_path, .protocol_mismatch = test_case.protocol_mismatch, .selected = if (test_case.reload_once) ReloadTest.once else &ReloadTest.rounds } else null, if (upgrade) |*coordinator| coordinator else null, server.group);
     const clients_passed = try resultsPassed(init, artifacts, peers);
     if (test_case.crash_after) try performance.seal(init, artifacts);
     // Simulation flush and session draining each have their own shutdown deadline.
@@ -328,7 +328,7 @@ fn waitForDisplay(init: std.process.Init, artifacts: []const u8) ![]const u8 {
     return error.DisplayStartupTimeout;
 }
 
-fn spawnClient(init: std.process.Init, arguments: Arguments, artifacts: []const u8, scenario: []const u8, peer: []const u8, peers: []const []const u8, connect_tick: usize, address: []const u8, client_version: []const u8, display: []const u8, extra_properties: []const []const u8) !ManagedChild {
+fn spawnClient(init: std.process.Init, arguments: Arguments, artifacts: []const u8, scenario: []const u8, peer: []const u8, peers: []const []const u8, connect_tick: usize, address: []const u8, client_version: []const u8, display: []const u8, extra_properties: []const []const u8, online: bool) !ManagedChild {
     const allocator = init.gpa;
     const version = try std.fmt.allocPrint(allocator, "-Dmcc.version={s}", .{client_version});
     defer allocator.free(version);
@@ -362,7 +362,13 @@ fn spawnClient(init: std.process.Init, arguments: Arguments, artifacts: []const 
     const bundle = try client_bundle.Bundle.open(init, client.bundle, client_version);
     const base_properties = [_][]const u8{ version, address_arg, events, output, peer_arg, expected, scenario_arg, connect_arg, fixture_arg };
     const properties = try std.mem.concat(init.arena.allocator(), []const u8, &.{ &base_properties, extra_properties });
-    const command = try bundle.command(init, run_dir, properties, &.{ "--username", peer, "--gameDir", run_dir }, .{ .fixtures = client.fixtures });
+    // Online, a client logs in as a Mojang account does: under the UUID the session server knows
+    // it by, with a token naming it, which the session server hands its chat key for. Releases
+    // before 1.21.9 only ask for one as an account of type msa; later ones ignore the type.
+    var uuid_text: [36]u8 = undefined;
+    const account = [_][]const u8{ "--userType", "msa", "--uuid", formatUuid(&uuid_text, @import("src/session_server.zig").onlineUuid(peer)), "--accessToken", peer };
+    const login = [_][]const u8{ "--username", peer, "--gameDir", run_dir };
+    const command = try bundle.command(init, run_dir, properties, if (online) &(login ++ account) else &login, .{ .fixtures = client.fixtures });
     const log_path = try std.fmt.allocPrint(allocator, "{s}/{s}.log", .{ artifacts, peer });
     defer allocator.free(log_path);
     const log = try std.Io.Dir.cwd().createFile(init.io, log_path, .{});
@@ -549,4 +555,16 @@ fn onSignal(_: std.posix.SIG) callconv(.c) void {
 
         if (value != 0) _ = std.os.linux.kill(-value, .KILL);
     }
+}
+
+fn formatUuid(buffer: *[36]u8, uuid: u128) []const u8 {
+    var hex: [32]u8 = undefined;
+    _ = std.fmt.bufPrint(&hex, "{x:0>32}", .{uuid}) catch unreachable;
+    _ = std.fmt.bufPrint(buffer, "{s}-{s}-{s}-{s}-{s}", .{ hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32] }) catch unreachable;
+    return buffer;
+}
+
+test "online UUIDs format as Java writes them" {
+    var buffer: [36]u8 = undefined;
+    try std.testing.expectEqualStrings("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0", formatUuid(&buffer, 0x0f1e2d3c4b5a69788796a5b4c3d2e1f0));
 }

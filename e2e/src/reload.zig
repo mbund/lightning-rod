@@ -5,7 +5,7 @@ const reload = @import("reload_execve");
 pub const Test = struct {
     const Fault = enum { missing_target, invalid_target, none };
     const Round = struct { name: []const u8, barrier: []const u8, fault: Fault = .none };
-    const rounds = [_]Round{
+    pub const rounds = [_]Round{
         .{ .name = "missing_target", .barrier = ".reload-ready", .fault = .missing_target },
         .{ .name = "invalid_target", .barrier = ".reload-armed-invalid_target", .fault = .invalid_target },
         .{ .name = "player_reload", .barrier = ".reload-armed-player_reload" },
@@ -13,14 +13,18 @@ pub const Test = struct {
         .{ .name = "unknown_metadata", .barrier = ".reload-armed-unknown_metadata" },
         .{ .name = "signal", .barrier = ".reload-armed-signal" },
     };
+    /// A reload a player asks for, as a scenario reloading once has.
+    pub const once: []const Round = rounds[2..3];
     world: []const u8,
     executable: []const u8,
     protocol_mismatch: bool = false,
+    /// The rounds to run, every one unless a scenario reloads once.
+    selected: []const Round = &rounds,
     round_index: usize = 0,
 
     pub fn poll(self: *Test, init: std.process.Init, artifacts: []const u8, peers: []const []const u8, _: i96, _: *std.atomic.Value(bool)) !void {
-        if (self.round_index == rounds.len) return;
-        const round = rounds[self.round_index];
+        if (self.round_index == self.selected.len) return;
+        const round = self.selected[self.round_index];
         if (try allMarkers(init, artifacts, peers, round.barrier)) {
             if (round.fault != .missing_target) {
                 const cwd = std.Io.Dir.cwd();

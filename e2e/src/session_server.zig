@@ -91,8 +91,49 @@ pub const SessionServer = struct {
             , .{ onlineUuid(name), name, textures_value });
             return request.respond(json, .{ .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
         }
+        const json_headers: []const std.http.Header = &.{.{ .name = "content-type", .value = "application/json" }};
+        // The keys clients check chat keys with, in place of Mojang's.
+        if (request.head.method == .GET and std.mem.eql(u8, target, "/publickeys"))
+            return request.respond(chat_keys.services, .{ .extra_headers = json_headers });
+        // What an account may do: chat and play on servers, nothing that reaches anyone else.
+        if (request.head.method == .GET and std.mem.eql(u8, target, "/player/attributes"))
+            return request.respond(attributes, .{ .extra_headers = json_headers });
+        if (request.head.method == .GET and std.mem.eql(u8, target, "/privacy/blocklist"))
+            return request.respond("{\"blockedProfiles\":[]}", .{ .extra_headers = json_headers });
+        // A player's chat key, for the token naming it, as clients ask Mojang for theirs.
+        if (request.head.method == .POST and std.mem.eql(u8, target, "/player/certificates")) {
+            var headers = request.iterateHeaders();
+            const token = while (headers.next()) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, "authorization") and std.mem.startsWith(u8, header.value, "Bearer ")) break header.value["Bearer ".len..];
+            } else "";
+            const certificate = chat_keys.certificate(token) orelse return request.respond("", .{ .status = .unauthorized });
+            std.log.info("event=session_certificate name={s}", .{token});
+            return request.respond(certificate, .{ .extra_headers = json_headers });
+        }
         return request.respond("", .{ .status = .not_found });
     }
+
+    const attributes =
+        \\{"privileges":{"onlineChat":{"enabled":true},"multiplayerServer":{"enabled":true},"multiplayerRealms":{"enabled":false},"telemetry":{"enabled":false},"optionalTelemetry":{"enabled":false}},"profanityFilterPreferences":{"profanityFilterOn":false}}
+    ;
+
+    /// Made by chat_keys/Generate.java: a key in place of Mojang's, and a key pair per player it
+    /// signed for the player's online UUID.
+    const chat_keys = struct {
+        const services = @embedFile("chat_keys/publickeys.json");
+        const names = [_][]const u8{ "alice", "bob", "carol", "mallory" };
+        const certificates = [_][]const u8{
+            @embedFile("chat_keys/alice.json"),
+            @embedFile("chat_keys/bob.json"),
+            @embedFile("chat_keys/carol.json"),
+            @embedFile("chat_keys/mallory.json"),
+        };
+
+        fn certificate(name: []const u8) ?[]const u8 {
+            for (names, certificates) |known, value| if (std.mem.eql(u8, known, name)) return value;
+            return null;
+        }
+    };
 
     fn remember(self: *SessionServer, server_id: []const u8) bool {
         if (server_id.len == 0 or server_id.len > 41) return false;

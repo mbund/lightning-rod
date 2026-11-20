@@ -28,6 +28,9 @@ pub const Scenario = struct {
     full_protocols: bool = false,
     /// The runner replaces the server binary in place between rounds.
     reload: bool = false,
+    /// With `reload`, the runner reloads once, as a player asks with /reload, instead of running
+    /// every reload round.
+    reload_once: bool = false,
     /// The runner starts the previous revision's server and upgrades it in place.
     upgrade: bool = false,
     protocol_mismatch: bool = false,
@@ -78,6 +81,7 @@ pub fn validate(manifest: Manifest) Error!void {
         if (scenario.name.len == 0 or scenario.peers.len == 0 or scenario.peers.len > maximum_peers) return error.InvalidTest;
         if (scenario.mixed_versions and scenario.peers.len < 2) return error.InvalidPeerVersions;
         if (scenario.protocol_mismatch and !scenario.reload) return error.InvalidTest;
+        if (scenario.reload_once and (!scenario.reload or scenario.protocol_mismatch)) return error.InvalidTest;
         if (scenario.upgrade and (scenario.peers.len != 3 or scenario.reload or scenario.fixture != null or scenario.prepare != null)) return error.InvalidTest;
         for (scenario.name) |character|
             if (!std.ascii.isLower(character) and !std.ascii.isDigit(character) and character != '-') return error.InvalidTestName;

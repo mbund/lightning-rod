@@ -1,0 +1,23 @@
+.{ .client = "SecureChatFixture", .scenarios = .{ .{
+    .name = "secure-chat",
+    .peers = .{ "alice", "bob" },
+    .session_server = true,
+    .reload = true,
+    .reload_once = true,
+}, .{
+    // The oldest release asks for a chat key only as an account of type msa.
+    .name = "secure-chat-legacy",
+    .peers = .{ "alice", "bob" },
+    .session_server = true,
+    .reload = true,
+    .reload_once = true,
+    .version = "1.21.5",
+}, .{
+    // The one release whose signed commands carry a signed checksum byte.
+    .name = "secure-chat-1-21-11",
+    .peers = .{ "alice", "bob" },
+    .session_server = true,
+    .reload = true,
+    .reload_once = true,
+    .version = "1.21.11",
+} } }
