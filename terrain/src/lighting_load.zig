@@ -1457,3 +1457,117 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
     }
     return .{ .packet_hash = digest.final(), .cpu_ns = @intCast(elapsed_cpu), .wire_bytes = recipient_bytes };
 }
+
+test "streams send each player the view distance it asks for, and follow changes to it" {
+    const render_distance = 6;
+    const io = std.testing.io;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .capacity = 256, .detailed_timers = true });
+    defer registry.deinit();
+    var path: [256]u8 = undefined;
+    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = try std.fmt.bufPrint(&path, ".zig-cache/tmp/{s}/view-distance", .{directory.sub_path}) });
+    defer store.deinit();
+    const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
+    const world = try dimensions.create(.{ .name = "test:distance", .dimension = .{ .name = "test:dimension", .minimum_section = -4, .section_count = 24, .skylight = true } });
+    var catalog = try protocols.Default.init(allocator);
+    defer catalog.deinit(allocator);
+    var sink: Sink = .{};
+    const service = try sessions.Service.init(allocator, io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = 2, .pages = 16, .page_bytes = 128 * 1024, .credit_bytes = 1024 * 1024, .protocols = &catalog.values });
+    defer {
+        if (service.tick_active) service.endTick(false);
+        var remaining = service.outputBatch();
+        while (remaining.next()) |packet| {
+            var recipients = packet.recipients.iterator();
+            while (recipients.next()) |handle| service.refund(handle, service.framedBound(packet.boundLength()));
+            service.recycle(io, &.{packet});
+        }
+        service.deinit();
+    }
+    var player_records: [2]Players.Player = undefined;
+    for (&player_records, 0..) |*player, index| {
+        player.* = .{ .handle = .{ .index = index, .generation = 1 }, .uuid = index + 1, .world = world, .stage = .ready, .loaded = true, .position = .{ .x = 0.5, .y = 65, .z = 0.5 }, .protocol = catalog.values[0].number };
+        service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
+    }
+    var players: Players = .{ .deps = undefined, .config = .{ .maximum = player_records.len, .render_distance = render_distance }, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
+    try players.initIndexes(allocator);
+    players.rebuildIndexes();
+    // The first player sees as far as the server sends; the second asks for less.
+    player_records[0].view_distance = players.viewDistance(32);
+    player_records[1].view_distance = players.viewDistance(3);
+    try std.testing.expectEqual(@as(i32, render_distance), player_records[0].view_distance);
+    const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = load_cache, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = try records.Workspaces.init(allocator, io, .{}) });
+    var source: Scene = .{ .empty = true };
+    terrain.setSource(chunks.Source.init(&source, Scene.read));
+    const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
+    const block_properties = try test_blocks.vanilla(allocator);
+    // Columns unload at the delivery radius, so what was sent is exactly what the view holds.
+    const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = load_budget, .retain_client_storage = false }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = load_budget }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
+    defer service.unsubscribeOutput(streaming.changed);
+    defer terrain.unsubscribeReady(streaming.changed);
+    const blocks = try BlockSynchronization.init(allocator, io, .{ .metrics = &registry, .chunks = terrain, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .worlds = dimensions }, .{});
+    var background: Terrain = .{ .chunks = terrain, .streaming = streaming, .blocks = blocks, .io = io };
+    background.start();
+    defer background.stop();
+
+    const Settle = struct {
+        /// Runs ticks until each stream holds exactly the columns within its player's distance.
+        fn run(context: anytype, expected: [2]i32) !void {
+            for (0..4096) |_| {
+                context.service.beginTick();
+                context.streaming.endTick(true);
+                context.blocks.endTick(true);
+                context.service.endTick(true);
+                for (0..8) |_| {
+                    try context.background.poll();
+                    while (try context.terrain.generation.processOne(context.io)) {}
+                    try context.terrain.poll();
+                    var batch = context.service.outputBatch();
+                    while (batch.next()) |packet| {
+                        var recipients = packet.recipients.iterator();
+                        while (recipients.next()) |handle| context.service.refund(handle, context.service.framedBound(packet.boundLength()));
+                        context.service.recycle(context.io, &.{packet});
+                    }
+                }
+                var settled = true;
+                for (context.streaming.streams, expected, 0..) |stream, distance, index| {
+                    if (stream.setup != .streaming or stream.view_distance != distance) {
+                        settled = false;
+                        continue;
+                    }
+                    const sent = sentColumns(context.streaming, index, render_distance);
+                    settled = settled and sent.inside == Streaming.Horizon.count(distance) and sent.outside == 0;
+                }
+                if (settled) return;
+            }
+            return error.ViewDistanceDidNotSettle;
+        }
+
+        fn sentColumns(streaming_: *const Streaming, index: usize, radius: i32) struct { inside: usize, outside: usize } {
+            const stream = streaming_.streams[index];
+            var inside: usize = 0;
+            var outside: usize = 0;
+            var z = -radius;
+            while (z <= radius) : (z += 1) {
+                var x = -radius;
+                while (x <= radius) : (x += 1) {
+                    const at: Streaming.Position = .{ .x = stream.center.x + x, .z = stream.center.z + z };
+                    const bit = streaming_.grid.bit(index, at);
+                    if (streaming_.sent[bit.word] & bit.mask == 0) continue;
+                    if (Streaming.Horizon.contains(stream.view_distance, stream.center, at)) inside += 1 else outside += 1;
+                }
+            }
+            return .{ .inside = inside, .outside = outside };
+        }
+    };
+    const context = .{ .service = service, .streaming = streaming, .blocks = blocks, .background = &background, .terrain = terrain, .io = io };
+    try Settle.run(context, .{ render_distance, 3 });
+    // Asking for more sends the ring it adds; asking for less unloads the ring it drops.
+    player_records[1].view_distance = players.viewDistance(5);
+    try Settle.run(context, .{ render_distance, 5 });
+    player_records[1].view_distance = players.viewDistance(1);
+    try Settle.run(context, .{ render_distance, 2 });
+}

@@ -166,6 +166,18 @@ pub const Players = struct {
         return self.spatial.query(.{ .world = world, .x = @intFromFloat(@floor(position.x / 16)), .z = @intFromFloat(@floor(position.z / 16)) }, radius);
     }
 
+    /// The chunks around them the player is sent, within the server's.
+    pub fn viewDistanceOf(self: *const Players, player: Player) i32 {
+        return @min(player.view_distance, self.config.render_distance);
+    }
+
+    /// Whether a point is within the player's view distance, by chunk column as `nearby` counts:
+    /// what a query around the point at the server's distance finds, narrowed to who sees it.
+    pub fn sees(self: *const Players, player: Player, position: minecraft.Position) bool {
+        const reach: f64 = @floatFromInt(self.viewDistanceOf(player));
+        return @abs(@floor(position.x / 16) - @floor(player.position.x / 16)) <= reach and @abs(@floor(position.z / 16) - @floor(player.position.z / 16)) <= reach;
+    }
+
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Players {
         const position = config.spawn orelse default_spawn;
         if (config.maximum == 0 or config.render_distance < 2 or config.render_distance > 32 or config.simulation_distance < 1 or config.dig_observers == 0 or config.dig_observers > 256)
@@ -306,7 +318,7 @@ pub const Players = struct {
                     .configuring = !joined.ready,
                 };
                 // What the client's settings said while it configured.
-                player.skin_parts = self.deps.sessions.profile(joined.handle).skin_parts;
+                self.takeSettings(player, self.deps.sessions.profile(joined.handle));
                 if (saved) |bytes| {
                     if (bytes.len != player.saved.len) return error.CorruptPlayer;
                     @memcpy(&player.saved, bytes);
@@ -343,7 +355,7 @@ pub const Players = struct {
                 player.configuring = false;
                 player.stage = .login;
                 // Settings may have come after the player joined, while it still configured.
-                player.skin_parts = self.deps.sessions.profile(handle).skin_parts;
+                self.takeSettings(player, self.deps.sessions.profile(handle));
             },
             .left => |handle| {
                 const player = &self.records[handle.index];
@@ -527,14 +539,27 @@ pub const Players = struct {
     /// The client changed its settings in play. Only the skin layers it shows matter to others.
     fn onSettings(self: *Players, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_common_settings.Reader) !void {
         _, const a = body.locale() catch return error.InvalidPacket;
-        _, const b = a.viewDistance() catch return error.InvalidPacket;
+        const requested, const b = a.viewDistance() catch return error.InvalidPacket;
         _, const c = b.chatFlags() catch return error.InvalidPacket;
         _, const d = c.chatColors() catch return error.InvalidPacket;
         const skin_parts, _ = d.skinParts() catch return error.InvalidPacket;
         const player = &self.records[handle.index];
+        // Streaming and visibility read the distance from the record each tick.
+        player.view_distance = self.viewDistance(std.math.cast(u8, requested) orelse 0);
         if (player.skin_parts == @as(u8, @bitCast(skin_parts))) return;
         player.skin_parts = @bitCast(skin_parts);
         player.revision += 1;
+    }
+
+    fn takeSettings(self: *const Players, player: *Player, profile: *const sessions.PlayerProfile) void {
+        player.skin_parts = profile.skin_parts;
+        player.view_distance = self.viewDistance(profile.view_distance);
+    }
+
+    /// The distance a player is sent for what its client asked, zero meaning it has not said.
+    pub fn viewDistance(self: *const Players, requested: u8) i32 {
+        const asked: i32 = if (requested == 0) 2 else requested;
+        return std.math.clamp(asked, 2, self.config.render_distance);
     }
 
     fn onEntityAction(self: *Players, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_entity_action.Reader) !void {

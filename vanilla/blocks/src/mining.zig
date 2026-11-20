@@ -229,6 +229,7 @@ pub const Mining = struct {
             const observer = players.records[other];
             const recipient = observer.handle orelse continue;
             if (other == handle.index or observer.world != player.world or observer.stage != .ready) continue;
+            if (!players.sees(observer, player.position)) continue;
             if (!self.disclosed(handle.index, other)) continue;
             targets[count] = .{ .handle = recipient, .protocol = observer.protocol };
             count += 1;
@@ -477,6 +478,7 @@ pub const Mining = struct {
                             const observer = players.records[other];
                             const recipient = observer.handle orelse continue;
                             if (other == index or observer.world != player.world or observer.stage != .ready) continue;
+                            if (!players.sees(observer, player.position)) continue;
                             if (!self.disclosed(index, other)) continue;
                             if (self.deps.streaming) |streaming| {
                                 if (!streaming.snapshotVisibility().blockVisible(other, &observer, player.world, .{ position.x, position.y, position.z })) continue;
@@ -588,7 +590,7 @@ pub const Mining = struct {
                     if (!captured) {
                         nearby.clear();
                         var candidates = players.nearby(subject.world, subject.position, players.config.render_distance);
-                        while (candidates.next()) |other| if (connected.view().contains(other)) nearby.insert(other);
+                        while (candidates.next()) |other| if (connected.view().contains(other) and players.sees(players.records[other], subject.position)) nearby.insert(other);
                         captured = true;
                     }
                     interested.copy(nearby.view());

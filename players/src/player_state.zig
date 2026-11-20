@@ -36,6 +36,11 @@ pub const Player = struct {
     flags: minecraft.EntityFlags = .{},
     /// The skin layers the player's client shows, one bit each, as its settings say.
     skin_parts: u8 = 0,
+    /// How many chunks around them the player is sent: what its client asked for, no fewer than 2
+    /// and no more than the server sends anyone, as vanilla's ChunkMap.getPlayerViewDistance.
+    /// Joining sets it, to 2 if the client has not said, as vanilla's ServerPlayer starts; a
+    /// record that never joined has no limit of its own.
+    view_distance: i32 = std.math.maxInt(i32),
     revision: u64 = 0,
     /// Whether blocks hide from the player what it cannot see. Spectators see through them.
     occluded: bool = true,

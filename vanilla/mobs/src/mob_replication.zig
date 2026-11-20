@@ -275,14 +275,16 @@ pub const MobReplication = struct {
         const mobs = self.deps.mobs;
         const range: f64 = @floatFromInt(@as(u32, mobs.traits(mob.species).tracking_range) * 16);
         const view_range: f64 = @floatFromInt(self.deps.players.config.render_distance * 16);
-        const reach = @min(range, view_range);
-        var nearby = self.deps.players.nearby(mob.world, .{ .x = mob.position[0], .y = mob.position[1], .z = mob.position[2] }, @intFromFloat(@ceil(reach / 16) + 1));
+        // Found at the farthest anyone sees, then narrowed to each player's own view distance.
+        const farthest = @min(range, view_range);
+        var nearby = self.deps.players.nearby(mob.world, .{ .x = mob.position[0], .y = mob.position[1], .z = mob.position[2] }, @intFromFloat(@ceil(farthest / 16) + 1));
         const own = living.box(mobs, mob);
         while (nearby.next()) |at| {
             const player = self.deps.players.records[at];
             if (player.handle == null or player.stage != .ready or player.world != mob.world) continue;
             const dx = player.position.x - mob.position[0];
             const dz = player.position.z - mob.position[2];
+            const reach = @min(range, @as(f64, @floatFromInt(self.deps.players.viewDistanceOf(player) * 16)));
             if (dx * dx + dz * dz > reach * reach) continue;
             if (!visibility.boundsVisible(at, &player, mob.world, .{
                 .minimum = .{ @intFromFloat(@floor(own.min[0])), @intFromFloat(@floor(own.min[1])), @intFromFloat(@floor(own.min[2])) },

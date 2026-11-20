@@ -159,12 +159,15 @@ pub fn spiral(index: usize) Position {
     };
 }
 
-/// Each row produces at most two departing spans. Retained columns are skipped
-/// in one step and retries copy the cursor without restarting the search.
+/// The columns within `radius` of `center` and not within `target_radius` of `target`: what leaves
+/// a view that moves or narrows, or with the two swapped, what a view gains. Each row produces at
+/// most two departing spans. Retained columns are skipped in one step and retries copy the cursor
+/// without restarting the search.
 pub const Difference = struct {
     center: Position = .{ .x = 0, .z = 0 },
     target: Position = .{ .x = 0, .z = 0 },
     radius: i32 = 0,
+    target_radius: i32 = 0,
     z: i64 = 1,
     x: i64 = 0,
     end: i64 = 0,
@@ -172,10 +175,14 @@ pub const Difference = struct {
     started: bool = false,
 
     pub fn init(center: Position, target: Position, radius: i32) Difference {
-        assert(radius >= 0);
+        return resized(center, radius, target, radius);
+    }
+
+    pub fn resized(center: Position, radius: i32, target: Position, target_radius: i32) Difference {
+        assert(radius >= 0 and target_radius >= 0);
         assert(@as(i64, center.x) - radius >= std.math.minInt(i32) and @as(i64, center.x) + radius <= std.math.maxInt(i32));
         assert(@as(i64, center.z) - radius >= std.math.minInt(i32) and @as(i64, center.z) + radius <= std.math.maxInt(i32));
-        return .{ .center = center, .target = target, .radius = radius, .z = -@as(i64, radius) };
+        return .{ .center = center, .target = target, .radius = radius, .target_radius = target_radius, .z = -@as(i64, radius) };
     }
 
     pub fn next(self: *Difference) ?Position {
@@ -185,7 +192,7 @@ pub const Difference = struct {
                 const source = row(self.radius, self.z).?;
                 self.x = @as(i64, self.center.x) + source.minimum;
                 self.end = @as(i64, self.center.x) + source.maximum;
-                self.skip = if (row(self.radius, z - self.target.z)) |target| .{
+                self.skip = if (row(self.target_radius, z - self.target.z)) |target| .{
                     .minimum = @as(i64, self.target.x) + target.minimum,
                     .maximum = @as(i64, self.target.x) + target.maximum,
                 } else .{ .minimum = 1, .maximum = 0 };
@@ -195,7 +202,7 @@ pub const Difference = struct {
             if (self.x <= self.end) {
                 const at: Position = .{ .x = @intCast(self.x), .z = @intCast(z) };
                 self.x += 1;
-                assert(contains(self.radius, self.center, at) and !contains(self.radius, self.target, at));
+                assert(contains(self.radius, self.center, at) and !contains(self.target_radius, self.target, at));
                 return at;
             }
             self.z += 1;
@@ -317,6 +324,31 @@ test "circular departures equal set subtraction across movement and teleports" {
         try std.testing.expectEqual(expected, differenceCount(radius, center, target));
         try std.testing.expectEqual(expected, differenceCount(radius, target, center));
         try std.testing.expectEqual(null, difference.next());
+    };
+}
+
+test "resized departures equal set subtraction as views widen, narrow and move" {
+    const center: Position = .{ .x = 5, .z = -9 };
+    for ([_]i32{ 0, 2, 7, 16, 32 }) |radius| for ([_]i32{ 0, 2, 7, 16, 32 }) |target_radius| for ([_]i32{ -40, -1, 0, 3 }) |dx| for ([_]i32{ -2, 0, 40 }) |dz| {
+        const target: Position = .{ .x = center.x + dx, .z = center.z + dz };
+        const side: usize = @intCast(radius * 2 + 1);
+        var seen: [65 * 65]bool = @splat(false);
+        var difference = Difference.resized(center, radius, target, target_radius);
+        var departed: usize = 0;
+        while (difference.next()) |at| {
+            const index = @as(usize, @intCast(at.z - center.z + radius)) * side + @as(usize, @intCast(at.x - center.x + radius));
+            try std.testing.expect(!seen[index]);
+            seen[index] = true;
+            departed += 1;
+        }
+        var expected: usize = 0;
+        for (0..side * side) |index| {
+            const at: Position = .{ .x = center.x + @as(i32, @intCast(index % side)) - radius, .z = center.z + @as(i32, @intCast(index / side)) - radius };
+            const removed = contains(radius, center, at) and !contains(target_radius, target, at);
+            try std.testing.expectEqual(removed, seen[index]);
+            expected += @intFromBool(removed);
+        }
+        try std.testing.expectEqual(expected, departed);
     };
 }
 

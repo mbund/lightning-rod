@@ -112,9 +112,13 @@ pub const Streaming = struct {
         eye_max: i32 = 0,
         occlusion: bool = true,
         frontier_debug: bool = false,
+        /// The chunks around its center the player is sent, as its client asked; the server's own
+        /// limit applies on top. Unlimited for views made without a player.
+        view_distance: i32 = std.math.maxInt(i32),
 
         pub fn capture(player: players.Players.Player) View {
             return .{
+                .view_distance = player.view_distance,
                 .eye_min = .{ @intFromFloat(@floor(player.position.x)), @intFromFloat(@floor(player.position.y + @as(f64, @as(f32, 0.2)))), @intFromFloat(@floor(player.position.z)) },
                 .eye_max = @intFromFloat(@floor(player.position.y + @as(f64, @as(f32, 1.62)))),
                 .occlusion = player.occluded,
@@ -375,6 +379,8 @@ pub const Streaming = struct {
         section_count: usize = 24,
         /// Delivery order rank of the next undelivered column, published for load diagnostics.
         cursor: usize = 0,
+        /// The player's view distance the stream delivers, within the server's.
+        view_distance: i32 = std.math.maxInt(i32),
     };
 
     const Stream = struct {
@@ -388,6 +394,10 @@ pub const Streaming = struct {
         center: Position = .{ .x = 0, .z = 0 },
         target: Position = .{ .x = 0, .z = 0 },
         cursor: usize = 0,
+        /// The view distance delivered around `center`, and the one to deliver around `target`.
+        /// The server's limit applies on top.
+        view_distance: i32 = std.math.maxInt(i32),
+        target_view_distance: i32 = std.math.maxInt(i32),
         departing: chunk_horizon.Difference = .{},
         minimum_section: i32 = -4,
         section_count: usize = 24,
@@ -401,7 +411,7 @@ pub const Streaming = struct {
         debug_history: bool = false,
 
         pub fn snapshot(self: *const Stream) Snapshot {
-            return .{ .generation = self.generation, .life = self.life, .prepared_teleport = self.prepared_teleport, .setup = self.setup, .center = self.center, .minimum_section = self.minimum_section, .section_count = self.section_count, .cursor = self.cursor };
+            return .{ .generation = self.generation, .life = self.life, .prepared_teleport = self.prepared_teleport, .setup = self.setup, .center = self.center, .minimum_section = self.minimum_section, .section_count = self.section_count, .cursor = self.cursor, .view_distance = self.view_distance };
         }
     };
 
@@ -1155,7 +1165,7 @@ pub const Streaming = struct {
                 const previous = &self.views[index];
                 const current = self.published.views[index];
                 self.background_players.insert(index);
-                if (!std.meta.eql(previous.handle, current.handle) or previous.world != current.world or previous.ready != current.ready or !std.meta.eql(previous.center, current.center) or (current.handle != null and !self.observers_index.contains(index))) {
+                if (!std.meta.eql(previous.handle, current.handle) or previous.world != current.world or previous.ready != current.ready or !std.meta.eql(previous.center, current.center) or previous.view_distance != current.view_distance or (current.handle != null and !self.observers_index.contains(index))) {
                     changed.insert(index);
                 }
                 self.updateView(index, current);
@@ -1184,7 +1194,7 @@ pub const Streaming = struct {
                     const handle = self.views[index].handle orelse continue;
                     if (stream.generation != handle.generation or stream.life != self.views[index].life) continue;
                     if (stream.minimum_section != dimension.minimumSection() or stream.section_count != dimension.sectionCount()) continue;
-                    if (!chunk_horizon.contains(self.deliveryRadius(), stream.center, .{ .x = section.x, .z = section.z })) continue;
+                    if (!chunk_horizon.contains(self.streamRadius(index), stream.center, .{ .x = section.x, .z = section.z })) continue;
                     // Visible edits arrive as deltas. Concealed edits invalidate retained terrain.
                     if (!self.sectionVisible(index, section)) self.invalidateSection(index, section);
                 }
@@ -1260,7 +1270,8 @@ pub const Streaming = struct {
                     .world = current.world,
                     .x = current.center.x,
                     .z = current.center.z,
-                    .radius = @intCast(self.deliveryRadius() + 1),
+                    // Only what this player is sent needs generating for them.
+                    .radius = @intCast(self.deliveryFor(current.view_distance) + 1),
                 } else null };
                 update_count += 1;
             }
@@ -1330,10 +1341,11 @@ pub const Streaming = struct {
                 }
 
                 const center = player.center;
+                const view_distance = self.viewDistance(player.view_distance);
 
                 if (stream.generation != handle.generation or stream.life != player.life) {
                     const dimension = self.deps.worlds.get(player.world).?.dimension;
-                    stream.* = .{ .generation = handle.generation, .life = player.life, .center = center, .target = center, .minimum_section = dimension.minimumSection(), .section_count = dimension.sectionCount(), .debug_history = player.frontier_debug };
+                    stream.* = .{ .generation = handle.generation, .life = player.life, .center = center, .target = center, .view_distance = view_distance, .target_view_distance = view_distance, .minimum_section = dimension.minimumSection(), .section_count = dimension.sectionCount(), .debug_history = player.frontier_debug };
                     const columns = self.grid.columns;
                     @memset(self.occluded[index * columns ..][0..columns], std.math.maxInt(u32));
                     @memset(self.stale[index * columns ..][0..columns], 0);
@@ -1347,14 +1359,17 @@ pub const Streaming = struct {
                     self.dirty_words.setRangeValue(.{ .start = index * self.grid.words, .end = (index + 1) * self.grid.words }, true);
                 }
 
+                // A player who moves, or asks to see more or less, is reframed the same way.
+                const reframed = !std.meta.eql(center, stream.center) or view_distance != self.viewDistance(stream.view_distance);
                 self.pending = self.pending or stream.setup != .streaming or stream.cursor < side * side or
-                    self.needsSource(index) or !std.meta.eql(center, stream.center) or (!stream.announced and player.placed);
-                if (!service.canSend(handle, 1) and (stream.setup != .streaming or !std.meta.eql(center, stream.center))) continue;
+                    self.needsSource(index) or reframed or (!stream.announced and player.placed);
+                if (!service.canSend(handle, 1) and (stream.setup != .streaming or reframed)) continue;
 
-                if (stream.setup == .streaming and !std.meta.eql(center, stream.center)) {
+                if (stream.setup == .streaming and reframed) {
                     stream.target = center;
+                    stream.target_view_distance = view_distance;
                     // Columns stay loaded until they leave the client storage, not the delivery radius.
-                    stream.departing = .init(stream.center, center, self.keepRadius());
+                    stream.departing = .resized(stream.center, self.keepFor(stream.view_distance), center, self.keepFor(view_distance));
                     stream.setup = .unloading;
                 }
 
@@ -1370,7 +1385,7 @@ pub const Streaming = struct {
                     }
 
                     if (!departing) {
-                        self.moveCenter(index, stream.target);
+                        self.moveCenter(index, stream.target, stream.target_view_distance);
                         self.updateAudience(index);
                         stream.setup = .center;
                     } else {
@@ -2187,14 +2202,13 @@ pub const Streaming = struct {
 
     fn planRecipients(self: *Streaming, pending: []const Pending, counts: []usize) void {
         assert(pending.len == counts.len and pending.len <= batch_max);
-        const radius = self.deliveryRadius();
         for (pending, counts, 0..) |item, *count, i| {
             const targets = self.recipients[i * self.views.len ..][0..self.views.len];
             const owner = self.views[item.owner];
             const handle = owner.handle.?;
             assert(handle.index == item.owner and owner.ready and owner.world == item.world and owner.protocol == item.protocol);
             assert(self.streams[item.owner].setup == .streaming and self.streams[item.owner].generation == handle.generation);
-            assert(chunk_horizon.contains(radius, self.streams[item.owner].center, item.at));
+            assert(chunk_horizon.contains(self.streamRadius(item.owner), self.streams[item.owner].center, item.at));
             targets[0] = handle;
             count.* = 1;
             var owner_state: ?DisclosureState = null;
@@ -2206,7 +2220,7 @@ pub const Streaming = struct {
                 const recipient = player.handle orelse continue;
                 if (player.world != item.world or !player.ready or !self.sameChunkFamily(player.protocol, item.protocol) or stream.setup != .streaming or stream.generation != recipient.generation)
                     continue;
-                if (!chunk_horizon.contains(radius, stream.center, item.at) or (self.hasSent(index, item.at) and !self.needsRefresh(index, item.at))) continue;
+                if (!chunk_horizon.contains(self.streamRadius(index), stream.center, item.at) or (self.hasSent(index, item.at) and !self.needsRefresh(index, item.at))) continue;
                 if (stream.delivered == 0 and !std.meta.eql(item.at, stream.center)) continue;
                 if (self.needsSource(index) and !self.deliveryReady(index, item.at)) {
                     const location: section_visibility_world.Column = .{ .world = item.world, .x = item.at.x, .z = item.at.z, .minimum = stream.minimum_section };
@@ -2329,12 +2343,11 @@ pub const Streaming = struct {
 
     /// Simulation thread. Whether any player is near enough to have been sent the column.
     fn lightAudience(self: *Streaming, world: u32, at: Position) bool {
-        const radius = self.deliveryRadius();
-        var audience = self.deps.players.nearby(world, .{ .x = @as(f64, @floatFromInt(at.x)) * 16, .y = 0, .z = @as(f64, @floatFromInt(at.z)) * 16 }, radius + 1);
+        var audience = self.deps.players.nearby(world, .{ .x = @as(f64, @floatFromInt(at.x)) * 16, .y = 0, .z = @as(f64, @floatFromInt(at.z)) * 16 }, self.deliveryRadius() + 1);
         while (audience.next()) |index| {
             const player = self.deps.players.records[index];
             if (player.handle == null or player.stage != .ready) continue;
-            if (chunk_horizon.contains(radius, View.capture(player).center, at)) return true;
+            if (chunk_horizon.contains(self.deliveryFor(player.view_distance), View.capture(player).center, at)) return true;
         }
         return false;
     }
@@ -2716,7 +2729,7 @@ pub const Streaming = struct {
                 .component = if (source.origin) |origin| origin.component else 0,
                 .occlusion_active = self.canConceal(handle.index),
                 .queued_columns = stream.delivered,
-                .total_columns = chunk_horizon.count(self.deliveryRadius()),
+                .total_columns = chunk_horizon.count(self.streamRadius(handle.index)),
             };
             const middle_y = @divFloor(view.eye_min[1], 16);
             for (0..streaming_debug.Snapshot.capacity) |i| {
@@ -2729,7 +2742,7 @@ pub const Streaming = struct {
                 const bit = @as(u32, 1) << @intCast(offset);
                 // After a teleport the view is where the player is and the stream is still
                 // where they were. Nothing is known there about columns around the view.
-                const within = chunk_horizon.contains(self.deliveryRadius(), stream.center, at);
+                const within = chunk_horizon.contains(self.streamRadius(handle.index), stream.center, at);
                 const column = if (within) self.columnIndex(handle.index, at) else 0;
                 const queued = stream.setup == .streaming and within and self.hasSent(handle.index, at);
                 snapshot.sections[snapshot.count] = .{
@@ -2800,10 +2813,11 @@ pub const Streaming = struct {
         pub fn boundsVisible(self: *const Visibility, player: usize, record: *const players.Players.Player, world: u32, bounds: geometry_bounds.Box) bool {
             bounds.validate();
             const stream = self.streams[player];
-            var z = @max(@divFloor(bounds.minimum[2], 16), stream.center.z - self.radius);
-            while (z <= @min(@divFloor(bounds.maximum[2] - 1, 16), stream.center.z + self.radius)) : (z += 1) {
-                var x = @max(@divFloor(bounds.minimum[0], 16), stream.center.x - self.radius);
-                while (x <= @min(@divFloor(bounds.maximum[0] - 1, 16), stream.center.x + self.radius)) : (x += 1) {
+            const radius = self.radiusOf(stream);
+            var z = @max(@divFloor(bounds.minimum[2], 16), stream.center.z - radius);
+            while (z <= @min(@divFloor(bounds.maximum[2] - 1, 16), stream.center.z + radius)) : (z += 1) {
+                var x = @max(@divFloor(bounds.minimum[0], 16), stream.center.x - radius);
+                while (x <= @min(@divFloor(bounds.maximum[0] - 1, 16), stream.center.x + radius)) : (x += 1) {
                     var y = std.math.clamp(@divFloor(bounds.minimum[1], 16), stream.minimum_section, stream.minimum_section + @as(i32, @intCast(stream.section_count)) - 1);
                     const end = std.math.clamp(@divFloor(bounds.maximum[1] - 1, 16), stream.minimum_section, stream.minimum_section + @as(i32, @intCast(stream.section_count)) - 1);
                     while (y <= end) : (y += 1) {
@@ -2821,8 +2835,13 @@ pub const Streaming = struct {
             const handle = record.handle orelse return false;
             const slot = self.grid.bit(player, .{ .x = x, .z = z });
             return stream.generation == handle.generation and stream.life == record.life and stream.setup != .opening and
-                chunk_horizon.contains(self.radius, stream.center, .{ .x = x, .z = z }) and
+                chunk_horizon.contains(self.radiusOf(stream), stream.center, .{ .x = x, .z = z }) and
                 self.sent[slot.word] & slot.mask != 0;
+        }
+
+        /// How far the player sees: its own view distance, within the server's.
+        fn radiusOf(self: *const Visibility, stream: Snapshot) i32 {
+            return @min(stream.view_distance, self.radius);
         }
     };
 
@@ -2831,8 +2850,33 @@ pub const Streaming = struct {
         return &self.visibility;
     }
 
+    /// The farthest any stream delivers: the server's view distance and the prefetch band. Grids,
+    /// the delivery order and audience queries cover this; each stream delivers its own.
     pub fn deliveryRadius(self: *const Streaming) i32 {
-        return self.deps.players.config.render_distance + @as(i32, self.config.prefetch);
+        return self.deliveryFor(self.deps.players.config.render_distance);
+    }
+
+    /// A view distance within the server's, as streams deliver it.
+    fn viewDistance(self: *const Streaming, requested: i32) i32 {
+        return @min(requested, self.deps.players.config.render_distance);
+    }
+
+    /// How far columns go out from a stream of this view distance: the view and the prefetch band.
+    fn deliveryFor(self: *const Streaming, view_distance: i32) i32 {
+        return self.viewDistance(view_distance) + @as(i32, self.config.prefetch);
+    }
+
+    /// The radius the player's stream delivers around its center.
+    fn streamRadius(self: *const Streaming, index: usize) i32 {
+        return self.deliveryFor(self.streams[index].view_distance);
+    }
+
+    /// How far a stream of this view distance keeps what it sent: the client's storage when
+    /// columns are retained, otherwise the delivery radius. Never past the grid.
+    fn keepFor(self: *const Streaming, view_distance: i32) i32 {
+        const keep = if (self.config.retain_client_storage) keepRadiusFor(self.viewDistance(view_distance)) else self.deliveryFor(view_distance);
+        assert(keep <= self.keepRadius());
+        return keep;
     }
 
     /// The vanilla client keeps columns within max(2, view distance) + 3 chunks of its view
@@ -2854,13 +2898,13 @@ pub const Streaming = struct {
     /// neighbor whose light reaches it, leaves the client copy stale. Forgetting the column
     /// here resends it in full if the player returns. The client drops its copy on its own.
     fn forgetKept(self: *Streaming, section: chunks.Section) void {
-        const delivery = self.deliveryRadius();
-        const keep = self.keepRadius();
-        if (keep == delivery) return;
-        var nearby = self.observers_index.query(.{ .world = section.world, .x = section.x, .z = section.z }, keep + 1);
+        if (self.keepRadius() == self.deliveryRadius()) return;
+        var nearby = self.observers_index.query(.{ .world = section.world, .x = section.x, .z = section.z }, self.keepRadius() + 1);
         while (nearby.next()) |index| {
             if (self.views[index].world != section.world) continue;
             const center = self.streams[index].center;
+            const delivery = self.streamRadius(index);
+            const keep = self.keepFor(self.streams[index].view_distance);
             for (0..9) |neighbor| {
                 const at: Position = .{ .x = section.x + @as(i32, @intCast(neighbor % 3)) - 1, .z = section.z + @as(i32, @intCast(neighbor / 3)) - 1 };
                 if (chunk_horizon.contains(delivery, center, at) or !chunk_horizon.contains(keep, center, at)) continue;
@@ -2869,8 +2913,14 @@ pub const Streaming = struct {
         }
     }
 
-    fn visibilityRadius(self: *const Streaming) i32 {
-        return self.deliveryRadius() + section_visibility_world.Source.horizon_padding;
+    /// How far the player's visibility is solved: what its stream delivers, or is about to as
+    /// the player asks for more, and the horizon padding.
+    fn visibilityRadius(self: *const Streaming, index: usize) i32 {
+        return self.coverage(index) + section_visibility_world.Source.horizon_padding;
+    }
+
+    fn coverage(self: *const Streaming, index: usize) i32 {
+        return @max(self.streamRadius(index), self.deliveryFor(self.views[index].view_distance));
     }
 
     fn updateAudience(self: *Streaming, index: usize) void {
@@ -2915,7 +2965,7 @@ pub const Streaming = struct {
         const handle = view.handle orelse return false;
         const stream = self.streams[index];
         return view.world == world and stream.generation == handle.generation and stream.life == view.life and
-            stream.setup != .opening and chunk_horizon.contains(self.deliveryRadius(), stream.center, .{ .x = x, .z = z }) and self.hasSent(index, .{ .x = x, .z = z });
+            stream.setup != .opening and chunk_horizon.contains(self.streamRadius(index), stream.center, .{ .x = x, .z = z }) and self.hasSent(index, .{ .x = x, .z = z });
     }
 
     fn sentIndex(self: *const Streaming, index: usize, at: Position) chunk_horizon.Index.Bit {
@@ -3000,8 +3050,7 @@ pub const Streaming = struct {
     }
 
     fn clearRefresh(self: *Streaming, index: usize, at: Position) void {
-        const radius = self.deliveryRadius();
-        if (!chunk_horizon.contains(radius, self.streams[index].center, at)) return;
+        if (!chunk_horizon.contains(self.streamRadius(index), self.streams[index].center, at)) return;
         const rank = self.order.positionRank(self.streams[index].center, at);
         self.refresh_bits[index * self.grid.words + rank / 64] &= ~(@as(u64, 1) << @intCast(rank % 64));
     }
@@ -3029,7 +3078,7 @@ pub const Streaming = struct {
             return;
         }
         const point: [3]i32 = .{ current.eye_min[0], current.eye_max, current.eye_min[2] };
-        const reusable = same and if (source.origin) |origin| origin.supports(current.world, point) and self.geometry.covers(index, current.world, current.center, self.deliveryRadius()) else false;
+        const reusable = same and if (source.origin) |origin| origin.supports(current.world, point) and self.geometry.covers(index, current.world, current.center, self.coverage(index)) else false;
         if (!reusable or previous.occlusion != current.occlusion) self.refresh(index, !reusable);
     }
 
@@ -3144,7 +3193,7 @@ pub const Streaming = struct {
         const handle = view.handle orelse return false;
         const stream = self.streams[index];
         if (!view.ready or view.world != column.world or stream.setup != .streaming or stream.generation != handle.generation) return false;
-        if (!chunk_horizon.contains(self.deliveryRadius(), stream.center, column.at)) return false;
+        if (!chunk_horizon.contains(self.streamRadius(index), stream.center, column.at)) return false;
         if (self.coldPending(column.world, column.at)) return false;
         const ready = self.deliveryReady(index, column.at);
         if (self.needsSource(index) and !ready) {
@@ -3215,7 +3264,7 @@ pub const Streaming = struct {
         var masks: [9]u32 = @splat(0);
         masks[4] = center_mask & available[4];
         if (!self.config.occlusion) return masks;
-        const radius = self.deliveryRadius();
+        const radius = self.streamRadius(index);
         const center = self.streams[index].center;
         assert(@abs(@as(i64, at.x) - center.x) <= radius and @abs(@as(i64, at.z) - center.z) <= radius);
         for (0..9) |column| {
@@ -3409,7 +3458,7 @@ pub const Streaming = struct {
             const view = self.views[index];
             const dimension = self.deps.worlds.get(view.world).?.dimension;
             const point: [3]i32 = .{ view.eye_min[0], view.eye_max, view.eye_min[2] };
-            if (self.geometry.reuse(index, view.world, point, dimension.minimumSection(), dimension.sectionCount(), self.visibilityRadius(), source.pace.precision())) {
+            if (self.geometry.reuse(index, view.world, point, dimension.minimumSection(), dimension.sectionCount(), self.visibilityRadius(index), source.pace.precision())) {
                 source.origin = self.geometry.sourceSnapshot(index);
                 source.known = true;
                 self.source_players.remove(index);
@@ -3428,7 +3477,7 @@ pub const Streaming = struct {
             {
                 const timing = self.cpu.visibility.start();
                 defer timing.end();
-                self.geometry.begin(index, source.origin.?, dimension.minimumSection(), dimension.sectionCount(), self.visibilityRadius());
+                self.geometry.begin(index, source.origin.?, dimension.minimumSection(), dimension.sectionCount(), self.visibilityRadius(index));
             }
             source.origin = self.geometry.sourceSnapshot(index);
         }
@@ -3496,7 +3545,7 @@ pub const Streaming = struct {
 
     fn scheduleColumn(self: *Streaming, index: usize, at: Position) void {
         const stream = &self.streams[index];
-        const radius = self.deliveryRadius();
+        const radius = self.streamRadius(index);
         if (!chunk_horizon.contains(radius, stream.center, at)) return;
         const rank = self.order.positionRank(stream.center, at);
         const ready = !self.config.occlusion or !self.views[index].occlusion or self.deliveryReady(index, at);
@@ -3519,7 +3568,7 @@ pub const Streaming = struct {
     fn columnPending(self: *const Streaming, index: usize, cursor: usize) bool {
         const stream = self.streams[index];
         const at = self.order.at(stream.center, cursor);
-        if (!chunk_horizon.contains(self.deliveryRadius(), stream.center, at)) return false;
+        if (!chunk_horizon.contains(self.streamRadius(index), stream.center, at)) return false;
         return !self.hasSent(index, at) or self.needsRefresh(index, at);
     }
 
@@ -3534,11 +3583,14 @@ pub const Streaming = struct {
         self.refreshReady(index);
     }
 
-    fn moveCenter(self: *Streaming, index: usize, center: Position) void {
+    /// Moves the stream to a new center and view distance: pending columns that stay within it
+    /// keep their place, and what it newly covers is scheduled.
+    fn moveCenter(self: *Streaming, index: usize, center: Position, view_distance: i32) void {
         const stream = &self.streams[index];
         const previous = stream.center;
-        const radius = self.deliveryRadius();
-        const side: usize = @intCast(2 * radius + 1);
+        const previous_radius = self.streamRadius(index);
+        const radius = self.deliveryFor(view_distance);
+        const side: usize = @intCast(2 * self.deliveryRadius() + 1);
         const bits = self.refresh_bits[index * self.grid.words ..][0..self.grid.words];
         @memset(self.pending_scratch, 0);
         for (bits, 0..) |word, word_index| {
@@ -3554,8 +3606,9 @@ pub const Streaming = struct {
         }
         @memcpy(bits, self.pending_scratch);
         stream.center = center;
+        stream.view_distance = view_distance;
         stream.cursor = 0;
-        var arrivals = chunk_horizon.Difference.init(center, previous, radius);
+        var arrivals = chunk_horizon.Difference.resized(center, radius, previous, previous_radius);
         while (arrivals.next()) |at| self.scheduleColumn(index, at);
         self.advanceCursor(index);
     }
@@ -3619,7 +3672,7 @@ pub const Streaming = struct {
     }
 
     fn markSent(self: *Streaming, index: usize, at: Position, value: bool) void {
-        if (value) assert(chunk_horizon.contains(self.deliveryRadius(), self.streams[index].center, at));
+        if (value) assert(chunk_horizon.contains(self.streamRadius(index), self.streams[index].center, at));
         const slot = self.sentIndex(index, at);
         if (!value) {
             if (self.streams[index].debug_history) self.painted[self.columnIndex(index, at)] = 0;
@@ -5043,7 +5096,7 @@ test "moving the delivery center remaps pending ranks and schedules only circula
     const next: Streaming.Position = .{ .x = 1, .z = 0 };
     const pending = [_]Streaming.Position{ .{ .x = -4, .z = 0 }, .{ .x = 0, .z = 0 }, .{ .x = 1, .z = 1 } };
     for (pending) |at| streaming.scheduleColumn(0, at);
-    streaming.moveCenter(0, next);
+    streaming.moveCenter(0, next, streaming.streams[0].view_distance);
     for (0..columns) |rank| {
         const at = streaming.order.at(next, rank);
         var expected = chunk_horizon.contains(radius, next, at) and !chunk_horizon.contains(radius, previous, at);

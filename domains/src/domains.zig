@@ -97,7 +97,7 @@ pub const Domains = struct {
         assert(slot < self.deps.players.records.len);
         const player = self.deps.players.records[slot];
         if (!player.inWorld() or player.world != column.world) return false;
-        return viewContains(self.deps.players.config.render_distance, playerColumn(player), .{ column.x, column.z });
+        return viewContains(self.deps.players.viewDistanceOf(player), playerColumn(player), .{ column.x, column.z });
     }
 
     /// Players are positioned by the time plugins after Players tick, so the domain moves first.

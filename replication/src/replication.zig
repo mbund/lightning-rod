@@ -105,6 +105,8 @@ pub const Replication = struct {
         spawned: audience_storage.Row = .{},
         pending: audience_storage.Row = .{},
         nearby: audience_storage.Row = .{},
+        /// The observer's view distance the nearby set was found for.
+        view_distance: i32 = 0,
         ready: bool = false,
         pending_dirty: bool = false,
     };
@@ -390,6 +392,7 @@ pub const Replication = struct {
         const ready_observers = self.temp(.ready_observers);
         ready_observers.clear();
         var neighborhood: ?SpatialIndex.Position = null;
+        var neighborhood_distance: i32 = 0;
         var affected = false;
         var captured = false;
         for (self.orderObservers(moved_cells or distance_changed or appeared)) |other| {
@@ -430,7 +433,11 @@ pub const Replication = struct {
             }
             if (!self.lifecycle.active.contains(other)) self.lifecycle.activate(other);
             ready_observers.insert(other);
-            if (watching.ready and watching.world == observer.world and !distance_changed and !watching.pending_dirty and !moved_cells) continue;
+            // Each observer sees subjects within its own view distance.
+            const reach = players.viewDistanceOf(observer);
+            const reached = watching.view_distance != reach;
+            watching.view_distance = reach;
+            if (watching.ready and watching.world == observer.world and !distance_changed and !reached and !watching.pending_dirty and !moved_cells) continue;
             const selected = self.temp(.selected);
             selected.copy(watching.pending.view());
             if (watching.world != observer.world) {
@@ -441,8 +448,9 @@ pub const Replication = struct {
                 watching.world = observer.world;
             }
             const center = spatialPosition(self.subjects[other]);
-            if (!std.meta.eql(neighborhood, @as(?SpatialIndex.Position, center))) {
+            if (!std.meta.eql(neighborhood, @as(?SpatialIndex.Position, center)) or neighborhood_distance != reach) {
                 neighborhood = center;
+                neighborhood_distance = reach;
                 captured = false;
                 affected = false;
                 if (moved_cells) {
@@ -450,11 +458,11 @@ pub const Replication = struct {
                     affected = changes.next() != null;
                 }
             }
-            if (distance_changed or spatial_changed.view().contains(other) or !watching.ready or affected) {
+            if (distance_changed or reached or spatial_changed.view().contains(other) or !watching.ready or affected) {
                 const nearby = self.temp(.nearby);
                 if (!captured) {
                     nearby.clear();
-                    var candidates = players.nearby(observer.world, observer.position, players.config.render_distance);
+                    var candidates = players.nearby(observer.world, observer.position, reach);
                     while (candidates.next()) |index| nearby.insert(index);
                     captured = true;
                 }

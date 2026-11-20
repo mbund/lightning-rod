@@ -73,6 +73,9 @@ pub fn build(b: *std.Build) void {
     const movement_tests = b.addRunArtifact(b.addTest(.{ .root_module = lighting_load_module, .filters = &.{"streaming movement"} }));
     b.step("test-streaming-movement", "Verify moving observers while chunk delivery catches up").dependOn(&movement_tests.step);
     test_step.dependOn(&movement_tests.step);
+    const view_distance_tests = b.addRunArtifact(b.addTest(.{ .root_module = lighting_load_module, .filters = &.{"view distance it asks for"} }));
+    b.step("test-streaming-view-distance", "Verify streams send each player its own view distance").dependOn(&view_distance_tests.step);
+    test_step.dependOn(&view_distance_tests.step);
     const cold_tests = b.addRunArtifact(b.addTest(.{ .root_module = lighting_load_module, .filters = &.{"cold lighting streams"} }));
     b.step("test-streaming-cold", "Verify cold lighting progress with separated observers and constrained caches").dependOn(&cold_tests.step);
     test_step.dependOn(&cold_tests.step);

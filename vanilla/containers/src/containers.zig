@@ -776,6 +776,7 @@ pub const Containers = struct {
                 const player = self.deps.players.records[player_index];
                 const handle = player.handle orelse continue;
                 if (player.stage != .ready) continue;
+                if (!self.deps.players.sees(player, .{ .x = @floatFromInt(key.position.x), .y = @floatFromInt(key.position.y), .z = @floatFromInt(key.position.z) })) continue;
                 self.targets[count] = .{ .handle = handle, .protocol = player.protocol };
                 count += 1;
             }
