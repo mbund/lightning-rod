@@ -16,6 +16,9 @@ pub const PlayerProfile = struct {
     /// The skin layers the client shows, as its settings name them: cape, jacket, sleeves,
     /// trousers and hat, one bit each. Nothing until the client says.
     skin_parts: u8 = 0,
+    /// What an online-mode client tells Mojang it joined this server with: SHA-1 over the server
+    /// id, the shared secret and the server's public key. Login reads it once encryption is on.
+    server_hash: ?[20]u8 = null,
 
     pub fn textures(self: *const PlayerProfile) ?Textures {
         if (self.textures_value_len == 0) return null;

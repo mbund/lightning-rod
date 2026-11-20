@@ -11,7 +11,7 @@ const LoginCompression = @import("connection").session_compression.LoginCompress
 const LoginEncryption = @import("connection").session_encryption.LoginEncryption;
 const LoginStart = @import("connection").session_login_start.LoginStart;
 const LoginSuccess = @import("connection").session_login_success.LoginSuccess;
-const OfflineAuthentication = @import("connection").offline_authentication.OfflineAuthentication;
+const Authentication = @import("connection").authentication.Authentication;
 const Players = @import("players").players.Players;
 const SessionConfiguration = @import("connection").session_configuration.Plugin;
 const Status = @import("connection").session_status.Status;
@@ -76,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
         lightning_rod.plugin.configured(LoginStart, LoginStart.Configuration{}),
         lightning_rod.plugin.configured(LoginEncryption, LoginEncryption.Configuration{}),
         lightning_rod.plugin.configured(Disconnect, Disconnect.Configuration{}),
-        lightning_rod.plugin.configured(OfflineAuthentication, OfflineAuthentication.Configuration{}),
+        lightning_rod.plugin.configured(Authentication, Authentication.Configuration{}),
         lightning_rod.plugin.configured(LoginCompression, LoginCompression.Configuration{}),
         lightning_rod.plugin.configured(ExtraNegotiation, ExtraNegotiation.Configuration{}),
         lightning_rod.plugin.configured(LoginSuccess, LoginSuccess.Configuration{}),

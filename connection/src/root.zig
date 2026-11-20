@@ -3,7 +3,8 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 
-pub const offline_authentication = @import("offline_authentication.zig");
+pub const authentication = @import("authentication.zig");
+pub const mojang_sessions = @import("mojang_sessions.zig");
 pub const payload_channels = @import("payload_channels.zig");
 pub const session_compression = @import("session_compression.zig");
 pub const session_configuration = @import("session_configuration.zig");
@@ -19,7 +20,7 @@ pub const session_client_settings = @import("session_client_settings.zig");
 const LoginStart = session_login_start.LoginStart;
 const LoginEncryption = session_encryption.LoginEncryption;
 const Disconnect = session_disconnect.Disconnect;
-const OfflineAuthentication = offline_authentication.OfflineAuthentication;
+const Authentication = authentication.Authentication;
 const LoginCompression = session_compression.LoginCompression;
 const LoginSuccess = session_login_success.LoginSuccess;
 const Keepalive = session_keepalive.Keepalive;
@@ -36,7 +37,7 @@ pub fn Plugins(comptime Catalog: type) type {
         lightning_rod.plugin.Selection(LoginStart),
         lightning_rod.plugin.Selection(LoginEncryption),
         lightning_rod.plugin.Selection(Disconnect),
-        lightning_rod.plugin.Selection(OfflineAuthentication),
+        lightning_rod.plugin.Selection(Authentication),
         lightning_rod.plugin.Selection(LoginCompression),
         lightning_rod.plugin.Selection(LoginSuccess),
         lightning_rod.plugin.Selection(Keepalive),
@@ -54,7 +55,7 @@ pub fn plugins(protocols: anytype) Plugins(@typeInfo(@TypeOf(protocols)).pointer
         lightning_rod.plugin.configured(LoginStart, LoginStart.Configuration{}),
         lightning_rod.plugin.configured(LoginEncryption, LoginEncryption.Configuration{}),
         lightning_rod.plugin.configured(Disconnect, Disconnect.Configuration{}),
-        lightning_rod.plugin.configured(OfflineAuthentication, OfflineAuthentication.Configuration{}),
+        lightning_rod.plugin.configured(Authentication, Authentication.Configuration{}),
         lightning_rod.plugin.configured(LoginCompression, LoginCompression.Configuration{}),
         lightning_rod.plugin.configured(LoginSuccess, LoginSuccess.Configuration{}),
         lightning_rod.plugin.configured(Keepalive, Keepalive.Configuration{}),
