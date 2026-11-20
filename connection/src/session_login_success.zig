@@ -4,11 +4,12 @@ const wire_26_2 = @import("wire_26_2");
 const sessions = @import("sessions");
 const protocols = @import("minecraft_packets").protocols;
 const Disconnect = @import("session_disconnect.zig").Disconnect;
+const writeTexturesProperty = @import("players").players.Players.writeTexturesProperty;
 
 pub const LoginSuccess = struct {
     pub const id = "minecraft:login_success";
     pub const Configuration = struct {};
-    pub const Dependencies = struct { disconnect: *Disconnect, input: *protocols.Input, phases: *sessions.Phases };
+    pub const Dependencies = struct { disconnect: *Disconnect, input: *protocols.Input, phases: *sessions.Phases, profiles: *sessions.Profiles };
     pub const SessionLoginState = struct {
         stage: enum { initial, admitting, success_sent } = .initial,
         acknowledged: bool = false,
@@ -48,7 +49,9 @@ pub const LoginSuccess = struct {
                     session_id[8] = (session_id[8] & 0x3f) | 0x80;
                     session_uuid = std.mem.readInt(u128, &session_id, .big);
                 }
-                const bytes = try sessions.packet_api.encodeFor(protocols.implementations, .{ writeSuccess, writeSuccessWithSession }, scope.profile.protocol, output, .{ scope.profile.uuid, scope.profile.name, session_uuid });
+                // The skin and cape Mojang gave an online player, as vanilla's login success carries them.
+                const textures = self.deps.profiles.of(scope.profile.connection).textures();
+                const bytes = try sessions.packet_api.encodeFor(protocols.implementations, .{ writeSuccess, writeSuccessWithSession }, scope.profile.protocol, output, .{ scope.profile.uuid, scope.profile.name, textures, session_uuid });
                 state.stage = .success_sent;
                 return .{ .send = bytes };
             },
@@ -56,15 +59,17 @@ pub const LoginSuccess = struct {
         }
     }
 
-    fn writeSuccess(packet: wire_1_21_5.login.toClient.packet_success.Writer, uuid: u128, name: []const u8, _: u128) ![]u8 {
+    fn writeSuccess(packet: wire_1_21_5.login.toClient.packet_success.Writer, uuid: u128, name: []const u8, textures: ?sessions.Textures, _: u128) ![]u8 {
         const identified = try packet.uuid(uuid);
-        const properties = try (try identified.username(name)).properties(0);
+        var properties = try (try identified.username(name)).properties(@intFromBool(textures != null));
+        if (textures) |value| try properties.advance(try writeTexturesProperty((try properties.next()).?, value));
         return (try properties.finish()).finish();
     }
 
-    fn writeSuccessWithSession(packet: wire_26_2.login.toClient.packet_success.Writer, uuid: u128, name: []const u8, session_uuid: u128) ![]u8 {
+    fn writeSuccessWithSession(packet: wire_26_2.login.toClient.packet_success.Writer, uuid: u128, name: []const u8, textures: ?sessions.Textures, session_uuid: u128) ![]u8 {
         const identified = try packet.uuid(uuid);
-        const properties = try (try identified.username(name)).properties(0);
+        var properties = try (try identified.username(name)).properties(@intFromBool(textures != null));
+        if (textures) |value| try properties.advance(try writeTexturesProperty((try properties.next()).?, value));
         return (try (try properties.finish()).sessionId(session_uuid)).finish();
     }
 

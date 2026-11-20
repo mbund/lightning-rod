@@ -566,7 +566,7 @@ pub const Replication = struct {
                     const result = switch (phase) {
                         .remove_entity => players.deps.packets.fanout(writeRemove, targets[0..count], .{entity_id}, 2048, deliveries[0..count]),
                         .remove_player => players.deps.packets.fanout(writePlayerRemove, targets[0..count], .{old_uuid}, 2048, deliveries[0..count]),
-                        .add_player => players.deps.packets.fanout(Players.writePlayerProfile, targets[0..count], .{ subject.uuid, subject.name[0..subject.name_len], @as(i32, @backingInt(self.subjects[index].gamemode)), listed_audience.contains(first) }, 2048, deliveries[0..count]),
+                        .add_player => players.deps.packets.fanout(Players.writePlayerProfile, targets[0..count], .{ subject.uuid, subject.name[0..subject.name_len], players.deps.sessions.profile(subject.handle.?).textures(), @as(i32, @backingInt(self.subjects[index].gamemode)), listed_audience.contains(first) }, Players.profile_packet_bytes, deliveries[0..count]),
                         .mode => players.deps.packets.fanout(writeInfo, targets[0..count], .{ subject.uuid, self.subjects[index].gamemode, listed_audience.contains(first) }, 2048, deliveries[0..count]),
                         .spawn => players.deps.packets.fanoutGroup(.{ .{ writeSpawnLegacy, writeSpawnPacked }, writeFlags, writeHeadRotation }, targets[0..count], .{
                             .{Spawn{ .entity_id = entity_id, .uuid = subject.uuid, .position = subject.position, .pitch = pitch, .yaw = yaw, .head_yaw = yaw }},

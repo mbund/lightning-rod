@@ -588,7 +588,7 @@ pub const Players = struct {
                 }
 
                 if (player.stage == .tab) {
-                    if (!self.sendPlayerAdd(player.protocol, handle, player.uuid, player.name[0..player.name_len], self.gameMode(index))) break;
+                    if (!self.sendPlayerAdd(player.protocol, handle, player.uuid, player.name[0..player.name_len], self.deps.sessions.profile(handle).textures(), self.gameMode(index))) break;
                     player.stage = .teleport;
                     continue;
                 }
@@ -658,8 +658,19 @@ pub const Players = struct {
         return true;
     }
 
-    pub fn sendPlayerAdd(self: *Players, protocol: i32, recipient: sessions.Handle, uuid: u128, name: []const u8, mode: minecraft.GameMode) bool {
-        return self.sendPacket(writePlayerAdd, protocol, recipient, .{ uuid, name, @as(i32, @backingInt(mode)) });
+    /// Room for a player info packet adding one player: the textures value and signature with their
+    /// length prefixes, and under 128 bytes of id, actions, UUID, name and the other fields.
+    pub const profile_packet_bytes = 4096;
+    comptime {
+        std.debug.assert(2 + sessions.PlayerProfile.value_max + 1 + 2 + sessions.PlayerProfile.signature_max + 128 <= profile_packet_bytes);
+    }
+
+    pub fn sendPlayerAdd(self: *Players, protocol: i32, recipient: sessions.Handle, uuid: u128, name: []const u8, textures: ?sessions.Textures, mode: minecraft.GameMode) bool {
+        self.deps.packets.sendPacket(writePlayerAdd, protocol, recipient, .{ uuid, name, textures, @as(i32, @backingInt(mode)) }, profile_packet_bytes) catch |err| switch (err) {
+            error.Backpressured, error.Closed => return false,
+            else => std.debug.panic("invalid server packet: {s}", .{@errorName(err)}),
+        };
+        return true;
     }
 
     fn writeBrand(packet: wire_1_21_5.play.toClient.packet_custom_payload.Writer, brand: []const u8) ![]u8 {
@@ -677,11 +688,11 @@ pub const Players = struct {
         return done.finish();
     }
 
-    pub fn writePlayerAdd(packet: wire_1_21_5.play.toClient.packet_player_info.Writer, uuid: u128, name: []const u8, mode: i32) ![]u8 {
-        return writePlayerProfile(packet, uuid, name, mode, true);
+    pub fn writePlayerAdd(packet: wire_1_21_5.play.toClient.packet_player_info.Writer, uuid: u128, name: []const u8, textures: ?sessions.Textures, mode: i32) ![]u8 {
+        return writePlayerProfile(packet, uuid, name, textures, mode, true);
     }
 
-    pub fn writePlayerProfile(packet: wire_1_21_5.play.toClient.packet_player_info.Writer, uuid: u128, name: []const u8, mode: i32, is_listed: bool) ![]u8 {
+    pub fn writePlayerProfile(packet: wire_1_21_5.play.toClient.packet_player_info.Writer, uuid: u128, name: []const u8, textures: ?sessions.Textures, mode: i32, is_listed: bool) ![]u8 {
         const action = try packet.action(.{
             .add_player = true,
             .initialize_chat = true,
@@ -696,7 +707,7 @@ pub const Players = struct {
         const entry = (try entries.next()).?;
         var player = try (try entry.uuid(uuid)).player();
         var present = try (try player.begin()).case_true();
-        const profile = try minecraft_packets.nested(.{writeProfile}).write(try present.begin(), name);
+        const profile = try minecraft_packets.nested(.{writeProfile}).write(try present.begin(), .{ .name = name, .textures = textures });
         const named = try player.advance(try present.advance(profile));
         var chat_session = try named.chatSession();
         var chat_present = try (try chat_session.begin()).case_true();
@@ -768,8 +779,21 @@ pub const Players = struct {
         return (try (try world_state.advance(spawn)).copyMetadata(keep_data)).finish();
     }
 
-    fn writeProfile(packet: wire_1_21_5.game_profile.Writer, name: []const u8) !wire_1_21_5.game_profile.Writer.Done {
-        return (try (try packet.name(name)).properties(0)).finish();
+    const Profile = struct { name: []const u8, textures: ?sessions.Textures };
+
+    fn writeProfile(packet: wire_1_21_5.game_profile.Writer, profile: Profile) !wire_1_21_5.game_profile.Writer.Done {
+        var properties = try (try packet.name(profile.name)).properties(@intFromBool(profile.textures != null));
+        if (profile.textures) |textures| try properties.advance(try writeTexturesProperty((try properties.next()).?, textures));
+        return properties.finish();
+    }
+
+    /// A profile's textures property, naming its skin and cape, with Mojang's signature when
+    /// there is one, as login success and player info both carry it.
+    pub fn writeTexturesProperty(entry: anytype, textures: sessions.Textures) !@TypeOf(entry).Done {
+        const valued = try (try entry.name("textures")).value(textures.value);
+        var signature = try valued.signature();
+        const present = try signature.begin();
+        return signature.advance(if (textures.signature.len == 0) try present.none() else try present.some(textures.signature));
     }
 
     fn writeChatSession(packet: wire_1_21_5.chat_session.Writer, _: void) !wire_1_21_5.chat_session.Writer.Done {
