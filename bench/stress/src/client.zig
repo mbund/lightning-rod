@@ -5,6 +5,8 @@ const java = @import("minecraft_java");
 const Version = protocols.version("26.2");
 const Protocol = Version.Protocol;
 const maximum = 2 * 1024 * 1024;
+/// The view distance each client asks for: the server's, as far as it sends anyone.
+const view_distance: i8 = 32;
 
 pub const Client = struct {
     io: std.Io,
@@ -71,6 +73,11 @@ pub const Client = struct {
                         codec.compressed = true;
                     } else if (header.id == Protocol.login.toClient.packetId(.success)) {
                         try send(&writer.interface, (try Protocol.login.toServer.write(&packet).login_acknowledged()).finish(), codec.compressed);
+                        // A client says how far it sees as it configures; without it the server
+                        // sends vanilla's default of two chunks.
+                        const settings = try (try (try (try Protocol.configuration.toServer.write(&packet).settings()).locale("en_us")).viewDistance(view_distance)).chatFlags(0);
+                        const shown = try (try (try (try settings.chatColors(true)).skinParts(0x7f)).mainHand(1)).enableTextFiltering(false);
+                        try send(&writer.interface, (try (try shown.enableServerListing(true)).particleStatus(0)).finish(), codec.compressed);
                         phase = .configuration;
                     } else if (header.id == Protocol.login.toClient.packetId(.disconnect)) return error.LoginRejected;
                 },

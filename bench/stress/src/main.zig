@@ -448,7 +448,7 @@ fn server(init: std.process.Init, world: []const u8, directory: []const u8, fd: 
                 stages[@backingInt(players.records[slot].stage)] += 1;
                 configuring += @intFromBool(players.records[slot].configuring);
             }
-            std.log.info("event=stress_stages active={d} configuring={d} stages={any} pool_active={d}/{d}", .{ players.activeSlots().len, configuring, stages[0..10], process.network.core.output_pool.active_units, process.network.core.output_pool.pages.len });
+            std.log.info("event=stress_stages active={d} configuring={d} stages={any} pool_active={d}/{d}", .{ players.activeSlots().len, configuring, stages[0..10], process.network.core.output_pool.active_units, process.network.core.output_pool.units() });
             std.log.info("event=stress_progress players={d} warmup={d}/{d} flight={d}/{d} stalls_idle={d} stalls_epoch={d} stalls_candidates={d} stalls_pool={d} stalls_credit={d} new_columns={d} deferred_cold={d}", .{ joined, waiting, warmup, moving, ticks, stalled.stalls.idle.value(), stalled.stalls.epoch.value(), stalled.stalls.candidates.value(), stalled.stalls.pool.value(), stalled.stalls.credit.value(), stalled.deliveries.new_columns.value(), stalled.deliveries.deferred_cold.value() });
         }
         try simulation.poll();
@@ -588,13 +588,13 @@ fn usage(process: *Process, output: *std.Io.Writer) !void {
         try output.print("{s:<34} {d:>6} / {d:<6} {d:>20.2}\n", .{ name, registry.count, registry.records.len, @as(f64, @floatFromInt(registry.memoryBytes())) / 1048576 });
     try output.writeAll("\nBuffer pool                        peak claims / maximum claims    backing MiB\n");
     const engine = process.network.core.worker.engine;
-    const pool_names = .{ "input_bursts", "output_bursts", "configurations", "control_raw", "decoded", "packet_bursts", "control_bursts" };
-    const pools = .{ &engine.input_bursts, &engine.output_bursts, &engine.configurations, &engine.control_raw, &engine.decoded, engine.packet_bursts, engine.control_bursts };
+    const pool_names = .{ "input_bursts", "configurations", "control_raw", "decoded", "packet_bursts", "control_bursts" };
+    const pools = .{ &engine.input_bursts, &engine.configurations, &engine.control_raw, &engine.decoded, engine.packet_bursts, engine.control_bursts };
     inline for (pool_names, pools) |name, pool| {
         try output.print("{s:<34} {d:>6} / {d:<6} {d:>20.2}\n", .{ name, pool.maximum_in_use.load(.monotonic), pool.maximum, @as(f64, @floatFromInt(pool.bytes.len)) / 1048576 });
     }
     const pages = &process.network.core.output_pool;
-    try output.print("shared output units                {d:>6} / {d:<6} {d:>20.2}\nlargest_output_reservation_bytes={d} peak_published_payload_MiB={d:.2}\n", .{ pages.peak_units, pages.pages.len, @as(f64, @floatFromInt(pages.bytes.len)) / 1048576, pages.largest_reservation, @as(f64, @floatFromInt(pages.peak_payload_bytes)) / 1048576 });
+    try output.print("shared output units                {d:>6} / {d:<6} {d:>20.2}\nlargest_output_reservation_bytes={d} peak_published_payload_MiB={d:.2}\n", .{ pages.peak_units, pages.units(), @as(f64, @floatFromInt(pages.bytes.len)) / 1048576, pages.largest_reservation, @as(f64, @floatFromInt(pages.peak_payload_bytes)) / 1048576 });
     const simulation = process.simulation;
     const chunks = simulation.get(Chunks);
     const streaming = simulation.get(Streaming);
