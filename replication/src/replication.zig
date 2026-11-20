@@ -55,7 +55,7 @@ pub const Replication = struct {
         yaw: i8 = 0,
         pitch: i8 = 0,
         head: ?i8 = null,
-        flags: ?minecraft.EntityFlags = null,
+        flags: ?Appearance = null,
         on_ground: bool = false,
     };
 
@@ -142,6 +142,9 @@ pub const Replication = struct {
     broadcast_groups: []BroadcastGroup,
     render_distance: i32 = 0,
 
+    /// The entity data a player's flags packet carries: its entity flags, the pose they imply,
+    /// and the skin layers its client shows.
+    const Appearance = struct { flags: minecraft.EntityFlags = .{}, skin_parts: u8 = 0 };
     const Motion = packed struct(u8) { moved: bool = false, turned: bool = false, _: u6 = 0 };
     const Subject = struct {
         generation: u32 = 0,
@@ -151,7 +154,7 @@ pub const Replication = struct {
         position: [3]i64 = @splat(0),
         yaw: i8 = 0,
         pitch: i8 = 0,
-        flags: minecraft.EntityFlags = .{},
+        flags: Appearance = .{},
         on_ground: bool = false,
         entity_visibility: u64 = 0,
         tab_visibility: u64 = 0,
@@ -353,7 +356,7 @@ pub const Replication = struct {
                 .position = .{ fixed(player.position.x), fixed(player.position.y), fixed(player.position.z) },
                 .yaw = angle(player.rotation.yaw),
                 .pitch = angle(player.rotation.pitch),
-                .flags = player.flags,
+                .flags = .{ .flags = player.flags, .skin_parts = player.skin_parts },
                 .on_ground = player.on_ground,
                 .entity_visibility = self.deps.visibility.player_entity.revision(index),
                 .tab_visibility = self.deps.visibility.tab_list.revision(index),
@@ -567,7 +570,7 @@ pub const Replication = struct {
                         .mode => players.deps.packets.fanout(writeInfo, targets[0..count], .{ subject.uuid, self.subjects[index].gamemode, listed_audience.contains(first) }, 2048, deliveries[0..count]),
                         .spawn => players.deps.packets.fanoutGroup(.{ .{ writeSpawnLegacy, writeSpawnPacked }, writeFlags, writeHeadRotation }, targets[0..count], .{
                             .{Spawn{ .entity_id = entity_id, .uuid = subject.uuid, .position = subject.position, .pitch = pitch, .yaw = yaw, .head_yaw = yaw }},
-                            .{ entity_id, subject.flags },
+                            .{ entity_id, self.subjects[index].flags },
                             .{ entity_id, yaw },
                         }, &.{ 2048, 32, 16 }, deliveries[0..count]),
                     };
@@ -666,7 +669,7 @@ pub const Replication = struct {
                 common.members[1].view().includes(eligible.view()) and common.members[2].view().includes(eligible.view()))
             {
                 const needed = !std.meta.eql(position, common.value.position) or yaw != common.value.yaw or pitch != common.value.pitch or subject.on_ground != common.value.on_ground or
-                    common.value.head == null or common.value.head.? != yaw or common.value.flags == null or !std.meta.eql(common.value.flags.?, subject.flags);
+                    common.value.head == null or common.value.head.? != yaw or common.value.flags == null or !std.meta.eql(common.value.flags.?, self.subjects[index].flags);
                 if (!needed) continue;
                 const members = self.temp(.members);
                 members.copy(eligible.view());
@@ -711,7 +714,7 @@ pub const Replication = struct {
                     const needed = !known or switch (phase) {
                         .movement => !std.meta.eql(position, seen.value.position) or yaw != seen.value.yaw or pitch != seen.value.pitch or subject.on_ground != seen.value.on_ground,
                         .head => seen.value.head == null or seen.value.head.? != yaw,
-                        .flags => seen.value.flags == null or !std.meta.eql(seen.value.flags.?, subject.flags),
+                        .flags => seen.value.flags == null or !std.meta.eql(seen.value.flags.?, self.subjects[index].flags),
                     };
                     if (!needed) continue;
                     outstanding.insert(other);
@@ -757,7 +760,7 @@ pub const Replication = struct {
                             .look => players.deps.packets.fanout(writeLook, recipients[0..count], .{ entity_id, yaw, pitch, subject.on_ground }, 32, deliveries[0..count]),
                         },
                         .head => players.deps.packets.fanout(writeHeadRotation, recipients[0..count], .{ entity_id, yaw }, 16, deliveries[0..count]),
-                        .flags => players.deps.packets.fanout(writeFlags, recipients[0..count], .{ entity_id, subject.flags }, 32, deliveries[0..count]),
+                        .flags => players.deps.packets.fanout(writeFlags, recipients[0..count], .{ entity_id, self.subjects[index].flags }, 32, deliveries[0..count]),
                     };
                     result catch |err| std.debug.panic("invalid server packet: {s}", .{@errorName(err)});
                     const delivered = self.temp(.delivered);
@@ -810,7 +813,7 @@ pub const Replication = struct {
                     const phase_needed = switch (phase) {
                         .movement => !std.meta.eql(position, common.value.position) or yaw != common.value.yaw or pitch != common.value.pitch or subject.on_ground != common.value.on_ground,
                         .head => common.value.head == null or common.value.head.? != yaw,
-                        .flags => common.value.flags == null or !std.meta.eql(common.value.flags.?, subject.flags),
+                        .flags => common.value.flags == null or !std.meta.eql(common.value.flags.?, self.subjects[index].flags),
                     };
                     if (phase_needed) {
                         const receipt = switch (phase) {
@@ -826,7 +829,7 @@ pub const Replication = struct {
                                 .look => players.deps.packets.broadcast(&self.broadcast, writeLook, excluded, required, .{ entity_id, yaw, pitch, subject.on_ground }, 32),
                             },
                             .head => players.deps.packets.broadcast(&self.broadcast, writeHeadRotation, excluded, required, .{ entity_id, yaw }, 16),
-                            .flags => players.deps.packets.broadcast(&self.broadcast, writeFlags, excluded, required, .{ entity_id, subject.flags }, 32),
+                            .flags => players.deps.packets.broadcast(&self.broadcast, writeFlags, excluded, required, .{ entity_id, self.subjects[index].flags }, 32),
                         } catch |err| std.debug.panic("invalid server packet: {s}", .{@errorName(err)});
                         receipts[index][@backingInt(phase)] = receipt;
                         required = receipt;
@@ -1110,17 +1113,27 @@ pub const Replication = struct {
         return (try (try packet.entityId(entity_id)).headYaw(yaw)).finish();
     }
 
-    fn writeFlags(packet: wire_1_21_5.play.toClient.packet_entity_metadata.Writer, entity_id: i32, flags: minecraft.EntityFlags) ![]u8 {
+    fn writeFlags(packet: wire_1_21_5.play.toClient.packet_entity_metadata.Writer, entity_id: i32, appearance: Appearance) ![]u8 {
         const entity = try packet.entityId(entity_id);
         var metadata = try entity.metadata();
-        return (try metadata.advance(try packets.nested(.{writeFlagMetadata}).write(try metadata.begin(), flags))).finish();
+        // 1.21.9 put Avatar between living entities and players, whose main hand and skin
+        // layers come first, which moved the skin layers from 17 to 16.
+        const skin_key: u8 = if (packet.protocolNumber() >= 773) 16 else 17;
+        return (try metadata.advance(try packets.nested(.{writeFlagMetadata}).write(try metadata.begin(), .{ .appearance = appearance, .skin_key = skin_key }))).finish();
     }
 
-    fn writeFlagMetadata(packet: wire_1_21_5.entityMetadata.Writer, flags: minecraft.EntityFlags) !wire_1_21_5.entityMetadata.Writer.Done {
-        var entries = try packet.value(2);
-        try entries.advance(try packets.nested(.{writeFlagEntry}).write((try entries.next()).?, flags));
-        try entries.advance(try packets.nested(.{writePoseEntry}).write((try entries.next()).?, flags));
+    const FlagMetadata = struct { appearance: Appearance, skin_key: u8 };
+
+    fn writeFlagMetadata(packet: wire_1_21_5.entityMetadata.Writer, value: FlagMetadata) !wire_1_21_5.entityMetadata.Writer.Done {
+        var entries = try packet.value(3);
+        try entries.advance(try packets.nested(.{writeFlagEntry}).write((try entries.next()).?, value.appearance.flags));
+        try entries.advance(try packets.nested(.{writePoseEntry}).write((try entries.next()).?, value.appearance.flags));
+        try entries.advance(try packets.nested(.{writeSkinEntry}).write((try entries.next()).?, value));
         return entries.finish();
+    }
+
+    fn writeSkinEntry(packet: FlagEntry, value: FlagMetadata) !FlagEntry.Done {
+        return (try (try packet.key(value.skin_key)).type()).value(@bitCast(value.appearance.skin_parts));
     }
 
     const FlagEntry = wire_1_21_5.entityMetadataEntry.cases.value.byte.Writer;

@@ -427,8 +427,11 @@ test "vanilla player state survives leaving, checkpoints and restarts, and corru
     const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
     const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
     var rows: [2]Player = @splat(.{});
+    // Players reads what sessions knew of a player as it joins; these know nothing.
+    var no_sessions: sessions.Service = undefined;
+    no_sessions.profiles = &.{};
     var players: Players = .{
-        .deps = .{ .sessions = undefined, .packets = undefined, .input = undefined, .storage = try store.openSpace(Players.id), .worlds = dimensions, .record_workspaces = &workspaces },
+        .deps = .{ .sessions = &no_sessions, .packets = undefined, .input = undefined, .storage = try store.openSpace(Players.id), .worlds = dimensions, .record_workspaces = &workspaces },
         .config = .{},
         .spawn_world = world,
         .records = &rows,

@@ -1,5 +1,5 @@
-//! Sessions before play: login, encryption, compression, status, keepalive, configuration and payload
-//! channels, and the pings a client sends in play.
+//! Sessions before play: login, encryption, compression, status, keepalive, configuration, client
+//! settings and payload channels, and the pings a client sends in play.
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
 
@@ -14,6 +14,7 @@ pub const session_login_start = @import("session_login_start.zig");
 pub const session_login_success = @import("session_login_success.zig");
 pub const session_ping = @import("session_ping.zig");
 pub const session_status = @import("session_status.zig");
+pub const session_client_settings = @import("session_client_settings.zig");
 
 const LoginStart = session_login_start.LoginStart;
 const LoginEncryption = session_encryption.LoginEncryption;
@@ -26,6 +27,7 @@ const Ping = session_ping.Ping;
 const Status = session_status.Status;
 const PayloadChannels = payload_channels;
 const SessionConfiguration = session_configuration.Plugin;
+const ClientSettings = session_client_settings.ClientSettings;
 
 /// The plugins a session runs before play, in order. Catalog is the protocol catalog the
 /// configuration phase serves.
@@ -41,6 +43,7 @@ pub fn Plugins(comptime Catalog: type) type {
         lightning_rod.plugin.Selection(Ping),
         lightning_rod.plugin.Selection(Status),
         lightning_rod.plugin.Selection(PayloadChannels.Session),
+        lightning_rod.plugin.Selection(ClientSettings),
         lightning_rod.plugin.Selection(SessionConfiguration(Catalog)),
     });
 }
@@ -58,6 +61,7 @@ pub fn plugins(protocols: anytype) Plugins(@typeInfo(@TypeOf(protocols)).pointer
         lightning_rod.plugin.configured(Ping, Ping.Configuration{}),
         lightning_rod.plugin.configured(Status, Status.Configuration{}),
         lightning_rod.plugin.configured(PayloadChannels.Session, PayloadChannels.Session.Configuration{}),
+        lightning_rod.plugin.configured(ClientSettings, ClientSettings.Configuration{}),
         lightning_rod.plugin.configured(ConfigurationPlugin, ConfigurationPlugin.Configuration{ .protocols = protocols }),
     };
 }

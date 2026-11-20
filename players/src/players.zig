@@ -195,6 +195,7 @@ pub const Players = struct {
         try deps.input.on(.look, self, onLook);
         try deps.input.on(.flying, self, onGround);
         try deps.input.on(.entity_action, self, onEntityAction);
+        try deps.input.on(.settings, self, onSettings);
         try deps.input.on(.player_input, self, onControls);
         try deps.input.on(.block_dig, self, onDig);
         return self;
@@ -304,6 +305,8 @@ pub const Players = struct {
                     .name_len = joined.name_len,
                     .configuring = !joined.ready,
                 };
+                // What the client's settings said while it configured.
+                player.skin_parts = self.deps.sessions.profile(joined.handle).skin_parts;
                 if (saved) |bytes| {
                     if (bytes.len != player.saved.len) return error.CorruptPlayer;
                     @memcpy(&player.saved, bytes);
@@ -339,6 +342,8 @@ pub const Players = struct {
                 std.debug.assert(player.configuring);
                 player.configuring = false;
                 player.stage = .login;
+                // Settings may have come after the player joined, while it still configured.
+                player.skin_parts = self.deps.sessions.profile(handle).skin_parts;
             },
             .left => |handle| {
                 const player = &self.records[handle.index];
@@ -517,6 +522,19 @@ pub const Players = struct {
         player.on_ground = movement.on_ground;
         player.revision += 1;
         if (self.movement_observer) |observer| try observer.vtable.call(observer.context, handle, accepted);
+    }
+
+    /// The client changed its settings in play. Only the skin layers it shows matter to others.
+    fn onSettings(self: *Players, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_common_settings.Reader) !void {
+        _, const a = body.locale() catch return error.InvalidPacket;
+        _, const b = a.viewDistance() catch return error.InvalidPacket;
+        _, const c = b.chatFlags() catch return error.InvalidPacket;
+        _, const d = c.chatColors() catch return error.InvalidPacket;
+        const skin_parts, _ = d.skinParts() catch return error.InvalidPacket;
+        const player = &self.records[handle.index];
+        if (player.skin_parts == @as(u8, @bitCast(skin_parts))) return;
+        player.skin_parts = @bitCast(skin_parts);
+        player.revision += 1;
     }
 
     fn onEntityAction(self: *Players, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_entity_action.Reader) !void {
@@ -843,8 +861,11 @@ test "disconnect stages player state until the next complete checkpoint" {
         const dimensions = try worlds.Worlds.init(arena.allocator(), .{ .maximum = 1 }, .{ .storage = try first.openSpace("worlds") });
         const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
         var records: [1]Players.Player = @splat(.{});
+        // Players reads what sessions knew of a player as it joins; these know nothing.
+        var no_sessions: sessions.Service = undefined;
+        no_sessions.profiles = &.{};
         var players: Players = .{
-            .deps = .{ .sessions = undefined, .packets = undefined, .input = undefined, .storage = space, .worlds = dimensions, .record_workspaces = record_workspaces },
+            .deps = .{ .sessions = &no_sessions, .packets = undefined, .input = undefined, .storage = space, .worlds = dimensions, .record_workspaces = record_workspaces },
             .config = .{ .spawn_for_player = if (previous_save) InitialSpawn.select else null },
             .spawn_world = world,
             .records = &records,
@@ -936,8 +957,11 @@ test "rotation validation precedes movement and normalizes movement teleports an
     const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
     const handle: sessions.Handle = .{ .index = 0, .generation = 1 };
     var records: [1]Players.Player = .{.{ .handle = handle, .uuid = 1, .world = world, .name = @splat(0), .stage = .ready }};
+    // Players reads what sessions knew of a player as it joins; these know nothing.
+    var no_sessions: sessions.Service = undefined;
+    no_sessions.profiles = &.{};
     var players: Players = .{
-        .deps = .{ .sessions = undefined, .packets = undefined, .input = undefined, .storage = space, .worlds = dimensions, .record_workspaces = &record_workspaces },
+        .deps = .{ .sessions = &no_sessions, .packets = undefined, .input = undefined, .storage = space, .worlds = dimensions, .record_workspaces = &record_workspaces },
         .config = .{},
         .spawn_world = world,
         .records = &records,
@@ -1024,8 +1048,11 @@ test "lifecycle batches preserve saved state and leave rejoin ordering" {
     const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
     const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
     var rows: [3]Players.Player = @splat(.{});
+    // Players reads what sessions knew of a player as it joins; these know nothing.
+    var no_sessions: sessions.Service = undefined;
+    no_sessions.profiles = &.{};
     var players: Players = .{
-        .deps = .{ .sessions = undefined, .packets = undefined, .input = undefined, .storage = space, .worlds = dimensions, .record_workspaces = &workspaces },
+        .deps = .{ .sessions = &no_sessions, .packets = undefined, .input = undefined, .storage = space, .worlds = dimensions, .record_workspaces = &workspaces },
         .config = .{},
         .spawn_world = world,
         .records = &rows,

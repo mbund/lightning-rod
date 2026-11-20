@@ -34,6 +34,8 @@ pub const Player = struct {
     loaded: bool = false,
     on_ground: bool = false,
     flags: minecraft.EntityFlags = .{},
+    /// The skin layers the player's client shows, one bit each, as its settings say.
+    skin_parts: u8 = 0,
     revision: u64 = 0,
     /// Whether blocks hide from the player what it cannot see. Spectators see through them.
     occluded: bool = true,

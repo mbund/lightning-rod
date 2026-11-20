@@ -2,6 +2,7 @@ package dev.lightningrod.e2e;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.util.Mth;
+import net.minecraft.world.entity.player.PlayerModelPart;
 
 final class PlayerSyncFixture extends Fixture {
     private boolean syncStarted;
@@ -67,10 +68,12 @@ final class PlayerSyncFixture extends Fixture {
                 && alice.isShiftKeyDown() == Boolean.parseBoolean(expected[6])
                 && alice.getPose() == net.minecraft.world.entity.Pose.CROUCHING
                 && !alice.isOnFire() && !alice.isSprinting() && !alice.isSwimming()
-                && !alice.isInvisible() && !alice.isCurrentlyGlowing() && !alice.isFallFlying();
+                && !alice.isInvisible() && !alice.isCurrentlyGlowing() && !alice.isFallFlying()
+                // Clients show every layer of their skin unless told otherwise, and say so in their settings.
+                && alice.isModelPartShown(PlayerModelPart.HAT) && alice.isModelPartShown(PlayerModelPart.JACKET);
             if (!matches) {
                 if (r.tick % 100 == 0) client.event("player_sync_mismatch", "x", alice.getX(), "y", alice.getY(), "z", alice.getZ(),
-                    "yaw", alice.getYRot(), "head_yaw", alice.getYHeadRot(), "body_yaw", alice.getVisualRotationYInDegrees(), "sneaking", alice.isShiftKeyDown());
+                    "yaw", alice.getYRot(), "head_yaw", alice.getYHeadRot(), "body_yaw", alice.getVisualRotationYInDegrees(), "sneaking", alice.isShiftKeyDown(), "hat", alice.isModelPartShown(PlayerModelPart.HAT), "jacket", alice.isModelPartShown(PlayerModelPart.JACKET));
                 return;
             }
             if (!viewPrepared) {
