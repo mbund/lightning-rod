@@ -14,6 +14,13 @@ pub const Authentication = struct {
     pub const Configuration = struct {
         online: bool = false,
         session_host: []const u8 = "https://sessionserver.mojang.com",
+        /// Mojang questions asked at once; logins past this wait their turn.
+        workers: u16 = 16,
+        timeout: std.Io.Duration = .fromSeconds(10),
+
+        fn options(self: Configuration) mojang_sessions.Options {
+            return .{ .session_host = self.session_host, .workers = self.workers, .timeout = self.timeout };
+        }
     };
     pub const Dependencies = struct {
         phases: *sessions.Phases,
@@ -27,9 +34,14 @@ pub const Authentication = struct {
     deps: Dependencies,
     authenticator: ?*Authenticator,
 
+    /// Online mode's workers, queue and root certificates, which grow with the server.
+    pub fn memoryBytes(configuration: Configuration, connections: usize) usize {
+        return if (configuration.online) Authenticator.memoryBytes(configuration.options(), connections) else 0;
+    }
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, configuration: Configuration, deps: Dependencies) !*Authentication {
         const self = try allocator.create(Authentication);
-        const authenticator = if (configuration.online) try Authenticator.init(allocator, io, deps.profiles.entries.len, deps.wake, configuration.session_host) else null;
+        const authenticator = if (configuration.online) try Authenticator.init(allocator, io, configuration.options(), deps.profiles.entries.len, deps.wake) else null;
         self.* = .{ .deps = deps, .authenticator = authenticator };
         try deps.phases.onLogin(self, onLogin);
         return self;
