@@ -31,7 +31,7 @@ pub fn Runtime(comptime Endpoint: type, comptime Selections: type) type {
         pub fn init(allocator: std.mem.Allocator, io: std.Io, selections: Selections, environment: anytype, memory_bytes: usize, connection_count: usize) !*Self {
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
-            self.* = .{ .allocator = allocator, .fixed = lightning_rod.PluginAllocator.init(allocator, memory_bytes) };
+            self.* = .{ .allocator = allocator, .fixed = lightning_rod.PluginAllocator.init(allocator, memory_bytes + declaredBytes(selections, connection_count)) };
             errdefer self.fixed.deinit();
             errdefer self.close(io);
             // A phase state for every connection, which grows with them, so it is kept apart from
@@ -65,6 +65,17 @@ pub fn Runtime(comptime Endpoint: type, comptime Selections: type) type {
             if (self.inputs.handshake.handler == null) return error.MissingHandshakeHandler;
             self.fixed.seal();
             return self;
+        }
+
+        /// What plugins say they need beyond the shared budget, for memory that grows with the
+        /// server: `pub fn memoryBytes(configuration, connections) usize`.
+        fn declaredBytes(selections: Selections, connection_count: usize) usize {
+            var total: usize = 0;
+            inline for (0..count) |index| {
+                const Plugin = lightning_rod.plugin.selectedPlugin(lightning_rod.plugin.selectedType(Selections, index));
+                if (@hasDecl(Plugin, "memoryBytes")) total += Plugin.memoryBytes(selections[index].configuration, connection_count);
+            }
+            return total;
         }
 
         pub fn deinit(self: *Self, io: std.Io) void {
