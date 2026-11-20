@@ -36,6 +36,11 @@ pub const Player = struct {
     flags: minecraft.EntityFlags = .{},
     /// The skin layers the player's client shows, one bit each, as its settings say.
     skin_parts: u8 = 0,
+    /// Which chat the client shows, as its settings say: 0 everything, 1 only system messages, 2
+    /// none.
+    chat_mode: u8 = 0,
+    /// Rises each time the player's chat key changes, so whoever shares it sees the change.
+    chat_revision: u32 = 0,
     /// How many chunks around them the player is sent: what its client asked for, no fewer than 2
     /// and no more than the server sends anyone, as vanilla's ChunkMap.getPlayerViewDistance.
     /// Joining sets it, to 2 if the client has not said, as vanilla's ServerPlayer starts; a

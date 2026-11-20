@@ -37,12 +37,14 @@ pub const ClientSettings = struct {
     fn remember(self: *ClientSettings, connection: sessions.Handle, packet: anytype) !void {
         _, const a = try packet.locale();
         const view_distance, const b = try a.viewDistance();
-        _, const c = try b.chatFlags();
+        const chat_mode, const c = try b.chatFlags();
         _, const d = try c.chatColors();
         const skin_parts, _ = try d.skinParts();
         const profile = self.profiles.of(connection);
         profile.skin_parts = @bitCast(skin_parts);
         // Anything but a positive distance is no distance, as if the client had not said.
         profile.view_distance = std.math.cast(u8, view_distance) orelse 0;
+        // Past the three modes there is nothing the client could mean; it shows everything.
+        profile.chat_mode = if (chat_mode >= 0 and chat_mode <= 2) @intCast(chat_mode) else 0;
     }
 };

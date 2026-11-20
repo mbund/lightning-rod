@@ -11,6 +11,7 @@ const minecraft_packets = @import("minecraft_packets");
 const lightning_rod = @import("lightning_rod");
 const IndexSet = lightning_rod.system.IndexSet;
 const Input = @import("input.zig").Input;
+pub const ChatSession = @import("chat_session.zig").ChatSession;
 const default_spawn: minecraft.Position = .{ .x = 0.5, .y = 65, .z = 0.5 };
 
 pub const Players = struct {
@@ -111,6 +112,10 @@ pub const Players = struct {
     dig_handlers: []DigHandler,
     dig_count: usize = 0,
 
+    /// Each slot's chat key, once its client sends one. Only a player Mojang vouched for gets
+    /// one from Mojang, so only theirs are taken.
+    chat_sessions: []?ChatSession = &.{},
+
     const MovementObserver = struct {
         context: *anyopaque,
         vtable: *const VTable,
@@ -197,6 +202,8 @@ pub const Players = struct {
         for (records) |*player| player.* = .{};
 
         self.* = .{ .deps = deps, .config = config, .spawn_world = config.world, .records = records, .dig_handlers = try allocator.alloc(DigHandler, config.dig_observers) };
+        self.chat_sessions = try allocator.alloc(?ChatSession, records.len);
+        @memset(self.chat_sessions, null);
         try self.initIndexes(allocator);
         self.rebuildIndexes();
         try deps.input.onLifecycle(self, onLifecycle);
@@ -210,6 +217,7 @@ pub const Players = struct {
         try deps.input.on(.settings, self, onSettings);
         try deps.input.on(.player_input, self, onControls);
         try deps.input.on(.block_dig, self, onDig);
+        try deps.input.on(.chat_session_update, self, onChatSession);
         return self;
     }
 
@@ -319,6 +327,7 @@ pub const Players = struct {
                 };
                 // What the client's settings said while it configured.
                 self.takeSettings(player, self.deps.sessions.profile(joined.handle));
+                self.forgetChat(joined.handle.index);
                 if (saved) |bytes| {
                     if (bytes.len != player.saved.len) return error.CorruptPlayer;
                     @memcpy(&player.saved, bytes);
@@ -361,6 +370,7 @@ pub const Players = struct {
                 const player = &self.records[handle.index];
                 std.debug.assert(player.handle != null and std.meta.eql(player.handle.?, handle));
                 player.* = .{};
+                self.forgetChat(handle.index);
                 self.updateIndexes(handle.index);
             },
             .input => {},
@@ -540,10 +550,11 @@ pub const Players = struct {
     fn onSettings(self: *Players, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_common_settings.Reader) !void {
         _, const a = body.locale() catch return error.InvalidPacket;
         const requested, const b = a.viewDistance() catch return error.InvalidPacket;
-        _, const c = b.chatFlags() catch return error.InvalidPacket;
+        const chat_mode, const c = b.chatFlags() catch return error.InvalidPacket;
         _, const d = c.chatColors() catch return error.InvalidPacket;
         const skin_parts, _ = d.skinParts() catch return error.InvalidPacket;
         const player = &self.records[handle.index];
+        player.chat_mode = if (chat_mode >= 0 and chat_mode <= 2) @intCast(chat_mode) else 0;
         // Streaming and visibility read the distance from the record each tick.
         player.view_distance = self.viewDistance(std.math.cast(u8, requested) orelse 0);
         if (player.skin_parts == @as(u8, @bitCast(skin_parts))) return;
@@ -554,6 +565,71 @@ pub const Players = struct {
     fn takeSettings(self: *const Players, player: *Player, profile: *const sessions.PlayerProfile) void {
         player.skin_parts = profile.skin_parts;
         player.view_distance = self.viewDistance(profile.view_distance);
+        player.chat_mode = profile.chat_mode;
+    }
+
+    /// The chat key of the player in a slot, if its client sent one.
+    pub fn chatSession(self: *const Players, slot: usize) ?*const ChatSession {
+        if (slot >= self.chat_sessions.len) return null;
+        if (self.chat_sessions[slot]) |*session| return session;
+        return null;
+    }
+
+    /// Whether the player in a slot is told the server takes signed chat: whoever Mojang vouched
+    /// for, as vanilla's enforce-secure-profile asks of online mode.
+    pub fn securesChat(self: *const Players, handle: sessions.Handle) bool {
+        return self.deps.sessions.profile(handle).authenticated;
+    }
+
+    /// The client's chat key, as vanilla's handleChatSessionUpdate takes it.
+    fn onChatSession(self: *Players, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_chat_session_update.Reader) !void {
+        const session_id, const a = body.sessionUUID() catch return error.InvalidPacket;
+        const expires_at, const b = a.expireTime() catch return error.InvalidPacket;
+        const key, const c = b.publicKey() catch return error.InvalidPacket;
+        const key_signature, _ = c.signature() catch return error.InvalidPacket;
+        // Vanilla's limits on the two fields.
+        if (key.len > 512 or key_signature.len > 4096) return error.InvalidPacket;
+        const player = &self.records[handle.index];
+        // The client sends its key once it has the login packet, which the rest of joining follows.
+        if (player.handle == null or player.configuring or player.stage == .login or handle.index >= self.chat_sessions.len) return;
+        // Offline, no client has a key from Mojang to send, and none is taken.
+        if (!self.securesChat(handle)) return;
+        const current = &self.chat_sessions[handle.index];
+        if (current.*) |*session| {
+            if (session.sameKey(expires_at, key, key_signature)) return;
+            if (expires_at < session.expires_at) return self.refuse(player, "multiplayer.disconnect.expired_public_key");
+        }
+        current.* = ChatSession.init(@bitCast(session_id), expires_at, key, key_signature) catch
+            return self.refuse(player, "multiplayer.disconnect.invalid_public_key_signature");
+        player.chat_revision +%= 1;
+    }
+
+    fn forgetChat(self: *Players, slot: usize) void {
+        if (slot < self.chat_sessions.len) self.chat_sessions[slot] = null;
+    }
+
+    /// Disconnects a player with vanilla's reason, named by its translation key, and refuses
+    /// the rest of its input.
+    pub fn refuse(self: *Players, player: *const Player, reason: []const u8) error{Refused} {
+        const handle = player.handle.?;
+        std.log.warn("event=player_refused connection={d}:{d} reason={s}", .{ handle.index, handle.generation, reason });
+        // The disconnect follows whatever is queued, so the client reads the reason first.
+        _ = self.sendPacket(writeRefusal, player.protocol, handle, .{reason});
+        self.deps.sessions.disconnect(handle);
+        return error.Refused;
+    }
+
+    fn writeRefusal(packet: wire_1_21_5.play.toClient.packet_kick_disconnect.Writer, key: []const u8) ![]u8 {
+        var component: [256]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&component);
+        try writer.writeByte(10);
+        try writer.writeByte(8);
+        try writer.writeInt(u16, "translate".len, .big);
+        try writer.writeAll("translate");
+        try writer.writeInt(u16, @intCast(key.len), .big);
+        try writer.writeAll(key);
+        try writer.writeByte(0);
+        return (try packet.reason(writer.buffered())).finish();
     }
 
     /// The distance a player is sent for what its client asked, zero meaning it has not said.
@@ -613,7 +689,7 @@ pub const Players = struct {
                 }
 
                 if (player.stage == .tab) {
-                    if (!self.sendPlayerAdd(player.protocol, handle, player.uuid, player.name[0..player.name_len], self.deps.sessions.profile(handle).textures(), self.gameMode(index))) break;
+                    if (!self.sendPlayerAdd(player.protocol, handle, player.uuid, player.name[0..player.name_len], self.deps.sessions.profile(handle).textures(), self.chatSession(index), self.gameMode(index))) break;
                     player.stage = .teleport;
                     continue;
                 }
@@ -647,7 +723,7 @@ pub const Players = struct {
                     .hashed_seed = 0,
                     .gamemode = @backingInt(self.gameMode(index)),
                     .sea_level = 63,
-                } })) break;
+                }, self.securesChat(handle) })) break;
                 player.stage = .brand;
             }
         }
@@ -684,14 +760,16 @@ pub const Players = struct {
     }
 
     /// Room for a player info packet adding one player: the textures value and signature with their
-    /// length prefixes, and under 128 bytes of id, actions, UUID, name and the other fields.
-    pub const profile_packet_bytes = 4096;
-    comptime {
-        std.debug.assert(2 + sessions.PlayerProfile.value_max + 1 + 2 + sessions.PlayerProfile.signature_max + 128 <= profile_packet_bytes);
+    /// length prefixes, the chat key, and under 128 bytes of id, actions, UUID, name and the rest.
+    pub fn profilePacketBytes(textures: ?sessions.Textures, chat: ?*const ChatSession) usize {
+        var total: usize = 128;
+        if (textures) |value| total += 2 + value.value.len + 1 + 2 + value.signature.len;
+        if (chat != null) total += 1 + ChatSession.encoded_max;
+        return total;
     }
 
-    pub fn sendPlayerAdd(self: *Players, protocol: i32, recipient: sessions.Handle, uuid: u128, name: []const u8, textures: ?sessions.Textures, mode: minecraft.GameMode) bool {
-        self.deps.packets.sendPacket(writePlayerAdd, protocol, recipient, .{ uuid, name, textures, @as(i32, @backingInt(mode)) }, profile_packet_bytes) catch |err| switch (err) {
+    pub fn sendPlayerAdd(self: *Players, protocol: i32, recipient: sessions.Handle, uuid: u128, name: []const u8, textures: ?sessions.Textures, chat: ?*const ChatSession, mode: minecraft.GameMode) bool {
+        self.deps.packets.sendPacket(writePlayerAdd, protocol, recipient, .{ uuid, name, textures, chat, @as(i32, @backingInt(mode)) }, profilePacketBytes(textures, chat)) catch |err| switch (err) {
             error.Backpressured, error.Closed => return false,
             else => std.debug.panic("invalid server packet: {s}", .{@errorName(err)}),
         };
@@ -713,11 +791,11 @@ pub const Players = struct {
         return done.finish();
     }
 
-    pub fn writePlayerAdd(packet: wire_1_21_5.play.toClient.packet_player_info.Writer, uuid: u128, name: []const u8, textures: ?sessions.Textures, mode: i32) ![]u8 {
-        return writePlayerProfile(packet, uuid, name, textures, mode, true);
+    pub fn writePlayerAdd(packet: wire_1_21_5.play.toClient.packet_player_info.Writer, uuid: u128, name: []const u8, textures: ?sessions.Textures, chat: ?*const ChatSession, mode: i32) ![]u8 {
+        return writePlayerProfile(packet, uuid, name, textures, chat, mode, true);
     }
 
-    pub fn writePlayerProfile(packet: wire_1_21_5.play.toClient.packet_player_info.Writer, uuid: u128, name: []const u8, textures: ?sessions.Textures, mode: i32, is_listed: bool) ![]u8 {
+    pub fn writePlayerProfile(packet: wire_1_21_5.play.toClient.packet_player_info.Writer, uuid: u128, name: []const u8, textures: ?sessions.Textures, chat: ?*const ChatSession, mode: i32, is_listed: bool) ![]u8 {
         const action = try packet.action(.{
             .add_player = true,
             .initialize_chat = true,
@@ -736,9 +814,9 @@ pub const Players = struct {
         const named = try player.advance(try present.advance(profile));
         var chat_session = try named.chatSession();
         var chat_present = try (try chat_session.begin()).case_true();
-        const chat_data = try minecraft_packets.nested(.{writeChatSession}).write(try chat_present.begin(), {});
-        const chat = try chat_session.advance(try chat_present.advance(chat_data));
-        var gamemode = try chat.gamemode();
+        const chat_data = try minecraft_packets.nested(.{writeChatSession}).write(try chat_present.begin(), chat);
+        const chatted = try chat_session.advance(try chat_present.advance(chat_data));
+        var gamemode = try chatted.gamemode();
         const game = try gamemode.advance(try (try gamemode.begin()).case_true(mode));
         var listed = try game.listed();
         const listing = try listed.advance(try (try listed.begin()).case_true(@intFromBool(is_listed)));
@@ -768,15 +846,17 @@ pub const Players = struct {
 
     const writeLogin = .{ writeLogin_1_21_5, writeLogin_26_2 };
 
-    fn writeLogin_1_21_5(packet: wire_1_21_5.play.toClient.packet_login.Writer, selected: *const sessions.Protocol, login: minecraft.Login) ![]u8 {
-        return writeLoginBody(packet, selected, login, false);
+    fn writeLogin_1_21_5(packet: wire_1_21_5.play.toClient.packet_login.Writer, selected: *const sessions.Protocol, login: minecraft.Login, secure: bool) ![]u8 {
+        return writeLoginBody(packet, selected, login, secure, false);
     }
 
-    fn writeLogin_26_2(packet: wire_26_2.play.toClient.packet_login.Writer, selected: *const sessions.Protocol, login: minecraft.Login) ![]u8 {
-        return writeLoginBody(packet, selected, login, true);
+    fn writeLogin_26_2(packet: wire_26_2.play.toClient.packet_login.Writer, selected: *const sessions.Protocol, login: minecraft.Login, secure: bool) ![]u8 {
+        return writeLoginBody(packet, selected, login, secure, true);
     }
 
-    fn writeLoginBody(packet: anytype, selected: *const sessions.Protocol, login: minecraft.Login, comptime online_mode: bool) ![]u8 {
+    /// A player Mojang vouched for is told the server is in online mode, which 26.2 clients wait for
+    /// before they make a chat key, and that it takes only signed chat.
+    fn writeLoginBody(packet: anytype, selected: *const sessions.Protocol, login: minecraft.Login, secure: bool, comptime online_mode: bool) ![]u8 {
         const dimension = try selected.registryId("minecraft:dimension_type", login.dimension_type);
         const entity = try packet.entityId(login.entity_id);
         const hardcore = try entity.isHardcore(false);
@@ -793,8 +873,8 @@ pub const Players = struct {
         var world_state = try crafting.worldState();
         const spawn = try minecraft_packets.nested(.{writeSpawnInfo}).write(try world_state.begin(), .{ .dimension = dimension, .name = login.world_name, .seed = login.hashed_seed, .mode = login.gamemode, .sea_level = login.sea_level });
         const world_done = try world_state.advance(spawn);
-        const chat_policy = if (comptime online_mode) try world_done.onlineMode(false) else world_done;
-        return (try chat_policy.enforcesSecureChat(false)).finish();
+        const chat_policy = if (comptime online_mode) try world_done.onlineMode(secure) else world_done;
+        return (try chat_policy.enforcesSecureChat(secure)).finish();
     }
 
     fn writeRespawn(packet: wire_1_21_5.play.toClient.packet_respawn.Writer, selected: *const sessions.Protocol, dimension_name: []const u8, world_name: []const u8, mode: i8, keep_data: u8) ![]u8 {
@@ -821,8 +901,14 @@ pub const Players = struct {
         return signature.advance(if (textures.signature.len == 0) try present.none() else try present.some(textures.signature));
     }
 
-    fn writeChatSession(packet: wire_1_21_5.chat_session.Writer, _: void) !wire_1_21_5.chat_session.Writer.Done {
-        return packet.none();
+    /// A player's chat key in a player info entry, or none, which clears what the client had.
+    pub fn writeChatSession(packet: wire_1_21_5.chat_session.Writer, chat: ?*const ChatSession) !wire_1_21_5.chat_session.Writer.Done {
+        const session = chat orelse return packet.none();
+        var present = try packet.some();
+        var key = try (try (try present.begin()).uuid(session.id)).publicKey();
+        const expiring = try (try key.begin()).expireTime(session.expires_at);
+        const keyed = try expiring.keyBytes(&session.key);
+        return present.advance(try key.advance(try keyed.keySignature(session.keySignature())));
     }
 
     const SpawnInfo = struct { dimension: i32, name: []const u8, mode: i8, seed: i64 = 0, sea_level: i32 = 63 };

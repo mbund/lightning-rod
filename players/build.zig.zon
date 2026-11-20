@@ -6,6 +6,7 @@
     .dependencies = .{
         .game_data = .{ .path = "../game_data" },
         .lightning_rod = .{ .path = ".." },
+        .minecraft_java = .{ .path = "../minecraft_java" },
         .minecraft_model = .{ .path = "../minecraft_model" },
         .minecraft_packets = .{ .path = "../minecraft_packets" },
         .protocol_1_21_5 = .{ .path = "../protocol_versions/v1_21_5" },

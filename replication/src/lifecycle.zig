@@ -14,6 +14,8 @@ pub const Lifecycle = struct {
         listed: bool = false,
         spawned: bool = false,
         gamemode: ?minecraft.GameMode = null,
+        /// The revision of the subject's chat key the observer was given.
+        chat: u32 = 0,
     };
     const Row = struct { value: State = .{}, epoch: u64 = 0, head: usize = absent, count: usize = 0 };
     const Column = struct { epoch: u64 = 0, head: usize = absent, count: usize = 0, previous: ?usize = null, next: ?usize = null };

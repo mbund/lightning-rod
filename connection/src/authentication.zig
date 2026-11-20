@@ -75,6 +75,7 @@ pub const Authentication = struct {
                 // Mojang matches names without regard to case; the name stays as the client gave it.
                 if (!std.ascii.eqlIgnoreCase(profile.nameText(), scope.profile.name)) return .{ .reject = try self.deps.disconnect.login(scope.profile.protocol, unverified_message, output) };
                 try scope.authenticate(profile.uuid);
+                self.deps.profiles.of(connection).authenticated = true;
                 if (profile.textures_value_len != 0) try self.deps.profiles.of(connection).setTextures(profile.textures_value[0..profile.textures_value_len], profile.textures_signature[0..profile.textures_signature_len]);
                 return .done;
             },

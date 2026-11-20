@@ -20,6 +20,12 @@ pub const PlayerProfile = struct {
     /// How many chunks around them the client asks to see, as its settings say. Nothing until the
     /// client says.
     view_distance: u8 = 0,
+    /// Which chat the client shows, as its settings say: 0 everything, 1 only system messages, 2
+    /// none. Vanilla sends player chat only to the first, and takes none from the last.
+    chat_mode: u8 = 0,
+    /// Whether Mojang vouched for who the player is, as online mode asks it to. Only such a player
+    /// gets a chat key from Mojang, so only they are told the server takes signed chat.
+    authenticated: bool = false,
     /// What an online-mode client tells Mojang it joined this server with: SHA-1 over the server
     /// id, the shared secret and the server's public key. Login reads it once encryption is on.
     server_hash: ?[20]u8 = null,
@@ -42,6 +48,8 @@ pub const PlayerProfile = struct {
     const textures_value_tag: fields.Tag = 2;
     const textures_signature_tag: fields.Tag = 3;
     const view_distance_tag: fields.Tag = 4;
+    const authenticated_tag: fields.Tag = 5;
+    const chat_mode_tag: fields.Tag = 6;
 
     /// What `writeList` writes: only what was set, the rest left to the defaults.
     pub fn listBytes(self: *const PlayerProfile) usize {
@@ -49,6 +57,8 @@ pub const PlayerProfile = struct {
         if (self.skin_parts != 0) total += fields.intBytes(u8);
         if (self.textures_value_len != 0) total += fields.fieldBytes(self.textures_value_len) + fields.fieldBytes(self.textures_signature_len);
         if (self.view_distance != 0) total += fields.intBytes(u8);
+        if (self.authenticated) total += fields.intBytes(u8);
+        if (self.chat_mode != 0) total += fields.intBytes(u8);
         return total;
     }
 
@@ -59,6 +69,8 @@ pub const PlayerProfile = struct {
             try fields.writeBytes(writer, textures_signature_tag, value.signature);
         }
         if (self.view_distance != 0) try fields.writeInt(writer, view_distance_tag, u8, self.view_distance);
+        if (self.authenticated) try fields.writeInt(writer, authenticated_tag, u8, 1);
+        if (self.chat_mode != 0) try fields.writeInt(writer, chat_mode_tag, u8, self.chat_mode);
         try fields.writeEnd(writer);
     }
 
@@ -69,6 +81,15 @@ pub const PlayerProfile = struct {
             textures_value_tag => profile.textures_value_len = @intCast((try list.bytes(field, &profile.textures_value)).len),
             textures_signature_tag => profile.textures_signature_len = @intCast((try list.bytes(field, &profile.textures_signature)).len),
             view_distance_tag => profile.view_distance = try list.int(field, u8),
+            authenticated_tag => profile.authenticated = switch (try list.int(field, u8)) {
+                0 => false,
+                1 => true,
+                else => return error.InvalidResume,
+            },
+            chat_mode_tag => {
+                profile.chat_mode = try list.int(field, u8);
+                if (profile.chat_mode > 2) return error.InvalidResume;
+            },
             else => try list.skip(field),
         };
         // A signature belongs to a value.

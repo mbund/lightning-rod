@@ -147,8 +147,9 @@ pub const Input = struct {
                                     break :packets;
                                 }
                                 if (slot.entry) |entry| entry.vtable.call(entry.context, input.handle, header.body, temporary) catch |err| {
-                                    if (err != error.InvalidPacket) return err;
-                                    self.reject(input.handle, "InvalidPacket");
+                                    // A refusal already told the client why, as vanilla disconnects with a reason.
+                                    if (err != error.InvalidPacket and err != error.Refused) return err;
+                                    self.reject(input.handle, @errorName(err));
                                     break :packets;
                                 };
                             }

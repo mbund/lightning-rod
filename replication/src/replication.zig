@@ -11,6 +11,7 @@ const std = @import("std");
 const protocols = @import("minecraft_packets").protocols;
 const sessions = @import("sessions");
 const Players = @import("players").players.Players;
+const ChatSession = @import("players").chat_session.ChatSession;
 const game_data = @import("game_data");
 const minecraft = @import("minecraft_model");
 const packets = @import("minecraft_packets");
@@ -160,6 +161,8 @@ pub const Replication = struct {
         on_ground: bool = false,
         entity_visibility: u64 = 0,
         tab_visibility: u64 = 0,
+        /// The player's chat key revision, so observers hear of a new key.
+        chat: u32 = 0,
     };
 
     const CachedBaseline = struct {
@@ -268,7 +271,7 @@ pub const Replication = struct {
     }
 
     const Work = enum { updates, interested, audience };
-    const Scratch = enum { changed, movement_changed, head_changed, flags_changed, connected, spatial_changed, ready_observers, selected, nearby, difference, listed, lifecycle_remove_entity, lifecycle_remove_player, lifecycle_add_player, lifecycle_mode, lifecycle_spawn, spawned, eligible, retry, previous, members, force, candidates, outstanding, group, delivered, failed, displaced, filtered, entity_audience, terrain_changed };
+    const Scratch = enum { changed, movement_changed, head_changed, flags_changed, connected, spatial_changed, ready_observers, selected, nearby, difference, listed, lifecycle_remove_entity, lifecycle_remove_player, lifecycle_add_player, lifecycle_mode, lifecycle_chat, lifecycle_spawn, spawned, eligible, retry, previous, members, force, candidates, outstanding, group, delivered, failed, displaced, filtered, entity_audience, terrain_changed };
 
     fn workMask(self: *const Replication, index: usize, comptime kind: Work) bit_sets.Set {
         assert(index < self.subjects.len);
@@ -362,9 +365,10 @@ pub const Replication = struct {
                 .on_ground = player.on_ground,
                 .entity_visibility = self.deps.visibility.player_entity.revision(index),
                 .tab_visibility = self.deps.visibility.tab_list.revision(index),
+                .chat = player.chat_revision,
             };
             if (generation != 0) connected.insert(index);
-            if (generation != subject.generation or next.gamemode != subject.gamemode or next.entity_visibility != subject.entity_visibility or next.tab_visibility != subject.tab_visibility) changed.insert(index);
+            if (generation != subject.generation or next.gamemode != subject.gamemode or next.entity_visibility != subject.entity_visibility or next.tab_visibility != subject.tab_visibility or next.chat != subject.chat) changed.insert(index);
             const moved = !std.meta.eql(next.position, subject.position);
             if (terrain != null and moved and !std.meta.eql(terrainSections(next.position), terrainSections(subject.position))) changed.insert(index);
             if (generation != subject.generation or next.world != subject.world or !std.meta.eql(next.cell, subject.cell)) {
@@ -523,8 +527,8 @@ pub const Replication = struct {
             }
             const entity_audience = entity_row.view();
             const listed_audience = listed_row.view();
-            const Action = enum { remove_entity, remove_player, add_player, mode, spawn };
-            const needed = [5]sparse_sets.Workspace.RowView{ self.temp(.lifecycle_remove_entity), self.temp(.lifecycle_remove_player), self.temp(.lifecycle_add_player), self.temp(.lifecycle_mode), self.temp(.lifecycle_spawn) };
+            const Action = enum { remove_entity, remove_player, add_player, mode, chat, spawn };
+            const needed = [6]sparse_sets.Workspace.RowView{ self.temp(.lifecycle_remove_entity), self.temp(.lifecycle_remove_player), self.temp(.lifecycle_add_player), self.temp(.lifecycle_mode), self.temp(.lifecycle_chat), self.temp(.lifecycle_spawn) };
             for (needed) |row| row.clear();
             var selected = audience.iterator();
             while (selected.next()) |other| {
@@ -548,6 +552,7 @@ pub const Replication = struct {
                     continue;
                 }
                 if (seen.gamemode != self.subjects[index].gamemode or seen.listed != (listed_audience.contains(other))) needed[@backingInt(Action.mode)].insert(other);
+                if (seen.chat != self.subjects[index].chat) needed[@backingInt(Action.chat)].insert(other);
                 if (!seen.spawned and wants_spawn) needed[@backingInt(Action.spawn)].insert(other);
             }
             const yaw = self.subjects[index].yaw;
@@ -574,8 +579,9 @@ pub const Replication = struct {
                     const result = switch (phase) {
                         .remove_entity => players.deps.packets.fanout(writeRemove, targets[0..count], .{entity_id}, 2048, deliveries[0..count]),
                         .remove_player => players.deps.packets.fanout(writePlayerRemove, targets[0..count], .{old_uuid}, 2048, deliveries[0..count]),
-                        .add_player => players.deps.packets.fanout(Players.writePlayerProfile, targets[0..count], .{ subject.uuid, subject.name[0..subject.name_len], players.deps.sessions.profile(subject.handle.?).textures(), @as(i32, @backingInt(self.subjects[index].gamemode)), listed_audience.contains(first) }, Players.profile_packet_bytes, deliveries[0..count]),
+                        .add_player => players.deps.packets.fanout(Players.writePlayerProfile, targets[0..count], .{ subject.uuid, subject.name[0..subject.name_len], players.deps.sessions.profile(subject.handle.?).textures(), players.chatSession(index), @as(i32, @backingInt(self.subjects[index].gamemode)), listed_audience.contains(first) }, Players.profilePacketBytes(players.deps.sessions.profile(subject.handle.?).textures(), players.chatSession(index)), deliveries[0..count]),
                         .mode => players.deps.packets.fanout(writeInfo, targets[0..count], .{ subject.uuid, self.subjects[index].gamemode, listed_audience.contains(first) }, 2048, deliveries[0..count]),
+                        .chat => players.deps.packets.fanout(writeChatInfo, targets[0..count], .{ subject.uuid, players.chatSession(index) }, 2048, deliveries[0..count]),
                         .spawn => players.deps.packets.fanoutGroup(.{ .{ writeSpawnLegacy, writeSpawnPacked }, writeFlags, writeHeadRotation }, targets[0..count], .{
                             .{Spawn{ .entity_id = entity_id, .uuid = subject.uuid, .position = subject.position, .pitch = pitch, .yaw = yaw, .head_yaw = yaw }},
                             .{ entity_id, self.subjects[index].flags },
@@ -607,6 +613,8 @@ pub const Replication = struct {
                                 seen.known = true;
                                 seen.listed = listed_audience.contains(other);
                                 seen.spawned = false;
+                                // The entry carries the key.
+                                seen.chat = self.subjects[index].chat;
                                 seen.gamemode = self.subjects[index].gamemode;
                                 if (self.workMask(index, .interested).contains(other) and subject.inWorld()) needed[@backingInt(Action.spawn)].insert(other);
                             },
@@ -614,6 +622,7 @@ pub const Replication = struct {
                                 seen.gamemode = self.subjects[index].gamemode;
                                 seen.listed = listed_audience.contains(other);
                             },
+                            .chat => seen.chat = self.subjects[index].chat,
                             .spawn => {
                                 spawned.insert(other);
                                 seen.spawned = true;
@@ -631,7 +640,7 @@ pub const Replication = struct {
                 const wants_listed = listed_audience.contains(other);
                 const wants_known = generation != 0 and (other == index or wants_spawn or wants_listed);
                 if (seen.generation != generation or seen.known != wants_known or
-                    (wants_known and (seen.gamemode != self.subjects[index].gamemode or seen.listed != wants_listed)) or
+                    (wants_known and (seen.gamemode != self.subjects[index].gamemode or seen.listed != wants_listed or seen.chat != self.subjects[index].chat)) or
                     (seen.spawned != wants_spawn))
                 {
                     watching.pending.insert(index);
@@ -1080,6 +1089,32 @@ pub const Replication = struct {
         const selected = try gamemode.advance(try (try gamemode.begin()).case_true(@backingInt(mode)));
         var listed = try selected.listed();
         const absent_listed = try listed.advance(try (try listed.begin()).case_true(@intFromBool(is_listed)));
+        var latency = try absent_listed.latency();
+        const absent_latency = try latency.advance(try (try latency.begin()).case_default());
+        var display = try absent_latency.displayName();
+        const absent_display = try display.advance(try (try display.begin()).case_default());
+        var priority = try absent_display.listPriority();
+        const absent_priority = try priority.advance(try (try priority.begin()).case_default());
+        var hat = try absent_priority.showHat();
+        try entries.advance(try hat.advance(try (try hat.begin()).case_default()));
+        return (try entries.finish()).finish();
+    }
+
+    /// A player's new chat key, as vanilla tells everyone when it takes one.
+    fn writeChatInfo(packet: wire_1_21_5.play.toClient.packet_player_info.Writer, uuid: u128, session: ?*const ChatSession) ![]u8 {
+        const action = try packet.action(.{ .initialize_chat = true });
+        var entries = try action.data(1);
+        const entry = (try entries.next()).?;
+        var player = try (try entry.uuid(uuid)).player();
+        const absent_player = try player.advance(try (try player.begin()).case_default());
+        var chat = try absent_player.chatSession();
+        var present = try (try chat.begin()).case_true();
+        const key = try packets.nested(.{Players.writeChatSession}).write(try present.begin(), session);
+        const chatted = try chat.advance(try present.advance(key));
+        var gamemode = try chatted.gamemode();
+        const absent_gamemode = try gamemode.advance(try (try gamemode.begin()).case_default());
+        var listed = try absent_gamemode.listed();
+        const absent_listed = try listed.advance(try (try listed.begin()).case_default());
         var latency = try absent_listed.latency();
         const absent_latency = try latency.advance(try (try latency.begin()).case_default());
         var display = try absent_latency.displayName();
