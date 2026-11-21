@@ -1,6 +1,7 @@
-//! Players acting on mobs, from ServerboundInteractPacket as ServerGamePacketListenerImpl
-//! handles it: attacks go through Player.attack, and uses through Mob.interact, where cows are
-//! milked with buckets, fed their food to fall in love or grow, and given spawn eggs for calves.
+//! Players acting on mobs and each other, from ServerboundInteractPacket as
+//! ServerGamePacketListenerImpl handles it: attacks go to Melee, and uses through Mob.interact,
+//! where cows are milked with buckets, fed their food to fall in love or grow, and given spawn
+//! eggs for calves.
 
 const std = @import("std");
 const game_data = @import("game_data");
@@ -15,13 +16,13 @@ const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
 const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
 const EquipmentAttributes = @import("vanilla_items").equipment_attributes.EquipmentAttributes;
 const Items = @import("vanilla_items").items.Items;
-const FallDamage = @import("vanilla_survival").fall_damage.FallDamage;
 const world_effects = @import("vanilla_blocks").world_effects;
 const mth = @import("vanilla_bodies").mth;
 const living = @import("living.zig");
 const mob_state = @import("mob.zig");
-const mob_replication = @import("mob_replication.zig");
 const Mobs = @import("mobs.zig").Mobs;
+const body = @import("vanilla_bodies").body;
+const Melee = @import("melee.zig").Melee;
 
 const Mob = mob_state.Mob;
 const registry = game_data.registry;
@@ -39,15 +40,10 @@ pub const MobInteraction = struct {
         items: *Items,
         menus: *PlayerInventory,
         attributes: *EquipmentAttributes,
-        falls: *FallDamage,
+        melee: *Melee,
     };
 
-    /// Player.attackStrengthTicker, by player slot: ticks since the last attack or change of
-    /// held item, and that item, to notice the change.
-    const Attack = struct { generation: u32 = 0, ticker: i32 = 0, held: ?u32 = null };
-
     deps: Dependencies,
-    attacks: []Attack,
     effects: world_effects.Effects,
     sound_seeds: std.Random.DefaultPrng,
     bucket: u32,
@@ -55,11 +51,8 @@ pub const MobInteraction = struct {
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*MobInteraction {
         const self = try allocator.create(MobInteraction);
-        const attacks = try allocator.alloc(Attack, deps.players.records.len);
-        @memset(attacks, .{});
         self.* = .{
             .deps = deps,
-            .attacks = attacks,
             .effects = try .init(allocator, deps.players),
             .sound_seeds = .init(0x696e7465726163),
             .bucket = @intCast(registry.itemId("minecraft:bucket").?),
@@ -72,36 +65,12 @@ pub const MobInteraction = struct {
         return self;
     }
 
-    /// Player.tick's attack strength: it climbs every tick and starts over when the held item
-    /// changes.
-    pub fn tick(self: *MobInteraction) !void {
-        for (self.deps.players.activeSlots()) |slot| {
-            const player = &self.deps.players.records[slot];
-            const handle = player.handle orelse continue;
-            const strength = &self.attacks[slot];
-            if (strength.generation != handle.generation) strength.* = .{ .generation = handle.generation };
-            strength.ticker += 1;
-            const held = try self.heldKind(slot, .main);
-            if (held != strength.held) {
-                strength.held = held;
-                strength.ticker = 0;
-            }
-        }
-    }
-
     const Hand = enum { main, off };
 
     fn heldSlot(self: *MobInteraction, slot: usize, hand: Hand) inventories.Slot {
         const player = &self.deps.players.records[slot];
         const state = self.deps.player_states.of(player);
         return .{ .owner = player.uuid, .index = if (hand == .off) 45 else 36 + @as(u16, state.selected_slot) };
-    }
-
-    fn heldKind(self: *MobInteraction, slot: usize, hand: Hand) !?u32 {
-        const stack = (try self.deps.inventories.get(self.heldSlot(slot, hand))).stack orelse return null;
-        const pinned = try self.deps.items.acquire(stack);
-        defer pinned.release();
-        return pinned.view.kind;
     }
 
     fn onUse(self: *MobInteraction, handle: sessions.Handle, packet: wire.play.toServer.packet_use_entity.Reader) !void {
@@ -173,26 +142,39 @@ pub const MobInteraction = struct {
         if (hand < 0 or hand > 1) return error.InvalidPacket;
         const player = &self.deps.players.records[handle.index];
         if (player.stage != .ready) return;
-        // Network ids of mobs are their negated entity ids.
-        if (target >= 0) return;
+        // Players' network ids are their slots plus one; mobs' are their negated entity ids.
+        if (target > 0) return self.dispatchPlayer(handle.index, @intCast(target - 1), mouse);
+        if (target == 0) return;
         const mob = self.deps.mobs.get(@intCast(-@as(i64, target))) orelse return;
         if (mob.world != player.world or mob.removed) return;
-        if (!try self.withinReach(handle.index, mob)) return;
+        if (!try self.withinReach(handle.index, living.box(self.deps.mobs, mob))) return;
         switch (mouse) {
-            1 => try self.attack(handle.index, mob),
+            1 => try self.deps.melee.attack(handle.index, .{ .mob = mob }),
             // Entity.interactAt passes for mobs, so only the plain interaction acts.
             0 => try self.interact(handle.index, mob, if (hand == 1) .off else .main),
             else => {},
         }
     }
 
+    /// An interaction with another player: an attack, as ServerPlayer.attack takes it. A player
+    /// cannot hit itself or someone in another world, and nothing uses a player.
+    fn dispatchPlayer(self: *MobInteraction, slot: usize, victim: usize, mouse: i32) !void {
+        if (mouse != 1 or victim == slot or victim >= self.deps.players.records.len) return;
+        const other = &self.deps.players.records[victim];
+        const player = &self.deps.players.records[slot];
+        if (other.handle == null or other.stage != .ready or other.world != player.world) return;
+        const at = other.position;
+        const height: f64 = if (other.flags.sneaking) 1.5 else 1.8;
+        if (!try self.withinReach(slot, .{ .min = .{ at.x - 0.3, at.y, at.z - 0.3 }, .max = .{ at.x + 0.3, at.y + height, at.z + 0.3 } })) return;
+        try self.deps.melee.attack(slot, .{ .player = victim });
+    }
+
     /// Player.canInteractWithEntity with ServerGamePacketListenerImpl's three blocks of slack:
-    /// the mob's box within the interaction range of the eyes.
-    fn withinReach(self: *MobInteraction, slot: usize, mob: *const Mob) !bool {
+    /// the entity's box within the interaction range of the eyes.
+    fn withinReach(self: *MobInteraction, slot: usize, box: body.Box) !bool {
         const player = &self.deps.players.records[slot];
         const range = try self.deps.attributes.value(slot, "minecraft:entity_interaction_range") + 3.0;
         const eye: [3]f64 = .{ player.position.x, player.position.y + (if (player.flags.sneaking) @as(f64, @as(f32, 1.27)) else @as(f64, @as(f32, 1.62))), player.position.z };
-        const box = living.box(self.deps.mobs, mob);
         var squared: f64 = 0;
         for (0..3) |axis| {
             const distance = @max(box.min[axis] - eye[axis], 0, eye[axis] - box.max[axis]);
@@ -297,54 +279,4 @@ pub const MobInteraction = struct {
         self.effects.sound(player.world, player.position, name, .players, 1, 1, @bitCast(self.sound_seeds.next()), slot);
     }
 
-    // Player.attack.
-
-    fn attack(self: *MobInteraction, slot: usize, mob: *Mob) !void {
-        const player = &self.deps.players.records[slot];
-        const state = self.deps.player_states.of(player);
-        if (state.gamemode == .spectator or state.health <= 0) return;
-        var damage: f32 = @floatCast(try self.deps.attributes.value(slot, "minecraft:attack_damage"));
-        const speed = try self.deps.attributes.value(slot, "minecraft:attack_speed");
-        // Player.getAttackStrengthScale(0.5).
-        const delay: f32 = @floatCast(1.0 / speed * 20.0);
-        const scale = mth.clamp((@as(f32, @floatFromInt(self.attacks[slot].ticker)) + 0.5) / delay, 0, 1);
-        damage *= 0.2 + scale * scale * 0.8;
-        self.attacks[slot].ticker = 0;
-        if (damage <= 0) return;
-        const strong = scale > 0.9;
-        const knockback_hit = player.flags.sprinting and strong;
-        if (knockback_hit) self.playerSoundAll(slot, "minecraft:entity.player.attack.knockback");
-        // Player.attack's critical hit, falling and not on the ground or sprinting.
-        const critical = strong and self.falling(slot) and !player.on_ground and !player.flags.sprinting;
-        if (critical) damage *= 1.5;
-        const hurt = try self.deps.mobs.hurt(mob, .{ .type = .player_attack, .attacker = @intCast(slot), .source = .{ player.position.x, player.position.y, player.position.z } }, damage);
-        if (!hurt) {
-            self.playerSoundAll(slot, "minecraft:entity.player.attack.nodamage");
-            return;
-        }
-        const knockback: f32 = @as(f32, @floatCast(try self.deps.attributes.value(slot, "minecraft:attack_knockback"))) + (if (knockback_hit) @as(f32, 1.0) else 0.0);
-        if (knockback > 0) {
-            const yaw = player.rotation.yaw * (std.math.pi / 180.0);
-            self.deps.mobs.knockback(mob, knockback * 0.5, mth.sin(yaw), -mth.cos(yaw));
-        }
-        if (critical) {
-            self.playerSoundAll(slot, "minecraft:entity.player.attack.crit");
-        } else {
-            self.playerSoundAll(slot, if (strong) "minecraft:entity.player.attack.strong" else "minecraft:entity.player.attack.weak");
-        }
-    }
-
-    fn falling(self: *MobInteraction, slot: usize) bool {
-        return fallingDistance(self.deps.falls, slot) > 0;
-    }
-
-    /// Level.playSound with no player: everyone nearby hears it, the attacker too.
-    fn playerSoundAll(self: *MobInteraction, slot: usize, name: []const u8) void {
-        const player = &self.deps.players.records[slot];
-        self.effects.sound(player.world, player.position, name, .players, 1, 1, @bitCast(self.sound_seeds.next()), null);
-    }
 };
-
-fn fallingDistance(falls: *const FallDamage, slot: usize) f64 {
-    return falls.falls[slot].distance;
-}

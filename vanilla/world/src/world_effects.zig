@@ -8,6 +8,9 @@ const minecraft = @import("minecraft_model");
 const packets = @import("minecraft_packets");
 const sessions = @import("sessions");
 const wire_1_21_5 = @import("wire_1_21_5");
+const wire_1_21_9 = @import("wire_1_21_9");
+const wire_26_1 = @import("wire_26_1");
+const wire_26_2 = @import("wire_26_2");
 const Players = @import("players").players.Players;
 
 /// SoundCategory, in vanilla's order.
@@ -47,8 +50,13 @@ pub const Effects = struct {
     }
 
     pub fn worldEvent(self: *Effects, world: u32, position: chunks.Position, event: i32, data: i32) void {
+        self.worldEventExcept(world, position, event, data, null);
+    }
+
+    /// Level.levelEvent with a player: everyone near but that player, whose client shows it.
+    pub fn worldEventExcept(self: *Effects, world: u32, position: chunks.Position, event: i32, data: i32, except: ?usize) void {
         const at: minecraft.Position = .{ .x = @floatFromInt(position.x), .y = @floatFromInt(position.y), .z = @floatFromInt(position.z) };
-        const count = self.gather(world, at, 64, null);
+        const count = self.gather(world, at, 64, except);
         if (count == 0) return;
         self.players.deps.packets.fanout(writeWorldEvent, self.targets[0..count], .{ position, event, data }, 64, self.deliveries[0..count]) catch |err|
             std.debug.panic("invalid server packet: {s}", .{@errorName(err)});
@@ -67,7 +75,56 @@ pub const Effects = struct {
         const at: minecraft.Position = .{ .x = @as(f64, @floatFromInt(position.x)) + 0.5, .y = @as(f64, @floatFromInt(position.y)) + 0.5, .z = @as(f64, @floatFromInt(position.z)) + 0.5 };
         self.sound(world, at, name, category, volume, pitch, seed, except);
     }
+
+    pub const Particles = struct {
+        particle: packets.Particle,
+        at: minecraft.Position,
+        count: i32,
+        offset: [3]f32 = @splat(0),
+        speed: f32 = 0,
+    };
+
+    /// ServerLevel.sendParticles without forcing: for the players within 32 blocks.
+    pub fn particles(self: *Effects, world: u32, request: Particles) void {
+        std.debug.assert(request.count >= 0);
+        const count = self.gather(world, request.at, 32, null);
+        if (count == 0) return;
+        self.players.deps.packets.fanout(writeParticles, self.targets[0..count], .{request}, 64, self.deliveries[0..count]) catch |err|
+            std.debug.panic("invalid server packet: {s}", .{@errorName(err)});
+    }
 };
+
+fn writeParticles(packet: wire_1_21_5.play.toClient.packet_world_particles.Writer, mapping: packets.Registry, request: Effects.Particles) ![]u8 {
+    const placed = try (try (try (try (try packet.longDistance(false)).alwaysShow(false)).x(request.at.x)).y(request.at.y)).z(request.at.z);
+    const spread = try (try (try (try placed.offsetX(request.offset[0])).offsetY(request.offset[1])).offsetZ(request.offset[2])).velocityOffset(request.speed);
+    var particle = try (try spread.amount(request.count)).particle();
+    return (try particle.advance(try packets.nested(.{ writeParticle, writeParticlePacked, writeParticleModern, writeParticleLatest }).write(try particle.begin(), try mapping.particleId(request.particle)))).finish();
+}
+
+/// A particle with no data of its own.
+fn writeParticle(packet: wire_1_21_5.Particle.Writer, id: i32) !wire_1_21_5.Particle.Writer.Done {
+    var data = try (try packet.type(id)).data();
+    return data.advance(try (try data.begin()).case_default());
+}
+
+/// The same from 1.21.9, whose particles carry other data.
+
+fn writeParticlePacked(packet: wire_1_21_9.Particle.Writer, id: i32) !wire_1_21_9.Particle.Writer.Done {
+    var data = try (try packet.type(id)).data();
+    return data.advance(try (try data.begin()).case_default());
+}
+
+/// And from 26.1.
+fn writeParticleModern(packet: wire_26_1.Particle.Writer, id: i32) !wire_26_1.Particle.Writer.Done {
+    var data = try (try packet.type(id)).data();
+    return data.advance(try (try data.begin()).case_default());
+}
+
+/// And from 26.2.
+fn writeParticleLatest(packet: wire_26_2.Particle.Writer, id: i32) !wire_26_2.Particle.Writer.Done {
+    var data = try (try packet.type(id)).data();
+    return data.advance(try (try data.begin()).case_default());
+}
 
 fn writeWorldEvent(cursor: wire_1_21_5.play.toClient.packet_world_event.Writer, _: packets.Registry, position: chunks.Position, event: i32, data: i32) ![]u8 {
     const packet = try cursor.effectId(event);

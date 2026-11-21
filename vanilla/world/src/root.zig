@@ -1,6 +1,7 @@
 //! Vanilla worlds: default dimensions, spawn, time, weather and their commands.
 const std = @import("std");
 
+pub const entity_effects = @import("entity_effects.zig");
 pub const world_effects = @import("world_effects.zig");
 pub const default_worlds = @import("default_worlds.zig");
 pub const environment = @import("environment.zig");

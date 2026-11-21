@@ -12,6 +12,8 @@ const ClientRegistries = @import("vanilla_content").client_registries.ClientRegi
 const Registries = @import("vanilla_content").content_registries.Registries;
 const custom_data = @import("vanilla_content").custom_data;
 const effects = @import("enchantment_effects.zig");
+const game_data = @import("game_data");
+const assert = std.debug.assert;
 
 pub const EquipmentAttributes = struct {
     pub const id = "minecraft:equipment_attributes";
@@ -31,6 +33,7 @@ pub const EquipmentAttributes = struct {
     const Key = struct { attribute: u32, slot: u3, id: []const u8 };
     const Sum = struct { add: f64 = 0, base: f64 = 0, total: f64 = 1 };
     const Modifier = struct { amount: f64, operation: effects.Operation };
+    const ItemModifier = struct { attribute: u32, slots: effects.Slots, id: []const u8, modifier: Modifier };
     const KeyContext = struct {
         pub fn hash(_: @This(), key: Key) u64 {
             var hasher = std.hash.Wyhash.init(key.attribute);
@@ -53,6 +56,12 @@ pub const EquipmentAttributes = struct {
     sent: []f64,
     sums: []Sum,
     properties: []Property,
+    /// Every item's default modifiers with their attributes resolved, flat by item: those of item
+    /// `k` are `item_modifiers[item_offsets[k]..item_offsets[k + 1]]`.
+    item_modifiers: []ItemModifier,
+    item_offsets: []u32,
+    /// The most default modifiers one item has.
+    item_modifiers_max: usize,
     modifiers: std.HashMapUnmanaged(Key, Modifier, KeyContext, 80) = .empty,
     actors: lightning_rod.system.IndexSet,
     observer: *inventories.Inventories.Observer,
@@ -73,7 +82,17 @@ pub const EquipmentAttributes = struct {
             .properties = try allocator.alloc(Property, registry.entries.len),
             .actors = try .init(allocator, deps.players.records.len),
             .observer = try deps.items.deps.inventories.observe(allocator, deps.players.records.len),
+            .item_modifiers = undefined,
+            .item_offsets = try allocator.alloc(u32, game_data.physics.item_count + 1),
+            .item_modifiers_max = 0,
         };
+        var item_modifier_count: usize = 0;
+        for (0..game_data.physics.item_count) |kind| {
+            const count = game_data.physics.itemModifierCount(@intCast(kind));
+            item_modifier_count += count;
+            self.item_modifiers_max = @max(self.item_modifiers_max, count);
+        }
+        self.item_modifiers = try allocator.alloc(ItemModifier, item_modifier_count);
         try self.owners.ensureTotalCapacity(allocator, self.states.len);
         @memset(self.states, .{});
         @memset(self.sent, std.math.nan(f64));
@@ -98,12 +117,56 @@ pub const EquipmentAttributes = struct {
         self.registry = self.deps.client.client.get("minecraft:attribute").?;
         std.debug.assert(self.registry.entries.len == self.ranges.len);
         self.modifiers.clearRetainingCapacity();
-        const capacity = try std.math.mul(usize, 6, self.deps.enchantments.effects.attribute_count);
+        // Six equipped slots, each with its item's own modifiers and its enchantments'.
+        const capacity = try std.math.mul(usize, 6, try std.math.add(usize, self.item_modifiers_max, self.deps.enchantments.effects.attribute_count));
         try self.modifiers.ensureTotalCapacity(self.allocator, std.math.cast(u32, capacity) orelse return error.TooManyAttributeModifiers);
         for (self.deps.enchantments.effects.values) |definition| for (definition.attributes) |attribute| {
             if (self.registry.id(attribute.attribute) == null) return error.UnknownAttribute;
         };
+        try self.resolveItemModifiers();
         for (self.states) |*state| state.invalid = 63;
+    }
+
+    /// Resolves every item's default modifiers to this registry's attributes, once for each
+    /// version of the registry rather than once for each equipment change.
+    fn resolveItemModifiers(self: *EquipmentAttributes) !void {
+        var at: u32 = 0;
+        for (0..game_data.physics.item_count) |kind| {
+            self.item_offsets[kind] = at;
+            for (0..game_data.physics.itemModifierCount(@intCast(kind))) |index| {
+                const modifier = game_data.physics.itemModifier(@intCast(kind), @intCast(index));
+                self.item_modifiers[at] = .{
+                    .attribute = self.registry.id(modifier.attribute) orelse return error.UnknownAttribute,
+                    .slots = slotsOf(modifier.slot),
+                    .id = modifier.id,
+                    .modifier = .{ .amount = modifier.amount, .operation = switch (modifier.operation) {
+                        .add_value => .add_value,
+                        .add_multiplied_base => .add_multiplied_base,
+                        .add_multiplied_total => .add_multiplied_total,
+                    } },
+                };
+                at += 1;
+            }
+        }
+        self.item_offsets[game_data.physics.item_count] = at;
+        assert(at == self.item_modifiers.len);
+    }
+
+    /// The equipped slots a slot group names, in the order equipment is gathered: main hand, off
+    /// hand, head, chest, legs, feet. A player has no body or saddle slot.
+    fn slotsOf(group: game_data.physics_data.SlotGroup) effects.Slots {
+        return switch (group) {
+            .any => .{ .mainhand = true, .offhand = true, .head = true, .chest = true, .legs = true, .feet = true },
+            .mainhand => .{ .mainhand = true },
+            .offhand => .{ .offhand = true },
+            .hand => .{ .mainhand = true, .offhand = true },
+            .head => .{ .head = true },
+            .chest => .{ .chest = true },
+            .legs => .{ .legs = true },
+            .feet => .{ .feet = true },
+            .armor => .{ .head = true, .chest = true, .legs = true, .feet = true },
+            .body, .saddle => .{},
+        };
     }
 
     fn ensure(self: *EquipmentAttributes, index: usize) !void {
@@ -148,6 +211,12 @@ pub const EquipmentAttributes = struct {
         defer for (pinned[0..count]) |item| item.release();
         self.modifiers.clearRetainingCapacity();
         for (pinned[0..count], equipped[0..count]) |item, slot| {
+            // The item's own modifiers for the slot it is in, as ItemStack.forEachModifier gives them.
+            assert(item.view.kind < game_data.physics.item_count);
+            for (self.item_modifiers[self.item_offsets[item.view.kind]..self.item_offsets[item.view.kind + 1]]) |own| {
+                if (!own.slots.contains(slot)) continue;
+                self.modifiers.putAssumeCapacity(.{ .attribute = own.attribute, .slot = slot, .id = own.id }, own.modifier);
+            }
             var entries = try Enchantments.Iterator.init(item.view.value(.enchantments) orelse continue);
             while (try entries.next()) |entry| {
                 const enchantment_index = self.deps.enchantments.effects.registry.id(entry.name) orelse continue;

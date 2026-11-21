@@ -192,6 +192,8 @@ pub const MobReplication = struct {
                 try self.deliver(known.view(), .{ .damage = .{ .id = networkId(mob), .type_id = mobs.damageTypeId(dealt.type), .cause = cause } });
             }
             mob.damage_event_count = 0;
+            for (mob.animations[0..mob.animation_count]) |animation| try self.deliver(known.view(), .{ .animation = .{ .id = networkId(mob), .animation = animation } });
+            mob.animation_count = 0;
             // The audience holds while neither the mob nor any player or what they see changed.
             const settled = !audience_changed and !mob.removed and view.audience_at != null and std.meta.eql(view.audience_at.?, mob.position);
             if (!settled) {
@@ -450,6 +452,7 @@ pub const MobReplication = struct {
             .move_look => |value| try encoder.fanout(writeMoveLook, targets, .{ value.id, value.delta, value.yaw, value.pitch, value.on_ground }, 32, deliveries),
             .head => |value| try encoder.fanout(writeHead, targets, .{ value.id, value.yaw }, 32, deliveries),
             .damage => |value| try encoder.fanout(writeDamage, targets, .{ value.id, value.type_id, value.cause }, 32, deliveries),
+            .animation => |value| try encoder.fanout(writeAnimation, targets, .{ value.id, value.animation }, 32, deliveries),
         }
         for (targets, deliveries) |target, delivery| switch (delivery) {
             .queued, .closed => {
@@ -475,6 +478,7 @@ const Outgoing = union(enum) {
     move_look: struct { id: i32, delta: [3]i16, yaw: i8, pitch: i8, on_ground: bool },
     head: struct { id: i32, yaw: i8 },
     damage: struct { id: i32, type_id: i32, cause: i32 },
+    animation: struct { id: i32, animation: u8 },
 };
 
 /// Negative entity ids, as items and orbs use, since players take the small positive ones.
@@ -629,6 +633,10 @@ fn writeVelocityPacked(packet: packed_wire.play.toClient.packet_entity_velocity.
 
 fn writeHead(packet: wire.play.toClient.packet_entity_head_rotation.Writer, id_value: i32, head: i8) ![]u8 {
     return (try (try packet.entityId(id_value)).headYaw(head)).finish();
+}
+
+fn writeAnimation(packet: wire.play.toClient.packet_animation.Writer, id_value: i32, animation: u8) ![]u8 {
+    return (try (try packet.entityId(id_value)).animation(animation)).finish();
 }
 
 fn writeStatus(packet: wire.play.toClient.packet_entity_status.Writer, id_value: i32, status: u8) ![]u8 {

@@ -10,14 +10,41 @@ const inventories = @import("inventories");
 const InventoryFixture = @import("inventory_test_fixture.zig").InventoryFixture;
 const Enchantments = @import("vanilla_items").enchantments.Enchantments;
 const effects = @import("vanilla_items").enchantment_effects;
+const attack_effects = @import("vanilla_items").attack_effects;
 const decoder = @import("vanilla_definitions").datapack_enchantments;
 const item_data = @import("vanilla_items").item_data;
 const Durability = @import("vanilla_items").item_properties.Durability;
 const EquipmentAttributes = @import("vanilla_items").equipment_attributes.EquipmentAttributes;
 const FallDamage = @import("vanilla_survival").fall_damage.FallDamage;
+const PlayerDamage = @import("vanilla_survival").player_damage.PlayerDamage;
+const DamageTypes = @import("vanilla_survival").damage_types.DamageTypes;
+const ItemUsing = @import("vanilla_items").item_using.ItemUsing;
+const ItemCooldowns = @import("vanilla_items").item_cooldowns.ItemCooldowns;
 const ItemActions = @import("vanilla_items").item_actions.ItemActions;
 const item_actions = @import("vanilla_items").item_actions;
 const menu_click = @import("vanilla_inventory").menu_click;
+
+/// PlayerDamage over the fixture, sending nothing: tests read what a hit leaves.
+fn playerDamage(context: *Test, allocator: std.mem.Allocator) !*PlayerDamage {
+    const fixture = context.fixture;
+    const attributes = try EquipmentAttributes.init(allocator, .{}, .{ .players = fixture.players, .player_states = fixture.player_states, .items = fixture.items, .enchantments = fixture.definitions.enchantments, .client = fixture.definitions.client });
+    const cooldowns = try ItemCooldowns.init(allocator, .{}, .{ .players = fixture.players });
+    return PlayerDamage.init(allocator, .{}, .{
+        .players = fixture.players,
+        .player_states = fixture.player_states,
+        .inventories = fixture.ownership,
+        .menus = fixture.menu,
+        .items = fixture.items,
+        .enchantments = fixture.definitions.enchantments,
+        .attributes = attributes,
+        .durability = try Durability.init(allocator, .{ .items = fixture.items, .inventories = fixture.ownership, .enchantments = fixture.definitions.enchantments }),
+        .client = fixture.definitions.client,
+        .damage_types = try DamageTypes.init(allocator, .{ .client = fixture.definitions.client }),
+        .replication = undefined,
+        .using = try ItemUsing.init(allocator, .{ .players = fixture.players, .player_states = fixture.player_states, .inventories = fixture.ownership, .items = fixture.items, .actions = try ItemActions.init(allocator, .{}, .{ .player_states = fixture.player_states, .items = fixture.items }), .cooldowns = cooldowns }),
+        .cooldowns = cooldowns,
+    });
+}
 
 const Test = struct {
     directory: std.testing.TmpDir,
@@ -140,7 +167,8 @@ test "fall damage combines armor protection caps it and excludes unrelated sourc
     var context = try Test.init(arena.allocator());
     defer context.deinit();
     const fixture = context.fixture;
-    const fall = try FallDamage.init(arena.allocator(), .{}, .{ .players = fixture.players, .player_states = fixture.player_states, .inventories = fixture.ownership, .items = fixture.items, .enchantments = fixture.definitions.enchantments, .client = fixture.definitions.client, .attributes = try EquipmentAttributes.init(arena.allocator(), .{}, .{ .players = fixture.players, .player_states = fixture.player_states, .items = fixture.items, .enchantments = fixture.definitions.enchantments, .client = fixture.definitions.client }), .storage = try context.store.openSpace("fall") });
+    const damage = try playerDamage(&context, arena.allocator());
+    const fall = try FallDamage.init(arena.allocator(), .{ .players = fixture.players, .player_states = fixture.player_states, .attributes = damage.deps.attributes, .damage = damage });
     const state = &fixture.player_states.records[0];
     state.gamemode = .survival;
     const boots = try context.item("minecraft:iron_boots", &.{.{ .name = "minecraft:feather_falling", .level = 4 }});
@@ -151,12 +179,17 @@ test "fall damage combines armor protection caps it and excludes unrelated sourc
     try fall.damage(0, 10);
     try std.testing.expectApproxEqAbs(@as(f32, 14.8), state.health, 0.0001);
     state.health = 20;
+    // A second hit soon after deals only what it has over the first.
+    try fall.damage(0, 10);
+    try std.testing.expectEqual(@as(f32, 20), state.health);
+    damage.living[0].invulnerable_time = 0;
     try context.equip(5, helmet);
     try context.equip(6, chestplate);
     try context.equip(7, leggings);
     try fall.damage(0, 10);
     try std.testing.expectApproxEqAbs(@as(f32, 18), state.health, 0.0001);
     state.health = 20;
+    damage.living[0].invulnerable_time = 0;
     state.gamemode = .creative;
     try fall.damage(0, 10);
     try std.testing.expectEqual(@as(f32, 20), state.health);
@@ -385,4 +418,159 @@ test "equipment watches follow player identities when connection slots are reass
     try attributes.tick();
     try std.testing.expectEqual(@as(usize, 0), attributes.owners.count());
     try std.testing.expectEqual(@as(usize, 0), attributes.observer.owners.count());
+}
+
+test "an item's own attribute modifiers apply in the slots its component names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var context = try Test.init(arena.allocator());
+    defer context.deinit();
+    const fixture = context.fixture;
+    const attributes = try EquipmentAttributes.init(arena.allocator(), .{}, .{ .players = fixture.players, .player_states = fixture.player_states, .items = fixture.items, .enchantments = fixture.definitions.enchantments, .client = fixture.definitions.client });
+    // An empty hand: vanilla's player defaults.
+    try std.testing.expectEqual(@as(f64, 1), try attributes.value(0, "minecraft:attack_damage"));
+    try std.testing.expectEqual(@as(f64, 4), try attributes.value(0, "minecraft:attack_speed"));
+    // A diamond axe adds 8 damage and takes 3 from the speed, as its attribute_modifiers say.
+    const axe = try context.item("minecraft:diamond_axe", &.{});
+    try context.equip(36, axe);
+    try std.testing.expectEqual(@as(f64, 9), try attributes.value(0, "minecraft:attack_damage"));
+    try std.testing.expectEqual(@as(f64, 1), try attributes.value(0, "minecraft:attack_speed"));
+    // Its modifiers are for the main hand only.
+    try context.equip(36, null);
+    try context.equip(45, axe);
+    try std.testing.expectEqual(@as(f64, 1), try attributes.value(0, "minecraft:attack_damage"));
+    try std.testing.expectEqual(@as(f64, 4), try attributes.value(0, "minecraft:attack_speed"));
+    // A helmet's armor counts on the head, not in the hand.
+    const helmet = try context.item("minecraft:diamond_helmet", &.{});
+    try context.equip(36, helmet);
+    try std.testing.expectEqual(@as(f64, 0), try attributes.value(0, "minecraft:armor"));
+    try context.equip(36, null);
+    try context.equip(5, helmet);
+    try std.testing.expectEqual(@as(f64, 3), try attributes.value(0, "minecraft:armor"));
+    try std.testing.expectEqual(@as(f64, 2), try attributes.value(0, "minecraft:armor_toughness"));
+}
+
+test "vanilla's weapon enchantments shape a hit by the target's type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var context = try Test.init(arena.allocator());
+    defer context.deinit();
+    const fixture = context.fixture;
+    var scratch_bytes: [4096]u8 = undefined;
+    var scratch: std.heap.FixedBufferAllocator = .init(&scratch_bytes);
+    var random: std.Random.DefaultPrng = .init(1);
+    const attack = try attack_effects.Attack.start(.{
+        .effects = &fixture.definitions.enchantments.effects,
+        .item_tags = &fixture.items.deps.definitions.tags,
+        .registries = &fixture.definitions.client.client,
+        .damage_type = "minecraft:player_attack",
+        .attacker = &fixture.players.records[0],
+        .direct_type = @intCast(game_data.registry.entityId("minecraft:player").?),
+        .random = random.random(),
+        .scratch = &scratch,
+    });
+    const cow: u32 = @intCast(game_data.registry.entityId("minecraft:cow").?);
+    const zombie: u32 = @intCast(game_data.registry.entityId("minecraft:zombie").?);
+    const sword = try context.item("minecraft:diamond_sword", &.{ .{ .name = "minecraft:sharpness", .level = 5 }, .{ .name = "minecraft:knockback", .level = 2 }, .{ .name = "minecraft:fire_aspect", .level = 2 } });
+    const pinned = try fixture.items.acquire(sword);
+    defer pinned.release();
+    // Sharpness V: 0.5 a level and 0.5 more.
+    try std.testing.expectEqual(@as(f32, 10), try attack.damage(pinned.view, cow, 7));
+    try std.testing.expectEqual(@as(f32, 2), try attack.knockback(pinned.view, cow, 0));
+    // Fire Aspect II sets the victim alight for 8 seconds.
+    var consequences: [4]effects.Consequence = undefined;
+    const count = try attack.postAttack(pinned.view, 0, .attacker, cow, &consequences);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(effects.PostAttack.Affected.victim, consequences[0].affected);
+    try std.testing.expectEqual(@as(f32, 8), consequences[0].action.ignite_seconds);
+    // Smite counts against the undead only.
+    const holy = try context.item("minecraft:diamond_sword", &.{.{ .name = "minecraft:smite", .level = 2 }});
+    const smite = try fixture.items.acquire(holy);
+    defer smite.release();
+    try std.testing.expectEqual(@as(f32, 7), try attack.damage(smite.view, cow, 7));
+    try std.testing.expectEqual(@as(f32, 12), try attack.damage(smite.view, zombie, 7));
+    // No weapon, no change.
+    try std.testing.expectEqual(@as(f32, 1), try attack.damage(null, zombie, 1));
+}
+
+test "armor and its toughness take a player's hurt, wear for it, and Breach pierces them" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var context = try Test.init(arena.allocator());
+    defer context.deinit();
+    const fixture = context.fixture;
+    const damage = try playerDamage(&context, arena.allocator());
+    const state = &fixture.player_states.records[0];
+    state.gamemode = .survival;
+    for ([_][]const u8{ "minecraft:diamond_helmet", "minecraft:diamond_chestplate", "minecraft:diamond_leggings", "minecraft:diamond_boots" }, 5..) |name, index| try context.equip(@intCast(index), try context.item(name, &.{}));
+    // Armor 20 and toughness 8 keep 70% of a 10 point hit off.
+    try std.testing.expect(try damage.hurt(0, .{ .type = .player_attack, .position = .{ 0, 65, 0 } }, 10));
+    try std.testing.expectApproxEqAbs(@as(f32, 17), state.health, 0.0001);
+    // Each piece wears by a quarter of the hit.
+    for (5..9) |index| {
+        const worn = (try fixture.ownership.get(.{ .owner = 1, .index = @intCast(index) })).stack.?;
+        const pinned = try fixture.items.acquire(worn);
+        defer pinned.release();
+        try std.testing.expectEqual(@as(i32, 2), (try @import("protocol_support").read_varint(pinned.view.value(.damage).?))[0]);
+    }
+    // The hit knocks the player back, as the tick sends.
+    try std.testing.expect(damage.living[0].marked);
+    // Breach IV takes 60% of the armor's effectiveness away.
+    damage.living[0].invulnerable_time = 0;
+    state.health = 20;
+    var scratch_bytes: [4096]u8 = undefined;
+    var scratch: std.heap.FixedBufferAllocator = .init(&scratch_bytes);
+    var random: std.Random.DefaultPrng = .init(1);
+    const attack = try attack_effects.Attack.start(.{
+        .effects = &fixture.definitions.enchantments.effects,
+        .item_tags = &fixture.items.deps.definitions.tags,
+        .registries = &fixture.definitions.client.client,
+        .damage_type = "minecraft:player_attack",
+        .attacker = &fixture.players.records[1],
+        .direct_type = @intCast(game_data.registry.entityId("minecraft:player").?),
+        .random = random.random(),
+        .scratch = &scratch,
+    });
+    const mace = try fixture.items.acquire(try context.item("minecraft:mace", &.{.{ .name = "minecraft:breach", .level = 4 }}));
+    defer mace.release();
+    try std.testing.expect(try damage.hurt(0, .{ .type = .player_attack, .attack = &attack, .weapon = mace.view }, 10));
+    try std.testing.expectApproxEqAbs(@as(f32, 11), state.health, 0.0001);
+    // Creative players take nothing.
+    damage.living[0].invulnerable_time = 0;
+    state.gamemode = .creative;
+    try std.testing.expect(!try damage.hurt(0, .{ .type = .player_attack }, 10));
+}
+
+test "a raised shield blocks a hit from in front once raised long enough, and wears for it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var context = try Test.init(arena.allocator());
+    defer context.deinit();
+    const fixture = context.fixture;
+    const damage = try playerDamage(&context, arena.allocator());
+    const state = &fixture.player_states.records[0];
+    state.gamemode = .survival;
+    const shield = try context.item("minecraft:shield", &.{});
+    try context.equip(45, shield);
+    const kind: u32 = @intCast(game_data.registry.itemId("minecraft:shield").?);
+    damage.deps.using.start(0, .off, shield, kind, 72000);
+    // Facing south, the attacker two blocks ahead. A shield raised for less than its quarter
+    // second of delay does nothing.
+    const ahead: PlayerDamage.Source = .{ .type = .player_attack, .position = .{ 0.5, 65, 2.5 } };
+    damage.deps.using.uses[0].?.ticks = 4;
+    try std.testing.expect(try damage.hurt(0, ahead, 4));
+    try std.testing.expectEqual(@as(f32, 16), state.health);
+    // Raised long enough, it takes the whole hit and wears by one more than the hit.
+    damage.living[0].invulnerable_time = 0;
+    damage.deps.using.uses[0].?.ticks = 5;
+    try std.testing.expect(!try damage.hurt(0, ahead, 10));
+    try std.testing.expectEqual(@as(f32, 16), state.health);
+    const worn = (try fixture.ownership.get(.{ .owner = 1, .index = 45 })).stack.?;
+    const pinned = try fixture.items.acquire(worn);
+    defer pinned.release();
+    try std.testing.expectEqual(@as(i32, 11), (try @import("protocol_support").read_varint(pinned.view.value(.damage).?))[0]);
+    // From behind it blocks nothing.
+    damage.living[0].invulnerable_time = 0;
+    try std.testing.expect(try damage.hurt(0, .{ .type = .player_attack, .position = .{ 0.5, 65, -1.5 } }, 4));
+    try std.testing.expectEqual(@as(f32, 12), state.health);
 }

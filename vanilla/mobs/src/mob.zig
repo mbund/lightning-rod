@@ -15,26 +15,7 @@ pub const Movement = @import("vanilla_bodies").block_effects.Movement;
 
 /// Damage types mobs take, by what vanilla names them. The panic_causes tag decides which make
 /// a cow panic, and the registry decides the rest.
-pub const DamageType = enum(u8) {
-    generic,
-    fall,
-    in_wall,
-    drown,
-    on_fire,
-    in_fire,
-    campfire,
-    lava,
-    hot_floor,
-    cactus,
-    sweet_berry_bush,
-    cramming,
-    freeze,
-    player_attack,
-    stalagmite,
-    out_of_world,
-    generic_kill,
-    mob_attack,
-};
+pub const DamageType = @import("vanilla_survival").damage_types.DamageType;
 
 pub const Damage = struct {
     type: DamageType,
@@ -206,6 +187,10 @@ pub const Mob = struct {
     /// Damage events (ServerLevel.broadcastDamageEvent) since the replication last sent them.
     damage_events: [2]Damage = undefined,
     damage_event_count: u8 = 0,
+    /// Animations (ClientboundAnimatePacket) since the replication last sent them: critical and
+    /// enchanted hits on the mob.
+    animations: [2]u8 = undefined,
+    animation_count: u8 = 0,
     /// Rises when data viewers see changes: health, age, fire, air, pose.
     revision: u32 = 0,
     /// Standing still on blocks that act on nothing, touching no other mob, after a tick that

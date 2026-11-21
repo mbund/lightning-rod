@@ -4,6 +4,7 @@ const std = @import("std");
 pub const block_actions = @import("block_actions.zig");
 pub const block_loot = @import("block_loot.zig");
 pub const buckets = @import("buckets.zig");
+pub const tool_actions = @import("tool_actions.zig");
 pub const doors = @import("doors.zig");
 pub const fluids = @import("fluids.zig");
 pub const growth = @import("growth.zig");

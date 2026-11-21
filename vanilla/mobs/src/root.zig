@@ -23,6 +23,7 @@ pub const pathfinding = @import("pathfinding.zig");
 pub const senses = @import("senses.zig");
 pub const random_positions = @import("random_positions.zig");
 pub const damage = @import("damage.zig");
+pub const melee = @import("melee.zig");
 pub const mob_interaction = @import("mob_interaction.zig");
 
 test {
@@ -39,5 +40,6 @@ comptime {
     _ = &mob_replication.MobReplication.tick;
     _ = &spawn_eggs.SpawnEggs.init;
     _ = &mob_interaction.MobInteraction.init;
-    _ = &mob_interaction.MobInteraction.tick;
+    _ = &melee.Melee.init;
+    _ = &melee.Melee.tick;
 }

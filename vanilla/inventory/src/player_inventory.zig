@@ -548,10 +548,19 @@ pub const PlayerInventory = struct {
     pub fn trade(self: *PlayerInventory, player: usize, name: []const u8, count: u16, buying: bool) !bool {
         const item = game_data.registry.itemId(name) orelse return error.UnknownItem;
         if (count == 0) return error.InvalidCount;
+        return self.tradeDefined(player, try self.deps.items.define(name), @intCast(item), count, buying);
+    }
 
-        const maximum = self.deps.items.deps.definitions.properties[@intCast(item)].stack_size;
+    /// Gives a stack as it is, its components kept, if all of it fits: the hotbar first, joining
+    /// stacks of the same item before taking empty slots.
+    pub fn giveStack(self: *PlayerInventory, player: usize, stack: inventories.Stack) !bool {
+        if (stack.count == 0) return error.InvalidCount;
+        return self.tradeDefined(player, stack.item, try self.deps.items.kind(stack), stack.count, true);
+    }
+
+    fn tradeDefined(self: *PlayerInventory, player: usize, definition_id: inventories.ItemId, item: u32, count: u16, buying: bool) !bool {
+        const maximum = self.deps.items.deps.definitions.properties[item].stack_size;
         const owner = self.deps.players.records[player].uuid;
-        const definition_id = try self.deps.items.define(name);
         var slots: [36]inventories.Slot = undefined;
 
         for (&slots, 0..) |*slot, index| slot.* = .{ .owner = owner, .index = @intCast(if (index < 9) index + 36 else index) };

@@ -39,6 +39,8 @@ const Weather = @import("vanilla_world").weather.Weather;
 const Items = @import("vanilla_items").items.Items;
 const ClientRegistries = @import("vanilla_content").client_registries.ClientRegistries;
 const Experience = @import("vanilla_survival").experience.Experience;
+const damage_types = @import("vanilla_survival").damage_types;
+const DamageTypes = damage_types.DamageTypes;
 const Loot = @import("vanilla_items").loot_registry.Loot;
 const loot = @import("vanilla_items").loot;
 const item_data = @import("vanilla_items").item_data;
@@ -122,6 +124,7 @@ pub const Mobs = struct {
         inventories: *inventories.Inventories,
         client: *ClientRegistries,
         experience: *Experience,
+        damage_types: *DamageTypes,
         loot: *Loot,
         dropped: *ItemEntities,
         furnaces: *Furnaces,
@@ -220,8 +223,6 @@ pub const Mobs = struct {
     loot_random: std.Random.DefaultPrng,
     loot_scratch: std.heap.FixedBufferAllocator,
     /// By damage type: what its tags say, and its id in the registry.
-    damage_flags: []damage.Flags,
-    damage_ids: []i32,
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Mobs {
         const self = try allocate(allocator, config, deps);
@@ -267,8 +268,6 @@ pub const Mobs = struct {
             .present = try allocator.alloc(herd_state.Audience.Player, deps.players.records.len),
             .holders = try allocator.alloc(herd_state.Audience.Player, deps.players.records.len),
             .overlay = try .init(allocator, config.edits),
-            .damage_flags = try allocator.alloc(damage.Flags, @typeInfo(mob_state.DamageType).@"enum".field_names.len),
-            .damage_ids = try allocator.alloc(i32, @typeInfo(mob_state.DamageType).@"enum".field_names.len),
         };
         self.copies.mark(self.blocks.marks);
         try self.readTags();
@@ -774,38 +773,15 @@ pub const Mobs = struct {
     fn readTags(self: *Mobs) !void {
         const tags = &self.deps.items.deps.definitions.tags;
         self.food_tag = tags.find("minecraft:cow_food");
-        @memset(self.damage_flags, .{});
-        const registry = self.deps.client.client.get("minecraft:damage_type") orelse return;
-        const Tag = struct { name: []const u8, flag: []const u8 };
-        const read = [_]Tag{
-            .{ .name = "minecraft:is_fire", .flag = "fire" },
-            .{ .name = "minecraft:bypasses_cooldown", .flag = "bypasses_cooldown" },
-            .{ .name = "minecraft:no_impact", .flag = "no_impact" },
-            .{ .name = "minecraft:no_knockback", .flag = "no_knockback" },
-            .{ .name = "minecraft:panic_causes", .flag = "panic" },
-            .{ .name = "minecraft:bypasses_invulnerability", .flag = "bypasses_invulnerability" },
-        };
-        inline for (read) |tag| {
-            if (registry.tags.find(tag.name)) |found| {
-                inline for (@typeInfo(mob_state.DamageType).@"enum".field_names, 0..) |field, index| {
-                    if (registry.id("minecraft:" ++ field)) |type_id| {
-                        if (registry.tags.contains(found, type_id)) @field(self.damage_flags[index], tag.flag) = true;
-                    }
-                }
-            }
-        }
-        inline for (@typeInfo(mob_state.DamageType).@"enum".field_names, 0..) |field, index| {
-            self.damage_ids[index] = if (registry.id("minecraft:" ++ field)) |type_id| @intCast(type_id) else 0;
-        }
     }
 
-    pub fn damageFlags(self: *const Mobs, damage_type: mob_state.DamageType) damage.Flags {
-        return self.damage_flags[@backingInt(damage_type)];
+    pub fn damageFlags(self: *const Mobs, damage_type: mob_state.DamageType) damage_types.Flags {
+        return self.deps.damage_types.flagsOf(damage_type);
     }
 
     /// The damage type's id in the registry players were sent.
     pub fn damageTypeId(self: *const Mobs, damage_type: mob_state.DamageType) i32 {
-        return self.damage_ids[@backingInt(damage_type)];
+        return self.deps.damage_types.idOf(damage_type);
     }
 
     /// AbstractCow.isFood: the cow_food item tag.
@@ -846,7 +822,7 @@ pub const Mobs = struct {
     pub fn shouldPanic(self: *Mobs, mob: *Mob) bool {
         if (self.gameTime() - mob.last_damage_stamp > 40) mob.last_damage = null;
         const dealt = mob.last_damage orelse return false;
-        return self.damage_flags[@backingInt(dealt.type)].panic;
+        return self.damageFlags(dealt.type).panic;
     }
 
     /// Animal.getWalkTargetValue: grass underfoot is best, else the light, through
@@ -933,6 +909,31 @@ pub const Mobs = struct {
 
     pub fn hurt(self: *Mobs, mob: *Mob, dealt: mob_state.Damage, amount: f32) !bool {
         return damage.hurt(self, mob, dealt, amount);
+    }
+
+    /// ServerPlayer.crit and magicCrit's ClientboundAnimatePacket, for the replication to send.
+    /// A third in one tick replaces the oldest.
+    pub fn animate(_: *Mobs, mob: *Mob, animation: Animation) void {
+        if (mob.animation_count == mob.animations.len) {
+            mob.animations[0] = mob.animations[1];
+            mob.animation_count -= 1;
+        }
+        mob.animations[mob.animation_count] = @intFromEnum(animation);
+        mob.animation_count += 1;
+    }
+
+    pub const Animation = enum(u8) { critical_hit = 4, enchanted_hit = 5 };
+
+    /// Entity.igniteForSeconds through LivingEntity.igniteForTicks: whole ticks, lengthened by
+    /// the burning_time attribute, and never shortening a fire already burning.
+    pub fn ignite(self: *Mobs, mob: *Mob, seconds: f32) void {
+        assert(std.math.isFinite(seconds));
+        const base: f64 = @floatFromInt(mth.floorFloat(seconds * 20.0));
+        const ticks = std.math.lossyCast(i32, @ceil(base * self.traits(mob.species).attribute(.burning_time)));
+        if (mob.fire_ticks >= ticks) return;
+        mob.fire_ticks = ticks;
+        mob.revision += 1;
+        self.rouse(@intCast(self.indexOf(mob)));
     }
 
     /// ServerLevel.broadcastDamageEvent, for the replication to send.
@@ -1167,7 +1168,9 @@ pub const Mobs = struct {
         return @intCast(found.len);
     }
 
-    pub const Nearness = enum { pushable, same_species };
+    /// pushable: what LivingEntity.pushEntities moves. same_species: mobs of the mob's own kind.
+    /// living: every living mob, as getEntitiesOfClass(LivingEntity) finds them.
+    pub const Nearness = enum { pushable, same_species, living };
 
     /// The other mobs whose boxes meet a box, in the order EntitySectionStorage.getEntities finds
     /// them: by section, then by when each came into its section. LivingEntity.isPushable keeps
@@ -1183,6 +1186,7 @@ pub const Mobs = struct {
             switch (which) {
                 .pushable => if (!other.alive() or try living.onClimbable(self, other)) continue,
                 .same_species => if (other.species != mob.species) continue,
+                .living => {},
             }
             self.nearby[count] = index;
             count += 1;

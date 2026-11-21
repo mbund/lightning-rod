@@ -54,6 +54,10 @@ pub const TeleportCommands = @import("vanilla_world").teleport_commands.Teleport
 pub const GamemodeCommands = @import("vanilla_player").gamemode_commands.GamemodeCommands;
 pub const JoinLeaveMessages = @import("vanilla_player").join_leave_messages.JoinLeaveMessages;
 pub const FallDamage = @import("vanilla_survival").fall_damage.FallDamage;
+pub const ItemCooldowns = @import("vanilla_items").item_cooldowns.ItemCooldowns;
+pub const ItemUsing = @import("vanilla_items").item_using.ItemUsing;
+pub const PlayerDamage = @import("vanilla_survival").player_damage.PlayerDamage;
+pub const DamageTypes = @import("vanilla_survival").damage_types.DamageTypes;
 pub const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
 pub const definitions = @import("vanilla_definitions").defaults.definitions;
 pub const prepareDefinitions = @import("vanilla_definitions").defaults.prepare;
@@ -98,9 +102,11 @@ pub const Mining = @import("vanilla_blocks").mining.Mining;
 pub const Growth = @import("vanilla_blocks").growth.Growth;
 pub const Fluids = @import("vanilla_blocks").fluids.Fluids;
 pub const Buckets = @import("vanilla_blocks").buckets.Buckets;
+pub const ToolActions = @import("vanilla_blocks").tool_actions.ToolActions;
 pub const Mobs = @import("vanilla_mobs").mobs.Mobs;
 pub const MobReplication = @import("vanilla_mobs").mob_replication.MobReplication;
 pub const SpawnEggs = @import("vanilla_mobs").spawn_eggs.SpawnEggs;
+pub const Melee = @import("vanilla_mobs").melee.Melee;
 pub const MobInteraction = @import("vanilla_mobs").mob_interaction.MobInteraction;
 pub const Placement = @import("vanilla_blocks").placement.Placement;
 pub const BlockActions = @import("vanilla_blocks").block_actions.BlockActions;
@@ -169,7 +175,8 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(EquipmentAttributes, .{}),
     lightning_rod.plugin.configured(ItemActions, .{}),
     lightning_rod.plugin.configured(Enchantments, .{}),
-    lightning_rod.plugin.configured(FallDamage, .{}),
+    lightning_rod.plugin.configured(ItemCooldowns, .{}),
+    lightning_rod.plugin.configured(ItemUsing, .{}),
     lightning_rod.plugin.configured(ItemContent, .{}),
     lightning_rod.plugin.configured(Lore, Lore.Configuration{}),
     lightning_rod.plugin.configured(ItemEntities, ItemEntities.Configuration{}),
@@ -190,6 +197,9 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Lighting, Lighting.Configuration{}),
     lightning_rod.plugin.configured(Streaming, Streaming.Configuration{}),
     lightning_rod.plugin.configured(Replication, Replication.Configuration{}),
+    lightning_rod.plugin.configured(DamageTypes, .{}),
+    lightning_rod.plugin.configured(PlayerDamage, .{}),
+    lightning_rod.plugin.configured(FallDamage, .{}),
     lightning_rod.plugin.configured(ExperienceReplication, .{}),
     lightning_rod.plugin.configured(BlockSynchronization, BlockSynchronization.Configuration{}),
     lightning_rod.plugin.configured(ItemUse, .{}),
@@ -199,9 +209,11 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Growth, Growth.Configuration{}),
     lightning_rod.plugin.configured(Fluids, Fluids.Configuration{}),
     lightning_rod.plugin.configured(Buckets, Buckets.Configuration{}),
+    lightning_rod.plugin.configured(ToolActions, .{}),
     lightning_rod.plugin.configured(RandomTicks, RandomTicks.Configuration{}),
     lightning_rod.plugin.configured(Mobs, Mobs.Configuration{}),
     lightning_rod.plugin.configured(SpawnEggs, SpawnEggs.Configuration{}),
+    lightning_rod.plugin.configured(Melee, .{}),
     lightning_rod.plugin.configured(MobInteraction, MobInteraction.Configuration{}),
     lightning_rod.plugin.configured(MobReplication, MobReplication.Configuration{}),
     lightning_rod.plugin.configured(Equipment, Equipment.Configuration{}),

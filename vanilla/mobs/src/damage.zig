@@ -11,17 +11,6 @@ const Mobs = @import("mobs.zig").Mobs;
 
 const Mob = mob_state.Mob;
 
-/// What a damage type's tags say, read from the registry when definitions change.
-pub const Flags = packed struct(u8) {
-    fire: bool = false,
-    bypasses_cooldown: bool = false,
-    no_impact: bool = false,
-    no_knockback: bool = false,
-    panic: bool = false,
-    bypasses_invulnerability: bool = false,
-    padding: u2 = 0,
-};
-
 pub fn hurt(mobs: *Mobs, mob: *Mob, damage: mob_state.Damage, amount: f32) !bool {
     const flags = mobs.damageFlags(damage.type);
     // LivingEntity.isInvulnerableTo: removed, or fire to the fire immune.

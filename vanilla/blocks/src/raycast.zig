@@ -3,6 +3,9 @@ const chunks = @import("chunks");
 const game_data = @import("game_data");
 const minecraft = @import("minecraft_model");
 
+/// A cell of a trace outside the world's height: air, with no section behind it.
+const void_air: u8 = std.math.maxInt(u8);
+
 pub const Hit = struct { block: chunks.Position, state: u16, position: minecraft.Position, distance: f64 };
 
 pub fn direction(rotation: minecraft.Rotation) [3]f64 {
@@ -73,25 +76,60 @@ pub const Ray = struct {
     }
 };
 
+/// The blocks a world has, bottom first; above and below them is air, as vanilla's void air.
+pub const Height = struct {
+    minimum: i32,
+    /// Exclusive.
+    maximum: i32,
+
+    pub const unbounded: Height = .{ .minimum = std.math.minInt(i32), .maximum = std.math.maxInt(i32) };
+
+    pub fn contains(self: Height, y: i32) bool {
+        return y >= self.minimum and y < self.maximum;
+    }
+};
+
 /// Traces collision shapes. Fluids and blocks without collision are ignored.
 pub fn trace(terrain: chunks.Chunks.Client, world: u32, origin: minecraft.Position, vector: [3]f64, maximum: f64) !?Hit {
-    var ray = try Ray.init(origin, vector, maximum);
     var window = chunks.ReadWindow(8).init(terrain);
     defer window.deinit();
+    return traceIn(&window, world, .unbounded, origin, vector, maximum);
+}
+
+/// Traces through a window the caller keeps, so traces near each other share its sections.
+/// Cells outside the height are air and read nothing.
+pub fn traceIn(window: *chunks.ReadWindow(8), world: u32, height: Height, origin: minecraft.Position, vector: [3]f64, maximum: f64) !?Hit {
+    var ray = try Ray.init(origin, vector, maximum);
     while (true) {
         var positions: [8]chunks.Position = undefined;
+        // Eight cells lie in one or two sections more often than not: each is read once.
         var sections: [8]chunks.Section = undefined;
+        var which: [8]u8 = undefined;
+        var distinct: usize = 0;
         var count: usize = 0;
         while (count < positions.len) : (count += 1) {
             const position = ray.next() orelse break;
             positions[count] = position;
-            sections[count] = chunks.sectionAt(world, position);
+            if (!height.contains(position.y)) {
+                which[count] = void_air;
+                continue;
+            }
+            const section = chunks.sectionAt(world, position);
+            const known = for (sections[0..distinct], 0..) |held, index| {
+                if (std.meta.eql(held, section)) break index;
+            } else blk: {
+                sections[distinct] = section;
+                distinct += 1;
+                break :blk distinct - 1;
+            };
+            which[count] = @intCast(known);
         }
         if (count == 0) return null;
-        var views: [8]chunks.View = undefined;
-        try window.readMany(sections[0..count], views[0..count]);
-        for (positions[0..count], views[0..count]) |position, view| {
-            const state = view.get(chunks.localIndex(position));
+        var read: [8]chunks.View = undefined;
+        if (distinct != 0) try window.readMany(sections[0..distinct], read[0..distinct]);
+        for (positions[0..count], which[0..count]) |position, index| {
+            if (index == void_air) continue;
+            const state = read[index].get(chunks.localIndex(position));
             if (state >= game_data.registry.block_state_collision_shape.len) return error.Corrupt;
             const shape = game_data.registry.collision_shapes[game_data.registry.block_state_collision_shape[state]];
             var closest: ?f64 = null;
