@@ -12,6 +12,7 @@ const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities
 const Players = @import("players").players.Players;
 const chunks = @import("chunks");
 const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
+const item_physics = @import("vanilla_item_entities").item_physics;
 
 fn itemPhysicsProbe(output: *std.Io.Writer) !void {
     const Source = struct {
@@ -88,6 +89,29 @@ fn itemPhysicsProbe(output: *std.Io.Writer) !void {
     try std.testing.expectApproxEqAbs(@as(f64, 16.2), crossing.body.position[0], 0.000001);
     neighborhood.deinit();
     try std.testing.expectEqual(@as(usize, 0), terrain.borrowed_count);
+
+    // Items lying on blocks that go fall on their own tick of four, by network id, which wireless
+    // redstone relies on: until then they keep to the ground they no longer have.
+    var fell_at: [4]u32 = @splat(0);
+    for (&fell_at, 1..) |*fell, id| {
+        const at: chunks.Position = .{ .x = 2 + @as(i32, @intCast(id)) * 2, .y = 69, .z = 3 };
+        try terrain.setBlock(0, at, game_data.registry.block_stone_default_state);
+        try terrain.setBlock(0, at, game_data.registry.block_air_default_state);
+        var resting: entities.State = .{ .uuid = 2 + id, .kind = 1, .world = 0, .position = .{ @as(f64, @floatFromInt(at.x)) + 0.5, 70, 3.5 }, .velocity = .{ 0, 0, 0 } };
+        var ground = true;
+        var window = physics.readWindow();
+        defer window.deinit();
+        for (1..9) |tick| {
+            const result = try physics.step(&window, @intCast(id), @intCast(tick), resting, ground, false);
+            resting = result.body;
+            ground = result.on_ground;
+            if (fell.* == 0 and resting.position[1] < 70) fell.* = @intCast(tick);
+        }
+        var first: u32 = 1;
+        while (!item_physics.movesOnPhase(first, @intCast(id))) first += 1;
+        try std.testing.expectEqual(first, fell.*);
+    }
+    for (fell_at, 0..) |a, i| for (fell_at[i + 1 ..]) |b| try std.testing.expect(a != b);
 
     for ([_]u16{ game_data.registry.block_air_default_state, game_data.registry.block_water_default_state, game_data.registry.block_stone_default_state, std.math.maxInt(u16) }, 0..) |state, index| {
         source.state = state;

@@ -78,6 +78,21 @@ pub const Inventories = struct {
     verified: []Stamp,
 
     observers: ?*Observer = null,
+    listeners: ?*Listener = null,
+
+    /// Hears of every slot that changes, whoever owns it: for those who keep state about many
+    /// owners, more than any watch has room for.
+    pub const Listener = struct {
+        context: *anyopaque,
+        function: *const fn (*anyopaque, Slot) void,
+        next: ?*Listener = null,
+    };
+
+    /// The listener stays borrowed for as long as the inventories live.
+    pub fn listen(self: *Inventories, listener: *Listener) void {
+        listener.next = self.listeners;
+        self.listeners = listener;
+    }
 
     pub const Observer = struct {
         pub const Target = struct { dirty: *u64, changed: ?storage.system.IndexSet.Signal = null };
@@ -121,6 +136,8 @@ pub const Inventories = struct {
     }
 
     fn changed(self: *Inventories, slot: Slot) void {
+        var listener = self.listeners;
+        while (listener) |current| : (listener = current.next) current.function(current.context, slot);
         var next = self.observers;
         while (next) |observer| : (next = observer.next) {
             if (observer.owners.get(slot.owner)) |entry| {

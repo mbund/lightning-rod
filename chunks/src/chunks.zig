@@ -36,7 +36,8 @@ const Backend = struct {
 
 const assert = std.debug.assert;
 /// Edits one section batch may carry, one for each of its cells.
-const edit_previous_max = 4096;
+/// The edits one notification batch holds at most, every section of it together.
+pub const edit_previous_max = 4096;
 /// Leases of at most this many sections take scratch of this size.
 const small_lease = 8;
 
@@ -460,6 +461,10 @@ pub const Chunks = struct {
     ready_count: usize = 0,
     observer_count: usize = 0,
     notifying: bool = false,
+    /// While notifying: the sections of the batch after the one told of, applied already, and
+    /// the states their edits replaced.
+    notify_later: []const SectionEdits = &.{},
+    notify_previous: []const u16 = &.{},
     /// Edits observers made in answer to the notification under way.
     chained: [chain_max]Chained = undefined,
     chained_count: usize = 0,
@@ -711,6 +716,14 @@ pub const Chunks = struct {
         self.chained_count += 1;
     }
 
+    /// While notifying, the edits of the batch after the section told of, which the world
+    /// shows already: an observer that answers now sees past them with the states they
+    /// replaced. Sections without a change are among them and replaced nothing.
+    pub fn notifiedLater(self: *const Chunks) struct { sections: []const SectionEdits, previous: []const u16 } {
+        assert(self.notifying);
+        return .{ .sections = self.notify_later, .previous = self.notify_previous };
+    }
+
     pub fn setBlock(self: *Chunks, world: World, pos: Position, state: u16) !void {
         try self.setBlocks(sectionAt(world, pos), &.{.{ .index = localIndex(pos), .state = state }});
     }
@@ -761,14 +774,18 @@ pub const Chunks = struct {
             }
             self.notifying = true;
             var offset: usize = 0;
-            for (batch, changed[0..count]) |section, did_change| {
+            for (batch, changed[0..count], 0..) |section, did_change, at| {
                 const previous = self.edit_previous[offset..][0..section.edits.len];
                 offset += section.edits.len;
                 if (!did_change) continue;
+                self.notify_later = batch[at + 1 ..];
+                self.notify_previous = self.edit_previous[offset..edits];
                 for (self.observers[0..self.observer_count]) |observer| observer.changed(section.section, section.edits, previous);
             }
             assert(offset == edits);
             self.notifying = false;
+            self.notify_later = &.{};
+            self.notify_previous = &.{};
             try self.stackChained();
             start += count;
         }

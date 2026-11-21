@@ -10,6 +10,7 @@ const chunks = @import("chunks");
 const Players = @import("players").players.Players;
 const Items = @import("vanilla_items").items.Items;
 const spatial = @import("item_spatial.zig");
+const item_physics = @import("item_physics.zig");
 
 const assert = std.debug.assert;
 
@@ -17,9 +18,53 @@ pub const ItemEntities = struct {
     pub const id = "minecraft:item_entities";
 
     pub const Configuration = struct {
-        cache_records: usize = 256,
+        cache_records: usize = 8192,
         /// Includes retired entities waiting for clients to accept their removal.
         maximum: usize = 1024,
+        /// Whether resting items sleep. Off, every one ticks every tick, which sleeping must
+        /// match.
+        sleep: bool = true,
+    };
+
+    /// What the ticks of a sleeping item do to it, from how it was when it fell asleep: on the
+    /// ground, still, with nothing around to change it. Its record stays as it was until someone
+    /// reads it through these, which first brings it up to date.
+    pub const Sleep = struct {
+        /// The last tick its record is as of.
+        since: u64 = 0,
+        /// The last tick it ticks through: past it, it stopped ticking, as an item no player
+        /// is near does.
+        until: u64 = std.math.maxInt(u64),
+        /// Its tick count and age when its record was last brought up to date, for knowing when
+        /// it must wake without reading the record.
+        ticks: u32 = 0,
+        age: i32 = 0,
+        /// The block it rests on slows and steadies it: Entity.getBlockSpeedFactor and the
+        /// friction ItemEntity.tick applies, both as the doubles they become.
+        speed: f64 = 1,
+        friction: f64 = 1,
+    };
+
+    /// How far the item tick has gone, as it goes over items in a fixed order: from `start`
+    /// up, then round from the lowest to before `start`.
+    pub const Clock = struct {
+        /// The tick under way, or done when not running.
+        tick: u64 = 0,
+        running: bool = false,
+        start: entities.Id = 0,
+        /// The last item ticked this tick, if any yet.
+        last: entities.Id = 0,
+
+        fn order(self: Clock, entity: entities.Id) u64 {
+            return if (entity >= self.start) entity - self.start else entity + (std.math.maxInt(u32) - self.start);
+        }
+
+        /// The last tick an item has had.
+        pub fn through(self: Clock, entity: entities.Id) u64 {
+            if (!self.running) return self.tick;
+            if (self.last != 0 and self.order(entity) <= self.order(self.last)) return self.tick;
+            return self.tick - 1;
+        }
     };
 
     pub const Dependencies = struct {
@@ -149,6 +194,18 @@ pub const ItemEntities = struct {
     const StackProperties = struct { item: ?inventories.ItemId = null, maximum: u16 = 0, slots: [1]u16 = .{0}, dirty: u64 = 1, full: bool = false, watched: bool = false };
     deps: Dependencies,
     changes: lightning_rod.system.IndexSet,
+    /// Slots asleep, and slots whose records are behind their ticks: asleep, or woken and not
+    /// read since.
+    sleeping: lightning_rod.system.IndexSet,
+    behind: lightning_rod.system.IndexSet,
+    sleeps: []Sleep,
+    clock: Clock = .{},
+    sleep: bool,
+    /// Items whose only change since replication last looked is their revision, as a resting
+    /// item's motion changes every tick, and the revision each slot holds now. Replication need
+    /// only note them until they are due to send.
+    moved: lightning_rod.system.IndexSet,
+    revisions: []u64,
     active: lightning_rod.system.IndexSet,
     cache: records.Cache,
     residents: []Resident,
@@ -221,6 +278,12 @@ pub const ItemEntities = struct {
             .stack_properties = stack_properties,
             .inventory_observer = try deps.inventories.observe(allocator, config.maximum),
             .changes = try lightning_rod.system.IndexSet.init(allocator, config.maximum),
+            .moved = try lightning_rod.system.IndexSet.init(allocator, config.maximum),
+            .sleeping = try lightning_rod.system.IndexSet.init(allocator, config.maximum),
+            .behind = try lightning_rod.system.IndexSet.init(allocator, config.maximum),
+            .sleeps = try allocator.alloc(Sleep, config.maximum),
+            .sleep = config.sleep,
+            .revisions = try allocator.alloc(u64, config.maximum),
             .active = try lightning_rod.system.IndexSet.init(allocator, config.maximum),
             .spatial = try spatial.Index.init(allocator, residents),
             .free = try allocator.alloc(u32, config.maximum),
@@ -323,13 +386,28 @@ pub const ItemEntities = struct {
             return decode(self.record.read() orelse return error.UnknownItemEntity);
         }
 
+        /// A write by anyone but catching up changes a sleeping item: it wakes.
         pub fn write(self: MetadataLease, metadata: Metadata) void {
-            const changed = if (self.record.read()) |bytes| changed: {
+            if (self.owner.sleeping.contains(self.index)) self.owner.wake(self.index, std.math.maxInt(u64));
+            self.writeQuietly(metadata);
+        }
+
+        fn writeQuietly(self: MetadataLease, metadata: Metadata) void {
+            const Change = enum { none, revision, other };
+            const change: Change = if (self.record.read()) |bytes| changed: {
                 const previous = decode(bytes) catch unreachable;
-                break :changed previous.revision != metadata.revision or previous.on_ground != metadata.on_ground or previous.alive != metadata.alive or
-                    previous.collector != metadata.collector or previous.collected != metadata.collected or previous.collection != metadata.collection;
-            } else true;
-            if (changed) self.owner.changes.insert(self.index);
+                if (previous.on_ground != metadata.on_ground or previous.alive != metadata.alive or
+                    previous.collector != metadata.collector or previous.collected != metadata.collected or previous.collection != metadata.collection or
+                    // Replication sends the stack again with the flags when a fire is lit or goes out.
+                    (previous.fire_ticks > 0) != (metadata.fire_ticks > 0)) break :changed .other;
+                break :changed if (previous.revision != metadata.revision) .revision else .none;
+            } else .other;
+            self.owner.revisions[self.index] = metadata.revision;
+            switch (change) {
+                .none => {},
+                .revision => self.owner.moved.insert(self.index),
+                .other => self.owner.changes.insert(self.index),
+            }
             metadata.encode(self.record.edit());
             self.record.commit(Metadata.encoded_size);
         }
@@ -410,6 +488,138 @@ pub const ItemEntities = struct {
         }
         try self.cache.acquireMany(slices[0..ids.len], metadata[0..ids.len]);
         for (output, metadata[0..ids.len], ids) |*lease, record, entity| lease.* = .{ .owner = self, .record = record, .index = self.ids.get(entity).? };
+        errdefer for (output) |lease| lease.release();
+        try self.catchUp(output);
+    }
+
+    /// Brings the records of items asleep, or behind, up to the tick they have had.
+    fn catchUp(self: *ItemEntities, leases: []const MetadataLease) !void {
+        if (self.behind.count == 0) return;
+        var ids: [16]entities.Id = undefined;
+        var at: [16]usize = undefined;
+        var count: usize = 0;
+        for (leases, 0..) |lease, index| {
+            if (!self.behind.contains(lease.index)) continue;
+            const sleep = &self.sleeps[lease.index];
+            if (@min(self.clock.through(self.residents[lease.index].id), sleep.until) == sleep.since) {
+                // Up to date: awake, it ticks for itself from here.
+                if (!self.sleeping.contains(lease.index)) self.behind.remove(lease.index);
+                continue;
+            }
+            ids[count] = self.residents[lease.index].id;
+            at[count] = index;
+            count += 1;
+        }
+        if (count == 0) return;
+        var bodies: [16]entities.Entities.Lease = undefined;
+        try self.deps.entities.acquireMany(ids[0..count], bodies[0..count]);
+        defer for (bodies[0..count]) |body| body.release();
+        for (ids[0..count], at[0..count], bodies[0..count]) |entity, index, body_lease| {
+            const lease = leases[index];
+            const sleep = &self.sleeps[lease.index];
+            const target = @min(self.clock.through(entity), sleep.until);
+            var metadata = try lease.read();
+            var body = (try body_lease.read()) orelse return error.Corrupt;
+            var tick = sleep.since;
+            while (tick < target) : (tick += 1) rest(&body, &metadata, entity, sleep.speed, sleep.friction);
+            try body_lease.write(body);
+            self.residents[lease.index] = resident(entity, body);
+            sleep.since = target;
+            sleep.ticks = metadata.ticks;
+            sleep.age = metadata.age;
+            lease.writeQuietly(metadata);
+            if (!self.sleeping.contains(lease.index)) self.behind.remove(lease.index);
+        }
+    }
+
+    /// One tick of a resting item, as ItemTick and ItemPhysics.advance go with nothing to move
+    /// it: its fall builds and stops, its slide wears off on its move ticks, and it ages.
+    pub fn rest(body: *entities.State, metadata: *Metadata, entity: entities.Id, speed: f64, friction: f64) void {
+        metadata.ticks +%= 1;
+        if (metadata.pickup_delay > 0 and metadata.pickup_delay != 32767) metadata.pickup_delay -= 1;
+        var next = body.*;
+        next.velocity[1] -= 0.04;
+        if (item_physics.movesOnPhase(metadata.ticks, @intCast(entity))) {
+            // Its fall stops on the block: Block.onEntityLand.
+            next.velocity[1] *= 0;
+            next.velocity[0] *= speed;
+            next.velocity[2] *= speed;
+            next.velocity[0] *= friction;
+            next.velocity[1] *= 0.98;
+            next.velocity[2] *= friction;
+        }
+        // As ItemTick, a body that compares equal, -0.0 and 0.0 alike, keeps its bits and its
+        // revision.
+        if (!std.meta.eql(body.*, next)) {
+            body.* = next;
+            metadata.revision += 1;
+        }
+        if (metadata.alive and metadata.age != -32768) metadata.age += 1;
+    }
+
+    /// Every item as it stands, sleepers as their ticks would have left them, read without
+    /// writing anything, for a test to hold sleeping to ticking.
+    pub fn digest(self: *ItemEntities) !u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        for (self.residents, 0..) |entry, index| {
+            if (entry.id == 0) continue;
+            const key = keyFor(entry.id);
+            const lease = try self.cache.acquire(&key);
+            defer lease.release();
+            var metadata = decode(lease.read() orelse return error.UnknownItemEntity) catch return error.Corrupt;
+            var bodies: [1]entities.Entities.Lease = undefined;
+            try self.deps.entities.acquireMany(&.{entry.id}, &bodies);
+            defer bodies[0].release();
+            var body = (try bodies[0].read()) orelse continue;
+            if (self.behind.contains(index)) {
+                const sleep = self.sleeps[index];
+                var tick = sleep.since;
+                while (tick < @min(self.clock.through(entry.id), sleep.until)) : (tick += 1) rest(&body, &metadata, entry.id, sleep.speed, sleep.friction);
+            }
+            var encoded: [Metadata.encoded_size]u8 = undefined;
+            metadata.encode(&encoded);
+            hasher.update(&encoded);
+            inline for (@typeInfo(entities.State).@"struct".field_names) |name| hasher.update(std.mem.asBytes(&@field(body, name)));
+        }
+        return hasher.final();
+    }
+
+    /// Lets an item sleep from the end of the tick it just had.
+    pub fn lull(self: *ItemEntities, entity: entities.Id, metadata: Metadata, speed: f64, friction: f64) void {
+        const index = self.ids.get(entity).?;
+        assert(!self.sleeping.contains(index));
+        self.sleeping.insert(index);
+        self.behind.insert(index);
+        self.sleeps[index] = .{ .since = self.clock.tick, .ticks = metadata.ticks, .age = metadata.age, .speed = speed, .friction = friction };
+    }
+
+    /// Wakes a sleeping item, to tick from now on; its record comes up to date when next read.
+    /// One that stops ticking stops at `until`.
+    pub fn wake(self: *ItemEntities, index: usize, until: u64) void {
+        assert(self.sleeping.contains(index));
+        self.sleeping.remove(index);
+        self.sleeps[index].until = until;
+    }
+
+    /// Brings every sleeper's record up to date, as a checkpoint must save what their ticks did.
+    fn catchUpAll(self: *ItemEntities) !void {
+        // Each round brings some up to date, which leaves them out of the next.
+        while (true) {
+            var ids: [16]entities.Id = undefined;
+            var count: usize = 0;
+            for (self.behind.values()) |index| {
+                const entity = self.residents[index].id;
+                const sleep = self.sleeps[index];
+                if (@min(self.clock.through(entity), sleep.until) == sleep.since) continue;
+                ids[count] = entity;
+                count += 1;
+                if (count == ids.len) break;
+            }
+            if (count == 0) return;
+            var leases: [16]MetadataLease = undefined;
+            try self.acquireMetadataMany(ids[0..count], leases[0..count]);
+            for (leases[0..count]) |lease| lease.release();
+        }
     }
 
     pub const Iterator = struct {
@@ -468,7 +678,8 @@ pub const ItemEntities = struct {
         errdefer self.deps.storage.fail();
         try record.body.write(after);
         const slot_index = self.ids.get(entity) orelse return error.UnknownItemEntity;
-        self.changes.insert(slot_index);
+        // Motion alone, as a resting item's every tick, comes to replication as a new revision.
+        if (before.world != after.world or !std.meta.eql(before.position, after.position)) self.changes.insert(slot_index);
         const previous = resident(entity, before);
         const next = resident(entity, after);
         assert(std.meta.eql(self.residents[slot_index], previous));
@@ -489,6 +700,9 @@ pub const ItemEntities = struct {
         properties.watched = false;
         try self.deps.entities.remove(entity);
         const slot_index = self.ids.get(entity) orelse return error.UnknownItemEntity;
+        // Gone, it neither sleeps nor needs catching up: whoever retired it read it first.
+        self.sleeping.remove(slot_index);
+        self.behind.remove(slot_index);
         self.spatial.remove(slot_index);
         self.residents[slot_index].alive = false;
         metadata.alive = false;
@@ -690,6 +904,7 @@ pub const ItemEntities = struct {
         assert(!self.stack_properties[slot_index].watched);
         self.stack_properties[slot_index] = .{};
         self.residents[slot_index] = if (body) |value| resident(entity, value) else .{ .id = entity };
+        assert(!self.sleeping.contains(slot_index) and !self.behind.contains(slot_index));
         self.changes.insert(slot_index);
         self.active.insert(slot_index);
         self.ids.putAssumeCapacityNoClobber(entity, slot_index);
@@ -725,6 +940,7 @@ pub const ItemEntities = struct {
     }
 
     pub fn checkpoint(self: *ItemEntities, _: lightning_rod.storage.Space) !void {
+        try self.catchUpAll();
         try self.cache.flush();
     }
 

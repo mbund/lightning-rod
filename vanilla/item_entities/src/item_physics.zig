@@ -128,6 +128,57 @@ pub const ItemPhysics = struct {
         return .{ .solid = try self.orbCollides(window, body), .water = water.fluid == .water and eye < @as(f64, @as(f32, @floatFromInt(position.y)) + (if (above.fluid == .water) @as(f32, 1) else water.height())), .lava = base.fluid == .lava };
     }
 
+    /// What a resting item's move ticks take from its block, if nothing else around it does
+    /// anything: every cell its box is in holds air, and the block it rests on is one that does
+    /// nothing to an item but hold, steady and slow it.
+    pub const Rest = struct { speed: f64, friction: f64 };
+
+    const restless_supports = [_][]const u8{
+        "minecraft:redstone_ore",          "minecraft:deepslate_redstone_ore", "minecraft:sculk_sensor",
+        "minecraft:calibrated_sculk_sensor", "minecraft:sculk_shrieker",       "minecraft:turtle_egg",
+        "minecraft:slime_block",           "minecraft:honey_block",            "minecraft:magma_block",
+        "minecraft:hopper",                "minecraft:campfire",               "minecraft:soul_campfire",
+        "minecraft:big_dripleaf",          "minecraft:cactus",                 "minecraft:pointed_dripstone",
+        "minecraft:scaffolding",           "minecraft:powder_snow",            "minecraft:bubble_column",
+    };
+
+    pub fn rest(self: *ItemPhysics, window: *Window, body: entities.State) !?Rest {
+        const p = body.position;
+        // The cells the box is in: 0.25 wide and high, standing on the block below.
+        var x = floorCell(p[0] - 0.125);
+        while (x <= floorCell(p[0] + 0.125)) : (x += 1) {
+            var z = floorCell(p[2] - 0.125);
+            while (z <= floorCell(p[2] + 0.125)) : (z += 1) {
+                var y = floorCell(p[1]);
+                while (y <= floorCell(p[1] + 0.25)) : (y += 1) {
+                    const state = try self.blockState(window, body.world, .{ .x = x, .y = y, .z = z });
+                    if (!isAir(state)) return null;
+                }
+            }
+        }
+        const below_position: chunks.Position = .{ .x = floorCell(p[0]), .y = floorCell(p[1] - @as(f64, @as(f32, 0.999999))), .z = floorCell(p[2]) };
+        const below = try self.blockState(window, body.world, below_position);
+        const name = game_data.registry.block_state_names[below];
+        const block = name[0 .. std.mem.indexOfScalar(u8, name, '[') orelse name.len];
+        for (restless_supports) |restless| if (std.mem.eql(u8, block, restless)) return null;
+        // As advanceBody works them out on a move tick.
+        const base = self.deps.blocks.get(try self.blockState(window, body.world, .{ .x = floorCell(p[0]), .y = floorCell(p[1]), .z = floorCell(p[2]) }));
+        var speed = base.speed;
+        if (speed == 1 and !base.water_block) speed = self.deps.blocks.get(below).speed;
+        var friction: f32 = 0.98;
+        friction *= self.deps.blocks.get(below).friction;
+        return .{ .speed = speed, .friction = friction };
+    }
+
+    fn floorCell(value: f64) i32 {
+        return @intFromFloat(@floor(value));
+    }
+
+    fn isAir(state: u16) bool {
+        return state == game_data.registry.block_air_default_state or game_data.registry.block_state_names[state].len >= 14 and
+            (std.mem.eql(u8, game_data.registry.block_state_names[state], "minecraft:cave_air") or std.mem.eql(u8, game_data.registry.block_state_names[state], "minecraft:void_air"));
+    }
+
     fn blockState(self: *ItemPhysics, window: *Window, world: u32, position: chunks.Position) !u16 {
         assert(window.client.chunks == self.deps.chunks and window.client.index == self.chunk_client.index);
         var views: [1]chunks.View = undefined;
@@ -394,7 +445,7 @@ pub const ItemPhysics = struct {
         var grounded = on_ground;
         var moved = false;
         if (orb or !on_ground or next.velocity[0] * next.velocity[0] + next.velocity[2] * next.velocity[2] > @as(f64, @as(f32, 0.00001)) or
-            (ticks +% entity_id) % 4 == 0)
+            movesOnPhase(ticks, entity_id))
         {
             moved = true;
             // Entity.move: what holds the body back takes its motion and is spent.
@@ -403,14 +454,18 @@ pub const ItemPhysics = struct {
                 next.velocity = .{ 0, 0, 0 };
             }
             const order: [3]usize = if (@abs(motion[0]) < @abs(motion[2])) .{ 1, 2, 0 } else .{ 1, 0, 2 };
+            // Entity.adjustMovementForCollisions moves the box axis by axis; Entity.move then takes
+            // the result only if it goes somewhere or the blocks barely held it back.
+            var box_at = next.position;
+            var adjusted: [3]f64 = .{ 0, 0, 0 };
 
             for (order) |axis| {
                 const requested = motion[axis];
                 if (requested == 0) continue;
 
                 var movement = requested;
-                const minimum: [3]f64 = .{ next.position[0] - @as(f64, if (orb) 0.25 else 0.125), next.position[1], next.position[2] - @as(f64, if (orb) 0.25 else 0.125) };
-                const maximum: [3]f64 = .{ next.position[0] + @as(f64, if (orb) 0.25 else 0.125), next.position[1] + @as(f64, if (orb) 0.5 else 0.25), next.position[2] + @as(f64, if (orb) 0.25 else 0.125) };
+                const minimum: [3]f64 = .{ box_at[0] - @as(f64, if (orb) 0.25 else 0.125), box_at[1], box_at[2] - @as(f64, if (orb) 0.25 else 0.125) };
+                const maximum: [3]f64 = .{ box_at[0] + @as(f64, if (orb) 0.25 else 0.125), box_at[1] + @as(f64, if (orb) 0.5 else 0.25), box_at[2] + @as(f64, if (orb) 0.25 else 0.125) };
                 var first: [3]i32 = undefined;
                 var last: [3]i32 = undefined;
 
@@ -486,11 +541,21 @@ pub const ItemPhysics = struct {
                     }
                 }
 
-                next.position[axis] += movement;
+                box_at[axis] += movement;
+                adjusted[axis] = movement;
 
                 if (axis == 1) grounded = requested < 0 and requested != movement;
 
-                if (requested != movement) next.velocity[axis] = 0;
+                // A vertical stop is Block.onEntityLand, which scales the fall away (to -0.0 when
+                // falling); a sideways one counts only past MathHelper.approximatelyEquals.
+                if (axis == 1) {
+                    if (requested != movement) next.velocity[1] *= 0;
+                } else if (!(@abs(movement - requested) < 1.0e-5)) next.velocity[axis] = 0;
+            }
+            const taken = adjusted[0] * adjusted[0] + adjusted[1] * adjusted[1] + adjusted[2] * adjusted[2];
+            const asked = motion[0] * motion[0] + motion[1] * motion[1] + motion[2] * motion[2];
+            if (taken > 1.0e-7 or asked - taken < 1.0e-7) {
+                for (&next.position, adjusted) |*axis, movement| axis.* += movement;
             }
 
             var below: ?u16 = null;
@@ -547,6 +612,32 @@ pub const ItemPhysics = struct {
         return .{ .body = next, .on_ground = grounded, .crossed_block = crossed, .moved = moved, .effects = orb_effects };
     }
 };
+
+/// ItemEntity.tick's `(age + getId()) % 4 == 0`, in Java's int arithmetic with the network id
+/// the world sends, which is the negated entity id. An item lying still on the ground moves, and
+/// so finds out its block went, only on these ticks: items fall in four groups by their id, which
+/// wireless redstone relies on. Sleeping must keep waking resting items in time for theirs.
+pub fn movesOnPhase(ticks: u32, entity_id: u32) bool {
+    assert(entity_id > 0 and entity_id <= std.math.maxInt(i32));
+    const network_id = -@as(i32, @intCast(entity_id));
+    return @rem(@as(i32, @bitCast(ticks)) +% network_id, 4) == 0;
+}
+
+test "resting items move on ticks grouped by their network id, four groups" {
+    // Entity 1 is network id -1: (5 + -1) % 4 == 0.
+    try std.testing.expect(movesOnPhase(5, 1));
+    try std.testing.expect(!movesOnPhase(5, 2));
+    try std.testing.expect(movesOnPhase(6, 2));
+    // Java's remainder keeps the sign: (1 + -3) % 4 is -2, not a move tick; (3 + -3) is.
+    try std.testing.expect(!movesOnPhase(1, 3));
+    try std.testing.expect(movesOnPhase(3, 3));
+    // Every tick, exactly a quarter of any four consecutive ids move.
+    for (0..8) |tick| {
+        var moving: usize = 0;
+        for (1..5) |id| moving += @intFromBool(movesOnPhase(@intCast(tick), @intCast(id)));
+        try std.testing.expectEqual(@as(usize, 1), moving);
+    }
+}
 
 /// Vec3.normalize: zero below a float's 1e-5 long.
 fn normalized(vector: [3]f64) [3]f64 {

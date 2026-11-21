@@ -77,6 +77,13 @@ const Options = struct {
     arrows: usize = 0,
     /// Ticks between volleys while measuring; zero shoots one that lands before measuring.
     volley_interval: usize = 0,
+    /// Dropped items spread around the players, left to settle before measuring.
+    drops: usize = 0,
+    /// Drops stand on a stone platform, and every so many ticks the block under the next one
+    /// goes, so it falls, on its own tick of four.
+    drop_edits: usize = 0,
+    /// Resting items tick every tick, as sleeping must match.
+    no_item_sleep: bool = false,
     /// Arrows that fly the whole run: high above the world and far from players, they read no
     /// chunks and have no viewers, so what they cost is their ticks and their paging.
     flying: usize = 0,
@@ -110,6 +117,11 @@ fn volley(simulation: *Simulation, world: u32, count: usize, round: usize) !void
             .pickup = .disallowed,
         });
     }
+}
+
+/// The block a drop on the platform stands on.
+fn dropSupport(index: usize, side: usize) @import("chunks").Position {
+    return .{ .x = -41 + @as(i32, @intCast(index % side)) * 2, .y = 99, .z = -41 + @as(i32, @intCast(index / side)) * 2 };
 }
 
 /// Arrows falling from far above, a block apart, a long way from every player.
@@ -154,6 +166,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
             lightning_rod.plugin.configured(Chunks, Chunks.Configuration.forPlayers(maximum)),
             lightning_rod.plugin.configured(vanilla.Mobs, .{ .maximum = @max(1024, options.cows) }),
             lightning_rod.plugin.configured(vanilla.Projectiles, .{ .cache_records = options.projectile_cache, .sleep = options.sleep, .trace_sends = options.digest }),
+            lightning_rod.plugin.configured(vanilla.ItemEntities, .{ .sleep = !options.no_item_sleep }),
             lightning_rod.plugin.configured(sessions.World, .{ .endpoint = service }),
             lightning_rod.plugin.configured(vanilla.RecipeBook, .{ .packet_bytes = service.config.page_bytes }),
         }),
@@ -226,6 +239,22 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
             if (options.detail and tick % 10 == 0) try writer.print("  settle tick={d} arrows={d}\n", .{ tick, simulation.get(vanilla.Projectiles).activeCount() });
         }
     }
+    if (options.drops > 0) {
+        const dropped = simulation.get(vanilla.ItemEntities);
+        const stone = try simulation.get(vanilla.Items).define("minecraft:stone");
+        const side = std.math.sqrt(options.drops) + 1;
+        for (0..options.drops) |index| {
+            // Two blocks apart, so they do not merge, in the chunks around the players.
+            const x: f64 = -40.5 + @as(f64, @floatFromInt(index % side)) * 2;
+            const z: f64 = -40.5 + @as(f64, @floatFromInt(index / side)) * 2;
+            if (options.drop_edits > 0) try simulation.get(Chunks).setBlock(spawn_world, dropSupport(index, side), game_data.registry.block_stone_default_state);
+            _ = try dropped.create(spawn_world, .{ x, if (options.drop_edits > 0) 100 else 90, z }, .{ 0, 0, 0 }, .{ .item = stone, .count = 1 });
+        }
+        for (0..200) |tick| {
+            try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
+            if (options.digest) try writer.print("settle tick={d} items={x} asleep={d}\n", .{ tick, try simulation.get(vanilla.ItemEntities).digest(), simulation.get(vanilla.ItemEntities).sleeping.count });
+        }
+    }
     if (options.flying > 0) {
         if (count == 0) return error.ArrowsNeedAPlayer;
         try flyers(simulation, spawn_world, options.flying);
@@ -271,13 +300,18 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
                 try simulation.get(Chunks).setBlock(spawn_world, .{ .x = 8 + 4 * (spot - 4), .y = 65, .z = 9 }, if (edits % 2 == 0) fence else air);
                 edits += 1;
             }
+            if (options.drop_edits > 0 and tick % options.drop_edits == 0) {
+                const side = std.math.sqrt(options.drops) + 1;
+                const index = (tick / options.drop_edits) % options.drops;
+                try simulation.get(Chunks).setBlock(spawn_world, dropSupport(index, side), game_data.registry.block_air_default_state);
+            }
             if (options.arrows > 0 and options.volley_interval > 0 and tick % options.volley_interval == 0) {
                 if (count == 0) return error.ArrowsNeedAPlayer;
                 try volley(simulation, spawn_world, options.arrows, volleys);
                 volleys += 1;
             }
             try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
-            if (options.digest) try writer.print("digest tick={d} projectiles={x} sent={x} packets={d} recipients={d} sleeping={d}\n", .{ tick, try simulation.get(vanilla.Projectiles).digest(), simulation.get(vanilla.Projectiles).sent, packets, recipients, simulation.get(vanilla.Projectiles).sleepingCount() });
+            if (options.digest) try writer.print("digest tick={d} projectiles={x} sent={x} items={x} packets={d} recipients={d} sleeping={d} items_asleep={d}\n", .{ tick, try simulation.get(vanilla.Projectiles).digest(), simulation.get(vanilla.Projectiles).sent, try simulation.get(vanilla.ItemEntities).digest(), packets, recipients, simulation.get(vanilla.Projectiles).sleepingCount(), simulation.get(vanilla.ItemEntities).sleeping.count });
         }
         cpus[sample] = @intCast(std.Io.Clock.now(.cpu_thread, io).nanoseconds - cpu);
         walls[sample] = @intCast(std.Io.Clock.now(.awake, io).nanoseconds - wall);
@@ -288,7 +322,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
         try fifo.writeStreamingAll(io, "disable\n");
     }
     // Cows walk into sections they have not read yet, so only a world without them is steady.
-    if (options.cows == 0 and options.volley_interval == 0 and reads != inventories.cache.metrics.reads.value() + inventories.items.metrics.reads.value() + chunks.cache.metrics.reads.value()) return error.UnexpectedSteadyStateReads;
+    if (options.cows == 0 and options.volley_interval == 0 and options.drop_edits == 0 and reads != inventories.cache.metrics.reads.value() + inventories.items.metrics.reads.value() + chunks.cache.metrics.reads.value()) return error.UnexpectedSteadyStateReads;
     const snapshots = simulation.metrics.snapshot(stages);
     std.mem.sort(u64, cpus, {}, std.sort.asc(u64));
     std.mem.sort(u64, walls, {}, std.sort.asc(u64));
@@ -384,6 +418,12 @@ pub fn main(init: std.process.Init) !void {
             options.arrows = try std.fmt.parseInt(usize, argument[9..], 10);
         } else if (std.mem.startsWith(u8, argument, "--projectile-cache=")) {
             options.projectile_cache = try std.fmt.parseInt(usize, argument[19..], 10);
+        } else if (std.mem.startsWith(u8, argument, "--drop-edits=")) {
+            options.drop_edits = try std.fmt.parseInt(usize, argument[13..], 10);
+        } else if (std.mem.eql(u8, argument, "--no-item-sleep")) {
+            options.no_item_sleep = true;
+        } else if (std.mem.startsWith(u8, argument, "--drops=")) {
+            options.drops = try std.fmt.parseInt(usize, argument[8..], 10);
         } else if (std.mem.startsWith(u8, argument, "--flying=")) {
             options.flying = try std.fmt.parseInt(usize, argument[9..], 10);
         } else if (std.mem.startsWith(u8, argument, "--volley-interval=")) {

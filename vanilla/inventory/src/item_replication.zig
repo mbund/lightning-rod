@@ -219,6 +219,31 @@ pub const ItemReplication = struct {
         }
     }
 
+    /// Items that only moved since last looked at: their viewers are owed a position, which goes
+    /// out on the item's turn. Off its turn nothing else would come of looking at one, so it is
+    /// only noted; on its turn, or when anything else changed, it is looked at in full.
+    fn noteMoved(self: *ItemReplication) void {
+        const dropped = self.deps.dropped;
+        defer dropped.moved.clear();
+        // A sleeper moves every tick as any resting item does: on its turn it is looked at in
+        // full, which brings it up to date first.
+        for (dropped.sleeping.values()) |index| {
+            if ((self.ticks + index) % self.position_interval == 0) dropped.changes.insert(index);
+        }
+        for (dropped.moved.values()) |index| {
+            if (dropped.changes.contains(index)) continue;
+            const resident_entry = dropped.residents[index];
+            const view = &self.views[index];
+            if ((self.ticks + index) % self.position_interval == 0 or resident_entry.id == 0 or view.entity != resident_entry.id) {
+                dropped.changes.insert(index);
+                continue;
+            }
+            if (view.revision == dropped.revisions[index]) continue;
+            view.dirty.unite(view.dirty.view(), view.spawned.view());
+            view.revision = dropped.revisions[index];
+        }
+    }
+
     pub fn tick(self: *ItemReplication) !void {
         assert(self.selection.count == 0);
         self.ticks += 1;
@@ -227,6 +252,7 @@ pub const ItemReplication = struct {
             assert(self.retries.count == 0);
             self.work.clear();
             self.pending.clear();
+            dropped.moved.clear();
             return;
         }
         const service = self.deps.sessions;
@@ -263,6 +289,7 @@ pub const ItemReplication = struct {
             if (replaced) reset.insert(index);
         }
 
+        self.noteMoved();
         const selection = self.selection.select(&dropped.spatial, &self.work);
         self.selection_candidates.add(selection.candidates);
         self.selection_nodes.add(selection.coverage_nodes);

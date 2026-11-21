@@ -43,6 +43,8 @@ pub const ItemPickup = struct {
     watched: lightning_rod.system.IndexSet,
     observer: *inventories.Inventories.Observer,
     query: ItemEntities.Query,
+    /// The candidates within reach, this tick.
+    reach: []entities.Id,
     audiences: lightning_rod.system.sparse_sets.Workspace,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*ItemPickup {
@@ -50,7 +52,7 @@ pub const ItemPickup = struct {
         const self = try allocator.create(ItemPickup);
         const admissions = try allocator.alloc(Admission, deps.players.records.len);
         @memset(admissions, .{});
-        self.* = .{ .watched = try lightning_rod.system.IndexSet.init(allocator, admissions.len), .deps = deps, .admissions = admissions, .observer = try deps.inventories.observe(allocator, admissions.len), .query = try ItemEntities.Query.init(allocator, deps.dropped, deps.players), .audiences = try lightning_rod.system.sparse_sets.Workspace.init(allocator, 17, admissions.len) };
+        self.* = .{ .watched = try lightning_rod.system.IndexSet.init(allocator, admissions.len), .deps = deps, .admissions = admissions, .observer = try deps.inventories.observe(allocator, admissions.len), .query = try ItemEntities.Query.init(allocator, deps.dropped, deps.players), .audiences = try lightning_rod.system.sparse_sets.Workspace.init(allocator, 17, admissions.len), .reach = try allocator.alloc(entities.Id, deps.dropped.residents.len) };
         return self;
     }
 
@@ -66,9 +68,28 @@ pub const ItemPickup = struct {
         remaining: ?inventories.Stack = null,
     };
 
+    /// Items a player stands within reach of, by where they are known to be, before any record
+    /// is read: reading a sleeping item brings it up to date, which only those it may go to need.
+    fn reachable(self: *ItemPickup, candidates: []const entities.Id) []const entities.Id {
+        const dropped = self.deps.dropped;
+        var count: usize = 0;
+        for (candidates) |entity| {
+            const at = dropped.residents[dropped.ids.get(entity).?];
+            var players = self.deps.players.nearby(at.world, .{ .x = at.position[0], .y = 0, .z = at.position[1] }, 1);
+            while (players.next()) |index| {
+                const player = self.deps.players.records[index];
+                if (player.world != at.world or @abs(at.position[0] - player.position.x) >= 1.425 or @abs(at.position[1] - player.position.z) >= 1.425) continue;
+                self.reach[count] = entity;
+                count += 1;
+                break;
+            }
+        }
+        return self.reach[0..count];
+    }
+
     pub fn tick(self: *ItemPickup) !void {
         const dropped = self.deps.dropped;
-        var iterator = dropped.iterate(self.query.read(1));
+        var iterator = dropped.iterate(self.reachable(self.query.read(1)));
         defer iterator.deinit();
         while (try iterator.next()) |batch| {
             var metadata: [16]ItemEntities.Metadata = undefined;

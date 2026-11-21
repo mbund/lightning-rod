@@ -2,6 +2,7 @@ const std = @import("std");
 const inventories = @import("inventories");
 const entities = @import("entities");
 const worlds = @import("worlds");
+const chunks = @import("chunks");
 const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
 const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
 const ItemMerging = @import("vanilla_item_entities").item_merging.ItemMerging;
@@ -45,6 +46,12 @@ pub const ItemTick = struct {
     last_ultrawarm: bool = false,
     query: ItemEntities.Query,
     hazards: hazards_module.Hazards,
+    /// The items ticking this tick, the active ones less those asleep, and which slots are
+    /// active.
+    awake: []entities.Id,
+    active_slots: std.DynamicBitSetUnmanaged,
+    /// Sleepers a block edit near them asked to wake on the next tick.
+    asked: std.DynamicBitSetUnmanaged,
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*ItemTick {
         try config.merge_work.validate(deps.dropped.residents.len, .{ .operations = 1 });
@@ -63,8 +70,56 @@ pub const ItemTick = struct {
                 .worlds = deps.worlds,
                 .inventories = deps.inventories,
             }),
+            .awake = try allocator.alloc(entities.Id, deps.dropped.residents.len),
+            .active_slots = try .initEmpty(allocator, deps.dropped.residents.len),
+            .asked = try .initEmpty(allocator, deps.dropped.residents.len),
         };
+        try deps.physics.deps.chunks.observe(.init(self, blocksChanged));
         return self;
+    }
+
+    /// Sleepers within a section of an edit wake on the next tick to look again: the block
+    /// they rest on may be gone, and they fall on their own tick of four.
+    fn blocksChanged(self: *ItemTick, section: chunks.Section, _: []const chunks.BlockEdit, _: []const u16) void {
+        const dropped = self.deps.dropped;
+        for (dropped.sleeping.values()) |index| {
+            const at = dropped.residents[index];
+            if (at.world != section.world or @abs(at.x - section.x) > 1 or @abs(at.z - section.z) > 1 or @abs(at.y - section.y) > 1) continue;
+            self.asked.set(index);
+        }
+    }
+
+    /// The items to tick this tick, in order: sleepers stay out but for those due to merge,
+    /// to despawn, or asked to wake. A sleeper no player is near any more stops where it is.
+    fn wakeful(self: *ItemTick, active: []const entities.Id, now: u64) []const entities.Id {
+        const dropped = self.deps.dropped;
+        self.active_slots.unsetAll();
+        var count: usize = 0;
+        for (active) |entity| {
+            const index = dropped.ids.get(entity).?;
+            self.active_slots.set(index);
+            if (dropped.sleeping.contains(index)) {
+                const sleep = dropped.sleeps[index];
+                const elapsed = now - sleep.since;
+                const ticks = sleep.ticks +% @as(u32, @intCast(elapsed));
+                const due = ticks % 40 == 0 or @as(i64, sleep.age) + @as(i64, @intCast(elapsed)) >= 6000;
+                if (!due and !self.asked.isSet(index)) continue;
+                dropped.wake(index, std.math.maxInt(u64));
+            }
+            self.awake[count] = entity;
+            count += 1;
+        }
+        var index: usize = 0;
+        while (index < dropped.sleeping.count) {
+            const slot = dropped.sleeping.values()[index];
+            if (self.active_slots.isSet(slot)) {
+                index += 1;
+                continue;
+            }
+            dropped.wake(slot, now - 1);
+        }
+        self.asked.unsetAll();
+        return self.awake[0..count];
     }
 
     /// Whether lava flows strongly in the world, as in the nether, which pushes items harder.
@@ -80,7 +135,8 @@ pub const ItemTick = struct {
     pub fn tick(self: *ItemTick) !void {
         const dropped = self.deps.dropped;
         var burst = self.merge_work.burst;
-        const active = self.query.read(self.deps.players.config.simulation_distance);
+        const now = dropped.clock.tick + 1;
+        const active = self.wakeful(self.query.read(self.deps.players.config.simulation_distance), now);
         var start_low: usize = 0;
         var start_high = active.len;
         while (start_low < start_high) {
@@ -93,15 +149,21 @@ pub const ItemTick = struct {
         self.hazards.window = &neighborhood;
         defer self.hazards.window = null;
         defer self.hazards.endTick();
+        // Items tick from just after the last merge candidate and round: others reading one
+        // know from this whether it has had this tick.
+        dropped.clock = .{ .tick = now, .running = true, .start = self.merge_after +| 1 };
+        defer dropped.clock.running = false;
         var iterator = dropped.iterate(active);
         defer iterator.deinit();
         iterator.start = start_low;
         while (try iterator.next()) |records| for (records) |record| {
             const entity = record.id;
+            defer dropped.clock.last = entity;
             var metadata = try record.read();
             if (!metadata.alive) continue;
 
             var body = (try record.body.read()) orelse return error.Corrupt;
+            const before = body.position;
             metadata.ticks +%= 1;
 
             // Entity.baseTick: pushed by currents, then burning down.
@@ -139,6 +201,7 @@ pub const ItemTick = struct {
                 metadata.revision += 1;
                 body = advanced.body;
             }
+            const moved_revision = metadata.revision;
 
             if (subject.removed) {
                 // ItemEntity.hurtServer: an item with no health left is destroyed.
@@ -304,7 +367,13 @@ pub const ItemTick = struct {
                 try dropped.retire(entity, body, &metadata);
             }
 
+            // Resting where it is, with nothing around to change it, it sleeps until something does.
+            const restful = dropped.sleep and metadata.alive and advanced.moved and advanced.on_ground and !advanced.crossed_block and
+                std.meta.eql(before, body.position) and @abs(body.velocity[0]) < 1.0e-5 and @abs(body.velocity[2]) < 1.0e-5 and
+                fluids.water == 0 and fluids.lava == 0 and metadata.fire_ticks == 0 and metadata.ticks_frozen == 0 and !subject.hurt and
+                metadata.stuck == .none and metadata.age >= 0 and metadata.age < 5999 and metadata.revision == moved_revision;
             record.write(metadata);
+            if (restful) if (try self.deps.physics.rest(&neighborhood, body)) |still| dropped.lull(entity, metadata, still.speed, still.friction);
         };
     }
 };
