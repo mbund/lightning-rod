@@ -1088,3 +1088,52 @@ test "packed reads bound their buffer and distinguish missing from unfinished va
     for (second_values) |value| try std.testing.expectEqual(@as(usize, 0), value.?.len);
     try std.testing.expectEqual(@as(usize, 0), second_output.used);
 }
+
+test "a pass larger than the cache keeps its resident part cached when the rest is transient" {
+    const Backend = struct {
+        pub const write_batch_size = 192;
+        reads: usize = 0,
+
+        pub fn getBatch(self: *@This(), requests: []const records.Get, lengths: []?usize) !void {
+            self.reads += requests.len;
+            for (requests, lengths) |request, *length| {
+                request.destination[0] = request.key[0];
+                length.* = 1;
+            }
+        }
+
+        pub fn putBatch(_: *@This(), _: []const records.Write) !void {
+            return error.UnexpectedWrite;
+        }
+
+        pub fn fail(_: *@This()) void {}
+    };
+    const TestCache = records.CacheFor(Backend);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const slots = 16;
+    const batch = 4;
+    const resident = slots - batch;
+    var keys: [40][1]u8 = undefined;
+    for (&keys, 0..) |*key, index| key.* = .{@intCast(index)};
+    for ([_]bool{ false, true }) |streaming| {
+        var cache = try TestCache.init(arena.allocator(), std.testing.io, .{}, .{ .slots = slots, .key_bytes = 1, .value_bytes = 1 });
+        for (0..4) |pass| {
+            const before = cache.backend.reads;
+            var at: usize = 0;
+            while (at < keys.len) : (at += batch) {
+                var requests: [batch][]const u8 = undefined;
+                for (&requests, keys[at..][0..batch]) |*request, *key| request.* = key;
+                var leases: [batch]TestCache.Lease = undefined;
+                if (streaming and at >= resident) try cache.acquireManyTransient(&requests, &leases) else try cache.acquireMany(&requests, &leases);
+                for (requests, leases) |request, lease| try std.testing.expectEqualSlices(u8, request, lease.read().?);
+                for (leases) |lease| lease.release();
+            }
+            if (pass == 0) continue;
+            // A clock over a cyclic pass larger than itself misses every time; transient
+            // acquisitions leave the resident part to hit.
+            const expected: usize = if (streaming) keys.len - resident else keys.len;
+            try std.testing.expectEqual(expected, cache.backend.reads - before);
+        }
+    }
+}

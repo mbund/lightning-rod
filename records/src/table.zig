@@ -298,6 +298,14 @@ const Cell = struct {
 const UpdateWorkspace = struct {
     blob_indices: [storage.batch_size]blob.Index = undefined,
     path: [maximum_depth]storage.Page = undefined,
+    /// The branch at each depth of the last descent, its page still in path and its navigation
+    /// validated, for the next update of the same batch to descend without decoding it again.
+    /// Anything an update changes above a leaf forgets them all.
+    known: [maximum_depth]?storage.PageId = @splat(null),
+    /// The table they are of, and the store as the last batch left it: writer workspaces serve
+    /// every table of their resources, and other writers may come between batches.
+    known_revision: ?KnownRevision = null,
+    navigation: [maximum_depth]Navigation = undefined,
     cells: [working_cells]Cell = undefined,
     parent_cells: [maximum_cells]Cell = undefined,
     peer_cells: [2][maximum_cells]Cell = undefined,
@@ -306,6 +314,8 @@ const UpdateWorkspace = struct {
     writes: [storage.batch_size]storage.Write = undefined,
     children: [maximum_outputs]Cell = undefined,
 };
+
+const KnownRevision = struct { table: TableIdentity, identity: [16]u8, token: u64, mutation: u64 };
 
 const TableIdentity = struct {
     store: *storage.Store,
@@ -975,6 +985,7 @@ pub const Table = struct {
         const lease = self.resources.acquireWrite(self.identity());
         defer lease.end();
         const workspace = lease.workspace;
+        try self.recall(&workspace.update);
         var nodes: NodeBatch = .{ .space = self.space, .ids = &workspace.ids, .pages = &workspace.pages };
         var begin: usize = 0;
         while (begin < writes.len) {
@@ -1007,7 +1018,7 @@ pub const Table = struct {
                 while (applied < unique) {
                     const limit = applied + @min(window, unique - applied);
                     const held = &workspace.borrowed;
-                    const kept = try self.prefetch(sorted[applied..limit], &nodes, &workspace.update.cells, held);
+                    const kept = try self.prefetch(sorted[applied..limit], &nodes, &workspace.update, held);
                     assert(kept <= limit - applied);
                     defer storage.PageLease.releaseMany(held[0..kept]);
                     while (applied < limit) {
@@ -1020,10 +1031,26 @@ pub const Table = struct {
             begin += count;
         }
         try nodes.flush();
+        workspace.update.known_revision = try self.knownRevision();
     }
 
     /// Retains leaf leases in held[0..result] until the caller finishes its update window.
-    fn prefetch(self: Table, writes: []const Write, nodes: *const NodeBatch, cells: []Cell, held: []storage.PageLease) storage.Error!usize {
+    /// Keeps the branches the last batch descended through when nothing has written a page of
+    /// the store since: any write moves its mutation count.
+    fn recall(self: Table, workspace: *UpdateWorkspace) storage.Error!void {
+        const now = try self.knownRevision();
+        const same = if (workspace.known_revision) |then| std.meta.eql(then, now) else false;
+        if (!same) workspace.known = @splat(null);
+        workspace.known_revision = null;
+    }
+
+    /// Where the store is now, for the next batch to see whether it moved.
+    fn knownRevision(self: Table) storage.Error!KnownRevision {
+        const revision = try self.space.revision();
+        return .{ .table = self.identity(), .identity = revision.identity, .token = revision.token, .mutation = revision.mutation };
+    }
+
+    fn prefetch(self: Table, writes: []const Write, nodes: *const NodeBatch, workspace: *UpdateWorkspace, held: []storage.PageLease) storage.Error!usize {
         assert(writes.len <= storage.batch_size and held.len >= writes.len);
         if (writes.len < 2) return 0;
         const root = try self.getRoot() orelse return 0;
@@ -1067,12 +1094,23 @@ pub const Table = struct {
             defer if (!retained) storage.PageLease.releaseMany(held[0..misses]);
             for (held[0..misses], missing_positions[0..misses]) |lease, index| views[index] = lease.bytes();
             for (views[0..reading], 0..) |bytes, page_index| {
-                const node = try Node.decode(bytes, cells);
+                // A leaf is only kept at hand here; the update reads and checks it.
+                const branch = bytes[4] != 0;
+                const navigation = &workspace.navigation[depth];
+                if (branch and workspace.known[depth] != unique[page_index]) {
+                    // The update descends through it next: it keeps the page and its navigation.
+                    workspace.known[depth] = null;
+                    @memcpy(&workspace.path[depth], bytes);
+                    try navigation.decode(&workspace.path[depth]);
+                    if (!navigation.branch) return error.Corrupt;
+                    if (reading == 1) workspace.known[depth] = unique[page_index];
+                }
+                const node: NodeView = .{ .page = &workspace.path[depth], .navigation = navigation };
                 for (writes, 0..) |write, index| {
                     if (!active[index] or mapping[index] != page_index) continue;
-                    if (node.branch) {
+                    if (branch) {
                         const position = node.lowerBound(write.key);
-                        ids[index] = @fromBackingInt(@intCast(node.cells[@min(position, node.count - 1)].reference));
+                        ids[index] = @fromBackingInt(@intCast(node.cell(@min(position, navigation.count - 1)).reference));
                     } else active[index] = false;
                 }
             }
@@ -1111,15 +1149,31 @@ pub const Table = struct {
             try self.setRoot(ids[0]);
         }
         var node: Node = undefined;
+        // Branches descend by navigation, as the last update left them where it can; the leaf
+        // is decoded whole, as it is rewritten.
         while (true) {
-            try nodes.read(ids[depth], &path[depth]);
-            node = try Node.decode(&path[depth], cells);
-            positions[depth] = node.lowerBound(first.key);
-            if (!node.branch) break;
-            positions[depth] = @min(positions[depth], node.count - 1);
-            if (positions[depth] + 1 != node.count) rightmost = false;
+            const known = workspace.known[depth] == ids[depth];
+            if (!known) {
+                workspace.known[depth] = null;
+                try nodes.read(ids[depth], &path[depth]);
+            }
+            if (path[depth][4] == 0) {
+                node = try Node.decode(&path[depth], cells);
+                positions[depth] = node.lowerBound(first.key);
+                if (node.branch) return error.Corrupt;
+                break;
+            }
+            const navigation = &workspace.navigation[depth];
+            if (!known) {
+                try navigation.decode(&path[depth]);
+                if (!navigation.branch) return error.Corrupt;
+                workspace.known[depth] = ids[depth];
+            }
+            const view: NodeView = .{ .page = &path[depth], .navigation = navigation };
+            positions[depth] = @min(view.lowerBound(first.key), navigation.count - 1);
+            if (positions[depth] + 1 != navigation.count) rightmost = false;
             if (depth + 1 == maximum_depth) return error.NoSpace;
-            ids[depth + 1] = @fromBackingInt(@intCast(node.cells[positions[depth]].reference));
+            ids[depth + 1] = @fromBackingInt(@intCast(view.cell(positions[depth]).reference));
             depth += 1;
         }
         var height = depth + 1;
@@ -1171,6 +1225,7 @@ pub const Table = struct {
         const children = &workspace.children;
         while (true) {
             if (depth == 0 and node.branch and node.count == 1) {
+                workspace.known = @splat(null);
                 const child: storage.PageId = @fromBackingInt(@intCast(node.cells[0].reference));
                 try self.setRoot(child);
                 nodes.discard(ids[0]);
@@ -1187,6 +1242,7 @@ pub const Table = struct {
             var node_bytes: usize = node_header_size;
             for (node.cells[0..node.count]) |*cell| node_bytes += cell.bytes();
             if (depth != 0 and (node_bytes > storage.page_size or node_bytes < storage.page_size / 2)) {
+                workspace.known = @splat(null);
                 const parent = try Node.decode(&path[depth - 1], parent_cells);
                 const at = positions[depth - 1];
                 const first_peer = @min(at -| 1, parent.count -| 3);
@@ -1358,6 +1414,7 @@ pub const Table = struct {
                 }
             }
             if (depth == 0) {
+                workspace.known = @splat(null);
                 if (child_count == 0) try self.setRoot(null);
                 if (child_count <= 1) return used;
                 if (height == maximum_depth) return error.NoSpace;
@@ -1371,6 +1428,13 @@ pub const Table = struct {
                 continue;
             }
             depth -= 1;
+            // A node rewritten in place under the same key leaves its parent as it was.
+            if (replaced == 1 and child_count == 1 and workspace.known[depth] == ids[depth]) {
+                const view: NodeView = .{ .page = &path[depth], .navigation = &workspace.navigation[depth] };
+                const cell = view.cell(positions[depth]);
+                if (cell.reference == children[0].reference and std.mem.eql(u8, cell.key, children[0].keySlice())) return used;
+            }
+            workspace.known = @splat(null);
             node = try Node.decode(&path[depth], cells);
             const at = positions[depth];
             if (replaced == 1 and child_count == 1 and node.cells[at].reference == children[0].reference and

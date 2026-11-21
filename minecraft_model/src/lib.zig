@@ -54,6 +54,15 @@ pub const EntityFlags = packed struct(u8) {
     gliding: bool = false,
 };
 
+/// LivingEntity's DATA_LIVING_ENTITY_FLAGS: whether it uses an item, in which hand, and whether
+/// it spins as a riptide trident throws it.
+pub const LivingFlags = packed struct(u8) {
+    using: bool = false,
+    off_hand: bool = false,
+    spin_attack: bool = false,
+    unused: u5 = 0,
+};
+
 pub const Action = enum(i32) {
     leave_bed,
     start_sprinting,

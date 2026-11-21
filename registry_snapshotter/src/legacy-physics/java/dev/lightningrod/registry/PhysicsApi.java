@@ -7,4 +7,5 @@ final class PhysicsApi {
     static int maximum(IntProvider provider) { return provider.getMaxValue(); }
     // Releases before 26.1 name the tag directly.
     static String resistedTag(net.minecraft.world.item.component.DamageResistant resistant) { return resistant.types().location().toString(); }
+    static String bypassedTag(net.minecraft.world.item.component.BlocksAttacks blocks) { return blocks.bypassedBy().map(tag -> tag.location().toString()).orElse(""); }
 }

@@ -1,6 +1,11 @@
 const std = @import("std");
 
+/// The particles the server sends, each found by name in a release's particle registry.
+pub const Particle = enum { sweep_attack, damage_indicator, crit, enchanted_hit };
+
 pub const Registry = struct {
+    /// Wire ids by Particle, absent ones negative. A mapping built by hand has none.
+    particles: []const i32 = &.{},
     entities: []const i32,
     items: []const i32,
     blocks: []const i32,
@@ -12,6 +17,7 @@ pub const Registry = struct {
 
     pub fn forVersion(comptime Version: type) Registry {
         return .{
+            .particles = comptime particleIds(Version),
             .entities = Version.Registry.canonical_entity_to_wire,
             .items = Version.Registry.canonical_item_to_wire,
             .blocks = Version.Registry.canonical_block_to_wire,
@@ -21,6 +27,10 @@ pub const Registry = struct {
             .effects = Version.Registry.canonical_effect_to_wire,
             .attributes = Version.Registry.canonical_attribute_to_wire,
         };
+    }
+
+    pub fn particleId(self: Registry, particle: Particle) !i32 {
+        return lookup(self.particles, @intFromEnum(particle));
     }
 
     pub fn entityId(self: Registry, canonical: i32) !i32 {
@@ -51,6 +61,15 @@ pub const Registry = struct {
         return lookup(self.attributes, canonical);
     }
 };
+
+fn particleIds(comptime Version: type) []const i32 {
+    @setEvalBranchQuota(100_000);
+    const all = std.enums.values(Particle);
+    var ids: [all.len]i32 = undefined;
+    for (all, &ids) |particle, *id| id.* = Version.Registry.particleId("minecraft:" ++ @tagName(particle)) orelse -1;
+    const final = ids;
+    return &final;
+}
 
 fn lookup(mapping: []const i32, canonical: i32) error{UnsupportedRegistryEntry}!i32 {
     if (canonical < 0 or canonical >= mapping.len) return error.UnsupportedRegistryEntry;

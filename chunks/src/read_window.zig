@@ -24,6 +24,8 @@ pub fn ReadWindow(comptime capacity: usize) type {
                 self.deinit();
                 return;
             }
+            // Everything held already, as for reads near the last: the views, and nothing moves.
+            if (self.viewsHeld(sections, views)) return;
             var required: usize = 0;
             for (0..self.count) |at| {
                 const wanted = for (sections) |request| {
@@ -69,6 +71,18 @@ pub fn ReadWindow(comptime capacity: usize) type {
                 } else unreachable;
                 view.* = self.leases[at].view();
             }
+        }
+
+        /// Fills the views if the window holds every section, the last held first.
+        fn viewsHeld(self: *const Self, sections: []const chunks.Section, views: []chunks.View) bool {
+            for (sections, views) |section, *view| {
+                const at = for (0..self.count) |offset| {
+                    const index = self.count - 1 - offset;
+                    if (std.meta.eql(self.sections[index], section)) break index;
+                } else return false;
+                view.* = self.leases[at].view();
+            }
+            return true;
         }
 
         pub fn deinit(self: *Self) void {

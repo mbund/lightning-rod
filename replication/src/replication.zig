@@ -146,8 +146,8 @@ pub const Replication = struct {
     render_distance: i32 = 0,
 
     /// The entity data a player's flags packet carries: its entity flags, the pose they imply,
-    /// and the skin layers its client shows.
-    const Appearance = struct { flags: minecraft.EntityFlags = .{}, skin_parts: u8 = 0 };
+    /// its living entity flags, and the skin layers its client shows.
+    const Appearance = struct { flags: minecraft.EntityFlags = .{}, living: minecraft.LivingFlags = .{}, skin_parts: u8 = 0 };
     const Motion = packed struct(u8) { moved: bool = false, turned: bool = false, _: u6 = 0 };
     const Subject = struct {
         generation: u32 = 0,
@@ -361,7 +361,7 @@ pub const Replication = struct {
                 .position = .{ fixed(player.position.x), fixed(player.position.y), fixed(player.position.z) },
                 .yaw = angle(player.rotation.yaw),
                 .pitch = angle(player.rotation.pitch),
-                .flags = .{ .flags = player.flags, .skin_parts = player.skin_parts },
+                .flags = .{ .flags = player.flags, .living = player.living_flags, .skin_parts = player.skin_parts },
                 .on_ground = player.on_ground,
                 .entity_visibility = self.deps.visibility.player_entity.revision(index),
                 .tab_visibility = self.deps.visibility.tab_list.revision(index),
@@ -1168,9 +1168,10 @@ pub const Replication = struct {
     const FlagMetadata = struct { appearance: Appearance, skin_key: u8 };
 
     fn writeFlagMetadata(packet: wire_1_21_5.entityMetadata.Writer, value: FlagMetadata) !wire_1_21_5.entityMetadata.Writer.Done {
-        var entries = try packet.value(3);
+        var entries = try packet.value(4);
         try entries.advance(try packets.nested(.{writeFlagEntry}).write((try entries.next()).?, value.appearance.flags));
         try entries.advance(try packets.nested(.{writePoseEntry}).write((try entries.next()).?, value.appearance.flags));
+        try entries.advance(try packets.nested(.{writeLivingEntry}).write((try entries.next()).?, value.appearance.living));
         try entries.advance(try packets.nested(.{writeSkinEntry}).write((try entries.next()).?, value));
         return entries.finish();
     }
@@ -1184,6 +1185,11 @@ pub const Replication = struct {
 
     fn writeFlagEntry(packet: FlagEntry, flags: minecraft.EntityFlags) !FlagEntry.Done {
         return (try (try packet.key(0)).type()).value(@bitCast(flags));
+    }
+
+    /// LivingEntity.DATA_LIVING_ENTITY_FLAGS, the first living entity field in every release.
+    fn writeLivingEntry(packet: FlagEntry, flags: minecraft.LivingFlags) !FlagEntry.Done {
+        return (try (try packet.key(8)).type()).value(@bitCast(flags));
     }
 
     fn writePoseEntry(packet: PoseEntry, flags: minecraft.EntityFlags) !PoseEntry.Done {

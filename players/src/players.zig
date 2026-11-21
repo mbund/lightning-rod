@@ -213,6 +213,7 @@ pub const Players = struct {
         try deps.input.on(.position_look, self, onPositionLook);
         try deps.input.on(.look, self, onLook);
         try deps.input.on(.flying, self, onGround);
+        try deps.input.on(.tick_end, self, onTickEnd);
         try deps.input.on(.entity_action, self, onEntityAction);
         try deps.input.on(.settings, self, onSettings);
         try deps.input.on(.player_input, self, onControls);
@@ -479,11 +480,21 @@ pub const Players = struct {
         player.teleport_id = if (player.teleport_id == std.math.maxInt(i32)) 1 else player.teleport_id + 1;
         try self.place(player);
         player.flags = .{};
+        player.known_movement = @splat(0);
         player.on_ground = false;
         player.loaded = false;
         player.stage = .respawn;
         player.revision += 1;
         self.updateIndexes(player.handle.?.index);
+    }
+
+    /// ServerGamePacketListenerImpl.handleClientTickEnd: a client tick without a move packet
+    /// moved nothing.
+    fn onTickEnd(self: *Players, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_tick_end.Reader) !void {
+        body.finish() catch return error.InvalidPacket;
+        const player = &self.records[handle.index];
+        if (!player.moved) player.known_movement = @splat(0);
+        player.moved = false;
     }
 
     fn onPlayerLoaded(self: *Players, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_player_loaded.Reader) !void {
@@ -536,6 +547,10 @@ pub const Players = struct {
             if (!self.allows(position)) return;
         }
         if (movement.rotation) |rotation| accepted.rotation = normalizeRotation(rotation) catch return;
+        // ServerPlayer.lastKnownClientMovement: what this packet moved, nothing for one that
+        // only turns.
+        player.known_movement = if (accepted.position) |position| .{ position.x - player.position.x, position.y - player.position.y, position.z - player.position.z } else @splat(0);
+        player.moved = true;
         if (accepted.position) |position| {
             player.position = position;
             self.updateIndexes(handle.index);

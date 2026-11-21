@@ -90,6 +90,59 @@ pub const EntityType = struct {
 
 const mob_state_size = 7;
 
+/// Where an item's attribute modifiers apply, as vanilla's EquipmentSlotGroup names them.
+pub const SlotGroup = enum { any, mainhand, offhand, hand, feet, legs, chest, head, armor, body, saddle };
+
+pub const ItemModifier = struct {
+    pub const Operation = enum(u8) { add_value, add_multiplied_base, add_multiplied_total };
+    attribute: []const u8,
+    id: []const u8,
+    slot: SlotGroup,
+    operation: Operation,
+    amount: f64,
+};
+
+pub const Weapon = struct { damage_per_attack: u16, disable_blocking_seconds: f32 };
+
+/// A blocks_attacks component: an item that blocks while raised, as shields do.
+pub const BlocksAttacks = struct {
+    pub const Reduction = struct { horizontal_angle: f32, typed: bool, base: f32, factor: f32 };
+    block_delay_seconds: f32,
+    disable_cooldown_scale: f32,
+    /// The damage reductions, `reduction_bytes` each, read with `reduction`.
+    reductions: []const u8,
+    damage_threshold: f32,
+    damage_base: f32,
+    damage_factor: f32,
+    /// A damage type tag that passes the block, a sound for a block and one for being disabled,
+    /// empty for none.
+    bypassed_by: []const u8,
+    block_sound: []const u8,
+    disabled_sound: []const u8,
+
+    pub const reduction_bytes = 4 + 1 + 4 + 4;
+
+    pub fn reductionCount(self: BlocksAttacks) usize {
+        return self.reductions.len / reduction_bytes;
+    }
+
+    pub fn reduction(self: BlocksAttacks, index: usize) Reduction {
+        const entry = self.reductions[index * reduction_bytes ..][0..reduction_bytes];
+        return .{
+            .horizontal_angle = @bitCast(std.mem.readInt(u32, entry[0..4], .big)),
+            .typed = entry[4] != 0,
+            .base = @bitCast(std.mem.readInt(u32, entry[5..9], .big)),
+            .factor = @bitCast(std.mem.readInt(u32, entry[9..13], .big)),
+        };
+    }
+};
+
+/// A blocks_attacks entry past its reductions: three floats of item damage and three names.
+const blocking_tail_bytes = 4 * 3 + 2 * 3;
+
+/// An attribute modifier entry: attribute, id and slot group names, operation and amount.
+const modifier_bytes = 2 + 2 + 2 + 1 + 8;
+
 pub fn Data(comptime expected_states: usize, comptime expected_blocks: usize, comptime bytes: []const u8) type {
     const shape_count = std.mem.readInt(u32, bytes[12..16], .big);
     const box_count = std.mem.readInt(u32, bytes[16..20], .big);
@@ -128,8 +181,33 @@ pub fn Data(comptime expected_states: usize, comptime expected_blocks: usize, co
         const count = std.mem.readInt(u32, bytes[at..][0..4], .big);
         break :items .{ .tags = tags, .count = count, .offset = at + 4 };
     };
-    std.debug.assert(bytes.len == items.offset + items.count);
-    std.debug.assert(std.mem.eql(u8, bytes[0..8], "LRPHYS08"));
+    const modifiers = comptime modifiers: {
+        @setEvalBranchQuota(1_000_000);
+        var at: usize = items.offset + items.count;
+        const name_count = std.mem.readInt(u32, bytes[at..][0..4], .big);
+        at += 4;
+        var names: [name_count][]const u8 = undefined;
+        for (&names) |*name| {
+            const length = std.mem.readInt(u16, bytes[at..][0..2], .big);
+            name.* = bytes[at + 2 ..][0..length];
+            at += 2 + length;
+        }
+        const count = std.mem.readInt(u32, bytes[at..][0..4], .big);
+        at += 4;
+        var offsets: [count]u32 = undefined;
+        var blocking: [count]u32 = undefined;
+        for (&offsets, &blocking) |*offset_value, *blocking_value| {
+            offset_value.* = at;
+            at += 1 + @as(usize, bytes[at]) * modifier_bytes;
+            at += if (bytes[at] == 0) 1 else 1 + 2 + 4;
+            blocking_value.* = at;
+            at += if (bytes[at] == 0) 1 else 1 + 4 + 4 + 1 + @as(usize, bytes[at + 9]) * BlocksAttacks.reduction_bytes + blocking_tail_bytes;
+        }
+        break :modifiers .{ .names = names, .offsets = offsets, .blocking = blocking, .end = at };
+    };
+    std.debug.assert(modifiers.offsets.len == items.count);
+    std.debug.assert(bytes.len == modifiers.end);
+    std.debug.assert(std.mem.eql(u8, bytes[0..8], "LRPHYS10"));
     std.debug.assert(std.mem.readInt(u32, bytes[8..12], .big) == expected_states);
     std.debug.assert(std.mem.readInt(u32, bytes[experience_offset..][0..4], .big) == expected_blocks);
     std.debug.assert(std.mem.readInt(u32, bytes[mob_states_offset..][0..4], .big) == expected_states);
@@ -173,6 +251,58 @@ pub fn Data(comptime expected_states: usize, comptime expected_blocks: usize, co
         }
 
         pub const item_count = items.count;
+
+        /// How many default attribute modifiers an item has, as its attribute_modifiers component
+        /// lists them.
+        pub fn itemModifierCount(item: u32) u8 {
+            std.debug.assert(item < items.count);
+            return bytes[modifiers.offsets[item]];
+        }
+
+        /// One of an item's default attribute modifiers, its names read in place.
+        pub fn itemModifier(item: u32, index: u8) ItemModifier {
+            std.debug.assert(index < itemModifierCount(item));
+            const entry = bytes[modifiers.offsets[item] + 1 + @as(usize, index) * modifier_bytes ..][0..modifier_bytes];
+            const operation = std.enums.fromInt(ItemModifier.Operation, entry[6]) orelse unreachable;
+            return .{
+                .attribute = modifiers.names[std.mem.readInt(u16, entry[0..2], .big)],
+                .id = modifiers.names[std.mem.readInt(u16, entry[2..4], .big)],
+                .slot = std.meta.stringToEnum(SlotGroup, modifiers.names[std.mem.readInt(u16, entry[4..6], .big)]) orelse unreachable,
+                .operation = operation,
+                .amount = @bitCast(std.mem.readInt(u64, entry[7..15], .big)),
+            };
+        }
+
+        /// An item's weapon component: how much an attack wears it, and how long it disables a
+        /// shield it hits.
+        pub fn itemWeapon(item: u32) ?Weapon {
+            const at = modifiers.offsets[item] + 1 + @as(usize, itemModifierCount(item)) * modifier_bytes;
+            if (bytes[at] == 0) return null;
+            return .{
+                .damage_per_attack = std.mem.readInt(u16, bytes[at + 1 ..][0..2], .big),
+                .disable_blocking_seconds = @bitCast(std.mem.readInt(u32, bytes[at + 3 ..][0..4], .big)),
+            };
+        }
+
+        /// An item's blocks_attacks component, its reductions and names read in place.
+        pub fn itemBlocksAttacks(item: u32) ?BlocksAttacks {
+            std.debug.assert(item < items.count);
+            const at = modifiers.blocking[item];
+            if (bytes[at] == 0) return null;
+            const count = bytes[at + 9];
+            const tail = at + 10 + @as(usize, count) * BlocksAttacks.reduction_bytes;
+            return .{
+                .block_delay_seconds = @bitCast(std.mem.readInt(u32, bytes[at + 1 ..][0..4], .big)),
+                .disable_cooldown_scale = @bitCast(std.mem.readInt(u32, bytes[at + 5 ..][0..4], .big)),
+                .reductions = bytes[at + 10 .. tail],
+                .damage_threshold = @bitCast(std.mem.readInt(u32, bytes[tail..][0..4], .big)),
+                .damage_base = @bitCast(std.mem.readInt(u32, bytes[tail + 4 ..][0..4], .big)),
+                .damage_factor = @bitCast(std.mem.readInt(u32, bytes[tail + 8 ..][0..4], .big)),
+                .bypassed_by = modifiers.names[std.mem.readInt(u16, bytes[tail + 12 ..][0..2], .big)],
+                .block_sound = modifiers.names[std.mem.readInt(u16, bytes[tail + 14 ..][0..2], .big)],
+                .disabled_sound = modifiers.names[std.mem.readInt(u16, bytes[tail + 16 ..][0..2], .big)],
+            };
+        }
 
         /// The damage type tag an item resists by default, as its damage_resistant component
         /// names it.

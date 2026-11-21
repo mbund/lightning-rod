@@ -9,4 +9,7 @@ final class PhysicsApi {
     static String resistedTag(net.minecraft.world.item.component.DamageResistant resistant) {
         return resistant.types().unwrapKey().orElseThrow(() -> new IllegalStateException("Damage resistance without a tag")).location().toString();
     }
+    static String bypassedTag(net.minecraft.world.item.component.BlocksAttacks blocks) {
+        return blocks.bypassedBy().flatMap(set -> set.unwrapKey()).map(tag -> tag.location().toString()).orElse("");
+    }
 }

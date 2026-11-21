@@ -127,6 +127,8 @@ pub fn main(init: std.process.Init) !void {
     try writeNamedRegistry(&output, "enchantment", enchantments.array.items);
     const component_mappings = protocol.object.get("types").?.object.get("SlotComponentType").?.array.items[1].object.get("mappings").?.object;
     try writeMappedRegistry(&output, "data_component", "dataComponent", component_mappings);
+    const particle_type = protocol.object.get("types").?.object.get("Particle").?.array.items[1].array.items[0].object.get("type").?;
+    try writeMappedRegistry(&output, "particle", "particle", particle_type.array.items[1].object.get("mappings").?.object);
 
     for (sounds.array.items, 0..) |entry, index| {
         if (try intField(entry.object, "id") != index + 1) return error.NonDenseSoundRegistry;

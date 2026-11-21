@@ -34,6 +34,13 @@ pub const Player = struct {
     loaded: bool = false,
     on_ground: bool = false,
     flags: minecraft.EntityFlags = .{},
+    /// Whether the player raises an item, and which hand holds it.
+    living_flags: minecraft.LivingFlags = .{},
+    /// What the client's last move packet moved the player, zero after a client tick without
+    /// one: ServerPlayer.getKnownMovement.
+    known_movement: [3]f64 = @splat(0),
+    /// Whether a move packet came this client tick.
+    moved: bool = false,
     /// The skin layers the player's client shows, one bit each, as its settings say.
     skin_parts: u8 = 0,
     /// Which chat the client shows, as its settings say: 0 everything, 1 only system messages, 2

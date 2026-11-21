@@ -58,7 +58,7 @@ final class PhysicsSnapshot {
         }
         int boxCount = shapes.keySet().stream().mapToInt(List::size).sum();
         try (var output = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(destination)))) {
-            output.write("LRPHYS08".getBytes(StandardCharsets.US_ASCII));
+            output.write("LRPHYS10".getBytes(StandardCharsets.US_ASCII));
             output.writeInt(Block.BLOCK_STATE_REGISTRY.size());
             output.writeInt(shapes.size());
             output.writeInt(boxCount);

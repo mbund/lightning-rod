@@ -109,11 +109,20 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
         scan_bytes: []u8,
         codec: ?Codec,
         encoded: []u8,
+        /// Entries transient acquisitions read, oldest first: eviction takes them before the
+        /// clock looks at anything else. A reference whose entry moved on is skipped.
+        transients: []Transient,
+        transient_head: usize = 0,
+        transient_count: usize = 0,
+
+        const Transient = struct { slot: usize, generation: u64 };
 
         const Entry = struct {
             generation: u64 = 0,
             revision: u64 = 0,
             referenced: bool = false,
+            /// Read by a transient acquisition and not asked for since by any other.
+            transient: bool = false,
             key_len: usize = 0,
             value_len: usize = 0,
             pins: usize = 0,
@@ -161,6 +170,8 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
             var dirty_entries = try IndexSet.init(allocator, slots);
             errdefer dirty_entries.deinit(allocator);
             const encoded = try allocator.alloc(u8, if (configuration.codec == null) 0 else @max(64 * 1024, configuration.value_bytes));
+            errdefer allocator.free(encoded);
+            const transients = try allocator.alloc(Transient, slots);
 
             for (scan_entries, 0..) |*entry, i|
                 entry.* = .{
@@ -175,6 +186,7 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
                 .scan_bytes = scan_bytes,
                 .codec = configuration.codec,
                 .encoded = encoded,
+                .transients = transients,
                 .order = order,
                 .index = index,
                 .lookup = lookup,
@@ -211,6 +223,7 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
                 @memcpy(replacement.keyBytes(index)[0..entry.key_len], self.keyBytes(index)[0..entry.key_len]);
                 replacement.entries[index] = entry;
                 replacement.entries[index].ordered = false;
+                replacement.entries[index].transient = false;
                 if (entry.indexed) replacement.lookup.putAssumeCapacity(replacement.keyBytes(index)[0..entry.key_len], index);
                 if (entry.dirty) replacement.dirty_entries.insert(index);
             }
@@ -232,6 +245,45 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
             allocator.free(self.scan_entries);
             allocator.free(self.scan_bytes);
             allocator.free(self.encoded);
+            allocator.free(self.transients);
+        }
+
+        /// Claims unpinned transient entries as victims, oldest first, up to the victims wanted.
+        /// Returns how many references were looked at, to drop once the claim stands.
+        fn claimTransients(self: *Self, victims: usize, available: *usize) usize {
+            var looked: usize = 0;
+            while (available.* < victims and looked < self.transient_count) : (looked += 1) {
+                const reference = self.transients[(self.transient_head + looked) % self.transients.len];
+                const entry = &self.entries[reference.slot];
+                if (entry.generation != reference.generation or !entry.transient or !entry.occupied) continue;
+                // In use: it and every newer one stay for now.
+                if (entry.pins != 0) break;
+                self.order[available.*] = reference.slot;
+                available.* += 1;
+                self.addPin(reference.slot);
+            }
+            return looked;
+        }
+
+        fn dropTransients(self: *Self, count: usize) void {
+            assert(count <= self.transient_count);
+            self.transient_head = (self.transient_head + count) % self.transients.len;
+            self.transient_count -= count;
+        }
+
+        fn markTransient(self: *Self, slot: usize) void {
+            const entry = &self.entries[slot];
+            // Only as used as a clock's first look: what is read once goes before what is read again.
+            entry.referenced = false;
+            entry.transient = true;
+            if (self.transient_count == self.transients.len) {
+                // The oldest reference makes room, and its entry is left to the clock.
+                const oldest = self.transients[self.transient_head];
+                if (self.entries[oldest.slot].generation == oldest.generation) self.entries[oldest.slot].transient = false;
+                self.dropTransients(1);
+            }
+            self.transients[(self.transient_head + self.transient_count) % self.transients.len] = .{ .slot = slot, .generation = entry.generation };
+            self.transient_count += 1;
         }
 
         fn addPin(self: *Self, index: usize) void {
@@ -264,7 +316,15 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
         }
 
         pub fn acquireMany(self: *Self, keys: []const []const u8, leases: []Lease) !void {
-            const result = try self.acquireBatch(keys, leases, false, null, self.capacity);
+            const result = try self.acquireBatch(keys, leases, false, null, self.capacity, false);
+            assert(result == .ready);
+        }
+
+        /// As acquireMany, but what it reads from storage is evicted before anything else. A pass
+        /// over more than the cache holds then streams its excess through a few slots instead of
+        /// displacing what every pass finds cached. Hits are hits as ever.
+        pub fn acquireManyTransient(self: *Self, keys: []const []const u8, leases: []Lease) !void {
+            const result = try self.acquireBatch(keys, leases, false, null, self.capacity, true);
             assert(result == .ready);
         }
 
@@ -277,10 +337,10 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
         pub fn reserveMany(self: *Self, keys: []const []const u8, leases: []Lease, victims: []Lease, pin_limit: usize) !Reservation {
             assert(keys.len <= 192 and victims.len >= keys.len);
             assert(pin_limit <= self.entries.len);
-            return self.acquireBatch(keys, leases, true, victims, pin_limit);
+            return self.acquireBatch(keys, leases, true, victims, pin_limit, false);
         }
 
-        fn acquireBatch(self: *Self, keys: []const []const u8, leases: []Lease, comptime reserve_only: bool, victims_out: ?[]Lease, pin_limit: usize) !Reservation {
+        fn acquireBatch(self: *Self, keys: []const []const u8, leases: []Lease, comptime reserve_only: bool, victims_out: ?[]Lease, pin_limit: usize, comptime transient: bool) !Reservation {
             assert(keys.len == leases.len);
             if (self.failed) return error.FailedTransaction;
             if (keys.len > self.entries.len) return error.WorkingSetTooLarge;
@@ -293,12 +353,12 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
             defer acquisition.end();
             self.metrics.acquired.add(keys.len);
             for (keys) |key| if (key.len == 0 or key.len > self.key_bytes) return error.InvalidArgument;
-            if (try self.acquireResident(keys, leases, reserve_only, pin_limit)) |result| return result;
+            if (try self.acquireResident(keys, leases, reserve_only, pin_limit, transient)) |result| return result;
             // Keep miss buffers out of resident lookup frames.
-            return @call(.never_inline, Self.acquireMissing, .{ self, keys, leases, reserve_only, victims_out, pin_limit });
+            return @call(.never_inline, Self.acquireMissing, .{ self, keys, leases, reserve_only, victims_out, pin_limit, transient });
         }
 
-        fn acquireResident(self: *Self, keys: []const []const u8, leases: []Lease, comptime reserve_only: bool, pin_limit: usize) !?Reservation {
+        fn acquireResident(self: *Self, keys: []const []const u8, leases: []Lease, comptime reserve_only: bool, pin_limit: usize, comptime transient: bool) !?Reservation {
             const lookup = self.metrics.lookup.start();
             defer lookup.end();
             var acquired: usize = 0;
@@ -318,13 +378,14 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
                 const entry = &self.entries[lease.index];
                 assert(entry.pins > 0 and entry.generation == lease.generation);
                 entry.referenced = true;
+                if (!transient) entry.transient = false;
             }
             self.metrics.hits.add(keys.len);
             owned = false;
             return .ready;
         }
 
-        fn acquireMissing(self: *Self, keys: []const []const u8, leases: []Lease, comptime reserve_only: bool, victims_out: ?[]Lease, pin_limit: usize) !Reservation {
+        fn acquireMissing(self: *Self, keys: []const []const u8, leases: []Lease, comptime reserve_only: bool, victims_out: ?[]Lease, pin_limit: usize, comptime transient: bool) !Reservation {
             var acquired: usize = 0;
             errdefer for (leases[0..acquired]) |lease| lease.release();
             const protect = keys.len > 192;
@@ -422,6 +483,8 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
                         hits_owned = false;
                         return .{ .blocked = shortfall };
                     }
+                    // What transient acquisitions read goes first, oldest first.
+                    const transients_taken = self.claimTransients(victims, &available);
                     // The first revolution clears references. The second claims every unpinned victim.
                     var examined: usize = 0;
                     while (available < victims and examined < self.entries.len * 2) : (examined += 1) {
@@ -484,6 +547,7 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
                         self.metrics.writes.add(write_count);
                     }
 
+                    self.dropTransients(transients_taken);
                     var victim: usize = 0;
                     var previous: ?u16 = null;
 
@@ -526,6 +590,7 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
                 for (hits[0..count], leases[base..][0..count]) |hit, *lease| {
                     const slot = hit.?;
                     self.entries[slot].referenced = true;
+                    if (!transient) self.entries[slot].transient = false;
                     lease.* = .{ .cache = self, .index = slot, .generation = self.entries[slot].generation };
                     acquired += 1;
                 }
@@ -567,6 +632,7 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
 
                     self.metrics.reads.add(missing_count);
                 }
+                if (transient) for (missing[0..missing_count]) |slot| self.markTransient(slot);
 
                 base += count;
             }
