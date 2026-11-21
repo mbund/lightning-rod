@@ -15,6 +15,7 @@ pub const ReadWindow = @import("read_window.zig").ReadWindow;
 pub const classification = @import("classification.zig");
 pub const topology = @import("topology.zig");
 pub const layer = @import("layer.zig");
+pub const occupancy = @import("occupancy.zig");
 pub const Copies = @import("copies.zig").Copies;
 
 const Cache = records.CacheFor(Backend);

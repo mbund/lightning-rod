@@ -685,6 +685,7 @@ test {
     _ = @import("generation.zig");
     _ = @import("topology.zig");
     _ = @import("layer.zig");
+    _ = @import("occupancy.zig");
     _ = @import("copies.zig");
 }
 

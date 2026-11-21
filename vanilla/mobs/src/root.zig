@@ -24,6 +24,11 @@ pub const senses = @import("senses.zig");
 pub const random_positions = @import("random_positions.zig");
 pub const damage = @import("damage.zig");
 pub const melee = @import("melee.zig");
+pub const projectiles = @import("projectiles.zig");
+pub const ranged = @import("ranged.zig");
+pub const projectile_packets = @import("projectile_packets.zig");
+pub const projectile_store = @import("projectile_store.zig");
+pub const projectile_claims = @import("projectile_claims.zig");
 pub const mob_interaction = @import("mob_interaction.zig");
 
 test {
@@ -42,4 +47,7 @@ comptime {
     _ = &mob_interaction.MobInteraction.init;
     _ = &melee.Melee.init;
     _ = &melee.Melee.tick;
+    _ = &projectiles.Projectiles.init;
+    _ = &projectiles.Projectiles.tick;
+    _ = &ranged.Ranged.init;
 }

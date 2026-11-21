@@ -1,0 +1,1 @@
+.{ .client = "RangedFixture", .scenarios = .{.{ .name = "ranged", .peers = .{"alice"} }} }

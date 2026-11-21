@@ -34,6 +34,31 @@ pub const Ray = struct {
         }
         if (!std.math.isFinite(length_squared) or length_squared == 0) return error.InvalidRay;
         const length = @sqrt(length_squared);
+        // The three axes at once, each lane the same operations as one axis alone.
+        const V = @Vector(3, f64);
+        const zero: V = @splat(0);
+        const at: V = position;
+        const component: V = @as(V, vector) / @as(V, @splat(length));
+        const cell = @floor(at);
+        const ahead = component > zero;
+        const still = component == zero;
+        const infinite: V = @splat(std.math.inf(f64));
+        const boundary = cell + @select(f64, ahead, @as(V, @splat(1)), zero);
+        return .{
+            .origin = position,
+            .direction = component,
+            .maximum = maximum,
+            .cell = @as(@Vector(3, i32), @intFromFloat(cell)),
+            .step = @select(i32, ahead, @as(@Vector(3, i32), @splat(1)), @select(i32, component < zero, @as(@Vector(3, i32), @splat(-1)), @as(@Vector(3, i32), @splat(0)))),
+            .crossing = @select(f64, still, infinite, (boundary - at) / component),
+            .interval = @select(f64, still, infinite, @abs(@as(V, @splat(1)) / component)),
+        };
+    }
+
+    /// Ray.init as it was, an axis at a time, for tests to hold the vector form to.
+    fn initScalar(origin: minecraft.Position, vector: [3]f64, maximum: f64) Ray {
+        const position: [3]f64 = .{ origin.x, origin.y, origin.z };
+        const length = @sqrt(vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]);
         var ray: Ray = .{ .origin = position, .direction = undefined, .maximum = maximum, .cell = undefined, .step = undefined, .crossing = undefined, .interval = undefined };
         for (0..3) |axis| {
             const component = vector[axis] / length;
@@ -99,6 +124,7 @@ pub fn trace(terrain: chunks.Chunks.Client, world: u32, origin: minecraft.Positi
 /// Traces through a window the caller keeps, so traces near each other share its sections.
 /// Cells outside the height are air and read nothing.
 pub fn traceIn(window: *chunks.ReadWindow(8), world: u32, height: Height, origin: minecraft.Position, vector: [3]f64, maximum: f64) !?Hit {
+    if (outside(height, origin.y, vector[1], maximum, vector)) return null;
     var ray = try Ray.init(origin, vector, maximum);
     while (true) {
         var positions: [8]chunks.Position = undefined;
@@ -152,4 +178,51 @@ test "ray traversal handles negative coordinates boundaries and range limits" {
     try std.testing.expectEqual(@as(i32, -1), boundary.next().?.x);
     try std.testing.expectEqual(@as(f64, 0), boundary.box(.{ -1, 0, 0 }, .{ 0, 1, 1 }).?);
     try std.testing.expectError(error.InvalidRay, Ray.init(.{ .x = 0, .y = 0, .z = 0 }, .{ 0, 0, 0 }, 10));
+}
+
+/// Whether every cell of a trace lies above or below the world's blocks, where all is air. The
+/// cells a ray visits lie between the floors of its two ends' heights.
+fn outside(height: Height, y: f64, rise: f64, maximum: f64, vector: [3]f64) bool {
+    const length = @sqrt(vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]);
+    if (!std.math.isFinite(length) or length == 0 or !std.math.isFinite(y)) return false;
+    // The ray stops past the cell its end is in, so the end is reached in full and a cell further.
+    const end = y + rise / length * (maximum + 1);
+    const low = @floor(@min(y, end));
+    const high = @floor(@max(y, end));
+    return low >= @as(f64, @floatFromInt(height.maximum)) or high < @as(f64, @floatFromInt(height.minimum));
+}
+
+test "vector ray setup matches the axis at a time setup bit for bit" {
+    var random = std.Random.DefaultPrng.init(0x7261_7973);
+    for (0..10_000) |_| {
+        const r = random.random();
+        const origin: minecraft.Position = .{ .x = (r.float(f64) - 0.5) * 2e5, .y = (r.float(f64) - 0.5) * 600, .z = (r.float(f64) - 0.5) * 2e5 };
+        var vector: [3]f64 = undefined;
+        for (&vector) |*axis| axis.* = switch (r.uintLessThan(u8, 4)) {
+            0 => 0,
+            1 => (r.float(f64) - 0.5) * 8,
+            2 => -r.float(f64) * 1e-9,
+            else => r.float(f64) * 100,
+        };
+        if (vector[0] == 0 and vector[1] == 0 and vector[2] == 0) vector[1] = -0.05;
+        const fast = try Ray.init(origin, vector, 4);
+        const slow = Ray.initScalar(origin, vector, 4);
+        try std.testing.expectEqual(slow.cell, fast.cell);
+        try std.testing.expectEqual(slow.step, fast.step);
+        for (0..3) |axis| {
+            try std.testing.expectEqual(@as(u64, @bitCast(slow.direction[axis])), @as(u64, @bitCast(fast.direction[axis])));
+            try std.testing.expectEqual(@as(u64, @bitCast(slow.crossing[axis])), @as(u64, @bitCast(fast.crossing[axis])));
+            try std.testing.expectEqual(@as(u64, @bitCast(slow.interval[axis])), @as(u64, @bitCast(fast.interval[axis])));
+        }
+    }
+}
+
+test "a trace wholly above or below the world reads nothing" {
+    const height: Height = .{ .minimum = -64, .maximum = 320 };
+    try std.testing.expect(outside(height, 4000, -5, 5, .{ 0, -5, 0 }));
+    try std.testing.expect(outside(height, -200, 3, 3, .{ 0, 3, 0 }));
+    // Its last cell reaches the top block: it must be traced.
+    try std.testing.expect(!outside(height, 323.5, -3, 3, .{ 0, -3, 0 }));
+    try std.testing.expect(!outside(height, 100, -5, 5, .{ 0, -5, 0 }));
+    try std.testing.expect(!outside(.unbounded, 1e9, 0, 1, .{ 1, 0, 0 }));
 }

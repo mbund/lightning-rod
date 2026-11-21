@@ -219,6 +219,18 @@ pub fn Data(comptime expected_states: usize, comptime expected_blocks: usize, co
             return @bitCast(std.mem.readInt(u32, bytes[sine_offset + @as(usize, index) * 4 ..][0..4], .little));
         }
 
+        /// Mth.ASIN_TAB and Mth.COS_TAB as arrays, read at compile time, for lookups that are
+        /// one load each.
+        pub const arcsines: [257]f64 = table(0);
+        pub const arccosines: [257]f64 = table(8);
+
+        fn table(comptime column: usize) [257]f64 {
+            @setEvalBranchQuota(10_000);
+            var result: [257]f64 = undefined;
+            for (&result, 0..) |*value, index| value.* = @bitCast(std.mem.readInt(u64, bytes[arcsine_offset + index * 16 + column ..][0..8], .little));
+            return result;
+        }
+
         /// Mth.ASIN_TAB and Mth.COS_TAB, which Mth.atan2 reads.
         pub fn arcsine(index: u9) [2]f64 {
             std.debug.assert(index <= 256);

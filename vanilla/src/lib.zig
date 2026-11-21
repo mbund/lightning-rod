@@ -107,6 +107,8 @@ pub const Mobs = @import("vanilla_mobs").mobs.Mobs;
 pub const MobReplication = @import("vanilla_mobs").mob_replication.MobReplication;
 pub const SpawnEggs = @import("vanilla_mobs").spawn_eggs.SpawnEggs;
 pub const Melee = @import("vanilla_mobs").melee.Melee;
+pub const Projectiles = @import("vanilla_mobs").projectiles.Projectiles;
+pub const Ranged = @import("vanilla_mobs").ranged.Ranged;
 pub const MobInteraction = @import("vanilla_mobs").mob_interaction.MobInteraction;
 pub const Placement = @import("vanilla_blocks").placement.Placement;
 pub const BlockActions = @import("vanilla_blocks").block_actions.BlockActions;
@@ -214,6 +216,8 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Mobs, Mobs.Configuration{}),
     lightning_rod.plugin.configured(SpawnEggs, SpawnEggs.Configuration{}),
     lightning_rod.plugin.configured(Melee, .{}),
+    lightning_rod.plugin.configured(Projectiles, .{}),
+    lightning_rod.plugin.configured(Ranged, .{}),
     lightning_rod.plugin.configured(MobInteraction, MobInteraction.Configuration{}),
     lightning_rod.plugin.configured(MobReplication, MobReplication.Configuration{}),
     lightning_rod.plugin.configured(Equipment, Equipment.Configuration{}),

@@ -73,7 +73,62 @@ const Options = struct {
     perf_control: ?[]const u8 = null,
     /// Ticks between block edits among the cows, a fence placed then taken away.
     edit_interval: usize = 0,
+    /// Arrows in a volley, shot from above the players by the first of them.
+    arrows: usize = 0,
+    /// Ticks between volleys while measuring; zero shoots one that lands before measuring.
+    volley_interval: usize = 0,
+    /// Arrows that fly the whole run: high above the world and far from players, they read no
+    /// chunks and have no viewers, so what they cost is their ticks and their paging.
+    flying: usize = 0,
+    /// Projectile records the cache holds.
+    projectile_cache: usize = 1024,
+    /// Flying projectiles with nothing near sleep; off, every one ticks every tick.
+    sleep: bool = true,
+    /// Print a digest of every projectile and the packets so far after each measured tick, for
+    /// runs with and without sleeping to be compared line by line.
+    digest: bool = false,
+    /// Storage through io_uring, as servers run, rather than buffered reads.
+    uring: bool = false,
 };
+
+/// A volley of arrows from a cannon above the players, fanned out and falling within the
+/// chunks around them.
+fn volley(simulation: *Simulation, world: u32, count: usize, round: usize) !void {
+    const projectiles = simulation.get(vanilla.Projectiles);
+    const items = simulation.get(vanilla.Items);
+    const arrow = try items.define("minecraft:arrow");
+    for (0..count) |index| {
+        const turn = @as(f64, @floatFromInt(index + round * 7)) * 2.399963;
+        const direction: [3]f64 = .{ @cos(turn), 0.3, @sin(turn) };
+        try projectiles.launch(.{
+            .kind = .arrow,
+            .world = world,
+            .position = .{ 8.5, 72, 8.5 },
+            .velocity = projectiles.aim(direction, 1.2, 1.0),
+            .owner = 0,
+            .stack = .{ .item = arrow, .count = 1 },
+            .pickup = .disallowed,
+        });
+    }
+}
+
+/// Arrows falling from far above, a block apart, a long way from every player.
+fn flyers(simulation: *Simulation, world: u32, count: usize) !void {
+    const projectiles = simulation.get(vanilla.Projectiles);
+    const arrow = try simulation.get(vanilla.Items).define("minecraft:arrow");
+    const side = std.math.sqrt(count) + 1;
+    for (0..count) |index| {
+        try projectiles.launch(.{
+            .kind = .arrow,
+            .world = world,
+            .position = .{ 100_000.5 + @as(f64, @floatFromInt(index % side)), 4000, 100_000.5 + @as(f64, @floatFromInt(index / side)) },
+            .velocity = .{ 0, 0, 0 },
+            .owner = 0,
+            .stack = .{ .item = arrow, .count = 1 },
+            .pickup = .disallowed,
+        });
+    }
+}
 
 fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize, mode: Mode, writer: *std.Io.Writer) !void {
     var memory = lightning_rod.Memory.init(allocator, io);
@@ -83,7 +138,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     try std.Io.Dir.cwd().createDirPath(io, directory);
     defer std.Io.Dir.cwd().deleteTree(io, directory) catch {};
     const path = try std.fmt.allocPrint(backing, "{s}/world", .{directory});
-    var store = try lightning_rod.storage.Store.init(backing, io, .{ .path = path, .io_mode = .standard });
+    var store = try lightning_rod.storage.Store.init(backing, io, .{ .path = path, .io_mode = if (options.uring) .uring else .standard });
     defer store.deinit();
     var sink: Sink = .{};
     var catalog = try protocols.Default.init(backing);
@@ -91,13 +146,14 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     const selected = &catalog.values;
     const maximum = options.capacity orelse @max(32, count);
     if (maximum < count or maximum == 0) return error.InvalidCapacity;
-    const service = try sessions.Service.init(backing, io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = maximum, .pages = options.pages, .page_bytes = 32768, .buffer_bytes = 128 * 1024, .protocols = selected });
+    const service = try sessions.Service.init(backing, io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = maximum, .pages = options.pages, .page_bytes = 32768, .credit_bytes = 128 * 1024, .protocols = selected });
     defer service.deinit();
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(vanilla.plugins(), .{
             lightning_rod.plugin.configured(Players, .{ .maximum = maximum, .render_distance = 8 }),
             lightning_rod.plugin.configured(Chunks, Chunks.Configuration.forPlayers(maximum)),
             lightning_rod.plugin.configured(vanilla.Mobs, .{ .maximum = @max(1024, options.cows) }),
+            lightning_rod.plugin.configured(vanilla.Projectiles, .{ .cache_records = options.projectile_cache, .sleep = options.sleep, .trace_sends = options.digest }),
             lightning_rod.plugin.configured(sessions.World, .{ .endpoint = service }),
             lightning_rod.plugin.configured(vanilla.RecipeBook, .{ .packet_bytes = service.config.page_bytes }),
         }),
@@ -162,6 +218,23 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
         }
         for (0..options.settle) |tick| try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
     }
+    if (options.arrows > 0 and options.volley_interval == 0) {
+        if (count == 0) return error.ArrowsNeedAPlayer;
+        try volley(simulation, spawn_world, options.arrows, 0);
+        for (0..100) |tick| {
+            try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
+            if (options.detail and tick % 10 == 0) try writer.print("  settle tick={d} arrows={d}\n", .{ tick, simulation.get(vanilla.Projectiles).activeCount() });
+        }
+    }
+    if (options.flying > 0) {
+        if (count == 0) return error.ArrowsNeedAPlayer;
+        try flyers(simulation, spawn_world, options.flying);
+        for (0..40) |tick| {
+            try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
+            if (options.digest) try writer.print("warm tick={d} projectiles={x} sent={x} queued={any} sleeping={d}\n", .{ tick, try simulation.get(vanilla.Projectiles).digest(), simulation.get(vanilla.Projectiles).sent, simulation.get(vanilla.Projectiles).queued, simulation.get(vanilla.Projectiles).sleepingCount() });
+        }
+    }
+    var volleys: usize = 0;
     const fence: u16 = @intCast(game_data.registry.blockStateId("minecraft:oak_fence[east=false,north=false,south=false,waterlogged=false,west=false]").?);
     const air: u16 = @intCast(game_data.registry.blockStateId("minecraft:air").?);
     var edits: usize = 0;
@@ -198,13 +271,24 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
                 try simulation.get(Chunks).setBlock(spawn_world, .{ .x = 8 + 4 * (spot - 4), .y = 65, .z = 9 }, if (edits % 2 == 0) fence else air);
                 edits += 1;
             }
+            if (options.arrows > 0 and options.volley_interval > 0 and tick % options.volley_interval == 0) {
+                if (count == 0) return error.ArrowsNeedAPlayer;
+                try volley(simulation, spawn_world, options.arrows, volleys);
+                volleys += 1;
+            }
             try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
+            if (options.digest) try writer.print("digest tick={d} projectiles={x} sent={x} packets={d} recipients={d} sleeping={d}\n", .{ tick, try simulation.get(vanilla.Projectiles).digest(), simulation.get(vanilla.Projectiles).sent, packets, recipients, simulation.get(vanilla.Projectiles).sleepingCount() });
         }
         cpus[sample] = @intCast(std.Io.Clock.now(.cpu_thread, io).nanoseconds - cpu);
         walls[sample] = @intCast(std.Io.Clock.now(.awake, io).nanoseconds - wall);
     }
+    if (options.perf_control) |control| {
+        const fifo = try std.Io.Dir.cwd().openFile(io, control, .{ .mode = .write_only });
+        defer fifo.close(io);
+        try fifo.writeStreamingAll(io, "disable\n");
+    }
     // Cows walk into sections they have not read yet, so only a world without them is steady.
-    if (options.cows == 0 and reads != inventories.cache.metrics.reads.value() + inventories.items.metrics.reads.value() + chunks.cache.metrics.reads.value()) return error.UnexpectedSteadyStateReads;
+    if (options.cows == 0 and options.volley_interval == 0 and reads != inventories.cache.metrics.reads.value() + inventories.items.metrics.reads.value() + chunks.cache.metrics.reads.value()) return error.UnexpectedSteadyStateReads;
     const snapshots = simulation.metrics.snapshot(stages);
     std.mem.sort(u64, cpus, {}, std.sort.asc(u64));
     std.mem.sort(u64, walls, {}, std.sort.asc(u64));
@@ -219,11 +303,20 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
         const mob = &mobs.mobs[index];
         if (options.detail and !mob.resting and mob.tick_count != ticks_before[index] and ticked % 97 == 0) try writer.print("  awake {any} v={any} ground={} hc={} fall={d} water={}\n", .{ mob.position, mob.velocity, mob.on_ground, mob.horizontal_collision, mob.fall_distance, mob.touching_water });
     }
+    if (options.arrows > 0 or options.flying > 0) try writer.print("  arrows={d} ticking={d} volleys={d} queued={any} taken={any} removals_waiting={d}\n", .{ simulation.get(vanilla.Projectiles).activeCount(), simulation.get(vanilla.Projectiles).tickingCount(), volleys, simulation.get(vanilla.Projectiles).queued, simulation.get(vanilla.Projectiles).taken, simulation.get(vanilla.Projectiles).removals });
     if (options.cows > 0) try writer.print("  domain_revision={d} audience_changes={d} cows={d} ticked={d} resting={d} idle_ticks={d} blocks={d} rare_lanes={d} travels_skipped={d} travels_run={d} path_searches={d:.3}/tick edits={d} edit_recomputes={d} edits_dropped={d} sections_decoded={d}\n", .{ mobs.domain_revision, simulation.get(vanilla.MobReplication).audience_changes, mobs.active.values().len, ticked, resting, mobs.idle_ticks - idle_before, mobs.idle_blocks - blocks_before, mobs.rare_lanes - rare_before, mobs.travels_skipped - skipped_before, mobs.travels_run - run_before, @as(f64, @floatFromInt(mobs.path_searches - searches_before)) / @as(f64, @floatFromInt(ticks)), edits, mobs.edit_recomputes - recomputes_before, mobs.edits_dropped, mobs.copies.decoded });
     if (options.detail) for (snapshots, before[0..snapshots.len]) |after, previous| {
         if (after.kind == .counter) {
             const operations = after.value - previous.value;
             if (operations != 0) try writer.print("  {s} {d:.2} /tick\n", .{ after.name, @as(f64, @floatFromInt(operations)) / @as(f64, @floatFromInt(ticks)) });
+            continue;
+        }
+        // The projectile cache's timers: time a tick, calls a tick, and time a call.
+        if (after.kind == .timer and std.mem.startsWith(u8, after.name, "projectiles.cache.")) {
+            const calls = after.count - previous.count;
+            if (calls == 0) continue;
+            const spent: f64 = @floatFromInt(after.total - previous.total);
+            try writer.print("  {s} {d:.2} us/tick {d:.2} calls/tick {d:.2} us/call\n", .{ after.name, spent / @as(f64, @floatFromInt(ticks)) / 1000, @as(f64, @floatFromInt(calls)) / @as(f64, @floatFromInt(ticks)), spent / @as(f64, @floatFromInt(calls)) / 1000 });
             continue;
         }
         if (after.kind != .timer or !std.mem.endsWith(u8, after.name, ".tick")) continue;
@@ -236,7 +329,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
 
 fn advance(simulation: *Simulation, service: *sessions.Service, handles: []const sessions.Handle, payloads: []const [1][]const u8, mode: Mode, packets: *u64, recipients: *u64, tick_time: *u64) !void {
     for (handles) |handle| {
-        service.credit[handle.index].store(@as(u64, handle.generation) << 32 | sessions.Service.active | service.config.buffer_bytes, .release);
+        service.credit[handle.index].store(@as(u64, handle.generation) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
         if (mode != .idle and mode != .boundary and (mode != .one_moving or handle.index == 0)) {
             service.releases[handle.index].store(0, .release);
             if (!service.push(.{ .input = .{ .handle = handle, .protocol = protocols.implementations[0].protocol_number, .packets = .{ .packets = &payloads[handle.index] } } })) return error.BenchmarkInputFull;
@@ -287,10 +380,24 @@ pub fn main(init: std.process.Init) !void {
             options.settle = try std.fmt.parseInt(usize, argument[9..], 10);
         } else if (std.mem.startsWith(u8, argument, "--cow-offset=")) {
             options.cow_offset = try std.fmt.parseFloat(f64, argument[13..]);
+        } else if (std.mem.startsWith(u8, argument, "--arrows=")) {
+            options.arrows = try std.fmt.parseInt(usize, argument[9..], 10);
+        } else if (std.mem.startsWith(u8, argument, "--projectile-cache=")) {
+            options.projectile_cache = try std.fmt.parseInt(usize, argument[19..], 10);
+        } else if (std.mem.startsWith(u8, argument, "--flying=")) {
+            options.flying = try std.fmt.parseInt(usize, argument[9..], 10);
+        } else if (std.mem.startsWith(u8, argument, "--volley-interval=")) {
+            options.volley_interval = try std.fmt.parseInt(usize, argument[18..], 10);
         } else if (std.mem.startsWith(u8, argument, "--edit-interval=")) {
             options.edit_interval = try std.fmt.parseInt(usize, argument[16..], 10);
         } else if (std.mem.eql(u8, argument, "--detail")) {
             options.detail = true;
+        } else if (std.mem.eql(u8, argument, "--no-sleep")) {
+            options.sleep = false;
+        } else if (std.mem.eql(u8, argument, "--digest")) {
+            options.digest = true;
+        } else if (std.mem.eql(u8, argument, "--uring")) {
+            options.uring = true;
         } else if (std.mem.eql(u8, argument, "--paced")) {
             options.paced = true;
         } else if (std.mem.eql(u8, argument, "--no-instrumentation")) {

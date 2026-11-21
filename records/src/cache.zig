@@ -112,6 +112,8 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
         /// Entries transient acquisitions read, oldest first: eviction takes them before the
         /// clock looks at anything else. A reference whose entry moved on is skipped.
         transients: []Transient,
+        /// Scratch for the entries an index rebuild adds.
+        added: []usize,
         transient_head: usize = 0,
         transient_count: usize = 0,
 
@@ -172,6 +174,8 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
             const encoded = try allocator.alloc(u8, if (configuration.codec == null) 0 else @max(64 * 1024, configuration.value_bytes));
             errdefer allocator.free(encoded);
             const transients = try allocator.alloc(Transient, slots);
+            errdefer allocator.free(transients);
+            const added = try allocator.alloc(usize, slots);
 
             for (scan_entries, 0..) |*entry, i|
                 entry.* = .{
@@ -187,6 +191,7 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
                 .codec = configuration.codec,
                 .encoded = encoded,
                 .transients = transients,
+                .added = added,
                 .order = order,
                 .index = index,
                 .lookup = lookup,
@@ -246,6 +251,7 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
             allocator.free(self.scan_bytes);
             allocator.free(self.encoded);
             allocator.free(self.transients);
+            allocator.free(self.added);
         }
 
         /// Claims unpinned transient entries as victims, oldest first, up to the victims wanted.
@@ -861,22 +867,17 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
 
         fn rebuildIndex(self: *Self) void {
             if (!self.index_dirty) return;
-            var added: [192]usize = undefined;
+            // Only what was added is sorted, then merged into the order kept: however many entries
+            // a batch adds, a rebuild does not sort the whole cache again.
+            const added = self.added;
             var additions: usize = 0;
             for (self.entries, 0..) |entry, slot| {
                 if (!entry.indexed or entry.ordered) continue;
-                if (additions < added.len) added[additions] = slot;
+                added[additions] = slot;
                 additions += 1;
             }
             var count: usize = 0;
-            if (additions > added.len) {
-                for (self.entries, 0..) |entry, slot| {
-                    if (!entry.indexed) continue;
-                    self.index[count] = slot;
-                    count += 1;
-                }
-                std.mem.sort(usize, self.index[0..count], self, lessKey);
-            } else {
+            {
                 std.mem.sort(usize, added[0..additions], self, lessKey);
                 var old: usize = 0;
                 var fresh: usize = 0;
