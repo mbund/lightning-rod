@@ -549,7 +549,7 @@ test "empty cache batches do no timed work and preserve failure checks" {
         try std.testing.expect(reservation == .ready);
     }
     try std.testing.expectEqual(@as(usize, 0), cache.backend.calls);
-    try std.testing.expectEqual(@as(u64, 0), cache.metrics.acquisition.read().?.count);
+    try std.testing.expectEqual(@as(u64, 0), cache.metrics.batches.value());
     cache.failed = true;
     try std.testing.expectError(error.FailedTransaction, cache.acquireMany(&.{}, &empty));
     try std.testing.expectError(error.FailedTransaction, cache.reserveMany(&.{}, &empty, &empty, cache.entries.len));

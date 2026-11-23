@@ -178,6 +178,13 @@ pub fn Simulation(comptime Selections: type) type {
             return self.instances.get(Plugin);
         }
 
+        /// Why the host should stop after this tick, if a plugin asks: it stops as for a signal,
+        /// checkpointing on the way out.
+        pub fn stopReason(self: *Self) ?anyerror {
+            assert(self.state == .ready);
+            return runtime.stopReason(&self.instances);
+        }
+
         /// Whether the host should start the next tick at once, for a sprint the tick rate plugin
         /// runs. Without that plugin selected, never.
         pub fn sprinting(self: *const Self) bool {

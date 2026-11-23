@@ -71,11 +71,11 @@ pub const DamageTypes = struct {
     }
 
     pub fn flagsOf(self: *const DamageTypes, damage_type: DamageType) Flags {
-        return self.flags[@intFromEnum(damage_type)];
+        return self.flags[@backingInt(damage_type)];
     }
 
     pub fn idOf(self: *const DamageTypes, damage_type: DamageType) i32 {
-        return self.ids[@intFromEnum(damage_type)];
+        return self.ids[@backingInt(damage_type)];
     }
 
     pub fn name(damage_type: DamageType) []const u8 {

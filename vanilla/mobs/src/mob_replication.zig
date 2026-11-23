@@ -4,6 +4,7 @@
 //! the last position sent.
 
 const std = @import("std");
+const entities = @import("entities");
 const lightning_rod = @import("lightning_rod");
 const audience = @import("players").audience;
 const sessions = @import("sessions");
@@ -30,20 +31,20 @@ const Data = struct {
     baby: bool = false,
     variant: u8 = default_variant,
 
-    fn of(mob: *const Mob) Data {
+    fn of(mob: Mob) Data {
         return .{
-            .burning = mob.fire_ticks > 0,
-            .air = mob.air_supply,
+            .burning = mob.entity.fire_ticks > 0,
+            .air = mob.living.air_supply,
             .dying = !mob.alive(),
-            .ticks_frozen = mob.ticks_frozen,
-            .health = mob.health,
+            .ticks_frozen = mob.entity.ticks_frozen,
+            .health = mob.living.health,
             .baby = mob.baby(),
-            .variant = mob.variant,
+            .variant = mob.cow.variant,
         };
     }
 };
 
-/// What a send reads of a mob: from its Mob, or from the herd while it idles.
+/// What a send reads of a mob: from its Mob, or from its idle group while it idles.
 const Subject = struct {
     network_id: i32,
     position: [3]f64,
@@ -93,11 +94,18 @@ const Connection = struct { generation: u32 = 0, life: u32 = 0, world: u32 = 0, 
 
 pub const MobReplication = struct {
     pub const id = "minecraft:mob_replication";
-    pub const Configuration = struct { audience_words: usize = 4096 };
+    pub const Configuration = struct {
+        audience_words: usize = 4096,
+        /// Keep a hash of every packet queued and of its viewers, for runs to be compared by.
+        trace_sends: bool = false,
+    };
     pub const Dependencies = struct { mobs: *Mobs, players: *Players, streaming: *Streaming, sessions: *sessions.Service, packets: *packets.Packets };
 
     deps: Dependencies,
-    views: []View,
+    /// What each mob's viewers were last sent, by slot: held while it is sent, then let go.
+    /// By mob slot, what each mob's viewers were last sent, in the pool, and not written out with
+    /// the mob.
+    views: entities.Array(View),
     connections: []Connection,
     tracked: lightning_rod.system.IndexSet,
     marks: []PlayerMark,
@@ -106,6 +114,8 @@ pub const MobReplication = struct {
     connections_changed: bool = false,
     /// Ticks replication has run.
     tick_count: u64 = 0,
+    /// What went wrong sending events early, from inside the mobs' tick, told at the next tick.
+    failure: ?anyerror = null,
     /// Ticks on which audiences had to be worked out again, for measuring.
     audience_changes: u64 = 0,
     known: audience.Matrix,
@@ -115,13 +125,16 @@ pub const MobReplication = struct {
     /// Players the last delivery reached, by slot.
     sent: []usize,
     sent_count: usize = 0,
+    /// A running hash of every packet asked to be sent and whom to, when tests trace it.
+    traced: u64 = 0,
+    tracing: bool,
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*MobReplication {
         const self = try allocator.create(MobReplication);
-        const count = deps.mobs.mobs.len;
+        const count = deps.mobs.slotCount();
         self.* = .{
             .deps = deps,
-            .views = try allocator.alloc(View, count),
+            .views = try .init(allocator, &deps.mobs.deps.entities.pool),
             .connections = try allocator.alloc(Connection, deps.players.records.len),
             .tracked = try .init(allocator, deps.players.records.len),
             .marks = try allocator.alloc(PlayerMark, deps.players.records.len),
@@ -130,42 +143,57 @@ pub const MobReplication = struct {
             .targets = try allocator.alloc(sessions.Service.Target, deps.players.records.len),
             .deliveries = try allocator.alloc(sessions.Service.Delivery, deps.players.records.len),
             .sent = try allocator.alloc(usize, deps.players.records.len),
+            .tracing = config.trace_sends,
         };
-        @memset(self.views, .{});
         @memset(self.connections, .{});
         @memset(self.marks, .{});
+        deps.mobs.events_full = .{ .context = self, .call = eventsFull };
         return self;
+    }
+
+    /// A mob's view, in memory until let go, made empty if it had none.
+    fn viewOf(self: *MobReplication, index: u32) !*View {
+        try self.views.ensureFilled(@as(usize, index) + 1, .{});
+        return self.views.at(index);
     }
 
     pub fn tick(self: *MobReplication) !void {
         const mobs = self.deps.mobs;
         defer self.tick_count += 1;
+        if (self.failure) |err| return err;
         self.forgetChangedConnections();
         const visibility = self.deps.streaming.snapshotVisibility();
         const audience_changed = self.audienceChanged(visibility);
         if (audience_changed) self.audience_changes += 1;
+        // What befell mobs goes first, in order, to those who knew them as it did: a death's
+        // puff arrives before the removal.
+        try self.sendEvents();
         // Only cows idle.
         const idle_interval = mobs.traits(.cow).update_interval;
-        // ChunkMap.tick goes through tracked entities by id, so packets leave in that order.
-        for (0..mobs.herd.count) |place| {
-            const index = mobs.herd.slots[place];
-            if (index == @import("herd.zig").no_place) continue;
+        // Mobs in the tick order's order, then the rest by id, so packets leave in that order.
+        const count = try mobs.collectOrder();
+        for (0..count) |at_order| {
+            const index = mobs.ordered.at(at_order).*;
+            const row = mobs.rows.ref(index);
+            const tracking = row.field("tracking");
+
             // An idle mob that went through here once since it began idling changes nothing a viewer
-            // sees but its head, nor do its viewers change, so it is sent from the herd alone.
-            if (!audience_changed and mobs.herd.idling[place] and !mobs.herd.hot.fresh[place]) {
-                const idle_view = &self.views[index];
+            // sees but its head, nor do its viewers change, so it is sent from its idle group alone.
+            if (!audience_changed and tracking.idling and !tracking.fresh) {
                 {
                     // Between send ticks there is nothing to look at.
-                    if (self.tick_count % idle_interval != mobs.herd.still.send_phase[place]) continue;
+                    if (self.tick_count % idle_interval != tracking.send_phase) continue;
+                    const motion = row.field("motion");
+                    const idle_view = try self.viewOf(index);
                     const at = idle_view.audience_at.?;
-                    assert(std.meta.eql(at, mobs.herd.still.position[place]));
+                    assert(std.meta.eql(at, motion.position));
                     try self.sendDue(self.known.row(index).view(), .{
-                        .network_id = -@as(i32, @intCast(mobs.herd.still.id[place])),
+                        .network_id = entities.Entities.networkOfSlot(index),
                         .position = at,
-                        .velocity = mobs.herd.still.velocity[place],
-                        .yaw = mobs.herd.still.yaw[place],
+                        .velocity = motion.velocity,
+                        .yaw = motion.yaw,
                         .pitch = 0,
-                        .head_yaw = mobs.herd.hot.head_yaw[place],
+                        .head_yaw = row.field("idle").head_yaw,
                         .on_ground = true,
                         .has_impulse = false,
                         .track_deltas = mobs.traits(.cow).track_deltas,
@@ -173,51 +201,47 @@ pub const MobReplication = struct {
                     continue;
                 }
             }
-            const mob = &mobs.mobs[index];
-            const view = &self.views[index];
+            try self.send(index, audience_changed, visibility);
+        }
+    }
+
+    /// One mob's tick of ChunkMap.TrackedEntity and ServerEntity: who should see it and who no
+    /// longer, and what changed.
+    fn send(self: *MobReplication, index: u32, audience_changed: bool, visibility: *const Streaming.Visibility) !void {
+        const mobs = self.deps.mobs;
+        const idle_interval = mobs.traits(.cow).update_interval;
+        {
+            const mob = try mobs.inSlot(index);
+            const view = try self.viewOf(index);
             const known = self.known.row(index);
-            if (view.id != mob.id) {
+            if (view.id != mob.entity.id) {
                 assert(!known.view().any());
                 view.* = start(mob);
                 view.started = self.tick_count;
             }
-            // Events first, so a death's puff arrives before the removal.
-            if (mob.event_count > 0) {
-                for (mob.events[0..mob.event_count]) |event| try self.deliver(known.view(), .{ .status = .{ .id = networkId(mob), .status = event } });
-                mob.event_count = 0;
-            }
-            for (mob.damage_events[0..mob.damage_event_count]) |dealt| {
-                // Players' network ids are their slots plus one, and the packet adds one more.
-                const cause: i32 = if (dealt.attacker) |slot| @as(i32, @intCast(slot)) + 2 else 0;
-                try self.deliver(known.view(), .{ .damage = .{ .id = networkId(mob), .type_id = mobs.damageTypeId(dealt.type), .cause = cause } });
-            }
-            mob.damage_event_count = 0;
-            for (mob.animations[0..mob.animation_count]) |animation| try self.deliver(known.view(), .{ .animation = .{ .id = networkId(mob), .animation = animation } });
-            mob.animation_count = 0;
             // The audience holds while neither the mob nor any player or what they see changed.
-            const settled = !audience_changed and !mob.removed and view.audience_at != null and std.meta.eql(view.audience_at.?, mob.position);
+            const settled = !audience_changed and !mob.entity.removed and view.audience_at != null and std.meta.eql(view.audience_at.?, mob.motion.position);
             if (!settled) {
                 const desired = self.scratch.row(0);
-                if (mob.removed) desired.clear() else self.interest(mob, visibility, desired);
+                if (mob.entity.removed) desired.clear() else self.interest(mob, visibility, desired);
                 const pending = self.scratch.row(1);
                 pending.subtract(known.view(), desired.view());
-                try self.deliver(pending.view(), .{ .remove = networkId(mob) });
+                try self.deliver(pending.view(), .{ .remove = networkId(self.deps.mobs, mob) });
                 for (self.targetsSent()) |player| known.remove(player);
                 pending.subtract(desired.view(), known.view());
                 try self.pair(index, mob, view, pending);
-                view.audience_at = mob.position;
+                view.audience_at = mob.motion.position;
             }
-            // An idle mob's head turns in the herd.
-            const head_yaw = if (mobs.idles(index)) mobs.herd.hot.head_yaw[mobs.herd.place_of[index]] else mob.head_yaw;
-            try self.sendChanges(index, mob, view, head_yaw);
-            if (mobs.idles(index)) {
-                // From here the herd alone sends it, on the ticks its count says.
-                mobs.herd.hot.fresh[place] = false;
-                mobs.herd.still.send_phase[place] = @intCast(view.started % idle_interval);
+            try self.sendChanges(index, mob, view, mob.idle.head_yaw);
+            const tracking = mobs.trackingOf(index);
+            if (tracking.idling) {
+                // From here its idle group alone sends it, on the ticks its count says.
+                tracking.fresh = false;
+                tracking.send_phase = @intCast(view.started % idle_interval);
             }
-            if (mob.removed and !known.view().any()) {
-                view.* = .{};
-                mobs.release(@intCast(index));
+            if (mob.entity.removed and !known.view().any()) {
+                self.views.at(index).* = .{};
+                try mobs.release(@intCast(index));
             }
         }
     }
@@ -257,7 +281,10 @@ pub const MobReplication = struct {
             const generation = if (player.handle) |handle| handle.generation else 0;
             const ready = player.stage == .ready and player.handle != null;
             if (connection.generation != generation or connection.life != player.life or connection.world != player.world or connection.ready != ready) {
-                for (mobs.active.values()) |index| self.known.row(index).remove(at);
+                for (0..mobs.active.count) |active_at| {
+                    const index = mobs.active.at(active_at);
+                    self.known.row(index).remove(at);
+                }
                 self.connections_changed = true;
                 connection.* = .{ .generation = generation, .life = player.life, .world = player.world, .ready = ready };
             }
@@ -272,23 +299,23 @@ pub const MobReplication = struct {
 
     /// ChunkMap.TrackedEntity.updatePlayer: players in the same world within the tracking range,
     /// measured horizontally, who can see the mob.
-    fn interest(self: *MobReplication, mob: *const Mob, visibility: *const Streaming.Visibility, desired: audience.Row) void {
+    fn interest(self: *MobReplication, mob: Mob, visibility: *const Streaming.Visibility, desired: audience.Row) void {
         desired.clear();
         const mobs = self.deps.mobs;
-        const range: f64 = @floatFromInt(@as(u32, mobs.traits(mob.species).tracking_range) * 16);
+        const range: f64 = @floatFromInt(@as(u32, mobs.traits(mob.entity.species).tracking_range) * 16);
         const view_range: f64 = @floatFromInt(self.deps.players.config.render_distance * 16);
         // Found at the farthest anyone sees, then narrowed to each player's own view distance.
         const farthest = @min(range, view_range);
-        var nearby = self.deps.players.nearby(mob.world, .{ .x = mob.position[0], .y = mob.position[1], .z = mob.position[2] }, @intFromFloat(@ceil(farthest / 16) + 1));
+        var nearby = self.deps.players.nearby(mob.motion.world, .{ .x = mob.motion.position[0], .y = mob.motion.position[1], .z = mob.motion.position[2] }, @intFromFloat(@ceil(farthest / 16) + 1));
         const own = living.box(mobs, mob);
         while (nearby.next()) |at| {
             const player = self.deps.players.records[at];
-            if (player.handle == null or player.stage != .ready or player.world != mob.world) continue;
-            const dx = player.position.x - mob.position[0];
-            const dz = player.position.z - mob.position[2];
+            if (player.handle == null or player.stage != .ready or player.world != mob.motion.world) continue;
+            const dx = player.position.x - mob.motion.position[0];
+            const dz = player.position.z - mob.motion.position[2];
             const reach = @min(range, @as(f64, @floatFromInt(self.deps.players.viewDistanceOf(player) * 16)));
             if (dx * dx + dz * dz > reach * reach) continue;
-            if (!visibility.boundsVisible(at, &player, mob.world, .{
+            if (!visibility.boundsVisible(at, &player, mob.motion.world, .{
                 .minimum = .{ @intFromFloat(@floor(own.min[0])), @intFromFloat(@floor(own.min[1])), @intFromFloat(@floor(own.min[2])) },
                 .maximum = .{ @intFromFloat(@ceil(own.max[0])), @intFromFloat(@ceil(own.max[1])), @intFromFloat(@ceil(own.max[2])) },
             })) continue;
@@ -296,24 +323,24 @@ pub const MobReplication = struct {
         }
     }
 
-    fn start(mob: *const Mob) View {
+    fn start(mob: Mob) View {
         return .{
-            .id = mob.id,
-            .base = mob.position,
-            .yaw = mth.packDegrees(mob.yaw),
-            .pitch = mth.packDegrees(mob.pitch),
-            .head_yaw = mth.packDegrees(mob.head_yaw),
-            .velocity = mob.velocity,
-            .was_on_ground = mob.on_ground,
+            .id = mob.entity.id,
+            .base = mob.motion.position,
+            .yaw = mth.packDegrees(mob.motion.yaw),
+            .pitch = mth.packDegrees(mob.motion.pitch),
+            .head_yaw = mth.packDegrees(mob.idle.head_yaw),
+            .velocity = mob.motion.velocity,
+            .was_on_ground = mob.motion.on_ground,
             .data = Data.of(mob),
         };
     }
 
     /// ServerEntity.sendPairingData: the mob as last sent, and its data that differs from the
     /// defaults.
-    fn pair(self: *MobReplication, index: usize, mob: *const Mob, view: *const View, recipients: audience.Row) !void {
-        const entity_type = self.deps.mobs.traits(mob.species).entity_type;
-        try self.deliver(recipients.view(), .{ .spawn = .{ .id = networkId(mob), .uuid = mob.uuid, .kind = entity_type, .position = view.base, .velocity = view.velocity, .yaw = view.yaw, .pitch = view.pitch, .head_yaw = view.head_yaw } });
+    fn pair(self: *MobReplication, index: usize, mob: Mob, view: *const View, recipients: audience.Row) !void {
+        const entity_type = self.deps.mobs.traits(mob.entity.species).entity_type;
+        try self.deliver(recipients.view(), .{ .spawn = .{ .id = networkId(self.deps.mobs, mob), .uuid = mob.entity.uuid, .kind = entity_type, .position = view.base, .velocity = view.velocity, .yaw = view.yaw, .pitch = view.pitch, .head_yaw = view.head_yaw } });
         const known = self.known.row(index);
         for (self.targetsSent()) |player| known.insert(player);
         const defaults: Data = .{};
@@ -326,34 +353,65 @@ pub const MobReplication = struct {
         changes.health = data.health != defaults.health;
         changes.baby = data.baby != defaults.baby;
         changes.variant = data.variant != defaults.variant;
-        if (changes.any()) try self.deliver(recipients.view(), .{ .metadata = .{ .id = networkId(mob), .data = data, .changes = changes } });
+        if (changes.any()) try self.deliver(recipients.view(), .{ .metadata = .{ .id = networkId(self.deps.mobs, mob), .data = data, .changes = changes } });
     }
 
     /// ServerEntity.sendChanges.
-    fn sendChanges(self: *MobReplication, index: usize, mob: *Mob, view: *View, head_yaw: f32) !void {
+    fn sendChanges(self: *MobReplication, index: usize, mob: Mob, view: *View, head_yaw: f32) !void {
         const known = self.known.row(index).view();
         const now = Data.of(mob);
         const changes = Changes.between(view.data, now);
-        const interval = self.deps.mobs.traits(mob.species).update_interval;
-        if ((self.tick_count - view.started) % interval == 0 or mob.has_impulse or changes.any()) {
+        const interval = self.deps.mobs.traits(mob.entity.species).update_interval;
+        if ((self.tick_count - view.started) % interval == 0 or mob.entity.has_impulse or changes.any()) {
             try self.sendDue(known, .{
-                .network_id = networkId(mob),
-                .position = mob.position,
-                .velocity = mob.velocity,
-                .yaw = mob.yaw,
-                .pitch = mob.pitch,
+                .network_id = networkId(self.deps.mobs, mob),
+                .position = mob.motion.position,
+                .velocity = mob.motion.velocity,
+                .yaw = mob.motion.yaw,
+                .pitch = mob.motion.pitch,
                 .head_yaw = head_yaw,
-                .on_ground = mob.on_ground,
-                .has_impulse = mob.has_impulse,
-                .track_deltas = self.deps.mobs.traits(mob.species).track_deltas,
+                .on_ground = mob.motion.on_ground,
+                .has_impulse = mob.entity.has_impulse,
+                .track_deltas = self.deps.mobs.traits(mob.entity.species).track_deltas,
             }, view, now, changes);
-            mob.has_impulse = false;
+            mob.entity.has_impulse = false;
         }
         // A hurt mob's new motion goes out at once, whatever the interval.
-        if (mob.hurt_marked) {
-            mob.hurt_marked = false;
-            try self.deliver(known, .{ .velocity = .{ .id = networkId(mob), .velocity = mob.velocity } });
+        if (mob.entity.hurt_marked) {
+            mob.entity.hurt_marked = false;
+            try self.deliver(known, .{ .velocity = .{ .id = networkId(self.deps.mobs, mob), .velocity = mob.motion.velocity } });
         }
+    }
+
+    /// What befell mobs since the events were last sent, in the order it did, each to those who
+    /// know its mob. A mob's slot holds it until its viewers hear it went.
+    fn sendEvents(self: *MobReplication) !void {
+        const mobs = self.deps.mobs;
+        for (mobs.takeEvents()) |event| {
+            const mob = try mobs.inSlot(event.slot);
+            assert(mob.entity.id == event.id);
+            // A mob new since the last tick is known to nobody yet.
+            if (event.slot >= self.views.len or self.views.at(event.slot).id != mob.entity.id) continue;
+            const known = self.known.row(event.slot).view();
+            switch (event.what) {
+                .status => |status| try self.deliver(known, .{ .status = .{ .id = networkId(self.deps.mobs, mob), .status = status } }),
+                .damage => |dealt| {
+                    // Players' network ids are their slots plus one, and the packet adds one more.
+                    const cause: i32 = if (dealt.attacker) |slot| @as(i32, @intCast(slot)) + 2 else 0;
+                    try self.deliver(known, .{ .damage = .{ .id = networkId(self.deps.mobs, mob), .type_id = mobs.damageTypeId(dealt.type), .cause = cause } });
+                },
+                .animation => |animation| try self.deliver(known, .{ .animation = .{ .id = networkId(self.deps.mobs, mob), .animation = animation } }),
+            }
+        }
+    }
+
+    /// More befell mobs in a tick than the mobs hold: what is held goes now, in order, as
+    /// vanilla sends each as it happens.
+    fn eventsFull(context: *anyopaque) void {
+        const self: *MobReplication = @ptrCast(@alignCast(context));
+        self.sendEvents() catch |err| {
+            self.failure = err;
+        };
     }
 
     fn sendDue(self: *MobReplication, known: lightning_rod.system.bit_sets.Set, subject: Subject, view: *View, now: Data, changes: Changes) !void {
@@ -437,6 +495,17 @@ pub const MobReplication = struct {
         }
         self.sent_count = 0;
         if (count == 0) return;
+        if (self.tracing) {
+            var hasher = std.hash.Wyhash.init(self.traced);
+            hasher.update(std.mem.asBytes(&self.tick_count));
+            hasher.update(&.{@backingInt(outgoing)});
+            switch (outgoing) {
+                inline else => |value| trace(&hasher, value),
+            }
+            var who = recipients.iterator();
+            while (who.next()) |player| hasher.update(std.mem.asBytes(&player));
+            self.traced = hasher.final();
+        }
         const targets = self.targets[0..count];
         const deliveries = self.deliveries[0..count];
         const encoder = self.deps.packets;
@@ -465,6 +534,26 @@ pub const MobReplication = struct {
     }
 };
 
+/// Hashes a value field by field, so padding and an empty optional's payload are left out.
+fn trace(hasher: *std.hash.Wyhash, value: anytype) void {
+    switch (@typeInfo(@TypeOf(value))) {
+        .@"struct" => |info| inline for (info.field_names) |name| trace(hasher, @field(value, name)),
+        .array => for (value) |item| trace(hasher, item),
+        .optional => if (value) |inner| {
+            hasher.update(&.{1});
+            trace(hasher, inner);
+        } else hasher.update(&.{0}),
+        .@"union" => switch (value) {
+            inline else => |inner, tag| {
+                hasher.update(&.{@backingInt(tag)});
+                trace(hasher, inner);
+            },
+        },
+        .bool => hasher.update(&.{@intFromBool(value)}),
+        else => hasher.update(std.mem.asBytes(&value)),
+    }
+}
+
 /// A packet to some of a mob's viewers.
 const Outgoing = union(enum) {
     status: struct { id: i32, status: u8 },
@@ -481,9 +570,9 @@ const Outgoing = union(enum) {
     animation: struct { id: i32, animation: u8 },
 };
 
-/// Negative entity ids, as items and orbs use, since players take the small positive ones.
-pub fn networkId(mob: *const Mob) i32 {
-    return -@as(i32, @intCast(mob.id));
+/// The id clients know a mob in memory by.
+pub fn networkId(mobs: *const Mobs, mob: Mob) i32 {
+    return mobs.deps.entities.networkOf(mob.entity.id).?;
 }
 
 /// VecDeltaCodec.encode.

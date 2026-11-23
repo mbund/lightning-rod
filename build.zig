@@ -97,6 +97,7 @@ pub fn build(b: *std.Build) void {
         // catalog run again with the one release a minimal server selects.
         .{ .directory = "players" },
         .{ .directory = "domains" },
+        .{ .directory = "entities" },
         .{ .directory = "ticks" },
         .{ .directory = "random_ticks" },
         .{ .directory = "occlusion" },

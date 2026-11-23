@@ -10,13 +10,17 @@ const e2e = @import("e2e");
 const sessions = @import("sessions");
 const inventories = @import("inventories");
 
+/// Items are never refused or lost, however little memory they have: every bound below is far
+/// smaller than what the test makes, so their states and bodies page through scratch files, and
+/// replication looks over everything as its notes overflow.
 pub fn main(init: std.process.Init) !void {
     const args = try e2e.profile.arguments(init);
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
             lightning_rod.plugin.configured(Players, Players.Configuration{ .render_distance = 2 }),
             lightning_rod.plugin.configured(vanilla.PlayerStates, .{ .gamemode = if (std.mem.eql(u8, args.fixture, "creative")) .creative else .survival }),
-            lightning_rod.plugin.configured(vanilla.ItemEntities, vanilla.ItemEntities.Configuration{ .maximum = 2 }),
+            lightning_rod.plugin.configured(vanilla.ItemEntities, vanilla.ItemEntities.Configuration{ .change_ids = 2 }),
+            lightning_rod.plugin.configured(vanilla.ItemReplication, vanilla.ItemReplication.Configuration{ .work_ids = 2 }),
         }),
         lightning_rod.plugin.configured(Probe, .{}),
     });
@@ -34,19 +38,22 @@ const Probe = struct {
         inventories: *Inventories,
         items: *vanilla.Items,
         menus: *vanilla.PlayerInventory,
+        player_states: *vanilla.PlayerStates,
         chunks: *Chunks,
-        mining: *vanilla.Mining,
     };
     const bread_count = 17;
+    /// Far more than any cache above holds.
+    const frozen_count = 200;
+    const block: @import("chunks").Position = .{ .x = 1, .y = 65, .z = 1 };
 
-    const Phase = enum { waiting, full, releasing, available, refilled, preparing_close, close_ready, verified };
-    const Mining = enum { waiting, active, rejected };
+    const Phase = enum { waiting, placed, mining, mined, closing, verified };
 
     deps: Dependencies,
-    frozen: [2]u64 = undefined,
-    tool: [32]u8 = undefined,
     phase: Phase = .waiting,
-    mining: Mining = .waiting,
+    /// Items there were before the block broke.
+    before_mining: usize = 0,
+    /// Stone there was before the menu closed.
+    stone: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*Probe {
         const self = try allocator.create(Probe);
@@ -56,77 +63,96 @@ const Probe = struct {
     }
 
     pub fn tick(self: *Probe) !void {
-        if (self.phase == .full and self.mining != .rejected) {
-            const state = self.deps.mining.states[0];
-            if (state.active and state.position.x == 1 and state.position.y == 65 and state.position.z == 1)
-                self.mining = .active;
-            if (self.mining == .active and !state.active) {
-                if (try (try self.deps.chunks.simulation(1)).getBlock(self.deps.players.records[0].world, .{ .x = 1, .y = 65, .z = 1 }) != protocols.registry.block_stone_default_state)
-                    return error.BlockMinedAtCapacity;
-                self.mining = .rejected;
-                try self.deps.control.send(self.deps.players.records[0].handle.?, "capacity mining rejected");
-            }
+        if (self.phase != .mining) return;
+        const world = self.deps.players.records[0].world;
+        if (try (try self.deps.chunks.simulation(1)).getBlock(world, block) == protocols.registry.block_stone_default_state) return;
+        // Broken: its drop came, refused for nothing.
+        const totals = try self.count();
+        if (totals.alive != self.before_mining + 1) return error.MinedDropMissing;
+        try self.freeze();
+        self.phase = .mined;
+        try self.deps.control.send(self.deps.players.records[0].handle.?, "capacity mined kept");
+    }
+
+    const Totals = struct { alive: usize = 0, bread: u32 = 0, stone: u32 = 0 };
+
+    /// Stone the player holds anywhere in its menu, cursor included.
+    fn heldStone(self: *Probe, player: usize) !u32 {
+        const stone = try self.deps.items.define("minecraft:stone");
+        var slots: [47]inventories.Slot = undefined;
+        var contents: [47]inventories.Contents = undefined;
+        try self.deps.menus.load(player, &slots, &contents);
+        var total: u32 = 0;
+        for (contents) |entry| if (entry.stack) |stack| {
+            if (std.mem.eql(u8, &stack.item, &stone)) total += stack.count;
+        };
+        return total;
+    }
+
+    /// Keeps every item where it is, so the player standing by picks none up while counted.
+    fn freeze(self: *Probe) !void {
+        var rows = self.deps.dropped.rows();
+        while ((try rows.next())) |row| {
+            if (!row.metadata.alive or row.metadata.pickup_delay == std.math.maxInt(i16)) continue;
+            var metadata = try self.deps.dropped.get(row.id);
+            metadata.pickup_delay = std.math.maxInt(i16);
+            try self.deps.dropped.put(row.id, metadata);
         }
-        if ((self.phase == .releasing or self.phase == .preparing_close) and self.deps.dropped.canCreate(1)) {
-            self.phase = if (self.phase == .releasing) .available else .close_ready;
-            try self.deps.control.send(self.deps.players.records[0].handle.?, if (self.phase == .close_ready) "capacity close ready" else "capacity freed");
+    }
+
+    /// Every live item, by reading every record.
+    fn count(self: *Probe) !Totals {
+        var totals: Totals = .{};
+        const bread = try self.deps.items.define("minecraft:bread");
+        var rows = self.deps.dropped.rows();
+        while ((try rows.next())) |row| {
+            if (!row.metadata.alive) continue;
+            totals.alive += 1;
+            const body = (try self.deps.entities.get(row.id)) orelse return error.BodyLost;
+            const stack = (try self.deps.inventories.get(vanilla.ItemEntities.slot(body))).stack orelse return error.StackLost;
+            if (std.mem.eql(u8, &stack.item, &bread)) totals.bread += stack.count;
+            if (std.mem.eql(u8, &stack.item, &(try self.deps.items.define("minecraft:stone")))) totals.stone += stack.count;
         }
+        return totals;
     }
 
     fn message(self: *Probe, handle: sessions.Handle, text: []const u8) !e2e.Control.Result {
         const player = self.deps.players.records[handle.index];
+        const creative = self.deps.player_states.of(&player).gamemode == .creative;
         if (std.mem.eql(u8, text, "capacity_setup")) {
             if (self.phase != .waiting) return error.UnexpectedCapacityPhase;
             if (!try self.deps.menus.give(handle.index, "minecraft:bread", bread_count)) return error.SetupFailed;
             if (!try self.deps.menus.give(handle.index, "minecraft:iron_pickaxe", 1)) return error.SetupFailed;
-            self.tool = (try self.deps.inventories.get(.{ .owner = player.uuid, .index = 37 })).stack.?.item;
             const stone = try self.deps.items.define("minecraft:stone");
-            for (&self.frozen, 0..) |*entity, i| {
-                entity.* = try self.deps.dropped.create(player.world, .{ 5.5 + @as(f64, @floatFromInt(i)), 65, 5.5 }, .{ 0, 0, 0 }, .{ .item = stone, .count = 1 });
-                try self.deps.dropped.put(entity.*, .{ .pickup_delay = std.math.maxInt(i16), .age = std.math.minInt(i16) });
+            // Out of reach and never picked up, around the player in several chunks.
+            for (0..frozen_count) |i| {
+                const x = 6.5 + @as(f64, @floatFromInt(i % 20)) * 1.5;
+                const z = -14.5 + @as(f64, @floatFromInt(i / 20)) * 3;
+                const entity = try self.deps.dropped.create(player.world, .{ x, 65, z }, .{ 0, 0, 0 }, .{ .item = stone, .count = 1 });
+                try self.deps.dropped.put(entity, .{ .pickup_delay = std.math.maxInt(i16), .age = std.math.minInt(i16) });
             }
-            try self.deps.chunks.setBlock(player.world, .{ .x = 1, .y = 65, .z = 1 }, protocols.registry.block_stone_default_state);
-            self.phase = .full;
-            try self.deps.control.send(handle, "capacity full");
-        } else if (std.mem.eql(u8, text, "capacity_check")) {
-            if (self.phase != .full) return error.UnexpectedCapacityPhase;
-            const held = (try self.deps.inventories.get(.{ .owner = player.uuid, .index = 36 })).stack orelse return error.InventoryLost;
-            if (held.count != bread_count or self.deps.dropped.canCreate(1)) return error.CapacityDropApplied;
-            const tool = (try self.deps.inventories.get(.{ .owner = player.uuid, .index = 37 })).stack orelse return error.ToolLost;
-            if (!std.mem.eql(u8, &tool.item, &self.tool)) return error.ToolWornAtCapacity;
-            if (try (try self.deps.chunks.simulation(1)).getBlock(player.world, .{ .x = 1, .y = 65, .z = 1 }) != protocols.registry.block_stone_default_state) return error.BlockMinedAtCapacity;
-            try self.deps.control.send(handle, "capacity unchanged");
-        } else if (std.mem.eql(u8, text, "capacity_free")) {
-            if (self.phase != .full) return error.UnexpectedCapacityPhase;
-            const entity = self.frozen[0];
-            var metadata = try self.deps.dropped.get(entity);
-            const body = (try self.deps.entities.get(entity)).?;
-            const slot = vanilla.ItemEntities.slot(body);
-            const held = try self.deps.inventories.get(slot);
-            if (!try self.deps.inventories.set(slot, held.revision, null)) return error.RetirementFailed;
-            try self.deps.dropped.retire(entity, body, &metadata);
-            self.phase = .releasing;
-        } else if (std.mem.eql(u8, text, "capacity_verify")) {
-            if (self.phase != .available) return error.UnexpectedCapacityPhase;
-            const held = (try self.deps.inventories.get(.{ .owner = player.uuid, .index = 36 })).stack orelse return error.InventoryLost;
-            if (held.count != bread_count - 1 or self.deps.dropped.canCreate(1)) return error.AdmittedDropMissing;
-            for (self.deps.dropped.residents) |resident| {
-                if (resident.id == 0 or !resident.alive) continue;
-                var metadata = try self.deps.dropped.get(resident.id);
-                metadata.pickup_delay = std.math.maxInt(i16);
-                metadata.age = std.math.minInt(i16);
-                try self.deps.dropped.put(resident.id, metadata);
+            try self.deps.chunks.setBlock(player.world, block, protocols.registry.block_stone_default_state);
+            self.phase = .placed;
+            try self.deps.control.send(handle, "capacity placed");
+        } else if (std.mem.eql(u8, text, "capacity_check_drop")) {
+            if (self.phase != .placed) return error.UnexpectedCapacityPhase;
+            // The whole stack dropped, and in creative four more: none refused.
+            const totals = try self.count();
+            const expected_bread: u32 = bread_count + if (creative) @as(u32, 4) else 0;
+            if (totals.bread != expected_bread) return error.DroppedBreadMissing;
+            if (totals.alive < @as(usize, frozen_count) + 1) return error.DropCountWrong;
+            if ((try self.deps.inventories.get(.{ .owner = player.uuid, .index = 36 })).stack != null) return error.DropNotApplied;
+            try self.freeze();
+            self.before_mining = totals.alive;
+            if (creative) {
+                self.phase = .verified;
+                try self.deps.control.send(handle, "capacity creative kept");
+            } else {
+                self.phase = .mining;
+                try self.deps.control.send(handle, "capacity drops kept");
             }
-            self.phase = .refilled;
-            try self.deps.control.send(handle, "capacity resumed");
         } else if (std.mem.eql(u8, text, "capacity_close_setup")) {
-            if (self.phase != .refilled) return error.UnexpectedCapacityPhase;
-            const entity = self.frozen[1];
-            var metadata = try self.deps.dropped.get(entity);
-            const body = (try self.deps.entities.get(entity)).?;
-            const held = try self.deps.inventories.get(vanilla.ItemEntities.slot(body));
-            if (!try self.deps.inventories.set(vanilla.ItemEntities.slot(body), held.revision, null)) return error.RetirementFailed;
-            try self.deps.dropped.retire(entity, body, &metadata);
+            if (self.phase != .mined) return error.UnexpectedCapacityPhase;
             const stone = try self.deps.items.define("minecraft:stone");
             for (9..46) |slot| {
                 const previous = try self.deps.inventories.get(.{ .owner = player.uuid, .index = @intCast(slot) });
@@ -145,19 +171,23 @@ const Probe = struct {
             next[36].?.count -= 1;
             next[vanilla.PlayerInventory.cursor] = .{ .item = stone, .count = 1 };
             if (!try self.deps.menus.apply(handle.index, &slots, &contents, &next, &.{})) return error.SetupFailed;
-            self.phase = .preparing_close;
+            // Stone in items and in the menu, which closing must keep all of.
+            self.stone = (try self.count()).stone + try self.heldStone(handle.index);
+            self.phase = .closing;
+            try self.deps.control.send(handle, "capacity close ready");
         } else if (std.mem.eql(u8, text, "capacity_close_check")) {
-            if (self.phase != .close_ready) return error.UnexpectedCapacityPhase;
-            if (self.deps.dropped.free_count != 1) return error.PartialCloseDrop;
+            if (self.phase != .closing) return error.UnexpectedCapacityPhase;
+            // Closing with all but a full inventory put back what fit and dropped the rest of the
+            // crafting grid and the cursor: none of it refused, none lost.
+            if ((try self.count()).stone + try self.heldStone(handle.index) != self.stone) return error.CloseLostStone;
             var slots: [47]inventories.Slot = undefined;
             var contents: [47]inventories.Contents = undefined;
             try self.deps.menus.load(handle.index, &slots, &contents);
             for ([_]usize{ 1, 2, 3, 4, vanilla.PlayerInventory.cursor }) |slot| {
-                const stack = contents[slot].stack orelse return error.CloseInventoryLost;
-                if (stack.count != 1) return error.CloseInventoryLost;
+                if (contents[slot].stack != null) return error.CloseNotApplied;
             }
             self.phase = .verified;
-            try self.deps.control.send(handle, "capacity close preserved");
+            try self.deps.control.send(handle, "capacity close kept");
         } else return .unhandled;
         return .handled;
     }

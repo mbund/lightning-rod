@@ -81,13 +81,13 @@ pub const Inventory = struct {
         try self.deps.inventories.getMany(&slots, &contents);
         if (expected_drops) |expected| {
             var dropped: u32 = 0;
-            var cursor: vanilla.ItemEntities.Cursor = .{};
-            while (cursor.more) for (try self.deps.dropped.scan(&cursor)) |row| {
+            var rows = self.deps.dropped.rows();
+            while ((try rows.next())) |row| {
                 if (!row.metadata.alive) continue;
                 const body = (try self.deps.entities.get(row.id)).?;
                 const held = try self.deps.inventories.get(vanilla.ItemEntities.slot(body));
                 dropped += held.stack.?.count;
-            };
+            }
             matches = matches and dropped == expected;
             std.log.info("event=inventory_drops case={s} expected={d} actual={d}", .{ label, expected, dropped });
         }

@@ -569,7 +569,7 @@ pub const Growth = struct {
             error.OutOfMemory, error.LootCapacity => return,
             else => return err,
         };
-        if (drops.len == 0 or !self.deps.dropped.canCreate(drops.len)) return;
+        if (drops.len == 0) return;
         var requests: [loot_tables.maximum_drops]ItemEntities.Spawn = undefined;
         var spawned: [loot_tables.maximum_drops]entities.Id = undefined;
         for (drops, requests[0..drops.len]) |drop, *request| request.* = .{

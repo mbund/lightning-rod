@@ -5,6 +5,7 @@ const recipe_placement = @import("vanilla_crafting").recipe_placement;
 const FuelConversionDefinition = @import("vanilla_crafting").recipes.FuelConversionDefinition;
 const std = @import("std");
 const Domains = @import("domains").domains.Domains;
+const EntityColumns = @import("domains").entity_columns.EntityColumns;
 const storage = @import("storage");
 const fault = @import("fault_disk");
 const metrics = @import("metrics");
@@ -66,42 +67,42 @@ test "experience pickup consumes one merged count every two ticks and ignores sp
     fixture.player_states.records[0].gamemode = .spectator;
     fixture.players.rebuildIndexes();
     try experience.award(fixture.players.records[0].world, .{ 0.5, 8, 0.5 }, 7);
-    const index = experience.active.values()[0];
-    experience.orbs[index].count = 3;
-    try experience.tick();
+    const index = (try liveOrbs(experience))[0];
+    try setOrb(experience, index, "count", 3);
+    try experience.deps.entities.tickAll();
     try std.testing.expectEqual(@as(i32, 0), fixture.player_states.records[0].experience.total);
-    try std.testing.expectEqual(@as(i32, 3), experience.orbs[index].count);
+    try std.testing.expectEqual(@as(i32, 3), (try orbOf(experience, index)).count);
     fixture.player_states.records[0].gamemode = .survival;
     for ([_]i32{ 7, 7, 14, 14, 21 }) |total| {
-        try experience.tick();
+        try experience.deps.entities.tickAll();
         try std.testing.expectEqual(total, fixture.player_states.records[0].experience.total);
     }
-    try std.testing.expect(!experience.orbs[index].alive);
-    try experience.tick();
-    try std.testing.expectEqual(@as(usize, 0), experience.active.values().len);
+    try std.testing.expect(!(try orbOf(experience, index)).alive);
+    try experience.deps.entities.tickAll();
+    try std.testing.expectEqual(@as(usize, 0), (try liveOrbs(experience)).len);
     const player = &fixture.players.records[0];
     const state = &fixture.player_states.records[0];
     state.health = 0;
     state.experience = .{ .level = 30, .total = 1500 };
-    try experience.tick();
+    try experience.deps.entities.tickAll();
     try std.testing.expectEqual(@as(i32, 0), state.experience.total);
-    try experience.tick();
+    try experience.deps.entities.tickAll();
     var reward: i32 = 0;
-    for (experience.active.values()) |at| reward += experience.orbs[at].count * experience.orbs[at].value;
+    for ((try liveOrbs(experience))) |at| reward += (try orbOf(experience, at)).count * (try orbOf(experience, at)).value;
     try std.testing.expectEqual(@as(i32, 100), reward);
     player.life += 1;
     state.experience = .{ .level = 1, .total = 7 };
     experience.config.keep_inventory = true;
-    try experience.tick();
+    try experience.deps.entities.tickAll();
     try std.testing.expectEqual(@as(i32, 7), state.experience.total);
     experience.config.keep_inventory = false;
     player.handle.?.generation += 1;
     player.life = 1;
     state.experience = .{ .level = 30, .total = 1500 };
-    try experience.tick();
+    try experience.deps.entities.tickAll();
     try std.testing.expectEqual(@as(i32, 0), state.experience.total);
     reward = 0;
-    for (experience.active.values()) |at| reward += experience.orbs[at].count * experience.orbs[at].value;
+    for ((try liveOrbs(experience))) |at| reward += (try orbOf(experience, at)).count * (try orbOf(experience, at)).value;
     try std.testing.expectEqual(@as(i32, 200), reward);
 }
 
@@ -186,22 +187,22 @@ test "competing experience collectors conserve every point under sustained bound
     var generated: i32 = 0;
     for (0..64) |_| {
         try experience.award(fixture.players.records[0].world, .{ 0.5, 8, 0.5 }, 73);
-        const index = experience.active.values()[0];
-        experience.orbs[index].count = 16;
+        const index = (try liveOrbs(experience))[0];
+        try setOrb(experience, index, "count", 16);
         generated += 73 * 16;
         for (0..16) |_| {
-            if (experience.orbs[index].alive) {
-                experience.orbs[index].body.position = .{ 0.5, 8, 0.5 };
-                experience.orbs[index].body.velocity = .{ 0, 0, 0 };
+            if ((try orbOf(experience, index)).alive) {
+                try setBody(experience, index, "position", .{ 0.5, 8, 0.5 });
+                try setBody(experience, index, "velocity", .{ 0, 0, 0 });
             }
-            try experience.tick();
+            try experience.deps.entities.tickAll();
             var remaining: i32 = 0;
-            for (experience.active.values()) |at| if (experience.orbs[at].alive) {
-                remaining += experience.orbs[at].value * experience.orbs[at].count;
+            for ((try liveOrbs(experience))) |at| if ((try orbOf(experience, at)).alive) {
+                remaining += (try orbOf(experience, at)).value * (try orbOf(experience, at)).count;
             };
             try std.testing.expectEqual(generated, remaining + fixture.player_states.records[0].experience.total + fixture.player_states.records[1].experience.total);
         }
-        try std.testing.expectEqual(@as(usize, 0), experience.active.values().len);
+        try std.testing.expectEqual(@as(usize, 0), (try liveOrbs(experience)).len);
     }
     for (fixture.player_states.records) |state| try std.testing.expectEqual(@divExact(generated, 2), state.experience.total);
 }
@@ -223,23 +224,23 @@ test "spawn time orb merging uses the vanilla signed entity group and resets age
     const experience = (try blockContainers(arena.allocator(), &store, &registry, fixture)).deps.experience;
     const world = fixture.players.records[0].world;
     try experience.award(world, .{ 0.5, 8, 0.5 }, 3);
-    const index = experience.active.values()[0];
-    const entity = experience.residents[index].id;
+    const index = (try liveOrbs(experience))[0];
+    const entity = index;
     try std.testing.expect(entity % 40 != 0 and entity % 40 != 20);
     var matched = false;
     for (0..4096) |seed| {
         var random: Random = .{ .source = .init(seed) };
-        if (random.random().uintLessThan(u32, 40) != @mod(@as(i64, Experience.networkId(entity)), 40)) continue;
+        if (random.random().uintLessThan(u32, 40) != @mod(@as(i64, experience.networkId(entity)), 40)) continue;
         experience.random.source = .init(seed);
         matched = true;
         break;
     }
     try std.testing.expect(matched);
-    experience.orbs[index].age = 1234;
+    try setOrb(experience, index, "age", 1234);
     try experience.award(world, .{ 0.5, 8, 0.5 }, 3);
-    try std.testing.expectEqual(@as(usize, 1), experience.active.values().len);
-    try std.testing.expectEqual(@as(i32, 2), experience.orbs[index].count);
-    try std.testing.expectEqual(@as(u16, 0), experience.orbs[index].age);
+    try std.testing.expectEqual(@as(usize, 1), (try liveOrbs(experience)).len);
+    try std.testing.expectEqual(@as(i32, 2), (try orbOf(experience, index)).count);
+    try std.testing.expectEqual(@as(u16, 0), (try orbOf(experience, index)).age);
 }
 
 test "experience pickup mending and remaining orbs commit atomically across interrupted checkpoints" {
@@ -301,9 +302,9 @@ fn verifyAtomicExperience(mode: fault.Disk.Mode) !void {
             });
             try std.testing.expect(try fixture.ownership.set(hand, 0, .{ .item = damaged, .count = 1 }));
             try experience.award(player.world, .{ 0.5, 8, 0.5 }, 7);
-            const index = experience.active.values()[0];
-            entity = experience.residents[index].id;
-            experience.orbs[index].count = 3;
+            const index = (try liveOrbs(experience))[0];
+            entity = index;
+            try setOrb(experience, index, "count", 3);
         } else {
             const table = records.Table.init(fixture.player_states.deps.storage, fixture.player_states.deps.record_workspaces.resources);
             const key = PlayerStates.experienceKey(player.uuid);
@@ -314,17 +315,19 @@ fn verifyAtomicExperience(mode: fault.Disk.Mode) !void {
             try std.testing.expectEqual(expected, state.experience.total);
             try std.testing.expectEqual(expected, state.experience.score);
             try std.testing.expectEqual(repaired_item, (try fixture.ownership.get(hand)).stack.?.item);
-            const index = experience.ids.get(entity).?;
-            try std.testing.expectEqual(@as(i32, if (phase == 3) 1 else 2), experience.orbs[index].count);
-            experience.orbs[index].body.position = .{ 0.5, 8, 0.5 };
-            experience.orbs[index].body.velocity = .{ 0, 0, 0 };
+            const index = entity;
+            try std.testing.expectEqual(@as(i32, if (phase == 3) 1 else 2), (try orbOf(experience, index)).count);
+            try setBody(experience, index, "position", .{ 0.5, 8, 0.5 });
+            try setBody(experience, index, "velocity", .{ 0, 0, 0 });
             if (phase == 3) continue;
         }
-        try experience.tick();
+        try experience.deps.entities.tickAll();
         try std.testing.expectEqual(@as(i32, if (phase == 0) 5 else 12), state.experience.total);
         try fixture.players.checkpoint(fixture.players.deps.storage);
         try fixture.player_states.checkpoint(fixture.player_states.deps.storage);
         try fixture.ownership.checkpoint(fixture.ownership.deps.storage);
+        // Orb bodies are entities, saved with every other body.
+        try fixture.bodies.checkpoint(fixture.bodies.deps.storage);
         try experience.checkpoint(experience.deps.storage);
         if (phase != 1) try store.waitDurable(try store.commit(if (phase == 0) 1 else 2));
     }
@@ -351,19 +354,19 @@ test "experience metadata bodies and random state survive reopen and discard int
         const experience = containers.deps.experience;
         if (pass == 0) {
             try experience.award(fixture.players.records[0].world, .{ 8.5, 8, 0.5 }, 73);
-            const index = experience.active.values()[0];
-            entity = experience.residents[index].id;
-            experience.orbs[index].count = 5;
-            experience.orbs[index].age = 1234;
-            experience.orbs[index].fire = 80;
+            const index = (try liveOrbs(experience))[0];
+            entity = index;
+            try setOrb(experience, index, "count", 5);
+            try setOrb(experience, index, "age", 1234);
+            try setOrb(experience, index, "fire", 80);
             try std.testing.expect(try experience.damage(entity, 1.5));
             expected_random = experience.random.encode();
             try fixture.bodies.checkpoint(fixture.bodies.deps.storage);
             try experience.checkpoint(experience.deps.storage);
             try store.waitDurable(try store.commit(1));
         } else {
-            const index = experience.ids.get(entity).?;
-            const orb = experience.orbs[index];
+            const index = entity;
+            const orb = (try orbOf(experience, index));
             try std.testing.expectEqual(@as(i32, 73), orb.value);
             try std.testing.expectEqual(@as(i32, 5), orb.count);
             try std.testing.expectEqual(@as(u16, 1234), orb.age);
@@ -398,25 +401,26 @@ test "orb merges preserve denomination counts and minimum age and expiry removes
     fixture.players.rebuildIndexes();
     const world = fixture.players.records[0].world;
     try experience.award(world, .{ 8, 8, 0 }, 3);
-    fixture.bodies.next_id += 39;
+    // Ids forty apart share a merge bucket: the 39 slots between are taken.
+    for (0..39) |at| _ = try fixture.bodies.enter(1_000_000 + at, 0);
     try experience.award(world, .{ 10, 8, 0 }, 3);
-    try std.testing.expectEqual(@as(usize, 2), experience.active.values().len);
-    const first = experience.active.values()[0];
-    const second = experience.active.values()[1];
-    experience.orbs[first].age = 200;
-    experience.orbs[first].count = 2;
-    experience.orbs[second].age = 100;
-    experience.orbs[second].count = 5;
-    experience.orbs[second].body.position = experience.orbs[first].body.position;
-    try experience.tick();
-    try std.testing.expectEqual(@as(usize, 1), experience.active.values().len);
-    try std.testing.expectEqual(@as(i32, 3), experience.orbs[first].value);
-    try std.testing.expectEqual(@as(i32, 7), experience.orbs[first].count);
-    try std.testing.expectEqual(@as(u16, 101), experience.orbs[first].age);
-    const entity = experience.residents[first].id;
-    experience.orbs[first].age = 5999;
-    try experience.tick();
-    try std.testing.expect(!experience.orbs[first].alive);
+    try std.testing.expectEqual(@as(usize, 2), (try liveOrbs(experience)).len);
+    const first = (try liveOrbs(experience))[0];
+    const second = (try liveOrbs(experience))[1];
+    try setOrb(experience, first, "age", 200);
+    try setOrb(experience, first, "count", 2);
+    try setOrb(experience, second, "age", 100);
+    try setOrb(experience, second, "count", 5);
+    try setBody(experience, second, "position", (try bodyOf(experience, first)).position);
+    try experience.deps.entities.tickAll();
+    try std.testing.expectEqual(@as(usize, 1), (try liveOrbs(experience)).len);
+    try std.testing.expectEqual(@as(i32, 3), (try orbOf(experience, first)).value);
+    try std.testing.expectEqual(@as(i32, 7), (try orbOf(experience, first)).count);
+    try std.testing.expectEqual(@as(u16, 101), (try orbOf(experience, first)).age);
+    const entity = first;
+    try setOrb(experience, first, "age", 5999);
+    try experience.deps.entities.tickAll();
+    try std.testing.expect(!(try orbOf(experience, first)).alive);
     try std.testing.expect((try fixture.bodies.get(entity)) == null);
 }
 
@@ -442,41 +446,41 @@ test "orb placement fluid currents block effects and fire follow vanilla physics
     fixture.players.rebuildIndexes();
     try containers.deps.chunks.setBlock(world, .{ .x = 0, .y = 8, .z = 0 }, @intCast(game_data.registry.blockStateId("minecraft:stone").?));
     try experience.award(world, .{ 1.1, 8, 0.5 }, 1);
-    const first = experience.active.values()[0];
-    try std.testing.expectEqual(@as(f64, 1.25), experience.orbs[first].body.position[0]);
-    try std.testing.expectEqual(@as(f64, 8), experience.orbs[first].body.position[1]);
+    const first = (try liveOrbs(experience))[0];
+    try std.testing.expectEqual(@as(f64, 1.25), (try bodyOf(experience, first)).position[0]);
+    try std.testing.expectEqual(@as(f64, 8), (try bodyOf(experience, first)).position[1]);
     const water: u16 = @intCast(game_data.registry.blockStateId("minecraft:water[level=0]").?);
     try containers.deps.chunks.setBlock(world, .{ .x = 4, .y = 8, .z = 4 }, water);
     try experience.award(world, .{ 4.5, 8, 4.5 }, 3);
-    const second = experience.active.values()[1];
-    experience.orbs[second].body.velocity = .{ 0.1, 0, 0.1 };
-    try experience.tick();
-    const body = experience.orbs[second].body;
+    const second = (try liveOrbs(experience))[1];
+    try setBody(experience, second, "velocity", .{ 0.1, 0, 0.1 });
+    try experience.deps.entities.tickAll();
+    const body = (try bodyOf(experience, second));
     try std.testing.expectApproxEqAbs(@as(f64, 0.1) * @as(f64, @as(f32, 0.99)) * @as(f64, @as(f32, 0.98)), body.velocity[0], 1e-12);
     try std.testing.expectApproxEqAbs(@as(f64, @as(f32, 0.0005)) * @as(f64, @as(f32, 0.98)), body.velocity[1], 1e-12);
     const stone: u16 = @intCast(game_data.registry.blockStateId("minecraft:stone").?);
     for ([_]chunks.Position{ .{ .x = 3, .y = 8, .z = 4 }, .{ .x = 4, .y = 8, .z = 3 }, .{ .x = 4, .y = 8, .z = 5 } }) |position| try containers.deps.chunks.setBlock(world, position, stone);
     try containers.deps.chunks.setBlock(world, .{ .x = 5, .y = 8, .z = 4 }, @intCast(game_data.registry.blockStateId("minecraft:water[level=4]").?));
-    experience.orbs[second].body.position = .{ 4.5, 8, 4.5 };
-    experience.orbs[second].body.velocity = .{ 0, 0, 0 };
-    try experience.tick();
-    try std.testing.expectApproxEqAbs(@as(f64, 0.014) * @as(f64, @as(f32, 0.99)) * @as(f64, @as(f32, 0.98)), experience.orbs[second].body.velocity[0], 1e-12);
-    try std.testing.expectEqual(@as(f64, 0), experience.orbs[second].body.velocity[2]);
+    try setBody(experience, second, "position", .{ 4.5, 8, 4.5 });
+    try setBody(experience, second, "velocity", .{ 0, 0, 0 });
+    try experience.deps.entities.tickAll();
+    try std.testing.expectApproxEqAbs(@as(f64, 0.014) * @as(f64, @as(f32, 0.99)) * @as(f64, @as(f32, 0.98)), (try bodyOf(experience, second)).velocity[0], 1e-12);
+    try std.testing.expectEqual(@as(f64, 0), (try bodyOf(experience, second)).velocity[2]);
     const lava: u16 = @intCast(game_data.registry.blockStateId("minecraft:lava[level=0]").?);
     try containers.deps.chunks.setBlock(world, .{ .x = 10, .y = 8, .z = 4 }, lava);
     try experience.award(world, .{ 10.5, 8, 4.5 }, 7);
-    const burning = experience.active.values()[2];
-    experience.orbs[burning].body.velocity = .{ 0, 0, 0 };
-    try experience.tick();
-    try std.testing.expectEqual(@as(i16, 1), experience.orbs[burning].health);
-    try std.testing.expectEqual(@as(i16, 300), experience.orbs[burning].fire);
-    try experience.tick();
-    try std.testing.expect(!experience.orbs[burning].alive);
+    const burning = (try liveOrbs(experience))[2];
+    try setBody(experience, burning, "velocity", .{ 0, 0, 0 });
+    try experience.deps.entities.tickAll();
+    try std.testing.expectEqual(@as(i16, 1), (try orbOf(experience, burning)).health);
+    try std.testing.expectEqual(@as(i16, 300), (try orbOf(experience, burning)).fire);
+    try experience.deps.entities.tickAll();
+    try std.testing.expect(!(try orbOf(experience, burning)).alive);
     try containers.deps.chunks.setBlock(world, .{ .x = 12, .y = 8, .z = 4 }, @intCast(game_data.registry.blockStateId("minecraft:bubble_column[drag=false]").?));
     try containers.deps.chunks.setBlock(world, .{ .x = 14, .y = 8, .z = 4 }, @intCast(game_data.registry.blockStateId("minecraft:cobweb").?));
     var window = experience.deps.physics.readWindow();
     defer window.deinit();
-    var moving = experience.orbs[second].body;
+    var moving = (try bodyOf(experience, second));
     moving.position = .{ 12.5, 8, 4.5 };
     moving.velocity = .{ 0, 0, 0 };
     const lifted = try experience.deps.physics.advanceOrb(&window, 1, 1, moving, false, .{ 0, 0, 0 });
@@ -543,15 +547,15 @@ test "furnace recipe rewards survive reordered content and claim exactly once" {
             try containers.click(player.handle.?, .{ .window_id = view.window, .state_id = 0, .slot = 2, .button = 1, .mode = 0 });
             try std.testing.expectEqual(@as(u16, 1), (try fixture.ownership.get(Containers.slot(key.world, key.position, 2))).stack.?.count);
             var total: i32 = 0;
-            for (containers.deps.experience.active.values()) |index| {
-                const orb = containers.deps.experience.orbs[index];
+            for ((try liveOrbs(containers.deps.experience))) |index| {
+                const orb = (try orbOf(containers.deps.experience, index));
                 total += orb.count * orb.value;
             }
             try std.testing.expect(total == 4 or total == 5);
             try containers.click(player.handle.?, .{ .window_id = view.window, .state_id = 0, .slot = 2, .button = 0, .mode = 0 });
             var after: i32 = 0;
-            for (containers.deps.experience.active.values()) |index| {
-                const orb = containers.deps.experience.orbs[index];
+            for ((try liveOrbs(containers.deps.experience))) |index| {
+                const orb = (try orbOf(containers.deps.experience, index));
                 after += orb.count * orb.value;
             }
             try std.testing.expectEqual(total, after);
@@ -668,12 +672,11 @@ fn blockContainers(allocator: std.mem.Allocator, store: *storage.Store, registry
     const resources = try records.Workspaces.init(allocator, std.testing.io, .{});
     const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .edit_sections = 1, .simulation_sections = 64, .cache_sections = 96, .cache_groups = 4 }, .{ .storage = try store.openSpace("chunks"), .metrics = registry, .record_workspaces = resources });
     const domains = try Domains.init(allocator, .{}, .{ .players = fixture.players });
-    domains.tick();
-    const experience = try Experience.init(allocator, .{ .maximum_orbs = 16 }, .{
+    _ = try EntityColumns.init(allocator, .{}, .{ .domains = domains, .entities = fixture.bodies });
+    const experience = try Experience.init(allocator, .{}, .{
         .enchantments = fixture.definitions.enchantments,
         .dimensions = fixture.definitions.dimensions,
         .players = fixture.players,
-        .domains = domains,
         .player_states = fixture.player_states,
         .entities = fixture.bodies,
         .physics = try ItemPhysics.init(allocator, .{ .blocks = fixture.definitions.blocks, .chunks = terrain }),
@@ -682,6 +685,10 @@ fn blockContainers(allocator: std.mem.Allocator, store: *storage.Store, registry
         .storage = try store.openSpace("experience"),
         .record_workspaces = resources,
     });
+    // Orbs hear of the columns that tick from the first tick on; those kept near the player
+    // come back into memory, as the orb tick would bring them.
+    domains.tick();
+    try experience.refresh();
     return Containers.init(allocator, std.testing.io, .{ .active_furnaces = 8 }, .{
         .definitions = fixture.definitions.blocks,
         .furnaces = fixture.definitions.furnaces,
@@ -880,21 +887,22 @@ test "container clicks enforce output fuel stack and recipe remainder rules" {
         try std.testing.expectEqual(@as(u64, 0), (try fixture.ownership.get(Containers.slot(first.world, first.position, 1))).revision);
         try std.testing.expectEqual(@as(u16, 0), try blocks.chunk_client.getBlock(first.world, first.position));
         try std.testing.expectEqual(blocks.states.chests[0][0][0], try blocks.chunk_client.getBlock(second.world, second.position));
-        var cursor: ItemEntities.Cursor = .{};
-        const drops = try fixture.dropped.scan(&cursor);
-        try std.testing.expectEqual(@as(usize, 1), drops.len);
-        const body = (try fixture.bodies.get(drops[0].id)).?;
+        var drops = fixture.dropped.rows();
+        const drop = (try drops.next()).?;
+        try std.testing.expect((try drops.next()) == null);
+        const body = (try fixture.bodies.get(drop.id)).?;
         const value = try fixture.ownership.get(ItemEntities.slot(body));
         try std.testing.expectEqual(bread, value.stack.?);
         const last: ContainerKey = .{ .world = first.world, .position = .{ .x = 5, .y = 1, .z = 0 } };
         const placed = try blocks.deps.actions.apply(.{ .action = .place, .player = &fixture.players.records[0], .position = last.position, .state = blocks.states.chests[0][0][0] });
         try std.testing.expectEqual(BlockActions.Result.applied, placed);
         try std.testing.expect(try fixture.ownership.set(Containers.slot(last.world, last.position, 0), 0, bread));
-        const reserved = fixture.dropped.free_count;
-        const denied = try blocks.deps.actions.apply(.{ .action = .remove, .player = &fixture.players.records[0], .position = last.position, .state = blocks.states.chests[0][0][0], .following_drops = reserved });
-        try std.testing.expectEqual(BlockActions.Result.denied, denied);
-        try std.testing.expectEqual(bread, (try fixture.ownership.get(Containers.slot(last.world, last.position, 0))).stack.?);
-        try std.testing.expectEqual(reserved, fixture.dropped.free_count);
+        // However many drops follow, nothing is refused: the chest's bread drops with them.
+        const before = fixture.dropped.count();
+        const removed = try blocks.deps.actions.apply(.{ .action = .remove, .player = &fixture.players.records[0], .position = last.position, .state = blocks.states.chests[0][0][0], .following_drops = 4096 });
+        try std.testing.expectEqual(BlockActions.Result.applied, removed);
+        try std.testing.expect((try fixture.ownership.get(Containers.slot(last.world, last.position, 0))).stack == null);
+        try std.testing.expectEqual(before + 1, fixture.dropped.count());
     }
 }
 
@@ -991,14 +999,16 @@ test "shared chest clicks revalidate drag slots and preserve independent cursors
     const destination = Containers.slot(key.world, key.position, 0);
     const previous = try fixture.ownership.get(destination);
     try std.testing.expect(try fixture.ownership.set(destination, previous.revision, bread));
-    while (fixture.dropped.free_count > 2) _ = try fixture.dropped.create(key.world, .{ 2, 1, 0 }, .{ 0, 0, 0 }, bread);
+    const before = fixture.dropped.count();
     try std.testing.expectEqual(BlockActions.Result.applied, try containers.deps.actions.apply(.{ .action = .remove, .player = &fixture.players.records[0], .position = key.position, .state = chest, .following_drops = 1 }));
     try std.testing.expect(!containers.opened.contains(0));
-    try std.testing.expectEqual(@as(usize, 1), fixture.dropped.free_count);
-    _ = try fixture.dropped.create(key.world, .{ 2, 1, 0 }, .{ 0, 0, 0 }, bread);
+    try std.testing.expectEqual(before + 1, fixture.dropped.count());
+    // With no room left in the inventory, closing drops what the cursor holds: nothing waits.
+    const dropped_before = fixture.dropped.count();
     try fixture.menu.closeMenu(0);
-    try std.testing.expect(fixture.menu.states[0].close);
-    try std.testing.expectEqual(coal, (try fixture.ownership.get(coal_slot)).stack.?);
+    try std.testing.expect(!fixture.menu.states[0].close);
+    try std.testing.expect((try fixture.ownership.get(coal_slot)).stack == null);
+    try std.testing.expectEqual(dropped_before + 1, fixture.dropped.count());
 }
 
 fn checkpointMenus(fixture: InventoryFixture, containers: *Containers, store: *storage.Store) ![5]u64 {
@@ -1044,10 +1054,9 @@ fn countOwned(fixture: InventoryFixture, keys: []const ContainerKey) ![conserved
         try fixture.ownership.getMany(slots[0..27], contents[0..27]);
         try addOwned(&totals, contents[0..27]);
     }
-    var cursor: ItemEntities.Cursor = .{};
-    while (cursor.more) {
-        const rows = try fixture.dropped.scan(&cursor);
-        for (rows) |row| {
+    var rows = fixture.dropped.rows();
+    {
+        while ((try rows.next())) |row| {
             if (!row.metadata.alive) continue;
             const body = (try fixture.bodies.get(row.id)) orelse return error.MissingDroppedBody;
             const owned = try fixture.ownership.get(ItemEntities.slot(body));
@@ -1170,7 +1179,7 @@ test "interrupted container saves recover a complete ownership snapshot" {
             const totals = try countOwned(fixture, &.{ chest_key, furnace_key });
             try std.testing.expectEqualSlices(u64, &.{ 17, 6, 3, if (complete) 1 else 2, if (complete) 1 else 0 }, &totals);
             try std.testing.expectEqual(complete, (try containers.chunk_client.getBlock(chest_key.world, chest_key.position)) == 0);
-            try std.testing.expectEqual(@as(usize, if (complete) 7 else 8), fixture.dropped.free_count);
+            try std.testing.expectEqual(@as(usize, if (complete) 1 else 0), fixture.dropped.count());
             const counters = containers.furnaceState(furnace_key.world, furnace_key.position);
             try std.testing.expectEqual(@as(u32, if (complete) 0 else 73), counters.cook);
             try std.testing.expectEqual(saved_burn - @as(u32, if (complete) 127 else 0), counters.burn_left);
@@ -1201,11 +1210,12 @@ test "inventory cache defaults follow player capacity and preserve explicit over
     const selected = [_]sessions.Protocol{.{ .number = protocols.implementations[0].protocol_number }};
     const fixture = try InventoryFixture.init(arena.allocator(), &store, &registry, &selected);
     defer fixture.service.deinit();
-    const capacity = try InventoryCapacity.init(arena.allocator(), .{ .players = fixture.players });
+    const capacity = try InventoryCapacity.init(arena.allocator(), .{ .item_slots = 64 }, .{ .players = fixture.players });
     var deps = fixture.ownership.deps;
     deps.capacity = capacity.provide(inventories.SlotCapacity);
     const automatic = try inventories.Inventories.init(arena.allocator(), std.testing.io, .{ .cache_items = 1, .max_item_bytes = 1024 }, deps);
-    try std.testing.expectEqual(92 * fixture.players.config.maximum, automatic.cache.entries.len);
+    // Every player's menu slots, and room for item stacks.
+    try std.testing.expectEqual(92 * fixture.players.config.maximum + 64, automatic.cache.entries.len);
     const explicit = try inventories.Inventories.init(arena.allocator(), std.testing.io, .{ .cache_slots = 256, .cache_items = 1, .max_item_bytes = 1024 }, deps);
     try std.testing.expectEqual(@as(usize, 256), explicit.cache.entries.len);
     deps.capacity = null;
@@ -1791,4 +1801,30 @@ test "items drift with water currents and float in water and lava, as vanilla's 
     dry.position = .{ 20.5, 8, 4.5 };
     const falling = try physics.step(&window, 1, 1, dry, false, false);
     try std.testing.expectEqual(@as([3]f64, .{ 0, -0.04 * 0.98, 0 }), falling.body.velocity);
+}
+
+var live_orbs: [256]u64 = undefined;
+
+fn liveOrbs(experience: *Experience) ![]u64 {
+    return experience.live(&live_orbs);
+}
+
+fn orbOf(experience: *Experience, entity: u64) !Experience.Orb {
+    return ((try experience.get(entity)) orelse return error.UnknownExperienceOrb).orb;
+}
+
+fn bodyOf(experience: *Experience, entity: u64) !@import("entities").State {
+    return ((try experience.get(entity)) orelse return error.UnknownExperienceOrb).body orelse error.OrbGone;
+}
+
+fn setOrb(experience: *Experience, entity: u64, comptime field: []const u8, value: anytype) !void {
+    var orb = try orbOf(experience, entity);
+    @field(orb, field) = value;
+    try experience.put(entity, orb, null);
+}
+
+fn setBody(experience: *Experience, entity: u64, comptime field: []const u8, value: anytype) !void {
+    var body = try bodyOf(experience, entity);
+    @field(body, field) = value;
+    try experience.put(entity, try orbOf(experience, entity), body);
 }

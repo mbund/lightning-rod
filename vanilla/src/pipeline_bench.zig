@@ -63,14 +63,6 @@ test "operation counts for mining progress and deferred drops" {
     try mining.benchmark();
 }
 
-test "operation counts for cached simulation and pickup item queries" {
-    try gameplay.benchmarkItemQueries();
-}
-
-test "operation counts for sparse and overlapping item query planning" {
-    try item_entities.benchmarkQueryPlanning();
-}
-
 test "operation counts for grouped block delivery and backpressure retries" {
     try inventory.benchmarkBlockPlanning();
 }

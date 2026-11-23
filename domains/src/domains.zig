@@ -2,7 +2,10 @@
 //! simulation distance of a player in a world, plus forced columns. Systems that change the world
 //! on their own, such as random ticks, run there and read one column further. A player counts
 //! from the moment they are placed in a world, as vanilla adds the player ticket then. The view domain
-//! is each player's render distance, a circle as vanilla measures it.
+//! is each player's render distance, a circle as vanilla measures it. The loaded domain is the
+//! square of each player's render distance and one more, or the simulation distance if further, plus
+//! forced columns: the columns whose entities are in
+//! memory, as vanilla keeps those of loaded chunks.
 
 const std = @import("std");
 const Players = @import("players").players.Players;
@@ -41,6 +44,11 @@ pub const Domains = struct {
     simulation: ticking.Ticking,
     observers: []Observer,
     observer_count: usize = 0,
+    loaded: ticking.Ticking,
+    /// Told of columns coming into the loaded domain before they tick, and of those leaving it
+    /// after they stop.
+    loaded_observers: []Observer,
+    loaded_observer_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Domains {
         if (config.observers == 0) return error.InvalidConfiguration;
@@ -52,7 +60,12 @@ pub const Domains = struct {
             .forced = config.forced,
         });
         errdefer simulation.deinit(allocator);
-        self.* = .{ .deps = deps, .simulation = simulation, .observers = try allocator.alloc(Observer, config.observers) };
+        const loaded = try ticking.Ticking.init(allocator, .{
+            .sources = deps.players.records.len,
+            .maximum_radius = @max(deps.players.config.render_distance + 1, deps.players.config.simulation_distance),
+            .forced = config.forced,
+        });
+        self.* = .{ .deps = deps, .simulation = simulation, .observers = try allocator.alloc(Observer, config.observers), .loaded = loaded, .loaded_observers = try allocator.alloc(Observer, config.observers) };
         return self;
     }
 
@@ -62,6 +75,24 @@ pub const Domains = struct {
         assert(self.simulation.columns() == 0);
         self.observers[self.observer_count] = observer;
         self.observer_count += 1;
+    }
+
+    /// Tells `observer` of columns coming into and leaving the loaded domain.
+    pub fn observeLoaded(self: *Domains, observer: Observer) !void {
+        if (self.loaded_observer_count == self.loaded_observers.len) return error.ObserverCapacity;
+        assert(self.loaded.columns() == 0);
+        self.loaded_observers[self.loaded_observer_count] = observer;
+        self.loaded_observer_count += 1;
+    }
+
+    /// Columns that may be loaded at once.
+    pub fn loadedCapacity(self: *const Domains) usize {
+        return self.loaded.capacity;
+    }
+
+    /// Whether a column's entities are in memory.
+    pub fn loads(self: *const Domains, column: Column) bool {
+        return self.loaded.contains(column);
     }
 
     /// Columns that may tick at once: every player's simulation distance and the forced ones.
@@ -85,10 +116,12 @@ pub const Domains = struct {
 
     pub fn force(self: *Domains, column: Column) !void {
         try self.simulation.force(column);
+        try self.loaded.force(column);
     }
 
     pub fn unforce(self: *Domains, column: Column) !void {
         try self.simulation.unforce(column);
+        try self.loaded.unforce(column);
     }
 
     /// Whether a player's client shows a column: vanilla's view distance from the nearest edge of
@@ -109,10 +142,14 @@ pub const Domains = struct {
                 break :source .{ .world = player.world, .x = at[0], .z = at[1], .radius = players.config.simulation_distance };
             } else null;
             self.simulation.update(slot, source);
+            self.loaded.update(slot, if (source) |ticking_source| .{ .world = ticking_source.world, .x = ticking_source.x, .z = ticking_source.z, .radius = @max(players.viewDistanceOf(player) + 1, players.config.simulation_distance) } else null);
         }
+        // Loaded before they tick, and ticking no more before they unload.
+        const loading = self.loaded.drain();
+        for (self.loaded_observers[0..self.loaded_observer_count]) |observer| if (loading.entered.len > 0) observer.changed(observer.context, loading.entered, &.{});
         const changes = self.simulation.drain();
-        if (changes.entered.len == 0 and changes.left.len == 0) return;
-        for (self.observers[0..self.observer_count]) |observer| observer.changed(observer.context, changes.entered, changes.left);
+        if (changes.entered.len > 0 or changes.left.len > 0) for (self.observers[0..self.observer_count]) |observer| observer.changed(observer.context, changes.entered, changes.left);
+        for (self.loaded_observers[0..self.loaded_observer_count]) |observer| if (loading.left.len > 0) observer.changed(observer.context, &.{}, loading.left);
     }
 };
 

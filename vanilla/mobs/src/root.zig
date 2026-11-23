@@ -16,7 +16,6 @@ pub const navigation = @import("navigation.zig");
 pub const block_effects = @import("block_effects.zig");
 pub const mobs = @import("mobs.zig");
 pub const herd = @import("herd.zig");
-pub const grid = @import("grid.zig");
 pub const mob_replication = @import("mob_replication.zig");
 pub const spawn_eggs = @import("spawn_eggs.zig");
 pub const pathfinding = @import("pathfinding.zig");
@@ -38,7 +37,7 @@ test {
 comptime {
     // Plugins and their functions compile only where referenced, so reference the entry points.
     _ = &mobs.Mobs.init;
-    _ = &mobs.Mobs.tick;
+    _ = &mobs.Mobs.tickRun;
     _ = &mobs.Mobs.checkpoint;
     _ = &mobs.Mobs.spawn;
     _ = &mob_replication.MobReplication.init;
@@ -48,6 +47,6 @@ comptime {
     _ = &melee.Melee.init;
     _ = &melee.Melee.tick;
     _ = &projectiles.Projectiles.init;
-    _ = &projectiles.Projectiles.tick;
+    _ = &projectiles.Projectiles.tickRun;
     _ = &ranged.Ranged.init;
 }

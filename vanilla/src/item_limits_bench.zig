@@ -1,4 +1,6 @@
 const vanilla_content = @import("vanilla_definitions").defaults;
+const Domains = @import("domains").domains.Domains;
+const EntityColumns = @import("domains").entity_columns.EntityColumns;
 const game_data = @import("game_data");
 const std = @import("std");
 const storage = @import("storage");
@@ -44,10 +46,10 @@ pub fn benchmark() !void {
         var stacks: [names.len]inventories.Stack = undefined;
         for (names, &stacks) |name, *stack| stack.* = .{ .item = try items.define(name), .count = stack_count };
 
-        const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 1024 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
+        const bodies = try entities.Entities.init(allocator, io, .{}, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
         const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
-        const dropped = try ItemEntities.init(allocator, io, .{ .cache_records = 1024, .maximum = 1024 }, .{
+        const dropped = try ItemEntities.init(allocator, io, .{}, .{
             .metrics = &registry,
             .record_workspaces = workspaces,
             .entities = bodies,
@@ -89,7 +91,9 @@ pub fn benchmark() !void {
         var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .position = .{ .x = 32, .y = 65, .z = 32 } }};
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        const tick = try tick_module.ItemTick.init(allocator, .{ .merge_work = .{ .guaranteed = .{ .operations = 1 }, .burst = .{ .operations = count * 128 } } }, .{ .dropped = dropped, .physics = physics, .merging = merging, .pickup = undefined, .players = &players, .entities = bodies, .inventories = ownership, .items = items, .worlds = dimensions, .dimensions = gameplay_definitions.dimensions, .client = gameplay_definitions.client });
+        const domains = try Domains.init(allocator, .{}, .{ .players = &players });
+        _ = try EntityColumns.init(allocator, .{}, .{ .domains = domains, .entities = bodies });
+        const tick = try tick_module.ItemTick.init(allocator, .{}, .{ .dropped = dropped, .physics = physics, .merging = merging, .pickup = undefined, .players = &players, .entities = bodies, .inventories = ownership, .items = items, .worlds = dimensions, .dimensions = gameplay_definitions.dimensions, .client = gameplay_definitions.client });
 
         players.rebuildIndexes();
 
@@ -104,7 +108,10 @@ pub fn benchmark() !void {
             const acquired = ownership.items.metrics.acquired.value();
             const slots = ownership.cache.metrics.acquired.value();
             const reads = ownership.cache.metrics.reads.value();
-            try tick.tick();
+            {
+                domains.tick();
+                try tick.deps.entities.tickAll();
+            }
             try std.testing.expectEqual(slots, ownership.cache.metrics.acquired.value());
             try std.testing.expectEqual(reads, ownership.cache.metrics.reads.value());
             try std.testing.expectEqual(@as(u64, 0), tick.merged);
@@ -114,40 +121,39 @@ pub fn benchmark() !void {
         }
 
         failing.fail_index = std.math.maxInt(usize);
-        const restored = try ItemEntities.init(allocator, io, .{ .cache_records = 1024, .maximum = 1024 }, dropped.deps);
+        // A restart: every entity's memory afresh, items coming back from the store.
+        const restored_bodies = try entities.Entities.init(allocator, io, .{}, bodies.deps);
+        // The columns ticking now; the player stands still, so they stay.
+        var ticking = domains.tickingColumns();
+        try restored_bodies.places.resyncTicking(&ticking);
+        var restored_deps = dropped.deps;
+        restored_deps.entities = restored_bodies;
+        const restored = try ItemEntities.init(allocator, io, .{}, restored_deps);
         tick.deps.dropped = restored;
-        tick.query = try ItemEntities.Query.init(allocator, restored, &players);
+        tick.deps.entities = restored_bodies;
+        try restored_bodies.addTicker(tick.ticker());
         failing.fail_index = failing.alloc_index;
         const restored_reads = ownership.items.metrics.reads.value();
         const restored_acquisitions = ownership.items.metrics.acquired.value();
-        try tick.tick();
-        try std.testing.expectEqual(restored_reads, ownership.items.metrics.reads.value());
-        try std.testing.expectEqual(restored_acquisitions, ownership.items.metrics.acquired.value());
-        var held: [1]ItemEntities.Record = undefined;
-        try restored.acquireMany(ids[0..1], &held);
-        defer held[0].release();
-        const body = (try held[0].body.read()).?;
+        {
+            domains.tick();
+            try tick.deps.entities.tickAll();
+        }
+        // Restored, the stack limits merging asks of are read again: once a kind at most.
+        try std.testing.expect(ownership.items.metrics.reads.value() <= restored_reads + stacks.len);
+        try std.testing.expect(ownership.items.metrics.acquired.value() <= restored_acquisitions + stacks.len);
+        const body = (try restored.read(ids[0])).?.body;
         const inventory_slot = ItemEntities.slot(body);
-        try std.testing.expectEqual(stack_count == 64, restored.fullStack(held[0]));
+        try std.testing.expectEqual(stack_count == 64, (try restored.fullStack(body)));
         const previous = try ownership.get(inventory_slot);
         const replacement: inventories.Stack = .{ .item = try items.define("minecraft:ender_pearl"), .count = 1 };
         try std.testing.expect(try ownership.set(inventory_slot, previous.revision, replacement));
-        try std.testing.expect(!restored.fullStack(held[0]));
-        const before = ownership.items.metrics.acquired.value();
-        try std.testing.expectEqual(@as(u16, 16), try restored.stackLimit(held[0], replacement));
-        try std.testing.expectEqual(before + 1, ownership.items.metrics.acquired.value());
-        var limits: [16]u16 = undefined;
-        try items.stackLimits(&stacks, &limits);
-        const evicted = ownership.items.metrics.acquired.value();
-        try std.testing.expectEqual(@as(u16, 16), try restored.stackLimit(held[0], replacement));
-        try std.testing.expectEqual(evicted, ownership.items.metrics.acquired.value());
-        _ = try restored.mergeLimit(held[0], replacement);
-        try std.testing.expect(!restored.fullStack(held[0]));
+        try std.testing.expect(!(try restored.fullStack(body)));
+        try std.testing.expectEqual(@as(u16, 16), try restored.stackLimit(replacement));
+        // A stack is read when asked of, so a full one is found full as soon as it is.
         const full: inventories.Stack = .{ .item = replacement.item, .count = 16 };
         try std.testing.expect(try ownership.set(inventory_slot, previous.revision + 1, full));
-        try std.testing.expect(!restored.fullStack(held[0]));
-        _ = try restored.mergeLimit(held[0], full);
-        try std.testing.expect(restored.fullStack(held[0]));
+        try std.testing.expect(try restored.fullStack(body));
     };
     try output.interface.flush();
 }

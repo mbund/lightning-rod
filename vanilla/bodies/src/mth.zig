@@ -164,7 +164,6 @@ pub fn atan2(y_in: f64, x_in: f64) f64 {
     return angle;
 }
 
-
 /// Mth.atan2 for several at once, each lane the same operations as `atan2` alone.
 pub fn atan2Many(comptime lanes: usize, y_in: @Vector(lanes, f64), x_in: @Vector(lanes, f64)) @Vector(lanes, f64) {
     const V = @Vector(lanes, f64);

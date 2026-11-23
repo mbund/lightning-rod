@@ -50,39 +50,39 @@ pub const Goal = enum(u3) {
 
 const all = [_]Goal{ .float, .panic, .breed, .tempt, .follow_parent, .stroll, .look_at_player, .look_around };
 
-fn running(mob: *const Mob, goal: Goal) bool {
-    return mob.goals.running & bit(goal) != 0;
+fn running(mob: Mob, goal: Goal) bool {
+    return mob.idle.running & bit(goal) != 0;
 }
 
 fn bit(goal: Goal) u8 {
     return @as(u8, 1) << @backingInt(goal);
 }
 
-pub fn isPanicking(mob: *const Mob) bool {
+pub fn isPanicking(mob: Mob) bool {
     return running(mob, .panic);
 }
 
 /// WrappedGoal.stop.
-fn stopGoal(mobs: *Mobs, mob: *Mob, goal: Goal) void {
+fn stopGoal(mobs: *Mobs, mob: Mob, goal: Goal) void {
     if (!running(mob, goal)) return;
-    mob.goals.running &= ~bit(goal);
+    mob.idle.running &= ~bit(goal);
     stop(mobs, mob, goal);
 }
 
 /// WrappedGoal.start.
-fn startGoal(mobs: *Mobs, mob: *Mob, goal: Goal) !void {
+fn startGoal(mobs: *Mobs, mob: Mob, goal: Goal) !void {
     if (running(mob, goal)) return;
-    mob.goals.running |= bit(goal);
+    mob.idle.running |= bit(goal);
     try start(mobs, mob, goal);
 }
 
 /// GoalSelector.goalCanBeReplacedForAllFlags: every flag is free, or held by a goal this one
 /// outranks. Every goal here may be interrupted.
-fn replaceable(mob: *const Mob, goal: Goal) bool {
+fn replaceable(mob: Mob, goal: Goal) bool {
     const flags = goal.flags();
     const owners = [_]struct { wanted: bool, owner: ?u3 }{
-        .{ .wanted = flags.move, .owner = mob.goals.move_owner },
-        .{ .wanted = flags.look, .owner = mob.goals.look_owner },
+        .{ .wanted = flags.move, .owner = mob.idle.move_owner },
+        .{ .wanted = flags.look, .owner = mob.idle.look_owner },
         .{ .wanted = flags.jump, .owner = mob.goals.jump_owner },
     };
     for (owners) |entry| {
@@ -94,17 +94,17 @@ fn replaceable(mob: *const Mob, goal: Goal) bool {
 }
 
 /// GoalSelector.tick.
-pub fn tick(mobs: *Mobs, mob: *Mob) !void {
+pub fn tick(mobs: *Mobs, mob: Mob) !void {
     // Mobs here carry no passengers and ride nothing, so no flag is disabled.
     for (all) |goal| {
         if (running(mob, goal) and !try canContinueToUse(mobs, mob, goal)) stopGoal(mobs, mob, goal);
     }
     // lockedFlags.removeIf(goal is not running).
-    if (mob.goals.move_owner) |owner| if (!running(mob, @fromBackingInt(@intCast(owner)))) {
-        mob.goals.move_owner = null;
+    if (mob.idle.move_owner) |owner| if (!running(mob, @fromBackingInt(@intCast(owner)))) {
+        mob.idle.move_owner = null;
     };
-    if (mob.goals.look_owner) |owner| if (!running(mob, @fromBackingInt(@intCast(owner)))) {
-        mob.goals.look_owner = null;
+    if (mob.idle.look_owner) |owner| if (!running(mob, @fromBackingInt(@intCast(owner)))) {
+        mob.idle.look_owner = null;
     };
     if (mob.goals.jump_owner) |owner| if (!running(mob, @fromBackingInt(@intCast(owner)))) {
         mob.goals.jump_owner = null;
@@ -114,12 +114,12 @@ pub fn tick(mobs: *Mobs, mob: *Mob) !void {
         if (!try canUse(mobs, mob, goal)) continue;
         const flags = goal.flags();
         if (flags.move) {
-            if (mob.goals.move_owner) |owner| stopGoal(mobs, mob, @fromBackingInt(@intCast(owner)));
-            mob.goals.move_owner = @backingInt(goal);
+            if (mob.idle.move_owner) |owner| stopGoal(mobs, mob, @fromBackingInt(@intCast(owner)));
+            mob.idle.move_owner = @backingInt(goal);
         }
         if (flags.look) {
-            if (mob.goals.look_owner) |owner| stopGoal(mobs, mob, @fromBackingInt(@intCast(owner)));
-            mob.goals.look_owner = @backingInt(goal);
+            if (mob.idle.look_owner) |owner| stopGoal(mobs, mob, @fromBackingInt(@intCast(owner)));
+            mob.idle.look_owner = @backingInt(goal);
         }
         if (flags.jump) {
             if (mob.goals.jump_owner) |owner| stopGoal(mobs, mob, @fromBackingInt(@intCast(owner)));
@@ -131,7 +131,7 @@ pub fn tick(mobs: *Mobs, mob: *Mob) !void {
 }
 
 /// GoalSelector.tickRunningGoals.
-pub fn tickRunning(mobs: *Mobs, mob: *Mob, every: bool) !void {
+pub fn tickRunning(mobs: *Mobs, mob: Mob, every: bool) !void {
     for (all) |goal| {
         if (running(mob, goal) and (every or goal.requiresUpdateEveryTick())) try tickGoal(mobs, mob, goal);
     }
@@ -146,7 +146,7 @@ fn adjustedTickDelay(goal: Goal, ticks: i32) i32 {
     return if (goal.requiresUpdateEveryTick()) ticks else reducedTickDelay(ticks);
 }
 
-fn canUse(mobs: *Mobs, mob: *Mob, goal: Goal) !bool {
+fn canUse(mobs: *Mobs, mob: Mob, goal: Goal) !bool {
     return switch (goal) {
         .float => floatCanUse(mobs, mob),
         .panic => try panicCanUse(mobs, mob),
@@ -155,88 +155,83 @@ fn canUse(mobs: *Mobs, mob: *Mob, goal: Goal) !bool {
         .follow_parent => try followParentCanUse(mobs, mob),
         .stroll => try strollCanUse(mobs, mob),
         .look_at_player => try lookAtPlayerCanUse(mobs, mob),
-        .look_around => mob.random.nextFloat() < 0.02,
+        .look_around => mob.idle.random.nextFloat() < 0.02,
     };
 }
 
-fn canContinueToUse(mobs: *Mobs, mob: *Mob, goal: Goal) !bool {
+fn canContinueToUse(mobs: *Mobs, mob: Mob, goal: Goal) !bool {
     return switch (goal) {
         .float => floatCanUse(mobs, mob),
         .panic => !navigation.done(mob),
-        .breed => breedCanContinue(mobs, mob),
+        .breed => try breedCanContinue(mobs, mob),
         .tempt => try temptCanUse(mobs, mob),
-        .follow_parent => followParentCanContinue(mobs, mob),
+        .follow_parent => try followParentCanContinue(mobs, mob),
         .stroll => !navigation.done(mob),
         .look_at_player => lookAtPlayerCanContinue(mobs, mob),
-        .look_around => mob.goals.look_around_time >= 0,
+        .look_around => mob.idle.look_around.time >= 0,
     };
 }
 
-fn start(mobs: *Mobs, mob: *Mob, goal: Goal) !void {
+fn start(mobs: *Mobs, mob: Mob, goal: Goal) !void {
     switch (goal) {
         .float => {},
-        .panic => {
-            const target = mob.goals.panic_target;
-            _ = try navigation.moveToPosition(mobs, mob, target[0], target[1], target[2], 2.0);
+        .panic, .stroll => {
+            const target = mobs.chosen.target;
+            _ = try navigation.moveToPosition(mobs, mob, target[0], target[1], target[2], if (goal == .panic) 2.0 else 1.0);
         },
-        .breed => {},
+        .breed => _ = try mob.put(.focus, .{ .breed = .{ .partner = mobs.chosen.partner.? } }),
         .tempt => {
-            const player = &mobs.deps.players.records[mob.goals.tempt_player.?];
-            mob.goals.tempt_player_position = .{ player.position.x, player.position.y, player.position.z };
+            const slot = mobs.chosen.player.?;
+            const player = &mobs.deps.players.records[slot];
+            _ = try mob.put(.focus, .{ .tempt = .{ .player = slot, .player_position = .{ player.position.x, player.position.y, player.position.z } } });
         },
-        .follow_parent => mob.goals.parent_recalculate = 0,
-        .stroll => {
-            const target = mob.goals.stroll_target;
-            _ = try navigation.moveToPosition(mobs, mob, target[0], target[1], target[2], 1.0);
+        .follow_parent => {
+            _ = try mob.put(.follow, .{ .parent = mobs.chosen.partner.? });
         },
-        .look_at_player => mob.goals.look_time = adjustedTickDelay(.look_at_player, 40 + mob.random.nextIntBounded(40)),
+        .look_at_player => _ = try mob.put(.focus, .{ .look_at_player = .{ .player = mobs.chosen.player.?, .time = adjustedTickDelay(.look_at_player, 40 + mob.idle.random.nextIntBounded(40)) } }),
         .look_around => {
-            const angle = (std.math.pi * 2.0) * mob.random.nextDouble();
-            mob.goals.look_around = .{ @cos(angle), @sin(angle) };
-            mob.goals.look_around_time = 20 + mob.random.nextIntBounded(20);
+            const angle = (std.math.pi * 2.0) * mob.idle.random.nextDouble();
+            const relative: [2]f64 = .{ @cos(angle), @sin(angle) };
+            mob.idle.look_around = .{ .relative = relative, .time = 20 + mob.idle.random.nextIntBounded(20) };
         },
     }
 }
 
-fn stop(mobs: *Mobs, mob: *Mob, goal: Goal) void {
+fn stop(mobs: *Mobs, mob: Mob, goal: Goal) void {
     _ = mobs;
     switch (goal) {
-        .float, .panic, .follow_parent => {
-            if (goal == .follow_parent) mob.goals.parent = null;
-        },
-        .breed => {
-            mob.goals.breed_partner = null;
-            mob.goals.breed_love_time = 0;
-        },
+        .float, .panic => {},
+        .follow_parent => mob.drop(.follow),
+        .breed, .look_at_player => mob.drop(.focus),
+        .look_around => {},
         .tempt => {
-            mob.goals.tempt_player = null;
+            mob.drop(.focus);
             navigation.stop(mob);
-            mob.goals.tempt_calm_down = reducedTickDelay(100);
+            mob.idle.tempt_calm_down = reducedTickDelay(100);
         },
         .stroll => navigation.stop(mob),
-        .look_at_player => mob.goals.look_at_player = null,
-        .look_around => {},
     }
 }
 
-fn tickGoal(mobs: *Mobs, mob: *Mob, goal: Goal) !void {
+fn tickGoal(mobs: *Mobs, mob: Mob, goal: Goal) !void {
     switch (goal) {
         .float => {
-            if (mob.random.nextFloat() < 0.8) mob.jump = true;
+            if (mob.idle.random.nextFloat() < 0.8) mob.control.jump = true;
         },
         .breed => try breedTick(mobs, mob),
         .tempt => try temptTick(mobs, mob),
         .follow_parent => try followParentTick(mobs, mob),
         .look_at_player => {
-            const slot = mob.goals.look_at_player orelse return;
-            if (!playerAlive(mobs, slot)) return;
-            const eye = senses.playerEye(mobs, slot);
+            const looking = &mob.part(.focus).?.look_at_player;
+            if (!playerAlive(mobs, looking.player)) return;
+            const eye = senses.playerEye(mobs, looking.player);
             ai.setLookAt(mob, eye[0], eye[1], eye[2], ai.head_rotation_speed, ai.max_head_pitch);
-            mob.goals.look_time -= 1;
+            looking.time -= 1;
         },
         .look_around => {
-            mob.goals.look_around_time -= 1;
-            ai.setLookAt(mob, mob.position[0] + mob.goals.look_around[0], living.eyeY(mobs, mob), mob.position[2] + mob.goals.look_around[1], ai.head_rotation_speed, ai.max_head_pitch);
+            const around = &mob.idle.look_around;
+            around.time -= 1;
+            ai.setLookAt(mob, mob.motion.position[0] + around.relative[0], living.eyeY(mobs, mob), mob.motion.position[2] + around.relative[1], ai.head_rotation_speed, ai.max_head_pitch);
         },
         .panic, .stroll => {},
     }
@@ -250,29 +245,29 @@ fn playerAlive(mobs: *Mobs, slot: u32) bool {
 
 // FloatGoal.
 
-fn floatCanUse(mobs: *Mobs, mob: *const Mob) bool {
-    return (mob.touching_water and mob.water_height > living.fluidJumpThreshold(mobs, mob)) or living.inLava(mob);
+fn floatCanUse(mobs: *Mobs, mob: Mob) bool {
+    return (mob.entity.touching_water and mob.entity.water_height > living.fluidJumpThreshold(mobs, mob)) or living.inLava(mob);
 }
 
 // PanicGoal.
 
-fn panicCanUse(mobs: *Mobs, mob: *Mob) !bool {
+fn panicCanUse(mobs: *Mobs, mob: Mob) !bool {
     if (!mobs.shouldPanic(mob)) return false;
-    if (mob.fire_ticks > 0) {
+    if (mob.entity.fire_ticks > 0) {
         if (try lookForWater(mobs, mob)) |water| {
-            mob.goals.panic_target = .{ @floatFromInt(water[0]), @floatFromInt(water[1]), @floatFromInt(water[2]) };
+            mobs.chosen.target = .{ @floatFromInt(water[0]), @floatFromInt(water[1]), @floatFromInt(water[2]) };
             return true;
         }
     }
     const target = try random_positions.defaultPosition(mobs, mob, 5, 4) orelse return false;
-    mob.goals.panic_target = target;
+    mobs.chosen.target = target;
     return true;
 }
 
 /// PanicGoal.lookForWater: from a block with no collision shape, the nearest water within 5
 /// blocks across and 1 up or down, in BlockPos.withinManhattan's order.
-fn lookForWater(mobs: *Mobs, mob: *const Mob) !?[3]i32 {
-    const level = mobs.level(mob.world);
+fn lookForWater(mobs: *Mobs, mob: Mob) !?[3]i32 {
+    const level = mobs.level(mob.motion.world);
     const at = mob.blockPosition();
     if (body.collisionBoxes(&level, try level.state(at[0], at[1], at[2]), at[0], at[1], at[2], .{ .empty = true }).count != 0) return null;
     const horizontal: i32 = 5;
@@ -301,71 +296,79 @@ fn lookForWater(mobs: *Mobs, mob: *const Mob) !?[3]i32 {
 
 // BreedGoal.
 
-fn breedCanUse(mobs: *Mobs, mob: *Mob) !bool {
-    if (mob.in_love <= 0) return false;
-    mob.goals.breed_partner = try freePartner(mobs, mob);
-    return mob.goals.breed_partner != null;
+fn breedCanUse(mobs: *Mobs, mob: Mob) !bool {
+    if (mob.inLove() <= 0) return false;
+    mobs.chosen.partner = try freePartner(mobs, mob);
+    return mobs.chosen.partner != null;
 }
 
 /// BreedGoal.getFreePartner: the nearest mob of the kind within 8 blocks that can mate and
 /// does not panic.
-fn freePartner(mobs: *Mobs, mob: *Mob) !?u32 {
-    var best: ?u32 = null;
-    var best_distance = std.math.floatMax(f64);
-    for (try mobs.near(mob, living.box(mobs, mob).inflate(8, 8, 8), .same_species)) |index| {
-        const other = &mobs.mobs[index];
-        if (!other.alive()) continue;
-        const distance = senses.distanceSquared(mob, other);
-        // PARTNER_TARGETING's range, which mobs see at full visibility.
-        if (distance > 64) continue;
-        if (!canMate(mob, other) or isPanicking(other)) continue;
-        if (distance < best_distance) {
-            best = index;
-            best_distance = distance;
+fn freePartner(mobs: *Mobs, mob: Mob) !?u64 {
+    var search: struct { mobs: *Mobs, mob: Mob, best: ?u64 = null, best_distance: f64 = std.math.floatMax(f64) } = .{ .mobs = mobs, .mob = mob };
+    try mobs.near(mob, living.box(mobs, mob).inflate(8, 8, 8), .same_species, &search, struct {
+        fn visit(context: *@TypeOf(search), other: Mob) anyerror!bool {
+            if (!other.alive()) return false;
+            const distance = senses.distanceSquared(context.mob, other);
+            // PARTNER_TARGETING's range, which mobs see at full visibility.
+            if (distance > 64) return false;
+            if (!canMate(context.mob, other) or isPanicking(other)) return false;
+            if (distance < context.best_distance) {
+                context.best = other.entity.id;
+                context.best_distance = distance;
+            }
+            return false;
         }
-    }
-    return best;
+    }.visit);
+    return search.best;
 }
 
 /// Animal.canMate: another of the same kind, both in love.
-pub fn canMate(mob: *const Mob, other: *const Mob) bool {
-    return mob != other and other.species == mob.species and mob.in_love > 0 and other.in_love > 0;
+pub fn canMate(mob: Mob, other: Mob) bool {
+    return !mob.same(other) and other.entity.species == mob.entity.species and mob.inLove() > 0 and other.inLove() > 0;
 }
 
-fn breedCanContinue(mobs: *Mobs, mob: *Mob) bool {
-    const partner = &mobs.mobs[mob.goals.breed_partner orelse return false];
-    return partner.alive() and partner.in_love > 0 and mob.goals.breed_love_time < 60 and !isPanicking(partner);
+fn breedCanContinue(mobs: *Mobs, mob: Mob) !bool {
+    // A partner gone from the world is no longer alive, as vanilla's removed entity.
+    const breeding = mob.part(.focus).?.breed;
+    const partner = (try mobs.byId(breeding.partner)) orelse return false;
+    return partner.alive() and partner.inLove() > 0 and breeding.love_time < 60 and !isPanicking(partner);
 }
 
-fn breedTick(mobs: *Mobs, mob: *Mob) !void {
-    const partner_index = mob.goals.breed_partner orelse return;
-    const partner = &mobs.mobs[partner_index];
-    ai.setLookAt(mob, partner.position[0], living.eyeY(mobs, partner), partner.position[2], 10.0, ai.max_head_pitch);
-    _ = try navigation.moveToEntity(mobs, mob, partner.position, 1.0);
-    mob.goals.breed_love_time += 1;
-    if (mob.goals.breed_love_time >= adjustedTickDelay(.breed, 60) and senses.distanceSquared(mob, partner) < 9.0) try mobs.breed(mob, partner);
+fn breedTick(mobs: *Mobs, mob: Mob) !void {
+    const breeding = &mob.part(.focus).?.breed;
+    const partner = (try mobs.byId(breeding.partner)) orelse return;
+    ai.setLookAt(mob, partner.motion.position[0], living.eyeY(mobs, partner), partner.motion.position[2], 10.0, ai.max_head_pitch);
+    _ = try navigation.moveToEntity(mobs, mob, partner.motion.position, 1.0);
+    breeding.love_time += 1;
+    if (breeding.love_time >= adjustedTickDelay(.breed, 60) and senses.distanceSquared(mob, partner) < 9.0) try mobs.breed(mob, partner);
 }
 
 // TemptGoal.
 
-fn temptCanUse(mobs: *Mobs, mob: *Mob) !bool {
-    if (mob.goals.tempt_calm_down > 0) {
-        mob.goals.tempt_calm_down -= 1;
+fn temptCanUse(mobs: *Mobs, mob: Mob) !bool {
+    if (mob.idle.tempt_calm_down > 0) {
+        mob.idle.tempt_calm_down -= 1;
         return false;
     }
-    const range = mobs.traits(mob.species).attribute(.tempt_range);
-    mob.goals.tempt_player = try senses.nearestPlayer(mobs, mob, .{ .range = range, .line_of_sight = false, .holding_food = true }, mob.position);
-    return mob.goals.tempt_player != null;
+    const range = mobs.traits(mob.entity.species).attribute(.tempt_range);
+    const found = try senses.nearestPlayer(mobs, mob, .{ .range = range, .line_of_sight = false, .holding_food = true }, mob.motion.position);
+    // Asked again while it runs, the player it follows is the one found; it stops on none.
+    const focus = mob.part(.focus);
+    if (focus != null and focus.?.* == .tempt) {
+        if (found) |slot| focus.?.tempt.player = slot;
+    } else mobs.chosen.player = found;
+    return found != null;
 }
 
-fn temptTick(mobs: *Mobs, mob: *Mob) !void {
-    const slot = mob.goals.tempt_player orelse return;
+fn temptTick(mobs: *Mobs, mob: Mob) !void {
+    const slot = mob.part(.focus).?.tempt.player;
     const player = &mobs.deps.players.records[slot];
     const eye = senses.playerEye(mobs, slot);
     ai.setLookAt(mob, eye[0], eye[1], eye[2], @as(f32, ai.max_head_yaw + 20), ai.max_head_pitch);
-    const dx = mob.position[0] - player.position.x;
-    const dy = mob.position[1] - player.position.y;
-    const dz = mob.position[2] - player.position.z;
+    const dx = mob.motion.position[0] - player.position.x;
+    const dy = mob.motion.position[1] - player.position.y;
+    const dz = mob.motion.position[2] - player.position.z;
     if (dx * dx + dy * dy + dz * dz < 2.5 * 2.5) {
         navigation.stop(mob);
     } else {
@@ -375,77 +378,80 @@ fn temptTick(mobs: *Mobs, mob: *Mob) !void {
 
 // FollowParentGoal.
 
-fn followParentCanUse(mobs: *Mobs, mob: *Mob) !bool {
-    if (mob.age >= 0) return false;
-    var best: ?u32 = null;
-    var best_distance = std.math.floatMax(f64);
-    for (try mobs.near(mob, living.box(mobs, mob).inflate(8, 4, 8), .same_species)) |index| {
-        const other = &mobs.mobs[index];
-        if (other.age < 0) continue;
-        const distance = senses.distanceSquared(mob, other);
-        if (!(distance > best_distance)) {
-            best_distance = distance;
-            best = index;
+fn followParentCanUse(mobs: *Mobs, mob: Mob) !bool {
+    if (mob.idle.age >= 0) return false;
+    var search: struct { mobs: *Mobs, mob: Mob, best: ?u64 = null, best_distance: f64 = std.math.floatMax(f64) } = .{ .mobs = mobs, .mob = mob };
+    try mobs.near(mob, living.box(mobs, mob).inflate(8, 4, 8), .same_species, &search, struct {
+        fn visit(context: *@TypeOf(search), other: Mob) anyerror!bool {
+            if (other.idle.age < 0) return false;
+            const distance = senses.distanceSquared(context.mob, other);
+            if (!(distance > context.best_distance)) {
+                context.best_distance = distance;
+                context.best = other.entity.id;
+            }
+            return false;
         }
-    }
-    const parent = best orelse return false;
+    }.visit);
+    const parent = search.best orelse return false;
+    const best_distance = search.best_distance;
     if (best_distance < 9.0) return false;
-    mob.goals.parent = parent;
+    mobs.chosen.partner = parent;
     return true;
 }
 
-fn followParentCanContinue(mobs: *Mobs, mob: *Mob) bool {
-    if (mob.age >= 0) return false;
-    const parent = &mobs.mobs[mob.goals.parent orelse return false];
+fn followParentCanContinue(mobs: *Mobs, mob: Mob) !bool {
+    if (mob.idle.age >= 0) return false;
+    const parent = (try mobs.byId((mob.part(.follow) orelse return false).parent)) orelse return false;
     if (!parent.alive()) return false;
     const distance = senses.distanceSquared(mob, parent);
     return !(distance < 9.0) and !(distance > 256.0);
 }
 
-fn followParentTick(mobs: *Mobs, mob: *Mob) !void {
-    mob.goals.parent_recalculate -= 1;
-    if (mob.goals.parent_recalculate > 0) return;
-    mob.goals.parent_recalculate = adjustedTickDelay(.follow_parent, 10);
-    const parent = &mobs.mobs[mob.goals.parent orelse return];
-    _ = try navigation.moveToEntity(mobs, mob, parent.position, 1.25);
+fn followParentTick(mobs: *Mobs, mob: Mob) !void {
+    const follow = mob.part(.follow) orelse return;
+    follow.recalculate -= 1;
+    if (follow.recalculate > 0) return;
+    follow.recalculate = adjustedTickDelay(.follow_parent, 10);
+    const parent = (try mobs.byId(follow.parent)) orelse return;
+    _ = try navigation.moveToEntity(mobs, mob, parent.motion.position, 1.25);
 }
 
 // WaterAvoidingRandomStrollGoal.
 
-fn strollCanUse(mobs: *Mobs, mob: *Mob) !bool {
+fn strollCanUse(mobs: *Mobs, mob: Mob) !bool {
     // RandomStrollGoal checks no action time: mobs no player came near lately stand still.
-    if (mob.no_action_time >= 100) return false;
-    if (mob.random.nextIntBounded(reducedTickDelay(120)) != 0) return false;
+    if (mob.idle.no_action_time >= 100) return false;
+    if (mob.idle.random.nextIntBounded(reducedTickDelay(120)) != 0) return false;
     const target = (try strollPosition(mobs, mob)) orelse return false;
-    mob.goals.stroll_target = target;
+    mobs.chosen.target = target;
     return true;
 }
 
 /// WaterAvoidingRandomStrollGoal.getPosition.
-fn strollPosition(mobs: *Mobs, mob: *Mob) !?[3]f64 {
-    if (mob.touching_water) {
+fn strollPosition(mobs: *Mobs, mob: Mob) !?[3]f64 {
+    if (mob.entity.touching_water) {
         return try random_positions.landPosition(mobs, mob, 15, 7) orelse try random_positions.defaultPosition(mobs, mob, 10, 7);
     }
-    if (mob.random.nextFloat() >= 0.001) return random_positions.landPosition(mobs, mob, 10, 7);
+    if (mob.idle.random.nextFloat() >= 0.001) return random_positions.landPosition(mobs, mob, 10, 7);
     return random_positions.defaultPosition(mobs, mob, 10, 7);
 }
 
 // LookAtPlayerGoal.
 
-fn lookAtPlayerCanUse(mobs: *Mobs, mob: *Mob) !bool {
-    if (mob.random.nextFloat() >= 0.02) return false;
-    const eye: [3]f64 = .{ mob.position[0], living.eyeY(mobs, mob), mob.position[2] };
-    mob.goals.look_at_player = try senses.nearestPlayer(mobs, mob, .{ .range = 6.0, .line_of_sight = true }, eye);
-    return mob.goals.look_at_player != null;
+fn lookAtPlayerCanUse(mobs: *Mobs, mob: Mob) !bool {
+    if (mob.idle.random.nextFloat() >= 0.02) return false;
+    const eye: [3]f64 = .{ mob.motion.position[0], living.eyeY(mobs, mob), mob.motion.position[2] };
+    mobs.chosen.player = try senses.nearestPlayer(mobs, mob, .{ .range = 6.0, .line_of_sight = true }, eye);
+    return mobs.chosen.player != null;
 }
 
-fn lookAtPlayerCanContinue(mobs: *Mobs, mob: *Mob) bool {
-    const slot = mob.goals.look_at_player orelse return false;
+fn lookAtPlayerCanContinue(mobs: *Mobs, mob: Mob) bool {
+    const slot = mob.part(.focus).?.look_at_player.player;
     if (!playerAlive(mobs, slot)) return false;
     const player = &mobs.deps.players.records[slot];
-    const dx = mob.position[0] - player.position.x;
-    const dy = mob.position[1] - player.position.y;
-    const dz = mob.position[2] - player.position.z;
+    const dx = mob.motion.position[0] - player.position.x;
+    const dy = mob.motion.position[1] - player.position.y;
+    const dz = mob.motion.position[2] - player.position.z;
     if (dx * dx + dy * dy + dz * dz > 6.0 * 6.0) return false;
-    return mob.goals.look_time > 0;
+    return mob.part(.focus).?.look_at_player.time > 0;
 }

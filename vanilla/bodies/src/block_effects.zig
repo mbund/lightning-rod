@@ -137,24 +137,24 @@ pub fn apply(host: anytype, subject: anytype, recorded: []const Movement) !bool 
     var count: usize = recorded.len;
     @memcpy(movements[0..count], recorded);
     if (count == 0) {
-        movements[0] = .{ .from = subject.old_position, .to = subject.position, .axis_independent = false };
+        movements[0] = .{ .from = fieldOf(subject, "old_position").*, .to = fieldOf(subject, "position").*, .axis_independent = false };
         count = 1;
     } else {
         const last = movements[count - 1].to;
-        const dx = last[0] - subject.position[0];
-        const dy = last[1] - subject.position[1];
-        const dz = last[2] - subject.position[2];
+        const dx = last[0] - fieldOf(subject, "position").*[0];
+        const dy = last[1] - fieldOf(subject, "position").*[1];
+        const dz = last[2] - fieldOf(subject, "position").*[2];
         if (dx * dx + dy * dy + dz * dz > @as(f64, @as(f32, 9.9999994e-11))) {
-            movements[count] = .{ .from = last, .to = subject.position, .axis_independent = false };
+            movements[count] = .{ .from = last, .to = fieldOf(subject, "position").*, .axis_independent = false };
             count += 1;
         }
     }
-    if (subject.removed) return true;
+    if (fieldOf(subject, "removed").*) return true;
     var acted = false;
-    if (subject.on_ground) acted = try stepOn(host, subject);
+    if (fieldOf(subject, "on_ground").*) acted = try stepOn(host, subject);
     const burning = try onFire(host, subject);
-    const freezing = subject.ticks_frozen > 0;
-    const fire_before = subject.fire_ticks;
+    const freezing = fieldOf(subject, "ticks_frozen").* > 0;
+    const fire_before = fieldOf(subject, "fire_ticks").*;
     const collector = &host.scratch().collector;
     collector.reset();
     // With no fluid and no block that acts on a body inside it around the one ticking, the walk
@@ -167,25 +167,25 @@ pub fn apply(host: anytype, subject: anytype, recorded: []const Movement) !bool 
         if (!host.alive(subject)) break;
         try run(host, subject, action);
     }
-    if ((burning and !try onFire(host, subject)) or (freezing and subject.ticks_frozen <= 0)) {
+    if ((burning and !try onFire(host, subject)) or (freezing and fieldOf(subject, "ticks_frozen").* <= 0)) {
         // Entity.playEntityOnFireExtinguishedSound.
         const random = host.random(subject);
         const pitch = 1.6 + (random.nextFloat() - random.nextFloat()) * 0.4;
         host.playSound(subject, .generic_extinguish_fire, 0.7, pitch);
     }
-    const ignited = subject.fire_ticks > fire_before;
-    if (!try onFire(host, subject) and !ignited) subject.fire_ticks = 0;
+    const ignited = fieldOf(subject, "fire_ticks").* > fire_before;
+    if (!try onFire(host, subject) and !ignited) fieldOf(subject, "fire_ticks").* = 0;
     return acted or collector.acted;
 }
 
 /// Entity.isOnFire on the server.
 pub fn onFire(host: anytype, subject: anytype) !bool {
-    return subject.fire_ticks > 0 and !try host.fireImmune(subject);
+    return fieldOf(subject, "fire_ticks").* > 0 and !try host.fireImmune(subject);
 }
 
 /// Block.stepOn for the block under the subject, and whether that block does anything.
 fn stepOn(host: anytype, subject: anytype) !bool {
-    const level = host.level(subject.world);
+    const level = host.level(fieldOf(subject, "world").*);
     const at = try host.onPosition(subject, 0.2);
     const state = try level.state(at[0], at[1], at[2]);
     const kind = level.blocks.get(state).kind;
@@ -197,16 +197,16 @@ fn stepOn(host: anytype, subject: anytype) !bool {
         },
         // SlimeBlock: slow on it unless falling or rising fast.
         .slime_block => {
-            const vertical = @abs(subject.velocity[1]);
+            const vertical = @abs(fieldOf(subject, "velocity").*[1]);
             if (vertical < 0.1) {
                 const factor = 0.4 + vertical * 0.2;
-                subject.velocity[0] *= factor;
-                subject.velocity[2] *= factor;
+                fieldOf(subject, "velocity").*[0] *= factor;
+                fieldOf(subject, "velocity").*[2] *= factor;
             }
         },
         // TurtleEggBlock: one step of a living body in a hundred cracks an egg, where mobs may
         // grief.
-        .turtle_egg => if (living and host.mobGriefing() and host.levelRandom().nextIntBounded(100) == 0) try host.crackTurtleEgg(subject.world, at, state),
+        .turtle_egg => if (living and host.mobGriefing() and host.levelRandom().nextIntBounded(100) == 0) try host.crackTurtleEgg(fieldOf(subject, "world").*, at, state),
         else => {},
     }
     return kind == .slime_block or (living and (kind == .magma_block or kind == .turtle_egg));
@@ -215,7 +215,7 @@ fn stepOn(host: anytype, subject: anytype) !bool {
 /// Whether the window around the body holds every cell the movements could visit, one block
 /// more for the fluid above, and none of them is a fluid or acts on what is inside it.
 fn quietAround(host: anytype, subject: anytype, movements: []const Movement) bool {
-    const level = host.level(subject.world);
+    const level = host.level(fieldOf(subject, "world").*);
     const half: f64 = host.width(subject) / 2.0;
     const tall: f64 = host.height(subject);
     var low: [3]f64 = movements[0].from;
@@ -274,8 +274,8 @@ fn boxOf(host: anytype, subject: anytype, position: [3]f64) Box {
 
 /// BlockGetter.forEachBlockIntersectedBetween with Entity.checkInsideBlocks' visitor.
 fn checkSegment(host: anytype, subject: anytype, from: [3]f64, to: [3]f64, collector: *Collector, visited: *Visited) !void {
-    const box = boxOf(host, subject, subject.position);
-    const at_to = box.move(.{ to[0] - subject.position[0], to[1] - subject.position[1], to[2] - subject.position[2] }).inflate(-1.0e-5, -1.0e-5, -1.0e-5);
+    const box = boxOf(host, subject, fieldOf(subject, "position").*);
+    const at_to = box.move(.{ to[0] - fieldOf(subject, "position").*[0], to[1] - fieldOf(subject, "position").*[1], to[2] - fieldOf(subject, "position").*[2] }).inflate(-1.0e-5, -1.0e-5, -1.0e-5);
     const delta: [3]f64 = .{ to[0] - from[0], to[1] - from[1], to[2] - from[2] };
     const length = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
     if (length < @as(f64, @as(f32, 0.99999)) * @as(f64, @as(f32, 0.99999))) {
@@ -392,7 +392,7 @@ fn clipCell(cell: [3]i32, from: [3]f64, to: [3]f64) ?[3]f64 {
 /// its inside shape, then its fluid's.
 fn visit(host: anytype, subject: anytype, position: [3]i32, step: i32, from: [3]f64, to: [3]f64, collector: *Collector, visited: *Visited) !bool {
     if (!host.alive(subject)) return false;
-    const level = host.level(subject.world);
+    const level = host.level(fieldOf(subject, "world").*);
     const state = try level.state(position[0], position[1], position[2]);
     const entry = level.blocks.get(state);
     if (entry.flags.air) return true;
@@ -419,7 +419,7 @@ fn visit(host: anytype, subject: anytype, position: [3]i32, step: i32, from: [3]
 /// BlockState.getEntityInsideCollisionShape: the whole block for most, the filled inside of
 /// cauldrons for theirs.
 fn meetsInside(host: anytype, subject: anytype, state: u16, position: [3]i32, from: [3]f64, to: [3]f64) !bool {
-    const entry = host.level(subject.world).blocks.get(state);
+    const entry = host.level(fieldOf(subject, "world").*).blocks.get(state);
     const origin: [3]f64 = .{ @floatFromInt(position[0]), @floatFromInt(position[1]), @floatFromInt(position[2]) };
     const filled: ?f64 = switch (entry.kind) {
         .lava_cauldron => 15.0,
@@ -445,7 +445,7 @@ fn meetsInside(host: anytype, subject: anytype, state: u16, position: [3]i32, fr
 
 /// Entity.collidedWithFluid: the fluid's box, its height in the block, met along the move.
 fn meetsFluid(host: anytype, subject: anytype, position: [3]i32, physics: game_data.physics_data.State, from: [3]f64, to: [3]f64) !bool {
-    const level = host.level(subject.world);
+    const level = host.level(fieldOf(subject, "world").*);
     const above = try level.fluid(position[0], position[1] + 1, position[2]);
     const height: f64 = if (above.fluid == physics.fluid) 1.0 else physics.height();
     const origin: [3]f64 = .{ @floatFromInt(position[0]), @floatFromInt(position[1]), @floatFromInt(position[2]) };
@@ -501,7 +501,7 @@ pub fn insideActs(kind: mob_blocks.Kind) bool {
 
 /// BlockBehaviour.entityInside, for the blocks that do something to what is inside them.
 fn entityInside(host: anytype, subject: anytype, state: u16, position: [3]i32, collector: *Collector) !void {
-    const level = host.level(subject.world);
+    const level = host.level(fieldOf(subject, "world").*);
     const entry = level.blocks.get(state);
     const living = @TypeOf(host).living;
     switch (entry.kind) {
@@ -519,8 +519,8 @@ fn entityInside(host: anytype, subject: anytype, state: u16, position: [3]i32, c
             makeStuck(subject, .{ @as(f32, 0.8), 0.75, @as(f32, 0.8) });
             if (entry.flags.aged) {
                 // The body moved since last tick, across rather than only up or down.
-                const dx = subject.old_position[0] - subject.position[0];
-                const dz = subject.old_position[2] - subject.position[2];
+                const dx = fieldOf(subject, "old_position").*[0] - fieldOf(subject, "position").*[0];
+                const dz = fieldOf(subject, "old_position").*[2] - fieldOf(subject, "position").*[2];
                 if (dx * dx + dz * dz > 0 and (@abs(dx) >= @as(f64, @as(f32, 0.003)) or @abs(dz) >= @as(f64, @as(f32, 0.003)))) {
                     _ = try host.hurt(subject, .sweet_berry_bush, 1.0);
                 }
@@ -529,7 +529,7 @@ fn entityInside(host: anytype, subject: anytype, state: u16, position: [3]i32, c
         .cobweb => makeStuck(subject, .{ 0.25, @as(f32, 0.05), 0.25 }),
         .powder_snow => {
             // PowderSnowBlock holds what is not living, and a living body whose feet are in it.
-            const at: [3]i32 = .{ mth.floor(subject.position[0]), mth.floor(subject.position[1]), mth.floor(subject.position[2]) };
+            const at: [3]i32 = .{ mth.floor(fieldOf(subject, "position").*[0]), mth.floor(fieldOf(subject, "position").*[1]), mth.floor(fieldOf(subject, "position").*[2]) };
             if (!living or level.blocks.get(try level.state(at[0], at[1], at[2])).kind == .powder_snow) makeStuck(subject, .{ @as(f32, 0.9), 1.5, @as(f32, 0.9) });
             collector.runBefore(.extinguish, .{ .melt_powder_snow = position });
             collector.apply(.freeze);
@@ -541,14 +541,14 @@ fn entityInside(host: anytype, subject: anytype, state: u16, position: [3]i32, c
             const open = body.contextFreeBoxes(above, position[0], position[2]).count == 0 and game_data.physics.get(above).fluid == .none;
             const drag = entry.flags.drag;
             if (open) {
-                subject.velocity[1] = if (drag) @max(-0.9, subject.velocity[1] - 0.03) else @min(1.8, subject.velocity[1] + 0.1);
+                fieldOf(subject, "velocity").*[1] = if (drag) @max(-0.9, fieldOf(subject, "velocity").*[1] - 0.03) else @min(1.8, fieldOf(subject, "velocity").*[1] + 0.1);
                 // Entity.sendBubbleColumnParticles draws from the level's random.
                 for (0..2) |_| for (0..4) |_| {
                     _ = host.levelRandom().nextDouble();
                 };
             } else {
-                subject.velocity[1] = if (drag) @max(-0.3, subject.velocity[1] - 0.03) else @min(0.7, subject.velocity[1] + 0.06);
-                subject.fall_distance = 0;
+                fieldOf(subject, "velocity").*[1] = if (drag) @max(-0.3, fieldOf(subject, "velocity").*[1] - 0.03) else @min(0.7, fieldOf(subject, "velocity").*[1] + 0.06);
+                fieldOf(subject, "fall_distance").* = 0;
             }
         },
         .lava_cauldron => {
@@ -565,28 +565,28 @@ fn entityInside(host: anytype, subject: anytype, state: u16, position: [3]i32, c
 
 /// Entity.makeStuckInBlock.
 fn makeStuck(subject: anytype, multiplier: [3]f64) void {
-    subject.fall_distance = 0;
-    subject.stuck = multiplier;
+    fieldOf(subject, "fall_distance").* = 0;
+    fieldOf(subject, "stuck").* = multiplier;
 }
 
 /// HoneyBlock.entityInside: a body falling down the side of a honey block slides slowly.
 fn honeySlide(host: anytype, subject: anytype, position: [3]i32) !void {
-    if (subject.on_ground) return;
-    if (subject.position[1] > @as(f64, @floatFromInt(position[1])) + 0.9375 - 1.0e-7) return;
-    const old_y = subject.velocity[1] / @as(f64, @as(f32, 0.98)) + 0.08;
+    if (fieldOf(subject, "on_ground").*) return;
+    if (fieldOf(subject, "position").*[1] > @as(f64, @floatFromInt(position[1])) + 0.9375 - 1.0e-7) return;
+    const old_y = fieldOf(subject, "velocity").*[1] / @as(f64, @as(f32, 0.98)) + 0.08;
     if (old_y >= -0.08) return;
-    const dx = @abs(@as(f64, @floatFromInt(position[0])) + 0.5 - subject.position[0]);
-    const dz = @abs(@as(f64, @floatFromInt(position[2])) + 0.5 - subject.position[2]);
+    const dx = @abs(@as(f64, @floatFromInt(position[0])) + 0.5 - fieldOf(subject, "position").*[0]);
+    const dz = @abs(@as(f64, @floatFromInt(position[2])) + 0.5 - fieldOf(subject, "position").*[2]);
     const reach = 0.4375 + @as(f64, host.width(subject) / 2.0);
     if (!(dx + 1.0e-7 > reach or dz + 1.0e-7 > reach)) return;
     const new_y = (-0.05 - 0.08) * @as(f64, @as(f32, 0.98));
     if (old_y < -0.13) {
         const scale = -0.05 / old_y;
-        subject.velocity = .{ subject.velocity[0] * scale, new_y, subject.velocity[2] * scale };
+        fieldOf(subject, "velocity").* = .{ fieldOf(subject, "velocity").*[0] * scale, new_y, fieldOf(subject, "velocity").*[2] * scale };
     } else {
-        subject.velocity[1] = new_y;
+        fieldOf(subject, "velocity").*[1] = new_y;
     }
-    subject.fall_distance = 0;
+    fieldOf(subject, "fall_distance").* = 0;
     // HoneyBlock.doesEntityDoHoneyBlockSlideEffects: living bodies, among those that tick here.
     if (!@TypeOf(host).living) return;
     if (host.levelRandom().nextIntBounded(5) == 0) host.playSound(subject, .honey_block_slide, 1, 1);
@@ -597,30 +597,52 @@ fn run(host: anytype, subject: anytype, action: Action) !void {
     switch (action) {
         .effect => |effect| switch (effect) {
             .freeze => {
-                subject.in_powder_snow = true;
-                subject.ticks_frozen = @min(140, subject.ticks_frozen + 1);
+                fieldOf(subject, "in_powder_snow").* = true;
+                fieldOf(subject, "ticks_frozen").* = @min(140, fieldOf(subject, "ticks_frozen").* + 1);
             },
             // BaseFireBlock.fireIgnite.
             .fire_ignite => if (!try host.fireImmune(subject)) {
-                if (subject.fire_ticks < 0) subject.fire_ticks += 1;
-                if (subject.fire_ticks >= 0) ignite(subject, 160);
+                if (fieldOf(subject, "fire_ticks").* < 0) fieldOf(subject, "fire_ticks").* += 1;
+                if (fieldOf(subject, "fire_ticks").* >= 0) ignite(subject, 160);
             },
             // Entity.lavaIgnite.
             .lava_ignite => if (!try host.fireImmune(subject)) ignite(subject, 300),
-            .extinguish => subject.fire_ticks = 0,
+            .extinguish => fieldOf(subject, "fire_ticks").* = 0,
         },
         .fire_hurt => |amount| _ = try host.hurt(subject, .in_fire, amount),
         // Entity.lavaHurt, with its sound when it hurts.
         .lava_hurt => if (!try host.fireImmune(subject)) {
             if (try host.hurt(subject, .lava, 4.0)) host.playSound(subject, .generic_burn, 0.4, 2.0 + host.random(subject).nextFloat() * 0.4);
         },
-        .melt_powder_snow => |position| if (try onFire(host, subject) and host.mobGriefing()) try host.destroyBlock(subject.world, position),
-        .lower_cauldron => |position| if (try onFire(host, subject)) try host.lowerCauldron(subject.world, position),
+        .melt_powder_snow => |position| if (try onFire(host, subject) and host.mobGriefing()) try host.destroyBlock(fieldOf(subject, "world").*, position),
+        .lower_cauldron => |position| if (try onFire(host, subject)) try host.lowerCauldron(fieldOf(subject, "world").*, position),
     }
 }
 
 /// Entity.igniteForTicks.
 fn ignite(subject: anytype, ticks: i32) void {
-    if (subject.fire_ticks < ticks) subject.fire_ticks = ticks;
-    subject.ticks_frozen = 0;
+    if (fieldOf(subject, "fire_ticks").* < ticks) fieldOf(subject, "fire_ticks").* = ticks;
+    fieldOf(subject, "ticks_frozen").* = 0;
+}
+
+/// A subject's field where it lies: its own, or, for a subject whose fields point into its
+/// owner's state, where that points.
+fn fieldOf(subject: anytype, comptime name: []const u8) FieldPointer(@TypeOf(subject), name) {
+    const Field = @TypeOf(@field(subject, name));
+    if (@typeInfo(Field) == .pointer) return @field(subject, name);
+    return &@field(subject, name);
+}
+
+fn FieldPointer(comptime Subject: type, comptime name: []const u8) type {
+    const Owner = switch (@typeInfo(Subject)) {
+        .pointer => |pointer| pointer.child,
+        else => Subject,
+    };
+    const Field = @FieldType(Owner, name);
+    if (@typeInfo(Field) == .pointer) return Field;
+    const constant = switch (@typeInfo(Subject)) {
+        .pointer => |pointer| pointer.attrs.@"const",
+        else => true,
+    };
+    return if (constant) *const Field else *Field;
 }

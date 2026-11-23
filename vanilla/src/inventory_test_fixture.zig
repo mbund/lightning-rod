@@ -77,8 +77,8 @@ pub const InventoryFixture = struct {
         });
         const gameplay_definitions = try vanilla_content.prepare(allocator);
         const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
-        const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 16 }, .{ .metrics = registry, .storage = try store.openSpace("entities"), .record_workspaces = workspaces });
-        const dropped = try ItemEntities.init(allocator, io, .{ .cache_records = 32, .maximum = 8 }, .{
+        const bodies = try entities.Entities.init(allocator, io, .{}, .{ .metrics = registry, .storage = try store.openSpace("entities"), .record_workspaces = workspaces });
+        const dropped = try ItemEntities.init(allocator, io, .{}, .{
             .metrics = registry,
             .storage = try store.openSpace("drops"),
             .record_workspaces = workspaces,
@@ -108,6 +108,8 @@ pub const InventoryFixture = struct {
             .items = items,
         });
         const menus = try InventoryMenus.init(allocator, .{ .containers = undefined, .inventory = menu, .input = input, .players = players, .player_states = player_states, .inventories = ownership, .items = items, .packets = undefined, .sessions = service });
+        // Items kept near the player come back into memory, as the item tick would bring them.
+        try dropped.refresh(&.{.{ .world = world, .x = 0, .z = 0 }}, 2, entities.residency.NoColumns{});
         return .{ .definitions = gameplay_definitions, .service = service, .input = input, .players = players, .player_states = player_states, .ownership = ownership, .items = items, .menu = menu, .menus = menus, .creative = creative, .bodies = bodies, .dropped = dropped };
     }
 };

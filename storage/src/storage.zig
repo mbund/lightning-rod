@@ -855,6 +855,17 @@ pub const Store = struct {
         return self;
     }
 
+    /// A file beside this store for state that lasts only while the process runs: empty when
+    /// opened, gone once closed, and never part of a transaction.
+    pub fn openScratch(self: *Store, name: [:0]const u8) !system.ScratchFile {
+        return system.ScratchFile.open(self.io, self.directory, name);
+    }
+
+    /// Whether reads and writes go through io_uring.
+    pub fn ioMode(self: *const Store) backend.Mode {
+        return self.io_mode;
+    }
+
     /// Open disposable pages during initialization. Their lifetime follows this store.
     /// A cache has no durability barrier and never participates in world transactions.
     pub fn openCache(self: *Store, suffix: []const u8, options: struct { maximum_pages: u64 = 1 << 24 }) !*DiskCache {

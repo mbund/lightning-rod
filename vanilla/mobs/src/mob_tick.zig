@@ -30,100 +30,101 @@ const Findings = struct {
     touched: u32 = 0,
 };
 
-pub fn tick(mobs: *Mobs, mob: *Mob) !void {
+pub fn tick(mobs: *Mobs, mob: Mob) !void {
     checkDespawn(mobs, mob);
-    mob.old_position = mob.position;
-    mob.old_yaw = mob.yaw;
-    mob.old_pitch = mob.pitch;
-    mob.tick_count += 1;
+    mob.motion.old_position = mob.motion.position;
+    mob.motion.old_yaw = mob.motion.yaw;
+    mob.motion.old_pitch = mob.motion.pitch;
+    mob.idle.tick_count += 1;
     var findings: Findings = .{};
     try baseTick(mobs, mob, &findings);
-    if (!mob.removed) try aiStep(mobs, mob, &findings);
+    if (!mob.entity.removed) try aiStep(mobs, mob, &findings);
     turnBody(mobs, mob);
     // Mob.tick: passengers decide the control flags, and mobs here carry none.
-    if (@rem(mob.tick_count, 5) == 0) mob.goals.disabled = 0;
+    if (@rem(mob.idle.tick_count, 5) == 0) mob.goals.disabled = 0;
     settle(mob, findings);
 }
 
 /// Whether the mob is where it rested, so what it read there still holds.
-fn restsInPlace(mob: *const Mob) bool {
-    return mob.resting and std.meta.eql(mob.position, mob.rest_position);
+fn restsInPlace(mob: Mob) bool {
+    return mob.motion.resting and std.meta.eql(mob.motion.position, mob.motion.rest_position);
 }
 
 /// Rests after a tick that left the mob standing still on the ground, moving only as gravity
 /// pulls it into the floor, with nothing in or under it acting on it and no mob touching it.
-fn settle(mob: *Mob, findings: Findings) void {
-    mob.resting = !mob.removed and mob.alive() and !findings.in_wall and !findings.blocks_acted and findings.touched == 0 and
-        mob.on_ground and !mob.horizontal_collision and std.meta.eql(mob.position, mob.old_position) and
-        mob.velocity[0] == 0 and mob.velocity[2] == 0 and mob.fall_distance == 0 and
-        !mob.touching_water and mob.lava_height == 0 and !mob.eye_in_water and
-        !mob.in_powder_snow and !mob.was_in_powder_snow and mob.ticks_frozen == 0 and mob.fire_ticks == 0 and
-        std.meta.eql(mob.stuck, [3]f64{ 0, 0, 0 }) and mob.last_climbable == null and mob.movement_count == 0;
-    if (!mob.resting) return;
-    mob.rest_position = mob.position;
-    mob.rest_velocity = mob.velocity;
+fn settle(mob: Mob, findings: Findings) void {
+    mob.motion.resting = !mob.entity.removed and mob.alive() and !findings.in_wall and !findings.blocks_acted and findings.touched == 0 and
+        mob.motion.on_ground and !mob.motion.horizontal_collision and std.meta.eql(mob.motion.position, mob.motion.old_position) and
+        mob.motion.velocity[0] == 0 and mob.motion.velocity[2] == 0 and mob.motion.fall_distance == 0 and
+        !mob.entity.touching_water and mob.entity.lava_height == 0 and !mob.entity.eye_in_water and
+        !mob.entity.in_powder_snow and !mob.entity.was_in_powder_snow and mob.entity.ticks_frozen == 0 and mob.entity.fire_ticks == 0 and
+        std.meta.eql(mob.motion.stuck, [3]f64{ 0, 0, 0 }) and mob.living.last_climbable == null and mob.motion.movement_count == 0;
+    if (!mob.motion.resting) return;
+    mob.motion.rest_position = mob.motion.position;
+    mob.motion.rest_velocity = mob.motion.velocity;
 }
 
 /// In Debug, the skipped part run on a copy must leave it as the skip leaves the mob.
-fn checkSkip(mob: *const Mob, copy: *const Mob) void {
-    if (!std.meta.eql(copy.*, mob.*)) {
-        std.debug.print("rest skip diverged for mob {d} at {any}\n", .{ mob.id, mob.position });
+fn checkSkip(mob: Mob, copy: Mob) void {
+    if (!std.meta.eql(copy.state(), mob.state())) {
+        std.debug.print("rest skip diverged for mob {d} at {any}\n", .{ mob.entity.id, mob.motion.position });
         unreachable;
     }
 }
 
 /// Mob.checkDespawn. Animals never despawn, but a mob no player is near stops counting as
 /// recently active, and vanilla draws from its random while it waits to despawn.
-fn checkDespawn(mobs: *Mobs, mob: *Mob) void {
-    if (mob.persistence_required) {
-        mob.no_action_time = 0;
+fn checkDespawn(mobs: *Mobs, mob: Mob) void {
+    if (mob.control.persistence_required) {
+        mob.idle.no_action_time = 0;
         return;
     }
-    const nearest = mobs.nearestPlayerDistanceSquared(mob.world, mob.position) orelse return;
+    const nearest = mobs.nearestPlayerDistanceSquared(mob.motion.world, mob.motion.position) orelse return;
     // MobCategory.CREATURE's distance within which mobs never despawn.
     const near = 32 * 32;
-    if (mob.no_action_time > 600 and mob.random.nextIntBounded(800) == 0 and nearest > near) {
+    if (mob.idle.no_action_time > 600 and mob.idle.random.nextIntBounded(800) == 0 and nearest > near) {
         // Animal.removeWhenFarAway is false.
     } else if (nearest < near) {
-        mob.no_action_time = 0;
+        mob.idle.no_action_time = 0;
     }
 }
 
 /// Entity.baseTick, LivingEntity.baseTick and Mob.baseTick.
-fn baseTick(mobs: *Mobs, mob: *Mob, findings: *Findings) !void {
+fn baseTick(mobs: *Mobs, mob: Mob, findings: *Findings) !void {
     // Entity.baseTick.
-    mob.was_in_powder_snow = mob.in_powder_snow;
-    mob.in_powder_snow = false;
+    mob.entity.was_in_powder_snow = mob.entity.in_powder_snow;
+    mob.entity.in_powder_snow = false;
     if (restsInPlace(mob)) {
         if (verify_rest) {
-            var copy = mob.*;
-            try living.updateFluids(mobs, &copy);
-            try living.updateEyes(mobs, &copy);
-            checkSkip(mob, &copy);
+            var copy_state = mob.state();
+            const copy = Mob.of(&copy_state);
+            try living.updateFluids(mobs, copy);
+            try living.updateEyes(mobs, copy);
+            checkSkip(mob, copy);
         }
     } else {
         try living.updateFluids(mobs, mob);
         try living.updateEyes(mobs, mob);
     }
-    if (mob.fire_ticks > 0) {
-        if (mobs.traits(mob.species).fire_immune) {
-            mob.fire_ticks -= 4;
+    if (mob.entity.fire_ticks > 0) {
+        if (mobs.traits(mob.entity.species).fire_immune) {
+            mob.entity.fire_ticks -= 4;
         } else {
-            if (@rem(mob.fire_ticks, 20) == 0 and !living.inLava(mob)) _ = try mobs.hurt(mob, .{ .type = .on_fire }, 1);
-            mob.fire_ticks -= 1;
+            if (@rem(mob.entity.fire_ticks, 20) == 0 and !living.inLava(mob)) _ = try mobs.hurt(mob, .{ .type = .on_fire }, 1);
+            mob.entity.fire_ticks -= 1;
         }
     }
-    if (living.inLava(mob)) mob.fall_distance *= 0.5;
-    const world_bottom = mobs.level(mob.world).minimum_y;
-    if (mob.position[1] < @as(f64, @floatFromInt(world_bottom - 64))) {
+    if (living.inLava(mob)) mob.motion.fall_distance *= 0.5;
+    const world_bottom = mobs.level(mob.motion.world).minimum_y;
+    if (mob.motion.position[1] < @as(f64, @floatFromInt(world_bottom - 64))) {
         // Entity.onBelowWorld discards the mob.
-        mob.removed = true;
+        mob.entity.removed = true;
         return;
     }
-    mob.first_tick = false;
+    mob.entity.first_tick = false;
 
     // LivingEntity.baseTick.
-    if (mobs.traits(mob.species).fire_immune) mob.fire_ticks = 0;
+    if (mobs.traits(mob.entity.species).fire_immune) mob.entity.fire_ticks = 0;
     if (mob.alive()) {
         if (restsInPlace(mob)) {
             if (verify_rest) assert(!try inWall(mobs, mob));
@@ -132,64 +133,59 @@ fn baseTick(mobs: *Mobs, mob: *Mob, findings: *Findings) !void {
             _ = try mobs.hurt(mob, .{ .type = .in_wall }, 1);
         }
         // The block at the eyes is only read for a mob whose eyes are in water.
-        if (mob.eye_in_water and !try bubbleAtEyes(mobs, mob)) {
-            mob.air_supply = decreaseAir(mobs, mob, mob.air_supply);
-            if (mob.air_supply == -20) {
-                mob.air_supply = 0;
+        if (mob.entity.eye_in_water and !try bubbleAtEyes(mobs, mob)) {
+            mob.living.air_supply = decreaseAir(mobs, mob, mob.living.air_supply);
+            if (mob.living.air_supply == -20) {
+                mob.living.air_supply = 0;
                 mobs.entityEvent(mob, 67);
                 _ = try mobs.hurt(mob, .{ .type = .drown }, 2);
             }
-        } else if (mob.air_supply < 300) {
-            mob.air_supply = @min(mob.air_supply + 4, 300);
+        } else if (mob.living.air_supply < 300) {
+            mob.living.air_supply = @min(mob.living.air_supply + 4, 300);
         }
     }
-    if (mob.hurt_time > 0) mob.hurt_time -= 1;
-    if (mob.invulnerable_time > 0) mob.invulnerable_time -= 1;
+    if (mob.living.hurt_time > 0) mob.living.hurt_time -= 1;
+    if (mob.living.invulnerable_time > 0) mob.living.invulnerable_time -= 1;
     if (!mob.alive()) mobs.tickDeath(mob);
-    if (mob.last_hurt_by_player_time > 0) {
-        mob.last_hurt_by_player_time -= 1;
-    } else {
-        mob.last_hurt_by_player = null;
-    }
-    if (mob.last_hurt_by_mob != null and mob.tick_count - mob.last_hurt_by_mob_timestamp > 100) mob.last_hurt_by_mob = null;
-    mob.old_head_yaw = mob.head_yaw;
-    mob.old_body_yaw = mob.body_yaw;
-    mob.old_yaw = mob.yaw;
-    mob.old_pitch = mob.pitch;
+    if (mob.living.last_hurt_by_player_time > 0) mob.living.last_hurt_by_player_time -= 1;
+    mob.idle.old_head_yaw = mob.idle.head_yaw;
+    mob.idle.old_body_yaw = mob.idle.body_yaw;
+    mob.motion.old_yaw = mob.motion.yaw;
+    mob.motion.old_pitch = mob.motion.pitch;
 
     // Mob.baseTick.
     if (mob.alive()) {
-        const roll = mob.random.nextIntBounded(1000);
-        const time = mob.ambient_sound_time;
-        mob.ambient_sound_time += 1;
+        const roll = mob.idle.random.nextIntBounded(1000);
+        const time = mob.idle.ambient_sound_time;
+        mob.idle.ambient_sound_time += 1;
         if (roll < time) {
-            mob.ambient_sound_time = -mobs.traits(mob.species).ambient_interval;
+            mob.idle.ambient_sound_time = -mobs.traits(mob.entity.species).ambient_interval;
             mobs.ambientSound(mob);
         }
     }
 }
 
-fn bubbleAtEyes(mobs: *Mobs, mob: *const Mob) !bool {
-    const level = mobs.level(mob.world);
+fn bubbleAtEyes(mobs: *Mobs, mob: Mob) !bool {
+    const level = mobs.level(mob.motion.world);
     const eye = living.eyeY(mobs, mob);
-    return level.blocks.get(try level.state(mth.floor(mob.position[0]), mth.floor(eye), mth.floor(mob.position[2]))).kind == .bubble_column;
+    return level.blocks.get(try level.state(mth.floor(mob.motion.position[0]), mth.floor(eye), mth.floor(mob.motion.position[2]))).kind == .bubble_column;
 }
 
 /// LivingEntity.decreaseAirSupply, with no oxygen bonus.
-fn decreaseAir(mobs: *Mobs, mob: *Mob, air: i32) i32 {
-    const bonus = mobs.traits(mob.species).attribute(.oxygen_bonus);
-    if (bonus > 0 and mob.random.nextDouble() >= 1.0 / (bonus + 1.0)) return air;
+fn decreaseAir(mobs: *Mobs, mob: Mob, air: i32) i32 {
+    const bonus = mobs.traits(mob.entity.species).attribute(.oxygen_bonus);
+    if (bonus > 0 and mob.idle.random.nextDouble() >= 1.0 / (bonus + 1.0)) return air;
     return air - 1;
 }
 
 /// Entity.isInWall: a suffocating block's collision shape across the eyes.
-fn inWall(mobs: *Mobs, mob: *const Mob) !bool {
-    const level = mobs.level(mob.world);
+fn inWall(mobs: *Mobs, mob: Mob) !bool {
+    const level = mobs.level(mob.motion.world);
     const size: f64 = living.width(mobs, mob) * 0.8;
     const eye = living.eyeY(mobs, mob);
     const probe: @import("vanilla_bodies").body.Box = .{
-        .min = .{ mob.position[0] - size / 2, eye - 1.0e-6 / 2.0, mob.position[2] - size / 2 },
-        .max = .{ mob.position[0] + size / 2, eye + 1.0e-6 / 2.0, mob.position[2] + size / 2 },
+        .min = .{ mob.motion.position[0] - size / 2, eye - 1.0e-6 / 2.0, mob.motion.position[2] - size / 2 },
+        .max = .{ mob.motion.position[0] + size / 2, eye + 1.0e-6 / 2.0, mob.motion.position[2] + size / 2 },
     };
     var x = mth.floor(probe.min[0]);
     while (x <= mth.floor(probe.max[0])) : (x += 1) {
@@ -216,47 +212,48 @@ fn inWall(mobs: *Mobs, mob: *const Mob) !bool {
 }
 
 /// LivingEntity.aiStep with Mob, AgeableMob and Animal's additions.
-fn aiStep(mobs: *Mobs, mob: *Mob, findings: *Findings) !void {
-    if (mob.no_jump_delay > 0) mob.no_jump_delay -= 1;
-    if (@abs(mob.velocity[0]) < 0.003) mob.velocity[0] = 0;
-    if (@abs(mob.velocity[1]) < 0.003) mob.velocity[1] = 0;
-    if (@abs(mob.velocity[2]) < 0.003) mob.velocity[2] = 0;
+fn aiStep(mobs: *Mobs, mob: Mob, findings: *Findings) !void {
+    if (mob.living.no_jump_delay > 0) mob.living.no_jump_delay -= 1;
+    if (@abs(mob.motion.velocity[0]) < 0.003) mob.motion.velocity[0] = 0;
+    if (@abs(mob.motion.velocity[1]) < 0.003) mob.motion.velocity[1] = 0;
+    if (@abs(mob.motion.velocity[2]) < 0.003) mob.motion.velocity[2] = 0;
     // LivingEntity.applyInput.
-    mob.strafe *= 0.98;
-    mob.forward *= 0.98;
+    mob.living.strafe *= 0.98;
+    mob.living.forward *= 0.98;
     if (!mob.alive()) {
-        mob.jumping = false;
-        mob.strafe = 0;
-        mob.forward = 0;
-    } else if (!mob.no_ai) {
+        mob.living.jumping = false;
+        mob.living.strafe = 0;
+        mob.living.forward = 0;
+    } else if (!mob.control.no_ai) {
         try ai.serverAiStep(mobs, mob);
     }
-    if (mob.jumping) {
+    if (mob.living.jumping) {
         const in_lava = living.inLava(mob);
-        const fluid_height = if (in_lava) mob.lava_height else mob.water_height;
-        const swimming = mob.touching_water and fluid_height > 0;
+        const fluid_height = if (in_lava) mob.entity.lava_height else mob.entity.water_height;
+        const swimming = mob.entity.touching_water and fluid_height > 0;
         const threshold = living.fluidJumpThreshold(mobs, mob);
-        if (swimming and !(mob.on_ground and !(fluid_height > threshold))) {
+        if (swimming and !(mob.motion.on_ground and !(fluid_height > threshold))) {
             living.jumpInLiquid(mob);
-        } else if (in_lava and !(mob.on_ground and !(fluid_height > threshold))) {
+        } else if (in_lava and !(mob.motion.on_ground and !(fluid_height > threshold))) {
             living.jumpInLiquid(mob);
-        } else if ((mob.on_ground or (swimming and fluid_height <= threshold)) and mob.no_jump_delay == 0) {
+        } else if ((mob.motion.on_ground or (swimming and fluid_height <= threshold)) and mob.living.no_jump_delay == 0) {
             try living.jumpFromGround(mobs, mob);
-            mob.no_jump_delay = 10;
+            mob.living.no_jump_delay = 10;
         }
     } else {
-        mob.no_jump_delay = 0;
+        mob.living.no_jump_delay = 0;
     }
-    const input: [3]f32 = .{ mob.strafe, mob.vertical_input, mob.forward };
-    if (!mob.no_ai) {
+    const input: [3]f32 = .{ mob.living.strafe, mob.living.vertical_input, mob.living.forward };
+    if (!mob.control.no_ai) {
         // At rest with no input, travel pulls the mob into the floor and back as last tick.
-        const still = std.meta.eql(input, [3]f32{ 0, 0, 0 }) and std.meta.eql(mob.velocity, mob.rest_velocity);
+        const still = std.meta.eql(input, [3]f32{ 0, 0, 0 }) and std.meta.eql(mob.motion.velocity, mob.motion.rest_velocity);
         if (restsInPlace(mob) and still) {
             mobs.travels_skipped += 1;
             if (verify_rest) {
-                var copy = mob.*;
-                try living.travel(mobs, &copy, input);
-                checkSkip(mob, &copy);
+                var copy_state = mob.state();
+                const copy = Mob.of(&copy_state);
+                try living.travel(mobs, copy, input);
+                checkSkip(mob, copy);
             }
         } else {
             mobs.travels_run += 1;
@@ -264,34 +261,36 @@ fn aiStep(mobs: *Mobs, mob: *Mob, findings: *Findings) !void {
         }
     }
     // Blocks act on a mob that moved, or stands in or on one that acts.
-    const unmoved = std.meta.eql(mob.position, mob.old_position) and mob.movement_count == 0 and mob.fire_ticks == 0 and mob.ticks_frozen == 0;
+    const unmoved = std.meta.eql(mob.motion.position, mob.motion.old_position) and mob.motion.movement_count == 0 and mob.entity.fire_ticks == 0 and mob.entity.ticks_frozen == 0;
     if (restsInPlace(mob) and unmoved) {
         if (verify_rest) {
-            var copy = mob.*;
-            assert(!try effects.applyEffectsFromBlocks(mobs, &copy));
-            checkSkip(mob, &copy);
+            var copy_state = mob.state();
+            const copy = Mob.of(&copy_state);
+            assert(!try effects.applyEffectsFromBlocks(mobs, copy));
+            checkSkip(mob, copy);
         }
     } else {
         findings.blocks_acted = try effects.applyEffectsFromBlocks(mobs, mob);
     }
     // Freezing: powder snow chills, and thaws two ticks at a time outside it.
-    if (!mob.in_powder_snow) mob.ticks_frozen = @max(0, mob.ticks_frozen - 2);
+    if (!mob.entity.in_powder_snow) mob.entity.ticks_frozen = @max(0, mob.entity.ticks_frozen - 2);
     // LivingEntity.removeFrost, then tryAddFrost over anything but air.
-    mob.frost_speed = 0;
-    if (mob.ticks_frozen > 0) {
+    mob.living.frost_speed = 0;
+    if (mob.entity.ticks_frozen > 0) {
         const under = try living.onPosition(mobs, mob, 0.2);
-        const level = mobs.level(mob.world);
+        const level = mobs.level(mob.motion.world);
         if (!level.blocks.get(try level.state(under[0], under[1], under[2])).flags.air) {
-            mob.frost_speed = -0.05 * (@as(f32, @floatFromInt(@min(140, mob.ticks_frozen))) / 140.0);
+            mob.living.frost_speed = -0.05 * (@as(f32, @floatFromInt(@min(140, mob.entity.ticks_frozen))) / 140.0);
         }
     }
-    if (@rem(mob.tick_count, 40) == 0 and mob.ticks_frozen >= 140) _ = try mobs.hurt(mob, .{ .type = .freeze }, 1);
+    if (@rem(mob.idle.tick_count, 40) == 0 and mob.entity.ticks_frozen >= 140) _ = try mobs.hurt(mob, .{ .type = .freeze }, 1);
     // A mob coming into contact wakes a resting one, so one at rest touches nothing.
     if (restsInPlace(mob)) {
         if (verify_rest) {
-            var copy = mob.*;
-            assert(try mobs.pushEntities(&copy) == 0);
-            checkSkip(mob, &copy);
+            var copy_state = mob.state();
+            const copy = Mob.of(&copy_state);
+            assert(try mobs.pushEntities(copy) == 0);
+            checkSkip(mob, copy);
         }
     } else {
         findings.touched = try mobs.pushEntities(mob);
@@ -299,46 +298,47 @@ fn aiStep(mobs: *Mobs, mob: *Mob, findings: *Findings) !void {
 
     // AgeableMob.aiStep.
     if (mob.alive()) {
-        if (mob.age < 0) {
-            mobs.setAge(mob, mob.age + 1);
-        } else if (mob.age > 0) {
-            mobs.setAge(mob, mob.age - 1);
+        if (mob.idle.age < 0) {
+            mobs.setAge(mob, mob.idle.age + 1);
+        } else if (mob.idle.age > 0) {
+            mobs.setAge(mob, mob.idle.age - 1);
         }
     }
     // Animal.aiStep.
-    if (mob.age != 0) mob.in_love = 0;
-    if (mob.in_love > 0) {
-        mob.in_love -= 1;
-        if (@rem(mob.in_love, 10) == 0) {
+    if (mob.idle.age != 0) mob.endLove();
+    if (mob.part(.breeding)) |breeding| if (breeding.in_love > 0) {
+        breeding.in_love -= 1;
+        if (breeding.in_love == 0 and breeding.love_cause == null) mob.drop(.breeding);
+        if (@rem(mob.inLove(), 10) == 0) {
             // A heart particle on the client, but the random draws happen on the server too.
-            _ = mob.random.nextGaussian();
-            _ = mob.random.nextGaussian();
-            _ = mob.random.nextGaussian();
-            _ = mob.random.nextDouble();
-            _ = mob.random.nextDouble();
-            _ = mob.random.nextDouble();
+            _ = mob.idle.random.nextGaussian();
+            _ = mob.idle.random.nextGaussian();
+            _ = mob.idle.random.nextGaussian();
+            _ = mob.idle.random.nextDouble();
+            _ = mob.idle.random.nextDouble();
+            _ = mob.idle.random.nextDouble();
         }
-    }
+    };
 }
 
 /// The end of LivingEntity.tick: the body faces where the mob walked, through
 /// BodyRotationControl, which Mob.tickHeadTurn uses.
-fn turnBody(mobs: *Mobs, mob: *Mob) void {
+fn turnBody(mobs: *Mobs, mob: Mob) void {
     _ = mobs;
-    const dx = mob.position[0] - mob.old_position[0];
-    const dz = mob.position[2] - mob.old_position[2];
+    const dx = mob.motion.position[0] - mob.motion.old_position[0];
+    const dz = mob.motion.position[2] - mob.motion.old_position[2];
     if (dx * dx + dz * dz > @as(f64, @as(f32, 2.5000003e-7))) {
-        mob.body_yaw = mob.yaw;
-        mob.head_yaw = mth.rotateIfNecessary(mob.head_yaw, mob.body_yaw, 75);
-        mob.last_stable_head_yaw = mob.head_yaw;
-        mob.head_stable_time = 0;
+        mob.idle.body_yaw = mob.motion.yaw;
+        mob.idle.head_yaw = mth.rotateIfNecessary(mob.idle.head_yaw, mob.idle.body_yaw, 75);
+        mob.idle.last_stable_head_yaw = mob.idle.head_yaw;
+        mob.idle.head_stable_time = 0;
         return;
     }
-    var turn: Turn = .{ .body = mob.body_yaw, .last_stable = mob.last_stable_head_yaw, .stable_time = mob.head_stable_time };
-    turnStill(mob.head_yaw, &turn);
-    mob.body_yaw = turn.body;
-    mob.last_stable_head_yaw = turn.last_stable;
-    mob.head_stable_time = turn.stable_time;
+    var turn: Turn = .{ .body = mob.idle.body_yaw, .last_stable = mob.idle.last_stable_head_yaw, .stable_time = mob.idle.head_stable_time };
+    turnStill(mob.idle.head_yaw, &turn);
+    mob.idle.body_yaw = turn.body;
+    mob.idle.last_stable_head_yaw = turn.last_stable;
+    mob.idle.head_stable_time = turn.stable_time;
 }
 
 /// The body of a mob that did not move, as BodyRotationControl turns it toward the head.

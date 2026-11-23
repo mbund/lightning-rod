@@ -63,6 +63,17 @@ pub fn endTick(instances: anytype, success: bool) void {
     }
 }
 
+/// Why a plugin wants the server to stop after this tick, as one whose bounds are nearly reached:
+/// stopping between ticks checkpoints what the next might not finish. The first plugin's asking.
+pub fn stopReason(instances: anytype) ?anyerror {
+    const Selections = @TypeOf(instances.*).selections;
+    inline for (0..comptime selection.selectedCount(Selections)) |index| {
+        const Plugin = selection.selectedPlugin(selection.selectedType(Selections, index));
+        if (@hasDecl(Plugin, "stopReason")) if (instances.get(Plugin).stopReason()) |reason| return reason;
+    }
+    return null;
+}
+
 pub fn publish(instances: anytype) void {
     const Selections = @TypeOf(instances.*).selections;
     inline for (0..comptime selection.selectedCount(Selections)) |index| {

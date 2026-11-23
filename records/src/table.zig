@@ -270,7 +270,8 @@ pub const Write = struct {
     key: []const u8,
     value: ?[]const u8,
 };
-pub const ScanCursor = struct { after: []u8, after_len: usize = 0 };
+/// Where a scan is: past `after`, and up to but not including `before`, when one is given.
+pub const ScanCursor = struct { after: []u8, after_len: usize = 0, before: []const u8 = &.{} };
 pub const ScanEntry = struct { key: []u8, value: []u8, key_len: usize = 0, value_len: usize = 0 };
 pub const ScanKey = struct { key: []u8, key_len: usize = 0 };
 pub const ScanResult = struct { count: usize, more: bool };
@@ -1487,6 +1488,10 @@ pub const Table = struct {
         while (true) {
             while (at < node.count and count < output.len) : (at += 1) {
                 const cell = &node.cells[at];
+                if (cursor.before.len != 0 and std.mem.order(u8, cell.keySlice(), cursor.before) != .lt) {
+                    if (include_values) try values.flush();
+                    return .{ .count = count, .more = false };
+                }
                 const row = &output[count];
                 if (row.key.len < cell.key_len or cursor.after.len < cell.key_len) return error.BufferTooSmall;
                 @memcpy(row.key[0..cell.key_len], cell.keySlice());

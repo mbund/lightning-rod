@@ -24,3 +24,4 @@ registry_snapshotter/bin/
 !/.vscode/extensions.json
 !/.vscode/settings.json
 !/.vscode/tasks.json
+bench/tick/zig-out-*/

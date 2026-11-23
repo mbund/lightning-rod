@@ -1,28 +1,30 @@
-//! Where projectiles live: one records cache over the projectiles' storage, as chunks and
-//! entities use, with every kind of entry under a prefix byte. Keys order as the tick does: by
-//! entity id, which is tick-list order, big-endian; by time; by block.
+//! The projectiles' indexes, in memory: one set of keys, every kind under a prefix byte, each
+//! found from the projectile's own state, so a restart builds them again. Keys order as the
+//! tick does: by entity id, which is tick-list order, big-endian; by time; by block.
 //!
-//! - record: id → the projectile.
-//! - ticking: id → nothing. Those that fly, in tick-list order.
-//! - due: tick, id → nothing. Stuck arrows by when they go.
-//! - stuck: world, cell x, cell z, place in cell, y, id → nothing. Stuck projectiles by the block
-//!   they are in, blocks by the four by four column of blocks they are in.
-//! - parked: group, id → nothing. Stuck arrows by the tick of a second they look over viewers.
-//! - removal: id → network id and viewers still to tell.
-//! - woken: id → nothing. Stuck projectiles whose block was edited.
-//! - sleeping: id → nothing. Flying projectiles left alone until they wake, which memory keeps.
+//! - due: tick, id. Stuck arrows by when they go.
+//! - stuck: world, cell x, cell z, place in cell, y, id. Stuck projectiles by the block they are
+//!   in, blocks by the four by four column of blocks they are in.
+//! - parked: group, id. Stuck arrows by the tick of a second they look over viewers.
+//! - removal: id. Projectiles gone whose removal some viewer is still owed.
+//! - woken: id. Stuck projectiles whose block was edited.
+//! - sleeping: id. Flying projectiles left alone until they wake.
+//! - frozen: world, column x, column z, id. Stuck arrows whose time came while their column was
+//!   frozen, waiting for it to tick again.
 
 const std = @import("std");
-const records = @import("records");
+const entities = @import("entities");
 
 const assert = std.debug.assert;
 
-pub const Prefix = enum(u8) { record = 1, ticking = 2, due = 3, stuck = 4, parked = 5, removal = 6, woken = 7, sleeping = 8 };
+pub const Prefix = enum(u8) { due = 3, stuck = 4, parked = 5, removal = 6, woken = 7, sleeping = 8, frozen = 10 };
 
 /// The longest key: a stuck entry.
 pub const key_bytes = 1 + 4 + 4 + 4 + 1 + 4 + 8;
 /// Blocks a side of a stuck cell, as a shift.
 pub const cell_shift = 2;
+
+pub const Index = entities.SortedKeys(key_bytes);
 
 pub const Key = struct {
     bytes: [key_bytes]u8 = undefined,
@@ -51,13 +53,13 @@ pub const Key = struct {
 
 fn start(prefix: Prefix) Key {
     var key: Key = .{};
-    key.bytes[0] = @intFromEnum(prefix);
+    key.bytes[0] = @backingInt(prefix);
     key.len = 1;
     return key;
 }
 
 pub fn byId(prefix: Prefix, id: u64) Key {
-    assert(prefix == .record or prefix == .ticking or prefix == .removal or prefix == .woken or prefix == .sleeping);
+    assert(prefix == .removal or prefix == .woken or prefix == .sleeping);
     var key = start(prefix);
     key.put(u64, id);
     return key;
@@ -74,9 +76,9 @@ fn timed(prefix: Prefix, at: u64, id: u64) Key {
     return key;
 }
 
-/// The tick a due or sleeping key comes due at.
+/// The tick a due key comes due at.
 pub fn dueAt(bytes: []const u8) u64 {
-    assert(bytes.len == 17 and (bytes[0] == @intFromEnum(Prefix.due) or bytes[0] == @intFromEnum(Prefix.sleeping)));
+    assert(bytes.len == 17 and bytes[0] == @backingInt(Prefix.due));
     return std.mem.readInt(u64, bytes[1..9], .big);
 }
 
@@ -100,11 +102,21 @@ pub fn cell(world: u32, x: i32, z: i32) Key {
 
 /// The block of a stuck key.
 pub fn stuckBlock(bytes: []const u8) [3]i32 {
-    assert(bytes.len == key_bytes and bytes[0] == @intFromEnum(Prefix.stuck));
+    assert(bytes.len == key_bytes and bytes[0] == @backingInt(Prefix.stuck));
     const cell_x: i32 = @bitCast(std.mem.readInt(u32, bytes[5..9], .big) ^ 0x8000_0000);
     const cell_z: i32 = @bitCast(std.mem.readInt(u32, bytes[9..13], .big) ^ 0x8000_0000);
     const place = bytes[13];
     return .{ cell_x << cell_shift | (place >> 2), @bitCast(std.mem.readInt(u32, bytes[14..18], .big) ^ 0x8000_0000), cell_z << cell_shift | (place & 3) };
+}
+
+/// A frozen key, or with no id, the prefix of a column's.
+pub fn frozen(world: u32, x: i32, z: i32, id: ?u64) Key {
+    var key = start(.frozen);
+    key.put(u32, world);
+    key.putSigned(x);
+    key.putSigned(z);
+    if (id) |entity| key.put(u64, entity);
+    return key;
 }
 
 pub fn parked(group: u8, id: ?u64) Key {
@@ -119,48 +131,42 @@ pub fn under(kind: Prefix) Key {
 }
 
 /// An ordered pass over the keys under a prefix, a batch at a time. Keys are copied out, so the
-/// cache may change between batches; a key added behind the pass is not seen.
+/// index may change between batches; a key added behind the pass is not seen.
 pub const Pass = struct {
     pub const batch = 64;
-    cache: *records.Cache,
+    index: *const Index,
     within: Key,
-    after: [key_bytes]u8 = undefined,
-    after_len: usize = 0,
+    after: Key,
     done: bool = false,
+    found: [batch]Index.Key = undefined,
     keys: [batch]Key = undefined,
 
-    pub fn init(cache: *records.Cache, within: Key) Pass {
-        var pass: Pass = .{ .cache = cache, .within = within };
-        @memcpy(pass.after[0..within.len], within.slice());
-        pass.after_len = within.len;
-        return pass;
+    pub fn init(index: *const Index, within: Key) Pass {
+        return .{ .index = index, .within = within, .after = within };
     }
 
     /// The next keys under the prefix, none once past it.
     pub fn next(self: *Pass) ![]const Key {
         if (self.done) return &.{};
-        var entries: [batch]records.BorrowedEntry = undefined;
-        var cursor: records.ScanCursor = .{ .after = &self.after, .after_len = self.after_len };
-        const result = try self.cache.scanBorrowed(&cursor, &entries);
-        self.after_len = cursor.after_len;
+        const found = self.index.after(self.after.slice(), &self.found);
         var count: usize = 0;
-        for (entries[0..result.count]) |entry| {
-            if (!std.mem.startsWith(u8, entry.key, self.within.slice())) {
+        for (found) |entry| {
+            if (!std.mem.startsWith(u8, entry.slice(), self.within.slice())) {
                 self.done = true;
                 break;
             }
-            assert(entry.key.len <= key_bytes);
-            self.keys[count] = .{ .len = @intCast(entry.key.len) };
-            @memcpy(self.keys[count].bytes[0..entry.key.len], entry.key);
+            self.keys[count] = .{ .len = entry.len };
+            @memcpy(self.keys[count].bytes[0..entry.len], entry.slice());
             count += 1;
         }
-        if (!result.more) self.done = true;
+        if (found.len < batch) self.done = true;
+        if (count > 0) self.after = self.keys[count - 1];
         return self.keys[0..count];
     }
 };
 
 test "keys order by id, by time and by block, signed coordinates included" {
-    try std.testing.expect(std.mem.order(u8, byId(.record, 1).slice(), byId(.record, 256).slice()) == .lt);
+    try std.testing.expect(std.mem.order(u8, byId(.woken, 1).slice(), byId(.woken, 256).slice()) == .lt);
     try std.testing.expect(std.mem.order(u8, due(5, 900).slice(), due(6, 1).slice()) == .lt);
     try std.testing.expect(std.mem.order(u8, stuck(0, -5, 0, 64, 1).slice(), stuck(0, 0, 0, 64, 1).slice()) == .lt);
     try std.testing.expect(std.mem.startsWith(u8, stuck(0, -3, 7, -60, 9).slice(), cell(0, -1, 1).slice()));
@@ -168,4 +174,7 @@ test "keys order by id, by time and by block, signed coordinates included" {
     try std.testing.expectEqual([3]i32{ -3, -60, 7 }, stuckBlock(stuck(0, -3, 7, -60, 9).slice()));
     try std.testing.expectEqual(@as(u64, 9), Key.id(stuck(0, -3, 7, -60, 9).slice()));
     try std.testing.expectEqual(@as(u64, 77), dueAt(due(77, 3).slice()));
+    try std.testing.expect(std.mem.startsWith(u8, frozen(0, -1, 2, 9).slice(), frozen(0, -1, 2, null).slice()));
+    try std.testing.expect(!std.mem.startsWith(u8, frozen(0, -1, 3, 9).slice(), frozen(0, -1, 2, null).slice()));
+    try std.testing.expectEqual(@as(u64, 9), Key.id(frozen(0, -1, 2, 9).slice()));
 }

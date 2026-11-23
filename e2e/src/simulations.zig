@@ -9,7 +9,6 @@ const vanilla = @import("vanilla");
 const BlockSynchronization = @import("terrain").block_sync.BlockSynchronization;
 const Chat = @import("chat").chat.Chat;
 const Chunks = @import("chunks").Chunks;
-const Entities = @import("entities").Entities;
 const Generation = @import("terrain").generation.Generation;
 const Inventories = @import("inventories").Inventories;
 const LoginEncryption = @import("connection").session_encryption.LoginEncryption;
@@ -112,8 +111,6 @@ pub fn run(init: std.process.Init, plugins: anytype, endpoints: []*sessions.Serv
         // and a few columns nothing holds, so the cache evicts all the time.
         lightning_rod.plugin.configured(Chunks, Chunks.Configuration{ .cache_sections = 24 + 64 + 192 + 192 + 8 + 48, .cache_groups = 6 }),
         lightning_rod.plugin.configured(BlockSynchronization, BlockSynchronization.Configuration{ .delta_sections = 8, .queued_sections = 8 }),
-        lightning_rod.plugin.configured(Entities, Entities.Configuration{ .cache_records = 16 }),
-        lightning_rod.plugin.configured(vanilla.ItemEntities, vanilla.ItemEntities.Configuration{ .cache_records = 16, .maximum = 64 }),
         lightning_rod.plugin.configured(vanilla.ItemReplication, vanilla.ItemReplication.Configuration{}),
         lightning_rod.plugin.configured(Inventories, Inventories.Configuration{ .cache_items = vanilla.crafting.maximum_inputs + 1 }),
         lightning_rod.plugin.configured(Chat, Chat.Configuration{ .pending_messages = 8 }),

@@ -340,8 +340,7 @@ test "transient entity IDs survive a checkpoint without storing transient entity
     try context.store.waitDurable(try context.store.commit(1));
     const restored = try entities.Entities.init(arena.allocator(), std.testing.io, .{}, bodies.deps);
     try std.testing.expectEqual(first + 8, try restored.reserveIds(2));
-    var cursor: entities.Cursor = .{};
-    try std.testing.expectEqual(@as(usize, 0), (try restored.scan(&cursor)).len);
+    try std.testing.expectEqual(@as(usize, 0), restored.directory.count());
     const before = restored.next_id;
     try std.testing.expectError(error.IdExhausted, restored.reserveIds(std.math.maxInt(usize)));
     try std.testing.expectEqual(before, restored.next_id);

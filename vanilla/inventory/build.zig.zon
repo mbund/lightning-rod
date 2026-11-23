@@ -15,6 +15,7 @@
         .protocol_1_21_5 = .{ .path = "../../protocol_versions/v1_21_5" },
         .protocol_1_21_9 = .{ .path = "../../protocol_versions/v1_21_9" },
         .records = .{ .path = "../../records" },
+        .domains = .{ .path = "../../domains" },
         .sessions = .{ .path = "../../sessions" },
         .terrain = .{ .path = "../../terrain" },
         .vanilla_bodies = .{ .path = "../bodies" },

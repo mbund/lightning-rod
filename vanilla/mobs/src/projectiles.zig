@@ -37,6 +37,8 @@ const body = @import("vanilla_bodies").body;
 const mth = @import("vanilla_bodies").mth;
 const living = @import("living.zig");
 const Mobs = @import("mobs.zig").Mobs;
+const Domains = @import("domains").domains.Domains;
+const DomainColumn = @import("domains").domains.Column;
 const Mob = @import("mob.zig").Mob;
 const packets = @import("projectile_packets.zig");
 const store = @import("projectile_store.zig");
@@ -166,18 +168,20 @@ const Projectile = extern struct {
     }
 };
 
-/// A record in hand for a batch: the projectile and its viewers where the cache keeps them, edited
-/// in place, the lease, and whether it was in the ground when read, which says what entries it has
-/// besides its record.
+/// A record in hand for a batch: the projectile and its viewers where memory keeps them, edited
+/// in place, and whether it was in the ground when taken, which says what entries it has.
 const Held = struct {
     projectile: *Projectile,
+    /// Its whole record: the projectile, its row, then `Stored`.
+    bytes: []align(16) u8,
     row: []u64,
-    lease: records.Cache.Lease,
     was_in_ground: bool,
     was_parked: bool,
     was_marked: bool = false,
     /// Woken only to send its update: nothing else happens to it this tick.
     quick: bool = false,
+    /// Taking its turn in the tick order, so awake there, whatever it was.
+    walked: bool = false,
 };
 
 /// A moving projectile of a batch by the section it is in.
@@ -190,15 +194,28 @@ const Order = struct {
     }
 };
 
-/// A change to an entry that is only its key.
+/// A change to an entry of the index.
 const IndexOp = struct {
     key: store.Key,
     mark: bool,
+};
 
-    fn before(_: void, a: IndexOp, b: IndexOp) bool {
-        return std.mem.order(u8, a.key.slice(), b.key.slice()) == .lt;
+/// What the store holds of a projectile, after its record and row in memory: the column it was
+/// last saved under, and whether it changed since.
+const Stored = extern struct {
+    world: u32 = 0,
+    x: i32 = 0,
+    z: i32 = 0,
+    stored: bool = false,
+    dirty: bool = false,
+
+    fn column(self: Stored) entities.space.Column {
+        return .{ .world = self.world, .x = self.x, .z = self.z };
     }
 };
+
+/// A saved projectile to delete at the checkpoint.
+const Gone = struct { column: entities.space.Column, id: u64 };
 
 /// Where a player stood, by its connection, and its game mode, which decides what it may pick up.
 const Seen = struct { generation: u32 = 0, world: u32 = 0, position: [3]f64 = @splat(0), stage: u8 = 0, gamemode: i8 = 0 };
@@ -206,8 +223,8 @@ const Seen = struct { generation: u32 = 0, world: u32 = 0, position: [3]f64 = @s
 pub const Projectiles = struct {
     pub const id = "minecraft:projectiles";
     pub const Configuration = struct {
-        /// Records in memory. More projectiles than this stream through it, a batch at a time.
-        cache_records: usize = 1024,
+        /// Columns stopped ticking with stuck arrows in them.
+        frozen_columns: usize = 4096,
         /// Sections whose blocks of 4x4x4 are known to hold, or not, what affects projectiles: a
         /// power of two. Forgetting one only means looking at it again.
         space_sections: usize = 4096,
@@ -236,6 +253,7 @@ pub const Projectiles = struct {
         record_workspaces: *records.Workspaces,
         metrics: *metrics.Registry,
         storage: storage.Space,
+        domains: *Domains,
     };
     /// AbstractArrow and its kin track 4 chunks away.
     const tracking_blocks = 64.0;
@@ -247,19 +265,21 @@ pub const Projectiles = struct {
     const window_sections = 8;
     /// Records a batch holds, a whole number of scan batches.
     const batch_max = store.Pass.batch;
-    /// How records lie in the cache: a projectile, then its viewer row of words.
-    const record_align = @alignOf(Projectile);
+    // How records lie in memory: a projectile, then its viewer row of words, then `Stored`.
     comptime {
-        assert(@sizeOf(Projectile) % @alignOf(u64) == 0);
+        assert(@sizeOf(Projectile) % @alignOf(u64) == 0 and @alignOf(Projectile) <= 16);
     }
     /// Entry changes a batch's projectiles make: as they land, fly again, sleep or go, five at
     /// most each.
     const ops_per_batch = batch_max * 5 + 1;
-    /// Changes a pass holds back across its batches, so the cache orders its keys once a pass
-    /// rather than once a batch.
+    /// Changes a pass holds back across its batches, so a pass sees the index as it began.
     const ops_max = ops_per_batch * 64;
-    /// Keys one reservation takes, as records reserve them.
-    const reserve_max = 128;
+    /// Index entries one projectile has at most: flying or asleep or parked, stuck, due or
+    /// frozen, woken; and a removal.
+    const keys_per_projectile = 5;
+    /// Store prefixes: a projectile under its column, and a frozen column with its tick.
+    const record_prefix = 0x30;
+    const frozen_prefix = 0x31;
     /// The most players a viewer row has room for.
     const max_row_bytes = 64;
     /// Chunks whose nearby players one tick keeps, each with up to every player.
@@ -273,8 +293,35 @@ pub const Projectiles = struct {
     /// The players who may be hit near a chunk: their slots, their boxes, and the box around them.
     const Targets = struct { players: []const u32, boxes: []const body.Box, bounds: ?body.Box };
 
+    /// A projectile as memory keeps it: its record, its viewer row, then `Stored`.
+    const Record = struct { bytes: [record_max]u8 align(16) };
+    const record_max = std.mem.alignForward(usize, @sizeOf(Projectile) + max_row_bytes + @sizeOf(Stored), 16);
+
     deps: Dependencies,
-    cache: records.Cache,
+    /// Every projectile. Read and written as copies, but for the batch in hand.
+    records: Records,
+    /// Removals owed: the network id in 8 bytes, then the viewers still to tell.
+    removal_rows: entities.Slab,
+    index: store.Index,
+    /// The one tick order every entity of every kind keeps a place in, and the kinds that are
+    /// projectiles.
+    tick_order: *entities.Order,
+    kinds: entities.Kinds,
+    /// Columns that stopped ticking with stuck arrows in them, and the tick they stopped on.
+    frozen_columns: std.AutoHashMapUnmanaged(DomainColumn, u64),
+    /// Whether every projectile kept was brought in at once, where nothing follows the loaded domain.
+    loaded_all: bool = false,
+    frozen_limit: usize,
+    frozen_changed: bool = false,
+    /// Projectiles changed since the checkpoint, some since gone; and saved ones gone.
+    dirty: []u64,
+    dirty_count: usize = 0,
+    gone: []Gone,
+    gone_count: usize = 0,
+    /// Ids for a pass over every projectile in id order.
+    id_scratch: []u64,
+    table: records.Table,
+    /// A projectile and its viewer row.
     record_bytes: usize,
     chunk_client: chunks.Chunks.Client,
     window: chunks.ReadWindow(window_sections),
@@ -295,6 +342,8 @@ pub const Projectiles = struct {
     op_count: usize = 0,
     /// Within a pass whose keys its batches do not read back, changes wait for its end.
     holding_index: bool = false,
+    /// Whether this tick has projectiles to see to, as found before entities tick.
+    active: bool = false,
     /// The space sleeping projectiles will pass through.
     claims: projectile_claims.Claims,
     sleeping: usize = 0,
@@ -318,7 +367,7 @@ pub const Projectiles = struct {
     /// The batch in hand.
     held: []Held,
     held_count: usize = 0,
-    /// Those of the batch written back already, whose records the cache has again.
+    /// Those of the batch settled already.
     held_settled: usize = 0,
     order: []Order,
     traces: []?raycast.Hit,
@@ -346,6 +395,12 @@ pub const Projectiles = struct {
     moved_at: u64 = 0,
     /// The last tick an arrow landed: until it stops shaking, everyone looks for pickups.
     landed_at: u64 = 0,
+    /// Columns that began and stopped ticking since the last tick, as the domains told: where
+    /// projectiles freeze, as vanilla's do outside entity-ticking chunks, and thaw.
+    entered: []DomainColumn,
+    entered_count: usize = 0,
+    left: []DomainColumn,
+    left_count: usize = 0,
     effects: world_effects.Effects,
     random: std.Random.DefaultPrng,
     scratch: std.heap.FixedBufferAllocator,
@@ -379,16 +434,15 @@ pub const Projectiles = struct {
     queued: [3]u64 = @splat(0),
     taken: [3]u64 = @splat(0),
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, configuration: Configuration, deps: Dependencies) !*Projectiles {
-        const self = try allocate(allocator, io, configuration, deps);
+    pub fn init(allocator: std.mem.Allocator, _: std.Io, configuration: Configuration, deps: Dependencies) !*Projectiles {
+        const self = try allocate(allocator, configuration, deps);
         try self.recover();
         return self;
     }
 
     /// Everything but what the world kept.
-    pub fn allocate(allocator: std.mem.Allocator, io: std.Io, configuration: Configuration, deps: Dependencies) !*Projectiles {
-        // A batch, and the entries it makes or removes as its projectiles land, go and fall.
-        if (configuration.cache_records < 4 * batch_max) return error.InvalidConfiguration;
+    pub fn allocate(allocator: std.mem.Allocator, configuration: Configuration, deps: Dependencies) !*Projectiles {
+        if (configuration.frozen_columns == 0) return error.InvalidConfiguration;
         if ((deps.players.records.len + 63) / 64 * 8 > max_row_bytes) return error.InvalidConfiguration;
         const self = try allocator.create(Projectiles);
         const row_words = (deps.players.records.len + 63) / 64;
@@ -399,17 +453,22 @@ pub const Projectiles = struct {
         const players = deps.players.records.len;
         const cells = try allocator.alloc(u16, cell_count);
         @memset(cells, 0);
+        var frozen_columns: std.AutoHashMapUnmanaged(DomainColumn, u64) = .empty;
+        try frozen_columns.ensureTotalCapacity(allocator, @intCast(configuration.frozen_columns));
+        const bound = deps.entities.directory.capacity();
         self.* = .{
             .deps = deps,
-            .cache = try records.Cache.init(allocator, io, records.Table.init(deps.storage, deps.record_workspaces.resources), .{
-                .metrics = deps.metrics,
-                .metrics_namespace = "projectiles.cache",
-                .slots = configuration.cache_records,
-                .key_bytes = store.key_bytes,
-                // Slots a whole number of alignments apart, so a record is edited where it lies.
-                .value_bytes = std.mem.alignForward(usize, record_bytes, record_align),
-                .scan_batch = store.Pass.batch,
-            }),
+            .records = try .init(allocator, deps.entities),
+            .removal_rows = try entities.Slab.init(allocator, &deps.entities.pool, 8 + row_words * 8, bound),
+            .index = try store.Index.init(allocator, bound * keys_per_projectile),
+            .frozen_columns = frozen_columns,
+            .tick_order = &deps.entities.places.order,
+            .kinds = .{},
+            .frozen_limit = configuration.frozen_columns,
+            .dirty = try allocator.alloc(u64, bound),
+            .gone = try allocator.alloc(Gone, bound),
+            .id_scratch = try allocator.alloc(u64, bound),
+            .table = records.Table.init(deps.storage, deps.record_workspaces.resources),
             .record_bytes = record_bytes,
             .chunk_client = chunk_client,
             .window = .init(chunk_client),
@@ -449,36 +508,328 @@ pub const Projectiles = struct {
             .leaving = try allocator.alloc(u64, row_words),
             .starved = try allocator.alloc(u64, row_words),
             .audience = try allocator.alloc(u64, row_words),
+            .entered = try allocator.alloc(DomainColumn, deps.domains.capacity()),
+            .left = try allocator.alloc(DomainColumn, deps.domains.capacity()),
         };
         @memset(self.seen, .{});
+        self.kinds = .of(&self.entity_types);
+        // Projectiles take their turns in the one tick order, a batch at a time.
+        try deps.entities.addTicker(.init(Projectiles, self, self.kinds, batch_max));
+        try deps.entities.addColumnHolder(.init(Projectiles, self, loadColumn, unloadColumn));
+        try self.records.register(&self.entity_types);
         try deps.chunks.observe(.init(self, blocksChanged));
+        try deps.domains.observe(.init(Projectiles, self, ticksChanged));
         return self;
     }
 
-    /// The clock and the counts, from what the world kept.
-    fn recover(self: *Projectiles) !void {
-        const clock = try self.cache.acquire(&.{0});
-        defer clock.release();
-        if (clock.read()) |bytes| {
-            if (bytes.len != 8) return error.Corrupt;
-            self.now = std.mem.readInt(u64, bytes[0..8], .little);
-        }
-        inline for (.{ .{ store.Prefix.record, "count" }, .{ store.Prefix.ticking, "ticking" }, .{ store.Prefix.removal, "removals" }, .{ store.Prefix.woken, "woken" }, .{ store.Prefix.sleeping, "sleeping" }, .{ store.Prefix.stuck, "" } }) |entry| {
-            var pass = store.Pass.init(&self.cache, store.under(entry[0]));
-            while (true) {
-                const keys = try pass.next();
-                if (keys.len == 0) break;
-                if (entry[1].len == 0) {
-                    for (keys) |key| self.countCell(store.stuckBlock(key.slice()), stuckWorld(key.slice()), 1);
-                } else @field(self, entry[1]) += keys.len;
-            }
-        }
-        // Claims live in memory: after a restart every sleeper wakes on the first tick.
-        self.rouse_all = self.sleeping > 0;
+    /// The domains tick before projectiles each tick: what they tell is taken in at its start.
+    fn ticksChanged(self: *Projectiles, entered: []const DomainColumn, left: []const DomainColumn) void {
+        // A column every tick tells of at most once, and none goes untaken between ticks.
+        assert(self.entered_count + entered.len <= self.entered.len and self.left_count + left.len <= self.left.len);
+        @memcpy(self.entered[self.entered_count..][0..entered.len], entered);
+        self.entered_count += entered.len;
+        @memcpy(self.left[self.left_count..][0..left.len], left);
+        self.left_count += left.len;
     }
 
-    fn stuckWorld(stuck_key: []const u8) u32 {
-        return std.mem.readInt(u32, stuck_key[1..5], .big);
+    fn ticksAt(self: *const Projectiles, world: u32, position: [3]f64) bool {
+        return self.deps.domains.ticks(.{ .world = world, .x = @intFromFloat(@floor(position[0] / 16)), .z = @intFromFloat(@floor(position[2] / 16)) });
+    }
+
+    /// Columns that stopped: the time of the stuck arrows in them stands still from now, and
+    /// sleepers whose way crosses one wake to freeze where they are. Columns that started: the
+    /// stuck arrows in them take up their time where it stood.
+    fn thaw(self: *Projectiles) !void {
+        defer {
+            self.entered_count = 0;
+            self.left_count = 0;
+        }
+        if (self.count == 0) return;
+        for (self.left[0..self.left_count]) |column| {
+            // Only stuck arrows keep time, and none can come to be stuck where nothing ticks.
+            if (self.columnHoldsStuck(column)) {
+                if (!self.frozen_columns.contains(column) and self.frozen_columns.count() >= self.frozen_limit) return error.FrozenColumnsFull;
+                self.frozen_columns.putAssumeCapacity(column, self.now);
+                self.frozen_changed = true;
+            }
+            const low: [3]f64 = .{ @floatFromInt(column.x * 16), -2.0e7, @floatFromInt(column.z * 16) };
+            self.rouseMeeting(column.world, .{ .low = low, .high = .{ low[0] + 16, 2.0e7, low[2] + 16 } }, 0);
+        }
+        for (self.entered[0..self.entered_count]) |column| {
+            const stopped_at = (self.frozen_columns.fetchRemove(column) orelse continue).value;
+            self.frozen_changed = true;
+            try self.resumeColumn(column, self.now - stopped_at);
+        }
+    }
+
+    /// Whether any cell of a column may hold a stuck projectile.
+    fn columnHoldsStuck(self: *const Projectiles, column: DomainColumn) bool {
+        const side = 16 >> store.cell_shift;
+        for (0..side) |cell_x| for (0..side) |cell_z| {
+            if (!self.cellEmpty(column.world, column.x * side + @as(i32, @intCast(cell_x)), column.z * side + @as(i32, @intCast(cell_z)))) return true;
+        };
+        return false;
+    }
+
+    /// A column ticks again after `frozen` ticks still: its stuck arrows' clocks move on by as
+    /// much, and those whose time came meanwhile go back to waiting for it.
+    fn resumeColumn(self: *Projectiles, column: DomainColumn, frozen: u64) !void {
+        const side = 16 >> store.cell_shift;
+        for (0..side) |cell_x| for (0..side) |cell_z| {
+            const x = (column.x * side) + @as(i32, @intCast(cell_x));
+            const z = (column.z * side) + @as(i32, @intCast(cell_z));
+            if (self.cellEmpty(column.world, x, z)) continue;
+            var pass = store.Pass.init(&self.index, store.cell(column.world, x, z));
+            var ids: [batch_max]u64 = undefined;
+            while (true) {
+                const count = try gather(&pass, &ids);
+                if (count == 0) break;
+                try self.hold(ids[0..count]);
+                for (self.held[0..self.held_count]) |*held| {
+                    const projectile = held.projectile;
+                    if (!projectile.parked) continue;
+                    const entity = projectile.id;
+                    // Past due, the expiry found it frozen and set it waiting.
+                    if (projectile.despawn_at < self.now) self.unmark(store.frozen(column.world, column.x, column.z, entity)) else self.unmark(store.due(projectile.despawn_at, entity));
+                    projectile.despawn_at += frozen;
+                    projectile.landed_at += frozen;
+                    projectile.born_at += frozen;
+                    self.mark(store.due(projectile.despawn_at, entity));
+                }
+                try self.settle();
+            }
+        };
+    }
+
+    /// The clock, the projectiles and the frozen columns, from what the world kept; the indexes
+    /// and counts from the projectiles' states. Viewers do not outlast a restart, so rows start
+    /// empty and no removal is owed.
+    /// The id clients know a projectile in memory by.
+    fn networkId(self: *const Projectiles, projectile: *const Projectile) i32 {
+        return self.deps.entities.networkOf(projectile.id).?;
+    }
+
+    fn recover(self: *Projectiles) !void {
+        try self.refuseOldRecords();
+        var clock: [8]u8 = undefined;
+        if (try self.table.get(&.{0}, &clock)) |length| {
+            if (length != 8) return error.Corrupt;
+            self.now = std.mem.readInt(u64, &clock, .little);
+        }
+        var frozen: entities.durable.ColumnReader(8) = .all(self.table, frozen_prefix);
+        var frozen_rows: [16]entities.durable.ColumnReader(8).Row = undefined;
+        while (true) {
+            const found = try frozen.next(&frozen_rows);
+            if (found.len == 0) break;
+            for (found, frozen.keys[0..found.len]) |row, key| {
+                if (row.value.len != 8 or self.frozen_columns.count() >= self.frozen_limit) return error.Corrupt;
+                const column = entities.durable.columnOf(&key);
+                self.frozen_columns.putAssumeCapacity(.{ .world = column.world, .x = column.x, .z = column.z }, std.mem.readInt(u64, row.value[0..8], .little));
+            }
+        }
+    }
+
+    /// Where nothing follows the loaded domain, every projectile kept comes into memory at once.
+    fn loadAll(self: *Projectiles) !void {
+        var reader: entities.durable.ColumnReader(@sizeOf(Projectile)) = .all(self.table, record_prefix);
+        try self.loadRows(&reader);
+    }
+
+    /// A column came into memory: its projectiles come back from the store, in id order, as each
+    /// joined when shot. One still in memory, its record left behind, is passed over.
+    fn loadColumn(self: *Projectiles, column: entities.Column) anyerror!void {
+        var reader: entities.durable.ColumnReader(@sizeOf(Projectile)) = .init(self.table, record_prefix, column);
+        try self.loadRows(&reader);
+    }
+
+    fn loadRows(self: *Projectiles, reader: *entities.durable.ColumnReader(@sizeOf(Projectile))) !void {
+        var rows: [16]entities.durable.ColumnReader(@sizeOf(Projectile)).Row = undefined;
+        while (true) {
+            const found = try reader.next(&rows);
+            if (found.len == 0) break;
+            for (found, reader.keys[0..found.len]) |row, key| {
+                if (row.value.len != @sizeOf(Projectile)) return error.Corrupt;
+                if (self.records.contains(row.id)) continue;
+                var kept: Record = .{ .bytes = @splat(0) };
+                const bytes: []align(16) u8 = &kept.bytes;
+                @memcpy(bytes[0..@sizeOf(Projectile)], row.value);
+                const column = entities.durable.columnOf(&key);
+                storedOf(self, bytes).* = .{ .world = column.world, .x = column.x, .z = column.z, .stored = true };
+                const projectile: *const Projectile = @ptrCast(bytes[0..@sizeOf(Projectile)]);
+                if (projectile.id != row.id) return error.Corrupt;
+                if (self.op_count + keys_per_projectile > self.ops.len) try self.applyIndex();
+                self.restoreEntries(projectile);
+                // The parked and asleep keep their place without being walked.
+                try self.records.add(row.id, self.entity_types[@backingInt(projectile.kind)], kept, if (projectile.parked) .dormant else if (projectile.marked) .asleep else .walked);
+                // Claims live in memory: a sleeper brought back wakes on the next tick.
+                if (projectile.marked) self.rouse_all = true;
+            }
+        }
+        try self.applyIndex();
+    }
+
+    /// A column left memory: its projectiles are saved under it and go, viewers told as of any
+    /// removal, their stacks kept with the inventories.
+    fn unloadColumn(self: *Projectiles, column: entities.Column) anyerror!void {
+        if (self.count == 0) return;
+        var batch: entities.durable.Batch(@sizeOf(Projectile)) = .{ .table = self.table };
+        const all = self.recordIds();
+        var at: usize = 0;
+        while (at < all.len) {
+            var ids: [batch_max]u64 = undefined;
+            var count: usize = 0;
+            while (at < all.len and count < ids.len) : (at += 1) {
+                const kept = (try self.records.get(all[at])) orelse continue;
+                const projectile: *const Projectile = @ptrCast(kept.bytes[0..@sizeOf(Projectile)]);
+                if (!std.meta.eql(entities.space.columnOf(projectile.world, projectile.position), column)) continue;
+                ids[count] = all[at];
+                count += 1;
+            }
+            if (count == 0) continue;
+            if (self.op_count + ops_per_batch > self.ops.len) try self.applyIndex();
+            try self.hold(ids[0..count]);
+            defer {
+                self.held_count = 0;
+                self.held_settled = 0;
+            }
+            for (self.held[0..self.held_count]) |*held| {
+                defer self.held_settled += 1;
+                const entity = held.projectile.id;
+                const stored = self.storedOf(held.bytes);
+                if (stored.stored and !std.meta.eql(stored.column(), column)) try batch.delete(entities.durable.key(record_prefix, stored.column(), entity));
+                try batch.put(entities.durable.key(record_prefix, column, entity), held.bytes[0..@sizeOf(Projectile)]);
+                // Due or frozen, whichever it waits as.
+                if (held.was_parked) self.unmark(store.frozen(column.world, column.x, column.z, entity));
+                try self.forgetEntries(held, .keep);
+                self.records.remove(entity);
+            }
+        }
+        try self.applyIndex();
+        try batch.flush();
+    }
+
+    /// Saves, forgets everything memory holds, and takes it back from the store, as a restart
+    /// does: what the store keeps must be all a projectile needs.
+    pub fn restart(self: *Projectiles) !void {
+        // What was in memory comes back: the columns its projectiles stood in.
+        var columns: [256]entities.Column = undefined;
+        var column_count: usize = 0;
+        for (self.recordIds()) |entity| {
+            const kept = (try self.records.get(entity)).?;
+            const projectile: *const Projectile = @ptrCast(kept.bytes[0..@sizeOf(Projectile)]);
+            const column = entities.space.columnOf(projectile.world, projectile.position);
+            for (columns[0..column_count]) |known| {
+                if (std.meta.eql(known, column)) break;
+            } else {
+                if (column_count == columns.len) return error.TooManyColumns;
+                columns[column_count] = column;
+                column_count += 1;
+            }
+        }
+        try self.checkpoint(self.deps.storage);
+        self.records.clear();
+        self.removal_rows.clear();
+        self.index.clear();
+        self.frozen_columns.clearRetainingCapacity();
+        self.claims.clear();
+        @memset(self.cells, 0);
+        self.count = 0;
+        self.ticking = 0;
+        self.removals = 0;
+        self.woken = 0;
+        self.sleeping = 0;
+        self.now = 0;
+        self.rousing_count = 0;
+        self.waking_count = 0;
+        try self.recover();
+        std.sort.pdq(entities.Column, columns[0..column_count], {}, columnBefore);
+        for (columns[0..column_count]) |column| try self.loadColumn(column);
+    }
+
+    fn columnBefore(_: void, a: entities.Column, b: entities.Column) bool {
+        if (a.world != b.world) return a.world < b.world;
+        if (a.x != b.x) return a.x < b.x;
+        return a.z < b.z;
+    }
+
+    /// Projectiles kept as the cache kept them before they lived in memory are refused.
+    fn refuseOldRecords(self: *Projectiles) !void {
+        var after: [1]u8 = .{0};
+        var cursor: records.ScanCursor = .{ .after = &after, .after_len = 1, .before = &.{record_prefix} };
+        var key: [32]u8 = undefined;
+        var found: [1]records.ScanKey = .{.{ .key = &key }};
+        const result = try self.table.scanKeys(&cursor, &found);
+        if (result.count > 0) return error.OldProjectileRecords;
+    }
+
+    /// The entries a projectile's state says it has, as `moveEntries` keeps them.
+    fn restoreEntries(self: *Projectiles, projectile: *const Projectile) void {
+        const entity = projectile.id;
+        self.count += 1;
+        if (projectile.marked) {
+            self.mark(store.byId(.sleeping, entity));
+            self.sleeping += 1;
+        } else if (!projectile.parked) self.ticking += 1;
+        if (projectile.in_ground) {
+            self.mark(self.stuckKey(projectile));
+            self.countCell(projectile.stuck, projectile.world, 1);
+            if (projectile.loose) {
+                self.mark(store.byId(.woken, entity));
+                self.woken += 1;
+            }
+        }
+        if (projectile.parked) {
+            self.mark(store.parked(group(entity), entity));
+            // Due by now, the expiry found its column frozen: it waits for the column.
+            if (projectile.despawn_at <= self.now) {
+                self.mark(store.frozen(projectile.world, mth.floor(projectile.position[0] / 16), mth.floor(projectile.position[2] / 16), entity));
+            } else self.mark(store.due(projectile.despawn_at, entity));
+        }
+    }
+
+    fn storedOf(self: *const Projectiles, bytes: []align(16) u8) *Stored {
+        return @ptrCast(@alignCast(bytes[self.record_bytes..][0..@sizeOf(Stored)]));
+    }
+
+    /// Notes a projectile as changed for the checkpoint to save.
+    fn touch(self: *Projectiles, entity: u64, bytes: []align(16) u8) void {
+        const stored = self.storedOf(bytes);
+        if (stored.dirty) return;
+        stored.dirty = true;
+        if (self.dirty_count == self.dirty.len) {
+            // Full of the gone: only those still here stay.
+            var kept: usize = 0;
+            for (self.dirty[0..self.dirty_count]) |other| if (self.records.contains(other)) {
+                self.dirty[kept] = other;
+                kept += 1;
+            };
+            self.dirty_count = kept;
+        }
+        self.dirty[self.dirty_count] = entity;
+        self.dirty_count += 1;
+    }
+
+    /// The ids of every projectile, sorted, for passes that may change which there are.
+    fn recordIds(self: *Projectiles) []u64 {
+        return self.records.ids(self.id_scratch);
+    }
+
+    /// A copy of a projectile's record, to write back once changed. One in hand is not read
+    /// this way: the batch holds what it is.
+    fn loadRecord(self: *Projectiles, entity: u64) !?Record {
+        if (std.debug.runtime_safety) for (self.held[self.held_settled..self.held_count]) |held| assert(held.projectile.id != entity);
+        return self.records.get(entity);
+    }
+
+    /// A projectile's record goes, as its record in hand says it was saved; the checkpoint
+    /// deletes what was saved of it.
+    fn drop(self: *Projectiles, entity: u64, bytes: []align(16) u8) void {
+        const stored = self.storedOf(bytes);
+        if (stored.stored) {
+            self.gone[self.gone_count] = .{ .column = stored.column(), .id = entity };
+            self.gone_count += 1;
+        }
+        self.records.remove(entity);
     }
 
     fn cellIndex(world_id: u32, x: i32, z: i32) usize {
@@ -500,13 +851,48 @@ pub const Projectiles = struct {
         return self.cells[cellIndex(world_id, cell_x, cell_z)] == 0;
     }
 
-    pub fn checkpoint(self: *Projectiles, _: storage.Space) !void {
-        const clock = try self.cache.acquire(&.{0});
-        std.mem.writeInt(u64, clock.edit()[0..8], self.now, .little);
-        clock.commit(8);
-        // Writeback takes only entries no one holds.
-        clock.release();
-        try self.cache.flush();
+    /// Saves what changed since the last checkpoint: projectiles under the column each is in,
+    /// the frozen columns, and the clock.
+    pub fn checkpoint(self: *Projectiles, space: storage.Space) !void {
+        errdefer space.fail();
+        var batch: entities.durable.Batch(@sizeOf(Projectile)) = .{ .table = self.table };
+        for (self.gone[0..self.gone_count]) |gone| try batch.delete(entities.durable.key(record_prefix, gone.column, gone.id));
+        self.gone_count = 0;
+        for (self.dirty[0..self.dirty_count]) |entity| {
+            var kept = try self.loadRecord(entity) orelse continue;
+            const bytes: []align(16) u8 = &kept.bytes;
+            const stored = self.storedOf(bytes);
+            const projectile: *const Projectile = @ptrCast(bytes[0..@sizeOf(Projectile)]);
+            const here = entities.space.columnOf(projectile.world, projectile.position);
+            if (stored.stored and !std.meta.eql(stored.column(), here)) try batch.delete(entities.durable.key(record_prefix, stored.column(), entity));
+            try batch.put(entities.durable.key(record_prefix, here, entity), bytes[0..@sizeOf(Projectile)]);
+            stored.* = .{ .world = here.world, .x = here.x, .z = here.z, .stored = true };
+            try self.records.put(entity, kept);
+        }
+        self.dirty_count = 0;
+        if (self.frozen_changed) {
+            // Rare: the saved set is replaced whole.
+            var reader: entities.durable.ColumnReader(8) = .all(self.table, frozen_prefix);
+            var rows: [16]entities.durable.ColumnReader(8).Row = undefined;
+            while (true) {
+                const found = try reader.next(&rows);
+                if (found.len == 0) break;
+                for (reader.keys[0..found.len]) |key| try batch.delete(key);
+                try batch.flush();
+            }
+            var columns = self.frozen_columns.iterator();
+            while (columns.next()) |entry| {
+                var value: [8]u8 = undefined;
+                std.mem.writeInt(u64, &value, entry.value_ptr.*, .little);
+                const column = entry.key_ptr.*;
+                try batch.put(entities.durable.key(frozen_prefix, .{ .world = column.world, .x = column.x, .z = column.z }, 0), &value);
+            }
+            self.frozen_changed = false;
+        }
+        try batch.flush();
+        var clock: [8]u8 = undefined;
+        std.mem.writeInt(u64, &clock, self.now, .little);
+        try self.table.put(&.{0}, &clock);
     }
 
     /// Puts a projectile in the world, moving as shot, with its pickup stack and weapon in slots of
@@ -515,7 +901,6 @@ pub const Projectiles = struct {
         assert(request.owner < self.deps.players.records.len);
         const player = &self.deps.players.records[request.owner];
         const entity = try self.deps.entities.reserveIds(1);
-        if (entity > std.math.maxInt(i32)) return error.IdExhausted;
         var projectile: Projectile = .{
             .id = entity,
             .uuid = self.random.random().int(u128) & ~@as(u128, 0xf000 << 64) | (@as(u128, 0x4000) << 64),
@@ -538,12 +923,13 @@ pub const Projectiles = struct {
         face(&projectile);
         try self.hand(projectile.uuid, 0, request.stack);
         if (request.weapon) |weapon| try self.hand(projectile.uuid, 1, weapon);
-        // A new id has nothing on disk.
-        var bytes: [@sizeOf(Projectile) + max_row_bytes]u8 = undefined;
+        // A new id: its record and row start empty.
+        if (self.records.contains(entity)) return error.Corrupt;
+        var kept: Record = .{ .bytes = @splat(0) };
+        const bytes: []align(16) u8 = &kept.bytes;
         @memcpy(bytes[0..@sizeOf(Projectile)], std.mem.asBytes(&projectile));
-        @memset(bytes[@sizeOf(Projectile)..self.record_bytes], 0);
-        try self.create(store.byId(.record, entity), bytes[0..self.record_bytes]);
-        self.mark(store.byId(.ticking, entity));
+        self.touch(entity, bytes);
+        try self.records.add(entity, self.entity_types[@backingInt(projectile.kind)], kept, .walked);
         try self.applyIndex();
         self.count += 1;
         self.ticking += 1;
@@ -571,64 +957,13 @@ pub const Projectiles = struct {
         self.op_count += 1;
     }
 
-    /// Applies the batch's entry changes in key order, so neighbours share pages. Nothing is
-    /// read: a projectile's state says which of its entries exist, so a new one is written and a
-    /// gone one deleted as it is.
+    /// Applies the batch's entry changes in the order they were made: a projectile's state says
+    /// which of its entries exist, so a new one is added and a gone one taken away as it is.
     fn applyIndex(self: *Projectiles) !void {
-        const ops = self.ops[0..self.op_count];
         defer self.op_count = 0;
-        std.mem.sortUnstable(IndexOp, ops, {}, IndexOp.before);
-        var done: usize = 0;
-        while (done < ops.len) {
-            const count = @min(ops.len - done, reserve_max);
-            var keys: [reserve_max][]const u8 = undefined;
-            for (ops[done..][0..count], keys[0..count]) |*op, *key| key.* = op.key.slice();
-            var leases: [reserve_max]records.Cache.Lease = undefined;
-            try self.reserve(keys[0..count], leases[0..count]);
-            for (ops[done..][0..count], leases[0..count]) |op, lease| {
-                defer lease.release();
-                if (!self.cache.entries[lease.index].loaded) lease.reserve().load(null);
-                if (op.mark) {
-                    _ = lease.edit();
-                    lease.commit(0);
-                } else lease.remove();
-            }
-            done += count;
+        for (self.ops[0..self.op_count]) |op| {
+            if (op.mark) try self.index.insert(op.key.slice()) else self.index.remove(op.key.slice());
         }
-    }
-
-    /// Slots for keys without reading storage, writing back what must make room.
-    fn reserve(self: *Projectiles, keys: []const []const u8, leases: []records.Cache.Lease) !void {
-        assert(keys.len <= reserve_max);
-        while (true) {
-            var victims: [reserve_max]records.Cache.Lease = undefined;
-            switch (try self.cache.reserveMany(keys, leases, &victims, self.cache.entries.len)) {
-                .ready => return,
-                .blocked => return error.CachePinned,
-                .writeback => |dirty| {
-                    defer for (dirty) |victim| victim.release();
-                    var writes: [reserve_max]records.Write = undefined;
-                    for (dirty, writes[0..dirty.len]) |victim, *write| write.* = .{ .key = victim.key(), .value = victim.read() };
-                    try self.cache.writeBack(writes[0..dirty.len]);
-                    for (dirty) |victim| victim.markWritten();
-                },
-            }
-        }
-    }
-
-    /// Writes an entry its key says is new, without reading storage for it.
-    fn create(self: *Projectiles, key: store.Key, bytes: []const u8) !void {
-        var leases: [1]records.Cache.Lease = undefined;
-        try self.reserve(&.{key.slice()}, &leases);
-        defer leases[0].release();
-        if (self.cache.entries[leases[0].index].loaded) {
-            if (leases[0].read() != null) return error.Corrupt;
-            @memcpy(leases[0].edit()[0..bytes.len], bytes);
-            return leases[0].commit(bytes.len);
-        }
-        const fill = leases[0].reserve();
-        @memcpy(fill.bytes[0..bytes.len], bytes);
-        fill.publish(bytes.len);
     }
 
     /// A stuck projectile whose block was edited is woken to look at it on the next tick.
@@ -650,7 +985,7 @@ pub const Projectiles = struct {
 
     fn wakeAt(self: *Projectiles, world_id: u32, at: [3]i32) !void {
         if (self.cellEmpty(world_id, at[0] >> store.cell_shift, at[2] >> store.cell_shift)) return;
-        var pass = store.Pass.init(&self.cache, store.stuck(world_id, at[0], at[2], at[1], null));
+        var pass = store.Pass.init(&self.index, store.stuck(world_id, at[0], at[2], at[1], null));
         while (true) {
             const keys = try pass.next();
             if (keys.len == 0) return;
@@ -662,28 +997,32 @@ pub const Projectiles = struct {
 
     /// Marks a stuck projectile woken, its record too, so what frees it knows to take the mark.
     fn wakeOne(self: *Projectiles, entity: u64) !void {
-        const held = try self.cache.acquire(store.byId(.record, entity).slice());
-        defer held.release();
-        const bytes = held.read() orelse return error.Corrupt;
-        var projectile: Projectile = undefined;
-        @memcpy(std.mem.asBytes(&projectile), bytes[0..@sizeOf(Projectile)]);
+        var kept = try self.loadRecord(entity) orelse return error.Corrupt;
+        const bytes: []align(16) u8 = &kept.bytes;
+        const projectile: *Projectile = @ptrCast(bytes[0..@sizeOf(Projectile)]);
         if (projectile.loose) return;
         projectile.loose = true;
-        const length = bytes.len;
-        @memcpy(held.edit()[0..@sizeOf(Projectile)], std.mem.asBytes(&projectile));
-        held.commit(length);
-        try self.create(store.byId(.woken, entity), &.{});
+        self.touch(entity, bytes);
+        try self.records.put(entity, kept);
+        try self.index.insert(store.byId(.woken, entity).slice());
         self.woken += 1;
     }
 
-    pub fn tick(self: *Projectiles) !void {
+    /// Before entities tick: the clock moves on, columns freeze and thaw, and the parked that
+    /// went, came due or were woken by edits are seen to; sleepers due this tick wake to take
+    /// their turns.
+    pub fn prepareTick(self: *Projectiles) !void {
+        if (!self.loaded_all and !self.deps.entities.columns_followed) try self.loadAll();
+        self.loaded_all = true;
+        self.active = false;
         self.now += 1;
         self.height_world = null;
         if (self.failure) |err| return err;
+        try self.thaw();
         if (self.count == 0 and self.removals == 0) return;
         // One window for every projectile this tick: arrows flying together read their
         // sections once. Nothing a projectile does edits blocks, so holding it is safe.
-        defer self.window.deinit();
+        self.active = true;
         if (self.columns.count() > 0) self.columns.clearRetainingCapacity();
         self.last_columns = .{ null, null };
         self.candidate_count = 0;
@@ -692,53 +1031,35 @@ pub const Projectiles = struct {
         try self.notice();
         self.watch();
         try self.holdingIndex(rouse);
-        // Everything this tick sends goes out by the end of it.
-        defer self.flush() catch |err| {
-            self.failure = err;
-        };
         try self.retire();
         try self.expire();
         try self.wake();
-        try self.holdingIndex(fly);
+        // Sleepers due and those something came near take their turns among the rest.
+        for (self.waking[0..self.waking_count]) |entity| try self.tick_order.wake(entity);
+    }
+
+    /// After entities tick: the parked look over their viewers, players pick up, and
+    /// everything this tick sends goes out.
+    pub fn finishTick(self: *Projectiles) !void {
+        if (!self.active) return;
+        defer self.window.deinit();
+        defer self.flush() catch |err| {
+            self.failure = err;
+        };
         try self.visitParked();
         try self.collect();
     }
 
-    /// The flying, in tick-list order, a batch at a time: those ticking, and the sleepers waking
-    /// this tick merged in among them by id.
-    fn fly(self: *Projectiles) !void {
-        if (self.ticking == 0 and self.waking_count == 0) return;
-        var pass = store.Pass.init(&self.cache, store.under(.ticking));
-        var keys: []const store.Key = &.{};
-        var key_at: usize = 0;
-        var woken_at: usize = 0;
+    /// The flying next in the tick order, sleepers waking this tick among them, held as one
+    /// batch: nothing one does changes another's flight.
+    pub fn tickRun(self: *Projectiles, run: []const entities.order.Entry) !void {
+        assert(self.active and run.len <= batch_max);
         var ids: [batch_max]u64 = undefined;
-        // The first so many stay cached from tick to tick; past them, the pass streams through a
-        // few slots, so a pass larger than the cache reads only what does not fit.
-        const resident = self.cache.entries.len - 4 * batch_max;
-        var visited: usize = 0;
-        while (true) {
-            var count: usize = 0;
-            while (count < batch_max) {
-                if (key_at == keys.len and !pass.done) {
-                    keys = try pass.next();
-                    key_at = 0;
-                }
-                const ticking: ?u64 = if (key_at < keys.len) store.Key.id(keys[key_at].slice()) else null;
-                const waking: ?u64 = if (woken_at < self.waking_count) self.waking[woken_at] else null;
-                if (ticking == null and waking == null) break;
-                if (waking == null or (ticking != null and ticking.? < waking.?)) {
-                    ids[count] = ticking.?;
-                    key_at += 1;
-                } else {
-                    ids[count] = waking.?;
-                    woken_at += 1;
-                }
-                count += 1;
-            }
-            if (count == 0) return;
-            try self.hold(ids[0..count], visited + count > resident);
-            visited += count;
+        for (run, ids[0..run.len]) |entry, *entity| entity.* = entry.id;
+        const count = run.len;
+        {
+            try self.hold(ids[0..count]);
+            for (self.held[0..self.held_count]) |*held| held.walked = true;
             for (self.held[0..self.held_count]) |*held| {
                 const projectile = held.projectile;
                 if (!projectile.asleep) continue;
@@ -750,6 +1071,12 @@ pub const Projectiles = struct {
             }
             try self.trace();
             for (self.held[0..self.held_count]) |*held| {
+                // Where nothing ticks it stands still, its age with it, until its column ticks.
+                if (!held.quick and !self.ticksAt(held.projectile.world, held.projectile.position)) {
+                    held.projectile.born_at += 1;
+                    held.projectile.marked = false;
+                    continue;
+                }
                 // Its tick was worked out when it fell asleep: only its update is left to send.
                 if (held.quick) try self.updates(held) else {
                     try self.step(held);
@@ -762,7 +1089,6 @@ pub const Projectiles = struct {
             try self.settle();
         }
     }
-
 
     /// Ids from a pass, as many as fill whole scan batches into `output`.
     fn gather(pass: *store.Pass, output: []u64) !usize {
@@ -778,61 +1104,41 @@ pub const Projectiles = struct {
         return count;
     }
 
-    /// Takes the records of a batch in hand, in the order given.
-    /// A transient hold reads what is not cached into slots evicted first, for a pass past what
-    /// the cache keeps.
-    fn hold(self: *Projectiles, ids: []const u64, transient: bool) !void {
+    /// Takes the records of a batch in hand, in the order given, edited where memory keeps them
+    /// until the batch is let go.
+    fn hold(self: *Projectiles, ids: []const u64) !void {
         assert(self.held_count == 0 and ids.len <= batch_max);
-        var keys: [batch_max]store.Key = undefined;
-        var slices: [batch_max][]const u8 = undefined;
-        var leases: [batch_max]records.Cache.Lease = undefined;
-        for (ids, 0..) |entity, index| {
-            keys[index] = store.byId(.record, entity);
-            slices[index] = keys[index].slice();
-        }
-        if (transient) try self.cache.acquireManyTransient(slices[0..ids.len], leases[0..ids.len]) else try self.cache.acquireMany(slices[0..ids.len], leases[0..ids.len]);
-        for (leases[0..ids.len]) |lease| {
-            const bytes = lease.read() orelse null;
-            if (bytes == null or bytes.?.len != self.record_bytes) {
-                for (leases[0..ids.len]) |other| other.release();
-                return error.Corrupt;
-            }
-        }
-        for (leases[0..ids.len], self.held[0..ids.len]) |lease, *held| {
-            // The cache's own bytes: the batch edits them where they are, and settling commits.
-            const bytes: []align(record_align) u8 = @alignCast(lease.edit()[0..self.record_bytes]);
+        for (ids, self.held[0..ids.len]) |entity, *held| {
+            const kept = try self.records.ptr(entity) orelse return error.Corrupt;
+            const bytes: []align(16) u8 = &kept.bytes;
+            self.touch(entity, bytes);
             const projectile: *Projectile = @ptrCast(bytes[0..@sizeOf(Projectile)]);
-            const row: []u64 = @alignCast(std.mem.bytesAsSlice(u64, bytes[@sizeOf(Projectile)..]));
-            held.* = .{ .projectile = projectile, .row = row, .lease = lease, .was_in_ground = projectile.in_ground, .was_parked = projectile.parked, .was_marked = projectile.marked };
+            const row: []u64 = @alignCast(std.mem.bytesAsSlice(u64, bytes[@sizeOf(Projectile)..self.record_bytes]));
+            held.* = .{ .projectile = projectile, .bytes = bytes, .row = row, .was_in_ground = projectile.in_ground, .was_parked = projectile.parked, .was_marked = projectile.marked };
         }
         self.held_count = ids.len;
     }
 
-    /// Writes the batch back: each record as it is now, its entries as it became, and its lease
-    /// let go. A projectile that went leaves its removal for viewers who knew of it.
+    /// Lets the batch go: each record's entries as it became. A projectile that went leaves its
+    /// removal for viewers who knew of it.
     fn settle(self: *Projectiles) !void {
         defer {
             self.held_count = 0;
             self.held_settled = 0;
         }
         for (self.held[0..self.held_count]) |*held| {
-            defer {
-                held.lease.release();
-                self.held_settled += 1;
-            }
+            defer self.held_settled += 1;
             const projectile = held.projectile;
             if (projectile.removed) {
                 // Its entries and slots go while the record is still in hand, then the record.
-                try self.forgetEntries(held);
-                held.lease.commit(self.record_bytes);
-                held.lease.remove();
+                try self.forgetEntries(held, .forget);
+                self.drop(projectile.id, held.bytes);
                 continue;
             }
             if (projectile.in_ground and projectile.kind != .trident and !projectile.parked) {
                 projectile.parked = true;
                 projectile.despawn_at = projectile.landed_at + 1200;
             }
-            held.lease.commit(self.record_bytes);
             self.moveEntries(held);
         }
         if (!self.holding_index or self.op_count + ops_per_batch > self.ops.len) try self.applyIndex();
@@ -861,13 +1167,17 @@ pub const Projectiles = struct {
             self.mark(store.byId(.sleeping, entity));
             self.sleeping += 1;
         }
-        if (was_ticking and !ticking) {
-            self.unmark(store.byId(.ticking, entity));
-            self.ticking -= 1;
-        }
-        if (!was_ticking and ticking) {
-            self.mark(store.byId(.ticking, entity));
-            self.ticking += 1;
+        if (was_ticking and !ticking) self.ticking -= 1;
+        if (!was_ticking and ticking) self.ticking += 1;
+        // Parked or asleep, it keeps its place in the tick order without being walked; one
+        // woken for this tick that sleeps on goes back to sleep.
+        const walked = was_ticking or held.walked;
+        if (ticking and !walked) self.tick_order.wake(entity) catch |err| {
+            self.failure = err;
+        };
+        // Parked, it sleeps long: its row goes dormant.
+        if (!ticking and walked) {
+            if (projectile.parked) self.tick_order.sleepLong(entity) else self.tick_order.sleep(entity);
         }
         if (held.was_in_ground and !projectile.in_ground) self.unstick(held);
         if (!held.was_in_ground and projectile.in_ground) {
@@ -886,35 +1196,36 @@ pub const Projectiles = struct {
 
     /// A projectile that went: its entries and slots go, and viewers who knew of it are owed its
     /// removal.
-    fn forgetEntries(self: *Projectiles, held: *Held) !void {
+    fn forgetEntries(self: *Projectiles, held: *Held, stacks: enum { forget, keep }) !void {
         const projectile = held.projectile;
         const entity = projectile.id;
         if (held.was_marked) {
             self.unmark(store.byId(.sleeping, entity));
             self.sleeping -= 1;
-        } else if (!held.was_parked) {
-            self.unmark(store.byId(.ticking, entity));
-            self.ticking -= 1;
-        }
+        } else if (!held.was_parked) self.ticking -= 1;
+        self.tick_order.leave(entity);
         if (held.was_in_ground) self.unstick(held);
         if (held.was_parked) {
             self.unmark(store.due(projectile.despawn_at, entity));
             self.unmark(store.parked(group(entity), entity));
         }
-        try self.hand(projectile.uuid, 0, null);
-        if (projectile.has_weapon) try self.hand(projectile.uuid, 1, null);
+        if (stacks == .forget) {
+            try self.hand(projectile.uuid, 0, null);
+            if (projectile.has_weapon) try self.hand(projectile.uuid, 1, null);
+        }
         self.count -= 1;
         const known = for (held.row) |word| {
             if (word != 0) break true;
         } else false;
         if (!known) return;
         // One removal for an id, ever: it is new.
-        var value: [8 + max_row_bytes]u8 = @splat(0);
-        std.mem.writeInt(i32, value[0..4], networkId(projectile), .little);
+        if (self.removal_rows.get(entity) != null) return error.Corrupt;
+        const value = try self.removal_rows.getOrCreate(entity);
+        std.mem.writeInt(i32, value[0..4], self.networkId(projectile), .little);
         @memcpy(value[8..][0 .. self.row_words * 8], std.mem.sliceAsBytes(held.row));
-        try self.create(store.byId(.removal, entity), value[0 .. 8 + self.row_words * 8]);
+        try self.index.insert(store.byId(.removal, entity).slice());
         self.removals += 1;
-        try self.queue(entity, held.row, .remove, true, packets.writeRemove, .{networkId(projectile)});
+        try self.queue(entity, held.row, .remove, true, packets.writeRemove, .{self.networkId(projectile)});
     }
 
     /// Takes a projectile's stuck entry away, and with it a waking it is still owed.
@@ -941,7 +1252,7 @@ pub const Projectiles = struct {
     /// they came due.
     fn expire(self: *Projectiles) !void {
         if (self.count == self.ticking + self.sleeping) return;
-        var pass = store.Pass.init(&self.cache, store.under(.due));
+        var pass = store.Pass.init(&self.index, store.under(.due));
         var ids: [batch_max]u64 = undefined;
         while (true) {
             var count: usize = 0;
@@ -959,10 +1270,18 @@ pub const Projectiles = struct {
                 }
             }
             if (count == 0) return;
-            try self.hold(ids[0..count], false);
+            try self.hold(ids[0..count]);
             for (self.held[0..self.held_count]) |*held| {
-                assert(held.projectile.parked and held.projectile.despawn_at <= self.now);
-                held.projectile.removed = true;
+                const projectile = held.projectile;
+                assert(projectile.parked and projectile.despawn_at <= self.now);
+                // Frozen, its time stands: it waits for its column, which moves it on.
+                if (!self.ticksAt(projectile.world, projectile.position)) {
+                    const column: [2]i32 = .{ @intFromFloat(@floor(projectile.position[0] / 16)), @intFromFloat(@floor(projectile.position[2] / 16)) };
+                    self.unmark(store.due(projectile.despawn_at, projectile.id));
+                    self.mark(store.frozen(projectile.world, column[0], column[1], projectile.id));
+                    continue;
+                }
+                projectile.removed = true;
             }
             try self.settle();
             if (past) return;
@@ -972,12 +1291,12 @@ pub const Projectiles = struct {
     /// Stuck projectiles whose block was edited look at it again, and fall if it went.
     fn wake(self: *Projectiles) !void {
         if (self.woken == 0) return;
-        var pass = store.Pass.init(&self.cache, store.under(.woken));
+        var pass = store.Pass.init(&self.index, store.under(.woken));
         var ids: [batch_max]u64 = undefined;
         while (true) {
             const count = try gather(&pass, &ids);
             if (count == 0) return;
-            try self.hold(ids[0..count], false);
+            try self.hold(ids[0..count]);
             for (self.held[0..self.held_count]) |*held| {
                 // The mark goes with the waking.
                 assert(held.projectile.loose);
@@ -999,12 +1318,12 @@ pub const Projectiles = struct {
     fn visitParked(self: *Projectiles) !void {
         // A round since anyone moved, every parked arrow has looked since: nothing to find.
         if (self.now > self.moved_at + update_interval) return;
-        var pass = store.Pass.init(&self.cache, store.parked(@intCast(self.now % update_interval), null));
+        var pass = store.Pass.init(&self.index, store.parked(@intCast(self.now % update_interval), null));
         var ids: [batch_max]u64 = undefined;
         while (true) {
             const count = try gather(&pass, &ids);
             if (count == 0) return;
-            try self.hold(ids[0..count], false);
+            try self.hold(ids[0..count]);
             for (self.held[0..self.held_count]) |*held| {
                 try self.forget(held);
                 try self.meet(held);
@@ -1060,11 +1379,13 @@ pub const Projectiles = struct {
     fn watch(self: *Projectiles) void {
         if (self.claims.count == 0) return;
         const mobs = self.deps.mobs;
-        for (mobs.active.values()) |index| {
-            const mob = &mobs.mobs[index];
-            if (mob.removed) continue;
-            const box = mobs.grid.boxes[index];
-            self.rouseMeeting(mob.world, .{ .low = box.min, .high = box.max }, 0);
+        // From their places, which hold where each stands and how big it is, without reading
+        // their states; the removed have no place.
+        for (0..mobs.active.count) |active_at| {
+            const index = mobs.active.at(active_at);
+            const box = mobs.placedBox(@intCast(index)) orelse continue;
+            const world = mobs.places.space.columnHolding(mobs.deps.entities.directory.entry(index).id).?.world;
+            self.rouseMeeting(world, .{ .low = box.min, .high = box.max }, 0);
         }
         var moved = self.moved.iterator(.{});
         while (moved.next()) |slot| {
@@ -1086,14 +1407,16 @@ pub const Projectiles = struct {
         if (self.sleeping == 0) return;
         if (self.rouse_all) {
             assert(self.claims.count == 0);
-            while (self.sleeping > 0) {
-                var pass = store.Pass.init(&self.cache, store.under(.sleeping));
+            // One pass: the index changes only once the pass is done.
+            var pass = store.Pass.init(&self.index, store.under(.sleeping));
+            while (true) {
                 const keys = try pass.next();
-                if (keys.len == 0) return error.Corrupt;
+                if (keys.len == 0) break;
                 var ids: [batch_max]u64 = undefined;
                 for (keys, ids[0..keys.len]) |key, *entity| entity.* = store.Key.id(key.slice());
                 try self.wakeAll(ids[0..keys.len]);
             }
+            if (self.sleeping != 0) return error.Corrupt;
             return;
         }
         for (self.rousing[0..self.rousing_count]) |claim| {
@@ -1102,9 +1425,7 @@ pub const Projectiles = struct {
             self.waking_count += 1;
         }
         self.claims.takeDue(self.now, self.waking, &self.waking_count);
-        std.mem.sortUnstable(u64, self.waking[0..self.waking_count], {}, std.sort.asc(u64));
     }
-
 
     /// A sleeper as it is at the end of the last tick. Woken when due, it is already: its record
     /// holds the state its sleep ends in. Woken early, it flies on from where it fell asleep.
@@ -1122,7 +1443,7 @@ pub const Projectiles = struct {
 
     /// Sleepers without claims, after a restart: each catches up and ticks from now on.
     fn wakeAll(self: *Projectiles, ids: []const u64) !void {
-        try self.hold(ids, false);
+        try self.hold(ids);
         for (self.held[0..self.held_count]) |*held| {
             const projectile = held.projectile;
             // Only marked sleepers are queued.
@@ -1138,11 +1459,13 @@ pub const Projectiles = struct {
 
     /// The states `drift` takes a projectile through, up to `ticks` of them or until it would
     /// fall past `floor`, worked out together: the motions first, as they do not depend on its
-    /// facing, then every tick's facing at once, four to a vector, then the easing toward them.
+    /// facing, then every tick's facing at once, a vector of them at a time, then the easing
+    /// toward them.
     /// Each lane does what `turn` does alone, so the states are those of `drift` bit for bit.
     fn plan(projectile: *const Projectile, ticks: usize, floor: f64, out: *[update_interval + 1]Motion, low: *[3]f64, high: *[3]f64) usize {
         assert(ticks <= update_interval);
-        const lanes = 4;
+        // As many as the target's vectors hold.
+        const lanes = std.simd.suggestVectorLength(f64) orelse 1;
         const V = @Vector(lanes, f64);
         const P = @Vector(3, f64);
         // Each tick's motion as it begins, by axis, a vector's worth past the last.
@@ -1231,7 +1554,7 @@ pub const Projectiles = struct {
             const t: f64 = @floatFromInt(until);
             const reach = @sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) * t + 0.025 * t * t + 1;
             const at = projectile.position;
-            if (self.anyoneIn(projectile.world, claimed(.{ at[0] - reach, at[1] - reach, at[2] - reach }, .{ at[0] + reach, at[1] + reach, at[2] + reach }))) return;
+            if (try self.anyoneIn(projectile.world, claimed(.{ at[0] - reach, at[1] - reach, at[2] - reach }, .{ at[0] + reach, at[1] + reach, at[2] + reach }))) return;
         }
         // Its states tick by tick, as far as it stays above the void.
         var states: [update_interval + 1]Motion = undefined;
@@ -1368,15 +1691,17 @@ pub const Projectiles = struct {
     }
 
     /// Whether any mob or player is in a box.
-    fn anyoneIn(self: *Projectiles, world: u32, box: projectile_claims.Box) bool {
+    fn anyoneIn(self: *Projectiles, world: u32, box: projectile_claims.Box) !bool {
         const mobs = self.deps.mobs;
         const within: body.Box = .{ .min = box.low, .max = box.high };
-        if (mobs.active.values().len > 0) {
-            var candidates = mobs.grid.query(world, .{ box.low[0] - mobs.widest_half, box.low[2] - mobs.widest_half }, .{ box.high[0] + mobs.widest_half, box.high[2] + mobs.widest_half });
-            while (candidates.next()) |index| {
-                if (mobs.grid.boxes[index].intersects(within)) return true;
+        var found = false;
+        try mobs.each(world, within, &found, struct {
+            fn visit(any: *bool, _: Mob) anyerror!bool {
+                any.* = true;
+                return true;
             }
-        }
+        }.visit);
+        if (found) return true;
         // Not near the box around a world's players: in no player's box.
         if (self.players_near_tick != self.now) self.gatherPlayers();
         for (self.players_near[0..self.players_near_count]) |near| {
@@ -1393,20 +1718,37 @@ pub const Projectiles = struct {
 
     /// Every projectile as it stands at the end of the tick, sleepers as their ticks would have
     /// left them, for a test to hold sleeping to ticking.
+    /// A copy of the projectile with a uuid, if it is in memory.
+    pub fn find(self: *Projectiles, uuid: u128) !?Projectile {
+        for (self.recordIds()) |entity| {
+            const kept = (try self.records.get(entity)).?;
+            var projectile: Projectile = undefined;
+            @memcpy(std.mem.asBytes(&projectile), kept.bytes[0..@sizeOf(Projectile)]);
+            if (projectile.uuid == uuid) return projectile;
+        }
+        return null;
+    }
+
+    /// The uuids of the projectiles in memory, into `output`.
+    pub fn uuids(self: *Projectiles, output: []u128) ![]u128 {
+        var count: usize = 0;
+        for (self.recordIds()) |entity| {
+            if (count == output.len) break;
+            const kept = (try self.records.get(entity)).?;
+            const projectile: *const Projectile = @ptrCast(kept.bytes[0..@sizeOf(Projectile)]);
+            output[count] = projectile.uuid;
+            count += 1;
+        }
+        return output[0..count];
+    }
+
     pub fn digest(self: *Projectiles) !u64 {
         var hasher = std.hash.Wyhash.init(0);
-        var pass = store.Pass.init(&self.cache, store.under(.record));
-        while (true) {
-            const keys = try pass.next();
-            if (keys.len == 0) break;
-            var copies: [store.Pass.batch]store.Key = undefined;
-            @memcpy(copies[0..keys.len], keys);
-            for (copies[0..keys.len]) |key| {
-                const lease = try self.cache.acquire(key.slice());
-                defer lease.release();
-                const bytes = lease.read() orelse return error.Corrupt;
+        {
+            for (self.recordIds()) |entity| {
+                const kept = (try self.records.get(entity)).?;
                 var projectile: Projectile = undefined;
-                @memcpy(std.mem.asBytes(&projectile), bytes[0..@sizeOf(Projectile)]);
+                @memcpy(std.mem.asBytes(&projectile), kept.bytes[0..@sizeOf(Projectile)]);
                 // A sleeper holds the state it wakes in; before then, it is on its way there.
                 // A sleeper holds the state its sleep ends in: after its last tick asleep, or
                 // after its update tick when it sleeps through that too.
@@ -1419,7 +1761,7 @@ pub const Projectiles = struct {
                 projectile.forgetSleep();
                 // Field by field: padding holds whatever the bytes held.
                 inline for (@typeInfo(Projectile).@"struct".field_names) |name| hasher.update(std.mem.asBytes(&@field(projectile, name)));
-                hasher.update(bytes[@sizeOf(Projectile)..self.record_bytes]);
+                hasher.update(kept.bytes[@sizeOf(Projectile)..self.record_bytes]);
             }
         }
         return hasher.final();
@@ -1542,7 +1884,7 @@ pub const Projectiles = struct {
         var start = from;
         var passes: usize = 0;
         while (passes < 8) : (passes += 1) {
-            const target = self.findTarget(projectile, start, end) orelse break;
+            const target = (try self.findTarget(projectile, start, end)) orelse break;
             projectile.position = target.at;
             const went_through = try self.hitTarget(projectile, target.target);
             projectile.impulse = true;
@@ -1566,7 +1908,7 @@ pub const Projectiles = struct {
             .registries = &self.deps.client.client,
             .damage_type = if (projectile.kind == .trident) "minecraft:trident" else "minecraft:arrow",
             .attacker = &self.deps.players.records[projectile.owner],
-            .direct_type = self.entity_types[@intFromEnum(projectile.kind)],
+            .direct_type = self.entity_types[@backingInt(projectile.kind)],
             .direct = false,
             .random = self.random.random(),
             .scratch = &self.scratch,
@@ -1639,7 +1981,7 @@ pub const Projectiles = struct {
         var any = false;
         for (self.deps.players.activeSlots()) |slot| {
             const player = &self.deps.players.records[slot];
-            const now: Seen = .{ .generation = if (player.handle) |handle| handle.generation else 0, .world = player.world, .position = .{ player.position.x, player.position.y, player.position.z }, .stage = @intFromEnum(player.stage), .gamemode = @intFromEnum(self.deps.player_states.of(player).gamemode) };
+            const now: Seen = .{ .generation = if (player.handle) |handle| handle.generation else 0, .world = player.world, .position = .{ player.position.x, player.position.y, player.position.z }, .stage = @backingInt(player.stage), .gamemode = @backingInt(self.deps.player_states.of(player).gamemode) };
             if (std.meta.eql(now, self.seen[slot])) continue;
             // Another connection in the slot was sent nothing yet.
             if (now.generation != self.seen[slot].generation) {
@@ -1658,25 +2000,16 @@ pub const Projectiles = struct {
     /// records at a time.
     fn unknown(self: *Projectiles, forgotten: []const u64) !void {
         assert(forgotten.len == self.row_words);
-        inline for (.{ store.Prefix.record, store.Prefix.removal }) |kind| {
-            var pass = store.Pass.init(&self.cache, store.under(kind));
-            while (true) {
-                const keys = try pass.next();
-                if (keys.len == 0) break;
-                var slices: [store.Pass.batch][]const u8 = undefined;
-                for (keys, slices[0..keys.len]) |*key, *slice| slice.* = key.slice();
-                var leases: [store.Pass.batch]records.Cache.Lease = undefined;
-                try self.cache.acquireMany(slices[0..keys.len], leases[0..keys.len]);
-                defer for (leases[0..keys.len]) |lease| lease.release();
-                const offset = if (kind == .record) @sizeOf(Projectile) else 8;
-                for (leases[0..keys.len]) |lease| {
-                    const length = (lease.read() orelse continue).len;
-                    const value = lease.edit();
-                    const row = std.mem.bytesAsSlice(u64, value[offset..][0 .. self.row_words * 8]);
-                    for (row, forgotten) |*word, gone| word.* &= ~gone;
-                    lease.commit(length);
-                }
-            }
+        for (self.recordIds()) |entity| {
+            var kept = (try self.loadRecord(entity)).?;
+            const row: []u64 = @alignCast(std.mem.bytesAsSlice(u64, kept.bytes[@sizeOf(Projectile)..][0 .. self.row_words * 8]));
+            for (row, forgotten) |*word, gone| word.* &= ~gone;
+            try self.records.put(entity, kept);
+        }
+        var removals = self.removal_rows.iterator();
+        while (removals.next()) |entry| {
+            const row: []u64 = @alignCast(std.mem.bytesAsSlice(u64, entry.bytes[8..][0 .. self.row_words * 8]));
+            for (row, forgotten) |*word, gone| word.* &= ~gone;
         }
     }
 
@@ -1708,7 +2041,7 @@ pub const Projectiles = struct {
 
     /// The stuck projectiles in one cell within a player's reach, a batch at a time.
     fn collectCell(self: *Projectiles, slot: usize, world_id: u32, x: i32, z: i32, reach: body.Box, creative: bool) !void {
-        var pass = store.Pass.init(&self.cache, store.cell(world_id, x, z));
+        var pass = store.Pass.init(&self.index, store.cell(world_id, x, z));
         var ids: [batch_max]u64 = undefined;
         while (true) {
             var count: usize = 0;
@@ -1723,7 +2056,7 @@ pub const Projectiles = struct {
                 }
             }
             if (count == 0) return;
-            try self.hold(ids[0..count], false);
+            try self.hold(ids[0..count]);
             for (self.held[0..self.held_count]) |*held| {
                 const projectile = held.projectile;
                 if (self.now < projectile.landed_at + 7 or !self.boxOf(projectile).intersects(reach)) continue;
@@ -1745,7 +2078,7 @@ pub const Projectiles = struct {
                 if (!try self.deps.menus.giveStack(slot, stack)) return;
             },
         }
-        try self.queue(projectile.id, held.row, .update, false, packets.writeCollect, .{ networkId(projectile), entity_effects.playerId(slot), @as(i32, 1) });
+        try self.queue(projectile.id, held.row, .update, false, packets.writeCollect, .{ self.networkId(projectile), entity_effects.playerId(slot), @as(i32, 1) });
         projectile.removed = true;
     }
 
@@ -1753,7 +2086,7 @@ pub const Projectiles = struct {
     /// go.
     fn retire(self: *Projectiles) !void {
         if (self.removals == 0) return;
-        var pass = store.Pass.init(&self.cache, store.under(.removal));
+        var pass = store.Pass.init(&self.index, store.under(.removal));
         while (true) {
             const keys = try pass.next();
             if (keys.len == 0) return;
@@ -1764,9 +2097,8 @@ pub const Projectiles = struct {
     }
 
     fn retireOne(self: *Projectiles, key: store.Key) !void {
-        const lease = try self.cache.acquire(key.slice());
-        defer lease.release();
-        const value = lease.edit();
+        const entity = store.Key.id(key.slice());
+        const value = self.removal_rows.get(entity) orelse return error.Corrupt;
         const network = std.mem.readInt(i32, value[0..4], .little);
         const row = std.mem.bytesAsSlice(u64, value[8..][0 .. self.row_words * 8]);
         var any = false;
@@ -1774,10 +2106,8 @@ pub const Projectiles = struct {
             word.* &= ~self.goneIn(at);
             any = any or word.* != 0;
         }
-        lease.commit(8 + self.row_words * 8);
         if (!any) {
-            lease.remove();
-            self.removals -= 1;
+            self.forgetRemoval(entity);
             return;
         }
         for (self.audience, row) |*audience, word| audience.* = word;
@@ -1819,7 +2149,7 @@ pub const Projectiles = struct {
             }
             any = any or leaving.* != 0;
         }
-        if (any) try self.queue(projectile.id, self.leaving, .remove, false, packets.writeRemove, .{networkId(projectile)});
+        if (any) try self.queue(projectile.id, self.leaving, .remove, false, packets.writeRemove, .{self.networkId(projectile)});
     }
 
     /// Players newly in range are sent it, its spawn and its data. Those in range of all of the
@@ -1839,7 +2169,7 @@ pub const Projectiles = struct {
             any = any or joining.* != 0;
         }
         if (!any) return;
-        const spawn: packets.Spawn = .{ .id = networkId(projectile), .uuid = projectile.uuid, .kind = self.entity_types[@intFromEnum(projectile.kind)], .position = projectile.position, .velocity = projectile.velocity, .yaw = angle(projectile.yaw), .pitch = angle(projectile.pitch), .owner = entity_effects.playerId(projectile.owner) };
+        const spawn: packets.Spawn = .{ .id = self.networkId(projectile), .uuid = projectile.uuid, .kind = self.entity_types[@backingInt(projectile.kind)], .position = projectile.position, .velocity = projectile.velocity, .yaw = angle(projectile.yaw), .pitch = angle(projectile.pitch), .owner = entity_effects.playerId(projectile.owner) };
         try self.queueSpawn(projectile.id, self.joining, spawn, self.dataOf(projectile));
     }
 
@@ -1851,10 +2181,10 @@ pub const Projectiles = struct {
         const moving = projectile.impulse or (due and !projectile.in_ground);
         if (!projectile.data_changed and !moving) return;
         for (self.audience, held.row, self.starved) |*audience, known, starved| audience.* = known & ~starved;
-        if (projectile.data_changed) try self.queue(projectile.id, self.audience, .update, false, packets.writeData, .{ networkId(projectile), self.dataOf(projectile) });
+        if (projectile.data_changed) try self.queue(projectile.id, self.audience, .update, false, packets.writeData, .{ self.networkId(projectile), self.dataOf(projectile) });
         projectile.data_changed = false;
         if (!moving) return;
-        try self.queue(projectile.id, self.audience, .update, false, packets.writeSync, .{ networkId(projectile), projectile.position, projectile.velocity, projectile.yaw, projectile.pitch, projectile.in_ground });
+        try self.queue(projectile.id, self.audience, .update, false, packets.writeSync, .{ self.networkId(projectile), projectile.position, projectile.velocity, projectile.yaw, projectile.pitch, projectile.in_ground });
         projectile.impulse = false;
     }
 
@@ -1866,7 +2196,7 @@ pub const Projectiles = struct {
     /// packets for the same viewers go in one batch, admitted for all of them at once. What each
     /// viewer took is read back when the batch goes, so the known rows say what clients have.
     fn queue(self: *Projectiles, entity: u64, audience: []const u64, kind: Purpose, removal: bool, comptime writer: anytype, arguments: anytype) !void {
-        self.traceSend(entity, audience, @intFromEnum(kind));
+        self.traceSend(entity, audience, @backingInt(kind));
         if (!try self.prepare(audience, 1)) return;
         const receipt = self.deps.players.deps.packets.broadcast(&self.outbox, writer, null, null, arguments, 128) catch |err| switch (err) {
             error.Backpressured => return self.backlog(),
@@ -1902,7 +2232,7 @@ pub const Projectiles = struct {
 
     fn record(self: *Projectiles, entity: u64, kind: Purpose, removal: bool, receipt: sessions.Service.Broadcast.Receipt) void {
         self.outbox_pending[self.outbox_count] = .{ .id = entity, .kind = kind, .removal = removal, .receipt = receipt };
-        self.queued[@intFromEnum(kind)] += 1;
+        self.queued[@backingInt(kind)] += 1;
         self.outbox_count += 1;
     }
 
@@ -1919,7 +2249,7 @@ pub const Projectiles = struct {
         for (self.outbox_pending[0..self.outbox_count]) |pending| {
             var unsupported = outbox.unsupported(pending.receipt).iterator();
             while (unsupported.next()) |index| self.deps.players.deps.sessions.disconnect(outbox.handleAt(index));
-            if (outbox.accepted(pending.receipt).count() > 0) self.taken[@intFromEnum(pending.kind)] += 1;
+            if (outbox.accepted(pending.receipt).count() > 0) self.taken[@backingInt(pending.kind)] += 1;
             // Whoever did not take it gets it on a later tick, and nothing more new this one.
             if (pending.kind != .update and outbox.accepted(pending.receipt).count() < outbox.recipients) self.starve(pending.receipt);
             if (pending.kind != .update) try self.acknowledge(pending);
@@ -1932,25 +2262,24 @@ pub const Projectiles = struct {
         if (!pending.removal) for (self.held[self.held_settled..self.held_count]) |*held| {
             if (held.projectile.id == pending.id) return self.apply(pending, held.row);
         };
-        if (!pending.removal) {
-            const lease = try self.cache.acquire(store.byId(.record, pending.id).slice());
-            defer lease.release();
-            if (lease.read() != null) {
-                const value = lease.edit();
-                self.apply(pending, std.mem.bytesAsSlice(u64, value[@sizeOf(Projectile)..self.record_bytes]));
-                return lease.commit(self.record_bytes);
-            }
-        }
+        if (!pending.removal) if (try self.loadRecord(pending.id)) |found| {
+            var kept = found;
+            const row: []u64 = @alignCast(std.mem.bytesAsSlice(u64, kept.bytes[@sizeOf(Projectile)..self.record_bytes]));
+            self.apply(pending, row);
+            return self.records.put(pending.id, kept);
+        };
         // A projectile gone since: its removal is owed to whoever took the spawn too.
-        const lease = try self.cache.acquire(store.byId(.removal, pending.id).slice());
-        defer lease.release();
-        if (lease.read() == null) return;
-        const value = lease.edit();
-        const row = std.mem.bytesAsSlice(u64, value[8..][0 .. self.row_words * 8]);
+        const value = self.removal_rows.get(pending.id) orelse return;
+        const row: []u64 = @alignCast(std.mem.bytesAsSlice(u64, value[8..][0 .. self.row_words * 8]));
         self.apply(pending, row);
-        lease.commit(8 + self.row_words * 8);
         for (row) |word| if (word != 0) return;
-        lease.remove();
+        self.forgetRemoval(pending.id);
+    }
+
+    /// A removal every viewer took, or who could have went.
+    fn forgetRemoval(self: *Projectiles, entity: u64) void {
+        self.removal_rows.remove(entity);
+        self.index.remove(store.byId(.removal, entity).slice());
         self.removals -= 1;
     }
 
@@ -1968,7 +2297,7 @@ pub const Projectiles = struct {
 
     /// A chunk's shared players, the last one asked for first.
     fn lookup(self: *Projectiles, column: Column) ?Range {
-        const kind = @intFromEnum(column.nearness);
+        const kind = @backingInt(column.nearness);
         if (self.last_columns[kind]) |last| if (std.meta.eql(last, column)) return self.last_ranges[kind];
         const range = self.columns.get(column) orelse return null;
         self.last_columns[kind] = column;
@@ -1994,13 +2323,13 @@ pub const Projectiles = struct {
     /// Blocks without a collision shape that still do something to a projectile inside them.
     /// Erring towards more only costs time: their space is looked at block by block.
     const affecting_blocks = [_][]const u8{
-        "minecraft:water",           "minecraft:lava",             "minecraft:bubble_column",
-        "minecraft:fire",            "minecraft:soul_fire",        "minecraft:cobweb",
-        "minecraft:nether_portal",   "minecraft:end_portal",       "minecraft:end_gateway",
-        "minecraft:tripwire",        "minecraft:powder_snow",      "minecraft:sweet_berry_bush",
-        "minecraft:wither_rose",     "minecraft:kelp",             "minecraft:kelp_plant",
-        "minecraft:seagrass",        "minecraft:tall_seagrass",    "minecraft:pointed_dripstone",
-        "minecraft:scaffolding",     "minecraft:light",            "minecraft:structure_void",
+        "minecraft:water",         "minecraft:lava",          "minecraft:bubble_column",
+        "minecraft:fire",          "minecraft:soul_fire",     "minecraft:cobweb",
+        "minecraft:nether_portal", "minecraft:end_portal",    "minecraft:end_gateway",
+        "minecraft:tripwire",      "minecraft:powder_snow",   "minecraft:sweet_berry_bush",
+        "minecraft:wither_rose",   "minecraft:kelp",          "minecraft:kelp_plant",
+        "minecraft:seagrass",      "minecraft:tall_seagrass", "minecraft:pointed_dripstone",
+        "minecraft:scaffolding",   "minecraft:light",         "minecraft:structure_void",
     };
 
     pub const affecting: u8 = 1;
@@ -2058,7 +2387,7 @@ pub const Projectiles = struct {
 
     /// ProjectileUtil.getEntityHitResult: the living things whose boxes, grown by the margin a
     /// projectile gains as it flies, the path from `from` to `to` enters, the nearest first.
-    fn findTarget(self: *Projectiles, projectile: *const Projectile, from: [3]f64, to: [3]f64) ?Found {
+    fn findTarget(self: *Projectiles, projectile: *const Projectile, from: [3]f64, to: [3]f64) !?Found {
         // In float, as vanilla grows boxes by it.
         const margin: f64 = @max(@as(f32, 0), @min(@as(f32, 0.3), @as(f32, @floatFromInt(self.age(projectile) - 2)) / 20.0));
         const low: [3]f64 = .{ @min(from[0], to[0]) - half_width - 1, @min(from[1], to[1]) - 1, @min(from[2], to[2]) - half_width - 1 };
@@ -2066,19 +2395,20 @@ pub const Projectiles = struct {
         const swept: body.Box = .{ .min = low, .max = high };
         var best: ?Found = null;
         var best_distance = std.math.inf(f64);
-        const mobs = self.deps.mobs;
-        // No mobs, no grid to look in.
-        var candidates = mobs.grid.query(projectile.world, .{ low[0] - mobs.widest_half, low[2] - mobs.widest_half }, .{ high[0] + mobs.widest_half, high[2] + mobs.widest_half });
-        while (mobs.active.values().len > 0) {
-            const index = candidates.next() orelse break;
-            const mob = &mobs.mobs[index];
-            if (mob.removed or !mob.alive() or !mobs.grid.boxes[index].intersects(swept) or self.pierced(projectile, mob.id)) continue;
-            const distance = clip(grown(living.box(mobs, mob), margin), from, to) orelse continue;
-            if (distance < best_distance) {
-                best_distance = distance;
-                best = .{ .target = .{ .mob = index }, .at = along(from, to, distance) };
+        var search: struct { projectiles: *Projectiles, projectile: *const Projectile, from: [3]f64, to: [3]f64, margin: f64, best: *?Found, best_distance: *f64 } = .{ .projectiles = self, .projectile = projectile, .from = from, .to = to, .margin = margin, .best = &best, .best_distance = &best_distance };
+        try self.deps.mobs.each(projectile.world, swept, &search, struct {
+            fn visit(context: *@TypeOf(search), mob: Mob) anyerror!bool {
+                const mobs = context.projectiles.deps.mobs;
+                const index = mobs.slotOf(mob.entity.id).?;
+                if (!mob.alive() or context.projectiles.pierced(context.projectile, mob.entity.id)) return false;
+                const distance = clip(grown(living.box(mobs, mob), context.margin), context.from, context.to) orelse return false;
+                if (distance < context.best_distance.*) {
+                    context.best_distance.* = distance;
+                    context.best.* = .{ .target = .{ .mob = index }, .at = along(context.from, context.to, distance) };
+                }
+                return false;
             }
-        }
+        }.visit);
         // A path longer than a chunk looks for itself; a shorter one shares its chunk's players.
         const far = high[0] - low[0] > 15 or high[2] - low[2] > 15;
         if (far) {
@@ -2135,7 +2465,7 @@ pub const Projectiles = struct {
     /// whether the projectile goes on through, as a piercing arrow does.
     fn hitTarget(self: *Projectiles, projectile: *Projectile, target: Target) !bool {
         const key: u64 = switch (target) {
-            .mob => |index| self.deps.mobs.mobs[index].id,
+            .mob => |index| (try self.deps.mobs.inSlot(index)).entity.id,
             .player => |other| @as(u64, @intCast(other + 1)) << 48,
         };
         if (projectile.pierce > 0) {
@@ -2174,7 +2504,7 @@ pub const Projectiles = struct {
     fn damageAmount(self: *Projectiles, projectile: *const Projectile, target: Target) !f32 {
         const base: f32 = if (projectile.kind == .trident) 8.0 else 2.0;
         const target_type = switch (target) {
-            .mob => |index| self.deps.mobs.traits(self.deps.mobs.mobs[index].species).entity_type,
+            .mob => |index| self.deps.mobs.traits((try self.deps.mobs.inSlot(index)).entity.species).entity_type,
             .player => self.player_type,
         };
         const enchanted = try self.withWeapon(projectile, struct {
@@ -2196,15 +2526,15 @@ pub const Projectiles = struct {
         const damage_type: @import("mob.zig").DamageType = if (projectile.kind == .trident) .trident else .arrow;
         switch (target) {
             .mob => |index| {
-                const mob = &self.deps.mobs.mobs[index];
+                const mob = try self.deps.mobs.inSlot(index);
                 if (projectile.fire_ticks > 0) self.deps.mobs.ignite(mob, 5);
                 // The push follows the projectile's motion, as calculateHorizontalHurtKnockbackDirection.
-                return self.deps.mobs.hurt(mob, .{ .type = damage_type, .attacker = @intCast(owner), .source = .{ mob.position[0] - v[0], mob.position[1], mob.position[2] - v[2] } }, amount);
+                return self.deps.mobs.hurt(mob, .{ .type = damage_type, .attacker = @intCast(owner), .source = .{ mob.motion.position[0] - v[0], mob.motion.position[1], mob.motion.position[2] - v[2] } }, amount);
             },
             .player => |other| {
                 if (projectile.fire_ticks > 0) try self.deps.damage.ignite(other, 5);
                 const cause = entity_effects.playerId(owner) + 1;
-                return self.deps.damage.hurt(other, .{ .type = damage_type, .attacker = owner, .cause_id = cause, .direct_id = networkId(projectile) + 1, .knockback = .{ v[0], v[2] }, .piercing = projectile.pierce > 0 }, amount);
+                return self.deps.damage.hurt(other, .{ .type = damage_type, .attacker = owner, .cause_id = cause, .direct_id = self.networkId(projectile) + 1, .knockback = .{ v[0], v[2] }, .piercing = projectile.pierce > 0 }, amount);
             },
         }
     }
@@ -2212,7 +2542,7 @@ pub const Projectiles = struct {
     /// AbstractArrow.doKnockback: Punch pushes along the flight.
     fn knockback(self: *Projectiles, projectile: *Projectile, target: Target) !void {
         const kind = switch (target) {
-            .mob => |index| self.deps.mobs.traits(self.deps.mobs.mobs[index].species).entity_type,
+            .mob => |index| self.deps.mobs.traits((try self.deps.mobs.inSlot(index)).entity.species).entity_type,
             .player => self.player_type,
         };
         const strength = try self.withWeapon(projectile, struct {
@@ -2225,11 +2555,11 @@ pub const Projectiles = struct {
         const flat = living.normalize(.{ v[0], 0, v[2] });
         switch (target) {
             .mob => |index| {
-                const mob = &self.deps.mobs.mobs[index];
-                const resistance = self.deps.mobs.traits(mob.species).attribute(.knockback_resistance);
+                const mob = try self.deps.mobs.inSlot(index);
+                const resistance = self.deps.mobs.traits(mob.entity.species).attribute(.knockback_resistance);
                 const push = @as(f64, strength) * 0.6 * @max(0, 1 - resistance);
-                mob.velocity = .{ mob.velocity[0] + flat[0] * push, mob.velocity[1] + 0.1, mob.velocity[2] + flat[2] * push };
-                mob.has_impulse = true;
+                mob.motion.velocity = .{ mob.motion.velocity[0] + flat[0] * push, mob.motion.velocity[1] + 0.1, mob.motion.velocity[2] + flat[2] * push };
+                mob.entity.has_impulse = true;
             },
             .player => |other| try self.deps.damage.knockback(other, @as(f64, strength) * 0.6, -flat[0], -flat[2]),
         }
@@ -2499,14 +2829,7 @@ pub const Projectiles = struct {
     fn sound(self: *Projectiles, projectile: *const Projectile, name: []const u8, volume: f32, pitch: f32) void {
         self.effects.sound(projectile.world, .{ .x = projectile.position[0], .y = projectile.position[1], .z = projectile.position[2] }, name, .neutral, volume, pitch, @bitCast(self.random.next()), null);
     }
-
 };
-
-
-/// Projectiles take negative network ids, as mobs and items do.
-fn networkId(projectile: *const Projectile) i32 {
-    return -@as(i32, @intCast(projectile.id));
-}
 
 fn angle(value: f32) i8 {
     return @bitCast(@as(u8, @intFromFloat(@mod(@floor(@as(f64, value) * 256.0 / 360.0), 256.0))));
@@ -2566,3 +2889,91 @@ test "a path enters a box where its slabs meet, and not from inside" {
     try std.testing.expect(clip(box, .{ -1, 2, 0.5 }, .{ 3, 2, 0.5 }) == null);
 }
 
+/// Projectiles' records: a row each in the arrows' table, in the tick order's sequence, those
+/// parked or frozen in its dormant part. Read and written through the directory by id.
+const Records = struct {
+    entities: *entities.Entities,
+    table: Table,
+
+    const Row = struct { record: Projectiles.Record };
+    const Table = entities.KindTable(Row);
+
+    fn init(allocator: std.mem.Allocator, owner: *entities.Entities) !Records {
+        return .{ .entities = owner, .table = try .init(allocator, &owner.pool, &owner.directory) };
+    }
+
+    /// Walked by the tick order and maintained at the end of each tick, for every kind of
+    /// projectile. Called once it is where it stays.
+    fn register(self: *Records, kinds: []const u32) !void {
+        for (kinds) |kind| try self.entities.addTable(kind, &self.table.core);
+    }
+
+    fn ours(self: *const Records, slot: u32) bool {
+        const entry = self.entities.directory.entry(slot);
+        return entry.block != entities.directory.none and self.entities.places.order.cores[entry.kind] == &self.table.core;
+    }
+
+    fn slotOf(self: *const Records, entity: u64) ?u32 {
+        const slot = self.entities.directory.slotOf(entity) orelse return null;
+        return if (self.ours(slot)) slot else null;
+    }
+
+    fn contains(self: *const Records, entity: u64) bool {
+        return self.slotOf(entity) != null;
+    }
+
+    fn count(self: *const Records) usize {
+        return self.table.standingCount();
+    }
+
+    /// A projectile's record where it lies, good until the tick's end.
+    fn ptr(self: *const Records, entity: u64) !?*Projectiles.Record {
+        return self.table.ref(self.slotOf(entity) orelse return null).field("record");
+    }
+
+    fn get(self: *const Records, entity: u64) !?Projectiles.Record {
+        return (try self.ptr(entity) orelse return null).*;
+    }
+
+    /// A record kept again, for a projectile that has one.
+    fn put(self: *Records, entity: u64, value: Projectiles.Record) !void {
+        (try self.ptr(entity) orelse return error.Corrupt).* = value;
+    }
+
+    /// A projectile comes into memory and joins the tick order last: walked, or asleep there, or
+    /// asleep long, its row dormant.
+    fn add(self: *Records, entity: u64, kind: u32, value: Projectiles.Record, state: enum { walked, asleep, dormant }) !void {
+        const slot = try self.entities.enter(entity, kind);
+        errdefer self.entities.leave(slot);
+        const order = &self.entities.places.order;
+        _ = try order.joinSlot(slot);
+        switch (state) {
+            .walked => {},
+            .asleep => order.sleepSlot(slot),
+            .dormant => order.sleepLongSlot(slot),
+        }
+        try self.table.add(slot, .{ .record = value }, state == .dormant);
+    }
+
+    fn remove(self: *Records, entity: u64) void {
+        const slot = self.slotOf(entity) orelse return;
+        self.table.remove(slot);
+        self.entities.leave(slot);
+    }
+
+    fn ids(self: *const Records, output: []u64) []u64 {
+        return self.table.idsInto(output);
+    }
+
+    /// Every projectile leaves memory.
+    fn clear(self: *Records) void {
+        var at: usize = 0;
+        while (at < self.entities.directory.high()) : (at += 1) {
+            const slot: u32 = @intCast(at);
+            if (self.entities.directory.entry(slot).id == 0 or !self.ours(slot)) continue;
+            self.table.remove(slot);
+            self.entities.leave(slot);
+        }
+        self.table.clear();
+    }
+};

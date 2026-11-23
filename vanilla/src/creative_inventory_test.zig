@@ -123,7 +123,7 @@ test "survival cursor placements drops and close preserve ownership across resta
             if (cut == .dropped or cut == .closed) {
                 next[PlayerInventory.cursor].?.count = 15;
                 try std.testing.expect(try fixture.menu.apply(0, &slots, &contents, &next, &.{.{ .item = bread.item, .count = 1 }}));
-                try std.testing.expectEqual(@as(usize, 7), fixture.dropped.free_count);
+                try std.testing.expectEqual(@as(usize, 1), fixture.dropped.count());
             }
             if (cut == .closed) {
                 var buffer: [16]u8 = undefined;
@@ -163,9 +163,10 @@ test "survival cursor placements drops and close preserve ownership across resta
             for (contents) |entry| if (entry.stack) |stack| {
                 total += stack.count;
             };
-            for (fixture.dropped.residents) |resident| {
-                if (resident.id == 0 or !resident.alive) continue;
-                const body = (try fixture.bodies.get(resident.id)).?;
+            var rows = fixture.dropped.rows();
+            while ((try rows.next())) |row| {
+                if (!row.metadata.alive) continue;
+                const body = (try fixture.bodies.get(row.id)).?;
                 const stack = (try fixture.ownership.get(ItemEntities.slot(body))).stack.?;
                 try std.testing.expectEqual(@as(u16, 1), stack.count);
                 total += stack.count;

@@ -78,7 +78,18 @@ pub fn Server(comptime Plugins: type, comptime Endpoint: type, comptime SessionP
                 {
                     const tick = simulation.server_tick.start();
                     defer tick.end();
-                    try simulation.tick();
+                    simulation.tick() catch |err| {
+                        if (!host.boundReached(err)) return err;
+                        // A bound passed during the tick: it is lost, and the store keeps the last
+                        // checkpoint.
+                        std.log.err("event=stopped reason={s} checkpoint_tick={d}", .{ @errorName(err), simulation.saved_tick });
+                        break;
+                    };
+                }
+                // A bound nearly reached: the server stops now, checkpointing this tick on the way out.
+                if (simulation.stopReason()) |reason| {
+                    std.log.err("event=stopping reason={s} tick={d}", .{ @errorName(reason), simulation.completed_tick });
+                    break;
                 }
                 if (process.reload_requested.swap(false, .acq_rel) and !request.pending and request.enabled) try request.stage(reload.signal_token);
                 if (request.pending) {

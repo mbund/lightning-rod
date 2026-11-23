@@ -97,6 +97,13 @@ pub const Overlay = struct {
             self.states.putAssumeCapacity(.{ .world = edit.world, .x = edit.position[0], .y = edit.position[1], .z = edit.position[2] }, edit.previous);
         }
     }
+
+    /// An edit made after every one laid, taken in their order: the world before it shows
+    /// where no earlier edit after `at` did.
+    pub fn layLater(self: *Overlay, world: u32, position: [3]i32, previous: u16) void {
+        const entry = self.states.getOrPutAssumeCapacity(.{ .world = world, .x = position[0], .y = position[1], .z = position[2] });
+        if (!entry.found_existing) entry.value_ptr.* = previous;
+    }
 };
 
 /// A block edit held for paths to answer.

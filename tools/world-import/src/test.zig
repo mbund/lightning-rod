@@ -5,6 +5,8 @@ const vanilla = @import("vanilla");
 const Players = @import("players").players.Players;
 const game_data = @import("game_data");
 const inventories = @import("inventories");
+const entity_store = @import("entities");
+const records = @import("records");
 const main = @import("main.zig");
 const importer = @import("import.zig");
 
@@ -371,10 +373,16 @@ test "Java world import reopens terrain players containers items and orbs throug
     try std.testing.expectEqual(@as(u32, 50), state.cook);
     try std.testing.expectEqual(@as(u32, 80), state.burn_left);
     const dropped = try vanilla.ItemEntities.init(allocator, io, .{}, .{ .record_workspaces = native.workspace, .metrics = &metrics, .entities = native.entities, .inventories = native.inventories, .items = native.items, .worlds = native.worlds, .storage = try store.openSpace(vanilla.ItemEntities.id) });
+    // The imported item comes into memory with its column, as near a player.
+    try dropped.refresh(&.{.{ .world = world, .x = -1, .z = -1 }}, 0, entity_store.residency.NoColumns{});
     const metadata = try dropped.get(1);
     try std.testing.expectEqual(@as(?u128, mapped), metadata.owner);
     try std.testing.expectEqual(@as(u16, 7), metadata.pickup_delay);
-    const body = (try native.entities.get(2)).?;
+    // The orb is kept as the orbs' store keeps it, under its column.
+    var orb_bytes: [vanilla.Experience.record_bytes]u8 = undefined;
+    const orb_key = entity_store.durable.key(0x30, .{ .world = world, .x = -1, .z = -1 }, 2);
+    try std.testing.expectEqual(@as(?usize, orb_bytes.len), try records.Table.init(try store.openSpace(vanilla.Experience.id), native.workspace.resources).get(&orb_key, &orb_bytes));
+    const body = try entity_store.decode(orb_bytes[0..entity_store.encoded_bytes]);
     try std.testing.expectEqual(@as(u128, 1001), body.uuid);
     try std.testing.expectEqual(@as(u32, @intCast(game_data.registry.entityId("minecraft:experience_orb").?)), body.kind);
 }

@@ -89,9 +89,9 @@ test "reference batches coalesce duplicates and slot swaps cancel reference chan
     });
     const first = try inventory.defineItem(&.{"first"});
     const second = try inventory.defineItem(&.{"second"});
-    const before = inventory.references.metrics.acquisition.read().?.count;
+    const before = inventory.references.metrics.batches.value();
     try inventory.retainItems(&.{ first, second, first, second, first });
-    try std.testing.expectEqual(before + 1, inventory.references.metrics.acquisition.read().?.count);
+    try std.testing.expectEqual(before + 1, inventory.references.metrics.batches.value());
     {
         var leases: [2]@TypeOf(inventory.references).Lease = undefined;
         try inventory.references.acquireMany(&.{ &first, &second }, &leases);
@@ -105,12 +105,12 @@ test "reference batches coalesce duplicates and slot swaps cancel reference chan
         .{ .slot = a, .revision = 0, .stack = .{ .item = first, .count = 1 } },
         .{ .slot = b, .revision = 0, .stack = .{ .item = second, .count = 1 } },
     }));
-    const before_swap = inventory.references.metrics.acquisition.read().?.count;
+    const before_swap = inventory.references.metrics.batches.value();
     try std.testing.expect(try inventory.editMany(&.{
         .{ .slot = a, .revision = 1, .stack = .{ .item = second, .count = 1 } },
         .{ .slot = b, .revision = 1, .stack = .{ .item = first, .count = 1 } },
     }));
-    try std.testing.expectEqual(before_swap, inventory.references.metrics.acquisition.read().?.count);
+    try std.testing.expectEqual(before_swap, inventory.references.metrics.batches.value());
     try inventory.releaseItems(&.{ first, second, first, second, first });
     try std.testing.expect(try inventory.editMany(&.{
         .{ .slot = a, .revision = 2, .stack = null },

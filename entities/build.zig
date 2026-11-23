@@ -18,4 +18,16 @@ pub fn build(b: *std.Build) void {
             .{ .name = "storage", .module = storage.module("storage") },
         },
     });
+
+    const tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "metrics", .module = metrics },
+            .{ .name = "records", .module = records.module("records") },
+            .{ .name = "storage", .module = storage.module("storage") },
+        },
+    }) });
+    b.step("test", "Run the entities tests").dependOn(&b.addRunArtifact(tests).step);
 }

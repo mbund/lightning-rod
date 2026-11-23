@@ -68,7 +68,7 @@ pub const Ticking = struct {
     maximum_radius: i32,
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration) !Ticking {
-        if (config.sources == 0 or config.maximum_radius < 1 or config.maximum_radius > 32) return error.InvalidConfiguration;
+        if (config.sources == 0 or config.maximum_radius < 1 or config.maximum_radius > 33) return error.InvalidConfiguration;
         const side: usize = @intCast(2 * config.maximum_radius + 1);
         const capacity = config.sources * side * side + config.forced;
         // Twice the capacity, rounded up, keeps probes short at a full table.

@@ -73,8 +73,8 @@ const Probe = struct {
         const handle = self.deps.players.records[0].handle orelse return;
         switch (self.phase) {
             .aiming => {
-                const cow = self.deps.mobs.get(self.cow) orelse return error.CowGone;
-                if (cow.health >= 10 and cow.alive()) return;
+                const cow = (try self.deps.mobs.get(self.cow)) orelse return error.CowGone;
+                if (cow.living.health >= 10 and cow.alive()) return;
                 if (try self.arrows() != 1) return error.ArrowNotSpent;
                 self.phase = .down;
                 try self.deps.control.send(handle, "down");

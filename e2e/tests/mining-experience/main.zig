@@ -99,12 +99,8 @@ const Probe = struct {
         if (self.phase != .normal and self.phase != .silk and self.phase != .wrong) return;
         const player = self.deps.players.records[0];
         if (player.handle == null or self.deps.mining.states[0].active or try (try self.deps.chunks.simulation(1)).getBlock(player.world, .{ .x = target.x, .y = target.y, .z = target.z }) != 0) return;
-        var remaining: i64 = 0;
+        const remaining = try self.deps.experience.totalValue();
         const points = self.deps.player_states.records[0].experience;
-        for (self.deps.experience.active.values()) |index| {
-            const orb = self.deps.experience.orbs[index];
-            if (orb.alive) remaining += @as(i64, orb.count) * orb.value;
-        }
         if (self.phase == .normal) {
             if (remaining > 0) return;
             if (points.total < 3 or points.total > 7) return error.MiningExperienceIncorrect;

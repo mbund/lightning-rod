@@ -47,10 +47,10 @@ test "pickup batches preserve player priority item order and partial collection"
             const bread = try items.define("minecraft:bread");
             const stone = try items.define("minecraft:stone");
             const apple = try items.define("minecraft:apple");
-            const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 16 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
+            const bodies = try entities.Entities.init(allocator, io, .{}, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
             const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
             const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
-            const dropped = try ItemEntities.init(allocator, io, .{ .cache_records = 32, .maximum = 8 }, .{
+            const dropped = try ItemEntities.init(allocator, io, .{}, .{
                 .metrics = &registry,
                 .record_workspaces = workspaces,
                 .entities = bodies,

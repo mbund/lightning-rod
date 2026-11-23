@@ -142,11 +142,11 @@ pub const MobInteraction = struct {
         if (hand < 0 or hand > 1) return error.InvalidPacket;
         const player = &self.deps.players.records[handle.index];
         if (player.stage != .ready) return;
-        // Players' network ids are their slots plus one; mobs' are their negated entity ids.
+        // Players' network ids are their slots plus one; other entities' are negative.
         if (target > 0) return self.dispatchPlayer(handle.index, @intCast(target - 1), mouse);
         if (target == 0) return;
-        const mob = self.deps.mobs.get(@intCast(-@as(i64, target))) orelse return;
-        if (mob.world != player.world or mob.removed) return;
+        const mob = (try self.deps.mobs.get(self.deps.mobs.deps.entities.entityOfNetwork(target) orelse return)) orelse return;
+        if (mob.motion.world != player.world or mob.entity.removed) return;
         if (!try self.withinReach(handle.index, living.box(self.deps.mobs, mob))) return;
         switch (mouse) {
             1 => try self.deps.melee.attack(handle.index, .{ .mob = mob }),
@@ -185,7 +185,7 @@ pub const MobInteraction = struct {
 
     // Mob.interact.
 
-    fn interact(self: *MobInteraction, slot: usize, mob: *Mob, hand: Hand) !void {
+    fn interact(self: *MobInteraction, slot: usize, mob: Mob, hand: Hand) !void {
         if (!mob.alive()) return;
         const player = &self.deps.players.records[slot];
         const state = self.deps.player_states.of(player);
@@ -196,7 +196,7 @@ pub const MobInteraction = struct {
         pinned.release();
         // Mob.checkAndHandleImportantInteractions: a spawn egg of the mob's kind makes a calf.
         if (game_data.physics.spawnEgg(@intCast(kind))) |entity_type| {
-            if (entity_type == self.deps.mobs.traits(mob.species).entity_type) {
+            if (entity_type == self.deps.mobs.traits(mob.entity.species).entity_type) {
                 try self.offspringFromEgg(slot, mob, hand);
                 return;
             }
@@ -209,14 +209,14 @@ pub const MobInteraction = struct {
         }
         // Animal.mobInteract.
         if (try self.deps.mobs.isFood(held)) {
-            if (mob.age == 0 and mob.in_love <= 0) {
+            if (mob.idle.age == 0 and mob.inLove() <= 0) {
                 try self.usePlayerItem(slot, hand);
-                self.deps.mobs.setInLove(mob, player.uuid);
+                try self.deps.mobs.setInLove(mob, player.uuid);
                 return;
             }
             if (mob.baby()) {
                 try self.usePlayerItem(slot, hand);
-                self.deps.mobs.ageUp(mob, speedUpSecondsWhenFeeding(-mob.age), true);
+                try self.deps.mobs.ageUp(mob, speedUpSecondsWhenFeeding(-mob.idle.age), true);
                 return;
             }
         }
@@ -228,10 +228,9 @@ pub const MobInteraction = struct {
     }
 
     /// SpawnEggItem.spawnOffspringFromSpawnEgg for a mob that can be a baby.
-    fn offspringFromEgg(self: *MobInteraction, slot: usize, mob: *Mob, hand: Hand) !void {
+    fn offspringFromEgg(self: *MobInteraction, slot: usize, mob: Mob, hand: Hand) !void {
         const mobs = self.deps.mobs;
-        if (!mobs.canSpawn()) return;
-        _ = try mobs.spawn(.{ .species = mob.species, .world = mob.world, .position = mob.position, .yaw = 0, .baby = true, .variant = mob.variant, .finalize = false });
+        _ = try mobs.spawn(.{ .species = mob.entity.species, .world = mob.motion.world, .position = mob.motion.position, .yaw = 0, .baby = true, .variant = mob.cow.variant, .finalize = false });
         try self.usePlayerItem(slot, hand);
     }
 
@@ -278,5 +277,4 @@ pub const MobInteraction = struct {
         const player = &self.deps.players.records[slot];
         self.effects.sound(player.world, player.position, name, .players, 1, 1, @bitCast(self.sound_seeds.next()), slot);
     }
-
 };

@@ -9,26 +9,31 @@ const game_data = @import("game_data");
 const sessions = @import("sessions");
 const minecraft = @import("minecraft_model");
 const inventories = @import("inventories");
-const Domains = @import("domains").domains.Domains;
 const Players = @import("players").players.Players;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
 const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
 const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
-const spatial = @import("vanilla_item_entities").item_spatial;
 const Random = @import("vanilla_content").random.Random;
 const item_data = @import("vanilla_items").item_data;
 const encoding = @import("protocol_support");
 const xp = @import("vanilla_player").experience_state;
 const assert = std.debug.assert;
 
+/// Experience orbs, each a record of its own beside its body, streamed through caches of any
+/// size: none is ever refused for want of room. They tick in the tick list's order where the
+/// domains tick, and are found by the area index, as items are.
 pub const Experience = struct {
     pub const id = "minecraft:experience";
-    pub const Configuration = struct { maximum_orbs: usize = 1024, seed: u64 = 0x657870657269656e, keep_inventory: bool = false };
+    pub const Configuration = struct {
+        seed: u64 = 0x657870657269656e,
+        keep_inventory: bool = false,
+        /// The columns holding orbs, and the columns they tick in.
+        columns: usize = 16384,
+    };
     pub const Dependencies = struct {
         enchantments: *EnchantmentRegistry,
         dimensions: *Dimensions,
         players: *Players,
-        domains: *Domains,
         player_states: *PlayerStates,
         entities: *entities.Entities,
         physics: *ItemPhysics,
@@ -37,17 +42,73 @@ pub const Experience = struct {
         storage: storage.Space,
         record_workspaces: *records.Workspaces,
     };
+
+    /// What holds an orb back on its next move: the blocks whose makeStuckInBlock reaches it.
+    pub const Stuck = enum(u8) {
+        none,
+        cobweb,
+        powder_snow,
+
+        pub fn multiplier(self: Stuck) [3]f64 {
+            return switch (self) {
+                .none => .{ 0, 0, 0 },
+                .cobweb => .{ 0.25, 0.05, 0.25 },
+                .powder_snow => .{ 0.9, 1.5, 0.9 },
+            };
+        }
+
+        pub fn of(multiplier_value: [3]f64) Stuck {
+            inline for (.{ Stuck.none, Stuck.cobweb, Stuck.powder_snow }) |each| {
+                if (std.meta.eql(multiplier_value, each.multiplier())) return each;
+            }
+            unreachable;
+        }
+    };
+
     pub const Orb = struct {
-        pub fn encode(orb: Orb) [16]u8 {
-            var bytes: [16]u8 = @splat(0);
-            bytes[0] = 1;
+        pub const encoded_size = 39;
+
+        pub fn encode(orb: Orb) [encoded_size]u8 {
+            var bytes: [encoded_size]u8 = @splat(0);
+            bytes[0] = 3;
             std.mem.writeInt(i32, bytes[1..5], orb.value, .little);
             std.mem.writeInt(i32, bytes[5..9], orb.count, .little);
             std.mem.writeInt(u16, bytes[9..11], orb.age, .little);
             std.mem.writeInt(i16, bytes[11..13], orb.health, .little);
             bytes[13] = @intFromBool(orb.on_ground);
             std.mem.writeInt(i16, bytes[14..16], orb.fire, .little);
+            std.mem.writeInt(u32, bytes[16..20], orb.ticks, .little);
+            bytes[20] = @backingInt(orb.stuck);
+            bytes[21] = @intFromBool(orb.following != null);
+            if (orb.following) |handle| {
+                std.mem.writeInt(u32, bytes[22..26], @intCast(handle.index), .little);
+                std.mem.writeInt(u32, bytes[26..30], handle.generation, .little);
+            }
+            std.mem.writeInt(u64, bytes[30..38], orb.revision, .little);
+            bytes[38] = @intFromBool(orb.alive);
             return bytes;
+        }
+
+        pub fn decode(bytes: []const u8) !Orb {
+            if (bytes.len != encoded_size or bytes[0] != 3) return error.CorruptExperienceOrb;
+            if (bytes[13] > 1) return error.CorruptExperienceOrb;
+            var orb: Orb = .{
+                .value = std.mem.readInt(i32, bytes[1..5], .little),
+                .count = std.mem.readInt(i32, bytes[5..9], .little),
+                .age = std.mem.readInt(u16, bytes[9..11], .little),
+                .health = std.mem.readInt(i16, bytes[11..13], .little),
+                .on_ground = bytes[13] != 0,
+                .fire = std.mem.readInt(i16, bytes[14..16], .little),
+                .alive = true,
+            };
+            if (bytes[20] > @backingInt(Stuck.powder_snow) or bytes[21] > 1 or bytes[38] > 1) return error.CorruptExperienceOrb;
+            orb.ticks = std.mem.readInt(u32, bytes[16..20], .little);
+            orb.stuck = @fromBackingInt(@intCast(bytes[20]));
+            if (bytes[21] == 1) orb.following = .{ .index = std.mem.readInt(u32, bytes[22..26], .little), .generation = std.mem.readInt(u32, bytes[26..30], .little) };
+            orb.revision = std.mem.readInt(u64, bytes[30..38], .little);
+            orb.alive = bytes[38] == 1;
+            if (orb.alive and (orb.value <= 0 or orb.count <= 0 or orb.age >= 6000 or orb.health <= 0)) return error.CorruptExperienceOrb;
+            return orb;
         }
 
         value: i32 = 0,
@@ -57,161 +118,272 @@ pub const Experience = struct {
         fire: i16 = 0,
         ticks: u32 = 0,
         following: ?sessions.Handle = null,
-        alive: bool = false,
+        alive: bool = true,
         on_ground: bool = false,
-        stuck: [3]f64 = .{ 0, 0, 0 },
+        stuck: Stuck = .none,
+        /// Grows whenever viewers are owed the orb's motion again.
         revision: u64 = 0,
-        viewers: usize = 0,
-        body: entities.State = .{ .uuid = 0, .kind = 0, .world = 0, .position = .{ 0, 0, 0 } },
     };
-    pub const Pickup = struct { entity: u64, collector: i32 };
+
+    /// An orb in hand: copies of its state and body, written back when let go.
+    pub const Held = struct {
+        id: entities.Id,
+        orb: Orb,
+        body: ?entities.State,
+        /// Where its body was when taken, for its place to follow it.
+        was: ?entities.State,
+    };
+
+    /// An orb in memory, and where its record in the store lies.
+    pub const Stored = struct {
+        orb: Orb,
+        stored: ?entities.Column = null,
+        dirty: bool = true,
+    };
+
+    pub const kind = game_data.registry.entityId("minecraft:experience_orb").?;
+    /// ExperienceOrb's size, 0.5 by 0.5.
+    pub const shape: entities.Shape = .{ .kind = kind, .half_width = 0.25, .height = 0.5 };
+    /// What lookups of orbs are after, among every kind in the space.
+    pub const kinds: entities.Kinds = .of(&.{kind});
+    const record_prefix = 0x30;
+    pub const record_bytes = entities.encoded_bytes + Orb.encoded_size;
+
+    /// An orb as the store keeps it, for tools that write worlds: its key under its column,
+    /// and its body and state.
+    pub fn storeRecord(entity: entities.Id, body: entities.State, orb: Orb, value: *[record_bytes]u8) entities.durable.Key {
+        entities.encode(body, value[0..entities.encoded_bytes]);
+        @memcpy(value[entities.encoded_bytes..], &orb.encode());
+        return entities.durable.key(record_prefix, entities.space.columnOf(body.world, body.position), entity);
+    }
+
+    /// A pickup and where the orb was, as the pickup that takes its last point takes its body.
+    pub const Pickup = struct { entity: u64, collector: i32, body: entities.State, value: i32 };
     const Death = struct { handle: ?sessions.Handle = null, life: u32 = 0 };
     pub const Sound = struct { handle: ?sessions.Handle = null, life: u32 = 0, ticks: u32 = 0, last: u32 = 0, volume: ?f32 = null, seed: i64 = 0 };
-    const encoded_size = 16;
     deps: Dependencies,
     config: Configuration,
-    orbs: []Orb,
-    residents: []spatial.Resident,
-    spatial: spatial.Index,
-    ids: std.AutoHashMapUnmanaged(u64, usize) = .empty,
-    active: lightning_rod.system.IndexSet,
-    free: []usize,
-    free_count: usize,
-    candidates: []usize,
-    saved: []u64,
-    saved_count: usize = 0,
+    allocator: std.mem.Allocator,
+    /// Every orb near players, gone ones not yet forgotten included.
+    orbs: entities.BodyTable(Stored),
+    /// Where every entity in memory is, and the order they tick in, shared by every kind.
+    places: *entities.Places,
+    residency: entities.Residency,
+    /// Room to copy ids and name columns into, for passes that change what they pass over.
+    scratch: []entities.Id,
+    centers: []entities.residency.Center,
+    /// What the last refresh went by: while all of it stands, so does what is in memory.
+    last_centers: []entities.residency.Center,
+    last_center_count: usize = 0,
+    last_radius: i32 = 0,
+    last_ticking: u64 = std.math.maxInt(u64),
+    last_held: u64 = std.math.maxInt(u64),
+    /// Told as an orb leaves memory, for those who keep anything of it.
+    leaving: ?Leaving = null,
     random: Random,
     table: records.Table,
     deaths: []Death,
     pickups: []Pickup,
     sounds: []Sound,
     pickup_count: usize = 0,
+    nearby: []entities.space.Entry,
+    /// While entities tick: the blocks orbs read, shared by them all.
+    window: ?ItemPhysics.Window = null,
+
+    pub const Leaving = struct {
+        context: *anyopaque,
+        function: *const fn (*anyopaque, entities.Id) void,
+    };
 
     pub fn allocate(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Experience {
         if (deps.inventories.items.entries.len < 2) return error.InventoryCacheTooSmall;
-        if (config.maximum_orbs == 0 or config.maximum_orbs > 65536) return error.InvalidExperienceCapacity;
         const self = try allocator.create(Experience);
-        const residents = try allocator.alloc(spatial.Resident, config.maximum_orbs);
-        @memset(residents, .{});
+        const table = records.Table.init(deps.storage, deps.record_workspaces.resources);
+        const bound = deps.entities.directory.capacity();
         self.* = .{
             .deps = deps,
             .config = config,
-            .orbs = try allocator.alloc(Orb, config.maximum_orbs),
-            .residents = residents,
-            .spatial = try .init(allocator, residents),
-            .active = try .init(allocator, config.maximum_orbs),
-            .free = try allocator.alloc(usize, config.maximum_orbs),
-            .free_count = config.maximum_orbs,
-            .candidates = try allocator.alloc(usize, config.maximum_orbs),
-            .saved = try allocator.alloc(u64, config.maximum_orbs),
+            .allocator = allocator,
+            .orbs = try .init(allocator, deps.entities, kind),
+            .places = &deps.entities.places,
+            .residency = try .init(allocator, config.columns),
+            .scratch = try allocator.alloc(entities.Id, bound),
+            .centers = try allocator.alloc(entities.residency.Center, deps.players.records.len),
+            .last_centers = try allocator.alloc(entities.residency.Center, deps.players.records.len),
             .deaths = try allocator.alloc(Death, deps.players.records.len),
             .pickups = try allocator.alloc(Pickup, deps.players.records.len),
             .sounds = try allocator.alloc(Sound, deps.players.records.len),
             .random = .{ .source = .init(config.seed) },
-            .table = records.Table.init(deps.storage, deps.record_workspaces.resources),
+            .table = table,
+            .nearby = try allocator.alloc(entities.space.Entry, 1024),
         };
-        @memset(self.orbs, .{});
         @memset(self.deaths, .{});
         @memset(self.sounds, .{});
-        for (self.free, 0..) |*slot, index| slot.* = self.free.len - index - 1;
-        try self.ids.ensureTotalCapacity(allocator, @intCast(config.maximum_orbs));
+        try deps.entities.addTicker(.init(Experience, self, kinds, batch_max));
+        try deps.entities.addColumnHolder(.init(Experience, self, columnLoaded, columnUnloaded));
+        try self.orbs.register();
         return self;
     }
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Experience {
         const self = try allocate(allocator, config, deps);
         if (try self.table.get(&.{0}, &self.random.saved)) |length| try self.random.restore(self.random.saved[0..length]);
-        var after: [9]u8 = undefined;
-        var cursor: records.ScanCursor = .{ .after = &after };
-        var keys: [16][9]u8 = undefined;
-        var values: [16][32]u8 = undefined;
-        var entries: [16]records.ScanEntry = undefined;
-        for (&entries, &keys, &values) |*entry, *key, *value| entry.* = .{ .key = key, .value = value };
-        while (true) {
-            const batch = try self.table.scan(&cursor, &entries);
-            for (entries[0..batch.count]) |entry| {
-                if (entry.key_len == 1 and entry.key[0] == 0) continue;
-                if (entry.key_len != 9 or entry.key[0] != 1 or entry.value_len != encoded_size) return error.CorruptExperienceOrb;
-                const entity = std.mem.readInt(u64, entry.key[1..9], .big);
-                const value = entry.value;
-                if (value[0] != 1 or value[13] > 1) return error.CorruptExperienceOrb;
-                const orb: Orb = .{
-                    .value = std.mem.readInt(i32, value[1..5], .little),
-                    .count = std.mem.readInt(i32, value[5..9], .little),
-                    .age = std.mem.readInt(u16, value[9..11], .little),
-                    .health = std.mem.readInt(i16, value[11..13], .little),
-                    .fire = std.mem.readInt(i16, value[14..16], .little),
-                    .alive = true,
-                    .on_ground = value[13] != 0,
-                };
-                if (orb.value <= 0 or orb.count <= 0 or orb.age >= 6000 or orb.health <= 0 or self.ids.contains(entity)) return error.CorruptExperienceOrb;
-                if (self.free_count == 0) return error.ExperienceCapacity;
-                const body = (try deps.entities.get(entity)) orelse return error.CorruptExperienceOrb;
-                if (entity > std.math.maxInt(i32) or body.kind != game_data.registry.entityId("minecraft:experience_orb").? or deps.players.deps.worlds.get(body.world) == null) return error.CorruptExperienceOrb;
-                const index = self.insert(entity, body, orb);
-                self.saved[self.saved_count] = self.residents[index].id;
-                self.saved_count += 1;
-            }
-            if (!batch.more) break;
-        }
+        // Orbs kept before they were kept by column are refused, not converted.
+        var after: [1]u8 = .{1};
+        var cursor: records.ScanCursor = .{ .after = &after, .after_len = 0, .before = &.{record_prefix} };
+        var key: [32]u8 = undefined;
+        var found: [2]records.ScanKey = .{ .{ .key = &key }, .{ .key = &key } };
+        const result = try self.table.scanKeys(&cursor, &found);
+        for (found[0..result.count]) |entry| if (!(entry.key_len == 1 and entry.key[0] == 0)) return error.OldExperienceRecords;
         return self;
     }
 
-    fn insert(self: *Experience, entity: u64, body: entities.State, orb: Orb) usize {
-        assert(self.free_count > 0 and !self.ids.contains(entity));
-        assert(self.active.values().len + self.free_count == self.orbs.len);
-        assert(self.ids.count() == self.active.values().len);
-        self.free_count -= 1;
-        const index = self.free[self.free_count];
-        self.orbs[index] = orb;
-        self.orbs[index].body = body;
-        self.ids.putAssumeCapacityNoClobber(entity, index);
-        self.active.insert(index);
-        self.residents[index].id = entity;
-        self.locate(index, body);
-        return index;
+    /// How many orbs are in memory, gone ones not yet forgotten included.
+    pub fn orbCount(self: *const Experience) usize {
+        return self.orbs.count();
     }
 
-    fn locate(self: *Experience, index: usize, body: entities.State) void {
-        const x: i32 = @intFromFloat(@floor(body.position[0] / 16));
-        const y: i32 = @intFromFloat(@floor(body.position[1] / 16));
-        const z: i32 = @intFromFloat(@floor(body.position[2] / 16));
-        const resident = &self.residents[index];
-        if (resident.alive and resident.world == body.world and resident.x == x and resident.y == y and resident.z == z) {
-            resident.position = .{ body.position[0], body.position[2] };
-            return;
+    /// The ids of the orbs near players, gone ones not yet forgotten included, by id. Good
+    /// until an orb comes or goes, or this is asked again.
+    pub fn ids(self: *Experience) []const entities.Id {
+        return self.orbs.ids(self.scratch);
+    }
+
+    /// Takes orbs in hand, at most 16: copies, written back as each is let go.
+    pub fn hold(self: *Experience, wanted: []const entities.Id, output: []Held, _: bool) !void {
+        assert(wanted.len == output.len and wanted.len <= 16);
+        for (wanted, output) |entity, *held| {
+            const stored = try self.orbs.get(entity) orelse return error.UnknownExperienceOrb;
+            const body = try self.deps.entities.get(entity);
+            held.* = .{ .id = entity, .orb = stored.orb, .body = body, .was = body };
         }
-        if (self.residents[index].alive) self.spatial.remove(@intCast(index));
-        self.residents[index] = .{ .id = self.residents[index].id, .world = body.world, .x = @intFromFloat(@floor(body.position[0] / 16)), .y = @intFromFloat(@floor(body.position[1] / 16)), .z = @intFromFloat(@floor(body.position[2] / 16)), .position = .{ body.position[0], body.position[2] }, .alive = self.orbs[index].alive };
-        if (self.orbs[index].alive) self.spatial.insert(@intCast(index));
     }
 
-    pub fn canAward(self: *const Experience, amount: i32) bool {
-        return self.canAwardMany(&.{amount});
-    }
-
-    pub fn canAwardMany(self: *const Experience, amounts: []const i32) bool {
-        var needed: usize = 0;
-        for (amounts) |amount| {
-            if (amount < 0) return false;
-            var left = amount;
-            for (xp.denominations) |value| {
-                const count: usize = @intCast(@divTrunc(left, value));
-                if (count > self.free_count - needed) return false;
-                needed += count;
-                left = @rem(left, value);
-            }
+    /// Writes back what changed of an orb in hand and lets it go.
+    pub fn settle(self: *Experience, held: *Held) !void {
+        var stored = try self.orbs.get(held.id) orelse return error.UnknownExperienceOrb;
+        const before = stored;
+        if (!std.meta.eql(stored.orb, held.orb)) {
+            stored.orb = held.orb;
+            stored.dirty = true;
         }
-        return needed == 0 or (self.deps.entities.next_id <= std.math.maxInt(i32) and needed - 1 <= std.math.maxInt(i32) - self.deps.entities.next_id);
+        if (held.body) |body| if (held.was) |was| if (!std.meta.eql(body, was)) {
+            if (!self.deps.entities.has(held.id)) return error.UnknownExperienceOrb;
+            try self.deps.entities.set(held.id, body);
+            stored.dirty = true;
+            try self.places.move(held.id, body.world, body.position);
+        };
+        if (!std.meta.eql(stored, before)) try self.orbs.put(held.id, stored);
+    }
+
+    /// An orb as it is, for tests and for whoever looks at one at a time.
+    pub fn get(self: *Experience, entity: entities.Id) !?struct { orb: Orb, body: ?entities.State } {
+        const stored = try self.orbs.get(entity) orelse return null;
+        return .{ .orb = stored.orb, .body = try self.deps.entities.get(entity) };
+    }
+
+    /// Changes an orb as given: its body moves its place with it.
+    pub fn put(self: *Experience, entity: entities.Id, orb: Orb, body: ?entities.State) !void {
+        var held: [1]Held = undefined;
+        try self.hold(&.{entity}, &held, false);
+        held[0].orb = orb;
+        if (body) |value| held[0].body = value;
+        try self.settle(&held[0]);
+    }
+
+    /// What the orbs not gone are worth together.
+    pub fn totalValue(self: *Experience) !i64 {
+        var total: i64 = 0;
+        for (self.ids()) |entity| {
+            const stored = (try self.orbs.get(entity)).?;
+            if (stored.orb.alive) total += @as(i64, stored.orb.value) * stored.orb.count;
+        }
+        return total;
+    }
+
+    /// Every orb's state and body, for telling two runs apart.
+    /// Each with the encoding orbs were kept in before, so digests compare across that change.
+    pub fn digest(self: *Experience) !u64 {
+        var sum: u64 = 0;
+        for (self.ids()) |entity| {
+            const stored = (try self.orbs.get(entity)).?;
+            var hasher = std.hash.Wyhash.init(entity);
+            var encoded = stored.orb.encode();
+            encoded[0] = 2;
+            hasher.update(&encoded);
+            if (try self.deps.entities.get(entity)) |body| inline for (@typeInfo(entities.State).@"struct".field_names) |name| hasher.update(std.mem.asBytes(&@field(body, name)));
+            sum +%= hasher.final();
+        }
+        return sum;
+    }
+
+    /// The orbs not gone, by id, as many as `output` holds.
+    pub fn live(self: *Experience, output: []entities.Id) ![]entities.Id {
+        var live_count: usize = 0;
+        for (self.ids()) |entity| {
+            const stored = (try self.orbs.get(entity)).?;
+            if (!stored.orb.alive) continue;
+            if (live_count == output.len) return error.WorkingSetTooLarge;
+            output[live_count] = entity;
+            live_count += 1;
+        }
+        const found = output[0..live_count];
+        std.sort.pdq(entities.Id, found, {}, std.sort.asc(entities.Id));
+        return found;
+    }
+
+    pub fn canAward(_: *const Experience, amount: i32) bool {
+        return amount >= 0;
+    }
+
+    pub fn canAwardMany(_: *const Experience, amounts: []const i32) bool {
+        for (amounts) |amount| if (amount < 0) return false;
+        return true;
     }
 
     pub fn award(self: *Experience, world: u32, position: [3]f64, amount: i32) !void {
         return self.awardWithDirection(world, position, .{ 0, 0, 0 }, amount);
     }
 
-    pub fn networkId(entity: u64) i32 {
-        assert(entity > 0 and entity <= std.math.maxInt(i32));
-        return -@as(i32, @intCast(entity));
+    /// The id clients know an orb in memory by.
+    pub fn networkId(self: *const Experience, entity: u64) i32 {
+        return self.deps.entities.networkOf(entity).?;
+    }
+
+    /// The id it was given, which the wire's negates: what vanilla's getId gives.
+    pub fn givenId(self: *const Experience, entity: u64) u32 {
+        return @intCast(-@as(i64, self.networkId(entity)));
+    }
+
+    /// Orbs of a box's columns in vanilla's order: x up, z from 0 up then the negative ones,
+    /// and in each column its sections' order, as getEntitiesByType goes; `visit` returns
+    /// whether to stop.
+    fn eachNear(self: *Experience, world: u32, low: [3]f64, high: [3]f64, context: anytype, comptime visit: fn (@TypeOf(context), entities.space.Entry) anyerror!bool) !void {
+        const first: [2]i32 = .{ @intFromFloat(@floor(low[0] / 16)), @intFromFloat(@floor(low[2] / 16)) };
+        const last: [2]i32 = .{ @intFromFloat(@floor(high[0] / 16)), @intFromFloat(@floor(high[2] / 16)) };
+        var x = first[0];
+        while (x <= last[0]) : (x += 1) {
+            var zs: [64]i32 = undefined;
+            var z_count: usize = 0;
+            var z = first[1];
+            while (z <= last[1] and z_count < zs.len) : (z += 1) {
+                zs[z_count] = z;
+                z_count += 1;
+            }
+            std.mem.sort(i32, zs[0..z_count], {}, struct {
+                fn less(_: void, a: i32, b: i32) bool {
+                    return entities.space.zOrder(a) < entities.space.zOrder(b);
+                }
+            }.less);
+            for (zs[0..z_count]) |column_z| {
+                var ordered = self.places.space.ordered(.{ .world = world, .x = x, .z = column_z }, @intFromFloat(@floor(low[1] / 16)), @intFromFloat(@floor(high[1] / 16)), kinds, self.nearby);
+                while (true) {
+                    const entries = try ordered.next();
+                    if (entries.len == 0) break;
+                    for (entries) |entry| if (try visit(context, entry)) return;
+                }
+            }
+        }
     }
 
     pub fn awardWithDirection(self: *Experience, world: u32, position: [3]f64, direction: [3]f64, amount: i32) !void {
@@ -219,31 +391,41 @@ pub const Experience = struct {
         for (direction) |component| assert(std.math.isFinite(component));
         if (self.deps.players.deps.worlds.get(world) == null) return error.UnknownWorld;
         if (amount < 0) return error.InvalidExperience;
-        if (!self.canAward(amount)) return error.ExperienceCapacity;
         errdefer self.deps.storage.fail();
         var window = self.deps.physics.readWindow();
         defer window.deinit();
-        var bodies: [64]entities.State = undefined;
-        var body_count: usize = 0;
-        const capacity = @min(bodies.len, self.deps.entities.cache.entries.len);
         var left = amount;
         while (left > 0) {
             const value = xp.denomination(left);
             left -= value;
             const bucket = self.random.random().uintLessThan(u32, 40);
-            var nearby = self.spatial.rectangle(world, .{ @intFromFloat(@floor((position[0] - 0.75) / 16)), @intFromFloat(@floor((position[2] - 0.75) / 16)) }, .{ @intFromFloat(@floor((position[0] + 0.75) / 16)), @intFromFloat(@floor((position[2] + 0.75) / 16)) });
-            const merged = while (nearby.next()) |at| {
-                const index: usize = at;
-                const entity = self.residents[index].id;
-                const orb = &self.orbs[index];
-                if (orb.value != value or @mod(@as(i64, networkId(entity)) - bucket, 40) != 0 or orb.count == std.math.maxInt(i32)) continue;
-                const body = self.orbs[index].body;
-                if (@abs(body.position[0] - position[0]) >= 0.75 or @abs(body.position[2] - position[2]) >= 0.75 or body.position[1] >= position[1] + 0.5 or body.position[1] <= position[1] - 1) continue;
+            // ExperienceOrb.tryMerge: the first orb nearby of the value and bucket takes it.
+            const Search = struct {
+                owner: *Experience,
+                value: i32,
+                bucket: u32,
+                position: [3]f64,
+                found: ?entities.Id = null,
+                fn visit(search: *@This(), entry: entities.space.Entry) !bool {
+                    const at = entry.position;
+                    if (@abs(at[0] - search.position[0]) >= 0.75 or @abs(at[2] - search.position[2]) >= 0.75 or at[1] >= search.position[1] + 0.5 or at[1] <= search.position[1] - 1) return false;
+                    if (@mod(@as(i64, search.owner.networkId(entry.id)) - search.bucket, 40) != 0) return false;
+                    const found = (try search.owner.get(entry.id)) orelse return false;
+                    if (!found.orb.alive or found.orb.value != search.value or found.orb.count == std.math.maxInt(i32)) return false;
+                    search.found = entry.id;
+                    return true;
+                }
+            };
+            var search: Search = .{ .owner = self, .value = value, .bucket = bucket, .position = position };
+            try self.eachNear(world, .{ position[0] - 0.75, position[1] - 1, position[2] - 0.75 }, .{ position[0] + 0.75, position[1] + 0.5, position[2] + 0.75 }, &search, Search.visit);
+            if (search.found) |entity| {
+                const found = (try self.get(entity)).?;
+                var orb = found.orb;
                 orb.count += 1;
                 orb.age = 0;
-                break true;
-            } else false;
-            if (merged) continue;
+                try self.put(entity, orb, null);
+                continue;
+            }
             const random = self.random.random();
             const yaw = random.float(f32) * 360;
             var velocity: [3]f64 = .{ (random.float(f64) * 0.2 - 0.1) * 2, random.float(f64) * 0.2 * 2, (random.float(f64) * 0.2 - 0.1) * 2 };
@@ -256,19 +438,8 @@ pub const Experience = struct {
                     if (dot < 0) motion.* = -motion.*;
                 }
             }
-            const expected = self.deps.entities.next_id + body_count;
-            var body: entities.State = .{ .uuid = @as(u128, expected) | (@as(u128, 0xe000) << 64), .kind = @intCast(game_data.registry.entityId("minecraft:experience_orb").?), .world = world, .position = origin, .velocity = velocity, .yaw = yaw };
-            try self.deps.physics.placeOrb(&window, &body);
-            // Later denominations may merge into this batch before its bodies reach storage.
-            _ = self.insert(expected, body, .{ .value = value, .alive = true });
-            bodies[body_count] = body;
-            body_count += 1;
-            if (body_count == capacity) {
-                try self.createBodies(bodies[0..body_count]);
-                body_count = 0;
-            }
+            try self.create(&window, world, origin, velocity, yaw, value);
         }
-        if (body_count > 0) try self.createBodies(bodies[0..body_count]);
     }
 
     /// One orb of the whole value, as `new ExperienceOrb(level, x, y, z, value)` makes it, where
@@ -277,68 +448,63 @@ pub const Experience = struct {
         for (position) |component| assert(std.math.isFinite(component) and @abs(component) <= 30_000_000);
         if (self.deps.players.deps.worlds.get(world) == null) return error.UnknownWorld;
         if (value <= 0) return error.InvalidExperience;
-        if (self.free_count == 0 or !self.canAwardMany(&.{1})) return error.ExperienceCapacity;
         errdefer self.deps.storage.fail();
         var window = self.deps.physics.readWindow();
         defer window.deinit();
         const random = self.random.random();
         const yaw = random.float(f32) * 360;
         const velocity: [3]f64 = .{ (random.float(f64) * 0.2 - 0.1) * 2, random.float(f64) * 0.2 * 2, (random.float(f64) * 0.2 - 0.1) * 2 };
+        try self.create(&window, world, position, velocity, yaw, value);
+    }
+
+    fn create(self: *Experience, window: *ItemPhysics.Window, world: u32, position: [3]f64, velocity: [3]f64, yaw: f32, value: i32) !void {
         const expected = self.deps.entities.next_id;
-        var body: entities.State = .{ .uuid = @as(u128, expected) | (@as(u128, 0xe000) << 64), .kind = @intCast(game_data.registry.entityId("minecraft:experience_orb").?), .world = world, .position = position, .velocity = velocity, .yaw = yaw };
-        try self.deps.physics.placeOrb(&window, &body);
-        _ = self.insert(expected, body, .{ .value = value, .alive = true });
-        try self.createBodies(&.{body});
+        var body: entities.State = .{ .uuid = @as(u128, expected) | (@as(u128, 0xe000) << 64), .kind = kind, .world = world, .position = position, .velocity = velocity, .yaw = yaw };
+        try self.deps.physics.placeOrb(window, &body);
+        if (!entities.valid(body)) return error.InvalidEntity;
+        const created = try self.deps.entities.reserveIds(1);
+        assert(created == expected);
+        try self.orbs.add(expected, body, .{ .orb = .{ .value = value } }, shape);
+        try self.residency.hold(entities.space.columnOf(world, body.position));
     }
 
-    fn createBodies(self: *Experience, bodies: []const entities.State) !void {
-        assert(bodies.len > 0 and bodies.len <= 64);
-        var created: [64]entities.Id = undefined;
-        const first = self.deps.entities.next_id;
-        try self.deps.entities.createMany(bodies, created[0..bodies.len]);
-        for (created[0..bodies.len], 0..) |entity, index| assert(entity == first + index);
-    }
-
-    pub fn snapshot(self: *const Experience, index: usize) entities.State {
-        assert(self.active.contains(index));
-        return self.orbs[index].body;
-    }
-
-    pub fn retire(self: *Experience, index: usize) !void {
-        assert(self.orbs[index].alive and self.residents[index].alive and self.active.contains(index));
+    /// An orb went: its body and place go now, its record when no client knows of it.
+    fn retire(self: *Experience, held: *Held) !void {
+        assert(held.orb.alive);
         errdefer self.deps.storage.fail();
-        try self.deps.entities.remove(self.residents[index].id);
-        self.orbs[index].alive = false;
-        self.spatial.remove(@intCast(index));
-        self.residents[index].alive = false;
+        self.orbs.dropBody(held.id);
+        self.places.remove(held.id);
+        held.orb.alive = false;
+        held.body = null;
+        held.was = null;
     }
 
     pub fn damage(self: *Experience, entity: u64, amount: f32) !bool {
         assert(std.math.isFinite(amount) and amount >= 0);
-        const index = self.ids.get(entity) orelse return false;
-        const orb = &self.orbs[index];
-        if (!orb.alive) return false;
-        orb.health = @intFromFloat(@max(@as(f32, std.math.minInt(i16)), @as(f32, @floatFromInt(orb.health)) - amount));
-        if (orb.health <= 0) try self.retire(index);
+        var held: [1]Held = undefined;
+        self.hold(&.{entity}, &held, false) catch return false;
+        defer self.settle(&held[0]) catch self.deps.storage.fail();
+        return self.hurt(&held[0], amount);
+    }
+
+    fn hurt(self: *Experience, held: *Held, amount: f32) !bool {
+        if (!held.orb.alive) return false;
+        held.orb.health = @intFromFloat(@max(@as(f32, std.math.minInt(i16)), @as(f32, @floatFromInt(held.orb.health)) - amount));
+        if (held.orb.health <= 0) try self.retire(held);
         return true;
     }
 
-    fn forget(self: *Experience, index: usize) void {
-        assert(!self.orbs[index].alive and !self.residents[index].alive and self.orbs[index].viewers == 0);
-        assert(self.active.contains(index));
-        const entity = self.residents[index].id;
-        const removed = self.ids.remove(entity);
-        assert(removed);
-        self.active.remove(index);
-        self.residents[index] = .{};
-        self.orbs[index] = .{};
-        self.free[self.free_count] = index;
-        self.free_count += 1;
-        assert(self.free_count + self.active.values().len == self.orbs.len);
-        assert(self.ids.count() == self.active.values().len);
+    /// Lets go of a gone orb's record, once no client knows of it.
+    pub fn forget(self: *Experience, entity: entities.Id) !void {
+        const stored = try self.orbs.take(entity) orelse return error.UnknownExperienceOrb;
+        assert(!stored.orb.alive);
+        if (stored.stored) |column| try self.table.putBatch(&.{.{ .key = &entities.durable.key(record_prefix, column, entity), .value = null }});
+        self.places.remove(entity);
     }
 
-    pub fn tick(self: *Experience) !void {
+    /// Before entities tick: players' pickup sounds count on, and orbs near players come into
+    /// memory.
+    pub fn prepareTick(self: *Experience) !void {
         errdefer self.deps.storage.fail();
         for (self.deps.players.activeSlots()) |index| {
             const player = self.deps.players.records[index];
@@ -346,108 +512,250 @@ pub const Experience = struct {
             self.sounds[index].ticks +%= 1;
         }
         self.pickup_count = 0;
-        var offset: usize = 0;
-        var window = self.deps.physics.readWindow();
-        defer window.deinit();
-        while (offset < self.active.values().len) {
-            const index = self.active.values()[offset];
-            const orb = &self.orbs[index];
-            if (!orb.alive) {
-                if (orb.viewers == 0) {
-                    self.forget(index);
-                    continue;
-                }
-                offset += 1;
-                continue;
-            }
-            offset += 1;
-            const entity = self.residents[index].id;
-            var body = orb.body;
-            if (!self.deps.domains.ticks(.{ .world = body.world, .x = @intFromFloat(@floor(body.position[0] / 16)), .z = @intFromFloat(@floor(body.position[2] / 16)) })) continue;
-            const world = self.deps.players.deps.worlds.get(body.world) orelse return error.CorruptExperienceOrb;
-            if (body.position[1] < @as(f64, @floatFromInt(world.dimension.minimum_section * 16)) - 64) {
-                try self.retire(index);
-                continue;
-            }
-            orb.ticks +%= 1;
-            try self.deps.physics.pushOrb(&window, &body, if (self.deps.dimensions.get(world.dimension.name)) |dimension| dimension.ultrawarm else false);
-            const environment = try self.deps.physics.orbEnvironment(&window, body);
-            if (orb.fire > 0) {
-                if (@mod(orb.fire, 20) == 0 and (try self.deps.physics.orbEffects(&window, body)).lava == 0) {
-                    _ = try self.damage(entity, 1);
-                    if (!orb.alive) continue;
-                }
-                orb.fire -= 1;
-            }
-            if (environment.water) {
-                body.velocity[0] *= @as(f64, @as(f32, 0.99));
-                body.velocity[1] = @min(body.velocity[1] + @as(f64, @as(f32, 0.0005)), @as(f64, @as(f32, 0.06)));
-                body.velocity[2] *= @as(f64, @as(f32, 0.99));
-            } else if (!environment.solid) body.velocity[1] -= 0.03;
-            if (environment.lava) {
-                const random = self.random.random();
-                body.velocity = .{ (random.float(f32) - random.float(f32)) * @as(f32, 0.2), @as(f64, @as(f32, 0.2)), (random.float(f32) - random.float(f32)) * @as(f32, 0.2) };
-            }
-            if (orb.ticks % 20 == 1) try self.merge(index, body);
-            var target: ?usize = null;
-            if (orb.following) |handle| {
-                const player = self.deps.players.records[handle.index];
-                if (std.meta.eql(player.handle, @as(?sessions.Handle, handle)) and player.world == body.world and self.deps.player_states.of(&player).gamemode != .spectator and distance(body.position, player.position) <= 64) target = handle.index;
-            }
-            if (target == null) {
-                var closest: f64 = 64;
-                var candidates = self.deps.players.nearby(body.world, .{ .x = body.position[0], .y = body.position[1], .z = body.position[2] }, 1);
-                while (candidates.next()) |player_index| {
-                    const player = self.deps.players.records[player_index];
-                    const state = self.deps.player_states.of(&player);
-                    if (state.gamemode == .spectator or state.health <= 0) continue;
-                    const squared = distance(body.position, player.position);
-                    if (squared < closest) {
-                        closest = squared;
-                        target = player_index;
-                    }
-                }
-            }
-            orb.following = if (target) |player_index| self.deps.players.records[player_index].handle else null;
-            if (target) |player_index| {
-                const player = self.deps.players.records[player_index];
-                const delta: [3]f64 = .{ player.position.x - body.position[0], player.position.y + @as(f64, @as(f32, if (player.flags.sneaking) 1.27 else 1.62)) / 2 - body.position[1], player.position.z - body.position[2] };
-                const length = @sqrt(delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]);
-                if (length >= 1e-4) {
-                    const strength = (1 - length / 8) * (1 - length / 8) * 0.1 / length;
-                    for (&body.velocity, 0..) |*component, axis| component.* += delta[axis] * strength;
-                }
-            }
-            if (target == null and environment.solid) {
-                var moved = body;
-                for (&moved.position, moved.velocity) |*position, velocity| position.* += velocity;
-                if (try self.deps.physics.orbCollides(&window, moved)) {
-                    try self.deps.physics.escapeOrb(&window, &body, self.random.random());
-                    orb.revision +%= 1;
-                }
-            }
-            const advanced = try self.deps.physics.advanceOrb(&window, @intCast(entity), orb.ticks, body, orb.on_ground, orb.stuck);
-            orb.on_ground = advanced.on_ground;
-            orb.body = advanced.body;
-            self.locate(index, advanced.body);
-            const hazards = advanced.effects;
-            orb.stuck = hazards.stuck;
-            if (hazards.lava > 0) {
-                orb.fire = @max(orb.fire, 300);
-                _ = try self.damage(entity, @as(f32, @floatFromInt(hazards.lava)) * 4);
-            }
-            if (orb.alive and hazards.fire > 0) {
-                orb.fire = @max(orb.fire, 160);
-                _ = try self.damage(entity, @floatFromInt(hazards.fire));
-            }
-            if (orb.alive and hazards.cactus > 0) _ = try self.damage(entity, @floatFromInt(hazards.cactus));
-            if (!orb.alive) continue;
-            if (hazards.extinguish) orb.fire = 0;
-            if (orb.fire == 0) orb.fire = -1;
-            if (orb.ticks % 20 == 0) orb.revision +%= 1;
-            orb.age += 1;
-            if (orb.age >= 6000) try self.retire(index);
+        // Where nothing follows the loaded domain, orbs follow the players themselves.
+        if (!self.deps.entities.columns_followed) try self.refresh();
+        self.window = self.deps.physics.readWindow();
+    }
+
+    /// Orbs next in the tick order, held together as they tick, as a merge may take another.
+    pub fn tickRun(self: *Experience, run: []const entities.order.Entry) !void {
+        errdefer self.deps.storage.fail();
+        var batch: [batch_max]entities.Id = undefined;
+        for (run, batch[0..run.len]) |entry, *entity| entity.* = entry.id;
+        var held: [batch_max]Held = undefined;
+        try self.hold(batch[0..run.len], held[0..run.len], true);
+        var settled: usize = 0;
+        defer for (held[settled..run.len]) |*orb| self.settle(orb) catch self.deps.storage.fail();
+        for (held[0..run.len]) |*orb| try self.tickOne(&self.window.?, orb, held[0..run.len]);
+        for (held[0..run.len]) |*orb| {
+            try self.settle(orb);
+            settled += 1;
         }
+    }
+
+    /// After entities tick: what players took goes.
+    pub fn finishTick(self: *Experience) !void {
+        errdefer self.deps.storage.fail();
+        defer {
+            if (self.window) |*window| window.deinit();
+            self.window = null;
+        }
+        try self.collect();
+    }
+
+    /// Orbs a run holds at once.
+    const batch_max = 16;
+
+    /// Orbs in memory are those near players, out to their view and one more, and those of
+    /// the columns that tick.
+    pub fn refresh(self: *Experience) !void {
+        var center_count: usize = 0;
+        var radius: i32 = 1;
+        for (self.deps.players.activeSlots()) |at| {
+            const player = self.deps.players.records[at];
+            if (player.stage != .ready) continue;
+            const column = entities.space.columnOf(player.world, .{ player.position.x, player.position.y, player.position.z });
+            self.centers[center_count] = .{ .world = column.world, .x = column.x, .z = column.z };
+            center_count += 1;
+            radius = @max(radius, self.deps.players.viewDistanceOf(player) + 1);
+        }
+        const centers = self.centers[0..center_count];
+        if (radius == self.last_radius and self.places.ticking_revision == self.last_ticking and self.residency.held == self.last_held and
+            std.mem.eql(u8, std.mem.sliceAsBytes(centers), std.mem.sliceAsBytes(self.last_centers[0..self.last_center_count]))) return;
+        @memcpy(self.last_centers[0..center_count], centers);
+        self.last_center_count = center_count;
+        self.last_radius = radius;
+        self.last_ticking = self.places.ticking_revision;
+        try self.residency.refresh(centers, radius, self.places.tickingColumns(), self, unloadColumn, loadColumn);
+        self.last_held = self.residency.held;
+    }
+
+    /// The loaded domain brought a column in: its orbs come back from the store.
+    fn columnLoaded(self: *Experience, column: entities.Column) anyerror!void {
+        if (try self.residency.enter(column)) try self.loadColumn(column);
+    }
+
+    /// The loaded domain let a column go: its orbs go to the store.
+    fn columnUnloaded(self: *Experience, column: entities.Column) anyerror!void {
+        if (!self.residency.holds(column)) return;
+        try self.unloadColumn(column);
+        _ = self.residency.leave(column);
+    }
+
+    fn unloadColumn(self: *Experience, column: entities.Column) anyerror!void {
+        var batch: entities.durable.Batch(record_bytes) = .{ .table = self.table };
+        var leaving_count: usize = 0;
+        var walk = self.places.space.entries(column, kinds);
+        while (walk.next()) |entry| {
+            self.scratch[leaving_count] = entry.id;
+            leaving_count += 1;
+        }
+        for (self.scratch[0..leaving_count]) |entity| {
+            if (self.leaving) |hook| hook.function(hook.context, entity);
+            const body = (try self.deps.entities.get(entity)).?;
+            const stored = (try self.orbs.take(entity)).?;
+            try save(&batch, entity, body, stored);
+            self.places.remove(entity);
+        }
+        try batch.flush();
+    }
+
+    fn loadColumn(self: *Experience, column: entities.Column) anyerror!void {
+        var reader = entities.durable.ColumnReader(record_bytes).init(self.table, record_prefix, column);
+        var rows: [16]entities.durable.ColumnReader(record_bytes).Row = undefined;
+        while (true) {
+            const found = try reader.next(&rows);
+            if (found.len == 0) break;
+            for (found) |row| {
+                if (row.value.len != record_bytes) return error.CorruptExperienceOrb;
+                const body = try entities.decode(row.value[0..entities.encoded_bytes]);
+                const orb = try Orb.decode(row.value[entities.encoded_bytes..]);
+                if (self.orbs.contains(row.id) or body.kind != kind) return error.CorruptExperienceOrb;
+                if (!entities.valid(body)) return error.InvalidEntity;
+                try self.orbs.add(row.id, body, .{ .orb = orb, .stored = column, .dirty = false }, shape);
+            }
+        }
+    }
+
+    fn save(batch: *entities.durable.Batch(record_bytes), entity: entities.Id, body: entities.State, stored: Stored) !void {
+        const here = entities.space.columnOf(body.world, body.position);
+        if (stored.stored) |was| if (!std.meta.eql(was, here)) try batch.delete(entities.durable.key(record_prefix, was, entity));
+        var value: [record_bytes]u8 = undefined;
+        entities.encode(body, value[0..entities.encoded_bytes]);
+        @memcpy(value[entities.encoded_bytes..], &stored.orb.encode());
+        try batch.put(entities.durable.key(record_prefix, here, entity), &value);
+    }
+
+    fn tickOne(self: *Experience, window: *ItemPhysics.Window, held: *Held, batch: []Held) !void {
+        const orb = &held.orb;
+        if (!orb.alive) return;
+        var body = held.body orelse return error.CorruptExperienceOrb;
+        // Visited but not ticked: moved this tick where nothing ticks.
+        if (!self.places.ticks(entities.space.columnOf(body.world, body.position))) return;
+        const world = self.deps.players.deps.worlds.get(body.world) orelse return error.CorruptExperienceOrb;
+        if (body.position[1] < @as(f64, @floatFromInt(world.dimension.minimum_section * 16)) - 64) {
+            try self.retire(held);
+            return;
+        }
+        orb.ticks +%= 1;
+        try self.deps.physics.pushOrb(window, &body, if (self.deps.dimensions.get(world.dimension.name)) |dimension| dimension.ultrawarm else false);
+        const environment = try self.deps.physics.orbEnvironment(window, body);
+        if (orb.fire > 0) {
+            if (@mod(orb.fire, 20) == 0 and (try self.deps.physics.orbEffects(window, body)).lava == 0) {
+                held.body = body;
+                _ = try self.hurt(held, 1);
+                if (!orb.alive) return;
+            }
+            orb.fire -= 1;
+        }
+        if (environment.water) {
+            body.velocity[0] *= @as(f64, @as(f32, 0.99));
+            body.velocity[1] = @min(body.velocity[1] + @as(f64, @as(f32, 0.0005)), @as(f64, @as(f32, 0.06)));
+            body.velocity[2] *= @as(f64, @as(f32, 0.99));
+        } else if (!environment.solid) body.velocity[1] -= 0.03;
+        if (environment.lava) {
+            const random = self.random.random();
+            body.velocity = .{ (random.float(f32) - random.float(f32)) * @as(f32, 0.2), @as(f64, @as(f32, 0.2)), (random.float(f32) - random.float(f32)) * @as(f32, 0.2) };
+        }
+        held.body = body;
+        if (orb.ticks % 20 == 1) try self.merge(held, batch);
+        var target: ?usize = null;
+        if (orb.following) |handle| {
+            const player = self.deps.players.records[handle.index];
+            if (std.meta.eql(player.handle, @as(?sessions.Handle, handle)) and player.world == body.world and self.deps.player_states.of(&player).gamemode != .spectator and distance(body.position, player.position) <= 64) target = handle.index;
+        }
+        if (target == null) {
+            var closest: f64 = 64;
+            var candidates = self.deps.players.nearby(body.world, .{ .x = body.position[0], .y = body.position[1], .z = body.position[2] }, 1);
+            while (candidates.next()) |player_index| {
+                const player = self.deps.players.records[player_index];
+                const state = self.deps.player_states.of(&player);
+                if (state.gamemode == .spectator or state.health <= 0) continue;
+                const squared = distance(body.position, player.position);
+                if (squared < closest) {
+                    closest = squared;
+                    target = player_index;
+                }
+            }
+        }
+        orb.following = if (target) |player_index| self.deps.players.records[player_index].handle else null;
+        if (target) |player_index| {
+            const player = self.deps.players.records[player_index];
+            const delta: [3]f64 = .{ player.position.x - body.position[0], player.position.y + @as(f64, @as(f32, if (player.flags.sneaking) 1.27 else 1.62)) / 2 - body.position[1], player.position.z - body.position[2] };
+            const length = @sqrt(delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]);
+            if (length >= 1e-4) {
+                const strength = (1 - length / 8) * (1 - length / 8) * 0.1 / length;
+                for (&body.velocity, 0..) |*component, axis| component.* += delta[axis] * strength;
+            }
+        }
+        if (target == null and environment.solid) {
+            var moved = body;
+            for (&moved.position, moved.velocity) |*position, velocity| position.* += velocity;
+            if (try self.deps.physics.orbCollides(window, moved)) {
+                try self.deps.physics.escapeOrb(window, &body, self.random.random());
+                orb.revision +%= 1;
+            }
+        }
+        const advanced = try self.deps.physics.advanceOrb(window, self.givenId(held.id), orb.ticks, body, orb.on_ground, orb.stuck.multiplier());
+        orb.on_ground = advanced.on_ground;
+        held.body = advanced.body;
+        const hazards = advanced.effects;
+        orb.stuck = Stuck.of(hazards.stuck);
+        if (hazards.lava > 0) {
+            orb.fire = @max(orb.fire, 300);
+            _ = try self.hurt(held, @as(f32, @floatFromInt(hazards.lava)) * 4);
+        }
+        if (orb.alive and hazards.fire > 0) {
+            orb.fire = @max(orb.fire, 160);
+            _ = try self.hurt(held, @floatFromInt(hazards.fire));
+        }
+        if (orb.alive and hazards.cactus > 0) _ = try self.hurt(held, @floatFromInt(hazards.cactus));
+        if (!orb.alive) return;
+        if (hazards.extinguish) orb.fire = 0;
+        if (orb.fire == 0) orb.fire = -1;
+        if (orb.ticks % 20 == 0) orb.revision +%= 1;
+        orb.age += 1;
+        if (orb.age >= 6000) try self.retire(held);
+    }
+
+    /// ExperienceOrb.scanForMerges: orbs of its value within a block, in the bucket of its id,
+    /// in the order found, fold into it; one of the batch in hand is folded where it lies.
+    fn merge(self: *Experience, held: *Held, batch: []Held) !void {
+        const body = held.body.?;
+        const Fold = struct {
+            owner: *Experience,
+            held: *Held,
+            batch: []Held,
+            fn visit(fold: *@This(), entry: entities.space.Entry) !bool {
+                if (entry.id == fold.held.id) return false;
+                const at = entry.position;
+                const here = fold.held.body.?.position;
+                if (@abs(at[0] - here[0]) >= 1 or @abs(at[1] - here[1]) >= 1 or @abs(at[2] - here[2]) >= 1) return false;
+                if (@mod(@as(i64, fold.owner.networkId(entry.id)) - @as(i64, fold.owner.networkId(fold.held.id)), 40) != 0) return false;
+                const in_batch = for (fold.batch) |*other| {
+                    if (other.id == entry.id) break other;
+                } else null;
+                var separate: [1]Held = undefined;
+                const other = in_batch orelse other: {
+                    try fold.owner.hold(&.{entry.id}, &separate, false);
+                    break :other &separate[0];
+                };
+                defer if (in_batch == null) fold.owner.settle(other) catch fold.owner.deps.storage.fail();
+                if (!other.orb.alive or other.orb.value != fold.held.orb.value) return false;
+                if (other.orb.count > std.math.maxInt(i32) - fold.held.orb.count) return false;
+                fold.held.orb.count += other.orb.count;
+                fold.held.orb.age = @min(fold.held.orb.age, other.orb.age);
+                try fold.owner.retire(other);
+                return false;
+            }
+        };
+        var fold: Fold = .{ .owner = self, .held = held, .batch = batch };
+        try self.eachNear(body.world, .{ body.position[0] - 1, body.position[1] - 1, body.position[2] - 1 }, .{ body.position[0] + 1, body.position[1] + 1, body.position[2] + 1 }, &fold, Fold.visit);
+    }
+
+    /// Players take what orbs they touch, one each tick of their delay; and those dying leave
+    /// theirs.
+    fn collect(self: *Experience) !void {
         for (self.deps.players.activeSlots()) |player_index| {
             const player = &self.deps.players.records[player_index];
             const state = self.deps.player_states.of(player);
@@ -463,24 +771,46 @@ pub const Experience = struct {
                 continue;
             }
             if (player.stage != .ready or state.gamemode == .spectator or state.experience_delay != 0) continue;
+            // Player.aiStep: of the orbs touched, one at random, Util.getRandom over them in
+            // the order they are found: counted first, then the chosen one found again.
             const reach = 1.25 + @as(f64, @as(f32, 0.6)) / 2;
-            var nearby = self.spatial.rectangle(player.world, .{ @intFromFloat(@floor((player.position.x - reach) / 16)), @intFromFloat(@floor((player.position.z - reach) / 16)) }, .{ @intFromFloat(@floor((player.position.x + reach) / 16)), @intFromFloat(@floor((player.position.z + reach) / 16)) });
-            var count: usize = 0;
-            while (nearby.next()) |index| {
-                const body = self.orbs[index].body;
-                if (@abs(body.position[0] - player.position.x) >= reach or @abs(body.position[2] - player.position.z) >= reach or body.position[1] + 0.5 <= player.position.y - 0.5 or body.position[1] >= player.position.y + @as(f64, @as(f32, if (player.flags.sneaking) 1.5 else 1.8)) + 0.5) continue;
-                self.candidates[count] = index;
-                count += 1;
-            }
-            if (count == 0) continue;
-            const index = self.candidates[self.random.random().uintLessThan(usize, count)];
-            const orb = &self.orbs[index];
+            const top = player.position.y + @as(f64, @as(f32, if (player.flags.sneaking) 1.5 else 1.8)) + 0.5;
+            const Touch = struct {
+                owner: *Experience,
+                player: minecraft.Position,
+                reach: f64,
+                top: f64,
+                count: usize = 0,
+                wanted: ?usize = null,
+                found: ?entities.Id = null,
+                fn visit(touch: *@This(), entry: entities.space.Entry) !bool {
+                    const at = entry.position;
+                    if (@abs(at[0] - touch.player.x) >= touch.reach or @abs(at[2] - touch.player.z) >= touch.reach or at[1] + 0.5 <= touch.player.y - 0.5 or at[1] >= touch.top) return false;
+                    if (touch.wanted) |wanted| if (touch.count == wanted) {
+                        touch.found = entry.id;
+                        return true;
+                    };
+                    touch.count += 1;
+                    return false;
+                }
+            };
+            const low: [3]f64 = .{ player.position.x - reach, player.position.y - 1, player.position.z - reach };
+            const high: [3]f64 = .{ player.position.x + reach, top, player.position.z + reach };
+            var counting: Touch = .{ .owner = self, .player = player.position, .reach = reach, .top = top };
+            try self.eachNear(player.world, low, high, &counting, Touch.visit);
+            if (counting.count == 0) continue;
+            var choosing: Touch = .{ .owner = self, .player = player.position, .reach = reach, .top = top, .wanted = self.random.random().uintLessThan(usize, counting.count) };
+            try self.eachNear(player.world, low, high, &choosing, Touch.visit);
+            const entity = choosing.found orelse return error.CorruptExperienceOrb;
+            var held: [1]Held = undefined;
+            try self.hold(&.{entity}, &held, false);
+            defer self.settle(&held[0]) catch self.deps.storage.fail();
             state.experience_delay = 2;
-            self.givePoints(player_index, try self.repair(player_index, orb.value));
-            orb.count -= 1;
-            self.pickups[self.pickup_count] = .{ .entity = self.residents[index].id, .collector = @intCast(player_index + 1) };
+            self.givePoints(player_index, try self.repair(player_index, held[0].orb.value));
+            held[0].orb.count -= 1;
+            self.pickups[self.pickup_count] = .{ .entity = entity, .collector = @intCast(player_index + 1), .body = held[0].body.?, .value = held[0].orb.value };
             self.pickup_count += 1;
-            if (orb.count == 0) try self.retire(index);
+            if (held[0].orb.count == 0) try self.retire(&held[0]);
         }
     }
 
@@ -589,89 +919,31 @@ pub const Experience = struct {
         return left;
     }
 
-    fn merge(self: *Experience, index: usize, body: entities.State) !void {
-        var nearby = self.spatial.rectangle(body.world, .{ @intFromFloat(@floor((body.position[0] - 1) / 16)), @intFromFloat(@floor((body.position[2] - 1) / 16)) }, .{ @intFromFloat(@floor((body.position[0] + 1) / 16)), @intFromFloat(@floor((body.position[2] + 1) / 16)) });
-        var count: usize = 0;
-        while (nearby.next()) |candidate| {
-            const other = self.orbs[candidate];
-            if (candidate == index or other.value != self.orbs[index].value or @mod(@as(i64, @intCast(self.residents[candidate].id)) - @as(i64, @intCast(self.residents[index].id)), 40) != 0) continue;
-            const at = self.orbs[candidate].body.position;
-            if (@abs(at[0] - body.position[0]) >= 1 or @abs(at[1] - body.position[1]) >= 1 or @abs(at[2] - body.position[2]) >= 1) continue;
-            self.candidates[count] = candidate;
-            count += 1;
-        }
-        for (self.candidates[0..count]) |candidate| {
-            const orb = &self.orbs[index];
-            if (self.orbs[candidate].count > std.math.maxInt(i32) - orb.count) continue;
-            orb.count += self.orbs[candidate].count;
-            orb.age = @min(orb.age, self.orbs[candidate].age);
-            try self.retire(candidate);
-        }
-    }
-
     pub fn checkpoint(self: *Experience, space: storage.Space) !void {
         errdefer space.fail();
-        var cursor: usize = 0;
-        const capacity = @min(128, self.deps.entities.cache.entries.len);
-        while (cursor < self.active.values().len) {
-            var ids: [128]u64 = undefined;
-            var indices: [128]usize = undefined;
-            var leases: [128]entities.Entities.Lease = undefined;
-            var count: usize = 0;
-            while (cursor < self.active.values().len and count < capacity) : (cursor += 1) {
-                const index = self.active.values()[cursor];
-                if (!self.orbs[index].alive) continue;
-                ids[count] = self.residents[index].id;
-                indices[count] = index;
-                count += 1;
+        var batch: entities.durable.Batch(record_bytes) = .{ .table = self.table };
+        for (self.ids()) |entity| {
+            var stored = (try self.orbs.get(entity)).?;
+            if (!stored.orb.alive) {
+                // Gone but not yet forgotten: its record goes now, and nothing comes back.
+                if (stored.stored) |column| try batch.delete(entities.durable.key(record_prefix, column, entity));
+                stored.stored = null;
+                try self.orbs.put(entity, stored);
+                continue;
             }
-            try self.deps.entities.acquireMany(ids[0..count], leases[0..count]);
-            defer for (leases[0..count]) |lease| lease.release();
-            for (indices[0..count], leases[0..count]) |index, lease| {
-                if (!std.meta.eql((try lease.read()).?, self.orbs[index].body)) try lease.write(self.orbs[index].body);
-            }
+            if (!stored.dirty) continue;
+            const body = (try self.deps.entities.get(entity)).?;
+            try save(&batch, entity, body, stored);
+            stored.stored = entities.space.columnOf(body.world, body.position);
+            stored.dirty = false;
+            try self.orbs.put(entity, stored);
         }
-        // Live bodies belong to this array. Their store may already have checkpointed.
-        try self.deps.entities.checkpoint(self.deps.entities.deps.storage);
-        var keys: [records.Table.write_batch_size][9]u8 = undefined;
-        var values: [records.Table.write_batch_size][encoded_size]u8 = undefined;
-        var writes: [records.Table.write_batch_size]records.Write = undefined;
-        var count: usize = 0;
-        for (self.saved[0..self.saved_count]) |entity| {
-            if (self.ids.get(entity)) |index| if (self.orbs[index].alive) continue;
-            keys[count][0] = 1;
-            std.mem.writeInt(u64, keys[count][1..9], entity, .big);
-            writes[count] = .{ .key = &keys[count], .value = null };
-            count += 1;
-            if (count == writes.len) {
-                try self.table.putBatch(writes[0..count]);
-                count = 0;
-            }
-        }
-        for (self.active.values()) |index| {
-            const orb = self.orbs[index];
-            if (!orb.alive) continue;
-            keys[count][0] = 1;
-            std.mem.writeInt(u64, keys[count][1..9], self.residents[index].id, .big);
-            values[count] = orb.encode();
-            writes[count] = .{ .key = &keys[count], .value = &values[count] };
-            count += 1;
-            if (count == writes.len) {
-                try self.table.putBatch(writes[0..count]);
-                count = 0;
-            }
-        }
-        if (count > 0) try self.table.putBatch(writes[0..count]);
+        try batch.flush();
         const random_bytes = self.random.encode();
         if (!std.mem.eql(u8, &random_bytes, &self.random.saved)) {
             try self.table.put(&.{0}, &random_bytes);
             self.random.saved = random_bytes;
         }
-        self.saved_count = 0;
-        for (self.active.values()) |index| if (self.orbs[index].alive) {
-            self.saved[self.saved_count] = self.residents[index].id;
-            self.saved_count += 1;
-        };
     }
 };
 

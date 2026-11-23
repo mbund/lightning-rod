@@ -1319,3 +1319,38 @@ test "key scans paginate without requiring value buffers" {
     try std.testing.expect(!second.more);
     try std.testing.expectEqualStrings("b", key[0..rows[0].key_len]);
 }
+
+test "a scan stops before its bound, on disk and in the cache alike" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/bounded", .{directory.sub_path});
+    const io = std.testing.io;
+    var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path, .io_mode = .standard });
+    defer store.deinit();
+    const resources = try records.Resources.init(std.testing.allocator, io, .{ .readers = 1, .writers = 1 });
+    defer resources.deinit();
+    const table = records.Table.init(try store.openSpace("bounded"), resources);
+    // Past the bound lie values too large for the scan's buffers, which it must not touch.
+    const large: [64]u8 = @splat(9);
+    try table.putBatch(&.{ .{ .key = "a1", .value = "x" }, .{ .key = "a3", .value = "y" }, .{ .key = "b1", .value = &large } });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .capacity = 32 });
+    defer registry.deinit();
+    var cache = try records.Cache.init(arena.allocator(), io, table, .{ .metrics = &registry, .slots = 8, .key_bytes = 4, .value_bytes = 4, .scan_batch = 8 });
+    // Cached, on either side of the bound.
+    for ([_][]const u8{ "a2", "b0" }) |key| {
+        const lease = try cache.acquire(key);
+        lease.edit()[0] = 'z';
+        lease.commit(1);
+        lease.release();
+    }
+    var after: [4]u8 = undefined;
+    var cursor: records.ScanCursor = .{ .after = &after, .before = "b" };
+    var rows: [8]records.BorrowedEntry = undefined;
+    const result = try cache.scanBorrowed(&cursor, &rows);
+    try std.testing.expect(!result.more);
+    try std.testing.expectEqual(@as(usize, 3), result.count);
+    for (rows[0..3], [_][]const u8{ "a1", "a2", "a3" }) |row, expected| try std.testing.expectEqualStrings(expected, row.key);
+}

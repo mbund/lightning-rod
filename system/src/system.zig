@@ -1,4 +1,6 @@
 pub const FileBatch = @import("file_io.zig").FileBatch;
+pub const scratch_file = @import("scratch_file.zig");
+pub const ScratchFile = scratch_file.ScratchFile;
 pub const Memory = @import("memory.zig").Memory;
 pub const work = @import("work.zig");
 pub const huge_page_allocator = @import("huge_pages.zig").allocator;
@@ -22,4 +24,5 @@ test {
     _ = @import("bit_sets.zig");
     _ = @import("sparse_sets.zig");
     _ = @import("file_io.zig");
+    _ = @import("scratch_file.zig");
 }

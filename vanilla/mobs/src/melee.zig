@@ -33,7 +33,7 @@ const assert = std.debug.assert;
 
 /// What a hit lands on.
 pub const Target = union(enum) {
-    mob: *Mob,
+    mob: Mob,
     /// A player, by slot.
     player: usize,
 };
@@ -257,7 +257,7 @@ pub const Melee = struct {
         try self.deps.damage.setMotion(slot, .{ player.known_movement[0], 0.01, player.known_movement[2] });
         self.deps.falls.reset(slot);
         const grounded = switch (target) {
-            .mob => |mob| mob.on_ground,
+            .mob => |mob| mob.motion.on_ground,
             .player => |victim| self.deps.players.records[victim].on_ground,
         };
         self.sound(slot, if (!grounded) "minecraft:item.mace.smash_air" else if (fallen > 5) "minecraft:item.mace.smash_ground_heavy" else "minecraft:item.mace.smash_ground");
@@ -274,18 +274,20 @@ pub const Melee = struct {
         const box = self.boxOf(target);
         const reach: body.Box = .{ .min = .{ box.min[0] - 3.5, box.min[1] - 3.5, box.min[2] - 3.5 }, .max = .{ box.max[0] + 3.5, box.max[1] + 3.5, box.max[2] + 3.5 } };
         const scale: f64 = if (fallen > 5) 2 else 1;
-        const mobs = self.deps.mobs;
-        var candidates = mobs.grid.query(player.world, .{ reach.min[0] - mobs.widest_half, reach.min[2] - mobs.widest_half }, .{ reach.max[0] + mobs.widest_half, reach.max[2] + mobs.widest_half });
-        while (candidates.next()) |index| {
-            const mob = &mobs.mobs[index];
-            if (mob.removed or !mob.alive() or (target == .mob and target.mob == mob) or !mobs.grid.boxes[index].intersects(reach)) continue;
-            const strength = smashStrength(center, mob.position, scale) * (1 - mobs.traits(mob.species).attribute(.knockback_resistance));
-            if (strength <= 0) continue;
-            const away = living.normalize(.{ mob.position[0] - center[0], mob.position[1] - center[1], mob.position[2] - center[2] });
-            mob.velocity = .{ mob.velocity[0] + away[0] * strength, mob.velocity[1] + 0.7, mob.velocity[2] + away[2] * strength };
-            mob.has_impulse = true;
-            mobs.rouse(index);
-        }
+        var knock: struct { mobs: *Mobs, target: Target, center: [3]f64, scale: f64 } = .{ .mobs = self.deps.mobs, .target = target, .center = center, .scale = scale };
+        try self.deps.mobs.each(player.world, reach, &knock, struct {
+            fn visit(context: *@TypeOf(knock), mob: Mob) anyerror!bool {
+                const mobs = context.mobs;
+                if (!mob.alive() or (context.target == .mob and context.target.mob.same(mob))) return false;
+                const strength = smashStrength(context.center, mob.motion.position, context.scale) * (1 - mobs.traits(mob.entity.species).attribute(.knockback_resistance));
+                if (strength <= 0) return false;
+                const away = living.normalize(.{ mob.motion.position[0] - context.center[0], mob.motion.position[1] - context.center[1], mob.motion.position[2] - context.center[2] });
+                mob.motion.velocity = .{ mob.motion.velocity[0] + away[0] * strength, mob.motion.velocity[1] + 0.7, mob.motion.velocity[2] + away[2] * strength };
+                mob.entity.has_impulse = true;
+                mobs.rouseMob(mob);
+                return false;
+            }
+        }.visit);
         var players = self.deps.players.nearby(player.world, .{ .x = center[0], .y = 0, .z = center[2] }, 1);
         while (players.next()) |other| {
             if (other == slot or (target == .player and target.player == other)) continue;
@@ -320,7 +322,7 @@ pub const Melee = struct {
 
     /// Player.attack's sweep: every other living thing in reach of the target's box inflated by
     /// (1, 0.25, 1) and within 3 blocks of the attacker, mobs in the order vanilla finds them and
-    /// then players. The mob grid and the players' spatial index give the few in the cells under
+    /// then players. The mobs' places and the players' spatial index give the few in the cells under
     /// the box, so a sweep looks at nothing farther.
     fn sweep(self: *Melee, slot: usize, weapon: ?item_data.View, effects: *const Attack, target: Target, hit: Hit) !void {
         const player = &self.deps.players.records[slot];
@@ -332,13 +334,17 @@ pub const Melee = struct {
             .max = .{ box.max[0] + 1, box.max[1] + 0.25, box.max[2] + 1 },
         };
         switch (target) {
-            // Hurting a mob makes no query of its own, so the slice holds through the loop.
-            .mob => |mob| for (try self.deps.mobs.near(mob, reach, .living)) |index| try self.sweepOne(slot, weapon, effects, .{ .mob = &self.deps.mobs.mobs[index] }, amount, hit.scale),
-            .player => {
-                var mobs = self.deps.mobs.grid.query(player.world, .{ reach.min[0] - self.deps.mobs.widest_half, reach.min[2] - self.deps.mobs.widest_half }, .{ reach.max[0] + self.deps.mobs.widest_half, reach.max[2] + self.deps.mobs.widest_half });
-                while (mobs.next()) |index| {
-                    if (!self.deps.mobs.grid.boxes[index].intersects(reach) or self.deps.mobs.mobs[index].removed) continue;
-                    try self.sweepOne(slot, weapon, effects, .{ .mob = &self.deps.mobs.mobs[index] }, amount, hit.scale);
+            .mob, .player => {
+                var swept: struct { melee: *Melee, slot: usize, weapon: @TypeOf(weapon), effects: @TypeOf(effects), amount: @TypeOf(amount), scale: @TypeOf(hit.scale) } = .{ .melee = self, .slot = slot, .weapon = weapon, .effects = effects, .amount = amount, .scale = hit.scale };
+                const Sweep = struct {
+                    fn visit(context: *@TypeOf(swept), mob: Mob) anyerror!bool {
+                        try context.melee.sweepOne(context.slot, context.weapon, context.effects, .{ .mob = mob }, context.amount, context.scale);
+                        return false;
+                    }
+                };
+                switch (target) {
+                    .mob => |mob| try self.deps.mobs.near(mob, reach, .living, &swept, Sweep.visit),
+                    .player => try self.deps.mobs.each(player.world, reach, &swept, Sweep.visit),
                 }
             },
         }
@@ -514,27 +520,27 @@ pub const Melee = struct {
     fn animate(self: *Melee, slot: usize, target: Target, animation: Mobs.Animation) void {
         switch (target) {
             .mob => |mob| self.deps.mobs.animate(mob, animation),
-            .player => |victim| self.entity.send(self.deps.replication.viewers(slot), slot, .{ .animation = .{ .id = entity_effects.playerId(victim), .animation = @intFromEnum(animation) } }),
+            .player => |victim| self.entity.send(self.deps.replication.viewers(slot), slot, .{ .animation = .{ .id = entity_effects.playerId(victim), .animation = @backingInt(animation) } }),
         }
     }
 
     fn typeOf(self: *const Melee, target: Target) u32 {
         return switch (target) {
-            .mob => |mob| self.deps.mobs.traits(mob.species).entity_type,
+            .mob => |mob| self.deps.mobs.traits(mob.entity.species).entity_type,
             .player => self.player_type,
         };
     }
 
     fn healthOf(self: *Melee, target: Target) f32 {
         return switch (target) {
-            .mob => |mob| mob.health,
+            .mob => |mob| mob.living.health,
             .player => |victim| self.deps.player_states.of(&self.deps.players.records[victim]).health,
         };
     }
 
     fn positionOf(self: *const Melee, target: Target) [3]f64 {
         return switch (target) {
-            .mob => |mob| mob.position,
+            .mob => |mob| mob.motion.position,
             .player => |victim| blk: {
                 const position = self.deps.players.records[victim].position;
                 break :blk .{ position.x, position.y, position.z };

@@ -460,8 +460,6 @@ pub const Containers = struct {
                     spawns[drops] = .{ .world = key.world, .position = .{ @as(f64, @floatFromInt(key.position.x)) + 0.5, @as(f64, @floatFromInt(key.position.y)) + 0.5, @as(f64, @floatFromInt(key.position.z)) + 0.5 }, .velocity = .{ 0, 0.2, 0 }, .stack = stack };
                     drops += 1;
                 };
-                assert(request.following_drops <= self.deps.dropped.residents.len);
-                if (!self.deps.dropped.canCreate(drops + request.following_drops)) return .denied;
                 const reward_plan: ?Reward = if (kind == .furnace) try self.reward(key) else null;
                 if (reward_plan) |plan| if (!self.deps.experience.canAwardMany(plan.amounts)) return .denied;
                 errdefer self.deps.storage.fail();
@@ -471,7 +469,6 @@ pub const Containers = struct {
                     const committed = try self.deps.inventories.editMany(edits[0..drops]);
                     assert(committed);
                 }
-                assert(self.deps.dropped.canCreate(request.following_drops));
                 if (kind == .chest) {
                     if (self.states.partner(request.state, key.position)) |partner| {
                         const other = try self.chunk_client.getBlock(key.world, partner);
@@ -630,10 +627,6 @@ pub const Containers = struct {
             view.drag = previous;
             return;
         };
-        if (!self.deps.dropped.canCreate(result.count)) {
-            view.drag = previous;
-            return;
-        }
         if (view.kind == .furnace) if (next[1]) |stack| {
             const old = contents[1].stack;
             const inserted = old == null or !inventories.Stack.sameItem(old.?, stack) or stack.count > old.?.count;

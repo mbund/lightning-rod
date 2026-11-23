@@ -72,19 +72,19 @@ const Probe = struct {
     }
 
     fn verify(self: *Probe) !void {
-        const target = self.deps.mobs.get(self.cows[1]) orelse return error.TargetGone;
+        const target = (try self.deps.mobs.get(self.cows[1])) orelse return error.TargetGone;
         // A diamond sword's 7, and Sharpness I's 1.
-        if (target.health != 2) {
-            std.log.err("event=melee_target health={d}", .{target.health});
+        if (target.living.health != 2) {
+            std.log.err("event=melee_target health={d}", .{target.living.health});
             return error.TargetHealthIncorrect;
         }
         // Fire Aspect I: four seconds alight.
-        if (target.fire_ticks <= 0 or target.fire_ticks > 80) return error.TargetNotBurning;
+        if (target.entity.fire_ticks <= 0 or target.entity.fire_ticks > 80) return error.TargetNotBurning;
         // The sweep's 1, and Sharpness I's 1 again.
         for ([_]u64{ self.cows[0], self.cows[2] }) |cow| {
-            const neighbor = self.deps.mobs.get(cow) orelse return error.NeighborGone;
-            if (neighbor.health != 8) {
-                std.log.err("event=melee_neighbor health={d}", .{neighbor.health});
+            const neighbor = (try self.deps.mobs.get(cow)) orelse return error.NeighborGone;
+            if (neighbor.living.health != 8) {
+                std.log.err("event=melee_neighbor health={d}", .{neighbor.living.health});
                 return error.SweepIncorrect;
             }
         }

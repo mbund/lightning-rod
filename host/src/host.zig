@@ -23,3 +23,12 @@ pub fn inheritedListener(init: std.process.Init) !?i32 {
 test {
     _ = timing;
 }
+
+/// Whether a tick failed for a bound the server has, past which vanilla would have crashed: then
+/// it stops cleanly rather than fails.
+pub fn boundReached(err: anyerror) bool {
+    return switch (err) {
+        error.EntitiesFull, error.EntityMemoryExhausted, error.DiskFull, error.NetworkIdsExhausted, error.NetworkIdsUnavailable => true,
+        else => false,
+    };
+}

@@ -398,9 +398,9 @@ pub fn benchmarkPickup() !void {
             .equipment = undefined,
             .dropped = undefined,
         });
-        const bodies = try entities.Entities.allocate(allocator, io, .{ .cache_records = 2 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
+        const bodies = try entities.Entities.allocate(allocator, io, .{}, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.allocate(allocator, .{ .maximum = 1 });
-        const dropped = try ItemEntities.allocate(allocator, io, .{ .cache_records = 4, .maximum = 1 }, .{
+        const dropped = try ItemEntities.allocate(allocator, io, .{}, .{
             .metrics = &registry,
             .record_workspaces = workspaces,
             .entities = bodies,
@@ -490,10 +490,10 @@ pub fn benchmarkItemReplication() !void {
         const gameplay_definitions = try vanilla_content.prepare(allocator);
         const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const stack: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 1 };
-        const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 128 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
+        const bodies = try entities.Entities.init(allocator, io, .{}, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
         const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
-        const dropped = try ItemEntities.init(allocator, io, .{ .cache_records = 256, .maximum = 64 }, .{
+        const dropped = try ItemEntities.init(allocator, io, .{}, .{
             .metrics = &registry,
             .record_workspaces = workspaces,
             .entities = bodies,
@@ -529,19 +529,14 @@ pub fn benchmarkItemReplication() !void {
         for (std.enums.values(Mode)) |mode| {
             const blocked = mode == .blocked_spawn or mode == .blocked_change or mode == .blocked_mutation or mode == .blocked_retirement;
             if (mode == .single_move) {
-                var held: [1]ItemEntities.Record = undefined;
-                try dropped.acquireMany(ids[0..1], &held);
-                defer held[0].release();
-                const before = (try held[0].body.read()).?;
+                const held_id = (ids[0..1])[0];
+                const before = (try dropped.read(held_id)).?.body;
                 var after = before;
                 after.position[0] += 0.125;
-                const spatial_revision = dropped.spatial.revision;
-                try dropped.move(held[0], before, after);
-                try std.testing.expectEqual(spatial_revision, dropped.spatial.revision);
-                try std.testing.expectEqualSlices(f64, &.{ after.position[0], after.position[2] }, &dropped.residents[dropped.ids.get(ids[0]).?].position);
-                var metadata = try held[0].read();
+                try dropped.move(held_id, before, after);
+                var metadata = try dropped.get(held_id);
                 metadata.revision += 1;
-                held[0].write(metadata);
+                try dropped.put(held_id, metadata);
             }
             if (mode == .single_stack) {
                 const body = (try bodies.get(ids[0])).?;
@@ -567,13 +562,10 @@ pub fn benchmarkItemReplication() !void {
                 id.* = try dropped.create(world, .{ 0.5, 65, 0.5 }, @splat(0), stack);
             };
             if (mode == .age_only) for (ids[0..count]) |id| {
-                var held_records: [1]ItemEntities.Record = undefined;
-                try dropped.acquireMany(&.{id}, &held_records);
-                defer held_records[0].release();
-                var metadata = try held_records[0].read();
+                var metadata = try dropped.get(id);
                 metadata.age += 1;
                 metadata.ticks += 1;
-                held_records[0].write(metadata);
+                try dropped.put(id, metadata);
             };
             if (mode == .leave_view) {
                 player_records[0].position.x = 1000;
@@ -589,8 +581,7 @@ pub fn benchmarkItemReplication() !void {
                 publication.life = player_records[0].life;
                 streaming.published.setStream(0, publication);
             }
-            const metadata_before = dropped.cache.metrics.acquired.value();
-            const bodies_before = bodies.cache.metrics.acquired.value();
+            const metadata_before = dropped.reads;
             service.credit[0].store((@as(u64, 1) << 32) | sessions.Service.active | @as(u64, if (blocked) 0 else service.config.credit_bytes), .release);
             const slots_before = ownership.cache.metrics.acquired.value();
             const definitions_before = ownership.items.metrics.acquired.value();
@@ -608,28 +599,27 @@ pub fn benchmarkItemReplication() !void {
             const unchanged = mode == .age_only or mode == .unchanged or mode == .unchanged_after_single_move or mode == .unchanged_after_single_stack or mode == .unchanged_after_mutation or mode == .unchanged_after_reuse;
             if (blocked or unchanged) try std.testing.expectEqual(@as(usize, 0), queued) else try std.testing.expect(queued >= (if (mode == .single_move or mode == .single_stack) @as(usize, 1) else count));
             if (unchanged) {
-                try std.testing.expectEqual(metadata_before, dropped.cache.metrics.acquired.value());
-                try std.testing.expectEqual(bodies_before, bodies.cache.metrics.acquired.value());
+                try std.testing.expectEqual(metadata_before, dropped.reads);
             }
             if (mode == .single_move or mode == .single_stack) {
-                try std.testing.expectEqual(@as(u64, 1), dropped.cache.metrics.acquired.value() - metadata_before);
-                try std.testing.expectEqual(@as(u64, 1), bodies.cache.metrics.acquired.value() - bodies_before);
+                try std.testing.expectEqual(@as(u64, 1), dropped.reads - metadata_before);
                 try std.testing.expectEqual(@as(usize, 1), queued);
             }
+            // A stack is read whenever anyone is interested in an item looked at.
             const acquired: usize = switch (mode) {
-                .single_stack => 1,
-                .spawn, .mutation, .resumed_mutation, .reuse => count,
+                .single_stack, .single_move => 1,
+                .blocked_spawn, .spawn, .blocked_change, .change, .mutation, .blocked_mutation, .resumed_mutation, .reuse, .return_view, .viewer_reset => count,
                 else => 0,
             };
-            const prepared: usize = if (mode == .change or mode == .return_view or mode == .viewer_reset) count else acquired;
+            // Definitions are read only for a stack to send: a move alone sends none.
+            const prepared: usize = if (mode == .change or mode == .return_view or mode == .viewer_reset) count else if (mode == .single_move) 0 else acquired;
             try std.testing.expectEqual(acquired, ownership.cache.metrics.acquired.value() - slots_before);
             try std.testing.expectEqual(prepared, ownership.items.metrics.acquired.value() - definitions_before);
-            if (mode == .retirement) try std.testing.expectEqual(@as(usize, 0), replication.inventory_observer.owners.count());
             if (mode == .mutation or mode == .resumed_mutation or mode == .reuse or mode == .unchanged_after_reuse) for (ids[0..count]) |id| {
-                const view = replication.views[dropped.ids.get(id).?];
-                const expected: u16 = if (mode == .mutation) 2 else if (mode == .resumed_mutation) 3 else 1;
-                try std.testing.expectEqual(expected, view.contents.stack.?.count);
-                try std.testing.expectEqual(@as(u64, 0), view.inventory_dirty);
+                // Its stack went out to its viewer: nothing is owed.
+                const view = try replication.known(id);
+                try std.testing.expectEqual(@as(usize, 0), view.stacks);
+                try std.testing.expectEqual(@as(usize, 0), view.pending);
             };
             try output.interface.print("{d:13} | {s:13} | {d:17} | {d:23} | {d}\n", .{ count, @tagName(mode), ownership.cache.metrics.acquired.value() - slots_before, ownership.items.metrics.acquired.value() - definitions_before, queued });
         }
@@ -750,10 +740,10 @@ pub fn benchmarkDrops() !void {
         const gameplay_definitions = try vanilla_content.prepare(allocator);
         const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const stack: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 1 };
-        const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 128 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
+        const bodies = try entities.Entities.init(allocator, io, .{}, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
         const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
-        const dropped = try ItemEntities.init(allocator, io, .{ .cache_records = 256, .maximum = 64 }, .{
+        const dropped = try ItemEntities.init(allocator, io, .{}, .{
             .metrics = &registry,
             .record_workspaces = workspaces,
             .entities = bodies,
@@ -782,17 +772,17 @@ pub fn benchmarkDrops() !void {
         const next_id = bodies.next_id;
         try std.testing.expectError(error.InvalidStack, menu.dropMany(player, &.{ stack, .{ .item = stack.item, .count = 0 } }));
         try std.testing.expectEqual(next_id, bodies.next_id);
-        try std.testing.expectEqual(@as(usize, 64), dropped.free_count);
-        const body_before = bodies.cache.metrics.acquired.value();
-        const metadata_before = dropped.cache.metrics.acquired.value();
+        try std.testing.expectEqual(@as(usize, 0), dropped.count());
+        const reads_before = dropped.reads;
         const slots_before = ownership.cache.metrics.acquired.value();
         const definitions_before = ownership.items.metrics.acquired.value();
         try std.testing.expect(try menu.dropMany(player, stacks[0..count]));
-        try std.testing.expectEqual(@as(u64, count), bodies.cache.metrics.acquired.value() - body_before);
-        try std.testing.expectEqual(@as(u64, count), dropped.cache.metrics.acquired.value() - metadata_before);
+        // Made, not read: each comes into memory as it is made.
+        try std.testing.expectEqual(reads_before, dropped.reads);
+        try std.testing.expectEqual(@as(usize, count), dropped.count());
         try std.testing.expectEqual(@as(u64, count), ownership.cache.metrics.acquired.value() - slots_before);
         try std.testing.expectEqual(@as(u64, 1), ownership.items.metrics.acquired.value() - definitions_before);
-        try output.interface.print("{d:5} | {d:17} | {d:21} | {d:22} | {d}\n", .{ count, bodies.cache.metrics.acquired.value() - body_before, dropped.cache.metrics.acquired.value() - metadata_before, ownership.cache.metrics.acquired.value() - slots_before, ownership.items.metrics.acquired.value() - definitions_before });
+        try output.interface.print("{d:5} | {d:22} | {d}\n", .{ count, ownership.cache.metrics.acquired.value() - slots_before, ownership.items.metrics.acquired.value() - definitions_before });
         for (next_id..bodies.next_id) |entity| {
             const metadata = try dropped.get(entity);
             try std.testing.expectEqual(@as(u16, 40), metadata.pickup_delay);
@@ -802,9 +792,10 @@ pub fn benchmarkDrops() !void {
             try std.testing.expectEqual(stack, held.stack.?);
             try std.testing.expectEqual(@as(u64, 1), held.revision);
         }
+        // Nothing is refused: another whole batch drops.
         const after = bodies.next_id;
-        try std.testing.expect(!try menu.dropMany(player, &stacks));
-        try std.testing.expectEqual(after, bodies.next_id);
+        try std.testing.expect(try menu.dropMany(player, &stacks));
+        try std.testing.expectEqual(after + stacks.len, bodies.next_id);
     }
     try output.interface.flush();
 }
@@ -841,10 +832,10 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
     const gameplay_definitions = try vanilla_content.prepare(allocator);
     const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
     const stack: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 64 };
-    const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 256 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
+    const bodies = try entities.Entities.init(allocator, io, .{}, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
     const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
     const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
-    const dropped = try ItemEntities.init(allocator, io, .{ .cache_records = 256, .maximum = 1024 }, .{
+    const dropped = try ItemEntities.init(allocator, io, .{}, .{
         .metrics = &registry,
         .record_workspaces = workspaces,
         .entities = bodies,
@@ -910,9 +901,7 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
         player_records[connection].position.x = step.position[0];
         player_records[connection].position.z = step.position[1];
         players.rebuildIndexes();
-        const metadata_before = dropped.cache.metrics.acquired.value();
-        const bodies_before = bodies.cache.metrics.acquired.value();
-        const reads_before = dropped.cache.metrics.reads.value() + bodies.cache.metrics.reads.value();
+        const metadata_before = dropped.reads;
         service.credit[connection].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
         service.beginTick();
         streaming.tick();
@@ -925,22 +914,18 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
             queued += 1;
             service.recycle(io, &.{packet});
         }
-        const metadata_acquired = dropped.cache.metrics.acquired.value() - metadata_before;
-        const bodies_acquired = bodies.cache.metrics.acquired.value() - bodies_before;
-        const reads = dropped.cache.metrics.reads.value() + bodies.cache.metrics.reads.value() - reads_before;
+        const metadata_acquired = dropped.reads - metadata_before;
         if (step.unchanged) {
             try std.testing.expectEqual(@as(u64, 0), metadata_acquired);
-            try std.testing.expectEqual(@as(u64, 0), bodies_acquired);
-            try std.testing.expectEqual(@as(u64, 0), reads);
         }
         if (was_visible == step.visible) try std.testing.expectEqual(@as(usize, 0), queued) else try std.testing.expect(queued > 0);
         for (ids[0..count]) |id| {
-            const view = replication.views[dropped.ids.get(id).?];
-            try std.testing.expectEqual(@as(usize, if (step.visible) 1 else 0), view.spawned.view().count());
-            try std.testing.expectEqual(@as(usize, 0), view.pending.view().count());
+            const view = try replication.known(id);
+            try std.testing.expectEqual(@as(usize, if (step.visible) 1 else 0), view.spawned);
+            try std.testing.expectEqual(@as(usize, 0), view.pending);
         }
         was_visible = step.visible;
-        try output.print("{d:15} | {d:13} | {d:15} | {d:21} | {d:17} | {d:20} | {d}\n", .{ capacity, count, index, metadata_acquired, bodies_acquired, reads, queued });
+        try output.print("{d:15} | {d:13} | {d:15} | {d:21} | {d}\n", .{ capacity, count, index, metadata_acquired, queued });
     }
 }
 
@@ -970,10 +955,10 @@ pub fn benchmarkItemVisibility() !void {
         const gameplay_definitions = try vanilla_content.prepare(allocator);
         const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const stack: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 64 };
-        const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 256 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
+        const bodies = try entities.Entities.init(allocator, io, .{}, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
         const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
-        const dropped = try ItemEntities.init(allocator, io, .{ .cache_records = 256, .maximum = 1024 }, .{
+        const dropped = try ItemEntities.init(allocator, io, .{}, .{
             .metrics = &registry,
             .record_workspaces = workspaces,
             .entities = bodies,
@@ -1034,9 +1019,7 @@ pub fn benchmarkItemVisibility() !void {
                 publication.setup = .streaming;
                 streaming.published.setStream(0, publication);
             }
-            const metadata_before = dropped.cache.metrics.acquired.value();
-            const bodies_before = bodies.cache.metrics.acquired.value();
-            const reads_before = dropped.cache.metrics.reads.value() + bodies.cache.metrics.reads.value();
+            const metadata_before = dropped.reads;
             for (0..2) |i| service.credit[i].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
             service.beginTick();
             streaming.tick();
@@ -1052,12 +1035,10 @@ pub fn benchmarkItemVisibility() !void {
             const unchanged = mode == 1 or mode == 2 or mode == 5 or mode == 6;
             if (unchanged) {
                 try std.testing.expectEqual(@as(usize, 0), queued);
-                try std.testing.expectEqual(metadata_before, dropped.cache.metrics.acquired.value());
-                try std.testing.expectEqual(bodies_before, bodies.cache.metrics.acquired.value());
-                try std.testing.expectEqual(reads_before, dropped.cache.metrics.reads.value() + bodies.cache.metrics.reads.value());
+                try std.testing.expectEqual(metadata_before, dropped.reads);
             } else try std.testing.expect(queued > 0);
-            for (ids[0..count]) |id| try std.testing.expectEqual(@as(usize, if (mode == 3 or mode == 7) 0 else 1), replication.views[dropped.ids.get(id).?].spawned.view().count());
-            try output.interface.print("VISIBILITY items={d} mode={d} metadata={d} bodies={d} backend_records={d} packets={d}\n", .{ count, mode, dropped.cache.metrics.acquired.value() - metadata_before, bodies.cache.metrics.acquired.value() - bodies_before, dropped.cache.metrics.reads.value() + bodies.cache.metrics.reads.value() - reads_before, queued });
+            for (ids[0..count]) |id| try std.testing.expectEqual(@as(usize, if (mode == 3 or mode == 7) 0 else 1), (try replication.known(id)).spawned);
+            try output.interface.print("VISIBILITY items={d} mode={d} reads={d} packets={d}\n", .{ count, mode, dropped.reads - metadata_before, queued });
         }
     }
     try output.interface.flush();
@@ -1105,9 +1086,9 @@ pub fn benchmarkPickupAdmission() !void {
             .equipment = undefined,
             .dropped = undefined,
         });
-        const bodies = try entities.Entities.allocate(allocator, io, .{ .cache_records = 2 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
+        const bodies = try entities.Entities.allocate(allocator, io, .{}, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.allocate(allocator, .{ .maximum = 1 });
-        const dropped = try ItemEntities.allocate(allocator, io, .{ .cache_records = 4, .maximum = 1 }, .{
+        const dropped = try ItemEntities.allocate(allocator, io, .{}, .{
             .metrics = &registry,
             .record_workspaces = workspaces,
             .entities = bodies,
@@ -1331,10 +1312,10 @@ pub fn benchmarkItemBroadcast() !void {
         const gameplay_definitions = try vanilla_content.prepare(allocator);
         const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const stack: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 1 };
-        const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 512 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
+        const bodies = try entities.Entities.init(allocator, io, .{}, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
         const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
-        const dropped = try ItemEntities.init(allocator, io, .{ .cache_records = 512, .maximum = 256 }, .{
+        const dropped = try ItemEntities.init(allocator, io, .{}, .{
             .metrics = &registry,
             .record_workspaces = workspaces,
             .entities = bodies,
@@ -1388,22 +1369,20 @@ pub fn benchmarkItemBroadcast() !void {
         }
         failing.fail_index = failing.alloc_index;
         for (ids[0..count]) |id| {
-            const view = replication.views[dropped.ids.get(id).?];
-            try std.testing.expectEqual(expected_viewers, view.spawned.view().count());
-            try std.testing.expectEqual(@as(usize, 0), view.pending.view().count());
+            const view = try replication.known(id);
+            try std.testing.expectEqual(expected_viewers, view.spawned);
+            try std.testing.expectEqual(@as(usize, 0), view.pending);
         }
         for ([_]bool{ false, true }) |limited| {
             for (ids[0..count]) |id| {
-                var held: [1]ItemEntities.Record = undefined;
-                try dropped.acquireMany(&.{id}, &held);
-                defer held[0].release();
-                const before = (try held[0].body.read()).?;
+                const held_id = (&.{id})[0];
+                const before = (try dropped.read(held_id)).?.body;
                 var after = before;
                 after.position[0] += 0.125;
-                try dropped.move(held[0], before, after);
-                var metadata = try held[0].read();
+                try dropped.move(held_id, before, after);
+                var metadata = try dropped.get(held_id);
                 metadata.revision += 1;
-                held[0].write(metadata);
+                try dropped.put(held_id, metadata);
             }
             for (service.credit, 0..) |*credit, index| {
                 const bytes = if (limited and index == 0) service.framedBound(128) * 2 else service.config.credit_bytes;
@@ -1433,7 +1412,7 @@ pub fn benchmarkItemBroadcast() !void {
                 const id, const next = try reader.entityId();
                 const x, _ = try next.x();
                 try std.testing.expectEqual(@as(f64, if (limited) 0.75 else 0.625), x);
-                const at: usize = @intCast(ItemEntities.networkId(ids[0]) - id);
+                const at: usize = @intCast(dropped.networkId(ids[0]) - id);
                 try std.testing.expect(at < count);
                 var recipient_iterator = packet.recipients.iterator();
                 while (recipient_iterator.next()) |handle| {
@@ -1459,8 +1438,7 @@ pub fn benchmarkItemBroadcast() !void {
             for (0..viewers) |viewer| {
                 if (!limited or viewer != 0) try std.testing.expectEqual(count, sent[viewer]);
                 for (ids[0..count], 0..) |id, at| {
-                    const view = replication.views[dropped.ids.get(id).?];
-                    try std.testing.expectEqual(!received[viewer][at], view.dirty.view().contains(viewer));
+                    try std.testing.expectEqual(!received[viewer][at], (try replication.dirtyFor(id, viewer)));
                 }
             }
             if (limited) {
@@ -1475,7 +1453,7 @@ pub fn benchmarkItemBroadcast() !void {
                     const header = try wire.play.toClient.readHeader(packet.bytes);
                     const reader: wire.play.toClient.packet_sync_entity_position.Reader = .{ ._cursor = .{ .buffer = header.body, .rest = header.body } };
                     const id, _ = try reader.entityId();
-                    const at: usize = @intCast(ItemEntities.networkId(ids[0]) - id);
+                    const at: usize = @intCast(dropped.networkId(ids[0]) - id);
                     try std.testing.expectEqual(@as(usize, 1), packet.recipients.len);
                     try std.testing.expectEqual(@as(u16, 0), packet.recipients.first().?.index);
                     try std.testing.expect(!received[0][at]);
@@ -1483,7 +1461,7 @@ pub fn benchmarkItemBroadcast() !void {
                     service.recycle(io, &.{packet});
                 }
                 try std.testing.expect(std.mem.allEqual(bool, received[0][0..count], true));
-                for (ids[0..count]) |id| try std.testing.expectEqual(@as(usize, 0), replication.views[dropped.ids.get(id).?].pending.view().count());
+                for (ids[0..count]) |id| try std.testing.expectEqual(@as(usize, 0), (try replication.known(id)).pending);
             }
         }
     };
@@ -1705,10 +1683,10 @@ pub fn benchmarkItemBoundaries() !void {
         const gameplay_definitions = try vanilla_content.prepare(allocator);
         const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const stack: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 64 };
-        const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 256 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
+        const bodies = try entities.Entities.init(allocator, io, .{}, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
         const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
-        const dropped = try ItemEntities.init(allocator, io, .{ .cache_records = 256, .maximum = 1024 }, .{
+        const dropped = try ItemEntities.init(allocator, io, .{}, .{
             .metrics = &registry,
             .record_workspaces = workspaces,
             .entities = bodies,
@@ -1754,9 +1732,7 @@ pub fn benchmarkItemBoundaries() !void {
             const candidates_before = replication.selection_candidates.value();
             const nodes_before = replication.selection_nodes.value();
             players.rebuildIndexes();
-            const metadata_before = dropped.cache.metrics.acquired.value();
-            const bodies_before = bodies.cache.metrics.acquired.value();
-            const reads_before = dropped.cache.metrics.reads.value() + bodies.cache.metrics.reads.value();
+            const metadata_before = dropped.reads;
             for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
             service.beginTick();
             streaming.tick();
@@ -1769,24 +1745,20 @@ pub fn benchmarkItemBoundaries() !void {
                 queued += 1;
                 service.recycle(io, &.{packet});
             }
-            const metadata_acquired = dropped.cache.metrics.acquired.value() - metadata_before;
-            const bodies_acquired = bodies.cache.metrics.acquired.value() - bodies_before;
-            const reads = dropped.cache.metrics.reads.value() + bodies.cache.metrics.reads.value() - reads_before;
+            const metadata_acquired = dropped.reads - metadata_before;
             if (step.unchanged) {
                 try std.testing.expectEqual(@as(u64, @intCast(count)), replication.selection_candidates.value() - candidates_before);
                 try std.testing.expect(replication.selection_nodes.value() - nodes_before <= (viewers * 4 + count) * 32);
                 try std.testing.expectEqual(@as(u64, 0), metadata_acquired);
-                try std.testing.expectEqual(@as(u64, 0), bodies_acquired);
-                try std.testing.expectEqual(@as(u64, 0), reads);
             }
             if (was_visible == step.visible) try std.testing.expectEqual(@as(usize, 0), queued) else try std.testing.expect(queued > 0);
             for (ids[0..count]) |id| {
-                const view = replication.views[dropped.ids.get(id).?];
-                try std.testing.expectEqual(@as(usize, if (step.visible) viewers else 0), view.spawned.view().count());
-                try std.testing.expectEqual(@as(usize, 0), view.pending.view().count());
+                const view = try replication.known(id);
+                try std.testing.expectEqual(@as(usize, if (step.visible) viewers else 0), view.spawned);
+                try std.testing.expectEqual(@as(usize, 0), view.pending);
             }
             was_visible = step.visible;
-            try output.interface.print("BOUNDARY viewers={d} items={d} step={d} spatial_candidates={d} coverage_nodes={d} metadata={d} bodies={d} backend_records={d} packets={d}\n", .{ viewers, count, index, replication.selection_candidates.value() - candidates_before, replication.selection_nodes.value() - nodes_before, metadata_acquired, bodies_acquired, reads, queued });
+            try output.interface.print("BOUNDARY viewers={d} items={d} step={d} spatial_candidates={d} coverage_nodes={d} reads={d} packets={d}\n", .{ viewers, count, index, replication.selection_candidates.value() - candidates_before, replication.selection_nodes.value() - nodes_before, metadata_acquired, queued });
         }
     };
     try output.interface.flush();
@@ -2367,10 +2339,10 @@ pub fn itemPositionInterval() !void {
         const gameplay_definitions = try vanilla_content.prepare(allocator);
         const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const stack: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 1 };
-        const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = 128 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
+        const bodies = try entities.Entities.init(allocator, io, .{}, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
         const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
-        const dropped = try ItemEntities.init(allocator, io, .{ .cache_records = 256, .maximum = 64 }, .{
+        const dropped = try ItemEntities.init(allocator, io, .{}, .{
             .metrics = &registry,
             .record_workspaces = workspaces,
             .entities = bodies,
@@ -2405,16 +2377,14 @@ pub fn itemPositionInterval() !void {
         var positions: usize = 0;
         for (0..41) |tick| {
             if (tick > 0) {
-                var held: [1]ItemEntities.Record = undefined;
-                try dropped.acquireMany(ids[0..1], &held);
-                defer held[0].release();
-                const before = (try held[0].body.read()).?;
+                const held_id = (ids[0..1])[0];
+                const before = (try dropped.read(held_id)).?.body;
                 var after = before;
                 after.position[0] += 0.125;
-                try dropped.move(held[0], before, after);
-                var metadata = try held[0].read();
+                try dropped.move(held_id, before, after);
+                var metadata = try dropped.get(held_id);
                 metadata.revision += 1;
-                held[0].write(metadata);
+                try dropped.put(held_id, metadata);
             }
             service.credit[0].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
             service.beginTick();

@@ -51,6 +51,12 @@ pub const ItemPhysics = struct {
     /// the blocks it crossed do to it, as Entity.applyEffectsFromBlocks, unless `effects` is
     /// void. A stuck item stays stuck until it moves.
     pub fn advance(self: *ItemPhysics, neighborhood: *Window, entity_id: u32, ticks: u32, pushed: entities.State, on_ground: bool, fluids: Fluids, stuck: [3]f64, effects: anytype) !Result {
+        return self.advanceRandomly(neighborhood, entity_id, ticks, pushed, on_ground, fluids, stuck, effects, null);
+    }
+
+    /// As `advance`, with the random an item inside a block is pushed out by: ItemEntity.tick's
+    /// noClip, then Entity.pushOutOfBlocks. Without one, an item inside a block stays as it is.
+    pub fn advanceRandomly(self: *ItemPhysics, neighborhood: *Window, entity_id: u32, ticks: u32, pushed: entities.State, on_ground: bool, fluids: Fluids, stuck: [3]f64, effects: anytype, random: ?std.Random) !Result {
         assert(entity_id > 0);
         var body = pushed;
         // ItemEntity.setUnderwaterMovement and setUnderLavaMovement in place of gravity.
@@ -59,7 +65,37 @@ pub const ItemPhysics = struct {
         } else if (fluids.lava > @as(f32, 0.1)) {
             buoy(&body.velocity, @as(f32, 0.95));
         } else body.velocity[1] -= 0.04;
+        // Inside a block, it moves through blocks, pushed towards the nearest way out.
+        var inside = false;
+        if (random) |source| if (try self.collides(neighborhood, body, 0.125, 0.25)) {
+            inside = true;
+            try self.escape(neighborhood, &body, source, 0.125);
+        };
+        if (inside) return self.advanceThrough(neighborhood, entity_id, ticks, body, on_ground, effects);
         return self.advanceBody(false, neighborhood, entity_id, ticks, body, on_ground, stuck, effects);
+    }
+
+    /// ItemEntity.tick's move with noClip set: Entity.move only adds the motion, touching neither
+    /// what holds the item back nor whether it is on the ground; the slowing after is as ever.
+    fn advanceThrough(self: *ItemPhysics, neighborhood: *Window, entity_id: u32, ticks: u32, body: entities.State, on_ground: bool, effects: anytype) !Result {
+        var next = body;
+        const moved = !on_ground or next.velocity[0] * next.velocity[0] + next.velocity[2] * next.velocity[2] > @as(f64, @as(f32, 0.00001)) or movesOnPhase(ticks, entity_id);
+        if (moved) {
+            for (&next.position, next.velocity) |*position, velocity| position.* += velocity;
+            if (@TypeOf(effects) != void) try effects.apply(&next, on_ground, body.position);
+            var friction: f32 = 0.98;
+            if (on_ground) {
+                const below: chunks.Position = .{ .x = @intFromFloat(@floor(next.position[0])), .y = @intFromFloat(@floor(next.position[1] - @as(f64, @as(f32, 0.999999)))), .z = @intFromFloat(@floor(next.position[2])) };
+                friction *= self.deps.blocks.get(try self.blockState(neighborhood, body.world, below)).friction;
+            }
+            next.velocity[0] *= friction;
+            next.velocity[1] *= 0.98;
+            next.velocity[2] *= friction;
+            if (on_ground and next.velocity[1] < 0) next.velocity[1] *= -0.5;
+        }
+        var crossed = false;
+        for (body.position, next.position) |before, after| crossed = crossed or @floor(before) != @floor(after);
+        return .{ .body = next, .on_ground = on_ground, .crossed_block = crossed, .moved = moved };
     }
 
     /// An item's movement alone, `push` then `advance`, with nothing holding it back and no
@@ -134,12 +170,12 @@ pub const ItemPhysics = struct {
     pub const Rest = struct { speed: f64, friction: f64 };
 
     const restless_supports = [_][]const u8{
-        "minecraft:redstone_ore",          "minecraft:deepslate_redstone_ore", "minecraft:sculk_sensor",
-        "minecraft:calibrated_sculk_sensor", "minecraft:sculk_shrieker",       "minecraft:turtle_egg",
-        "minecraft:slime_block",           "minecraft:honey_block",            "minecraft:magma_block",
-        "minecraft:hopper",                "minecraft:campfire",               "minecraft:soul_campfire",
-        "minecraft:big_dripleaf",          "minecraft:cactus",                 "minecraft:pointed_dripstone",
-        "minecraft:scaffolding",           "minecraft:powder_snow",            "minecraft:bubble_column",
+        "minecraft:redstone_ore",            "minecraft:deepslate_redstone_ore", "minecraft:sculk_sensor",
+        "minecraft:calibrated_sculk_sensor", "minecraft:sculk_shrieker",         "minecraft:turtle_egg",
+        "minecraft:slime_block",             "minecraft:honey_block",            "minecraft:magma_block",
+        "minecraft:hopper",                  "minecraft:campfire",               "minecraft:soul_campfire",
+        "minecraft:big_dripleaf",            "minecraft:cactus",                 "minecraft:pointed_dripstone",
+        "minecraft:scaffolding",             "minecraft:powder_snow",            "minecraft:bubble_column",
     };
 
     pub fn rest(self: *ItemPhysics, window: *Window, body: entities.State) !?Rest {
@@ -156,7 +192,9 @@ pub const ItemPhysics = struct {
                 }
             }
         }
-        const below_position: chunks.Position = .{ .x = floorCell(p[0]), .y = floorCell(p[1] - @as(f64, @as(f32, 0.999999))), .z = floorCell(p[2]) };
+        // The block it rests on, as advanceBody finds it after a move; none, and it keeps awake.
+        const supporting = (try self.nearestSupport(window, body.world, p, 0.125, .{ 0, 0 })) orelse return null;
+        const below_position: chunks.Position = .{ .x = supporting.x, .y = floorCell(p[1] - @as(f64, @as(f32, 0.500001))), .z = supporting.z };
         const below = try self.blockState(window, body.world, below_position);
         const name = game_data.registry.block_state_names[below];
         const block = name[0 .. std.mem.indexOfScalar(u8, name, '[') orelse name.len];
@@ -304,10 +342,64 @@ pub const ItemPhysics = struct {
         return normalized(velocity);
     }
 
+    /// Entity.updateSupportingBlockPos for a body on the ground: of the blocks under a sliver
+    /// below its box, World.findSupportingBlockPos's nearest by block centre, ties to the
+    /// greatest by y, z then x; none there, the same back along the move. Getting the block a
+    /// wall or fence gate keeps for itself is left out: those stand 1.5 high, so the height
+    /// half a block under the feet is their own block anyway.
+    fn supportingBlock(self: *ItemPhysics, window: *Window, world: u32, position: [3]f64, half_width: f64, moved: [3]f64) !?chunks.Position {
+        if (try self.nearestSupport(window, world, position, half_width, .{ 0, 0 })) |found| return found;
+        return self.nearestSupport(window, world, position, half_width, .{ -moved[0], -moved[2] });
+    }
+
+    fn nearestSupport(self: *ItemPhysics, window: *Window, world: u32, position: [3]f64, half_width: f64, shift: [2]f64) !?chunks.Position {
+        const low: [3]f64 = .{ position[0] - half_width + shift[0], position[1] - 1.0e-6, position[2] - half_width + shift[1] };
+        const high: [3]f64 = .{ position[0] + half_width + shift[0], position[1], position[2] + half_width + shift[1] };
+        var best: ?chunks.Position = null;
+        var best_distance = std.math.floatMax(f64);
+        var y: i32 = @intFromFloat(@floor(low[1]));
+        while (y <= @as(i32, @intFromFloat(@floor(high[1])))) : (y += 1) {
+            var z: i32 = @intFromFloat(@floor(low[2]));
+            while (z <= @as(i32, @intFromFloat(@floor(high[2])))) : (z += 1) {
+                var x: i32 = @intFromFloat(@floor(low[0]));
+                while (x <= @as(i32, @intFromFloat(@floor(high[0])))) : (x += 1) {
+                    const at: chunks.Position = .{ .x = x, .y = y, .z = z };
+                    const state = try self.blockState(window, world, at);
+                    if (state >= game_data.registry.block_state_collision_shape.len) return error.Corrupt;
+                    const shape = game_data.registry.collision_shapes[game_data.registry.block_state_collision_shape[state]];
+                    const offset: [3]f64 = .{ @floatFromInt(x), @floatFromInt(y), @floatFromInt(z) };
+                    const touches = for (game_data.registry.collision_boxes[shape.offset..][0..shape.count]) |box| {
+                        const minimum: [3]f64 = .{ offset[0] + @as(f64, @floatFromInt(box.min_x)) / 64, offset[1] + @as(f64, @floatFromInt(box.min_y)) / 64, offset[2] + @as(f64, @floatFromInt(box.min_z)) / 64 };
+                        const maximum: [3]f64 = .{ offset[0] + @as(f64, @floatFromInt(box.max_x)) / 64, offset[1] + @as(f64, @floatFromInt(box.max_y)) / 64, offset[2] + @as(f64, @floatFromInt(box.max_z)) / 64 };
+                        if (for (0..3) |axis| {
+                            if (!(low[axis] < maximum[axis] and high[axis] > minimum[axis])) break false;
+                        } else true) break true;
+                    } else false;
+                    if (!touches) continue;
+                    // Vec3i.getSquaredDistance from the block's centre.
+                    var distance: f64 = 0;
+                    for (offset, position) |corner, value| distance += (corner + 0.5 - value) * (corner + 0.5 - value);
+                    const later = if (best) |previous| previous.y < y or (previous.y == y and (previous.z < z or (previous.z == z and previous.x < x))) else true;
+                    if (distance < best_distance or (distance == best_distance and later)) {
+                        best = at;
+                        best_distance = distance;
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
     pub fn orbCollides(self: *ItemPhysics, window: *Window, body: entities.State) !bool {
+        return self.collides(window, body, 0.25, 0.5);
+    }
+
+    /// Whether a body's box, `half_width` to each side and `height` up from its feet, overlaps
+    /// any block's collision shape: World.isSpaceEmpty of the box drawn in by 1e-7.
+    pub fn collides(self: *ItemPhysics, window: *Window, body: entities.State, comptime half_width: f64, comptime height: f64) !bool {
         assert(window.client.chunks == self.deps.chunks and window.client.index == self.chunk_client.index);
-        const low: [3]f64 = .{ body.position[0] - 0.25, body.position[1], body.position[2] - 0.25 };
-        const high: [3]f64 = .{ body.position[0] + 0.25, body.position[1] + 0.5, body.position[2] + 0.25 };
+        const low: [3]f64 = .{ body.position[0] - half_width, body.position[1], body.position[2] - half_width };
+        const high: [3]f64 = .{ body.position[0] + half_width, body.position[1] + height, body.position[2] + half_width };
         var y: i32 = @intFromFloat(@floor(low[1] + 1e-7));
         while (@as(f64, @floatFromInt(y)) < high[1] - 1e-7) : (y += 1) {
             var z: i32 = @intFromFloat(@floor(low[2] + 1e-7));
@@ -336,8 +428,14 @@ pub const ItemPhysics = struct {
     }
 
     pub fn escapeOrb(self: *ItemPhysics, window: *Window, body: *entities.State, random: std.Random) !void {
+        return self.escape(window, body, random, 0.25);
+    }
+
+    /// Entity.pushOutOfBlocks from the middle of the body's box, `half_height` above its feet:
+    /// towards the nearest side, of four and the top, that is not a full block.
+    pub fn escape(self: *ItemPhysics, window: *Window, body: *entities.State, random: std.Random, comptime half_height: f64) !void {
         assert(window.client.chunks == self.deps.chunks and window.client.index == self.chunk_client.index);
-        const center: [3]f64 = .{ body.position[0], body.position[1] + 0.25, body.position[2] };
+        const center: [3]f64 = .{ body.position[0], body.position[1] + half_height, body.position[2] };
         const directions = [_][3]i32{ .{ 0, 0, -1 }, .{ 0, 0, 1 }, .{ -1, 0, 0 }, .{ 1, 0, 0 }, .{ 0, 1, 0 } };
         var selected: usize = 4;
         var closest = std.math.inf(f64);
@@ -559,7 +657,12 @@ pub const ItemPhysics = struct {
             }
 
             var below: ?u16 = null;
-            const below_position: chunks.Position = .{ .x = @intFromFloat(@floor(next.position[0])), .y = @intFromFloat(@floor(next.position[1] - @as(f64, @as(f32, 0.999999)))), .z = @intFromFloat(@floor(next.position[2])) };
+            const half_width: f64 = if (orb) 0.25 else 0.125;
+            // Entity.getVelocityAffectingPos: the block it rests on when it rests on one, at the
+            // height just over half a block below its feet.
+            const supporting = if (grounded) try self.supportingBlock(neighborhood, body.world, next.position, half_width, adjusted) else null;
+            const below_y: i32 = @intFromFloat(@floor(next.position[1] - @as(f64, @as(f32, 0.500001))));
+            const below_position: chunks.Position = if (supporting) |at| .{ .x = at.x, .y = below_y, .z = at.z } else .{ .x = @intFromFloat(@floor(next.position[0])), .y = below_y, .z = @intFromFloat(@floor(next.position[2])) };
             // Entity.getBlockSpeedFactor, which slows every body on soul sand and honey.
             {
                 const base = self.deps.blocks.get(try self.blockState(neighborhood, body.world, .{ .x = @intFromFloat(@floor(next.position[0])), .y = @intFromFloat(@floor(next.position[1])), .z = @intFromFloat(@floor(next.position[2])) }));

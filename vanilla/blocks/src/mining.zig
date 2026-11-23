@@ -402,7 +402,7 @@ pub const Mining = struct {
                                 };
                             };
                         }
-                        if (!admitted or !self.deps.experience.canAward(experience) or !self.deps.dropped.canCreate(drops.len)) {
+                        if (!admitted or !self.deps.experience.canAward(experience)) {
                             self.deps.blocks.correct(player.world, position);
                             state.active = false;
                             state.finishing = false;
@@ -429,7 +429,6 @@ pub const Mining = struct {
                             state.stage = -1;
                             continue;
                         }
-                        assert(self.deps.dropped.canCreate(following_drops));
                         self.random.source = experience_random;
                         var worn = held.stack;
 

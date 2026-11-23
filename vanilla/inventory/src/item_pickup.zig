@@ -30,6 +30,7 @@ pub const ItemPickup = struct {
         for (&result, 0..) |*slot, index| slot.* = @intCast(if (index < 9) index + 36 else if (index == 36) 45 else index);
         break :numbers result;
     };
+    const Quiet = struct { world: u32 = 0, position: [2]f64 = @splat(0), revision: ?u64 = null };
     const Admission = struct {
         owner: ?u128 = null,
         dirty: u64 = 0,
@@ -42,8 +43,10 @@ pub const ItemPickup = struct {
     admissions: []Admission,
     watched: lightning_rod.system.IndexSet,
     observer: *inventories.Inventories.Observer,
-    query: ItemEntities.Query,
-    /// The candidates within reach, this tick.
+    /// Players who found nothing in reach, and where: while they stand there and nothing near
+    /// changes, they find nothing again.
+    quiet: []Quiet,
+    /// The candidates within reach, a round of this tick.
     reach: []entities.Id,
     audiences: lightning_rod.system.sparse_sets.Workspace,
 
@@ -52,7 +55,8 @@ pub const ItemPickup = struct {
         const self = try allocator.create(ItemPickup);
         const admissions = try allocator.alloc(Admission, deps.players.records.len);
         @memset(admissions, .{});
-        self.* = .{ .watched = try lightning_rod.system.IndexSet.init(allocator, admissions.len), .deps = deps, .admissions = admissions, .observer = try deps.inventories.observe(allocator, admissions.len), .query = try ItemEntities.Query.init(allocator, deps.dropped, deps.players), .audiences = try lightning_rod.system.sparse_sets.Workspace.init(allocator, 17, admissions.len), .reach = try allocator.alloc(entities.Id, deps.dropped.residents.len) };
+        self.* = .{ .watched = try lightning_rod.system.IndexSet.init(allocator, admissions.len), .deps = deps, .admissions = admissions, .observer = try deps.inventories.observe(allocator, admissions.len), .audiences = try lightning_rod.system.sparse_sets.Workspace.init(allocator, 17, admissions.len), .reach = try allocator.alloc(entities.Id, 4096), .quiet = try allocator.alloc(Quiet, admissions.len) };
+        @memset(self.quiet, .{});
         return self;
     }
 
@@ -68,38 +72,99 @@ pub const ItemPickup = struct {
         remaining: ?inventories.Stack = null,
     };
 
-    /// Items a player stands within reach of, by where they are known to be, before any record
-    /// is read: reading a sleeping item brings it up to date, which only those it may go to need.
-    fn reachable(self: *ItemPickup, candidates: []const entities.Id) []const entities.Id {
+    /// Items a player stands within reach of, by where the area index knows them to be, before
+    /// any record is read: reading a sleeping item brings it up to date, which only those it may
+    /// go to need. In ascending id order, as many as `reach` holds past `after`; `more` says
+    /// whether others remain.
+    fn reachable(self: *ItemPickup, after: entities.Id, more: *bool) ![]const entities.Id {
         const dropped = self.deps.dropped;
         var count: usize = 0;
-        for (candidates) |entity| {
-            const at = dropped.residents[dropped.ids.get(entity).?];
-            var players = self.deps.players.nearby(at.world, .{ .x = at.position[0], .y = 0, .z = at.position[1] }, 1);
-            while (players.next()) |index| {
-                const player = self.deps.players.records[index];
-                if (player.world != at.world or @abs(at.position[0] - player.position.x) >= 1.425 or @abs(at.position[1] - player.position.z) >= 1.425) continue;
-                self.reach[count] = entity;
-                count += 1;
-                break;
+        var cutoff: ?entities.Id = null;
+        more.* = false;
+        for (self.deps.players.activeSlots()) |index| {
+            const player = self.deps.players.records[index];
+            if (!player.inWorld()) continue;
+            const revision = dropped.revisionAround(player.world, .{ player.position.x, 0, player.position.z }, 1.425);
+            const quiet = &self.quiet[index];
+            if (quiet.revision) |known| if (known == revision and quiet.world == player.world and quiet.position[0] == player.position.x and quiet.position[1] == player.position.z) continue;
+            var found = false;
+            defer if (after == 0 and !found) {
+                quiet.* = .{ .world = player.world, .position = .{ player.position.x, player.position.z }, .revision = revision };
+            } else if (found) {
+                quiet.revision = null;
+            };
+            const low: [2]i32 = .{ @intFromFloat(@floor((player.position.x - 1.425) / 16)), @intFromFloat(@floor((player.position.z - 1.425) / 16)) };
+            const high: [2]i32 = .{ @intFromFloat(@floor((player.position.x + 1.425) / 16)), @intFromFloat(@floor((player.position.z + 1.425) / 16)) };
+            var x = low[0];
+            while (x <= high[0]) : (x += 1) {
+                var z = low[1];
+                while (z <= high[1]) : (z += 1) {
+                    var walk = dropped.places.space.entries(.{ .world = player.world, .x = x, .z = z }, ItemEntities.kinds);
+                    while (walk.next()) |entry| {
+                        if (entry.id <= after) continue;
+                        if (@abs(entry.position[0] - player.position.x) >= 1.425 or @abs(entry.position[2] - player.position.z) >= 1.425) continue;
+                        found = true;
+                        if (cutoff) |limit| if (entry.id > limit) {
+                            more.* = true;
+                            continue;
+                        };
+                        if (count == self.reach.len) {
+                            // Full: keep the lower half, and leave the rest for the next round.
+                            count = unique(self.reach);
+                            if (count > self.reach.len / 2) count = self.reach.len / 2;
+                            cutoff = self.reach[count - 1];
+                            more.* = true;
+                            if (entry.id > cutoff.?) continue;
+                        }
+                        self.reach[count] = entry.id;
+                        count += 1;
+                    }
+                }
             }
         }
-        return self.reach[0..count];
+        return self.reach[0..unique(self.reach[0..count])];
+    }
+
+    /// Sorts ids and keeps each once, returning how many there are.
+    fn unique(ids: []entities.Id) usize {
+        std.mem.sort(entities.Id, ids, {}, std.sort.asc(entities.Id));
+        var count: usize = 0;
+        for (ids) |entity| {
+            if (count != 0 and ids[count - 1] == entity) continue;
+            ids[count] = entity;
+            count += 1;
+        }
+        return count;
     }
 
     pub fn tick(self: *ItemPickup) !void {
+        var after: entities.Id = 0;
+        while (true) {
+            var more = false;
+            const reached = try self.reachable(after, &more);
+            if (reached.len != 0) {
+                after = reached[reached.len - 1];
+                try self.pickUp(reached);
+            }
+            if (!more) return;
+        }
+    }
+
+    fn pickUp(self: *ItemPickup, reached: []const entities.Id) !void {
         const dropped = self.deps.dropped;
-        var iterator = dropped.iterate(self.reachable(self.query.read(1)));
-        defer iterator.deinit();
-        while (try iterator.next()) |batch| {
+        var next: usize = 0;
+        while (next < reached.len) {
+            const batch = reached[next..][0..@min(16, reached.len - next)];
+            next += batch.len;
             var metadata: [16]ItemEntities.Metadata = undefined;
             var bodies: [16]entities.State = undefined;
             for (0..17) |row| self.audiences.row(row).clear();
             const players = self.audiences.row(16);
-            for (batch, 0..) |record, at| {
-                metadata[at] = try record.read();
+            for (batch, 0..) |entity, at| {
+                const view = (try dropped.read(entity)) orelse return error.UnknownItemEntity;
+                metadata[at] = view.metadata;
                 if (!metadata[at].alive or metadata[at].pickup_delay != 0) continue;
-                const body = (try record.body.read()) orelse return error.Corrupt;
+                const body = view.body;
                 bodies[at] = body;
                 var candidates = self.deps.players.nearby(body.world, .{ .x = body.position[0], .y = body.position[1], .z = body.position[2] }, 1);
                 while (candidates.next()) |index| {
@@ -136,7 +201,7 @@ pub const ItemPickup = struct {
                     value.collected = result.collected;
                     value.collection += 1;
                     value.revision += 1;
-                    if (result.remaining == null) try dropped.retire(batch[at].id, bodies[at], value) else batch[at].write(value.*);
+                    if (result.remaining == null) try dropped.retire(batch[at], bodies[at], value) else try dropped.put(batch[at], value.*);
                 }
             }
         }

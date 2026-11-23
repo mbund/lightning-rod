@@ -58,13 +58,8 @@ const Probe = struct {
         self.deps.inventory.changed(0);
     }
 
-    fn totalExperience(self: *Probe) i64 {
-        var amount: i64 = self.deps.player_states.records[0].experience.total;
-        for (self.deps.experience.active.values()) |index| {
-            const orb = self.deps.experience.orbs[index];
-            if (orb.alive) amount += @as(i64, orb.value) * orb.count;
-        }
-        return amount;
+    fn totalExperience(self: *Probe) !i64 {
+        return self.deps.player_states.records[0].experience.total + try self.deps.experience.totalValue();
     }
 
     fn message(self: *Probe, _: sessions.Handle, text: []const u8) !e2e.Control.Result {
@@ -111,13 +106,13 @@ const Probe = struct {
             const player = self.deps.players.records[0];
             if (try (try self.deps.chunks.simulation(1)).getBlock(player.world, .{ .x = spawner.x, .y = spawner.y, .z = spawner.z }) != 0) return;
             if (self.phase == .normal) {
-                self.experience = self.totalExperience();
+                self.experience = (try self.totalExperience());
                 if (self.experience < 15 or self.experience > 43) return error.SpawnerExperienceIncorrect;
-                if (self.deps.dropped.active.values().len != 0) return error.UnenchantedSpawnerDropped;
+                if (self.deps.dropped.count() != 0) return error.UnenchantedSpawnerDropped;
                 self.phase = .normal_done;
             } else {
-                if (self.totalExperience() != self.experience) return error.SilkSpawnerProducedExperience;
-                if (self.deps.dropped.active.values().len != 1) return error.SilkSpawnerMissing;
+                if ((try self.totalExperience()) != self.experience) return error.SilkSpawnerProducedExperience;
+                if (self.deps.dropped.count() != 1) return error.SilkSpawnerMissing;
                 self.phase = .silk_done;
             }
             try self.deps.control.send(player.handle.?, @tagName(self.phase));

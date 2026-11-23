@@ -8,15 +8,16 @@ import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Blocks;
 
+/// Nothing is refused for want of room: drops, mining and closing a full inventory all go
+/// through, with item caches far smaller than what the server holds.
 final class ItemCapacityFixture extends Fixture {
     private static final int BREAD_COUNT = 17;
     private static final BlockPos BLOCK = new BlockPos(1, 65, 1);
-    private enum Phase {
-        SETUP, DROP, DROP_REJECTED, MINING_REJECTED,
-        UNCHANGED, FREE_SLOT, DROP_ACCEPTED, RESUMED,
-        CLOSE_READY, CLOSE_REJECTED, CLOSE_VERIFIED
-    }
+    /// Ticks to hold the dig: an iron pickaxe breaks stone in 8.
+    private static final int MINING_TICKS = 20;
+    private enum Phase { SETUP, DROP, DROPPED, MINING, MINED, CLOSE_READY, CLOSED, VERIFIED }
     private Phase phase = Phase.SETUP;
+    private int mining_ticks = 0;
 
     ItemCapacityFixture(Recorder r) { super(r); }
 
@@ -26,68 +27,53 @@ final class ItemCapacityFixture extends Fixture {
         if (phase == Phase.SETUP) {
             client.send("capacity_setup");
             phase = Phase.DROP;
-        } else if (phase == Phase.DROP && client.received("capacity full") && inventory.getItem(0).getCount() == BREAD_COUNT) {
+        } else if (phase == Phase.DROP && client.received("capacity placed") && inventory.getItem(0).getCount() == BREAD_COUNT) {
             game.player.drop(true);
             if (r.scenario.endsWith("creative"))
                 game.gameMode.handleCreativeModeItemDrop(new net.minecraft.world.item.ItemStack(Items.BREAD, 4));
             client.fence("capacity-drop");
-            phase = Phase.DROP_REJECTED;
-        } else if (phase == Phase.DROP_REJECTED && client.fenced("capacity-drop")) {
-            if (!inventory.getItem(0).is(Items.BREAD) || inventory.getItem(0).getCount() != BREAD_COUNT) {
-                client.fail("capacity_inventory_not_restored"); return;
+            phase = Phase.DROPPED;
+        } else if (phase == Phase.DROPPED && client.fenced("capacity-drop")) {
+            if (!inventory.getItem(0).isEmpty()) {
+                client.fail("capacity_drop_refused"); return;
             }
-            if (!r.scenario.endsWith("creative")) {
+            client.send("capacity_check_drop");
+            phase = Phase.MINING;
+        } else if (phase == Phase.MINING) {
+            if (r.scenario.endsWith("creative")) {
+                if (client.received("capacity creative kept")) {
+                    client.pass("drops_are_never_refused_with_tiny_item_caches");
+                    phase = Phase.VERIFIED;
+                }
+                return;
+            }
+            if (!client.received("capacity drops kept")) return;
+            if (mining_ticks == 0) {
                 inventory.setSelectedSlot(1);
                 game.getConnection().send(new ServerboundSetCarriedItemPacket(1));
                 game.getConnection().send(new ServerboundPlayerActionPacket(
                     ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK, BLOCK, Direction.UP, 0));
-                game.getConnection().send(new ServerboundPlayerActionPacket(
-                    ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK, BLOCK, Direction.UP, 1));
-                phase = Phase.MINING_REJECTED;
-            } else {
-                client.send("capacity_check");
-                phase = Phase.UNCHANGED;
             }
-        } else if (phase == Phase.MINING_REJECTED) {
-            if (!client.received("capacity mining rejected")) return;
+            mining_ticks += 1;
+            if (mining_ticks < MINING_TICKS) return;
+            game.getConnection().send(new ServerboundPlayerActionPacket(
+                ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK, BLOCK, Direction.UP, 1));
+            phase = Phase.MINED;
+        } else if (phase == Phase.MINED && client.received("capacity mined kept")) {
+            if (game.level.getBlockState(BLOCK).is(Blocks.STONE)) return;
             inventory.setSelectedSlot(0);
             game.getConnection().send(new ServerboundSetCarriedItemPacket(0));
-            client.send("capacity_check");
-            phase = Phase.UNCHANGED;
-        } else if (phase == Phase.UNCHANGED && client.received("capacity unchanged")) {
-            if (!game.level.getBlockState(BLOCK).is(Blocks.STONE)) return;
-            if (!client.screenshot("capacity_rejected_without_mutation").done()) return;
-            client.send("capacity_free");
-            phase = Phase.FREE_SLOT;
-        } else if (phase == Phase.FREE_SLOT && client.received("capacity freed")) {
-            game.player.drop(false);
-            phase = Phase.DROP_ACCEPTED;
-        } else if (phase == Phase.DROP_ACCEPTED && inventory.getItem(0).getCount() == BREAD_COUNT - 1) {
-            client.send("capacity_verify");
-            phase = Phase.RESUMED;
-        } else if (phase == Phase.RESUMED && client.received("capacity resumed")) {
-            if (r.scenario.endsWith("creative")) {
-                client.pass("capacity_rejection_and_recovery_preserve_inventory_and_world");
-            } else {
-                client.send("capacity_close_setup");
-                phase = Phase.CLOSE_READY;
-            }
+            client.send("capacity_close_setup");
+            phase = Phase.CLOSE_READY;
         } else if (phase == Phase.CLOSE_READY && client.received("capacity close ready")) {
             game.getConnection().send(new net.minecraft.network.protocol.game.ServerboundContainerClosePacket(0));
             client.fence("capacity-close");
-            phase = Phase.CLOSE_REJECTED;
-        } else if (phase == Phase.CLOSE_REJECTED && client.fenced("capacity-close")) {
+            phase = Phase.CLOSED;
+        } else if (phase == Phase.CLOSED && client.fenced("capacity-close")) {
             client.send("capacity_close_check");
-            phase = Phase.CLOSE_VERIFIED;
-        } else if (phase == Phase.CLOSE_VERIFIED && client.received("capacity close preserved")) {
-            for (int slot = 1; slot <= 4; slot++)
-                if (game.player.containerMenu.getSlot(slot).getItem().getCount() != 1) {
-                    client.fail("capacity_close_slot_lost"); return;
-                }
-            if (game.player.containerMenu.getCarried().getCount() != 1) {
-                client.fail("capacity_close_cursor_lost"); return;
-            }
-            client.pass("capacity_rejection_batch_atomicity_and_recovery_preserve_items");
+            phase = Phase.VERIFIED;
+        } else if (phase == Phase.VERIFIED && client.received("capacity close kept")) {
+            client.pass("drops_mining_and_closing_are_never_refused_with_tiny_item_caches");
         }
     }
 }

@@ -4,6 +4,7 @@ const Streaming = @import("terrain").streaming.Streaming;
 const Lighting = @import("terrain").lighting.Lighting;
 const std = @import("std");
 const Domains = @import("domains").domains.Domains;
+const EntityColumns = @import("domains").entity_columns.EntityColumns;
 const storage = @import("storage");
 const records = @import("records");
 const metrics = @import("metrics");
@@ -89,8 +90,8 @@ const Fixture = struct {
         const ownership = try inventories.Inventories.init(allocator, std.testing.io, .{ .cache_slots = 1024, .cache_items = 8, .max_item_bytes = 1024 }, .{ .metrics = registry, .storage = try store.openSpace("inventory"), .record_workspaces = workspaces });
         const gameplay_definitions = try vanilla_content.prepare(allocator);
         const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
-        const bodies = try entities.Entities.init(allocator, std.testing.io, .{ .cache_records = 16 }, .{ .metrics = registry, .storage = try store.openSpace("entities"), .record_workspaces = workspaces });
-        const dropped = try ItemEntities.init(allocator, std.testing.io, .{ .cache_records = 16, .maximum = 8 }, .{
+        const bodies = try entities.Entities.init(allocator, std.testing.io, .{}, .{ .metrics = registry, .storage = try store.openSpace("entities"), .record_workspaces = workspaces });
+        const dropped = try ItemEntities.init(allocator, std.testing.io, .{}, .{
             .entities = bodies,
             .inventories = ownership,
             .items = items,
@@ -105,8 +106,10 @@ const Fixture = struct {
         const streaming = try Streaming.init(allocator, std.testing.io, .{ .chunk_sections = 24, .occlusion = false }, .{ .metrics = registry, .players = players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .lighting = light, .blocks = &gameplay_definitions.blocks.published });
         const blocks = try Blocks.init(allocator, std.testing.io, .{ .metrics = registry, .chunks = terrain, .players = players, .streaming = streaming, .sessions = service, .packets = encoding, .worlds = dimensions }, .{ .delta_sections = 16, .queued_sections = 32 });
         const domains = try Domains.init(allocator, .{}, .{ .players = players });
+        _ = try EntityColumns.init(allocator, .{}, .{ .domains = domains, .entities = bodies });
+        const experience = try Experience.init(allocator, .{}, .{ .enchantments = gameplay_definitions.enchantments, .dimensions = gameplay_definitions.dimensions, .players = players, .player_states = player_states, .entities = bodies, .physics = try ItemPhysics.init(allocator, .{ .blocks = gameplay_definitions.blocks, .chunks = terrain }), .inventories = ownership, .inventory = menus, .storage = try store.openSpace("experience"), .record_workspaces = workspaces });
+        // Orbs hear of the columns that tick from the first tick on.
         domains.tick();
-        const experience = try Experience.init(allocator, .{ .maximum_orbs = 64 }, .{ .enchantments = gameplay_definitions.enchantments, .dimensions = gameplay_definitions.dimensions, .players = players, .domains = domains, .player_states = player_states, .entities = bodies, .physics = try ItemPhysics.init(allocator, .{ .blocks = gameplay_definitions.blocks, .chunks = terrain }), .inventories = ownership, .inventory = menus, .storage = try store.openSpace("experience"), .record_workspaces = workspaces });
         const mining = try Mining.allocate(allocator, .{}, .{ .enchantments = gameplay_definitions.enchantments, .block_definitions = gameplay_definitions.blocks, .attributes = try EquipmentAttributes.init(allocator, .{}, .{ .players = players, .player_states = player_states, .items = items, .enchantments = gameplay_definitions.enchantments, .client = gameplay_definitions.client }), .definitions = gameplay_definitions.mining, .visibility = try Visibility.init(allocator, .{}, .{ .players = players }), .metrics = registry, .storage = try store.openSpace("mining"), .players = players, .player_states = player_states, .input = input, .inventories = ownership, .items = items, .durability = try Durability.init(allocator, .{ .items = items, .inventories = ownership, .enchantments = gameplay_definitions.enchantments }), .worlds = dimensions, .chunks = terrain, .menus = menus, .loot = try BlockLoot.init(allocator, .{ .loot = gameplay_definitions.loot }), .experience = experience, .dropped = dropped, .blocks = blocks, .actions = try BlockActions.init(allocator, .{}) });
         const tool: inventories.Stack = .{ .item = try items.define("minecraft:diamond_pickaxe"), .count = 1 };
         for (players.records) |player| try std.testing.expect(try ownership.set(.{ .owner = player.uuid, .index = 36 }, 0, tool));
@@ -425,7 +428,7 @@ pub fn verifyReadWindow() !void {
     }
     try std.testing.expectEqual(@as(usize, 0), action.terrain.cache.pinned_entries);
     const dropped = fixture.mining.deps.dropped;
-    try std.testing.expectEqual(dropped.residents.len, dropped.free_count);
+    try std.testing.expectEqual(@as(usize, 0), dropped.count());
 
     const player = &fixture.mining.deps.players.records[0];
     fixture.mining.deps.player_states.records[0].gamemode = .survival;
@@ -438,15 +441,15 @@ pub fn verifyReadWindow() !void {
     _ = try fixture.tick();
     try std.testing.expectEqual(@as(u16, 0), try fixture.mining.chunk_client.getBlock(player.world, at));
     try std.testing.expectEqual(@as(usize, 1), action.calls);
-    try std.testing.expectEqual(dropped.residents.len - 1, dropped.free_count);
+    try std.testing.expectEqual(@as(usize, 1), dropped.count());
     const worn = (try ownership.get(slot)).stack.?;
     try std.testing.expectEqual(@as(u16, 1), worn.count);
     try std.testing.expect(!inventories.Stack.sameItem(before, worn));
-    var cursor: ItemEntities.Cursor = .{};
-    const rows = try dropped.scan(&cursor);
-    try std.testing.expectEqual(@as(usize, 1), rows.len);
-    try std.testing.expect(rows[0].metadata.alive);
-    const body = (try dropped.deps.entities.get(rows[0].id)).?;
+    var rows = dropped.rows();
+    const row = (try rows.next()).?;
+    try std.testing.expect((try rows.next()) == null);
+    try std.testing.expect(row.metadata.alive);
+    const body = (try dropped.deps.entities.get(row.id)).?;
     const loot = (try ownership.get(ItemEntities.slot(body))).stack.?;
     try std.testing.expectEqual(@as(u16, 1), loot.count);
     try std.testing.expectEqual(@as(u32, @intCast(game_data.registry.itemId("minecraft:cobblestone").?)), try fixture.mining.deps.items.kind(loot));
@@ -563,7 +566,7 @@ pub fn verifyExperience() !void {
         try std.testing.expectEqual(expected, ordinary.experience.maximum());
     }
     var normal_experience: i32 = 0;
-    const Break = struct { tool: ?[]const u8 = "minecraft:diamond_pickaxe", enchantment: ?[]const u8 = null, block: []const u8 = "minecraft:diamond_ore", mode: minecraft.GameMode = .survival, minimum: i32 = 0, maximum: i32 = 0, exhausted: bool = false, denied: bool = false, break_tool: bool = false };
+    const Break = struct { tool: ?[]const u8 = "minecraft:diamond_pickaxe", enchantment: ?[]const u8 = null, block: []const u8 = "minecraft:diamond_ore", mode: minecraft.GameMode = .survival, minimum: i32 = 0, maximum: i32 = 0, crowded: bool = false, denied: bool = false, break_tool: bool = false };
     for ([_]Break{
         .{ .minimum = 3, .maximum = 7 },
         .{ .enchantment = "minecraft:fortune", .minimum = 3, .maximum = 7 },
@@ -582,7 +585,8 @@ pub fn verifyExperience() !void {
         .{ .block = "minecraft:spawner", .enchantment = "minecraft:silk_touch", .minimum = 15, .maximum = 43 },
         .{ .block = "minecraft:spawner", .tool = null },
         .{ .block = "minecraft:spawner", .tool = "minecraft:wooden_pickaxe", .minimum = 15, .maximum = 43 },
-        .{ .exhausted = true },
+        // Orbs everywhere already: mining goes ahead all the same, as nothing is refused for room.
+        .{ .crowded = true, .minimum = 3 + 64, .maximum = 7 + 64 },
         .{ .denied = true },
     }, 0..) |case, ordinal| {
         var directory = std.testing.tmpDir(.{});
@@ -624,9 +628,8 @@ pub fn verifyExperience() !void {
         const held = try fixture.mining.deps.inventories.get(slot);
         try std.testing.expect(try fixture.mining.deps.inventories.set(slot, held.revision, tool));
         const xp = fixture.mining.deps.experience;
-        if (case.exhausted) {
-            for (0..xp.orbs.len) |index| try xp.award(world, .{ @as(f64, @floatFromInt(index)) * 2 + 32, 65, 0 }, 1);
-            try std.testing.expectEqual(@as(usize, 0), xp.free_count);
+        if (case.crowded) {
+            for (0..64) |index| try xp.award(world, .{ @as(f64, @floatFromInt(index)) * 2 + 32, 65, 0 }, 1);
         }
         const Reject = struct {
             fn apply(_: *@This(), _: BlockActions.Request) !BlockActions.Result {
@@ -641,16 +644,16 @@ pub fn verifyExperience() !void {
         if (fixture.mining.states[0].active) fixture.mining.states[0].complete = true;
         _ = try fixture.tick();
         var total: i32 = 0;
-        for (xp.active.values()) |index| if (xp.orbs[index].alive) {
-            total += xp.orbs[index].value * xp.orbs[index].count;
-            if (!case.exhausted) try std.testing.expectEqual(@as([3]f64, .{ 8.5, 65.5, 8.5 }), xp.orbs[index].body.position);
-        };
-        if (case.exhausted) {
-            try std.testing.expectEqual(@as(i32, @intCast(xp.orbs.len)), total);
-        } else try std.testing.expect(total >= case.minimum and total <= case.maximum);
+        var live: [128]u64 = undefined;
+        for (try xp.live(&live)) |entity| {
+            const found = (try xp.get(entity)).?;
+            total += found.orb.value * found.orb.count;
+            if (!case.crowded) try std.testing.expectEqual(@as([3]f64, .{ 8.5, 65.5, 8.5 }), found.body.?.position);
+        }
+        try std.testing.expect(total >= case.minimum and total <= case.maximum);
         if (ordinal == 0) normal_experience = total;
         if (ordinal == 1) try std.testing.expectEqual(normal_experience, total);
-        const refused = case.exhausted or case.denied or case.mode == .spectator or case.mode == .adventure;
+        const refused = case.denied or case.mode == .spectator or case.mode == .adventure;
         try std.testing.expectEqual(if (refused) state else @as(u16, 0), try fixture.mining.chunk_client.getBlock(world, target));
         if (refused) {
             try std.testing.expectEqual(tool, (try fixture.mining.deps.inventories.get(slot)).stack);
@@ -660,9 +663,10 @@ pub fn verifyExperience() !void {
         const loot = fixture.mining.deps.definitions.evaluate(state, fixture.mining.states[0].tool.kind);
         const dropped = fixture.mining.deps.dropped;
         const should_drop = !refused and case.mode != .creative and loot.harvest and !std.mem.eql(u8, case.block, "minecraft:spawner");
-        try std.testing.expectEqual(@as(usize, @intFromBool(should_drop)), dropped.residents.len - dropped.free_count);
-        for (dropped.residents) |resident| if (resident.alive) {
-            const body = (try dropped.deps.entities.get(resident.id)).?;
+        try std.testing.expectEqual(@as(usize, @intFromBool(should_drop)), dropped.count());
+        var drops = dropped.rows();
+        while ((try drops.next())) |row| if (row.metadata.alive) {
+            const body = (try dropped.deps.entities.get(row.id)).?;
             const stack = (try fixture.mining.deps.inventories.get(ItemEntities.slot(body))).stack.?;
             try std.testing.expectEqual(@as(u32, @intCast(game_data.registry.itemId(if (case.enchantment != null and std.mem.eql(u8, case.enchantment.?, "minecraft:silk_touch")) "minecraft:diamond_ore" else "minecraft:diamond").?)), try fixture.mining.deps.items.kind(stack));
         };
@@ -670,9 +674,10 @@ pub fn verifyExperience() !void {
         try fixture.dig(0, 2, position);
         _ = try fixture.tick();
         var repeated: i32 = 0;
-        for (xp.active.values()) |index| if (xp.orbs[index].alive) {
-            repeated += xp.orbs[index].value * xp.orbs[index].count;
-        };
+        for (try xp.live(&live)) |entity| {
+            const found = (try xp.get(entity)).?;
+            repeated += found.orb.value * found.orb.count;
+        }
         try std.testing.expectEqual(total, repeated);
         try std.testing.expectEqualSlices(u8, &completed_random, &fixture.mining.random.encode());
     }

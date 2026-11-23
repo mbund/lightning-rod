@@ -6,6 +6,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const module = b.addModule("domains", .{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
     module.addImport("players", b.dependency("players", .{ .target = target, .optimize = optimize }).module("players"));
+    module.addImport("entities", b.dependency("entities", .{ .target = target, .optimize = optimize }).module("entities"));
 
     // Standalone development selects every supported release, as a server does by default.
     // Consumers supply their own selection.

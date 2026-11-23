@@ -26,12 +26,12 @@ fn playerEyeHeight(sneaking: bool) f64 {
 
 /// EntityGetter.getNearestPlayer(TargetingConditions, LivingEntity, x, y, z): the player who
 /// passes the conditions nearest the point, the first of equals.
-pub fn nearestPlayer(mobs: *Mobs, mob: *const Mob, conditions: Conditions, point: [3]f64) !?u32 {
+pub fn nearestPlayer(mobs: *Mobs, mob: Mob, conditions: Conditions, point: [3]f64) !?u32 {
     var best: ?u32 = null;
     var best_distance: f64 = -1;
     for (mobs.deps.players.activeSlots()) |slot| {
         const player = &mobs.deps.players.records[slot];
-        if (player.world != mob.world or player.stage != .ready or player.handle == null) continue;
+        if (player.world != mob.motion.world or player.stage != .ready or player.handle == null) continue;
         if (!try test_(mobs, mob, conditions, @intCast(slot))) continue;
         const dx = player.position.x - point[0];
         const dy = player.position.y - point[1];
@@ -46,7 +46,7 @@ pub fn nearestPlayer(mobs: *Mobs, mob: *const Mob, conditions: Conditions, point
 }
 
 /// TargetingConditions.test for a mob looking at a player, without combat.
-pub fn test_(mobs: *Mobs, mob: *const Mob, conditions: Conditions, slot: u32) !bool {
+pub fn test_(mobs: *Mobs, mob: Mob, conditions: Conditions, slot: u32) !bool {
     const player = &mobs.deps.players.records[slot];
     const state = mobs.deps.player_states.of(player);
     // LivingEntity.canBeSeenByAnyone.
@@ -54,9 +54,9 @@ pub fn test_(mobs: *Mobs, mob: *const Mob, conditions: Conditions, slot: u32) !b
     // LivingEntity.getVisibilityPercent: sneaking players are noticed closer.
     const visibility: f64 = if (player.flags.sneaking) 0.8 else 1.0;
     const reach = @max(conditions.range * visibility, 2.0);
-    const dx = mob.position[0] - player.position.x;
-    const dy = mob.position[1] - player.position.y;
-    const dz = mob.position[2] - player.position.z;
+    const dx = mob.motion.position[0] - player.position.x;
+    const dy = mob.motion.position[1] - player.position.y;
+    const dz = mob.motion.position[2] - player.position.z;
     if (dx * dx + dy * dy + dz * dz > reach * reach) return false;
     // Vanilla tests the selector before the range, and both only read, so the cheaper goes first.
     if (conditions.holding_food and !mobs.holdsFood(slot)) return false;
@@ -70,13 +70,13 @@ pub fn playerEye(mobs: *Mobs, slot: u32) [3]f64 {
 }
 
 /// LivingEntity.hasLineOfSight: no collision shape between the eyes, within 128 blocks.
-pub fn hasLineOfSight(mobs: *Mobs, mob: *const Mob, target: [3]f64) !bool {
-    const eye: [3]f64 = .{ mob.position[0], living.eyeY(mobs, mob), mob.position[2] };
+pub fn hasLineOfSight(mobs: *Mobs, mob: Mob, target: [3]f64) !bool {
+    const eye: [3]f64 = .{ mob.motion.position[0], living.eyeY(mobs, mob), mob.motion.position[2] };
     const dx = target[0] - eye[0];
     const dy = target[1] - eye[1];
     const dz = target[2] - eye[2];
     if (@sqrt(dx * dx + dy * dy + dz * dz) > 128.0) return false;
-    const level = mobs.level(mob.world);
+    const level = mobs.level(mob.motion.world);
     return !try clipsCollider(&level, eye, target, living.context(mob));
 }
 
@@ -147,9 +147,9 @@ fn entersBox(target: body.Box, from: [3]f64, delta: [3]f64) bool {
     return enter <= 1.0;
 }
 
-pub fn distanceSquared(a: *const Mob, b: *const Mob) f64 {
-    const dx = a.position[0] - b.position[0];
-    const dy = a.position[1] - b.position[1];
-    const dz = a.position[2] - b.position[2];
+pub fn distanceSquared(a: Mob, b: Mob) f64 {
+    const dx = a.motion.position[0] - b.motion.position[0];
+    const dy = a.motion.position[1] - b.motion.position[1];
+    const dz = a.motion.position[2] - b.motion.position[2];
     return dx * dx + dy * dy + dz * dz;
 }

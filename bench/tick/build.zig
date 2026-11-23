@@ -23,6 +23,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "lightning_rod", .module = b.dependency("lightning_rod", .{ .target = target, .optimize = optimize }).module("lightning_rod") },
                 .{ .name = "vanilla", .module = vanilla },
                 .{ .name = "game_data", .module = vanilla.import_table.get("game_data").? },
+                .{ .name = "terrain", .module = vanilla.import_table.get("terrain").? },
                 .{ .name = "sessions", .module = sessions },
                 .{ .name = "networking", .module = sessions.import_table.get("networking").? },
                 .{ .name = "protocols", .module = protocols },

@@ -34,13 +34,14 @@ pub const Instrumentation = struct {
     writes: metrics.Counter = .{},
     evictions: metrics.Counter = .{},
     acquired: metrics.Counter = .{},
+    batches: metrics.Counter = .{},
     written_bytes: metrics.Counter = .{},
 
     pub fn init(registry: ?*metrics.Registry, namespace: []const u8) !Instrumentation {
         const owner = registry orelse return .{};
         return .{
-            .acquisition = try owner.timer(.{ .namespace = namespace, .name = "acquisition", .description = "Acquire a cache working set" }),
-            .lookup = try owner.timer(.{ .namespace = namespace, .name = "lookup", .description = "Locate cached records" }),
+            .acquisition = try owner.timer(.{ .namespace = namespace, .name = "acquisition", .description = "Acquire a working set some of which was not cached" }),
+            .lookup = try owner.timer(.{ .namespace = namespace, .name = "lookup", .description = "Locate cached records for a working set some of which was not cached" }),
             .eviction = try owner.timer(.{ .namespace = namespace, .name = "eviction", .description = "Select and reclaim cache slots" }),
             .storage = try owner.timer(.{ .namespace = namespace, .name = "storage", .description = "Read missing records" }),
             .eviction_write = try owner.timer(.{ .namespace = namespace, .name = "eviction_write", .description = "Write dirty eviction victims" }),
@@ -50,6 +51,7 @@ pub const Instrumentation = struct {
             .writes = try owner.counter(.{ .namespace = namespace, .name = "writes", .description = "Records written to storage" }),
             .evictions = try owner.counter(.{ .namespace = namespace, .name = "evictions", .description = "Occupied cache slots reclaimed" }),
             .acquired = try owner.counter(.{ .namespace = namespace, .name = "acquired", .description = "Records requested" }),
+            .batches = try owner.counter(.{ .namespace = namespace, .name = "batches", .description = "Working sets requested" }),
             .written_bytes = try owner.counter(.{ .namespace = namespace, .name = "written_bytes", .description = "Evicted value bytes", .unit = .bytes }),
         };
     }
@@ -355,18 +357,19 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
                 return .ready;
             }
 
+            self.metrics.acquired.add(keys.len);
+            self.metrics.batches.add(1);
+            for (keys) |key| if (key.len == 0 or key.len > self.key_bytes) return error.InvalidArgument;
+            // A working set found whole is not timed: reading the clock would cost more than
+            // finding it.
+            if (try self.acquireResident(keys, leases, reserve_only, pin_limit, transient)) |result| return result;
             const acquisition = self.metrics.acquisition.start();
             defer acquisition.end();
-            self.metrics.acquired.add(keys.len);
-            for (keys) |key| if (key.len == 0 or key.len > self.key_bytes) return error.InvalidArgument;
-            if (try self.acquireResident(keys, leases, reserve_only, pin_limit, transient)) |result| return result;
             // Keep miss buffers out of resident lookup frames.
             return @call(.never_inline, Self.acquireMissing, .{ self, keys, leases, reserve_only, victims_out, pin_limit, transient });
         }
 
         fn acquireResident(self: *Self, keys: []const []const u8, leases: []Lease, comptime reserve_only: bool, pin_limit: usize, comptime transient: bool) !?Reservation {
-            const lookup = self.metrics.lookup.start();
-            defer lookup.end();
             var acquired: usize = 0;
             var owned = true;
             defer if (owned) for (leases[0..acquired]) |lease| lease.release();
@@ -701,7 +704,7 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
             self.rebuildIndex();
             const after = self.scan_bytes[self.scan_bytes.len - self.key_bytes ..];
             @memcpy(after[0..cursor.after_len], cursor.after[0..cursor.after_len]);
-            var disk_cursor: ScanCursor = .{ .after = after, .after_len = cursor.after_len };
+            var disk_cursor: ScanCursor = .{ .after = after, .after_len = cursor.after_len, .before = cursor.before };
             const disk = try self.backend.scan(&disk_cursor, self.scan_entries[0..output.len]);
             assert(disk.count <= output.len);
             var cached = self.lowerBound(cursor.after[0..cursor.after_len]);
@@ -713,9 +716,12 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
             var stored: usize = 0;
             var count: usize = 0;
 
-            while (count < output.len and (stored < disk.count or (!disk.more and cached < self.index_count))) {
+            // Cached keys at or past the bound are as good as none.
+            var cached_end = self.index_count;
+            if (cursor.before.len != 0) cached_end = self.lowerBound(cursor.before);
+            while (count < output.len and (stored < disk.count or (!disk.more and cached < cached_end))) {
                 const row = if (stored < disk.count) self.scan_entries[stored] else null;
-                const slot = if (cached < self.index_count) self.index[cached] else null;
+                const slot = if (cached < cached_end) self.index[cached] else null;
                 const cache_key = if (slot) |id| self.keyBytes(id)[0..self.entries[id].key_len] else null;
                 const order = if (row) |r| if (cache_key) |key| std.mem.order(u8, key, r.key[0..r.key_len]) else .gt else .lt;
                 const key = if (order != .gt) cache_key.? else row.?.key[0..row.?.key_len];
@@ -749,7 +755,7 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
             }
 
             assert(count <= output.len);
-            return .{ .count = count, .more = stored < disk.count or disk.more or cached < self.index_count };
+            return .{ .count = count, .more = stored < disk.count or disk.more or cached < cached_end };
         }
 
         /// Existing leases remain immutable snapshots until released.

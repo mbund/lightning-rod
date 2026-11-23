@@ -79,14 +79,6 @@ pub const CreativeInventory = struct {
         var slots: [47]inventories.Slot = undefined;
         var contents: [47]inventories.Contents = undefined;
         try menu.load(player_index, &slots, &contents);
-        const dropping = switch (action) {
-            .creative_slot => |set| set.slot == -1 and set.item != null,
-            .dig => |dig| dig.action == .drop_item or dig.action == .drop_stack,
-        };
-        if (dropping and !menu.deps.dropped.canCreate(1)) {
-            state.dirty = PlayerInventory.all_slots;
-            return;
-        }
         var next: [47]?inventories.Stack = undefined;
         for (&next, contents) |*stack, value| stack.* = value.stack;
 

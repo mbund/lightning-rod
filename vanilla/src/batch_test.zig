@@ -249,8 +249,23 @@ test "prepared definitions survive cache reuse and revalidate changed bytes" {
     for (ownership.items.entries) |entry| try std.testing.expectEqual(@as(usize, 0), entry.pins);
 }
 
-test "pinned item batches observe earlier mutations and retirement" {
-    for ([_]usize{ 4, 8 }) |cache_records| {
+/// The items the space has in a column of x, at z 0, as they entered it.
+fn inColumn(dropped: *ItemEntities, world: u32, x: i32, output: []entities.Id) !usize {
+    var buffer: [4]entities.space.Entry = undefined;
+    var ordered = dropped.inColumn(.{ .world = world, .x = x, .z = 0 }, std.math.minInt(i32), std.math.maxInt(i32), &buffer);
+    var count: usize = 0;
+    while (true) {
+        const entries = try ordered.next();
+        if (entries.len == 0) return count;
+        for (entries) |entry| {
+            output[count] = entry.id;
+            count += 1;
+        }
+    }
+}
+
+test "items read by id see earlier writes, moves and retirement" {
+    {
         var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
         defer threaded.deinit();
         const io = threaded.io();
@@ -271,10 +286,10 @@ test "pinned item batches observe earlier mutations and retirement" {
         const ownership = try inventories.Inventories.init(allocator, io, .{ .cache_items = 2, .cache_slots = 8, .max_item_bytes = 1024 }, .{ .metrics = &metric_registry, .storage = try transaction.openSpace("inventory"), .record_workspaces = workspaces });
         const gameplay_definitions = try vanilla_content.prepare(allocator);
         const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
-        const bodies = try entities.Entities.init(allocator, io, .{ .cache_records = cache_records / 2 }, .{ .metrics = &metric_registry, .storage = try transaction.openSpace("bodies"), .record_workspaces = workspaces });
+        const bodies = try entities.Entities.init(allocator, io, .{}, .{ .metrics = &metric_registry, .storage = try transaction.openSpace("bodies"), .record_workspaces = workspaces });
         const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try transaction.openSpace("worlds") });
         const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
-        const dropped = try ItemEntities.init(allocator, io, .{ .cache_records = cache_records, .maximum = 4 }, .{
+        const dropped = try ItemEntities.init(allocator, io, .{}, .{
             .metrics = &metric_registry,
             .record_workspaces = workspaces,
             .entities = bodies,
@@ -290,146 +305,33 @@ test "pinned item batches observe earlier mutations and retirement" {
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
         players.rebuildIndexes();
-        var query = try ItemEntities.Query.init(allocator, dropped, &players);
-        var other_query = try ItemEntities.Query.init(allocator, dropped, &players);
-        const selected = query.read(0);
-        try std.testing.expectEqualSlices(entities.Id, &.{ first, second }, selected);
-        _ = other_query.read(2);
-        const rebuilds = query.rebuilds.value();
-        player_records[0].position.x = 0.25;
-        for (0..64) |_| {
-            try std.testing.expectEqualSlices(entities.Id, &.{ first, second }, query.read(0));
-            _ = other_query.read(2);
-        }
-        try std.testing.expectEqual(rebuilds, query.rebuilds.value());
-        try std.testing.expectEqualSlices(entities.Id, &.{ first, second }, selected);
-        player_records[0].world = world + 1;
-        try std.testing.expectEqual(@as(usize, 0), query.read(0).len);
-        player_records[0].world = world;
-        const connected = player_records[0].handle;
-        player_records[0].handle = null;
-        try std.testing.expectEqual(@as(usize, 0), query.read(0).len);
-        player_records[0].handle = connected;
-        try std.testing.expectEqualSlices(entities.Id, &.{ first, second }, query.read(0));
-        var iterator = dropped.iterate(&.{ first, second });
-        defer iterator.deinit();
-        const batch = (try iterator.next()).?;
-        try std.testing.expectEqual(cache_records / 4, batch.len);
+        // The area index holds where each is: both start in column 0.
+        var found: [4]entities.Id = undefined;
+        try std.testing.expectEqualSlices(entities.Id, &.{ first, second }, found[0..try inColumn(dropped, world, 0, &found)]);
         {
-            var extra: [1]ItemEntities.Record = undefined;
-            if (batch.len == 1) try dropped.acquireMany(&.{second}, &extra);
-            defer if (batch.len == 1) extra[0].release();
-            const partner = if (batch.len == 1) extra[0] else batch[1];
             var metadata = try dropped.get(second);
             metadata.age = 77;
-            const unchanged = query.rebuilds.value();
             try dropped.put(second, metadata);
-            _ = query.read(0);
-            try std.testing.expectEqual(unchanged, query.rebuilds.value());
-            try std.testing.expectEqual(@as(i32, 77), (try partner.read()).age);
-            var body = (try partner.body.read()).?;
+            try std.testing.expectEqual(@as(i32, 77), (try dropped.read(second)).?.metadata.age);
+            const was = (try dropped.read(second)).?.body;
+            var body = was;
             body.position[0] = 32;
-            try dropped.move(partner, (try partner.body.read()).?, body);
-            try std.testing.expectEqual(@as(f64, 32), (try partner.body.read()).?.position[0]);
-            const first_view = query.read(0);
-            try std.testing.expectEqualSlices(entities.Id, &.{first}, first_view);
-            player_records[0].position.x = 32;
-            try std.testing.expectEqualSlices(entities.Id, &.{second}, other_query.read(0));
-            try std.testing.expectEqualSlices(entities.Id, &.{first}, first_view);
-            try std.testing.expectEqualSlices(entities.Id, &.{second}, query.read(0));
+            try dropped.move(second, was, body);
+            try std.testing.expectEqual(@as(f64, 32), (try dropped.read(second)).?.body.position[0]);
+            try std.testing.expectEqualSlices(entities.Id, &.{first}, found[0..try inColumn(dropped, world, 0, &found)]);
+            try std.testing.expectEqualSlices(entities.Id, &.{second}, found[0..try inColumn(dropped, world, 2, &found)]);
             const slot = ItemEntities.slot(body);
             const held = try ownership.get(slot);
             try std.testing.expect(try ownership.set(slot, held.revision, null));
             try dropped.retire(second, body, &metadata);
-            try std.testing.expect(!(try partner.read()).alive);
-            try std.testing.expect(try partner.body.read() == null);
+            try std.testing.expect(!(try dropped.get(second)).alive);
+            try std.testing.expect((try bodies.get(second)) == null);
         }
-        iterator.deinit();
+        // Retired, it is gone from its column; one made there takes its place.
+        try std.testing.expectEqual(@as(usize, 0), try inColumn(dropped, world, 2, &found));
         const replacement = try dropped.create(world, .{ 32, 65, 0 }, @splat(0), stack);
-        try std.testing.expectEqualSlices(entities.Id, &.{replacement}, query.read(0));
-        player_records[0].position.x = 0;
-        try std.testing.expectEqualSlices(entities.Id, &.{ first, replacement }, query.read(2));
-        for (dropped.cache.entries) |entry| try std.testing.expectEqual(@as(usize, 0), entry.pins);
-        for (bodies.cache.entries) |entry| try std.testing.expectEqual(@as(usize, 0), entry.pins);
+        try std.testing.expectEqualSlices(entities.Id, &.{replacement}, found[0..try inColumn(dropped, world, 2, &found)]);
     }
-}
-
-pub fn benchmarkItemQueries() !void {
-    const io = std.testing.io;
-    var output_buffer: [1024]u8 = undefined;
-    var output = std.Io.File.stdout().writer(io, &output_buffer);
-    try output.interface.writeAll("items | query reads | spatial rebuilds | unchanged rebuilds\n");
-    for ([_]usize{ 1024, 8192 }) |count| {
-        var temporary = std.testing.tmpDir(.{});
-        defer temporary.cleanup();
-        var path_buffer: [256]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/queries", .{temporary.sub_path});
-        var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
-        defer store.deinit();
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        var failing = std.testing.FailingAllocator.init(arena.allocator(), .{});
-        const allocator = failing.allocator();
-        var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .capacity = 128 });
-        defer registry.deinit();
-        const workspaces = try persistent_records.Workspaces.init(allocator, io, .{});
-        const ownership = try inventories.Inventories.allocate(allocator, io, .{ .cache_slots = 2, .cache_items = 1, .max_item_bytes = 64 }, .{
-            .metrics = &registry,
-            .storage = try store.openSpace("inventory"),
-            .record_workspaces = workspaces,
-        });
-        const gameplay_definitions = try vanilla_content.prepare(allocator);
-        const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
-        const bodies = try entities.Entities.allocate(allocator, io, .{ .cache_records = 2 }, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
-        const dimensions = try worlds.Worlds.allocate(allocator, .{ .maximum = 1 });
-        const dropped = try ItemEntities.allocate(allocator, io, .{ .cache_records = 4, .maximum = count }, .{
-            .metrics = &registry,
-            .record_workspaces = workspaces,
-            .entities = bodies,
-            .inventories = ownership,
-            .items = items,
-            .worlds = dimensions,
-            .storage = try store.openSpace("metadata"),
-        });
-        const expected = try allocator.alloc(entities.Id, count);
-        const nearby = try allocator.alloc(entities.Id, count);
-        var nearby_count: usize = 0;
-        var random = std.Random.DefaultPrng.init(20261025);
-        for (dropped.residents, expected, 0..) |*resident, *id, index| {
-            resident.* = .{ .id = index + 1, .world = 0, .x = random.random().intRangeAtMost(i32, -8, 8), .z = random.random().intRangeAtMost(i32, -8, 8), .y = 4, .alive = true };
-            dropped.spatial.insert(@intCast(index));
-            dropped.ids.putAssumeCapacityNoClobber(resident.id, @intCast(index));
-            id.* = resident.id;
-            if (@abs(resident.x) <= 1 and @abs(resident.z) <= 1) {
-                nearby[nearby_count] = resident.id;
-                nearby_count += 1;
-            }
-        }
-        dropped.free_count = 0;
-        var rows = [_]Players.Player{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = 0, .position = .{ .x = 8, .y = 65, .z = 8 } }};
-        var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &rows, .dig_handlers = &.{} };
-        try players.initIndexes(allocator);
-        players.rebuildIndexes();
-        var simulation = try ItemEntities.Query.init(allocator, dropped, &players);
-        var pickup = try ItemEntities.Query.init(allocator, dropped, &players);
-        failing.fail_index = failing.alloc_index;
-        const initial = simulation.rebuilds.value();
-        for (0..20) |_| {
-            try std.testing.expectEqualSlices(entities.Id, expected, simulation.read(8));
-            try std.testing.expectEqualSlices(entities.Id, nearby[0..nearby_count], pickup.read(1));
-        }
-        const rebuilt = simulation.rebuilds.value() - initial;
-        try std.testing.expectEqual(@as(u64, 2), rebuilt);
-        const warm = simulation.rebuilds.value();
-        for (0..20) |_| {
-            _ = simulation.read(8);
-            _ = pickup.read(1);
-        }
-        const unchanged = simulation.rebuilds.value() - warm;
-        try std.testing.expectEqual(@as(u64, 0), unchanged);
-        try output.interface.print("{d:5} | {d:11} | {d:16} | {d}\n", .{ count, 40, rebuilt, unchanged });
-    }
-    try output.interface.flush();
 }
 
 pub fn benchmarkItemPhysicsWindow() !void {
@@ -476,7 +378,7 @@ pub fn benchmarkItemPhysicsWindow() !void {
     try output.interface.writeAll("moving items | section acquisitions | acquisition batches | storage reads\n");
     for ([_]usize{ 1, 64, 1024 }) |count| {
         const before = terrain.cache.metrics.acquired.value();
-        const batches = terrain.cache.metrics.acquisition.read().?.count;
+        const batches = terrain.cache.metrics.batches.value();
         const reads = terrain.cache.metrics.reads.value();
         const generated = source.generated;
         var window = physics.readWindow();
@@ -491,7 +393,7 @@ pub fn benchmarkItemPhysicsWindow() !void {
         try std.testing.expectEqual(reads, terrain.cache.metrics.reads.value());
         try std.testing.expectEqual(generated, source.generated);
         const acquired = terrain.cache.metrics.acquired.value() - before;
-        const calls = terrain.cache.metrics.acquisition.read().?.count - batches;
+        const calls = terrain.cache.metrics.batches.value() - batches;
         try std.testing.expectEqual(@as(u64, 4), acquired);
         try std.testing.expectEqual(@as(u64, 1), calls);
         try output.interface.print("{d:12} | {d:20} | {d:19} | 0\n", .{ count, acquired, calls });

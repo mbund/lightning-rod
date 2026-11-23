@@ -1,4 +1,4 @@
-//! The mobs of every world, in a fixed array with a grid of where they stand, ticked in vanilla's order
+//! The mobs of every world, in memory with the places they stand, ticked in vanilla's order
 //! where the ticking domain reaches and saved at checkpoints. Mobs read blocks through copies
 //! of the sections they touch, kept across ticks.
 
@@ -29,7 +29,7 @@ const JavaRandom = @import("vanilla_bodies").java_random.JavaRandom;
 const pathfinding = @import("pathfinding.zig");
 const navigation = @import("navigation.zig");
 const herd_state = @import("herd.zig");
-const grid_state = @import("grid.zig");
+const mob_extras = @import("extras.zig");
 const goals = @import("goals.zig");
 const inventories = @import("inventories");
 const Lighting = @import("terrain").lighting.Lighting;
@@ -50,6 +50,7 @@ const EnchantmentRegistry = @import("vanilla_items").enchantment_registry.Enchan
 const damage = @import("damage.zig");
 
 const Mob = mob_state.Mob;
+const MobState = mob_state.MobState;
 const Species = mob_state.Species;
 const assert = std.debug.assert;
 
@@ -96,12 +97,12 @@ pub const Mobs = struct {
     pub const id = "minecraft:mobs";
 
     pub const Configuration = struct {
-        /// Mobs in every world together, alive or dying.
-        maximum: usize = 1024,
+        /// Events held for the replication between its ticks; past them, it sends them early.
+        events: usize = 1024,
         /// Sections of blocks mobs keep decoded across ticks.
         copies: u32 = 512,
         /// Block edits held for paths to answer in a batch, from the first that changes a
-        /// collision. Edits past it are counted and go unanswered.
+        /// collision. When they fill, the paths answer them at once.
         edits: u32 = 16384,
         seed: u64 = 0x6d6f6273,
     };
@@ -133,19 +134,26 @@ pub const Mobs = struct {
 
     deps: Dependencies,
     config: Configuration,
-    mobs: []Mob,
-    /// Mobs by the cell they stand in, and where and when they came into their section.
-    grid: grid_state.Grid,
-    arrivals: []grid_state.Arrival,
-    arrival_stamp: u64 = 0,
-    /// Room for what a query near a box finds.
-    nearby: []u32,
-    /// Half the width of the widest mob, which a box query reaches out by.
+    /// Every mob's components, a row each in the mobs' table, in the tick order's sequence, each
+    /// component a column: `inSlot` gives where a mob's records lie, good until the tick's end.
+    rows: Table,
+    cow_type: u32,
+    /// Where every entity is, by section and in the order each came into its own, as vanilla's
+    /// entity sections keep them, and the order they tick in: shared by every kind.
+    places: *entities.Places,
+    /// What lookups of mobs are after, among every kind in the space.
+    kinds: entities.Kinds,
+    /// The places' ticking columns as mobs last learned their places in the order.
+    /// Half the width of the widest mob, and the height of the tallest, which a box query
+    /// reaches out by from the places of mobs' feet.
     widest_half: f64,
-    ids: std.AutoHashMapUnmanaged(u64, u32) = .empty,
-    active: lightning_rod.system.IndexSet,
-    free: []u32,
-    free_count: usize,
+    tallest: f64,
+    /// Mobs' rare parts, behind their rows' links.
+    extras: mob_extras.Store,
+    /// Mobs in memory, by their directory slots.
+    active: entities.pool.IndexSet,
+    /// Every mob's slot in the order replication sends them, as `collectOrder` last found.
+    ordered: entities.Array(u32),
     blocks: *mob_blocks.MobBlocks,
     copies: *chunks.Copies,
     species: [@typeInfo(Species).@"enum".field_names.len]species_data.Traits,
@@ -157,19 +165,31 @@ pub const Mobs = struct {
     sound_seeds: std.Random.DefaultPrng,
     effects: world_effects.Effects,
     table: records.Table,
-    /// Mobs saved at the last checkpoint, to remove the ones gone since.
-    saved: []u64,
-    saved_count: usize = 0,
+    /// Whether every kept mob was brought in at once, where nothing follows the loaded domain.
+    loaded_all: bool = false,
     air_state: u16,
     /// The working memory of path searches, one at a time on the simulation thread.
     search: pathfinding.Search,
-    /// Each mob's path, at its index, path_capacity nodes apiece.
-    paths: []pathfinding.PathNode,
+    /// The nodes of the paths mobs are following, each path a blob in the entities' pool, and
+    /// a path's nodes read whole while its navigation works on them.
+    path_nodes: entities.extras.Blobs,
+    path_work: []pathfinding.PathNode,
     /// Edits since the first that changed a collision, which paths answer in a batch, in order.
     edits: []body.Edit,
     edit_count: usize = 0,
-    /// Edits past the capacity, which no path answers.
-    edits_dropped: u64 = 0,
+    /// While held edits are answered early: the rest of the section being told of, which the
+    /// world shows already.
+    later: ?Later = null,
+    /// Times the held edits filled and were answered early, for measuring.
+    edits_answered_early: u64 = 0,
+    /// What went wrong answering edits early, inside a notification, told at the next tick.
+    failure: ?anyerror = null,
+    /// What befell mobs since the replication last sent it, in order.
+    events: []mob_state.Event,
+    event_count: usize = 0,
+    /// Sends the events at once, when they fill within a tick; without it, as with no
+    /// replication, nobody hears and they are let go.
+    events_full: ?EventsFull = null,
     /// Path searches run, and recomputations edits asked for, for measuring.
     path_searches: u64 = 0,
     edit_recomputes: u64 = 0,
@@ -178,11 +198,9 @@ pub const Mobs = struct {
     travels_run: u64 = 0,
     /// Ticks idle mobs took in the herd, for measuring.
     idle_ticks: u64 = 0,
-    /// Blocks of eight idle mobs advanced together, and lanes in them left to the scalar tick.
+    /// Blocks of idle mobs, one per lane, advanced together, and lanes in them left to the scalar tick.
     idle_blocks: u64 = 0,
     rare_lanes: u64 = 0,
-    /// Mobs following a path while a batch of edits is answered.
-    candidates: []u32,
     /// Blocks as they stood after the edit being answered, which levels read while it is set.
     overlay: body.Overlay,
     overlay_view: ?*const body.Overlay = null,
@@ -195,8 +213,6 @@ pub const Mobs = struct {
     /// By player slot, whether the player holds cow food in either hand, noted as mobs start
     /// ticking: tempting asks every other tick for every mob, and hands change only between.
     holding_food: []bool,
-    /// Mobs in entity id order, the order they tick in, with idle mobs' hot state.
-    herd: herd_state.Herd,
     /// The players idle mobs look for this tick.
     present: []herd_state.Audience.Player,
     present_count: usize = 0,
@@ -206,14 +222,17 @@ pub const Mobs = struct {
     muted: bool = false,
     /// Rises whenever columns start or stop ticking.
     domain_revision: u64 = 0,
-    /// By slot, whether the mob's column ticked, as of a domains revision.
-    column_ticks: []ColumnTicks,
     /// Worlds' levels found this tick, kept only while mobs tick.
     views: [8]WorldView = undefined,
     view_count: usize = 0,
     ticking: bool = false,
     /// Entity.movementThisTick for the mob ticking, which only it adds to and reads.
     movements: [8]mob_state.Movement = undefined,
+    /// While entities tick: the players idle mobs look for and what they know of their kind.
+    context: TickContext = undefined,
+    /// What a goal's canUse chose, which its start takes up at once: a place to go, a mob, or
+    /// a player.
+    chosen: struct { target: [3]f64 = .{ 0, 0, 0 }, partner: ?u64 = null, player: ?u32 = null } = .{},
     /// The last path found, until a navigation takes it.
     scratch_path: []pathfinding.PathNode,
     scratch: struct { count: u16 = 0, target: [3]i32 = .{ 0, 0, 0 }, reached: bool = false } = .{},
@@ -223,28 +242,29 @@ pub const Mobs = struct {
     loot_random: std.Random.DefaultPrng,
     loot_scratch: std.heap.FixedBufferAllocator,
     /// By damage type: what its tags say, and its id in the registry.
-
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Mobs {
         const self = try allocate(allocator, config, deps);
-        try self.load();
+        try self.migrate();
         return self;
     }
 
     pub fn allocate(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Mobs {
-        if (config.maximum == 0 or config.maximum > 65536) return error.InvalidMobCapacity;
         if (config.edits == 0) return error.InvalidEditCapacity;
         const self = try allocator.create(Mobs);
+        const pool = &deps.entities.pool;
+        const cow_type: u32 = @intCast(game_data.registry.entityId("minecraft:cow").?);
         self.* = .{
             .deps = deps,
             .config = config,
-            .mobs = try allocator.alloc(Mob, config.maximum),
-            .grid = try .init(allocator, config.maximum),
-            .arrivals = try allocator.alloc(grid_state.Arrival, config.maximum),
-            .nearby = try allocator.alloc(u32, config.maximum),
+            .rows = try .init(allocator, pool, &deps.entities.directory),
+            .cow_type = cow_type,
+            .places = &deps.entities.places,
+            .kinds = .{},
             .widest_half = 0,
-            .active = try .init(allocator, config.maximum),
-            .free = try allocator.alloc(u32, config.maximum),
-            .free_count = config.maximum,
+            .tallest = 0,
+            .active = try .init(allocator, pool),
+            .extras = try .init(allocator, pool),
+            .ordered = try .init(allocator, pool),
             .blocks = try mob_blocks.MobBlocks.init(allocator, deps.block_definitions),
             .copies = try chunks.Copies.init(allocator, deps.chunks, config.copies),
             .species = undefined,
@@ -255,19 +275,17 @@ pub const Mobs = struct {
             .loot_scratch = .init(try allocator.alloc(u8, 16 * 1024)),
             .effects = try .init(allocator, deps.players),
             .table = records.Table.init(deps.storage, deps.record_workspaces.resources),
-            .saved = try allocator.alloc(u64, config.maximum),
             .air_state = @intCast(game_data.registry.blockStateId("minecraft:air").?),
             .search = try .init(allocator, search_nodes),
-            .paths = try allocator.alloc(pathfinding.PathNode, config.maximum * path_capacity),
+            .path_nodes = try .init(allocator, pool),
+            .path_work = try allocator.alloc(pathfinding.PathNode, path_capacity),
             .scratch_path = try allocator.alloc(pathfinding.PathNode, path_capacity),
             .edits = try allocator.alloc(body.Edit, config.edits),
-            .candidates = try allocator.alloc(u32, config.maximum),
+            .events = try allocator.alloc(mob_state.Event, config.events),
             .holding_food = try allocator.alloc(bool, deps.players.records.len),
-            .column_ticks = try allocator.alloc(ColumnTicks, config.maximum),
-            .herd = try .init(allocator, config.maximum),
             .present = try allocator.alloc(herd_state.Audience.Player, deps.players.records.len),
             .holders = try allocator.alloc(herd_state.Audience.Player, deps.players.records.len),
-            .overlay = try .init(allocator, config.edits),
+            .overlay = try .init(allocator, config.edits + chunks.edit_previous_max),
         };
         self.copies.mark(self.blocks.marks);
         try self.readTags();
@@ -275,10 +293,16 @@ pub const Mobs = struct {
         try deps.chunks.observe(.init(self, blocksChanged));
         try deps.domains.observe(.init(Mobs, self, domainsChanged));
         try deps.client.registry.onChange(self, readTags);
-        for (self.free, 0..) |*slot, index| slot.* = @intCast(config.maximum - 1 - index);
         inline for (@typeInfo(Species).@"enum".field_names, 0..) |field, index| self.species[index] = species_data.traits(@field(Species, field));
-        for (self.species) |species| self.widest_half = @max(self.widest_half, @as(f64, species.width) / 2);
-        try self.ids.ensureTotalCapacity(allocator, @intCast(config.maximum));
+        for (self.species) |species| self.kinds.bits.set(species.entity_type);
+        for (self.species) |species| try deps.entities.addTable(species.entity_type, &self.rows.core);
+        // Mobs take their turns in the one tick order, as many as fill a pass's run.
+        try deps.entities.addTicker(.init(Mobs, self, self.kinds, entities.Entities.run_max));
+        try deps.entities.addColumnHolder(.init(Mobs, self, loadColumn, unloadColumn));
+        for (self.species) |species| {
+            self.widest_half = @max(self.widest_half, @as(f64, species.width) / 2);
+            self.tallest = @max(self.tallest, @as(f64, species.height));
+        }
         return self;
     }
 
@@ -337,10 +361,6 @@ pub const Mobs = struct {
         return true;
     }
 
-    pub fn canSpawn(self: *const Mobs) bool {
-        return self.free_count > 0;
-    }
-
     pub const Spawn = struct {
         species: Species,
         world: u32,
@@ -354,36 +374,42 @@ pub const Mobs = struct {
 
     /// Adds a mob as EntityType.create and Mob.finalizeSpawn leave it, at a position.
     pub fn spawn(self: *Mobs, request: Spawn) !u64 {
-        if (self.free_count == 0) return error.MobCapacity;
         const entity = try self.deps.entities.reserveIds(1);
-        if (entity > std.math.maxInt(i32)) return error.IdExhausted;
         var random = entityRandom(self.config.seed, entity);
         const traits_entry = self.traits(request.species);
-        var created: Mob = .{
-            .id = entity,
-            .uuid = randomUuid(&random),
-            .species = request.species,
-            .world = request.world,
-            .position = request.position,
-            .old_position = request.position,
-            .random = random,
-            .health = @floatCast(traits_entry.attribute(.max_health)),
-            .yaw = request.yaw,
-            .old_yaw = request.yaw,
-            .head_yaw = request.yaw,
-            .body_yaw = request.yaw,
-            .variant = request.variant,
+        var created: MobState = .{
+            .entity = .{
+                .id = entity,
+                .uuid = randomUuid(&random),
+                .species = request.species,
+            },
+            .idle = .{
+                .random = random,
+                .head_yaw = request.yaw,
+                .body_yaw = request.yaw,
+            },
+            .motion = .{
+                .world = request.world,
+                .position = request.position,
+                .old_position = request.position,
+                .yaw = request.yaw,
+                .old_yaw = request.yaw,
+            },
+            .living = .{
+                .health = @floatCast(traits_entry.attribute(.max_health)),
+            },
+            .cow = .{ .variant = request.variant },
         };
         if (request.finalize) {
             // Mob.finalizeSpawn: a random bonus to the follow range, then the left hand chance.
-            created.follow_range_bonus = self.level_random.triangle(0.0, 0.11485000000000001);
-            created.left_handed = self.level_random.nextFloat() < 0.05;
+            created.living.follow_range_bonus = self.level_random.triangle(0.0, 0.11485000000000001);
+            created.control.left_handed = self.level_random.nextFloat() < 0.05;
         } else {
             // LivingEntity's constructor turns the head by Math.random in radians, read as degrees,
             // and snapTo leaves it while the body faces the given yaw.
-            created.head_yaw = @floatCast(@as(f64, @floatFromInt(self.seeds.next() >> 11)) / (1 << 53) * @as(f64, @as(f32, std.math.pi * 2.0)));
+            created.idle.head_yaw = @floatCast(@as(f64, @floatFromInt(self.seeds.next() >> 11)) / (1 << 53) * @as(f64, @as(f32, std.math.pi * 2.0)));
         }
-        if (request.baby) created.age = -24000;
+        if (request.baby) created.idle.age = -24000;
         return self.insert(created);
     }
 
@@ -404,100 +430,257 @@ pub const Mobs = struct {
         return bytes;
     }
 
-    fn insert(self: *Mobs, created: Mob) !u64 {
-        assert(self.free_count > 0);
-        assert(self.active.values().len + self.free_count == self.mobs.len);
-        self.free_count -= 1;
-        const index = self.free[self.free_count];
-        self.mobs[index] = created;
-        self.ids.putAssumeCapacityNoClobber(created.id, index);
-        self.active.insert(index);
-        self.herd.add(self.mobs, index);
-        self.arrivals[index] = .{ .section = sectionOf(created.position), .stamp = self.nextArrival() };
-        self.column_ticks[index] = .{};
-        self.locate(index);
+    fn insert(self: *Mobs, created: MobState) !u64 {
+        const held = self.deps.entities;
+        // A mob's slot is its directory slot.
+        const index = try held.enter(created.entity.id, self.traits(created.entity.species).entity_type);
+        errdefer held.leave(index);
+        // Dormant until placed: the tick order gives it its place in `locate`.
+        try self.rows.add(index, rowOf(created), true);
+        errdefer self.rows.remove(index);
+        try self.extras.write(self.rows.ref(index).field("extras"), created.rare);
+        try self.active.insert(index);
+        try self.locate(index);
         // A mob appearing touches the mobs around it.
-        const placed = living.box(self, &self.mobs[index]);
-        self.wake(created.world, placed.min, placed.max);
-        return created.id;
+        const placed = living.box(self, try self.inSlot(index));
+        self.wake(created.motion.world, placed.min, placed.max);
+        return created.entity.id;
     }
 
-    /// Keeps a mob in the grid cell it stands in, and notes when it comes into a new section.
-    pub fn locate(self: *Mobs, index: u32) void {
-        const mob = &self.mobs[index];
-        if (mob.removed) return self.grid.remove(index);
-        const section = sectionOf(mob.position);
-        if (!std.meta.eql(section, self.arrivals[index].section)) self.arrivals[index] = .{ .section = section, .stamp = self.nextArrival() };
-        self.grid.place(index, grid_state.Grid.cellOf(mob.world, mob.position[0], mob.position[2]), living.box(self, mob));
-    }
-
-    fn nextArrival(self: *Mobs) u64 {
-        self.arrival_stamp += 1;
-        return self.arrival_stamp;
+    /// Keeps a mob's place where it stands: into a new section it comes last, and removed it
+    /// leaves its section, as vanilla's entity sections hear of every move at once.
+    pub fn locate(self: *Mobs, index: u32) !void {
+        const mob = try self.inSlot(index);
+        if (mob.entity.removed) {
+            if (mob.entity.placed) self.places.remove(mob.entity.id);
+            mob.entity.placed = false;
+            return;
+        }
+        if (mob.entity.placed and mob.entity.placed_world == mob.motion.world and std.meta.eql(mob.entity.placed_position, mob.motion.position)) return;
+        // Into a column that does not tick, it leaves the tick list; back into one, it joins last.
+        if (mob.entity.placed) try self.places.move(mob.entity.id, mob.motion.world, mob.motion.position) else try self.places.insert(mob.entity.id, mob.motion.world, mob.motion.position, self.shapeOf(mob));
+        _ = !mob.entity.placed or mob.entity.placed_world != mob.motion.world or !std.meta.eql(entities.space.columnOf(mob.entity.placed_world, mob.entity.placed_position), entities.space.columnOf(mob.motion.world, mob.motion.position));
+        mob.entity.placed = true;
+        mob.entity.placed_world = mob.motion.world;
+        mob.entity.placed_position = mob.motion.position;
     }
 
     /// Forgets a removed mob. Its viewers have been told, so the slot is free.
-    pub fn release(self: *Mobs, index: u32) void {
-        const mob = &self.mobs[index];
-        assert(mob.removed);
-        self.grid.remove(index);
-        assert(self.ids.remove(mob.id));
+    pub fn release(self: *Mobs, index: u32) !void {
+        const mob = try self.inSlot(index);
+        assert(mob.entity.removed);
+        if (mob.entity.placed) self.places.remove(mob.entity.id);
+        mob.entity.placed = false;
+        self.releasePath(mob);
+        const entity = mob.entity.id;
+        if (!mob.entity.unloaded) try self.forgetRecord(index, entity);
         self.active.remove(index);
-        self.herd.remove(index);
-        self.free[self.free_count] = index;
-        self.free_count += 1;
+        self.extras.free(self.rows.ref(index).field("extras"));
+        self.rows.remove(index);
+        self.deps.entities.leave(index);
+    }
+
+    /// The slot of a mob in the world, if it is.
+    pub fn slotOf(self: *const Mobs, entity: u64) ?u32 {
+        const directory = &self.deps.entities.directory;
+        const slot = directory.slotOf(entity) orelse return null;
+        return if (self.isMob(slot)) slot else null;
+    }
+
+    /// Where the components of the mob in a slot lie, good until the tick's end.
+    pub fn inSlot(self: *Mobs, index: u32) !Mob {
+        const row = self.rows.ref(index);
+        var mob: Mob = undefined;
+        inline for (Mob.groups) |name| @field(mob, name) = row.field(name);
+        mob.extras = .{ .table = .{ .link = row.field("extras"), .store = &self.extras } };
+        return mob;
+    }
+
+    fn rowOf(state: MobState) Row {
+        var row: Row = undefined;
+        row.tracking = .{};
+        row.extras = mob_extras.none;
+        inline for (Mob.groups) |name| @field(row, name) = @field(state, name);
+        return row;
+    }
+
+    /// Every mob's slot into `ordered`: those in the tick order in its order, then the rest by id.
+    /// How many there are.
+    pub fn collectOrder(self: *Mobs) !usize {
+        const core = &self.rows.core;
+        var count: usize = 0;
+        for ([_]*const entities.Array(u32){ &core.ticking, &core.dormant }, 0..) |list, part| {
+            const first = count;
+            for (0..list.len) |at| {
+                const block = core.page(list.at(at).*);
+                for (0..entities.kind_table.Core.counter(block).*) |r| {
+                    const row: u32 = @intCast(r);
+                    if (!core.bit(block, core.layout.alive, row)) continue;
+                    try self.ordered.ensure(count + 1);
+                    self.ordered.at(count).* = core.slots(block)[row];
+                    count += 1;
+                }
+            }
+            if (part == 0) continue;
+            const ById = struct {
+                mobs: *Mobs,
+                fn id(sort: @This(), at: usize) u64 {
+                    return sort.mobs.deps.entities.directory.entry(sort.mobs.ordered.at(at).*).id;
+                }
+                pub fn lessThan(sort: @This(), a: usize, b: usize) bool {
+                    return sort.id(a) < sort.id(b);
+                }
+                pub fn swap(sort: @This(), a: usize, b: usize) void {
+                    std.mem.swap(u32, sort.mobs.ordered.at(a), sort.mobs.ordered.at(b));
+                }
+            };
+            std.sort.pdqContext(first, count, ById{ .mobs = self });
+        }
+        return count;
+    }
+
+    /// How many slots there may be: one for every entity the directory may hold.
+    pub fn slotCount(self: *const Mobs) usize {
+        return self.deps.entities.directory.capacity();
+    }
+
+    /// A placed mob's box as lookups meet it, read from its place without its state.
+    pub fn placedBox(self: *const Mobs, index: u32) ?body.Box {
+        const entry = self.places.space.get(self.deps.entities.directory.entry(index).id) orelse return null;
+        const box = entry.box();
+        return .{ .min = box.min, .max = box.max };
+    }
+
+    /// A copy of the mob in a slot, as it stands, idle hot fields aside.
+    pub fn copyAt(self: *Mobs, index: u32) !MobState {
+        const row = self.rows.ref(index);
+        var state: MobState = undefined;
+        inline for (Mob.groups) |name| @field(state, name) = row.field(name).*;
+        state.rare = self.extras.read(row.field("extras").*);
+        return state;
     }
 
     /// A mob for systems outside the tick, which may change it, so it stops idling first.
-    pub fn get(self: *Mobs, entity: u64) ?*Mob {
-        const index = self.ids.get(entity) orelse return null;
-        self.stopIdling(index);
+    pub fn get(self: *Mobs, entity: u64) !?Mob {
+        const index = self.slotOf(entity) orelse return null;
+        try self.stopIdling(index);
         // It may be moved, so whether it ticks is asked again.
-        const place = self.herd.place_of[index];
-        if (place != herd_state.no_place) self.herd.still.dormant_revision[place] = std.math.maxInt(u64);
-        return &self.mobs[index];
+        self.trackingOf(index).dormant_revision = std.math.maxInt(u64);
+        return try self.inSlot(index);
     }
 
-    /// The mob's hot fields go back to it from the herd, if it idles.
-    fn stopIdling(self: *Mobs, index: u32) void {
-        const place = self.herd.place_of[index];
-        if (place != herd_state.no_place and self.herd.idling[place]) self.herd.leave(place, &self.mobs[index]);
+    /// Another mob a mob keeps track of, as a partner or a parent, if it is still in the world.
+    /// Read as it stands, idle or not, as goals read their targets.
+    pub fn byId(self: *Mobs, entity: u64) !?Mob {
+        const index = self.slotOf(entity) orelse return null;
+        const mob = try self.inSlot(index);
+        if (mob.entity.removed) return null;
+        return mob;
     }
 
-    /// Whether the mob idles in the herd, so nothing about it changes but its counters.
-    pub fn idles(self: *const Mobs, index: usize) bool {
-        const place = self.herd.place_of[index];
-        return place != herd_state.no_place and self.herd.idling[place];
+    /// The mob stops idling, if it does: whatever changes it next, its full tick follows.
+    fn stopIdling(self: *Mobs, index: u32) !void {
+        self.trackingOf(index).idling = false;
+    }
+
+    /// What the mobs keep beside a mob's state, good until the tick's end.
+    pub fn trackingOf(self: *Mobs, index: u32) *Tracking {
+        return self.rows.ref(index).field("tracking");
+    }
+
+    /// Whether the mob idles, so nothing about it changes but its idle group.
+    pub fn idles(self: *Mobs, index: u32) bool {
+        return self.trackingOf(index).idling;
     }
 
     /// Wakes a resting mob, which then ticks in full.
-    pub fn rouse(self: *Mobs, index: u32) void {
-        self.stopIdling(index);
-        self.mobs[index].resting = false;
+    pub fn rouse(self: *Mobs, index: u32) !void {
+        self.rouseHeld(index, try self.inSlot(index));
     }
 
-    pub fn tick(self: *Mobs) !void {
+    /// Wakes a resting mob in hand.
+    fn rouseHeld(self: *Mobs, index: u32, mob: Mob) void {
+        self.trackingOf(index).idling = false;
+        mob.motion.resting = false;
+    }
+
+    pub const EventsFull = struct { context: *anyopaque, call: *const fn (*anyopaque) void };
+
+    /// Notes what befell a mob for its viewers. Full, everything held goes now, as vanilla
+    /// sends each when it happens. Copies Debug checks run on tell nobody.
+    fn happen(self: *Mobs, mob: Mob, what: @FieldType(mob_state.Event, "what")) void {
+        if (!self.inPool(mob)) return;
+        if (self.event_count == self.events.len) {
+            if (self.events_full) |hook| hook.call(hook.context);
+            self.event_count = 0;
+        }
+        self.events[self.event_count] = .{ .slot = self.slotOf(mob.entity.id).?, .id = mob.entity.id, .what = what };
+        self.event_count += 1;
+    }
+
+    /// The events held since last taken, which the taker sends.
+    pub fn takeEvents(self: *Mobs) []const mob_state.Event {
+        defer self.event_count = 0;
+        return self.events[0..self.event_count];
+    }
+
+    /// Before entities tick: mobs learn their places in the order, edits held are answered,
+    /// and what idle mobs look for is noted.
+    pub fn prepareTick(self: *Mobs) !void {
+        if (self.failure) |err| return err;
+        if (!self.loaded_all and !self.deps.entities.columns_followed) try self.loadAll();
+        self.loaded_all = true;
         self.tickViews(true);
-        defer self.tickViews(false);
         try self.noteHeldFood();
-        defer self.copies.endTick();
         try self.answerEdits();
-        self.herd.tidy(self.mobs);
         const audience = self.noteAudience();
         const cow = self.traits(.cow);
         const species: herd_state.Species = .{ .tempt_range = cow.attribute(.tempt_range), .eye_height = cow.eye_height, .ambient_interval = cow.ambient_interval };
-        var context: TickContext = .{ .audience = audience, .species = species, .volume = cow.sound_volume };
-        // ServerLevel's entity tick list, by entity id. Runs of eight idle mobs advance at once.
-        var place: usize = 0;
-        while (place < self.herd.count) {
-            if (place + herd_state.lane_count <= self.herd.count and self.idleRun(place, &context.ticking)) {
-                try self.tickBlock(place, &context);
-                place += herd_state.lane_count;
+        self.context = .{ .audience = audience, .species = species, .volume = cow.sound_volume };
+    }
+
+    /// Mobs next in ServerLevel's entity tick list: runs of idle ones side by side in the mobs'
+    /// table, one per lane, advance at once.
+    pub fn tickRun(self: *Mobs, entries: []const entities.order.Entry) !void {
+        const context = &self.context;
+        var at: usize = 0;
+        while (at < entries.len) {
+            if (at + herd_state.lane_count <= entries.len) if (self.idleRun(entries[at..][0..herd_state.lane_count], &context.ticking)) |first| {
+                try self.tickBlock(first, context);
+                at += herd_state.lane_count;
                 continue;
-            }
-            try self.tickPlace(place, &context);
-            place += 1;
+            };
+            defer at += 1;
+            // One gone from the world since the pass began is passed over.
+            const index = self.slotOf(entries[at].id) orelse continue;
+            try self.tickPlace(index, context);
         }
+    }
+
+    /// The id a mob was given in memory, which the wire's negates: what vanilla's getId gives.
+    pub fn givenId(self: *const Mobs, mob: Mob) u32 {
+        return @intCast(-@as(i64, self.deps.entities.networkOf(mob.entity.id).?));
+    }
+
+    /// The id a mob in a slot was given, as `givenId`.
+    fn givenOfSlot(slot: u32) i32 {
+        return -entities.Entities.networkOfSlot(slot);
+    }
+
+    /// Whether an entity's slot holds a mob of the mobs' table.
+    fn isMob(self: *const Mobs, slot: u32) bool {
+        const entry = self.deps.entities.directory.entry(slot);
+        return entry.block != entities.directory.none and self.places.order.cores[entry.kind] == &self.rows.core;
+    }
+
+    pub fn finishTick(self: *Mobs) !void {
+        self.copies.endTick();
+        self.tickViews(false);
+    }
+
+    /// A mob's box as lookups meet it: its kind's size, a baby's when young.
+    fn shapeOf(self: *const Mobs, mob: Mob) entities.Shape {
+        return .{ .kind = self.traits(mob.entity.species).entity_type, .half_width = living.width(self, mob) / 2.0, .height = living.height(self, mob) };
     }
 
     const TickContext = struct {
@@ -508,85 +691,106 @@ pub const Mobs = struct {
     };
 
     /// Whether an idle mob's column ticks, which holds until the domains change.
-    fn idleTicks(self: *Mobs, place: usize, ticking: *TickingMemo) bool {
-        const still = &self.herd.still;
-        if (still.ticks_revision[place] != self.domain_revision) {
-            still.ticks[place] = ticking.ticks(self, still.world[place], still.chunk[place]);
-            still.ticks_revision[place] = self.domain_revision;
-        }
-        return still.ticks[place];
+    fn idleTicks(self: *Mobs, tracking: *Tracking, motion: *const mob_state.Motion, ticking: *TickingMemo) bool {
+        return self.knownTicks(tracking, motion.world, chunkOf(motion.position), ticking);
     }
 
-    /// Whether the eight places from one are all idle mobs that tick.
-    fn idleRun(self: *Mobs, first: usize, ticking: *TickingMemo) bool {
-        for (first..first + herd_state.lane_count) |place| {
-            if (self.herd.slots[place] == herd_state.no_place or !self.herd.idling[place]) return false;
-            if (!self.idleTicks(place, ticking)) return false;
+    /// Where the run of mobs next in the tick list lies in the mobs' table, if all are idle and
+    /// ticking and side by side in one block.
+    fn idleRun(self: *Mobs, entries: []const entities.order.Entry, ticking: *TickingMemo) ?Table.Ref {
+        const directory = &self.deps.entities.directory;
+        const first = directory.entry(entries[0].slot);
+        if (first.block == entities.directory.none or first.dormant or @as(usize, first.row) + entries.len > Table.rows) return null;
+        const block = self.rows.core.page(first.block);
+        const trackings = Table.columnOf(block, "tracking");
+        const motions = Table.columnOf(block, "motion");
+        for (entries, 0..) |entry, offset| {
+            const held = directory.entry(entry.slot);
+            const row = first.row + offset;
+            if (held.block != first.block or held.row != row or held.kind != first.kind or !self.isMob(entry.slot)) return null;
+            if (!trackings[row].idling or !self.idleTicks(&trackings[row], &motions[row], ticking)) return null;
         }
-        return true;
+        return .{ .block = block, .row = first.row };
     }
 
-    fn tickBlock(self: *Mobs, first: usize, context: *TickContext) !void {
-        var before: [herd_state.lane_count]Mob = undefined;
-        if (verify_idle) for (&before, 0..) |*lane, offset| {
-            lane.* = self.idleBefore(first + offset);
+    fn tickBlock(self: *Mobs, first: Table.Ref, context: *TickContext) !void {
+        const lanes = herd_state.lane_count;
+        const slots = self.rows.core.slots(first.block)[first.row..][0..lanes];
+        var before: [lanes]MobState = undefined;
+        if (verify_idle) for (&before, slots) |*lane, slot| {
+            lane.* = try self.copyAt(slot);
         };
-        const block = herd_state.advanceBlock(&self.herd, first, context.audience, context.species);
+        const trackings = Table.columnOf(first.block, "tracking")[first.row..][0..lanes];
+        const controls = Table.columnOf(first.block, "control")[first.row..][0..lanes];
+        var run: herd_state.Run = .{
+            .idle = Table.columnOf(first.block, "idle")[first.row..][0..lanes],
+            .motion = Table.columnOf(first.block, "motion")[first.row..][0..lanes],
+            .persistent = undefined,
+            .given = undefined,
+            .gaze_yaw = undefined,
+        };
+        inline for (0..lanes) |lane| {
+            run.persistent[lane] = controls[lane].persistence_required;
+            run.given[lane] = givenOfSlot(slots[lane]);
+            run.gaze_yaw[lane] = trackings[lane].gaze_yaw;
+        }
+        const block = herd_state.advanceBlock(run, context.audience, context.species);
         self.idle_blocks += 1;
         if (!block.any_rare) {
-            herd_state.commitBlock(&self.herd, first, &block);
-            self.idle_ticks += herd_state.lane_count;
-            if (verify_idle) for (before, 0..) |lane, offset| try self.checkIdle(first + offset, lane);
+            herd_state.commitBlock(run, &block);
+            self.idle_ticks += lanes;
+            if (verify_idle) for (before, slots) |lane, slot| try self.checkIdle(slot, lane);
             return;
         }
         // In order: a rare lane takes its own tick, which may wake the lanes after it.
-        for (0..herd_state.lane_count) |offset| {
-            const place = first + offset;
-            if (block.rare[offset] or !self.herd.idling[place]) {
+        for (0..lanes) |offset| {
+            const slot = slots[offset];
+            if (block.rare[offset] or !trackings[offset].idling) {
                 if (block.rare[offset]) self.rare_lanes += 1;
-                try self.tickPlace(place, context);
+                try self.tickPlace(slot, context);
                 continue;
             }
-            herd_state.commitLane(&self.herd, first, &block, offset);
+            herd_state.commitLane(&run.idle[offset], &block, offset);
             self.idle_ticks += 1;
-            if (verify_idle) try self.checkIdle(place, before[offset]);
+            if (verify_idle) try self.checkIdle(slot, before[offset]);
         }
     }
 
-    fn tickPlace(self: *Mobs, place: usize, context: *TickContext) !void {
-        const index = self.herd.slots[place];
-        if (index == herd_state.no_place) return;
-        // An idle mob is read from the herd alone, without touching its Mob.
-        if (self.herd.idling[place]) {
-            if (!self.idleTicks(place, &context.ticking)) return;
-            const before = if (verify_idle) self.idleBefore(place) else {};
-            switch (herd_state.advance(&self.herd, place, context.audience, context.species)) {
+    fn tickPlace(self: *Mobs, index: u32, context: *TickContext) !void {
+        const row = self.rows.ref(index);
+        const tracking = row.field("tracking");
+        // An idle mob is read from its idle group alone, without touching the rest.
+        if (tracking.idling) {
+            const motion = row.field("motion");
+            if (!self.idleTicks(tracking, motion, &context.ticking)) return;
+            const before = if (verify_idle) try self.copyAt(index) else {};
+            const still: herd_state.Still = .{ .world = motion.world, .position = motion.position, .persistent = row.field("control").persistence_required, .given = givenOfSlot(index) };
+            switch (herd_state.advance(row.field("idle"), still, &tracking.gaze_yaw, context.audience, context.species)) {
                 .idled => |sound| {
                     self.idle_ticks += 1;
                     // Mob.playAmbientSound, once the tick is sure to stand.
                     if (sound) |pitch| {
-                        const still = &self.herd.still;
-                        const at = still.position[place];
-                        self.effects.sound(still.world[place], .{ .x = at[0], .y = at[1], .z = at[2] }, Sound.cow_ambient.name(), .neutral, context.volume, pitch, @bitCast(self.sound_seeds.next()), null);
+                        const at = motion.position;
+                        self.effects.sound(motion.world, .{ .x = at[0], .y = at[1], .z = at[2] }, Sound.cow_ambient.name(), .neutral, context.volume, pitch, @bitCast(self.sound_seeds.next()), null);
                     }
-                    if (verify_idle) try self.checkIdle(place, before);
+                    if (verify_idle) try self.checkIdle(index, before);
                     return;
                 },
                 // Something starts, so the mob takes its full tick from the start.
-                .started => self.herd.leave(place, &self.mobs[index]),
+                .started => tracking.idling = false,
             }
         }
-        if (self.herd.still.dormant_revision[place] == self.domain_revision) return;
-        const mob = &self.mobs[index];
-        if (mob.removed) return;
-        if (!self.columnTicks(index, &context.ticking)) {
-            self.herd.still.dormant_revision[place] = self.domain_revision;
+        if (tracking.dormant_revision == self.domain_revision) return;
+        const mob = try self.inSlot(index);
+        if (mob.entity.removed) return;
+        if (!self.columnTicks(index, mob, &context.ticking)) {
+            tracking.dormant_revision = self.domain_revision;
             return;
         }
         // An awake mob reads the blocks around it many times over, so they are read once. A resting
         // one reads almost none.
-        if (!mob.resting) {
-            const around = self.level(mob.world);
+        if (!mob.motion.resting) {
+            const around = self.level(mob.motion.world);
             try self.window.fill(&around, mob.blockPosition());
             self.window_view = &self.window;
         }
@@ -594,10 +798,16 @@ pub const Mobs = struct {
             defer self.window_view = null;
             try mob_tick.tick(self, mob);
         }
-        self.locate(index);
+        // Done, its path's nodes are read no more.
+        if (navigation.done(mob)) self.releasePath(mob);
+        try self.locate(index);
         // Blocks the mob changed, as trampled farmland, before the next mob moves.
         try self.answerEdits();
-        if (!self.herd.idling[place] and herd_state.idle(self, mob)) self.herd.enter(place, mob);
+        if (!tracking.idling and herd_state.idle(self, mob)) {
+            tracking.idling = true;
+            tracking.gaze_yaw = herd_state.gazeYaw(mob);
+            tracking.fresh = true;
+        }
     }
 
     /// The players idle mobs look for, as mobs start ticking and players stand still.
@@ -620,22 +830,15 @@ pub const Mobs = struct {
     /// Debug builds check every idle tick against the full tick it stands for.
     const verify_idle = @import("builtin").mode == .debug;
 
-    fn idleBefore(self: *Mobs, place: usize) Mob {
-        var before = self.mobs[self.herd.slots[place]];
-        self.herd.writeBack(place, &before);
-        return before;
-    }
-
-    fn checkIdle(self: *Mobs, place: usize, before: Mob) !void {
+    fn checkIdle(self: *Mobs, index: u32, before: MobState) !void {
         var expected = before;
         // The full tick on the copy plays nothing, as the idle tick already did.
         self.muted = true;
         defer self.muted = false;
-        try mob_tick.tick(self, &expected);
-        var actual = self.mobs[self.herd.slots[place]];
-        self.herd.writeBack(place, &actual);
+        try mob_tick.tick(self, Mob.of(&expected));
+        const actual = try self.copyAt(index);
         if (!std.meta.eql(expected, actual)) {
-            std.debug.print("idle tick diverged for mob {d}\n", .{actual.id});
+            std.debug.print("idle tick diverged for mob {d}\n", .{actual.entity.id});
             unreachable;
         }
     }
@@ -656,12 +859,14 @@ pub const Mobs = struct {
     };
 
     /// Whether a mob's column ticks, asking the domains only when they or the column changed.
-    fn columnTicks(self: *Mobs, index: u32, ticking: *TickingMemo) bool {
-        const mob = &self.mobs[index];
-        const chunk = chunkOf(mob.position);
-        const known = &self.column_ticks[index];
-        if (known.revision == self.domain_revision and known.world == mob.world and std.meta.eql(known.chunk, chunk)) return known.ticks;
-        known.* = .{ .revision = self.domain_revision, .world = mob.world, .chunk = chunk, .ticks = ticking.ticks(self, mob.world, chunk) };
+    fn columnTicks(self: *Mobs, index: u32, mob: Mob, ticking: *TickingMemo) bool {
+        return self.knownTicks(self.trackingOf(index), mob.motion.world, chunkOf(mob.motion.position), ticking);
+    }
+
+    fn knownTicks(self: *Mobs, tracking: *Tracking, world: u32, chunk: [2]i32, ticking: *TickingMemo) bool {
+        const known = &tracking.column;
+        if (known.revision == self.domain_revision and known.world == world and std.meta.eql(known.chunk, chunk)) return known.ticks;
+        known.* = .{ .revision = self.domain_revision, .world = world, .chunk = chunk, .ticks = ticking.ticks(self, world, chunk) };
         return known.ticks;
     }
 
@@ -673,7 +878,7 @@ pub const Mobs = struct {
     /// time, with what they replaced. From the first that changes a collision shape on, every edit
     /// is kept until the next answer, so each path that recomputes can see the world as it stood.
     fn blocksChanged(self: *Mobs, section: chunks.Section, edits: []const chunks.BlockEdit, previous: []const u16) void {
-        if (self.active.values().len == 0) return;
+        if (self.active.count == 0) return;
         // The window around the mob ticking shows edits as they happen.
         if (self.window_view != null) for (edits) |edit| {
             const at: i32 = edit.index;
@@ -692,13 +897,19 @@ pub const Mobs = struct {
         }
         const origin: [3]i32 = .{ section.x * 16, section.y * 16, section.z * 16 };
         self.wake(section.world, .{ @floatFromInt(origin[0] + low[0]), @floatFromInt(origin[1] + low[1]), @floatFromInt(origin[2] + low[2]) }, .{ @floatFromInt(origin[0] + high[0] + 1), @floatFromInt(origin[1] + high[1] + 1), @floatFromInt(origin[2] + high[2] + 1) });
-        for (edits, previous) |edit, old| {
+        for (edits, previous, 0..) |edit, old, at| {
             const collision = self.blocks.get(old).collision != self.blocks.get(edit.state).collision;
-            if (!collision and self.edit_count == 0) continue;
             if (self.edit_count == self.edits.len) {
-                self.edits_dropped += 1;
-                continue;
+                // Full: what is held is answered now, against the world before this edit.
+                self.later = .{ .section = section, .edits = edits[at..], .previous = previous[at..] };
+                defer self.later = null;
+                self.edits_answered_early += 1;
+                self.answerEdits() catch |err| {
+                    self.failure = err;
+                    return;
+                };
             }
+            if (!collision and self.edit_count == 0) continue;
             const index: i32 = edit.index;
             self.edits[self.edit_count] = .{
                 .world = section.world,
@@ -715,38 +926,60 @@ pub const Mobs = struct {
     /// their order. A mob following a path near an edit that changed a collision finds the way
     /// again, at the edit's game time and against the world as of the edit. Mobs have not moved
     /// since, as edits are answered before mobs tick and after each one that ticks.
+    ///
+    /// A path is found against blocks alone, so each mob may answer every edit in turn before
+    /// the next mob.
     fn answerEdits(self: *Mobs) !void {
         if (self.edit_count == 0) return;
         defer self.edit_count = 0;
-        var candidate_count: usize = 0;
-        for (self.active.values()) |index| {
-            const mob = &self.mobs[index];
-            if (mob.removed or navigation.done(mob) or mob.navigation.has_delayed_recomputation) continue;
-            if (!self.loaded(mob.world, mob.blockPosition())) continue;
-            self.candidates[candidate_count] = @intCast(index);
-            candidate_count += 1;
-        }
-        if (candidate_count == 0) return;
         defer self.overlay_view = null;
         var laid_after: ?usize = null;
+        for (0..self.active.count) |active_at| {
+            const index = self.active.at(active_at);
+            try self.answerFor(@intCast(index), &laid_after);
+        }
+    }
+
+    /// One mob following a path answers the held edits that changed collisions, in order.
+    fn answerFor(self: *Mobs, index: u32, laid_after: *?usize) !void {
+        const mob = try self.inSlot(index);
+        if (mob.entity.removed or navigation.done(mob) or mob.navigation.has_delayed_recomputation) return;
+        if (!self.loaded(mob.motion.world, mob.blockPosition())) return;
         for (self.edits[0..self.edit_count], 0..) |edit, at| {
             if (!edit.collision) continue;
-            for (self.candidates[0..candidate_count]) |index| {
-                const mob = &self.mobs[index];
-                if (mob.world != edit.world or !navigation.shouldRecomputePath(self, mob, edit.position)) continue;
-                if (laid_after != at) {
-                    self.layOver(at);
-                    laid_after = at;
-                }
-                self.edit_recomputes += 1;
-                try navigation.recomputePath(self, mob, edit.game_time);
+            if (mob.motion.world != edit.world or !navigation.shouldRecomputePath(self, mob, edit.position)) continue;
+            if (laid_after.* != at) {
+                self.layOver(at);
+                laid_after.* = at;
             }
+            self.edit_recomputes += 1;
+            try navigation.recomputePath(self, mob, edit.game_time);
         }
     }
 
     fn layOver(self: *Mobs, at: usize) void {
         self.overlay.layAfter(self.edits[0..self.edit_count], at);
+        // Answered early, the edits after the held ones show already: they are undone too.
+        if (self.later) |later| {
+            layLaterSection(&self.overlay, later.section, later.edits, later.previous);
+            const batch = self.deps.chunks.notifiedLater();
+            var offset: usize = 0;
+            for (batch.sections) |section| {
+                layLaterSection(&self.overlay, section.section, section.edits, batch.previous[offset..][0..section.edits.len]);
+                offset += section.edits.len;
+            }
+            assert(offset == batch.previous.len);
+        }
         self.overlay_view = if (self.overlay.states.count() == 0) null else &self.overlay;
+    }
+
+    const Later = struct { section: chunks.Section, edits: []const chunks.BlockEdit, previous: []const u16 };
+
+    fn layLaterSection(overlay: *body.Overlay, section: chunks.Section, edits: []const chunks.BlockEdit, previous: []const u16) void {
+        for (edits, previous) |edit, old| {
+            const index: i32 = edit.index;
+            overlay.layLater(section.world, .{ section.x * 16 + (index & 15), section.y * 16 + (index >> 8), section.z * 16 + ((index >> 4) & 15) }, old);
+        }
     }
 
     /// The game time, Level.getGameTime, which navigation times stalls and recomputations by.
@@ -754,13 +987,70 @@ pub const Mobs = struct {
         return self.deps.time.game_time;
     }
 
-    pub fn indexOf(self: *const Mobs, mob: *const Mob) usize {
-        return (@intFromPtr(mob) - @intFromPtr(self.mobs.ptr)) / @sizeOf(Mob);
+    /// Every mob's place, motion and path, for telling two runs apart; idle mobs as the herd has them.
+    pub fn digest(self: *Mobs) !u64 {
+        var sum: u64 = 0;
+        for (0..self.active.count) |active_at| {
+            const index = self.active.at(active_at);
+            var current = try self.copyAt(@intCast(index));
+            if (current.entity.removed) continue;
+            var hasher = std.hash.Wyhash.init(current.entity.id);
+            hasher.update(std.mem.asBytes(&current.motion.position));
+            hasher.update(std.mem.asBytes(&current.motion.velocity));
+            const path = current.navigation.path;
+            hasher.update(std.mem.asBytes(&[_]u64{ @intFromBool(path.active), path.count, path.next }));
+            if (path.active) hasher.update(std.mem.asBytes(&path.fingerprint));
+            sum +%= hasher.final();
+        }
+        return sum;
     }
 
-    pub fn pathNodes(self: *Mobs, mob: *const Mob) []pathfinding.PathNode {
-        const index = self.indexOf(mob);
-        return self.paths[index * path_capacity ..][0..path_capacity];
+    /// One node of the path a mob follows.
+    pub fn pathNode(self: *Mobs, mob: Mob, index: usize) pathfinding.PathNode {
+        const path = mob.navigation.path;
+        assert(path.nodes != mob_state.no_nodes and index < path.count);
+        var node: pathfinding.PathNode = undefined;
+        self.path_nodes.read(path.nodes, index * @sizeOf(pathfinding.PathNode), std.mem.asBytes(&node));
+        return node;
+    }
+
+    /// The nodes of the path a mob follows, read whole into the mobs' working copy, good until
+    /// the next read; `writePathNodes` keeps changes to them.
+    pub fn pathNodes(self: *Mobs, mob: Mob) []pathfinding.PathNode {
+        const path = mob.navigation.path;
+        if (path.nodes == mob_state.no_nodes) {
+            assert(path.count == 0 or navigation.done(mob));
+            return &.{};
+        }
+        const nodes = self.path_work[0..path.count];
+        self.path_nodes.read(path.nodes, 0, std.mem.sliceAsBytes(nodes));
+        return nodes;
+    }
+
+    pub fn writePathNodes(self: *Mobs, mob: Mob, nodes: []const pathfinding.PathNode) void {
+        self.path_nodes.write(mob.navigation.path.nodes, 0, std.mem.sliceAsBytes(nodes));
+    }
+
+    /// The path last found becomes the mob's, its nodes in a blob of their own.
+    pub fn takeFoundPath(self: *Mobs, mob: Mob) !void {
+        assert(self.inPool(mob));
+        self.releasePath(mob);
+        const fresh = self.scratch_path[0..self.scratch.count];
+        var path: mob_state.Path = .{ .active = true, .count = self.scratch.count, .next = 0, .target = self.scratch.target, .reached = self.scratch.reached, .fingerprint = navigation.fingerprint(fresh) };
+        if (fresh.len > 0) {
+            path.nodes = try self.path_nodes.create(std.mem.sliceAsBytes(fresh));
+            const last = fresh[fresh.len - 1];
+            path.end = .{ last.x, last.y, last.z };
+        }
+        mob.navigation.path = path;
+    }
+
+    /// Gives back the nodes of a mob's path, if it holds any.
+    pub fn releasePath(self: *Mobs, mob: Mob) void {
+        const path = &mob.navigation.path;
+        if (path.nodes == mob_state.no_nodes) return;
+        self.path_nodes.free(path.nodes);
+        path.nodes = mob_state.no_nodes;
     }
 
     /// Whether the chunk holding a position is loaded, as ChunkSource.getChunkNow asks: a
@@ -819,18 +1109,21 @@ pub const Mobs = struct {
 
     /// PanicGoal.shouldPanic: damage of a type in panic_causes, in the last two seconds, as
     /// LivingEntity.getLastDamageSource forgets older damage.
-    pub fn shouldPanic(self: *Mobs, mob: *Mob) bool {
-        if (self.gameTime() - mob.last_damage_stamp > 40) mob.last_damage = null;
-        const dealt = mob.last_damage orelse return false;
-        return self.damageFlags(dealt.type).panic;
+    pub fn shouldPanic(self: *Mobs, mob: Mob) bool {
+        const memory = mob.part(.hurt) orelse return false;
+        if (self.gameTime() - memory.stamp > 40) {
+            mob.drop(.hurt);
+            return false;
+        }
+        return self.damageFlags(memory.damage.type).panic;
     }
 
     /// Animal.getWalkTargetValue: grass underfoot is best, else the light, through
     /// LevelReader.getPathfindingCostFromLightLevels.
-    pub fn walkTargetValue(self: *Mobs, mob: *const Mob, position: [3]i32) !f32 {
-        const reader = self.level(mob.world);
+    pub fn walkTargetValue(self: *Mobs, mob: Mob, position: [3]i32) !f32 {
+        const reader = self.level(mob.motion.world);
         if (reader.blocks.get(try reader.state(position[0], position[1] - 1, position[2])).kind == .grass_block) return 10.0;
-        const brightness: f32 = @floatFromInt(try self.rawBrightness(mob.world, position));
+        const brightness: f32 = @floatFromInt(try self.rawBrightness(mob.motion.world, position));
         const fraction = brightness / 15.0;
         const curve = fraction / (4.0 - 3.0 * fraction);
         // Dimensions mobs live in here have no ambient light.
@@ -858,33 +1151,32 @@ pub const Mobs = struct {
     }
 
     /// Animal.spawnChildFromBreeding with Cow.getBreedOffspring.
-    pub fn breed(self: *Mobs, mob: *Mob, partner: *Mob) !void {
-        if (!self.canSpawn()) return;
-        const variant = if (mob.random.nextBoolean()) mob.variant else partner.variant;
+    pub fn breed(self: *Mobs, mob: Mob, partner: Mob) !void {
+        const variant = if (mob.idle.random.nextBoolean()) mob.cow.variant else partner.cow.variant;
         const child = try self.spawnChild(mob, variant);
         _ = child;
         // Animal.finalizeSpawnChildFromBreeding.
         self.setAge(mob, 6000);
         self.setAge(partner, 6000);
-        mob.in_love = 0;
-        partner.in_love = 0;
+        mob.endLove();
+        partner.endLove();
         self.entityEvent(mob, 18);
         // One orb of one to seven, from the mob's own random, when mobs drop loot.
-        const value = mob.random.nextIntBounded(7) + 1;
-        if (self.deps.experience.free_count > 0) try self.deps.experience.spawnOrb(mob.world, mob.position, value);
+        const value = mob.idle.random.nextIntBounded(7) + 1;
+        try self.deps.experience.spawnOrb(mob.motion.world, mob.motion.position, value);
     }
 
-    fn spawnChild(self: *Mobs, parent: *Mob, variant: u8) !u64 {
+    fn spawnChild(self: *Mobs, parent: Mob, variant: u8) !u64 {
         // EntityType.create for breeding, then setBaby and snapTo the parent with no rotation.
-        return self.spawn(.{ .species = parent.species, .world = parent.world, .position = parent.position, .yaw = 0, .baby = true, .variant = variant, .finalize = false });
+        return self.spawn(.{ .species = parent.entity.species, .world = parent.motion.world, .position = parent.motion.position, .yaw = 0, .baby = true, .variant = variant, .finalize = false });
     }
 
     // What moving and living cause.
 
-    pub fn playSound(self: *Mobs, mob: *const Mob, sound: Sound, volume: f32, pitch: f32) void {
+    pub fn playSound(self: *Mobs, mob: Mob, sound: Sound, volume: f32, pitch: f32) void {
         if (self.muted) return;
-        const at: minecraft.Position = .{ .x = mob.position[0], .y = mob.position[1], .z = mob.position[2] };
-        self.effects.sound(mob.world, at, sound.name(), .neutral, volume, pitch, @bitCast(self.sound_seeds.next()), null);
+        const at: minecraft.Position = .{ .x = mob.motion.position[0], .y = mob.motion.position[1], .z = mob.motion.position[2] };
+        self.effects.sound(mob.motion.world, at, sound.name(), .neutral, volume, pitch, @bitCast(self.sound_seeds.next()), null);
     }
 
     pub fn blockSound(self: *Mobs, world: u32, at: [3]f64, sound: Sound, volume: f32, pitch: f32) void {
@@ -892,66 +1184,55 @@ pub const Mobs = struct {
     }
 
     /// Mob.playStepSound as each species overrides it.
-    pub fn stepSound(self: *Mobs, mob: *const Mob, _: u16) void {
-        switch (mob.species) {
+    pub fn stepSound(self: *Mobs, mob: Mob, _: u16) void {
+        switch (mob.entity.species) {
             .cow => self.playSound(mob, .cow_step, 0.15, 1.0),
         }
     }
 
     /// The block's fall sound at half volume and three quarters pitch. Block sound types are not
     /// in the snapshot yet, so this plays the generic fall sound.
-    pub fn blockFallSound(self: *Mobs, mob: *const Mob, _: u16) void {
+    pub fn blockFallSound(self: *Mobs, mob: Mob, _: u16) void {
         self.playSound(mob, .generic_small_fall, 0.5, 0.75);
     }
 
     /// ServerLevel.sendParticles of block particles. Particle packets are not written yet.
     pub fn blockParticles(_: *Mobs, _: u32, _: [3]f64, _: u16, _: i32, _: f32) void {}
 
-    pub fn hurt(self: *Mobs, mob: *Mob, dealt: mob_state.Damage, amount: f32) !bool {
+    pub fn hurt(self: *Mobs, mob: Mob, dealt: mob_state.Damage, amount: f32) !bool {
         return damage.hurt(self, mob, dealt, amount);
     }
 
     /// ServerPlayer.crit and magicCrit's ClientboundAnimatePacket, for the replication to send.
-    /// A third in one tick replaces the oldest.
-    pub fn animate(_: *Mobs, mob: *Mob, animation: Animation) void {
-        if (mob.animation_count == mob.animations.len) {
-            mob.animations[0] = mob.animations[1];
-            mob.animation_count -= 1;
-        }
-        mob.animations[mob.animation_count] = @intFromEnum(animation);
-        mob.animation_count += 1;
+    pub fn animate(self: *Mobs, mob: Mob, animation: Animation) void {
+        self.happen(mob, .{ .animation = @backingInt(animation) });
     }
 
     pub const Animation = enum(u8) { critical_hit = 4, enchanted_hit = 5 };
 
     /// Entity.igniteForSeconds through LivingEntity.igniteForTicks: whole ticks, lengthened by
     /// the burning_time attribute, and never shortening a fire already burning.
-    pub fn ignite(self: *Mobs, mob: *Mob, seconds: f32) void {
+    pub fn ignite(self: *Mobs, mob: Mob, seconds: f32) void {
         assert(std.math.isFinite(seconds));
         const base: f64 = @floatFromInt(mth.floorFloat(seconds * 20.0));
-        const ticks = std.math.lossyCast(i32, @ceil(base * self.traits(mob.species).attribute(.burning_time)));
-        if (mob.fire_ticks >= ticks) return;
-        mob.fire_ticks = ticks;
-        mob.revision += 1;
-        self.rouse(@intCast(self.indexOf(mob)));
+        const ticks = std.math.lossyCast(i32, @ceil(base * self.traits(mob.entity.species).attribute(.burning_time)));
+        if (mob.entity.fire_ticks >= ticks) return;
+        mob.entity.fire_ticks = ticks;
+        mob.entity.revision += 1;
+        self.rouseMob(mob);
     }
 
     /// ServerLevel.broadcastDamageEvent, for the replication to send.
-    pub fn damageEvent(_: *Mobs, mob: *Mob, dealt: mob_state.Damage) void {
-        if (mob.damage_event_count == mob.damage_events.len) {
-            mob.damage_events[0] = mob.damage_events[1];
-            mob.damage_event_count -= 1;
-        }
-        mob.damage_events[mob.damage_event_count] = dealt;
-        mob.damage_event_count += 1;
+    pub fn damageEvent(self: *Mobs, mob: Mob, dealt: mob_state.Damage) void {
+        self.happen(mob, .{ .damage = dealt });
     }
 
     /// LivingEntity.knockback. A direction too short to normalize turns random, from Math.random
     /// rather than the mob's random.
-    pub fn knockback(self: *Mobs, mob: *Mob, strength_in: f64, x_in: f64, z_in: f64) void {
-        const strength = strength_in * (1.0 - self.traits(mob.species).attribute(.knockback_resistance));
+    pub fn knockback(self: *Mobs, mob: Mob, strength_in: f64, x_in: f64, z_in: f64) void {
+        const strength = strength_in * (1.0 - self.traits(mob.entity.species).attribute(.knockback_resistance));
         if (strength <= 0) return;
-        mob.has_impulse = true;
+        mob.entity.has_impulse = true;
         var x = x_in;
         var z = z_in;
         const random = self.seeds.random();
@@ -960,52 +1241,52 @@ pub const Mobs = struct {
             z = (random.float(f64) - random.float(f64)) * 0.01;
         }
         const direction = living.normalize(.{ x, 0, z });
-        const velocity = mob.velocity;
-        mob.velocity = .{
+        const velocity = mob.motion.velocity;
+        mob.motion.velocity = .{
             velocity[0] / 2.0 - direction[0] * strength,
-            if (mob.on_ground) @min(0.4, velocity[1] / 2.0 + strength) else velocity[1],
+            if (mob.motion.on_ground) @min(0.4, velocity[1] / 2.0 + strength) else velocity[1],
             velocity[2] / 2.0 - direction[2] * strength,
         };
     }
 
     /// LivingEntity.makeSound: at the mob's volume and voice pitch.
-    pub fn makeSound(self: *Mobs, mob: *Mob, sound: Sound) void {
-        const volume = self.traits(mob.species).sound_volume;
+    pub fn makeSound(self: *Mobs, mob: Mob, sound: Sound) void {
+        const volume = self.traits(mob.entity.species).sound_volume;
         const pitch = self.voicePitch(mob);
         self.playSound(mob, sound, volume, pitch);
     }
 
     /// Animal.setInLove: ten seconds of hearts.
-    pub fn setInLove(self: *Mobs, mob: *Mob, cause: ?u128) void {
-        mob.in_love = 600;
-        mob.love_cause = cause;
+    pub fn setInLove(self: *Mobs, mob: Mob, cause: ?u128) !void {
+        _ = try mob.put(.breeding, .{ .in_love = 600, .love_cause = cause });
         self.entityEvent(mob, 18);
     }
 
     /// AgeableMob.ageUp: a baby grows by seconds, and the growth fed to it is remembered.
-    pub fn ageUp(self: *Mobs, mob: *Mob, seconds: i32, forced: bool) void {
-        const before = mob.age;
+    pub fn ageUp(self: *Mobs, mob: Mob, seconds: i32, forced: bool) !void {
+        const before = mob.idle.age;
         var age = before + seconds * 20;
         if (age > 0) age = 0;
         const grown = age - before;
         self.setAge(mob, age);
         if (forced) {
-            mob.forced_age += grown;
-            if (mob.forced_age_timer == 0) mob.forced_age_timer = 40;
+            const ageing = mob.part(.ageing) orelse try mob.put(.ageing, .{});
+            ageing.forced_age += grown;
+            if (ageing.forced_age_timer == 0) ageing.forced_age_timer = 40;
         }
-        if (mob.age == 0) self.setAge(mob, mob.forced_age);
+        if (mob.idle.age == 0) self.setAge(mob, if (mob.part(.ageing)) |ageing| ageing.forced_age else 0);
     }
 
     /// ExperienceOrb.award at the mob, as LivingEntity.dropExperience does.
-    pub fn awardExperience(self: *Mobs, mob: *const Mob, amount: i32) !void {
+    pub fn awardExperience(self: *Mobs, mob: Mob, amount: i32) !void {
         if (!self.deps.experience.canAward(amount)) return;
-        try self.deps.experience.award(mob.world, mob.position, amount);
+        try self.deps.experience.award(mob.motion.world, mob.motion.position, amount);
     }
 
     /// LivingEntity.dropFromLootTable: the species' table, knowing whether the mob burned, who
     /// killed it and with what, dropped where it died as Entity.spawnAtLocation drops items.
-    pub fn dropLoot(self: *Mobs, mob: *Mob, dealt: mob_state.Damage, by_player: bool) !void {
-        const name = switch (mob.species) {
+    pub fn dropLoot(self: *Mobs, mob: Mob, dealt: mob_state.Damage, by_player: bool) !void {
+        const name = switch (mob.entity.species) {
             .cow => "minecraft:entities/cow",
         };
         const table = self.deps.loot.tables.get(name) orelse return;
@@ -1020,8 +1301,8 @@ pub const Mobs = struct {
         var buffer: [loot.maximum_drops]loot.Drop = undefined;
         const context: loot.Context = .{
             .items = self.deps.items.deps.definitions,
-            .location = .{ .world = mob.world, .x = mob.position[0], .y = mob.position[1], .z = mob.position[2] },
-            .on_fire = mob.fire_ticks > 0,
+            .location = .{ .world = mob.motion.world, .x = mob.motion.position[0], .y = mob.motion.position[1], .z = mob.motion.position[2] },
+            .on_fire = mob.entity.fire_ticks > 0,
             .killed_by_player = by_player,
             .attacker_weapon = if (weapon) |pinned| pinned.view else null,
             .smelter = .{ .context = self, .smelt = smelt },
@@ -1033,15 +1314,15 @@ pub const Mobs = struct {
             error.OutOfMemory, error.LootCapacity => return,
             else => return err,
         };
-        if (drops.len == 0 or !self.deps.dropped.canCreate(drops.len)) return;
+        if (drops.len == 0) return;
         var requests: [loot.maximum_drops]ItemEntities.Spawn = undefined;
         var spawned: [loot.maximum_drops]entities.Id = undefined;
         for (drops, requests[0..drops.len]) |drop, *request| {
             const dx = self.level_random.nextDouble() * 0.2 - 0.1;
             const dz = self.level_random.nextDouble() * 0.2 - 0.1;
             request.* = .{
-                .world = mob.world,
-                .position = mob.position,
+                .world = mob.motion.world,
+                .position = mob.motion.position,
                 .velocity = .{ dx, 0.2, dz },
                 .stack = .{ .item = try item_data.define(self.deps.inventories, drop.kind, drop.components), .count = @intCast(drop.count) },
             };
@@ -1068,55 +1349,51 @@ pub const Mobs = struct {
     }
 
     /// Level.broadcastEntityEvent: a status byte every viewer gets.
-    pub fn entityEvent(_: *Mobs, mob: *Mob, event: u8) void {
-        if (mob.event_count == mob.events.len) {
-            std.mem.copyForwards(u8, mob.events[0 .. mob.events.len - 1], mob.events[1..]);
-            mob.event_count -= 1;
-        }
-        mob.events[mob.event_count] = event;
-        mob.event_count += 1;
+    pub fn entityEvent(self: *Mobs, mob: Mob, event: u8) void {
+        self.happen(mob, .{ .status = event });
     }
 
     /// LivingEntity.tickDeath: the body lies twenty ticks, then goes in a puff.
-    pub fn tickDeath(self: *Mobs, mob: *Mob) void {
-        mob.death_time += 1;
-        if (mob.death_time >= 20 and !mob.removed) {
+    pub fn tickDeath(self: *Mobs, mob: Mob) void {
+        mob.living.death_time += 1;
+        if (mob.living.death_time >= 20 and !mob.entity.removed) {
             self.entityEvent(mob, 60);
-            mob.removed = true;
+            mob.entity.removed = true;
         }
     }
 
     /// LivingEntity.getVoicePitch.
-    pub fn voicePitch(_: *Mobs, mob: *Mob) f32 {
-        const spread = (mob.random.nextFloat() - mob.random.nextFloat()) * 0.2;
+    pub fn voicePitch(_: *Mobs, mob: Mob) f32 {
+        const spread = (mob.idle.random.nextFloat() - mob.idle.random.nextFloat()) * 0.2;
         return spread + (if (mob.baby()) @as(f32, 1.5) else 1.0);
     }
 
     /// Mob.playAmbientSound.
-    pub fn ambientSound(self: *Mobs, mob: *Mob) void {
-        const volume = self.traits(mob.species).sound_volume;
+    pub fn ambientSound(self: *Mobs, mob: Mob) void {
+        const volume = self.traits(mob.entity.species).sound_volume;
         const pitch = self.voicePitch(mob);
-        switch (mob.species) {
+        switch (mob.entity.species) {
             .cow => self.playSound(mob, .cow_ambient, volume, pitch),
         }
     }
 
     /// AgeableMob.setAge: growing up or becoming a baby changes the size viewers see.
-    pub fn setAge(self: *Mobs, mob: *Mob, age: i32) void {
-        const was_baby = mob.age < 0;
-        mob.age = age;
+    pub fn setAge(self: *Mobs, mob: Mob, age: i32) void {
+        const was_baby = mob.idle.age < 0;
+        mob.idle.age = age;
         if (was_baby == (age < 0)) return;
-        mob.revision +%= 1;
+        mob.entity.revision +%= 1;
         // A new size reaches new blocks and mobs, and others find it by its new box at once.
         const grown = living.box(self, mob);
-        self.wake(mob.world, grown.min, grown.max);
-        if (self.stored(mob)) self.locate(@intCast(self.indexOf(mob)));
+        self.wake(mob.motion.world, grown.min, grown.max);
+        if (self.inPool(mob) and mob.entity.placed) self.places.space.reshape(mob.entity.id, self.shapeOf(mob));
     }
 
     /// Whether a mob is one the plugin holds, and not a copy Debug checks run on.
-    fn stored(self: *const Mobs, mob: *const Mob) bool {
-        const address = @intFromPtr(mob);
-        return address >= @intFromPtr(self.mobs.ptr) and address < @intFromPtr(self.mobs.ptr + self.mobs.len);
+    fn inPool(self: *const Mobs, mob: Mob) bool {
+        const address = @intFromPtr(mob.entity);
+        const memory = self.deps.entities.pool.memory;
+        return address >= @intFromPtr(memory.ptr) and address < @intFromPtr(memory.ptr + memory.len);
     }
 
     /// Wakes the resting mobs within reach of a region, which then tick in full. A resting mob
@@ -1124,11 +1401,38 @@ pub const Mobs = struct {
     pub fn wake(self: *Mobs, world: u32, low: [3]f64, high: [3]f64) void {
         const margin = 2.0;
         const reach: body.Box = .{ .min = .{ low[0] - margin, low[1] - margin, low[2] - margin }, .max = .{ high[0] + margin, high[1] + margin, high[2] + margin } };
-        var candidates = self.grid.query(world, .{ reach.min[0] - self.widest_half, reach.min[2] - self.widest_half }, .{ reach.max[0] + self.widest_half, reach.max[2] + self.widest_half });
-        while (candidates.next()) |index| {
-            const mob = &self.mobs[index];
-            if (mob.resting and living.box(self, mob).intersects(reach)) self.rouse(index);
-        }
+        self.each(world, reach, self, struct {
+            fn visit(mobs: *Mobs, mob: Mob) anyerror!bool {
+                if (mob.motion.resting) mobs.rouseMob(mob);
+                return false;
+            }
+        }.visit) catch |err| {
+            self.failure = err;
+        };
+    }
+
+    /// Visits the mobs whose boxes meet a box, in the order EntitySectionStorage.getEntities
+    /// finds them: columns by x, then by z as an unsigned field, each column's sections by y as
+    /// one, and in each section as they came into it. `visit` returns whether to stop. Every
+    /// query keeps its own round of places, so a visit may ask again.
+    pub fn each(self: *Mobs, world: u32, query: body.Box, context: anytype, comptime visit: fn (@TypeOf(context), Mob) anyerror!bool) !void {
+        if (self.active.count == 0) return;
+        const Lookup = struct {
+            mobs: *Mobs,
+            query: body.Box,
+            context: @TypeOf(context),
+
+            fn each(lookup: *const @This(), entry: entities.space.Entry) anyerror!bool {
+                const mobs = lookup.mobs;
+                const index = mobs.slotOf(entry.id) orelse return false;
+                // Held only while visited; a visitor keeps ids, not mobs.
+                const mob = try mobs.inSlot(index);
+                if (mob.entity.removed or !living.box(mobs, mob).intersects(lookup.query)) return false;
+                return visit(lookup.context, mob);
+            }
+        };
+        const lookup: Lookup = .{ .mobs = self, .query = query, .context = context };
+        try self.places.space.each(world, .{ .min = query.min, .max = query.max }, self.kinds, &lookup, Lookup.each);
     }
 
     /// The squared distance to the nearest player in the world who is not a spectator, as
@@ -1151,21 +1455,39 @@ pub const Mobs = struct {
     /// LivingEntity.pushEntities: mobs push the pushable mobs their box overlaps, in the order vanilla
     /// finds them, and each moves apart, after the cramming check. How many it touched, each of
     /// which wakes, as resting mobs skip their own query.
-    pub fn pushEntities(self: *Mobs, mob: *Mob) !u32 {
+    pub fn pushEntities(self: *Mobs, mob: Mob) !u32 {
         const own = living.box(self, mob);
-        const found = try self.near(mob, own, .pushable);
-        if (found.len == 0) return 0;
+        // Counted first, for the cramming check before any push, then pushed in the same order:
+        // the hurt moves nothing.
+        var found: u32 = 0;
+        try self.near(mob, own, .pushable, &found, struct {
+            fn visit(count: *u32, _: Mob) anyerror!bool {
+                count.* += 1;
+                return false;
+            }
+        }.visit);
+        if (found == 0) return 0;
         // The maxEntityCramming rule at its default: past 23 others, one tick in four hurts.
         const cramming = 24;
-        if (found.len > cramming - 1 and mob.random.nextIntBounded(4) == 0) {
+        if (found > cramming - 1 and mob.idle.random.nextIntBounded(4) == 0) {
             // None of them rides anything here.
             _ = try self.hurt(mob, .{ .type = .cramming }, 6.0);
         }
-        for (found) |index| {
-            self.rouse(index);
-            push(&self.mobs[index], mob);
-        }
-        return @intCast(found.len);
+        const Pushing = struct { mobs: *Mobs, mob: Mob };
+        try self.near(mob, own, .pushable, Pushing{ .mobs = self, .mob = mob }, struct {
+            fn visit(pushing: Pushing, other: Mob) anyerror!bool {
+                pushing.mobs.rouseMob(other);
+                push(other, pushing.mob);
+                return false;
+            }
+        }.visit);
+        return found;
+    }
+
+    /// Wakes a resting mob, one the plugin holds or a copy Debug checks run on.
+    pub fn rouseMob(self: *Mobs, mob: Mob) void {
+        if (self.inPool(mob)) return self.rouseHeld(self.slotOf(mob.entity.id).?, mob);
+        mob.motion.resting = false;
     }
 
     /// pushable: what LivingEntity.pushEntities moves. same_species: mobs of the mob's own kind.
@@ -1174,30 +1496,27 @@ pub const Mobs = struct {
 
     /// The other mobs whose boxes meet a box, in the order EntitySectionStorage.getEntities finds
     /// them: by section, then by when each came into its section. LivingEntity.isPushable keeps
-    /// the living off climbables, and asking marks a climber as vanilla's check does. The slice
-    /// lasts until the next query.
-    pub fn near(self: *Mobs, mob: *const Mob, query: body.Box, which: Nearness) ![]const u32 {
-        var count: usize = 0;
-        var candidates = self.grid.query(mob.world, .{ query.min[0] - self.widest_half, query.min[2] - self.widest_half }, .{ query.max[0] + self.widest_half, query.max[2] + self.widest_half });
-        while (candidates.next()) |index| {
-            if (!self.grid.boxes[index].intersects(query)) continue;
-            const other = &self.mobs[index];
-            if (other.id == mob.id or other.removed) continue;
-            switch (which) {
-                .pushable => if (!other.alive() or try living.onClimbable(self, other)) continue,
-                .same_species => if (other.species != mob.species) continue,
-                .living => {},
-            }
-            self.nearby[count] = index;
-            count += 1;
-        }
-        const found = self.nearby[0..count];
-        std.mem.sort(u32, found, self, inVanillaOrder);
-        return found;
-    }
+    /// the living off climbables, and asking marks a climber as vanilla's check does.
+    pub fn near(self: *Mobs, mob: Mob, query: body.Box, which: Nearness, context: anytype, comptime visit: fn (@TypeOf(context), Mob) anyerror!bool) !void {
+        const Search = struct {
+            mobs: *Mobs,
+            mob: Mob,
+            which: Nearness,
+            context: @TypeOf(context),
 
-    fn inVanillaOrder(self: *const Mobs, a: u32, b: u32) bool {
-        return grid_state.Arrival.before(self.arrivals[a], self.arrivals[b]);
+            fn each(search: *const @This(), other: Mob) anyerror!bool {
+                const mobs = search.mobs;
+                if (other.entity.id == search.mob.entity.id) return false;
+                switch (search.which) {
+                    .pushable => if (!other.alive() or try living.onClimbable(mobs, other)) return false,
+                    .same_species => if (other.entity.species != search.mob.entity.species) return false,
+                    .living => {},
+                }
+                return visit(search.context, other);
+            }
+        };
+        const search: Search = .{ .mobs = self, .mob = mob, .which = which, .context = context };
+        try self.each(mob.motion.world, query, &search, Search.each);
     }
 
     /// FarmBlock.turnToDirt.
@@ -1245,35 +1564,36 @@ pub const Mobs = struct {
 
     const encoded_size = 160;
 
-    fn encode(mob: *const Mob) [encoded_size]u8 {
+    fn encode(mob: *const MobState) [encoded_size]u8 {
         var bytes: [encoded_size]u8 = @splat(0);
         var writer = std.Io.Writer.fixed(&bytes);
         writer.writeByte(1) catch unreachable;
-        writer.writeByte(@backingInt(mob.species)) catch unreachable;
-        writer.writeInt(u128, mob.uuid, .little) catch unreachable;
-        writer.writeInt(u32, mob.world, .little) catch unreachable;
-        for (mob.position ++ mob.velocity) |value| writer.writeInt(u64, @bitCast(value), .little) catch unreachable;
-        writer.writeInt(u32, @bitCast(mob.yaw), .little) catch unreachable;
-        writer.writeInt(u32, @bitCast(mob.pitch), .little) catch unreachable;
-        writer.writeInt(u64, @bitCast(mob.fall_distance), .little) catch unreachable;
-        writer.writeInt(i16, @intCast(std.math.clamp(mob.fire_ticks, std.math.minInt(i16), std.math.maxInt(i16))), .little) catch unreachable;
-        writer.writeInt(i16, @intCast(std.math.clamp(mob.air_supply, std.math.minInt(i16), std.math.maxInt(i16))), .little) catch unreachable;
-        writer.writeByte(@intFromBool(mob.on_ground)) catch unreachable;
-        writer.writeInt(u32, @bitCast(mob.health), .little) catch unreachable;
-        writer.writeInt(i16, @intCast(mob.hurt_time), .little) catch unreachable;
-        writer.writeInt(i16, @intCast(mob.death_time), .little) catch unreachable;
-        writer.writeInt(i32, mob.age, .little) catch unreachable;
-        writer.writeInt(i32, mob.forced_age, .little) catch unreachable;
-        writer.writeInt(i32, mob.in_love, .little) catch unreachable;
-        writer.writeInt(u128, mob.love_cause orelse 0, .little) catch unreachable;
-        writer.writeByte(@as(u8, @intFromBool(mob.love_cause != null)) | @as(u8, @intFromBool(mob.persistence_required)) << 1 | @as(u8, @intFromBool(mob.left_handed)) << 2 | @as(u8, @intFromBool(mob.no_ai)) << 3) catch unreachable;
-        writer.writeInt(u64, @bitCast(mob.follow_range_bonus), .little) catch unreachable;
-        writer.writeByte(mob.variant) catch unreachable;
-        writer.writeInt(u64, mob.random.state(), .little) catch unreachable;
+        writer.writeByte(@backingInt(mob.entity.species)) catch unreachable;
+        writer.writeInt(u128, mob.entity.uuid, .little) catch unreachable;
+        writer.writeInt(u32, mob.motion.world, .little) catch unreachable;
+        for (mob.motion.position ++ mob.motion.velocity) |value| writer.writeInt(u64, @bitCast(value), .little) catch unreachable;
+        writer.writeInt(u32, @bitCast(mob.motion.yaw), .little) catch unreachable;
+        writer.writeInt(u32, @bitCast(mob.motion.pitch), .little) catch unreachable;
+        writer.writeInt(u64, @bitCast(mob.motion.fall_distance), .little) catch unreachable;
+        writer.writeInt(i16, @intCast(std.math.clamp(mob.entity.fire_ticks, std.math.minInt(i16), std.math.maxInt(i16))), .little) catch unreachable;
+        writer.writeInt(i16, @intCast(std.math.clamp(mob.living.air_supply, std.math.minInt(i16), std.math.maxInt(i16))), .little) catch unreachable;
+        writer.writeByte(@intFromBool(mob.motion.on_ground)) catch unreachable;
+        writer.writeInt(u32, @bitCast(mob.living.health), .little) catch unreachable;
+        writer.writeInt(i16, @intCast(mob.living.hurt_time), .little) catch unreachable;
+        writer.writeInt(i16, @intCast(mob.living.death_time), .little) catch unreachable;
+        writer.writeInt(i32, mob.idle.age, .little) catch unreachable;
+        const breeding = mob.rare.breeding orelse mob_state.Breeding{};
+        writer.writeInt(i32, if (mob.rare.ageing) |ageing| ageing.forced_age else 0, .little) catch unreachable;
+        writer.writeInt(i32, breeding.in_love, .little) catch unreachable;
+        writer.writeInt(u128, breeding.love_cause orelse 0, .little) catch unreachable;
+        writer.writeByte(@as(u8, @intFromBool(breeding.love_cause != null)) | @as(u8, @intFromBool(mob.control.persistence_required)) << 1 | @as(u8, @intFromBool(mob.control.left_handed)) << 2 | @as(u8, @intFromBool(mob.control.no_ai)) << 3) catch unreachable;
+        writer.writeInt(u64, @bitCast(mob.living.follow_range_bonus), .little) catch unreachable;
+        writer.writeByte(mob.cow.variant) catch unreachable;
+        writer.writeInt(u64, mob.idle.random.state(), .little) catch unreachable;
         return bytes;
     }
 
-    fn decode(entity: u64, bytes: []const u8) !Mob {
+    fn decode(entity: u64, bytes: []const u8) !MobState {
         if (bytes.len != encoded_size or bytes[0] != 1) return error.CorruptMob;
         var reader = std.Io.Reader.fixed(bytes[1..]);
         const species = std.enums.fromInt(Species, try reader.takeByte()) orelse return error.CorruptMob;
@@ -1302,161 +1622,228 @@ pub const Mobs = struct {
         if (!std.math.isFinite(yaw) or !std.math.isFinite(pitch) or !std.math.isFinite(health) or on_ground > 1) return error.CorruptMob;
         const position: [3]f64 = vectors[0..3].*;
         return .{
-            .id = entity,
-            .uuid = uuid,
-            .species = species,
-            .world = world,
-            .position = position,
-            .old_position = position,
-            .velocity = vectors[3..6].*,
-            .yaw = yaw,
-            .pitch = pitch,
-            .old_yaw = yaw,
-            .old_pitch = pitch,
-            .head_yaw = yaw,
-            .body_yaw = yaw,
-            .random = .restore(random_state),
-            .fall_distance = fall_distance,
-            .fire_ticks = fire_ticks,
-            .air_supply = air_supply,
-            .on_ground = on_ground != 0,
-            .health = health,
-            .hurt_time = hurt_time,
-            .death_time = death_time,
-            .age = age,
-            .forced_age = forced_age,
-            .in_love = in_love,
-            .love_cause = if (flags & 1 != 0) love_cause else null,
-            .persistence_required = flags & 2 != 0,
-            .left_handed = flags & 4 != 0,
-            .no_ai = flags & 8 != 0,
-            .follow_range_bonus = follow_range_bonus,
-            .variant = variant,
+            .entity = .{
+                .id = entity,
+                .uuid = uuid,
+                .species = species,
+                .fire_ticks = fire_ticks,
+            },
+            .idle = .{
+                .random = .restore(random_state),
+                .head_yaw = yaw,
+                .body_yaw = yaw,
+                .age = age,
+            },
+            .motion = .{
+                .world = world,
+                .position = position,
+                .old_position = position,
+                .velocity = vectors[3..6].*,
+                .yaw = yaw,
+                .pitch = pitch,
+                .old_yaw = yaw,
+                .old_pitch = pitch,
+                .fall_distance = fall_distance,
+                .on_ground = on_ground != 0,
+            },
+            .living = .{
+                .air_supply = air_supply,
+                .health = health,
+                .hurt_time = hurt_time,
+                .death_time = death_time,
+                .follow_range_bonus = follow_range_bonus,
+            },
+            .control = .{
+                .persistence_required = flags & 2 != 0,
+                .left_handed = flags & 4 != 0,
+                .no_ai = flags & 8 != 0,
+            },
+            .rare = .{
+                .ageing = if (forced_age != 0) .{ .forced_age = forced_age } else null,
+                .breeding = if (in_love != 0 or flags & 1 != 0) .{ .in_love = in_love, .love_cause = if (flags & 1 != 0) love_cause else null } else null,
+            },
+            .cow = .{
+                .variant = variant,
+            },
         };
     }
 
-    fn keyFor(entity: u64) [9]u8 {
-        var key: [9]u8 = undefined;
-        key[0] = 1;
-        std.mem.writeInt(u64, key[1..9], entity, .big);
-        return key;
-    }
+    /// Mobs are kept under the column each stood in when saved, so a column comes back with one
+    /// scan: written as their column leaves memory and at checkpoints, read as it comes back.
+    const record_prefix = 3;
+    /// Before, they were kept by id alone, and all came into memory at once.
+    const old_prefix = 1;
 
-    fn load(self: *Mobs) !void {
-        var after: [9]u8 = undefined;
-        var cursor: records.ScanCursor = .{ .after = &after };
-        var keys: [16][9]u8 = undefined;
-        var values: [16][encoded_size]u8 = undefined;
-        var entries: [16]records.ScanEntry = undefined;
-        for (&entries, &keys, &values) |*entry, *key, *value| entry.* = .{ .key = key, .value = value };
+    /// Where a mob's record lies in the store, once it has been saved.
+    const Stored = struct { column: entities.Column = .{ .world = 0, .x = 0, .z = 0 }, kept: bool = false };
+
+    /// Records kept by id are moved under their columns, a scan's worth at a time.
+    fn migrate(self: *Mobs) !void {
         while (true) {
-            const batch = try self.table.scan(&cursor, &entries);
-            for (entries[0..batch.count]) |entry| {
-                if (entry.key_len != 9 or entry.key[0] != 1) return error.CorruptMob;
+            var after: [9]u8 = undefined;
+            var cursor: records.ScanCursor = .{ .after = &after, .before = &.{old_prefix + 1} };
+            var keys: [16][9]u8 = undefined;
+            var values: [16][encoded_size]u8 = undefined;
+            var entries: [16]records.ScanEntry = undefined;
+            for (&entries, &keys, &values) |*entry, *key, *value| entry.* = .{ .key = key, .value = value };
+            const found = try self.table.scan(&cursor, &entries);
+            if (found.count == 0) return;
+            var batch: entities.durable.Batch(encoded_size) = .{ .table = self.table };
+            var gone: [16]records.Write = undefined;
+            for (entries[0..found.count], &gone) |entry, *write| {
+                if (entry.key_len != 9 or entry.key[0] != old_prefix) return error.CorruptMob;
                 const entity = std.mem.readInt(u64, entry.key[1..9], .big);
                 const restored = try decode(entity, entry.value[0..entry.value_len]);
-                if (self.deps.worlds.get(restored.world) == null or self.ids.contains(entity) or entity > std.math.maxInt(i32)) return error.CorruptMob;
-                if (self.free_count == 0) return error.MobCapacity;
-                _ = try self.insert(restored);
-                self.saved[self.saved_count] = entity;
-                self.saved_count += 1;
+                if (self.deps.worlds.get(restored.motion.world) == null) return error.CorruptMob;
+                try batch.put(entities.durable.key(record_prefix, entities.space.columnOf(restored.motion.world, restored.motion.position), entity), entry.value[0..entry.value_len]);
+                write.* = .{ .key = entry.key[0..9], .value = null };
             }
-            if (!batch.more) break;
-        }
-        separateUuids(self.mobs, self.nearby[0..self.active.values().len], self.active.values(), self.config.seed);
-    }
-
-    /// Mobs saved before UUIDs came from entity ids may share one, as each start drew the same
-    /// first UUIDs, and clients show only the first mob with a UUID. Every other mob holding a
-    /// UUID already taken draws its own, by UUID order in the neighbour scratch, unused until the
-    /// first tick.
-    fn separateUuids(mobs: []Mob, order: []u32, active: []const usize, seed: u64) void {
-        for (order, active) |*slot, index| slot.* = @intCast(index);
-        std.mem.sort(u32, order, @as([]const Mob, mobs), struct {
-            fn less(all: []const Mob, a: u32, b: u32) bool {
-                if (all[a].uuid != all[b].uuid) return all[a].uuid < all[b].uuid;
-                return all[a].id < all[b].id;
-            }
-        }.less);
-        if (order.len == 0) return;
-        var last = mobs[order[0]].uuid;
-        for (order[1..]) |index| {
-            const mob = &mobs[index];
-            if (mob.uuid != last) {
-                last = mob.uuid;
-                continue;
-            }
-            var random = entityRandom(seed, mob.id);
-            mob.uuid = randomUuid(&random);
+            try batch.flush();
+            try self.table.putBatch(gone[0..found.count]);
         }
     }
 
+    /// A column came into memory: its mobs come back from the store. One whose column left a
+    /// moment ago and is still going stays; a record left behind by a mob since gone elsewhere is
+    /// passed over.
+    fn loadColumn(self: *Mobs, column: entities.Column) anyerror!void {
+        var reader: entities.durable.ColumnReader(encoded_size) = .init(self.table, record_prefix, column);
+        var rows: [16]entities.durable.ColumnReader(encoded_size).Row = undefined;
+        while (true) {
+            const found = try reader.next(&rows);
+            if (found.len == 0) return;
+            for (found) |row| try self.loadRow(column, row.id, row.value);
+        }
+    }
+
+    fn loadRow(self: *Mobs, column: entities.Column, entity: u64, value: []const u8) !void {
+        if (self.slotOf(entity)) |index| {
+            const mob = try self.inSlot(index);
+            if (!mob.entity.unloaded) return;
+            mob.entity.unloaded = false;
+            mob.entity.removed = false;
+            try self.locate(index);
+            return;
+        }
+        const restored = try decode(entity, value);
+        if (self.deps.worlds.get(restored.motion.world) == null) return error.CorruptMob;
+        _ = try self.insert(restored);
+        self.trackingOf(self.slotOf(entity).?).stored = .{ .column = column, .kept = true };
+    }
+
+    /// Where nothing follows the loaded domain, every mob kept comes into memory at once.
+    fn loadAll(self: *Mobs) !void {
+        var reader: entities.durable.ColumnReader(encoded_size) = .all(self.table, record_prefix);
+        var rows: [16]entities.durable.ColumnReader(encoded_size).Row = undefined;
+        while (true) {
+            const found = try reader.next(&rows);
+            if (found.len == 0) return;
+            for (found, reader.keys[0..found.len]) |row, key| try self.loadRow(entities.durable.columnOf(&key), row.id, row.value);
+        }
+    }
+
+    /// A column left memory: its mobs are saved under it and go, told to their viewers as gone
+    /// and let go once they are.
+    fn unloadColumn(self: *Mobs, column: entities.Column) anyerror!void {
+        var leaving: [64]u64 = undefined;
+        while (true) {
+            // Taken a run at a time, as each leaving changes the column.
+            var count: usize = 0;
+            var walk = self.places.space.entries(column, self.kinds);
+            while (count < leaving.len) {
+                const entry = walk.next() orelse break;
+                leaving[count] = entry.id;
+                count += 1;
+            }
+            if (count == 0) return;
+            var batch: entities.durable.Batch(encoded_size) = .{ .table = self.table };
+            for (leaving[0..count]) |entity| {
+                const index = self.slotOf(entity) orelse return error.CorruptMob;
+                const mob = try self.inSlot(index);
+                self.trackingOf(index).idling = false;
+                var state = mob.state();
+                try self.save(&batch, index, &state);
+                mob.entity.unloaded = true;
+                mob.entity.removed = true;
+                try self.locate(index);
+            }
+            try batch.flush();
+        }
+    }
+
+    /// A mob's record put under the column it stands in, the one it left behind removed.
+    fn save(self: *Mobs, batch: *entities.durable.Batch(encoded_size), index: u32, state: *const MobState) !void {
+        const here = entities.space.columnOf(state.motion.world, state.motion.position);
+        const stored = &self.trackingOf(index).stored;
+        if (stored.kept and !std.meta.eql(stored.column, here)) try batch.delete(entities.durable.key(record_prefix, stored.column, state.entity.id));
+        try batch.put(entities.durable.key(record_prefix, here, state.entity.id), &encode(state));
+        stored.* = .{ .column = here, .kept = true };
+    }
+
+    /// A removed mob's record goes from the store, if it has one.
+    fn forgetRecord(self: *Mobs, index: u32, entity: u64) !void {
+        const stored = &self.trackingOf(index).stored;
+        if (!stored.kept) return;
+        var batch: entities.durable.Batch(encoded_size) = .{ .table = self.table };
+        try batch.delete(entities.durable.key(record_prefix, stored.column, entity));
+        try batch.flush();
+        stored.kept = false;
+    }
+
+    /// Saves every mob in memory, and removes the records of the removed whose viewers are not yet
+    /// told. Those whose columns left were saved as they did.
     pub fn checkpoint(self: *Mobs, space: storage.Space) !void {
         errdefer space.fail();
-        var keys: [records.Table.write_batch_size][9]u8 = undefined;
-        var values: [records.Table.write_batch_size][encoded_size]u8 = undefined;
-        var writes: [records.Table.write_batch_size]records.Write = undefined;
-        var count: usize = 0;
-        for (self.saved[0..self.saved_count]) |entity| {
-            if (self.ids.get(entity)) |index| if (!self.mobs[index].removed) continue;
-            keys[count] = keyFor(entity);
-            writes[count] = .{ .key = &keys[count], .value = null };
-            count += 1;
-            if (count == writes.len) {
-                try self.table.putBatch(writes[0..count]);
-                count = 0;
+        var batch: entities.durable.Batch(encoded_size) = .{ .table = self.table };
+        for (0..self.active.count) |active_at| {
+            const index = self.active.at(active_at);
+            var current = try self.copyAt(@intCast(index));
+            if (current.entity.removed) {
+                if (current.entity.unloaded) continue;
+                const stored = &self.trackingOf(index).stored;
+                if (stored.kept) try batch.delete(entities.durable.key(record_prefix, stored.column, current.entity.id));
+                stored.kept = false;
+                continue;
             }
+            try self.save(&batch, @intCast(index), &current);
         }
-        self.saved_count = 0;
-        for (self.active.values()) |index| {
-            const mob = &self.mobs[index];
-            if (mob.removed) continue;
-            keys[count] = keyFor(mob.id);
-            // An idle mob's hot fields are in the herd.
-            var current = mob.*;
-            const place = self.herd.place_of[index];
-            if (place != herd_state.no_place and self.herd.idling[place]) self.herd.writeBack(place, &current);
-            values[count] = encode(&current);
-            writes[count] = .{ .key = &keys[count], .value = &values[count] };
-            count += 1;
-            self.saved[self.saved_count] = mob.id;
-            self.saved_count += 1;
-            if (count == writes.len) {
-                try self.table.putBatch(writes[0..count]);
-                count = 0;
-            }
-        }
-        if (count > 0) try self.table.putBatch(writes[0..count]);
+        try batch.flush();
     }
 };
 
 test "mob records round trip" {
     var random = JavaRandom.init(7);
-    const original: Mob = .{
-        .id = 5,
-        .uuid = 0x1234,
-        .species = .cow,
-        .world = 1,
-        .position = .{ 1.5, 64, -3.25 },
-        .old_position = .{ 1.5, 64, -3.25 },
-        .velocity = .{ 0, -0.0784, 0 },
-        .yaw = 90,
-        .random = random,
-        .health = 7.5,
-        .age = -100,
-        .in_love = 30,
-        .love_cause = 99,
-        .variant = 2,
+    const original: MobState = .{
+        .idle = .{ .random = random, .age = -100 },
+        .motion = .{
+            .world = 1,
+            .position = .{ 1.5, 64, -3.25 },
+            .old_position = .{ 1.5, 64, -3.25 },
+            .velocity = .{ 0, -0.0784, 0 },
+            .yaw = 90,
+        },
+        .entity = .{
+            .id = 5,
+            .uuid = 0x1234,
+            .species = .cow,
+        },
+        .living = .{
+            .health = 7.5,
+        },
+        .rare = .{ .breeding = .{ .in_love = 30, .love_cause = 99 } },
+        .cow = .{
+            .variant = 2,
+        },
     };
     _ = random.nextInt();
     const decoded = try Mobs.decode(5, &Mobs.encode(&original));
-    try std.testing.expectEqual(original.position, decoded.position);
-    try std.testing.expectEqual(original.health, decoded.health);
-    try std.testing.expectEqual(original.love_cause, decoded.love_cause);
-    try std.testing.expectEqual(original.random.state(), decoded.random.state());
+    try std.testing.expectEqual(original.motion.position, decoded.motion.position);
+    try std.testing.expectEqual(original.living.health, decoded.living.health);
+    try std.testing.expectEqual(original.rare.breeding.?.love_cause, decoded.rare.breeding.?.love_cause);
+    try std.testing.expectEqual(original.idle.random.state(), decoded.idle.random.state());
 }
 
-test "mobs draw UUIDs of their own across restarts, and saved mobs sharing one are told apart" {
+test "mobs draw UUIDs of their own across restarts" {
     // Each start used to draw the same first UUIDs from a fixed seed; ids never repeat.
     var seen: [256]u128 = undefined;
     for (&seen, 0..) |*uuid, entity| {
@@ -1465,18 +1852,6 @@ test "mobs draw UUIDs of their own across restarts, and saved mobs sharing one a
     }
     std.mem.sort(u128, &seen, {}, std.sort.asc(u128));
     for (seen[1..], seen[0 .. seen.len - 1]) |uuid, previous| try std.testing.expect(uuid != previous);
-
-    const shared: u128 = 0x4b41e369_565a_4963_88e5_f3d9fc4a498a;
-    const template: Mob = .{ .id = 0, .uuid = shared, .species = .cow, .world = 0, .position = .{ 0, 64, 0 }, .old_position = .{ 0, 64, 0 }, .random = JavaRandom.init(1), .health = 10 };
-    var mobs: [4]Mob = .{ template, template, template, template };
-    for (&mobs, [_]u64{ 13212, 12124, 13887, 12875 }) |*mob, id| mob.id = id;
-    mobs[3].uuid = 7;
-    var order: [4]u32 = undefined;
-    Mobs.separateUuids(&mobs, &order, &.{ 0, 1, 2, 3 }, 0x6d6f6273);
-    // The first saved keeps its UUID, as clients showed it.
-    try std.testing.expectEqual(shared, mobs[1].uuid);
-    try std.testing.expectEqual(@as(u128, 7), mobs[3].uuid);
-    for (mobs, 0..) |mob, at| for (mobs[at + 1 ..]) |other| try std.testing.expect(mob.uuid != other.uuid);
 }
 
 fn mth_floor(value: f64) i32 {
@@ -1484,9 +1859,9 @@ fn mth_floor(value: f64) i32 {
 }
 
 /// Entity.push(Entity): the pusher and the pushed move apart, each by up to 0.05 a tick.
-fn push(pushed: *Mob, pusher: *Mob) void {
-    var dx = pusher.position[0] - pushed.position[0];
-    var dz = pusher.position[2] - pushed.position[2];
+fn push(pushed: Mob, pusher: Mob) void {
+    var dx = pusher.motion.position[0] - pushed.motion.position[0];
+    var dz = pusher.motion.position[2] - pushed.motion.position[2];
     var farthest = @max(@abs(dx), @abs(dz));
     if (farthest < @as(f64, @as(f32, 0.01))) return;
     farthest = @sqrt(farthest);
@@ -1495,22 +1870,50 @@ fn push(pushed: *Mob, pusher: *Mob) void {
     const scale = @min(1.0, 1.0 / farthest);
     dx *= scale * @as(f64, @as(f32, 0.05));
     dz *= scale * @as(f64, @as(f32, 0.05));
-    pushed.velocity[0] -= dx;
-    pushed.velocity[2] -= dz;
-    pushed.has_impulse = true;
-    pusher.velocity[0] += dx;
-    pusher.velocity[2] += dz;
-    pusher.has_impulse = true;
+    pushed.motion.velocity[0] -= dx;
+    pushed.motion.velocity[2] -= dz;
+    pushed.entity.has_impulse = true;
+    pusher.motion.velocity[0] += dx;
+    pusher.motion.velocity[2] += dz;
+    pusher.entity.has_impulse = true;
 }
+
+/// A path's nodes, as many as a path holds at most.
+/// The mobs' table: a row each, a column for each of a mob's components.
+/// What the mobs keep of each mob beside its state: whether it idles and the look an idle
+/// tick keeps, whether its column ticks, and where its record lies in the store.
+const Tracking = struct {
+    idling: bool = false,
+    gaze_yaw: f32 = 0,
+    /// Began idling since replication last sent the mob in full, which it does once to catch
+    /// anything that changed on the way in; then it sends on the ticks the phase says.
+    fresh: bool = false,
+    send_phase: u8 = 0,
+    column: ColumnTicks = .{},
+    /// The domains revision as of which its column did not tick, so it waits unread.
+    dormant_revision: u64 = std.math.maxInt(u64),
+    stored: Mobs.Stored = .{},
+};
+
+/// A row of the mobs' table: each group of a mob's state a column, and what the mobs keep beside.
+const Row = struct {
+    idle: mob_state.Idle,
+    motion: mob_state.Motion,
+    entity: mob_state.EntityPart,
+    living: mob_state.Living,
+    control: mob_state.Control,
+    goals: mob_state.Goals,
+    navigation: mob_state.Navigation,
+    cow: mob_state.CowPart,
+    tracking: Tracking,
+    /// The link to the mob's rare parts in `extras`, or none.
+    extras: u32,
+};
+const Table = entities.KindTable(Row);
 
 const ColumnTicks = struct { revision: u64 = std.math.maxInt(u64), world: u32 = 0, chunk: [2]i32 = .{ 0, 0 }, ticks: bool = false };
 
 const WorldView = struct { world: u32, level: body.Level, ultrawarm: bool };
-
-/// The entity section a position is in, as SectionPos.of(blockPosition).
-fn sectionOf(position: [3]f64) [3]i32 {
-    return .{ @divFloor(mth_floor(position[0]), 16), @divFloor(mth_floor(position[1]), 16), @divFloor(mth_floor(position[2]), 16) };
-}
 
 /// The chunk column a position is in.
 pub fn chunkOf(position: [3]f64) [2]i32 {

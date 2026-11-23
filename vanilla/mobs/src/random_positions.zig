@@ -12,38 +12,38 @@ const Mobs = @import("mobs.zig").Mobs;
 const Mob = mob_state.Mob;
 
 /// RandomPos.generateRandomDirection.
-fn randomDirection(mob: *Mob, horizontal: i32, vertical: i32) [3]i32 {
-    const x = mob.random.nextIntBounded(2 * horizontal + 1) - horizontal;
-    const y = mob.random.nextIntBounded(2 * vertical + 1) - vertical;
-    const z = mob.random.nextIntBounded(2 * horizontal + 1) - horizontal;
+fn randomDirection(mob: Mob, horizontal: i32, vertical: i32) [3]i32 {
+    const x = mob.idle.random.nextIntBounded(2 * horizontal + 1) - horizontal;
+    const y = mob.idle.random.nextIntBounded(2 * vertical + 1) - vertical;
+    const z = mob.idle.random.nextIntBounded(2 * horizontal + 1) - horizontal;
     return .{ x, y, z };
 }
 
 /// RandomPos.generateRandomPosTowardDirection, for mobs with no home to keep to.
-fn towardDirection(mob: *const Mob, direction: [3]i32) [3]i32 {
+fn towardDirection(mob: Mob, direction: [3]i32) [3]i32 {
     return .{
-        mth.floor(@as(f64, @floatFromInt(direction[0])) + mob.position[0]),
-        mth.floor(@as(f64, @floatFromInt(direction[1])) + mob.position[1]),
-        mth.floor(@as(f64, @floatFromInt(direction[2])) + mob.position[2]),
+        mth.floor(@as(f64, @floatFromInt(direction[0])) + mob.motion.position[0]),
+        mth.floor(@as(f64, @floatFromInt(direction[1])) + mob.motion.position[1]),
+        mth.floor(@as(f64, @floatFromInt(direction[2])) + mob.motion.position[2]),
     };
 }
 
 /// GoalUtils.isOutsideLimits: outside the world's build height.
-fn outsideLimits(mobs: *Mobs, mob: *const Mob, position: [3]i32) bool {
-    const level = mobs.level(mob.world);
+fn outsideLimits(mobs: *Mobs, mob: Mob, position: [3]i32) bool {
+    const level = mobs.level(mob.motion.world);
     return position[1] < level.minimum_y or position[1] >= level.minimum_y + level.height;
 }
 
 /// GoalUtils.hasMalus: the block costs the mob anything to path through.
-fn hasMalus(mobs: *Mobs, mob: *const Mob, position: [3]i32) !bool {
-    const level = mobs.level(mob.world);
+fn hasMalus(mobs: *Mobs, mob: Mob, position: [3]i32) !bool {
+    const level = mobs.level(mob.motion.world);
     const evaluator_mob = navigation.pathfindingMob(mobs, mob);
     const path_type = try pathfinding.staticPathType(&level, position[0], position[1], position[2]);
     return evaluator_mob.pathfindingMalus(path_type) != 0;
 }
 
 /// RandomPos.generateRandomPos: the best of ten tries by walk target value.
-fn bestOfTen(mobs: *Mobs, mob: *Mob, comptime land: bool, horizontal: i32, vertical: i32) !?[3]f64 {
+fn bestOfTen(mobs: *Mobs, mob: Mob, comptime land: bool, horizontal: i32, vertical: i32) !?[3]f64 {
     var best_value = -std.math.inf(f64);
     var best: ?[3]i32 = null;
     for (0..10) |_| {
@@ -58,7 +58,7 @@ fn bestOfTen(mobs: *Mobs, mob: *Mob, comptime land: bool, horizontal: i32, verti
     return .{ @as(f64, @floatFromInt(found[0])) + 0.5, @floatFromInt(found[1]), @as(f64, @floatFromInt(found[2])) + 0.5 };
 }
 
-fn tryOnce(mobs: *Mobs, mob: *Mob, comptime land: bool, horizontal: i32, vertical: i32) !?[3]i32 {
+fn tryOnce(mobs: *Mobs, mob: Mob, comptime land: bool, horizontal: i32, vertical: i32) !?[3]i32 {
     const direction = randomDirection(mob, horizontal, vertical);
     const position = towardDirection(mob, direction);
     if (outsideLimits(mobs, mob, position)) return null;
@@ -69,7 +69,7 @@ fn tryOnce(mobs: *Mobs, mob: *Mob, comptime land: bool, horizontal: i32, vertica
         return position;
     }
     // LandRandomPos.movePosUpOutOfSolid, then no water and no malus.
-    const level = mobs.level(mob.world);
+    const level = mobs.level(mob.motion.world);
     var moved = position;
     if (level.blocks.get(try level.state(moved[0], moved[1], moved[2])).flags.solid) {
         moved[1] += 1;
@@ -81,10 +81,10 @@ fn tryOnce(mobs: *Mobs, mob: *Mob, comptime land: bool, horizontal: i32, vertica
     return moved;
 }
 
-pub fn defaultPosition(mobs: *Mobs, mob: *Mob, horizontal: i32, vertical: i32) !?[3]f64 {
+pub fn defaultPosition(mobs: *Mobs, mob: Mob, horizontal: i32, vertical: i32) !?[3]f64 {
     return bestOfTen(mobs, mob, false, horizontal, vertical);
 }
 
-pub fn landPosition(mobs: *Mobs, mob: *Mob, horizontal: i32, vertical: i32) !?[3]f64 {
+pub fn landPosition(mobs: *Mobs, mob: Mob, horizontal: i32, vertical: i32) !?[3]f64 {
     return bestOfTen(mobs, mob, true, horizontal, vertical);
 }

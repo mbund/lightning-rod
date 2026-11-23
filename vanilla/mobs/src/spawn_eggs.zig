@@ -48,7 +48,6 @@ pub const SpawnEggs = struct {
         const species = speciesOf(context.item.kind) orelse return .pass;
         const player = context.player;
         const mobs = self.deps.mobs;
-        if (!mobs.canSpawn()) return .applied;
         const level = mobs.level(player.world);
         const clicked: [3]i32 = .{ hit.position.x, hit.position.y, hit.position.z };
         const state = try level.state(clicked[0], clicked[1], clicked[2]);
@@ -69,7 +68,7 @@ pub const SpawnEggs = struct {
             .variant = mob_replication.default_variant,
         });
         // EntityType.create and EntityType.spawn each play the ambient sound.
-        const mob = mobs.get(entity).?;
+        const mob = (try mobs.get(entity)).?;
         mobs.ambientSound(mob);
         mobs.ambientSound(mob);
         try self.consume(context);

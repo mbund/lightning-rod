@@ -474,7 +474,6 @@ pub const PlayerInventory = struct {
             }
         }
         if (drops.len > maximum_drops) return false;
-        if (drops.len != 0 and !self.deps.dropped.canCreate(drops.len)) return false;
         errdefer self.fail();
         if (!try self.dropMany(self.deps.players.records[index], drops)) return false;
         if (!std.meta.eql(contents[0].stack, next[0])) state.dirty |= 1;
@@ -529,7 +528,6 @@ pub const PlayerInventory = struct {
     pub fn dropMany(self: *PlayerInventory, player: Players.Player, stacks: []const inventories.Stack) !bool {
         if (stacks.len == 0) return true;
         if (stacks.len > maximum_drops) return error.WorkingSetTooLarge;
-        if (!self.deps.dropped.canCreate(stacks.len)) return false;
         const yaw = @as(f64, player.rotation.yaw) * std.math.pi / 180;
         const pitch = @as(f64, player.rotation.pitch) * std.math.pi / 180;
         const velocity: [3]f64 = .{ -@sin(yaw) * @cos(pitch) * 0.3, -@sin(pitch) * 0.3 + 0.1, @cos(yaw) * @cos(pitch) * 0.3 };

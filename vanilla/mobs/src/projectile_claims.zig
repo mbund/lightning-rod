@@ -103,6 +103,13 @@ pub const Claims = struct {
         return index;
     }
 
+    /// Lets every claim go.
+    pub fn clear(self: *Claims) void {
+        for (0..self.claims.len) |index| if (self.used(@intCast(index))) {
+            _ = self.remove(@intCast(index));
+        };
+    }
+
     pub fn used(self: *const Claims, index: u32) bool {
         return self.claims[index].used;
     }

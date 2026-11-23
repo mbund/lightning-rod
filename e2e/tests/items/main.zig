@@ -131,11 +131,8 @@ const Probe = struct {
                 }
             }
 
-            var cursor: vanilla.ItemEntities.Cursor = .{};
-
-            while (cursor.more) for (try self.deps.dropped.scan(&cursor)) |row| {
-                if (row.metadata.alive) return error.ItemStillAlive;
-            };
+            var rows = self.deps.dropped.rows();
+            while ((try rows.next())) |row| if (row.metadata.alive) return error.ItemStillAlive;
 
             if (total != bread_total or self.deps.item_tick.merged != 1) return error.ItemConservation;
             std.log.info("event=items_verified inventory={d} merged={d}", .{ total, self.deps.item_tick.merged });

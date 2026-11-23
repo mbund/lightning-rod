@@ -6,14 +6,16 @@ const sessions = @import("sessions");
 const records = @import("records");
 const commands = @import("commands");
 const Chunks = @import("chunks").Chunks;
-const Entities = @import("entities").Entities;
+pub const Entities = @import("entities").Entities;
+pub const EntityColumns = @import("domains").entity_columns.EntityColumns;
+pub const EntityTicks = @import("entities").EntityTicks;
 const Inventories = @import("inventories").Inventories;
 const Worlds = @import("worlds").Worlds;
 const Reload = @import("reload").Reload;
 const Packets = @import("minecraft_packets").Packets;
 const Input = @import("players").input.Input;
 const Players = @import("players").players.Players;
-const Domains = @import("domains").domains.Domains;
+pub const Domains = @import("domains").domains.Domains;
 const game_data = @import("game_data");
 const Ticks = @import("ticks").ticks.Ticks;
 pub const RandomTicks = @import("random_ticks").random_ticks.RandomTicks;
@@ -168,6 +170,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(CommandDispatch, CommandDispatch.Configuration{}),
     lightning_rod.plugin.configured(ChatCommands, ChatCommands.Configuration{}),
     lightning_rod.plugin.configured(Entities, Entities.Configuration{}),
+    lightning_rod.plugin.configured(EntityColumns, .{}),
     lightning_rod.plugin.configured(InventoryCapacity, .{}),
     lightning_rod.plugin.configured(Inventories, Inventories.Configuration{ .cache_items = crafting.maximum_inputs + 1 }),
     lightning_rod.plugin.configured(Items, Items.Configuration{}),
@@ -202,7 +205,6 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(DamageTypes, .{}),
     lightning_rod.plugin.configured(PlayerDamage, .{}),
     lightning_rod.plugin.configured(FallDamage, .{}),
-    lightning_rod.plugin.configured(ExperienceReplication, .{}),
     lightning_rod.plugin.configured(BlockSynchronization, BlockSynchronization.Configuration{}),
     lightning_rod.plugin.configured(ItemUse, .{}),
     lightning_rod.plugin.configured(Doors, Doors.Configuration{}),
@@ -219,6 +221,8 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Projectiles, .{}),
     lightning_rod.plugin.configured(Ranged, .{}),
     lightning_rod.plugin.configured(MobInteraction, MobInteraction.Configuration{}),
+    lightning_rod.plugin.configured(EntityTicks, .{}),
+    lightning_rod.plugin.configured(ExperienceReplication, .{}),
     lightning_rod.plugin.configured(MobReplication, MobReplication.Configuration{}),
     lightning_rod.plugin.configured(Equipment, Equipment.Configuration{}),
     lightning_rod.plugin.configured(ItemReplication, ItemReplication.Configuration{}),

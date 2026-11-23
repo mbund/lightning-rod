@@ -58,11 +58,11 @@ const Probe = struct {
             if (previous != null and previous.?.sequence > 0) {
                 if (std.mem.eql(u8, previous.?.token(), "e2e:xp-collected")) {
                     try self.verifyPlayers(99);
-                    if (self.orbTotal() != 0) return error.ExperienceOrbsDuplicated;
+                    if ((try self.orbTotal()) != 0) return error.ExperienceOrbsDuplicated;
                     try self.deps.control.broadcast("complete");
                 } else if (std.mem.eql(u8, previous.?.token(), "e2e:orbs")) {
                     try self.verifyPlayers(0);
-                    if (self.orbTotal() != 100) return error.ExperienceOrbsLost;
+                    if ((try self.orbTotal()) != 100) return error.ExperienceOrbsLost;
                     try self.deps.control.broadcast("restored_orbs");
                 } else return error.UnexpectedExperienceReload;
             } else {
@@ -81,7 +81,7 @@ const Probe = struct {
                     self.deps.inventory.changed(index);
                 }
                 try self.deps.experience.award(player.world, .{ 8.5, 65, 0.5 }, 100);
-                if (self.orbTotal() != 100) return error.ExperienceAwardIncorrect;
+                if ((try self.orbTotal()) != 100) return error.ExperienceAwardIncorrect;
                 try self.deps.control.broadcast("spawned");
             }
         } else if (std.mem.eql(u8, text, "seen")) {
@@ -92,7 +92,7 @@ const Probe = struct {
             try self.deps.reload.stage("e2e:orbs");
         } else if (std.mem.eql(u8, text, "collected")) {
             try self.verifyPlayers(99);
-            if (self.orbTotal() != 0) return error.ExperienceOrbStillAlive;
+            if ((try self.orbTotal()) != 0) return error.ExperienceOrbStillAlive;
             try self.deps.reload.stage("e2e:xp-collected");
         } else if (std.mem.startsWith(u8, text, "points ")) {
             self.deps.experience.givePoints(handle.index, try std.fmt.parseInt(i32, text["points ".len..], 10));
@@ -104,13 +104,8 @@ const Probe = struct {
         return .handled;
     }
 
-    fn orbTotal(self: *Probe) i64 {
-        var total: i64 = 0;
-        for (self.deps.experience.active.values()) |index| {
-            const orb = self.deps.experience.orbs[index];
-            if (orb.alive) total += @as(i64, orb.value) * orb.count;
-        }
-        return total;
+    fn orbTotal(self: *Probe) !i64 {
+        return self.deps.experience.totalValue();
     }
 
     fn verifyPlayers(self: *Probe, amount: i32) !void {
