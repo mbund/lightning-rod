@@ -221,6 +221,8 @@ pub const Experience = struct {
         @memset(self.sounds, .{});
         try deps.entities.addTicker(.init(Experience, self, kinds, batch_max));
         try deps.entities.addColumnHolder(.init(Experience, self, columnLoaded, columnUnloaded));
+        // Items and orbs collide with the border players are kept in.
+        if (deps.player_states.config.world_border) |diameter| deps.physics.border = diameter / 2;
         try self.orbs.register();
         return self;
     }

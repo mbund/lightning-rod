@@ -8,6 +8,7 @@ const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
 const ItemMerging = @import("vanilla_item_entities").item_merging.ItemMerging;
 const ItemPickup = @import("item_pickup.zig").ItemPickup;
 const Players = @import("players").players.Players;
+const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
 const Items = @import("vanilla_items").items.Items;
 const Dimensions = @import("vanilla_content").dimensions.Dimensions;
 const ClientRegistries = @import("vanilla_content").client_registries.ClientRegistries;
@@ -29,6 +30,8 @@ pub const ItemTick = struct {
         merging: *ItemMerging,
         pickup: *ItemPickup,
         players: *Players,
+        /// For the world border, when the server keeps players in one.
+        player_states: ?*PlayerStates = null,
         entities: *entities.Entities,
         inventories: *inventories.Inventories,
         items: *Items,
@@ -64,6 +67,10 @@ pub const ItemTick = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*ItemTick {
         const self = try allocator.create(ItemTick);
+        // Items collide with the border players are kept in.
+        if (deps.player_states) |states| if (states.config.world_border) |diameter| {
+            deps.physics.border = diameter / 2;
+        };
         self.* = .{
             .deps = deps,
             .centers = try allocator.alloc(entities.residency.Center, deps.players.records.len),

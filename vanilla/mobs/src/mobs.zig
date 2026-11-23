@@ -337,6 +337,7 @@ pub const Mobs = struct {
                 .minimum_y = definition.dimension.minimumSection() * 16,
                 .height = @intCast(definition.dimension.sectionCount() * 16),
                 .air = self.air_state,
+                .border = if (self.deps.player_states.config.world_border) |diameter| diameter / 2 else null,
             },
             .ultrawarm = if (dimension) |found| found.ultrawarm else false,
         };

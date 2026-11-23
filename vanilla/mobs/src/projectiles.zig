@@ -1337,7 +1337,9 @@ pub const Projectiles = struct {
         const projectile = held.projectile;
         if (projectile.shake > 0) projectile.shake -= 1;
         if (projectile.kind == .trident and projectile.in_ground_time > 4) projectile.dealt_damage = true;
-        if (projectile.kind == .trident and projectile.loyalty > 0 and (projectile.dealt_damage or projectile.returning)) {
+        // ThrownTrident.tick: a loyal one returns once it dealt damage, while its owner is in its
+        // world; with none, it is an arrow like any other.
+        if (projectile.kind == .trident and projectile.loyalty > 0 and (projectile.dealt_damage or projectile.returning) and self.ownerPresent(projectile)) {
             try self.comeBack(projectile);
         } else {
             // A stuck one returns before ProjectileEntity.tick and Entity.baseTick.
@@ -1878,9 +1880,21 @@ pub const Projectiles = struct {
 
     /// stepMoveAndHit: the nearest block in the path, and before it the nearest living thing,
     /// which a piercing arrow passes through to the next.
-    fn move(self: *Projectiles, projectile: *Projectile, block: ?raycast.Hit, v: [3]f64) !void {
+    fn move(self: *Projectiles, projectile: *Projectile, traced: ?raycast.Hit, v: [3]f64) !void {
         const from = projectile.position;
-        const end: [3]f64 = if (block) |hit| .{ hit.position.x, hit.position.y, hit.position.z } else .{ from[0] + v[0], from[1] + v[1], from[2] + v[2] };
+        var block = traced;
+        var end: [3]f64 = if (block) |hit| .{ hit.position.x, hit.position.y, hit.position.z } else .{ from[0] + v[0], from[1] + v[1], from[2] + v[2] };
+        // World.getCollisionsIncludingWorldBorder: a way out through the border meets it there.
+        var against_border = false;
+        if (self.deps.player_states.config.world_border) |diameter| {
+            const half = diameter / 2;
+            if (insideBorder(half, from) and !insideBorder(half, end)) {
+                const inner = half - 9.999999747378752e-6;
+                end = .{ std.math.clamp(end[0], -half, inner), end[1], std.math.clamp(end[2], -half, inner) };
+                block = null;
+                against_border = true;
+            }
+        }
         var start = from;
         var passes: usize = 0;
         while (passes < 8) : (passes += 1) {
@@ -1893,6 +1907,17 @@ pub const Projectiles = struct {
         }
         projectile.position = end;
         if (block) |hit| self.land(projectile, hit);
+        // ProjectileDeflection.SIMPLE: back it comes at half the speed, turned about.
+        if (against_border) {
+            for (&projectile.velocity) |*axis| axis.* *= -0.5;
+            projectile.yaw += 170.0 + self.random.random().float(f32) * 20.0;
+            projectile.impulse = true;
+        }
+    }
+
+    /// WorldBorder.contains of a point, for a border this far to each side of the origin.
+    fn insideBorder(half: f64, at: [3]f64) bool {
+        return at[0] >= -half and at[0] < half and at[2] >= -half and at[2] < half;
     }
 
     /// Runs an enchantment hook with the weapon a projectile came from, from its own slot.
@@ -1943,11 +1968,32 @@ pub const Projectiles = struct {
         if (projectile.kind == .trident) self.sound(projectile, "minecraft:item.trident.hit_ground", 1, 1) else self.sound(projectile, hitSound(projectile), 1, 1.2 / (random.float(f32) * 0.2 + 0.9));
     }
 
+    /// ProjectileEntity.getOwner: the player who threw it, while in its world.
+    fn ownerPresent(self: *Projectiles, projectile: *const Projectile) bool {
+        const owner = &self.deps.players.records[projectile.owner];
+        const generation = if (owner.handle) |handle| handle.generation else 0;
+        return generation == projectile.owner_generation and owner.world == projectile.world;
+    }
+
+    /// Entity.dropStack: the projectile's stack as an item at its feet, `lift` up, moving as a new
+    /// item does, from the level's random.
+    fn dropStack(self: *Projectiles, projectile: *const Projectile, lift: f64) !void {
+        const stack = (try self.deps.inventories.get(.{ .owner = projectile.uuid, .index = 0 })).stack orelse return error.Corrupt;
+        const random = self.deps.mobs.levelRandom();
+        const dx = random.nextDouble() * 0.2 - 0.1;
+        const dz = random.nextDouble() * 0.2 - 0.1;
+        const at: [3]f64 = .{ projectile.position[0], projectile.position[1] + lift, projectile.position[2] };
+        _ = try self.deps.mobs.deps.dropped.create(projectile.world, at, .{ dx, 0.2, dz }, stack);
+    }
+
     /// ThrownTrident's loyalty: it flies back to its owner's eyes through anything.
     fn comeBack(self: *Projectiles, projectile: *Projectile) !void {
         const owner = &self.deps.players.records[projectile.owner];
-        const generation = if (owner.handle) |handle| handle.generation else 0;
-        if (generation != projectile.owner_generation or owner.world != projectile.world or self.deps.player_states.of(owner).health <= 0) {
+        // isOwnerAlive: an owner dead or spectating takes nothing back. The trident drops as an
+        // item where it is, a tenth of a block up, if it could be picked up, and goes.
+        const state = self.deps.player_states.of(owner);
+        if (state.health <= 0 or state.gamemode == .spectator) {
+            if (projectile.pickup == .allowed) try self.dropStack(projectile, 0.1);
             projectile.removed = true;
             return;
         }

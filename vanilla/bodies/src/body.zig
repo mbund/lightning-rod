@@ -266,6 +266,8 @@ pub const Level = struct {
     minimum_y: i32,
     height: i32,
     air: u16,
+    /// The world border, a square around the origin this far to each side, if there is one.
+    border: ?f64 = null,
 
     /// Outside the world's height a level reads void air, which collides with nothing.
     pub fn state(self: *const Level, x: i32, y: i32, z: i32) !u16 {
@@ -419,9 +421,13 @@ pub const Shapes = struct {
     }
 };
 
-/// Shapes.collide along one axis, against every shape the query yields.
-fn collideAxis(level: *const Level, query: Box, context: Context, moving: Box, axis: usize, distance: f64) !f64 {
+/// Shapes.collide along one axis, against every shape the query yields, the border's first.
+fn collideAxis(level: *const Level, query: Box, context: Context, border: ?[4]Box, moving: Box, axis: usize, distance: f64) !f64 {
     var result = distance;
+    if (border) |outside| {
+        if (@abs(result) < 1.0e-7) return 0;
+        for (outside) |side| result = collideBox(side, moving, axis, result);
+    }
     var shapes: Shapes = .init(level, query, context);
     while (try shapes.next()) |shape| {
         if (@abs(result) < 1.0e-7) return 0;
@@ -466,10 +472,19 @@ pub const Colliders = struct {
     const box_capacity = 256;
 
     /// Fills in place, as the boxes are too many to copy around.
-    pub fn gather(self: *Colliders, level: *const Level, query: Box, context: Context) !void {
+    pub fn gather(self: *Colliders, level: *const Level, query: Box, context: Context, border: ?[4]Box) !void {
         self.box_count = 0;
         self.shape_count = 0;
         self.complete = true;
+        // Entity.findCollisionsForMovement: the border's shape before the blocks'.
+        if (border) |outside| {
+            for (outside) |side| {
+                self.boxes[self.box_count] = side;
+                self.box_count += 1;
+            }
+            self.ends[self.shape_count] = @intCast(self.box_count);
+            self.shape_count += 1;
+        }
         var shapes: Shapes = .init(level, query, context);
         while (try shapes.next()) |shape| {
             if (self.box_count + shape.boxes.count > box_capacity) {
@@ -532,15 +547,41 @@ pub const Colliders = struct {
 /// Entity.collideWithShapes against what a query gathers, or the world itself past what fits.
 fn collideWithShapes(level: *const Level, query: Box, context: Context, movement: [3]f64, start: Box) ![3]f64 {
     const colliders = level.colliders.?;
-    try colliders.gather(level, query, context);
+    const border = borderFor(level, start, query);
+    try colliders.gather(level, query, context, border);
     if (colliders.complete) return colliders.collideWith(movement, start);
     var result: [3]f64 = .{ 0, 0, 0 };
     const order: [3]usize = if (@abs(movement[0]) < @abs(movement[2])) .{ 1, 2, 0 } else .{ 1, 0, 2 };
     for (order) |axis| {
         if (movement[axis] == 0) continue;
-        result[axis] = try collideAxis(level, query, context, start.move(result), axis, movement[axis]);
+        result[axis] = try collideAxis(level, query, context, border, start.move(result), axis, movement[axis]);
     }
     return result;
+}
+
+/// WorldBorder.canCollide for a body whose box is `start`, moving through `query`: near the border
+/// and inside it, by the query's longer side, the border's outside as four boxes.
+pub fn borderFor(level: *const Level, start: Box, query: Box) ?[4]Box {
+    const half = level.border orelse return null;
+    const limit = 29999984.0;
+    const west = @max(-half, -limit);
+    const east = @min(half, limit);
+    const x = (start.min[0] + start.max[0]) / 2;
+    const z = (start.min[2] + start.max[2]) / 2;
+    const margin = @max(@max(@abs(query.max[0] - query.min[0]), @abs(query.max[2] - query.min[2])), 1.0);
+    const inside = @min(@min(x - west, east - x), @min(z - west, east - z));
+    if (!(inside < margin * 2.0)) return null;
+    if (!(x >= west - margin and x < east + margin and z >= west - margin and z < east + margin)) return null;
+    // VoxelShapes.cuboid of the inside, its bounds floored and ceiled, cut from all space.
+    const far = 1.0e8;
+    const low = @floor(west);
+    const high = @ceil(east);
+    return .{
+        .{ .min = .{ -far, -far, -far }, .max = .{ low, far, far } },
+        .{ .min = .{ high, -far, -far }, .max = .{ far, far, far } },
+        .{ .min = .{ low, -far, -far }, .max = .{ high, far, low } },
+        .{ .min = .{ low, -far, high }, .max = .{ high, far, far } },
+    };
 }
 
 /// Entity.collide, with stepping up onto blocks no higher than max_up_step.
@@ -556,7 +597,7 @@ pub fn collide(level: *const Level, start: Box, movement: [3]f64, context: Conte
         var query = base.expandTowards(.{ movement[0], max_up_step, movement[2] });
         if (!landed) query = query.expandTowards(.{ 0, -@as(f64, @as(f32, 1.0e-5)), 0 });
         const colliders = level.colliders.?;
-        try colliders.gather(level, query, context);
+        try colliders.gather(level, query, context, borderFor(level, start, query));
         var heights: [64]f32 = undefined;
         const count = if (colliders.complete) colliders.stepHeights(base, max_up_step, @floatCast(collided[1]), &heights) else try stepHeights(level, query, context, base, max_up_step, @floatCast(collided[1]), &heights);
         for (heights[0..count]) |height| {
@@ -646,5 +687,21 @@ pub fn contextFreeBoxes(state: u16, x: i32, z: i32) game_data.physics.Boxes {
 
 /// Shapes.collide along Y against the shapes a query yields, as EntityType.getYOffset asks.
 pub fn collideVertical(level: *const Level, query: Box, context: Context, moving: Box, distance: f64) !f64 {
-    return collideAxis(level, query, context, moving, 1, distance);
+    return collideAxis(level, query, context, null, moving, 1, distance);
+}
+
+test "the world border stops a body near it and leaves the far ones alone" {
+    var level: Level = undefined;
+    level.border = 8;
+    const moving: Box = .{ .min = .{ 7.2, 64, 0.2 }, .max = .{ 7.8, 65.4, 0.8 } };
+    const query = moving.expandTowards(.{ 1, 0, 0 });
+    const outside = borderFor(&level, moving, query).?;
+    var distance: f64 = 1;
+    for (outside) |side| distance = collideBox(side, moving, 0, distance);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.2), distance, 1e-12);
+    // Far inside, it is not in the way at all; with none, never.
+    const far: Box = .{ .min = .{ 0.2, 64, 0.2 }, .max = .{ 0.8, 65.4, 0.8 } };
+    try std.testing.expectEqual(@as(?[4]Box, null), borderFor(&level, far, far.expandTowards(.{ 1, 0, 0 })));
+    level.border = null;
+    try std.testing.expectEqual(@as(?[4]Box, null), borderFor(&level, moving, query));
 }

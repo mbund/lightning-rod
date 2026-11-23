@@ -27,6 +27,9 @@ pub const ItemPhysics = struct {
     deps: Dependencies,
     /// Reads block sections from the simulation budget, two windows of eight at once.
     chunk_client: chunks.Chunks.Client,
+    /// The world border, a square around the origin this far to each side, which bodies moving
+    /// near it collide with; set by whoever knows it.
+    border: ?f64 = null,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*ItemPhysics {
         const self = try allocator.create(ItemPhysics);
@@ -532,6 +535,42 @@ pub const ItemPhysics = struct {
         body.position = .{ destination[0], destination[1] - 0.25, destination[2] };
     }
 
+    /// WorldBorder.canCollide for a body whose feet stand at `position`, moving by `motion`: near
+    /// the border and inside it, the border's outside as four boxes, as Entity.findCollisionsForMovement
+    /// adds it. The same rule as vanilla_bodies' borderFor.
+    fn borderFor(self: *const ItemPhysics, position: [3]f64, half_width: f64, motion: [3]f64) ?[4][2][3]f64 {
+        const half = self.border orelse return null;
+        const limit = 29999984.0;
+        const west = @max(-half, -limit);
+        const east = @min(half, limit);
+        const x = position[0];
+        const z = position[2];
+        const margin = @max(@max(half_width * 2 + @abs(motion[0]), half_width * 2 + @abs(motion[2])), 1.0);
+        const inside = @min(@min(x - west, east - x), @min(z - west, east - z));
+        if (!(inside < margin * 2.0)) return null;
+        if (!(x >= west - margin and x < east + margin and z >= west - margin and z < east + margin)) return null;
+        const far = 1.0e8;
+        const low = @floor(west);
+        const high = @ceil(east);
+        return .{
+            .{ .{ -far, -far, -far }, .{ low, far, far } },
+            .{ .{ high, -far, -far }, .{ far, far, far } },
+            .{ .{ low, -far, -far }, .{ high, far, low } },
+            .{ .{ low, -far, high }, .{ high, far, far } },
+        };
+    }
+
+    /// VoxelShape.collide along one axis for one box, within vanilla's 1e-7 tolerance.
+    fn clampAgainst(low: [3]f64, high: [3]f64, minimum: [3]f64, maximum: [3]f64, axis: usize, requested: f64) f64 {
+        const a = (axis + 1) % 3;
+        const b = (axis + 2) % 3;
+        if (maximum[a] <= low[a] + 1e-7 or minimum[a] >= high[a] - 1e-7 or maximum[b] <= low[b] + 1e-7 or minimum[b] >= high[b] - 1e-7) return requested;
+        var movement = requested;
+        if (movement > 0 and maximum[axis] <= low[axis] + 1e-7) movement = @min(movement, @max(0, low[axis] - maximum[axis]));
+        if (movement < 0 and minimum[axis] >= high[axis] - 1e-7) movement = @max(movement, @min(0, high[axis] - minimum[axis]));
+        return movement;
+    }
+
     fn advanceBody(self: *ItemPhysics, comptime orb: bool, neighborhood: *Window, entity_id: u32, ticks: u32, body: entities.State, on_ground: bool, stuck: [3]f64, effects: anytype) !Result {
         assert(entity_id > 0 and neighborhood.client.index == self.chunk_client.index);
         var next = body;
@@ -556,14 +595,21 @@ pub const ItemPhysics = struct {
             // the result only if it goes somewhere or the blocks barely held it back.
             var box_at = next.position;
             var adjusted: [3]f64 = .{ 0, 0, 0 };
+            const body_half: f64 = if (orb) 0.25 else 0.125;
+            const body_tall: f64 = if (orb) 0.5 else 0.25;
+            const border = self.borderFor(next.position, body_half, motion);
 
             for (order) |axis| {
                 const requested = motion[axis];
                 if (requested == 0) continue;
 
                 var movement = requested;
-                const minimum: [3]f64 = .{ box_at[0] - @as(f64, if (orb) 0.25 else 0.125), box_at[1], box_at[2] - @as(f64, if (orb) 0.25 else 0.125) };
-                const maximum: [3]f64 = .{ box_at[0] + @as(f64, if (orb) 0.25 else 0.125), box_at[1] + @as(f64, if (orb) 0.5 else 0.25), box_at[2] + @as(f64, if (orb) 0.25 else 0.125) };
+                const minimum: [3]f64 = .{ box_at[0] - body_half, box_at[1], box_at[2] - body_half };
+                const maximum: [3]f64 = .{ box_at[0] + body_half, box_at[1] + body_tall, box_at[2] + body_half };
+                // The border's shape comes before the blocks'.
+                if (border) |outside| for (outside) |side| {
+                    movement = clampAgainst(side[0], side[1], minimum, maximum, axis, movement);
+                };
                 var first: [3]i32 = undefined;
                 var last: [3]i32 = undefined;
 
