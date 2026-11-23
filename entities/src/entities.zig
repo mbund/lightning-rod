@@ -372,6 +372,8 @@ pub const Entities = struct {
     /// An entity kept in a kind's table leaves memory, its row gone first.
     pub fn leave(self: *Entities, slot: u32) void {
         assert(self.directory.entry(slot).block == directory.none);
+        // Placed, it would stay in the space with no slot to be found by.
+        assert(self.directory.entry(slot).space_column == directory.none);
         self.places.order.leaveSlot(slot);
         self.directory.remove(slot);
     }

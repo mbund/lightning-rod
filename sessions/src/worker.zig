@@ -759,8 +759,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
                                 move.state.store(.idle, .release);
                                 const announced = source.push(.{ .left = old });
                                 assert(announced);
-                                const held = source.occupied[index].swap(false, .release);
-                                assert(held);
+                                // The source frees the slot once its game has told everyone the player left.
                                 std.log.info("event=session_transfer connection={d}:{d} source={d}:{d} destination={d}:{d}", .{ native.index, native.generation, old.index, old.generation, next.index, next.generation });
                             }
                         }
@@ -1034,11 +1033,16 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             const binding = self.bindings[handle.index].?;
             assert(std.meta.eql(binding.native, handle));
             _ = binding.endpoint.credit[binding.handle.index].fetchAnd(~Service.active, .acq_rel);
-            if ((!binding.configuring or binding.previous == null) and !binding.endpoint.push(.{ .left = binding.handle })) return false;
+            const announced = !binding.configuring or binding.previous == null;
+            if (announced and !binding.endpoint.push(.{ .left = binding.handle })) return false;
             binding.endpoint.routes[binding.handle.index] = null;
             self.bindings[handle.index] = null;
-            const held = binding.endpoint.occupied[binding.handle.index].swap(false, .release);
-            assert(held);
+            // A departure the game hears of frees its slot once the game has told everyone; one it
+            // never heard of is free now.
+            if (!announced) {
+                const held = binding.endpoint.occupied[binding.handle.index].swap(false, .release);
+                assert(held);
+            }
             return true;
         }
 

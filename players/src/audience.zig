@@ -75,6 +75,13 @@ pub const Matrix = struct {
         return .{ .storage = try sparse_sets.Matrix.init(allocator, rows, players.records.len, words), .players = players, .orientation = orientation };
     }
 
+    /// A matrix with room for every row to hold every player at once: no row can fill, so none
+    /// ever turns a player away.
+    pub fn complete(allocator: std.mem.Allocator, players: *Players, rows: usize, orientation: Orientation) !Matrix {
+        const stride = std.math.divCeil(usize, players.records.len, @bitSizeOf(usize)) catch unreachable;
+        return init(allocator, players, rows, try std.math.mul(usize, rows, stride -| 1), orientation);
+    }
+
     pub fn row(self: Matrix, index: usize) Row {
         return .{ .storage = self.storage.row(index), .players = self.players, .owner = switch (self.orientation) {
             .recipients => null,

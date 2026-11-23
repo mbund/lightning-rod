@@ -3,6 +3,7 @@ const std = @import("std");
 
 pub const entity_packets = @import("entity_packets.zig");
 pub const lifecycle = @import("lifecycle.zig");
+pub const replication_test = @import("replication_test.zig");
 pub const region_debug = @import("region_debug.zig");
 pub const replication = @import("replication.zig");
 pub const visibility = @import("visibility.zig");

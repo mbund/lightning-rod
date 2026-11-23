@@ -27,13 +27,6 @@ pub const Replication = struct {
     pub const id = "minecraft:player_replication";
 
     pub const Configuration = struct {
-        /// Pairs of players whose view of each other differs from what most pairs of
-        /// their row share. Null lets every player differ with up to 255 others, which
-        /// is every pair there is up to 256 players. A fixed count ran out when more
-        /// than 64 players met in one place, and the player with the most in view was
-        /// disconnected to make room.
-        lifecycle_exceptions: ?usize = null,
-        audience_words: usize = 4096,
         /// Ticks between a player's movement updates. Vanilla tracks players every second tick.
         update_interval: u8 = 2,
     };
@@ -117,8 +110,10 @@ pub const Replication = struct {
     spatial_changes: SpatialIndex,
     neighborhoods: SpatialGroups,
     lifecycle: Lifecycle,
-    rejected: []u32,
-    baselines: []CachedBaseline,
+    /// What each observer's client last took of each subject's movement and head, subject
+    /// major: exact for every pair, so an observer that fell behind catches up with relative
+    /// moves instead of absolute ones.
+    pairs: []Pair,
     observers: []Observer,
     subjects: []Subject,
     /// Movement and head turns since a subject's last update tick. Vanilla tracks players every
@@ -163,11 +158,19 @@ pub const Replication = struct {
         tab_visibility: u64 = 0,
         /// The player's chat key revision, so observers hear of a new key.
         chat: u32 = 0,
+        /// Who holds the slot, kept after it leaves until every observer was told it is gone.
+        uuid: u128 = 0,
     };
 
-    const CachedBaseline = struct {
-        key: [4]usize = @splat(0),
-        value: Baseline = .{},
+    /// One pair's movement and head baseline. Flags are not kept per pair: an observer off the
+    /// shared flags is sent them whole, which is what a flags update is anyway.
+    const Pair = struct {
+        position: [3]i64 = @splat(0),
+        yaw: i8 = 0,
+        pitch: i8 = 0,
+        head: i8 = 0,
+        on_ground: bool = false,
+        /// Which of movement and head this holds, as Observation.known.
         known: u3 = 0,
     };
 
@@ -199,7 +202,7 @@ pub const Replication = struct {
             const protocol = std.math.order(a.group.protocol, b.group.protocol);
             const absolute = std.math.order(@intFromBool(a.group.absolute), @intFromBool(b.group.absolute));
             const baseline = std.mem.order(i64, &a.group.baseline, &b.group.baseline);
-            const move = std.math.order(@intFromEnum(a.group.move), @intFromEnum(b.group.move));
+            const move = std.math.order(@backingInt(a.group.move), @backingInt(b.group.move));
             return protocol == .lt or (protocol == .eq and (absolute == .lt or (absolute == .eq and (baseline == .lt or (baseline == .eq and move == .lt)))));
         }
     };
@@ -208,11 +211,9 @@ pub const Replication = struct {
         if (config.update_interval == 0) return error.InvalidConfiguration;
         const self = try allocator.create(Replication);
         const slots = deps.players.records.len;
-        const lifecycle = try Lifecycle.init(allocator, slots, config.lifecycle_exceptions orelse slots * @min(slots -| 1, 255));
-        const rejected = try allocator.alloc(u32, deps.players.records.len);
-        @memset(rejected, 0);
-        const baselines = try allocator.alloc(CachedBaseline, deps.players.records.len);
-        @memset(baselines, .{});
+        const lifecycle = try Lifecycle.init(allocator, slots);
+        const pairs = try allocator.alloc(Pair, try std.math.mul(usize, slots, slots));
+        @memset(pairs, .{});
         const observers = try allocator.alloc(Observer, deps.players.records.len);
         @memset(observers, .{});
         const subjects = try allocator.alloc(Subject, deps.players.records.len);
@@ -221,20 +222,20 @@ pub const Replication = struct {
         @memset(motion, .{});
         const viewer_revisions = try allocator.alloc(u64, subjects.len);
         @memset(viewer_revisions, 0);
-        const viewer_masks = try audience_storage.Matrix.init(allocator, deps.players, deps.players.records.len, config.audience_words, .recipients);
-        const pending_updates = try audience_storage.Matrix.init(allocator, deps.players, deps.players.records.len, config.audience_words, .recipients);
+        const viewer_masks = try audience_storage.Matrix.complete(allocator, deps.players, deps.players.records.len, .recipients);
+        const pending_updates = try audience_storage.Matrix.complete(allocator, deps.players, deps.players.records.len, .recipients);
         const common = try allocator.alloc(Common, deps.players.records.len);
         @memset(common, .{});
         const broadcast = try sessions.Service.Broadcast.init(allocator, deps.players.deps.sessions, 3 * deps.players.records.len * deps.players.deps.sessions.config.protocols.len);
         const audience_groups = try AudienceGroups.init(allocator, deps.players.records.len);
         const broadcast_groups = try allocator.alloc(BroadcastGroup, deps.players.records.len);
-        const observer_sets = try audience_storage.Matrix.init(allocator, deps.players, try std.math.mul(usize, 3, observers.len), config.audience_words, .{ .subjects = 3 });
+        const observer_sets = try audience_storage.Matrix.complete(allocator, deps.players, try std.math.mul(usize, 3, observers.len), .{ .subjects = 3 });
         for (observers, 0..) |*observer, index| observer.* = .{ .spawned = observer_sets.row(index * 3), .pending = observer_sets.row(index * 3 + 1), .nearby = observer_sets.row(index * 3 + 2) };
-        const common_sets = try audience_storage.Matrix.init(allocator, deps.players, try std.math.mul(usize, 3, common.len), config.audience_words, .recipients);
+        const common_sets = try audience_storage.Matrix.complete(allocator, deps.players, try std.math.mul(usize, 3, common.len), .recipients);
         for (common, 0..) |*value, index| for (&value.members, 0..) |*members, phase| {
             members.* = common_sets.row(index * 3 + phase);
         };
-        const group_sets = try sparse_sets.Matrix.init(allocator, broadcast_groups.len, broadcast_groups.len, config.audience_words);
+        const group_sets = (try sparse_sets.Workspace.init(allocator, broadcast_groups.len, broadcast_groups.len)).matrix;
         const group_links = try allocator.alloc(usize, broadcast_groups.len);
         const group_owners = try allocator.alloc(u64, broadcast_groups.len);
         @memset(group_owners, 0);
@@ -242,7 +243,7 @@ pub const Replication = struct {
         self.* = .{
             .spatial_changes = try SpatialIndex.init(allocator, try std.math.mul(usize, 2, subjects.len)),
             .neighborhoods = try SpatialGroups.init(allocator, subjects.len),
-            .work_masks = try audience_storage.Matrix.init(allocator, deps.players, try std.math.mul(usize, 3, deps.players.records.len), config.audience_words, .recipients),
+            .work_masks = try audience_storage.Matrix.complete(allocator, deps.players, try std.math.mul(usize, 3, deps.players.records.len), .recipients),
             .dirty_work = try IndexSet.init(allocator, try std.math.mul(usize, 3, deps.players.records.len)),
             .scratch = try sparse_sets.Workspace.init(allocator, std.enums.values(Scratch).len, deps.players.records.len),
             .targets = try allocator.alloc(sessions.Service.Target, deps.players.records.len),
@@ -256,8 +257,7 @@ pub const Replication = struct {
             .deps = deps,
             .actors = try IndexSet.init(allocator, deps.players.records.len),
             .lifecycle = lifecycle,
-            .rejected = rejected,
-            .baselines = baselines,
+            .pairs = pairs,
             .observers = observers,
             .subjects = subjects,
             .motion = motion,
@@ -342,16 +342,20 @@ pub const Replication = struct {
         for (self.actors.values()) |index| {
             const player = players.records[index];
             const subject = &self.subjects[index];
-            const generation = if (player.handle) |handle| (if (self.rejected[index] == handle.generation) @as(u32, 0) else handle.generation) else 0;
+            const generation = if (player.handle) |handle| handle.generation else 0;
             if (generation == 0) {
                 if (subject.generation != 0) {
                     changed.insert(index);
                     spatial_changed.insert(index);
                     self.spatial_changes.update(index * 2, spatialPosition(subject.*));
-                    subject.* = .{};
+                    // Its uuid stays while observers are still told it left.
+                    subject.* = .{ .uuid = subject.uuid };
+                    self.forgetSubject(index);
                 }
                 continue;
             }
+            // A slot takes a new player only once every observer forgot the last.
+            if (subject.generation != generation) assert(subject.generation != 0 or self.lifecycle.drained(index));
             appeared = appeared or (player.stage == .ready and !self.observers[index].ready);
             const next: Subject = .{
                 .generation = generation,
@@ -366,9 +370,11 @@ pub const Replication = struct {
                 .entity_visibility = self.deps.visibility.player_entity.revision(index),
                 .tab_visibility = self.deps.visibility.tab_list.revision(index),
                 .chat = player.chat_revision,
+                .uuid = player.uuid,
             };
             if (generation != 0) connected.insert(index);
             if (generation != subject.generation or next.gamemode != subject.gamemode or next.entity_visibility != subject.entity_visibility or next.tab_visibility != subject.tab_visibility or next.chat != subject.chat) changed.insert(index);
+            if (generation == subject.generation and next.chat != subject.chat) self.lifecycle.chatChanged(index);
             const moved = !std.meta.eql(next.position, subject.position);
             if (terrain != null and moved and !std.meta.eql(terrainSections(next.position), terrainSections(subject.position))) changed.insert(index);
             if (generation != subject.generation or next.world != subject.world or !std.meta.eql(next.cell, subject.cell)) {
@@ -402,7 +408,7 @@ pub const Replication = struct {
         for (self.orderObservers(moved_cells or distance_changed or appeared)) |other| {
             const observer = players.records[other];
             const watching = &self.observers[other];
-            const generation = if (observer.handle) |handle| (if (self.rejected[other] == handle.generation) @as(u32, 0) else handle.generation) else 0;
+            const generation = if (observer.handle) |handle| handle.generation else 0;
             if (watching.generation != generation or (watching.ready and observer.stage != .ready)) {
                 var spawned = watching.spawned.view().iterator();
                 while (spawned.next()) |index| {
@@ -412,7 +418,9 @@ pub const Replication = struct {
                 }
             }
             if (watching.generation != generation) {
-                self.lifecycle.deactivate(other);
+                // That client is gone: nothing it was told counts.
+                self.lifecycle.forget(other);
+                self.forgetObserver(other);
                 const spawned = watching.spawned;
                 const pending = watching.pending;
                 const nearby = watching.nearby;
@@ -435,7 +443,6 @@ pub const Replication = struct {
                 watching.ready = false;
                 continue;
             }
-            if (!self.lifecycle.active.contains(other)) self.lifecycle.activate(other);
             ready_observers.insert(other);
             // Each observer sees subjects within its own view distance.
             const reach = players.viewDistanceOf(observer);
@@ -501,7 +508,7 @@ pub const Replication = struct {
             if (!self.dirty_work.contains(index * 3 + @backingInt(Work.audience))) continue;
             const audience = self.workMask(index, .audience);
             if (!audience.any()) continue;
-            while (!self.lifecycle.begin(index, audience)) self.evictObserver(ready_observers);
+            self.lifecycle.begin(index, audience);
             defer self.lifecycle.commit();
             var selected_observers = audience.iterator();
             while (selected_observers.next()) |other| self.lifecycle.edit(other).spawned = self.observers[other].spawned.view().contains(index);
@@ -533,16 +540,14 @@ pub const Replication = struct {
             var selected = audience.iterator();
             while (selected.next()) |other| {
                 const seen = self.lifecycle.edit(other);
-                if (seen.generation != generation and !seen.known) seen.* = .{ .generation = generation, .uuid = subject.uuid };
                 const wants_spawn = other != index and entity_audience.contains(other);
                 const wants_known = generation != 0 and (other == index or wants_spawn or listed_audience.contains(other));
                 if (other == index and !seen.known) {
                     seen.known = true;
                     seen.listed = true;
                 }
-                const stale = seen.generation != generation;
-                if (seen.spawned and (stale or !wants_spawn)) needed[@backingInt(Action.remove_entity)].insert(other);
-                if (seen.known and (stale or !wants_known)) {
+                if (seen.spawned and !wants_spawn) needed[@backingInt(Action.remove_entity)].insert(other);
+                if (seen.known and !wants_known) {
                     if (!seen.spawned) needed[@backingInt(Action.remove_player)].insert(other);
                     continue;
                 }
@@ -552,7 +557,7 @@ pub const Replication = struct {
                     continue;
                 }
                 if (seen.gamemode != self.subjects[index].gamemode or seen.listed != (listed_audience.contains(other))) needed[@backingInt(Action.mode)].insert(other);
-                if (seen.chat != self.subjects[index].chat) needed[@backingInt(Action.chat)].insert(other);
+                if (!seen.chat and self.subjects[index].chat != 0) needed[@backingInt(Action.chat)].insert(other);
                 if (!seen.spawned and wants_spawn) needed[@backingInt(Action.spawn)].insert(other);
             }
             const yaw = self.subjects[index].yaw;
@@ -562,14 +567,13 @@ pub const Replication = struct {
                 const remaining = needed[@backingInt(phase)];
                 while (remaining.view().any()) {
                     const first = remaining.view().firstFrom(0).?;
-                    const old_uuid = self.lifecycle.get(index, first).uuid;
+                    // A departed player's slot keeps its uuid until everyone was told.
+                    const old_uuid = self.subjects[index].uuid;
                     const targets = self.targets;
                     const deliveries = self.deliveries;
                     var count: usize = 0;
                     var pending = remaining.view().iterator();
                     while (pending.next()) |other| {
-                        const seen = self.lifecycle.edit(other);
-                        if (phase == .remove_player and seen.uuid != old_uuid) continue;
                         if ((phase == .add_player or phase == .mode) and (listed_audience.contains(other)) != (listed_audience.contains(first))) continue;
                         remaining.remove(other);
                         const observer = players.records[other];
@@ -602,11 +606,11 @@ pub const Replication = struct {
                             .remove_entity => {
                                 self.detach(index, other);
                                 seen.spawned = false;
-                                if (seen.generation != generation or (other != index and !listed_audience.contains(other) and !entity_audience.contains(other))) needed[@backingInt(Action.remove_player)].insert(other);
+                                if (generation == 0 or (other != index and !listed_audience.contains(other) and !entity_audience.contains(other))) needed[@backingInt(Action.remove_player)].insert(other);
                             },
                             .remove_player => {
                                 self.detach(index, other);
-                                seen.* = .{ .generation = generation, .uuid = subject.uuid };
+                                seen.* = .{};
                                 if (generation != 0 and (other == index or listed_audience.contains(other) or entity_audience.contains(other))) needed[@backingInt(Action.add_player)].insert(other);
                             },
                             .add_player => {
@@ -614,7 +618,7 @@ pub const Replication = struct {
                                 seen.listed = listed_audience.contains(other);
                                 seen.spawned = false;
                                 // The entry carries the key.
-                                seen.chat = self.subjects[index].chat;
+                                seen.chat = true;
                                 seen.gamemode = self.subjects[index].gamemode;
                                 if (self.workMask(index, .interested).contains(other) and subject.inWorld()) needed[@backingInt(Action.spawn)].insert(other);
                             },
@@ -622,7 +626,7 @@ pub const Replication = struct {
                                 seen.gamemode = self.subjects[index].gamemode;
                                 seen.listed = listed_audience.contains(other);
                             },
-                            .chat => seen.chat = self.subjects[index].chat,
+                            .chat => seen.chat = true,
                             .spawn => {
                                 spawned.insert(other);
                                 seen.spawned = true;
@@ -639,8 +643,8 @@ pub const Replication = struct {
                 const wants_spawn = other != index and generation != 0 and self.workMask(index, .interested).contains(other) and subject.inWorld();
                 const wants_listed = listed_audience.contains(other);
                 const wants_known = generation != 0 and (other == index or wants_spawn or wants_listed);
-                if (seen.generation != generation or seen.known != wants_known or
-                    (wants_known and (seen.gamemode != self.subjects[index].gamemode or seen.listed != wants_listed or seen.chat != self.subjects[index].chat)) or
+                if (seen.known != wants_known or
+                    (wants_known and (seen.gamemode != self.subjects[index].gamemode or seen.listed != wants_listed or (!seen.chat and self.subjects[index].chat != 0))) or
                     (seen.spawned != wants_spawn))
                 {
                     watching.pending.insert(index);
@@ -649,7 +653,7 @@ pub const Replication = struct {
                 if (seen.spawned) {
                     watching.spawned.insert(index);
                     self.viewer_masks.row(index).insert(other);
-                    if (seen.generation == generation and self.workMask(index, .interested).contains(other) and subject.inWorld()) {
+                    if (self.workMask(index, .interested).contains(other) and subject.inWorld()) {
                         self.editWorkMask(index, .updates).insert(other);
                     } else self.editWorkMask(index, .updates).remove(other);
                 } else {
@@ -725,7 +729,7 @@ pub const Replication = struct {
                 while (selecting.next()) |other| {
                     const observer = players.records[other];
                     const seen = self.observed(index, other);
-                    assert(seen.state.spawned and seen.state.generation == self.subjects[index].generation);
+                    assert(seen.state.spawned);
                     assert(observer.stage == .ready and observer.world == subject.world);
                     const known = seen.known & (@as(u3, 1) << @backingInt(phase)) != 0;
                     const needed = !known or switch (phase) {
@@ -873,12 +877,17 @@ pub const Replication = struct {
         var retiring: usize = 0;
         while (retiring < self.actors.count) {
             const index = self.actors.indices[retiring];
+            // A slot whose player some observer still knows is owed to it: nobody new takes it
+            // until every observer was told the player left.
+            const drained = self.lifecycle.drained(index);
+            players.deps.sessions.holdSlot(index, !drained);
             if (players.records[index].handle == null and self.subjects[index].generation == 0 and self.observers[index].generation == 0) {
                 self.pending_updates.row(index).intersect(self.pending_updates.row(index).view(), connected.view());
                 if (!self.pending_updates.row(index).view().any()) self.pending_subjects.remove(index);
-                if (self.lifecycle.prune(index) and !self.pending_subjects.contains(index)) {
+                if (drained and !self.pending_subjects.contains(index)) {
                     self.viewer_masks.row(index).clear();
                     for (self.common[index].members) |members| members.clear();
+                    self.subjects[index].uuid = 0;
                     self.actors.remove(index);
                     continue;
                 }
@@ -900,84 +909,73 @@ pub const Replication = struct {
         }
     }
 
-    fn state(self: *const Replication, subject: usize, observer: usize) Seen {
+    /// What an observer's client was told of a subject.
+    pub fn state(self: *const Replication, subject: usize, observer: usize) Seen {
         var value = self.lifecycle.get(subject, observer);
         if (self.lifecycle.working != subject) value.spawned = self.observers[observer].spawned.view().contains(subject);
         return value;
     }
 
-    fn evictObserver(self: *Replication, ready: sparse_sets.Workspace.RowView) void {
-        const other = self.lifecycle.largestObserver();
-        const watching = &self.observers[other];
-        const handle = self.deps.players.records[other].handle.?;
-        self.rejected[other] = handle.generation;
-        self.deps.players.deps.sessions.disconnect(handle);
-        var spawned = watching.spawned.view().iterator();
-        while (spawned.next()) |subject| {
-            self.detach(subject, other);
-            self.viewer_masks.row(subject).remove(other);
-            self.viewer_revisions[subject] += 1;
-        }
-        watching.spawned.clear();
-        watching.pending.clear();
-        watching.nearby.clear();
-        watching.ready = false;
-        watching.pending_dirty = false;
-        self.lifecycle.deactivate(other);
-        ready.remove(other);
-        for (self.dirty_work.values()) |row| self.work_masks.row(row).remove(other);
-        std.log.warn("event=replication_capacity_exceeded player={d}", .{handle.index});
+    fn pair(self: *const Replication, subject: usize, observer: usize) *Pair {
+        return &self.pairs[subject * self.subjects.len + observer];
     }
 
-    fn baselineKey(self: *const Replication, subject: usize, observer: usize) [4]usize {
-        return .{ subject, observer, self.state(subject, observer).generation, self.observers[observer].generation };
+    /// Forgets every baseline a subject's slot had, as a new player is new to every client.
+    fn forgetSubject(self: *Replication, subject: usize) void {
+        @memset(self.pairs[subject * self.subjects.len ..][0..self.subjects.len], .{});
     }
 
-    fn baselineSlot(self: *const Replication, key: [4]usize) usize {
-        return @intCast(std.hash.Wyhash.hash(0, std.mem.asBytes(&key)) % self.baselines.len);
+    /// Forgets every baseline an observer's client had, as that client is gone.
+    fn forgetObserver(self: *Replication, observer: usize) void {
+        for (0..self.subjects.len) |subject| self.pair(subject, observer).* = .{};
     }
 
     fn observed(self: *const Replication, subject: usize, observer: usize) Observation {
         var result: Observation = .{ .state = self.state(subject, observer) };
         const common = &self.common[subject];
-        var cached: ?*const CachedBaseline = null;
-        var checked_cache = false;
+        const own = self.pair(subject, observer).*;
         inline for (std.enums.values(Phase)) |phase| {
             const flag = @as(u3, 1) << @backingInt(phase);
             if (common.members[@backingInt(phase)].view().contains(observer)) {
                 assign(&result.value, common.value, phase);
                 result.known |= flag;
-            } else {
-                if (!checked_cache) {
-                    checked_cache = true;
-                    const key = self.baselineKey(subject, observer);
-                    const entry = &self.baselines[self.baselineSlot(key)];
-                    if (std.meta.eql(key, entry.key)) cached = entry;
+            } else if (own.known & flag != 0) {
+                switch (phase) {
+                    .movement => {
+                        result.value.position = own.position;
+                        result.value.yaw = own.yaw;
+                        result.value.pitch = own.pitch;
+                        result.value.on_ground = own.on_ground;
+                    },
+                    .head => result.value.head = own.head,
+                    .flags => unreachable,
                 }
-                if (cached) |entry| if (entry.known & flag != 0) {
-                    assign(&result.value, entry.value, phase);
-                    result.known |= flag;
-                };
+                result.known |= flag;
             }
         }
         return result;
     }
 
-    // Eviction loses only delta encoding opportunities. Unknown baselines use absolute updates.
+    /// Keeps what an observer stepping off the shared baseline last took, exactly. Flags are
+    /// not kept: an observer off the shared flags gets them whole.
     fn remember(self: *Replication, subject: usize, observer: usize, value: Baseline, phase: Phase) void {
-        const key = self.baselineKey(subject, observer);
-        assert(key[2] != 0 and key[3] != 0);
-        const entry = &self.baselines[self.baselineSlot(key)];
-        if (!std.meta.eql(key, entry.key)) entry.* = .{ .key = key };
-        assign(&entry.value, value, phase);
-        entry.known |= @as(u3, 1) << @backingInt(phase);
+        const own = self.pair(subject, observer);
+        switch (phase) {
+            .movement => {
+                own.position = value.position;
+                own.yaw = value.yaw;
+                own.pitch = value.pitch;
+                own.on_ground = value.on_ground;
+            },
+            .head => own.head = value.head orelse return,
+            .flags => return,
+        }
+        own.known |= @as(u3, 1) << @backingInt(phase);
     }
 
+    /// The observer no longer has the subject spawned: a new spawn starts its baselines over.
     fn detach(self: *Replication, subject: usize, observer: usize) void {
-        const observed_state = self.observed(subject, observer);
-        inline for (std.enums.values(Phase)) |phase| {
-            if (observed_state.known & (@as(u3, 1) << @backingInt(phase)) != 0) self.remember(subject, observer, observed_state.value, phase);
-        }
+        self.pair(subject, observer).* = .{};
         for (self.common[subject].members) |members| members.remove(observer);
     }
 
@@ -1313,28 +1311,29 @@ test "movement fanout preserves independent admission and observer baselines" {
     replication.tick();
     try std.testing.expectEqual(@as(usize, 1), try Drain.run(service, 1));
     try std.testing.expect(replication.observed(0, 1).value.position[0] != replication.observed(0, 2).value.position[0]);
-    @memset(replication.baselines, .{});
-    try std.testing.expectEqual(@as(u3, 0), replication.observed(0, 2).known & 1);
+    // The observer that fell behind kept its baseline exactly, however many pairs there are.
+    try std.testing.expectEqual(@as(u3, 1), replication.observed(0, 2).known & 1);
     service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     records[0].position.x += 1;
     players.rebuildIndexes();
     replication.deps.visibility.tick();
     replication.tick();
     var fallback_packets: usize = 0;
-    var absolute_updates: usize = 0;
+    var relative_updates: usize = 0;
     while (service.output.takeReady()) |packet| {
         try std.testing.expectEqual(@as(usize, 1), packet.recipients.len);
         if (packet.recipients.first().?.index == 2) {
+            // It catches up from its own baseline with a relative move, not an absolute one.
             const Client = protocols.implementations[0].Protocol.play.toClient;
-            try std.testing.expectEqual(Client.packetId(.sync_entity_position), (try Client.readHeader(packet.bytes)).id);
-            absolute_updates += 1;
+            try std.testing.expectEqual(Client.packetId(.rel_entity_move), (try Client.readHeader(packet.bytes)).id);
+            relative_updates += 1;
         }
         try std.testing.expect(service.output.releaseReady(packet.page, packet.generation));
         _ = service.preparing.fetchSub(1, .release);
         fallback_packets += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), fallback_packets);
-    try std.testing.expectEqual(@as(usize, 1), absolute_updates);
+    try std.testing.expectEqual(@as(usize, 1), relative_updates);
     try std.testing.expectEqual(replication.observed(0, 1).value.position[0], replication.observed(0, 2).value.position[0]);
     records[0].position.x += 16;
     players.rebuildIndexes();
@@ -1421,8 +1420,8 @@ test "movement fanout preserves independent admission and observer baselines" {
     try std.testing.expectEqual(@as(usize, 6), replication.viewers(0).words[0]);
     try std.testing.expectEqual(@as(usize, 5), replication.viewers(1).words[0]);
     try std.testing.expectEqual(@as(usize, 3), replication.viewers(2).words[0]);
-    try std.testing.expectEqual(@as(u32, 2), replication.state(2, 0).generation);
-    try std.testing.expectEqual(@as(u32, 2), replication.state(2, 1).generation);
+    try std.testing.expect(replication.state(2, 0).known and replication.state(2, 0).spawned);
+    try std.testing.expect(replication.state(2, 1).known and replication.state(2, 1).spawned);
 
     records[2].stage = .respawn;
     replication.deps.visibility.tick();

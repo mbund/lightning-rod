@@ -89,8 +89,10 @@ pub fn BodyTable(comptime Extra: type) type {
             self.table.ref(slot).field("bodied").* = false;
         }
 
+        /// The entity goes from memory: out of its place and the tick order, and its row with it.
         pub fn remove(self: *Self, entity: Id) void {
             const slot = self.slotOf(entity) orelse return;
+            self.entities.places.remove(entity);
             self.table.remove(slot);
             self.entities.leave(slot);
         }

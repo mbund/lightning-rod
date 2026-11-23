@@ -131,6 +131,11 @@ pub const Service = struct {
     departed: []std.atomic.Value(u32),
     routes: []?network.Handle,
     occupied: []std.atomic.Value(bool),
+    /// Slots the game still owes their departed player's goodbyes for: kept from new players
+    /// until the game lets them go. Only the game's thread touches these two.
+    held: []bool,
+    /// Slots whose player left while held, freed once let go.
+    vacated: []bool,
     moves: []Move,
     staged_move: ?usize = null,
     owner: ?*const Owner = null,
@@ -231,6 +236,12 @@ pub const Service = struct {
         errdefer allocator.free(occupied);
 
         for (occupied) |*value| value.* = .init(false);
+        const held = try allocator.alloc(bool, config.connections);
+        errdefer allocator.free(held);
+        @memset(held, false);
+        const vacated = try allocator.alloc(bool, config.connections);
+        errdefer allocator.free(vacated);
+        @memset(vacated, false);
         const moves = try allocator.alloc(Move, config.connections);
         errdefer allocator.free(moves);
 
@@ -262,6 +273,8 @@ pub const Service = struct {
             .departed = departed,
             .routes = routes,
             .occupied = occupied,
+            .held = held,
+            .vacated = vacated,
             .moves = moves,
             .committed_moves = committed_moves,
             .activity = activity,
@@ -276,7 +289,8 @@ pub const Service = struct {
         assert(!self.tick_active and self.staged_move == null and self.preparing.load(.acquire) == 0);
         assert(self.owner == null and self.readiness == null);
 
-        for (self.occupied) |*value| assert(!value.load(.acquire));
+        // A slot still draining is free: the game that held it for its departure is gone.
+        for (self.occupied, self.vacated) |*value, vacated| assert(vacated or !value.load(.acquire));
 
         for (self.moves) |*move| assert(move.state.load(.acquire) == .idle);
 
@@ -288,6 +302,8 @@ pub const Service = struct {
         self.allocator.free(self.committed_moves);
         self.allocator.free(self.moves);
         self.allocator.free(self.occupied);
+        self.allocator.free(self.held);
+        self.allocator.free(self.vacated);
         self.allocator.free(self.routes);
         self.allocator.free(self.releases);
         self.allocator.free(self.departed);
@@ -1244,6 +1260,27 @@ pub const Service = struct {
         }
     }
 
+    /// Keeps a slot from new players while the game still owes others the departure of the
+    /// player in it, or lets it go. A slot let go after its player left is free again at once.
+    pub fn holdSlot(self: *Service, index: usize, hold: bool) void {
+        self.held[index] = hold;
+        if (!hold and self.vacated[index]) {
+            self.vacated[index] = false;
+            self.occupied[index].store(false, .release);
+        }
+    }
+
+    /// A slot's player left and the game heard it: free unless the game still holds it.
+    fn vacate(self: *Service, index: usize, held: bool) void {
+        if (held) {
+            self.vacated[index] = true;
+            return;
+        }
+        self.held[index] = false;
+        const occupied = self.occupied[index].swap(false, .release);
+        assert(occupied);
+    }
+
     /// The simulation consumer must be quiescent before abandoning its loans.
     pub fn discardInputs(self: *Service) void {
         assert(!self.tick_active);
@@ -1255,10 +1292,15 @@ pub const Service = struct {
             self.releaseInput(handle);
             notify = true;
         }
-        while (self.next()) |event| if (event == .input) {
-            _ = self.sealInput(event.input);
-            self.releaseInput(event.input.handle);
-            notify = true;
+        while (self.next()) |event| switch (event) {
+            .input => {
+                _ = self.sealInput(event.input);
+                self.releaseInput(event.input.handle);
+                notify = true;
+            },
+            // Nothing is owed for a departure the game never heard of.
+            .left => self.vacate(event.left.index, false),
+            else => {},
         };
         if (notify) self.transport.notify(self.io);
         self.instruments.input_pending.set(0);
@@ -1283,6 +1325,7 @@ pub const Service = struct {
         if (completed) for (self.input_events) |event| {
             if (event == .left) {
                 self.departed[event.left.index].store(event.left.generation, .release);
+                self.vacate(event.left.index, self.held[event.left.index]);
                 notify = true;
             }
         };
@@ -1375,4 +1418,23 @@ fn frameBound(protocols: []const engine.Protocol, length: usize) usize {
     var maximum: usize = 0;
     for (protocols) |protocol| maximum = @max(maximum, protocol.frame_bound.bytes(length));
     return maximum;
+}
+
+test "a held slot stays taken after its player leaves until the game lets it go" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const service = try Service.init(arena.allocator(), std.testing.io, undefined, .{ .connections = 2, .pages = 4, .page_bytes = 4096, .credit_bytes = 4096, .protocols = &.{.{ .number = 772 }} });
+    for (service.occupied) |*occupied| occupied.store(true, .release);
+    // A slot nobody holds is free as soon as the departure is heard.
+    service.vacate(0, service.held[0]);
+    try std.testing.expect(!service.occupied[0].load(.acquire));
+    // A held slot waits for the game to let it go.
+    service.holdSlot(1, true);
+    service.vacate(1, service.held[1]);
+    try std.testing.expect(service.occupied[1].load(.acquire));
+    service.holdSlot(1, true);
+    try std.testing.expect(service.occupied[1].load(.acquire));
+    service.holdSlot(1, false);
+    try std.testing.expect(!service.occupied[1].load(.acquire));
+    try std.testing.expect(!service.held[1] and !service.vacated[1]);
 }
