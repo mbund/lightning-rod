@@ -30,6 +30,7 @@ pub const DamageType = enum(u8) {
     arrow,
     trident,
     mace_smash,
+    outside_border,
 };
 
 /// What the registry's tags say of a damage type.

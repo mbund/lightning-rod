@@ -13,6 +13,7 @@ const minecraft = @import("minecraft_model");
 const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
 const Players = @import("players").players.Players;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
+const WorldBorder = @import("vanilla_world").world_border.WorldBorder;
 const Input = @import("players").input.Input;
 const Items = @import("vanilla_items").items.Items;
 const ItemActions = @import("vanilla_items").item_actions.ItemActions;
@@ -33,6 +34,7 @@ pub const Placement = struct {
         menus: *PlayerInventory,
         players: *Players,
         player_states: *PlayerStates,
+        world_border: *WorldBorder,
         input: *Input,
         inventories: *inventories.Inventories,
         items: *Items,
@@ -84,6 +86,8 @@ pub const Placement = struct {
         const hit_dy = @as(f64, @floatFromInt(place.position.y)) + 0.5 - player.position.y - 1.62;
         const hit_dz = @as(f64, @floatFromInt(place.position.z)) + 0.5 - player.position.z;
         if (hit_dx * hit_dx + hit_dy * hit_dy + hit_dz * hit_dz > 36) return;
+        // ServerLevel.mayInteract: nothing is used or placed against a block outside the border.
+        if (!self.deps.world_border.containsBlock(player.world, place.position.x, place.position.z)) return;
 
         const slot: inventories.Slot = .{ .owner = player.uuid, .index = if (place.hand == 1) 45 else 36 + @as(u16, state.selected_slot) };
         const held = try self.deps.inventories.get(slot);
@@ -125,7 +129,6 @@ pub const Placement = struct {
             position.z += offset[@intCast(place.face)][2];
         }
         if (position.y < minimum_y or position.y >= minimum_y + @as(i32, @intCast(dimension.sectionCount() * 16))) return;
-        if (!self.deps.player_states.insideBorder(.{ .x = @as(f64, @floatFromInt(position.x)) + 0.5, .y = @floatFromInt(position.y), .z = @as(f64, @floatFromInt(position.z)) + 0.5 })) return;
 
         const dx = @as(f64, @floatFromInt(position.x)) + 0.5 - player.position.x;
         const dy = @as(f64, @floatFromInt(position.y)) + 0.5 - player.position.y - 1.62;

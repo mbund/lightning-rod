@@ -23,6 +23,7 @@ const inventories = @import("inventories");
 const Worlds = @import("worlds").Worlds;
 const Players = @import("players").players.Players;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
+const WorldBorder = @import("vanilla_world").world_border.WorldBorder;
 const Items = @import("vanilla_items").items.Items;
 const item_data = @import("vanilla_items").item_data;
 const attack_effects = @import("vanilla_items").attack_effects;
@@ -240,6 +241,7 @@ pub const Projectiles = struct {
     pub const Dependencies = struct {
         players: *Players,
         player_states: *PlayerStates,
+        world_border: *WorldBorder,
         mobs: *Mobs,
         worlds: *Worlds,
         chunks: *chunks.Chunks,
@@ -1886,14 +1888,12 @@ pub const Projectiles = struct {
         var end: [3]f64 = if (block) |hit| .{ hit.position.x, hit.position.y, hit.position.z } else .{ from[0] + v[0], from[1] + v[1], from[2] + v[2] };
         // World.getCollisionsIncludingWorldBorder: a way out through the border meets it there.
         var against_border = false;
-        if (self.deps.player_states.config.world_border) |diameter| {
-            const half = diameter / 2;
-            if (insideBorder(half, from) and !insideBorder(half, end)) {
-                const inner = half - 9.999999747378752e-6;
-                end = .{ std.math.clamp(end[0], -half, inner), end[1], std.math.clamp(end[2], -half, inner) };
-                block = null;
-                against_border = true;
-            }
+        const bounds = self.deps.world_border.bounds(projectile.world);
+        if (bounds.contains(from[0], from[2]) and !bounds.contains(end[0], end[2])) {
+            const clamped = bounds.clamp(end[0], end[2]);
+            end = .{ clamped[0], end[1], clamped[1] };
+            block = null;
+            against_border = true;
         }
         var start = from;
         var passes: usize = 0;
@@ -1913,11 +1913,6 @@ pub const Projectiles = struct {
             projectile.yaw += 170.0 + self.random.random().float(f32) * 20.0;
             projectile.impulse = true;
         }
-    }
-
-    /// WorldBorder.contains of a point, for a border this far to each side of the origin.
-    fn insideBorder(half: f64, at: [3]f64) bool {
-        return at[0] >= -half and at[0] < half and at[2] >= -half and at[2] < half;
     }
 
     /// Runs an enchantment hook with the weapon a projectile came from, from its own slot.

@@ -25,6 +25,7 @@ const storage = @import("storage");
 const Random = @import("vanilla_content").random.Random;
 const Players = @import("players").players.Players;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
+const WorldBorder = @import("vanilla_world").world_border.WorldBorder;
 const Input = @import("players").input.Input;
 const Items = @import("vanilla_items").items.Items;
 const Durability = @import("vanilla_items").item_properties.Durability;
@@ -58,6 +59,7 @@ pub const Mining = struct {
         storage: storage.Space,
         players: *Players,
         player_states: *PlayerStates,
+        world_border: *WorldBorder,
         input: *Input,
         inventories: *inventories.Inventories,
         items: *Items,
@@ -291,6 +293,8 @@ pub const Mining = struct {
         const dy = player.position.y + 1.62 - (@as(f64, @floatFromInt(position.y)) + 0.5);
         const dz = player.position.z - (@as(f64, @floatFromInt(position.z)) + 0.5);
         if (dx * dx + dy * dy + dz * dz > 36) return;
+        // ServerPlayerGameMode.handleBlockBreakAction: nothing outside the border starts to break.
+        if (action == .start and !self.deps.world_border.containsBlock(player.world, position.x, position.z)) return;
         const block = try self.chunk_client.getBlock(player.world, .{ .x = position.x, .y = position.y, .z = position.z });
         if (block == 0 or block >= game_data.registry.block_state_to_block.len) return;
         const slot: inventories.Slot = .{ .owner = player.uuid, .index = 36 + @as(u16, status.selected_slot) };

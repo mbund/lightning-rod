@@ -678,6 +678,7 @@ fn blockContainers(allocator: std.mem.Allocator, store: *storage.Store, registry
         .dimensions = fixture.definitions.dimensions,
         .players = fixture.players,
         .player_states = fixture.player_states,
+        .world_border = fixture.world_border,
         .entities = fixture.bodies,
         .physics = try ItemPhysics.init(allocator, .{ .blocks = fixture.definitions.blocks, .chunks = terrain }),
         .inventories = fixture.ownership,

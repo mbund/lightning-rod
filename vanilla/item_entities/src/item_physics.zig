@@ -1,4 +1,5 @@
 const Blocks = @import("vanilla_content").blocks.Blocks;
+const Border = @import("vanilla_content").border.Border;
 const game_data = @import("game_data");
 const std = @import("std");
 const chunks = @import("chunks");
@@ -27,9 +28,8 @@ pub const ItemPhysics = struct {
     deps: Dependencies,
     /// Reads block sections from the simulation budget, two windows of eight at once.
     chunk_client: chunks.Chunks.Client,
-    /// The world border, a square around the origin this far to each side, which bodies moving
-    /// near it collide with; set by whoever knows it.
-    border: ?f64 = null,
+    /// The world border, which bodies moving near it collide with; set by whoever keeps it.
+    border: ?*const Border = null,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*ItemPhysics {
         const self = try allocator.create(ItemPhysics);
@@ -538,26 +538,11 @@ pub const ItemPhysics = struct {
     /// WorldBorder.canCollide for a body whose feet stand at `position`, moving by `motion`: near
     /// the border and inside it, the border's outside as four boxes, as Entity.findCollisionsForMovement
     /// adds it. The same rule as vanilla_bodies' borderFor.
-    fn borderFor(self: *const ItemPhysics, position: [3]f64, half_width: f64, motion: [3]f64) ?[4][2][3]f64 {
-        const half = self.border orelse return null;
-        const limit = 29999984.0;
-        const west = @max(-half, -limit);
-        const east = @min(half, limit);
-        const x = position[0];
-        const z = position[2];
-        const margin = @max(@max(half_width * 2 + @abs(motion[0]), half_width * 2 + @abs(motion[2])), 1.0);
-        const inside = @min(@min(x - west, east - x), @min(z - west, east - z));
-        if (!(inside < margin * 2.0)) return null;
-        if (!(x >= west - margin and x < east + margin and z >= west - margin and z < east + margin)) return null;
-        const far = 1.0e8;
-        const low = @floor(west);
-        const high = @ceil(east);
-        return .{
-            .{ .{ -far, -far, -far }, .{ low, far, far } },
-            .{ .{ high, -far, -far }, .{ far, far, far } },
-            .{ .{ low, -far, -far }, .{ high, far, low } },
-            .{ .{ low, -far, high }, .{ high, far, far } },
-        };
+    fn borderFor(self: *const ItemPhysics, world: u32, position: [3]f64, half_width: f64, motion: [3]f64) ?[4][2][3]f64 {
+        const shared = self.border orelse return null;
+        const bounds = shared.of(world);
+        if (!bounds.canCollide(position[0], position[2], half_width * 2 + @abs(motion[0]), half_width * 2 + @abs(motion[2]))) return null;
+        return bounds.outside();
     }
 
     /// VoxelShape.collide along one axis for one box, within vanilla's 1e-7 tolerance.
@@ -597,7 +582,7 @@ pub const ItemPhysics = struct {
             var adjusted: [3]f64 = .{ 0, 0, 0 };
             const body_half: f64 = if (orb) 0.25 else 0.125;
             const body_tall: f64 = if (orb) 0.5 else 0.25;
-            const border = self.borderFor(next.position, body_half, motion);
+            const border = self.borderFor(body.world, next.position, body_half, motion);
 
             for (order) |axis| {
                 const requested = motion[axis];

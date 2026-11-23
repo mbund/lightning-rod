@@ -7,6 +7,7 @@ const storage = @import("storage");
 const Worlds = @import("worlds").Worlds;
 const Blocks = @import("vanilla_content").blocks.Blocks;
 const Dimensions = @import("vanilla_content").dimensions.Dimensions;
+const border = @import("vanilla_content").border;
 
 pub const Spawn = struct {
     pub const id = "minecraft:spawn";
@@ -155,23 +156,24 @@ pub const Spawn = struct {
         return .{ .position = fallback, .radius = self.config.radius };
     }
 
-    pub fn select(self: *Spawn, world: u32, mode: minecraft.GameMode, border: ?f64) !Result {
-        if (border) |diameter| if (!std.math.isFinite(diameter) or diameter < 1 or diameter > 60_000_000) return error.InvalidSpawn;
+    /// ServerPlayer.adjustSpawnLocation within the world border, the server default where
+    /// `bounds` is null.
+    pub fn select(self: *Spawn, world: u32, mode: minecraft.GameMode, bounds: ?border.Bounds) !Result {
+        const limits = bounds orelse border.Bounds.around(0, 0, border.max_size);
         var anchor = try self.get(world);
-        if (border) |diameter| {
-            const half = diameter / 2;
-            if (@as(f64, @floatFromInt(anchor.position.x)) + 1 <= -half or @as(f64, @floatFromInt(anchor.position.x)) >= half or @as(f64, @floatFromInt(anchor.position.z)) + 1 <= -half or @as(f64, @floatFromInt(anchor.position.z)) >= half) {
-                const sample = try self.scanColumn(world, 0, 0);
-                anchor.position = .{ .x = 0, .y = sample.motion + 1, .z = 0 };
-            }
+        // Level.getSharedSpawnPos: a spawn outside the border moves to the top of its center.
+        if (!limits.containsBlock(anchor.position.x, anchor.position.z)) {
+            const x: i32 = @intFromFloat(@floor((limits.west + limits.east) / 2));
+            const z: i32 = @intFromFloat(@floor((limits.north + limits.south) / 2));
+            const sample = try self.scanColumn(world, x, z);
+            anchor.position = .{ .x = x, .y = sample.motion + 1, .z = z };
         }
         const value = try self.entry(world);
         const dimension = (self.deps.worlds.get(world) orelse return error.UnknownWorld).dimension;
         var position = anchor.position;
         if (dimension.skylight and mode != .adventure) {
             var radius: i32 = @max(0, anchor.radius);
-            const half = (border orelse 59_999_968) / 2;
-            const distance: i32 = @intFromFloat(@floor(@min(half - @abs(@as(f64, @floatFromInt(position.x))), half - @abs(@as(f64, @floatFromInt(position.z))))));
+            const distance: i32 = std.math.lossyCast(i32, @floor(limits.distanceInside(@floatFromInt(position.x), @floatFromInt(position.z))));
             if (distance < radius) radius = distance;
             if (distance <= 1) radius = 1;
             const width = radius *% 2 +% 1;
@@ -181,13 +183,13 @@ pub const Spawn = struct {
             var candidates: Candidates = .{ .radius = radius, .count = count, .start = start };
             while (candidates.next()) |offset| {
                 const candidate = try self.column(world, anchor.position.x +% offset[0], anchor.position.z +% offset[1]) orelse continue;
-                if (try self.clear(world, candidate, border)) return result(candidate, anchor.angle);
+                if (try self.clear(world, candidate, limits)) return result(candidate, anchor.angle);
             }
         }
         const minimum = dimension.minimum_section * 16;
         const maximum = (dimension.minimum_section + @as(i32, dimension.section_count)) * 16 - 1;
-        while (!try self.clear(world, position, border) and position.y < maximum) position.y += 1;
-        while (try self.clear(world, .{ .x = position.x, .y = position.y - 1, .z = position.z }, border) and position.y > minimum + 1) position.y -= 1;
+        while (!try self.clear(world, position, limits) and position.y < maximum) position.y += 1;
+        while (try self.clear(world, .{ .x = position.x, .y = position.y - 1, .z = position.z }, limits) and position.y > minimum + 1) position.y -= 1;
         return result(position, anchor.angle);
     }
 
@@ -244,20 +246,16 @@ pub const Spawn = struct {
         return .{ .minimum = minimum, .motion = motion, .surface = surface, .floor = floor, .start = if (ceiling) self.config.origin.y else motion, .position = if (candidate) |y| .{ .x = x, .y = y, .z = z } else null };
     }
 
-    fn clear(self: *Spawn, world: u32, position: chunks.Position, border: ?f64) !bool {
+    fn clear(self: *Spawn, world: u32, position: chunks.Position, area: border.Bounds) !bool {
         const dimension = self.deps.worlds.get(world).?.dimension;
         const half_width: f64 = @as(f64, @as(f32, 0.6)) / 2;
         const height: f64 = @as(f32, 1.8);
         const center: [3]f64 = .{ @as(f64, @floatFromInt(position.x)) + 0.5, @floatFromInt(position.y), @as(f64, @floatFromInt(position.z)) + 0.5 };
         const low: [3]f64 = .{ center[0] - half_width, center[1], center[2] - half_width };
         const high: [3]f64 = .{ center[0] + half_width, center[1] + height, center[2] + half_width };
-        if (border) |diameter| {
-            // The fresh player's collision context is still at the origin.
-            if (diameter < 4) {
-                const minimum = @floor(-diameter / 2);
-                const maximum = @ceil(diameter / 2);
-                if (low[0] < minimum or high[0] > maximum or low[2] < minimum or high[2] > maximum) return false;
-            }
+        // The fresh player is still at the origin, which decides whether the border collides.
+        if (area.canCollide(0, 0, high[0] - low[0], high[2] - low[2])) {
+            if (low[0] < @floor(area.west) or high[0] > @ceil(area.east) or low[2] < @floor(area.north) or high[2] > @ceil(area.south)) return false;
         }
         var window = chunks.ReadWindow(32).init(self.chunk_client);
         defer window.deinit();

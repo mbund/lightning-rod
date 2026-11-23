@@ -13,6 +13,7 @@ const packets = @import("minecraft_packets");
 const Items = @import("vanilla_items").items.Items;
 const Players = @import("players").players.Players;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
+const WorldBorder = @import("vanilla_world").world_border.WorldBorder;
 const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
 const Input = @import("players").input.Input;
 const Placement = @import("vanilla_blocks").placement.Placement;
@@ -63,6 +64,8 @@ const Fixture = struct {
             .world = world,
             .stage = .ready,
         };
+        const gameplay_definitions = try vanilla_content.prepare(allocator);
+        const world_border = try WorldBorder.init(allocator, .{}, .{ .storage = try store.openSpace(WorldBorder.id), .worlds = dimensions, .dimensions = gameplay_definitions.dimensions, .players = players });
         const player_states = try PlayerStates.init(allocator, .{}, .{
             .record_workspaces = workspaces,
             .players = players,
@@ -71,6 +74,7 @@ const Fixture = struct {
             .storage = try store.openSpace(PlayerStates.id),
             .worlds = dimensions,
             .vanilla_worlds = undefined,
+            .world_border = world_border,
         });
         for (player_states.records, 0..) |*state, index| state.* = .{ .uuid = index + 1 };
         const ownership = try inventories.Inventories.init(allocator, io, .{ .cache_slots = 64, .cache_items = 8, .max_item_bytes = 1024 }, .{
@@ -78,7 +82,6 @@ const Fixture = struct {
             .storage = try store.openSpace("inventory"),
             .record_workspaces = workspaces,
         });
-        const gameplay_definitions = try vanilla_content.prepare(allocator);
         const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const menus = try PlayerInventory.init(allocator, .{}, .{
             .crafting = gameplay_definitions.crafting,
@@ -122,6 +125,7 @@ const Fixture = struct {
             .menus = menus,
             .players = players,
             .player_states = player_states,
+            .world_border = world_border,
             .input = input,
             .inventories = ownership,
             .items = items,

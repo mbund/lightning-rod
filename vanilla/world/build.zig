@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) void {
         module.addImport(name, b.dependency(name, .{ .target = target, .optimize = optimize }).module(name));
     module.addImport("wire_1_21_5", b.dependency("protocol_1_21_5", .{ .target = target, .optimize = optimize }).module("wire"));
     module.addImport("wire_1_21_9", b.dependency("protocol_1_21_9", .{ .target = target, .optimize = optimize }).module("wire"));
+    module.addImport("wire_1_21_11", b.dependency("protocol_1_21_11", .{ .target = target, .optimize = optimize }).module("wire"));
     module.addImport("wire_26_1", b.dependency("protocol_26_1", .{ .target = target, .optimize = optimize }).module("wire"));
     module.addImport("wire_26_2", b.dependency("protocol_26_2", .{ .target = target, .optimize = optimize }).module("wire"));
 
@@ -27,7 +28,7 @@ pub fn build(b: *std.Build) void {
 
     const filter = b.option([]const u8, "test-filter", "Run matching tests");
     const tests = b.addTest(.{ .root_module = module, .filters = if (filter) |value| &.{value} else &.{} });
-    const test_step = b.step("test", "Verify vanilla worlds, spawn, time and weather");
+    const test_step = b.step("test", "Verify vanilla worlds, spawn, time, weather and the world border");
     test_step.dependOn(&b.addRunArtifact(tests).step);
     // EXTRAS
 }

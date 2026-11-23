@@ -19,7 +19,7 @@ pub fn main(init: std.process.Init) !void {
         lightning_rod.plugin.replace(lightning_rod.plugin.remove(lightning_rod.plugin.remove(e2e.profile.plugins(), ChatCommands), vanilla.JoinLeaveMessages), .{
             lightning_rod.plugin.configured(PlayerChat, PlayerChat.Configuration{ .chat_input = false }),
             lightning_rod.plugin.configured(Players, .{ .spawn_for_player = spawn, .spawn = .{ .x = 0.5, .y = 65, .z = 0.5 } }),
-            lightning_rod.plugin.configured(vanilla.PlayerStates, .{ .world_border = 512 }),
+            lightning_rod.plugin.configured(vanilla.WorldBorder, .{ .size = 512 }),
             lightning_rod.plugin.configured(skyblock.Terrain, .{ .kind = .hub }),
         }),
         lightning_rod.plugin.configured(skyblock.IslandCommands, .{ .catalog = &directory, .routing = &routing, .index = 0 }),

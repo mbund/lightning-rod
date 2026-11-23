@@ -32,6 +32,7 @@ fn playerDamage(context: *Test, allocator: std.mem.Allocator) !*PlayerDamage {
     return PlayerDamage.init(allocator, .{}, .{
         .players = fixture.players,
         .player_states = fixture.player_states,
+        .world_border = fixture.world_border,
         .inventories = fixture.ownership,
         .menus = fixture.menu,
         .items = fixture.items,

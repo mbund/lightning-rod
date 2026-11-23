@@ -196,6 +196,14 @@ fn level(directory: std.Io.Dir, io: std.Io) !void {
     try writer.putInt("rainTime", 6000);
     try writer.putInt("thunderTime", 8000);
     try writer.putByte("raining", 1);
+    // A border shrinking from 512 to 256, two seconds in, as level.dat keeps it.
+    try writer.putDouble("BorderCenterX", 100.5);
+    try writer.putDouble("BorderCenterZ", 300);
+    try writer.putDouble("BorderSize", 512);
+    try writer.putLong("BorderSizeLerpTime", 2010);
+    try writer.putDouble("BorderSizeLerpTarget", 256);
+    try writer.putDouble("BorderDamagePerBlock", 0.5);
+    try writer.putDouble("BorderWarningBlocks", 8);
     try writer.beginNamedCompound("GameRules");
     try writer.putString("doDaylightCycle", "false");
     try writer.putString("doWeatherCycle", "false");
@@ -325,6 +333,11 @@ test "Java world import reopens terrain players containers items and orbs throug
     const weather = try vanilla.Weather.init(allocator, .{}, .{ .storage = try store.openSpace(vanilla.Weather.id) });
     try std.testing.expect(weather.raining and !weather.weather_cycle);
     try std.testing.expectEqual(@as(i32, 6000), weather.rain_ticks);
+    var border_bytes: [128]u8 = undefined;
+    const border_length = (try records.Value.init(try store.openSpace(vanilla.WorldBorder.id)).read(&border_bytes)).?;
+    const border = try vanilla.WorldBorder.Settings.decode(border_bytes[0..border_length]);
+    // The time left counts whole ticks.
+    try std.testing.expectEqual(vanilla.WorldBorder.Settings{ .center_x = 100.5, .center_z = 300, .size = 512, .damage_per_block = 0.5, .warning_blocks = 8, .target = 256, .remaining = 40 }, border);
     var book_key: [16]u8 = undefined;
     std.mem.writeInt(u128, &book_key, mapped, .big);
     var book_bytes: [4096]u8 = undefined;

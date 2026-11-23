@@ -11,6 +11,7 @@ const mth = @import("mth.zig");
 const mob_blocks = @import("mob_blocks.zig");
 const shape_classes = @import("shape_classes.zig");
 const JavaRandom = @import("java_random.zig").JavaRandom;
+const Bounds = @import("vanilla_content").border.Bounds;
 
 const MobBlocks = mob_blocks.MobBlocks;
 const assert = std.debug.assert;
@@ -266,8 +267,8 @@ pub const Level = struct {
     minimum_y: i32,
     height: i32,
     air: u16,
-    /// The world border, a square around the origin this far to each side, if there is one.
-    border: ?f64 = null,
+    /// The world border in this world, if bodies collide with one.
+    border: ?Bounds = null,
 
     /// Outside the world's height a level reads void air, which collides with nothing.
     pub fn state(self: *const Level, x: i32, y: i32, z: i32) !u16 {
@@ -562,26 +563,13 @@ fn collideWithShapes(level: *const Level, query: Box, context: Context, movement
 /// WorldBorder.canCollide for a body whose box is `start`, moving through `query`: near the border
 /// and inside it, by the query's longer side, the border's outside as four boxes.
 pub fn borderFor(level: *const Level, start: Box, query: Box) ?[4]Box {
-    const half = level.border orelse return null;
-    const limit = 29999984.0;
-    const west = @max(-half, -limit);
-    const east = @min(half, limit);
+    const bounds = level.border orelse return null;
     const x = (start.min[0] + start.max[0]) / 2;
     const z = (start.min[2] + start.max[2]) / 2;
-    const margin = @max(@max(@abs(query.max[0] - query.min[0]), @abs(query.max[2] - query.min[2])), 1.0);
-    const inside = @min(@min(x - west, east - x), @min(z - west, east - z));
-    if (!(inside < margin * 2.0)) return null;
-    if (!(x >= west - margin and x < east + margin and z >= west - margin and z < east + margin)) return null;
-    // VoxelShapes.cuboid of the inside, its bounds floored and ceiled, cut from all space.
-    const far = 1.0e8;
-    const low = @floor(west);
-    const high = @ceil(east);
-    return .{
-        .{ .min = .{ -far, -far, -far }, .max = .{ low, far, far } },
-        .{ .min = .{ high, -far, -far }, .max = .{ far, far, far } },
-        .{ .min = .{ low, -far, -far }, .max = .{ high, far, low } },
-        .{ .min = .{ low, -far, high }, .max = .{ high, far, far } },
-    };
+    if (!bounds.canCollide(x, z, query.max[0] - query.min[0], query.max[2] - query.min[2])) return null;
+    var boxes: [4]Box = undefined;
+    for (&boxes, bounds.outside()) |*side, corners| side.* = .{ .min = corners[0], .max = corners[1] };
+    return boxes;
 }
 
 /// Entity.collide, with stepping up onto blocks no higher than max_up_step.
@@ -692,7 +680,7 @@ pub fn collideVertical(level: *const Level, query: Box, context: Context, moving
 
 test "the world border stops a body near it and leaves the far ones alone" {
     var level: Level = undefined;
-    level.border = 8;
+    level.border = .around(0, 0, 16);
     const moving: Box = .{ .min = .{ 7.2, 64, 0.2 }, .max = .{ 7.8, 65.4, 0.8 } };
     const query = moving.expandTowards(.{ 1, 0, 0 });
     const outside = borderFor(&level, moving, query).?;

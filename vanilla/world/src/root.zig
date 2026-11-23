@@ -1,4 +1,4 @@
-//! Vanilla worlds: default dimensions, spawn, time, weather and their commands.
+//! Vanilla worlds: default dimensions, spawn, time, weather, the world border and their commands.
 const std = @import("std");
 
 pub const entity_effects = @import("entity_effects.zig");
@@ -11,6 +11,8 @@ pub const teleport_commands = @import("teleport_commands.zig");
 pub const time = @import("time.zig");
 pub const time_commands = @import("time_commands.zig");
 pub const weather = @import("weather.zig");
+pub const world_border = @import("world_border.zig");
+pub const world_border_commands = @import("world_border_commands.zig");
 
 test {
     std.testing.refAllDecls(@This());

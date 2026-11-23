@@ -10,6 +10,7 @@ const minecraft = @import("minecraft_model");
 const Worlds = @import("worlds").Worlds;
 const Players = @import("players").players.Players;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
+const WorldBorder = @import("vanilla_world").world_border.WorldBorder;
 const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
 const Dimensions = @import("vanilla_content").dimensions.Dimensions;
 const Items = @import("vanilla_items").items.Items;
@@ -51,6 +52,7 @@ pub const Buckets = struct {
         actions: *ItemActions,
         players: *Players,
         player_states: *PlayerStates,
+        world_border: *WorldBorder,
         menus: *PlayerInventory,
         inventories: *inventories.Inventories,
         items: *Items,
@@ -127,7 +129,7 @@ pub const Buckets = struct {
         const beside = offset(hit.position, hit.side);
         // World.canEntityModifyAt and PlayerEntity.canPlaceOn: inside the border, and a player
         // who may change the world.
-        if (!self.inside(hit.position) or (state.gamemode != .survival and state.gamemode != .creative)) return .denied;
+        if (!self.deps.world_border.containsBlock(player.world, hit.position.x, hit.position.z) or (state.gamemode != .survival and state.gamemode != .creative)) return .denied;
         const world = player.world;
         if (bucket == .empty) {
             const filled = try self.drain(world, hit.position) orelse return .denied;
@@ -144,10 +146,6 @@ pub const Buckets = struct {
         // BucketItem.getEmptiedStack gives an empty bucket back, but in creative.
         if (state.gamemode != .creative) try self.exchange(context, self.bucket);
         return .applied;
-    }
-
-    fn inside(self: *Buckets, position: chunks.Position) bool {
-        return self.deps.player_states.insideBorder(.{ .x = @as(f64, @floatFromInt(position.x)) + 0.5, .y = @floatFromInt(position.y), .z = @as(f64, @floatFromInt(position.z)) + 0.5 });
     }
 
     /// FluidDrainable.tryDrainFluid of FluidBlock, Waterloggable, BubbleColumnBlock and

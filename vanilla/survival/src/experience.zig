@@ -11,6 +11,7 @@ const minecraft = @import("minecraft_model");
 const inventories = @import("inventories");
 const Players = @import("players").players.Players;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
+const WorldBorder = @import("vanilla_world").world_border.WorldBorder;
 const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
 const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
 const Random = @import("vanilla_content").random.Random;
@@ -35,6 +36,7 @@ pub const Experience = struct {
         dimensions: *Dimensions,
         players: *Players,
         player_states: *PlayerStates,
+        world_border: *WorldBorder,
         entities: *entities.Entities,
         physics: *ItemPhysics,
         inventories: *inventories.Inventories,
@@ -221,8 +223,8 @@ pub const Experience = struct {
         @memset(self.sounds, .{});
         try deps.entities.addTicker(.init(Experience, self, kinds, batch_max));
         try deps.entities.addColumnHolder(.init(Experience, self, columnLoaded, columnUnloaded));
-        // Items and orbs collide with the border players are kept in.
-        if (deps.player_states.config.world_border) |diameter| deps.physics.border = diameter / 2;
+        // Items and orbs collide with the world border.
+        deps.physics.border = &deps.world_border.shared;
         try self.orbs.register();
         return self;
     }

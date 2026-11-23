@@ -56,21 +56,16 @@ pub const Players = struct {
             game_mode: *const fn (*anyopaque, usize) minecraft.GameMode,
             spawn_world: *const fn (*anyopaque) u32,
             spawn_point: *const fn (*anyopaque, *const Player) anyerror!?Spawn,
-            allows_position: *const fn (*anyopaque, minecraft.Position) bool,
         };
 
         pub const Spawn = struct { position: minecraft.Position, rotation: minecraft.Rotation = .{ .yaw = 0, .pitch = 0 } };
 
         /// `game_mode` names what the client of the player in a slot shows, at login, on
         /// respawn and in player lists. `spawn_world` is where players with nothing saved
-        /// appear, and `spawn_point` where in it, or null for the engine to choose. A player
-        /// moves or is teleported only where `allows_position` says.
-        pub fn init(comptime Context: type, context: *Context, comptime game_mode: fn (*Context, usize) minecraft.GameMode, comptime spawn_world: fn (*Context) u32, comptime spawn_point: fn (*Context, *const Player) anyerror!?Spawn, comptime allows_position: fn (*Context, minecraft.Position) bool) Rules {
+        /// appear, and `spawn_point` where in it, or null for the engine to choose.
+        pub fn init(comptime Context: type, context: *Context, comptime game_mode: fn (*Context, usize) minecraft.GameMode, comptime spawn_world: fn (*Context) u32, comptime spawn_point: fn (*Context, *const Player) anyerror!?Spawn) Rules {
             const Adapter = struct {
-                const vtable: VTable = .{ .game_mode = mode, .spawn_world = world, .spawn_point = point, .allows_position = permits };
-                fn permits(raw: *anyopaque, position: minecraft.Position) bool {
-                    return allows_position(@ptrCast(@alignCast(raw)), position);
-                }
+                const vtable: VTable = .{ .game_mode = mode, .spawn_world = world, .spawn_point = point };
                 fn mode(raw: *anyopaque, slot: usize) minecraft.GameMode {
                     return game_mode(@ptrCast(@alignCast(raw)), slot);
                 }
@@ -241,12 +236,6 @@ pub const Players = struct {
         };
         self.presence_observers[self.presence_observer_count] = .{ .context = context, .call = Adapter.call };
         self.presence_observer_count += 1;
-    }
-
-    /// Whether game rules let a player be at a position.
-    pub fn allows(self: *const Players, position: minecraft.Position) bool {
-        const rules = self.rules orelse return true;
-        return rules.vtable.allows_position(rules.context, position);
     }
 
     /// The game mode the client of the player in a slot shows.
@@ -544,7 +533,6 @@ pub const Players = struct {
         var accepted = movement;
         if (movement.position) |position| {
             if (!std.math.isFinite(position.x) or !std.math.isFinite(position.y) or !std.math.isFinite(position.z) or @abs(position.x) > 30_000_000 or @abs(position.y) > 30_000_000 or @abs(position.z) > 30_000_000) return;
-            if (!self.allows(position)) return;
         }
         if (movement.rotation) |rotation| accepted.rotation = normalizeRotation(rotation) catch return;
         // ServerPlayer.lastKnownClientMovement: what this packet moved, nothing for one that
@@ -954,7 +942,6 @@ pub const Players = struct {
 
         inline for (.{ position.x, position.y, position.z }) |value|
             if (!std.math.isFinite(value) or @abs(value) > 30_000_000) return error.InvalidPosition;
-        if (!self.allows(position)) return error.InvalidPosition;
         const normalized = normalizeRotation(rotation) catch return error.InvalidPosition;
         player.stage = if (player.stage == .respawn or player.world != world) .respawn else .teleport;
         player.keep_respawn_data = true;

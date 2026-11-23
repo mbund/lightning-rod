@@ -50,6 +50,9 @@ pub const Spawn = @import("vanilla_world").spawn.Spawn;
 pub const Time = @import("vanilla_world").time.Time;
 pub const TimeCommands = @import("vanilla_world").time_commands.TimeCommands;
 pub const Weather = @import("vanilla_world").weather.Weather;
+pub const world_border = @import("vanilla_world").world_border;
+pub const WorldBorder = @import("vanilla_world").world_border.WorldBorder;
+pub const WorldBorderCommands = @import("vanilla_world").world_border_commands.WorldBorderCommands;
 pub const Environment = @import("vanilla_world").environment.Environment;
 pub const VanillaWorlds = @import("vanilla_world").default_worlds.VanillaWorlds;
 pub const TeleportCommands = @import("vanilla_world").teleport_commands.TeleportCommands;
@@ -148,6 +151,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Chunks, Chunks.Configuration.forPlayers((Players.Configuration{}).maximum)),
     lightning_rod.plugin.configured(Spawn, Spawn.Configuration{}),
     lightning_rod.plugin.configured(Players, Players.Configuration{}),
+    lightning_rod.plugin.configured(WorldBorder, WorldBorder.Configuration{}),
     lightning_rod.plugin.configured(PlayerStates, PlayerStates.Configuration{}),
     lightning_rod.plugin.configured(Domains, Domains.Configuration{}),
     lightning_rod.plugin.configured(Ticks, Ticks.Configuration{}),
@@ -165,6 +169,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(TeleportCommands, TeleportCommands.Configuration{}),
     lightning_rod.plugin.configured(GamemodeCommands, GamemodeCommands.Configuration{}),
     lightning_rod.plugin.configured(TimeCommands, TimeCommands.Configuration{}),
+    lightning_rod.plugin.configured(WorldBorderCommands, WorldBorderCommands.Configuration{}),
     lightning_rod.plugin.configured(Reload, Reload.Configuration{}),
     lightning_rod.plugin.configured(ReloadCommands, ReloadCommands.Configuration{}),
     lightning_rod.plugin.configured(CommandDispatch, CommandDispatch.Configuration{}),

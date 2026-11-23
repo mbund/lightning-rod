@@ -15,6 +15,7 @@ const Blocks = @import("vanilla_content").blocks.Blocks;
 const Dimensions = @import("vanilla_content").dimensions.Dimensions;
 const Players = @import("players").players.Players;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
+const WorldBorder = @import("vanilla_world").world_border.WorldBorder;
 const Domains = @import("domains").domains.Domains;
 const world_effects = @import("vanilla_blocks").world_effects;
 const body = @import("vanilla_bodies").body;
@@ -114,6 +115,7 @@ pub const Mobs = struct {
         dimensions: *Dimensions,
         players: *Players,
         player_states: *PlayerStates,
+        world_border: *WorldBorder,
         domains: *Domains,
         entities: *entities.Entities,
         record_workspaces: *records.Workspaces,
@@ -337,7 +339,7 @@ pub const Mobs = struct {
                 .minimum_y = definition.dimension.minimumSection() * 16,
                 .height = @intCast(definition.dimension.sectionCount() * 16),
                 .air = self.air_state,
-                .border = if (self.deps.player_states.config.world_border) |diameter| diameter / 2 else null,
+                .border = self.deps.world_border.bounds(world),
             },
             .ultrawarm = if (dimension) |found| found.ultrawarm else false,
         };

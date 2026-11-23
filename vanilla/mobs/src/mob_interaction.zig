@@ -13,6 +13,7 @@ const protocols = @import("minecraft_packets").protocols;
 const Input = @import("players").input.Input;
 const Players = @import("players").players.Players;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
+const WorldBorder = @import("vanilla_world").world_border.WorldBorder;
 const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
 const EquipmentAttributes = @import("vanilla_items").equipment_attributes.EquipmentAttributes;
 const Items = @import("vanilla_items").items.Items;
@@ -35,6 +36,7 @@ pub const MobInteraction = struct {
         input: *Input,
         players: *Players,
         player_states: *PlayerStates,
+        world_border: *WorldBorder,
         mobs: *Mobs,
         inventories: *inventories.Inventories,
         items: *Items,
@@ -147,6 +149,8 @@ pub const MobInteraction = struct {
         if (target == 0) return;
         const mob = (try self.deps.mobs.get(self.deps.mobs.deps.entities.entityOfNetwork(target) orelse return)) orelse return;
         if (mob.motion.world != player.world or mob.entity.removed) return;
+        // ServerGamePacketListenerImpl.handleInteract: nothing outside the border is reached.
+        if (!self.deps.world_border.containsBlock(player.world, mth.floor(mob.motion.position[0]), mth.floor(mob.motion.position[2]))) return;
         if (!try self.withinReach(handle.index, living.box(self.deps.mobs, mob))) return;
         switch (mouse) {
             1 => try self.deps.melee.attack(handle.index, .{ .mob = mob }),
@@ -164,6 +168,7 @@ pub const MobInteraction = struct {
         const player = &self.deps.players.records[slot];
         if (other.handle == null or other.stage != .ready or other.world != player.world) return;
         const at = other.position;
+        if (!self.deps.world_border.containsBlock(player.world, mth.floor(at.x), mth.floor(at.z))) return;
         const height: f64 = if (other.flags.sneaking) 1.5 else 1.8;
         if (!try self.withinReach(slot, .{ .min = .{ at.x - 0.3, at.y, at.z - 0.3 }, .max = .{ at.x + 0.3, at.y + height, at.z + 0.3 } })) return;
         try self.deps.melee.attack(slot, .{ .player = victim });

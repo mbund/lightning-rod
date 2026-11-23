@@ -9,6 +9,7 @@ const inventories = @import("inventories");
 const Players = @import("players").players.Players;
 const Player = @import("players").player_state.Player;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
+const WorldBorder = @import("vanilla_world").world_border.WorldBorder;
 const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
 const Items = @import("vanilla_items").items.Items;
 const item_data = @import("vanilla_items").item_data;
@@ -45,6 +46,7 @@ pub const PlayerDamage = struct {
     pub const Dependencies = struct {
         players: *Players,
         player_states: *PlayerStates,
+        world_border: *WorldBorder,
         inventories: *inventories.Inventories,
         menus: *PlayerInventory,
         items: *Items,
@@ -451,7 +453,8 @@ pub const PlayerDamage = struct {
         }
     }
 
-    /// Ticks invulnerability down, burns, and sends what this tick's hits showed.
+    /// Ticks invulnerability down, burns, hurts players outside the world border, and sends what
+    /// this tick's hits showed.
     pub fn tick(self: *PlayerDamage) !void {
         for (self.deps.players.activeSlots()) |slot| {
             const player = &self.deps.players.records[slot];
@@ -459,6 +462,7 @@ pub const PlayerDamage = struct {
             const living = self.livingOf(slot);
             if (living.invulnerable_time > 0) living.invulnerable_time -= 1;
             if (living.fire_ticks > 0) try self.burn(slot);
+            try self.borderDamage(slot);
             self.flush(slot, living);
             // The health bar follows whatever changed the health.
             const state = self.deps.player_states.of(player);
@@ -495,6 +499,16 @@ pub const PlayerDamage = struct {
             player.flags.burning = false;
             player.revision += 1;
         }
+    }
+
+    /// LivingEntity.baseTick: a living player outside the world border and its buffer is hurt
+    /// for each block it is beyond.
+    fn borderDamage(self: *PlayerDamage, slot: usize) !void {
+        const player = &self.deps.players.records[slot];
+        if (self.deps.player_states.of(player).health <= 0) return;
+        const half_width: f64 = @as(f64, @as(f32, 0.6)) / 2;
+        const amount = self.deps.world_border.damageOutside(player.world, player.position.x, player.position.z, half_width) orelse return;
+        _ = try self.hurt(slot, .{ .type = .outside_border }, amount);
     }
 
     /// A sound at a player, for everyone near and itself too, once the tick sends it. More than

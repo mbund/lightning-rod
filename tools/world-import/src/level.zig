@@ -45,4 +45,36 @@ pub fn read(owner: *world_import.Import, doc: nbt.Document, data: nbt.Node) !voi
     weather.rain_level = if (weather.raining) 1 else 0;
     weather.thunder_level = if (weather.thundering) 1 else 0;
     try weather.checkpoint(try owner.store.openSpace(vanilla.Weather.id));
+    try vanilla.WorldBorder.save(try owner.store.openSpace(vanilla.WorldBorder.id), try border(doc, data));
+}
+
+/// A number level.dat may hold as any numeric tag, as Dynamic.asDouble reads it.
+fn numberOr(doc: nbt.Document, data: nbt.Node, name: []const u8, default: f64) !f64 {
+    const value = data.childNamed(doc.nodes, name) orelse return default;
+    return switch (value.tag) {
+        .float, .double => try fields.number(value),
+        else => @floatFromInt(try fields.integer(value)),
+    };
+}
+
+/// WorldBorder.Settings.read: its center held within the largest radius, and the time a moving
+/// border has left, kept in milliseconds, in ticks.
+fn border(doc: nbt.Document, data: nbt.Node) !vanilla.WorldBorder.Settings {
+    const radius = vanilla.world_border.max_radius;
+    const size = try numberOr(doc, data, "BorderSize", vanilla.world_border.max_size);
+    const milliseconds = try fields.optionalInt(doc, data, "BorderSizeLerpTime", 0);
+    const remaining = @divTrunc(@max(milliseconds, 0), 50);
+    const warning_blocks = try numberOr(doc, data, "BorderWarningBlocks", 5);
+    const warning_time = try numberOr(doc, data, "BorderWarningTime", 15);
+    return .{
+        .center_x = std.math.clamp(try numberOr(doc, data, "BorderCenterX", 0), -radius, radius),
+        .center_z = std.math.clamp(try numberOr(doc, data, "BorderCenterZ", 0), -radius, radius),
+        .size = size,
+        .damage_per_block = try numberOr(doc, data, "BorderDamagePerBlock", 0.2),
+        .safe_zone = try numberOr(doc, data, "BorderSafeZone", 5),
+        .warning_blocks = std.math.lossyCast(i32, warning_blocks),
+        .warning_time = std.math.lossyCast(i32, warning_time),
+        .target = if (remaining > 0) try numberOr(doc, data, "BorderSizeLerpTarget", size) else size,
+        .remaining = remaining,
+    };
 }

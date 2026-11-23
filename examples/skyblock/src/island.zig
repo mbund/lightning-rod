@@ -61,7 +61,7 @@ fn selections(content: vanilla.definition_provider.Dependencies, config: IslandC
             lightning_rod.plugin.configured(Inventories, .{ .cache_items = 6 }),
             lightning_rod.plugin.configured(BlockSynchronization, .{ .delta_sections = 32, .queued_sections = 32 }),
             lightning_rod.plugin.configured(Players, .{ .maximum = if (config.index == 0) catalog.maximum_players else catalog.island_connections, .render_distance = 4, .spawn = .{ .x = 0.5, .y = 65, .z = 0.5 } }),
-            lightning_rod.plugin.configured(vanilla.PlayerStates, .{ .world_border = 512 }),
+            lightning_rod.plugin.configured(vanilla.WorldBorder, .{ .size = 512 }),
         }),
         lightning_rod.plugin.configured(IslandCommands, config),
         lightning_rod.plugin.configured(global_chat.GlobalChat, .{ .channel = chat }),

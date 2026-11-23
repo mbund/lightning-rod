@@ -15,6 +15,7 @@ const default_worlds = @import("vanilla_world").default_worlds;
 const experience = @import("experience_state.zig");
 const Input = @import("players").input.Input;
 const Spawn = @import("vanilla_world").spawn.Spawn;
+const WorldBorder = @import("vanilla_world").world_border.WorldBorder;
 const Players = @import("players").players.Players;
 const Player = Players.Player;
 
@@ -24,8 +25,6 @@ pub const PlayerStates = struct {
     pub const Configuration = struct {
         /// The game mode of players with nothing saved.
         gamemode: minecraft.GameMode = .creative,
-        /// A square border around the origin that players cannot cross.
-        world_border: ?f64 = null,
     };
 
     pub const Dependencies = struct {
@@ -36,6 +35,7 @@ pub const PlayerStates = struct {
         storage: lightning_rod.storage.Space,
         worlds: *worlds.Worlds,
         vanilla_worlds: *default_worlds.VanillaWorlds,
+        world_border: *WorldBorder,
         spawn: ?*Spawn = null,
     };
 
@@ -60,7 +60,6 @@ pub const PlayerStates = struct {
         experience_delay: u8 = 0,
         /// The engine's counts when the client was last told this state.
         arrivals: u32 = 0,
-        life: u32 = 0,
         sending: Sending = .done,
         saved: [encoded_size]u8 = @splat(0),
         saved_experience: [experience.State.encoded_size]u8 = @splat(0),
@@ -111,7 +110,7 @@ pub const PlayerStates = struct {
     };
 
     /// What the client still has to hear after it arrives somewhere.
-    const Sending = enum { done, border, spawn, health, selection };
+    const Sending = enum { done, spawn, health, selection };
 
     deps: Dependencies,
     config: Configuration,
@@ -125,15 +124,11 @@ pub const PlayerStates = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*PlayerStates {
-        if (config.world_border) |diameter| {
-            const position = deps.players.config.spawn orelse minecraft.Position{ .x = 0.5, .y = 65, .z = 0.5 };
-            if (!std.math.isFinite(diameter) or diameter < 1 or diameter > 60_000_000 or @abs(position.x) > diameter / 2 - 0.3 or @abs(position.z) > diameter / 2 - 0.3) return error.InvalidConfiguration;
-        }
         const self = try allocator.create(PlayerStates);
         const records = try allocator.alloc(State, deps.players.records.len);
         @memset(records, .{});
         self.* = .{ .deps = deps, .config = config, .records = records };
-        deps.players.setRules(.init(PlayerStates, self, gameModeOf, spawnWorld, spawnPoint, insideBorder));
+        deps.players.setRules(.init(PlayerStates, self, gameModeOf, spawnWorld, spawnPoint));
         try deps.players.observePresence(PlayerStates, self, onPresence);
         try deps.input.on(.client_command, self, onClientCommand);
         try deps.input.on(.held_item_slot, self, onHeldSlot);
@@ -151,11 +146,6 @@ pub const PlayerStates = struct {
         return state;
     }
 
-    pub fn insideBorder(self: *const PlayerStates, position: minecraft.Position) bool {
-        const diameter = self.config.world_border orelse return true;
-        return @abs(position.x) <= diameter / 2 - 0.3 and @abs(position.z) <= diameter / 2 - 0.3;
-    }
-
     fn gameModeOf(self: *PlayerStates, slot: usize) minecraft.GameMode {
         return self.records[slot].gamemode;
     }
@@ -166,7 +156,7 @@ pub const PlayerStates = struct {
 
     fn spawnPoint(self: *PlayerStates, player: *const Player) !?Players.Rules.Spawn {
         const spawn = self.deps.spawn orelse return null;
-        const selected = try spawn.select(player.world, self.config.gamemode, self.config.world_border);
+        const selected = try spawn.select(player.world, self.config.gamemode, self.deps.world_border.bounds(player.world));
         return .{ .position = selected.position, .rotation = selected.rotation };
     }
 
@@ -271,19 +261,12 @@ pub const PlayerStates = struct {
             const state = &self.records[index];
             if (state.arrivals != player.arrivals) {
                 state.arrivals = player.arrivals;
-                // A client that joined or respawned has forgotten the border, and one that changed
-                // world the spawn too, as vanilla sends both with every arrival in a world.
-                state.sending = if (state.life != player.life) .border else .spawn;
-                state.life = player.life;
+                // A client that arrives somewhere is told the spawn again, as vanilla sends it
+                // with every arrival in a world.
+                state.sending = .spawn;
             }
             while (state.sending != .done) {
                 switch (state.sending) {
-                    .border => {
-                        if (self.config.world_border) |diameter| {
-                            if (!players.sendPacket(writeBorder, player.protocol, handle, .{diameter})) break;
-                        }
-                        state.sending = .spawn;
-                    },
                     .spawn => {
                         if (!try self.sendSpawn(player)) break;
                         state.sending = .health;
@@ -418,17 +401,6 @@ pub const PlayerStates = struct {
         const reason = try packet.reason(3);
         return (try reason.gameMode(@floatFromInt(@backingInt(mode)))).finish();
     }
-
-    fn writeBorder(packet: wire_1_21_5.play.toClient.packet_initialize_world_border.Writer, diameter: f64) ![]u8 {
-        const x = try packet.x(0);
-        const z = try x.z(0);
-        const old = try z.oldDiameter(diameter);
-        const next = try old.newDiameter(diameter);
-        const speed = try next.speed(0);
-        const boundary = try speed.portalTeleportBoundary(29_999_984);
-        const blocks = try boundary.warningBlocks(5);
-        return (try blocks.warningTime(15)).finish();
-    }
 };
 
 test "vanilla player state survives leaving, checkpoints and restarts, and corrupt records are refused" {
@@ -462,7 +434,7 @@ test "vanilla player state survives leaving, checkpoints and restarts, and corru
     const space = try store.openSpace(PlayerStates.id);
     var states: [2]PlayerStates.State = @splat(.{});
     var player_states: PlayerStates = .{
-        .deps = .{ .record_workspaces = &workspaces, .players = &players, .input = undefined, .packets = undefined, .storage = space, .worlds = dimensions, .vanilla_worlds = undefined },
+        .deps = .{ .record_workspaces = &workspaces, .players = &players, .input = undefined, .packets = undefined, .storage = space, .worlds = dimensions, .vanilla_worlds = undefined, .world_border = undefined },
         .config = .{ .gamemode = .survival },
         .records = &states,
     };

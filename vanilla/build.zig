@@ -42,6 +42,7 @@ pub fn build(b: *std.Build) void {
         .{ .source = "creative_inventory_test" },
         .{ .source = "visibility_replication_test", .step = "test-player-replication", .description = "Verify player visibility and independent packet admission" },
         .{ .source = "environment_test" },
+        .{ .source = "world_border_test", .step = "test-world-border", .description = "Verify the world border, its packets and its command" },
         .{ .source = "spawn_test", .step = "test-spawn", .description = "Verify vanilla world and player spawn selection" },
         .{ .source = "enchantment_test", .step = "test-enchantments", .description = "Verify native and datapack enchantment behavior" },
         .{ .source = "registry_test", .step = "test-registries", .description = "Verify independently owned gameplay definitions" },

@@ -16,6 +16,7 @@ const CreativeInventory = @import("vanilla_inventory").creative_inventory.Creati
 const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
 const Players = @import("players").players.Players;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
+const WorldBorder = @import("vanilla_world").world_border.WorldBorder;
 const Input = @import("players").input.Input;
 const Items = @import("vanilla_items").items.Items;
 const EquipmentSlots = @import("vanilla_items").item_properties.EquipmentSlots;
@@ -26,6 +27,7 @@ pub const InventoryFixture = struct {
     input: *Input,
     players: *Players,
     player_states: *PlayerStates,
+    world_border: *WorldBorder,
     ownership: *inventories.Inventories,
     items: *Items,
     menu: *PlayerInventory,
@@ -60,6 +62,8 @@ pub const InventoryFixture = struct {
         });
         players.records[0] = .{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .loaded = true };
         players.rebuildIndexes();
+        const gameplay_definitions = try vanilla_content.prepare(allocator);
+        const world_border = try WorldBorder.init(allocator, .{}, .{ .storage = try store.openSpace(WorldBorder.id), .worlds = dimensions, .dimensions = gameplay_definitions.dimensions, .players = players });
         const player_states = try PlayerStates.init(allocator, .{}, .{
             .record_workspaces = workspaces,
             .players = players,
@@ -68,6 +72,7 @@ pub const InventoryFixture = struct {
             .storage = try store.openSpace(PlayerStates.id),
             .worlds = dimensions,
             .vanilla_worlds = undefined,
+            .world_border = world_border,
         });
         player_states.records[0] = .{ .uuid = 1, .gamemode = .creative };
         const ownership = try inventories.Inventories.init(allocator, io, .{ .cache_slots = 128, .cache_items = 8, .max_item_bytes = 1024 }, .{
@@ -75,7 +80,6 @@ pub const InventoryFixture = struct {
             .storage = try store.openSpace("inventory"),
             .record_workspaces = workspaces,
         });
-        const gameplay_definitions = try vanilla_content.prepare(allocator);
         const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
         const bodies = try entities.Entities.init(allocator, io, .{}, .{ .metrics = registry, .storage = try store.openSpace("entities"), .record_workspaces = workspaces });
         const dropped = try ItemEntities.init(allocator, io, .{}, .{
@@ -110,6 +114,6 @@ pub const InventoryFixture = struct {
         const menus = try InventoryMenus.init(allocator, .{ .containers = undefined, .inventory = menu, .input = input, .players = players, .player_states = player_states, .inventories = ownership, .items = items, .packets = undefined, .sessions = service });
         // Items kept near the player come back into memory, as the item tick would bring them.
         try dropped.refresh(&.{.{ .world = world, .x = 0, .z = 0 }}, 2, entities.residency.NoColumns{});
-        return .{ .definitions = gameplay_definitions, .service = service, .input = input, .players = players, .player_states = player_states, .ownership = ownership, .items = items, .menu = menu, .menus = menus, .creative = creative, .bodies = bodies, .dropped = dropped };
+        return .{ .definitions = gameplay_definitions, .service = service, .input = input, .players = players, .player_states = player_states, .world_border = world_border, .ownership = ownership, .items = items, .menu = menu, .menus = menus, .creative = creative, .bodies = bodies, .dropped = dropped };
     }
 };
