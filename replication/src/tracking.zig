@@ -8,11 +8,18 @@
 //! (isChunkTracked), and some section its box is in is not hidden from the player.
 //!
 //! What each client was told lives here, a row of player bits for every directory slot: `known`
-//! is who has the entity spawned, `stale` who of them missed a delta and needs it whole. Each
-//! tick, what changed (players moving, reconnecting, changing view distance, chunks sent or
-//! hidden, entities moving, spawning, leaving) picks the entities whose answer can differ and
-//! for which players; only those are asked again. Kinds take the differences, send what they
-//! send in their own order, and confirm what was accepted: what was not is offered again.
+//! is who has the entity spawned, `stale` who of them missed a delta and needs it whole. Kinds take
+//! the differences, send what they send in their own order, and confirm what was accepted: what
+//! was not is offered again.
+//!
+//! Every player stands at an anchor, where it last was more than `slack` blocks from: around it,
+//! each column is, for each tracking range, wholly within reach of the player wherever it goes
+//! until it moves that far again (yes), wholly out of reach (no), or neither (edge). Those answers
+//! are bits of player masks kept for every column of the tiles where tracked entities are, so an
+//! entity that moves is answered by its column's masks, and only its edge players are measured;
+//! a player that moves measures only the entities of its edge columns; one that leaves its slack
+//! is anchored again, and only columns whose answer changed are looked at. With nothing moving,
+//! nothing is done.
 //!
 //! An entity some client still knows keeps its directory slot, and with it its network id,
 //! until every such client was told it is gone.
@@ -21,7 +28,6 @@ const std = @import("std");
 const entities_module = @import("entities");
 const lightning_rod = @import("lightning_rod");
 const Players = @import("players").players.Players;
-const Player = Players.Player;
 const Streaming = @import("terrain").streaming.Streaming;
 const geometry_bounds = @import("occlusion").bounds;
 const PlayerChanges = @import("player_changes.zig").PlayerChanges;
@@ -29,10 +35,11 @@ const PlayerChanges = @import("player_changes.zig").PlayerChanges;
 const bit_sets = lightning_rod.system.bit_sets;
 const Entities = entities_module.Entities;
 const Array = entities_module.Array;
+const Records = entities_module.extras.Records;
 const Entry = entities_module.space.Entry;
-const Sweeps = entities_module.Sweeps;
-const Sweep = entities_module.sweeps.Sweep;
-const SweptBox = entities_module.sweeps.Box;
+const Feet = entities_module.space.Feet;
+const Boxed = entities_module.space.Boxed;
+const Block = entities_module.space.Block;
 const Placed = entities_module.Space.Placed;
 const builtin = @import("builtin");
 const Kinds = entities_module.Kinds;
@@ -49,6 +56,8 @@ pub const Tracking = struct {
         /// Entities whose answer can change in one tick before the tick looks over every entity
         /// near every player instead.
         work: u32 = 65536,
+        /// Tiles of columns tracking keeps masks for at most.
+        tiles: u32 = 4096,
     };
 
     pub const Dependencies = struct {
@@ -65,14 +74,12 @@ pub const Tracking = struct {
         /// The most any of its entities' own ranges reaches, as one carrying passengers takes theirs:
         /// the range when none has a range of its own.
         max_range: ?u32 = null,
-        /// Where its entities that do not keep a place in the space every tick are: a box each
-        /// stays in until a tick. With them, `exact` says where one is now, which tracking asks
-        /// only where a box leaves an answer unsure.
-        sweeps: ?*Sweeps = null,
+        /// Where one of its boxed entities is now: tracking asks only where a box leaves an answer
+        /// unsure. Kinds that box their entities give it.
         exact: ?Exact = null,
     };
 
-    /// Where a swept entity is now, from its kind: without side effects, as tracking asks it
+    /// Where a boxed entity is now, from its kind: without side effects, as tracking asks it
     /// whenever it must.
     pub const Exact = struct {
         context: *anyopaque,
@@ -92,32 +99,68 @@ pub const Tracking = struct {
     /// One player's answer for an entity anywhere in a box: the same everywhere, or unsure.
     const Answer = enum { no, yes, unsure };
 
+    /// How a column stands against a player's anchor, for one range: wholly within reach wherever
+    /// the player is within its slack, wholly out of it, or neither.
+    const Class = enum(u2) { no, edge, yes };
+
     pub const TrackerId = u8;
     const max_trackers = 32;
+    const max_groups = 16;
     const no_tracker = std.math.maxInt(u8);
     const none = std.math.maxInt(u32);
+    const no_owner = std.math.maxInt(u16);
 
-    /// `own_ranges` counts its entities with ranges of their own: with none, the group's circle is
-    /// every one's.
-    const Group = struct { range: f64, kinds: Kinds, own_ranges: u32 = 0, live: bool = true };
+    /// How far a player goes from its anchor before it is anchored again.
+    pub const slack = 6.0;
+
+    /// Trackers of one range, answered by the same masks.
+    const Group = struct { range: f64, kinds: Kinds };
 
     const Tracker = struct {
         kinds: Kinds,
         range: f64,
         max_range: f64,
         group: u8,
-        sweeps: ?*Sweeps,
         exact: ?Exact,
     };
-    const no_owner = std.math.maxInt(u16);
+
+    /// Columns of a tile on a side.
+    const tile_side = 8;
+    const tile_columns = tile_side * tile_side;
+
+    /// Eight by eight columns: which of them hold tracked entities or boxes, as last seen, and the
+    /// space's index of each, as last found.
+    const Tile = struct {
+        world: u32,
+        x: i32,
+        z: i32,
+        generation: u32,
+        occupied: u64 = 0,
+        index: [tile_columns]u32 = @splat(none),
+        made: [tile_columns]u64 = @splat(0),
+    };
+    const TileBucket = struct { key: u128 = 0, at: u32 = none };
+
+    /// An edge column of a player for one range, while the tile is the same.
+    const EdgeRef = struct { tile: u32, generation: u32, column: u8, group: u8 };
+
     const PlayerBounds = struct { world: u32, low: [2]f64, high: [2]f64 };
-    const NearKey = struct { world: u32, x: i32, z: i32, chunks: i32 };
-    const Run = struct { start: u32, count: u32 };
-    const SeenKey = struct { world: u32, x: i32, z: i32, footprint: Footprint };
-    /// Columns and footprints one tick shares; past them each entity asks alone.
-    const shared_columns = 4096;
     const bounds_max = 8;
     const any_world = std.math.maxInt(u32);
+    const SeenKey = struct { world: u32, x: i32, z: i32, footprint: Footprint };
+    /// A multiply and a fold: keys are small integers, asked of many times a tick.
+    const SeenContext = struct {
+        pub fn hash(_: SeenContext, key: SeenKey) u64 {
+            var mixed: u64 = @as(u64, key.world) *% 0x9e3779b97f4a7c15;
+            for ([_]i32{ key.x, key.z, key.footprint.low[0], key.footprint.low[1], key.footprint.low[2], key.footprint.high[0], key.footprint.high[1], key.footprint.high[2] }) |part| mixed = (mixed ^ @as(u32, @bitCast(part))) *% 0xc2b2ae3d27d4eb4f;
+            return mixed ^ (mixed >> 29);
+        }
+        pub fn eql(_: SeenContext, a: SeenKey, b: SeenKey) bool {
+            return std.meta.eql(a, b);
+        }
+    };
+    /// Footprints one tick shares; past them each entity asks alone.
+    const shared_footprints = 4096;
 
     /// What tracking keeps of an entity beside its rows.
     const Meta = struct {
@@ -126,16 +169,18 @@ pub const Tracking = struct {
         entity: u64 = 0,
         /// Its entry in this tick's work, or none.
         work: u32 = none,
-        /// The tick it was last looked at, so a log naming it twice costs once.
+        /// The pass it was last looked at, so a log naming it twice costs once.
         looked: u64 = 0,
         /// Gone from the space, its removal owed to whoever still knows it.
         gone: bool = false,
-        /// The tick it last joined the unsettled, so it joins once.
+        /// The pass it last joined the unsettled, so it joins once.
         unsettled: u64 = 0,
-        /// The tracking tick a kind was told an entity is settled anywhere in a box, and the box:
-        /// swept there that tick, it needs no asking again.
+        /// The pass a kind was told an entity is settled anywhere in a box, and the box: boxed
+        /// there that pass, it needs no asking again.
         settled_for: u64 = 0,
-        settled_box: SweptBox = .{ .low = .{ 0, 0, 0 }, .high = .{ 0, 0, 0 } },
+        settled_box: Feet = .{ .low = .{ 0, 0, 0 }, .high = .{ 0, 0, 0 } },
+        /// The players heard when it was settled: heard again since, the answer may be another.
+        settled_heard: u64 = 0,
         /// What the entity says of itself, which the rule reads: its own range, scaled, where it
         /// is not its type's (getEffectiveRange with passengers); the player it is, who never
         /// sees itself; whether only spectators see it (ServerPlayer.broadcastToPlayer); and
@@ -144,17 +189,15 @@ pub const Tracking = struct {
         owner: u16 = no_owner,
         spectators_only: bool = false,
         restricted: bool = false,
-        /// Where it was checked against every player, how far it could go from there before any
-        /// answer could change, and the players' drift and epoch then.
+        /// Where it was last answered for every player: a point's column and footprint, which its
+        /// answers for players not at an edge depend on.
+        placed: bool = false,
         world: u32 = 0,
-        x: f64 = 0,
-        z: f64 = 0,
-        /// Its own column, then the columns and sections its box is in, as occlusion reads them.
         column: [2]i32 = .{ 0, 0 },
         footprint: Footprint = .{},
-        margin: f64 = -1,
-        drift: f64 = 0,
-        epoch: u64 = 0,
+        /// The tile of that column, while it is the same tile.
+        tile: u32 = none,
+        tile_generation: u32 = 0,
     };
 
     /// A change of one entity's audience to send: whom to spawn it for, whom to remove it from,
@@ -166,6 +209,31 @@ pub const Tracking = struct {
         gone: bool,
     };
 
+    /// What tracking did, for measuring it against what had to be done.
+    pub const Stats = struct {
+        passes: u64 = 0,
+        /// Entities placed, moved, removed or boxed, as the log told.
+        logged: u64 = 0,
+        /// Of those, answered without measuring anything.
+        logged_quiet: u64 = 0,
+        /// Players anchored again, and players that moved within their slack.
+        anchored: u64 = 0,
+        slack_moves: u64 = 0,
+        /// Columns looked at for a player, and entities measured in them.
+        columns: u64 = 0,
+        measured: u64 = 0,
+        /// Pairs whose answer was asked whole, and of them those that changed.
+        asked: u64 = 0,
+        changed: u64 = 0,
+        /// Near entities measured, and every entity of edge columns measured again.
+        near_measured: u64 = 0,
+        edge_walks: u64 = 0,
+        /// Boxes answered for a player, and kinds asked where an entity is.
+        boxes: u64 = 0,
+        exact: u64 = 0,
+        tiles_made: u64 = 0,
+    };
+
     deps: Dependencies,
     config: Configuration,
     changes: PlayerChanges,
@@ -173,13 +241,9 @@ pub const Tracking = struct {
     tracker_count: usize = 0,
     tracker_of: [Kinds.max_kinds]u8 = @splat(no_tracker),
     tracked: Kinds = .{},
-    /// The trackers' kinds by their widest range, so each ring is walked once a range.
-    groups: [max_trackers]Group = undefined,
+    groups: [max_groups]Group = undefined,
     group_count: usize = 0,
-    /// Every kind's sweeps, once each.
-    sources: [max_trackers]*Sweeps = undefined,
-    source_count: usize = 0,
-    /// Swept entities some player was unsure of this tick: asked again the next.
+    /// Boxed entities some player was unsure of this tick: asked again the next.
     unsettled: Array(u32),
     /// Words of player bits in a row as kept: a power of two, so a slot's rows share a page.
     words: usize,
@@ -191,70 +255,113 @@ pub const Tracking = struct {
     /// This tick's work: the slots, and for each its mask of players and their answers, which
     /// become the spawn and remove rows once the tick has looked everything over.
     work_slots: Array(u32),
+    /// Each entry's tracker, beside it, so a kind walks its own without reading the rest.
+    work_trackers: Array(u8),
     work_rows: Array(u64),
+    /// Whether each entry holds answers, being worked out this pass, rather than the spawns and
+    /// removals owed; those opened this pass, finalized at its end; and how many hold nothing.
+    work_open: Array(u8),
+    opened: Array(u32),
+    work_empty: usize = 0,
     work_overflowed: bool = false,
-    /// Slots whose differences were not all accepted, asked again next tick.
+    /// Slots asked about again next pass, as what they said of themselves changed or a box of
+    /// theirs was unsure.
     retry: Array(u32),
     /// Slots of entities gone that clients still know.
     gone: Array(u32),
-    candidates: []u16,
-    /// This tick's players near each column, and who of them the terrain lets see each box
-    /// footprint there: shared by every entity of the column, as a volley's arrows or a herd are.
-    near_columns: std.AutoHashMapUnmanaged(NearKey, Run),
-    near_players: []u16,
-    near_count: usize = 0,
-    seen_footprints: std.AutoHashMapUnmanaged(SeenKey, u32),
+    /// Slots of entities with ranges of their own, asked of every player each pass.
+    own_ranged: Array(u32),
+    /// This tick's footprints whose sight was asked: for each, the players asked and those who see.
+    seen_footprints: std.HashMapUnmanaged(SeenKey, u32, SeenContext, 80),
     seen_rows: []u64,
     seen_count: usize = 0,
-    /// The players as columns, for the distance test eight at a time.
+    /// The players, as tracking hears them each tick.
     xs: []f64,
     zs: []f64,
     reaches: []f64,
     worlds: []u32,
     ready: []bool,
     spectating: []bool,
+    /// Where each player last measured every entity of its edge columns, and its near entities
+    /// then: those within `near_band` of its reach, each with the reach it is measured by,
+    /// squared, and whether it was within it last time, side by side for a test a vector at a
+    /// time; and the boxes of its edge columns. Past room, it measures every edge entity the next
+    /// time it moves.
+    measure_x: []f64,
+    measure_z: []f64,
+    near_chunks: [][]NearChunk,
+    near_count: []usize,
+    near_boxes: [][]u32,
+    near_box_count: []usize,
+    near_full: []bool,
+    /// How many near entities each player had when it last gathered them: grown twice that, by
+    /// entities moving near its reach, its near entities are gathered afresh.
+    near_gathered: []usize,
+    /// Each player's anchor, and its reach and world then.
+    anchor_x: []f64,
+    anchor_z: []f64,
+    anchor_reach: []f64,
+    anchor_world: []u32,
+    anchored: []bool,
+    /// Each player's edge columns holding tracked entities, found when it was anchored and as
+    /// columns filled since.
+    edges: []Array(EdgeRef),
+    /// Tiles by their index, found by hash, and their masks: for every column of a tile, for each
+    /// range, the yes row then the edge row of players.
+    tiles: Records(Tile),
+    tile_buckets: Array(TileBucket),
+    tile_masks: Array(u64),
+    tile_stride: usize = 0,
+    tile_generation: u32 = 0,
+    /// The tile last found, and its key.
+    last_tile: u32 = none,
+    last_tile_key: u128 = 0,
+    /// Per box of the space, the pass and player it was last answered for.
+    box_stamps: Array(u64),
     /// The box around each world's ready players this tick, horizontally: an entity whose reach
     /// misses it is seen by no one, without looking for players. Past room for worlds, the last
     /// stands for every other and covers everything.
     bounds: [bounds_max]PlayerBounds = undefined,
     bounds_count: usize = 0,
+    /// Whether the players were heard since the bounds were gathered.
+    bounds_stale: bool = true,
     /// For entities only some players may see, those players, by slot.
     allowed: Array(u64),
     scratch: []u64,
     /// A row of nobody, for slots never tracked.
     zeros: []u64,
     tick_count: u64 = 0,
+    /// Passes that heard the players.
+    heard_count: u64 = 0,
     /// Players as subjects too, once asked: each in the space while in its world, by a slot of
     /// its own, its tracker's and its kind.
     player_tracker: ?TrackerId = null,
     player_kind: u32 = 0,
     player_slots: []u32,
     player_ids: []u64,
-    subject_at: [][3]f64,
-    subject_world: []u32,
     /// Whether each was last told tracking it is in spectator mode.
     subject_spectator: []bool,
-    /// Their x and z apart, for the distance test eight at a time; none where there is none.
-    subject_x: []f64,
-    subject_z: []f64,
-    /// Each observer's last measure of players as subjects: where, the drift then, and how far
-    /// the nearest was from its edge; negative asks for a measure.
-    player_anchor: [][2]f64,
-    player_drift: []f64,
-    player_slack: []f64,
+    /// Where each was placed, whether it moved or was placed this pass, and whether placed anew.
+    subject_at: [][3]f64,
+    subject_world: []u32,
+    subject_moved: []bool,
+    subject_fresh: []bool,
     finalized: bool = false,
+    /// Whether the entities placed before tracking began were looked at.
+    primed: bool = false,
+    stats: Stats = .{},
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Tracking {
-        if (config.range_percentage < 10 or config.range_percentage > 1000 or config.work == 0) return error.InvalidConfiguration;
+        if (config.range_percentage < 10 or config.range_percentage > 1000 or config.work == 0 or config.tiles == 0) return error.InvalidConfiguration;
         const self = try allocator.create(Tracking);
         const count = deps.players.records.len;
         // A power of two, so a slot's rows never straddle a page.
         const words = try std.math.ceilPowerOfTwo(usize, @max(1, std.math.divCeil(usize, count, 64) catch unreachable));
         const pool = &deps.entities.pool;
-        var near_columns: std.AutoHashMapUnmanaged(NearKey, Run) = .empty;
-        try near_columns.ensureTotalCapacity(allocator, shared_columns);
-        var seen_footprints: std.AutoHashMapUnmanaged(SeenKey, u32) = .empty;
-        try seen_footprints.ensureTotalCapacity(allocator, shared_columns);
+        var seen_footprints: std.HashMapUnmanaged(SeenKey, u32, SeenContext, 80) = .empty;
+        try seen_footprints.ensureTotalCapacity(allocator, shared_footprints);
+        const edges = try allocator.alloc(Array(EdgeRef), count);
+        for (edges) |*list| list.* = try .init(allocator, pool);
         self.* = .{
             .deps = deps,
             .config = config,
@@ -264,46 +371,66 @@ pub const Tracking = struct {
             .rows = try .init(allocator, pool),
             .metas = try .init(allocator, pool),
             .work_slots = try .init(allocator, pool),
+            .work_trackers = try .init(allocator, pool),
+            .work_open = try .init(allocator, pool),
+            .opened = try .init(allocator, pool),
             .work_rows = try .init(allocator, pool),
             .retry = try .init(allocator, pool),
             .unsettled = try .init(allocator, pool),
             .gone = try .init(allocator, pool),
-            .candidates = try allocator.alloc(u16, count),
-            .near_columns = near_columns,
-            .near_players = try allocator.alloc(u16, shared_columns * 16),
+            .own_ranged = try .init(allocator, pool),
             .seen_footprints = seen_footprints,
-            .seen_rows = try allocator.alloc(u64, shared_columns * words),
+            .seen_rows = try allocator.alloc(u64, shared_footprints * 2 * words),
             .xs = try allocator.alloc(f64, count),
             .zs = try allocator.alloc(f64, count),
             .reaches = try allocator.alloc(f64, count),
             .worlds = try allocator.alloc(u32, count),
             .ready = try allocator.alloc(bool, count),
             .spectating = try allocator.alloc(bool, count),
+            .measure_x = try allocator.alloc(f64, count),
+            .measure_z = try allocator.alloc(f64, count),
+            .near_chunks = try perPlayer(NearChunk, allocator, count, near_max / near_lanes),
+            .near_count = try allocator.alloc(usize, count),
+            .near_boxes = try perPlayer(u32, allocator, count, near_boxes_max),
+            .near_box_count = try allocator.alloc(usize, count),
+            .near_full = try allocator.alloc(bool, count),
+            .near_gathered = try allocator.alloc(usize, count),
+            .anchor_x = try allocator.alloc(f64, count),
+            .anchor_z = try allocator.alloc(f64, count),
+            .anchor_reach = try allocator.alloc(f64, count),
+            .anchor_world = try allocator.alloc(u32, count),
+            .anchored = try allocator.alloc(bool, count),
+            .edges = edges,
+            .tiles = try .init(allocator, pool),
+            .tile_buckets = try .init(allocator, pool),
+            .tile_masks = try .init(allocator, pool),
+            .box_stamps = try .init(allocator, pool),
             .player_slots = try allocator.alloc(u32, count),
             .player_ids = try allocator.alloc(u64, count),
+            .subject_spectator = try allocator.alloc(bool, count),
             .subject_at = try allocator.alloc([3]f64, count),
             .subject_world = try allocator.alloc(u32, count),
-            .subject_spectator = try allocator.alloc(bool, count),
-            .subject_x = try allocator.alloc(f64, std.mem.alignForward(usize, count, 8)),
-            .subject_z = try allocator.alloc(f64, std.mem.alignForward(usize, count, 8)),
-            .player_anchor = try allocator.alloc([2]f64, count),
-            .player_drift = try allocator.alloc(f64, count),
-            .player_slack = try allocator.alloc(f64, count),
+            .subject_moved = try allocator.alloc(bool, count),
+            .subject_fresh = try allocator.alloc(bool, count),
             .allowed = try .init(allocator, pool),
             .scratch = try allocator.alloc(u64, 4 * words),
             .zeros = try allocator.alloc(u64, words),
         };
         @memset(self.ready, false);
         @memset(self.spectating, false);
+        @memset(self.anchored, false);
+        @memset(self.near_full, false);
+        @memset(self.near_count, 0);
+        @memset(self.near_box_count, 0);
+        @memset(self.near_gathered, 0);
         @memset(self.player_slots, none);
         @memset(self.player_ids, 0);
-        @memset(self.subject_x, std.math.inf(f64));
-        @memset(self.player_slack, -1);
         @memset(self.subject_spectator, false);
-        @memset(self.player_drift, 0);
-        @memset(self.player_anchor, .{ 0, 0 });
-        @memset(self.subject_z, std.math.inf(f64));
+        @memset(self.subject_moved, false);
+        @memset(self.subject_fresh, false);
         @memset(self.zeros, 0);
+        // Twice the tiles at most, so a probe ends soon.
+        try self.tile_buckets.ensureFilled(try std.math.ceilPowerOfTwo(usize, @as(usize, config.tiles) * 2), .{});
         deps.entities.places.space.logging = true;
         return self;
     }
@@ -315,6 +442,11 @@ pub const Tracking = struct {
         const tracker = try self.register(.{ .kinds = .of(&.{kind}), .range = 32 * 16 });
         self.player_tracker = tracker;
         self.player_kind = kind;
+        // Players are somewhere, not ticked there; their moves are told by the players.
+        self.deps.entities.places.keepsOwnTurns(.of(&.{kind}));
+        self.deps.entities.places.space.unlogged_moves.bits.set(kind);
+        // Players are not stored with columns: their own column unloaded is no stray.
+        self.deps.entities.places.space.unstored.bits.set(kind);
         return tracker;
     }
 
@@ -327,10 +459,18 @@ pub const Tracking = struct {
     /// Ids of players as subjects, apart from every entity's, which count up from one.
     const player_id_base: u64 = 1 << 63;
 
+    /// Occlusion is asked of the sections a block and a half around a player and three high, as
+    /// players replicated before: a looser box than its own, so one at a section's edge does not
+    /// come and go.
+    const player_shape_half_width = 1.5;
+    const player_shape_height = 3;
+
     /// Players as subjects follow the players: placed while in their world, moved as they move,
     /// gone as they leave it or their connection does.
     fn syncPlayers(self: *Tracking) !void {
         if (self.player_tracker == null) return;
+        const space = &self.deps.entities.places.space;
+        const shape: entities_module.space.Shape = .{ .kind = self.player_kind, .half_width = player_shape_half_width, .height = player_shape_height };
         for (self.deps.players.records, self.changes.snapshots, 0..) |player, snapshot, index| {
             const entity = player_id_base | (@as(u64, snapshot.generation) << 16) | index;
             // In its world from joining, as vanilla adds a player to its level before the first
@@ -338,11 +478,9 @@ pub const Tracking = struct {
             const wanted = player.inWorld();
             if (self.player_slots[index] != none and (!wanted or self.player_ids[index] != entity)) {
                 const slot = self.player_slots[index];
-                self.player_slots[index] = none;
-                self.subject_x[index] = std.math.inf(f64);
-                self.subject_z[index] = std.math.inf(f64);
+                space.remove(self.player_ids[index]);
                 self.deps.entities.leave(slot);
-                try self.look(slot, false);
+                self.player_slots[index] = none;
             }
             if (!wanted) continue;
             const position: [3]f64 = .{ player.position.x, player.position.y, player.position.z };
@@ -350,21 +488,18 @@ pub const Tracking = struct {
                 const slot = try self.deps.entities.enter(entity, self.player_kind);
                 self.player_slots[index] = slot;
                 self.player_ids[index] = entity;
-                self.subject_at[index] = position;
-                self.subject_world[index] = player.world;
-                self.subject_x[index] = position[0];
-                self.subject_z[index] = position[2];
                 self.subject_spectator[index] = false;
-                self.nearObservers(index);
+                self.subject_fresh[index] = true;
                 try self.setOwner(slot, index);
-                try self.look(slot, false);
-            } else if (self.subject_world[index] != player.world or !std.meta.eql(self.subject_at[index], position)) {
-                self.subject_at[index] = position;
-                self.subject_world[index] = player.world;
-                self.subject_x[index] = position[0];
-                self.subject_z[index] = position[2];
-                try self.look(self.player_slots[index], true);
+                try space.insert(entity, player.world, position, shape);
+                self.subject_moved[index] = true;
+            } else {
+                // Moved by its slot, which saves finding it by id.
+                self.subject_moved[index] = self.subject_world[index] != player.world or !std.meta.eql(self.subject_at[index], position);
+                if (self.subject_moved[index]) try space.moveSlot(self.player_slots[index], player.world, position);
             }
+            self.subject_at[index] = position;
+            self.subject_world[index] = player.world;
             if (self.subject_spectator[index] != snapshot.spectator) {
                 self.subject_spectator[index] = snapshot.spectator;
                 try self.setSpectatorsOnly(self.player_slots[index], snapshot.spectator);
@@ -372,61 +507,46 @@ pub const Tracking = struct {
         }
     }
 
-    /// Occlusion is asked of the sections a block and a half around a player and three high, as
-    /// players replicated before: a looser box than its own, so one at a section's edge does not
-    /// come and go.
-    const player_shape_half_width = 1.5;
-    const player_shape_height = 3;
-
-    /// Where the entity in a slot is: a player as a subject where tracking last saw it, as they
-    /// are not in the space; every other entity in its place there.
-    fn placedAt(self: *const Tracking, slot: u32) ?Placed {
-        const directory = &self.deps.entities.directory;
-        if (self.player_tracker != null and slot < directory.high() and slot < self.metas.len) {
-            const entry = directory.entry(slot);
-            if (!entry.retired and entry.id != 0 and entry.kind == self.player_kind) {
-                const player = self.metas.at(slot).owner;
-                if (player == no_owner or self.player_slots[player] != slot) return null;
-                const position = self.subject_at[player];
-                const shape: entities_module.space.Shape = .{ .kind = self.player_kind, .half_width = player_shape_half_width, .height = player_shape_height };
-                return .{ .entry = .{ .id = entry.id, .slot = slot, .section = entities_module.space.coordinate(position[1]), .entered = 0, .position = position, .shape = shape }, .world = self.subject_world[player] };
-            }
+    /// Players as subjects that moved or were placed, answered from where they were put: their
+    /// entries in the log pass.
+    fn lookPlayers(self: *Tracking) !void {
+        if (self.player_tracker == null) return;
+        const shape: entities_module.space.Shape = .{ .kind = self.player_kind, .half_width = player_shape_half_width, .height = player_shape_height };
+        for (self.player_slots, self.subject_moved, self.subject_fresh, self.subject_at, self.subject_world, 0..) |slot, went, *fresh, at, world, index| {
+            if (slot == none or !went) continue;
+            if (slot < self.metas.len and self.metas.at(slot).looked == self.tick_count) continue;
+            const entry: Entry = .{ .id = self.player_ids[index], .slot = slot, .section = entities_module.space.coordinate(at[1]), .entered = 0, .position = at, .shape = shape };
+            try self.checkPoint(entry, world, fresh.*);
+            fresh.* = false;
         }
-        return self.deps.entities.places.space.atSlot(slot);
     }
 
     /// A tracking layer over entities of its own, for tests of what builds on it.
     pub fn forTests(allocator: std.mem.Allocator, players: *Players) !*Tracking {
-        const owned = try Entities.allocate(allocator, std.testing.io, .{ .memory = 256 * entities_module.pool.page_bytes }, undefined);
-        return Tracking.init(allocator, .{}, .{ .entities = owned, .players = players });
+        const owned = try Entities.allocate(allocator, std.testing.io, .{ .memory = 1024 * entities_module.pool.page_bytes }, undefined);
+        return Tracking.init(allocator, .{ .tiles = 256 }, .{ .entities = owned, .players = players });
     }
 
     /// A kind's entities are tracked from now on. Call while starting.
     pub fn register(self: *Tracking, spec: Spec) !TrackerId {
         if (self.tracker_count == max_trackers) return error.TooManyTrackers;
+        if (self.tile_stride != 0) return error.TrackingStarted;
         const scale = self.config.range_percentage;
         const index: TrackerId = @intCast(self.tracker_count);
+        const range: f64 = @floatFromInt(spec.range * scale / 100);
         const max_range: f64 = @floatFromInt((spec.max_range orelse spec.range) * scale / 100);
-        // Trackers of one widest range share their walks.
+        // Trackers of one range share their masks.
         const group: u8 = for (self.groups[0..self.group_count], 0..) |*group, at| {
-            if (group.range != max_range) continue;
+            if (group.range != range) continue;
             group.kinds.bits.setUnion(spec.kinds.bits);
             break @intCast(at);
         } else group: {
-            self.groups[self.group_count] = .{ .range = max_range, .kinds = spec.kinds };
+            if (self.group_count == max_groups) return error.TooManyTrackers;
+            self.groups[self.group_count] = .{ .range = range, .kinds = spec.kinds };
             self.group_count += 1;
             break :group @intCast(self.group_count - 1);
         };
-        if ((spec.sweeps == null) != (spec.exact == null)) return error.InvalidConfiguration;
-        self.trackers[index] = .{ .kinds = spec.kinds, .range = @floatFromInt(spec.range * scale / 100), .max_range = max_range, .group = group, .sweeps = spec.sweeps, .exact = spec.exact };
-        if (spec.sweeps) |source| {
-            for (self.sources[0..self.source_count]) |existing| {
-                if (existing == source) break;
-            } else {
-                self.sources[self.source_count] = source;
-                self.source_count += 1;
-            }
-        }
+        self.trackers[index] = .{ .kinds = spec.kinds, .range = range, .max_range = max_range, .group = group, .exact = spec.exact };
         for (0..Kinds.max_kinds) |entity_kind| if (spec.kinds.has(@intCast(entity_kind))) {
             if (self.tracker_of[entity_kind] != no_tracker) return error.KindTrackedTwice;
             self.tracker_of[entity_kind] = index;
@@ -506,13 +626,9 @@ pub const Tracking = struct {
 
     // The rule.
 
-    /// Where the distance test stands for a whole column: every point inside the circle, none
-    /// of them, or some.
-    const Hint = enum { inside, outside, test_each };
-
     /// An entity's tracking range: its own, else its type's.
     fn rangeOf(self: *const Tracking, tracker: *const Tracker, slot: u32) f64 {
-        const own = self.metas.at(slot).range;
+        const own = if (slot < self.metas.len) self.metas.at(slot).range else 0;
         return if (own > 0) own else tracker.range;
     }
 
@@ -529,37 +645,83 @@ pub const Tracking = struct {
     const Footprint = struct { low: [3]i32 = .{ 0, 0, 0 }, high: [3]i32 = .{ 0, 0, 0 } };
 
     fn footprintOf(entry: Entry) Footprint {
-        const blocks = blocksOf(entry);
+        const half: f64 = entry.shape.half_width;
+        const low: [3]f64 = .{ entry.position[0] - half, entry.position[1], entry.position[2] - half };
+        const high: [3]f64 = .{ entry.position[0] + half, entry.position[1] + entry.shape.height, entry.position[2] + half };
         var result: Footprint = undefined;
-        for (0..3) |axis| {
-            result.low[axis] = @divFloor(blocks.minimum[axis], 16);
-            result.high[axis] = @divFloor(@max(blocks.maximum[axis], blocks.minimum[axis] + 1) - 1, 16);
+        inline for (0..3) |axis| {
+            // As blocksOf, whole blocks, at least one.
+            const first: i32 = @intFromFloat(@floor(low[axis]));
+            const last: i32 = @intFromFloat(@ceil(high[axis]));
+            result.low[axis] = first >> 4;
+            result.high[axis] = (@max(last, first + 1) - 1) >> 4;
         }
         return result;
     }
 
-    /// updatePlayer's answer for one player.
-    fn sees(self: *const Tracking, slot: u32, entry: Entry, world: u32, range: f64, player: usize, hint: Hint) bool {
+    /// updatePlayer's answer for one player, every part of it.
+    fn sees(self: *const Tracking, slot: u32, entry: Entry, world: u32, range: f64, player: usize) bool {
         if (!self.ready[player] or self.worlds[player] != world) return false;
-        switch (hint) {
-            .outside => return false,
-            .inside => {},
-            .test_each => {
-                const reach = @min(range, self.reaches[player]);
-                const dx = self.xs[player] - entry.position[0];
-                const dz = self.zs[player] - entry.position[2];
-                if (dx * dx + dz * dz > reach * reach) return false;
-            },
-        }
+        const reach = @min(range, self.reaches[player]);
+        const dx = self.xs[player] - entry.position[0];
+        const dz = self.zs[player] - entry.position[2];
+        if (dx * dx + dz * dz > reach * reach) return false;
         const meta = self.metas.at(slot);
-        if (meta.owner == player or (meta.spectators_only and !self.spectating[player])) return false;
-        if (meta.restricted and !has(self.allowedWords(slot), player)) return false;
+        if (!self.admits(meta, slot, player)) return false;
         const streaming = self.deps.streaming orelse return true;
         const visibility = streaming.snapshotVisibility();
         const record = &self.deps.players.records[player];
         const column = entities_module.space.columnOf(world, entry.position);
         if (!visibility.visible(player, record, world, column.x, column.z)) return false;
         return visibility.boundsVisible(player, record, world, blocksOf(entry));
+    }
+
+    /// What an entity says of itself lets a player see it.
+    fn admits(self: *const Tracking, meta: *const Meta, slot: u32, player: usize) bool {
+        if (meta.owner == player or (meta.spectators_only and !self.spectating[player])) return false;
+        return !meta.restricted or has(self.allowedWords(slot), player);
+    }
+
+    /// Whether the terrain lets a ready player in the world see an entity of this footprint: its
+    /// column sent, and some section of its box not hidden. Asked once a pass for every entity of
+    /// a footprint and a player.
+    fn terrainLets(self: *Tracking, world: u32, entry: Entry, player: usize) bool {
+        if (self.deps.streaming == null) return true;
+        const row = self.seenRow(world, entry);
+        if (row) |both| if (has(both[0..self.words], player)) return has(both[self.words..], player);
+        const seen = self.terrainAnswer(world, entry, player);
+        if (row) |both| {
+            put(both[0..self.words], player, true);
+            put(both[self.words..], player, seen);
+        }
+        return seen;
+    }
+
+    /// The terrain's answer for one player, unkept: its column sent, and some section of its box
+    /// not hidden.
+    fn terrainAnswer(self: *const Tracking, world: u32, entry: Entry, player: usize) bool {
+        const visibility = (self.deps.streaming orelse return true).snapshotVisibility();
+        const column = entities_module.space.columnOf(world, entry.position);
+        const record = &self.deps.players.records[player];
+        return visibility.visible(player, record, world, column.x, column.z) and visibility.boundsVisible(player, record, world, blocksOf(entry));
+    }
+
+    /// The pass's row of the players asked whether the terrain lets them see an entity at this
+    /// footprint, then of those it does; null past room for footprints.
+    fn seenRow(self: *Tracking, world: u32, entry: Entry) ?[]u64 {
+        const column = entities_module.space.columnOf(world, entry.position);
+        return row: {
+            const footprint = footprintOf(entry);
+            const key: SeenKey = .{ .world = world, .x = column.x, .z = column.z, .footprint = footprint };
+            if (self.seen_footprints.get(key)) |at| break :row self.seen_rows[at * 2 * self.words ..][0 .. 2 * self.words];
+            if (self.seen_footprints.count() == shared_footprints) break :row null;
+            const at = self.seen_count;
+            self.seen_count += 1;
+            self.seen_footprints.putAssumeCapacity(key, @intCast(at));
+            const fresh = self.seen_rows[at * 2 * self.words ..][0 .. 2 * self.words];
+            @memset(fresh, 0);
+            break :row fresh;
+        };
     }
 
     // Work.
@@ -572,12 +734,39 @@ pub const Tracking = struct {
     /// The slot's entry in this tick's work, made if it has none; null once the work is full.
     fn workOf(self: *Tracking, slot: u32) !?[]u64 {
         const meta = self.metas.at(slot);
-        if (meta.work != none) return self.item(meta.work);
+        if (meta.work != none) {
+            const rows = self.item(meta.work);
+            const open = self.work_open.at(meta.work);
+            if (open.* == 0) {
+                // Spawns and removals still owed become answers again: each owed pair, and what
+                // it wants, for this pass to change.
+                for (0..self.words) |word| {
+                    const spawn = rows[word];
+                    const remove = rows[self.words + word];
+                    rows[word] = spawn | remove;
+                    rows[self.words + word] = spawn;
+                }
+                open.* = 1;
+                _ = try self.opened.append(meta.work);
+            }
+            return rows;
+        }
+        const rows = (try self.newWork(slot)) orelse return null;
+        self.work_open.at(meta.work).* = 1;
+        _ = try self.opened.append(meta.work);
+        return rows;
+    }
+
+    /// An entry of the work for a slot, holding nothing.
+    fn newWork(self: *Tracking, slot: u32) !?[]u64 {
+        const meta = self.metas.at(slot);
         if (self.work_slots.len == self.config.work) {
             self.work_overflowed = true;
             return null;
         }
         const index = try self.work_slots.append(slot);
+        _ = try self.work_trackers.append(meta.tracker);
+        _ = try self.work_open.append(0);
         try self.work_rows.ensureFilled((index + 1) * 2 * self.words, 0);
         meta.work = @intCast(index);
         const rows = self.item(meta.work);
@@ -588,28 +777,19 @@ pub const Tracking = struct {
     /// One player's answer for an entity, kept where it differs from what the client has.
     fn note(self: *Tracking, slot: u32, player: usize, wanted: bool) !void {
         const meta = self.metas.at(slot);
-        if (meta.work == none and has(self.knownWords(slot), player) == wanted) return;
+        if (meta.work == none) {
+            if (has(self.knownWords(slot), player) == wanted) return;
+        } else if (self.work_open.at(meta.work).* == 0) {
+            // Owed already as it wants: a spawn owed wants it, a removal owed does not, and
+            // with neither it wants what it has.
+            const rows = self.item(meta.work);
+            const owed = has(rows[0..self.words], player) or (has(self.knownWords(slot), player) and !has(rows[self.words..], player));
+            if (owed == wanted) return;
+        }
+        self.stats.changed += 1;
         const rows = (try self.workOf(slot)) orelse return;
         put(rows[0..self.words], player, true);
         put(rows[self.words..], player, wanted);
-    }
-
-    /// The entity checked against one player, as a player change asks.
-    fn checkFor(self: *Tracking, entry: Entry, world: u32, player: usize, hint: Hint) !void {
-        const tracker_index = self.tracker_of[entry.shape.kind];
-        if (tracker_index == no_tracker) return;
-        const tracker = &self.trackers[tracker_index];
-        // A swept one is where its sweep says, which the walks of sweeps ask about.
-        if (tracker.sweeps) |source| if (source.of(entry.slot) != null) return;
-        try self.adopt(entry, tracker_index);
-        const meta = self.metas.at(entry.slot);
-        if (meta.gone) return;
-        const exact = self.metas.at(entry.slot).range == 0;
-        try self.note(entry.slot, player, self.sees(entry.slot, entry, world, self.rangeOf(tracker, entry.slot), player, if (exact) hint else .test_each));
-    }
-
-    fn adopt(self: *Tracking, entry: Entry, tracker: u8) !void {
-        _ = try self.adoptSlot(entry.slot, entry.id, tracker);
     }
 
     /// What tracking keeps of the entity in a slot, made afresh for one it has not seen there.
@@ -619,16 +799,12 @@ pub const Tracking = struct {
         if (meta.tracker == tracker and meta.entity == entity) return meta;
         // A slot let go and taken by another entity: nobody has the new one yet.
         assert(!any(self.knownWords(slot)));
-        if (meta.work != none) @memset(self.item(meta.work), 0);
-        self.forgetData(meta);
+        if (meta.work != none) {
+            @memset(self.item(meta.work), 0);
+            self.work_trackers.at(meta.work).* = tracker;
+        }
         meta.* = .{ .tracker = tracker, .entity = entity, .looked = meta.looked, .work = meta.work };
         return meta;
-    }
-
-    /// What an entity said of itself goes with it.
-    fn forgetData(self: *Tracking, meta: *Meta) void {
-        if (meta.range > 0) self.groups[self.trackers[meta.tracker].group].own_ranges -= 1;
-        meta.range = 0;
     }
 
     // What entities say of themselves.
@@ -650,9 +826,7 @@ pub const Tracking = struct {
         const range: f64 = if (blocks) |value| @floatFromInt(value * self.config.range_percentage / 100) else 0;
         assert(range <= tracker.max_range);
         if (range == meta.range) return;
-        const group = &self.groups[tracker.group];
-        if (meta.range > 0) group.own_ranges -= 1;
-        if (range > 0) group.own_ranges += 1;
+        if (range > 0 and meta.range == 0) _ = try self.own_ranged.append(slot);
         meta.range = range;
         try self.relook(slot);
     }
@@ -695,117 +869,822 @@ pub const Tracking = struct {
         return true;
     }
 
-    /// The entity checked against every player who could see it and every one who has it, as
-    /// its own change asks; and how far it can now go before any answer could change.
-    fn checkAll(self: *Tracking, entry: Entry, world: u32) !void {
-        const tracker_index = self.tracker_of[entry.shape.kind];
-        if (tracker_index == no_tracker) return;
-        const tracker = &self.trackers[tracker_index];
-        try self.adopt(entry, tracker_index);
-        const meta = self.metas.at(entry.slot);
-        meta.gone = false;
-        const range = self.rangeOf(tracker, entry.slot);
-        const chunks: i32 = @intFromFloat(@ceil(tracker.max_range / 16) + 2);
-        // Players beyond the chunks asked about are at least this far from the entity, and
-        // their circles no wider than the widest.
-        var margin: f64 = @as(f64, @floatFromInt(chunks - 1)) * 16 - tracker.max_range;
-        // Far from every player: seen by none, until one comes that much nearer. The players near
-        // are not asked about, so that is all the margin says.
-        const away = self.awayFromPlayers(world, .{ entry.position[0], entry.position[2] }, .{ entry.position[0], entry.position[2] });
-        if (away > tracker.max_range) margin = away - tracker.max_range;
-        const column = entities_module.space.columnOf(world, entry.position);
-        const around = if (away <= tracker.max_range) self.playersNear(column, chunks) else self.candidates[0..0];
-        const seen = if (around.len > 0) self.seenFrom(column, entry, around) else self.zeros;
-        const wanted = self.scratch[0..self.words];
-        @memset(wanted, 0);
-        // The distance test eight players at a time.
+    // Tiles.
+
+    fn tileKey(world: u32, x: i32, z: i32) u128 {
+        const ux: u32 = @bitCast(x);
+        const uz: u32 = @bitCast(z);
+        return @as(u128, world) << 64 | @as(u128, ux) << 32 | uz;
+    }
+
+    fn tileHash(key: u128) u64 {
+        const low: u64 = @truncate(key);
+        const high: u64 = @truncate(key >> 64);
+        const mixed = low *% 0x9e3779b97f4a7c15 ^ high *% 0xc2b2ae3d27d4eb4f;
+        return mixed ^ (mixed >> 29);
+    }
+
+    fn tileBucketOf(self: *const Tracking, key: u128) usize {
+        const mask = self.tile_buckets.len - 1;
+        var at: usize = @as(usize, @truncate(tileHash(key))) & mask;
+        while (true) : (at = (at + 1) & mask) {
+            const bucket = self.tile_buckets.at(at);
+            if (bucket.at == none or bucket.key == key) return at;
+        }
+    }
+
+    fn findTile(self: *const Tracking, world: u32, x: i32, z: i32) ?u32 {
+        const key = tileKey(world, x, z);
+        // Most asked again at once, as the columns of a box or a player's walk share tiles.
+        if (self.last_tile != none and self.last_tile_key == key) return self.last_tile;
+        const bucket = self.tile_buckets.at(self.tileBucketOf(key));
+        if (bucket.at == none) return null;
+        const held = @constCast(self);
+        held.last_tile = bucket.at;
+        held.last_tile_key = key;
+        return bucket.at;
+    }
+
+    /// The tile of a column, made with every player's answers if it had none.
+    fn tileOf(self: *Tracking, world: u32, column_x: i32, column_z: i32) !u32 {
+        const x = column_x >> 3;
+        const z = column_z >> 3;
+        if (self.findTile(world, x, z)) |found| return found;
+        // A power of two, so no tile straddles a page.
+        if (self.tile_stride == 0) self.tile_stride = try std.math.ceilPowerOfTwo(usize, tile_columns * self.group_count * 2 * self.words);
+        if (self.tiles.count == self.config.tiles) try self.dropEmptyTiles();
+        if (self.tiles.count == self.config.tiles) return error.TrackingTilesExhausted;
+        self.tile_generation +%= 1;
+        if (self.tile_generation == 0) self.tile_generation = 1;
+        const index = try self.tiles.add(.{ .world = world, .x = x, .z = z, .generation = self.tile_generation });
+        errdefer self.tiles.remove(index);
+        try self.tile_masks.ensureFilled((@as(usize, index) + 1) * self.tile_stride, 0);
+        @memset(self.tileMasks(index), 0);
+        self.tile_buckets.at(self.tileBucketOf(tileKey(world, x, z))).* = .{ .key = tileKey(world, x, z), .at = index };
+        self.stats.tiles_made += 1;
+        for (0..self.deps.players.records.len) |player| {
+            if (!self.anchored[player] or self.anchor_world[player] != world) continue;
+            self.answerTile(index, player, self.anchor_x[player], self.anchor_z[player], self.anchor_reach[player]);
+        }
+        return index;
+    }
+
+    fn tileMasks(self: *const Tracking, tile: u32) []u64 {
+        const start = @as(usize, tile) * self.tile_stride;
+        return self.tile_masks.run(start, start + self.tile_stride).?;
+    }
+
+    /// A column's yes row and edge row of one range.
+    fn masksOf(self: *const Tracking, tile: u32, column: usize, group: usize) struct { yes: []u64, edge: []u64 } {
+        const start = @as(usize, tile) * self.tile_stride + (column * self.group_count + group) * 2 * self.words;
+        const both = self.tile_masks.run(start, start + 2 * self.words).?;
+        return .{ .yes = both[0..self.words], .edge = both[self.words..] };
+    }
+
+    fn classOf(self: *const Tracking, tile: u32, column: usize, group: usize, player: usize) Class {
+        const masks = self.masksOf(tile, column, group);
+        if (has(masks.yes, player)) return .yes;
+        if (has(masks.edge, player)) return .edge;
+        return .no;
+    }
+
+    fn setClass(self: *const Tracking, tile: u32, column: usize, group: usize, player: usize, class: Class) void {
+        const masks = self.masksOf(tile, column, group);
+        put(masks.yes, player, class == .yes);
+        put(masks.edge, player, class == .edge);
+    }
+
+    /// How a square stands against a player at an anchor with a reach, wherever within its slack
+    /// the player goes.
+    fn classify(x: f64, z: f64, reach: f64, low_x: f64, low_z: f64, side: f64) Class {
+        const near_x = @max(0, @max(low_x - x, x - (low_x + side)));
+        const near_z = @max(0, @max(low_z - z, z - (low_z + side)));
+        const far_x = @max(@abs(x - low_x), @abs(x - (low_x + side)));
+        const far_z = @max(@abs(z - low_z), @abs(z - (low_z + side)));
+        const outer = reach + slack;
+        if (near_x * near_x + near_z * near_z > outer * outer) return .no;
+        const inner = reach - slack;
+        if (inner >= 0 and far_x * far_x + far_z * far_z <= inner * inner) return .yes;
+        return .edge;
+    }
+
+    /// One range's reach for a player.
+    fn reachOf(self: *const Tracking, group: usize, reach: f64) f64 {
+        return @min(self.groups[group].range, reach);
+    }
+
+    /// A player's answers for every column of a tile, from an anchor.
+    fn answerTile(self: *Tracking, tile: u32, player: usize, x: f64, z: f64, reach: f64) void {
+        const held = self.tiles.at(tile);
+        const low_x: f64 = @floatFromInt(held.x * tile_side * 16);
+        const low_z: f64 = @floatFromInt(held.z * tile_side * 16);
+        for (0..self.group_count) |group| {
+            const group_reach = self.reachOf(group, reach);
+            const whole = classify(x, z, group_reach, low_x, low_z, tile_side * 16);
+            for (0..tile_columns) |column| {
+                const class = if (whole != .edge) whole else classify(x, z, group_reach, low_x + @as(f64, @floatFromInt(column % tile_side)) * 16, low_z + @as(f64, @floatFromInt(column / tile_side)) * 16, 16);
+                self.setClass(tile, column, group, player, class);
+            }
+        }
+    }
+
+    /// The space's index of a tile's column, if it is there still; the tile forgets it if not.
+    fn spaceIndex(self: *Tracking, tile: u32, column: usize) ?u32 {
+        const held = self.tiles.at(tile);
+        const space = &self.deps.entities.places.space;
+        const cached = held.index[column];
+        if (cached != none and cached < space.columns.values.len and space.data(cached).made == held.made[column]) return cached;
+        const at: Column = .{ .world = held.world, .x = held.x * tile_side + @as(i32, @intCast(column % tile_side)), .z = held.z * tile_side + @as(i32, @intCast(column / tile_side)) };
+        const index = space.indexOf(at) orelse {
+            held.index[column] = none;
+            return null;
+        };
+        held.index[column] = index;
+        held.made[column] = space.data(index).made;
+        return index;
+    }
+
+    /// A column holds tracked entities or boxes: newly so, it joins the edge lists of the players
+    /// at its edge.
+    fn occupy(self: *Tracking, tile: u32, column: usize) !void {
+        const held = self.tiles.at(tile);
+        const bit = @as(u64, 1) << @intCast(column);
+        if (held.occupied & bit != 0) return;
+        held.occupied |= bit;
+        for (0..self.group_count) |group| {
+            const edge = self.masksOf(tile, column, group).edge;
+            for (edge, 0..) |word, at| {
+                var bits = word;
+                while (bits != 0) : (bits &= bits - 1) _ = try self.edges[at * 64 + @ctz(bits)].append(.{ .tile = tile, .generation = held.generation, .column = @intCast(column), .group = @intCast(group) });
+            }
+        }
+    }
+
+    /// Tiles holding nothing tracked go, to make room.
+    fn dropEmptyTiles(self: *Tracking) !void {
+        for (0..self.tiles.values.len) |index| {
+            const tile: u32 = @intCast(index);
+            const held = self.tiles.at(tile);
+            if (held.generation == 0) continue;
+            var occupied = held.occupied;
+            while (occupied != 0) : (occupied &= occupied - 1) {
+                const column = @ctz(occupied);
+                if (self.spaceIndex(tile, column) == null) held.occupied &= ~(@as(u64, 1) << @intCast(column));
+            }
+            if (held.occupied != 0) continue;
+            self.unhashTile(tileKey(held.world, held.x, held.z));
+            self.tiles.remove(tile);
+            self.tiles.at(tile).generation = 0;
+        }
+    }
+
+    fn unhashTile(self: *Tracking, key: u128) void {
+        if (self.last_tile_key == key) self.last_tile = none;
+        const mask = self.tile_buckets.len - 1;
+        var hole = self.tileBucketOf(key);
+        var at = hole;
+        while (true) {
+            at = (at + 1) & mask;
+            const bucket = self.tile_buckets.at(at);
+            if (bucket.at == none) break;
+            const home = @as(usize, @truncate(tileHash(bucket.key))) & mask;
+            const stays = if (hole <= at) (home > hole and home <= at) else (home > hole or home <= at);
+            if (stays) continue;
+            self.tile_buckets.at(hole).* = bucket.*;
+            hole = at;
+        }
+        self.tile_buckets.at(hole).* = .{};
+    }
+
+    // Answers for one player.
+
+    /// An entity's answer for one player whose distance test is known: what it says of itself and
+    /// the terrain asked only where it is within reach.
+    fn consider(self: *Tracking, slot: u32, entry: Entry, world: u32, player: usize, within: bool) !void {
+        if (!within) {
+            self.stats.asked += 1;
+            if (slot < self.metas.len and (self.metas.at(slot).work != none or has(self.knownWords(slot), player))) try self.note(slot, player, false);
+            return;
+        }
+        const tracker = self.tracker_of[entry.shape.kind];
+        if (tracker == no_tracker) return;
+        const meta = try self.adoptSlot(slot, entry.id, tracker);
+        return self.considerAdopted(meta, slot, entry, world, player, within);
+    }
+
+    /// `consider`, for an entity whose tracking data is in hand.
+    fn considerAdopted(self: *Tracking, meta: *const Meta, slot: u32, entry: Entry, world: u32, player: usize, within: bool) !void {
+        self.stats.asked += 1;
+        if (!within) {
+            if (meta.work != none or has(self.knownWords(slot), player)) try self.note(slot, player, false);
+            return;
+        }
+        if (meta.gone) return;
+        const wanted = self.ready[player] and self.worlds[player] == world and self.admits(meta, slot, player) and self.terrainLets(world, entry, player);
+        try self.note(slot, player, wanted);
+    }
+
+    fn perPlayer(comptime T: type, allocator: std.mem.Allocator, count: usize, each: usize) ![][]T {
+        const lists = try allocator.alloc([]T, count);
+        for (lists) |*list| list.* = try allocator.alloc(T, each);
+        return lists;
+    }
+
+    /// Near entities eight at a time, each part side by side.
+    const near_lanes = 8;
+    const NearChunk = struct {
+        x: [near_lanes]f64,
+        z: [near_lanes]f64,
+        reach: [near_lanes]f64,
+        slot: [near_lanes]u32,
+        within: [near_lanes]u8,
+    };
+
+    /// How near its reach an edge entity must be, when a player last measured, to be measured each
+    /// time the player moves; the player measures everything again once it moved that far.
+    pub const near_band = 2.0;
+    /// Near entities and boxes a player keeps at most.
+    const near_max = 512;
+    const near_boxes_max = 64;
+
+    fn resetNear(self: *Tracking, player: usize) void {
+        self.near_count[player] = 0;
+        self.near_box_count[player] = 0;
+        self.near_full[player] = false;
+    }
+
+    /// An entity near a player's reach, measured each time it moves. One that moved is added
+    /// again; past twice what was gathered, they are gathered afresh.
+    fn addNear(self: *Tracking, player: usize, x: f64, z: f64, squared: f64, slot: u32, within: bool) !void {
+        if (self.near_full[player]) return;
+        const at = self.near_count[player];
+        if (at == near_max or at >= 2 * self.near_gathered[player] + 64) {
+            self.near_full[player] = true;
+            return;
+        }
+        const chunk = &self.near_chunks[player][at / near_lanes];
+        const lane = at % near_lanes;
+        chunk.x[lane] = x;
+        chunk.z[lane] = z;
+        chunk.reach[lane] = squared;
+        chunk.slot[lane] = slot;
+        chunk.within[lane] = @intFromBool(within);
+        self.near_count[player] = at + 1;
+    }
+
+    fn addNearBox(self: *Tracking, player: usize, slot: u32) !void {
+        if (self.near_full[player]) return;
+        const at = self.near_box_count[player];
+        if (at == near_boxes_max) {
+            self.near_full[player] = true;
+            return;
+        }
+        self.near_boxes[player][at] = slot;
+        self.near_box_count[player] = at + 1;
+    }
+
+    /// Whether an entity a player just answered at `squared` distance of a reach is near enough
+    /// the reach, as the player last measured, to be measured each time it moves.
+    fn nearReach(self: *const Tracking, player: usize, squared: f64, reach: f64) bool {
+        const dx = self.xs[player] - self.measure_x[player];
+        const dz = self.zs[player] - self.measure_z[player];
+        const band = near_band + @sqrt(dx * dx + dz * dz);
+        const inner = @max(0, reach - band);
+        const outer = reach + band;
+        return squared > inner * inner and squared < outer * outer;
+    }
+
+    /// A player's near entities measured where it is: those that went across their reach since
+    /// last measured are answered again, and the near boxes.
+    fn nearTest(self: *Tracking, player: usize) !void {
+        const space = &self.deps.entities.places.space;
+        const count = self.near_count[player];
+        self.stats.near_measured += count;
+        const V = @Vector(near_lanes, f64);
+        const px: V = @splat(self.xs[player]);
+        const pz: V = @splat(self.zs[player]);
+        for (self.near_chunks[player][0 .. (count + near_lanes - 1) / near_lanes], 0..) |*chunk, index| {
+            const width = @min(near_lanes, count - index * near_lanes);
+            const dx = @as(V, chunk.x) - px;
+            const dz = @as(V, chunk.z) - pz;
+            const within: u8 = @bitCast(dx * dx + dz * dz <= @as(V, chunk.reach));
+            const was: u8 = @bitCast(@as(@Vector(near_lanes, u8), chunk.within) != @as(@Vector(near_lanes, u8), @splat(0)));
+            var picked: u8 = (within ^ was) & @as(u8, @truncate((@as(u16, 1) << @intCast(width)) - 1));
+            while (picked != 0) : (picked &= picked - 1) {
+                const lane = @ctz(picked);
+                chunk.within[lane] = @intFromBool(within & (@as(u8, 1) << @intCast(lane)) != 0);
+                const slot = chunk.slot[lane];
+                // Where it is now, which a near entry made before it moved again may not say.
+                if (space.boxOf(slot)) |boxed| {
+                    try self.boxFor(space.box_of[slot], boxed, player);
+                    continue;
+                }
+                const placed = space.atSlot(slot) orelse continue;
+                // One with its own range is asked of every player each pass anyway.
+                if (slot < self.metas.len and self.metas.at(slot).range > 0) continue;
+                const ex = placed.entry.position[0] - self.xs[player];
+                const ez = placed.entry.position[2] - self.zs[player];
+                try self.consider(slot, placed.entry, placed.world, player, ex * ex + ez * ez <= chunk.reach[lane]);
+            }
+        }
+        for (self.near_boxes[player][0..self.near_box_count[player]]) |slot| {
+            const boxed = space.boxOf(slot) orelse continue;
+            try self.boxFor(space.box_of[slot], boxed, player);
+        }
+    }
+
+    /// The entities of one range in a column, for one player: every one measured from where it
+    /// stands now, or, with `from`, only those the move from there to here took across its reach.
+    /// With `collect`, those near its reach join its near entities.
+    fn columnFor(self: *Tracking, tile: u32, column: usize, group: usize, player: usize, from: ?[2]f64, collect: bool) !void {
+        const index = self.spaceIndex(tile, column) orelse {
+            self.tiles.at(tile).occupied &= ~(@as(u64, 1) << @intCast(column));
+            return;
+        };
+        self.stats.columns += 1;
+        const space = &self.deps.entities.places.space;
+        const world = self.tiles.at(tile).world;
+        const reach = self.reachOf(group, self.reaches[player]);
+        const squared = reach * reach;
+        const x = self.xs[player];
+        const z = self.zs[player];
         const lanes = 8;
         const V = @Vector(lanes, f64);
-        var start: usize = 0;
-        while (start < around.len) : (start += lanes) {
-            const count = @min(lanes, around.len - start);
-            var xs: [lanes]f64 = @splat(0);
-            var zs: [lanes]f64 = @splat(0);
-            var reaches: [lanes]f64 = @splat(-1);
-            for (0..count) |lane| {
-                const player = around[start + lane];
-                if (!self.ready[player] or self.worlds[player] != world) continue;
-                xs[lane] = self.xs[player];
-                zs[lane] = self.zs[player];
-                reaches[lane] = @min(range, self.reaches[player]);
-            }
-            const px: V = xs;
-            const pz: V = zs;
-            const reach: V = reaches;
-            const dx = px - @as(V, @splat(entry.position[0]));
-            const dz = pz - @as(V, @splat(entry.position[2]));
-            const squared = dx * dx + dz * dz;
-            // Compared squared, as vanilla does; the margin only needs the distance.
-            const within: [lanes]bool = squared <= reach * reach;
-            const distance: [lanes]f64 = @as(V, @sqrt(squared));
-            for (0..count) |lane| {
-                if (reaches[lane] < 0) continue;
-                margin = @min(margin, @abs(distance[lane] - reaches[lane]));
-                if (!within[lane]) continue;
-                const player = around[start + lane];
-                if (has(seen, player) and self.admits(meta, entry.slot, player)) put(wanted, player, true);
+        var runs = space.runsAt(index, self.groups[group].kinds);
+        while (runs.next()) |run| {
+            var at = run.first;
+            while (at != entities_module.space.none) {
+                const block = space.blockAt(at);
+                at = block.next;
+                self.stats.measured += block.count;
+                var start: usize = 0;
+                while (start < block.count) : (start += lanes) {
+                    // Rows past the count are measured and passed over.
+                    const bx: V = block.x[start..][0..lanes].*;
+                    const bz: V = block.z[start..][0..lanes].*;
+                    const dx = bx - @as(V, @splat(x));
+                    const dz = bz - @as(V, @splat(z));
+                    const now: @Vector(lanes, bool) = dx * dx + dz * dz <= @as(V, @splat(squared));
+                    var picked: u8 = if (from) |was| picked: {
+                        const ex = bx - @as(V, @splat(was[0]));
+                        const ez = bz - @as(V, @splat(was[1]));
+                        const then: @Vector(lanes, bool) = ex * ex + ez * ez <= @as(V, @splat(squared));
+                        break :picked @bitCast(now != then);
+                    } else 0xff;
+                    const live: u8 = if (block.count - start >= lanes) 0xff else @truncate((@as(u16, 1) << @intCast(block.count - start)) - 1);
+                    picked &= live;
+                    const within: u8 = @bitCast(now);
+                    if (collect) {
+                        const squares = dx * dx + dz * dz;
+                        const inner = @max(0, reach - near_band);
+                        const outer = reach + near_band;
+                        var close: u8 = @as(u8, @bitCast(squares > @as(V, @splat(inner * inner)))) & @as(u8, @bitCast(squares < @as(V, @splat(outer * outer))));
+                        close &= live;
+                        while (close != 0) : (close &= close - 1) {
+                            const lane = @ctz(close);
+                            const row = start + lane;
+                            try self.addNear(player, block.x[row], block.z[row], squared, block.slot[row], within & (@as(u8, 1) << @intCast(lane)) != 0);
+                        }
+                    }
+                    while (picked != 0) : (picked &= picked - 1) {
+                        const lane = @ctz(picked);
+                        const row: u32 = @intCast(start + lane);
+                        const entry: Entry = .{
+                            .id = block.id[row],
+                            .slot = block.slot[row],
+                            .section = entities_module.space.coordinate(block.y[row]),
+                            .entered = block.entered[row],
+                            .position = block.position(row),
+                            .shape = .{ .kind = run.kind, .half_width = block.half_width[row], .height = block.height[row] },
+                        };
+                        try self.consider(entry.slot, entry, world, player, within & (@as(u8, 1) << @intCast(lane)) != 0);
+                    }
+                }
             }
         }
-        meta.world = world;
-        meta.x = entry.position[0];
-        meta.z = entry.position[2];
-        meta.column = .{ column.x, column.z };
-        meta.footprint = footprintOf(entry);
-        meta.margin = margin;
-        meta.drift = self.changes.drift;
-        meta.epoch = self.changes.epoch;
-        try self.commit(entry.slot, wanted);
+        var boxes = space.boxesAt(index);
+        while (boxes.next()) |box| {
+            const boxed = space.boxAt(box);
+            if (!self.groups[group].kinds.has(boxed.kind)) continue;
+            if (collect) try self.addNearBox(player, boxed.slot);
+            try self.boxFor(box, boxed, player);
+        }
     }
 
-    /// Every player's answer for an entity, kept where it differs from what clients have: whoever
-    /// has it and is not wanted, and whoever is wanted and lacks it.
-    fn commit(self: *Tracking, slot: u32, wanted: []const u64) !void {
+    /// A box answered for one player, once a pass whatever columns it is met in.
+    fn boxFor(self: *Tracking, index: u32, boxed: *const Boxed, player: usize) !void {
+        try self.box_stamps.ensureFilled(@as(usize, index) + 1, 0);
+        const stamp = self.tick_count << 16 | player;
+        if (self.box_stamps.at(index).* == stamp) return;
+        self.box_stamps.at(index).* = stamp;
+        const tracker = self.tracker_of[boxed.kind];
+        if (tracker == no_tracker) return;
+        const meta = try self.adoptSlot(boxed.slot, self.deps.entities.directory.entry(boxed.slot).id, tracker);
+        if (meta.gone) return;
+        self.stats.boxes += 1;
+        const wanted = switch (self.boxAnswer(boxed.slot, boxed.world, boxed.feet, boxed.reach(), self.rangeOf(&self.trackers[tracker], boxed.slot), player)) {
+            .no => false,
+            .yes => true,
+            .unsure => wanted: {
+                try self.unsettle(boxed.slot);
+                const placed = try self.exactOf(tracker, boxed);
+                break :wanted self.sees(boxed.slot, placed.entry, placed.world, self.rangeOf(&self.trackers[tracker], boxed.slot), player);
+            },
+        };
+        try self.note(boxed.slot, player, wanted);
+    }
+
+    // Players.
+
+    /// The tiles a player's answers can be other than no in, around a point.
+    fn tileSpan(self: *const Tracking, x: f64, z: f64, reach: f64) [2][2]i32 {
+        var widest: f64 = 0;
+        for (self.groups[0..self.group_count]) |group| widest = @max(widest, @min(group.range, reach));
+        const out = widest + slack + 1;
+        return .{
+            .{ @as(i32, @intFromFloat(@floor((x - out) / 16))) >> 3, @as(i32, @intFromFloat(@floor((x + out) / 16))) >> 3 },
+            .{ @as(i32, @intFromFloat(@floor((z - out) / 16))) >> 3, @as(i32, @intFromFloat(@floor((z + out) / 16))) >> 3 },
+        };
+    }
+
+    /// A player anchored where it is: every column whose answer changes, and every edge column,
+    /// has its entities answered for the player again; its edge list is made afresh.
+    fn anchor(self: *Tracking, player: usize) !void {
+        self.stats.anchored += 1;
+        const was_anchored = self.anchored[player];
+        const old_world = self.anchor_world[player];
+        const old_x = self.anchor_x[player];
+        const old_z = self.anchor_z[player];
+        const old_reach = self.anchor_reach[player];
+        const world = self.worlds[player];
+        const x = self.xs[player];
+        const z = self.zs[player];
+        const reach = self.reaches[player];
+        // Its near entities brought up to where it is first, so each edge column measured from
+        // where it last measured answers for all of them; then gathered afresh.
+        if (was_anchored) try self.nearTest(player);
+        const from: [2]f64 = .{ self.measure_x[player], self.measure_z[player] };
+        self.resetNear(player);
+        defer self.near_gathered[player] = self.near_count[player];
+        self.measure_x[player] = x;
+        self.measure_z[player] = z;
+        self.anchored[player] = true;
+        self.anchor_world[player] = world;
+        self.anchor_x[player] = x;
+        self.anchor_z[player] = z;
+        self.anchor_reach[player] = reach;
+        self.edges[player].reset();
+        const now = self.tileSpan(x, z, reach);
+        var tx = now[0][0];
+        while (tx <= now[0][1]) : (tx += 1) {
+            var tz = now[1][0];
+            while (tz <= now[1][1]) : (tz += 1) {
+                const tile = self.findTile(world, tx, tz) orelse continue;
+                try self.reanswerTile(tile, player, was_anchored and old_world == world, old_x, old_z, old_reach, x, z, reach, from);
+            }
+        }
+        // Tiles around where it was and not around where it is: only answers going to no.
+        if (!was_anchored) return;
+        const then = self.tileSpan(old_x, old_z, old_reach);
+        tx = then[0][0];
+        while (tx <= then[0][1]) : (tx += 1) {
+            var tz = then[1][0];
+            while (tz <= then[1][1]) : (tz += 1) {
+                if (old_world == world and tx >= now[0][0] and tx <= now[0][1] and tz >= now[1][0] and tz <= now[1][1]) continue;
+                const tile = self.findTile(old_world, tx, tz) orelse continue;
+                try self.reanswerTile(tile, player, true, old_x, old_z, old_reach, x, z, reach, from);
+            }
+        }
+    }
+
+    /// A player's answers for a tile from a new anchor: columns whose answer changed, or that are
+    /// at its edge, have their entities answered again.
+    fn reanswerTile(self: *Tracking, tile: u32, player: usize, had: bool, old_x: f64, old_z: f64, old_reach: f64, x: f64, z: f64, reach: f64, from: [2]f64) !void {
+        const held = self.tiles.at(tile);
+        const in_world = self.ready[player] and held.world == self.worlds[player];
+        const low_x: f64 = @floatFromInt(held.x * tile_side * 16);
+        const low_z: f64 = @floatFromInt(held.z * tile_side * 16);
+        for (0..self.group_count) |group| {
+            const old_whole: Class = if (had) classify(old_x, old_z, self.reachOf(group, old_reach), low_x, low_z, tile_side * 16) else .no;
+            const new_whole: Class = if (in_world) classify(x, z, self.reachOf(group, reach), low_x, low_z, tile_side * 16) else .no;
+            if (old_whole == new_whole and old_whole != .edge) continue;
+            for (0..tile_columns) |column| {
+                const column_x = low_x + @as(f64, @floatFromInt(column % tile_side)) * 16;
+                const column_z = low_z + @as(f64, @floatFromInt(column / tile_side)) * 16;
+                const old: Class = if (old_whole != .edge) old_whole else classify(old_x, old_z, self.reachOf(group, old_reach), column_x, column_z, 16);
+                const new: Class = if (new_whole != .edge) new_whole else classify(x, z, self.reachOf(group, reach), column_x, column_z, 16);
+                if (old != new) self.setClass(tile, column, group, player, new);
+                if (self.tiles.at(tile).occupied & (@as(u64, 1) << @intCast(column)) == 0) continue;
+                if (old == new and new != .edge) continue;
+                if (new == .edge) _ = try self.edges[player].append(.{ .tile = tile, .generation = held.generation, .column = @intCast(column), .group = @intCast(group) });
+                // An edge column it was at the edge of before answers as last measured; any other
+                // is measured whole.
+                try self.columnFor(tile, column, group, player, if (old == .edge and new == .edge and reach == old_reach) from else null, new == .edge);
+            }
+        }
+    }
+
+    /// A player that moved within its slack: its near entities measured, or, once it went that
+    /// far from where it last measured, or its near entities did not fit, every entity of its
+    /// edge columns it went across the reach of, and its near entities gathered afresh.
+    fn slackMove(self: *Tracking, player: usize) !void {
+        self.stats.slack_moves += 1;
+        const mx = self.xs[player] - self.measure_x[player];
+        const mz = self.zs[player] - self.measure_z[player];
+        if (!self.near_full[player] and mx * mx + mz * mz < near_band * near_band) return self.nearTest(player);
+        try self.nearTest(player);
+        self.stats.edge_walks += 1;
+        const from: [2]f64 = .{ self.measure_x[player], self.measure_z[player] };
+        self.resetNear(player);
+        self.measure_x[player] = self.xs[player];
+        self.measure_z[player] = self.zs[player];
+        const list = &self.edges[player];
+        var at: usize = 0;
+        while (at < list.len) : (at += 1) {
+            const edge = list.at(at).*;
+            const held = self.tiles.at(edge.tile);
+            if (held.generation != edge.generation or held.occupied & (@as(u64, 1) << @intCast(edge.column)) == 0) continue;
+            if (self.classOf(edge.tile, edge.column, edge.group, player) != .edge) continue;
+            try self.columnFor(edge.tile, edge.column, edge.group, player, from, true);
+        }
+        self.near_gathered[player] = self.near_count[player];
+    }
+
+    /// A player's answers taken away: its bits cleared in every tile around its anchor.
+    fn unanchor(self: *Tracking, player: usize) void {
+        // What was owed it from before is owed no more: whatever it is owed now is asked anew.
+        for (0..self.work_slots.len) |index| {
+            const rows = self.item(@intCast(index));
+            put(rows[0..self.words], player, false);
+            put(rows[self.words..], player, false);
+        }
+        if (!self.anchored[player]) return;
+        self.anchored[player] = false;
+        self.edges[player].reset();
+        self.resetNear(player);
+        const span = self.tileSpan(self.anchor_x[player], self.anchor_z[player], self.anchor_reach[player]);
+        var tx = span[0][0];
+        while (tx <= span[0][1]) : (tx += 1) {
+            var tz = span[1][0];
+            while (tz <= span[1][1]) : (tz += 1) {
+                const tile = self.findTile(self.anchor_world[player], tx, tz) orelse continue;
+                for (0..tile_columns) |column| for (0..self.group_count) |group| self.setClass(tile, column, group, player, .no);
+            }
+        }
+    }
+
+    /// What a player was shown around where it was: forgotten, as its client forgot it; told gone,
+    /// as it stopped being ready; or asked about again, as its mode changed and it may have moved.
+    const Near = enum { forget, drop, recheck };
+
+    fn near(self: *Tracking, player: usize, was: PlayerChanges.Snapshot, mode: Near) !void {
+        const space = &self.deps.entities.places.space;
+        const span = self.tileSpan(was.x, was.z, was.reach);
+        var tx = span[0][0];
+        while (tx <= span[0][1]) : (tx += 1) {
+            var tz = span[1][0];
+            while (tz <= span[1][1]) : (tz += 1) {
+                const tile = self.findTile(was.world, tx, tz) orelse continue;
+                var occupied = self.tiles.at(tile).occupied;
+                while (occupied != 0) : (occupied &= occupied - 1) {
+                    const index = self.spaceIndex(tile, @ctz(occupied)) orelse continue;
+                    var walk = space.entriesAt(index, self.tracked);
+                    while (walk.next()) |entry| try self.nearPair(entry.slot, player, mode);
+                    var boxes = space.boxesAt(index);
+                    while (boxes.next()) |box| try self.nearPair(space.boxAt(box).slot, player, mode);
+                }
+            }
+        }
+        // And those it may have farther off: gone, offered last tick and not taken, moved since,
+        // or with ranges of their own.
+        for ([_]*Array(u32){ &self.gone, &self.retry, &self.own_ranged }) |list| {
+            var at: usize = 0;
+            while (at < list.len) : (at += 1) try self.nearPair(list.at(at).*, player, mode);
+        }
+        const log = space.logged();
+        var at: usize = 0;
+        while (at < log.len) : (at += 1) try self.nearPair(log.at(at).slot, player, mode);
+        if (space.log_overflowed) for (0..self.metas.len) |slot| try self.nearPair(@intCast(slot), player, mode);
+    }
+
+    fn nearPair(self: *Tracking, slot: u32, player: usize, mode: Near) !void {
+        if (mode == .recheck) return self.recheckPair(slot, player);
+        if (slot >= self.metas.len) return;
+        switch (mode) {
+            .forget => self.forgetPair(slot, player),
+            .drop => if (has(self.knownWords(slot), player)) try self.note(slot, player, false),
+            .recheck => try self.recheckPair(slot, player),
+        }
+    }
+
+    /// An entity answered for one player where it is now, every part of the rule asked.
+    fn recheckPair(self: *Tracking, slot: u32, player: usize) !void {
+        const space = &self.deps.entities.places.space;
+        if (space.boxOf(slot)) |boxed| return self.boxFor(space.box_of[slot], boxed, player);
+        const placed = space.atSlot(slot) orelse return;
+        const tracker = self.tracker_of[placed.entry.shape.kind];
+        if (tracker == no_tracker) return;
+        const reach = @min(self.rangeOf(&self.trackers[tracker], slot), self.reaches[player]);
+        const dx = self.xs[player] - placed.entry.position[0];
+        const dz = self.zs[player] - placed.entry.position[2];
+        try self.consider(slot, placed.entry, placed.world, player, self.ready[player] and self.worlds[player] == placed.world and dx * dx + dz * dz <= reach * reach);
+    }
+
+    fn forgetPair(self: *Tracking, slot: u32, player: usize) void {
+        put(self.knownWords(slot), player, false);
+        put(self.staleWords(slot), player, false);
+        self.release(slot);
+    }
+
+    /// An entity nobody knows any more lets its slot go; one that is gone is forgotten.
+    fn release(self: *Tracking, slot: u32) void {
+        if (any(self.knownWords(slot))) return;
         const meta = self.metas.at(slot);
-        const known_words = self.knownWords(slot);
-        var differs = meta.work != none;
-        for (known_words, wanted) |have, want| differs = differs or have != want;
-        if (!differs) return;
-        const rows = (try self.workOf(slot)) orelse return;
-        for (rows[0..self.words], rows[self.words..], known_words, wanted) |*mask, *answer, have, want| {
-            mask.* |= have | want;
-            answer.* = (answer.* & ~(have | want)) | want;
+        if (meta.tracker == no_tracker) return;
+        self.deps.entities.holdSlot(slot, false);
+        if (meta.gone) {
+            if (meta.work != none) self.work_trackers.at(meta.work).* = no_tracker;
+            meta.* = .{ .looked = meta.looked, .work = meta.work };
         }
     }
 
-    // Swept entities.
+    // Entities.
 
-    /// The swept entity in a slot of a tracker, if it is swept.
-    fn sweptIn(self: *const Tracking, slot: u32) ?struct { sweep: *const Sweep, tracker: u8 } {
+    /// Asks again about one entity by its slot, as it stands now; `fresh` when what it said of
+    /// itself or its last answer may be stale, so every player near is asked.
+    fn look(self: *Tracking, slot: u32, fresh: bool) !void {
         const directory = &self.deps.entities.directory;
-        if (slot >= directory.high()) return null;
-        const entry = directory.entry(slot);
-        if (entry.retired or entry.id == 0) return null;
-        const tracker = self.tracker_of[entry.kind];
-        if (tracker == no_tracker) return null;
-        const source = self.trackers[tracker].sweeps orelse return null;
-        return .{ .sweep = source.of(slot) orelse return null, .tracker = tracker };
+        if (slot >= directory.high()) return;
+        const space = &self.deps.entities.places.space;
+        if (space.boxOf(slot)) |boxed| return self.checkBox(slot, boxed);
+        if (space.atSlot(slot)) |placed| return self.checkPoint(placed.entry, placed.world, fresh);
+        // Gone from the space: whoever has it is told.
+        if (slot >= self.metas.len) return;
+        const meta = self.metas.at(slot);
+        if (meta.tracker == no_tracker) return;
+        meta.looked = self.tick_count;
+        meta.placed = false;
+        if (!any(self.knownWords(slot))) {
+            meta.gone = true;
+            self.release(slot);
+            return;
+        }
+        if (!meta.gone) {
+            meta.gone = true;
+            _ = try self.gone.append(slot);
+        }
+        try self.owe(slot);
     }
 
-    /// Where a swept entity is now, as its kind says, which must be in its sweep.
-    fn placeOf(self: *Tracking, tracker: u8, slot: u32, sweep: *const Sweep) !Placed {
-        const exact = self.trackers[tracker].exact.?;
-        const placed = try exact.place(exact.context, slot);
-        assert(placed.world == sweep.world and sweep.box.contains(placed.entry.position));
-        return placed;
+    /// An entity at a point, answered from its column's masks: when it stays in its column and
+    /// footprint, only players at the column's edge are measured; else every player the column is
+    /// not a no for is asked.
+    fn checkPoint(self: *Tracking, entry: Entry, world: u32, fresh: bool) !void {
+        const slot = entry.slot;
+        const tracker = self.tracker_of[entry.shape.kind];
+        if (tracker == no_tracker) return;
+        const meta = try self.adoptSlot(slot, entry.id, tracker);
+        meta.gone = false;
+        meta.looked = self.tick_count;
+        meta.settled_for = 0;
+        // One with its own range is asked of every player each pass.
+        if (meta.range > 0) return self.checkEveryone(entry, world);
+        const column = entities_module.space.columnOf(world, entry.position);
+        const footprint = footprintOf(entry);
+        const same_column = meta.placed and meta.world == world and meta.column[0] == column.x and meta.column[1] == column.z;
+        const same = !fresh and same_column and std.meta.eql(meta.footprint, footprint);
+        const kept = same_column and meta.tile != none and self.tiles.at(meta.tile).generation == meta.tile_generation;
+        meta.placed = true;
+        meta.world = world;
+        meta.column = .{ column.x, column.z };
+        meta.footprint = footprint;
+        const tile = if (kept) meta.tile else try self.tileOf(world, column.x, column.z);
+        meta.tile = tile;
+        meta.tile_generation = self.tiles.at(tile).generation;
+        const index: usize = @intCast((column.x & 7) + (column.z & 7) * tile_side);
+        try self.occupy(tile, index);
+        const masks = self.masksOf(tile, index, self.trackers[tracker].group);
+        const known_words = self.knownWords(slot);
+        // Those who have it and whom the column is a no for are told it is gone.
+        var quiet = true;
+        for (known_words, masks.yes, masks.edge, 0..) |have, yes, edge, word| {
+            var gone = have & ~(yes | edge);
+            if (gone != 0) quiet = false;
+            while (gone != 0) : (gone &= gone - 1) try self.note(slot, word * 64 + @ctz(gone), false);
+        }
+        // Players the column is a yes for are within reach wherever they are: moved within its
+        // column and footprint, the rest of their answer is the same as it was. Those at its edge
+        // are measured. Each is answered a word at a time.
+        const reach = self.trackers[tracker].range;
+        const asked = self.scratch[0..self.words];
+        const within = self.scratch[self.words..][0..self.words];
+        for (masks.yes, masks.edge, asked, within, 0..) |yes, edge, *ask, *in, word| {
+            ask.* = (if (same) 0 else yes) | edge;
+            in.* = if (same) 0 else yes;
+            var measured = edge;
+            while (measured != 0) : (measured &= measured - 1) {
+                const player = word * 64 + @ctz(measured);
+                const player_reach = @min(reach, self.reaches[player]);
+                const dx = self.xs[player] - entry.position[0];
+                const dz = self.zs[player] - entry.position[2];
+                const squared = dx * dx + dz * dz;
+                const close = squared <= player_reach * player_reach;
+                if (close) in.* |= @as(u64, 1) << @intCast(player % 64);
+                // Near its reach, it is measured as the player moves.
+                if (self.anchored[player] and self.nearReach(player, squared, player_reach)) try self.addNear(player, entry.position[0], entry.position[2], player_reach * player_reach, slot, close);
+            }
+        }
+        if (any(asked)) {
+            quiet = false;
+            try self.answerWords(meta, slot, entry, world, asked, within);
+        }
+        if (quiet) self.stats.logged_quiet += 1;
     }
 
-    /// One player's answer for an entity anywhere in a sweep: where its feet may be, and its box
+    /// An entity answered for the players asked, a word at a time: those within reach who the
+    /// terrain lets see it and it lets see it want it, the rest asked do not; only those whose
+    /// answer differs from what they have or are owed are noted.
+    fn answerWords(self: *Tracking, meta: *const Meta, slot: u32, entry: Entry, world: u32, asked: []const u64, within: []u64) !void {
+        self.stats.asked += popCount(asked);
+        // Who of those within reach the terrain lets see it, a footprint at once.
+        if (any(within) and !meta.gone) {
+            if (self.deps.streaming == null) {} else if (self.seenRow(world, entry)) |both| {
+                const checked = both[0..self.words];
+                const seen = both[self.words..];
+                for (within, checked, seen, 0..) |*in, *done, *sees_it, word| {
+                    var unknown = in.* & ~done.*;
+                    while (unknown != 0) : (unknown &= unknown - 1) {
+                        const player = word * 64 + @ctz(unknown);
+                        if (self.terrainAnswer(world, entry, player)) sees_it.* |= @as(u64, 1) << @intCast(player % 64);
+                    }
+                    done.* |= in.*;
+                    in.* &= sees_it.*;
+                }
+            } else for (within, 0..) |*in, word| {
+                var unknown = in.*;
+                while (unknown != 0) : (unknown &= unknown - 1) {
+                    const player = word * 64 + @ctz(unknown);
+                    if (!self.terrainAnswer(world, entry, player)) in.* &= ~(@as(u64, 1) << @intCast(player % 64));
+                }
+            }
+            // What it says of itself.
+            if (meta.owner != no_owner) put(within, meta.owner, false);
+            if (meta.spectators_only) for (within, 0..) |*in, player_word| {
+                in.* &= self.spectatingWord(player_word);
+            };
+            if (meta.restricted) for (within, self.allowedWords(slot)) |*in, allowed| {
+                in.* &= allowed;
+            };
+        } else @memset(within, 0);
+        const known_words = self.knownWords(slot);
+        const rows: ?[]u64 = if (meta.work != none) self.item(meta.work) else null;
+        const open = if (meta.work != none) self.work_open.at(meta.work).* != 0 else false;
+        for (asked, within, known_words, 0..) |ask, want, have, word| {
+            // What the client has or is owed now, as `note` reads it.
+            const current = if (rows) |both| (if (open) (both[self.words + word] & both[word]) | (have & ~both[word]) else both[word] | (have & ~both[self.words + word])) else have;
+            var differ = (want ^ current) & ask;
+            while (differ != 0) : (differ &= differ - 1) {
+                const bit = @ctz(differ);
+                try self.note(slot, word * 64 + bit, want & (@as(u64, 1) << @intCast(bit)) != 0);
+            }
+        }
+    }
+
+    fn popCount(words: []const u64) u64 {
+        var total: u64 = 0;
+        for (words) |word| total += @popCount(word);
+        return total;
+    }
+
+    /// A word of the players in spectator mode.
+    fn spectatingWord(self: *const Tracking, word: usize) u64 {
+        var bits: u64 = 0;
+        const first = word * 64;
+        for (self.spectating[first..@min(first + 64, self.spectating.len)], 0..) |spectator, at| {
+            if (spectator) bits |= @as(u64, 1) << @intCast(at);
+        }
+        return bits;
+    }
+
+    /// An entity asked of every player in its world, by its own range.
+    fn checkEveryone(self: *Tracking, entry: Entry, world: u32) !void {
+        const range = self.rangeOf(&self.trackers[self.tracker_of[entry.shape.kind]], entry.slot);
+        for (0..self.deps.players.records.len) |player| {
+            const reach = @min(range, self.reaches[player]);
+            const dx = self.xs[player] - entry.position[0];
+            const dz = self.zs[player] - entry.position[2];
+            try self.consider(entry.slot, entry, world, player, self.ready[player] and self.worlds[player] == world and dx * dx + dz * dz <= reach * reach);
+        }
+    }
+
+    // Boxes.
+
+    /// One player's answer for an entity anywhere in a box: where its feet may be, and its box
     /// anywhere along.
-    fn boxAnswer(self: *const Tracking, slot: u32, world: u32, feet: SweptBox, reach_box: SweptBox, range: f64, player: usize) Answer {
+    fn boxAnswer(self: *const Tracking, slot: u32, world: u32, feet: Feet, reach_box: Feet, range: f64, player: usize) Answer {
         if (!self.ready[player] or self.worlds[player] != world) return .no;
         const meta = self.metas.at(slot);
-        if (meta.owner == player or (meta.spectators_only and !self.spectating[player])) return .no;
-        if (meta.restricted and !has(self.allowedWords(slot), player)) return .no;
+        if (!self.admits(meta, slot, player)) return .no;
         var answer: Answer = switch (distanceAnswer(feet, self.xs[player], self.zs[player], @min(range, self.reaches[player]))) {
             .no => return .no,
             else => |value| value,
@@ -853,7 +1732,7 @@ pub const Tracking = struct {
     }
 
     /// The distance test for feet anywhere in a box: all of it within reach, none, or some.
-    fn distanceAnswer(feet: SweptBox, x: f64, z: f64, reach: f64) Answer {
+    fn distanceAnswer(feet: Feet, x: f64, z: f64, reach: f64) Answer {
         const near_x = @max(0, @max(feet.low[0] - x, x - feet.high[0]));
         const near_z = @max(0, @max(feet.low[2] - z, z - feet.high[2]));
         const far_x = @max(@abs(x - feet.low[0]), @abs(x - feet.high[0]));
@@ -864,47 +1743,86 @@ pub const Tracking = struct {
         return .unsure;
     }
 
-    /// A swept entity checked against every player who could see it anywhere in its sweep and
-    /// every one who has it.
-    fn checkSwept(self: *Tracking, slot: u32, sweep: *const Sweep, tracker_index: u8) !void {
-        const meta = try self.adoptSlot(slot, self.deps.entities.directory.entry(slot).id, tracker_index);
-        meta.gone = false;
-        meta.margin = -1;
-        meta.looked = self.tick_count;
-        // Answered for this very box this tick already, as players stood before it; what they did
-        // since the walks of sweeps ask about.
-        if (meta.settled_for == self.tick_count and meta.work == none and std.meta.eql(meta.settled_box, sweep.box)) return;
-        const wanted = self.scratch[0..self.words];
-        @memset(wanted, 0);
-        _ = try self.sweepAnswers(slot, sweep.world, sweep.box, sweep.reach(), tracker_index, sweep, wanted);
-        try self.commit(slot, wanted);
+    /// Where a boxed entity is now, as its kind says, which must be in its box.
+    fn exactOf(self: *Tracking, tracker: u8, boxed: *const Boxed) !Placed {
+        self.stats.exact += 1;
+        const exact = self.trackers[tracker].exact orelse return error.BoxWithoutExactPlace;
+        const placed = try exact.place(exact.context, boxed.slot);
+        assert(placed.world == boxed.world and boxed.feet.contains(placed.entry.position));
+        return placed;
     }
 
-    /// Every player's answer for an entity anywhere in a box into `wanted`; the kind is asked where
-    /// it is for those unsure, when `sweep` says it is swept there, and it is asked again next
-    /// tick. Returns whether some answer was unsure.
-    fn sweepAnswers(self: *Tracking, slot: u32, world: u32, feet: SweptBox, reach_box: SweptBox, tracker_index: u8, sweep: ?*const Sweep, wanted: []u64) !bool {
-        const tracker = &self.trackers[tracker_index];
-        const range = self.rangeOf(tracker, slot);
-        const middle: [2]f64 = .{ (feet.low[0] + feet.high[0]) / 2, (feet.low[2] + feet.high[2]) / 2 };
-        const half = @max(feet.high[0] - feet.low[0], feet.high[2] - feet.low[2]) / 2;
-        const chunks: i32 = @intFromFloat(@ceil((tracker.max_range + half) / 16) + 2);
+    /// The players a box can be other than a no for: those its columns are not a no for, of the
+    /// range of its kind. Their tiles are made.
+    fn boxCandidates(self: *Tracking, world: u32, reach_box: Feet, group: usize, candidates: []u64, edges: ?[]u64) !void {
+        var x = entities_module.space.coordinate(reach_box.low[0]);
+        while (x <= entities_module.space.coordinate(reach_box.high[0])) : (x += 1) {
+            var z = entities_module.space.coordinate(reach_box.low[2]);
+            while (z <= entities_module.space.coordinate(reach_box.high[2])) : (z += 1) {
+                const tile = try self.tileOf(world, x, z);
+                const index: usize = @intCast((x & 7) + (z & 7) * tile_side);
+                const masks = self.masksOf(tile, index, group);
+                for (candidates, masks.yes, masks.edge) |*word, yes, edge| word.* |= yes | edge;
+                if (edges) |row| for (row, masks.edge) |*word, edge| {
+                    word.* |= edge;
+                };
+            }
+        }
+    }
+
+    /// A boxed entity checked against every player who could see it anywhere in its box and every
+    /// one who has it.
+    fn checkBox(self: *Tracking, slot: u32, boxed: *const Boxed) !void {
+        const tracker = self.tracker_of[boxed.kind];
+        if (tracker == no_tracker) return;
+        const meta = try self.adoptSlot(slot, self.deps.entities.directory.entry(slot).id, tracker);
+        meta.gone = false;
+        meta.placed = false;
+        meta.looked = self.tick_count;
+        // The box's columns hold it, for the walks of players.
+        const reach_box = boxed.reach();
+        var x = entities_module.space.coordinate(reach_box.low[0]);
+        while (x <= entities_module.space.coordinate(reach_box.high[0])) : (x += 1) {
+            var z = entities_module.space.coordinate(reach_box.low[2]);
+            while (z <= entities_module.space.coordinate(reach_box.high[2])) : (z += 1) {
+                try self.occupy(try self.tileOf(boxed.world, x, z), @intCast((x & 7) + (z & 7) * tile_side));
+            }
+        }
+        // Answered for this very box this pass already, as players stood: what they did since
+        // their walks ask about.
+        if (meta.settled_for == self.tick_count and meta.settled_heard == self.heard_count and meta.work == none and std.meta.eql(meta.settled_box, boxed.feet)) return;
+        const candidates = self.scratch[0..self.words];
+        @memcpy(candidates, self.knownWords(slot));
+        const edges = self.scratch[2 * self.words ..][0..self.words];
+        @memset(edges, 0);
+        try self.boxCandidates(boxed.world, reach_box, self.trackers[tracker].group, candidates, edges);
+        // Players at the edge of its columns answer it as they move.
+        for (edges, 0..) |word, at| {
+            var bits = word;
+            while (bits != 0) : (bits &= bits - 1) {
+                const player = at * 64 + @ctz(bits);
+                if (self.anchored[player]) try self.addNearBox(player, slot);
+            }
+        }
         var exact: ?Placed = null;
-        var unsure = false;
-        if (self.awayFromPlayers(world, .{ feet.low[0], feet.low[2] }, .{ feet.high[0], feet.high[2] }) > tracker.max_range) return false;
-        var nearby = self.deps.players.nearby(world, .{ .x = middle[0], .y = feet.low[1], .z = middle[1] }, chunks);
-        while (nearby.next()) |player| switch (self.boxAnswer(slot, world, feet, reach_box, range, player)) {
-            .no => {},
-            .yes => put(wanted, player, true),
-            .unsure => {
-                unsure = true;
-                const swept = sweep orelse continue;
-                if (exact == null) exact = try self.placeOf(tracker_index, slot, swept);
-                if (self.sees(slot, exact.?.entry, exact.?.world, range, player, .test_each)) put(wanted, player, true);
-            },
-        };
-        if (unsure and sweep != null) try self.unsettle(slot);
-        return unsure;
+        const range = self.rangeOf(&self.trackers[tracker], slot);
+        for (candidates, 0..) |word, at| {
+            var bits = word;
+            while (bits != 0) : (bits &= bits - 1) {
+                const player = at * 64 + @ctz(bits);
+                self.stats.boxes += 1;
+                const wanted = switch (self.boxAnswer(slot, boxed.world, boxed.feet, reach_box, range, player)) {
+                    .no => false,
+                    .yes => true,
+                    .unsure => wanted: {
+                        try self.unsettle(slot);
+                        if (exact == null) exact = try self.exactOf(tracker, boxed);
+                        break :wanted self.sees(slot, exact.?.entry, exact.?.world, range, player);
+                    },
+                };
+                try self.note(slot, player, wanted);
+            }
+        }
     }
 
     fn unsettle(self: *Tracking, slot: u32) !void {
@@ -914,572 +1832,49 @@ pub const Tracking = struct {
         _ = try self.unsettled.append(slot);
     }
 
-    /// A swept entity checked against one player, as a player change asks.
-    fn checkSweptFor(self: *Tracking, slot: u32, sweep: *const Sweep, tracker_index: u8, player: usize) !void {
-        const meta = try self.adoptSlot(slot, self.deps.entities.directory.entry(slot).id, tracker_index);
-        if (meta.gone) return;
-        const tracker = &self.trackers[tracker_index];
-        const range = self.rangeOf(tracker, slot);
-        const wanted = switch (self.boxAnswer(slot, sweep.world, sweep.box, sweep.reach(), range, player)) {
-            .no => false,
-            .yes => true,
-            .unsure => wanted: {
-                try self.unsettle(slot);
-                const placed = try self.placeOf(tracker_index, slot, sweep);
-                break :wanted self.sees(slot, placed.entry, placed.world, range, player, .test_each);
-            },
-        };
-        try self.note(slot, player, wanted);
-    }
-
     /// Whether an entity anywhere in a box, until its kind places it again, is seen by every
     /// player as clients have it now: none unsure, none to spawn or remove. What a kind asks before
-    /// sweeping one.
-    pub fn settled(self: *Tracking, slot: u32, world: u32, feet: SweptBox, half_width: f32, height: f32) !bool {
-        // Far from every player, it is settled where no one has it.
-        if (slot < self.metas.len) {
-            const meta = self.metas.at(slot);
-            const entry = self.deps.entities.directory.entry(slot);
-            if (meta.entity == entry.id and meta.tracker == self.tracker_of[entry.kind] and meta.work == none and
-                self.awayFromPlayers(world, .{ feet.low[0], feet.low[2] }, .{ feet.high[0], feet.high[2] }) > self.trackers[meta.tracker].max_range)
-            {
-                if (any(self.knownWords(slot))) return false;
-                meta.settled_for = self.tick_count + 1;
-                meta.settled_box = feet;
-                return true;
-            }
-        }
+    /// boxing one.
+    pub fn settled(self: *Tracking, slot: u32, world: u32, feet: Feet, half_width: f32, height: f32) !bool {
         const meta = try self.subject(slot);
         if (meta.work != none) return false;
-        const reach_box: SweptBox = .{
+        const tracker = meta.tracker;
+        const reach_box: Feet = .{
             .low = .{ feet.low[0] - half_width, feet.low[1], feet.low[2] - half_width },
             .high = .{ feet.high[0] + half_width, feet.high[1] + height, feet.high[2] + half_width },
         };
-        const wanted = self.scratch[self.words..][0..self.words];
-        @memset(wanted, 0);
-        if (try self.sweepAnswers(slot, world, feet, reach_box, meta.tracker, null, wanted)) return false;
-        if (!std.mem.eql(u64, wanted, self.knownWords(slot))) return false;
-        // Before the tracking tick, which counts on.
+        const known_words = self.knownWords(slot);
+        if (self.bounds_stale) self.gatherBounds();
+        // Far from every player, it is settled where no one has it.
+        if (self.awayFromPlayers(world, .{ feet.low[0], feet.low[2] }, .{ feet.high[0], feet.high[2] }) > self.trackers[tracker].max_range + slack) {
+            if (any(known_words)) return false;
+        } else {
+            const candidates = self.scratch[self.words..][0..self.words];
+            @memcpy(candidates, known_words);
+            try self.boxCandidates(world, reach_box, self.trackers[tracker].group, candidates, null);
+            const range = self.rangeOf(&self.trackers[tracker], slot);
+            for (candidates, 0..) |word, at| {
+                var bits = word;
+                while (bits != 0) : (bits &= bits - 1) {
+                    const player = at * 64 + @ctz(bits);
+                    const wanted = switch (self.boxAnswer(slot, world, feet, reach_box, range, player)) {
+                        .unsure => return false,
+                        .yes => true,
+                        .no => false,
+                    };
+                    if (wanted != has(known_words, player)) return false;
+                }
+            }
+        }
+        // Before the tracking pass, which counts on.
         meta.settled_for = self.tick_count + 1;
+        meta.settled_heard = self.heard_count;
         meta.settled_box = feet;
         return true;
     }
 
-    /// The players near a column this tick, out to `chunks` of it: asked once for every entity of
-    /// the column.
-    fn playersNear(self: *Tracking, column: Column, chunks: i32) []const u16 {
-        const key: NearKey = .{ .world = column.world, .x = column.x, .z = column.z, .chunks = chunks };
-        if (self.near_columns.get(key)) |run| return self.near_players[run.start..][0..run.count];
-        var count: usize = 0;
-        var nearby = self.deps.players.nearby(column.world, .{ .x = @as(f64, @floatFromInt(column.x)) * 16 + 8, .y = 0, .z = @as(f64, @floatFromInt(column.z)) * 16 + 8 }, chunks);
-        while (nearby.next()) |player| {
-            self.candidates[count] = @intCast(player);
-            count += 1;
-        }
-        if (self.near_columns.count() == shared_columns or self.near_count + count > self.near_players.len) return self.candidates[0..count];
-        const start = self.near_count;
-        @memcpy(self.near_players[start..][0..count], self.candidates[0..count]);
-        self.near_count += count;
-        self.near_columns.putAssumeCapacity(key, .{ .start = @intCast(start), .count = @intCast(count) });
-        return self.near_players[start..][0..count];
-    }
-
-    /// Who of the players near a column the terrain lets see an entity there: in its world and
-    /// ready, sent its column, and some section of its box not hidden from them. The same for
-    /// every entity of the column whose box is in the same sections.
-    fn seenFrom(self: *Tracking, column: Column, entry: Entry, around: []const u16) []const u64 {
-        const footprint = footprintOf(entry);
-        const key: SeenKey = .{ .world = column.world, .x = column.x, .z = column.z, .footprint = footprint };
-        if (self.seen_footprints.get(key)) |at| return self.seen_rows[at * self.words ..][0..self.words];
-        const shared = self.seen_footprints.count() < shared_columns;
-        const row = if (shared) self.seen_rows[self.seen_count * self.words ..][0..self.words] else self.scratch[2 * self.words ..][0..self.words];
-        @memset(row, 0);
-        const visibility = if (self.deps.streaming) |streaming| streaming.snapshotVisibility() else null;
-        const blocks = blocksOf(entry);
-        for (around) |player| {
-            if (!self.ready[player] or self.worlds[player] != column.world) continue;
-            if (visibility) |view| {
-                const record = &self.deps.players.records[player];
-                if (!view.visible(player, record, column.world, column.x, column.z) or !view.boundsVisible(player, record, column.world, blocks)) continue;
-            }
-            put(row, player, true);
-        }
-        if (shared) {
-            self.seen_footprints.putAssumeCapacity(key, @intCast(self.seen_count));
-            self.seen_count += 1;
-        }
-        return row;
-    }
-
-    /// What an entity says of itself lets a player see it.
-    fn admits(self: *const Tracking, meta: *const Meta, slot: u32, player: usize) bool {
-        if (meta.owner == player or (meta.spectators_only and !self.spectating[player])) return false;
-        return !meta.restricted or has(self.allowedWords(slot), player);
-    }
-
-    /// Whether an entity that moved can still give every player the answer it gave.
-    fn unchanged(self: *const Tracking, meta: *const Meta, entry: Entry, world: u32) bool {
-        if (meta.margin < 0 or meta.epoch != self.changes.epoch or meta.world != world) return false;
-        const column = entities_module.space.columnOf(world, entry.position);
-        if (column.x != meta.column[0] or column.z != meta.column[1] or !std.meta.eql(footprintOf(entry), meta.footprint)) return false;
-        const dx = entry.position[0] - meta.x;
-        const dz = entry.position[2] - meta.z;
-        const left = meta.margin - (self.changes.drift - meta.drift);
-        return dx * dx + dz * dz < left * left and left > 0;
-    }
-
-    // Columns.
-
-    /// The columns of a world within `reach` of a point, and how each stands against the circle.
-    const Circle = struct {
-        world: u32,
-        x: f64,
-        z: f64,
-        reach: f64,
-
-        fn contains(self: Circle, position: [3]f64) bool {
-            const dx = self.x - position[0];
-            const dz = self.z - position[2];
-            return dx * dx + dz * dz <= self.reach * self.reach;
-        }
-
-        fn hint(self: Circle, column: Column) Hint {
-            const low_x: f64 = @floatFromInt(column.x * 16);
-            const low_z: f64 = @floatFromInt(column.z * 16);
-            const near_x = @max(0, @max(low_x - self.x, self.x - (low_x + 16)));
-            const near_z = @max(0, @max(low_z - self.z, self.z - (low_z + 16)));
-            const far_x = @max(@abs(self.x - low_x), @abs(self.x - (low_x + 16)));
-            const far_z = @max(@abs(self.z - low_z), @abs(self.z - (low_z + 16)));
-            const squared = self.reach * self.reach;
-            if (near_x * near_x + near_z * near_z > squared) return .outside;
-            if (far_x * far_x + far_z * far_z <= squared) return .inside;
-            return .test_each;
-        }
-
-        /// The column rows the circle touches.
-        fn rows(self: Circle) [2]i32 {
-            return .{ @intFromFloat(@floor((self.z - self.reach) / 16)), @intFromFloat(@floor((self.z + self.reach) / 16)) };
-        }
-
-        /// In one column row, the columns the circle touches, and those wholly inside it.
-        fn span(self: Circle, row: i32) struct { touch: ?[2]i32, inside: ?[2]i32 } {
-            const low: f64 = @floatFromInt(row * 16);
-            const nearest = @max(0, @max(low - self.z, self.z - (low + 16)));
-            const far = @max(@abs(self.z - low), @abs(self.z - (low + 16)));
-            const squared = self.reach * self.reach;
-            if (nearest * nearest > squared) return .{ .touch = null, .inside = null };
-            const wide = @sqrt(squared - nearest * nearest);
-            const touch: [2]i32 = .{ @intFromFloat(@floor((self.x - wide) / 16)), @intFromFloat(@floor((self.x + wide) / 16)) };
-            if (far * far > squared) return .{ .touch = touch, .inside = null };
-            const narrow = @sqrt(squared - far * far);
-            const first: i32 = @intFromFloat(@ceil((self.x - narrow) / 16));
-            const last: i32 = @as(i32, @intFromFloat(@floor((self.x + narrow) / 16))) - 1;
-            return .{ .touch = touch, .inside = if (first <= last) .{ first, last } else null };
-        }
-    };
-
-    /// Every column where a player's answer can differ between two circles: those either touches,
-    /// but not those wholly inside both. `before` null asks for every column `after` touches.
-    fn eachBetween(self: *Tracking, before: ?Circle, after: Circle, player: usize, kinds: Kinds, exact: bool) !void {
-        if (self.source_count > 0) try self.sweptBetween(before, after, player, kinds);
-        // Players as subjects are few and listed: each is looked at, rather than the columns.
-        if (self.player_tracker != null and kinds.has(self.player_kind)) {
-            try self.playersBetween(before, after, player, exact);
-            var rest = kinds;
-            rest.bits.unset(self.player_kind);
-            if (rest.bits.count() == 0) return;
-            return self.columnsBetween(before, after, player, rest, exact);
-        }
-        return self.columnsBetween(before, after, player, kinds, exact);
-    }
-
-    /// An observer's answers for players as subjects hold while it and they moved less, together,
-    /// than the nearest of them was from its reach's edge when it last measured: only then is the
-    /// circle it measured from compared with where it is, and the nearest measured again.
-    fn playerRing(self: *Tracking, player: usize, snapshot: PlayerChanges.Snapshot, reach: f64) !void {
-        const anchor = self.player_anchor[player];
-        const walked = @sqrt((snapshot.x - anchor[0]) * (snapshot.x - anchor[0]) + (snapshot.z - anchor[1]) * (snapshot.z - anchor[1]));
-        const slack = self.player_slack[player];
-        if (slack >= 0 and walked + (self.changes.drift - self.player_drift[player]) < slack) return;
-        const after: Circle = .{ .world = snapshot.world, .x = snapshot.x, .z = snapshot.z, .reach = reach };
-        const before: ?Circle = if (slack >= 0) .{ .world = snapshot.world, .x = anchor[0], .z = anchor[1], .reach = reach } else null;
-        try self.playersBetween(before, after, player, true);
-        self.player_anchor[player] = .{ snapshot.x, snapshot.z };
-        self.player_drift[player] = self.changes.drift;
-        self.player_slack[player] = self.measurePlayers(player, after);
-    }
-
-    /// How far the nearest player as a subject is from the edge of a circle.
-    fn measurePlayers(self: *const Tracking, player: usize, circle: Circle) f64 {
-        var nearest = circle.reach;
-        for (self.player_slots, self.subject_x[0..self.player_slots.len], self.subject_z[0..self.player_slots.len], self.subject_world, 0..) |slot, x, z, world, index| {
-            if (slot == none or world != circle.world or index == player) continue;
-            const distance = @sqrt((x - circle.x) * (x - circle.x) + (z - circle.z) * (z - circle.z));
-            nearest = @min(nearest, @abs(distance - circle.reach));
-        }
-        return nearest;
-    }
-
-    /// A player newly a subject is as near some observer's edge as it is: their measures say so.
-    fn nearObservers(self: *Tracking, newcomer: usize) void {
-        const x = self.subject_x[newcomer];
-        const z = self.subject_z[newcomer];
-        const range = self.trackers[self.player_tracker.?].max_range;
-        for (self.player_slack, self.player_anchor, self.reaches, 0..) |*slack, anchor, reach, observer| {
-            if (slack.* < 0 or observer == newcomer) continue;
-            const distance = @sqrt((x - anchor[0]) * (x - anchor[0]) + (z - anchor[1]) * (z - anchor[1]));
-            slack.* = @min(slack.*, @abs(distance - @min(range, reach)) - (self.changes.drift - self.player_drift[observer]));
-            if (slack.* < 0) slack.* = 0;
-        }
-    }
-
-    /// Every player as a subject where an observer's answer can differ between two circles.
-    fn playersBetween(self: *Tracking, before: ?Circle, after: Circle, player: usize, exact: bool) !void {
-        // Eight at a time: those on one side of one circle and the other side of the other.
-        const lanes = 8;
-        const V = @Vector(lanes, f64);
-        const count = self.player_slots.len;
-        var start: usize = 0;
-        while (start < count) : (start += lanes) {
-            const width = @min(lanes, count - start);
-            var crossed: u8 = if (before == null or !exact) @truncate((@as(u16, 1) << @intCast(width)) - 1) else 0;
-            if (before) |then| if (exact) {
-                // Padded to whole vectors with no one there.
-                const x: V = self.subject_x[start..][0..lanes].*;
-                const z: V = self.subject_z[start..][0..lanes].*;
-                const ax = x - @as(V, @splat(after.x));
-                const az = z - @as(V, @splat(after.z));
-                const bx = x - @as(V, @splat(then.x));
-                const bz = z - @as(V, @splat(then.z));
-                const inside_after = ax * ax + az * az <= @as(V, @splat(after.reach * after.reach));
-                const inside_before = bx * bx + bz * bz <= @as(V, @splat(then.reach * then.reach));
-                crossed = @bitCast(inside_after != inside_before);
-                crossed &= @truncate((@as(u16, 1) << @intCast(width)) - 1);
-            };
-            while (crossed != 0) : (crossed &= crossed - 1) {
-                const index = start + @ctz(crossed);
-                const slot = self.player_slots[index];
-                if (slot == none or self.subject_world[index] != after.world) continue;
-                const placed = self.placedAt(slot) orelse continue;
-                try self.checkFor(placed.entry, placed.world, player, .test_each);
-            }
-        }
-    }
-
-    fn columnsBetween(self: *Tracking, before: ?Circle, after: Circle, player: usize, kinds: Kinds, exact: bool) !void {
-        const space = &self.deps.entities.places.space;
-        if (space.countOf(kinds) == 0) return;
-        // Walked along x, as the space keeps its columns: the circles with their axes swapped give,
-        // for each x, the run of z they touch.
-        const now_circle = swapped(after);
-        const then_circle = if (before) |circle| swapped(circle) else null;
-        const lines_after = now_circle.rows();
-        const lines_before = if (then_circle) |circle| circle.rows() else lines_after;
-        var x = @min(lines_after[0], lines_before[0]);
-        while (x <= @max(lines_after[1], lines_before[1])) : (x += 1) {
-            const now = now_circle.span(x);
-            const then = if (then_circle) |circle| circle.span(x) else @TypeOf(now){ .touch = null, .inside = null };
-            const first = if (now.touch) |a| (if (then.touch) |b| @min(a[0], b[0]) else a[0]) else (if (then.touch) |b| b[0] else continue);
-            const last = if (now.touch) |a| (if (then.touch) |b| @max(a[1], b[1]) else a[1]) else then.touch.?[1];
-            // Wholly inside both: the answer stands.
-            const both: ?[2]i32 = if (before == null) null else if (now.inside) |a| (if (then.inside) |b| .{ @max(a[0], b[0]), @min(a[1], b[1]) } else null) else null;
-            // Either side of what is wholly inside both, each found by one search.
-            const runs: [2][2]i32 = if (both) |range| .{ .{ first, range[0] - 1 }, .{ range[1] + 1, last } } else .{ .{ first, last }, .{ 1, 0 } };
-            for (runs) |run| {
-                var along = space.columnsAlong(after.world, x, run[0], run[1]);
-                while (along.next()) |found| try self.eachAt(found.column, found.index, player, kinds, after, before, exact);
-            }
-        }
-    }
-
-    /// The swept entities of some kinds where a player's answer can differ between two circles.
-    fn sweptBetween(self: *Tracking, before: ?Circle, after: Circle, player: usize, kinds: Kinds) !void {
-        var low: [2]f64 = .{ after.x - after.reach, after.z - after.reach };
-        var high: [2]f64 = .{ after.x + after.reach, after.z + after.reach };
-        if (before) |then| {
-            low = .{ @min(low[0], then.x - then.reach), @min(low[1], then.z - then.reach) };
-            high = .{ @max(high[0], then.x + then.reach), @max(high[1], then.z + then.reach) };
-        }
-        try self.eachSwept(after.world, low, high, struct {
-            owner: *Tracking,
-            before: ?Circle,
-            after: Circle,
-            player: usize,
-            kinds: Kinds,
-            fn visit(walk: @This(), sweep: *const Sweep) !void {
-                const owner = walk.owner;
-                const kind = owner.deps.entities.directory.entry(sweep.slot).kind;
-                if (!walk.kinds.has(kind)) return;
-                const tracker = owner.tracker_of[kind];
-                // With its type's range, the circles are its own: the same answer in both stands.
-                if (walk.before) |then| if (sweep.slot >= owner.metas.len or owner.metas.at(sweep.slot).range == 0) {
-                    const now = distanceAnswer(sweep.box, walk.after.x, walk.after.z, walk.after.reach);
-                    if (now != .unsure and now == distanceAnswer(sweep.box, then.x, then.z, then.reach)) return;
-                };
-                try owner.checkSweptFor(sweep.slot, sweep, tracker, walk.player);
-            }
-        }{ .owner = self, .before = before, .after = after, .player = player, .kinds = kinds });
-    }
-
-    /// Visits every swept entity whose box reaches into a horizontal box, of every kind's sweeps.
-    fn eachSwept(self: *Tracking, world: u32, low: [2]f64, high: [2]f64, context: anytype) !void {
-        for (self.sources[0..self.source_count]) |source| {
-            if (source.count == 0) continue;
-            const Walk = struct {
-                inner: @TypeOf(context),
-                source: *Sweeps,
-                failure: *?anyerror,
-                pub fn visit(walk: @This(), index: u32) bool {
-                    walk.inner.visit(walk.source.at(index)) catch |err| {
-                        walk.failure.* = err;
-                        return false;
-                    };
-                    return true;
-                }
-            };
-            var failure: ?anyerror = null;
-            _ = source.each(world, .{ .low = .{ low[0], 0, low[1] }, .high = .{ high[0], 0, high[1] } }, 0, Walk{ .inner = context, .source = source, .failure = &failure }, false);
-            if (failure) |err| return err;
-        }
-    }
-
-    fn swapped(circle: Circle) Circle {
-        return .{ .world = circle.world, .x = circle.z, .z = circle.x, .reach = circle.reach };
-    }
-
-    /// Every entity whose box is in a column, for one player: those placed in it, and those of
-    /// the columns around whose box reaches into it.
-    fn eachTouching(self: *Tracking, column: Column, player: usize) !void {
-        // Players as subjects whose box reaches into it, from the list, as they are not in the space.
-        if (self.player_tracker != null) for (self.player_slots, self.subject_world) |slot, world| {
-            if (slot == none or world != column.world) continue;
-            const placed = self.placedAt(slot) orelse continue;
-            const footprint = footprintOf(placed.entry);
-            if (column.x < footprint.low[0] or column.x > footprint.high[0] or column.z < footprint.low[2] or column.z > footprint.high[2]) continue;
-            try self.checkFor(placed.entry, placed.world, player, .test_each);
-        };
-        const low: [2]f64 = .{ @as(f64, @floatFromInt(column.x)) * 16, @as(f64, @floatFromInt(column.z)) * 16 };
-        try self.eachSwept(column.world, low, .{ low[0] + 16, low[1] + 16 }, struct {
-            owner: *Tracking,
-            player: usize,
-            fn visit(walk: @This(), sweep: *const Sweep) !void {
-                const owner = walk.owner;
-                try owner.checkSweptFor(sweep.slot, sweep, owner.tracker_of[owner.deps.entities.directory.entry(sweep.slot).kind], walk.player);
-            }
-        }{ .owner = self, .player = player });
-        try self.eachInColumn(column, player, self.tracked, null);
-        const space = &self.deps.entities.places.space;
-        var dz: i32 = -1;
-        while (dz <= 1) : (dz += 1) {
-            var dx: i32 = -1;
-            while (dx <= 1) : (dx += 1) {
-                if (dx == 0 and dz == 0) continue;
-                const around: Column = .{ .world = column.world, .x = column.x + dx, .z = column.z + dz };
-                if (space.indexOf(around) == null) continue;
-                var walk = space.entries(around, self.tracked);
-                while (walk.next()) |entry| {
-                    const footprint = footprintOf(entry);
-                    if (column.x < footprint.low[0] or column.x > footprint.high[0] or column.z < footprint.low[2] or column.z > footprint.high[2]) continue;
-                    try self.checkFor(entry, column.world, player, .test_each);
-                }
-            }
-        }
-    }
-
-    /// The entities of a column for one player whose circle went from `before` to `circle`: only
-    /// those on one side of one and the other side of the other can be answered differently, as
-    /// every other input has a change of its own to ask again by.
-    fn eachAt(self: *Tracking, column: Column, index: u32, player: usize, kinds: Kinds, circle: Circle, before: ?Circle, exact: bool) !void {
-        const hint = circle.hint(column);
-        const space = &self.deps.entities.places.space;
-        const Visit = struct {
-            owner: *Tracking,
-            world: u32,
-            player: usize,
-            hint: Hint,
-            fn each(visit: @This(), entry: Entry) !void {
-                try visit.owner.checkFor(entry, visit.world, visit.player, visit.hint);
-            }
-        };
-        const visit: Visit = .{ .owner = self, .world = column.world, .player = player, .hint = hint };
-        if (before) |then| if (exact) return space.eachCrossing(index, kinds, .{ circle.x, circle.z }, circle.reach, .{ then.x, then.z }, then.reach, visit, Visit.each);
-        var walk = space.entriesAt(index, kinds);
-        while (walk.next()) |entry| try visit.each(entry);
-    }
-
-    fn eachInColumn(self: *Tracking, column: Column, player: usize, kinds: Kinds, circle: ?Circle) !void {
-        const space = &self.deps.entities.places.space;
-        if (space.indexOf(column) == null) return;
-        const hint: Hint = if (circle) |value| value.hint(column) else .test_each;
-        var walk = space.entries(column, kinds);
-        while (walk.next()) |entry| try self.checkFor(entry, column.world, player, hint);
-    }
-
-    /// What to do with each entity near a player.
-    const Near = enum {
-        /// Its client forgot it: clear the player from it.
-        forget,
-        /// The player stopped being ready: tell it the entities it has are gone.
-        drop,
-        /// Ask about it again for the player.
-        recheck,
-    };
-
-    /// Every entity a player could know, from where it stood: those within its widest reach
-    /// and a little more, which is as far as any it was shown can have gone without being asked
-    /// about again; and, but for a recheck, those gone.
-    fn near(self: *Tracking, player: usize, was: PlayerChanges.Snapshot, mode: Near) !void {
-        var widest: f64 = 0;
-        for (self.trackers[0..self.tracker_count]) |tracker| widest = @max(widest, tracker.max_range);
-        const reach = @min(widest, was.reach) + 32;
-        const space = &self.deps.entities.places.space;
-        const low_x: i32 = @intFromFloat(@floor((was.x - reach) / 16));
-        const high_x: i32 = @intFromFloat(@floor((was.x + reach) / 16));
-        const low_z: i32 = @intFromFloat(@floor((was.z - reach) / 16));
-        const high_z: i32 = @intFromFloat(@floor((was.z + reach) / 16));
-        var x = low_x;
-        while (x <= high_x) : (x += 1) {
-            var along = space.columnsAlong(was.world, x, low_z, high_z);
-            while (along.next()) |found| {
-                var walk = space.entriesAt(found.index, self.tracked);
-                while (walk.next()) |entry| switch (mode) {
-                    .forget => if (entry.slot < self.metas.len) self.forgetPair(entry.slot, player),
-                    .drop => if (entry.slot < self.metas.len and has(self.knownWords(entry.slot), player)) try self.note(entry.slot, player, false),
-                    .recheck => try self.checkFor(entry, was.world, player, .test_each),
-                };
-            }
-        }
-        // And the swept ones there.
-        try self.eachSwept(was.world, .{ @as(f64, @floatFromInt(low_x)) * 16, @as(f64, @floatFromInt(low_z)) * 16 }, .{ @as(f64, @floatFromInt(high_x + 1)) * 16, @as(f64, @floatFromInt(high_z + 1)) * 16 }, struct {
-            owner: *Tracking,
-            player: usize,
-            mode: Near,
-            fn visit(walk: @This(), sweep: *const Sweep) !void {
-                const owner = walk.owner;
-                const slot = sweep.slot;
-                switch (walk.mode) {
-                    .forget => if (slot < owner.metas.len) owner.forgetPair(slot, walk.player),
-                    .drop => if (slot < owner.metas.len and has(owner.knownWords(slot), walk.player)) try owner.note(slot, walk.player, false),
-                    .recheck => try owner.checkSweptFor(slot, sweep, owner.tracker_of[owner.deps.entities.directory.entry(slot).kind], walk.player),
-                }
-            }
-        }{ .owner = self, .player = player, .mode = mode });
-        // And players as subjects there, from the list.
-        if (self.player_tracker != null) for (self.player_slots, self.subject_at, self.subject_world) |slot, at, world| {
-            if (slot == none or world != was.world or slot >= self.metas.len) continue;
-            if (at[0] < was.x - reach or at[0] > was.x + reach or at[2] < was.z - reach or at[2] > was.z + reach) continue;
-            switch (mode) {
-                .forget => self.forgetPair(slot, player),
-                .drop => if (has(self.knownWords(slot), player)) try self.note(slot, player, false),
-                .recheck => if (self.placedAt(slot)) |placed| try self.checkFor(placed.entry, placed.world, player, .test_each),
-            }
-        };
-        if (mode != .forget) return;
-        // And those it may have farther off: gone, offered last tick and not taken, or moved
-        // since.
-        var at: usize = 0;
-        while (at < self.gone.len) : (at += 1) self.forgetPair(self.gone.at(at).*, player);
-        at = 0;
-        while (at < self.retry.len) : (at += 1) if (self.retry.at(at).* < self.metas.len) self.forgetPair(self.retry.at(at).*, player);
-        const log = space.logged();
-        at = 0;
-        while (at < log.len) : (at += 1) if (log.at(at).slot < self.metas.len) self.forgetPair(log.at(at).slot, player);
-        if (space.log_overflowed) for (0..self.metas.len) |slot| self.forgetPair(@intCast(slot), player);
-    }
-
-    fn forget(self: *Tracking, player: usize, was: PlayerChanges.Snapshot) !void {
-        return self.near(player, was, .forget);
-    }
-
-    fn forgetPair(self: *Tracking, slot: u32, player: usize) void {
-        put(self.knownWords(slot), player, false);
-        put(self.staleWords(slot), player, false);
-        self.release(slot);
-    }
-
-    /// An entity nobody knows any more lets its slot go; one that is gone is forgotten.
-    fn release(self: *Tracking, slot: u32) void {
-        if (any(self.knownWords(slot))) return;
-        const meta = self.metas.at(slot);
-        if (meta.tracker == no_tracker) return;
-        self.deps.entities.holdSlot(slot, false);
-        if (meta.gone) {
-            self.forgetData(meta);
-            meta.* = .{};
-        }
-    }
-
-    // The tick.
-
-    /// Works out every change of audience since the last tick. Run after entities moved and
-    /// players were heard, before kinds send.
-    pub fn tick(self: *Tracking) !void {
-        return self.pass(true);
-    }
-
-    /// The second pass of a tick, once entities ticked: what they did, answered against the
-    /// players as the first pass heard them, as vanilla moves its trackers by players once a tick.
-    pub fn tickEntities(self: *Tracking) !void {
-        return self.pass(false);
-    }
-
-    fn pass(self: *Tracking, heard: bool) !void {
-        self.tick_count += 1;
-        try self.carryOver();
-        const players = self.deps.players;
-        if (heard) {
-            self.changes.update(players);
-            for (players.records, 0..) |_, index| {
-                const snapshot = self.changes.snapshots[index];
-                self.ready[index] = snapshot.ready;
-                self.xs[index] = snapshot.x;
-                self.zs[index] = snapshot.z;
-                self.reaches[index] = snapshot.reach;
-                self.worlds[index] = snapshot.world;
-                self.spectating[index] = snapshot.spectator;
-            }
-            self.gatherBounds();
-        } else self.changes.clearLists();
-        // Cleared only when used: clearing wipes the whole table.
-        if (self.near_columns.count() > 0) self.near_columns.clearRetainingCapacity();
-        self.near_count = 0;
-        if (self.seen_footprints.count() > 0) self.seen_footprints.clearRetainingCapacity();
-        self.seen_count = 0;
-        // Players as subjects move with the players, asked about as they do.
-        if (heard) try self.syncPlayers();
-        // Groups with nothing placed or swept have no walks to make this tick.
-        const space = &self.deps.entities.places.space;
-        var swept = false;
-        for (self.sources[0..self.source_count]) |source| swept = swept or source.count > 0;
-        var subjects = false;
-        for (self.player_slots) |slot| subjects = subjects or slot != none;
-        for (self.groups[0..self.group_count]) |*group| group.live = swept or space.countOf(group.kinds) > 0 or (subjects and group.kinds.has(self.player_kind));
-        if (self.tracker_count == 0) {
-            self.deps.entities.places.space.clearLog();
-            self.finalize();
-            return;
-        }
-        const resets = self.changes.resetList();
-        for (resets) |reset| if (reset.was.ready) {
-            // A client that forgot is cleared; one that only stopped being ready is told.
-            // One that changed only its mode is asked about again where it stood, as it may also
-            // have moved.
-            if (reset.forgot) try self.forget(reset.player, reset.was) else if (!reset.now.ready) try self.near(reset.player, reset.was, .drop) else try self.near(reset.player, reset.was, .recheck);
-        };
-        for (resets) |reset| if (reset.now.ready) try self.disc(reset.player, reset.now);
-        for (self.changes.moveList()) |move| try self.ring(move);
-        for (self.changes.viewList()) |view| try self.annulus(view);
-        if (self.deps.streaming) |streaming| try self.terrain(streaming.snapshotVisibility(), resets);
-        // What was offered and not taken first, in full: a move logged later finds it looked at.
-        var at: usize = 0;
-        while (at < self.retry.len) : (at += 1) try self.again(self.retry.at(at).*);
-        self.retry.reset();
-        try self.logged();
-        if (self.work_overflowed) try self.sweepAll();
-        self.finalize();
-    }
-
     fn gatherBounds(self: *Tracking) void {
+        self.bounds_stale = false;
         self.bounds_count = 0;
         for (self.ready, 0..) |ready, player| {
             if (!ready) continue;
@@ -1512,79 +1907,133 @@ pub const Tracking = struct {
         return nearest;
     }
 
-    /// What the last tick offered and was not all accepted is asked again; the last tick's work
-    /// is let go.
-    fn carryOver(self: *Tracking) !void {
-        for (0..self.work_slots.len) |index| {
-            const slot = self.work_slots.at(index).*;
-            const rows = self.item(@intCast(index));
-            if (any(rows)) _ = try self.retry.append(slot);
-            self.metas.at(slot).work = none;
+    // The tick.
+
+    /// Works out every change of audience since the last tick. Run after players were heard,
+    /// before kinds send.
+    pub fn tick(self: *Tracking) !void {
+        return self.pass(true);
+    }
+
+    /// The second pass of a tick, once entities ticked: what they did, answered against the
+    /// players as the first pass heard them, as vanilla moves its trackers by players once a tick.
+    pub fn tickEntities(self: *Tracking) !void {
+        return self.pass(false);
+    }
+
+    fn pass(self: *Tracking, heard: bool) !void {
+        self.tick_count += 1;
+        self.stats.passes += 1;
+        try self.carryOver();
+        if (self.seen_footprints.count() > 0) self.seen_footprints.clearRetainingCapacity();
+        self.seen_count = 0;
+        const space = &self.deps.entities.places.space;
+        if (heard) {
+            self.heard_count += 1;
+            const players = self.deps.players;
+            self.changes.update(players);
+            for (self.changes.snapshots, 0..) |snapshot, index| {
+                self.ready[index] = snapshot.ready;
+                self.xs[index] = snapshot.x;
+                self.zs[index] = snapshot.z;
+                self.reaches[index] = snapshot.reach;
+                self.worlds[index] = snapshot.world;
+                self.spectating[index] = snapshot.spectator;
+            }
+            self.bounds_stale = true;
+            // Players as subjects move with the players, asked about as they do.
+            try self.syncPlayers();
         }
-        self.work_slots.reset();
-        self.work_rows.reset();
+        if (self.tracker_count == 0) {
+            space.clearLog();
+            self.finalize();
+            return;
+        }
+        if (heard) {
+            const resets = self.changes.resetList();
+            for (resets) |reset| {
+                self.unanchor(reset.player);
+                if (reset.was.ready) {
+                    // A client that forgot is cleared; one that only stopped being ready is told.
+                    if (reset.forgot) try self.near(reset.player, reset.was, .forget) else if (!reset.now.ready) try self.near(reset.player, reset.was, .drop) else try self.near(reset.player, reset.was, .recheck);
+                }
+            }
+            for (resets) |reset| if (reset.now.ready) try self.anchor(reset.player);
+            for (self.changes.moveList()) |move| try self.moved(move.player);
+            for (self.changes.viewList()) |view| if (self.ready[view.player]) try self.anchor(view.player);
+            if (self.deps.streaming) |streaming| try self.terrain(streaming.snapshotVisibility(), resets);
+        }
+        // Entities placed before tracking began, once.
+        if (!self.primed) {
+            self.primed = true;
+            for (0..self.deps.entities.directory.high()) |slot| if (space.atSlot(@intCast(slot)) != null or space.boxOf(@intCast(slot)) != null) try self.look(@intCast(slot), true);
+        }
+        // What was offered and not taken first, in full.
+        var at: usize = 0;
+        while (at < self.retry.len) : (at += 1) try self.again(self.retry.at(at).*);
+        self.retry.reset();
+        if (heard) try self.lookPlayers();
+        try self.logged();
+        // Those with ranges of their own, of every player.
+        try self.ownRanged();
+        if (self.work_overflowed) try self.sweepAll();
+        self.finalize();
+    }
+
+    /// A player that moved: anchored again when out of its slack, else its edges measured.
+    fn moved(self: *Tracking, player: usize) !void {
+        if (!self.anchored[player]) return self.anchor(player);
+        const dx = self.xs[player] - self.anchor_x[player];
+        const dz = self.zs[player] - self.anchor_z[player];
+        if (dx * dx + dz * dz > slack * slack) return self.anchor(player);
+        return self.slackMove(player);
+    }
+
+    /// What was offered and not taken is offered again as it was: what changed since asks again
+    /// on its own, and its answer takes the place of the one carried.
+    fn carryOver(self: *Tracking) !void {
+        // Entries holding nothing are let go once they are half of them, in one sweep.
+        if (self.work_empty > 0 and self.work_empty * 2 >= self.work_slots.len) {
+            var kept: usize = 0;
+            for (0..self.work_slots.len) |index| {
+                const slot = self.work_slots.at(index).*;
+                const meta = self.metas.at(slot);
+                const rows = self.item(@intCast(index));
+                if (!any(rows)) {
+                    if (meta.work == index) meta.work = none;
+                    continue;
+                }
+                if (kept != index) @memcpy(self.item(@intCast(kept)), rows);
+                self.work_slots.at(kept).* = slot;
+                self.work_trackers.at(kept).* = self.work_trackers.at(index).*;
+                self.work_open.at(kept).* = 0;
+                meta.work = @intCast(kept);
+                kept += 1;
+            }
+            self.work_slots.shrink(kept);
+            self.work_trackers.shrink(kept);
+            self.work_open.shrink(kept);
+            self.work_rows.shrink(kept * 2 * self.words);
+            self.work_empty = 0;
+        }
         self.work_overflowed = false;
         self.finalized = false;
-        // Swept entities some player was unsure of move along their sweeps: asked again.
+        // Boxed entities some player was unsure of move along their boxes: asked again.
         var at: usize = 0;
         while (at < self.unsettled.len) : (at += 1) _ = try self.retry.append(self.unsettled.at(at).*);
         self.unsettled.reset();
-        if (builtin.mode == .debug) try self.checkSweeps();
+        if (builtin.mode == .debug) try self.checkBoxes();
     }
 
-    /// Every swept entity is where its sweep says: what tracking trusts its answers to.
-    fn checkSweeps(self: *Tracking) !void {
-        for (self.sources[0..self.source_count]) |source| {
-            for (0..source.sweeps.len) |index| {
-                if (!source.used(@intCast(index))) continue;
-                const sweep = source.at(@intCast(index));
-                _ = try self.placeOf(self.tracker_of[self.deps.entities.directory.entry(sweep.slot).kind], sweep.slot, sweep);
-            }
-        }
-    }
-
-    fn disc(self: *Tracking, player: usize, now: PlayerChanges.Snapshot) !void {
-        self.player_slack[player] = -1;
-        for (self.groups[0..self.group_count]) |tracker| {
-            if (!tracker.live) continue;
-            try self.eachBetween(null, .{ .world = now.world, .x = now.x, .z = now.z, .reach = @min(tracker.range, now.reach) }, player, tracker.kinds, tracker.own_ranges == 0);
-        }
-    }
-
-    fn ring(self: *Tracking, move: PlayerChanges.Move) !void {
-        const snapshot = self.changes.snapshots[move.player];
-        for (self.groups[0..self.group_count], 0..) |tracker, group| {
-            if (!tracker.live) continue;
-            const reach = @min(tracker.range, snapshot.reach);
-            if (self.player_tracker) |players| if (group == self.trackers[players].group and tracker.kinds.bits.count() == 1) {
-                try self.playerRing(move.player, snapshot, reach);
-                continue;
-            };
-            try self.eachBetween(
-                .{ .world = snapshot.world, .x = move.from[0], .z = move.from[1], .reach = reach },
-                .{ .world = snapshot.world, .x = move.to[0], .z = move.to[1], .reach = reach },
-                move.player,
-                tracker.kinds,
-                tracker.own_ranges == 0,
-            );
-        }
-    }
-
-    fn annulus(self: *Tracking, view: PlayerChanges.View) !void {
-        const snapshot = self.changes.snapshots[view.player];
-        self.player_slack[view.player] = -1;
-        for (self.groups[0..self.group_count]) |tracker| {
-            if (!tracker.live) continue;
-            const was = @min(tracker.range, view.from);
-            const now = @min(tracker.range, view.to);
-            if (was == now) continue;
-            try self.eachBetween(
-                .{ .world = snapshot.world, .x = snapshot.x, .z = snapshot.z, .reach = was },
-                .{ .world = snapshot.world, .x = snapshot.x, .z = snapshot.z, .reach = now },
-                view.player,
-                tracker.kinds,
-                tracker.own_ranges == 0,
-            );
+    /// Every boxed entity is where its box says: what tracking trusts its answers to.
+    fn checkBoxes(self: *Tracking) !void {
+        const space = &self.deps.entities.places.space;
+        if (space.box_count == 0) return;
+        for (0..self.deps.entities.directory.high()) |slot| {
+            const boxed = space.boxOf(@intCast(slot)) orelse continue;
+            const tracker = self.tracker_of[boxed.kind];
+            if (tracker == no_tracker or self.trackers[tracker].exact == null) continue;
+            _ = try self.exactOf(tracker, boxed);
         }
     }
 
@@ -1595,7 +2044,10 @@ pub const Tracking = struct {
             if (!self.ready[player]) continue;
             for (resets) |reset| {
                 if (reset.player == player) break;
-            } else try self.disc(player, self.changes.snapshots[player]);
+            } else {
+                self.unanchor(player);
+                try self.anchor(player);
+            }
         }
         for (visibility.changed_words.values()) |word| {
             const player = word / visibility.grid.words;
@@ -1609,63 +2061,58 @@ pub const Tracking = struct {
                 bits &= bits - 1;
                 if (cell >= visibility.grid.columns) continue;
                 const side: i32 = @intCast(visibility.grid.width);
-                const column: Column = .{
-                    .world = self.worlds[player],
-                    .x = x + @mod(@mod(cell, side) - @mod(x, side), side),
-                    .z = z + @mod(@divTrunc(cell, side) - @mod(z, side), side),
-                };
-                try self.eachTouching(column, player);
+                const column_x = x + @mod(@mod(cell, side) - @mod(x, side), side);
+                const column_z = z + @mod(@divTrunc(cell, side) - @mod(z, side), side);
+                try self.eachTouching(self.worlds[player], column_x, column_z, player);
             }
         }
     }
 
-    /// Entities placed, moved and removed since the last tick.
+    /// Every entity whose box reaches into a column, for one player: those of its own column and
+    /// its neighbours', which a box may reach across, and the boxes listed there.
+    fn eachTouching(self: *Tracking, world: u32, column_x: i32, column_z: i32, player: usize) !void {
+        var x = column_x - 1;
+        while (x <= column_x + 1) : (x += 1) {
+            var z = column_z - 1;
+            while (z <= column_z + 1) : (z += 1) {
+                const tile = self.findTile(world, x >> 3, z >> 3) orelse continue;
+                const column: usize = @intCast((x & 7) + (z & 7) * tile_side);
+                if (self.tiles.at(tile).occupied & (@as(u64, 1) << @intCast(column)) == 0) continue;
+                for (0..self.group_count) |group| try self.columnFor(tile, column, group, player, null, false);
+            }
+        }
+    }
+
+    /// Entities placed, moved, removed and boxed since the log was last taken.
     fn logged(self: *Tracking) !void {
         const space = &self.deps.entities.places.space;
         const log = space.logged();
         var at: usize = 0;
         while (at < log.len) : (at += 1) {
             const change = log.at(at).*;
+            self.stats.logged += 1;
             if (change.slot < self.metas.len and self.metas.at(change.slot).looked == self.tick_count) continue;
-            try self.look(change.slot, change.event == .moved);
+            try self.look(change.slot, change.event == .placed);
         }
         const overflowed = space.log_overflowed;
         space.clearLog();
         if (overflowed) try self.sweepGone();
     }
 
-    /// Asks again about one entity by its slot, as it stands now.
-    fn look(self: *Tracking, slot: u32, moved: bool) !void {
-        const directory = &self.deps.entities.directory;
-        if (slot >= directory.high()) return;
-        // Swept: answered by its box, whatever place it kept.
-        if (self.sweptIn(slot)) |swept| return self.checkSwept(slot, swept.sweep, swept.tracker);
-        if (self.placedAt(slot)) |placed| {
-            const entry = placed.entry;
-            const world = placed.world;
-            if (!self.tracked.has(entry.shape.kind)) return;
-            try self.ensureSlot(slot);
-            const meta = self.metas.at(slot);
-            meta.looked = self.tick_count;
-            if (moved and meta.tracker != no_tracker and meta.entity == entry.id and !meta.gone and self.unchanged(meta, entry, world)) return;
-            try self.checkAll(entry, world);
-            return;
+    fn ownRanged(self: *Tracking) !void {
+        const space = &self.deps.entities.places.space;
+        var kept: usize = 0;
+        var at: usize = 0;
+        while (at < self.own_ranged.len) : (at += 1) {
+            const slot = self.own_ranged.at(at).*;
+            if (slot >= self.metas.len or self.metas.at(slot).range == 0) continue;
+            self.own_ranged.at(kept).* = slot;
+            kept += 1;
+            if (space.boxOf(slot)) |boxed| {
+                try self.checkBox(slot, boxed);
+            } else if (space.atSlot(slot)) |placed| try self.checkEveryone(placed.entry, placed.world);
         }
-        // Gone from the space: whoever has it is told.
-        if (slot >= self.metas.len) return;
-        const meta = self.metas.at(slot);
-        if (meta.tracker == no_tracker) return;
-        meta.looked = self.tick_count;
-        if (!any(self.knownWords(slot))) {
-            meta.gone = true;
-            self.release(slot);
-            return;
-        }
-        if (!meta.gone) {
-            meta.gone = true;
-            _ = try self.gone.append(slot);
-        }
-        try self.owe(slot);
+        while (self.own_ranged.len > kept) self.own_ranged.pop();
     }
 
     /// Every client that has a gone entity is to be told.
@@ -1677,7 +2124,7 @@ pub const Tracking = struct {
         }
     }
 
-    /// Asks about an entity again at the next tick, as something it said of itself changed.
+    /// Asks about an entity again at the next pass, as something it said of itself changed.
     fn relook(self: *Tracking, slot: u32) !void {
         // What was settled was settled for what it said before.
         if (slot < self.metas.len) self.metas.at(slot).settled_for = 0;
@@ -1686,48 +2133,56 @@ pub const Tracking = struct {
 
     fn again(self: *Tracking, slot: u32) !void {
         if (slot < self.metas.len and self.metas.at(slot).looked == self.tick_count) return;
-        try self.look(slot, false);
+        try self.look(slot, true);
     }
 
-    /// The work did not fit: every entity near a ready player, and every one a client has, asked
+    /// The work did not fit: every player anchored again and every entity a client has asked
     /// again.
     fn sweepAll(self: *Tracking) !void {
         self.work_overflowed = false;
         for (0..self.work_slots.len) |index| self.metas.at(self.work_slots.at(index).*).work = none;
         self.work_slots.clear();
+        self.work_trackers.clear();
+        self.work_open.clear();
+        self.opened.reset();
+        self.work_empty = 0;
         self.work_rows.clear();
         // The sweep's work is every entity near a player and every one some client has, which
         // the pool bounds and the configured work does not.
         const limit = self.config.work;
         self.config.work = std.math.maxInt(u32);
         defer self.config.work = limit;
-        for (self.changes.snapshots, 0..) |snapshot, player| {
-            if (!snapshot.ready) continue;
-            try self.near(player, snapshot, .recheck);
+        for (0..self.deps.players.records.len) |player| {
+            self.unanchor(player);
+            if (self.ready[player]) try self.anchor(player);
         }
-        // Those some client has, wherever they are and whoever it is.
         for (0..self.metas.len) |index| {
             const slot: u32 = @intCast(index);
             if (self.metas.at(slot).tracker == no_tracker or !any(self.knownWords(slot))) continue;
-            try self.look(slot, false);
+            try self.look(slot, true);
         }
     }
 
     /// The log could not hold a removal: every tracked slot no longer placed is looked at.
     fn sweepGone(self: *Tracking) !void {
+        const space = &self.deps.entities.places.space;
         for (0..self.metas.len) |index| {
             const slot: u32 = @intCast(index);
             const meta = self.metas.at(slot);
-            if (meta.tracker == no_tracker or meta.gone or self.placedAt(slot) != null) continue;
-            try self.look(slot, false);
+            if (meta.tracker == no_tracker or meta.gone) continue;
+            if (space.atSlot(slot) != null and space.boxOf(slot) == null) continue;
+            try self.look(slot, true);
         }
     }
 
     /// Turns each entity's answers into whom to spawn it for and whom to remove it from.
     fn finalize(self: *Tracking) void {
-        for (0..self.work_slots.len) |index| {
+        // Only those opened this pass: the rest hold what is owed already.
+        for (0..self.opened.len) |at| {
+            const index = self.opened.at(at).*;
+            self.work_open.at(index).* = 0;
             const slot = self.work_slots.at(index).*;
-            const rows = self.item(@intCast(index));
+            const rows = self.item(index);
             const gone = self.metas.at(slot).gone;
             for (rows[0..self.words], rows[self.words..], self.knownWords(slot)) |*mask_word, *answer_word, have| {
                 const mask = mask_word.*;
@@ -1735,7 +2190,9 @@ pub const Tracking = struct {
                 mask_word.* = want & ~have & mask;
                 answer_word.* = have & ~want & mask;
             }
+            if (!any(rows)) self.work_empty += 1;
         }
+        self.opened.reset();
         // A gone entity that has its removals owed keeps them; the list keeps only those.
         var kept: usize = 0;
         for (0..self.gone.len) |index| {
@@ -1766,8 +2223,7 @@ pub const Tracking = struct {
             while (self.at < self.owner.work_slots.len) {
                 const index = self.at;
                 self.at += 1;
-                const slot = self.owner.work_slots.at(index).*;
-                if (self.owner.metas.at(slot).tracker != self.tracker) continue;
+                if (self.owner.work_trackers.at(index).* != self.tracker) continue;
                 if (self.owner.changeAt(@intCast(index))) |change| return change;
             }
             return null;
@@ -1781,6 +2237,17 @@ pub const Tracking = struct {
         return .{ .slot = slot, .spawn = self.set(rows[0..self.words]), .remove = self.set(rows[self.words..]), .gone = self.metas.at(slot).gone };
     }
 
+    /// Where the entity in a slot is: a boxed one where its kind says.
+    fn placeNow(self: *Tracking, slot: u32) !?Placed {
+        const space = &self.deps.entities.places.space;
+        if (space.boxOf(slot)) |boxed| {
+            const tracker = self.tracker_of[boxed.kind];
+            if (tracker == no_tracker) return null;
+            return try self.exactOf(tracker, boxed);
+        }
+        return space.atSlot(slot);
+    }
+
     /// Asks about an entity again now, after the tick's changes were worked out, as something it
     /// said of itself changed since: its change becomes what it now must be. Every player is
     /// asked, as this is rare.
@@ -1790,18 +2257,19 @@ pub const Tracking = struct {
         const meta = self.metas.at(slot);
         if (meta.tracker == no_tracker or meta.gone) return;
         const tracker = &self.trackers[meta.tracker];
-        const placed = if (self.sweptIn(slot)) |swept| try self.placeOf(swept.tracker, slot, swept.sweep) else self.placedAt(slot) orelse return;
+        const placed = (try self.placeNow(slot)) orelse return;
         const wanted = self.scratch[0..self.words];
         @memset(wanted, 0);
         const range = self.rangeOf(tracker, slot);
         for (0..self.deps.players.records.len) |player| {
-            if (self.sees(slot, placed.entry, placed.world, range, player, .test_each)) put(wanted, player, true);
+            if (self.sees(slot, placed.entry, placed.world, range, player)) put(wanted, player, true);
         }
         const known_words = self.knownWords(slot);
         var differs = meta.work != none;
         for (known_words, wanted) |have, want| differs = differs or have != want;
         if (!differs) return;
-        const rows = (try self.workOf(slot)) orelse return;
+        // Asked after the pass, its entry holds what is owed at once.
+        const rows = (if (meta.work != none) self.item(meta.work) else try self.newWork(slot)) orelse return;
         for (rows[0..self.words], rows[self.words..], known_words, wanted) |*spawn, *remove, have, want| {
             spawn.* = want & ~have;
             remove.* = have & ~want;
@@ -1825,6 +2293,10 @@ pub const Tracking = struct {
         const rows = self.item(meta.work);
         const known_words = self.knownWords(slot);
         const stale_words = self.staleWords(slot);
+        const had = any(rows);
+        defer if (had and !any(rows)) {
+            self.work_empty += 1;
+        };
         for (rows[0..self.words], rows[self.words..], known_words, stale_words, 0..) |*spawn, *remove, *have, *behind, word| {
             const taken = spawn.* & wordOf(spawned, word);
             const dropped = remove.* & wordOf(removed, word);
@@ -1850,22 +2322,76 @@ pub const Tracking = struct {
 
     // The oracle.
 
-    /// updatePlayer asked of every tracked entity and every player, against what clients have:
-    /// with every change confirmed, they agree. For tests and checked benches.
-    pub fn check(self: *Tracking) !void {
+    /// Every tile's bits are what each player's anchor says, and every point an anchored player
+    /// has is in a column its anchor does not say no for.
+    fn checkMasks(self: *Tracking) !void {
+        for (0..self.tiles.values.len) |index| {
+            const tile: u32 = @intCast(index);
+            const held = self.tiles.at(tile);
+            if (held.generation == 0) continue;
+            const low_x: f64 = @floatFromInt(held.x * tile_side * 16);
+            const low_z: f64 = @floatFromInt(held.z * tile_side * 16);
+            for (0..self.deps.players.records.len) |player| for (0..self.group_count) |group| for (0..tile_columns) |column| {
+                const wanted: Class = if (!self.anchored[player] or self.anchor_world[player] != held.world) .no else classify(self.anchor_x[player], self.anchor_z[player], self.reachOf(group, self.anchor_reach[player]), low_x + @as(f64, @floatFromInt(column % tile_side)) * 16, low_z + @as(f64, @floatFromInt(column / tile_side)) * 16, 16);
+                if (wanted != self.classOf(tile, column, group, player)) {
+                    std.log.err("event=tracking_mask_mismatch tile={d},{d} column={d} group={d} player={d} wanted={t} kept={t} tick={d}", .{ held.x, held.z, column, group, player, wanted, self.classOf(tile, column, group, player), self.tick_count });
+                    return error.TrackingMismatch;
+                }
+            };
+        }
+        const space = &self.deps.entities.places.space;
         for (0..self.metas.len) |index| {
             const slot: u32 = @intCast(index);
             const meta = self.metas.at(slot);
-            // A swept one where its kind says it is.
-            const placed = if (self.sweptIn(slot)) |swept| try self.placeOf(swept.tracker, slot, swept.sweep) else self.placedAt(slot);
+            if (meta.tracker == no_tracker or meta.range > 0) continue;
+            const placed = space.atSlot(slot) orelse continue;
+            const column = entities_module.space.columnOf(placed.world, placed.entry.position);
+            const tile = self.findTile(placed.world, column.x >> 3, column.z >> 3) orelse continue;
+            const cell: usize = @intCast((column.x & 7) + (column.z & 7) * tile_side);
+            for (0..self.deps.players.records.len) |player| {
+                if (!has(self.knownWords(slot), player) or !self.anchored[player]) continue;
+                if (self.classOf(tile, cell, self.trackers[meta.tracker].group, player) == .no) {
+                    std.log.err("event=tracking_known_outside slot={d} player={d} tick={d} looked={d} column={d},{d} anchor={d},{d}", .{ slot, player, self.tick_count, meta.looked, column.x, column.z, self.anchor_x[player], self.anchor_z[player] });
+                    return error.TrackingMismatch;
+                }
+            }
+        }
+    }
+
+    /// updatePlayer asked of every tracked entity and every player, against what clients have:
+    /// with every change confirmed, they agree. For tests and checked benches.
+    /// Whether a pair is owed as it is wanted: a spawn owed for one that wants it, a removal owed
+    /// for one that does not.
+    fn owes(self: *const Tracking, slot: u32, player: usize, wanted: bool) bool {
+        const meta = self.metas.at(slot);
+        if (meta.work == none or !self.finalized) return false;
+        const rows = self.item(meta.work);
+        return if (wanted) has(rows[0..self.words], player) else has(rows[self.words..], player);
+    }
+
+    pub fn check(self: *Tracking) !void {
+        try self.checkMasks();
+        for (0..self.metas.len) |index| {
+            const slot: u32 = @intCast(index);
+            const meta = self.metas.at(slot);
+            const placed = try self.placeNow(slot);
             const tracker_index = if (placed) |value| self.tracker_of[value.entry.shape.kind] else meta.tracker;
             if (tracker_index == no_tracker) continue;
             const known_words = self.knownWords(slot);
             for (0..self.deps.players.records.len) |player| {
-                const wanted = if (placed) |value| self.sees(slot, value.entry, value.world, self.rangeOf(&self.trackers[tracker_index], slot), player, .test_each) else false;
+                const wanted = if (placed) |value| self.sees(slot, value.entry, value.world, self.rangeOf(&self.trackers[tracker_index], slot), player) else false;
                 if (wanted != has(known_words, player)) {
-                    std.log.err("event=tracking_mismatch slot={d} player={d} wanted={} known={} placed={} gone={} margin={d} epoch={d}/{d} at={d},{d} player_at={d},{d} reach={d} ready={} tick={d} looked={d}", .{ slot, player, wanted, has(known_words, player), placed != null, meta.gone, meta.margin, meta.epoch, self.changes.epoch, meta.x, meta.z, self.xs[player], self.zs[player], self.reaches[player], self.ready[player], self.tick_count, meta.looked });
+                    // Owed as it should be, waiting for room to send: what backpressure leaves.
+                    if (self.owes(slot, player, wanted)) continue;
+                    std.log.err("event=tracking_mismatch slot={d} player={d} wanted={} known={} placed={} gone={} player_at={d},{d} anchor={d},{d} reach={d} ready={} tick={d} looked={d}", .{ slot, player, wanted, has(known_words, player), placed != null, meta.gone, self.xs[player], self.zs[player], self.anchor_x[player], self.anchor_z[player], self.reaches[player], self.ready[player], self.tick_count, meta.looked });
                     if (placed) |value| std.log.err("event=tracking_mismatch_entity position={any} kind={d}", .{ value.entry.position, value.entry.shape.kind });
+                    if (placed) |value| {
+                        const column = entities_module.space.columnOf(value.world, value.entry.position);
+                        if (self.findTile(value.world, column.x >> 3, column.z >> 3)) |tile| {
+                            const cell: usize = @intCast((column.x & 7) + (column.z & 7) * tile_side);
+                            std.log.err("event=tracking_mismatch_tile occupied={} class={t} anchored={} edges={d} meta_placed={} meta_column={any}", .{ self.tiles.at(tile).occupied & (@as(u64, 1) << @intCast(cell)) != 0, self.classOf(tile, cell, self.trackers[tracker_index].group, player), self.anchored[player], self.edges[player].len, meta.placed, meta.column });
+                        } else std.log.err("event=tracking_mismatch_no_tile", .{});
+                    }
                     return error.TrackingMismatch;
                 }
             }

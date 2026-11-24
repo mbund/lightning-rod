@@ -18,11 +18,12 @@ const Fixture = struct {
     next_id: u64 = 1,
     live: std.ArrayList(u64) = .empty,
     allocator: std.mem.Allocator,
-    /// Entities of kind 3 sleep along straight paths, swept, as arrows do.
-    sweeps: entities.Sweeps,
+    /// Entities of kind 3 sleep along straight paths, boxed, as arrows do.
     plans: []Plan,
     now: u64 = 0,
     sleepy: bool = false,
+    /// How far players walk a tick at most, before any jump.
+    stride: f64 = 6,
 
     const Plan = struct { start: [3]f64 = .{ 0, 0, 0 }, velocity: [3]f64 = .{ 0, 0, 0 }, since: u64 = 0 };
     const swept_kind = 3;
@@ -37,7 +38,6 @@ const Fixture = struct {
             .players = .{ .deps = undefined, .config = .{ .maximum = count, .render_distance = 6 }, .spawn_world = 0, .records = records, .dig_handlers = &.{} },
             .tracking = undefined,
             .modes = try allocator.alloc(minecraft.GameMode, count),
-            .sweeps = undefined,
             .plans = undefined,
             .random = .init(seed),
             .allocator = allocator,
@@ -49,10 +49,9 @@ const Fixture = struct {
         self.tracking = try Tracking.init(allocator, .{ .work = work }, .{ .entities = self.entities, .players = &self.players });
         _ = try self.tracking.register(.{ .kinds = .of(&.{1}), .range = 96 });
         _ = try self.tracking.register(.{ .kinds = .of(&.{2}), .range = 160, .max_range = 240 });
-        self.sweeps = try .init(allocator, 256, self.entities.directory.capacity(), &self.entities.places.space);
         self.plans = try allocator.alloc(Plan, self.entities.directory.capacity());
         @memset(self.plans, .{});
-        _ = try self.tracking.register(.{ .kinds = .of(&.{swept_kind}), .range = 64, .sweeps = &self.sweeps, .exact = .of(Fixture, self) });
+        _ = try self.tracking.register(.{ .kinds = .of(&.{swept_kind}), .range = 64, .exact = .of(Fixture, self) });
     }
 
     /// Where a sleeping entity is now, along its plan.
@@ -69,25 +68,25 @@ const Fixture = struct {
         const random = self.random.random();
         var due: [256]u32 = undefined;
         var found: usize = 0;
-        self.sweeps.takeDue(self.now, &due, &found);
+        self.entities.places.space.takeDue(self.now, .all, &due, &found);
         for (due[0..found]) |slot| {
             const placed = try self.trackingPlace(slot);
+            _ = self.entities.places.space.unbox(slot);
             try self.entities.places.space.insert(placed.entry.id, 0, placed.entry.position, shape);
         }
         for (self.live.items) |id| {
             const slot = self.entities.directory.slotOf(id).?;
-            if (self.entities.directory.entry(slot).kind != swept_kind or self.sweeps.of(slot) != null) continue;
+            if (self.entities.directory.entry(slot).kind != swept_kind or self.entities.places.space.boxOf(slot) != null) continue;
             if (random.uintLessThan(u8, 4) != 0) continue;
             const start = self.entities.places.space.get(id).?.position;
             const velocity: [3]f64 = .{ (random.float(f64) - 0.5) * 2, 0, (random.float(f64) - 0.5) * 2 };
             const ticks = random.intRangeAtMost(u64, 2, 20);
             const end: [3]f64 = .{ start[0] + velocity[0] * @as(f64, @floatFromInt(ticks)), start[1], start[2] + velocity[2] * @as(f64, @floatFromInt(ticks)) };
-            const feet: entities.sweeps.Box = .{ .low = .{ @min(start[0], end[0]), start[1], @min(start[2], end[2]) }, .high = .{ @max(start[0], end[0]), start[1], @max(start[2], end[2]) } };
-            if (!entities.Sweeps.fits(feet)) continue;
+            const feet: entities.Feet = .{ .low = .{ @min(start[0], end[0]), start[1], @min(start[2], end[2]) }, .high = .{ @max(start[0], end[0]), start[1], @max(start[2], end[2]) } };
+            if (!entities.Space.boxFits(feet, shape.half_width)) continue;
             if (random.boolean() and !try self.tracking.settled(slot, 0, feet, shape.half_width, shape.height)) continue;
             self.plans[slot] = .{ .start = start, .velocity = velocity, .since = self.now };
-            self.entities.places.space.remove(id);
-            _ = self.sweeps.place(slot, 0, feet, shape.half_width, shape.height, self.now, self.now + ticks).?;
+            if (!try self.entities.places.space.box(slot, 0, feet, shape.half_width, shape.height, self.now, self.now + ticks)) unreachable;
         }
     }
 
@@ -145,7 +144,7 @@ const Fixture = struct {
     fn despawn(self: *Fixture, at: usize) void {
         const id = self.live.swapRemove(at);
         const slot = self.entities.directory.slotOf(id).?;
-        _ = self.sweeps.removeSlot(slot);
+        _ = self.entities.places.space.unbox(slot);
         self.entities.places.remove(id);
         self.entities.leave(slot);
     }
@@ -161,8 +160,8 @@ const Fixture = struct {
                 3 => player.life += 1,
                 4 => player.handle.?.generation += 1,
                 else => {
-                    player.position.x += (random.float(f64) - 0.5) * 6;
-                    player.position.z += (random.float(f64) - 0.5) * 6;
+                    player.position.x += (random.float(f64) - 0.5) * self.stride;
+                    player.position.z += (random.float(f64) - 0.5) * self.stride;
                 },
             }
         }
@@ -253,6 +252,27 @@ test "a second pass answers what entities did against the players as first heard
     }
 }
 
+test "players creeping along their reach are answered as they go, and entities near it as they move" {
+    for ([_]u64{ 41, 42 }) |seed| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var fixture: Fixture = undefined;
+        try fixture.init(arena.allocator(), if (seed % 2 == 0) 70 else 6, 65536, seed);
+        fixture.stride = 0.5;
+        fixture.sleepy = true;
+        for (0..400) |_| try fixture.spawn();
+        for (0..400) |_| {
+            try fixture.shake();
+            try fixture.sleepSome();
+            try fixture.tracking.tick();
+            fixture.deliver(&everyone);
+            try fixture.tracking.check();
+        }
+        // The near entities were what was measured, most ticks.
+        try std.testing.expect(fixture.tracking.stats.near_measured > fixture.tracking.stats.edge_walks);
+    }
+}
+
 test "changes not accepted are offered again until they are" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -336,7 +356,7 @@ test "what entities say of themselves and who spectates are followed as the rule
     }
 }
 
-test "entities asleep along paths are answered by their sweeps, the kind asked only where unsure" {
+test "entities asleep along paths are answered by their boxes, the kind asked only where unsure" {
     for ([_]u64{ 31, 32, 33, 34 }) |seed| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
@@ -344,12 +364,12 @@ test "entities asleep along paths are answered by their sweeps, the kind asked o
         try fixture.init(arena.allocator(), if (seed % 2 == 0) 70 else 6, 65536, seed);
         fixture.sleepy = true;
         for (0..150) |_| try fixture.spawn();
-        var swept: usize = 0;
+        var boxed: usize = 0;
         var unsure: usize = 0;
         for (0..300) |_| {
             try fixture.shake();
             try fixture.sleepSome();
-            swept += fixture.sweeps.count;
+            boxed += fixture.entities.places.space.box_count;
             unsure += fixture.tracking.unsettled.len;
             if (seed >= 33) try fixture.sayThings();
             try fixture.tracking.tick();
@@ -361,6 +381,6 @@ test "entities asleep along paths are answered by their sweeps, the kind asked o
             try fixture.tracking.check();
         }
         // Both ways of answering were asked of.
-        try std.testing.expect(swept > 300 and unsure > 0);
+        try std.testing.expect(boxed > 300 and unsure > 0);
     }
 }

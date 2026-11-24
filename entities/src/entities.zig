@@ -15,13 +15,13 @@ pub const Table = table.Table;
 pub const order = @import("order.zig");
 pub const Order = order.Order;
 pub const space = @import("space.zig");
-pub const sweeps = @import("sweeps.zig");
-pub const Sweeps = sweeps.Sweeps;
 pub const Space = space.Space;
 pub const Shape = space.Shape;
 pub const Kinds = space.Kinds;
 pub const Column = space.Column;
 pub const Box = space.Box;
+pub const Feet = space.Feet;
+pub const Boxed = space.Boxed;
 pub const places = @import("places.zig");
 pub const Places = places.Places;
 pub const durable = @import("durable.zig");
@@ -101,6 +101,7 @@ pub const Entities = struct {
 
     /// Every kind's table brought up to date: what left goes, and what slept or woke moves.
     pub fn maintainAll(self: *Entities) !void {
+        self.places.space.releaseEmptied();
         const tick_order = &self.places.order;
         tick_order.endTick();
         for (tick_order.walked[0..tick_order.walked_count]) |core| try core.maintain();

@@ -169,6 +169,12 @@ pub fn Array(comptime T: type) type {
             self.len = 0;
         }
 
+        /// Its first `count` kept, its pages too.
+        pub fn shrink(self: *Self, count: usize) void {
+            assert(count <= self.len);
+            self.len = count;
+        }
+
         /// The bytes its pages hold, for measuring.
         pub fn memoryBytes(self: *const Self) usize {
             return self.page_count * page_bytes;

@@ -340,24 +340,18 @@ pub const Projectiles = struct {
     holding_index: bool = false,
     /// Whether this tick has projectiles to see to, as found before entities tick.
     active: bool = false,
-    /// Where sleeping projectiles will pass until they wake, which tracking answers by and what
-    /// comes near wakes them for.
-    sweeps: entities.Sweeps,
     /// Who sees projectiles, set by ProjectileReplication.
     tracking: ?*Tracking = null,
     tracker: Tracking.TrackerId = 0,
-    /// Room for the slots of sweeps due.
+    /// Room for the slots of boxes due.
     due: []u32,
     sleeping: usize = 0,
     sleep: bool,
     /// A running hash of everything asked to be sent, when tests trace it.
     sent: u64 = 0,
     tracing: bool,
-    /// The box around each world's players this tick, horizontally, for telling at once that
-    /// no one is near: a world, and its least and greatest x and z.
-    players_near: [players_near_max]struct { world: u32, low: [2]f64, high: [2]f64 } = undefined,
-    players_near_count: usize = 0,
-    players_near_tick: u64 = std.math.maxInt(u64),
+    /// Mobs placed anywhere as the tick began.
+    mobs_placed: usize = 0,
     /// Room for the states a sleeper plans.
     plan_states: [update_interval + 1]Motion = undefined,
     /// Sleepers something came near since the last tick, to wake before the flying. With more
@@ -469,7 +463,6 @@ pub const Projectiles = struct {
             .cells = cells,
             .ops = try allocator.alloc(IndexOp, ops_max),
             .held = try allocator.alloc(Held, batch_max),
-            .sweeps = try .init(allocator, configuration.claims, bound, &deps.entities.places.space),
             .due = try allocator.alloc(u32, configuration.claims),
             .sleep = configuration.sleep,
             .tracing = configuration.trace_sends,
@@ -505,9 +498,10 @@ pub const Projectiles = struct {
         };
         @memset(self.seen, .{});
         self.kinds = .of(&self.entity_types);
-        self.records.sweeps = &self.sweeps;
         // Projectiles keep their own turns: frozen columns hold them, not the columns' ticking.
         deps.entities.places.keepsOwnTurns(self.kinds);
+        // What moves is what can come near a sleeper.
+        deps.entities.places.space.keepMovers();
         // Projectiles take their turns in the one tick order, a batch at a time.
         try deps.entities.addTicker(.init(Projectiles, self, self.kinds, batch_max));
         try deps.entities.addColumnHolder(.init(Projectiles, self, loadColumn, unloadColumn));
@@ -596,9 +590,9 @@ pub const Projectiles = struct {
         };
     }
 
-    /// Projectiles are tracked from now on, swept while they sleep. ProjectileReplication asks.
+    /// Projectiles are tracked from now on, boxed while they sleep. ProjectileReplication asks.
     pub fn track(self: *Projectiles, tracking: *Tracking) !void {
-        self.tracker = try tracking.register(.{ .kinds = self.kinds, .range = 4 * 16, .sweeps = &self.sweeps, .exact = .of(Projectiles, self) });
+        self.tracker = try tracking.register(.{ .kinds = self.kinds, .range = 4 * 16, .exact = .of(Projectiles, self) });
         self.tracking = tracking;
     }
 
@@ -739,7 +733,6 @@ pub const Projectiles = struct {
             }
         }
         try self.checkpoint(self.deps.storage);
-        self.sweeps.clear();
         self.records.clear();
         self.index.clear();
         self.frozen_columns.clearRetainingCapacity();
@@ -1023,6 +1016,9 @@ pub const Projectiles = struct {
     /// went, came due or were woken by edits are seen to; sleepers due this tick wake to take
     /// their turns.
     pub fn prepareTick(self: *Projectiles) !void {
+        // Mobs placed anywhere, counted once a tick: one placed since is a mover, which wakes what
+        // it meets the next.
+        self.mobs_placed = self.deps.entities.places.space.countOf(self.deps.mobs.kinds);
         if (!self.loaded_all and !self.deps.entities.columns_followed) try self.loadAll();
         self.loaded_all = true;
         self.active = false;
@@ -1359,26 +1355,47 @@ pub const Projectiles = struct {
 
     /// Asks the sleepers whose paths a box meets, horizontally grown by `reach`, to wake: a path
     /// as findTarget sweeps it, its box grown by 1.5 all round.
-    fn rouseMeeting(self: *Projectiles, world: u32, box: entities.sweeps.Box, reach: f64) void {
+    /// Sleeping projectiles boxed in the space: where they pass until they wake, which tracking
+    /// answers by and what comes near wakes them for.
+    fn boxedCount(self: *const Projectiles) usize {
+        return self.deps.entities.places.space.boxCountOf(self.kinds);
+    }
+
+    fn rouseMeeting(self: *Projectiles, world: u32, box: entities.Feet, reach: f64) void {
         // Asked to wake are woken by the next tick's rouse; past room for them, all are.
-        if (self.sweeps.count == 0 or self.rouse_all) return;
-        const path: entities.sweeps.Box = .{ .low = .{ box.low[0], box.low[1] - 1.5, box.low[2] }, .high = .{ box.high[0], box.high[1] + 1.5, box.high[2] } };
-        if (!self.sweeps.meeting(world, path, reach + 1.5, self.rousing, &self.rousing_count)) self.rouse_all = true;
+        if (self.boxedCount() == 0 or self.rouse_all) return;
+        const path: entities.Feet = .{ .low = .{ box.low[0], box.low[1] - 1.5, box.low[2] }, .high = .{ box.high[0], box.high[1] + 1.5, box.high[2] } };
+        const space = &self.deps.entities.places.space;
+        const Gather = struct {
+            owner: *Projectiles,
+            pub fn visit(context: @This(), index: u32) bool {
+                const owner = context.owner;
+                if (owner.rousing_count == owner.rousing.len) return false;
+                owner.rousing[owner.rousing_count] = owner.deps.entities.places.space.boxAt(index).slot;
+                owner.rousing_count += 1;
+                return true;
+            }
+        };
+        if (!space.eachBox(world, path, reach + 1.5, self.kinds, Gather{ .owner = self }, true)) self.rouse_all = true;
     }
 
     /// What may have moved since the last tick wakes the sleepers it came near: a mob or player
     /// in a path might be hit. Who sees a sleeper tracking answers by its sweep. While projectiles
     /// fly nothing moves: a hit changes motion, which moves things on their own ticks.
     fn watch(self: *Projectiles) void {
-        if (self.sweeps.count == 0) return;
+        const space = &self.deps.entities.places.space;
+        defer space.clearMovers();
+        if (self.boxedCount() == 0) return;
         const mobs = self.deps.mobs;
-        // From their places, which hold where each stands and how big it is, without reading
-        // their states; the removed have no place.
-        for (0..mobs.active.count) |active_at| {
-            const index = mobs.active.at(active_at);
-            const box = mobs.placedBox(@intCast(index)) orelse continue;
-            const world = mobs.places.space.columnHolding(mobs.deps.entities.directory.entry(index).id).?.world;
-            self.rouseMeeting(world, .{ .low = box.min, .high = box.max }, 0);
+        // Mobs that moved, or came, since: one that stood still was not near any path boxed
+        // since, as none sleeps where a body is. From their places, which hold where each
+        // stands and how big it is, without reading their states; the removed have no place.
+        const movers = space.moversSince();
+        if (movers.overflowed) {
+            for (0..mobs.active.count) |active_at| self.rouseMob(@intCast(mobs.active.at(active_at)));
+        } else for (0..movers.slots.len) |at| {
+            const slot = movers.slots.at(at).*;
+            if (mobs.kinds.has(self.deps.entities.directory.entry(slot).kind)) self.rouseMob(slot);
         }
         var moved = self.moved.iterator(.{});
         while (moved.next()) |slot| {
@@ -1386,6 +1403,62 @@ pub const Projectiles = struct {
             const box = playerBox(player);
             self.rouseMeeting(player.world, .{ .low = box.min, .high = box.max }, 0);
         }
+    }
+
+    fn rouseMob(self: *Projectiles, slot: u32) void {
+        const placed = self.deps.entities.places.space.atSlot(slot) orelse return;
+        const box = placed.entry.box();
+        self.rouseMeeting(placed.world, .{ .low = box.min, .high = box.max }, 0);
+    }
+
+    /// How many ticks of a planned path stay clear of every body: the first tick whose path,
+    /// grown as findTarget sweeps it, meets a mob or a player, else all of them.
+    fn untilNear(self: *Projectiles, world: u32, states: *const [update_interval + 1]Motion, ticks: u64) !u64 {
+        var low = states[0].position;
+        var high = states[0].position;
+        for (states[1 .. ticks + 1]) |*state| for (0..3) |axis| {
+            low[axis] = @min(low[axis], state.position[axis]);
+            high[axis] = @max(high[axis], state.position[axis]);
+        };
+        const path = claimed(low, high);
+        const within: body.Box = .{ .min = path.low, .max = path.high };
+        var found: struct { boxes: [64]body.Box = undefined, count: usize = 0, overflowed: bool = false } = .{};
+        const space = &self.deps.entities.places.space;
+        if (self.mobs_placed > 0) try space.each(world, .{ .min = within.min, .max = within.max }, self.deps.mobs.kinds, &found, struct {
+            fn visit(list: *@TypeOf(found), entry: entities.space.Entry) anyerror!bool {
+                if (list.count == list.boxes.len) {
+                    list.overflowed = true;
+                    return true;
+                }
+                const box = entry.box();
+                list.boxes[list.count] = .{ .min = box.min, .max = box.max };
+                list.count += 1;
+                return false;
+            }
+        }.visit);
+        // Too many to weigh: it does not sleep.
+        if (found.overflowed) return 0;
+        for (self.deps.players.activeSlots()) |slot| {
+            const player = &self.deps.players.records[slot];
+            if (player.world != world) continue;
+            const box = playerBox(player);
+            if (!box.intersects(within)) continue;
+            if (found.count == found.boxes.len) return 0;
+            found.boxes[found.count] = box;
+            found.count += 1;
+        }
+        var free = ticks;
+        for (found.boxes[0..found.count]) |box| {
+            for (0..@intCast(free)) |tick| {
+                const segment = claimed(.{ @min(states[tick].position[0], states[tick + 1].position[0]), @min(states[tick].position[1], states[tick + 1].position[1]), @min(states[tick].position[2], states[tick + 1].position[2]) }, .{ @max(states[tick].position[0], states[tick + 1].position[0]), @max(states[tick].position[1], states[tick + 1].position[1]), @max(states[tick].position[2], states[tick + 1].position[2]) });
+                const swept: body.Box = .{ .min = segment.low, .max = segment.high };
+                if (swept.intersects(box)) {
+                    free = tick;
+                    break;
+                }
+            }
+        }
+        return free;
     }
 
     /// Which sleepers wake this tick, before the flying: those something came near and those
@@ -1399,7 +1472,7 @@ pub const Projectiles = struct {
         }
         if (self.sleeping == 0) return;
         if (self.rouse_all) {
-            assert(self.sweeps.count == 0);
+            assert(self.boxedCount() == 0);
             // One pass: the index changes only once the pass is done.
             var pass = store.Pass.init(&self.index, store.under(.sleeping));
             while (true) {
@@ -1412,13 +1485,17 @@ pub const Projectiles = struct {
             if (self.sleeping != 0) return error.Corrupt;
             return;
         }
-        for (self.rousing[0..self.rousing_count]) |index| {
-            if (!self.sweeps.used(index)) continue;
-            self.waking[self.waking_count] = self.deps.entities.directory.entry(self.sweeps.remove(index)).id;
+        const space = &self.deps.entities.places.space;
+        for (self.rousing[0..self.rousing_count]) |slot| {
+            // Woken already, or the slot another's since.
+            const boxed = space.boxOf(slot) orelse continue;
+            if (!self.kinds.has(boxed.kind)) continue;
+            _ = space.unbox(slot);
+            self.waking[self.waking_count] = self.deps.entities.directory.entry(slot).id;
             self.waking_count += 1;
         }
         var due: usize = 0;
-        self.sweeps.takeDue(self.now, self.due, &due);
+        space.takeDue(self.now, self.kinds, self.due, &due);
         for (self.due[0..due]) |slot| {
             self.waking[self.waking_count] = self.deps.entities.directory.entry(slot).id;
             self.waking_count += 1;
@@ -1444,6 +1521,8 @@ pub const Projectiles = struct {
     /// its sweep stands for.
     fn locate(self: *Projectiles, slot: u32, projectile: *const Projectile) !void {
         const space = &self.deps.entities.places.space;
+        // Awake, its box is no longer where it is: one due and not boxed again is taken back.
+        _ = space.unbox(slot);
         const shape: entities.space.Shape = .{ .kind = self.entity_types[@backingInt(projectile.kind)], .half_width = half_width, .height = height };
         if (space.atSlot(slot)) |placed| {
             if (placed.world == projectile.world and std.meta.eql(placed.entry.position, projectile.position)) return;
@@ -1572,15 +1651,6 @@ pub const Projectiles = struct {
         const until: u64 = @intCast(update_interval - @rem(self.age(projectile), update_interval));
         if (until < 3) return;
         const bounds = try self.heightOf(projectile.world);
-        // Someone anywhere it could reach, and planning is not worth it: it moves at most its
-        // speed a tick, and gravity a little more each tick.
-        {
-            const v = projectile.velocity;
-            const t: f64 = @floatFromInt(until);
-            const reach = @sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) * t + 0.025 * t * t + 1;
-            const at = projectile.position;
-            if (try self.anyoneIn(projectile.world, claimed(.{ at[0] - reach, at[1] - reach, at[2] - reach }, .{ at[0] + reach, at[1] + reach, at[2] + reach }))) return;
-        }
         // Its states tick by tick, as far as it stays above the void.
         // Kept between calls, as safety fills a fresh one every time.
         const states = &self.plan_states;
@@ -1595,9 +1665,12 @@ pub const Projectiles = struct {
             while (clear_ticks < ticks and try self.clear(projectile.world, states[clear_ticks].position, states[clear_ticks + 1].position)) clear_ticks += 1;
             ticks = clear_ticks;
         }
+        // As far as nothing could be hit: it sleeps up to the first tick its path comes near a body,
+        // and what moves near it later wakes it.
+        ticks = @min(ticks, try self.untilNear(projectile.world, states, ticks));
         if (ticks < 2) return;
-        // Seen alike by every player all along, as tracking answers for the box of its path; else
-        // along half of it.
+        // Seen alike by every player all along, as tracking answers for the box of its path, and
+        // within the columns a box may reach; else along half of it.
         const slot = held.slot;
         var bounded = planned;
         while (ticks >= 2) : (ticks /= 2) {
@@ -1611,13 +1684,13 @@ pub const Projectiles = struct {
                 };
                 bounded = ticks;
             }
-            if (try self.settled(slot, projectile.world, .{ .low = low, .high = high })) break;
+            if (entities.Space.boxFits(.{ .low = low, .high = high }, half_width) and try self.settled(slot, projectile.world, .{ .low = low, .high = high })) break;
         }
         if (ticks < 2) return;
         const synced = ticks == until;
         const wake_at = if (synced) self.now + until else self.now + ticks + 1;
         // Swept where its feet go: what comes near wakes it, and tracking answers by the box.
-        _ = self.sweeps.place(slot, projectile.world, .{ .low = low, .high = high }, half_width, height, self.now, wake_at) orelse return;
+        if (!try self.deps.entities.places.space.box(slot, projectile.world, .{ .low = low, .high = high }, half_width, height, self.now, wake_at)) return;
         const end = &states[ticks];
         projectile.start_position = projectile.position;
         projectile.start_velocity = projectile.velocity;
@@ -1640,7 +1713,7 @@ pub const Projectiles = struct {
     const retry_ticks = 10;
 
     /// findTarget's swept box over paths within a box of positions, and a little more.
-    fn claimed(low: [3]f64, high: [3]f64) entities.sweeps.Box {
+    fn claimed(low: [3]f64, high: [3]f64) entities.Feet {
         const reach = half_width + 1 + 0.5;
         return .{
             .low = .{ low[0] - reach, low[1] - 1.5, low[2] - reach },
@@ -1649,66 +1722,13 @@ pub const Projectiles = struct {
     }
 
     /// Whether every player sees a projectile anywhere its feet go in a box as clients have it now.
-    fn settled(self: *Projectiles, slot: u32, world: u32, box: entities.sweeps.Box) !bool {
+    fn settled(self: *Projectiles, slot: u32, world: u32, box: entities.Feet) !bool {
         const tracking = self.tracking orelse return true;
         return tracking.settled(slot, world, box, half_width, height);
     }
 
     /// The box around each world's players, worked out once a tick; with more worlds than room,
     /// the last stands for all the rest by covering everything.
-    fn gatherPlayers(self: *Projectiles) void {
-        self.players_near_tick = self.now;
-        self.players_near_count = 0;
-        for (self.deps.players.activeSlots()) |slot| {
-            const player = &self.deps.players.records[slot];
-            const at: [2]f64 = .{ player.position.x, player.position.z };
-            for (self.players_near[0..self.players_near_count]) |*near| {
-                if (near.world != player.world) continue;
-                near.low = .{ @min(near.low[0], at[0]), @min(near.low[1], at[1]) };
-                near.high = .{ @max(near.high[0], at[0]), @max(near.high[1], at[1]) };
-                break;
-            } else if (self.players_near_count < players_near_max) {
-                self.players_near[self.players_near_count] = .{ .world = player.world, .low = at, .high = at };
-                self.players_near_count += 1;
-            } else {
-                // Out of room: everything counts as near, and each player is looked at.
-                const last = &self.players_near[players_near_max - 1];
-                last.world = any_world;
-                last.low = @splat(-std.math.inf(f64));
-                last.high = @splat(std.math.inf(f64));
-            }
-        }
-    }
-
-    const players_near_max = 8;
-    const any_world = std.math.maxInt(u32);
-
-    /// Whether any mob or player is in a box.
-    fn anyoneIn(self: *Projectiles, world: u32, box: entities.sweeps.Box) !bool {
-        const mobs = self.deps.mobs;
-        const within: body.Box = .{ .min = box.low, .max = box.high };
-        var found = false;
-        try mobs.each(world, within, &found, struct {
-            fn visit(any: *bool, _: Mob) anyerror!bool {
-                any.* = true;
-                return true;
-            }
-        }.visit);
-        if (found) return true;
-        // Not near the box around a world's players: in no player's box.
-        if (self.players_near_tick != self.now) self.gatherPlayers();
-        for (self.players_near[0..self.players_near_count]) |near| {
-            if (near.world != world and near.world != any_world) continue;
-            if (box.low[0] - 1 > near.high[0] or box.high[0] + 1 < near.low[0] or box.low[2] - 1 > near.high[1] or box.high[2] + 1 < near.low[1]) return false;
-            break;
-        } else return false;
-        for (self.deps.players.activeSlots()) |slot| {
-            const player = &self.deps.players.records[slot];
-            if (player.world == world and playerBox(player).intersects(within)) return true;
-        }
-        return false;
-    }
-
     /// Every projectile as it stands at the end of the tick, sleepers as their ticks would have
     /// left them, for a test to hold sleeping to ticking.
     /// A copy of the projectile with a uuid, if it is in memory.
@@ -2111,13 +2131,19 @@ pub const Projectiles = struct {
                 try self.queue(change.slot, self.audience, .remove, true, packets.writeRemove, .{entities.Entities.networkOfSlot(change.slot)});
             }
             if (change.gone or !change.spawn.any()) continue;
+            // Those it would go to with room first: with none, as a backlog has, nothing is read.
+            var wanted = false;
+            for (self.audience, self.starved, 0..) |*audience, starved, at| {
+                audience.* = change.spawn.wordAt(at) & ~starved;
+                wanted = wanted or audience.* != 0;
+            }
+            if (!wanted) continue;
             const entity = self.deps.entities.directory.entry(change.slot).id;
             const kept = (try self.records.get(entity)) orelse return error.Corrupt;
             var stored: Projectile = undefined;
             @memcpy(std.mem.asBytes(&stored), kept.bytes[0..@sizeOf(Projectile)]);
             // A sleeper where its plan has it now.
             const projectile = self.present(stored, self.now);
-            for (self.audience, self.starved, 0..) |*audience, starved, at| audience.* = change.spawn.wordAt(at) & ~starved;
             const spawn: packets.Spawn = .{ .id = entities.Entities.networkOfSlot(change.slot), .uuid = projectile.uuid, .kind = self.entity_types[@backingInt(projectile.kind)], .position = projectile.position, .velocity = projectile.velocity, .yaw = angle(projectile.yaw), .pitch = angle(projectile.pitch), .owner = entity_effects.playerId(projectile.owner) };
             try self.queueSpawn(change.slot, self.audience, spawn, self.dataOf(&projectile));
         }
@@ -2762,8 +2788,6 @@ test "a path enters a box where its slabs meet, and not from inside" {
 const Records = struct {
     entities: *entities.Entities,
     table: Table,
-    /// Where the asleep are, set once the projectiles are.
-    sweeps: ?*entities.Sweeps = null,
 
     const Row = struct { record: Projectiles.Record };
     const Table = entities.KindTable(Row);
@@ -2834,7 +2858,7 @@ const Records = struct {
 
     /// A projectile leaving memory leaves its place, or its sweep.
     fn unplace(self: *Records, slot: u32, entity: u64) void {
-        if (self.sweeps) |sweeps| _ = sweeps.removeSlot(slot);
+        _ = self.entities.places.space.unbox(slot);
         self.entities.places.space.remove(entity);
     }
 

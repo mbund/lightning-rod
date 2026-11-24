@@ -95,7 +95,8 @@ pub const EntityColumns = struct {
             var count: usize = 0;
             for (0..space.columnCount()) |at| {
                 const held = space.columnAt(at);
-                if (held.count == 0) continue;
+                // Only what is stored goes to the store: players as subjects stay where they are.
+                if (held.count == 0 or !space.holdsStored(held)) continue;
                 const column = held.column;
                 if (self.deps.domains.loads(.{ .world = column.world, .x = column.x, .z = column.z })) continue;
                 if (count == strays.len) break;

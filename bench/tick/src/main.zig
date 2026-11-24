@@ -77,6 +77,11 @@ const Options = struct {
     cow_offset: f64 = 0,
     /// Ticks the cows get to settle before measuring.
     settle: usize = 400,
+    /// Ticks before anything is placed: with streaming, enough for every column to reach every
+    /// client, so what is measured is the rest.
+    warm: usize = 200,
+    /// Every tick, tracking's answers held to the rule asked of every pair: slow, for checking.
+    check_tracking: bool = false,
     /// Every cow in love once they settle, so they breed and their calves follow them.
     love: bool = false,
     /// Every player holds wheat once the cows settle, so the cows near follow them.
@@ -307,7 +312,8 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     var tick_time: u64 = 0;
     var packets: u64 = 0;
     var recipients: u64 = 0;
-    for (0..200) |tick| try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
+    checking_tracking = options.check_tracking;
+    for (0..options.warm) |tick| try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
     const mobs = simulation.get(vanilla.Mobs);
     if (options.cows > 0) {
         // A square field on the flat grass, its middle east of the players at 8, 8 by the offset.
@@ -403,6 +409,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     const rare_before = mobs.rare_lanes;
     const run_before = mobs.travels_run;
     const recomputes_before = mobs.edit_recomputes;
+    const tracking_before = simulation.get(vanilla.Tracking).stats;
     if (options.perf_control) |control| {
         const fifo = try std.Io.Dir.cwd().openFile(io, control, .{ .mode = .write_only });
         defer fifo.close(io);
@@ -458,8 +465,8 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
         try fifo.writeStreamingAll(io, "disable\n");
     }
     // Cows walk into sections they have not read yet, so only a world without them is steady.
-    // Items streaming through caches smaller than they are read on purpose.
-    if (options.cows == 0 and options.orbs == 0 and options.volley_interval == 0 and options.drop_edits == 0 and reads != inventories.cache.metrics.reads.value() + inventories.items.metrics.reads.value() + chunks.cache.metrics.reads.value()) return error.UnexpectedSteadyStateReads;
+    // Items streaming through caches smaller than they are read on purpose, as are columns streamed.
+    if (!options.stream and options.cows == 0 and options.orbs == 0 and options.volley_interval == 0 and options.drop_edits == 0 and reads != inventories.cache.metrics.reads.value() + inventories.items.metrics.reads.value() + chunks.cache.metrics.reads.value()) return error.UnexpectedSteadyStateReads;
     const snapshots = simulation.metrics.snapshot(stages);
     std.mem.sort(u64, cpus, {}, std.sort.asc(u64));
     std.mem.sort(u64, walls, {}, std.sort.asc(u64));
@@ -482,6 +489,13 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
         const held = simulation.get(vanilla.Entities);
         try writer.print("  entity pool pages={d} used={d} entities={d}\n", .{ pool.pageCount(), pool.pageCount() - pool.freeCount(), held.directory.count() });
     }
+    {
+        const tracking = simulation.get(vanilla.Tracking);
+        const done = tracking.stats;
+        const was = tracking_before;
+        const per: f64 = @floatFromInt(ticks);
+        try writer.print("  tracking logged={d:.1} quiet={d:.1} anchored={d:.2} slack_moves={d:.1} columns={d:.1} measured={d:.1} asked={d:.1} changed={d:.1} near={d:.1} walks={d:.2} boxes={d:.1} exact={d:.2} tiles={d} /tick\n", .{ @as(f64, @floatFromInt(done.logged - was.logged)) / per, @as(f64, @floatFromInt(done.logged_quiet - was.logged_quiet)) / per, @as(f64, @floatFromInt(done.anchored - was.anchored)) / per, @as(f64, @floatFromInt(done.slack_moves - was.slack_moves)) / per, @as(f64, @floatFromInt(done.columns - was.columns)) / per, @as(f64, @floatFromInt(done.measured - was.measured)) / per, @as(f64, @floatFromInt(done.asked - was.asked)) / per, @as(f64, @floatFromInt(done.changed - was.changed)) / per, @as(f64, @floatFromInt(done.near_measured - was.near_measured)) / per, @as(f64, @floatFromInt(done.edge_walks - was.edge_walks)) / per, @as(f64, @floatFromInt(done.boxes - was.boxes)) / per, @as(f64, @floatFromInt(done.exact - was.exact)) / per, done.tiles_made });
+    }
     if (options.arrows > 0 or options.flying > 0) try writer.print("  arrows={d} ticking={d} volleys={d} queued={any} taken={any} sleeping={d}\n", .{ simulation.get(vanilla.Projectiles).activeCount(), simulation.get(vanilla.Projectiles).tickingCount(), volleys, simulation.get(vanilla.Projectiles).queued, simulation.get(vanilla.Projectiles).taken, simulation.get(vanilla.Projectiles).sleepingCount() });
     if (options.cows > 0) try writer.print("  domain_revision={d} audience_changes={d} cows={d} ticked={d} resting={d} idle_ticks={d} blocks={d} rare_lanes={d} travels_skipped={d} travels_run={d} path_searches={d:.3}/tick edits={d} edit_recomputes={d} edits_answered_early={d} sections_decoded={d}\n", .{ mobs.domain_revision, simulation.get(vanilla.MobReplication).audience_changes, mobs.active.count, ticked, resting, mobs.idle_ticks - idle_before, mobs.idle_blocks - blocks_before, mobs.rare_lanes - rare_before, mobs.travels_skipped - skipped_before, mobs.travels_run - run_before, @as(f64, @floatFromInt(mobs.path_searches - searches_before)) / @as(f64, @floatFromInt(ticks)), edits, mobs.edit_recomputes - recomputes_before, mobs.edits_answered_early, mobs.copies.decoded });
     if (options.detail) for (snapshots, before[0..snapshots.len]) |after, previous| {
@@ -497,6 +511,9 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     };
     try writer.flush();
 }
+
+/// Whether each tick holds tracking to the rule, as `--check-tracking` asks.
+var checking_tracking = false;
 
 fn advance(simulation: *Simulation, service: *sessions.Service, handles: []const sessions.Handle, payloads: []const [1][]const u8, mode: Mode, packets: *u64, recipients: *u64, tick_time: *u64) !void {
     for (handles) |handle| {
@@ -515,6 +532,7 @@ fn advance(simulation: *Simulation, service: *sessions.Service, handles: []const
         service.endTick(true);
         service.flush();
     } else try simulation.tick();
+    if (checking_tracking) try simulation.get(vanilla.Tracking).check();
     if (streamed) |terrain| try terrain.poll();
     timer.end();
     tick_time.* += @intCast(std.Io.Clock.now(.awake, simulation.io).nanoseconds - tick_started);
@@ -578,6 +596,10 @@ pub fn main(init: std.process.Init) !void {
             options.no_item_sleep = true;
         } else if (std.mem.startsWith(u8, argument, "--drops=")) {
             options.drops = try std.fmt.parseInt(usize, argument[8..], 10);
+        } else if (std.mem.eql(u8, argument, "--check-tracking")) {
+            options.check_tracking = true;
+        } else if (std.mem.startsWith(u8, argument, "--warm=")) {
+            options.warm = try std.fmt.parseInt(usize, argument[7..], 10);
         } else if (std.mem.startsWith(u8, argument, "--flying=")) {
             options.flying = try std.fmt.parseInt(usize, argument[9..], 10);
         } else if (std.mem.startsWith(u8, argument, "--volley-interval=")) {

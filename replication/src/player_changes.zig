@@ -38,14 +38,6 @@ pub const PlayerChanges = struct {
     move_count: usize = 0,
     views: []View,
     view_count: usize = 0,
-    /// How far, at most, any player's circle edge has come towards anything since the server
-    /// started: the farthest any player moved each tick and any view distance shrank or grew,
-    /// summed. A distance to the nearest edge measured at one drift is good, less what the
-    /// drift grew since.
-    drift: f64 = 0,
-    /// Rises whenever a player arrives anywhere: a new circle, which no distance measured before
-    /// knew of.
-    epoch: u64 = 0,
     /// Whether spectator mode is read: a player's game mode is asked for, and costs a call.
     modes: bool,
 
@@ -87,8 +79,6 @@ pub const PlayerChanges = struct {
         self.reset_count = 0;
         self.move_count = 0;
         self.view_count = 0;
-        var farthest: f64 = 0;
-        var arrived = false;
         for (players.records, self.snapshots, 0..) |player, *snapshot, index| {
             const now = snapshotOf(players, player, index, self.modes);
             const was = snapshot.*;
@@ -99,23 +89,18 @@ pub const PlayerChanges = struct {
                 const forgot = was.generation != now.generation or was.life != now.life or was.world != now.world;
                 self.resets[self.reset_count] = .{ .player = @intCast(index), .was = was, .now = now, .forgot = forgot };
                 self.reset_count += 1;
-                if (now.ready) arrived = true;
                 continue;
             }
             if (!now.ready) continue;
             if (was.x != now.x or was.z != now.z) {
                 self.moves[self.move_count] = .{ .player = @intCast(index), .from = .{ was.x, was.z }, .to = .{ now.x, now.z } };
                 self.move_count += 1;
-                farthest = @max(farthest, @sqrt((now.x - was.x) * (now.x - was.x) + (now.z - was.z) * (now.z - was.z)));
             }
             if (was.reach != now.reach) {
                 self.views[self.view_count] = .{ .player = @intCast(index), .from = was.reach, .to = now.reach };
                 self.view_count += 1;
-                farthest = @max(farthest, @abs(now.reach - was.reach));
             }
         }
-        self.drift += farthest;
-        if (arrived) self.epoch += 1;
     }
 
     pub fn resetList(self: *const PlayerChanges) []const Reset {

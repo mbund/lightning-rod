@@ -46,7 +46,8 @@ pub fn Records(comptime T: type) type {
 
         pub fn remove(self: *Self, index: u32) void {
             assert(index < self.values.len);
-            self.values.at(index).* = undefined;
+            // Poisoned for checks; a released build leaves the bytes.
+            if (@import("builtin").mode == .debug) self.values.at(index).* = undefined;
             self.free.at(self.free_count).* = index;
             self.free_count += 1;
             self.count -= 1;

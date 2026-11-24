@@ -390,7 +390,7 @@ pub const ItemReplication = struct {
             var ids: [16]entities.Id = undefined;
             @memcpy(ids[0..count], self.work.values()[cursor..][0..count]);
             cursor += count;
-            try self.process(ids[0..count], pass);
+            try self.process(ids[0..count], pass, false);
         }
         // Those only due their turn, and looked at in full for nothing else.
         cursor = 0;
@@ -403,7 +403,7 @@ pub const ItemReplication = struct {
                 ids[count] = entity;
                 count += 1;
             }
-            try self.process(ids[0..count], pass);
+            try self.process(ids[0..count], pass, true);
         }
         self.work.clear();
         if (sweep) {
@@ -468,7 +468,7 @@ pub const ItemReplication = struct {
             var ids: [16]entities.Id = undefined;
             @memcpy(ids[0..count], viewed[at..][0..count]);
             at += count;
-            try self.process(self.unswept(ids[0..count]), pass);
+            try self.process(self.unswept(ids[0..count]), pass, false);
         }
         // And every item whose audience changed, as the work could not hold them all.
         var found_count: usize = 0;
@@ -485,7 +485,7 @@ pub const ItemReplication = struct {
             var ids: [16]entities.Id = undefined;
             @memcpy(ids[0..count], self.found[next..][0..count]);
             next += count;
-            try self.process(self.unswept(ids[0..count]), pass);
+            try self.process(self.unswept(ids[0..count]), pass, false);
         }
     }
 
@@ -502,7 +502,10 @@ pub const ItemReplication = struct {
     }
 
     /// Looks at up to 16 items: who is interested, what each viewer is owed, and sends it.
-    fn process(self: *ItemReplication, given: []const entities.Id, pass: Pass) !void {
+    /// Items looked at: their audience as tracking has it, their stacks read for anyone interested,
+    /// and what each viewer is owed sent. `turn_only` when nothing but their turn brought them,
+    /// so a stack read is owed only where tracking changed who sees one.
+    fn process(self: *ItemReplication, given: []const entities.Id, pass: Pass, turn_only: bool) !void {
         assert(given.len <= 16);
         const dropped = self.deps.dropped;
         const service = self.deps.sessions;
@@ -572,11 +575,14 @@ pub const ItemReplication = struct {
                 if (view.done) continue;
                 // Who is to have it: who has it, as tracking changes that.
                 interests[index].copy(view.known);
-                if (self.deps.tracking.changed(view.slot)) |change| {
+                const changed = self.deps.tracking.changed(view.slot);
+                if (changed) |change| {
                     interests[index].subtract(interests[index].view(), change.remove);
                     interests[index].unite(interests[index].view(), change.spawn);
                 }
                 if (maybe_body == null) continue;
+                // Only its turn: no one's interest in it changed, and neither did its stack.
+                if (turn_only and changed == null) continue;
                 const body = maybe_body.?;
                 // Read for anyone interested, sendable now or not: a change unread would be lost.
                 if (interests[index].view().any()) {

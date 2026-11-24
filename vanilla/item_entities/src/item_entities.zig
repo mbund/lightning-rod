@@ -542,14 +542,14 @@ pub const ItemEntities = struct {
         try self.schedule(entity, sleep.ticks +% elapsed, sleep.age +% @as(i32, @intCast(elapsed)));
     }
 
-    /// The change counts of the columns within `reach` of a place, summed: counts only grow, so
-    /// the same sum is the same columns.
+    /// The change counts of the items of the columns within `reach` of a place, summed: counts
+    /// only grow, so the same sum is the same items there. What other kinds do leaves it.
     pub fn revisionAround(self: *const ItemEntities, world: u32, position: [3]f64, reach: f64) u64 {
         var sum: u64 = 0;
         var x = entities.space.coordinate(position[0] - reach);
         while (x <= entities.space.coordinate(position[0] + reach)) : (x += 1) {
             var z = entities.space.coordinate(position[2] - reach);
-            while (z <= entities.space.coordinate(position[2] + reach)) : (z += 1) sum += self.places.space.revision(.{ .world = world, .x = x, .z = z });
+            while (z <= entities.space.coordinate(position[2] + reach)) : (z += 1) sum += self.places.space.revisionOf(.{ .world = world, .x = x, .z = z }, kinds);
         }
         return sum;
     }
