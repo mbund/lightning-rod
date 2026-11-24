@@ -224,22 +224,29 @@ pub const wheel_ticks = 32;
 /// An entity's box: where its feet stay until a tick, and its own size, so its box anywhere along
 /// is the feet's grown by it.
 pub const Boxed = struct {
+    // Two cache lines, all a box placed again in its columns reads and writes: its columns'
+    // dense indices are in the links, for those that walk or leave them.
+    feet: Feet align(64) = .{ .low = .{ 0, 0, 0 }, .high = .{ 0, 0, 0 } },
+    until: u64 = 0,
+    half_width: f32 = 0,
+    height: f32 = 0,
     slot: u32 = 0,
     kind: u32 = 0,
     world: u32 = 0,
-    until: u64 = 0,
-    feet: Feet = .{ .low = .{ 0, 0, 0 }, .high = .{ 0, 0, 0 } },
-    half_width: f32 = 0,
-    height: f32 = 0,
-    /// The columns it is listed in, by dense index.
-    columns: [box_links]u32 = @splat(none),
+    /// Where it is in its tick's turn of the wheel.
+    wheel_at: u32 = none,
+    /// The columns it is listed in: x and z from these, so many of each, x first.
+    x: i32 = 0,
+    z: i32 = 0,
+    x_count: u8 = 0,
+    z_count: u8 = 0,
     column_count: u8 = 0,
     used: bool = false,
     /// In the wheel, or taken from it as due and waiting to be placed again or taken back.
     in_wheel: bool = false,
     due: bool = false,
-    wheel_next: u32 = none,
-    wheel_previous: u32 = none,
+    /// Placed again last in the columns it was in already.
+    in_place: bool = false,
 
     /// The entity's box anywhere along.
     pub fn reach(self: *const Boxed) Feet {
@@ -313,7 +320,10 @@ pub const Space = struct {
     boxes: extras.Records(Boxed),
     link_next: Array(u32),
     link_previous: Array(u32),
-    wheel: [wheel_ticks]u32 = @splat(none),
+    /// The dense index of the column each link is in.
+    link_column: Array(u32),
+    /// The boxes due on each tick of a turn, in no order.
+    wheel: [wheel_ticks]Array(u32),
     box_count: usize = 0,
     /// Of each kind.
     kind_boxed: [Kinds.max_kinds]u32 = @splat(0),
@@ -345,11 +355,14 @@ pub const Space = struct {
             .boxes = try .init(allocator, pool),
             .link_next = try .init(allocator, pool),
             .link_previous = try .init(allocator, pool),
+            .link_column = try .init(allocator, pool),
+            .wheel = undefined,
             .box_of = try allocator.alloc(u32, directory.capacity()),
             .emptied = try .init(allocator, pool),
             .found = undefined,
         };
         for (&self.found) |*list| list.* = try .init(allocator, pool);
+        for (&self.wheel) |*turn| turn.* = try .init(allocator, pool);
         @memset(self.noted, 0);
         @memset(self.mover_noted, 0);
         @memset(self.box_of, none);
@@ -994,12 +1007,15 @@ pub const Space = struct {
         const xs = columnRange(feet.low[0] - half, feet.high[0] + half) orelse return false;
         const zs = columnRange(feet.low[2] - half, feet.high[2] + half) orelse return false;
         if (xs[1] - xs[0] >= box_span or zs[1] - zs[0] >= box_span) return false;
+        // Room in its turn first, so nothing after can fail.
+        const turn = &self.wheel[until % wheel_ticks];
+        try turn.reserve(1);
         // Boxed already, as one due goes on to its next box: in its columns still, it stays
         // listed where it is.
         if (self.box_of[slot] != none) {
             const index = self.box_of[slot];
             const boxed = self.boxes.at(index);
-            if (boxed.world == world and self.sameColumns(boxed, xs, zs)) {
+            if (boxed.world == world and sameColumns(boxed, xs, zs)) {
                 const at = self.reserve(slot) catch overflowed: {
                     self.log_overflowed = true;
                     break :overflowed null;
@@ -1011,6 +1027,7 @@ pub const Space = struct {
                 boxed.half_width = half_width;
                 boxed.height = height;
                 boxed.until = until;
+                boxed.in_place = true;
                 self.enwheel(index);
                 self.fill(at, slot, .boxed);
                 return true;
@@ -1023,6 +1040,7 @@ pub const Space = struct {
         errdefer self.boxes.remove(index);
         try self.link_next.ensureFilled((@as(usize, index) + 1) * box_links, none);
         try self.link_previous.ensureFilled((@as(usize, index) + 1) * box_links, none);
+        try self.link_column.ensureFilled((@as(usize, index) + 1) * box_links, none);
         var made: [box_links]u32 = undefined;
         var made_count: usize = 0;
         errdefer for (made[0..made_count]) |column| self.releaseColumn(column);
@@ -1043,7 +1061,7 @@ pub const Space = struct {
         const boxed = self.boxes.at(index);
         for (made[0..made_count], 0..) |column, link_at| {
             const link: u32 = @intCast(@as(usize, index) * box_links + link_at);
-            boxed.columns[link_at] = column;
+            self.link_column.at(link).* = column;
             const held = self.columns.at(column);
             self.link_next.at(link).* = held.box_first;
             self.link_previous.at(link).* = none;
@@ -1052,6 +1070,10 @@ pub const Space = struct {
             held.box_count += 1;
         }
         boxed.column_count = @intCast(made_count);
+        boxed.x = xs[0];
+        boxed.z = zs[0];
+        boxed.x_count = @intCast(xs[1] - xs[0] + 1);
+        boxed.z_count = @intCast(zs[1] - zs[0] + 1);
         // Listed first, so its place going lets none of its columns go.
         if (self.directory.entry(slot).space_column != none) self.unplace(self.directory.entry(slot).id);
         self.enwheel(index);
@@ -1063,38 +1085,31 @@ pub const Space = struct {
     }
 
     /// Whether a box is listed in exactly the columns of a range.
-    fn sameColumns(self: *const Space, boxed: *const Boxed, xs: [2]i32, zs: [2]i32) bool {
-        const spanned: usize = @intCast((xs[1] - xs[0] + 1) * (zs[1] - zs[0] + 1));
-        if (boxed.column_count != spanned) return false;
-        var link_at: usize = 0;
-        var x = xs[0];
-        while (x <= xs[1]) : (x += 1) {
-            var z = zs[0];
-            while (z <= zs[1]) : (z += 1) {
-                const column = self.columns.at(boxed.columns[link_at]).column;
-                if (column.x != x or column.z != z) return false;
-                link_at += 1;
-            }
-        }
-        return true;
+    fn sameColumns(boxed: *const Boxed, xs: [2]i32, zs: [2]i32) bool {
+        return boxed.x == xs[0] and boxed.z == zs[0] and boxed.x_count == xs[1] - xs[0] + 1 and boxed.z_count == zs[1] - zs[0] + 1;
     }
 
+    /// Into its tick's turn, which has room for it.
     fn enwheel(self: *Space, index: u32) void {
         const boxed = self.boxes.at(index);
         assert(!boxed.in_wheel);
         const turn = &self.wheel[boxed.until % wheel_ticks];
-        boxed.wheel_previous = none;
-        boxed.wheel_next = turn.*;
-        if (turn.* != none) self.boxes.at(turn.*).wheel_previous = index;
-        turn.* = index;
+        boxed.wheel_at = @intCast(turn.len);
+        _ = turn.append(index) catch unreachable;
         boxed.in_wheel = true;
     }
 
+    /// Out of its turn, the last of it taking its place.
     fn unwheel(self: *Space, index: u32) void {
         const boxed = self.boxes.at(index);
         if (!boxed.in_wheel) return;
-        if (boxed.wheel_previous != none) self.boxes.at(boxed.wheel_previous).wheel_next = boxed.wheel_next else self.wheel[boxed.until % wheel_ticks] = boxed.wheel_next;
-        if (boxed.wheel_next != none) self.boxes.at(boxed.wheel_next).wheel_previous = boxed.wheel_previous;
+        const turn = &self.wheel[boxed.until % wheel_ticks];
+        const last = turn.at(turn.len - 1).*;
+        if (last != index) {
+            turn.at(boxed.wheel_at).* = last;
+            self.boxes.at(last).wheel_at = boxed.wheel_at;
+        }
+        turn.pop();
         boxed.in_wheel = false;
     }
 
@@ -1131,8 +1146,12 @@ pub const Space = struct {
         const boxed = self.boxes.at(index);
         assert(boxed.used);
         const slot = boxed.slot;
-        for (boxed.columns[0..boxed.column_count], 0..) |column, link_at| {
+        var columns: [box_links]u32 = undefined;
+        const column_count = boxed.column_count;
+        for (0..column_count) |link_at| {
             const link: u32 = @intCast(@as(usize, index) * box_links + link_at);
+            const column = self.link_column.at(link).*;
+            columns[link_at] = column;
             const held = self.columns.at(column);
             const previous = self.link_previous.at(link).*;
             const next = self.link_next.at(link).*;
@@ -1142,8 +1161,6 @@ pub const Space = struct {
         }
         self.unwheel(index);
         if (boxed.due) self.kind_due[boxed.kind] -= 1;
-        const columns = boxed.columns;
-        const column_count = boxed.column_count;
         self.kind_boxed[boxed.kind] -= 1;
         self.boxes.remove(index);
         self.box_count -= 1;
@@ -1163,30 +1180,34 @@ pub const Space = struct {
     pub fn takeDue(self: *Space, now: u64, kinds: Kinds, output: []u32, found: *usize) void {
         var waiting = kinds.bits.iterator(.{});
         while (waiting.next()) |kind| assert(self.kind_due[kind] == 0);
-        var index = self.wheel[now % wheel_ticks];
-        while (index != none) {
+        // Every box in this turn is due now, as none is longer than the wheel: those of other
+        // kinds stay, packed to the front.
+        const turn = &self.wheel[now % wheel_ticks];
+        var kept: usize = 0;
+        for (0..turn.len) |at| {
+            const index = turn.at(at).*;
             const boxed = self.boxes.at(index);
-            const following = boxed.wheel_next;
-            assert(boxed.used and boxed.until >= now);
-            if (boxed.until == now and kinds.has(boxed.kind)) {
+            assert(boxed.used and boxed.in_wheel and boxed.until == now);
+            if (kinds.has(boxed.kind)) {
                 assert(found.* < output.len);
                 output[found.*] = boxed.slot;
                 found.* += 1;
-                self.unwheel(index);
+                boxed.in_wheel = false;
                 boxed.due = true;
                 self.kind_due[boxed.kind] += 1;
+            } else {
+                boxed.wheel_at = @intCast(kept);
+                turn.at(kept).* = index;
+                kept += 1;
             }
-            index = following;
         }
+        turn.shrink(kept);
     }
 
     /// Whether some box is overdue: none must be, as kinds place their entities again on time.
     pub fn overdue(self: *const Space, now: u64) bool {
-        for (self.wheel) |head| {
-            var index = head;
-            while (index != none) : (index = self.boxes.at(index).wheel_next) {
-                if (self.boxes.at(index).until < now) return true;
-            }
+        for (&self.wheel) |*turn| {
+            for (0..turn.len) |at| if (self.boxes.at(turn.at(at).*).until < now) return true;
         }
         return false;
     }
@@ -1231,7 +1252,7 @@ pub const Space = struct {
                     const boxed = self.boxes.at(box_index);
                     if (!kinds.has(boxed.kind)) continue;
                     // Found once: in the first of its columns the walk meets.
-                    if (!self.firstMet(boxed, xs, zs, link % box_links)) continue;
+                    if (!firstMet(boxed, xs, zs, link % box_links)) continue;
                     const c = boxed.reach();
                     if (c.low[0] > high_x or c.high[0] < low_x or c.low[2] > high_z or c.high[2] < low_z) continue;
                     if (vertical and (c.low[1] > query.high[1] or c.high[1] < query.low[1])) continue;
@@ -1244,15 +1265,23 @@ pub const Space = struct {
 
     /// Whether a box's column at `link_at` is the first of its columns within the walked ones, as
     /// the walk goes, so each box is visited once.
-    fn firstMet(self: *const Space, boxed: *const Boxed, xs: [2]i32, zs: [2]i32, link_at: usize) bool {
-        for (boxed.columns[0..link_at]) |index| {
-            const column = self.columns.at(index).column;
-            if (column.x >= xs[0] and column.x <= xs[1] and column.z >= zs[0] and column.z <= zs[1]) return false;
+    fn firstMet(boxed: *const Boxed, xs: [2]i32, zs: [2]i32, link_at: usize) bool {
+        for (0..link_at) |earlier| {
+            const x = boxed.x + @as(i32, @intCast(earlier / boxed.z_count));
+            const z = boxed.z + @as(i32, @intCast(earlier % boxed.z_count));
+            if (x >= xs[0] and x <= xs[1] and z >= zs[0] and z <= zs[1]) return false;
         }
         return true;
     }
 
     // Lookups.
+
+    /// Whether a column may hold some of the kinds whose fold is `fold`, as `Kinds.fold`: one
+    /// lookup, for whoever would walk it, and false only where none is.
+    pub fn holdsAny(self: *const Space, column: Column, fold: u64) bool {
+        const index = self.indexOf(column) orelse return false;
+        return self.columns.at(index).folded & fold != 0;
+    }
 
     /// The entities of one column whose sections lie from `low` to `high`, in vanilla's order,
     /// a round at a time into `buffer`: between rounds the space may change, and the next round
@@ -1260,6 +1289,14 @@ pub const Space = struct {
     pub fn ordered(self: *const Space, column: Column, low: i32, high: i32, kinds: Kinds, buffer: []Entry) Ordered {
         assert(buffer.len >= 2 and low <= high);
         return .{ .space = self, .column = column, .low = low, .high = high, .kinds = kinds, .buffer = buffer };
+    }
+
+    /// As `ordered`, of those whose feet are within a box only: for a caller that takes no other,
+    /// the rest are passed over before they are put in order.
+    pub fn orderedWithin(self: *const Space, column: Column, low: i32, high: i32, kinds: Kinds, within: Feet, buffer: []Entry) Ordered {
+        var walk = self.ordered(column, low, high, kinds, buffer);
+        walk.within = within;
+        return walk;
     }
 
     pub const Ordered = struct {
@@ -1271,6 +1308,7 @@ pub const Space = struct {
         buffer: []Entry,
         after: ?Entry = null,
         done: bool = false,
+        within: ?Feet = null,
 
         /// Each round keeps the least past the last given, halving when the buffer fills.
         pub fn next(self: *Ordered) ![]const Entry {
@@ -1282,6 +1320,7 @@ pub const Space = struct {
             var walk = self.space.entries(self.column, self.kinds);
             while (walk.next()) |entry| {
                 if (entry.section < self.low or entry.section > self.high) continue;
+                if (self.within) |feet| if (!feet.contains(entry.position)) continue;
                 if (self.after) |last| if (!before(last, entry)) continue;
                 if (cutoff) |limit| if (before(limit, entry)) {
                     more = true;
@@ -1616,9 +1655,11 @@ test "boxes are found by what meets them and by their tick, and leave when taken
     space.takeDue(105, .all, &slots, &due);
     try testing.expectEqualSlices(u32, &.{seven}, slots[0..due]);
     // Due, it stays where it is until placed again: in its columns still, it is not moved.
-    const columns = space.boxOf(seven).?.columns;
+    const index = space.box_of[seven];
+    const first_column = space.link_column.at(@as(usize, index) * box_links).*;
     try testing.expect(try space.box(seven, 0, .{ .low = .{ 61, 70, 10 }, .high = .{ 69, 90, 20 } }, 0.25, 0.5, 105, 110));
-    try testing.expectEqualSlices(u32, &columns, &space.boxOf(seven).?.columns);
+    try testing.expectEqual(index, space.box_of[seven]);
+    try testing.expectEqual(first_column, space.link_column.at(@as(usize, index) * box_links).*);
     try testing.expect(space.unbox(seven));
     try testing.expect(space.boxOf(seven) == null);
     try testing.expect(space.unbox(eight));

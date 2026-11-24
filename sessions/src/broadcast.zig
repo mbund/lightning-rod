@@ -199,7 +199,21 @@ pub const Broadcast = struct {
         return self.writeGroup(implementations, Encoder, excluded, required, arguments, &.{maximum_bytes});
     }
 
+    /// What writing a group fills before it reads, kept apart so filling it is not paid for.
+    const GroupScratch = struct {
+        packets: [service.Service.batch_max]service.Service.Packet,
+        buffers: [service.Service.batch_max][]u8,
+        lengths: [service.Service.batch_max]usize,
+    };
+
     pub fn writeGroup(self: *Broadcast, comptime implementations: anytype, comptime Encoder: type, excluded: ?network.Handle, required: ?Receipt, arguments: anytype, capacities: []const usize) !Receipt {
+        // As in `Service.fanout`: its scratch is written before it is read.
+        @setRuntimeSafety(false);
+        var scratch: GroupScratch = undefined;
+        return self.writeGroupWith(&scratch, implementations, Encoder, excluded, required, arguments, capacities);
+    }
+
+    fn writeGroupWith(self: *Broadcast, scratch: *GroupScratch, comptime implementations: anytype, comptime Encoder: type, excluded: ?network.Handle, required: ?Receipt, arguments: anytype, capacities: []const usize) !Receipt {
         assert(self.active);
         assert(capacities.len > 0 and capacities.len <= service.Service.batch_max);
         const omitted = if (excluded) |handle| self.ordinalOf(handle) else null;
@@ -216,7 +230,7 @@ pub const Broadcast = struct {
                 } else false;
                 if (wanted and self.available[protocol] != 0) version: {
                     if (capacities.len > self.entries.len - self.count) return error.BroadcastFull;
-                    var packets: [service.Service.batch_max]service.Service.Packet = undefined;
+                    const packets = &scratch.packets;
                     var reserved = self.owner.reserveBatch(capacities, packets[0..capacities.len]) catch |err| {
                         if (err == error.Closed) break :version;
                         return err;
@@ -235,8 +249,8 @@ pub const Broadcast = struct {
                         for (packets[0..reserved]) |*packet| packet.cancel();
                     };
                     if (reserved != capacities.len) break :version;
-                    var buffers: [service.Service.batch_max][]u8 = undefined;
-                    var lengths: [service.Service.batch_max]usize = undefined;
+                    const buffers = &scratch.buffers;
+                    const lengths = &scratch.lengths;
                     for (packets[0..reserved], buffers[0..reserved]) |packet, *buffer| buffer.* = packet.bytes;
                     Encoder.writeGroup(Version, buffers[0..reserved], lengths[0..reserved], arguments) catch |err| {
                         if (err == error.UnsupportedEncoding) {

@@ -75,6 +75,10 @@ pub const Inventories = struct {
     cache: SlotCache,
     items: records.Cache,
     references: ReferenceCache,
+    /// Scratch for reference counts: changes gathered, and what adjusting them reads and
+    /// writes. Kept here, as safety fills fresh ones every time.
+    reference_changes: ReferenceChanges = .{},
+    reference_scratch: ReferenceScratch = undefined,
     verified: []Stamp,
 
     observers: ?*Observer = null,
@@ -350,11 +354,11 @@ pub const Inventories = struct {
                 return error.RevisionExhausted;
         }
 
-        var references: ReferenceChanges = .{};
+        const references = self.freshChanges();
         for (edits, leases[0..edits.len]) |edit, lease| {
             references.change((try decode(lease.read())).stack, edit.stack);
         }
-        try self.adjustReferences(&references);
+        try self.adjustReferences(references);
         for (edits, leases[0..edits.len]) |edit, lease| {
             encode(.{ .stack = edit.stack, .revision = edit.revision + 1 }, lease.edit());
             lease.commit(encoded_bytes);
@@ -422,10 +426,10 @@ pub const Inventories = struct {
         source.stack = if (existing.count == request.count) null else .{ .item = existing.item, .count = existing.count - request.count };
         source.revision += 1;
         destination.revision += 1;
-        var references: ReferenceChanges = .{};
+        const references = self.freshChanges();
         references.change(old_source, source.stack);
         references.change(old_destination, destination.stack);
-        try self.adjustReferences(&references);
+        try self.adjustReferences(references);
         encode(source, leases[0].edit());
         encode(destination, leases[1].edit());
         leases[0].commit(encoded_bytes);
@@ -474,17 +478,30 @@ pub const Inventories = struct {
     };
 
     fn changeReferences(self: *Inventories, previous: ?Stack, next: ?Stack) !void {
-        var changes: ReferenceChanges = .{};
+        const changes = self.freshChanges();
         changes.change(previous, next);
-        try self.adjustReferences(&changes);
+        try self.adjustReferences(changes);
     }
+
+    /// The changes scratch emptied, for one adjustment at a time.
+    fn freshChanges(self: *Inventories) *ReferenceChanges {
+        self.reference_changes.count = 0;
+        return &self.reference_changes;
+    }
+
+    const ReferenceScratch = struct {
+        keys: [128][]const u8,
+        deltas: [128]i64,
+        leases: [128]ReferenceCache.Lease,
+        updated: [128]u64,
+    };
 
     fn adjustReferences(self: *Inventories, changes: *ReferenceChanges) !void {
         errdefer self.deps.storage.fail();
         changes.coalesce();
-        var keys: [128][]const u8 = undefined;
-        var deltas: [128]i64 = undefined;
-        var leases: [128]ReferenceCache.Lease = undefined;
+        const keys = &self.reference_scratch.keys;
+        const deltas = &self.reference_scratch.deltas;
+        const leases = &self.reference_scratch.leases;
         var cursor: usize = 0;
         while (cursor < changes.count) {
             var count: usize = 0;
@@ -497,7 +514,7 @@ pub const Inventories = struct {
             if (count == 0) continue;
             try self.references.acquireMany(keys[0..count], leases[0..count]);
             defer for (leases[0..count]) |lease| lease.release();
-            var updated: [128]u64 = undefined;
+            const updated = &self.reference_scratch.updated;
             for (leases[0..count], deltas[0..count], updated[0..count]) |lease, delta, *value| {
                 const bytes = lease.read() orelse return error.UnknownItem;
                 if (bytes.len != 8) return error.Corrupt;
@@ -526,9 +543,9 @@ pub const Inventories = struct {
         var cursor: usize = 0;
         while (cursor < items.len) {
             const count = @min(items.len - cursor, 128);
-            var changes: ReferenceChanges = .{};
+            const changes = self.freshChanges();
             for (items[cursor..][0..count]) |item| changes.add(item, delta);
-            try self.adjustReferences(&changes);
+            try self.adjustReferences(changes);
             cursor += count;
         }
     }

@@ -354,6 +354,10 @@ pub const Projectiles = struct {
     mobs_placed: usize = 0,
     /// Room for the states a sleeper plans.
     plan_states: [update_interval + 1]Motion = undefined,
+    plan_scratch: PlanScratch = undefined,
+    /// The bodies near a path being weighed for sleep; kept here, as safety fills a fresh one
+    /// every time.
+    near_bodies: NearBodies = .{},
     /// Sleepers something came near since the last tick, to wake before the flying. With more
     /// than fit, every sleeper wakes.
     rousing: []u32,
@@ -1413,19 +1417,18 @@ pub const Projectiles = struct {
 
     /// How many ticks of a planned path stay clear of every body: the first tick whose path,
     /// grown as findTarget sweeps it, meets a mob or a player, else all of them.
-    fn untilNear(self: *Projectiles, world: u32, states: *const [update_interval + 1]Motion, ticks: u64) !u64 {
-        var low = states[0].position;
-        var high = states[0].position;
-        for (states[1 .. ticks + 1]) |*state| for (0..3) |axis| {
-            low[axis] = @min(low[axis], state.position[axis]);
-            high[axis] = @max(high[axis], state.position[axis]);
-        };
+    const NearBodies = struct { boxes: [64]body.Box = undefined, count: usize = 0, overflowed: bool = false };
+
+    /// `low` and `high` bound the positions of `states` through `ticks`.
+    fn untilNear(self: *Projectiles, world: u32, states: *const [update_interval + 1]Motion, ticks: u64, low: [3]f64, high: [3]f64) !u64 {
         const path = claimed(low, high);
         const within: body.Box = .{ .min = path.low, .max = path.high };
-        var found: struct { boxes: [64]body.Box = undefined, count: usize = 0, overflowed: bool = false } = .{};
+        const found = &self.near_bodies;
+        found.count = 0;
+        found.overflowed = false;
         const space = &self.deps.entities.places.space;
-        if (self.mobs_placed > 0) try space.each(world, .{ .min = within.min, .max = within.max }, self.deps.mobs.kinds, &found, struct {
-            fn visit(list: *@TypeOf(found), entry: entities.space.Entry) anyerror!bool {
+        if (self.mobs_placed > 0) try space.each(world, .{ .min = within.min, .max = within.max }, self.deps.mobs.kinds, found, struct {
+            fn visit(list: *NearBodies, entry: entities.space.Entry) anyerror!bool {
                 if (list.count == list.boxes.len) {
                     list.overflowed = true;
                     return true;
@@ -1566,16 +1569,26 @@ pub const Projectiles = struct {
     /// facing, then every tick's facing at once, a vector of them at a time, then the easing
     /// toward them.
     /// Each lane does what `turn` does alone, so the states are those of `drift` bit for bit.
-    fn plan(projectile: *const Projectile, ticks: usize, floor: f64, out: *[update_interval + 1]Motion, low: *[3]f64, high: *[3]f64) usize {
+    const plan_lanes = std.simd.suggestVectorLength(f64) orelse 1;
+
+    /// Each tick's motion as it begins, by axis, a vector's worth past the last, and the angles
+    /// it turns toward: kept on the plugin, as safety fills fresh ones every time.
+    const PlanScratch = struct {
+        xs: [update_interval + plan_lanes]f64,
+        ys: [update_interval + plan_lanes]f64,
+        zs: [update_interval + plan_lanes]f64,
+        yaws: [update_interval + plan_lanes]f32,
+        pitches: [update_interval + plan_lanes]f32,
+    };
+
+    fn plan(projectile: *const Projectile, ticks: usize, floor: f64, out: *[update_interval + 1]Motion, scratch: *PlanScratch, low: *[3]f64, high: *[3]f64) usize {
         assert(ticks <= update_interval);
-        // As many as the target's vectors hold.
-        const lanes = std.simd.suggestVectorLength(f64) orelse 1;
+        const lanes = plan_lanes;
         const V = @Vector(lanes, f64);
         const P = @Vector(3, f64);
-        // Each tick's motion as it begins, by axis, a vector's worth past the last.
-        var xs: [update_interval + lanes]f64 = undefined;
-        var ys: [update_interval + lanes]f64 = undefined;
-        var zs: [update_interval + lanes]f64 = undefined;
+        const xs = &scratch.xs;
+        const ys = &scratch.ys;
+        const zs = &scratch.zs;
         out[0] = .{ .position = projectile.position, .velocity = projectile.velocity, .yaw = projectile.yaw, .pitch = projectile.pitch, .shake = projectile.shake };
         var v = projectile.velocity;
         var at = projectile.position;
@@ -1592,8 +1605,10 @@ pub const Projectiles = struct {
             at = next;
             out[count + 1].position = at;
             out[count + 1].velocity = v;
-            least = @min(least, @as(P, at));
-            most = @max(most, @as(P, at));
+            // Positions are finite: a plain compare, not @min's care for NaN, in the chain.
+            const here: P = at;
+            least = @select(f64, here < least, here, least);
+            most = @select(f64, here > most, here, most);
             count += 1;
         }
         low.* = least;
@@ -1602,8 +1617,8 @@ pub const Projectiles = struct {
         @memset(xs[count..][0..lanes], 0);
         @memset(ys[count..][0..lanes], 0);
         @memset(zs[count..][0..lanes], 0);
-        var yaws: [update_interval + lanes]f32 = undefined;
-        var pitches: [update_interval + lanes]f32 = undefined;
+        const yaws = &scratch.yaws;
+        const pitches = &scratch.pitches;
         const degrees: V = @splat(57.2957763671875);
         var first: usize = 0;
         while (first < count) : (first += lanes) {
@@ -1657,7 +1672,7 @@ pub const Projectiles = struct {
         var low: [3]f64 = undefined;
         var high: [3]f64 = undefined;
         // Through its update tick, if all of it is clear: then it wakes only to send the update.
-        var ticks: u64 = plan(projectile, @intCast(until), @floatFromInt(bounds.minimum - 64), states, &low, &high);
+        var ticks: u64 = plan(projectile, @intCast(until), @floatFromInt(bounds.minimum - 64), states, &self.plan_scratch, &low, &high);
         const planned = ticks;
         // Clear all at once, most often; else as far as each tick's path is.
         if (!try self.clear(projectile.world, low, high)) {
@@ -1667,21 +1682,18 @@ pub const Projectiles = struct {
         }
         // As far as nothing could be hit: it sleeps up to the first tick its path comes near a body,
         // and what moves near it later wakes it.
-        ticks = @min(ticks, try self.untilNear(projectile.world, states, ticks));
+        if (ticks != planned) boundStates(states, ticks, &low, &high);
+        // What `low` and `high` bound.
+        var bounded = ticks;
+        ticks = @min(ticks, try self.untilNear(projectile.world, states, ticks, low, high));
         if (ticks < 2) return;
         // Seen alike by every player all along, as tracking answers for the box of its path, and
         // within the columns a box may reach; else along half of it.
         const slot = held.slot;
-        var bounded = planned;
         while (ticks >= 2) : (ticks /= 2) {
             // A shorter sleep passes through less.
             if (ticks != bounded) {
-                low = states[0].position;
-                high = states[0].position;
-                for (states[1 .. ticks + 1]) |*state| for (0..3) |axis| {
-                    low[axis] = @min(low[axis], state.position[axis]);
-                    high[axis] = @max(high[axis], state.position[axis]);
-                };
+                boundStates(states, ticks, &low, &high);
                 bounded = ticks;
             }
             if (entities.Space.boxFits(.{ .low = low, .high = high }, half_width) and try self.settled(slot, projectile.world, .{ .low = low, .high = high })) break;
@@ -1707,6 +1719,16 @@ pub const Projectiles = struct {
         projectile.slept_at = self.now;
         projectile.wake_at = wake_at;
         projectile.synced = synced;
+    }
+
+    /// The box of the positions of `states` through `ticks`.
+    fn boundStates(states: *const [update_interval + 1]Motion, ticks: u64, low: *[3]f64, high: *[3]f64) void {
+        low.* = states[0].position;
+        high.* = states[0].position;
+        for (states[1 .. ticks + 1]) |*state| for (0..3) |axis| {
+            low[axis] = @min(low[axis], state.position[axis]);
+            high[axis] = @max(high[axis], state.position[axis]);
+        };
     }
 
     /// Ticks between tries to sleep for a projectile that could not.

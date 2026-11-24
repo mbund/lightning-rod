@@ -98,9 +98,17 @@ pub const Places = struct {
     /// An entity moved. Into a column that does not tick, it stops at once; back into one, it
     /// joins last.
     pub fn move(self: *Places, entity: Id, world: u32, position: [3]f64) !void {
-        const was = self.space.columnHolding(entity) orelse return error.NotPlaced;
+        return self.moveSlot(self.space.directory.slotOf(entity) orelse return error.NotPlaced, world, position);
+    }
+
+    /// As `move`, for the entity in a slot: found without its id.
+    pub fn moveSlot(self: *Places, slot: u32, world: u32, position: [3]f64) !void {
+        const entry = self.space.directory.entry(slot);
+        if (entry.space_column == directory_module.none) return error.NotPlaced;
+        const entity = entry.id;
+        const was = self.space.data(entry.space_column).column;
         const ticked = self.ticks(was);
-        try self.space.move(entity, world, position);
+        try self.space.moveSlot(slot, world, position);
         const to = space_module.columnOf(world, position);
         if (std.meta.eql(was, to)) return;
         const ticking_now = self.ticks(to);

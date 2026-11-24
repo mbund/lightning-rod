@@ -298,6 +298,8 @@ pub const ItemTick = struct {
         // A full stack finds out when its stack is read, once there is something to merge with.
         const low: [3]i32 = .{ entities.space.coordinate(body.position[0] - 0.75), entities.space.coordinate(body.position[1] - 0.25), entities.space.coordinate(body.position[2] - 0.75) };
         const high: [3]i32 = .{ entities.space.coordinate(body.position[0] + 0.75), entities.space.coordinate(body.position[1] + 0.25), entities.space.coordinate(body.position[2] + 0.75) };
+        // Only those within it merge: the rest are passed over before they are put in order.
+        const within: entities.Feet = .{ .low = .{ body.position[0] - 0.75, body.position[1] - 0.25, body.position[2] - 0.75 }, .high = .{ body.position[0] + 0.75, body.position[1] + 0.25, body.position[2] + 0.75 } };
         var x = low[0];
         while (x <= high[0]) : (x += 1) {
             // Within one x, vanilla's sections go by z from 0 up, then the negative ones: the box
@@ -305,7 +307,7 @@ pub const ItemTick = struct {
             const z_first = if (low[2] < 0 and high[2] >= 0) high[2] else low[2];
             const z_order = [2]i32{ z_first, if (z_first == low[2]) high[2] else low[2] };
             for (z_order[0 .. @as(usize, @intCast(high[2] - low[2])) + 1]) |z| {
-                var ordered = dropped.inColumn(.{ .world = body.world, .x = x, .z = z }, low[1], high[1], self.nearby);
+                var ordered = dropped.inColumnWithin(.{ .world = body.world, .x = x, .z = z }, low[1], high[1], within, self.nearby);
                 while (true) {
                     const entries = try ordered.next();
                     if (entries.len == 0) break;
@@ -314,7 +316,7 @@ pub const ItemTick = struct {
                         // The index knows where each is: those out of the box are not read.
                         const at = candidate.position;
                         if (@abs(body.position[0] - at[0]) >= 0.75 or @abs(body.position[1] - at[1]) >= 0.25 or @abs(body.position[2] - at[2]) >= 0.75) continue;
-                        switch (try self.mergeWith(entity, body.*, metadata, candidate.id)) {
+                        switch (try self.mergeWith(entity, body.*, metadata, candidate)) {
                             .next => {},
                             .done => return,
                         }
@@ -327,9 +329,11 @@ pub const ItemTick = struct {
     const Merge = enum { next, done };
 
     /// One neighbour, as ItemEntity.tryToMerge takes it.
-    fn mergeWith(self: *ItemTick, entity: entities.Id, body: entities.State, metadata: *ItemEntities.Metadata, other_id: entities.Id) !Merge {
+    fn mergeWith(self: *ItemTick, entity: entities.Id, body: entities.State, metadata: *ItemEntities.Metadata, candidate: entities.space.Entry) !Merge {
         const dropped = self.deps.dropped;
-        const view = (try dropped.read(other_id)) orelse return .next;
+        const other_id = candidate.id;
+        // The space gave its slot: it is not found again by its id.
+        const view = try dropped.readAt(other_id, candidate.slot);
         var other_meta = view.metadata;
         const other = view.body;
         if (!other_meta.alive or other_meta.owner != metadata.owner or other_meta.age == -32768 or other_meta.age >= 6000 or other_meta.pickup_delay == 32767) return .next;

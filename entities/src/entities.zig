@@ -84,7 +84,7 @@ pub const Entities = struct {
     }
 
     /// An entity's body where it lies, by slot, if it has one.
-    fn bodyAt(self: *Entities, slot: u32) ?*State {
+    pub fn bodyAt(self: *Entities, slot: u32) ?*State {
         const entry = self.directory.entry(slot);
         if (self.body_columns[entry.kind]) |column| {
             if (entry.block == directory.none) return null;

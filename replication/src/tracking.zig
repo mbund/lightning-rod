@@ -1775,6 +1775,17 @@ pub const Tracking = struct {
     fn checkBox(self: *Tracking, slot: u32, boxed: *const Boxed) !void {
         const tracker = self.tracker_of[boxed.kind];
         if (tracker == no_tracker) return;
+        // Placed again in the columns it was in, which hold it already, and answered for this
+        // very box as its kind asked this tick: nothing is left to do.
+        if (boxed.in_place and slot < self.metas.len) {
+            const meta = self.metas.at(slot);
+            if (meta.tracker == tracker and meta.settled_for == self.tick_count and meta.settled_heard == self.heard_count and meta.work == none and std.meta.eql(meta.settled_box, boxed.feet)) {
+                meta.gone = false;
+                meta.placed = false;
+                meta.looked = self.tick_count;
+                return;
+            }
+        }
         const meta = try self.adoptSlot(slot, self.deps.entities.directory.entry(slot).id, tracker);
         meta.gone = false;
         meta.placed = false;

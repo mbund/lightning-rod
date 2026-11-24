@@ -130,6 +130,8 @@ pub const Experience = struct {
     /// An orb in hand: copies of its state and body, written back when let go.
     pub const Held = struct {
         id: entities.Id,
+        /// Its directory slot, found once by its id: the rest of its holding goes by it.
+        slot: u32,
         orb: Orb,
         body: ?entities.State,
         /// Where its body was when taken, for its place to follow it.
@@ -254,27 +256,27 @@ pub const Experience = struct {
     pub fn hold(self: *Experience, wanted: []const entities.Id, output: []Held, _: bool) !void {
         assert(wanted.len == output.len and wanted.len <= 16);
         for (wanted, output) |entity, *held| {
-            const stored = try self.orbs.get(entity) orelse return error.UnknownExperienceOrb;
-            const body = try self.deps.entities.get(entity);
-            held.* = .{ .id = entity, .orb = stored.orb, .body = body, .was = body };
+            const at = self.orbs.slotOf(entity) orelse return error.UnknownExperienceOrb;
+            const stored = self.orbs.ptrAt(at);
+            const body: ?entities.State = if (self.deps.entities.bodyAt(at)) |found| found.* else null;
+            held.* = .{ .id = entity, .slot = at, .orb = stored.orb, .body = body, .was = body };
         }
     }
 
     /// Writes back what changed of an orb in hand and lets it go.
     pub fn settle(self: *Experience, held: *Held) !void {
-        var stored = try self.orbs.get(held.id) orelse return error.UnknownExperienceOrb;
-        const before = stored;
+        const stored = self.orbs.ptrAt(held.slot);
+        assert(self.deps.entities.directory.entry(held.slot).id == held.id);
         if (!std.meta.eql(stored.orb, held.orb)) {
             stored.orb = held.orb;
             stored.dirty = true;
         }
         if (held.body) |body| if (held.was) |was| if (!std.meta.eql(body, was)) {
-            if (!self.deps.entities.has(held.id)) return error.UnknownExperienceOrb;
-            try self.deps.entities.set(held.id, body);
+            const kept = self.deps.entities.bodyAt(held.slot) orelse return error.UnknownExperienceOrb;
+            kept.* = body;
             stored.dirty = true;
-            try self.places.move(held.id, body.world, body.position);
+            try self.places.moveSlot(held.slot, body.world, body.position);
         };
-        if (!std.meta.eql(stored, before)) try self.orbs.put(held.id, stored);
     }
 
     /// An orb as it is, for tests and for whoever looks at one at a time.
@@ -360,28 +362,27 @@ pub const Experience = struct {
     /// and in each column its sections' order, as getEntitiesByType goes; `visit` returns
     /// whether to stop.
     fn eachNear(self: *Experience, world: u32, low: [3]f64, high: [3]f64, context: anytype, comptime visit: fn (@TypeOf(context), entities.space.Entry) anyerror!bool) !void {
+        const space = &self.places.space;
+        const fold = kinds.fold();
         const first: [2]i32 = .{ @intFromFloat(@floor(low[0] / 16)), @intFromFloat(@floor(low[2] / 16)) };
         const last: [2]i32 = .{ @intFromFloat(@floor(high[0] / 16)), @intFromFloat(@floor(high[2] / 16)) };
         var x = first[0];
         while (x <= last[0]) : (x += 1) {
-            var zs: [64]i32 = undefined;
-            var z_count: usize = 0;
-            var z = first[1];
-            while (z <= last[1] and z_count < zs.len) : (z += 1) {
-                zs[z_count] = z;
-                z_count += 1;
-            }
-            std.mem.sort(i32, zs[0..z_count], {}, struct {
-                fn less(_: void, a: i32, b: i32) bool {
-                    return entities.space.zOrder(a) < entities.space.zOrder(b);
-                }
-            }.less);
-            for (zs[0..z_count]) |column_z| {
-                var ordered = self.places.space.ordered(.{ .world = world, .x = x, .z = column_z }, @intFromFloat(@floor(low[1] / 16)), @intFromFloat(@floor(high[1] / 16)), kinds, self.nearby);
-                while (true) {
-                    const entries = try ordered.next();
-                    if (entries.len == 0) break;
-                    for (entries) |entry| if (try visit(context, entry)) return;
+            // z as an unsigned field: from 0 up, then the negative ones up.
+            const spans: [2][2]i32 = .{ .{ @max(first[1], 0), last[1] }, .{ first[1], @min(last[1], -1) } };
+            for (spans) |span| {
+                var column_z = span[0];
+                while (column_z <= span[1]) : (column_z += 1) {
+                    const column: entities.Column = .{ .world = world, .x = x, .z = column_z };
+                    // Most columns near a player hold no orb: one lookup says so.
+                    if (!space.holdsAny(column, fold)) continue;
+                    // Every visit here takes only orbs within the box.
+                    var ordered = space.orderedWithin(column, @intFromFloat(@floor(low[1] / 16)), @intFromFloat(@floor(high[1] / 16)), kinds, .{ .low = low, .high = high }, self.nearby);
+                    while (true) {
+                        const entries = try ordered.next();
+                        if (entries.len == 0) break;
+                        for (entries) |entry| if (try visit(context, entry)) return;
+                    }
                 }
             }
         }
@@ -410,7 +411,7 @@ pub const Experience = struct {
                 fn visit(search: *@This(), entry: entities.space.Entry) !bool {
                     const at = entry.position;
                     if (@abs(at[0] - search.position[0]) >= 0.75 or @abs(at[2] - search.position[2]) >= 0.75 or at[1] >= search.position[1] + 0.5 or at[1] <= search.position[1] - 1) return false;
-                    if (@mod(@as(i64, search.owner.networkId(entry.id)) - search.bucket, 40) != 0) return false;
+                    if (@mod(@as(i64, entities.Entities.networkOfSlot(entry.slot)) - search.bucket, 40) != 0) return false;
                     const found = (try search.owner.get(entry.id)) orelse return false;
                     if (!found.orb.alive or found.orb.value != search.value or found.orb.count == std.math.maxInt(i32)) return false;
                     search.found = entry.id;
@@ -743,7 +744,7 @@ pub const Experience = struct {
                 const at = entry.position;
                 const here = fold.held.body.?.position;
                 if (@abs(at[0] - here[0]) >= 1 or @abs(at[1] - here[1]) >= 1 or @abs(at[2] - here[2]) >= 1) return false;
-                if (@mod(@as(i64, fold.owner.networkId(entry.id)) - @as(i64, fold.owner.networkId(fold.held.id)), 40) != 0) return false;
+                if (@mod(@as(i64, entities.Entities.networkOfSlot(entry.slot)) - @as(i64, fold.owner.networkId(fold.held.id)), 40) != 0) return false;
                 const in_batch = for (fold.batch) |*other| {
                     if (other.id == entry.id) break other;
                 } else null;

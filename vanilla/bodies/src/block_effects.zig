@@ -132,8 +132,15 @@ pub const Scratch = struct {
 /// Entity.applyEffectsFromBlocks over the movements recorded this tick. Whether a block under
 /// or around the subject could act on it, as resting bodies need none to.
 pub fn apply(host: anytype, subject: anytype, recorded: []const Movement) !bool {
-    assert(recorded.len <= maximum_movements);
+    // Release builds keep safety, which fills undefined memory: these movements are written
+    // before they are read, and filling them every body's tick cost more than the rest.
+    @setRuntimeSafety(false);
     var movements: [maximum_movements + 1]Movement = undefined;
+    return applyWith(host, subject, recorded, &movements);
+}
+
+fn applyWith(host: anytype, subject: anytype, recorded: []const Movement, movements: *[maximum_movements + 1]Movement) !bool {
+    assert(recorded.len <= maximum_movements);
     var count: usize = recorded.len;
     @memcpy(movements[0..count], recorded);
     if (count == 0) {

@@ -68,6 +68,12 @@ pub fn BodyTable(comptime Extra: type) type {
             return (try self.ptr(entity) orelse return null).*;
         }
 
+        /// The kind's record of the entity in a slot, which `slotOf` gave: found without its id.
+        pub fn ptrAt(self: *const Self, slot: u32) *Extra {
+            std.debug.assert(self.entities.directory.entry(slot).kind == self.kind);
+            return self.table.ref(slot).field("extra");
+        }
+
         /// The kind's record kept again, for an entity that has one.
         pub fn put(self: *Self, entity: Id, value: Extra) !void {
             (try self.ptr(entity) orelse return error.UnknownEntity).* = value;

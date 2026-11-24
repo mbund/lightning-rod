@@ -19,6 +19,8 @@ pub const Pool = struct {
     memory: []align(huge_page_bytes) u8,
     free: []u32,
     free_count: usize,
+    /// Page tables handed out, each begun a cache line further than the last.
+    tables: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, size: usize) !Pool {
         const count = size / page_bytes;
@@ -70,6 +72,9 @@ pub const Pool = struct {
     }
 };
 
+/// Cache lines a page of a level-one cache spans, across which page tables are spread.
+const table_colors = 4096 / std.atomic.cache_line;
+
 /// A dense array of values in pool pages, growing a page at a time and giving pages back as it
 /// shrinks. Pointers into it hold while it does not shrink past them.
 pub fn Array(comptime T: type) type {
@@ -87,7 +92,14 @@ pub fn Array(comptime T: type) type {
         len: usize = 0,
 
         pub fn init(allocator: std.mem.Allocator, pool: *Pool) !Self {
-            return .{ .pool = pool, .pages = try allocator.alloc(u32, pool.pageCount()) };
+            // Every table would begin a page in, so the same entry of each would share one set of
+            // the cache, and the tables of arrays read together would put each other out: each
+            // begins a line further on than the last, across every set.
+            const line_words = std.atomic.cache_line / @sizeOf(u32);
+            const color = pool.tables % table_colors;
+            pool.tables += 1;
+            const table = try allocator.alloc(u32, pool.pageCount() + (table_colors - 1) * line_words);
+            return .{ .pool = pool, .pages = table[color * line_words ..][0..pool.pageCount()] };
         }
 
         pub fn at(self: *const Self, index: usize) *T {
@@ -125,6 +137,15 @@ pub fn Array(comptime T: type) type {
         /// At least `count` values, those added undefined.
         pub fn ensure(self: *Self, count: usize) !void {
             while (self.len < count) _ = try self.grow();
+        }
+
+        /// Room for `extra` more, pages taken if need be, its length unchanged.
+        pub fn reserve(self: *Self, extra: usize) !void {
+            while (self.page_count * per_page < self.len + extra) {
+                if (self.page_count == self.pages.len) return error.EntityMemoryExhausted;
+                self.pages[self.page_count] = try self.pool.take();
+                self.page_count += 1;
+            }
         }
 
         /// At least `count` values, those added set to `value`.

@@ -379,12 +379,17 @@ pub const ItemEntities = struct {
 
     /// An item near players as it is now, a sleeper first brought up to the tick it has had.
     pub fn read(self: *ItemEntities, entity: entities.Id) !?View {
-        if (!self.items.contains(entity)) return null;
+        // Found by its id once: the rest by its slot.
+        return try self.readAt(entity, self.items.slotOf(entity) orelse return null);
+    }
+
+    /// As `read`, for an item whose slot is known, as an entry of the space gives it.
+    pub fn readAt(self: *ItemEntities, entity: entities.Id, at: u32) !View {
         self.reads += 1;
-        try self.catchUp(entity);
-        const item = (try self.items.get(entity)).?;
-        const body = try self.deps.entities.get(entity) orelse return .{ .body = undefined, .metadata = item.metadata };
-        return .{ .body = body, .metadata = item.metadata };
+        try self.catchUpAt(entity, at);
+        const item = self.items.ptrAt(at).*;
+        const body = self.deps.entities.bodyAt(at) orelse return .{ .body = undefined, .metadata = item.metadata };
+        return .{ .body = body.*, .metadata = item.metadata };
     }
 
     pub fn get(self: *ItemEntities, entity: entities.Id) !Metadata {
@@ -421,16 +426,19 @@ pub const ItemEntities = struct {
 
     /// Brings an item's state up to the tick it has had, if it slept behind.
     fn catchUp(self: *ItemEntities, entity: entities.Id) !void {
+        return self.catchUpAt(entity, self.items.slotOf(entity) orelse return);
+    }
+
+    /// As `catchUp`, for an item whose slot is known.
+    fn catchUpAt(self: *ItemEntities, entity: entities.Id, at: u32) !void {
         const sleep = self.sleepers.get(entity) orelse return;
         const target = @min(self.clock.through(sleep.sequence), sleep.until);
         if (target != sleep.since) {
-            var item = (try self.items.get(entity)).?;
-            var body = try self.deps.entities.get(entity) orelse return error.Corrupt;
+            const item = self.items.ptrAt(at);
+            const body = self.deps.entities.bodyAt(at) orelse return error.Corrupt;
             var tick = sleep.since;
-            while (tick < target) : (tick += 1) rest(&body, &item.metadata, self.givenId(entity), sleep.speed, sleep.friction);
+            while (tick < target) : (tick += 1) rest(body, &item.metadata, self.givenId(entity), sleep.speed, sleep.friction);
             item.dirty = true;
-            try self.items.put(entity, item);
-            try self.deps.entities.set(entity, body);
             sleep.since = target;
             sleep.ticks = item.metadata.ticks;
             sleep.age = item.metadata.age;
@@ -643,6 +651,11 @@ pub const ItemEntities = struct {
     /// SectionPos.asLong sorts them, then as they entered each.
     pub fn inColumn(self: *ItemEntities, column: Column, low: i32, high: i32, buffer: []entities.space.Entry) entities.Space.Ordered {
         return self.places.space.ordered(column, low, high, kinds, buffer);
+    }
+
+    /// As `inColumn`, of those whose feet are within a box only, for a caller that takes no other.
+    pub fn inColumnWithin(self: *ItemEntities, column: Column, low: i32, high: i32, within: entities.Feet, buffer: []entities.space.Entry) entities.Space.Ordered {
+        return self.places.space.orderedWithin(column, low, high, kinds, within, buffer);
     }
 
     /// Keeps in memory the items of the columns near the centers, out to `radius`, and of the

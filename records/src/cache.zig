@@ -394,7 +394,26 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
             return .ready;
         }
 
+        /// What a batch of misses fills before it reads, kept apart so filling it is not paid for.
+        const MissingScratch = struct {
+            requests: [192]Get,
+            lengths: [192]?usize,
+            missing: [192]usize,
+            sorted: [192]u16,
+            writes: [192]Write,
+            evicted: [192]Write,
+        };
+
         fn acquireMissing(self: *Self, keys: []const []const u8, leases: []Lease, comptime reserve_only: bool, victims_out: ?[]Lease, pin_limit: usize, comptime transient: bool) !Reservation {
+            // Release builds keep safety, which fills undefined memory: this scratch is written
+            // before it is read, and filling its kilobytes every batch cost more than the rest.
+            // Safety stays on for the work.
+            @setRuntimeSafety(false);
+            var scratch: MissingScratch = undefined;
+            return self.acquireMissingWith(&scratch, keys, leases, reserve_only, victims_out, pin_limit, transient);
+        }
+
+        fn acquireMissingWith(self: *Self, scratch: *MissingScratch, keys: []const []const u8, leases: []Lease, comptime reserve_only: bool, victims_out: ?[]Lease, pin_limit: usize, comptime transient: bool) !Reservation {
             var acquired: usize = 0;
             errdefer for (leases[0..acquired]) |lease| lease.release();
             const protect = keys.len > 192;
@@ -415,9 +434,9 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
                 const count = @min(192, keys.len - base);
                 const batch = keys[base..][0..count];
                 var hits: [192]?usize = @splat(null);
-                var requests: [192]Get = undefined;
-                var lengths: [192]?usize = undefined;
-                var missing: [192]usize = undefined;
+                const requests = &scratch.requests;
+                const lengths = &scratch.lengths;
+                const missing = &scratch.missing;
                 var missing_count: usize = 0;
                 errdefer {
                     for (missing[0..missing_count]) |slot| {
@@ -469,11 +488,16 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
                     const eviction = self.metrics.eviction.start();
                     defer eviction.end();
 
-                    var sorted: [192]u16 = undefined;
+                    const sorted = &scratch.sorted;
                     for (sorted[0..count], 0..) |*request, index| request.* = @intCast(index);
-                    std.mem.sort(u16, sorted[0..count], batch, struct {
+                    // By key, then by place: the order a stable sort gives, without its buffer.
+                    std.sort.pdq(u16, sorted[0..count], batch, struct {
                         fn less(items: []const []const u8, a: u16, b: u16) bool {
-                            return std.mem.order(u8, items[a], items[b]) == .lt;
+                            return switch (std.mem.order(u8, items[a], items[b])) {
+                                .lt => true,
+                                .gt => false,
+                                .eq => a < b,
+                            };
                         }
                     }.less);
                     var victims: usize = 0;
@@ -513,7 +537,7 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
                     for (self.order[0..available]) |slot| self.removePin(slot);
                     assert(available == victims);
 
-                    var writes: [192]Write = undefined;
+                    const writes = &scratch.writes;
                     var write_count: usize = 0;
                     for (self.order[0..victims]) |slot| {
                         const entry = &self.entries[slot];
@@ -615,7 +639,7 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
                                 .blocked => return error.CachePinned,
                                 .writeback => |dirty| {
                                     defer for (dirty) |victim| victim.release();
-                                    var writes: [192]Write = undefined;
+                                    const writes = &scratch.evicted;
                                     for (dirty, writes[0..dirty.len]) |victim, *write| write.* = .{ .key = victim.key(), .value = victim.read() };
                                     try self.writeBack(writes[0..dirty.len]);
                                     for (dirty) |victim| victim.markWritten();

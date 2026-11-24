@@ -617,9 +617,15 @@ pub const Service = struct {
     };
 
     pub fn publishGroups(self: *Service, groups: []const GroupPublication) void {
+        // As in `fanout`: its scratch is written before it is read.
+        @setRuntimeSafety(false);
+        var pending: [batch_max]shared.SharedPages.Publication = undefined;
+        self.publishGroupsWith(groups, &pending);
+    }
+
+    fn publishGroupsWith(self: *Service, groups: []const GroupPublication, pending: *[batch_max]shared.SharedPages.Publication) void {
         self.publication.lockUncancelable(self.output.producer_io);
         defer self.publication.unlock(self.output.producer_io);
-        var pending: [batch_max]shared.SharedPages.Publication = undefined;
         var published: usize = 0;
         for (groups) |group| {
             const packets = group.packets;
@@ -689,8 +695,14 @@ pub const Service = struct {
     }
 
     pub fn cancelPackets(self: *Service, packets: []Packet) void {
-        assert(packets.len <= batch_max);
+        // As in `fanout`: its scratch is written before it is read.
+        @setRuntimeSafety(false);
         var reservations: [batch_max]shared.Reservation = undefined;
+        self.cancelPacketsWith(packets, &reservations);
+    }
+
+    fn cancelPacketsWith(self: *Service, packets: []Packet, reservations: *[batch_max]shared.Reservation) void {
+        assert(packets.len <= batch_max);
         var count: usize = 0;
         for (packets) |*packet| {
             if (packet.credit) |held| self.refund(held.handle, held.bytes);
@@ -882,7 +894,31 @@ pub const Service = struct {
 
     /// Admit recipients independently. Groups with no eligible recipients never invoke the encoder.
     /// Encode each protocol group directly into owned output storage before publishing it.
+    /// A version a fanout encodes for, and its protocol number.
+    const FanoutProtocol = struct { version: usize, number: i32 };
+
+    /// What a fanout fills before it reads, kept apart so filling it is not paid for.
+    fn FanoutScratch(comptime versions: usize) type {
+        return struct {
+            protocols: [versions]FanoutProtocol,
+            sizes: [batch_max]usize,
+            packets: [batch_max]Packet,
+            publications: [batch_max]GroupPublication,
+            members: [batch_max]GroupPacket,
+            buffers: [batch_max][]u8,
+            lengths: [batch_max]usize,
+        };
+    }
+
     pub fn fanout(self: *Service, comptime implementations: anytype, comptime Encoder: type, targets: []const Target, arguments: anytype, capacities: []const usize, delivered: []Delivery) !void {
+        // Release builds keep safety, which fills undefined memory: its scratch is written before
+        // it is read, and filling it cost more than the rest. Safety stays on for the work.
+        @setRuntimeSafety(false);
+        var scratch: FanoutScratch(implementations.len) = undefined;
+        return self.fanoutWith(&scratch, implementations, Encoder, targets, arguments, capacities, delivered);
+    }
+
+    fn fanoutWith(self: *Service, scratch: anytype, comptime implementations: anytype, comptime Encoder: type, targets: []const Target, arguments: anytype, capacities: []const usize, delivered: []Delivery) !void {
         assert(targets.len == delivered.len and targets.len <= self.config.connections);
         assert(capacities.len > 0 and capacities.len <= batch_max);
         @memset(delivered, .backpressured);
@@ -910,8 +946,7 @@ pub const Service = struct {
                 if (target.protocol == Version.protocol_number) wanted[version] = true;
             }
         }
-        const ProtocolGroup = struct { version: usize, number: i32 };
-        var protocols: [implementations.len]ProtocolGroup = undefined;
+        const protocols = &scratch.protocols;
         var protocol_count: usize = 0;
         inline for (implementations, 0..) |Version, version| {
             if (wanted[version]) {
@@ -922,21 +957,21 @@ pub const Service = struct {
         var begin: usize = 0;
         while (begin < protocol_count) {
             const count = @min(batch_max / capacities.len, protocol_count - begin);
-            var sizes: [batch_max]usize = undefined;
+            const sizes = &scratch.sizes;
             for (0..count) |index| @memcpy(sizes[index * capacities.len ..][0..capacities.len], capacities);
-            var packets: [batch_max]Packet = undefined;
+            const packets = &scratch.packets;
             const reserved = try self.reserveBatch(sizes[0 .. count * capacities.len], packets[0 .. count * capacities.len]);
             defer self.cancelPackets(packets[0..reserved]);
             const complete = reserved / capacities.len;
             if (complete == 0) return;
-            var publications: [batch_max]GroupPublication = undefined;
-            var members: [batch_max]GroupPacket = undefined;
+            const publications = &scratch.publications;
+            const members = &scratch.members;
             var ready: usize = 0;
             for (protocols[begin..][0..complete], 0..) |protocol, index| {
                 const first = index * capacities.len;
                 const selected = packets[first..][0..capacities.len];
-                var buffers: [batch_max][]u8 = undefined;
-                var lengths: [batch_max]usize = undefined;
+                const buffers = &scratch.buffers;
+                const lengths = &scratch.lengths;
                 for (selected, buffers[0..selected.len]) |packet, *buffer| buffer.* = packet.bytes;
                 var encoded = true;
                 inline for (implementations, 0..) |Version, version| if (protocol.version == version) {
