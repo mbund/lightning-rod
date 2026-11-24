@@ -52,6 +52,8 @@ pub const InventoryFixture = struct {
         const input = try Input.init(allocator, .{ .sessions = service });
         const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
         const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
+        // Players are entities: the space comes first.
+        const bodies = try entities.Entities.init(allocator, io, .{}, .{ .metrics = registry, .storage = try store.openSpace("entities"), .record_workspaces = workspaces });
         const players = try Players.init(allocator, .{ .maximum = 2, .world = world }, .{
             .record_workspaces = workspaces,
             .sessions = service,
@@ -59,9 +61,10 @@ pub const InventoryFixture = struct {
             .input = input,
             .storage = try store.openSpace("players"),
             .worlds = dimensions,
+            .entities = bodies,
         });
         players.records[0] = .{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .loaded = true };
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const gameplay_definitions = try vanilla_content.prepare(allocator);
         const world_border = try WorldBorder.init(allocator, .{}, .{ .storage = try store.openSpace(WorldBorder.id), .worlds = dimensions, .dimensions = gameplay_definitions.dimensions, .players = players });
         const player_states = try PlayerStates.init(allocator, .{}, .{
@@ -81,7 +84,6 @@ pub const InventoryFixture = struct {
             .record_workspaces = workspaces,
         });
         const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
-        const bodies = try entities.Entities.init(allocator, io, .{}, .{ .metrics = registry, .storage = try store.openSpace("entities"), .record_workspaces = workspaces });
         const dropped = try ItemEntities.init(allocator, io, .{}, .{
             .metrics = registry,
             .storage = try store.openSpace("drops"),

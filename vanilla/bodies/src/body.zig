@@ -540,7 +540,7 @@ pub const Colliders = struct {
                 count += 1;
             }
         }
-        std.mem.sort(f32, output[0..count], {}, std.sort.asc(f32));
+        std.sort.insertion(f32, output[0..count], {}, std.sort.asc(f32));
         return count;
     }
 };
@@ -618,7 +618,7 @@ fn stepHeights(level: *const Level, query: Box, context: Context, base: Box, max
             }
         }
     }
-    std.mem.sort(f32, output[0..count], {}, std.sort.asc(f32));
+    std.sort.insertion(f32, output[0..count], {}, std.sort.asc(f32));
     return count;
 }
 

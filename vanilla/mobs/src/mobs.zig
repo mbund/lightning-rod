@@ -297,6 +297,8 @@ pub const Mobs = struct {
         try deps.client.registry.onChange(self, readTags);
         inline for (@typeInfo(Species).@"enum".field_names, 0..) |field, index| self.species[index] = species_data.traits(@field(Species, field));
         for (self.species) |species| self.kinds.bits.set(species.entity_type);
+        // Each species tracks at its own range, as EntityType clientTrackingRange says.
+        for (self.species) |species| try deps.entities.declare(.{ .kinds = .of(&.{species.entity_type}), .tracking_range = @as(u32, species.tracking_range) * 16 });
         for (self.species) |species| try deps.entities.addTable(species.entity_type, &self.rows.core);
         // Mobs take their turns in the one tick order, as many as fill a pass's run.
         try deps.entities.addTicker(.init(Mobs, self, self.kinds, entities.Entities.run_max));
@@ -1853,7 +1855,7 @@ test "mobs draw UUIDs of their own across restarts" {
         var random = Mobs.entityRandom(0x6d6f6273, 12000 + entity);
         uuid.* = Mobs.randomUuid(&random);
     }
-    std.mem.sort(u128, &seen, {}, std.sort.asc(u128));
+    std.sort.pdq(u128, &seen, {}, std.sort.asc(u128));
     for (seen[1..], seen[0 .. seen.len - 1]) |uuid, previous| try std.testing.expect(uuid != previous);
 }
 

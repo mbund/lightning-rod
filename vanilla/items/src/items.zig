@@ -104,9 +104,11 @@ pub const Items = struct {
         std.debug.assert(self.views.len > 0);
         var order: [128]u8 = undefined;
         for (order[0..stacks.len], 0..) |*index, at| index.* = @intCast(at);
-        std.mem.sort(u8, order[0..stacks.len], stacks, struct {
+        std.sort.pdq(u8, order[0..stacks.len], stacks, struct {
             fn less(values: []const inventories.Stack, a: u8, b: u8) bool {
-                return std.mem.order(u8, &values[a].item, &values[b].item) == .lt;
+                // By item, then by place: the order a stable sort gives.
+                const result = std.mem.order(u8, &values[a].item, &values[b].item);
+                return if (result == .eq) a < b else result == .lt;
             }
         }.less);
         var cursor: usize = 0;

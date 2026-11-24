@@ -254,6 +254,7 @@ pub const ItemEntities = struct {
             .sleep = config.sleep,
             .table = records.Table.init(deps.storage, deps.record_workspaces.resources),
         };
+        try deps.entities.declare(.{ .kinds = kinds, .tracking_range = 6 * 16 });
         try self.places.watchStopping(kinds, .{ .context = self, .function = stoppedTicking });
         try deps.entities.addColumnHolder(.init(ItemEntities, self, columnLoaded, columnUnloaded));
         try self.items.register();

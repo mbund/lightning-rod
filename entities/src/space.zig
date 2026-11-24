@@ -209,6 +209,8 @@ pub const ColumnData = struct {
     emptied: bool = false,
     /// Where it is in the list of live columns.
     live_at: u32 = 0,
+    /// Its tile's dense index.
+    tile: u32 = none,
     /// Whether its entities tick, as the domains say.
     ticking: bool = false,
     /// For whoever walks the columns, to tell those seen.
@@ -260,6 +262,28 @@ pub const Boxed = struct {
 
 const Bucket = struct { key: u128 = 0, at: u32 = none };
 
+/// Columns a tile spans on each axis.
+pub const tile_side = 8;
+
+/// Where a column's tile is: its world, and its columns' coordinates shifted down.
+pub fn tileOf(column: Column) Column {
+    return .{ .world = column.world, .x = column.x >> 3, .z = column.z >> 3 };
+}
+
+/// The bit of a column in its tile's mask.
+fn tileBit(column: Column) u64 {
+    return @as(u64, 1) << @intCast((column.x & 7) + (column.z & 7) * tile_side);
+}
+
+/// A tile holding live columns: which, and the kinds they held since it came, folded. A kind
+/// that left stays in the fold until the tile goes: a walk then looks at a column for nothing.
+pub const TileData = struct {
+    tile: Column,
+    columns: u64 = 0,
+    folded: u64 = 0,
+    live_at: u32 = 0,
+};
+
 fn keyOf(column: Column) u128 {
     const x: u32 = @bitCast(column.x);
     const z: u32 = @bitCast(column.z);
@@ -281,6 +305,12 @@ pub const Space = struct {
     live: Array(u32),
     buckets: Array(Bucket),
     bucket_mask: usize = 0,
+    /// Tiles of `tile_side` columns a side holding live columns, those live listed, and their
+    /// indices by tile, by hash: what queries far around a point walk, not every column.
+    tiles: extras.Records(TileData),
+    tile_live: Array(u32),
+    tile_buckets: Array(Bucket),
+    tile_mask: usize = 0,
     runs: extras.Records(Run),
     blocks: extras.Records(Block),
     placed: usize = 0,
@@ -346,6 +376,9 @@ pub const Space = struct {
             .columns = try .init(allocator, pool),
             .live = try .init(allocator, pool),
             .buckets = try .init(allocator, pool),
+            .tiles = try .init(allocator, pool),
+            .tile_live = try .init(allocator, pool),
+            .tile_buckets = try .init(allocator, pool),
             .runs = try .init(allocator, pool),
             .blocks = try .init(allocator, pool),
             .log = try .init(allocator, pool),
@@ -435,6 +468,77 @@ pub const Space = struct {
         self.buckets.at(hole).* = .{};
     }
 
+    // Tiles, found as columns are: their own buckets, in the same way.
+
+    fn tileBucketOf(self: *const Space, key: u128) usize {
+        var at: usize = @as(usize, @truncate(hashOf(key))) & self.tile_mask;
+        while (true) : (at = (at + 1) & self.tile_mask) {
+            const bucket = self.tile_buckets.at(at);
+            if (bucket.at == none or bucket.key == key) return at;
+        }
+    }
+
+    /// A tile's dense index, if it holds live columns.
+    pub fn tileIndex(self: *const Space, tile: Column) ?u32 {
+        if (self.tile_buckets.len == 0) return null;
+        const bucket = self.tile_buckets.at(self.tileBucketOf(keyOf(tile)));
+        return if (bucket.at == none) null else bucket.at;
+    }
+
+    pub fn tileData(self: *const Space, index: u32) *TileData {
+        return self.tiles.at(index);
+    }
+
+    fn tileRehash(self: *Space, wanted: usize) !void {
+        self.tile_buckets.clear();
+        const capacity = try std.math.ceilPowerOfTwo(usize, @max(initial_buckets, wanted * 2));
+        try self.tile_buckets.ensureFilled(capacity, .{});
+        self.tile_mask = capacity - 1;
+        for (0..self.tile_live.len) |at| {
+            const index = self.tile_live.at(at).*;
+            const key = keyOf(self.tiles.at(index).tile);
+            self.tile_buckets.at(self.tileBucketOf(key)).* = .{ .key = key, .at = index };
+        }
+    }
+
+    /// The tile of a column, made if it had none.
+    fn ensureTile(self: *Space, column: Column) !u32 {
+        const tile = tileOf(column);
+        if (self.tileIndex(tile)) |index| return index;
+        if ((self.tile_live.len + 1) * 2 > self.tile_buckets.len) try self.tileRehash(self.tile_live.len + 1);
+        try self.tile_live.ensure(self.tile_live.len + 1);
+        const index = try self.tiles.add(.{ .tile = tile, .live_at = @intCast(self.tile_live.len - 1) });
+        self.tile_live.at(self.tile_live.len - 1).* = index;
+        self.tile_buckets.at(self.tileBucketOf(keyOf(tile))).* = .{ .key = keyOf(tile), .at = index };
+        return index;
+    }
+
+    /// A column left its tile: the tile goes with its last.
+    fn leaveTile(self: *Space, index: u32, column: Column) void {
+        const held = self.tiles.at(index);
+        held.columns &= ~tileBit(column);
+        if (held.columns != 0) return;
+        const last = self.tile_live.at(self.tile_live.len - 1).*;
+        self.tile_live.at(held.live_at).* = last;
+        self.tiles.at(last).live_at = held.live_at;
+        self.tile_live.pop();
+        var hole = self.tileBucketOf(keyOf(held.tile));
+        assert(self.tile_buckets.at(hole).at == index);
+        var at = hole;
+        while (true) {
+            at = (at + 1) & self.tile_mask;
+            const bucket = self.tile_buckets.at(at);
+            if (bucket.at == none) break;
+            const home = @as(usize, @truncate(hashOf(bucket.key))) & self.tile_mask;
+            const stays = if (hole <= at) (home > hole and home <= at) else (home > hole or home <= at);
+            if (stays) continue;
+            self.tile_buckets.at(hole).* = bucket.*;
+            hole = at;
+        }
+        self.tile_buckets.at(hole).* = .{};
+        self.tiles.remove(index);
+    }
+
     /// A column's dense index, if it holds entities, boxes or ticks.
     pub fn indexOf(self: *const Space, column: Column) ?u32 {
         return self.lookup(keyOf(column));
@@ -450,8 +554,10 @@ pub const Space = struct {
         if (self.lookup(key)) |index| return index;
         if ((self.live.len + 1) * 2 > self.buckets.len) try self.rehash(self.live.len + 1);
         try self.live.ensure(self.live.len + 1);
+        const tile = try self.ensureTile(column);
         self.columns_made += 1;
-        const index = try self.columns.add(.{ .column = column, .made = self.columns_made, .live_at = @intCast(self.live.len - 1) });
+        const index = try self.columns.add(.{ .column = column, .made = self.columns_made, .live_at = @intCast(self.live.len - 1), .tile = tile });
+        self.tiles.at(tile).columns |= tileBit(column);
         self.live.at(self.live.len - 1).* = index;
         self.buckets.at(self.bucketOf(key)).* = .{ .key = key, .at = index };
         return index;
@@ -469,6 +575,7 @@ pub const Space = struct {
         self.columns.at(last).live_at = held.live_at;
         self.live.pop();
         self.unhash(key);
+        self.leaveTile(held.tile, held.column);
         if (self.last_key == key) {
             self.last_key = std.math.maxInt(u128);
             self.last_index = none;
@@ -711,6 +818,7 @@ pub const Space = struct {
         const made = try self.runs.add(.{ .kind = kind, .column = index, .next = held.first_run });
         held.first_run = made;
         held.folded |= foldOf(kind);
+        self.tiles.at(held.tile).folded |= foldOf(kind);
         return made;
     }
 
@@ -1283,6 +1391,84 @@ pub const Space = struct {
         return self.columns.at(index).folded & fold != 0;
     }
 
+    /// Entities of some kinds in the columns at most `radius` from a column on both axes, a tile
+    /// at a time: a query far around a point walks the tiles there, not every column.
+    pub fn near(self: *const Space, center: Column, radius: i32, kinds: Kinds) Near {
+        assert(radius >= 0);
+        const low: [2]i32 = .{ center.x -| radius, center.z -| radius };
+        const high: [2]i32 = .{ center.x +| radius, center.z +| radius };
+        return .{ .space = self, .world = center.world, .low = low, .high = high, .kinds = kinds, .fold = kinds.fold(), .tile_low = .{ low[0] >> 3, low[1] >> 3 }, .tile_high = .{ high[0] >> 3, high[1] >> 3 }, .tile = .{ low[0] >> 3, low[1] >> 3 } };
+    }
+
+    pub const Near = struct {
+        space: *const Space,
+        world: u32,
+        low: [2]i32,
+        high: [2]i32,
+        kinds: Kinds,
+        fold: u64,
+        tile_low: [2]i32,
+        tile_high: [2]i32,
+        /// The tile looked at next, and the columns of the one at hand left to walk.
+        tile: [2]i32,
+        columns: u64 = 0,
+        origin: [2]i32 = .{ 0, 0 },
+        walk: ?Entries = null,
+        done: bool = false,
+        /// Columns walked, for bounding a query's work.
+        visited: usize = 0,
+
+        pub fn next(self: *Near) ?Entry {
+            while (true) {
+                if (self.walk) |*walk| {
+                    if (walk.next()) |entry| return entry;
+                    self.walk = null;
+                }
+                if (self.columns != 0) {
+                    const bit: u6 = @intCast(@ctz(self.columns));
+                    self.columns &= self.columns - 1;
+                    const column: Column = .{ .world = self.world, .x = self.origin[0] + (bit & 7), .z = self.origin[1] + (bit >> 3) };
+                    const index = self.space.indexOf(column) orelse continue;
+                    self.visited += 1;
+                    self.walk = self.space.entriesAt(index, self.kinds);
+                    continue;
+                }
+                if (!self.nextTile()) return null;
+            }
+        }
+
+        /// The next tile of the range holding some of the kinds: its columns within the range.
+        fn nextTile(self: *Near) bool {
+            while (!self.done) {
+                const at = self.tile;
+                if (at[1] < self.tile_high[1]) self.tile[1] += 1 else if (at[0] < self.tile_high[0]) {
+                    self.tile = .{ at[0] + 1, self.tile_low[1] };
+                } else self.done = true;
+                const index = self.space.tileIndex(.{ .world = self.world, .x = at[0], .z = at[1] }) orelse continue;
+                const held = self.space.tileData(index);
+                if (held.folded & self.fold == 0) continue;
+                self.origin = .{ at[0] * tile_side, at[1] * tile_side };
+                self.columns = held.columns & self.within();
+                if (self.columns != 0) return true;
+            }
+            return false;
+        }
+
+        /// The columns of the tile at hand that lie in the range, as its mask has them.
+        fn within(self: *const Near) u64 {
+            const low_x = @max(self.low[0] - self.origin[0], 0);
+            const high_x = @min(self.high[0] - self.origin[0], tile_side - 1);
+            const low_z = @max(self.low[1] - self.origin[1], 0);
+            const high_z = @min(self.high[1] - self.origin[1], tile_side - 1);
+            if (low_x > high_x or low_z > high_z) return 0;
+            const row: u64 = ((@as(u64, 1) << @intCast(high_x - low_x + 1)) - 1) << @intCast(low_x);
+            var mask: u64 = 0;
+            var z = low_z;
+            while (z <= high_z) : (z += 1) mask |= row << @intCast(z * tile_side);
+            return mask;
+        }
+    };
+
     /// The entities of one column whose sections lie from `low` to `high`, in vanilla's order,
     /// a round at a time into `buffer`: between rounds the space may change, and the next round
     /// takes up after the last given.
@@ -1688,4 +1874,40 @@ test "movers are kept once each until taken" {
     const movers = space.moversSince().slots;
     try testing.expectEqual(@as(usize, 1), movers.len);
     try testing.expectEqual(fixture.directory.slotOf(2).?, movers.at(0).*);
+}
+
+test "near finds exactly the entities of its kinds within its columns, by tiles" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var fixture: Fixture = undefined;
+    try fixture.init(arena.allocator());
+    const space = &fixture.space;
+    var random = std.Random.DefaultPrng.init(0x7e1e);
+    const player: Shape = .{ .kind = 5, .half_width = 0.3, .height = 1.8 };
+    var at: [600][3]f64 = undefined;
+    for (&at, 0..) |*position, index| {
+        position.* = .{ @floatFromInt(random.random().intRangeAtMost(i32, -700, 700)), 64, @floatFromInt(random.random().intRangeAtMost(i32, -700, 700)) };
+        try fixture.insertAs(index + 1, position.*, if (index % 3 == 0) player else cow);
+    }
+    // Some leave, and the tiles of the columns they emptied go with them.
+    for (0..at.len) |index| if (index % 5 == 1) space.remove(index + 1);
+    space.releaseEmptied();
+    for (0..200) |_| {
+        const center: Column = .{ .world = 0, .x = random.random().intRangeAtMost(i32, -50, 50), .z = random.random().intRangeAtMost(i32, -50, 50) };
+        const radius = random.random().intRangeAtMost(i32, 0, 33);
+        var expected: [at.len]bool = @splat(false);
+        for (at, 0..) |position, index| {
+            if (index % 3 != 0 or index % 5 == 1) continue;
+            const column = columnOf(0, position);
+            expected[index] = @abs(column.x - center.x) <= radius and @abs(column.z - center.z) <= radius;
+        }
+        var found = space.near(center, radius, .of(&.{5}));
+        while (found.next()) |entry| {
+            const index: usize = @intCast(entry.id - 1);
+            try testing.expect(expected[index]);
+            expected[index] = false;
+        }
+        for (expected) |missing| try testing.expect(!missing);
+    }
+    try testing.expectEqual(@as(?u32, null), space.tileIndex(.{ .world = 1, .x = 0, .z = 0 }));
 }

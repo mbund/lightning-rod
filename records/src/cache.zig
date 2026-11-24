@@ -798,7 +798,7 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
             }
             const count = self.dirty_entries.count;
             @memcpy(self.order[0..count], self.dirty_entries.values());
-            std.mem.sort(usize, self.order[0..count], self, lessKey);
+            std.sort.pdq(usize, self.order[0..count], self, lessKey);
             var begin: usize = 0;
             while (begin < count) {
                 const length = @min(write_batch_size, count - begin);
@@ -891,8 +891,13 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
             self.index_dirty = true;
         }
 
+        /// By key, then by slot: a total order, so unstable sorts give one result.
         fn lessKey(self: *Self, a: usize, b: usize) bool {
-            return std.mem.order(u8, self.keyBytes(a)[0..self.entries[a].key_len], self.keyBytes(b)[0..self.entries[b].key_len]) == .lt;
+            return switch (std.mem.order(u8, self.keyBytes(a)[0..self.entries[a].key_len], self.keyBytes(b)[0..self.entries[b].key_len])) {
+                .lt => true,
+                .gt => false,
+                .eq => a < b,
+            };
         }
 
         fn rebuildIndex(self: *Self) void {
@@ -908,7 +913,7 @@ pub fn CacheWithValues(comptime Backend: type, comptime Values: type) type {
             }
             var count: usize = 0;
             {
-                std.mem.sort(usize, added[0..additions], self, lessKey);
+                std.sort.pdq(usize, added[0..additions], self, lessKey);
                 var old: usize = 0;
                 var fresh: usize = 0;
                 while (old < self.index_count or fresh < additions) {

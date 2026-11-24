@@ -322,8 +322,8 @@ pub const Melee = struct {
 
     /// Player.attack's sweep: every other living thing in reach of the target's box inflated by
     /// (1, 0.25, 1) and within 3 blocks of the attacker, mobs in the order vanilla finds them and
-    /// then players. The mobs' places and the players' spatial index give the few in the cells under
-    /// the box, so a sweep looks at nothing farther.
+    /// then players in theirs. The space gives the few in the sections under the box, so a sweep
+    /// looks at nothing farther.
     fn sweep(self: *Melee, slot: usize, weapon: ?item_data.View, effects: *const Attack, target: Target, hit: Hit) !void {
         const player = &self.deps.players.records[slot];
         const ratio: f32 = @floatCast(try self.deps.attributes.value(slot, "minecraft:sweeping_damage_ratio"));
@@ -348,14 +348,19 @@ pub const Melee = struct {
                 }
             },
         }
-        var players = self.deps.players.nearby(player.world, .{ .x = (reach.min[0] + reach.max[0]) / 2, .y = 0, .z = (reach.min[2] + reach.max[2]) / 2 }, 1);
-        while (players.next()) |other| {
-            if (other == slot or std.meta.eql(target, Target{ .player = other })) continue;
-            const candidate = &self.deps.players.records[other];
-            if (candidate.world != player.world or self.deps.player_states.of(candidate).gamemode == .spectator) continue;
-            if (!playerBox(candidate).intersects(reach)) continue;
-            try self.sweepOne(slot, weapon, effects, .{ .player = other }, amount, hit.scale);
-        }
+        // Players as vanilla's level finds them in the box: section by section, as they entered.
+        var others: struct { melee: *Melee, slot: usize, world: u32, target: Target, reach: body.Box, weapon: @TypeOf(weapon), effects: @TypeOf(effects), amount: @TypeOf(amount), scale: @TypeOf(hit.scale) } = .{ .melee = self, .slot = slot, .world = player.world, .target = target, .reach = reach, .weapon = weapon, .effects = effects, .amount = amount, .scale = hit.scale };
+        try self.deps.players.eachInBox(player.world, .{ .min = reach.min, .max = reach.max }, &others, struct {
+            fn visit(context: *@TypeOf(others), other: usize) anyerror!bool {
+                const melee = context.melee;
+                if (other == context.slot or std.meta.eql(context.target, Target{ .player = other })) return false;
+                const candidate = &melee.deps.players.records[other];
+                if (candidate.world != context.world or melee.deps.player_states.of(candidate).gamemode == .spectator) return false;
+                if (!playerBox(candidate).intersects(context.reach)) return false;
+                try melee.sweepOne(context.slot, context.weapon, context.effects, .{ .player = other }, context.amount, context.scale);
+                return false;
+            }
+        }.visit);
         self.sound(slot, "minecraft:entity.player.attack.sweep");
         self.sweepParticle(slot);
     }

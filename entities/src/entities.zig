@@ -63,6 +63,26 @@ pub const State = struct {
 pub const Entities = struct {
     pub const id = "lightning_rod:entities";
 
+    /// What the substrate keeps of a kind: declared once, by the plugin that owns it, as it starts.
+    pub const KindSpec = struct {
+        kinds: Kinds,
+        /// How its entities tick: as the columns they are in tick, as vanilla's chunks tick
+        /// theirs, or in turns the kind keeps itself.
+        turns: enum { columns, own } = .columns,
+        /// Whether a move within its column goes in the space's log. A kind whose moves its own
+        /// owner tells of says no.
+        log_moves: bool = true,
+        /// Whether its entities are stored with their columns.
+        stored: bool = true,
+        /// Its tracking range in blocks, EntityType clientTrackingRange times 16, and the most any of
+        /// its entities' own ranges reach; null for one nobody is shown.
+        tracking_range: ?u32 = null,
+        tracking_max_range: ?u32 = null,
+    };
+
+    /// A kind's tracking, as declared.
+    pub const Tracked = struct { range: u32, max_range: u32 };
+
     pub const Configuration = struct {
         /// Memory entity state lives in: every table, of every kind, draws whole pages from it.
         /// The one bound: memory used up, the server stops cleanly, as vanilla runs out of heap.
@@ -77,6 +97,35 @@ pub const Entities = struct {
         context: *anyopaque,
         body: *const fn (*anyopaque, u32) ?*State,
     };
+
+    /// A kind's traits, applied wherever the substrate keeps them. The same declared again is
+    /// nothing new; another is an error.
+    pub fn declare(self: *Entities, spec: KindSpec) !void {
+        var kinds = spec.kinds.bits.iterator(.{});
+        while (kinds.next()) |kind| {
+            const wanted: Declared = .{ .turns_own = spec.turns == .own, .log_moves = spec.log_moves, .stored = spec.stored, .tracked = if (spec.tracking_range) |range| .{ .range = range, .max_range = spec.tracking_max_range orelse range } else null };
+            if (self.declared[kind]) |known| {
+                if (!std.meta.eql(known, wanted)) return error.KindDeclaredTwice;
+                continue;
+            }
+            self.declared[kind] = wanted;
+            const one: Kinds = .of(&.{@intCast(kind)});
+            if (wanted.turns_own) self.places.keepsOwnTurns(one);
+            if (!wanted.log_moves) self.places.space.unlogged_moves.bits.set(kind);
+            if (!wanted.stored) self.places.space.unstored.bits.set(kind);
+        }
+    }
+
+    /// How a declared kind is tracked, or null for one nobody is shown or none declared.
+    pub fn trackedOf(self: *const Entities, kind: u32) ?Tracked {
+        return (self.declared[kind] orelse return null).tracked;
+    }
+
+    pub fn isDeclared(self: *const Entities, kind: u32) bool {
+        return self.declared[kind] != null;
+    }
+
+    const Declared = struct { turns_own: bool, log_moves: bool, stored: bool, tracked: ?Tracked };
 
     pub fn addBodyColumn(self: *Entities, kind: u32, column: BodyColumn) !void {
         if (self.body_columns[kind] != null) return error.BodyColumnTaken;
@@ -123,6 +172,8 @@ pub const Entities = struct {
     directory: Directory,
     /// Where each kind keeping its bodies in its own table has them.
     body_columns: [Kinds.max_kinds]?BodyColumn = @splat(null),
+    /// Each kind's traits, as its owner declared them.
+    declared: [Kinds.max_kinds]?Declared = @splat(null),
     /// Why the server should stop after this tick: a bound nearly reached.
     stopping: ?anyerror = null,
     /// Where every entity of every kind is, and the one order they all tick in.

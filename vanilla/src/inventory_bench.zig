@@ -102,7 +102,7 @@ pub fn benchmark() !void {
         var players_buffer: [1]Players.Player = .{.{ .handle = handle, .uuid = 1, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number }};
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &players_buffer, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const player_states = try survivalStates(allocator, &players_buffer);
         const menu = try PlayerInventory.init(allocator, .{}, .{
             .crafting = gameplay_definitions.crafting,
@@ -229,7 +229,7 @@ pub fn benchmarkEquipment() !void {
             for (&edits, stacks, [_]u16{ 36, 45, 8, 7, 6, 5 }) |*edit, stack, slot| edit.* = .{ .slot = .{ .owner = player.uuid, .index = slot }, .revision = 0, .stack = stack };
             try std.testing.expect(try ownership.editMany(&edits));
         }
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const player_states = try survivalStates(allocator, player_records);
         const replication = try Replication.init(allocator, .{}, .{ .players = &players, .visibility = try Visibility.init(allocator, .{}, .{ .players = &players }), .tracking = try Tracking.forTests(allocator, &players) });
         const equipment = try Equipment.init(allocator, .{}, .{
@@ -387,7 +387,7 @@ pub fn benchmarkPickup() !void {
         var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .stage = .ready, .loaded = true }};
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const player_states = try survivalStates(allocator, &player_records);
         const menu = try PlayerInventory.init(allocator, .{}, .{
             .crafting = gameplay_definitions.crafting,
@@ -515,7 +515,7 @@ pub fn benchmarkItemReplication() !void {
         var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number }};
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 2 }, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 256, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
         const block_properties = &(try vanilla_content.blocks(allocator)).published;
         const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = 24, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = 24 }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
@@ -570,11 +570,11 @@ pub fn benchmarkItemReplication() !void {
             };
             if (mode == .leave_view) {
                 player_records[0].position.x = 1000;
-                players.rebuildIndexes();
+                try players.rebuildIndexes();
             }
             if (mode == .return_view) {
                 player_records[0].position.x = 0;
-                players.rebuildIndexes();
+                try players.rebuildIndexes();
             }
             if (mode == .viewer_reset) {
                 player_records[0].life += 1;
@@ -647,7 +647,7 @@ pub fn benchmarkBossbars() !void {
     player_records[1].stage = .login;
     var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &player_records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const bars = try Bossbars.init(allocator, .{ .players = &players, .packets = encoding }, .{ .maximum = 2 });
     const first = try bars.create(.{ .title = "", .progress = 0 });
     const second = try bars.create(.{ .title = "private", .audience = .{ .player = 2 } });
@@ -758,7 +758,7 @@ pub fn benchmarkDrops() !void {
         var player_records: [1]Players.Player = .{player};
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const player_states = try survivalStates(allocator, &player_records);
         const menu = try PlayerInventory.init(allocator, .{}, .{
             .crafting = gameplay_definitions.crafting,
@@ -863,7 +863,7 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
     try players.initIndexes(allocator);
     player_records[connection].position.x = 1;
     player_records[connection].position.z = 1;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 256, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
     const block_properties = &(try vanilla_content.blocks(allocator)).published;
     const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = 24, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = 24 }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
@@ -903,7 +903,7 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
     for (steps, 0..) |step, index| {
         player_records[connection].position.x = step.position[0];
         player_records[connection].position.z = step.position[1];
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const metadata_before = dropped.reads;
         service.credit[connection].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
         service.beginTick();
@@ -985,7 +985,7 @@ pub fn benchmarkItemVisibility() !void {
         try players.initIndexes(allocator);
         player_records[0].position.x = 1;
         player_records[0].position.z = 1;
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 256, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
         const block_properties = &(try vanilla_content.blocks(allocator)).published;
         const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = 24, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = 24 }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
@@ -1079,7 +1079,7 @@ pub fn benchmarkPickupAdmission() !void {
         for (player_records[0..player_count], 0..) |*player, index| player.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 }, .uuid = index + 1, .stage = .ready, .loaded = true };
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = player_records[0..player_count], .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const player_states = try survivalStates(allocator, player_records[0..player_count]);
         const menu = try PlayerInventory.init(allocator, .{}, .{
             .crafting = gameplay_definitions.crafting,
@@ -1221,7 +1221,7 @@ pub fn benchmarkIdleTerrain() !void {
         for (player_records, 0..) |*player, index| player.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 }, .uuid = index + 1, .world = world, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number };
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 8 }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 256, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
         const block_properties = &(try vanilla_content.blocks(allocator)).published;
         const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = 24, .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = 24 }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
@@ -1349,7 +1349,7 @@ pub fn benchmarkItemBroadcast() !void {
         };
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 2 }, .spawn_world = world, .records = player_records[0..viewers], .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 256, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
         const block_properties = &(try vanilla_content.blocks(allocator)).published;
         const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = 24, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = 24 }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
@@ -1507,7 +1507,7 @@ pub fn benchmarkBlockPlanning() !void {
         for (player_records, 0..) |*player, index| player.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 }, .uuid = index + 1, .world = world, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number };
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = radius }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 256, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
         const block_properties = &(try vanilla_content.blocks(allocator)).published;
         const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = 24, .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = 24 }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
@@ -1716,7 +1716,7 @@ pub fn benchmarkItemBoundaries() !void {
         for (player_records, 0..) |*player, index| player.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 }, .uuid = index + 1, .world = world, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number, .position = .{ .x = 1, .y = 65, .z = 1 } };
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 8 }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 256, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
         const block_properties = &(try vanilla_content.blocks(allocator)).published;
         const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = 24, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = 24 }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
@@ -1737,7 +1737,7 @@ pub fn benchmarkItemBoundaries() !void {
                 player.position.x = step.position[0] + @as(f64, @floatFromInt(player.handle.?.index)) / @as(f64, @floatFromInt(viewers * 16));
                 player.position.z = step.position[1];
             }
-            players.rebuildIndexes();
+            try players.rebuildIndexes();
             const metadata_before = dropped.reads;
             for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
             service.beginTick();
@@ -1807,7 +1807,7 @@ pub fn benchmarkTerrainBackpressure() !void {
         for (player_records, 0..) |*player, index| player.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 }, .uuid = index + 1, .world = world, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number };
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 8 }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 320, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
         const block_properties = &(try vanilla_content.blocks(allocator)).published;
         const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = 24, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = 24 }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
@@ -1961,7 +1961,7 @@ test "operation counts for audience overflow preserve unrelated connections" {
         player_records[index].handle = .{ .index = index, .generation = 1 };
         service.credit[index].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
     }
-    var players: Players = .{ .deps = .{ .sessions = service, .packets = undefined, .input = undefined, .storage = undefined, .worlds = undefined, .record_workspaces = undefined }, .config = .{}, .spawn_world = 0, .records = player_records, .dig_handlers = &.{} };
+    var players: Players = .{ .deps = .{ .entities = undefined, .sessions = service, .packets = undefined, .input = undefined, .storage = undefined, .worlds = undefined, .record_workspaces = undefined }, .config = .{}, .spawn_world = 0, .records = player_records, .dig_handlers = &.{} };
     const matrix = try audience_storage.Matrix.init(allocator, &players, 101, 0, .recipients);
     const selected = try bit_sets.Matrix.init(allocator, 1, capacity);
     selected.row(0).insert(0);
@@ -2018,7 +2018,7 @@ pub fn benchmarkSparseTerrainStreaming() !void {
         }
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 8 }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 256, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
         const block_properties = &(try vanilla_content.blocks(allocator)).published;
         const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = 24, .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = 24 }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
@@ -2067,7 +2067,7 @@ pub fn benchmarkSparseTerrainStreaming() !void {
         try std.testing.expect(query.visited <= 16);
         try output.interface.print("terrain slots={d} active={d} chunk_packets={d} cursor_updates=1 recipient_candidates={d}\n", .{ count, if (populated) count else 1, packets_sent, query.visited });
         player_records[0].position.x += 1024;
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         service.credit[0].store((@as(u64, 1) << 32) | sessions.Service.active, .release);
         service.beginTick();
         streaming.endTick(true);
@@ -2130,7 +2130,7 @@ pub fn benchmarkSparseBlockPlanning() !void {
         for (player_records, 0..) |*player, index| player.* = if (populated or index == 0) .{ .handle = .{ .index = index, .generation = 1 }, .uuid = index + 1, .world = world, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number, .position = .{ .x = @floatFromInt(index * 1024), .y = 65, .z = 0 } } else .{};
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = radius }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 256, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
         const block_properties = &(try vanilla_content.blocks(allocator)).published;
         const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = 24, .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = 24 }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
@@ -2187,7 +2187,7 @@ pub fn benchmarkSparseBlockPlanning() !void {
         service.credit[0].store((@as(u64, 1) << 32) | sessions.Service.active, .release);
         try std.testing.expect(!try blocks.poll(io));
         player_records[0].handle = null;
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         service.beginTick();
         blocks.endTick(true);
         service.endTick(true);
@@ -2196,7 +2196,7 @@ pub fn benchmarkSparseBlockPlanning() !void {
         try std.testing.expect(!blocks.selections.row(0).view().any());
         try std.testing.expectEqual(@as(usize, 0), blocks.observers[0].pending);
         player_records[0].handle = .{ .index = 0, .generation = 2 };
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         service.beginTick();
         blocks.correct(world, .{ .x = 0, .y = 65, .z = 0 });
         blocks.endTick(true);
@@ -2242,7 +2242,7 @@ pub fn verifyBlockBatchRetirement() !void {
         for (player_records, 0..) |*player, index| player.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 }, .uuid = index + 1, .world = world, .stage = .ready, .loaded = true, .protocol = catalog.values[if (mode == .protocols) index % catalog.values.len else 0].number };
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = radius }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 256, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
         const block_properties = &(try vanilla_content.blocks(allocator)).published;
         const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = 24, .occlusion = false, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = 24 }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
@@ -2368,7 +2368,7 @@ pub fn itemPositionInterval() !void {
         var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number }};
         var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 2 }, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 256, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
         const block_properties = &(try vanilla_content.blocks(allocator)).published;
         const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = 24, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = 24 }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });

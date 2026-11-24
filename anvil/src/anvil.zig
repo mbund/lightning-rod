@@ -7,7 +7,8 @@ const maximum_chunk_bytes = 8 * 1024 * 1024;
 pub const Property = struct { name: []const u8, value: []const u8 };
 
 pub fn stateKey(allocator: std.mem.Allocator, name: []const u8, properties: []Property) ![]const u8 {
-    std.mem.sort(Property, properties, {}, struct {
+    // A handful, and the order a stable sort gives, without its buffer.
+    std.sort.insertion(Property, properties, {}, struct {
         fn less(_: void, a: Property, b: Property) bool {
             return std.mem.lessThan(u8, a.name, b.name);
         }

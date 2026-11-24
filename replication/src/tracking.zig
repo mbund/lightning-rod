@@ -69,10 +69,10 @@ pub const Tracking = struct {
     /// What a kind tells about its entities.
     pub const Spec = struct {
         kinds: Kinds,
-        /// The type's tracking range in blocks: EntityType clientTrackingRange × 16.
-        range: u32,
-        /// The most any of its entities' own ranges reaches, as one carrying passengers takes theirs:
-        /// the range when none has a range of its own.
+        /// The type's tracking range in blocks, EntityType clientTrackingRange × 16, and the most any of
+        /// its entities' own ranges reach, as one carrying passengers takes theirs. Null for what
+        /// the kinds' owners declared, which is where a kind says it.
+        range: ?u32 = null,
         max_range: ?u32 = null,
         /// Where one of its boxed entities is now: tracking asks only where a box leaves an answer
         /// unsure. Kinds that box their entities give it.
@@ -352,6 +352,8 @@ pub const Tracking = struct {
     stats: Stats = .{},
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Tracking {
+        // Players and whatever they track share one space.
+        try deps.players.useEntities(deps.entities);
         if (config.range_percentage < 10 or config.range_percentage > 1000 or config.work == 0 or config.tiles == 0) return error.InvalidConfiguration;
         const self = try allocator.create(Tracking);
         const count = deps.players.records.len;
@@ -439,14 +441,11 @@ pub const Tracking = struct {
     /// space from joining its world, never shown itself, and in spectator mode shown to spectators
     /// alone (ServerPlayer.broadcastToPlayer). Call while starting.
     pub fn trackPlayers(self: *Tracking, kind: u32) !TrackerId {
-        const tracker = try self.register(.{ .kinds = .of(&.{kind}), .range = 32 * 16 });
+        const tracker = try self.register(.{ .kinds = .of(&.{kind}) });
         self.player_tracker = tracker;
         self.player_kind = kind;
-        // Players are somewhere, not ticked there; their moves are told by the players.
-        self.deps.entities.places.keepsOwnTurns(.of(&.{kind}));
-        self.deps.entities.places.space.unlogged_moves.bits.set(kind);
-        // Players are not stored with columns: their own column unloaded is no stray.
-        self.deps.entities.places.space.unstored.bits.set(kind);
+        // The players place themselves among entities, and say how they are kept there.
+        assert(kind == Players.entity_kind);
         return tracker;
     }
 
@@ -455,9 +454,6 @@ pub const Tracking = struct {
         const slot = self.player_slots[player];
         return if (slot == none) null else slot;
     }
-
-    /// Ids of players as subjects, apart from every entity's, which count up from one.
-    const player_id_base: u64 = 1 << 63;
 
     /// Occlusion is asked of the sections a block and a half around a player and three high, as
     /// players replicated before: a looser box than its own, so one at a section's edge does not
@@ -469,40 +465,30 @@ pub const Tracking = struct {
     /// gone as they leave it or their connection does.
     fn syncPlayers(self: *Tracking) !void {
         if (self.player_tracker == null) return;
-        const space = &self.deps.entities.places.space;
-        const shape: entities_module.space.Shape = .{ .kind = self.player_kind, .half_width = player_shape_half_width, .height = player_shape_height };
-        for (self.deps.players.records, self.changes.snapshots, 0..) |player, snapshot, index| {
-            const entity = player_id_base | (@as(u64, snapshot.generation) << 16) | index;
-            // In its world from joining, as vanilla adds a player to its level before the first
-            // teleport is confirmed.
-            const wanted = player.inWorld();
-            if (self.player_slots[index] != none and (!wanted or self.player_ids[index] != entity)) {
-                const slot = self.player_slots[index];
-                space.remove(self.player_ids[index]);
-                self.deps.entities.leave(slot);
+        const players = self.deps.players;
+        for (players.records, self.changes.snapshots, 0..) |player, snapshot, index| {
+            const slot = players.entity_slots[index];
+            // Gone from its world: the space told of it, and whoever had it is told.
+            if (slot == none) {
                 self.player_slots[index] = none;
+                continue;
             }
-            if (!wanted) continue;
             const position: [3]f64 = .{ player.position.x, player.position.y, player.position.z };
-            if (self.player_slots[index] == none) {
-                const slot = try self.deps.entities.enter(entity, self.player_kind);
+            if (self.player_slots[index] != slot or self.player_ids[index] != players.entity_ids[index]) {
                 self.player_slots[index] = slot;
-                self.player_ids[index] = entity;
+                self.player_ids[index] = players.entity_ids[index];
                 self.subject_spectator[index] = false;
                 self.subject_fresh[index] = true;
                 try self.setOwner(slot, index);
-                try space.insert(entity, player.world, position, shape);
                 self.subject_moved[index] = true;
             } else {
-                // Moved by its slot, which saves finding it by id.
                 self.subject_moved[index] = self.subject_world[index] != player.world or !std.meta.eql(self.subject_at[index], position);
-                if (self.subject_moved[index]) try space.moveSlot(self.player_slots[index], player.world, position);
             }
             self.subject_at[index] = position;
             self.subject_world[index] = player.world;
             if (self.subject_spectator[index] != snapshot.spectator) {
                 self.subject_spectator[index] = snapshot.spectator;
-                try self.setSpectatorsOnly(self.player_slots[index], snapshot.spectator);
+                try self.setSpectatorsOnly(slot, snapshot.spectator);
             }
         }
     }
@@ -523,8 +509,26 @@ pub const Tracking = struct {
 
     /// A tracking layer over entities of its own, for tests of what builds on it.
     pub fn forTests(allocator: std.mem.Allocator, players: *Players) !*Tracking {
-        const owned = try Entities.allocate(allocator, std.testing.io, .{ .memory = 1024 * entities_module.pool.page_bytes }, undefined);
+        // The players' entities, where they placed themselves; or made here, for them to use.
+        const owned = players.entities orelse made: {
+            const made = try Entities.allocate(allocator, std.testing.io, .{ .memory = 1024 * entities_module.pool.page_bytes }, undefined);
+            players.entities = made;
+            break :made made;
+        };
         return Tracking.init(allocator, .{ .tiles = 256 }, .{ .entities = owned, .players = players });
+    }
+
+    /// A spec's ranges: given, or as its kinds were declared, all alike.
+    fn declaredRange(self: *const Tracking, spec: Spec) !Entities.Tracked {
+        if (spec.range) |range| return .{ .range = range, .max_range = spec.max_range orelse range };
+        var found: ?Entities.Tracked = null;
+        var kinds = spec.kinds.bits.iterator(.{});
+        while (kinds.next()) |kind| {
+            const tracked = self.deps.entities.trackedOf(@intCast(kind)) orelse return error.KindNotDeclaredTracked;
+            if (found) |other| if (!std.meta.eql(other, tracked)) return error.KindsTrackedApart;
+            found = tracked;
+        }
+        return found orelse error.NoKinds;
     }
 
     /// A kind's entities are tracked from now on. Call while starting.
@@ -533,8 +537,9 @@ pub const Tracking = struct {
         if (self.tile_stride != 0) return error.TrackingStarted;
         const scale = self.config.range_percentage;
         const index: TrackerId = @intCast(self.tracker_count);
-        const range: f64 = @floatFromInt(spec.range * scale / 100);
-        const max_range: f64 = @floatFromInt((spec.max_range orelse spec.range) * scale / 100);
+        const declared = try self.declaredRange(spec);
+        const range: f64 = @floatFromInt(declared.range * scale / 100);
+        const max_range: f64 = @floatFromInt(declared.max_range * scale / 100);
         // Trackers of one range share their masks.
         const group: u8 = for (self.groups[0..self.group_count], 0..) |*group, at| {
             if (group.range != range) continue;
@@ -634,7 +639,7 @@ pub const Tracking = struct {
 
     /// The whole blocks an entity's box is in, as occlusion asks about them.
     fn blocksOf(entry: Entry) geometry_bounds.Box {
-        const box = entry.box();
+        const box = answered(entry).box();
         return .{
             .minimum = .{ @intFromFloat(@floor(box.min[0])), @intFromFloat(@floor(box.min[1])), @intFromFloat(@floor(box.min[2])) },
             .maximum = .{ @intFromFloat(@ceil(box.max[0])), @intFromFloat(@ceil(box.max[1])), @intFromFloat(@ceil(box.max[2])) },
@@ -644,7 +649,18 @@ pub const Tracking = struct {
     /// The columns and sections an entity's box is in: low x, y, z, then high.
     const Footprint = struct { low: [3]i32 = .{ 0, 0, 0 }, high: [3]i32 = .{ 0, 0, 0 } };
 
-    fn footprintOf(entry: Entry) Footprint {
+    /// An entity as the rule answers it: as it is, but a player in the looser box occlusion asks
+    /// about, which the space does not hold.
+    fn answered(entry: Entry) Entry {
+        if (entry.shape.kind != Players.entity_kind) return entry;
+        var widened = entry;
+        widened.shape.half_width = player_shape_half_width;
+        widened.shape.height = player_shape_height;
+        return widened;
+    }
+
+    fn footprintOf(given: Entry) Footprint {
+        const entry = answered(given);
         const half: f64 = entry.shape.half_width;
         const low: [3]f64 = .{ entry.position[0] - half, entry.position[1], entry.position[2] - half };
         const high: [3]f64 = .{ entry.position[0] + half, entry.position[1] + entry.shape.height, entry.position[2] + half };

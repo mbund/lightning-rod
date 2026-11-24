@@ -78,7 +78,7 @@ test "resident merge candidates filter metadata and conserve item ownership with
         var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready }};
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const domains = try Domains.init(allocator, .{}, .{ .players = &players });
         _ = try EntityColumns.init(allocator, .{}, .{ .domains = domains, .entities = bodies });
         const tick = try tick_module.ItemTick.init(allocator, .{}, .{ .dropped = dropped, .physics = physics, .merging = merging, .pickup = undefined, .players = &players, .entities = bodies, .inventories = ownership, .items = items, .worlds = dimensions, .dimensions = gameplay_definitions.dimensions, .client = gameplay_definitions.client });
@@ -223,7 +223,7 @@ test "items burn in lava and fire unless they resist it, and blocks hold, lift a
     var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .position = .{ .x = 16, .y = 64, .z = 72 } }};
     var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const domains = try Domains.init(allocator, .{}, .{ .players = &players });
     _ = try EntityColumns.init(allocator, .{}, .{ .domains = domains, .entities = bodies });
     const tick = try tick_module.ItemTick.init(allocator, .{}, .{ .dropped = dropped, .physics = physics, .merging = merging, .pickup = undefined, .players = &players, .entities = bodies, .inventories = ownership, .items = items, .worlds = dimensions, .dimensions = gameplay_definitions.dimensions, .client = gameplay_definitions.client });

@@ -385,7 +385,7 @@ test "visibility layers compose independently and reset both sides of reused con
     for (&records, 0..) |*player, index| player.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 } };
     var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const visibility = try Visibility.init(allocator, .{}, .{ .players = &players });
     const vanish = try visibility.createLayer();
     const minigame = try visibility.createLayer();
@@ -433,7 +433,7 @@ test "all-observer exclusions include future joins while connection-specific exc
     for (&records, 0..) |*player, index| player.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 } };
     var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const visibility = try Visibility.init(allocator, .{}, .{ .players = &players });
     const layer = try visibility.createLayer();
     const subject = records[0].handle.?;
@@ -463,7 +463,7 @@ test "visibility exhaustion preserves the complete previous policy" {
     for (&records, 0..) |*player, index| player.* = .{ .handle = .{ .index = index, .generation = 1 } };
     var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const visibility = try Visibility.init(allocator, .{ .exceptions = 1 }, .{ .players = &players });
     const layer = try visibility.createLayer();
     failing.fail_index = failing.alloc_index;
@@ -494,7 +494,7 @@ test "visibility staged rows match a model through overlapping batches and capac
     }
     var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const visibility = try Visibility.init(allocator, .{ .exceptions = 8 }, .{ .players = &players });
     const layers = [_]Visibility.Layer{ try visibility.createLayer(), try visibility.createLayer() };
     const channels = [_]Visibility.Channel{ visibility.player_entity, visibility.tab_list, visibility.announcements };

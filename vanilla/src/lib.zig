@@ -153,6 +153,8 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(VanillaWorlds, VanillaWorlds.Configuration{}),
     lightning_rod.plugin.configured(Chunks, Chunks.Configuration.forPlayers((Players.Configuration{}).maximum)),
     lightning_rod.plugin.configured(Spawn, Spawn.Configuration{}),
+    // Players are entities: they place themselves among them as they come and go.
+    lightning_rod.plugin.configured(Entities, Entities.Configuration{}),
     lightning_rod.plugin.configured(Players, Players.Configuration{}),
     lightning_rod.plugin.configured(WorldBorder, WorldBorder.Configuration{}),
     lightning_rod.plugin.configured(PlayerStates, PlayerStates.Configuration{}),
@@ -177,7 +179,6 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(ReloadCommands, ReloadCommands.Configuration{}),
     lightning_rod.plugin.configured(CommandDispatch, CommandDispatch.Configuration{}),
     lightning_rod.plugin.configured(ChatCommands, ChatCommands.Configuration{}),
-    lightning_rod.plugin.configured(Entities, Entities.Configuration{}),
     lightning_rod.plugin.configured(EntityColumns, .{}),
     lightning_rod.plugin.configured(InventoryCapacity, .{}),
     lightning_rod.plugin.configured(Inventories, Inventories.Configuration{ .cache_items = crafting.maximum_inputs + 1 }),

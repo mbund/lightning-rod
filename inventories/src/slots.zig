@@ -75,9 +75,11 @@ pub const Slots = struct {
             position.* = @intCast(index);
             if (index != 0 and sorted) sorted = std.mem.order(u8, requests[index - 1].key, request.key) != .gt;
         }
-        if (!sorted) std.mem.sort(u16, order, requests, struct {
+        if (!sorted) std.sort.pdq(u16, order, requests, struct {
             fn less(items: []const records.Get, a: u16, b: u16) bool {
-                return std.mem.order(u8, items[a].key, items[b].key) == .lt;
+                // By key, then by place: the order a stable sort gives.
+                const result = std.mem.order(u8, items[a].key, items[b].key);
+                return if (result == .eq) a < b else result == .lt;
             }
         }.less);
         var count: usize = 0;
@@ -118,7 +120,7 @@ pub const Slots = struct {
         if (writes.len > self.values.len) return error.InvalidArgument;
         const order = self.order;
         for (order[0..writes.len], 0..) |*index, at| index.* = @intCast(at);
-        std.mem.sort(u16, order[0..writes.len], writes, struct {
+        std.sort.pdq(u16, order[0..writes.len], writes, struct {
             fn less(items: []const records.Write, a: u16, b: u16) bool {
                 const result = std.mem.order(u8, items[a].key, items[b].key);
                 return if (result == .eq) a < b else result == .lt;

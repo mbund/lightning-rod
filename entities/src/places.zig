@@ -117,6 +117,7 @@ pub const Places = struct {
     }
 
     /// A kind keeps its own turns: its entities are left out of the columns' ticking.
+    /// As `Entities.declare` says, which is where a kind says it.
     pub fn keepsOwnTurns(self: *Places, kinds: Kinds) void {
         self.following.bits.setIntersection(kinds.bits.complement());
     }

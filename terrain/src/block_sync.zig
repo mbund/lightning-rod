@@ -1216,7 +1216,7 @@ test "a saturated block queue marks only the changed section for matching viewer
     };
     var players: Players = .{ .deps = undefined, .records = &records, .spawn_world = 1, .config = .{ .render_distance = 32 }, .dig_handlers = &.{} };
     try players.initIndexes(arena.allocator());
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     var mask: [64]u64 = @splat(0);
     mask[0] = 1;
     for (0..3) |index| {

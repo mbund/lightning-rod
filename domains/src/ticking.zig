@@ -158,8 +158,9 @@ pub const Ticking = struct {
     /// appears in neither.
     pub fn drain(self: *Ticking) struct { entered: []const Column, left: []const Column } {
         // Several sources changing in one tick can enter, leave and enter a column again.
-        std.mem.sort(Column, self.entered[0..self.entered_count], {}, lessThan);
-        std.mem.sort(Column, self.left[0..self.left_count], {}, lessThan);
+        // Columns are their whole order: equal ones are the same, so unstable sorts do.
+        std.sort.pdq(Column, self.entered[0..self.entered_count], {}, lessThan);
+        std.sort.pdq(Column, self.left[0..self.left_count], {}, lessThan);
         var entered: usize = 0;
         for (self.entered[0..self.entered_count]) |column| {
             if (!self.contains(column)) continue;

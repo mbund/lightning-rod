@@ -65,7 +65,7 @@ test "experience pickup consumes one merged count every two ticks and ignores sp
     bounded.fail_index = bounded.alloc_index;
     fixture.players.records[0].position = .{ .x = 0.5, .y = 8, .z = 0.5 };
     fixture.player_states.records[0].gamemode = .spectator;
-    fixture.players.rebuildIndexes();
+    try fixture.players.rebuildIndexes();
     try experience.award(fixture.players.records[0].world, .{ 0.5, 8, 0.5 }, 7);
     const index = (try liveOrbs(experience))[0];
     try setOrb(experience, index, "count", 3);
@@ -182,7 +182,7 @@ test "competing experience collectors conserve every point under sustained bound
         state.gamemode = .survival;
         player.position = .{ .x = 0.5, .y = 8, .z = 0.5 };
     }
-    fixture.players.rebuildIndexes();
+    try fixture.players.rebuildIndexes();
     bounded.fail_index = bounded.alloc_index;
     var generated: i32 = 0;
     for (0..64) |_| {
@@ -289,7 +289,7 @@ fn verifyAtomicExperience(mode: fault.Disk.Mode) !void {
         player.position = .{ .x = 0.5, .y = 8, .z = 0.5 };
         const state = &fixture.player_states.records[0];
         state.gamemode = .survival;
-        fixture.players.rebuildIndexes();
+        try fixture.players.rebuildIndexes();
         const hand: inventories.Slot = .{ .owner = player.uuid, .index = 36 };
         if (phase == 0) {
             var bytes: [128]u8 = undefined;
@@ -398,7 +398,7 @@ test "orb merges preserve denomination counts and minimum age and expiry removes
     const experience = containers.deps.experience;
     fixture.players.records[0].position = .{ .x = 0, .y = 8, .z = 0 };
     fixture.player_states.records[0].gamemode = .spectator;
-    fixture.players.rebuildIndexes();
+    try fixture.players.rebuildIndexes();
     const world = fixture.players.records[0].world;
     try experience.award(world, .{ 8, 8, 0 }, 3);
     // Ids forty apart share a merge bucket: the 39 slots between are taken.
@@ -443,7 +443,7 @@ test "orb placement fluid currents block effects and fire follow vanilla physics
     const world = fixture.players.records[0].world;
     fixture.player_states.records[0].gamemode = .spectator;
     fixture.players.records[0].position = .{ .x = 8, .y = 8, .z = 8 };
-    fixture.players.rebuildIndexes();
+    try fixture.players.rebuildIndexes();
     try containers.deps.chunks.setBlock(world, .{ .x = 0, .y = 8, .z = 0 }, @intCast(game_data.registry.blockStateId("minecraft:stone").?));
     try experience.award(world, .{ 1.1, 8, 0.5 }, 1);
     const first = (try liveOrbs(experience))[0];

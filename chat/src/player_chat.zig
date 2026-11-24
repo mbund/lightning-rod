@@ -1191,7 +1191,7 @@ const Fixture = struct {
         self.players.deps.sessions = service;
         self.players.deps.packets = encoding;
         try self.players.initIndexes(allocator);
-        self.players.rebuildIndexes();
+        try self.players.rebuildIndexes();
         self.chat = try Chat.init(allocator, .{ .players = &self.players, .sessions = service, .packets = encoding }, .{});
         const input = try Input.init(allocator, .{ .sessions = service });
         self.relay = try PlayerChat.init(allocator, io, config, .{ .players = &self.players, .input = input, .sessions = service, .packets = encoding, .chat = self.chat });

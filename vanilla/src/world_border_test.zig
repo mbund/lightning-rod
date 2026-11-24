@@ -45,9 +45,9 @@ const Fixture = struct {
             player.* = .{ .handle = .{ .index = @intCast(at), .generation = 1 }, .uuid = at + 1, .world = overworld, .protocol = selected[0].number, .name = @splat('a'), .name_len = 1, .stage = .ready, .arrivals = 1, .position = .{ .x = 8, .y = 65, .z = 6.5 } };
             service.credit[at].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
         }
-        self.players = .{ .deps = .{ .sessions = service, .packets = packets, .input = undefined, .storage = undefined, .worlds = worlds, .record_workspaces = undefined }, .config = .{ .maximum = 2 }, .spawn_world = overworld, .records = &self.records, .dig_handlers = &.{} };
+        self.players = .{ .deps = .{ .entities = undefined, .sessions = service, .packets = packets, .input = undefined, .storage = undefined, .worlds = worlds, .record_workspaces = undefined }, .config = .{ .maximum = 2 }, .spawn_world = overworld, .records = &self.records, .dig_handlers = &.{} };
         try self.players.initIndexes(allocator);
-        self.players.rebuildIndexes();
+        try self.players.rebuildIndexes();
         self.world_border = try WorldBorder.allocate(allocator, config, .{ .storage = undefined, .worlds = worlds, .dimensions = prepared.dimensions, .players = &self.players });
     }
 

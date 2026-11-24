@@ -495,7 +495,7 @@ test "block discovery batches samples and invalidates only occupied edits withou
     fixture.players.records[1] = fixture.players.records[0];
     fixture.players.records[1].uuid = 2;
     fixture.players.records[1].handle = .{ .index = 1, .generation = 1 };
-    fixture.players.rebuildIndexes();
+    try fixture.players.rebuildIndexes();
     const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .edit_sections = 1, .simulation_sections = 16, .cache_sections = 17, .cache_groups = 1 }, .{
         .metrics = &registry,
         .storage = try store.openSpace("recipe_chunks"),
@@ -556,10 +556,10 @@ test "block discovery batches samples and invalidates only occupied edits withou
     try std.testing.expect(try book.knows(0, planks));
     try std.testing.expect(!try book.knows(1, planks));
     fixture.players.records[1].position.x = 128.25;
-    fixture.players.rebuildIndexes();
+    try fixture.players.rebuildIndexes();
     try terrain.setBlock(fixture.players.records[1].world, .{ .x = 0, .y = 0, .z = 0 }, game_data.registry.block_stone_default_state);
     fixture.players.records[1].position.x = 0.25;
-    fixture.players.rebuildIndexes();
+    try fixture.players.rebuildIndexes();
     const occupied = terrain.cache.metrics.acquired.value();
     try book.tick();
     try std.testing.expectEqual(occupied + 1, terrain.cache.metrics.acquired.value());
@@ -577,11 +577,11 @@ test "block discovery batches samples and invalidates only occupied edits withou
     try book.tick();
     try std.testing.expect(!try book.knows(1, pickaxe));
     fixture.players.records[1].handle = null;
-    fixture.players.rebuildIndexes();
+    try fixture.players.rebuildIndexes();
     try book.tick();
     try std.testing.expectEqual(@as(usize, 0), book.block_watches.count());
     fixture.players.records[1].handle = .{ .index = 1, .generation = 2 };
-    fixture.players.rebuildIndexes();
+    try fixture.players.rebuildIndexes();
     const reconnect = terrain.cache.metrics.acquired.value();
     try book.tick();
     try std.testing.expectEqual(reconnect + 1, terrain.cache.metrics.acquired.value());
@@ -595,13 +595,13 @@ test "block discovery batches samples and invalidates only occupied edits withou
     try book.tick();
     try std.testing.expectEqual(negative + 1, terrain.cache.metrics.acquired.value());
     fixture.players.records[1].uuid = 3;
-    fixture.players.rebuildIndexes();
+    try fixture.players.rebuildIndexes();
     try book.tick();
     try std.testing.expect(!try book.knows(1, planks));
     try std.testing.expect(try book.knows(1, pickaxe));
     try std.testing.expectEqual(@as(usize, 1), book.block_watches.count());
     fixture.players.records[1].uuid = 2;
-    fixture.players.rebuildIndexes();
+    try fixture.players.rebuildIndexes();
     const restored = terrain.cache.metrics.acquired.value();
     try book.tick();
     try std.testing.expect(try book.knows(1, planks));
@@ -609,7 +609,7 @@ test "block discovery batches samples and invalidates only occupied edits withou
     try std.testing.expectEqual(restored, terrain.cache.metrics.acquired.value());
     try std.testing.expectEqual(@as(usize, 0), book.block_watches.count());
     for (fixture.players.records) |*player| player.handle = null;
-    fixture.players.rebuildIndexes();
+    try fixture.players.rebuildIndexes();
     try book.tick();
     try std.testing.expectEqual(@as(usize, 0), book.block_watches.count());
     try std.testing.expectEqual(bounded.fail_index, bounded.alloc_index);

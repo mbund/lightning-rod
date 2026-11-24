@@ -44,8 +44,10 @@ const Fixture = struct {
         };
         @memset(self.modes, .survival);
         self.players.setRules(.init(Fixture, self, gameMode, spawnWorld, spawnPoint));
+        // Its players place themselves among these entities.
+        self.players.entities = self.entities;
         try self.players.initIndexes(allocator);
-        self.players.rebuildIndexes();
+        try self.players.rebuildIndexes();
         self.tracking = try Tracking.init(allocator, .{ .work = work }, .{ .entities = self.entities, .players = &self.players });
         _ = try self.tracking.register(.{ .kinds = .of(&.{1}), .range = 96 });
         _ = try self.tracking.register(.{ .kinds = .of(&.{2}), .range = 160, .max_range = 240 });
@@ -165,7 +167,7 @@ const Fixture = struct {
                 },
             }
         }
-        self.players.rebuildIndexes();
+        try self.players.rebuildIndexes();
         self.now += 1;
         try self.stir();
     }

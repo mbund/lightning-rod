@@ -23,9 +23,9 @@ test "environment updates admit healthy clients independently and retry blocked 
         player.* = .{ .handle = .{ .index = @intCast(i), .generation = 1 }, .uuid = i + 1, .world = world, .protocol = selected[0].number, .name = @splat(0), .name_len = 1, .stage = .ready };
         service.credit[i].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     }
-    var players: Players = .{ .deps = .{ .sessions = service, .packets = packets, .input = undefined, .storage = undefined, .worlds = worlds, .record_workspaces = undefined }, .config = .{ .maximum = 2 }, .spawn_world = world, .records = &records, .dig_handlers = &.{} };
+    var players: Players = .{ .deps = .{ .entities = undefined, .sessions = service, .packets = packets, .input = undefined, .storage = undefined, .worlds = worlds, .record_workspaces = undefined }, .config = .{ .maximum = 2 }, .spawn_world = world, .records = &records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const time = try vanilla.Time.allocate(allocator, .{});
     const weather = try vanilla.Weather.allocate(allocator, .{ .weather_cycle = false });
     const environment = try vanilla.Environment.init(allocator, .{ .players = &players, .time = time, .weather = weather });

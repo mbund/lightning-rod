@@ -63,7 +63,7 @@ const Fixture = struct {
         }
         self.* = .{
             .service = service,
-            .players = .{ .deps = .{ .sessions = service, .packets = try packets.Packets.init(allocator, .{ .sessions = service }), .input = undefined, .storage = undefined, .worlds = undefined, .record_workspaces = undefined }, .config = .{ .maximum = count, .render_distance = 2 }, .spawn_world = 0, .records = records, .dig_handlers = &.{} },
+            .players = .{ .deps = .{ .entities = undefined, .sessions = service, .packets = try packets.Packets.init(allocator, .{ .sessions = service }), .input = undefined, .storage = undefined, .worlds = undefined, .record_workspaces = undefined }, .config = .{ .maximum = count, .render_distance = 2 }, .spawn_world = 0, .records = records, .dig_handlers = &.{} },
             .visibility = undefined,
             .replication = undefined,
             .log = .{ .ids = try allocator.alloc([256]u32, count), .counts = try allocator.alloc(usize, count) },
@@ -72,7 +72,7 @@ const Fixture = struct {
         @memset(self.modes, .survival);
         self.log.clear();
         try self.players.initIndexes(allocator);
-        self.players.rebuildIndexes();
+        try self.players.rebuildIndexes();
         self.players.setRules(.init(Fixture, self, Rules.gameMode, Rules.spawnWorld, Rules.spawnPoint));
         self.visibility = try Visibility.init(allocator, .{}, .{ .players = &self.players });
         self.replication = try Replication.init(allocator, .{ .update_interval = 1 }, .{ .players = &self.players, .visibility = self.visibility, .tracking = try Tracking.forTests(allocator, &self.players) });
@@ -86,7 +86,7 @@ const Fixture = struct {
     }
 
     fn step(self: *Fixture) !void {
-        self.players.rebuildIndexes();
+        try self.players.rebuildIndexes();
         self.visibility.tick();
         try self.replication.deps.tracking.tick();
         try self.replication.tick();

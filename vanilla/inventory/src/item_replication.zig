@@ -253,7 +253,7 @@ pub const ItemReplication = struct {
         };
         deps.inventories.listen(&self.listener);
         deps.dropped.leaving = .{ .context = self, .function = itemLeaving };
-        self.tracker = try deps.tracking.register(.{ .kinds = ItemEntities.kinds, .range = 6 * 16 });
+        self.tracker = try deps.tracking.register(.{ .kinds = ItemEntities.kinds });
         return self;
     }
 

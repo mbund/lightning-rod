@@ -95,7 +95,7 @@ pub fn benchmark() !void {
         _ = try EntityColumns.init(allocator, .{}, .{ .domains = domains, .entities = bodies });
         const tick = try tick_module.ItemTick.init(allocator, .{}, .{ .dropped = dropped, .physics = physics, .merging = merging, .pickup = undefined, .players = &players, .entities = bodies, .inventories = ownership, .items = items, .worlds = dimensions, .dimensions = gameplay_definitions.dimensions, .client = gameplay_definitions.client });
 
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
 
         failing.fail_index = failing.alloc_index;
         for (0..3) |pass| {

@@ -278,7 +278,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
             payloads[phase][index][0] = (try pitch.flags(.{ .onGround = true, .hasHorizontalCollision = false })).finish();
         }
     }
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const visibility = simulation.get(Visibility);
     const layer = simulation.get(Policy).layer;
     if (mode == .hidden) try layer.updateMany(&.{.{ .subjects = handles[0..count], .channels = &.{visibility.player_entity}, .excluded = true }});

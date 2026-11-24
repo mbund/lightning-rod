@@ -998,7 +998,7 @@ pub const Table = struct {
                 if (write.key.len == 0 or write.key.len > maximum_key) return error.InvalidArgument;
                 index.* = @intCast(at);
             }
-            std.mem.sort(u16, order[0..count], batch, struct {
+            std.sort.pdq(u16, order[0..count], batch, struct {
                 fn less(items: []const Write, a: u16, b: u16) bool {
                     const result = key_order.compare(items[a].key, items[b].key);
                     return if (result == .eq) a < b else result == .lt;

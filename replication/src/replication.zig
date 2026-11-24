@@ -715,6 +715,7 @@ pub const Replication = struct {
                     targets[target_count] = .{ .group = group, .handle = observer.handle.? };
                     target_count += 1;
                 }
+                // lint: stable sort, ties keep the observers' order and a group may hold every player.
                 if (!uniform) std.mem.sort(Target, targets[0..target_count], {}, Target.less);
                 var start: usize = 0;
                 while (start < target_count) {
@@ -1199,14 +1200,14 @@ test "movement fanout preserves independent admission and observer baselines" {
         service.credit[i].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     }
     var players: Players = .{
-        .deps = .{ .sessions = service, .packets = packet_service, .input = undefined, .storage = undefined, .worlds = undefined, .record_workspaces = undefined },
+        .deps = .{ .entities = undefined, .sessions = service, .packets = packet_service, .input = undefined, .storage = undefined, .worlds = undefined, .record_workspaces = undefined },
         .config = .{ .maximum = 3, .render_distance = 2 },
         .spawn_world = 0,
         .records = &records,
         .dig_handlers = &.{},
     };
     try players.initIndexes(allocator);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const replication = try Replication.init(allocator, .{ .update_interval = 1 }, .{ .players = &players, .visibility = try Visibility.init(allocator, .{}, .{ .players = &players }), .tracking = try Tracking.forTests(allocator, &players) });
     const Drain = struct {
         fn run(endpoint: *sessions.Service, recipients: usize) !usize {
@@ -1241,7 +1242,7 @@ test "movement fanout preserves independent admission and observer baselines" {
     for (0..3) |i| service.credit[i].store(@as(u64, 1) << 32 | sessions.Service.active, .release);
     for (0..64) |_| {
         records[0].position.x += 0.01;
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         replication.deps.visibility.tick();
         try replication.deps.tracking.tick();
         try replication.tick();
@@ -1255,7 +1256,7 @@ test "movement fanout preserves independent admission and observer baselines" {
     try std.testing.expectEqual(@as(usize, 1), try Drain.run(service, 2));
     service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active, .release);
     records[0].position.x += 1;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     replication.deps.visibility.tick();
     try replication.deps.tracking.tick();
     try replication.tick();
@@ -1265,7 +1266,7 @@ test "movement fanout preserves independent admission and observer baselines" {
     try std.testing.expectEqual(@as(u3, 1), replication.observed(0, 2).known & 1);
     service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     records[0].position.x += 1;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     replication.deps.visibility.tick();
     try replication.deps.tracking.tick();
     try replication.tick();
@@ -1287,7 +1288,7 @@ test "movement fanout preserves independent admission and observer baselines" {
     try std.testing.expectEqual(@as(usize, 1), relative_updates);
     try std.testing.expectEqual(replication.observed(0, 1).value.position[0], replication.observed(0, 2).value.position[0]);
     records[0].position.x += 16;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     replication.deps.visibility.tick();
     try replication.deps.tracking.tick();
     try replication.tick();
@@ -1295,7 +1296,7 @@ test "movement fanout preserves independent admission and observer baselines" {
     if (comptime selected.len > 1) {
         records[2].protocol = selected[1].number;
         records[0].position.x += 1;
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         replication.deps.visibility.tick();
         try replication.deps.tracking.tick();
         try replication.tick();
@@ -1321,7 +1322,7 @@ test "movement fanout preserves independent admission and observer baselines" {
 
     service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active, .release);
     records[2].position.x = 1000;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     replication.deps.visibility.tick();
     try replication.deps.tracking.tick();
     try replication.tick();
@@ -1339,7 +1340,7 @@ test "movement fanout preserves independent admission and observer baselines" {
 
     service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active, .release);
     records[2].position = records[1].position;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     replication.deps.visibility.tick();
     try replication.deps.tracking.tick();
     try replication.tick();
@@ -1364,7 +1365,7 @@ test "movement fanout preserves independent admission and observer baselines" {
     for (service.output.slots, statuses) |*slot, status| try std.testing.expectEqual(status, slot.status.load(.acquire));
 
     records[2].handle = null;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     replication.deps.visibility.tick();
     try replication.deps.tracking.tick();
     try replication.tick();
@@ -1373,7 +1374,7 @@ test "movement fanout preserves independent admission and observer baselines" {
     try std.testing.expectEqual(@as(usize, 1), replication.viewers(1).words[0]);
     try std.testing.expectEqual(@as(usize, 0), replication.viewers(2).words[0]);
     records[2].handle = .{ .index = 2, .generation = 2 };
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     service.credit[2].store(@as(u64, 2) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     replication.deps.visibility.tick();
     try replication.deps.tracking.tick();
@@ -1392,7 +1393,7 @@ test "movement fanout preserves independent admission and observer baselines" {
     _ = try Drain.run(service, 0);
     try std.testing.expectEqual(@as(usize, 2), replication.viewers(0).words[0]);
     records[0].position.x += 1;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     replication.deps.visibility.tick();
     try replication.deps.tracking.tick();
     try replication.tick();
@@ -1406,7 +1407,7 @@ test "movement fanout preserves independent admission and observer baselines" {
     try std.testing.expectEqual(replication.observed(0, 1).value.position, replication.observed(0, 2).value.position);
 
     records[2].world = 1;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     replication.deps.visibility.tick();
     try replication.deps.tracking.tick();
     try replication.tick();
@@ -1414,7 +1415,7 @@ test "movement fanout preserves independent admission and observer baselines" {
     try std.testing.expectEqual(@as(usize, 2), replication.viewers(0).words[0]);
     try std.testing.expectEqual(@as(usize, 0), replication.viewers(2).words[0]);
     records[2].world = 0;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     replication.deps.visibility.tick();
     try replication.deps.tracking.tick();
     try replication.tick();
@@ -1446,9 +1447,9 @@ test "operation counts for shared player neighborhoods and local spatial invalid
         const encoding = try packets.Packets.init(allocator, .{ .sessions = endpoint });
         const rows = try allocator.alloc(Players.Player, count);
         for (rows, 0..) |*player, index| player.* = .{ .handle = .{ .index = index, .generation = 1 }, .uuid = index + 1, .protocol = selected[0].number, .name = @splat('a'), .name_len = 1, .stage = .ready, .loaded = true, .on_ground = true, .position = .{ .x = (if (clustered) 0 else @as(f64, @floatFromInt(index * 128))) + 15.9, .y = 65, .z = 8 } };
-        var players: Players = .{ .deps = .{ .sessions = endpoint, .packets = encoding, .input = undefined, .storage = undefined, .worlds = undefined, .record_workspaces = undefined }, .config = .{ .maximum = count, .render_distance = 2 }, .spawn_world = 0, .records = rows, .dig_handlers = &.{} };
+        var players: Players = .{ .deps = .{ .entities = undefined, .sessions = endpoint, .packets = encoding, .input = undefined, .storage = undefined, .worlds = undefined, .record_workspaces = undefined }, .config = .{ .maximum = count, .render_distance = 2 }, .spawn_world = 0, .records = rows, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const visibility = try Visibility.init(allocator, .{}, .{ .players = &players });
         const replication = try Replication.init(allocator, .{ .update_interval = 1 }, .{ .players = &players, .visibility = visibility, .tracking = try Tracking.forTests(allocator, &players) });
         failing.fail_index = failing.alloc_index;
@@ -1464,7 +1465,7 @@ test "operation counts for shared player neighborhoods and local spatial invalid
         }
         for (endpoint.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | endpoint.config.credit_bytes, .release);
         for (rows[0..moving]) |*row| row.position.x += 0.2;
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
 
         visibility.tick();
         try replication.deps.tracking.tick();
@@ -1514,7 +1515,7 @@ test "operation counts for shared player neighborhoods and local spatial invalid
                     },
                     else => unreachable,
                 };
-                players.rebuildIndexes();
+                try players.rebuildIndexes();
                 for (rows, endpoint.credit) |row, *credit| credit.store((@as(u64, if (row.handle) |handle| handle.generation else 0) << 32) | sessions.Service.active | endpoint.config.credit_bytes, .release);
                 visibility.tick();
                 try replication.deps.tracking.tick();
@@ -1558,14 +1559,14 @@ test "players update every second tick with the movement that changed" {
         service.credit[i].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     }
     var players: Players = .{
-        .deps = .{ .sessions = service, .packets = packet_service, .input = undefined, .storage = undefined, .worlds = undefined, .record_workspaces = undefined },
+        .deps = .{ .entities = undefined, .sessions = service, .packets = packet_service, .input = undefined, .storage = undefined, .worlds = undefined, .record_workspaces = undefined },
         .config = .{ .maximum = 2, .render_distance = 2 },
         .spawn_world = 0,
         .records = &records,
         .dig_handlers = &.{},
     };
     try players.initIndexes(allocator);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const replication = try Replication.init(allocator, .{}, .{ .players = &players, .visibility = try Visibility.init(allocator, .{}, .{ .players = &players }), .tracking = try Tracking.forTests(allocator, &players) });
     const Client = protocols.implementations[0].Protocol.play.toClient;
     const Seen = struct { shift: usize = 0, look: usize = 0, both: usize = 0 };
@@ -1591,7 +1592,7 @@ test "players update every second tick with the movement that changed" {
     var total: Seen = .{};
     for (0..10) |_| {
         records[0].position.x += 0.1;
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         replication.deps.visibility.tick();
         try replication.deps.tracking.tick();
         try replication.tick();
@@ -1606,7 +1607,7 @@ test "players update every second tick with the movement that changed" {
     for (0..4) |tick| {
         records[0].rotation.yaw += 30;
         if (tick >= 2) records[0].position.z += 0.1;
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         replication.deps.visibility.tick();
         try replication.deps.tracking.tick();
         try replication.tick();

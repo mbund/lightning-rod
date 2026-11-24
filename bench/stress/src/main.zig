@@ -370,7 +370,7 @@ fn server(init: std.process.Init, world: []const u8, directory: []const u8, fd: 
                 player.position.z += directions[slot][1];
             }
         }
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         if (joined == player_count) {
             if (waiting < warmup) waiting += 1 else {
                 if (moving == 0) {

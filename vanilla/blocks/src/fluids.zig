@@ -380,8 +380,9 @@ fn coversSquare(first: u16, second: u16, face: Direction) bool {
         vs[edges + 1] = std.math.clamp(rectangle[3], 0, 1);
         edges += 2;
     }
-    std.mem.sort(f32, us[0..edges], {}, std.sort.asc(f32));
-    std.mem.sort(f32, vs[0..edges], {}, std.sort.asc(f32));
+    // A handful: stable, without a buffer.
+    std.sort.insertion(f32, us[0..edges], {}, std.sort.asc(f32));
+    std.sort.insertion(f32, vs[0..edges], {}, std.sort.asc(f32));
     for (0..edges - 1) |i| {
         if (us[i + 1] - us[i] < 1e-6) continue;
         const u = (us[i] + us[i + 1]) / 2;

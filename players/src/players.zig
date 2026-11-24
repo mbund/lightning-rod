@@ -1,5 +1,6 @@
 const player_state = @import("player_state.zig");
-const SpatialIndex = @import("player_spatial.zig").Index;
+const entities = @import("entities");
+const game_data = @import("game_data");
 const persistent_records = @import("records");
 const std = @import("std");
 const wire_26_2 = @import("wire_26_2");
@@ -9,6 +10,7 @@ const sessions = @import("sessions");
 const minecraft = @import("minecraft_model");
 const minecraft_packets = @import("minecraft_packets");
 const lightning_rod = @import("lightning_rod");
+const assert = std.debug.assert;
 const IndexSet = lightning_rod.system.IndexSet;
 const Input = @import("input.zig").Input;
 pub const ChatSession = @import("chat_session.zig").ChatSession;
@@ -44,6 +46,7 @@ pub const Players = struct {
         input: *Input,
         storage: lightning_rod.storage.Space,
         worlds: *worlds.Worlds,
+        entities: *entities.Entities,
     };
 
     /// What game rules decide for players that the protocol needs from the engine. Game
@@ -100,7 +103,15 @@ pub const Players = struct {
     presence_observer_count: usize = 0,
     ticks: u64 = 0,
     connected: IndexSet = .{ .indices = &.{}, .positions = &.{} },
-    spatial: SpatialIndex = .{},
+    /// Players are entities of the space, as vanilla's level holds its players: the one index of
+    /// where they are, which every query of who is near reads. Its own, in tests made without one.
+    entities: ?*entities.Entities = null,
+    /// Each player's slot and entity while in its world.
+    entity_slots: []u32 = &.{},
+    entity_ids: []entities.Id = &.{},
+    /// When each came into its world: vanilla's level keeps its players in that order.
+    joined_at: []u64 = &.{},
+    join_count: u64 = 0,
     movement_observer: ?MovementObserver = null,
     teleport_gate: ?TeleportGate = null,
 
@@ -140,30 +151,127 @@ pub const Players = struct {
     };
 
     pub fn initIndexes(self: *Players, allocator: std.mem.Allocator) !void {
-        std.debug.assert(self.spatial.nodes.len == 0);
+        std.debug.assert(self.entity_slots.len == 0);
         if (self.records.len != 0) self.connected = try IndexSet.init(allocator, self.records.len);
-        self.spatial = try SpatialIndex.init(allocator, self.records.len);
+        self.entity_slots = try allocator.alloc(u32, self.records.len);
+        @memset(self.entity_slots, entities.directory.none);
+        self.entity_ids = try allocator.alloc(entities.Id, self.records.len);
+        self.joined_at = try allocator.alloc(u64, self.records.len);
+        @memset(self.joined_at, 0);
+        const owned = self.entities orelse owned: {
+            // Made without a server's entities, as in tests: room for its players of its own.
+            const pages = @max(64, self.records.len * 2048 / entities.pool.page_bytes + 64);
+            const made = try entities.Entities.allocate(allocator, undefined, .{ .memory = pages * entities.pool.page_bytes }, undefined);
+            self.entities = made;
+            break :owned made;
+        };
+        try keepAmong(owned);
     }
 
-    pub fn rebuildIndexes(self: *Players) void {
-        for (0..self.records.len) |index| self.updateIndexes(index);
+    /// How players are kept among entities: somewhere, not ticked there; their moves within a
+    /// column told by the players themselves; never stored with columns.
+    fn keepAmong(owned: *entities.Entities) !void {
+        try owned.declare(.{ .kinds = .of(&.{entity_kind}), .turns = .own, .log_moves = false, .stored = false, .tracking_range = 32 * 16 });
     }
 
-    fn updateIndexes(self: *Players, index: usize) void {
-        std.debug.assert(index < self.records.len);
+    /// The players place themselves among these entities from now on: what tracks them reads
+    /// the same. Those placed elsewhere before are placed here again.
+    pub fn useEntities(self: *Players, owned: *entities.Entities) !void {
+        if (self.entities == owned) return;
+        self.entities = owned;
+        // Indexes not made yet are made there.
+        if (self.entity_slots.len == 0) return;
+        try keepAmong(owned);
+        @memset(self.entity_slots, entities.directory.none);
+        try self.rebuildIndexes();
+    }
+
+    /// The kind players are among entities.
+    pub const entity_kind: u32 = kind: {
+        @setEvalBranchQuota(100_000);
+        break :kind @intCast(game_data.registry.entityId("minecraft:player").?);
+    };
+
+    pub fn entityKind() u32 {
+        return entity_kind;
+    }
+
+    /// The box a player stands in, in the space: vanilla's standing one. Whoever needs another
+    /// pose's works it out.
+    pub const entity_shape: entities.space.Shape = .{ .kind = 0, .half_width = 0.3, .height = 1.8 };
+
+    /// Ids of players among entities, apart from every other entity's, which count up from one.
+    pub const entity_id_base: entities.Id = 1 << 63;
+
+    /// The player an entity among them is.
+    pub fn playerOfEntity(entity: entities.Id) usize {
+        assert(entity & entity_id_base != 0);
+        return @intCast(entity & 0xffff_ffff);
+    }
+
+    pub fn rebuildIndexes(self: *Players) !void {
+        for (0..self.records.len) |index| try self.updateIndexes(index);
+    }
+
+    /// A player's place among entities follows it: placed as it comes into its world, moved as it
+    /// moves, gone as it leaves or its connection does.
+    fn updateIndexes(self: *Players, index: usize) !void {
+        assert(index < self.records.len);
         self.track(index);
+        const owned = self.entities.?;
+        const space = &owned.places.space;
         const player = self.records[index];
-        self.spatial.update(index, if (player.inWorld()) .{
-            .world = player.world,
-            .x = @intFromFloat(@floor(player.position.x / 16)),
-            .z = @intFromFloat(@floor(player.position.z / 16)),
-        } else null);
+        const entity: ?entities.Id = if (player.handle) |handle| entity_id_base | (@as(entities.Id, handle.generation & 0x7fff_ffff) << 32) | index else null;
+        const slot = self.entity_slots[index];
+        if (slot != entities.directory.none and (entity == null or self.entity_ids[index] != entity.?)) {
+            space.remove(self.entity_ids[index]);
+            owned.leave(slot);
+            self.entity_slots[index] = entities.directory.none;
+        }
+        const joined = entity orelse return;
+        const position: [3]f64 = .{ player.position.x, player.position.y, player.position.z };
+        if (self.entity_slots[index] == entities.directory.none) {
+            const made = try owned.enter(joined, entityKind());
+            var shape = entity_shape;
+            shape.kind = entityKind();
+            try space.insert(joined, player.world, position, shape);
+            self.entity_slots[index] = made;
+            self.entity_ids[index] = joined;
+            self.join_count += 1;
+            self.joined_at[index] = self.join_count;
+        } else try space.moveSlot(self.entity_slots[index], player.world, position);
     }
 
-    pub const Nearby = SpatialIndex.Query;
+    /// Players in the chunk columns at most `radius` from a point's on both axes, in its world.
+    pub const Nearby = struct {
+        found: entities.Space.Near,
+
+        pub fn next(self: *Nearby) ?usize {
+            const entry = self.found.next() orelse return null;
+            return playerOfEntity(entry.id);
+        }
+    };
 
     pub fn nearby(self: *const Players, world: u32, position: minecraft.Position, radius: i32) Nearby {
-        return self.spatial.query(.{ .world = world, .x = @intFromFloat(@floor(position.x / 16)), .z = @intFromFloat(@floor(position.z / 16)) }, radius);
+        const center: entities.Column = .{ .world = world, .x = @intFromFloat(@floor(position.x / 16)), .z = @intFromFloat(@floor(position.z / 16)) };
+        return .{ .found = self.entities.?.places.space.near(center, radius, .of(&.{entityKind()})) };
+    }
+
+    /// Players whose standing box meets a box, as vanilla's level finds entities of a class in
+    /// one: section by section, and in each in the order they entered it. Standing is the largest
+    /// pose, so a visit checks its own. `visit` takes each one's index and returns whether to stop.
+    pub fn eachInBox(self: *Players, world: u32, box: entities.space.Box, context: anytype, comptime visit: fn (@TypeOf(context), usize) anyerror!bool) !void {
+        const Adapter = struct {
+            fn each(inner: @TypeOf(context), entry: entities.space.Entry) anyerror!bool {
+                return visit(inner, playerOfEntity(entry.id));
+            }
+        };
+        try self.entities.?.places.space.each(world, box, .of(&.{entity_kind}), context, Adapter.each);
+    }
+
+    /// Whether `a` came into its world before `b`: who of equals vanilla's level finds first.
+    pub fn joinedBefore(self: *const Players, a: usize, b: usize) bool {
+        return self.joined_at[a] < self.joined_at[b];
     }
 
     /// The chunks around them the player is sent, within the server's.
@@ -196,11 +304,11 @@ pub const Players = struct {
 
         for (records) |*player| player.* = .{};
 
-        self.* = .{ .deps = deps, .config = config, .spawn_world = config.world, .records = records, .dig_handlers = try allocator.alloc(DigHandler, config.dig_observers) };
+        self.* = .{ .deps = deps, .config = config, .spawn_world = config.world, .records = records, .dig_handlers = try allocator.alloc(DigHandler, config.dig_observers), .entities = deps.entities };
         self.chat_sessions = try allocator.alloc(?ChatSession, records.len);
         @memset(self.chat_sessions, null);
         try self.initIndexes(allocator);
-        self.rebuildIndexes();
+        try self.rebuildIndexes();
         try deps.input.onLifecycle(self, onLifecycle);
         try deps.input.on(.teleport_confirm, self, onTeleportConfirm);
         try deps.input.on(.player_loaded, self, onPlayerLoaded);
@@ -345,7 +453,7 @@ pub const Players = struct {
                     player.world = try reader.takeInt(u32, .little);
                     if (self.deps.worlds.get(player.world) == null) return error.UnknownWorld;
                 } else try self.place(player);
-                self.updateIndexes(joined.handle.index);
+                try self.updateIndexes(joined.handle.index);
             },
             .ready => |handle| {
                 const player = &self.records[handle.index];
@@ -361,7 +469,7 @@ pub const Players = struct {
                 std.debug.assert(player.handle != null and std.meta.eql(player.handle.?, handle));
                 player.* = .{};
                 self.forgetChat(handle.index);
-                self.updateIndexes(handle.index);
+                try self.updateIndexes(handle.index);
             },
             .input => {},
         }
@@ -474,7 +582,7 @@ pub const Players = struct {
         player.loaded = false;
         player.stage = .respawn;
         player.revision += 1;
-        self.updateIndexes(player.handle.?.index);
+        try self.updateIndexes(player.handle.?.index);
     }
 
     /// ServerGamePacketListenerImpl.handleClientTickEnd: a client tick without a move packet
@@ -541,7 +649,7 @@ pub const Players = struct {
         player.moved = true;
         if (accepted.position) |position| {
             player.position = position;
-            self.updateIndexes(handle.index);
+            try self.updateIndexes(handle.index);
         }
         if (accepted.rotation) |rotation| player.rotation = rotation;
         player.on_ground = movement.on_ground;
@@ -953,7 +1061,7 @@ pub const Players = struct {
 
         player.world = world;
         player.position = position;
-        self.updateIndexes(player.handle.?.index);
+        try self.updateIndexes(player.handle.?.index);
         player.rotation = normalized;
         player.on_ground = false;
         player.revision += 1;
@@ -1002,14 +1110,14 @@ test "disconnect stages player state until the next complete checkpoint" {
         var no_sessions: sessions.Service = undefined;
         no_sessions.profiles = &.{};
         var players: Players = .{
-            .deps = .{ .sessions = &no_sessions, .packets = undefined, .input = undefined, .storage = space, .worlds = dimensions, .record_workspaces = record_workspaces },
+            .deps = .{ .sessions = &no_sessions, .packets = undefined, .input = undefined, .storage = space, .worlds = dimensions, .record_workspaces = record_workspaces, .entities = undefined },
             .config = .{ .spawn_for_player = if (previous_save) InitialSpawn.select else null },
             .spawn_world = world,
             .records = &records,
             .dig_handlers = &.{},
         };
         try players.initIndexes(arena.allocator());
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const handle: sessions.Handle = .{ .index = 0, .generation = 1 };
         const joined: sessions.Event = .{ .joined = .{ .handle = handle, .uuid = 1, .protocol = 0, .name = @splat(0), .name_len = 1 } };
         try players.onLifecycle(&.{joined});
@@ -1064,7 +1172,7 @@ test "teleport preparation leaves the simulation running without sending a prema
     var rows = [_]Players.Player{.{ .handle = .{ .index = 0, .generation = 1 }, .stage = .teleport }};
     var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &rows, .dig_handlers = &.{} };
     try players.initIndexes(arena.allocator());
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     var gate: Gate = .{};
     players.gateTeleports(Players.TeleportGate.init(Gate, &gate, Gate.ready));
     try players.tick();
@@ -1098,14 +1206,14 @@ test "rotation validation precedes movement and normalizes movement teleports an
     var no_sessions: sessions.Service = undefined;
     no_sessions.profiles = &.{};
     var players: Players = .{
-        .deps = .{ .sessions = &no_sessions, .packets = undefined, .input = undefined, .storage = space, .worlds = dimensions, .record_workspaces = &record_workspaces },
+        .deps = .{ .sessions = &no_sessions, .packets = undefined, .input = undefined, .storage = space, .worlds = dimensions, .record_workspaces = &record_workspaces, .entities = undefined },
         .config = .{},
         .spawn_world = world,
         .records = &records,
         .dig_handlers = &.{},
     };
     try players.initIndexes(arena.allocator());
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const Observer = struct {
         calls: usize = 0,
         last: minecraft.Movement = undefined,
@@ -1189,14 +1297,14 @@ test "lifecycle batches preserve saved state and leave rejoin ordering" {
     var no_sessions: sessions.Service = undefined;
     no_sessions.profiles = &.{};
     var players: Players = .{
-        .deps = .{ .sessions = &no_sessions, .packets = undefined, .input = undefined, .storage = space, .worlds = dimensions, .record_workspaces = &workspaces },
+        .deps = .{ .sessions = &no_sessions, .packets = undefined, .input = undefined, .storage = space, .worlds = dimensions, .record_workspaces = &workspaces, .entities = undefined },
         .config = .{},
         .spawn_world = world,
         .records = &rows,
         .dig_handlers = &.{},
     };
     try players.initIndexes(arena.allocator());
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     var joins: [3]sessions.Event = undefined;
     var departures: [3]sessions.Event = undefined;
     for (&joins, &departures, 0..) |*join, *departure, index| {
@@ -1228,14 +1336,14 @@ test "incremental player spatial updates match direct neighborhood queries" {
     var records: [64]Players.Player = @splat(.{});
     var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &records, .dig_handlers = &.{} };
     try players.initIndexes(arena.allocator());
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     var random = std.Random.DefaultPrng.init(0);
     for (0..2048) |_| {
         const index = random.random().uintLessThan(usize, records.len);
         records[index].handle = if (random.random().boolean()) .{ .index = @intCast(index), .generation = 1 } else null;
         records[index].world = random.random().uintLessThan(u32, 3);
         records[index].position = .{ .x = @as(f64, @floatFromInt(random.random().uintLessThan(u32, 64))) - 32, .y = 65, .z = @as(f64, @floatFromInt(random.random().uintLessThan(u32, 64))) - 32 };
-        players.updateIndexes(index);
+        try players.updateIndexes(index);
         const world = random.random().uintLessThan(u32, 3);
         const position = records[random.random().uintLessThan(usize, records.len)].position;
         var expected: [64]bool = @splat(false);
@@ -1251,7 +1359,7 @@ test "incremental player spatial updates match direct neighborhood queries" {
             actual[at] = true;
         }
         try std.testing.expectEqualSlices(bool, &expected, &actual);
-        try std.testing.expectEqual(players.activeSlots().len, players.spatial.active.count);
+        try std.testing.expectEqual(players.activeSlots().len, players.entities.?.places.space.countOf(.of(&.{Players.entityKind()})));
     }
 }
 
@@ -1267,14 +1375,14 @@ test "nearby queries bound candidate work along either axis and retain inclusive
         };
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &rows, .dig_handlers = &.{} };
         try players.initIndexes(arena.allocator());
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         var visited: usize = 0;
         for (0..1024) |number| {
             const index = number % rows.len;
             var query = players.nearby(0, rows[index].position, 1);
             try std.testing.expectEqual(index, query.next().?);
             try std.testing.expectEqual(null, query.next());
-            visited += query.visited;
+            visited += query.found.visited;
         }
         try std.testing.expect(visited <= 4096);
         try expectNearby(players.nearby(1, rows[0].position, 32), &.{});
@@ -1295,16 +1403,16 @@ test "full capacity spatial updates preserve neighborhoods through movement remo
     };
     var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &rows, .dig_handlers = &.{} };
     try players.initIndexes(arena.allocator());
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     for (&rows, 0..) |*row, index| {
         row.position.x += 0.2;
-        players.updateIndexes(index);
+        try players.updateIndexes(index);
     }
     for (rows, 0..) |row, index| try expectNearby(players.nearby(row.world, row.position, 0), &.{index});
     rows[255].handle = null;
-    players.updateIndexes(255);
+    try players.updateIndexes(255);
     rows[255].handle = .{ .index = 255, .generation = 2 };
-    players.updateIndexes(255);
+    try players.updateIndexes(255);
     var random = std.Random.DefaultPrng.init(20261025);
     for (0..2048) |step| {
         const index = random.random().uintLessThan(usize, rows.len);
@@ -1312,11 +1420,11 @@ test "full capacity spatial updates preserve neighborhoods through movement remo
         rows[index].world = random.random().uintLessThan(u32, 3);
         rows[index].position.x = @floatFromInt(random.random().intRangeAtMost(i32, -512, 512));
         rows[index].position.z = @floatFromInt(random.random().intRangeAtMost(i32, -512, 512));
-        players.updateIndexes(index);
+        try players.updateIndexes(index);
         if (step % 16 == 0) {
             var rebuilt: Players = .{ .deps = undefined, .config = .{}, .spawn_world = 0, .records = &rows, .dig_handlers = &.{} };
             try rebuilt.initIndexes(arena.allocator());
-            rebuilt.rebuildIndexes();
+            try rebuilt.rebuildIndexes();
             for (rows) |row| {
                 var expected: [513]bool = @splat(false);
                 var actual: [513]bool = @splat(false);
@@ -1345,12 +1453,12 @@ test "player spatial indexes preserve slots beyond sixteen bits" {
     records[65_536] = .{ .handle = .{ .index = 65_536, .generation = 1 }, .world = 4, .position = .{ .x = 8, .y = 65, .z = 8 } };
     var players: Players = .{ .deps = undefined, .config = .{ .maximum = records.len }, .spawn_world = 4, .records = records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     try expectNearby(players.nearby(4, records[65_536].position, 0), &.{65_536});
     records[65_536].position.x = 1024;
-    players.updateIndexes(65_536);
+    try players.updateIndexes(65_536);
     try expectNearby(players.nearby(4, records[65_536].position, 0), &.{65_536});
     records[65_536].handle = null;
-    players.updateIndexes(65_536);
+    try players.updateIndexes(65_536);
     try expectNearby(players.nearby(4, records[65_536].position, 0), &.{});
 }

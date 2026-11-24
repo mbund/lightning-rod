@@ -83,16 +83,17 @@ const Fixture = struct {
         const dimension: worlds.Worlds.Dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 };
         const world = try dimensions.create(.{ .name = "test:first", .dimension = dimension });
         const other_world = try dimensions.create(.{ .name = "test:second", .dimension = dimension });
-        const players = try Players.init(allocator, .{ .maximum = count, .world = world, .render_distance = 2 }, .{ .record_workspaces = workspaces, .sessions = service, .packets = encoding, .input = input, .storage = try store.openSpace("players"), .worlds = dimensions });
+        // Players are entities: the space comes first.
+        const bodies = try entities.Entities.init(allocator, std.testing.io, .{}, .{ .metrics = registry, .storage = try store.openSpace("entities"), .record_workspaces = workspaces });
+        const players = try Players.init(allocator, .{ .maximum = count, .world = world, .render_distance = 2 }, .{ .record_workspaces = workspaces, .sessions = service, .packets = encoding, .input = input, .storage = try store.openSpace("players"), .worlds = dimensions, .entities = bodies });
         for (players.records, 0..) |*player, at| player.* = .{ .handle = .{ .index = @intCast(at), .generation = 1 }, .uuid = at + 1, .world = world, .stage = .ready, .protocol = selected_protocols[0].number, .position = .{ .x = 8, .y = 65, .z = 6.5 }, .on_ground = true };
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const gameplay_definitions = try vanilla_content.prepare(allocator);
         const world_border = try WorldBorder.init(allocator, .{}, .{ .storage = try store.openSpace(WorldBorder.id), .worlds = dimensions, .dimensions = gameplay_definitions.dimensions, .players = players });
         const player_states = try PlayerStates.init(allocator, .{ .gamemode = .survival }, .{ .record_workspaces = workspaces, .players = players, .input = input, .packets = encoding, .storage = try store.openSpace(PlayerStates.id), .worlds = dimensions, .vanilla_worlds = undefined, .world_border = world_border });
         for (player_states.records, 0..) |*state, at| state.* = .{ .uuid = at + 1, .gamemode = .survival };
         const ownership = try inventories.Inventories.init(allocator, std.testing.io, .{ .cache_slots = 1024, .cache_items = 8, .max_item_bytes = 1024 }, .{ .metrics = registry, .storage = try store.openSpace("inventory"), .record_workspaces = workspaces });
         const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
-        const bodies = try entities.Entities.init(allocator, std.testing.io, .{}, .{ .metrics = registry, .storage = try store.openSpace("entities"), .record_workspaces = workspaces });
         const dropped = try ItemEntities.init(allocator, std.testing.io, .{}, .{
             .entities = bodies,
             .inventories = ownership,
@@ -334,13 +335,13 @@ pub fn verifyDelivery() !void {
 
     const audience = fixture.mining.audience_checks.value();
     players.records[2].position.x = 256;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const departed = try fixture.tick();
     try std.testing.expectEqual(count - 2, departed.recipients[2]);
     try std.testing.expectEqual(@as(u64, 1), fixture.mining.audience_checks.value() - audience);
     for (fixture.clients[2 * count ..][0..count]) |client| try std.testing.expectEqual(@as(i8, -1), client.stage);
     players.records[2].position.x = 8;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const returned = try fixture.tick();
     try std.testing.expectEqual(count - 2, returned.recipients[2]);
     for (returned.recipients[0..count], 0..) |received, recipient| if (recipient != 2) try std.testing.expectEqual(@as(usize, 0), received);
@@ -348,17 +349,17 @@ pub fn verifyDelivery() !void {
     const home = players.records[2].world;
     players.records[2].world = fixture.other_world;
     fixture.clearClient(2);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     try std.testing.expectEqual(@as(usize, 0), (try fixture.tick()).packets);
     players.records[2].world = home;
     fixture.clearClient(2);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     try std.testing.expectEqual(count - 2, (try fixture.tick()).recipients[2]);
 
     players.records[3].handle.?.generation += 1;
     fixture.clearClient(3);
     fixture.grantAll();
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const rejoined = try fixture.tick();
     try std.testing.expectEqual(count - 3, rejoined.recipients[3]);
     for (0..count) |recipient| try std.testing.expectEqual(@as(i8, -1), fixture.clients[recipient * count + 3].stage);
@@ -382,7 +383,7 @@ pub fn verifyDelivery() !void {
     for (ready.recipients[0..count], 0..) |received, recipient| if (recipient != 5) try std.testing.expectEqual(@as(usize, 0), received);
 
     players.records[6].handle = null;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const disconnected = try fixture.tick();
     try std.testing.expectEqual(@as(usize, 0), disconnected.recipients[6]);
     for (0..count) |recipient| {
@@ -478,7 +479,7 @@ pub fn verifyNeighborhoods() !void {
         try terrain.setBlock(players.records[0].world, .{ .x = target.x, .y = target.y, .z = target.z }, game_data.registry.block_obsidian_default_state);
         try terrain.setBlock(fixture.other_world, .{ .x = target.x, .y = target.y, .z = target.z }, game_data.registry.block_obsidian_default_state);
         for (players.records) |*player| player.position.x = 15.9;
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const layer = try fixture.mining.deps.visibility.createLayer();
         const hidden = players.records[0].handle.?;
         const excluded = try allocator.alloc(usize, std.math.divCeil(usize, count, @bitSizeOf(usize)) catch unreachable);
@@ -504,7 +505,7 @@ pub fn verifyNeighborhoods() !void {
                 },
                 else => unreachable,
             };
-            players.rebuildIndexes();
+            try players.rebuildIndexes();
             _ = try fixture.tick();
             for (players.records, fixture.mining.views, 0..) |subject, view, index| {
                 for (players.records, 0..) |observer, other| {

@@ -76,7 +76,8 @@ pub fn encode(input: []const u8, output: []u8) storage.Error![]const u8 {
             return self.counts[a] > self.counts[b] or (self.counts[a] == self.counts[b] and self.palette[a] < self.palette[b]);
         }
     };
-    std.mem.sort(u16, order[0..count], Sort{ .palette = palette[0..count], .counts = counts[0..count] }, Sort.less);
+    // A total order, by count then state: unstable, it gives the stable result.
+    std.sort.pdq(u16, order[0..count], Sort{ .palette = palette[0..count], .counts = counts[0..count] }, Sort.less);
     for (order[0..count], 0..) |old, rank| {
         std.mem.writeInt(u16, output[3 + rank * 2 ..][0..2], palette[old], .little);
         counts[old] = @intCast(rank);

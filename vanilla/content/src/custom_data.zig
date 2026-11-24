@@ -150,6 +150,7 @@ fn writeCompound(allocator: std.mem.Allocator, writer: *std.Io.Writer, compound:
 
 fn writeFields(allocator: std.mem.Allocator, writer: *std.Io.Writer, fields: []Field, depth: usize) anyerror!void {
     if (depth >= 128) return error.NbtDepthLimit;
+    // lint: stable sort, written once as content loads.
     std.mem.sort(Field, fields, {}, struct {
         fn less(_: void, a: Field, b: Field) bool {
             return std.mem.lessThan(u8, a.name, b.name);

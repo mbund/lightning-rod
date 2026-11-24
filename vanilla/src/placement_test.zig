@@ -3,6 +3,7 @@ const std = @import("std");
 const storage = @import("storage");
 const records = @import("records");
 const metrics = @import("metrics");
+const entities = @import("entities");
 const inventories = @import("inventories");
 const worlds = @import("worlds");
 const chunks = @import("chunks");
@@ -50,6 +51,8 @@ const Fixture = struct {
         const dimension: worlds.Worlds.Dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 };
         const world = try dimensions.create(.{ .name = "test:first", .dimension = dimension });
         const other_world = try dimensions.create(.{ .name = "test:second", .dimension = dimension });
+        // Players are entities: the space comes first.
+        const bodies = try entities.Entities.init(allocator, io, .{}, .{ .metrics = registry, .storage = try store.openSpace("entities"), .record_workspaces = workspaces });
         const players = try Players.init(allocator, .{ .maximum = 2, .world = world, .render_distance = 2 }, .{
             .record_workspaces = workspaces,
             .sessions = service,
@@ -57,6 +60,7 @@ const Fixture = struct {
             .input = input,
             .storage = try store.openSpace("players"),
             .worlds = dimensions,
+            .entities = bodies,
         });
         for (players.records, 0..) |*player, index| player.* = .{
             .handle = .{ .index = @intCast(index), .generation = 1 },
@@ -146,7 +150,7 @@ const Fixture = struct {
     fn place(self: *Fixture, position: chunks.Position, item: inventories.ItemId) !u16 {
         const player = &self.players.records[0];
         player.position = .{ .x = @as(f64, @floatFromInt(position.x)) - 1.5, .y = @floatFromInt(position.y), .z = @as(f64, @floatFromInt(position.z)) + 0.5 };
-        self.players.rebuildIndexes();
+        try self.players.rebuildIndexes();
         const slot: inventories.Slot = .{ .owner = player.uuid, .index = 36 };
         const held = try self.inventories.get(slot);
         try std.testing.expect(try self.inventories.set(slot, held.revision, .{ .item = item, .count = 64 }));

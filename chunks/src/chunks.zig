@@ -815,7 +815,7 @@ pub const Chunks = struct {
         while (true) {
             try self.acquireLocked(edits_client, positions[0..sections.len], leases[0..sections.len], null);
             for (leases[0..sections.len], indices[0..sections.len]) |lease, *index| index.* = lease.record.index;
-            std.mem.sort(usize, indices[0..sections.len], {}, std.sort.asc(usize));
+            std.sort.pdq(usize, indices[0..sections.len], {}, std.sort.asc(usize));
             var first: usize = 0;
             var borrowed = false;
             while (first < sections.len) {

@@ -127,7 +127,7 @@ pub const ItemPickup = struct {
 
     /// Sorts ids and keeps each once, returning how many there are.
     fn unique(ids: []entities.Id) usize {
-        std.mem.sort(entities.Id, ids, {}, std.sort.asc(entities.Id));
+        std.sort.pdq(entities.Id, ids, {}, std.sort.asc(entities.Id));
         var count: usize = 0;
         for (ids) |entity| {
             if (count != 0 and ids[count - 1] == entity) continue;

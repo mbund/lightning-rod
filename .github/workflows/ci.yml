@@ -14,6 +14,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  scratch-lint:
+    name: Scratch memory
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash .github/scripts/scratch-lint.sh
+
   prepare-zig:
     name: Prepare Zig
     runs-on: ubuntu-24.04

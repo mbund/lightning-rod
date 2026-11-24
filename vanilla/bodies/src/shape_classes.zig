@@ -96,7 +96,7 @@ fn sameSpace(a: Boxes, b: Boxes) bool {
             lengths[axis] += 2;
         };
         const values = grid[axis][0..lengths[axis]];
-        std.mem.sort(f64, values, {}, std.sort.asc(f64));
+        std.sort.insertion(f64, values, {}, std.sort.asc(f64));
         var unique: usize = 0;
         for (values) |value| {
             if (unique > 0 and values[unique - 1] == value) continue;

@@ -220,6 +220,7 @@ pub const Experience = struct {
         };
         @memset(self.deaths, .{});
         @memset(self.sounds, .{});
+        try deps.entities.declare(.{ .kinds = kinds, .tracking_range = 6 * 16 });
         try deps.entities.addTicker(.init(Experience, self, kinds, batch_max));
         try deps.entities.addColumnHolder(.init(Experience, self, columnLoaded, columnUnloaded));
         // Items and orbs collide with the world border.
@@ -685,7 +686,9 @@ pub const Experience = struct {
                 const state = self.deps.player_states.of(&player);
                 if (state.gamemode == .spectator or state.health <= 0) continue;
                 const squared = distance(body.position, player.position);
-                if (squared < closest) {
+                // ExperienceOrb.tick: Level.getNearestPlayer over the level's players in the order
+                // they came, the first of equals.
+                if (squared < closest or (squared == closest and target != null and self.deps.players.joinedBefore(player_index, target.?))) {
                     closest = squared;
                     target = player_index;
                 }

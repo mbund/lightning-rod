@@ -414,7 +414,7 @@ pub const Baker = struct {
                     return self_.counts[a] > self_.counts[b] or (self_.counts[a] == self_.counts[b] and self_.states[a] < self_.states[b]);
                 }
             };
-            std.mem.sort(u16, self.order[0..palette_count], Order{ .states = self.palette[0..palette_count], .counts = self.frequencies[0..palette_count] }, Order.less);
+            std.sort.pdq(u16, self.order[0..palette_count], Order{ .states = self.palette[0..palette_count], .counts = self.frequencies[0..palette_count] }, Order.less);
             // The most common state takes the lowest rank. Cells map through this small
             // table instead of the state table.
             var sorted: [256]u16 = undefined;

@@ -83,7 +83,7 @@ pub const ExperienceReplication = struct {
         @memset(self.connections, .{});
         @memset(self.events, .{});
         @memset(self.event_rows, 0);
-        self.tracker = try deps.tracking.register(.{ .kinds = Experience.kinds, .range = 6 * 16 });
+        self.tracker = try deps.tracking.register(.{ .kinds = Experience.kinds });
         return self;
     }
 

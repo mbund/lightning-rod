@@ -199,6 +199,7 @@ pub const Equipment = struct {
                 subject.retrying = subject.pending.view().any();
                 continue;
             }
+            // lint: stable sort, ties keep the viewers' order and every player may view.
             std.mem.sort(Target, targets[0..count], {}, Target.less);
 
             var slots: [6]inventories.Slot = undefined;

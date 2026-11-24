@@ -140,7 +140,7 @@ pub const MobReplication = struct {
             done[traits.tracking_range] = true;
             var kinds: entities.Kinds = .{};
             for (mobs.species[at..]) |other| if (other.tracking_range == traits.tracking_range) kinds.bits.set(other.entity_type);
-            _ = try deps.tracking.register(.{ .kinds = kinds, .range = @as(u32, traits.tracking_range) * 16 });
+            _ = try deps.tracking.register(.{ .kinds = kinds });
         }
         return self;
     }

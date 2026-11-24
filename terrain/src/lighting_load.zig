@@ -154,7 +154,7 @@ test "cold lighting streams do not block a ready player behind a paused generato
         }
         var players: Players = .{ .deps = undefined, .config = .{ .maximum = player_records.len, .render_distance = 1 }, .spawn_world = 0, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = load_cache, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace(chunks.Chunks.id), .record_workspaces = try records.Workspaces.init(allocator, io, .{}) });
         for (0..25) |index| {
             const position: chunks.Position = .{ .x = (@as(i32, @intCast(index % 5)) - 2) * 16, .y = 0, .z = (@as(i32, @intCast(index / 5)) - 2) * 16 };
@@ -249,7 +249,7 @@ fn lightingLoad(scenario: LightingLoad, output: *std.Io.Writer) !void {
     }
     var players: Players = .{ .deps = undefined, .config = .{ .maximum = count, .render_distance = 2 }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = load_cache, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = resources });
     var source: Scene = .{};
     terrain.setSource(chunks.Source.init(&source, Scene.read));
@@ -270,7 +270,7 @@ fn lightingLoad(scenario: LightingLoad, output: *std.Io.Writer) !void {
     for (0..2) |phase| {
         if (phase != 0) {
             for (player_records) |*player| player.position.x += 16;
-            players.rebuildIndexes();
+            try players.rebuildIndexes();
         }
         var complete = false;
         for (0..1024) |_| {
@@ -406,7 +406,7 @@ test "edited light reaches every holder exactly and only where it changed" {
     }
     var players: Players = .{ .deps = undefined, .config = .{ .maximum = count, .render_distance = radius }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = load_cache + 144, .cache_groups = 8 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = resources });
     var source: Scene = .{};
     terrain.setSource(chunks.Source.init(&source, Scene.read));
@@ -645,7 +645,7 @@ test "streaming movement preserves planned owners while delivery catches up" {
     }
     var players: Players = .{ .deps = undefined, .config = .{ .maximum = player_records.len, .render_distance = render_distance }, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = load_cache, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = try records.Workspaces.init(allocator, io, .{}) });
     var source: Scene = .{ .empty = true };
     terrain.setSource(chunks.Source.init(&source, Scene.read));
@@ -695,7 +695,7 @@ test "streaming movement preserves planned owners while delivery catches up" {
             player_records[0].position = .{ .x = 0.5 + step * 0.75, .y = 65 + step * 0.25, .z = 0.5 - step * 0.5 };
             player_records[1].position = .{ .x = 0.5 - step * 0.5, .y = 65, .z = 0.5 + step * 0.75 };
             movements += 1;
-            players.rebuildIndexes();
+            try players.rebuildIndexes();
         }
         if (initialized and movements < 32) {
             service.credit[1].store((@as(u64, 1) << 32) | sessions.Service.active, .release);
@@ -984,7 +984,7 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
     }
     var players: Players = .{ .deps = undefined, .config = .{ .maximum = count, .render_distance = radius }, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = load_cache + 144, .cache_groups = workload.cache_groups }, .{ .metrics = &registry, .storage = try store.openSpace(chunks.Chunks.id), .record_workspaces = resources });
     const Disk = struct {
         fn read(_: *@This(), _: std.Io, batch: chunks.Source.Batch) void {
@@ -1071,7 +1071,7 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
     if (workload.flight) for (player_records) |*player| {
         player.position.y = @max(150, player.position.y);
     };
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     var overlapping_horizons: usize = 0;
     var overlapping_light_halos: usize = 0;
     var minimum_separation: u64 = if (count > 1) std.math.maxInt(u64) else 0;
@@ -1334,7 +1334,7 @@ fn streamPlayers(workload: StreamingCase) !StreamingResult {
                 const after = Streaming.View.capture(player.*).center;
                 required_columns += Streaming.Horizon.differenceCount(@intCast(radius), before, after);
             }
-            players.rebuildIndexes();
+            try players.rebuildIndexes();
             service.beginTick();
             streaming.endTick(true);
             service.endTick(true);
@@ -1494,7 +1494,7 @@ test "streams send each player the view distance it asks for, and follow changes
     }
     var players: Players = .{ .deps = undefined, .config = .{ .maximum = player_records.len, .render_distance = render_distance }, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     // The first player sees as far as the server sends; the second asks for less.
     player_records[0].view_distance = players.viewDistance(32);
     player_records[1].view_distance = players.viewDistance(3);

@@ -395,7 +395,7 @@ test "equipment watches follow player identities when connection slots are reass
     fixture.players.records[1].uuid = 2;
     fixture.player_states.records[1] = .{ .uuid = 2 };
     fixture.players.records[1].handle = .{ .index = 1, .generation = 1 };
-    fixture.players.rebuildIndexes();
+    try fixture.players.rebuildIndexes();
     bounded.fail_index = bounded.alloc_index;
     _ = try attributes.value(0, "minecraft:mining_efficiency");
     _ = try attributes.value(1, "minecraft:mining_efficiency");
@@ -414,7 +414,7 @@ test "equipment watches follow player identities when connection slots are reass
         try std.testing.expectEqual(@as(usize, 2), attributes.owners.count());
     }
     for (fixture.players.records) |*player| player.handle = null;
-    fixture.players.rebuildIndexes();
+    try fixture.players.rebuildIndexes();
     try attributes.tick();
     try std.testing.expectEqual(@as(usize, 0), attributes.owners.count());
     try std.testing.expectEqual(@as(usize, 0), attributes.observer.owners.count());

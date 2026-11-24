@@ -47,7 +47,7 @@ test "command visibility caches policy decisions and retries publication without
     }
     var players: Players = .{ .deps = undefined, .config = .{ .maximum = 64 }, .spawn_world = 0, .records = &records, .dig_handlers = &.{} };
     try players.initIndexes(allocator);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const chat = try Chat.init(allocator, .{ .players = &players, .sessions = service, .packets = encoding }, .{});
     const input = try Input.init(allocator, .{ .sessions = service });
     const player_chat = try PlayerChat.init(allocator, std.testing.io, .{}, .{ .players = &players, .input = input, .sessions = service, .packets = encoding, .chat = chat });

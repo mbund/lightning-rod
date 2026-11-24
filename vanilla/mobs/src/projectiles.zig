@@ -503,7 +503,7 @@ pub const Projectiles = struct {
         @memset(self.seen, .{});
         self.kinds = .of(&self.entity_types);
         // Projectiles keep their own turns: frozen columns hold them, not the columns' ticking.
-        deps.entities.places.keepsOwnTurns(self.kinds);
+        try deps.entities.declare(.{ .kinds = self.kinds, .turns = .own, .tracking_range = 4 * 16 });
         // What moves is what can come near a sleeper.
         deps.entities.places.space.keepMovers();
         // Projectiles take their turns in the one tick order, a batch at a time.
@@ -596,7 +596,7 @@ pub const Projectiles = struct {
 
     /// Projectiles are tracked from now on, boxed while they sleep. ProjectileReplication asks.
     pub fn track(self: *Projectiles, tracking: *Tracking) !void {
-        self.tracker = try tracking.register(.{ .kinds = self.kinds, .range = 4 * 16, .exact = .of(Projectiles, self) });
+        self.tracker = try tracking.register(.{ .kinds = self.kinds, .exact = .of(Projectiles, self) });
         self.tracking = tracking;
     }
 
@@ -2383,17 +2383,21 @@ pub const Projectiles = struct {
         // A path longer than a chunk looks for itself; a shorter one shares its chunk's players.
         const far = high[0] - low[0] > 15 or high[2] - low[2] > 15;
         if (far) {
-            var players = self.deps.players.nearby(projectile.world, .{ .x = (low[0] + high[0]) / 2, .y = 0, .z = (low[2] + high[2]) / 2 }, @intFromFloat(@ceil((high[0] - low[0] + high[2] - low[2]) / 32) + 1));
-            while (players.next()) |other| {
-                const box = playerBox(&self.deps.players.records[other]);
-                if (!box.intersects(swept) or !self.canHitPlayer(projectile, other)) continue;
-                self.nearer(&best, &best_distance, .{ .player = other }, box, margin, from, to);
-            }
+            // In the order vanilla's level finds them in the box: of equals, the first.
+            var far_search: struct { projectiles: *Projectiles, projectile: *const Projectile, swept: body.Box, best: *?Found, best_distance: *f64, margin: f64, from: [3]f64, to: [3]f64 } = .{ .projectiles = self, .projectile = projectile, .swept = swept, .best = &best, .best_distance = &best_distance, .margin = margin, .from = from, .to = to };
+            try self.deps.players.eachInBox(projectile.world, .{ .min = swept.min, .max = swept.max }, &far_search, struct {
+                fn visit(context: *@TypeOf(far_search), other: usize) anyerror!bool {
+                    const box = playerBox(&context.projectiles.deps.players.records[other]);
+                    if (!box.intersects(context.swept) or !context.projectiles.canHitPlayer(context.projectile, other)) return false;
+                    context.projectiles.nearer(context.best, context.best_distance, .{ .player = other }, box, context.margin, context.from, context.to);
+                    return false;
+                }
+            }.visit);
             return best;
         }
         // The players a chunk shares, ruled out at once when the path misses the box around them
         // all; they are known to be playing and alive.
-        const shared = self.targetsNear(projectile);
+        const shared = try self.targetsNear(projectile);
         const bounds = shared.bounds orelse return best;
         if (!bounds.intersects(swept)) return best;
         for (shared.players, shared.boxes) |other, box| {
@@ -2645,16 +2649,16 @@ pub const Projectiles = struct {
 
     /// The players a projectile flying through its chunk may hit: in the world, playing and
     /// alive, found once a tick for every projectile there.
-    fn targetsNear(self: *Projectiles, projectile: *const Projectile) Targets {
+    fn targetsNear(self: *Projectiles, projectile: *const Projectile) !Targets {
         const column = columnOf(projectile, .targets);
         if (self.lookup(column)) |range| return self.targetsOf(range);
         const players = self.deps.players.records.len;
         if (self.candidate_count + players > self.candidates.len) {
-            const count = self.eligible(column, self.overflow, self.overflow_boxes);
+            const count = try self.eligible(column, self.overflow, self.overflow_boxes);
             return .{ .players = self.overflow[0..count], .boxes = self.overflow_boxes[0..count], .bounds = around(self.overflow_boxes[0..count]) };
         }
         const start = self.candidate_count;
-        const count = self.eligible(column, self.candidates[start..][0..players], self.candidate_boxes[start..][0..players]);
+        const count = try self.eligible(column, self.candidates[start..][0..players], self.candidate_boxes[start..][0..players]);
         self.candidate_count += count;
         const range: Range = .{ .start = @intCast(start), .len = @intCast(count), .bounds = around(self.candidate_boxes[start..][0..count]) orelse undefined };
         self.columns.putAssumeCapacity(column, range);
@@ -2667,20 +2671,27 @@ pub const Projectiles = struct {
 
     /// The players within a chunk of a chunk who may be hit, the farthest a path through it
     /// shorter than a chunk reaches.
-    fn eligible(self: *Projectiles, column: Column, output: []u32, boxes: []body.Box) usize {
-        var count: usize = 0;
-        var nearby = self.deps.players.nearby(column.world, .{ .x = @as(f64, @floatFromInt(column.x)) * 16 + 8, .y = 0, .z = @as(f64, @floatFromInt(column.z)) * 16 + 8 }, 1);
-        while (nearby.next()) |other| {
-            const player = &self.deps.players.records[other];
-            if (player.world != column.world or player.stage != .ready or player.handle == null) continue;
-            const state = self.deps.player_states.of(player);
-            if (state.gamemode == .spectator or state.health <= 0) continue;
-            assert(count < output.len);
-            output[count] = @intCast(other);
-            boxes[count] = playerBox(player);
-            count += 1;
-        }
-        return count;
+    fn eligible(self: *Projectiles, column: Column, output: []u32, boxes: []body.Box) !usize {
+        // In the order vanilla's level finds them, which any box within keeps: of equals a path
+        // meets, the first.
+        var found: struct { projectiles: *Projectiles, world: u32, output: []u32, boxes: []body.Box, count: usize = 0 } = .{ .projectiles = self, .world = column.world, .output = output, .boxes = boxes };
+        const low_x: f64 = @floatFromInt((column.x - 1) * 16);
+        const low_z: f64 = @floatFromInt((column.z - 1) * 16);
+        const around_column: entities.space.Box = .{ .min = .{ low_x, -1.0e7, low_z }, .max = .{ low_x + 48, 1.0e7, low_z + 48 } };
+        try self.deps.players.eachInBox(column.world, around_column, &found, struct {
+            fn visit(context: *@TypeOf(found), other: usize) anyerror!bool {
+                const player = &context.projectiles.deps.players.records[other];
+                if (player.world != context.world or player.stage != .ready or player.handle == null) return false;
+                const state = context.projectiles.deps.player_states.of(player);
+                if (state.gamemode == .spectator or state.health <= 0) return false;
+                assert(context.count < context.output.len);
+                context.output[context.count] = @intCast(other);
+                context.boxes[context.count] = playerBox(player);
+                context.count += 1;
+                return false;
+            }
+        }.visit);
+        return found.count;
     }
 
     fn dataOf(_: *const Projectiles, projectile: *const Projectile) packets.Data {

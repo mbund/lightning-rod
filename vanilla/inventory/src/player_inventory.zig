@@ -193,7 +193,7 @@ pub const PlayerInventory = struct {
     }
 
     pub fn craftBatch(self: *PlayerInventory) CraftBatch {
-        std.mem.sort(crafting.Completion, self.crafting_completions[0..self.crafting_count], {}, struct {
+        std.sort.insertion(crafting.Completion, self.crafting_completions[0..self.crafting_count], {}, struct {
             fn less(_: void, a: crafting.Completion, b: crafting.Completion) bool {
                 return a.group < b.group or (a.group == b.group and a.ordinal < b.ordinal);
             }

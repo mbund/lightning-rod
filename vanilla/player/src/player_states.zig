@@ -423,18 +423,18 @@ test "vanilla player state survives leaving, checkpoints and restarts, and corru
     var no_sessions: sessions.Service = undefined;
     no_sessions.profiles = &.{};
     var players: Players = .{
-        .deps = .{ .sessions = &no_sessions, .packets = undefined, .input = undefined, .storage = try store.openSpace(Players.id), .worlds = dimensions, .record_workspaces = &workspaces },
+        .deps = .{ .entities = undefined, .sessions = &no_sessions, .packets = undefined, .input = undefined, .storage = try store.openSpace(Players.id), .worlds = dimensions, .record_workspaces = &workspaces },
         .config = .{},
         .spawn_world = world,
         .records = &rows,
         .dig_handlers = &.{},
     };
     try players.initIndexes(allocator);
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     const space = try store.openSpace(PlayerStates.id);
     var states: [2]PlayerStates.State = @splat(.{});
     var player_states: PlayerStates = .{
-        .deps = .{ .record_workspaces = &workspaces, .players = &players, .input = undefined, .packets = undefined, .storage = space, .worlds = dimensions, .vanilla_worlds = undefined, .world_border = undefined },
+        .deps = .{ .entities = undefined, .record_workspaces = &workspaces, .players = &players, .input = undefined, .packets = undefined, .storage = space, .worlds = dimensions, .vanilla_worlds = undefined, .world_border = undefined },
         .config = .{ .gamemode = .survival },
         .records = &states,
     };

@@ -85,7 +85,7 @@ test "pickup batches preserve player priority item order and partial collection"
             var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = world, .records = player_records, .dig_handlers = &.{} };
             var player_states: PlayerStates = .{ .deps = undefined, .config = .{}, .records = state_records };
             try players.initIndexes(allocator);
-            players.rebuildIndexes();
+            try players.rebuildIndexes();
             const menu = try PlayerInventory.init(allocator, .{}, .{
                 .crafting = gameplay_definitions.crafting,
                 .furnaces = gameplay_definitions.furnaces,
@@ -108,7 +108,7 @@ test "pickup batches preserve player priority item order and partial collection"
                 try dropped.put(id.*, metadata);
             }
             if (batched) {
-                players.rebuildIndexes();
+                try players.rebuildIndexes();
                 try pickup.tick();
             } else {
                 for (ids, item_bodies) |id, body| {

@@ -173,31 +173,31 @@ test "spatial refresh retains configuring players and follows movement and disco
     try players.initIndexes(allocator);
     records[0] = .{ .handle = .{ .index = 0, .generation = 1 }, .stage = .ready };
     records[1] = .{ .handle = .{ .index = 1, .generation = 1 }, .stage = .ready, .position = .{ .x = -32, .y = 65, .z = 0 } };
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     try std.testing.expectEqual(@as(usize, 1), nearbyMask(players.nearby(0, records[0].position, 0)));
     records[1].position = records[0].position;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     try std.testing.expectEqual(@as(usize, 3), nearbyMask(players.nearby(0, records[0].position, 0)));
     records[1].position.z += 16;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     try std.testing.expectEqual(@as(usize, 1), nearbyMask(players.nearby(0, records[0].position, 0)));
     records[1].world = 1;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     try std.testing.expectEqual(@as(usize, 2), nearbyMask(players.nearby(1, records[1].position, 0)));
     records[1].stage = .awaiting_teleport;
     records[0].handle = null;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     try std.testing.expectEqual(@as(usize, 2), nearbyMask(players.nearby(1, records[1].position, 32)));
     records[1].configuring = true;
     records[1].stage = .login;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     try std.testing.expectEqual(@as(usize, 2), nearbyMask(players.nearby(1, records[1].position, 0)));
     records[1].configuring = false;
     records[1].stage = .ready;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     try std.testing.expectEqual(@as(usize, 2), nearbyMask(players.nearby(1, records[1].position, 0)));
     records[1].handle = null;
-    players.rebuildIndexes();
+    try players.rebuildIndexes();
     try std.testing.expectEqual(@as(usize, 0), nearbyMask(players.nearby(1, records[1].position, 32)));
 }
 
@@ -304,7 +304,7 @@ test "items read by id see earlier writes, moves and retirement" {
         var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .stage = .ready, .world = world, .position = .{ .x = 0, .y = 65, .z = 0 } }};
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
         try players.initIndexes(allocator);
-        players.rebuildIndexes();
+        try players.rebuildIndexes();
         // The area index holds where each is: both start in column 0.
         var found: [4]entities.Id = undefined;
         try std.testing.expectEqualSlices(entities.Id, &.{ first, second }, found[0..try inColumn(dropped, world, 0, &found)]);
