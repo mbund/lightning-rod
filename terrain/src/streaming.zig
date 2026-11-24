@@ -610,6 +610,7 @@ pub const Streaming = struct {
         deferred_cold: metrics.Counter = .{},
         /// Columns whose rebuilt packet outgrew the declared bound reserved for it.
         outgrown_reservations: metrics.Counter = .{},
+        oversized_columns: metrics.Counter = .{},
         refresh_columns: metrics.Counter = .{},
     } = .{},
     encoding_duration: metrics.Timer,
@@ -702,9 +703,21 @@ pub const Streaming = struct {
     /// The bound the last stored column declared, as a guess at the next one of a
     /// player nothing was reserved for yet.
     reserve_typical: usize = 16 * 1024,
+    /// Columns whose packet outgrew the bound their frame declared, and what they needed: their
+    /// next reservation is that large. Bounded; past room it starts over.
+    outgrown_needs: std.AutoHashMapUnmanaged(OutgrownKey, usize) = .empty,
     changed: *std.Io.Event,
     wake_pending: bool = false,
     debug_slots: []streaming_debug.Slot = &.{},
+
+    const OutgrownKey = struct { world: u32, x: i32, z: i32 };
+    const outgrown_capacity = 1024;
+
+    /// What a column that outgrew its reservation needed, for its next one.
+    fn rememberNeed(self: *Streaming, world: u32, at: Position, bytes: usize) void {
+        if (self.outgrown_needs.count() == outgrown_capacity) self.outgrown_needs.clearRetainingCapacity();
+        self.outgrown_needs.putAssumeCapacity(.{ .world = world, .x = at.x, .z = at.z }, bytes);
+    }
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Configuration, deps: Dependencies) !*Streaming {
         const self = try allocate(allocator, io, config, deps);
@@ -848,6 +861,7 @@ pub const Streaming = struct {
                 .page_reservations = try deps.metrics.counter(.{ .name = "streaming.delivery.page_reservations", .description = "Columns reserving a full page because no stored record declares their size" }),
                 .deferred_cold = try deps.metrics.counter(.{ .name = "streaming.delivery.deferred_cold", .description = "Cold columns deferred to a batch of their own" }),
                 .outgrown_reservations = try deps.metrics.counter(.{ .name = "streaming.delivery.outgrown_reservations", .description = "Columns retried because their rebuilt packet outgrew the declared bound" }),
+                .oversized_columns = try deps.metrics.counter(.{ .name = "streaming.delivery.oversized_columns", .description = "Columns no page could hold, whose clients were disconnected" }),
                 .new_sections = try deps.metrics.counter(.{ .name = "streaming.delivery.new_sections", .description = "Sections first disclosed or replaced after a world edit" }),
                 .repeated_sections = try deps.metrics.counter(.{ .name = "streaming.delivery.repeated_sections", .description = "Unchanged known sections repeated in column replacements" }),
                 .refresh_scans = try deps.metrics.counter(.{ .name = "streaming.delivery.refresh_scans", .description = "Horizon scans after disclosure changes" }),
@@ -935,6 +949,7 @@ pub const Streaming = struct {
             .transient_compiles = try deps.metrics.counter(.{ .name = "streaming.delivery.transient_compiles", .description = "Compiles from unbaked sections that cannot be stored" }),
             .unbaked_uniform = try deps.metrics.counter(.{ .name = "streaming.delivery.unbaked_uniform", .description = "Unbaked columns delivered without a record because disclosed sections are uniform" }),
         };
+        try self.outgrown_needs.ensureTotalCapacity(allocator, outgrown_capacity);
         return self;
     }
 
@@ -1266,13 +1281,16 @@ pub const Streaming = struct {
             for (changed.values()) |index| {
                 const current = self.views[index];
                 self.updateAudience(index);
-                updates[update_count] = .{ .player = index, .interest = if (current.handle != null and current.ready) .{
-                    .world = current.world,
-                    .x = current.center.x,
-                    .z = current.center.z,
-                    // Only what this player is sent needs generating for them.
-                    .radius = @intCast(self.deliveryFor(current.view_distance) + 1),
-                } else null };
+                updates[update_count] = .{
+                    .player = index,
+                    .interest = if (current.handle != null and current.ready) .{
+                        .world = current.world,
+                        .x = current.center.x,
+                        .z = current.center.z,
+                        // Only what this player is sent needs generating for them.
+                        .radius = @intCast(self.deliveryFor(current.view_distance) + 1),
+                    } else null,
+                };
                 update_count += 1;
             }
             self.deps.chunks.generation.updateMany(updates[0..update_count]);
@@ -1728,7 +1746,10 @@ pub const Streaming = struct {
             // Frames bound their terrain without light, which changes after they are kept, so
             // the reservation adds the most light a column of this height carries.
             const sections = self.deps.worlds.get(item.world).?.dimension.sectionCount();
-            const declared = if (record) |bound| bound + lighting.Data.maximumEncodedSize(@intCast(sections)) else null;
+            const framed = if (record) |bound| bound + lighting.Data.maximumEncodedSize(@intCast(sections)) else null;
+            // A column that outgrew what its frame declared reserves what it needed then.
+            const needed = self.outgrown_needs.get(.{ .world = item.world, .x = item.at.x, .z = item.at.z });
+            const declared: ?usize = if (framed) |bound| @max(bound, needed orelse 0) else null;
             if (declared) |bound| self.reserve_typical = @min(bound, service.config.page_bytes);
             if (declared == null) self.deliveries.page_reservations.add(1);
             size.* = @min(service.config.page_bytes, declared orelse service.config.page_bytes);
@@ -1963,16 +1984,29 @@ pub const Streaming = struct {
                     error.DeliveryDeferred => continue :columns,
                     else => return err,
                 };
-                // A stale record can rebuild into a larger packet than the bound reserved from it.
-                // The rebuilt record is stored at batch end, so the retry reserves its new bound.
-                if (prepared.maximumSize() > packet.bytes.len) {
-                    self.deliveries.outgrown_reservations.add(1);
-                    continue :columns;
-                }
-                packet.limit(prepared.maximumSize());
+                // A record can rebuild into a larger bound than the frame its reservation was sized
+                // from. The bound is only an upper one: the packet is written into what was
+                // reserved, and only where it truly does not fit is the column tried again, with
+                // room for its bound.
+                const fits = prepared.maximumSize() <= packet.bytes.len;
+                if (fits) packet.limit(prepared.maximumSize());
                 self.streams[item.owner].reserve_bytes = packet.bytes.len;
                 if (!credit.canWrite(packet, self.views[item.owner].handle.?)) continue :columns;
-                break :encode try prepared.writePacket(self.deps.packets, item.protocol, packet, definition);
+                break :encode prepared.writePacket(self.deps.packets, item.protocol, packet, definition) catch |err| {
+                    if (fits) return err;
+                    if (outgrown(prepared.maximumSize(), packet.bytes.len, service.config.page_bytes) == .retry) {
+                        self.deliveries.outgrown_reservations.add(1);
+                        self.rememberNeed(item.world, item.at, prepared.maximumSize());
+                        continue :columns;
+                    }
+                    // Not even a whole page holds it, and no reservation is larger: the client
+                    // cannot be sent this column, so it cannot play here. Retried, it would be
+                    // read and encoded every tick for nothing.
+                    self.deliveries.oversized_columns.add(1);
+                    std.log.warn("event=column_exceeds_page world={d} x={d} z={d} bound={d} page={d} error={t}", .{ item.world, item.at.x, item.at.z, prepared.maximumSize(), packet.bytes.len, err });
+                    service.disconnect(self.views[item.owner].handle.?);
+                    continue :columns;
+                };
             };
             credit.finish(packet, self.views[item.owner].handle.?, encoded.len);
             self.concealed_sections.add(@popCount(~item.disclosure & ((@as(u32, 1) << @intCast(dimension.sectionCount())) - 1)));
@@ -4257,6 +4291,22 @@ test "teleports wait for the matching destination terrain without waiting for co
     try std.testing.expect(Streaming.View.capture(player).ready);
     player.configuring = true;
     try std.testing.expect(!Streaming.View.capture(player).ready);
+}
+
+/// What a column whose packet may need `bound` bytes and did not fit in `reserved` of them does,
+/// when no reservation is larger than `page`: it fits; it is retried, and reserves its bound
+/// then; or, as it had a whole page, it cannot be sent at all.
+fn outgrown(bound: usize, reserved: usize, page: usize) enum { fits, retry, whole_page } {
+    if (bound <= reserved) return .fits;
+    if (reserved < page) return .retry;
+    return .whole_page;
+}
+
+test "a column bound past every reservation is written into a page, never retried forever" {
+    try std.testing.expectEqual(.fits, outgrown(3000, 4096, 32768));
+    try std.testing.expectEqual(.retry, outgrown(5000, 4096, 32768));
+    // Retried, it reserves what its bound says, a page at most: past that there is no more room.
+    try std.testing.expectEqual(.whole_page, outgrown(44107, @min(44107, 32768), 32768));
 }
 
 /// Whether the build selected every one of these protocols, which a single release does not.

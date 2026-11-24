@@ -1008,6 +1008,8 @@ pub const Delivery = struct {
         const workspace = self.packet.chunk.workspace;
         assert(workspace.preparation == self.packet.preparation and self.owner.active and self.owner.generation == self.generation);
         const compressed = try frontend.writePacket(write_delivery, protocol, packet.bytes, .{ self, definition });
+        // Its whole length is charged against the reservation, which must hold it.
+        if (workspace.fragments.decoded > packet.bytes.len) return error.PacketTooLarge;
         packet.prepare(workspace.fragments.decoded);
         return compressed;
     }

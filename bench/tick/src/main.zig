@@ -63,7 +63,7 @@ const Simulation = lightning_rod.Simulation(@TypeOf(defaults));
 const Options = struct {
     players: ?usize = null,
     capacity: ?usize = null,
-    pages: usize = 2048,
+    pages: usize = 1024,
     mode: ?Mode = null,
     ticks: usize = 1000,
     samples: usize = 3,
@@ -226,7 +226,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     const selected = &catalog.values;
     const maximum = options.capacity orelse @max(32, count);
     if (maximum < count or maximum == 0) return error.InvalidCapacity;
-    const service = try sessions.Service.init(backing, io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = maximum, .pages = options.pages, .page_bytes = 32768, .credit_bytes = 128 * 1024, .protocols = selected });
+    const service = try sessions.Service.init(backing, io, .{ .context = &sink, .vtable = network.Transport.adapter(Sink) }, .{ .connections = maximum, .pages = options.pages, .page_bytes = 65536, .credit_bytes = 128 * 1024, .protocols = selected });
     defer service.deinit();
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(vanilla.plugins(), .{
