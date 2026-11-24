@@ -289,9 +289,8 @@ pub const Service = struct {
         assert(!self.tick_active and self.staged_move == null and self.preparing.load(.acquire) == 0);
         assert(self.owner == null and self.readiness == null);
 
-        // A slot still draining is free: the game that held it for its departure is gone.
-        for (self.occupied, self.vacated) |*value, vacated| assert(vacated or !value.load(.acquire));
-
+        // A slot may still be draining, or its player's departure unheard by a game that stopped:
+        // with every connection gone, as the routes say, nothing holds it.
         for (self.moves) |*move| assert(move.state.load(.acquire) == .idle);
 
         for (self.routes) |route| assert(route == null);

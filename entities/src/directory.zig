@@ -35,6 +35,11 @@ pub const Entry = struct {
     space_row: u16 = 0,
     /// While the slot is free, the one let go after it.
     next_free: u32 = none,
+    /// Whether clients still know the entity, so the slot, and with it the network id, stays
+    /// its own until they are told it is gone.
+    held: bool = false,
+    /// Whether the entity left memory while held: the slot frees once let go.
+    retired: bool = false,
 };
 
 /// An entity held by another: its slot, and its id to tell it from a later one in the slot.
@@ -120,8 +125,23 @@ pub const Directory = struct {
     /// The entity leaves memory; its components' records must have gone first.
     pub fn remove(self: *Directory, slot: u32) void {
         const gone = self.entries.at(slot);
+        assert(!gone.held and !gone.retired);
         assert(self.ids.remove(gone.id));
-        gone.* = .{};
+        self.free(slot);
+    }
+
+    /// The entity leaves memory but its slot stays taken: clients still know it by the slot.
+    /// Lookups by its id miss from now on.
+    pub fn retire(self: *Directory, slot: u32) void {
+        const gone = self.entries.at(slot);
+        assert(gone.held and !gone.retired);
+        assert(self.ids.remove(gone.id));
+        gone.* = .{ .held = true, .retired = true };
+    }
+
+    /// A slot no entity holds any more goes back, taken again last.
+    pub fn free(self: *Directory, slot: u32) void {
+        self.entries.at(slot).* = .{};
         if (self.free_tail == none) self.free_head = slot else self.entries.at(self.free_tail).next_free = slot;
         self.free_tail = slot;
         self.free_count += 1;

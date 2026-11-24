@@ -24,10 +24,10 @@ pub const random_positions = @import("random_positions.zig");
 pub const damage = @import("damage.zig");
 pub const melee = @import("melee.zig");
 pub const projectiles = @import("projectiles.zig");
+pub const projectile_replication = @import("projectile_replication.zig");
 pub const ranged = @import("ranged.zig");
 pub const projectile_packets = @import("projectile_packets.zig");
 pub const projectile_store = @import("projectile_store.zig");
-pub const projectile_claims = @import("projectile_claims.zig");
 pub const mob_interaction = @import("mob_interaction.zig");
 
 test {

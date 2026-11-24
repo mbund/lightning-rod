@@ -286,7 +286,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
         const mining = simulation.get(vanilla.Mining);
         const equipment = simulation.get(vanilla.Equipment);
         try writer.print("# protocols={d} metrics={d} instrumentation={any} assigned_bytes={d}\n", .{ selected.len, simulation.metrics.count, options.instrumentation, memory.assigned_bytes });
-        try writer.print("# replication_records_bytes={d} mining_masks_bytes={d} equipment_masks_bytes={d}\n", .{ replication.lifecycle.entries.len * @sizeOf(@TypeOf(replication.lifecycle.entries[0])), mining.selections.memoryBytes(), equipment.selections.memoryBytes() });
+        try writer.print("# replication_records_bytes={d} mining_masks_bytes={d} equipment_masks_bytes={d}\n", .{ replication.lifecycle.memoryBytes(), mining.selections.memoryBytes(), equipment.selections.memoryBytes() });
     }
     // Streaming asks for chunks the tick never reads, which only a worker generates, as the
     // server's do.
@@ -482,7 +482,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
         const held = simulation.get(vanilla.Entities);
         try writer.print("  entity pool pages={d} used={d} entities={d}\n", .{ pool.pageCount(), pool.pageCount() - pool.freeCount(), held.directory.count() });
     }
-    if (options.arrows > 0 or options.flying > 0) try writer.print("  arrows={d} ticking={d} volleys={d} queued={any} taken={any} removals_waiting={d}\n", .{ simulation.get(vanilla.Projectiles).activeCount(), simulation.get(vanilla.Projectiles).tickingCount(), volleys, simulation.get(vanilla.Projectiles).queued, simulation.get(vanilla.Projectiles).taken, simulation.get(vanilla.Projectiles).removals });
+    if (options.arrows > 0 or options.flying > 0) try writer.print("  arrows={d} ticking={d} volleys={d} queued={any} taken={any} sleeping={d}\n", .{ simulation.get(vanilla.Projectiles).activeCount(), simulation.get(vanilla.Projectiles).tickingCount(), volleys, simulation.get(vanilla.Projectiles).queued, simulation.get(vanilla.Projectiles).taken, simulation.get(vanilla.Projectiles).sleepingCount() });
     if (options.cows > 0) try writer.print("  domain_revision={d} audience_changes={d} cows={d} ticked={d} resting={d} idle_ticks={d} blocks={d} rare_lanes={d} travels_skipped={d} travels_run={d} path_searches={d:.3}/tick edits={d} edit_recomputes={d} edits_answered_early={d} sections_decoded={d}\n", .{ mobs.domain_revision, simulation.get(vanilla.MobReplication).audience_changes, mobs.active.count, ticked, resting, mobs.idle_ticks - idle_before, mobs.idle_blocks - blocks_before, mobs.rare_lanes - rare_before, mobs.travels_skipped - skipped_before, mobs.travels_run - run_before, @as(f64, @floatFromInt(mobs.path_searches - searches_before)) / @as(f64, @floatFromInt(ticks)), edits, mobs.edit_recomputes - recomputes_before, mobs.edits_answered_early, mobs.copies.decoded });
     if (options.detail) for (snapshots, before[0..snapshots.len]) |after, previous| {
         if (after.kind == .counter) {

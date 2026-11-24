@@ -3,6 +3,7 @@ test {
     _ = @import("table.zig");
     _ = @import("order.zig");
     _ = @import("space.zig");
+    _ = @import("sweeps.zig");
     _ = @import("places.zig");
     _ = @import("durable.zig");
     _ = @import("residency.zig");

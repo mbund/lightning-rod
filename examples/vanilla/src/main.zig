@@ -44,6 +44,8 @@ pub fn main(init: std.process.Init) !void {
     var tps_bar = true;
     var render_distance: i32 = 32;
     var simulation_distance: i32 = 8;
+    // server.properties entity-broadcast-range-percentage.
+    var range_percentage: u32 = 100;
     var port: u16 = if (init.environ_map.get("LIGHTNING_ROD_PORT")) |value| try std.fmt.parseInt(u16, value, 10) else 25565;
 
     _ = args.skip();
@@ -78,6 +80,9 @@ pub fn main(init: std.process.Init) !void {
             render_distance = try std.fmt.parseInt(i32, argument["--view-distance=".len..], 10);
         } else if (std.mem.startsWith(u8, argument, "--simulation-distance=")) {
             simulation_distance = try std.fmt.parseInt(i32, argument["--simulation-distance=".len..], 10);
+        } else if (std.mem.startsWith(u8, argument, "--entity-broadcast-range-percentage=")) {
+            range_percentage = try std.fmt.parseInt(u32, argument["--entity-broadcast-range-percentage=".len..], 10);
+            if (range_percentage < 10 or range_percentage > 1000) return error.InvalidBroadcastRange;
         } else if (std.mem.startsWith(u8, argument, "--prefetch=")) {
             prefetch = try std.fmt.parseInt(u2, argument["--prefetch=".len..], 10);
         } else if (std.mem.eql(u8, argument, "--no-tps-bar")) {
@@ -99,6 +104,7 @@ pub fn main(init: std.process.Init) !void {
             lightning_rod.plugin.configured(Streaming, .{ .prefetch = prefetch, .hull = hull }),
             lightning_rod.plugin.configured(Players, Players.Configuration{ .maximum = max_players, .render_distance = render_distance, .simulation_distance = simulation_distance }),
             lightning_rod.plugin.configured(Chunks, chunk_configuration),
+            lightning_rod.plugin.configured(vanilla.Tracking, vanilla.Tracking.Configuration{ .range_percentage = range_percentage }),
         }),
         lightning_rod.plugin.configured(AllOperators, .{}),
         lightning_rod.plugin.configured(tps.Tps, .{ .shown = tps_bar }),

@@ -43,8 +43,19 @@ pub const Kinds = struct {
     }
 };
 
+/// What happened to an entity's place, for whoever keeps track of what clients see.
+pub const Change = struct {
+    slot: u32,
+    event: Event,
+
+    /// `swept`: its box valid until a tick was placed, taken back or replaced.
+    pub const Event = enum(u8) { placed, moved, removed, swept };
+};
+
 pub const Entry = struct {
     id: Id,
+    /// Its directory slot.
+    slot: u32 = 0,
     section: i32,
     /// When it entered its section, which orders a section's entities.
     entered: u64,
@@ -150,6 +161,8 @@ pub const Space = struct {
     keys: Array(Key),
     blocks: extras.Records(Block),
     placed: usize = 0,
+    /// Of each kind.
+    kind_placed: [Kinds.max_kinds]u32 = @splat(0),
     entered: u64 = 0,
     /// Rises with every change anywhere, so a column's revision is never seen twice, even one
     /// emptied and filled again.
@@ -158,6 +171,15 @@ pub const Space = struct {
     columns_made: u64 = 0,
     /// What each lookup found, one list for each lookup asked from inside another's visit.
     found: [max_depth]Array(Entry),
+    /// Since the log was last taken: each entity placed, moved or removed, by slot, while the
+    /// log is kept. Whoever needs to know what changed takes it once a tick.
+    log: Array(Change),
+    logging: bool = false,
+    /// Whether a removal could not be logged: whoever takes the log then looks over everything.
+    log_overflowed: bool = false,
+    /// The log's tick each slot was last noted in, so it is noted once.
+    noted: []u32,
+    log_epoch: u32 = 1,
     /// The column last found, which lookups mostly ask again.
     last_key: u128 = std.math.maxInt(u128),
     last_place: usize = 0,
@@ -171,10 +193,21 @@ pub const Space = struct {
             .columns = try .init(allocator, pool),
             .keys = try .init(allocator, pool),
             .blocks = try .init(allocator, pool),
+            .log = try .init(allocator, pool),
+            .noted = try allocator.alloc(u32, directory.capacity()),
             .found = undefined,
         };
         for (&self.found) |*list| list.* = try .init(allocator, pool);
+        @memset(self.noted, 0);
         return self;
+    }
+
+    /// How many of some kinds are placed.
+    pub fn countOf(self: *const Space, kinds: Kinds) usize {
+        var total: usize = 0;
+        var set = kinds.bits.iterator(.{});
+        while (set.next()) |kind| total += self.kind_placed[kind];
+        return total;
     }
 
     pub fn count(self: *const Space) usize {
@@ -235,6 +268,35 @@ pub const Space = struct {
     }
 
     /// Every column with an index, in order: `columnCount` of them, the `at`th by `columnAt`.
+    /// The columns holding entities in a world along one x, from z `low` to `high`, in order:
+    /// one search, then a step for each column kept there.
+    pub fn columnsAlong(self: *const Space, world: u32, x: i32, low: i32, high: i32) Along {
+        if (low > high) return .{ .space = self, .at = self.keys.len, .end = 0 };
+        const start = self.search(keyOf(.{ .world = world, .x = x, .z = low }));
+        return .{ .space = self, .at = start.at, .end = keyOf(.{ .world = world, .x = x, .z = high }) };
+    }
+
+    pub const Along = struct {
+        space: *const Space,
+        at: usize,
+        end: u128,
+
+        pub const Found = struct { column: Column, index: u32 };
+
+        pub fn next(self: *Along) ?Found {
+            if (self.at >= self.space.keys.len) return null;
+            while (self.at < self.space.keys.len) {
+                const key = self.space.keys.at(self.at);
+                if (key.key > self.end) return null;
+                self.at += 1;
+                // A column kept for ticking with nothing in it is no column here.
+                const held = self.space.columns.at(key.at);
+                if (held.count != 0) return .{ .column = held.column, .index = key.at };
+            }
+            return null;
+        }
+    };
+
     pub fn columnCount(self: *const Space) usize {
         return self.keys.len;
     }
@@ -268,11 +330,22 @@ pub const Space = struct {
     fn entryAt(_: *const Space, block: *const Block, row: u32) Entry {
         return .{
             .id = block.id[row],
+            .slot = block.slot[row],
             .section = block.section[row],
             .entered = block.entered[row],
             .position = block.position[row],
             .shape = .{ .kind = block.kind[row], .half_width = block.half_width[row], .height = block.height[row] },
         };
+    }
+
+    pub const Placed = struct { entry: Entry, world: u32 };
+
+    /// The entity in a slot, and its world, where it is placed.
+    pub fn atSlot(self: *const Space, slot: u32) ?Placed {
+        if (slot >= self.directory.high()) return null;
+        const place = self.directory.entry(slot);
+        if (place.space_column == none) return null;
+        return .{ .entry = self.entryAt(self.blocks.at(place.space_block), place.space_row), .world = self.columns.at(place.space_column).column.world };
     }
 
     pub fn get(self: *const Space, entity: Id) ?Entry {
@@ -286,6 +359,11 @@ pub const Space = struct {
     }
 
     /// The entities of the kinds of a column, in no order.
+    /// The entities of the column at a dense index, as `columnsAlong` finds it.
+    pub fn entriesAt(self: *const Space, index: u32, kinds: Kinds) Entries {
+        return .{ .space = self, .block = self.columns.at(index).first, .kinds = kinds };
+    }
+
     pub fn entries(self: *const Space, column: Column, kinds: Kinds) Entries {
         const index = self.indexOf(column) orelse return .{ .space = self, .block = none, .kinds = kinds };
         return .{ .space = self, .block = self.columns.at(index).first, .kinds = kinds };
@@ -312,6 +390,29 @@ pub const Space = struct {
         }
     };
 
+    /// The entities of some kinds in the column at a dense index whose horizontal distance from
+    /// `a` is within `a_reach` and from `b` is not, or the other way round: those a circle that
+    /// moved from one place to the other passed over. Only those are made entries and visited.
+    pub fn eachCrossing(self: *const Space, index: u32, kinds: Kinds, a: [2]f64, a_reach: f64, b: [2]f64, b_reach: f64, context: anytype, comptime visit: fn (@TypeOf(context), Entry) anyerror!void) !void {
+        const a_squared = a_reach * a_reach;
+        const b_squared = b_reach * b_reach;
+        var at = self.columns.at(index).first;
+        while (at != none) {
+            const block = self.blocks.at(at);
+            for (0..block.count) |row| {
+                const position = block.position[row];
+                const ax = position[0] - a[0];
+                const az = position[2] - a[1];
+                const bx = position[0] - b[0];
+                const bz = position[2] - b[1];
+                if ((ax * ax + az * az <= a_squared) == (bx * bx + bz * bz <= b_squared)) continue;
+                if (!kinds.has(block.kind[row])) continue;
+                try visit(context, self.entryAt(block, @intCast(row)));
+            }
+            at = block.next;
+        }
+    }
+
     fn changed(self: *Space, held: *ColumnData) void {
         self.changes += 1;
         held.revision = self.changes;
@@ -319,6 +420,14 @@ pub const Space = struct {
 
     /// An entity comes into the world: last of its section.
     pub fn insert(self: *Space, entity: Id, world: u32, position: [3]f64, shape: Shape) !void {
+        const slot = self.directory.slotOf(entity) orelse return error.NotInMemory;
+        const at = try self.reserve(slot);
+        errdefer self.unreserve(slot, at);
+        try self.putPlace(entity, world, position, shape);
+        self.fill(at, slot, .placed);
+    }
+
+    fn putPlace(self: *Space, entity: Id, world: u32, position: [3]f64, shape: Shape) !void {
         assert(shape.kind < Kinds.max_kinds);
         const slot = self.directory.slotOf(entity) orelse return error.NotInMemory;
         const entry = self.directory.entry(slot);
@@ -352,16 +461,78 @@ pub const Space = struct {
         if (held.count == 0) self.columns_made += 1;
         held.count += 1;
         self.placed += 1;
+        self.kind_placed[shape.kind] += 1;
         self.entered += 1;
         self.changed(held);
     }
 
+    /// Room in the log for the change about to be made, taken before making it so a change is
+    /// never made unlogged.
+    /// Once a tick for a slot: whoever takes the log looks at the slot as it then is.
+    fn reserve(self: *Space, slot: u32) !?usize {
+        if (!self.logging or self.noted[slot] == self.log_epoch) return null;
+        const at = try self.log.grow();
+        self.noted[slot] = self.log_epoch;
+        return at;
+    }
+
+    fn unreserve(self: *Space, slot: u32, at: ?usize) void {
+        if (at) |index| {
+            assert(index + 1 == self.log.len);
+            self.log.pop();
+            self.noted[slot] = 0;
+        }
+    }
+
+    fn fill(self: *Space, at: ?usize, slot: u32, event: Change.Event) void {
+        if (at) |index| self.log.at(index).* = .{ .slot = slot, .event = event };
+    }
+
+    /// Takes the log: what changed since it was last taken. Good until the next change.
+    pub fn logged(self: *const Space) Array(Change) {
+        return self.log;
+    }
+
+    /// Notes a change of an entity's place kept outside the space, as its sweep.
+    pub fn note(self: *Space, slot: u32, event: Change.Event) void {
+        const at = self.reserve(slot) catch {
+            self.log_overflowed = true;
+            return;
+        };
+        self.fill(at, slot, event);
+    }
+
+    pub fn clearLog(self: *Space) void {
+        self.log.reset();
+        self.log_epoch +%= 1;
+        if (self.log_epoch == 0) {
+            @memset(self.noted, 0);
+            self.log_epoch = 1;
+        }
+        self.log_overflowed = false;
+    }
+
     pub fn remove(self: *Space, entity: Id) void {
+        const slot = self.directory.slotOf(entity) orelse return;
+        if (self.directory.entry(slot).space_column == none) return;
+        // A log that cannot grow is where vanilla runs out of heap: the removal still stands,
+        // and whoever takes the log looks over everything.
+        const at = self.reserve(slot) catch {
+            self.log_overflowed = true;
+            self.unplace(entity);
+            return;
+        };
+        self.unplace(entity);
+        self.fill(at, slot, .removed);
+    }
+
+    fn unplace(self: *Space, entity: Id) void {
         const entry = self.placeOf(entity) orelse return;
         const index = entry.space_column;
         const held = self.columns.at(index);
         const hole = self.blocks.at(entry.space_block);
         const hole_row = entry.space_row;
+        self.kind_placed[hole.kind[hole_row]] -= 1;
         // The column's last entity fills the hole.
         const last = self.blocks.at(held.last);
         const last_row = last.count - 1;
@@ -401,6 +572,7 @@ pub const Space = struct {
         const row = entry.space_row;
         if (std.meta.eql(held.column, columnOf(world, position))) {
             if (std.meta.eql(block.position[row], position)) return;
+            const at = try self.reserve(block.slot[row]);
             const section = coordinate(position[1]);
             if (section != block.section[row]) {
                 block.section[row] = section;
@@ -409,11 +581,16 @@ pub const Space = struct {
             }
             block.position[row] = position;
             self.changed(held);
+            self.fill(at, block.slot[row], .moved);
             return;
         }
         const shape: Shape = .{ .kind = block.kind[row], .half_width = block.half_width[row], .height = block.height[row] };
-        self.remove(entity);
-        try self.insert(entity, world, position, shape);
+        const slot = block.slot[row];
+        const at = try self.reserve(slot);
+        errdefer self.unreserve(slot, at);
+        self.unplace(entity);
+        try self.putPlace(entity, world, position, shape);
+        self.fill(at, slot, .moved);
     }
 
     /// A new size, as a baby grows up: its box changes, and its turn does not.

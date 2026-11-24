@@ -8,6 +8,7 @@ const packets = @import("minecraft_packets");
 const Players = @import("players").players.Players;
 const Replication = @import("replication").replication.Replication;
 const Visibility = @import("replication").visibility.Visibility;
+const Tracking = @import("replication").tracking.Tracking;
 const Protocol = protocols.implementations[0].Protocol;
 
 const View = struct { known: bool = false, listed: bool = false, spawned: bool = false };
@@ -17,7 +18,8 @@ const Wire = struct {
 
     fn tick(self: *Wire, replication: *Replication) !void {
         replication.deps.visibility.tick();
-        replication.tick();
+        try replication.deps.tracking.tick();
+        try replication.tick();
         self.packets = 0;
         const service = replication.deps.players.deps.sessions;
         while (service.output.takeReady()) |packet| {
@@ -111,7 +113,7 @@ test "visibility independently reconciles profiles tab listing and entities unde
     const visibility = try Visibility.init(allocator, .{}, .{ .players = &players });
     const vanish = try visibility.createLayer();
     const minigame = try visibility.createLayer();
-    const replication = try Replication.init(allocator, .{}, .{ .players = &players, .visibility = visibility });
+    const replication = try Replication.init(allocator, .{}, .{ .players = &players, .visibility = visibility, .tracking = try Tracking.forTests(allocator, &players) });
     failing.fail_index = failing.alloc_index;
     var wire: Wire = .{};
     for (0..3) |index| wire.clients[index][index] = .{ .known = true, .listed = true };

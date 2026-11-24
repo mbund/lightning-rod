@@ -1,14 +1,13 @@
 const std = @import("std");
 const lightning_rod = @import("lightning_rod");
-const audience = @import("players").audience;
 const sessions = @import("sessions");
 const packets = @import("minecraft_packets");
 const minecraft = @import("minecraft_model");
 const entities = @import("entities");
-const records = @import("records");
-const game_data = @import("game_data");
 const wire = @import("wire_1_21_5");
-const entity_packets = @import("replication").entity_packets;
+const replication = @import("replication");
+const entity_packets = replication.entity_packets;
+const Tracking = replication.tracking.Tracking;
 const bit_sets = lightning_rod.system.bit_sets;
 const Experience = @import("experience.zig").Experience;
 const State = @import("vanilla_player").experience_state.State;
@@ -17,138 +16,102 @@ const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
 const Streaming = @import("terrain").streaming.Streaming;
 const assert = std.debug.assert;
 
-/// What clients know of experience orbs: each orb's view is a record beside it, of who has it
-/// spawned and who is owed its motion or its value, looked at every tick as every orb is.
+/// What clients know of experience orbs. Tracking says who is to have each orb; this sends the
+/// spawns and removals it asks for, and to whoever has an orb, its motion and value as they
+/// change and its pickups before it goes.
 pub const ExperienceReplication = struct {
     pub const id = "minecraft:experience_replication";
     pub const Configuration = struct {
-        audience_words: usize = 4096,
+        /// Pickups owed to clients at once; past it the oldest is let go, its clients seeing the
+        /// orb go without it.
         pickup_events: usize = 1024,
-        /// Orbs clients are shown at once.
-        views: usize = 16384,
         /// Keep a hash of every packet queued and whom to, for runs to be compared by.
         trace_sends: bool = false,
     };
-    pub const Dependencies = struct { experience: *Experience, players: *Players, player_states: *PlayerStates, streaming: *Streaming, sessions: *sessions.Service, packets: *packets.Packets };
+    pub const Dependencies = struct { experience: *Experience, players: *Players, player_states: *PlayerStates, streaming: *Streaming, sessions: *sessions.Service, packets: *packets.Packets, tracking: *Tracking };
 
-    /// At the head of a view record; the rows of who knows the orb, who is owed its motion and
-    /// who its value follow.
-    const Header = extern struct {
-        revision: u64 = 0,
-        burning: bool = false,
-        padding: [7]u8 = @splat(0),
-    };
-    const row_count = 3;
-
-    const View = struct {
-        entity: entities.Id,
-        header: *Header,
-        known: bit_sets.Row,
-        dirty: bit_sets.Row,
-        metadata: bit_sets.Row,
-        /// Gone, and no client knows of it: its view goes once let go.
-        forget: bool = false,
-
-        fn holds(self: *const View) bool {
-            return self.known.view().any() or self.dirty.view().any() or self.metadata.view().any();
-        }
-    };
-
+    /// What clients that have an orb were last sent of it.
+    const Sent = struct { entity: entities.Id = 0, revision: u64 = 0, burning: bool = false };
     const Connection = struct { generation: u32 = 0, life: u32 = 0, world: u32 = 0, ready: bool = false, sent: ?State = null };
-    const Event = struct { entity: u64 = 0, collector: i32 = 0 };
-    const Phase = enum { spawn, position, metadata, remove };
+    const Event = struct { slot: u32 = 0, collector: i32 = 0 };
+    const Phase = enum { spawn, position, metadata, whole, remove };
+    /// An orb as it stands, for those that are not gone.
+    const Live = struct { entity: entities.Id, orb: Experience.Orb, body: entities.State };
+
     deps: Dependencies,
+    tracker: Tracking.TrackerId,
     /// A running hash of every packet asked to be sent and whom to, when tests trace it.
     traced: u64 = 0,
     tracing: bool,
-    /// Room to copy the orbs' ids into, as looking at them may forget some.
+    /// Room to copy the orbs' ids into.
     orbs: []entities.Id,
-    /// Views by orb id: an orb no client knows of has none.
-    views: entities.Slab,
-    record_bytes: usize,
-    row_words: usize,
+    sent: entities.Array(Sent),
+    words: usize,
     connections: []Connection,
     tracked: lightning_rod.system.IndexSet,
-    /// Players whose connection was replaced this tick: no view knows them any more.
-    reset: audience.Row,
-    scratch: audience.Matrix,
-    event_recipients: audience.Matrix,
     events: []Event,
+    /// Each event's clients still owed it, a row of words each.
+    event_rows: []usize,
     event_slots: lightning_rod.system.IndexSet,
     first_event: usize = 0,
     event_span: usize = 0,
+    rows: []usize,
     targets: []sessions.Service.Target,
     deliveries: []sessions.Service.Delivery,
-    reset_matrix: audience.Matrix,
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*ExperienceReplication {
         if (config.pickup_events == 0) return error.InvalidExperienceCapacity;
         const self = try allocator.create(ExperienceReplication);
         const players = deps.players.records.len;
-        const row_words = std.math.divCeil(usize, players, @bitSizeOf(usize)) catch unreachable;
-        const record_bytes = @sizeOf(Header) + row_count * row_words * @sizeOf(usize);
-        const experience = deps.experience;
-        const reset_matrix = try audience.Matrix.init(allocator, deps.players, 1, config.audience_words, .recipients);
+        const words = deps.tracking.row_words;
         self.* = .{
             .deps = deps,
+            .tracker = undefined,
             .tracing = config.trace_sends,
-            .views = try .init(allocator, &deps.experience.deps.entities.pool, record_bytes, config.views),
-            .orbs = try allocator.alloc(entities.Id, experience.orbs.bound()),
-            .record_bytes = record_bytes,
-            .row_words = row_words,
+            .orbs = try allocator.alloc(entities.Id, deps.experience.orbs.bound()),
+            .sent = try .init(allocator, &deps.experience.deps.entities.pool),
+            .words = words,
             .connections = try allocator.alloc(Connection, players),
             .tracked = try .init(allocator, players),
-            .reset = reset_matrix.row(0),
-            .reset_matrix = reset_matrix,
-            .scratch = try .init(allocator, deps.players, 4, config.audience_words, .recipients),
-            .event_recipients = try .init(allocator, deps.players, config.pickup_events, config.audience_words, .recipients),
             .events = try allocator.alloc(Event, config.pickup_events),
+            .event_rows = try allocator.alloc(usize, config.pickup_events * words),
             .event_slots = try .init(allocator, config.pickup_events),
+            .rows = try allocator.alloc(usize, 5 * words),
             .targets = try allocator.alloc(sessions.Service.Target, players),
             .deliveries = try allocator.alloc(sessions.Service.Delivery, players),
         };
         @memset(self.connections, .{});
         @memset(self.events, .{});
-        experience.leaving = .{ .context = self, .function = orbLeaving };
+        @memset(self.event_rows, 0);
+        self.tracker = try deps.tracking.register(.{ .kinds = Experience.kinds, .range = 6 * 16 });
         return self;
     }
 
-    /// An orb left memory, far from every player: no client keeps it, and its view goes.
-    fn orbLeaving(context: *anyopaque, entity: entities.Id) void {
-        const self: *ExperienceReplication = @ptrCast(@alignCast(context));
-        self.views.remove(entity);
+    fn row(self: *ExperienceReplication, index: usize) []usize {
+        return self.rows[index * self.words ..][0..self.words];
     }
 
-    fn holdViews(self: *ExperienceReplication, ids: []const entities.Id, output: []View) !void {
-        assert(ids.len == output.len and ids.len <= 16);
-        for (ids, output) |entity, *view| {
-            const bytes = try self.views.getOrCreate(entity);
-            const words: []usize = @alignCast(std.mem.bytesAsSlice(usize, bytes[@sizeOf(Header)..]));
-            const capacity = self.connections.len;
-            view.* = .{
-                .entity = entity,
-                .header = @ptrCast(bytes[0..@sizeOf(Header)]),
-                .known = .{ .words = words[0..self.row_words], .capacity = capacity },
-                .dirty = .{ .words = words[self.row_words..][0..self.row_words], .capacity = capacity },
-                .metadata = .{ .words = words[self.row_words * 2 ..][0..self.row_words], .capacity = capacity },
-            };
-        }
+    fn set(self: *const ExperienceReplication, words: []const usize) bit_sets.Set {
+        return .{ .words = words, .capacity = self.connections.len };
     }
 
-    fn letGo(self: *ExperienceReplication, view: *View) void {
-        if (!view.holds() or view.forget) self.views.remove(view.entity);
+    fn eventRow(self: *ExperienceReplication, at: usize) []usize {
+        return self.event_rows[at * self.words ..][0..self.words];
+    }
+
+    fn put(words: []usize, player: usize, value: bool) void {
+        const bit = @as(usize, 1) << @intCast(player % 64);
+        if (value) words[player / 64] |= bit else words[player / 64] &= ~bit;
     }
 
     /// How many clients have an orb spawned, for tests.
     pub fn knownBy(self: *ExperienceReplication, entity: entities.Id) !usize {
-        const bytes = self.views.get(entity) orelse return 0;
-        const words: []const usize = @alignCast(std.mem.bytesAsSlice(usize, bytes[@sizeOf(Header)..]));
-        return (bit_sets.Set{ .words = words[0..self.row_words], .capacity = self.connections.len }).count();
+        const slot = self.deps.experience.deps.entities.directory.slotOf(entity) orelse return 0;
+        return self.deps.tracking.known(slot).count();
     }
 
     pub fn tick(self: *ExperienceReplication) !void {
         const experience = self.deps.experience;
-        self.reset.clear();
         for (self.deps.players.activeSlots()) |at| self.tracked.insert(at);
         var tracked_offset: usize = 0;
         while (tracked_offset < self.tracked.values().len) {
@@ -156,11 +119,11 @@ pub const ExperienceReplication = struct {
             const player = self.deps.players.records[at];
             const connection = &self.connections[at];
             const generation = if (player.handle) |handle| handle.generation else 0;
-            if (connection.generation != generation or connection.life != player.life or connection.world != player.world or connection.ready != (player.stage == .ready and player.handle != null)) {
-                // Every view is looked at below this tick, which forgets this player in each.
-                self.reset.insert(at);
-                for (self.event_slots.values()) |index| self.event_recipients.row(index).remove(at);
-                connection.* = .{ .generation = generation, .life = player.life, .world = player.world, .ready = player.stage == .ready and player.handle != null };
+            const ready = player.stage == .ready and player.handle != null;
+            if (connection.generation != generation or connection.life != player.life or connection.world != player.world or connection.ready != ready) {
+                // A client that forgot what it was shown is owed no pickups.
+                for (self.event_slots.values()) |index| put(self.eventRow(index), at, false);
+                connection.* = .{ .generation = generation, .life = player.life, .world = player.world, .ready = ready };
             }
             if (player.handle == null) {
                 self.tracked.remove(at);
@@ -178,76 +141,186 @@ pub const ExperienceReplication = struct {
                 connection.sent = points;
             }
         }
-        const visibility = self.deps.streaming.snapshotVisibility();
+        // Pickups, owed to whoever has the orb, before it goes for them.
         for (experience.pickups[0..experience.pickup_count]) |pickup| {
-            var views: [1]View = undefined;
-            try self.holdViews(&.{pickup.entity}, &views);
-            defer self.letGo(&views[0]);
-            const view = &views[0];
-            self.forgetReset(view);
-            const desired = self.interest(pickup.body, visibility);
-            const spawning = self.scratch.row(1);
-            spawning.subtract(desired.view(), view.known.view());
-            try self.deliver(.spawn, view, pickup.body, pickup.value, false, spawning);
-            const known = view.known.view();
+            const known = self.deps.tracking.known(pickup.slot);
             if (!known.any()) continue;
             if (self.event_span == self.events.len) {
-                const at = self.first_event;
-                const recipients = self.event_recipients.row(at);
-                var blocked = recipients.view().iterator();
-                while (blocked.next()) |player| if (self.deps.players.records[player].handle) |handle| self.deps.sessions.disconnect(handle);
-                self.event_slots.remove(at);
-                self.first_event = (at + 1) % self.events.len;
+                self.event_slots.remove(self.first_event);
+                self.first_event = (self.first_event + 1) % self.events.len;
                 self.event_span -= 1;
             }
             const at = (self.first_event + self.event_span) % self.events.len;
             self.event_span += 1;
-            const recipients = self.event_recipients.row(at);
-            recipients.copy(known);
-            self.events[at] = .{ .entity = pickup.entity, .collector = pickup.collector };
+            for (self.eventRow(at), 0..) |*word, index| word.* = known.wordAt(index);
+            self.events[at] = .{ .slot = pickup.slot, .collector = pickup.collector };
             self.event_slots.insert(at);
         }
-        const blocked = self.scratch.row(2);
-        blocked.clear();
+        try self.sendPickups();
+        // Orbs gone, then every orb there is, by id.
+        var changes = self.deps.tracking.changesOf(self.tracker);
+        while (changes.next()) |change| if (change.gone) try self.update(change.slot, null, change);
+        const ids = experience.ids();
+        const orbs = self.orbs[0..ids.len];
+        @memcpy(orbs, ids);
+        const directory = &experience.deps.entities.directory;
+        for (orbs) |entity| {
+            const found = (try experience.get(entity)) orelse return error.Corrupt;
+            if (!found.orb.alive) continue;
+            const slot = directory.slotOf(entity) orelse return error.Corrupt;
+            try self.update(slot, .{ .entity = entity, .orb = found.orb, .body = found.body orelse return error.Corrupt }, self.deps.tracking.changed(slot));
+        }
+        try self.sendSounds();
+    }
+
+    fn sendPickups(self: *ExperienceReplication) !void {
+        const blocked = self.row(0);
+        @memset(blocked, 0);
         for (0..self.event_span) |event_offset| {
             const at = (self.first_event + event_offset) % self.events.len;
             if (!self.event_slots.contains(at)) continue;
             const event = self.events[at];
-            const recipients = self.event_recipients.row(at);
+            const recipients = self.eventRow(at);
             var count: usize = 0;
-            var remaining = recipients.view().iterator();
+            var remaining = self.set(recipients).iterator();
             while (remaining.next()) |player| {
-                if (blocked.view().contains(player)) continue;
+                if (self.set(blocked).contains(player)) continue;
                 if (self.deps.players.records[player].handle) |handle| {
                     self.targets[count] = .{ .handle = handle, .protocol = self.deps.players.records[player].protocol };
                     count += 1;
-                } else recipients.remove(player);
+                } else put(recipients, player, false);
             }
-            try self.deps.packets.fanout(writeCollect, self.targets[0..count], .{ self.deps.experience.networkId(event.entity), event.collector }, 32, self.deliveries[0..count]);
+            try self.deps.packets.fanout(writeCollect, self.targets[0..count], .{ entities.Entities.networkOfSlot(event.slot), event.collector }, 32, self.deliveries[0..count]);
             for (self.targets[0..count], self.deliveries[0..count]) |target, delivery| switch (delivery) {
-                .queued, .closed => recipients.remove(target.handle.index),
+                .queued, .closed => put(recipients, target.handle.index, false),
                 .unsupported => {
                     self.deps.sessions.disconnect(target.handle);
-                    recipients.remove(target.handle.index);
+                    put(recipients, target.handle.index, false);
                 },
-                .backpressured => blocked.insert(target.handle.index),
+                .backpressured => put(blocked, target.handle.index, true),
             };
-            if (!recipients.view().any()) self.event_slots.remove(at);
+            if (!self.set(recipients).any()) self.event_slots.remove(at);
         }
         while (self.event_span > 0 and !self.event_slots.contains(self.first_event)) {
             self.first_event = (self.first_event + 1) % self.events.len;
             self.event_span -= 1;
         }
-        // Every orb, by id, a batch at a time: the ids come sorted.
-        const ids = experience.ids();
-        const orbs = self.orbs[0..ids.len];
-        @memcpy(orbs, ids);
-        var next: usize = 0;
-        while (next < orbs.len) {
-            const count = @min(16, orbs.len - next);
-            try self.lookAt(orbs[next..][0..count], visibility);
-            next += count;
+    }
+
+    /// One orb: its removals, but not before a pickup a client is owed; its motion and value to
+    /// whoever has it, whole to whoever missed some; then its spawns.
+    fn update(self: *ExperienceReplication, slot: u32, live: ?Live, change: ?Tracking.Change) !void {
+        const tracking = self.deps.tracking;
+        const spawned = self.row(1);
+        const removed = self.row(2);
+        const pending = self.row(3);
+        @memset(spawned, 0);
+        @memset(removed, 0);
+        if (change) |value| {
+            // Whoever is still owed a pickup of the orb keeps it until then.
+            for (pending, 0..) |*word, index| word.* = value.remove.wordAt(index);
+            for (0..self.event_span) |event_offset| {
+                const at = (self.first_event + event_offset) % self.events.len;
+                if (!self.event_slots.contains(at) or self.events[at].slot != slot) continue;
+                for (pending, self.eventRow(at)) |*word, owed| word.* &= ~owed;
+            }
+            try self.deliver(.remove, slot, live, pending, removed);
         }
+        if (live) |orb| {
+            try self.sent.ensureFilled(@as(usize, slot) + 1, .{});
+            const sent = self.sent.at(slot);
+            if (sent.entity != orb.entity) sent.* = .{ .entity = orb.entity, .revision = orb.orb.revision, .burning = orb.orb.fire > 0 };
+            const known = tracking.known(slot);
+            if (known.any()) {
+                const stale = tracking.stale(slot);
+                const missed = self.row(4);
+                @memset(missed, 0);
+                if (sent.revision != orb.orb.revision) {
+                    for (pending, 0..) |*word, index| word.* = known.wordAt(index) & ~stale.wordAt(index) & ~removed[index];
+                    try self.deliver(.position, slot, live, pending, missed);
+                }
+                if (sent.burning != (orb.orb.fire > 0)) {
+                    for (pending, 0..) |*word, index| word.* = known.wordAt(index) & ~stale.wordAt(index) & ~removed[index];
+                    try self.deliver(.metadata, slot, live, pending, missed);
+                }
+                if (any(missed)) tracking.missed(slot, self.set(missed));
+                if (stale.any()) {
+                    for (pending, 0..) |*word, index| word.* = stale.wordAt(index) & ~removed[index];
+                    @memset(missed, 0);
+                    try self.deliver(.whole, slot, live, pending, missed);
+                    tracking.caughtUp(slot, self.set(missed));
+                }
+            }
+            sent.revision = orb.orb.revision;
+            sent.burning = orb.orb.fire > 0;
+            if (change) |value| {
+                for (pending, 0..) |*word, index| word.* = value.spawn.wordAt(index);
+                try self.deliver(.spawn, slot, live, pending, spawned);
+            }
+        }
+        if (change != null) tracking.confirm(slot, self.set(spawned), self.set(removed));
+    }
+
+    fn any(words: []const usize) bool {
+        for (words) |word| if (word != 0) return true;
+        return false;
+    }
+
+    /// Sends one phase to the players in `audience_words`; those it was queued for, or whose
+    /// session closed, go into `done`, but for a position or metadata, where `done` takes those
+    /// it could not be queued for.
+    fn deliver(self: *ExperienceReplication, comptime phase: Phase, slot: u32, live: ?Live, audience_words: []const usize, done: []usize) !void {
+        var recipients = self.set(audience_words).iterator();
+        var count: usize = 0;
+        while (recipients.next()) |player| {
+            const record = self.deps.players.records[player];
+            const handle = record.handle orelse {
+                put(done, player, phase != .position and phase != .metadata);
+                continue;
+            };
+            self.targets[count] = .{ .handle = handle, .protocol = record.protocol };
+            count += 1;
+        }
+        if (count == 0) return;
+        const entity = entities.Entities.networkOfSlot(slot);
+        const value = if (live) |orb| orb.orb.value else 0;
+        if (self.tracing) {
+            var hasher = std.hash.Wyhash.init(self.traced);
+            hasher.update(std.mem.asBytes(&entity));
+            hasher.update(&.{@backingInt(phase)});
+            hasher.update(std.mem.asBytes(&value));
+            for (self.targets[0..count]) |target| hasher.update(std.mem.asBytes(&target.handle.index));
+            self.traced = hasher.final();
+        }
+        const targets = self.targets[0..count];
+        const deliveries = self.deliveries[0..count];
+        switch (phase) {
+            .remove => try self.deps.packets.fanout(writeRemove, targets, .{entity}, 32, deliveries),
+            .spawn => {
+                const orb = live.?;
+                try self.deps.packets.fanoutGroup(.{ entity_packets.spawn, writeValue }, targets, .{ .{ entity, orb.body }, .{ entity, value, orb.orb.fire > 0 } }, &.{ 128, 32 }, deliveries);
+            },
+            .position => try self.deps.packets.fanout(writePosition, targets, .{ entity, live.?.body, live.?.orb.on_ground }, 128, deliveries),
+            .metadata => try self.deps.packets.fanout(writeValue, targets, .{ entity, value, live.?.orb.fire > 0 }, 32, deliveries),
+            .whole => {
+                const orb = live.?;
+                try self.deps.packets.fanoutGroup(.{ writePosition, writeValue }, targets, .{ .{ entity, orb.body, orb.orb.on_ground }, .{ entity, value, orb.orb.fire > 0 } }, &.{ 128, 32 }, deliveries);
+            },
+        }
+        for (targets, deliveries) |target, delivery| {
+            const player = target.handle.index;
+            switch (phase) {
+                .position, .metadata => if (delivery == .backpressured) put(done, player, true),
+                else => if (delivery == .queued or delivery == .closed) put(done, player, true),
+            }
+            if (delivery == .unsupported) self.deps.sessions.disconnect(target.handle);
+        }
+    }
+
+    /// The level-up sounds players earned this tick, to those around who can see them.
+    fn sendSounds(self: *ExperienceReplication) !void {
+        const experience = self.deps.experience;
+        const visibility = self.deps.streaming.snapshotVisibility();
         for (self.deps.players.activeSlots()) |source| {
             const sound = experience.sounds[source];
             const volume = sound.volume orelse continue;
@@ -271,127 +344,6 @@ pub const ExperienceReplication = struct {
             try self.deps.packets.fanout(writeLevelSound, self.targets[0..count], .{ player.position, volume, sound.seed }, 64, self.deliveries[0..count]);
             experience.sounds[source].volume = null;
         }
-    }
-
-    /// A replaced connection's player knows none of an orb any more.
-    fn forgetReset(self: *ExperienceReplication, view: *View) void {
-        if (!self.reset.view().any()) return;
-        view.known.subtract(view.known.view(), self.reset.view());
-        view.dirty.subtract(view.dirty.view(), self.reset.view());
-        view.metadata.subtract(view.metadata.view(), self.reset.view());
-    }
-
-    fn lookAt(self: *ExperienceReplication, ids: []const entities.Id, visibility: *const Streaming.Visibility) !void {
-        const experience = self.deps.experience;
-        var views: [16]View = undefined;
-        try self.holdViews(ids, views[0..ids.len]);
-        var let_go: usize = 0;
-        defer for (views[let_go..ids.len]) |*view| self.letGo(view);
-        var forgotten: [16]entities.Id = undefined;
-        var forgotten_count: usize = 0;
-        for (ids, views[0..ids.len]) |entity, *view| {
-            const found = (try experience.get(entity)) orelse return error.Corrupt;
-            const orb = found.orb;
-            const body = found.body orelse entities.State{ .uuid = 0, .kind = 0, .world = 0, .position = .{ 0, 0, 0 } };
-            self.forgetReset(view);
-            if (view.header.revision != orb.revision) {
-                view.dirty.unite(view.dirty.view(), view.known.view());
-                view.header.revision = orb.revision;
-            }
-            if (view.header.burning != (orb.fire > 0)) {
-                view.metadata.unite(view.metadata.view(), view.known.view());
-                view.header.burning = orb.fire > 0;
-            }
-            const desired = self.scratch.row(0);
-            const pending = self.scratch.row(1);
-            if (orb.alive) _ = self.interest(body, visibility) else desired.clear();
-            const collecting = self.scratch.row(3);
-            collecting.clear();
-            for (0..self.event_span) |event_offset| {
-                const at = (self.first_event + event_offset) % self.events.len;
-                if (!self.event_slots.contains(at) or self.events[at].entity != entity) continue;
-                collecting.unite(collecting.view(), self.event_recipients.row(at).view());
-            }
-            pending.subtract(view.known.view(), desired.view());
-            pending.subtract(pending.view(), collecting.view());
-            try self.deliver(.remove, view, body, orb.value, orb.on_ground, pending);
-            pending.subtract(desired.view(), view.known.view());
-            try self.deliver(.spawn, view, body, orb.value, orb.on_ground, pending);
-            pending.intersect(view.metadata.view(), desired.view());
-            try self.deliver(.metadata, view, body, orb.value, orb.on_ground, pending);
-            pending.intersect(view.dirty.view(), desired.view());
-            try self.deliver(.position, view, body, orb.value, orb.on_ground, pending);
-            if (!orb.alive and !view.known.view().any() and !collecting.view().any()) {
-                view.forget = true;
-                forgotten[forgotten_count] = entity;
-                forgotten_count += 1;
-            }
-        }
-        for (views[0..ids.len]) |*view| {
-            self.letGo(view);
-            let_go += 1;
-        }
-        for (forgotten[0..forgotten_count]) |entity| try experience.forget(entity);
-    }
-
-    fn interest(self: *ExperienceReplication, body: entities.State, visibility: *const Streaming.Visibility) audience.Row {
-        const desired = self.scratch.row(0);
-        desired.clear();
-        var nearby = self.deps.players.nearby(body.world, .{ .x = body.position[0], .y = body.position[1], .z = body.position[2] }, 6);
-        while (nearby.next()) |at| {
-            const player = self.deps.players.records[at];
-            if (player.handle == null or player.stage != .ready) continue;
-            if (@abs(player.position.x - body.position[0]) > 96 or @abs(player.position.z - body.position[2]) > 96) continue;
-            if (visibility.boundsVisible(at, &player, body.world, .{
-                .minimum = .{ @intFromFloat(@floor(body.position[0] - 1)), @intFromFloat(@floor(body.position[1] - 1)), @intFromFloat(@floor(body.position[2] - 1)) },
-                .maximum = .{ @intFromFloat(@ceil(body.position[0] + 1)), @intFromFloat(@ceil(body.position[1] + 1)), @intFromFloat(@ceil(body.position[2] + 1)) },
-            })) desired.insert(at);
-        }
-        return desired;
-    }
-
-    fn deliver(self: *ExperienceReplication, comptime phase: Phase, view: *View, body: entities.State, value: i32, on_ground: bool, audience_row: audience.Row) !void {
-        var recipients = audience_row.view().iterator();
-        var count: usize = 0;
-        while (recipients.next()) |player| {
-            self.targets[count] = .{ .handle = self.deps.players.records[player].handle.?, .protocol = self.deps.players.records[player].protocol };
-            count += 1;
-        }
-        if (count == 0) return;
-        const entity = self.deps.experience.networkId(view.entity);
-        if (self.tracing) {
-            var hasher = std.hash.Wyhash.init(self.traced);
-            hasher.update(std.mem.asBytes(&entity));
-            hasher.update(&.{@backingInt(phase)});
-            hasher.update(std.mem.asBytes(&value));
-            for (self.targets[0..count]) |target| hasher.update(std.mem.asBytes(&target.handle.index));
-            self.traced = hasher.final();
-        }
-        switch (phase) {
-            .spawn => try self.deps.packets.fanoutGroup(.{ entity_packets.spawn, writeValue }, self.targets[0..count], .{ .{ entity, body }, .{ entity, value, view.header.burning } }, &.{ 128, 32 }, self.deliveries[0..count]),
-            .position => try self.deps.packets.fanout(writePosition, self.targets[0..count], .{ entity, body, on_ground }, 128, self.deliveries[0..count]),
-            .metadata => try self.deps.packets.fanout(writeValue, self.targets[0..count], .{ entity, value, view.header.burning }, 32, self.deliveries[0..count]),
-            .remove => try self.deps.packets.fanout(writeRemove, self.targets[0..count], .{entity}, 32, self.deliveries[0..count]),
-        }
-        for (self.targets[0..count], self.deliveries[0..count]) |target, delivery| switch (delivery) {
-            .queued => switch (phase) {
-                .spawn => view.known.insert(target.handle.index),
-                .position => view.dirty.remove(target.handle.index),
-                .metadata => view.metadata.remove(target.handle.index),
-                .remove => {
-                    view.known.remove(target.handle.index);
-                    view.dirty.remove(target.handle.index);
-                    view.metadata.remove(target.handle.index);
-                },
-            },
-            .unsupported => self.deps.sessions.disconnect(target.handle),
-            .closed => {
-                view.known.remove(target.handle.index);
-                view.dirty.remove(target.handle.index);
-                view.metadata.remove(target.handle.index);
-            },
-            .backpressured => {},
-        };
     }
 };
 fn writeExperience(packet: wire.play.toClient.packet_experience.Writer, value: State) ![]u8 {

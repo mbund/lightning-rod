@@ -36,6 +36,13 @@ pub const Lifecycle = struct {
     working: ?usize = null,
     selected: bit_sets.Set = undefined,
 
+    /// The bytes its rows take.
+    pub fn memoryBytes(self: *const Lifecycle) usize {
+        var words = self.known.words.len + self.listed.words.len + self.chat.words.len + self.moded.words.len;
+        for (self.mode) |matrix| words += matrix.words.len;
+        return words * @sizeOf(usize);
+    }
+
     pub fn init(allocator: std.mem.Allocator, players: usize) !Lifecycle {
         assert(players > 0);
         return .{

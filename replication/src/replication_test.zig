@@ -10,6 +10,7 @@ const minecraft = @import("minecraft_model");
 const Players = @import("players").players.Players;
 const Replication = @import("replication.zig").Replication;
 const Visibility = @import("visibility.zig").Visibility;
+const Tracking = @import("tracking.zig").Tracking;
 
 const Client = protocols.implementations[0].Protocol.play.toClient;
 
@@ -74,7 +75,7 @@ const Fixture = struct {
         self.players.rebuildIndexes();
         self.players.setRules(.init(Fixture, self, Rules.gameMode, Rules.spawnWorld, Rules.spawnPoint));
         self.visibility = try Visibility.init(allocator, .{}, .{ .players = &self.players });
-        self.replication = try Replication.init(allocator, .{ .update_interval = 1 }, .{ .players = &self.players, .visibility = self.visibility });
+        self.replication = try Replication.init(allocator, .{ .update_interval = 1 }, .{ .players = &self.players, .visibility = self.visibility, .tracking = try Tracking.forTests(allocator, &self.players) });
         for (0..count) |index| self.open(index, true);
     }
 
@@ -87,7 +88,8 @@ const Fixture = struct {
     fn step(self: *Fixture) !void {
         self.players.rebuildIndexes();
         self.visibility.tick();
-        self.replication.tick();
+        try self.replication.deps.tracking.tick();
+        try self.replication.tick();
         while (self.service.output.takeReady()) |packet| {
             const id = (try Client.readHeader(packet.bytes)).id;
             var recipients = packet.recipients.iterator();
@@ -254,4 +256,23 @@ test "observers that fall behind catch up with relative moves, even with 512 pla
     }
     try std.testing.expect(moves > 0);
     try std.testing.expect(!fixture.disconnected());
+}
+
+test "a turn and a walk reach every observer whole" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var fixture: Fixture = undefined;
+    try fixture.init(arena.allocator(), 2);
+    for (0..4) |_| try fixture.step();
+    try std.testing.expect(fixture.replication.state(0, 1).spawned);
+    const alice = &fixture.players.records[0];
+    alice.rotation.yaw = 90;
+    for (0..12) |tick| {
+        if (tick < 6) alice.position.x -= 0.1;
+        try fixture.step();
+    }
+    const seen = fixture.replication.observed(0, 1);
+    // 90 degrees as an angle byte.
+    try std.testing.expectEqual(@as(i8, 64), seen.value.yaw);
+    try std.testing.expectEqual(@as(?i8, 64), seen.value.head);
 }

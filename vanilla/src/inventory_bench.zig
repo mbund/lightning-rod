@@ -33,6 +33,7 @@ const Lighting = @import("terrain").lighting.Lighting;
 const Streaming = @import("terrain").streaming.Streaming;
 const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
 const ItemReplication = @import("vanilla_inventory").item_replication.ItemReplication;
+const Tracking = @import("replication").tracking.Tracking;
 const InventoryMenus = @import("vanilla_containers").inventory_menus.InventoryMenus;
 
 const Sink = struct {
@@ -230,7 +231,7 @@ pub fn benchmarkEquipment() !void {
         }
         players.rebuildIndexes();
         const player_states = try survivalStates(allocator, player_records);
-        const replication = try Replication.init(allocator, .{}, .{ .players = &players, .visibility = try Visibility.init(allocator, .{}, .{ .players = &players }) });
+        const replication = try Replication.init(allocator, .{}, .{ .players = &players, .visibility = try Visibility.init(allocator, .{}, .{ .players = &players }), .tracking = try Tracking.forTests(allocator, &players) });
         const equipment = try Equipment.init(allocator, .{}, .{
             .replication = replication,
             .menus = undefined,
@@ -524,7 +525,7 @@ pub fn benchmarkItemReplication() !void {
         @memset(streaming.published.sent, std.math.maxInt(u64));
         @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
-        const replication = try ItemReplication.init(allocator, .{ .position_interval = 1 }, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
+        const replication = try ItemReplication.init(allocator, .{ .position_interval = 1 }, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
         const Mode = enum { blocked_spawn, spawn, unchanged, single_move, unchanged_after_single_move, single_stack, unchanged_after_single_stack, age_only, blocked_change, change, mutation, unchanged_after_mutation, blocked_mutation, resumed_mutation, blocked_retirement, retirement, reuse, unchanged_after_reuse, leave_view, return_view, viewer_reset };
         for (std.enums.values(Mode)) |mode| {
             const blocked = mode == .blocked_spawn or mode == .blocked_change or mode == .blocked_mutation or mode == .blocked_retirement;
@@ -587,6 +588,7 @@ pub fn benchmarkItemReplication() !void {
             const definitions_before = ownership.items.metrics.acquired.value();
             service.beginTick();
             streaming.tick();
+            try replication.deps.tracking.tick();
             try replication.tick();
             service.endTick(true);
             service.flush();
@@ -871,7 +873,7 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
     @memset(streaming.published.sent, std.math.maxInt(u64));
     @memset(streaming.published.occluded, 0);
     streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
-    const replication = try ItemReplication.init(allocator, .{ .position_interval = 1 }, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
+    const replication = try ItemReplication.init(allocator, .{ .position_interval = 1 }, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
 
     const Step = struct { position: [2]f64, visible: bool = true, unchanged: bool = false };
     const steps = [_]Step{
@@ -880,21 +882,22 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
         .{ .position = .{ 1.125, 1 }, .unchanged = true },
         .{ .position = .{ 1.125, 1.125 }, .unchanged = true },
         .{ .position = .{ 1, 1 }, .unchanged = true },
-        .{ .position = .{ 96.5, 0 } },
-        .{ .position = .{ 96.625, 0 }, .visible = false },
-        .{ .position = .{ 96.5, 0 } },
-        .{ .position = .{ 0, 96.5 } },
-        .{ .position = .{ 0, 96.625 }, .visible = false },
-        .{ .position = .{ 0, 96.5 } },
-        .{ .position = .{ 96.5, 96.5 } },
-        .{ .position = .{ 96.625, 96.625 }, .visible = false },
-        .{ .position = .{ 96.5, 96.5 } },
-        .{ .position = .{ -95.5, 0 } },
-        .{ .position = .{ -95.625, 0 }, .visible = false },
-        .{ .position = .{ -95.5, 0 } },
-        .{ .position = .{ 0, -95.5 } },
-        .{ .position = .{ 0, -95.625 }, .visible = false },
-        .{ .position = .{ 0, -95.5 } },
+        // The items sit at 0.5, 0.5: tracked out to 96 blocks around, measured as a circle.
+        .{ .position = .{ 96.5, 0.5 } },
+        .{ .position = .{ 96.625, 0.5 }, .visible = false },
+        .{ .position = .{ 96.5, 0.5 } },
+        .{ .position = .{ 0.5, 96.5 } },
+        .{ .position = .{ 0.5, 96.625 }, .visible = false },
+        .{ .position = .{ 0.5, 96.5 } },
+        .{ .position = .{ 68.375, 68.375 } },
+        .{ .position = .{ 68.5, 68.5 }, .visible = false },
+        .{ .position = .{ 68.375, 68.375 } },
+        .{ .position = .{ -95.5, 0.5 } },
+        .{ .position = .{ -95.625, 0.5 }, .visible = false },
+        .{ .position = .{ -95.5, 0.5 } },
+        .{ .position = .{ 0.5, -95.5 } },
+        .{ .position = .{ 0.5, -95.625 }, .visible = false },
+        .{ .position = .{ 0.5, -95.5 } },
     };
     var was_visible = false;
     for (steps, 0..) |step, index| {
@@ -905,6 +908,7 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
         service.credit[connection].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
         service.beginTick();
         streaming.tick();
+        try replication.deps.tracking.tick();
         try replication.tick();
         service.endTick(true);
         service.flush();
@@ -992,7 +996,7 @@ pub fn benchmarkItemVisibility() !void {
         @memset(streaming.published.sent, std.math.maxInt(u64));
         @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
-        const replication = try ItemReplication.init(allocator, .{ .position_interval = 1 }, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
+        const replication = try ItemReplication.init(allocator, .{ .position_interval = 1 }, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
 
         for (0..9) |mode| {
             if (mode == 2) {
@@ -1023,6 +1027,7 @@ pub fn benchmarkItemVisibility() !void {
             for (0..2) |i| service.credit[i].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
             service.beginTick();
             streaming.tick();
+            try replication.deps.tracking.tick();
             try replication.tick();
             service.endTick(true);
             service.flush();
@@ -1354,13 +1359,14 @@ pub fn benchmarkItemBroadcast() !void {
         @memset(streaming.published.sent, std.math.maxInt(u64));
         @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
-        const replication = try ItemReplication.init(allocator, .{ .position_interval = 1 }, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
+        const replication = try ItemReplication.init(allocator, .{ .position_interval = 1 }, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
 
         const expected_viewers = viewers;
         for (0..2) |_| {
             for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
             service.beginTick();
             streaming.tick();
+            try replication.deps.tracking.tick();
             try replication.tick();
             service.endTick(true);
             service.flush();
@@ -1391,6 +1397,7 @@ pub fn benchmarkItemBroadcast() !void {
             const reservations = service.instruments.broadcast_reservations.value();
             service.beginTick();
             streaming.tick();
+            try replication.deps.tracking.tick();
             try replication.tick();
             service.endTick(true);
             service.flush();
@@ -1445,6 +1452,7 @@ pub fn benchmarkItemBroadcast() !void {
                 for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
                 service.beginTick();
                 streaming.tick();
+                try replication.deps.tracking.tick();
                 try replication.tick();
                 service.endTick(true);
                 service.flush();
@@ -1696,7 +1704,7 @@ pub fn benchmarkItemBoundaries() !void {
             .storage = try store.openSpace("metadata"),
         });
         var ids: [1024]entities.Id = undefined;
-        for (ids[0..count]) |*id| id.* = try dropped.create(world, .{ 96.5, 65, 0.5 }, @splat(0), stack);
+        for (ids[0..count]) |*id| id.* = try dropped.create(world, .{ 96.5, 65, 1 }, @splat(0), stack);
         var catalog = try protocols.Default.init(allocator);
         defer catalog.deinit(allocator);
         var sink: Sink = .{};
@@ -1718,7 +1726,7 @@ pub fn benchmarkItemBoundaries() !void {
         @memset(streaming.published.sent, std.math.maxInt(u64));
         @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
-        const replication = try ItemReplication.init(allocator, .{ .position_interval = 1 }, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
+        const replication = try ItemReplication.init(allocator, .{ .position_interval = 1 }, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
 
         failing.fail_index = failing.alloc_index;
         const Step = struct { position: [2]f64, visible: bool = true, unchanged: bool = false };
@@ -1729,13 +1737,12 @@ pub fn benchmarkItemBoundaries() !void {
                 player.position.x = step.position[0] + @as(f64, @floatFromInt(player.handle.?.index)) / @as(f64, @floatFromInt(viewers * 16));
                 player.position.z = step.position[1];
             }
-            const candidates_before = replication.selection_candidates.value();
-            const nodes_before = replication.selection_nodes.value();
             players.rebuildIndexes();
             const metadata_before = dropped.reads;
             for (service.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
             service.beginTick();
             streaming.tick();
+            try replication.deps.tracking.tick();
             try replication.tick();
             service.endTick(true);
             service.flush();
@@ -1747,8 +1754,6 @@ pub fn benchmarkItemBoundaries() !void {
             }
             const metadata_acquired = dropped.reads - metadata_before;
             if (step.unchanged) {
-                try std.testing.expectEqual(@as(u64, @intCast(count)), replication.selection_candidates.value() - candidates_before);
-                try std.testing.expect(replication.selection_nodes.value() - nodes_before <= (viewers * 4 + count) * 32);
                 try std.testing.expectEqual(@as(u64, 0), metadata_acquired);
             }
             if (was_visible == step.visible) try std.testing.expectEqual(@as(usize, 0), queued) else try std.testing.expect(queued > 0);
@@ -1758,7 +1763,7 @@ pub fn benchmarkItemBoundaries() !void {
                 try std.testing.expectEqual(@as(usize, 0), view.pending);
             }
             was_visible = step.visible;
-            try output.interface.print("BOUNDARY viewers={d} items={d} step={d} spatial_candidates={d} coverage_nodes={d} reads={d} packets={d}\n", .{ viewers, count, index, replication.selection_candidates.value() - candidates_before, replication.selection_nodes.value() - nodes_before, metadata_acquired, queued });
+            try output.interface.print("BOUNDARY viewers={d} items={d} step={d} reads={d} packets={d}\n", .{ viewers, count, index, metadata_acquired, queued });
         }
     };
     try output.interface.flush();
@@ -2373,7 +2378,7 @@ pub fn itemPositionInterval() !void {
         @memset(streaming.published.sent, std.math.maxInt(u64));
         @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
-        const replication = try ItemReplication.init(allocator, .{}, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .streaming = streaming, .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
+        const replication = try ItemReplication.init(allocator, .{}, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
         var positions: usize = 0;
         for (0..41) |tick| {
             if (tick > 0) {
@@ -2389,6 +2394,7 @@ pub fn itemPositionInterval() !void {
             service.credit[0].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
             service.beginTick();
             streaming.tick();
+            try replication.deps.tracking.tick();
             try replication.tick();
             service.endTick(true);
             service.flush();

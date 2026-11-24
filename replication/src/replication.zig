@@ -5,8 +5,6 @@ const Lifecycle = @import("lifecycle.zig").Lifecycle;
 const bit_sets = @import("lightning_rod").system.bit_sets;
 const IndexSet = @import("lightning_rod").system.IndexSet;
 const Visibility = @import("visibility.zig").Visibility;
-const Streaming = @import("terrain").streaming.Streaming;
-const geometry_bounds = @import("occlusion").bounds;
 const std = @import("std");
 const protocols = @import("minecraft_packets").protocols;
 const sessions = @import("sessions");
@@ -18,8 +16,7 @@ const packets = @import("minecraft_packets");
 const wire_1_21_5 = @import("wire_1_21_5");
 const wire_1_21_9 = @import("wire_1_21_9");
 
-const SpatialIndex = @import("players").player_spatial.Index;
-const SpatialGroups = @import("players").player_spatial.Groups;
+const Tracking = @import("tracking.zig").Tracking;
 
 const assert = std.debug.assert;
 
@@ -30,8 +27,9 @@ pub const Replication = struct {
         /// Ticks between a player's movement updates. Vanilla tracks players every second tick.
         update_interval: u8 = 2,
     };
+    const no_slot = std.math.maxInt(u32);
 
-    pub const Dependencies = struct { players: *Players, visibility: *Visibility, streaming: ?*Streaming = null };
+    pub const Dependencies = struct { players: *Players, visibility: *Visibility, tracking: *Tracking };
 
     const Spawn = struct {
         entity_id: i32,
@@ -98,17 +96,12 @@ pub const Replication = struct {
         world: u32 = 0,
         spawned: audience_storage.Row = .{},
         pending: audience_storage.Row = .{},
-        nearby: audience_storage.Row = .{},
-        /// The observer's view distance the nearby set was found for.
-        view_distance: i32 = 0,
         ready: bool = false,
         pending_dirty: bool = false,
     };
 
     deps: Dependencies,
     actors: IndexSet,
-    spatial_changes: SpatialIndex,
-    neighborhoods: SpatialGroups,
     lifecycle: Lifecycle,
     /// What each observer's client last took of each subject's movement and head, subject
     /// major: exact for every pair, so an observer that fell behind catches up with relative
@@ -138,7 +131,12 @@ pub const Replication = struct {
     group_epoch: u64 = 0,
     last_group_count: usize = 0,
     broadcast_groups: []BroadcastGroup,
-    render_distance: i32 = 0,
+    /// Who sees each player as an entity, as tracking answers: each subject's slot there, kept
+    /// after it leaves until every observer was told, and the visibility revision and connections
+    /// its allowed observers were last worked out for.
+    subject_slots: []u32,
+    allowed_revisions: []u64,
+    connections_changed: bool = false,
 
     /// The entity data a player's flags packet carries: its entity flags, the pose they imply,
     /// its living entity flags, and the skin layers its client shows.
@@ -220,6 +218,11 @@ pub const Replication = struct {
         @memset(subjects, .{});
         const motion = try allocator.alloc(Motion, deps.players.records.len);
         @memset(motion, .{});
+        const subject_slots = try allocator.alloc(u32, subjects.len);
+        @memset(subject_slots, no_slot);
+        const allowed_revisions = try allocator.alloc(u64, subjects.len);
+        @memset(allowed_revisions, std.math.maxInt(u64));
+        _ = try deps.tracking.trackPlayers(@intCast(game_data.registry.entityId("minecraft:player").?));
         const viewer_revisions = try allocator.alloc(u64, subjects.len);
         @memset(viewer_revisions, 0);
         const viewer_masks = try audience_storage.Matrix.complete(allocator, deps.players, deps.players.records.len, .recipients);
@@ -230,7 +233,7 @@ pub const Replication = struct {
         const audience_groups = try AudienceGroups.init(allocator, deps.players.records.len);
         const broadcast_groups = try allocator.alloc(BroadcastGroup, deps.players.records.len);
         const observer_sets = try audience_storage.Matrix.complete(allocator, deps.players, try std.math.mul(usize, 3, observers.len), .{ .subjects = 3 });
-        for (observers, 0..) |*observer, index| observer.* = .{ .spawned = observer_sets.row(index * 3), .pending = observer_sets.row(index * 3 + 1), .nearby = observer_sets.row(index * 3 + 2) };
+        for (observers, 0..) |*observer, index| observer.* = .{ .spawned = observer_sets.row(index * 3), .pending = observer_sets.row(index * 3 + 1) };
         const common_sets = try audience_storage.Matrix.complete(allocator, deps.players, try std.math.mul(usize, 3, common.len), .recipients);
         for (common, 0..) |*value, index| for (&value.members, 0..) |*members, phase| {
             members.* = common_sets.row(index * 3 + phase);
@@ -241,8 +244,6 @@ pub const Replication = struct {
         @memset(group_owners, 0);
         for (broadcast_groups, 0..) |*group, index| group.* = .{ .members = group_sets.row(index), .subjects = .{ .next = group_links, .owners = group_owners, .epoch = &self.group_epoch } };
         self.* = .{
-            .spatial_changes = try SpatialIndex.init(allocator, try std.math.mul(usize, 2, subjects.len)),
-            .neighborhoods = try SpatialGroups.init(allocator, subjects.len),
             .work_masks = try audience_storage.Matrix.complete(allocator, deps.players, try std.math.mul(usize, 3, deps.players.records.len), .recipients),
             .dirty_work = try IndexSet.init(allocator, try std.math.mul(usize, 3, deps.players.records.len)),
             .scratch = try sparse_sets.Workspace.init(allocator, std.enums.values(Scratch).len, deps.players.records.len),
@@ -256,6 +257,8 @@ pub const Replication = struct {
             .broadcast = broadcast,
             .deps = deps,
             .actors = try IndexSet.init(allocator, deps.players.records.len),
+            .subject_slots = subject_slots,
+            .allowed_revisions = allowed_revisions,
             .lifecycle = lifecycle,
             .pairs = pairs,
             .observers = observers,
@@ -271,7 +274,7 @@ pub const Replication = struct {
     }
 
     const Work = enum { updates, interested, audience };
-    const Scratch = enum { changed, movement_changed, head_changed, flags_changed, connected, spatial_changed, ready_observers, selected, nearby, difference, listed, lifecycle_remove_entity, lifecycle_remove_player, lifecycle_add_player, lifecycle_mode, lifecycle_chat, lifecycle_spawn, spawned, eligible, retry, previous, members, force, candidates, outstanding, group, delivered, failed, displaced, filtered, entity_audience, terrain_changed };
+    const Scratch = enum { changed, movement_changed, head_changed, flags_changed, connected, spatial_changed, ready_observers, selected, nearby, difference, listed, lifecycle_remove_entity, lifecycle_remove_player, lifecycle_add_player, lifecycle_mode, lifecycle_chat, lifecycle_spawn, spawned, eligible, retry, previous, members, force, candidates, outstanding, group, delivered, failed, displaced, filtered, entity_audience, terrain_changed, unspawned };
 
     fn workMask(self: *const Replication, index: usize, comptime kind: Work) bit_sets.Set {
         assert(index < self.subjects.len);
@@ -295,31 +298,45 @@ pub const Replication = struct {
         self.pending_subjects.insert(subject);
     }
 
-    fn spatialPosition(subject: Subject) SpatialIndex.Position {
-        assert(subject.generation != 0);
-        return .{ .world = subject.world, .x = @intCast(subject.cell[0]), .z = @intCast(subject.cell[1]) };
-    }
-
-    fn orderObservers(self: *Replication, spatial: bool) []const usize {
-        self.neighborhoods.clear();
-        if (!spatial) return self.actors.values();
-        for (self.actors.values()) |index| {
-            const subject = self.subjects[index];
-            self.neighborhoods.add(index, .{ .world = subject.world, .x = @intCast(subject.cell[0]), .z = @intCast(subject.cell[1]) });
-        }
-        assert(self.neighborhoods.members == self.actors.count);
-        return self.neighborhoods.ordered();
-    }
-
-    pub fn tick(self: *Replication) void {
+    /// The pairs tracking changed for every player as a subject go to work; removals owed to
+    /// observers not ready, whose clients start over, are taken as told. Each subject's allowed
+    /// observers follow its visibility rules, worked out again as they or the connections change.
+    fn trackedChanges(self: *Replication, ready: bit_sets.Set, connected: bit_sets.Set) !void {
+        const tracking = self.deps.tracking;
         const players = self.deps.players;
-        const terrain = if (self.deps.streaming) |streaming| streaming.snapshotVisibility() else null;
-        const terrain_changed = self.temp(.terrain_changed);
-        terrain_changed.clear();
-        if (terrain) |snapshot| {
-            for (snapshot.reset.values()) |index| terrain_changed.insert(index);
-            for (snapshot.changed_words.values()) |word| terrain_changed.insert(word / snapshot.grid.words);
+        for (self.actors.values()) |index| {
+            if (tracking.playerSlot(index)) |slot| self.subject_slots[index] = slot;
+            const slot = self.subject_slots[index];
+            if (slot == no_slot) continue;
+            // Gone and told everywhere: the slot is no longer its.
+            if (tracking.playerSlot(index) == null and !tracking.known(slot).any()) {
+                self.subject_slots[index] = no_slot;
+                continue;
+            }
+            if (players.records[index].handle) |handle| if (tracking.playerSlot(index) != null) {
+                const revision = self.deps.visibility.player_entity.revision(index);
+                if (revision != self.allowed_revisions[index] or self.connections_changed) {
+                    self.allowed_revisions[index] = revision;
+                    const allowed = self.temp(.filtered);
+                    _ = self.deps.visibility.player_entity.filter(handle, connected, allowed);
+                    // At once, as rules hide and show players the tick they change.
+                    if (try tracking.restrict(slot, if (allowed.view().eql(connected)) null else allowed.view())) try tracking.reconsider(slot);
+                }
+            };
+            const change = tracking.changed(slot) orelse continue;
+            const audience = self.editWorkMask(index, .audience);
+            const forgotten = self.temp(.unspawned);
+            forgotten.clear();
+            var spawning = change.spawn.iterator();
+            while (spawning.next()) |other| if (ready.contains(other)) audience.insert(other);
+            var removing = change.remove.iterator();
+            while (removing.next()) |other| if (ready.contains(other)) audience.insert(other) else forgotten.insert(other);
+            if (forgotten.view().any()) tracking.confirm(slot, tracking.nobody(), forgotten.view());
         }
+    }
+
+    pub fn tick(self: *Replication) !void {
+        const players = self.deps.players;
         for (players.activeSlots()) |index| self.actors.insert(index);
         const changed = self.temp(.changed);
         changed.clear();
@@ -331,14 +348,6 @@ pub const Replication = struct {
         flags_changed.clear();
         const connected = self.temp(.connected);
         connected.clear();
-        const spatial_changed = self.temp(.spatial_changed);
-        spatial_changed.clear();
-        var appeared = false;
-        const distance_changed = self.render_distance != players.config.render_distance;
-        self.render_distance = players.config.render_distance;
-        while (self.spatial_changes.active.count != 0) {
-            self.spatial_changes.update(self.spatial_changes.active.indices[self.spatial_changes.active.count - 1], null);
-        }
         for (self.actors.values()) |index| {
             const player = players.records[index];
             const subject = &self.subjects[index];
@@ -346,8 +355,6 @@ pub const Replication = struct {
             if (generation == 0) {
                 if (subject.generation != 0) {
                     changed.insert(index);
-                    spatial_changed.insert(index);
-                    self.spatial_changes.update(index * 2, spatialPosition(subject.*));
                     // Its uuid stays while observers are still told it left.
                     subject.* = .{ .uuid = subject.uuid };
                     self.forgetSubject(index);
@@ -356,7 +363,6 @@ pub const Replication = struct {
             }
             // A slot takes a new player only once every observer forgot the last.
             if (subject.generation != generation) assert(subject.generation != 0 or self.lifecycle.drained(index));
-            appeared = appeared or (player.stage == .ready and !self.observers[index].ready);
             const next: Subject = .{
                 .generation = generation,
                 .gamemode = players.gameMode(index),
@@ -376,12 +382,6 @@ pub const Replication = struct {
             if (generation != subject.generation or next.gamemode != subject.gamemode or next.entity_visibility != subject.entity_visibility or next.tab_visibility != subject.tab_visibility or next.chat != subject.chat) changed.insert(index);
             if (generation == subject.generation and next.chat != subject.chat) self.lifecycle.chatChanged(index);
             const moved = !std.meta.eql(next.position, subject.position);
-            if (terrain != null and moved and !std.meta.eql(terrainSections(next.position), terrainSections(subject.position))) changed.insert(index);
-            if (generation != subject.generation or next.world != subject.world or !std.meta.eql(next.cell, subject.cell)) {
-                spatial_changed.insert(index);
-                if (subject.generation != 0) self.spatial_changes.update(index * 2, spatialPosition(subject.*));
-                self.spatial_changes.update(index * 2 + 1, spatialPosition(next));
-            }
             const motion = &self.motion[index];
             if (moved or next.yaw != subject.yaw or next.pitch != subject.pitch or next.on_ground != subject.on_ground) motion.moved = true;
             if (next.yaw != subject.yaw) motion.turned = true;
@@ -398,14 +398,9 @@ pub const Replication = struct {
         for (self.dirty_work.values()) |row| self.work_masks.row(row).clear();
         self.dirty_work.clear();
         const lifecycle_changed = changed.view().any();
-        const moved_cells = spatial_changed.view().any();
         const ready_observers = self.temp(.ready_observers);
         ready_observers.clear();
-        var neighborhood: ?SpatialIndex.Position = null;
-        var neighborhood_distance: i32 = 0;
-        var affected = false;
-        var captured = false;
-        for (self.orderObservers(moved_cells or distance_changed or appeared)) |other| {
+        for (self.actors.values()) |other| {
             const observer = players.records[other];
             const watching = &self.observers[other];
             const generation = if (observer.handle) |handle| handle.generation else 0;
@@ -423,20 +418,15 @@ pub const Replication = struct {
                 self.forgetObserver(other);
                 const spawned = watching.spawned;
                 const pending = watching.pending;
-                const nearby = watching.nearby;
                 spawned.clear();
                 if (generation == 0) pending.clear() else pending.copy(connected.view());
-                nearby.clear();
-                watching.* = .{ .generation = generation, .world = observer.world, .spawned = spawned, .pending = pending, .nearby = nearby, .pending_dirty = true };
+                watching.* = .{ .generation = generation, .world = observer.world, .spawned = spawned, .pending = pending, .pending_dirty = true };
+                // Who may see whom is worked out again for the connections there now.
+                self.connections_changed = true;
             }
             if (generation == 0) continue;
             if (lifecycle_changed) {
                 watching.pending.unite(watching.pending.view(), changed.view());
-                watching.pending_dirty = true;
-            }
-            if (terrain_changed.view().contains(other)) {
-                watching.pending.unite(watching.pending.view(), watching.nearby.view());
-                watching.pending.unite(watching.pending.view(), watching.spawned.view());
                 watching.pending_dirty = true;
             }
             if (observer.stage != .ready) {
@@ -444,11 +434,7 @@ pub const Replication = struct {
                 continue;
             }
             ready_observers.insert(other);
-            // Each observer sees subjects within its own view distance.
-            const reach = players.viewDistanceOf(observer);
-            const reached = watching.view_distance != reach;
-            watching.view_distance = reach;
-            if (watching.ready and watching.world == observer.world and !distance_changed and !reached and !watching.pending_dirty and !moved_cells) continue;
+            if (watching.ready and watching.world == observer.world and !watching.pending_dirty) continue;
             const selected = self.temp(.selected);
             selected.copy(watching.pending.view());
             if (watching.world != observer.world) {
@@ -458,30 +444,6 @@ pub const Replication = struct {
                 watching.spawned.clear();
                 watching.world = observer.world;
             }
-            const center = spatialPosition(self.subjects[other]);
-            if (!std.meta.eql(neighborhood, @as(?SpatialIndex.Position, center)) or neighborhood_distance != reach) {
-                neighborhood = center;
-                neighborhood_distance = reach;
-                captured = false;
-                affected = false;
-                if (moved_cells) {
-                    var changes = self.spatial_changes.query(center, self.render_distance);
-                    affected = changes.next() != null;
-                }
-            }
-            if (distance_changed or reached or spatial_changed.view().contains(other) or !watching.ready or affected) {
-                const nearby = self.temp(.nearby);
-                if (!captured) {
-                    nearby.clear();
-                    var candidates = players.nearby(observer.world, observer.position, reach);
-                    while (candidates.next()) |index| nearby.insert(index);
-                    captured = true;
-                }
-                const difference = self.temp(.difference);
-                difference.difference(watching.nearby.view(), nearby.view());
-                selected.unite(selected.view(), difference.view());
-                watching.nearby.copy(nearby.view());
-            }
             if (!watching.ready) {
                 selected.unite(selected.view(), connected.view());
                 selected.unite(selected.view(), watching.spawned.view());
@@ -490,11 +452,12 @@ pub const Replication = struct {
             watching.pending.clear();
             watching.pending_dirty = false;
             var changed_subjects = selected.view().iterator();
-            while (changed_subjects.next()) |index| {
-                self.editWorkMask(index, .audience).insert(other);
-                if (watching.nearby.view().contains(index)) self.editWorkMask(index, .interested).insert(other);
-            }
+            while (changed_subjects.next()) |index| self.editWorkMask(index, .audience).insert(other);
         }
+        // Whom tracking says each player is to be shown to or no longer: those pairs are looked at.
+        // An observer not ready forgets what it was shown, and is taken as told.
+        try self.trackedChanges(ready_observers.view(), connected.view());
+        self.connections_changed = false;
         for (self.actors.values()) |index| {
             const moving = movement_changed.view().contains(index) or head_changed.view().contains(index) or flags_changed.view().contains(index);
             if (!moving and !self.pending_subjects.contains(index)) continue;
@@ -511,27 +474,23 @@ pub const Replication = struct {
             self.lifecycle.begin(index, audience);
             defer self.lifecycle.commit();
             var selected_observers = audience.iterator();
-            while (selected_observers.next()) |other| self.lifecycle.edit(other).spawned = self.observers[other].spawned.view().contains(index);
+            // Who has it spawned, as tracking keeps it.
+            const slot = self.subject_slots[index];
+            const known = if (slot == no_slot) self.deps.tracking.nobody() else self.deps.tracking.known(slot);
+            while (selected_observers.next()) |other| self.lifecycle.edit(other).spawned = known.contains(other);
             self.viewer_revisions[index] += 1;
             const generation = self.subjects[index].generation;
             const entity_row = self.editWorkMask(index, .interested);
             const listed_row = self.temp(.listed);
+            // Who is to have it, as tracking answers: who has it, less and more as this tick changes.
+            entity_row.copy(known);
+            if (slot != no_slot) if (self.deps.tracking.changed(slot)) |change| {
+                entity_row.subtract(entity_row.view(), change.remove);
+                entity_row.unite(entity_row.view(), change.spawn);
+            };
             if (subject.handle) |handle| {
-                const filtered = self.temp(.entity_audience);
-                _ = self.deps.visibility.player_entity.filter(handle, entity_row.view(), filtered);
-                entity_row.copy(filtered.view());
-                if (terrain) |snapshot| {
-                    const bounds = terrainBounds(self.subjects[index].position);
-                    var observers = entity_row.view().iterator();
-                    while (observers.next()) |other| {
-                        if (!snapshot.boundsVisible(other, &players.records[other], subject.world, bounds)) entity_row.remove(other);
-                    }
-                }
                 _ = self.deps.visibility.tab_list.filter(handle, ready_observers.view(), listed_row);
-            } else {
-                entity_row.clear();
-                listed_row.clear();
-            }
+            } else listed_row.clear();
             const entity_audience = entity_row.view();
             const listed_audience = listed_row.view();
             const Action = enum { remove_entity, remove_player, add_player, mode, chat, spawn };
@@ -598,6 +557,8 @@ pub const Replication = struct {
                     };
                     const spawned = self.temp(.spawned);
                     spawned.clear();
+                    const unspawned = self.temp(.unspawned);
+                    unspawned.clear();
                     for (targets[0..count], deliveries[0..count]) |target, delivery| {
                         const other = target.handle.index;
                         if (delivery != .queued) continue;
@@ -606,6 +567,7 @@ pub const Replication = struct {
                             .remove_entity => {
                                 self.detach(index, other);
                                 seen.spawned = false;
+                                unspawned.insert(other);
                                 if (generation == 0 or (other != index and !listed_audience.contains(other) and !entity_audience.contains(other))) needed[@backingInt(Action.remove_player)].insert(other);
                             },
                             .remove_player => {
@@ -634,6 +596,9 @@ pub const Replication = struct {
                         }
                     }
                     if (spawned.view().any()) inline for (std.enums.values(Phase)) |update| self.advance(index, update, spawned.view());
+                    // Tracking hears what clients now have.
+                    if (slot != no_slot and self.deps.tracking.changed(slot) != null and (spawned.view().any() or unspawned.view().any()))
+                        self.deps.tracking.confirm(slot, spawned.view(), unspawned.view());
                 }
             }
             selected = audience.iterator();
@@ -930,7 +895,7 @@ pub const Replication = struct {
         for (0..self.subjects.len) |subject| self.pair(subject, observer).* = .{};
     }
 
-    fn observed(self: *const Replication, subject: usize, observer: usize) Observation {
+    pub fn observed(self: *const Replication, subject: usize, observer: usize) Observation {
         var result: Observation = .{ .state = self.state(subject, observer) };
         const common = &self.common[subject];
         const own = self.pair(subject, observer).*;
@@ -1206,25 +1171,6 @@ fn relative(position: [3]i64, baseline: [3]i64) bool {
     return dx >= -32768 and dx <= 32767 and dy >= -32768 and dy <= 32767 and dz >= -32768 and dz <= 32767;
 }
 
-fn terrainBounds(position: [3]i64) geometry_bounds.Box {
-    var bounds: geometry_bounds.Box = undefined;
-    for (0..3) |axis| {
-        const coordinate: i32 = @intCast(@divFloor(position[axis], 4096));
-        bounds.minimum[axis] = coordinate - 1;
-        bounds.maximum[axis] = coordinate + (if (axis == 1) @as(i32, 3) else 2);
-    }
-    return bounds;
-}
-
-fn terrainSections(position: [3]i64) geometry_bounds.Box {
-    var bounds = terrainBounds(position);
-    for (0..3) |axis| {
-        bounds.minimum[axis] = @divFloor(bounds.minimum[axis], 16);
-        bounds.maximum[axis] = @divFloor(bounds.maximum[axis] - 1, 16) + 1;
-    }
-    return bounds;
-}
-
 fn fixed(value: f64) i64 {
     return @intFromFloat(@floor(value * 4096.0));
 }
@@ -1261,7 +1207,7 @@ test "movement fanout preserves independent admission and observer baselines" {
     };
     try players.initIndexes(allocator);
     players.rebuildIndexes();
-    const replication = try Replication.init(allocator, .{ .update_interval = 1 }, .{ .players = &players, .visibility = try Visibility.init(allocator, .{}, .{ .players = &players }) });
+    const replication = try Replication.init(allocator, .{ .update_interval = 1 }, .{ .players = &players, .visibility = try Visibility.init(allocator, .{}, .{ .players = &players }), .tracking = try Tracking.forTests(allocator, &players) });
     const Drain = struct {
         fn run(endpoint: *sessions.Service, recipients: usize) !usize {
             var count: usize = 0;
@@ -1287,7 +1233,8 @@ test "movement fanout preserves independent admission and observer baselines" {
         }
     };
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     _ = try Drain.run(service, 0);
     const statuses = try allocator.alloc(u64, service.output.slots.len);
     for (service.output.slots, statuses) |*slot, *status| status.* = slot.status.load(.acquire);
@@ -1296,19 +1243,22 @@ test "movement fanout preserves independent admission and observer baselines" {
         records[0].position.x += 0.01;
         players.rebuildIndexes();
         replication.deps.visibility.tick();
-        replication.tick();
+        try replication.deps.tracking.tick();
+        try replication.tick();
         try std.testing.expectEqual(@as(usize, 0), try Drain.run(service, 0));
     }
     for (service.output.slots, statuses) |*slot, status| try std.testing.expectEqual(status, slot.status.load(.acquire));
     for (0..3) |i| service.credit[i].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     try std.testing.expectEqual(@as(usize, 1), try Drain.run(service, 2));
     service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active, .release);
     records[0].position.x += 1;
     players.rebuildIndexes();
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     try std.testing.expectEqual(@as(usize, 1), try Drain.run(service, 1));
     try std.testing.expect(replication.observed(0, 1).value.position[0] != replication.observed(0, 2).value.position[0]);
     // The observer that fell behind kept its baseline exactly, however many pairs there are.
@@ -1317,7 +1267,8 @@ test "movement fanout preserves independent admission and observer baselines" {
     records[0].position.x += 1;
     players.rebuildIndexes();
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     var fallback_packets: usize = 0;
     var relative_updates: usize = 0;
     while (service.output.takeReady()) |packet| {
@@ -1338,14 +1289,16 @@ test "movement fanout preserves independent admission and observer baselines" {
     records[0].position.x += 16;
     players.rebuildIndexes();
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     try std.testing.expectEqual(@as(usize, 1), try Drain.run(service, 2));
     if (comptime selected.len > 1) {
         records[2].protocol = selected[1].number;
         records[0].position.x += 1;
         players.rebuildIndexes();
         replication.deps.visibility.tick();
-        replication.tick();
+        try replication.deps.tracking.tick();
+        try replication.tick();
         try std.testing.expectEqual(@as(usize, 2), try Drain.run(service, 1));
     }
 
@@ -1354,12 +1307,14 @@ test "movement fanout preserves independent admission and observer baselines" {
     records[0].flags.sneaking = true;
     records[0].on_ground = true;
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     try std.testing.expectEqual(@as(usize, 3), try Drain.run(service, 1));
     try std.testing.expectEqual(@as(usize, 4), replication.pending_updates.row(0).view().wordAt(0));
     service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     try std.testing.expectEqual(@as(usize, 3), try Drain.run(service, 1));
     try std.testing.expectEqual(@as(usize, 0), replication.pending_updates.row(0).view().wordAt(0));
     try std.testing.expectEqual(replication.observed(0, 1), replication.observed(0, 2));
@@ -1368,12 +1323,14 @@ test "movement fanout preserves independent admission and observer baselines" {
     records[2].position.x = 1000;
     players.rebuildIndexes();
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     _ = try Drain.run(service, 0);
     try std.testing.expectEqual(@as(usize, 3), replication.observers[2].pending.view().wordAt(0));
     service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     try std.testing.expectEqual(@as(usize, 2), try Drain.run(service, 1));
     try std.testing.expectEqual(@as(usize, 0), replication.observers[2].pending.view().wordAt(0));
     try std.testing.expectEqual(@as(usize, 2), replication.viewers(0).words[0]);
@@ -1384,12 +1341,14 @@ test "movement fanout preserves independent admission and observer baselines" {
     records[2].position = records[1].position;
     players.rebuildIndexes();
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     _ = try Drain.run(service, 0);
     try std.testing.expectEqual(@as(usize, 3), replication.observers[2].pending.view().wordAt(0));
     service.credit[2].store(@as(u64, 1) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     _ = try Drain.run(service, 0);
     try std.testing.expectEqual(@as(usize, 0), replication.observers[2].pending.view().wordAt(0));
     try std.testing.expectEqual(@as(usize, 6), replication.viewers(0).words[0]);
@@ -1398,7 +1357,8 @@ test "movement fanout preserves independent admission and observer baselines" {
     for (service.output.slots, statuses) |*slot, *status| status.* = slot.status.load(.acquire);
     for (0..64) |_| {
         replication.deps.visibility.tick();
-        replication.tick();
+        try replication.deps.tracking.tick();
+        try replication.tick();
         try std.testing.expectEqual(@as(usize, 0), try Drain.run(service, 0));
     }
     for (service.output.slots, statuses) |*slot, status| try std.testing.expectEqual(status, slot.status.load(.acquire));
@@ -1406,7 +1366,8 @@ test "movement fanout preserves independent admission and observer baselines" {
     records[2].handle = null;
     players.rebuildIndexes();
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     _ = try Drain.run(service, 0);
     try std.testing.expectEqual(@as(usize, 2), replication.viewers(0).words[0]);
     try std.testing.expectEqual(@as(usize, 1), replication.viewers(1).words[0]);
@@ -1415,7 +1376,8 @@ test "movement fanout preserves independent admission and observer baselines" {
     players.rebuildIndexes();
     service.credit[2].store(@as(u64, 2) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     _ = try Drain.run(service, 0);
     try std.testing.expectEqual(@as(usize, 6), replication.viewers(0).words[0]);
     try std.testing.expectEqual(@as(usize, 5), replication.viewers(1).words[0]);
@@ -1425,17 +1387,20 @@ test "movement fanout preserves independent admission and observer baselines" {
 
     records[2].stage = .respawn;
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     _ = try Drain.run(service, 0);
     try std.testing.expectEqual(@as(usize, 2), replication.viewers(0).words[0]);
     records[0].position.x += 1;
     players.rebuildIndexes();
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     try std.testing.expectEqual(@as(usize, 1), try Drain.run(service, 1));
     records[2].stage = .ready;
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     _ = try Drain.run(service, 0);
     try std.testing.expectEqual(@as(usize, 6), replication.viewers(0).words[0]);
     try std.testing.expectEqual(replication.observed(0, 1).value.position, replication.observed(0, 2).value.position);
@@ -1443,20 +1408,23 @@ test "movement fanout preserves independent admission and observer baselines" {
     records[2].world = 1;
     players.rebuildIndexes();
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     _ = try Drain.run(service, 0);
     try std.testing.expectEqual(@as(usize, 2), replication.viewers(0).words[0]);
     try std.testing.expectEqual(@as(usize, 0), replication.viewers(2).words[0]);
     records[2].world = 0;
     players.rebuildIndexes();
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     _ = try Drain.run(service, 0);
     try std.testing.expectEqual(@as(usize, 6), replication.viewers(0).words[0]);
     try std.testing.expectEqual(@as(usize, 3), replication.viewers(2).words[0]);
     for (0..2) |_| {
         replication.deps.visibility.tick();
-        replication.tick();
+        try replication.deps.tracking.tick();
+        try replication.tick();
         try std.testing.expectEqual(@as(usize, 0), try Drain.run(service, 0));
     }
     try std.testing.expectEqual(@as(usize, 0), replication.dirty_work.count);
@@ -1482,12 +1450,13 @@ test "operation counts for shared player neighborhoods and local spatial invalid
         try players.initIndexes(allocator);
         players.rebuildIndexes();
         const visibility = try Visibility.init(allocator, .{}, .{ .players = &players });
-        const replication = try Replication.init(allocator, .{ .update_interval = 1 }, .{ .players = &players, .visibility = visibility });
+        const replication = try Replication.init(allocator, .{ .update_interval = 1 }, .{ .players = &players, .visibility = visibility, .tracking = try Tracking.forTests(allocator, &players) });
         failing.fail_index = failing.alloc_index;
         for (0..3) |_| {
             for (endpoint.credit) |*credit| credit.store((@as(u64, 1) << 32) | sessions.Service.active | endpoint.config.credit_bytes, .release);
             visibility.tick();
-            replication.tick();
+            try replication.deps.tracking.tick();
+            try replication.tick();
             while (endpoint.output.takeReady()) |packet| {
                 try std.testing.expect(endpoint.output.releaseReady(packet.page, packet.generation));
                 _ = endpoint.preparing.fetchSub(1, .release);
@@ -1498,7 +1467,8 @@ test "operation counts for shared player neighborhoods and local spatial invalid
         players.rebuildIndexes();
 
         visibility.tick();
-        replication.tick();
+        try replication.deps.tracking.tick();
+        try replication.tick();
         var outgoing: usize = 0;
         var receivers: usize = 0;
         while (endpoint.output.takeReady()) |packet| {
@@ -1508,7 +1478,6 @@ test "operation counts for shared player neighborhoods and local spatial invalid
             _ = endpoint.preparing.fetchSub(1, .release);
         }
         if (clustered and moving > 0) {
-            try std.testing.expectEqual(@as(usize, if (moving == count) 1 else 2), replication.neighborhoods.count());
             try std.testing.expectEqual(moving, outgoing);
             try std.testing.expectEqual(moving * (count - 1), receivers);
         }
@@ -1548,20 +1517,23 @@ test "operation counts for shared player neighborhoods and local spatial invalid
                 players.rebuildIndexes();
                 for (rows, endpoint.credit) |row, *credit| credit.store((@as(u64, if (row.handle) |handle| handle.generation else 0) << 32) | sessions.Service.active | endpoint.config.credit_bytes, .release);
                 visibility.tick();
-                replication.tick();
+                try replication.deps.tracking.tick();
+                try replication.tick();
                 while (endpoint.output.takeReady()) |packet| {
                     try std.testing.expect(endpoint.output.releaseReady(packet.page, packet.generation));
                     _ = endpoint.preparing.fetchSub(1, .release);
                 }
             }
+            // Each pair spawned as vanilla's rule says: in the same world, within the view
+            // distance measured as a circle, and never itself.
             for (rows, 0..) |observer, other| {
                 if (observer.handle == null or observer.stage != .ready) continue;
-                const nearby = replication.observers[other].nearby.view();
+                const reach: f64 = @floatFromInt(players.viewDistanceOf(observer) * 16);
                 for (rows, 0..) |subject, index| {
-                    const expected = subject.handle != null and subject.world == observer.world and
-                        @abs(@floor(subject.position.x / 16) - @floor(observer.position.x / 16)) <= @as(f64, @floatFromInt(players.config.render_distance)) and
-                        @abs(@floor(subject.position.z / 16) - @floor(observer.position.z / 16)) <= @as(f64, @floatFromInt(players.config.render_distance));
-                    try std.testing.expectEqual(expected, nearby.contains(index));
+                    const dx = subject.position.x - observer.position.x;
+                    const dz = subject.position.z - observer.position.z;
+                    const expected = index != other and subject.handle != null and subject.world == observer.world and dx * dx + dz * dz <= reach * reach;
+                    try std.testing.expectEqual(expected, replication.state(index, other).spawned);
                 }
             }
         }
@@ -1594,7 +1566,7 @@ test "players update every second tick with the movement that changed" {
     };
     try players.initIndexes(allocator);
     players.rebuildIndexes();
-    const replication = try Replication.init(allocator, .{}, .{ .players = &players, .visibility = try Visibility.init(allocator, .{}, .{ .players = &players }) });
+    const replication = try Replication.init(allocator, .{}, .{ .players = &players, .visibility = try Visibility.init(allocator, .{}, .{ .players = &players }), .tracking = try Tracking.forTests(allocator, &players) });
     const Client = protocols.implementations[0].Protocol.play.toClient;
     const Seen = struct { shift: usize = 0, look: usize = 0, both: usize = 0 };
     const drain = struct {
@@ -1612,7 +1584,8 @@ test "players update every second tick with the movement that changed" {
         }
     }.run;
     replication.deps.visibility.tick();
-    replication.tick();
+    try replication.deps.tracking.tick();
+    try replication.tick();
     _ = drain(service);
     // Moving every tick for ten ticks: five updates per watcher, each carrying only the position.
     var total: Seen = .{};
@@ -1620,7 +1593,8 @@ test "players update every second tick with the movement that changed" {
         records[0].position.x += 0.1;
         players.rebuildIndexes();
         replication.deps.visibility.tick();
-        replication.tick();
+        try replication.deps.tracking.tick();
+        try replication.tick();
         const seen = drain(service);
         total.shift += seen.shift;
         total.look += seen.look;
@@ -1634,7 +1608,8 @@ test "players update every second tick with the movement that changed" {
         if (tick >= 2) records[0].position.z += 0.1;
         players.rebuildIndexes();
         replication.deps.visibility.tick();
-        replication.tick();
+        try replication.deps.tracking.tick();
+        try replication.tick();
         const seen = drain(service);
         total.shift += seen.shift;
         total.look += seen.look;

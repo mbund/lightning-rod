@@ -1,7 +1,6 @@
 const sparse_sets = @import("lightning_rod").system.sparse_sets;
 const bit_sets = @import("lightning_rod").system.bit_sets;
 const std = @import("std");
-const Selection = @import("vanilla_item_entities").item_selection.Selection;
 const Items = @import("vanilla_items").items.Items;
 const inventories = @import("inventories");
 const entities = @import("entities");
@@ -17,7 +16,7 @@ const wire_1_21_9 = @import("wire_1_21_9");
 const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
 const ItemTick = @import("item_tick.zig").ItemTick;
 const Players = @import("players").players.Players;
-const Streaming = @import("terrain").streaming.Streaming;
+const Tracking = @import("replication").tracking.Tracking;
 
 const assert = std.debug.assert;
 
@@ -30,19 +29,17 @@ pub const ItemReplication = struct {
         position_interval: u8 = 20,
         /// Items clients are shown at once.
         views: usize = 65536,
-        /// Items looked at in one tick before replication looks over all of them instead.
+        /// Items looked at in one tick before replication looks over all it has views of instead.
         work_ids: usize = 65536,
         /// Keep a hash of every packet queued, for runs to be compared by.
         trace_sends: bool = false,
     };
 
-    const tracking_distance = 96;
-
     pub const Dependencies = struct {
         dropped: *ItemEntities,
         item_tick: *ItemTick,
         players: *Players,
-        streaming: *Streaming,
+        tracking: *Tracking,
         sessions: *sessions.Service,
         packets: *packets.Packets,
         entities: *entities.Entities,
@@ -68,7 +65,7 @@ pub const ItemReplication = struct {
         burning: bool = false,
         padding: [6]u8 = @splat(0),
     };
-    const row_count = 6;
+    const row_count = 5;
     const record_align = @alignOf(Header);
     comptime {
         assert(@sizeOf(Header) % @alignOf(usize) == 0);
@@ -77,8 +74,10 @@ pub const ItemReplication = struct {
     /// An item's view, where it lies, edited in place while in hand.
     const View = struct {
         entity: entities.Id,
+        slot: u32,
         header: *Header,
-        spawned: bit_sets.Row,
+        /// Who has it spawned, as tracking keeps it.
+        known: bit_sets.Set,
         dirty: bit_sets.Row,
         collected: bit_sets.Row,
         interested: bit_sets.Row,
@@ -91,19 +90,12 @@ pub const ItemReplication = struct {
 
         /// Whether it holds anything a later tick needs: a view of nothing is no view.
         fn holds(self: *const View) bool {
-            inline for (.{ "spawned", "dirty", "collected", "interested", "stacks", "pending" }) |name| {
+            if (self.known.any()) return true;
+            inline for (.{ "dirty", "collected", "interested", "stacks", "pending" }) |name| {
                 if (@field(self, name).view().any()) return true;
             }
             return false;
         }
-    };
-
-    const Connection = struct {
-        generation: u32 = 0,
-        life: u32 = 0,
-        world: u32 = 0,
-        position: [2]f64 = @splat(0),
-        ready: bool = false,
     };
 
     const Phase = enum { spawn, stack, position, collect, remove };
@@ -164,7 +156,7 @@ pub const ItemReplication = struct {
                 const view = delivery.view;
                 switch (delivery.phase) {
                     .spawn => {
-                        view.spawned.unite(view.spawned.view(), delivered);
+                        owner.deps.tracking.confirm(view.slot, delivered, owner.deps.tracking.nobody());
                         view.dirty.unite(view.dirty.view(), delivered);
                         view.stacks.subtract(view.stacks.view(), delivered);
                         view.collected.unite(view.collected.view(), delivered);
@@ -173,7 +165,7 @@ pub const ItemReplication = struct {
                     .position => view.dirty.subtract(view.dirty.view(), delivered),
                     .collect => view.collected.unite(view.collected.view(), delivered),
                     .remove => {
-                        view.spawned.subtract(view.spawned.view(), delivered);
+                        owner.deps.tracking.confirm(view.slot, owner.deps.tracking.nobody(), delivered);
                         view.dirty.subtract(view.dirty.view(), delivered);
                         view.collected.subtract(view.collected.view(), delivered);
                         view.stacks.subtract(view.stacks.view(), delivered);
@@ -188,9 +180,6 @@ pub const ItemReplication = struct {
 
     /// What one tick looks at items with: who may be sent to, who was replaced, what changed.
     const Pass = struct {
-        visibility: *const Streaming.Visibility,
-        valid: sparse_sets.Workspace.RowView,
-        reset: sparse_sets.Workspace.RowView,
         available: sparse_sets.Workspace.RowView,
         presentation_changed: bool,
         outgoing: *Batch,
@@ -214,14 +203,13 @@ pub const ItemReplication = struct {
     /// Viewers some retry is owed something by, as of the last tick.
     pending: sparse_sets.Workspace.RowView,
     selections: sparse_sets.Workspace,
-    connections: []Connection,
-    tracked_connections: lightning_rod.system.IndexSet,
     recipients: []sessions.Service.Target,
     listener: inventories.Inventories.Listener,
     broadcast: sessions.Service.Broadcast,
-    selection: Selection,
-    selection_candidates: lightning_rod.metrics.Counter,
-    selection_nodes: lightning_rod.metrics.Counter,
+    tracker: Tracking.TrackerId,
+    /// Room to tell players of items that left memory.
+    targets: []sessions.Service.Target,
+    deliveries: []sessions.Service.Delivery,
     sweeps: lightning_rod.metrics.Counter,
     position_interval: u8,
     ticks: u64 = 0,
@@ -237,10 +225,9 @@ pub const ItemReplication = struct {
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*ItemReplication {
         if (config.position_interval == 0) return error.InvalidConfiguration;
         const self = try allocator.create(ItemReplication);
-        const connections = try allocator.alloc(Connection, deps.players.records.len);
-        @memset(connections, .{});
-        const selections = try sparse_sets.Workspace.init(allocator, 28, connections.len);
-        const row_words = std.math.divCeil(usize, connections.len, @bitSizeOf(usize)) catch unreachable;
+        const players = deps.players.records.len;
+        const selections = try sparse_sets.Workspace.init(allocator, 28, players);
+        const row_words = std.math.divCeil(usize, players, @bitSizeOf(usize)) catch unreachable;
         const record_bytes = @sizeOf(Header) + row_count * row_words * @sizeOf(usize);
         self.* = .{
             .pending = selections.row(0),
@@ -255,21 +242,18 @@ pub const ItemReplication = struct {
             .work = try entities.IdSet.init(allocator, &deps.dropped.deps.entities.pool, config.work_ids),
             .turns = try entities.IdSet.init(allocator, &deps.dropped.deps.entities.pool, config.work_ids),
             .retries = try entities.IdSet.init(allocator, &deps.dropped.deps.entities.pool, config.work_ids),
-            .connections = connections,
-            .tracked_connections = try lightning_rod.system.IndexSet.init(allocator, connections.len),
-            .recipients = try allocator.alloc(sessions.Service.Target, connections.len),
+            .recipients = try allocator.alloc(sessions.Service.Target, players),
+            .targets = try allocator.alloc(sessions.Service.Target, players),
+            .deliveries = try allocator.alloc(sessions.Service.Delivery, players),
+            .tracker = undefined,
             .listener = .{ .context = self, .function = slotChanged },
-            // A connection selects at most six regions a tick: both views when its view resets,
-            // and two strips for each axis it moves along.
-            .selection = try Selection.init(allocator, connections.len * 6),
-            .selection_candidates = try deps.dropped.deps.metrics.counter(.{ .name = "items.replication.selection.candidates", .description = "Indexed items examined by movement selection" }),
-            .selection_nodes = try deps.dropped.deps.metrics.counter(.{ .name = "items.replication.selection.coverage_nodes", .description = "Coverage nodes updated or examined by batched movement selection" }),
             .sweeps = try deps.dropped.deps.metrics.counter(.{ .name = "items.replication.sweeps", .description = "Ticks that looked over every item, as more changed than could be noted" }),
             .position_interval = config.position_interval,
             .tracing = config.trace_sends,
         };
         deps.inventories.listen(&self.listener);
         deps.dropped.leaving = .{ .context = self, .function = itemLeaving };
+        self.tracker = try deps.tracking.register(.{ .kinds = ItemEntities.kinds, .range = 6 * 16 });
         return self;
     }
 
@@ -288,7 +272,7 @@ pub const ItemReplication = struct {
     pub fn known(self: *ItemReplication, entity: entities.Id) !Known {
         const bytes = self.views.get(entity) orelse return .{};
         const view = self.viewOf(entity, bytes);
-        return .{ .spawned = view.spawned.view().count(), .pending = view.pending.view().count(), .stacks = view.stacks.view().count() };
+        return .{ .spawned = view.known.count(), .pending = view.pending.view().count(), .stacks = view.stacks.view().count() };
     }
 
     /// Whether a viewer is owed an item's position, for tests.
@@ -305,18 +289,20 @@ pub const ItemReplication = struct {
 
     fn viewOf(self: *ItemReplication, entity: entities.Id, bytes: []align(16) u8) View {
         const words: []usize = @alignCast(std.mem.bytesAsSlice(usize, bytes[@sizeOf(Header)..]));
-        const capacity = self.connections.len;
+        const capacity = self.deps.players.records.len;
+        const slot = self.deps.entities.directory.slotOf(entity).?;
         var rows: [row_count]bit_sets.Row = undefined;
         for (&rows, 0..) |*row, at| row.* = .{ .words = words[at * self.row_words ..][0..self.row_words], .capacity = capacity };
         return .{
             .entity = entity,
+            .slot = slot,
             .header = @ptrCast(bytes[0..@sizeOf(Header)]),
-            .spawned = rows[0],
-            .dirty = rows[1],
-            .collected = rows[2],
-            .interested = rows[3],
-            .stacks = rows[4],
-            .pending = rows[5],
+            .known = self.deps.tracking.known(slot),
+            .dirty = rows[0],
+            .collected = rows[1],
+            .interested = rows[2],
+            .stacks = rows[3],
+            .pending = rows[4],
         };
     }
 
@@ -354,9 +340,15 @@ pub const ItemReplication = struct {
     }
 
     pub fn tick(self: *ItemReplication) !void {
-        assert(self.selection.count == 0);
         self.ticks += 1;
         const dropped = self.deps.dropped;
+        // Items whose audience changed: those that left memory are told gone here, the rest
+        // looked at below.
+        var changes = self.deps.tracking.changesOf(self.tracker);
+        while (changes.next()) |change| {
+            const entry = self.deps.entities.directory.entry(change.slot);
+            if (entry.retired) try self.removeLeft(change) else self.work.insert(entry.id);
+        }
         if (dropped.count() == 0) {
             self.work.clear();
             self.turns.clear();
@@ -367,41 +359,15 @@ pub const ItemReplication = struct {
             return;
         }
         const service = self.deps.sessions;
-        const visibility = self.deps.streaming.snapshotVisibility();
         const presentation_changed = self.presentation != self.deps.items.components.revision;
         self.presentation = self.deps.items.components.revision;
-        const valid = self.selections.row(1);
-        const reset = self.selections.row(2);
         const available = self.selections.row(3);
-        valid.clear();
-        reset.clear();
         available.clear();
-        for (self.deps.players.activeSlots()) |index| self.tracked_connections.insert(index);
-        var observer_index: usize = 0;
-        while (observer_index < self.tracked_connections.count) {
-            const index = self.tracked_connections.indices[observer_index];
-            const player = self.deps.players.records[index];
-            const connection = &self.connections[index];
-            if (player.handle == null) self.tracked_connections.remove(index) else observer_index += 1;
-            const current: Connection = .{ .generation = if (player.handle) |handle| handle.generation else 0, .life = player.life, .world = player.world, .position = .{ player.position.x, player.position.z }, .ready = player.stage == .ready };
-            const changed = connection.generation != current.generation or connection.life != current.life or connection.world != current.world or connection.ready != current.ready;
-            if (changed or visibility.reset.contains(index)) {
-                if (connection.ready) self.selectBounds(connection.world, .{ connection.position[0] - tracking_distance, connection.position[1] - tracking_distance }, .{ connection.position[0] + tracking_distance, connection.position[1] + tracking_distance });
-                if (current.ready) self.selectBounds(current.world, .{ current.position[0] - tracking_distance, current.position[1] - tracking_distance }, .{ current.position[0] + tracking_distance, current.position[1] + tracking_distance });
-            }
-            if (!changed and current.ready and !std.meta.eql(connection.position, current.position)) self.selectMovement(current.world, connection.position, current.position);
-            const replaced = connection.generation != current.generation or connection.life != current.life;
-            connection.* = current;
-            const handle = player.handle orelse continue;
-            valid.insert(index);
+        for (self.deps.players.activeSlots()) |index| {
+            const handle = self.deps.players.records[index].handle orelse continue;
             if (service.outputCredit(handle) != 0) available.insert(index);
-            if (replaced) reset.insert(index);
         }
         self.noteMoved();
-        const selection = try self.selection.select(&dropped.places.space, ItemEntities.kinds, &self.work);
-        self.selection_candidates.add(selection.candidates);
-        self.selection_nodes.add(selection.coverage_nodes);
-        try self.selectVisibility(visibility);
         for (dropped.changes.values()) |entity| self.work.insert(entity);
         // More changed than could be noted, or every stack shows differently: look at them all.
         const sweep = presentation_changed or dropped.changes.overflowed or dropped.moved.overflowed or self.work.overflowed or self.retries.overflowed or self.turns.overflowed;
@@ -416,7 +382,7 @@ pub const ItemReplication = struct {
         if (self.work.count() == 0 and self.turns.count() == 0 and !sweep) return;
         var outgoing: Batch = .{ .owner = self, .audience = self.selections.row(4) };
         defer if (self.broadcast.active) self.broadcast.cancel();
-        const pass: Pass = .{ .visibility = visibility, .valid = valid, .reset = reset, .available = available, .presentation_changed = presentation_changed, .outgoing = &outgoing };
+        const pass: Pass = .{ .available = available, .presentation_changed = presentation_changed, .outgoing = &outgoing };
         // The work set takes no more while it is gone over; what comes of it waits for the next.
         var cursor: usize = 0;
         while (cursor < self.work.count()) {
@@ -424,7 +390,7 @@ pub const ItemReplication = struct {
             var ids: [16]entities.Id = undefined;
             @memcpy(ids[0..count], self.work.values()[cursor..][0..count]);
             cursor += count;
-            try self.process(ids[0..count], pass, false);
+            try self.process(ids[0..count], pass);
         }
         // Those only due their turn, and looked at in full for nothing else.
         cursor = 0;
@@ -437,7 +403,7 @@ pub const ItemReplication = struct {
                 ids[count] = entity;
                 count += 1;
             }
-            try self.process(ids[0..count], pass, true);
+            try self.process(ids[0..count], pass);
         }
         self.work.clear();
         if (sweep) {
@@ -464,7 +430,7 @@ pub const ItemReplication = struct {
                 }
                 continue;
             }
-            if (!alive and !view.spawned.view().any()) {
+            if (!alive and !view.known.any()) {
                 self.retries.remove(view.entity);
                 view.forget = true;
                 forgotten[forgotten_count] = view.entity;
@@ -472,13 +438,13 @@ pub const ItemReplication = struct {
                 continue;
             }
             const interested = view.interested.view();
-            view.pending.difference(interested, view.spawned.view());
+            view.pending.difference(interested, view.known);
             const changed = self.selections.row(8);
             changed.unite(view.stacks.view(), view.dirty.view());
             changed.intersect(changed.view(), interested);
             view.pending.unite(view.pending.view(), changed.view());
             if (view.header.collecting) {
-                changed.subtract(view.spawned.view(), view.collected.view());
+                changed.subtract(view.known, view.collected.view());
                 view.pending.unite(view.pending.view(), changed.view());
             }
             if (view.pending.view().any()) {
@@ -490,7 +456,7 @@ pub const ItemReplication = struct {
         for (forgotten[0..forgotten_count]) |entity| try self.deps.dropped.forget(entity);
     }
 
-    /// Looks at every item with a view, and every item within tracking distance of a player,
+    /// Looks at every item with a view, and every item whose audience changed,
     /// each once while the work set, empty by now, has room to remember it.
     fn sweepAll(self: *ItemReplication, pass: Pass) !void {
         assert(self.work.count() == 0);
@@ -502,35 +468,24 @@ pub const ItemReplication = struct {
             var ids: [16]entities.Id = undefined;
             @memcpy(ids[0..count], viewed[at..][0..count]);
             at += count;
-            try self.process(self.unswept(ids[0..count]), pass, false);
+            try self.process(self.unswept(ids[0..count]), pass);
         }
-        const dropped = self.deps.dropped;
-        const reach = tracking_distance / 16 + 1;
-        for (self.deps.players.activeSlots()) |index| {
-            const player = self.deps.players.records[index];
-            if (player.handle == null or player.stage != .ready) continue;
-            const center: [2]i32 = .{ @intFromFloat(@floor(player.position.x / 16)), @intFromFloat(@floor(player.position.z / 16)) };
-            var x = center[0] - reach;
-            while (x <= center[0] + reach) : (x += 1) {
-                var z = center[1] - reach;
-                while (z <= center[1] + reach) : (z += 1) {
-                    // Copied, as looking at items may forget some.
-                    var found_count: usize = 0;
-                    var walk = dropped.places.space.entries(.{ .world = player.world, .x = x, .z = z }, ItemEntities.kinds);
-                    while (walk.next()) |entry| {
-                        self.found[found_count] = entry.id;
-                        found_count += 1;
-                    }
-                    var next: usize = 0;
-                    while (next < found_count) {
-                        const count = @min(16, found_count - next);
-                        var ids: [16]entities.Id = undefined;
-                        @memcpy(ids[0..count], self.found[next..][0..count]);
-                        next += count;
-                        try self.process(self.unswept(ids[0..count]), pass, false);
-                    }
-                }
-            }
+        // And every item whose audience changed, as the work could not hold them all.
+        var found_count: usize = 0;
+        var changes = self.deps.tracking.changesOf(self.tracker);
+        while (changes.next()) |change| {
+            const entry = self.deps.entities.directory.entry(change.slot);
+            if (entry.retired) continue;
+            self.found[found_count] = entry.id;
+            found_count += 1;
+        }
+        var next: usize = 0;
+        while (next < found_count) {
+            const count = @min(16, found_count - next);
+            var ids: [16]entities.Id = undefined;
+            @memcpy(ids[0..count], self.found[next..][0..count]);
+            next += count;
+            try self.process(self.unswept(ids[0..count]), pass);
         }
     }
 
@@ -547,13 +502,11 @@ pub const ItemReplication = struct {
     }
 
     /// Looks at up to 16 items: who is interested, what each viewer is owed, and sends it.
-    fn process(self: *ItemReplication, given: []const entities.Id, pass: Pass, turn_only: bool) !void {
+    fn process(self: *ItemReplication, given: []const entities.Id, pass: Pass) !void {
         assert(given.len <= 16);
         const dropped = self.deps.dropped;
         const service = self.deps.sessions;
         const outgoing = pass.outgoing;
-        const valid = pass.valid;
-        const reset = pass.reset;
         const available = pass.available;
         const presentation_changed = pass.presentation_changed;
         var ids: [16]entities.Id = undefined;
@@ -597,12 +550,8 @@ pub const ItemReplication = struct {
                 value.* = read.metadata;
                 alive.* = value.alive;
                 if (value.alive) body.* = read.body;
-                // Gone, or with no player near enough to view it, and no client knowing of it.
-                const near = if (body.*) |at| near: {
-                    var nearby = self.deps.players.nearby(at.world, .{ .x = @floor(at.position[0] / 16) * 16, .y = 0, .z = @floor(at.position[2] / 16) * 16 }, self.deps.players.config.render_distance);
-                    break :near nearby.next() != null;
-                } else false;
-                if (!near and !view.spawned.view().any()) {
+                // No client has it, nor is any to have it.
+                if (!view.known.any() and self.deps.tracking.changed(view.slot) == null) {
                     self.retries.remove(entity);
                     view.pending.clear();
                     view.interested.clear();
@@ -621,23 +570,14 @@ pub const ItemReplication = struct {
             var slot_count: usize = 0;
             for (views[0..batch.len], bodies[0..batch.len], 0..) |*view, maybe_body, index| {
                 if (view.done) continue;
-                const body = maybe_body orelse continue;
-                // Only its turn: no one's interest in it changed, and neither did its stack.
-                if (turn_only) {
-                    interests[index].copy(view.interested.view());
-                    continue;
+                // Who is to have it: who has it, as tracking changes that.
+                interests[index].copy(view.known);
+                if (self.deps.tracking.changed(view.slot)) |change| {
+                    interests[index].subtract(interests[index].view(), change.remove);
+                    interests[index].unite(interests[index].view(), change.spawn);
                 }
-                const position: minecraft.Position = .{ .x = body.position[0], .y = body.position[1], .z = body.position[2] };
-                var candidates = self.deps.players.nearby(body.world, position, tracking_distance / 16);
-                while (candidates.next()) |player_index| {
-                    const player = &self.deps.players.records[player_index];
-                    if (player.handle == null or player.stage != .ready or body.world != player.world) continue;
-                    if (@abs(body.position[0] - player.position.x) > tracking_distance or @abs(body.position[2] - player.position.z) > tracking_distance) continue;
-                    if (pass.visibility.boundsVisible(player_index, player, body.world, .{
-                        .minimum = .{ @intFromFloat(@floor(body.position[0] - 1)), @intFromFloat(@floor(body.position[1] - 1)), @intFromFloat(@floor(body.position[2] - 1)) },
-                        .maximum = .{ @intFromFloat(@ceil(body.position[0] + 1)), @intFromFloat(@ceil(body.position[1] + 1)), @intFromFloat(@ceil(body.position[2] + 1)) },
-                    })) interests[index].insert(player_index);
-                }
+                if (maybe_body == null) continue;
+                const body = maybe_body.?;
                 // Read for anyone interested, sendable now or not: a change unread would be lost.
                 if (interests[index].view().any()) {
                     slot_indices[index] = slot_count;
@@ -656,11 +596,8 @@ pub const ItemReplication = struct {
                 if (view.done) continue;
                 const at = slot_at orelse continue;
                 const held = contents[at];
-                const spawned = self.selections.row(8);
-                spawned.intersect(view.spawned.view(), valid.view());
-                spawned.subtract(spawned.view(), reset.view());
                 const missing = self.selections.row(9);
-                missing.subtract(interests[index].view(), spawned.view());
+                missing.subtract(interests[index].view(), view.known);
                 // A fire lit or put out sends the stack again with the flags.
                 const burning = value.fire_ticks > 0;
                 if (!presentation_changed and held.revision == view.header.inventory_revision and burning == view.header.burning and
@@ -679,13 +616,11 @@ pub const ItemReplication = struct {
             for (batch, views[0..batch.len], metadata[0..batch.len], bodies[0..batch.len], slot_indices[0..batch.len], 0..) |entity, *view, value, body, slot_at, record_index| {
                 if (view.done) continue;
                 const header = view.header;
-                view.spawned.intersect(view.spawned.view(), valid.view());
-                view.spawned.subtract(view.spawned.view(), reset.view());
-                view.dirty.intersect(view.dirty.view(), view.spawned.view());
-                view.collected.intersect(view.collected.view(), view.spawned.view());
-                view.stacks.intersect(view.stacks.view(), view.spawned.view());
+                view.dirty.intersect(view.dirty.view(), view.known);
+                view.collected.intersect(view.collected.view(), view.known);
+                view.stacks.intersect(view.stacks.view(), view.known);
                 if (header.revision != value.revision) {
-                    view.dirty.unite(view.dirty.view(), view.spawned.view());
+                    view.dirty.unite(view.dirty.view(), view.known);
                     header.revision = value.revision;
                 }
                 if (header.collection != value.collection) {
@@ -699,15 +634,15 @@ pub const ItemReplication = struct {
                 const held: ?inventories.Contents = if (slot_at) |at| contents[at] else null;
                 if (held) |read| if (read.revision != header.inventory_revision) {
                     header.inventory_revision = read.revision;
-                    view.stacks.unite(view.stacks.view(), view.spawned.view());
+                    view.stacks.unite(view.stacks.view(), view.known);
                 };
                 // Every stack shows differently: each viewer is owed it again, read now or not.
-                if (presentation_changed) view.stacks.unite(view.stacks.view(), view.spawned.view());
+                if (presentation_changed) view.stacks.unite(view.stacks.view(), view.known);
                 // The flags go with the stack, so a fire lit or put out sends both again.
                 const burning = value.fire_ticks > 0;
                 if (burning != header.burning) {
                     header.burning = burning;
-                    view.stacks.unite(view.stacks.view(), view.spawned.view());
+                    view.stacks.unite(view.stacks.view(), view.known);
                 }
                 const entity_id = self.deps.dropped.networkId(entity);
                 var queued = std.EnumSet(Phase).empty;
@@ -725,23 +660,23 @@ pub const ItemReplication = struct {
                     }
                     const wanted = self.selections.row(6);
                     switch (phase) {
-                        .spawn => wanted.subtract(interested, view.spawned.view()),
+                        .spawn => wanted.subtract(interested, view.known),
                         .stack => {
-                            wanted.intersect(interested, view.spawned.view());
+                            wanted.intersect(interested, view.known);
                             wanted.intersect(wanted.view(), view.stacks.view());
                         },
                         .position => {
-                            wanted.intersect(interested, view.spawned.view());
+                            wanted.intersect(interested, view.known);
                             wanted.intersect(wanted.view(), view.dirty.view());
                             wanted.subtract(wanted.view(), view.stacks.view());
                             if (!self.onTurn(entity)) wanted.clear();
                         },
                         .collect => {
                             wanted.clear();
-                            if (value.collected > 0) wanted.subtract(view.spawned.view(), view.collected.view());
+                            if (value.collected > 0) wanted.subtract(view.known, view.collected.view());
                         },
                         .remove => {
-                            wanted.subtract(view.spawned.view(), interested);
+                            wanted.subtract(view.known, interested);
                             if (value.collected > 0) wanted.intersect(wanted.view(), view.collected.view());
                         },
                     }
@@ -811,52 +746,35 @@ pub const ItemReplication = struct {
         }
     }
 
-    fn selectVisibility(self: *ItemReplication, visibility: *const Streaming.Visibility) !void {
-        for (visibility.changed_words.values()) |word| {
-            const player_index = word / visibility.grid.words;
-            if (visibility.reset.contains(player_index)) continue;
-            const player = self.deps.players.records[player_index];
-            if (player.handle == null or player.stage != .ready) continue;
-            const center = visibility.viewCenter(player_index);
-            const x = center.x - visibility.radius;
-            const z = center.z - visibility.radius;
-            var bits = visibility.changed[word];
-            while (bits != 0) {
-                const cell: i32 = @intCast((word % visibility.grid.words) * 64 + @ctz(bits));
-                bits &= bits - 1;
-                if (cell >= visibility.grid.columns) continue;
-                const side: i32 = @intCast(visibility.grid.width);
-                const column: [2]i32 = .{
-                    x + @mod(@mod(cell, side) - @mod(x, side), side),
-                    z + @mod(@divTrunc(cell, side) - @mod(z, side), side),
-                };
-                self.deps.dropped.selectColumns(player.world, column, column, &self.work);
+    /// An item that left memory, which those who had it are told is gone.
+    fn removeLeft(self: *ItemReplication, change: Tracking.Change) !void {
+        var count: usize = 0;
+        var recipients = change.remove.iterator();
+        while (recipients.next()) |player| {
+            const record = self.deps.players.records[player];
+            const handle = record.handle orelse continue;
+            self.targets[count] = .{ .handle = handle, .protocol = record.protocol };
+            count += 1;
+        }
+        const removed = self.selections.row(10);
+        removed.clear();
+        if (count > 0) {
+            const entity_id = entities.Entities.networkOfSlot(change.slot);
+            try self.deps.packets.fanout(writeRemove, self.targets[0..count], .{entity_id}, 32, self.deliveries[0..count]);
+            if (self.tracing) {
+                var hasher = std.hash.Wyhash.init(self.traced);
+                hasher.update(std.mem.asBytes(&self.ticks));
+                hasher.update(std.mem.asBytes(&entity_id));
+                hasher.update(&.{@backingInt(Phase.remove)});
+                self.traced = hasher.final();
             }
+            for (self.targets[0..count], self.deliveries[0..count]) |target, delivery| switch (delivery) {
+                .queued, .closed => removed.insert(target.handle.index),
+                .unsupported => self.deps.sessions.disconnect(target.handle),
+                .backpressured => {},
+            };
         }
-    }
-
-    fn selectMovement(self: *ItemReplication, world: u32, before: [2]f64, after: [2]f64) void {
-        const minimum: [2]f64 = .{ @min(before[0], after[0]) - tracking_distance, @min(before[1], after[1]) - tracking_distance };
-        const maximum: [2]f64 = .{ @max(before[0], after[0]) + tracking_distance, @max(before[1], after[1]) + tracking_distance };
-        const crossed_column = @floor(before[0] / 16) != @floor(after[0] / 16) or @floor(before[1] / 16) != @floor(after[1] / 16);
-        if (crossed_column) {
-            self.selectBounds(world, .{ before[0] - tracking_distance, before[1] - tracking_distance }, .{ before[0] + tracking_distance, before[1] + tracking_distance });
-            self.selectBounds(world, .{ after[0] - tracking_distance, after[1] - tracking_distance }, .{ after[0] + tracking_distance, after[1] + tracking_distance });
-            return;
-        }
-        // Include both endpoints because the exact tracking boundary is inclusive.
-        if (before[0] != after[0]) {
-            self.selectBounds(world, minimum, .{ @max(before[0], after[0]) - tracking_distance, maximum[1] });
-            self.selectBounds(world, .{ @min(before[0], after[0]) + tracking_distance, minimum[1] }, maximum);
-        }
-        if (before[1] != after[1]) {
-            self.selectBounds(world, minimum, .{ maximum[0], @max(before[1], after[1]) - tracking_distance });
-            self.selectBounds(world, .{ minimum[0], @min(before[1], after[1]) + tracking_distance }, maximum);
-        }
-    }
-
-    fn selectBounds(self: *ItemReplication, world: u32, minimum: [2]f64, maximum: [2]f64) void {
-        self.selection.append(world, minimum, maximum);
+        self.deps.tracking.confirm(change.slot, self.deps.tracking.nobody(), removed.view());
     }
 
     fn writeSpawnLegacy(packet: wire_1_21_5.play.toClient.packet_spawn_entity.Writer, registry: packets.Registry, value: Spawn) ![]u8 {

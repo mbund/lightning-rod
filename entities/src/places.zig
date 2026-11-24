@@ -38,6 +38,10 @@ pub const Places = struct {
     stopped_count: usize = 0,
     /// Rises whenever a column starts or stops ticking.
     ticking_revision: u64 = 0,
+    /// The kinds whose entities join and leave the tick order as their columns start and stop
+    /// ticking. Kinds that keep their own turns, as projectiles do, and subjects that only are
+    /// somewhere, as players are, are not among them.
+    following: Kinds = .all,
 
     const max_watchers = 8;
     const Watcher = struct { kinds: Kinds, hook: Stopped };
@@ -104,6 +108,11 @@ pub const Places = struct {
         if (ticking_now) _ = try self.order.join(entity) else self.stopOne(entity);
     }
 
+    /// A kind keeps its own turns: its entities are left out of the columns' ticking.
+    pub fn keepsOwnTurns(self: *Places, kinds: Kinds) void {
+        self.following.bits.setIntersection(kinds.bits.complement());
+    }
+
     /// An entity went, or left memory: it leaves its section at once, as vanilla's do, and the
     /// order.
     pub fn remove(self: *Places, entity: Id) void {
@@ -119,7 +128,7 @@ pub const Places = struct {
         for (left) |column| {
             const index = self.space.indexOf(column) orelse continue;
             if (!self.space.data(index).ticking) continue;
-            var walk = self.space.entries(column, .all);
+            var walk = self.space.entries(column, self.following);
             while (walk.next()) |entry| self.stopOne(entry.id);
             self.space.data(index).ticking = false;
             self.space.releaseColumn(index);
@@ -189,7 +198,7 @@ pub const Places = struct {
 
     fn startTicking(self: *Places, column: Column) !void {
         var held: usize = 0;
-        var walk = self.space.entries(column, .all);
+        var walk = self.space.entries(column, self.following);
         while (walk.next()) |entry| {
             try self.starting.ensure(held + 1);
             self.starting.at(held).* = entry;

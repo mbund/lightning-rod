@@ -43,7 +43,7 @@ const DomainColumn = @import("domains").domains.Column;
 const Mob = @import("mob.zig").Mob;
 const packets = @import("projectile_packets.zig");
 const store = @import("projectile_store.zig");
-const projectile_claims = @import("projectile_claims.zig");
+const Tracking = @import("replication").tracking.Tracking;
 
 const assert = std.debug.assert;
 const registry = game_data.registry;
@@ -169,13 +169,14 @@ const Projectile = extern struct {
     }
 };
 
-/// A record in hand for a batch: the projectile and its viewers where memory keeps them, edited
-/// in place, and whether it was in the ground when taken, which says what entries it has.
+/// A record in hand for a batch: the projectile where memory keeps it, edited in place, and
+/// whether it was in the ground when taken, which says what entries it has.
 const Held = struct {
     projectile: *Projectile,
-    /// Its whole record: the projectile, its row, then `Stored`.
+    /// Its whole record: the projectile, then `Stored`.
     bytes: []align(16) u8,
-    row: []u64,
+    /// Its directory slot, which tracking knows it by.
+    slot: u32,
     was_in_ground: bool,
     was_parked: bool,
     was_marked: bool = false,
@@ -201,7 +202,7 @@ const IndexOp = struct {
     mark: bool,
 };
 
-/// What the store holds of a projectile, after its record and row in memory: the column it was
+/// What the store holds of a projectile, after its record in memory: the column it was
 /// last saved under, and whether it changed since.
 const Stored = extern struct {
     world: u32 = 0,
@@ -257,8 +258,6 @@ pub const Projectiles = struct {
         storage: storage.Space,
         domains: *Domains,
     };
-    /// AbstractArrow and its kin track 4 chunks away.
-    const tracking_blocks = 64.0;
     /// ServerEntity's update interval for arrows.
     const update_interval = 20;
     const half_width = 0.25;
@@ -267,7 +266,7 @@ pub const Projectiles = struct {
     const window_sections = 8;
     /// Records a batch holds, a whole number of scan batches.
     const batch_max = store.Pass.batch;
-    // How records lie in memory: a projectile, then its viewer row of words, then `Stored`.
+    // How records lie in memory: a projectile, then `Stored`.
     comptime {
         assert(@sizeOf(Projectile) % @alignOf(u64) == 0 and @alignOf(Projectile) <= 16);
     }
@@ -282,8 +281,6 @@ pub const Projectiles = struct {
     /// Store prefixes: a projectile under its column, and a frozen column with its tick.
     const record_prefix = 0x30;
     const frozen_prefix = 0x31;
-    /// The most players a viewer row has room for.
-    const max_row_bytes = 64;
     /// Chunks whose nearby players one tick keeps, each with up to every player.
     const shared_columns = 256;
     /// Counters of stuck projectiles by hashed cell.
@@ -295,15 +292,13 @@ pub const Projectiles = struct {
     /// The players who may be hit near a chunk: their slots, their boxes, and the box around them.
     const Targets = struct { players: []const u32, boxes: []const body.Box, bounds: ?body.Box };
 
-    /// A projectile as memory keeps it: its record, its viewer row, then `Stored`.
+    /// A projectile as memory keeps it: its record, then `Stored`.
     const Record = struct { bytes: [record_max]u8 align(16) };
-    const record_max = std.mem.alignForward(usize, @sizeOf(Projectile) + max_row_bytes + @sizeOf(Stored), 16);
+    const record_max = std.mem.alignForward(usize, @sizeOf(Projectile) + @sizeOf(Stored), 16);
 
     deps: Dependencies,
     /// Every projectile. Read and written as copies, but for the batch in hand.
     records: Records,
-    /// Removals owed: the network id in 8 bytes, then the viewers still to tell.
-    removal_rows: entities.Slab,
     index: store.Index,
     /// The one tick order every entity of every kind keeps a place in, and the kinds that are
     /// projectiles.
@@ -323,14 +318,13 @@ pub const Projectiles = struct {
     /// Ids for a pass over every projectile in id order.
     id_scratch: []u64,
     table: records.Table,
-    /// A projectile and its viewer row.
+    /// A projectile as memory keeps it, `Stored` past it.
     record_bytes: usize,
     chunk_client: chunks.Chunks.Client,
     window: chunks.ReadWindow(window_sections),
-    /// How many projectiles there are, how many fly, and how many removals and wakings are owed.
+    /// How many projectiles there are, how many fly, and how many wakings are owed.
     count: u64 = 0,
     ticking: u64 = 0,
-    removals: u64 = 0,
     woken: u64 = 0,
     /// Stuck projectiles by the cell they are in, hashed: a cell whose count is zero holds none,
     /// so pickups and edits look only where something is stuck. A count at its most stays there.
@@ -346,8 +340,14 @@ pub const Projectiles = struct {
     holding_index: bool = false,
     /// Whether this tick has projectiles to see to, as found before entities tick.
     active: bool = false,
-    /// The space sleeping projectiles will pass through.
-    claims: projectile_claims.Claims,
+    /// Where sleeping projectiles will pass until they wake, which tracking answers by and what
+    /// comes near wakes them for.
+    sweeps: entities.Sweeps,
+    /// Who sees projectiles, set by ProjectileReplication.
+    tracking: ?*Tracking = null,
+    tracker: Tracking.TrackerId = 0,
+    /// Room for the slots of sweeps due.
+    due: []u32,
     sleeping: usize = 0,
     sleep: bool,
     /// A running hash of everything asked to be sent, when tests trace it.
@@ -358,6 +358,8 @@ pub const Projectiles = struct {
     players_near: [players_near_max]struct { world: u32, low: [2]f64, high: [2]f64 } = undefined,
     players_near_count: usize = 0,
     players_near_tick: u64 = std.math.maxInt(u64),
+    /// Room for the states a sleeper plans.
+    plan_states: [update_interval + 1]Motion = undefined,
     /// Sleepers something came near since the last tick, to wake before the flying. With more
     /// than fit, every sleeper wakes.
     rousing: []u32,
@@ -376,9 +378,7 @@ pub const Projectiles = struct {
     /// The motion each projectile of the batch began its tick with, which its move goes by.
     motions: [][3]f64,
     row_words: usize,
-    /// The players near each chunk with projectiles, found once a tick: who may be hit as a list,
-    /// and who sees, as two rows of words, those in range of all of the chunk and those in range
-    /// of some of it.
+    /// The players near each chunk with projectiles who may be hit, found once a tick.
     columns: std.AutoHashMapUnmanaged(Column, Range),
     candidates: []u32,
     candidate_boxes: []body.Box,
@@ -386,15 +386,12 @@ pub const Projectiles = struct {
     /// The last chunk looked up for each, which the next projectile shares more often than not.
     last_columns: [2]?Column = .{ null, null },
     last_ranges: [2]Range = undefined,
-    masks: []u64,
-    mask_count: usize = 0,
     /// The players near one chunk past the shared ones, kept for one projectile.
     overflow: []u32,
     overflow_boxes: []body.Box,
-    /// Where each player was last tick, to tell who moved; and when anyone last did.
+    /// Where each player was last tick, to tell who moved.
     seen: []Seen,
     moved: std.DynamicBitSetUnmanaged,
-    moved_at: u64 = 0,
     /// The last tick an arrow landed: until it stops shaking, everyone looks for pickups.
     landed_at: u64 = 0,
     /// Columns that began and stopped ticking since the last tick, as the domains told: where
@@ -426,10 +423,7 @@ pub const Projectiles = struct {
     outbox_pending: [sessions.Service.batch_max]Pending = undefined,
     outbox_count: usize = 0,
     recipients: []sessions.Service.Target,
-    /// One projectile's viewers to tell of its spawn and of its removal, those out of room this
-    /// tick, and those one update goes to.
-    joining: []u64,
-    leaving: []u64,
+    /// Viewers out of room this tick, and those one packet goes to.
     starved: []u64,
     audience: []u64,
     /// Packets queued and packets some viewer took, by purpose: spawns, updates, removals.
@@ -445,10 +439,9 @@ pub const Projectiles = struct {
     /// Everything but what the world kept.
     pub fn allocate(allocator: std.mem.Allocator, configuration: Configuration, deps: Dependencies) !*Projectiles {
         if (configuration.frozen_columns == 0) return error.InvalidConfiguration;
-        if ((deps.players.records.len + 63) / 64 * 8 > max_row_bytes) return error.InvalidConfiguration;
         const self = try allocator.create(Projectiles);
         const row_words = (deps.players.records.len + 63) / 64;
-        const record_bytes = @sizeOf(Projectile) + row_words * 8;
+        const record_bytes = @sizeOf(Projectile);
         const chunk_client = try deps.chunks.simulation(window_sections);
         var columns: std.AutoHashMapUnmanaged(Column, Range) = .empty;
         try columns.ensureTotalCapacity(allocator, shared_columns * 2);
@@ -461,7 +454,6 @@ pub const Projectiles = struct {
         self.* = .{
             .deps = deps,
             .records = try .init(allocator, deps.entities),
-            .removal_rows = try entities.Slab.init(allocator, &deps.entities.pool, 8 + row_words * 8, bound),
             .index = try store.Index.init(allocator, bound * keys_per_projectile),
             .frozen_columns = frozen_columns,
             .tick_order = &deps.entities.places.order,
@@ -477,7 +469,8 @@ pub const Projectiles = struct {
             .cells = cells,
             .ops = try allocator.alloc(IndexOp, ops_max),
             .held = try allocator.alloc(Held, batch_max),
-            .claims = try projectile_claims.Claims.init(allocator, configuration.claims),
+            .sweeps = try .init(allocator, configuration.claims, bound, &deps.entities.places.space),
+            .due = try allocator.alloc(u32, configuration.claims),
             .sleep = configuration.sleep,
             .tracing = configuration.trace_sends,
             .rousing = try allocator.alloc(u32, rousing_max),
@@ -489,7 +482,6 @@ pub const Projectiles = struct {
             .columns = columns,
             .candidates = try allocator.alloc(u32, shared_columns * players),
             .candidate_boxes = try allocator.alloc(body.Box, shared_columns * players),
-            .masks = try allocator.alloc(u64, shared_columns * 2 * row_words),
             .overflow = try allocator.alloc(u32, players),
             .overflow_boxes = try allocator.alloc(body.Box, players),
             .seen = try allocator.alloc(Seen, players),
@@ -506,8 +498,6 @@ pub const Projectiles = struct {
             .outbox = try .init(allocator, deps.players.deps.sessions, sessions.Service.batch_max * deps.players.deps.sessions.config.protocols.len),
             .outbox_audience = try allocator.alloc(u64, row_words),
             .recipients = try allocator.alloc(sessions.Service.Target, players),
-            .joining = try allocator.alloc(u64, row_words),
-            .leaving = try allocator.alloc(u64, row_words),
             .starved = try allocator.alloc(u64, row_words),
             .audience = try allocator.alloc(u64, row_words),
             .entered = try allocator.alloc(DomainColumn, deps.domains.capacity()),
@@ -515,6 +505,9 @@ pub const Projectiles = struct {
         };
         @memset(self.seen, .{});
         self.kinds = .of(&self.entity_types);
+        self.records.sweeps = &self.sweeps;
+        // Projectiles keep their own turns: frozen columns hold them, not the columns' ticking.
+        deps.entities.places.keepsOwnTurns(self.kinds);
         // Projectiles take their turns in the one tick order, a batch at a time.
         try deps.entities.addTicker(.init(Projectiles, self, self.kinds, batch_max));
         try deps.entities.addColumnHolder(.init(Projectiles, self, loadColumn, unloadColumn));
@@ -603,14 +596,30 @@ pub const Projectiles = struct {
         };
     }
 
-    /// The clock, the projectiles and the frozen columns, from what the world kept; the indexes
-    /// and counts from the projectiles' states. Viewers do not outlast a restart, so rows start
-    /// empty and no removal is owed.
+    /// Projectiles are tracked from now on, swept while they sleep. ProjectileReplication asks.
+    pub fn track(self: *Projectiles, tracking: *Tracking) !void {
+        self.tracker = try tracking.register(.{ .kinds = self.kinds, .range = 4 * 16, .sweeps = &self.sweeps, .exact = .of(Projectiles, self) });
+        self.tracking = tracking;
+    }
+
+    /// Where a sleeping projectile is now, along its plan, for tracking: side effects none.
+    pub fn trackingPlace(self: *Projectiles, slot: u32) !entities.Space.Placed {
+        const entity = self.deps.entities.directory.entry(slot).id;
+        const kept = (try self.records.get(entity)) orelse return error.Corrupt;
+        var stored: Projectile = undefined;
+        @memcpy(std.mem.asBytes(&stored), kept.bytes[0..@sizeOf(Projectile)]);
+        const projectile = self.present(stored, self.now);
+        const shape: entities.space.Shape = .{ .kind = self.entity_types[@backingInt(projectile.kind)], .half_width = half_width, .height = height };
+        return .{ .entry = .{ .id = entity, .slot = slot, .section = entities.space.coordinate(projectile.position[1]), .entered = 0, .position = projectile.position, .shape = shape }, .world = projectile.world };
+    }
+
     /// The id clients know a projectile in memory by.
     fn networkId(self: *const Projectiles, projectile: *const Projectile) i32 {
         return self.deps.entities.networkOf(projectile.id).?;
     }
 
+    /// The clock, the projectiles and the frozen columns, from what the world kept; the indexes
+    /// and counts from the projectiles' states. Clients know of none after a restart.
     fn recover(self: *Projectiles) !void {
         try self.refuseOldRecords();
         var clock: [8]u8 = undefined;
@@ -663,6 +672,7 @@ pub const Projectiles = struct {
                 self.restoreEntries(projectile);
                 // The parked and asleep keep their place without being walked.
                 try self.records.add(row.id, self.entity_types[@backingInt(projectile.kind)], kept, if (projectile.parked) .dormant else if (projectile.marked) .asleep else .walked);
+                try self.locate(self.records.slotOf(row.id).?, &self.present(projectile.*, self.now));
                 // Claims live in memory: a sleeper brought back wakes on the next tick.
                 if (projectile.marked) self.rouse_all = true;
             }
@@ -729,15 +739,13 @@ pub const Projectiles = struct {
             }
         }
         try self.checkpoint(self.deps.storage);
+        self.sweeps.clear();
         self.records.clear();
-        self.removal_rows.clear();
         self.index.clear();
         self.frozen_columns.clearRetainingCapacity();
-        self.claims.clear();
         @memset(self.cells, 0);
         self.count = 0;
         self.ticking = 0;
-        self.removals = 0;
         self.woken = 0;
         self.sleeping = 0;
         self.now = 0;
@@ -925,13 +933,14 @@ pub const Projectiles = struct {
         face(&projectile);
         try self.hand(projectile.uuid, 0, request.stack);
         if (request.weapon) |weapon| try self.hand(projectile.uuid, 1, weapon);
-        // A new id: its record and row start empty.
+        // A new id: its record starts empty.
         if (self.records.contains(entity)) return error.Corrupt;
         var kept: Record = .{ .bytes = @splat(0) };
         const bytes: []align(16) u8 = &kept.bytes;
         @memcpy(bytes[0..@sizeOf(Projectile)], std.mem.asBytes(&projectile));
         self.touch(entity, bytes);
         try self.records.add(entity, self.entity_types[@backingInt(projectile.kind)], kept, .walked);
+        try self.locate(self.records.slotOf(entity).?, &projectile);
         try self.applyIndex();
         self.count += 1;
         self.ticking += 1;
@@ -1021,19 +1030,17 @@ pub const Projectiles = struct {
         self.height_world = null;
         if (self.failure) |err| return err;
         try self.thaw();
-        if (self.count == 0 and self.removals == 0) return;
+        if (self.count == 0) return;
         // One window for every projectile this tick: arrows flying together read their
         // sections once. Nothing a projectile does edits blocks, so holding it is safe.
         self.active = true;
         if (self.columns.count() > 0) self.columns.clearRetainingCapacity();
         self.last_columns = .{ null, null };
         self.candidate_count = 0;
-        self.mask_count = 0;
         @memset(self.starved, 0);
-        try self.notice();
+        self.notice();
         self.watch();
         try self.holdingIndex(rouse);
-        try self.retire();
         try self.expire();
         try self.wake();
         // Sleepers due and those something came near take their turns among the rest.
@@ -1048,7 +1055,6 @@ pub const Projectiles = struct {
         defer self.flush() catch |err| {
             self.failure = err;
         };
-        try self.visitParked();
         try self.collect();
     }
 
@@ -1057,10 +1063,14 @@ pub const Projectiles = struct {
     pub fn tickRun(self: *Projectiles, run: []const entities.order.Entry) !void {
         assert(self.active and run.len <= batch_max);
         var ids: [batch_max]u64 = undefined;
-        for (run, ids[0..run.len]) |entry, *entity| entity.* = entry.id;
+        var slots: [batch_max]u32 = undefined;
+        for (run, ids[0..run.len], slots[0..run.len]) |entry, *entity, *slot| {
+            entity.* = entry.id;
+            slot.* = entry.slot;
+        }
         const count = run.len;
         {
-            try self.hold(ids[0..count]);
+            try self.holdSlots(ids[0..count], slots[0..count]);
             for (self.held[0..self.held_count]) |*held| held.walked = true;
             for (self.held[0..self.held_count]) |*held| {
                 const projectile = held.projectile;
@@ -1109,14 +1119,20 @@ pub const Projectiles = struct {
     /// Takes the records of a batch in hand, in the order given, edited where memory keeps them
     /// until the batch is let go.
     fn hold(self: *Projectiles, ids: []const u64) !void {
+        var slots: [batch_max]u32 = undefined;
+        for (ids, slots[0..ids.len]) |entity, *slot| slot.* = self.records.slotOf(entity) orelse return error.Corrupt;
+        return self.holdSlots(ids, slots[0..ids.len]);
+    }
+
+    /// As `hold`, with the slots known, as the tick order gives them.
+    fn holdSlots(self: *Projectiles, ids: []const u64, slots: []const u32) !void {
         assert(self.held_count == 0 and ids.len <= batch_max);
-        for (ids, self.held[0..ids.len]) |entity, *held| {
-            const kept = try self.records.ptr(entity) orelse return error.Corrupt;
+        for (ids, slots, self.held[0..ids.len]) |entity, slot, *held| {
+            const kept = self.records.table.ref(slot).field("record");
             const bytes: []align(16) u8 = &kept.bytes;
             self.touch(entity, bytes);
             const projectile: *Projectile = @ptrCast(bytes[0..@sizeOf(Projectile)]);
-            const row: []u64 = @alignCast(std.mem.bytesAsSlice(u64, bytes[@sizeOf(Projectile)..self.record_bytes]));
-            held.* = .{ .projectile = projectile, .bytes = bytes, .row = row, .was_in_ground = projectile.in_ground, .was_parked = projectile.parked, .was_marked = projectile.marked };
+            held.* = .{ .projectile = projectile, .bytes = bytes, .slot = slot, .was_in_ground = projectile.in_ground, .was_parked = projectile.parked, .was_marked = projectile.marked };
         }
         self.held_count = ids.len;
     }
@@ -1142,6 +1158,8 @@ pub const Projectiles = struct {
                 projectile.despawn_at = projectile.landed_at + 1200;
             }
             self.moveEntries(held);
+            // A sleeper is swept; the rest keep their place.
+            if (!projectile.asleep) try self.locate(held.slot, projectile);
         }
         if (!self.holding_index or self.op_count + ops_per_batch > self.ops.len) try self.applyIndex();
     }
@@ -1196,8 +1214,7 @@ pub const Projectiles = struct {
         }
     }
 
-    /// A projectile that went: its entries and slots go, and viewers who knew of it are owed its
-    /// removal.
+    /// A projectile that went: its entries and slots go. Tracking tells whoever knew of it.
     fn forgetEntries(self: *Projectiles, held: *Held, stacks: enum { forget, keep }) !void {
         const projectile = held.projectile;
         const entity = projectile.id;
@@ -1216,18 +1233,6 @@ pub const Projectiles = struct {
             if (projectile.has_weapon) try self.hand(projectile.uuid, 1, null);
         }
         self.count -= 1;
-        const known = for (held.row) |word| {
-            if (word != 0) break true;
-        } else false;
-        if (!known) return;
-        // One removal for an id, ever: it is new.
-        if (self.removal_rows.get(entity) != null) return error.Corrupt;
-        const value = try self.removal_rows.getOrCreate(entity);
-        std.mem.writeInt(i32, value[0..4], self.networkId(projectile), .little);
-        @memcpy(value[8..][0 .. self.row_words * 8], std.mem.sliceAsBytes(held.row));
-        try self.index.insert(store.byId(.removal, entity).slice());
-        self.removals += 1;
-        try self.queue(entity, held.row, .remove, true, packets.writeRemove, .{self.networkId(projectile)});
     }
 
     /// Takes a projectile's stuck entry away, and with it a waking it is still owed.
@@ -1316,24 +1321,6 @@ pub const Projectiles = struct {
         }
     }
 
-    /// The parked look over their viewers once a second, a twentieth of them a tick.
-    fn visitParked(self: *Projectiles) !void {
-        // A round since anyone moved, every parked arrow has looked since: nothing to find.
-        if (self.now > self.moved_at + update_interval) return;
-        var pass = store.Pass.init(&self.index, store.parked(@intCast(self.now % update_interval), null));
-        var ids: [batch_max]u64 = undefined;
-        while (true) {
-            const count = try gather(&pass, &ids);
-            if (count == 0) return;
-            try self.hold(ids[0..count]);
-            for (self.held[0..self.held_count]) |*held| {
-                try self.forget(held);
-                try self.meet(held);
-            }
-            try self.settle();
-        }
-    }
-
     /// PersistentProjectileEntity.tick, with TridentEntity's return before it.
     fn step(self: *Projectiles, held: *Held) !void {
         const projectile = held.projectile;
@@ -1370,18 +1357,20 @@ pub const Projectiles = struct {
     /// Sleepers that may be asked to wake between two ticks before every sleeper wakes instead.
     const rousing_max = 4096;
 
-    /// Asks the sleepers whose claims a box meets, horizontally grown by `reach`, to wake.
-    fn rouseMeeting(self: *Projectiles, world: u32, box: projectile_claims.Box, reach: f64) void {
+    /// Asks the sleepers whose paths a box meets, horizontally grown by `reach`, to wake: a path
+    /// as findTarget sweeps it, its box grown by 1.5 all round.
+    fn rouseMeeting(self: *Projectiles, world: u32, box: entities.sweeps.Box, reach: f64) void {
         // Asked to wake are woken by the next tick's rouse; past room for them, all are.
-        if (self.claims.count == 0 or self.rouse_all) return;
-        if (!self.claims.meeting(world, box, reach, self.rousing, &self.rousing_count)) self.rouse_all = true;
+        if (self.sweeps.count == 0 or self.rouse_all) return;
+        const path: entities.sweeps.Box = .{ .low = .{ box.low[0], box.low[1] - 1.5, box.low[2] }, .high = .{ box.high[0], box.high[1] + 1.5, box.high[2] } };
+        if (!self.sweeps.meeting(world, path, reach + 1.5, self.rousing, &self.rousing_count)) self.rouse_all = true;
     }
 
     /// What may have moved since the last tick wakes the sleepers it came near: a mob or player
-    /// in a claim might be hit, and a player moving near one might come to see it or stop. While
-    /// projectiles fly nothing moves: a hit changes motion, which moves things on their own ticks.
+    /// in a path might be hit. Who sees a sleeper tracking answers by its sweep. While projectiles
+    /// fly nothing moves: a hit changes motion, which moves things on their own ticks.
     fn watch(self: *Projectiles) void {
-        if (self.claims.count == 0) return;
+        if (self.sweeps.count == 0) return;
         const mobs = self.deps.mobs;
         // From their places, which hold where each stands and how big it is, without reading
         // their states; the removed have no place.
@@ -1395,7 +1384,7 @@ pub const Projectiles = struct {
         while (moved.next()) |slot| {
             const player = &self.deps.players.records[slot];
             const box = playerBox(player);
-            self.rouseMeeting(player.world, .{ .low = box.min, .high = box.max }, tracking_blocks + 1);
+            self.rouseMeeting(player.world, .{ .low = box.min, .high = box.max }, 0);
         }
     }
 
@@ -1410,7 +1399,7 @@ pub const Projectiles = struct {
         }
         if (self.sleeping == 0) return;
         if (self.rouse_all) {
-            assert(self.claims.count == 0);
+            assert(self.sweeps.count == 0);
             // One pass: the index changes only once the pass is done.
             var pass = store.Pass.init(&self.index, store.under(.sleeping));
             while (true) {
@@ -1423,12 +1412,44 @@ pub const Projectiles = struct {
             if (self.sleeping != 0) return error.Corrupt;
             return;
         }
-        for (self.rousing[0..self.rousing_count]) |claim| {
-            if (!self.claims.used(claim)) continue;
-            self.waking[self.waking_count] = self.claims.remove(claim);
+        for (self.rousing[0..self.rousing_count]) |index| {
+            if (!self.sweeps.used(index)) continue;
+            self.waking[self.waking_count] = self.deps.entities.directory.entry(self.sweeps.remove(index)).id;
             self.waking_count += 1;
         }
-        self.claims.takeDue(self.now, self.waking, &self.waking_count);
+        var due: usize = 0;
+        self.sweeps.takeDue(self.now, self.due, &due);
+        for (self.due[0..due]) |slot| {
+            self.waking[self.waking_count] = self.deps.entities.directory.entry(slot).id;
+            self.waking_count += 1;
+        }
+    }
+
+    /// A projectile as it is after a tick: a sleeper on its way along its plan, or where its sleep
+    /// ends, which its record holds.
+    fn present(self: *const Projectiles, stored: Projectile, tick: u64) Projectile {
+        _ = self;
+        var projectile = stored;
+        if (!projectile.asleep) return projectile;
+        const ends_at = if (projectile.synced) projectile.wake_at else projectile.wake_at - 1;
+        if (tick >= ends_at) return projectile;
+        projectile.restart();
+        var at = projectile.slept_at + 1;
+        while (at <= tick) : (at += 1) drift(&projectile);
+        return projectile;
+    }
+
+    /// A projectile takes its place in the space, or moves to it, as every entity keeps one: what
+    /// tracking answers by while it is awake. Asleep, it keeps the place it fell asleep at, which
+    /// its sweep stands for.
+    fn locate(self: *Projectiles, slot: u32, projectile: *const Projectile) !void {
+        const space = &self.deps.entities.places.space;
+        const shape: entities.space.Shape = .{ .kind = self.entity_types[@backingInt(projectile.kind)], .half_width = half_width, .height = height };
+        if (space.atSlot(slot)) |placed| {
+            if (placed.world == projectile.world and std.meta.eql(placed.entry.position, projectile.position)) return;
+            return space.move(projectile.id, projectile.world, projectile.position);
+        }
+        try space.insert(projectile.id, projectile.world, projectile.position, shape);
     }
 
     /// A sleeper as it is at the end of the last tick. Woken when due, it is already: its record
@@ -1561,11 +1582,12 @@ pub const Projectiles = struct {
             if (try self.anyoneIn(projectile.world, claimed(.{ at[0] - reach, at[1] - reach, at[2] - reach }, .{ at[0] + reach, at[1] + reach, at[2] + reach }))) return;
         }
         // Its states tick by tick, as far as it stays above the void.
-        var states: [update_interval + 1]Motion = undefined;
+        // Kept between calls, as safety fills a fresh one every time.
+        const states = &self.plan_states;
         var low: [3]f64 = undefined;
         var high: [3]f64 = undefined;
         // Through its update tick, if all of it is clear: then it wakes only to send the update.
-        var ticks: u64 = plan(projectile, @intCast(until), @floatFromInt(bounds.minimum - 64), &states, &low, &high);
+        var ticks: u64 = plan(projectile, @intCast(until), @floatFromInt(bounds.minimum - 64), states, &low, &high);
         const planned = ticks;
         // Clear all at once, most often; else as far as each tick's path is.
         if (!try self.clear(projectile.world, low, high)) {
@@ -1574,31 +1596,28 @@ pub const Projectiles = struct {
             ticks = clear_ticks;
         }
         if (ticks < 2) return;
-        // Seen alike by every player, most often by none near; else as far as it is.
-        if (!self.unseenAround(projectile.world, low, high, held.row)) {
-            var seen_ticks: u64 = 0;
-            var ghost = projectile.*;
-            while (seen_ticks < ticks) {
-                ghost.position = states[seen_ticks + 1].position;
-                if (!self.viewedAlike(held.row, &ghost)) break;
-                seen_ticks += 1;
+        // Seen alike by every player all along, as tracking answers for the box of its path; else
+        // along half of it.
+        const slot = held.slot;
+        var bounded = planned;
+        while (ticks >= 2) : (ticks /= 2) {
+            // A shorter sleep passes through less.
+            if (ticks != bounded) {
+                low = states[0].position;
+                high = states[0].position;
+                for (states[1 .. ticks + 1]) |*state| for (0..3) |axis| {
+                    low[axis] = @min(low[axis], state.position[axis]);
+                    high[axis] = @max(high[axis], state.position[axis]);
+                };
+                bounded = ticks;
             }
-            ticks = seen_ticks;
+            if (try self.settled(slot, projectile.world, .{ .low = low, .high = high })) break;
         }
         if (ticks < 2) return;
-        // A shorter sleep passes through less.
-        if (ticks != planned) {
-            low = states[0].position;
-            high = states[0].position;
-            for (states[1 .. ticks + 1]) |*state| for (0..3) |axis| {
-                low[axis] = @min(low[axis], state.position[axis]);
-                high[axis] = @max(high[axis], state.position[axis]);
-            };
-        }
-        const box = claimed(low, high);
         const synced = ticks == until;
         const wake_at = if (synced) self.now + until else self.now + ticks + 1;
-        _ = self.claims.add(projectile.id, projectile.world, box, self.now, wake_at) orelse return;
+        // Swept where its feet go: what comes near wakes it, and tracking answers by the box.
+        _ = self.sweeps.place(slot, projectile.world, .{ .low = low, .high = high }, half_width, height, self.now, wake_at) orelse return;
         const end = &states[ticks];
         projectile.start_position = projectile.position;
         projectile.start_velocity = projectile.velocity;
@@ -1621,7 +1640,7 @@ pub const Projectiles = struct {
     const retry_ticks = 10;
 
     /// findTarget's swept box over paths within a box of positions, and a little more.
-    fn claimed(low: [3]f64, high: [3]f64) projectile_claims.Box {
+    fn claimed(low: [3]f64, high: [3]f64) entities.sweeps.Box {
         const reach = half_width + 1 + 0.5;
         return .{
             .low = .{ low[0] - reach, low[1] - 1.5, low[2] - reach },
@@ -1629,26 +1648,10 @@ pub const Projectiles = struct {
         };
     }
 
-    /// Whether no player knows of a projectile, and none is close enough to see it anywhere in a
-    /// box: then every place in it is seen alike, by no one.
-    fn unseenAround(self: *Projectiles, world: u32, low: [3]f64, high: [3]f64, row: []const u64) bool {
-        for (row) |word| if (word != 0) return false;
-        if (self.players_near_tick != self.now) self.gatherPlayers();
-        const reach = tracking_blocks + 1;
-        for (self.players_near[0..self.players_near_count]) |near| {
-            if (near.world != world and near.world != any_world) continue;
-            // Far from the box around them all: far from each.
-            if (low[0] - reach > near.high[0] or high[0] + reach < near.low[0] or low[2] - reach > near.high[1] or high[2] + reach < near.low[1]) return true;
-            break;
-        } else return true;
-        for (self.deps.players.activeSlots()) |slot| {
-            const player = &self.deps.players.records[slot];
-            if (player.world != world) continue;
-            const dx = @max(low[0] - player.position.x, 0, player.position.x - high[0]);
-            const dz = @max(low[2] - player.position.z, 0, player.position.z - high[2]);
-            if (dx * dx + dz * dz <= reach * reach) return false;
-        }
-        return true;
+    /// Whether every player sees a projectile anywhere its feet go in a box as clients have it now.
+    fn settled(self: *Projectiles, slot: u32, world: u32, box: entities.sweeps.Box) !bool {
+        const tracking = self.tracking orelse return true;
+        return tracking.settled(slot, world, box, half_width, height);
     }
 
     /// The box around each world's players, worked out once a tick; with more worlds than room,
@@ -1680,22 +1683,8 @@ pub const Projectiles = struct {
     const players_near_max = 8;
     const any_world = std.math.maxInt(u32);
 
-    /// Whether players would see a projectile at a place as those who know of it now.
-    fn viewedAlike(self: *Projectiles, row: []const u64, ghost: *const Projectile) bool {
-        const near = self.viewersNear(ghost);
-        for (row, near.always, near.maybe, 0..) |known, always, maybe, at| {
-            var seen = always;
-            var measured = maybe;
-            while (measured != 0) : (measured &= measured - 1) {
-                if (self.sees(at * 64 + @ctz(measured), ghost)) seen |= @as(u64, 1) << @intCast(@ctz(measured));
-            }
-            if (seen != known) return false;
-        }
-        return true;
-    }
-
     /// Whether any mob or player is in a box.
-    fn anyoneIn(self: *Projectiles, world: u32, box: projectile_claims.Box) !bool {
+    fn anyoneIn(self: *Projectiles, world: u32, box: entities.sweeps.Box) !bool {
         const mobs = self.deps.mobs;
         const within: body.Box = .{ .min = box.low, .max = box.high };
         var found = false;
@@ -1765,7 +1754,6 @@ pub const Projectiles = struct {
                 projectile.forgetSleep();
                 // Field by field: padding holds whatever the bytes held.
                 inline for (@typeInfo(Projectile).@"struct".field_names) |name| hasher.update(std.mem.asBytes(&@field(projectile, name)));
-                hasher.update(kept.bytes[@sizeOf(Projectile)..self.record_bytes]);
             }
         }
         return hasher.final();
@@ -2016,41 +2004,14 @@ pub const Projectiles = struct {
     }
 
     /// Who moved, joined or left since last tick.
-    fn notice(self: *Projectiles) !void {
+    fn notice(self: *Projectiles) void {
         self.moved.unsetAll();
-        var forgotten: [max_row_bytes / 8]u64 = @splat(0);
-        var any = false;
         for (self.deps.players.activeSlots()) |slot| {
             const player = &self.deps.players.records[slot];
             const now: Seen = .{ .generation = if (player.handle) |handle| handle.generation else 0, .world = player.world, .position = .{ player.position.x, player.position.y, player.position.z }, .stage = @backingInt(player.stage), .gamemode = @backingInt(self.deps.player_states.of(player).gamemode) };
             if (std.meta.eql(now, self.seen[slot])) continue;
-            // Another connection in the slot was sent nothing yet.
-            if (now.generation != self.seen[slot].generation) {
-                forgotten[slot / 64] |= @as(u64, 1) << @intCast(slot % 64);
-                any = true;
-            }
             self.seen[slot] = now;
             self.moved.set(slot);
-            self.moved_at = self.now;
-        }
-        if (any) try self.unknown(forgotten[0..self.row_words]);
-    }
-
-    /// Players whose slots hold new connections know of no projectile. Like vanilla's tracker on
-    /// a player's removal, it looks at every projectile: once a tick for all of them, a batch of
-    /// records at a time.
-    fn unknown(self: *Projectiles, forgotten: []const u64) !void {
-        assert(forgotten.len == self.row_words);
-        for (self.recordIds()) |entity| {
-            var kept = (try self.loadRecord(entity)).?;
-            const row: []u64 = @alignCast(std.mem.bytesAsSlice(u64, kept.bytes[@sizeOf(Projectile)..][0 .. self.row_words * 8]));
-            for (row, forgotten) |*word, gone| word.* &= ~gone;
-            try self.records.put(entity, kept);
-        }
-        var removals = self.removal_rows.iterator();
-        while (removals.next()) |entry| {
-            const row: []u64 = @alignCast(std.mem.bytesAsSlice(u64, entry.bytes[8..][0 .. self.row_words * 8]));
-            for (row, forgotten) |*word, gone| word.* &= ~gone;
         }
     }
 
@@ -2119,99 +2080,48 @@ pub const Projectiles = struct {
                 if (!try self.deps.menus.giveStack(slot, stack)) return;
             },
         }
-        try self.queue(projectile.id, held.row, .update, false, packets.writeCollect, .{ self.networkId(projectile), entity_effects.playerId(slot), @as(i32, 1) });
+        try self.queue(projectile.id, self.knownTo(held.slot, false), .update, false, packets.writeCollect, .{ self.networkId(projectile), entity_effects.playerId(slot), @as(i32, 1) });
         projectile.removed = true;
-    }
-
-    /// Removals a viewer had no room for are sent again; the gone are forgotten; those all told
-    /// go.
-    fn retire(self: *Projectiles) !void {
-        if (self.removals == 0) return;
-        var pass = store.Pass.init(&self.index, store.under(.removal));
-        while (true) {
-            const keys = try pass.next();
-            if (keys.len == 0) return;
-            var copies: [store.Pass.batch]store.Key = undefined;
-            @memcpy(copies[0..keys.len], keys);
-            for (copies[0..keys.len]) |key| try self.retireOne(key);
-        }
-    }
-
-    fn retireOne(self: *Projectiles, key: store.Key) !void {
-        const entity = store.Key.id(key.slice());
-        const value = self.removal_rows.get(entity) orelse return error.Corrupt;
-        const network = std.mem.readInt(i32, value[0..4], .little);
-        const row = std.mem.bytesAsSlice(u64, value[8..][0 .. self.row_words * 8]);
-        var any = false;
-        for (row, 0..) |*word, at| {
-            word.* &= ~self.goneIn(at);
-            any = any or word.* != 0;
-        }
-        if (!any) {
-            self.forgetRemoval(entity);
-            return;
-        }
-        for (self.audience, row) |*audience, word| audience.* = word;
-        try self.queue(store.Key.id(key.slice()), self.audience, .remove, true, packets.writeRemove, .{network});
-    }
-
-    /// The players in a word of a row who have gone, whom nothing can be sent to.
-    fn goneIn(self: *const Projectiles, word: usize) u64 {
-        var gone: u64 = 0;
-        for (0..64) |bit| {
-            const other = word * 64 + bit;
-            if (other >= self.deps.players.records.len) break;
-            const player = &self.deps.players.records[other];
-            if (player.handle == null or player.stage != .ready) gone |= @as(u64, 1) << @intCast(bit);
-        }
-        return gone;
     }
 
     /// ServerEntity for projectiles: who sees one is told of it once, then of its state when
     /// it changes and where it is when it was pushed or every second.
     fn replicate(self: *Projectiles, held: *Held) !void {
-        try self.forget(held);
-        try self.meet(held);
         try self.updates(held);
     }
 
-    /// Viewers out of range, or gone, are told it is. Those out of range of all of the chunk go
-    /// by whole words; only those in range of part of it are measured. A viewer stays known
-    /// until it has taken the removal.
-    fn forget(self: *Projectiles, held: *Held) !void {
-        const projectile = held.projectile;
-        const near = self.viewersNear(projectile);
-        var any = false;
-        for (held.row, near.always, near.maybe, self.leaving, 0..) |word, always, maybe, *leaving, at| {
-            leaving.* = word & ~(always | maybe);
-            var measured = word & maybe;
-            while (measured != 0) : (measured &= measured - 1) {
-                if (!self.sees(at * 64 + @ctz(measured), projectile)) leaving.* |= @as(u64, 1) << @intCast(@ctz(measured));
-            }
-            any = any or leaving.* != 0;
-        }
-        if (any) try self.queue(projectile.id, self.leaving, .remove, false, packets.writeRemove, .{self.networkId(projectile)});
+    /// Who has a projectile spawned, as tracking keeps it; with `roomy`, only those with room
+    /// this tick.
+    fn knownTo(self: *Projectiles, slot: u32, roomy: bool) []const u64 {
+        @memset(self.audience, 0);
+        const tracking = self.tracking orelse return self.audience;
+        const known = tracking.known(slot);
+        for (self.audience, self.starved, 0..) |*audience, starved, at| audience.* = known.wordAt(at) & (if (roomy) ~starved else ~@as(u64, 0));
+        return self.audience;
     }
 
-    /// Players newly in range are sent it, its spawn and its data. Those in range of all of the
-    /// chunk join by whole words, and projectiles joining the same players share a batch.
-    fn meet(self: *Projectiles, held: *Held) !void {
-        const projectile = held.projectile;
-        const near = self.viewersNear(projectile);
-        var any = false;
-        for (held.row, near.always, near.maybe, self.joining, self.starved, 0..) |word, always, maybe, *joining, starved, at| {
-            joining.* = always & ~word;
-            var measured = maybe & ~word;
-            while (measured != 0) : (measured &= measured - 1) {
-                if (self.sees(at * 64 + @ctz(measured), projectile)) joining.* |= @as(u64, 1) << @intCast(@ctz(measured));
+    /// Spawns and removals, as tracking found them this tick, after every entity ticked: each
+    /// to those who have room, the rest a later tick. Run by ProjectileReplication.
+    pub fn replicateChanges(self: *Projectiles) !void {
+        const tracking = self.tracking orelse return;
+        var changes = tracking.changesOf(self.tracker);
+        while (changes.next()) |change| {
+            if (change.remove.any()) {
+                for (self.audience, self.starved, 0..) |*audience, starved, at| audience.* = change.remove.wordAt(at) & ~starved;
+                try self.queue(change.slot, self.audience, .remove, true, packets.writeRemove, .{entities.Entities.networkOfSlot(change.slot)});
             }
-            // Viewers out of room this tick get it on a later one.
-            joining.* &= ~starved;
-            any = any or joining.* != 0;
+            if (change.gone or !change.spawn.any()) continue;
+            const entity = self.deps.entities.directory.entry(change.slot).id;
+            const kept = (try self.records.get(entity)) orelse return error.Corrupt;
+            var stored: Projectile = undefined;
+            @memcpy(std.mem.asBytes(&stored), kept.bytes[0..@sizeOf(Projectile)]);
+            // A sleeper where its plan has it now.
+            const projectile = self.present(stored, self.now);
+            for (self.audience, self.starved, 0..) |*audience, starved, at| audience.* = change.spawn.wordAt(at) & ~starved;
+            const spawn: packets.Spawn = .{ .id = entities.Entities.networkOfSlot(change.slot), .uuid = projectile.uuid, .kind = self.entity_types[@backingInt(projectile.kind)], .position = projectile.position, .velocity = projectile.velocity, .yaw = angle(projectile.yaw), .pitch = angle(projectile.pitch), .owner = entity_effects.playerId(projectile.owner) };
+            try self.queueSpawn(change.slot, self.audience, spawn, self.dataOf(&projectile));
         }
-        if (!any) return;
-        const spawn: packets.Spawn = .{ .id = self.networkId(projectile), .uuid = projectile.uuid, .kind = self.entity_types[@backingInt(projectile.kind)], .position = projectile.position, .velocity = projectile.velocity, .yaw = angle(projectile.yaw), .pitch = angle(projectile.pitch), .owner = entity_effects.playerId(projectile.owner) };
-        try self.queueSpawn(projectile.id, self.joining, spawn, self.dataOf(projectile));
+        try self.flush();
     }
 
     /// Changes of state and position, for the viewers who have room this tick; a client that
@@ -2221,7 +2131,7 @@ pub const Projectiles = struct {
         const due = @rem(self.age(projectile), update_interval) == 0;
         const moving = projectile.impulse or (due and !projectile.in_ground);
         if (!projectile.data_changed and !moving) return;
-        for (self.audience, held.row, self.starved) |*audience, known, starved| audience.* = known & ~starved;
+        _ = self.knownTo(held.slot, true);
         if (projectile.data_changed) try self.queue(projectile.id, self.audience, .update, false, packets.writeData, .{ self.networkId(projectile), self.dataOf(projectile) });
         projectile.data_changed = false;
         if (!moving) return;
@@ -2277,8 +2187,7 @@ pub const Projectiles = struct {
         self.outbox_count += 1;
     }
 
-    /// Sends the batch and reads back who took each packet: spawns become known, removals
-    /// forgotten, and a removal no viewer is left to take goes.
+    /// Sends the batch and reads back who took each packet: spawns and removals tracking hears of.
     fn flush(self: *Projectiles) !void {
         const outbox = &self.outbox;
         if (!outbox.active) return;
@@ -2297,42 +2206,15 @@ pub const Projectiles = struct {
         }
     }
 
-    /// Marks who took a spawn or a removal in the row it belongs to: of a projectile in hand, of
-    /// one in the cache, or of a removal owed.
+    /// Tells tracking who took a spawn or a removal, by the slot it was queued for.
     fn acknowledge(self: *Projectiles, pending: Pending) !void {
-        if (!pending.removal) for (self.held[self.held_settled..self.held_count]) |*held| {
-            if (held.projectile.id == pending.id) return self.apply(pending, held.row);
-        };
-        if (!pending.removal) if (try self.loadRecord(pending.id)) |found| {
-            var kept = found;
-            const row: []u64 = @alignCast(std.mem.bytesAsSlice(u64, kept.bytes[@sizeOf(Projectile)..self.record_bytes]));
-            self.apply(pending, row);
-            return self.records.put(pending.id, kept);
-        };
-        // A projectile gone since: its removal is owed to whoever took the spawn too.
-        const value = self.removal_rows.get(pending.id) orelse return;
-        const row: []u64 = @alignCast(std.mem.bytesAsSlice(u64, value[8..][0 .. self.row_words * 8]));
-        self.apply(pending, row);
-        for (row) |word| if (word != 0) return;
-        self.forgetRemoval(pending.id);
-    }
-
-    /// A removal every viewer took, or who could have went.
-    fn forgetRemoval(self: *Projectiles, entity: u64) void {
-        self.removal_rows.remove(entity);
-        self.index.remove(store.byId(.removal, entity).slice());
-        self.removals -= 1;
-    }
-
-    fn apply(self: *Projectiles, pending: Pending, row: anytype) void {
-        var accepted = self.outbox.accepted(pending.receipt).iterator();
-        while (accepted.next()) |other| {
-            const bit = @as(u64, 1) << @intCast(other % 64);
-            switch (pending.kind) {
-                .spawn => row[other / 64] |= bit,
-                .remove => row[other / 64] &= ~bit,
-                .update => unreachable,
-            }
+        const tracking = self.tracking orelse return;
+        const accepted = self.outbox.accepted(pending.receipt);
+        const slot: u32 = @intCast(pending.id);
+        switch (pending.kind) {
+            .spawn => tracking.confirm(slot, accepted, tracking.nobody()),
+            .remove => tracking.confirm(slot, tracking.nobody(), accepted),
+            .update => unreachable,
         }
     }
 
@@ -2706,64 +2588,11 @@ pub const Projectiles = struct {
         return self.world_height;
     }
 
-    /// Whether a player is within tracking range of a projectile.
-    fn sees(self: *const Projectiles, other: usize, projectile: *const Projectile) bool {
-        const viewer = &self.deps.players.records[other];
-        const dx = viewer.position.x - projectile.position[0];
-        const dz = viewer.position.z - projectile.position[2];
-        return viewer.world == projectile.world and viewer.stage == .ready and viewer.handle != null and dx * dx + dz * dz <= tracking_blocks * tracking_blocks;
-    }
-
-    /// viewers: who sees into the chunk. targets: who may be hit by anything flying through it.
+    /// targets: who may be hit by anything flying through a chunk. Viewers are tracking's.
     const Nearness = enum { viewers, targets };
-    const Viewers = struct { always: []const u64, maybe: []const u64 };
 
     fn columnOf(projectile: *const Projectile, nearness: Nearness) Column {
         return .{ .world = projectile.world, .x = mth.floor(projectile.position[0] / 16), .z = mth.floor(projectile.position[2] / 16), .nearness = nearness };
-    }
-
-    /// Who sees into a projectile's chunk, found once a tick for every projectile in it: those
-    /// in range of all of it, and those in range of some of it. Past the shared rows, each
-    /// projectile finds its own.
-    fn viewersNear(self: *Projectiles, projectile: *const Projectile) Viewers {
-        const column = columnOf(projectile, .viewers);
-        const words = self.row_words;
-        if (self.lookup(column)) |range| return .{ .always = self.masks[range.start..][0..words], .maybe = self.masks[range.start + words ..][0..words] };
-        const shared = self.mask_count + 2 * words <= self.masks.len;
-        const start = if (shared) self.mask_count else self.masks.len - 2 * words;
-        const rows = self.masks[start..][0 .. 2 * words];
-        self.classify(column, rows[0..words], rows[words..]);
-        if (shared) {
-            self.mask_count += 2 * words;
-            self.columns.putAssumeCapacity(column, .{ .start = @intCast(start), .len = @intCast(2 * words) });
-        }
-        return .{ .always = rows[0..words], .maybe = rows[words..] };
-    }
-
-    /// Sorts the players near a chunk by how much of it is within their tracking range.
-    fn classify(self: *Projectiles, column: Column, always: []u64, maybe: []u64) void {
-        @memset(always, 0);
-        @memset(maybe, 0);
-        const low: [2]f64 = .{ @as(f64, @floatFromInt(column.x)) * 16, @as(f64, @floatFromInt(column.z)) * 16 };
-        // Four chunks of range, and one more for anywhere in this chunk.
-        var nearby = self.deps.players.nearby(column.world, .{ .x = low[0] + 8, .y = 0, .z = low[1] + 8 }, 5);
-        while (nearby.next()) |other| {
-            const viewer = &self.deps.players.records[other];
-            if (viewer.world != column.world or viewer.stage != .ready or viewer.handle == null) continue;
-            const at: [2]f64 = .{ viewer.position.x, viewer.position.z };
-            var nearest: f64 = 0;
-            var farthest: f64 = 0;
-            for (at, low) |point, start| {
-                const near = @max(start - point, 0, point - (start + 16));
-                const far = @max(@abs(point - start), @abs(point - (start + 16)));
-                nearest += near * near;
-                farthest += far * far;
-            }
-            const bit = @as(u64, 1) << @intCast(other % 64);
-            if (farthest <= tracking_blocks * tracking_blocks) {
-                always[other / 64] |= bit;
-            } else if (nearest <= tracking_blocks * tracking_blocks) maybe[other / 64] |= bit;
-        }
     }
 
     /// The players a projectile flying through its chunk may hit: in the world, playing and
@@ -2817,7 +2646,6 @@ pub const Projectiles = struct {
 
     /// The viewers in the batch who did not take a packet are starved for the rest of the tick.
     fn starve(self: *Projectiles, receipt: sessions.Service.Broadcast.Receipt) void {
-        self.moved_at = self.now;
         const accepted = self.outbox.accepted(receipt);
         for (self.outbox_audience, 0..) |word, at| {
             var bits = word;
@@ -2860,10 +2688,9 @@ pub const Projectiles = struct {
         return true;
     }
 
-    /// The batch's viewers had no room: parked arrows keep looking over their viewers until all
-    /// are told, and those viewers are sent no more spawns this tick.
+    /// The batch's viewers had no room: they are sent no more this tick, and tracking offers
+    /// them what they missed again.
     fn backlog(self: *Projectiles) void {
-        self.moved_at = self.now;
         for (self.starved, self.outbox_audience) |*starved, audience| starved.* |= audience;
     }
 
@@ -2935,6 +2762,8 @@ test "a path enters a box where its slabs meet, and not from inside" {
 const Records = struct {
     entities: *entities.Entities,
     table: Table,
+    /// Where the asleep are, set once the projectiles are.
+    sweeps: ?*entities.Sweeps = null,
 
     const Row = struct { record: Projectiles.Record };
     const Table = entities.KindTable(Row);
@@ -2998,8 +2827,15 @@ const Records = struct {
 
     fn remove(self: *Records, entity: u64) void {
         const slot = self.slotOf(entity) orelse return;
+        self.unplace(slot, entity);
         self.table.remove(slot);
         self.entities.leave(slot);
+    }
+
+    /// A projectile leaving memory leaves its place, or its sweep.
+    fn unplace(self: *Records, slot: u32, entity: u64) void {
+        if (self.sweeps) |sweeps| _ = sweeps.removeSlot(slot);
+        self.entities.places.space.remove(entity);
     }
 
     fn ids(self: *const Records, output: []u64) []u64 {
@@ -3012,6 +2848,7 @@ const Records = struct {
         while (at < self.entities.directory.high()) : (at += 1) {
             const slot: u32 = @intCast(at);
             if (self.entities.directory.entry(slot).id == 0 or !self.ours(slot)) continue;
+            self.unplace(slot, self.entities.directory.entry(slot).id);
             self.table.remove(slot);
             self.entities.leave(slot);
         }

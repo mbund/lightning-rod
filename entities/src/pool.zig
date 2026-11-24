@@ -164,6 +164,11 @@ pub fn Array(comptime T: type) type {
             while (self.len > 0) self.pop();
         }
 
+        /// Empty again, its pages kept for what comes next, as for a list filled every tick.
+        pub fn reset(self: *Self) void {
+            self.len = 0;
+        }
+
         /// The bytes its pages hold, for measuring.
         pub fn memoryBytes(self: *const Self) usize {
             return self.page_count * page_bytes;

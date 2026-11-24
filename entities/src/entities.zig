@@ -15,6 +15,8 @@ pub const Table = table.Table;
 pub const order = @import("order.zig");
 pub const Order = order.Order;
 pub const space = @import("space.zig");
+pub const sweeps = @import("sweeps.zig");
+pub const Sweeps = sweeps.Sweeps;
 pub const Space = space.Space;
 pub const Shape = space.Shape;
 pub const Kinds = space.Kinds;
@@ -369,13 +371,28 @@ pub const Entities = struct {
         return if (entity == 0) null else entity;
     }
 
-    /// An entity kept in a kind's table leaves memory, its row gone first.
+    /// An entity kept in a kind's table leaves memory, its row gone first. A held slot stays
+    /// taken until let go.
     pub fn leave(self: *Entities, slot: u32) void {
-        assert(self.directory.entry(slot).block == directory.none);
+        const entry = self.directory.entry(slot);
+        assert(entry.block == directory.none);
         // Placed, it would stay in the space with no slot to be found by.
-        assert(self.directory.entry(slot).space_column == directory.none);
+        assert(entry.space_column == directory.none);
         self.places.order.leaveSlot(slot);
-        self.directory.remove(slot);
+        if (entry.held) self.directory.retire(slot) else self.directory.remove(slot);
+    }
+
+    /// Keeps a slot, and so the network id clients know its entity by, from any new entity until
+    /// every client was told the entity is gone; or lets it go, freeing it if the entity left.
+    pub fn holdSlot(self: *Entities, slot: u32, hold: bool) void {
+        const entry = self.directory.entry(slot);
+        if (hold) {
+            assert(!entry.retired);
+            entry.held = true;
+            return;
+        }
+        if (entry.retired) return self.directory.free(slot);
+        entry.held = false;
     }
 
     /// The entity's entry, its records where they lie until the tick's end.

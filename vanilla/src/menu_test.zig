@@ -1810,8 +1810,10 @@ fn liveOrbs(experience: *Experience) ![]u64 {
     return experience.live(&live_orbs);
 }
 
+/// An orb as it stands; one gone is forgotten at the end of the tick it went, and reads as gone.
 fn orbOf(experience: *Experience, entity: u64) !Experience.Orb {
-    return ((try experience.get(entity)) orelse return error.UnknownExperienceOrb).orb;
+    const found = (try experience.get(entity)) orelse return .{ .alive = false };
+    return found.orb;
 }
 
 fn bodyOf(experience: *Experience, entity: u64) !@import("entities").State {

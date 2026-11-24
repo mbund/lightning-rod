@@ -160,7 +160,7 @@ pub const Experience = struct {
     }
 
     /// A pickup and where the orb was, as the pickup that takes its last point takes its body.
-    pub const Pickup = struct { entity: u64, collector: i32, body: entities.State, value: i32 };
+    pub const Pickup = struct { entity: u64, slot: u32, collector: i32, body: entities.State, value: i32 };
     const Death = struct { handle: ?sessions.Handle = null, life: u32 = 0 };
     pub const Sound = struct { handle: ?sessions.Handle = null, life: u32 = 0, ticks: u32 = 0, last: u32 = 0, volume: ?f32 = null, seed: i64 = 0 };
     deps: Dependencies,
@@ -180,22 +180,18 @@ pub const Experience = struct {
     last_radius: i32 = 0,
     last_ticking: u64 = std.math.maxInt(u64),
     last_held: u64 = std.math.maxInt(u64),
-    /// Told as an orb leaves memory, for those who keep anything of it.
-    leaving: ?Leaving = null,
     random: Random,
     table: records.Table,
     deaths: []Death,
     pickups: []Pickup,
     sounds: []Sound,
     pickup_count: usize = 0,
+    /// Orbs gone since their records were last let go.
+    retired: []entities.Id,
+    retired_count: usize = 0,
     nearby: []entities.space.Entry,
     /// While entities tick: the blocks orbs read, shared by them all.
     window: ?ItemPhysics.Window = null,
-
-    pub const Leaving = struct {
-        context: *anyopaque,
-        function: *const fn (*anyopaque, entities.Id) void,
-    };
 
     pub fn allocate(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Experience {
         if (deps.inventories.items.entries.len < 2) return error.InventoryCacheTooSmall;
@@ -218,6 +214,7 @@ pub const Experience = struct {
             .random = .{ .source = .init(config.seed) },
             .table = table,
             .nearby = try allocator.alloc(entities.space.Entry, 1024),
+            .retired = try allocator.alloc(entities.Id, bound),
         };
         @memset(self.deaths, .{});
         @memset(self.sounds, .{});
@@ -481,6 +478,8 @@ pub const Experience = struct {
         held.orb.alive = false;
         held.body = null;
         held.was = null;
+        self.retired[self.retired_count] = held.id;
+        self.retired_count += 1;
     }
 
     pub fn damage(self: *Experience, entity: u64, amount: f32) !bool {
@@ -498,7 +497,8 @@ pub const Experience = struct {
         return true;
     }
 
-    /// Lets go of a gone orb's record, once no client knows of it.
+    /// Lets go of a gone orb's record. Its slot, and with it the id clients know it by, stays
+    /// until every client that had it was told it went.
     pub fn forget(self: *Experience, entity: entities.Id) !void {
         const stored = try self.orbs.take(entity) orelse return error.UnknownExperienceOrb;
         assert(!stored.orb.alive);
@@ -516,6 +516,8 @@ pub const Experience = struct {
             self.sounds[index].ticks +%= 1;
         }
         self.pickup_count = 0;
+        // Orbs hurt to death between ticks.
+        try self.forgetRetired();
         // Where nothing follows the loaded domain, orbs follow the players themselves.
         if (!self.deps.entities.columns_followed) try self.refresh();
         self.window = self.deps.physics.readWindow();
@@ -545,6 +547,13 @@ pub const Experience = struct {
             self.window = null;
         }
         try self.collect();
+        try self.forgetRetired();
+    }
+
+    /// The records of orbs that went go too.
+    fn forgetRetired(self: *Experience) !void {
+        for (self.retired[0..self.retired_count]) |entity| try self.forget(entity);
+        self.retired_count = 0;
     }
 
     /// Orbs a run holds at once.
@@ -595,7 +604,6 @@ pub const Experience = struct {
             leaving_count += 1;
         }
         for (self.scratch[0..leaving_count]) |entity| {
-            if (self.leaving) |hook| hook.function(hook.context, entity);
             const body = (try self.deps.entities.get(entity)).?;
             const stored = (try self.orbs.take(entity)).?;
             try save(&batch, entity, body, stored);
@@ -812,7 +820,7 @@ pub const Experience = struct {
             state.experience_delay = 2;
             self.givePoints(player_index, try self.repair(player_index, held[0].orb.value));
             held[0].orb.count -= 1;
-            self.pickups[self.pickup_count] = .{ .entity = entity, .collector = @intCast(player_index + 1), .body = held[0].body.?, .value = held[0].orb.value };
+            self.pickups[self.pickup_count] = .{ .entity = entity, .slot = self.deps.entities.directory.slotOf(entity).?, .collector = @intCast(player_index + 1), .body = held[0].body.?, .value = held[0].orb.value };
             self.pickup_count += 1;
             if (held[0].orb.count == 0) try self.retire(&held[0]);
         }

@@ -21,7 +21,9 @@ const Ticks = @import("ticks").ticks.Ticks;
 pub const RandomTicks = @import("random_ticks").random_ticks.RandomTicks;
 const PayloadChannels = @import("connection").payload_channels;
 const Visibility = @import("replication").visibility.Visibility;
-const Replication = @import("replication").replication.Replication;
+pub const Replication = @import("replication").replication.Replication;
+pub const Tracking = @import("replication").tracking.Tracking;
+pub const TrackingPass = @import("replication").tracking.TrackingPass;
 const Bossbars = @import("bossbars").bossbars.Bossbars;
 const Chat = @import("chat").chat.Chat;
 const PlayerChat = @import("chat").player_chat.PlayerChat;
@@ -113,6 +115,7 @@ pub const MobReplication = @import("vanilla_mobs").mob_replication.MobReplicatio
 pub const SpawnEggs = @import("vanilla_mobs").spawn_eggs.SpawnEggs;
 pub const Melee = @import("vanilla_mobs").melee.Melee;
 pub const Projectiles = @import("vanilla_mobs").projectiles.Projectiles;
+pub const ProjectileReplication = @import("vanilla_mobs").projectile_replication.ProjectileReplication;
 pub const Ranged = @import("vanilla_mobs").ranged.Ranged;
 pub const MobInteraction = @import("vanilla_mobs").mob_interaction.MobInteraction;
 pub const Placement = @import("vanilla_blocks").placement.Placement;
@@ -206,6 +209,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Flat, Flat.Configuration{}),
     lightning_rod.plugin.configured(Lighting, Lighting.Configuration{}),
     lightning_rod.plugin.configured(Streaming, Streaming.Configuration{}),
+    lightning_rod.plugin.configured(Tracking, Tracking.Configuration{}),
     lightning_rod.plugin.configured(Replication, Replication.Configuration{}),
     lightning_rod.plugin.configured(DamageTypes, .{}),
     lightning_rod.plugin.configured(PlayerDamage, .{}),
@@ -227,6 +231,8 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Ranged, .{}),
     lightning_rod.plugin.configured(MobInteraction, MobInteraction.Configuration{}),
     lightning_rod.plugin.configured(EntityTicks, .{}),
+    lightning_rod.plugin.configured(TrackingPass, .{}),
+    lightning_rod.plugin.configured(ProjectileReplication, .{}),
     lightning_rod.plugin.configured(ExperienceReplication, .{}),
     lightning_rod.plugin.configured(MobReplication, MobReplication.Configuration{}),
     lightning_rod.plugin.configured(Equipment, Equipment.Configuration{}),

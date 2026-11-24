@@ -639,19 +639,6 @@ pub const ItemEntities = struct {
         self.moved.remove(entity);
     }
 
-    /// The items of the columns from `minimum` to `maximum`, into `selected`.
-    pub fn selectColumns(self: *ItemEntities, world: u32, minimum: [2]i32, maximum: [2]i32, selected: *entities.IdSet) void {
-        assert(minimum[0] <= maximum[0] and minimum[1] <= maximum[1]);
-        var x = minimum[0];
-        while (x <= maximum[0]) : (x += 1) {
-            var z = minimum[1];
-            while (z <= maximum[1]) : (z += 1) {
-                var walk = self.places.space.entries(.{ .world = world, .x = x, .z = z }, kinds);
-                while (walk.next()) |entry| selected.insert(entry.id);
-            }
-        }
-    }
-
     /// Live items of a column's sections `low` through `high`, in vanilla's order: sections as
     /// SectionPos.asLong sorts them, then as they entered each.
     pub fn inColumn(self: *ItemEntities, column: Column, low: i32, high: i32, buffer: []entities.space.Entry) entities.Space.Ordered {
