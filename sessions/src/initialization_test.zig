@@ -1149,6 +1149,15 @@ test "broadcast groups retain independent protocol admission across audience reu
     // Its one recipient had room: the packet went whole, as `accepted` agrees.
     try std.testing.expect(batch.wentWhole());
     try std.testing.expectEqual(@as(usize, 2), batch.accepted(next).words[0]);
+    // Its one recipient has no room at all: nothing is written for its protocol, and the batch
+    // did not go whole, as `accepted` agrees.
+    endpoint.credit[1].store(@as(u64, 2) << 32 | service_module.Service.active, .release);
+    try batch.begin(targets[1..2]);
+    const starved = try batch.write(.{ One, Two }, Encoder, null, null, {}, 8);
+    batch.finish();
+    try std.testing.expect(!batch.wentWhole());
+    try std.testing.expectEqual(@as(usize, 0), batch.accepted(starved).words[0]);
+    endpoint.credit[1].store(@as(u64, 2) << 32 | service_module.Service.active | endpoint.config.credit_bytes, .release);
     var packets: usize = 0;
     while (endpoint.output.takeReady()) |packet| {
         if (packets < 2) {

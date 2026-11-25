@@ -232,6 +232,8 @@ pub const Broadcast = struct {
                 const wanted = for (membership) |bits| {
                     if (bits != 0) break true;
                 } else false;
+                // None of its players with room: it goes to none of them.
+                if (wanted and self.available[protocol] == 0) self.whole = false;
                 if (wanted and self.available[protocol] != 0) version: {
                     if (capacities.len > self.entries.len - self.count) return error.BroadcastFull;
                     const packets = &scratch.packets;
