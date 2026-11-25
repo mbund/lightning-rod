@@ -452,7 +452,7 @@ pub fn verifyReadWindow() !void {
     const row = (try rows.next()).?;
     try std.testing.expect((try rows.next()) == null);
     try std.testing.expect(row.metadata.alive);
-    const body = (try dropped.deps.entities.get(row.id)).?;
+    const body = (try dropped.deps.entities.getById(row.id)).?;
     const loot = (try ownership.get(ItemEntities.slot(body))).stack.?;
     try std.testing.expectEqual(@as(u16, 1), loot.count);
     try std.testing.expectEqual(@as(u32, @intCast(game_data.registry.itemId("minecraft:cobblestone").?)), try fixture.mining.deps.items.kind(loot));
@@ -669,7 +669,7 @@ pub fn verifyExperience() !void {
         try std.testing.expectEqual(@as(usize, @intFromBool(should_drop)), dropped.count());
         var drops = dropped.rows();
         while ((try drops.next())) |row| if (row.metadata.alive) {
-            const body = (try dropped.deps.entities.get(row.id)).?;
+            const body = (try dropped.deps.entities.getById(row.id)).?;
             const stack = (try fixture.mining.deps.inventories.get(ItemEntities.slot(body))).stack.?;
             try std.testing.expectEqual(@as(u32, @intCast(game_data.registry.itemId(if (case.enchantment != null and std.mem.eql(u8, case.enchantment.?, "minecraft:silk_touch")) "minecraft:diamond_ore" else "minecraft:diamond").?)), try fixture.mining.deps.items.kind(stack));
         };

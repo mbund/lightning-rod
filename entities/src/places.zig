@@ -97,18 +97,18 @@ pub const Places = struct {
 
     /// An entity moved. Into a column that does not tick, it stops at once; back into one, it
     /// joins last.
-    pub fn move(self: *Places, entity: Id, world: u32, position: [3]f64) !void {
-        return self.moveSlot(self.space.directory.slotOf(entity) orelse return error.NotPlaced, world, position);
+    pub fn moveById(self: *Places, entity: Id, world: u32, position: [3]f64) !void {
+        return self.move(self.space.directory.slotOf(entity) orelse return error.NotPlaced, world, position);
     }
 
     /// As `move`, for the entity in a slot: found without its id.
-    pub fn moveSlot(self: *Places, slot: u32, world: u32, position: [3]f64) !void {
+    pub fn move(self: *Places, slot: u32, world: u32, position: [3]f64) !void {
         const entry = self.space.directory.entry(slot);
         if (entry.space_column == directory_module.none) return error.NotPlaced;
         const entity = entry.id;
         const was = self.space.data(entry.space_column).column;
         const ticked = self.ticks(was);
-        try self.space.moveSlot(slot, world, position);
+        try self.space.move(slot, world, position);
         const to = space_module.columnOf(world, position);
         if (std.meta.eql(was, to)) return;
         const ticking_now = self.ticks(to);
@@ -274,9 +274,9 @@ test "entities tick in their columns' order as columns start, and stop as they m
     try places.changeTicking(&.{ b, a }, &.{});
     try testing.expectEqualSlices(Id, &.{ 2, 1, 3 }, try passIds(&places, &table, &buffer));
     // Into a column that does not tick it stops; back, it joins last.
-    try places.move(2, 0, .{ 90, 3, 1 });
+    try places.moveById(2, 0, .{ 90, 3, 1 });
     try testing.expectEqualSlices(Id, &.{ 1, 3 }, try passIds(&places, &table, &buffer));
-    try places.move(2, 0, .{ 2, 3, 1 });
+    try places.moveById(2, 0, .{ 2, 3, 1 });
     try testing.expectEqualSlices(Id, &.{ 1, 3, 2 }, try passIds(&places, &table, &buffer));
     try places.changeTicking(&.{}, &.{a});
     try testing.expectEqualSlices(Id, &.{3}, try passIds(&places, &table, &buffer));

@@ -166,7 +166,7 @@ test "survival cursor placements drops and close preserve ownership across resta
             var rows = fixture.dropped.rows();
             while ((try rows.next())) |row| {
                 if (!row.metadata.alive) continue;
-                const body = (try fixture.bodies.get(row.id)).?;
+                const body = (try fixture.bodies.getById(row.id)).?;
                 const stack = (try fixture.ownership.get(ItemEntities.slot(body))).stack.?;
                 try std.testing.expectEqual(@as(u16, 1), stack.count);
                 total += stack.count;

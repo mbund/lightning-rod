@@ -140,7 +140,7 @@ pub const Entities = struct {
     }
 
     /// An entity's body where it lies, by slot, if it has one.
-    pub fn bodyAt(self: *Entities, slot: u32) ?*State {
+    pub fn body(self: *Entities, slot: u32) ?*State {
         const entry = self.directory.entry(slot);
         if (self.body_columns[entry.kind]) |column| {
             if (entry.block == directory.none) return null;
@@ -380,24 +380,24 @@ pub const Entities = struct {
     }
 
     /// A copy of an entity's body, if it has one.
-    pub fn get(self: *Entities, entity: Id) !?State {
+    pub fn getById(self: *Entities, entity: Id) !?State {
         const slot = self.directory.slotOf(entity) orelse return null;
-        return (self.bodyAt(slot) orelse return null).*;
+        return (self.body(slot) orelse return null).*;
     }
 
     /// An entity's body where it lies, good until the tick's end.
-    pub fn body(self: *Entities, entity: Id) !?*State {
-        return self.bodyAt(self.directory.slotOf(entity) orelse return null);
+    pub fn bodyById(self: *Entities, entity: Id) !?*State {
+        return self.body(self.directory.slotOf(entity) orelse return null);
     }
 
     /// Replaces the body of an entity that has one.
-    pub fn set(self: *Entities, entity: Id, state: State) !void {
-        ((try self.body(entity)) orelse unreachable).* = state;
+    pub fn setById(self: *Entities, entity: Id, state: State) !void {
+        ((try self.bodyById(entity)) orelse unreachable).* = state;
     }
 
-    pub fn has(self: *Entities, entity: Id) bool {
+    pub fn hasById(self: *Entities, entity: Id) bool {
         const slot = self.directory.slotOf(entity) orelse return false;
-        return self.bodyAt(slot) != null;
+        return self.body(slot) != null;
     }
 
     /// The directory slot of an entity coming into memory, made if it has none. A full

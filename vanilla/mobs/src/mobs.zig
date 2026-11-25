@@ -463,7 +463,7 @@ pub const Mobs = struct {
         }
         if (mob.entity.placed and mob.entity.placed_world == mob.motion.world and std.meta.eql(mob.entity.placed_position, mob.motion.position)) return;
         // Into a column that does not tick, it leaves the tick list; back into one, it joins last.
-        if (mob.entity.placed) try self.places.move(mob.entity.id, mob.motion.world, mob.motion.position) else try self.places.insert(mob.entity.id, mob.motion.world, mob.motion.position, self.shapeOf(mob));
+        if (mob.entity.placed) try self.places.move(index, mob.motion.world, mob.motion.position) else try self.places.insert(mob.entity.id, mob.motion.world, mob.motion.position, self.shapeOf(mob));
         _ = !mob.entity.placed or mob.entity.placed_world != mob.motion.world or !std.meta.eql(entities.space.columnOf(mob.entity.placed_world, mob.entity.placed_position), entities.space.columnOf(mob.motion.world, mob.motion.position));
         mob.entity.placed = true;
         mob.entity.placed_world = mob.motion.world;
@@ -551,8 +551,8 @@ pub const Mobs = struct {
 
     /// A placed mob's box as lookups meet it, read from its place without its state.
     pub fn placedBox(self: *const Mobs, index: u32) ?body.Box {
-        const entry = self.places.space.get(self.deps.entities.directory.entry(index).id) orelse return null;
-        const box = entry.box();
+        const placed = self.places.space.atSlot(index) orelse return null;
+        const box = placed.entry.box();
         return .{ .min = box.min, .max = box.max };
     }
 
@@ -1429,7 +1429,9 @@ pub const Mobs = struct {
 
             fn each(lookup: *const @This(), entry: entities.space.Entry) anyerror!bool {
                 const mobs = lookup.mobs;
-                const index = mobs.slotOf(entry.id) orelse return false;
+                // The space gives only the mobs' kinds, each with its slot.
+                const index = entry.slot;
+                if (@import("builtin").mode == .debug) std.debug.assert(mobs.isMob(index));
                 // Held only while visited; a visitor keeps ids, not mobs.
                 const mob = try mobs.inSlot(index);
                 if (mob.entity.removed or !living.box(mobs, mob).intersects(lookup.query)) return false;

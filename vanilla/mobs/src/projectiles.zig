@@ -344,8 +344,6 @@ pub const Projectiles = struct {
     /// Who sees projectiles, set by ProjectileReplication.
     tracking: ?*Tracking = null,
     tracker: Tracking.TrackerId = 0,
-    /// Room for the slots of boxes due.
-    due: []u32,
     sleeping: usize = 0,
     sleep: bool,
     /// A running hash of everything asked to be sent, when tests trace it.
@@ -364,8 +362,9 @@ pub const Projectiles = struct {
     rousing: []u32,
     rousing_count: usize = 0,
     rouse_all: bool = false,
-    /// Sleepers waking this tick, by id, for the flying to take among the others.
-    waking: []u64,
+    /// Sleepers waking this tick, by slot, for the flying to take among the others: a slot freed
+    /// since wakes nothing.
+    waking: []u32,
     waking_count: usize = 0,
     /// The batch in hand.
     held: []Held,
@@ -465,11 +464,10 @@ pub const Projectiles = struct {
             .cells = cells,
             .ops = try allocator.alloc(IndexOp, ops_max),
             .held = try allocator.alloc(Held, batch_max),
-            .due = try allocator.alloc(u32, configuration.claims),
             .sleep = configuration.sleep,
             .tracing = configuration.trace_sends,
             .rousing = try allocator.alloc(u32, rousing_max),
-            .waking = try allocator.alloc(u64, configuration.claims),
+            .waking = try allocator.alloc(u32, configuration.claims),
             .order = try allocator.alloc(Order, batch_max),
             .traces = try allocator.alloc(?raycast.Hit, batch_max),
             .motions = try allocator.alloc([3]f64, batch_max),
@@ -1040,7 +1038,7 @@ pub const Projectiles = struct {
         try self.expire();
         try self.wake();
         // Sleepers due and those something came near take their turns among the rest.
-        for (self.waking[0..self.waking_count]) |entity| try self.tick_order.wake(entity);
+        for (self.waking[0..self.waking_count]) |slot| try self.tick_order.wakeSlot(slot);
     }
 
     /// After entities tick: the parked look over their viewers, players pick up, and
@@ -1490,15 +1488,11 @@ pub const Projectiles = struct {
             const boxed = space.boxOf(slot) orelse continue;
             if (!self.kinds.has(boxed.kind)) continue;
             _ = space.unbox(slot);
-            self.waking[self.waking_count] = self.deps.entities.directory.entry(slot).id;
+            self.waking[self.waking_count] = slot;
             self.waking_count += 1;
         }
-        var due: usize = 0;
-        space.takeDue(self.now, self.kinds, self.due, &due);
-        for (self.due[0..due]) |slot| {
-            self.waking[self.waking_count] = self.deps.entities.directory.entry(slot).id;
-            self.waking_count += 1;
-        }
+        // Those due join them.
+        space.takeDue(self.now, self.kinds, self.waking, &self.waking_count);
     }
 
     /// A projectile as it is after a tick: a sleeper on its way along its plan, or where its sleep
@@ -1525,7 +1519,7 @@ pub const Projectiles = struct {
         const shape: entities.space.Shape = .{ .kind = self.entity_types[@backingInt(projectile.kind)], .half_width = half_width, .height = height };
         if (space.atSlot(slot)) |placed| {
             if (placed.world == projectile.world and std.meta.eql(placed.entry.position, projectile.position)) return;
-            return space.move(projectile.id, projectile.world, projectile.position);
+            return space.move(slot, projectile.world, projectile.position);
         }
         try space.insert(projectile.id, projectile.world, projectile.position, shape);
     }

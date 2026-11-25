@@ -84,7 +84,7 @@ pub const Inventory = struct {
             var rows = self.deps.dropped.rows();
             while ((try rows.next())) |row| {
                 if (!row.metadata.alive) continue;
-                const body = (try self.deps.entities.get(row.id)).?;
+                const body = (try self.deps.entities.getById(row.id)).?;
                 const held = try self.deps.inventories.get(vanilla.ItemEntities.slot(body));
                 dropped += held.stack.?.count;
             }

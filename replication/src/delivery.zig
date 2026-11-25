@@ -122,6 +122,11 @@ pub fn Batch(comptime Payload: type) type {
         recipients: []sessions.Service.Target,
         /// The audience of the batch under way, as words.
         audience: []usize,
+        /// Room for whom a packet of the batch missed.
+        missed: []usize,
+        /// How many of `recipients` the batch under way goes to, and room for them as a set.
+        recipient_count: usize = 0,
+        reached: []usize,
         entries: [sessions.Service.batch_max]Entry = undefined,
         count: usize = 0,
 
@@ -133,6 +138,8 @@ pub fn Batch(comptime Payload: type) type {
                 .sessions = service,
                 .recipients = try allocator.alloc(sessions.Service.Target, players.records.len),
                 .audience = try allocator.alloc(usize, words),
+                .missed = try allocator.alloc(usize, words),
+                .reached = try allocator.alloc(usize, words),
             };
         }
 
@@ -163,6 +170,7 @@ pub fn Batch(comptime Payload: type) type {
                 count += 1;
             }
             if (count == 0) return .nobody;
+            self.recipient_count = count;
             broadcast.begin(self.recipients[0..count]) catch |err| switch (err) {
                 error.Backpressured => return .backpressured,
                 else => return err,
@@ -216,11 +224,33 @@ pub fn Batch(comptime Payload: type) type {
                 broadcast.cancel();
                 self.count = 0;
             }
+            // Every packet went to every recipient: what each reached needs no working out.
+            if (broadcast.wentWhole()) {
+                @memset(self.reached, 0);
+                for (self.recipients[0..self.recipient_count]) |target| self.reached[target.handle.index / 64] |= @as(usize, 1) << @intCast(target.handle.index % 64);
+                const everyone: bit_sets.Set = .{ .words = self.reached, .capacity = self.players.records.len };
+                for (self.entries[0..self.count]) |entry| try settle(context, entry.payload, everyone, broadcast.recipients);
+                return;
+            }
             for (self.entries[0..self.count]) |entry| {
                 var unsupported = broadcast.unsupported(entry.receipt).iterator();
                 while (unsupported.next()) |index| self.sessions.disconnect(broadcast.handleAt(index));
                 try settle(context, entry.payload, broadcast.accepted(entry.receipt), broadcast.recipients);
             }
+        }
+
+        /// Of the batch's audience in a session, those a packet that reached `accepted` missed:
+        /// their output was full, or they were not yet playing. What `settle` is handed lets a kind
+        /// owe them the state whole. Good until the next call.
+        pub fn missedOf(self: *const Self, accepted: bit_sets.Set) bit_sets.Set {
+            const audience: bit_sets.Set = .{ .words = self.audience, .capacity = self.players.records.len };
+            var each = audience.iterator();
+            @memset(self.missed, 0);
+            while (each.next()) |player| {
+                if (self.players.records[player].handle == null or accepted.contains(player)) continue;
+                self.missed[player / 64] |= @as(usize, 1) << @intCast(player % 64);
+            }
+            return .{ .words = self.missed, .capacity = self.players.records.len };
         }
 
         /// Gives up the batch under way, nothing of it sent.

@@ -252,7 +252,7 @@ test "prepared definitions survive cache reuse and revalidate changed bytes" {
 /// The items the space has in a column of x, at z 0, as they entered it.
 fn inColumn(dropped: *ItemEntities, world: u32, x: i32, output: []entities.Id) !usize {
     var buffer: [4]entities.space.Entry = undefined;
-    var ordered = dropped.inColumn(.{ .world = world, .x = x, .z = 0 }, std.math.minInt(i32), std.math.maxInt(i32), &buffer);
+    var ordered = dropped.places.space.ordered(.{ .world = world, .x = x, .z = 0 }, std.math.minInt(i32), std.math.maxInt(i32), ItemEntities.kinds, &buffer);
     var count: usize = 0;
     while (true) {
         const entries = try ordered.next();
@@ -325,7 +325,7 @@ test "items read by id see earlier writes, moves and retirement" {
             try std.testing.expect(try ownership.set(slot, held.revision, null));
             try dropped.retire(second, body, &metadata);
             try std.testing.expect(!(try dropped.get(second)).alive);
-            try std.testing.expect((try bodies.get(second)) == null);
+            try std.testing.expect((try bodies.getById(second)) == null);
         }
         // Retired, it is gone from its column; one made there takes its place.
         try std.testing.expectEqual(@as(usize, 0), try inColumn(dropped, world, 2, &found));

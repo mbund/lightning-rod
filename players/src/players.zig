@@ -239,7 +239,7 @@ pub const Players = struct {
             self.entity_ids[index] = joined;
             self.join_count += 1;
             self.joined_at[index] = self.join_count;
-        } else try space.moveSlot(self.entity_slots[index], player.world, position);
+        } else try space.move(self.entity_slots[index], player.world, position);
     }
 
     /// Players in the chunk columns at most `radius` from a point's on both axes, in its world.

@@ -8,6 +8,8 @@ const entities = @import("entities");
 const lightning_rod = @import("lightning_rod");
 const Tracking = @import("replication").tracking.Tracking;
 const Delivery = @import("replication").delivery.Delivery;
+/// Mobs' deltas, by the slot of the mob each is of: whom each missed is owed the mob whole.
+const Batch = @import("replication").delivery.Batch(u32);
 const sessions = @import("sessions");
 const packets = @import("minecraft_packets");
 const wire = @import("wire_1_21_5");
@@ -108,8 +110,13 @@ pub const MobReplication = struct {
     /// Players a delivery could not be queued for, who then need the mob whole.
     missed: []usize,
     missed_any: bool = false,
+    /// Room for those a queued delta could not go to at all.
+    owed: []usize,
     /// How a mob's packets go out, as every kind's do: whom the last reached and missed.
     delivery: Delivery,
+    /// Deltas of mobs that go to the same players, admitted for all of them at once. Whatever
+    /// goes out alone sends them first, so each player has its packets in the order they came.
+    batch: Batch,
     /// A running hash of every packet asked to be sent and whom to, when tests trace it.
     traced: u64 = 0,
     tracing: bool,
@@ -123,7 +130,9 @@ pub const MobReplication = struct {
             .rows = try allocator.alloc(usize, 4 * words),
             .words = words,
             .missed = try allocator.alloc(usize, words),
+            .owed = try allocator.alloc(usize, words),
             .delivery = try .init(allocator, deps.players, deps.packets, deps.sessions),
+            .batch = try .init(allocator, deps.players, deps.packets, deps.sessions, words),
             .tracing = config.trace_sends,
         };
         @memset(self.missed, 0);
@@ -180,6 +189,7 @@ pub const MobReplication = struct {
         const mobs = self.deps.mobs;
         const tracking = self.deps.tracking;
         defer self.tick_count += 1;
+        errdefer self.batch.abandon();
         if (self.failure) |err| return err;
         // What befell mobs goes first, in order, to those who knew them as it did: a death's
         // puff arrives before the removal.
@@ -205,7 +215,7 @@ pub const MobReplication = struct {
                 if (self.tick_count % idle_interval != state.send_phase) continue;
                 const motion = mob_row.field("motion");
                 const idle_view = try self.viewOf(index);
-                try self.sendDue(self.current(index), .{
+                try self.sendDue(index, self.current(index), .{
                     .network_id = entities.Entities.networkOfSlot(index),
                     .position = motion.position,
                     .velocity = motion.velocity,
@@ -221,6 +231,7 @@ pub const MobReplication = struct {
             }
             try self.send(index, change);
         }
+        try self.flushQueued();
         if (changed) self.audience_changes += 1;
     }
 
@@ -259,6 +270,8 @@ pub const MobReplication = struct {
             state.send_phase = @intCast(view.started % idle_interval);
         }
         if (mob.entity.removed and !tracking.known(index).any()) {
+            // Its deltas settle by its slot, so they go before the slot does.
+            try self.flushQueued();
             self.views.at(index).* = .{};
             try mobs.release(@intCast(index));
         }
@@ -321,7 +334,7 @@ pub const MobReplication = struct {
         const changes = Changes.between(view.data, now);
         const interval = self.deps.mobs.traits(mob.entity.species).update_interval;
         if ((self.tick_count - view.started) % interval == 0 or mob.entity.has_impulse or changes.any()) {
-            try self.sendDue(known, .{
+            try self.sendDue(index, known, .{
                 .network_id = networkId(self.deps.mobs, mob),
                 .position = mob.motion.position,
                 .velocity = mob.motion.velocity,
@@ -337,7 +350,7 @@ pub const MobReplication = struct {
         // A hurt mob's new motion goes out at once, whatever the interval.
         if (mob.entity.hurt_marked) {
             mob.entity.hurt_marked = false;
-            try self.deliver(known, .{ .velocity = .{ .id = networkId(self.deps.mobs, mob), .velocity = mob.motion.velocity } });
+            try self.queue(index, known, .{ .velocity = .{ .id = networkId(self.deps.mobs, mob), .velocity = mob.motion.velocity } });
         }
     }
 
@@ -371,7 +384,7 @@ pub const MobReplication = struct {
         };
     }
 
-    fn sendDue(self: *MobReplication, known: lightning_rod.system.bit_sets.Set, subject: Subject, view: *View, now: Data, changes: Changes) !void {
+    fn sendDue(self: *MobReplication, index: u32, known: lightning_rod.system.bit_sets.Set, subject: Subject, view: *View, now: Data, changes: Changes) !void {
         const yaw = mth.packDegrees(subject.yaw);
         const pitch = mth.packDegrees(subject.pitch);
         const turned = @abs(@as(i32, yaw) - view.yaw) >= 1 or @abs(@as(i32, pitch) - view.pitch) >= 1;
@@ -413,20 +426,20 @@ pub const MobReplication = struct {
             const length = subject.velocity[0] * subject.velocity[0] + subject.velocity[1] * subject.velocity[1] + subject.velocity[2] * subject.velocity[2];
             if (squared > 1.0e-7 or (squared > 0 and length == 0)) {
                 view.velocity = subject.velocity;
-                try self.deliver(known, .{ .velocity = .{ .id = subject.network_id, .velocity = view.velocity } });
+                try self.queue(index, known, .{ .velocity = .{ .id = subject.network_id, .velocity = view.velocity } });
             }
         }
         const id_value = subject.network_id;
         const short: [3]i16 = .{ @truncate(encoded[0]), @truncate(encoded[1]), @truncate(encoded[2]) };
         switch (movement) {
             .none => {},
-            .sync => try self.deliver(known, .{ .sync = .{ .id = id_value, .position = subject.position, .velocity = subject.velocity, .yaw = subject.yaw, .pitch = subject.pitch, .on_ground = subject.on_ground } }),
-            .position => try self.deliver(known, .{ .relative = .{ .id = id_value, .delta = short, .on_ground = subject.on_ground } }),
-            .rotation => try self.deliver(known, .{ .look = .{ .id = id_value, .yaw = yaw, .pitch = pitch, .on_ground = subject.on_ground } }),
-            .both => try self.deliver(known, .{ .move_look = .{ .id = id_value, .delta = short, .yaw = yaw, .pitch = pitch, .on_ground = subject.on_ground } }),
+            .sync => try self.queue(index, known, .{ .sync = .{ .id = id_value, .position = subject.position, .velocity = subject.velocity, .yaw = subject.yaw, .pitch = subject.pitch, .on_ground = subject.on_ground } }),
+            .position => try self.queue(index, known, .{ .relative = .{ .id = id_value, .delta = short, .on_ground = subject.on_ground } }),
+            .rotation => try self.queue(index, known, .{ .look = .{ .id = id_value, .yaw = yaw, .pitch = pitch, .on_ground = subject.on_ground } }),
+            .both => try self.queue(index, known, .{ .move_look = .{ .id = id_value, .delta = short, .yaw = yaw, .pitch = pitch, .on_ground = subject.on_ground } }),
         }
         if (changes.any()) {
-            try self.deliver(known, .{ .metadata = .{ .id = id_value, .data = now, .changes = changes } });
+            try self.queue(index, known, .{ .metadata = .{ .id = id_value, .data = now, .changes = changes } });
             view.data = now;
         }
         if (sent_position) view.base = subject.position;
@@ -436,30 +449,22 @@ pub const MobReplication = struct {
         }
         const head = mth.packDegrees(subject.head_yaw);
         if (@abs(@as(i32, head) - view.head_yaw) >= 1) {
-            try self.deliver(known, .{ .head = .{ .id = id_value, .yaw = head } });
+            try self.queue(index, known, .{ .head = .{ .id = id_value, .yaw = head } });
             view.head_yaw = head;
         }
     }
 
-    /// Sends a packet to a set of players, noting in `sent` who got it.
+    /// Sends a packet to a set of players now, noting who got it and who missed it: what was
+    /// queued goes first.
     fn deliver(self: *MobReplication, recipients: lightning_rod.system.bit_sets.Set, outgoing: Outgoing) !void {
+        try self.flushQueued();
         const delivery = &self.delivery;
         if (!recipients.any()) {
             delivery.reached_count = 0;
             delivery.missed_count = 0;
             return;
         }
-        if (self.tracing) {
-            var hasher = std.hash.Wyhash.init(self.traced);
-            hasher.update(std.mem.asBytes(&self.tick_count));
-            hasher.update(&.{@backingInt(outgoing)});
-            switch (outgoing) {
-                inline else => |value| trace(&hasher, value),
-            }
-            var who = recipients.iterator();
-            while (who.next()) |player| hasher.update(std.mem.asBytes(&player));
-            self.traced = hasher.final();
-        }
+        self.traceSend(recipients, outgoing);
         switch (outgoing) {
             .status => |value| try delivery.send(recipients, writeStatus, .{ value.id, value.status }, 32),
             .remove => |value| try delivery.send(recipients, writeRemove, .{value}, 32),
@@ -478,6 +483,63 @@ pub const MobReplication = struct {
             put(self.missed, player);
             self.missed_any = true;
         }
+    }
+
+    /// Folds a packet asked to be sent, and whom to, into the trace when tests ask for one.
+    fn traceSend(self: *MobReplication, recipients: lightning_rod.system.bit_sets.Set, outgoing: Outgoing) void {
+        if (!self.tracing) return;
+        var hasher = std.hash.Wyhash.init(self.traced);
+        hasher.update(std.mem.asBytes(&self.tick_count));
+        hasher.update(&.{@backingInt(outgoing)});
+        switch (outgoing) {
+            inline else => |value| trace(&hasher, value),
+        }
+        var who = recipients.iterator();
+        while (who.next()) |player| hasher.update(std.mem.asBytes(&player));
+        self.traced = hasher.final();
+    }
+
+    /// Queues a delta of the mob in a slot for a set of players, with others for the same players:
+    /// whom it misses learn so when the batch goes, and are owed the mob whole.
+    fn queue(self: *MobReplication, slot: u32, recipients: lightning_rod.system.bit_sets.Set, outgoing: Outgoing) !void {
+        if (!recipients.any()) return;
+        self.traceSend(recipients, outgoing);
+        // Room the batch lacks sends what it holds; a second miss means its players have none.
+        for (0..2) |_| {
+            switch (try self.batch.prepare(recipients, 1, self, settleQueued)) {
+                .ready => {},
+                // None of them playing yet, or none with room: they are owed it all the same.
+                .nobody, .backpressured => break,
+            }
+            const sent = switch (outgoing) {
+                .metadata => |value| try self.batch.send(slot, Metadata.write, .{ value.id, value.data, value.changes }, 128),
+                .velocity => |value| try self.batch.send(slot, .{ writeVelocityLegacy, writeVelocityPacked }, .{ value.id, value.velocity }, 64),
+                .sync => |value| try self.batch.send(slot, writeSync, .{ value.id, value.position, value.velocity, value.yaw, value.pitch, value.on_ground }, 128),
+                .relative => |value| try self.batch.send(slot, writeRelative, .{ value.id, value.delta, value.on_ground }, 32),
+                .look => |value| try self.batch.send(slot, writeLook, .{ value.id, value.yaw, value.pitch, value.on_ground }, 32),
+                .move_look => |value| try self.batch.send(slot, writeMoveLook, .{ value.id, value.delta, value.yaw, value.pitch, value.on_ground }, 32),
+                .head => |value| try self.batch.send(slot, writeHead, .{ value.id, value.yaw }, 32),
+                else => unreachable,
+            };
+            if (sent) return;
+            try self.flushQueued();
+        }
+        // Nothing went: those in a session are owed the mob whole.
+        @memset(self.owed, 0);
+        var each = recipients.iterator();
+        while (each.next()) |player| if (self.deps.players.records[player].handle != null) put(self.owed, player);
+        self.deps.tracking.missed(slot, self.set(self.owed));
+    }
+
+    /// What a queued delta of the mob in a slot reached: whom it missed are behind.
+    fn settleQueued(self: *MobReplication, slot: u32, accepted: lightning_rod.system.bit_sets.Set, _: usize) !void {
+        const missed = self.batch.missedOf(accepted);
+        if (missed.any()) self.deps.tracking.missed(slot, missed);
+    }
+
+    /// Sends what is queued.
+    fn flushQueued(self: *MobReplication) !void {
+        try self.batch.flush(self, settleQueued);
     }
 };
 

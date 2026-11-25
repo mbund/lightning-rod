@@ -66,6 +66,9 @@ pub const Broadcast = struct {
     epoch: u64 = 0,
     generation: u64 = 0,
     active: bool = false,
+    /// Whether every packet written since `begin` went to every recipient: none short of room,
+    /// none skipped, excluded or unsupported.
+    whole: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, owner: *service.Service, maximum_packets: usize) !Broadcast {
         assert(maximum_packets > 0);
@@ -147,6 +150,7 @@ pub const Broadcast = struct {
         @memset(self.available, 0);
         self.generation += 1;
         self.count = 0;
+        self.whole = true;
         self.mask_count = 0;
         @memset(self.mapped_ready[self.mask_capacity..], false);
         self.mask_index.clear();
@@ -232,7 +236,10 @@ pub const Broadcast = struct {
                     if (capacities.len > self.entries.len - self.count) return error.BroadcastFull;
                     const packets = &scratch.packets;
                     var reserved = self.owner.reserveBatch(capacities, packets[0..capacities.len]) catch |err| {
-                        if (err == error.Closed) break :version;
+                        if (err == error.Closed) {
+                            self.whole = false;
+                            break :version;
+                        }
                         return err;
                     };
                     if (reserved != capacities.len) {
@@ -240,7 +247,10 @@ pub const Broadcast = struct {
                         self.commit();
                         self.owner.flush();
                         reserved = self.owner.reserveBatch(capacities, packets[0..capacities.len]) catch |err| {
-                            if (err == error.Closed) break :version;
+                            if (err == error.Closed) {
+                                self.whole = false;
+                                break :version;
+                            }
                             return err;
                         };
                     }
@@ -248,7 +258,10 @@ pub const Broadcast = struct {
                     defer if (!transferred) {
                         for (packets[0..reserved]) |*packet| packet.cancel();
                     };
-                    if (reserved != capacities.len) break :version;
+                    if (reserved != capacities.len) {
+                        self.whole = false;
+                        break :version;
+                    }
                     const buffers = &scratch.buffers;
                     const lengths = &scratch.lengths;
                     for (packets[0..reserved], buffers[0..reserved]) |packet, *buffer| buffer.* = packet.bytes;
@@ -417,6 +430,7 @@ pub const Broadcast = struct {
         defer owner.publication.unlock(owner.io);
         const first = self.committed;
         if (owner.stopping.load(.acquire) or owner.epoch.load(.acquire) != self.epoch) {
+            self.whole = false;
             for (self.entries[first..self.count]) |*entry| entry.packet.cancel();
             self.committed = self.count;
             return;
@@ -457,6 +471,7 @@ pub const Broadcast = struct {
             }
         }
         var slow_count: usize = 0;
+        var healthy_members: usize = 0;
         var reservations: usize = 0;
         for (0..self.recipients) |index| {
             const handle = self.audience_handles[index];
@@ -478,6 +493,7 @@ pub const Broadcast = struct {
                 const bit = @as(usize, 1) << @as(Shift, @intCast(index % width));
                 if (reserve == needed and self.forced[index / width] & bit == 0) {
                     member.healthy = true;
+                    healthy_members += 1;
                     self.healthy[member.protocol * self.words + index / width] |= bit;
                 } else {
                     member.remaining = reserve;
@@ -490,11 +506,13 @@ pub const Broadcast = struct {
         owner.instruments.broadcast_reservations.add(reservations);
         owner.instruments.broadcast_exceptions.add(slow_count);
         @memset(self.totals, 0);
+        var whole = slow_count == 0 and healthy_members == self.recipients;
         var publications: [service.Service.batch_max]shared.SharedPages.Publication = undefined;
         var published: usize = 0;
         var total_published: usize = 0;
         for (self.entries[first..self.count], first..) |*entry, index| {
             const accepted_mask = self.admission[0..self.words];
+            if (entry.unsupported or entry.excluded != null or entry.required != null) whole = false;
             if (entry.unsupported) continue;
             if (entry.group.index == 0) {
                 @memcpy(accepted_mask, self.healthy[entry.protocol * self.words ..][0..self.words]);
@@ -534,6 +552,7 @@ pub const Broadcast = struct {
                 if (bits != 0) break true;
             } else false;
             if (!any) {
+                whole = false;
                 entry.packet.cancel();
                 continue;
             }
@@ -562,6 +581,13 @@ pub const Broadcast = struct {
             assert(refund <= member.reserved);
             if (refund != 0) owner.refund(self.audience_handles[index], refund);
         }
+        self.whole = self.whole and whole;
         self.committed = self.count;
+    }
+
+    /// Whether every packet since `begin` reached every recipient. When it did, no packet's
+    /// `accepted` needs asking: each is everyone.
+    pub fn wentWhole(self: *const Broadcast) bool {
+        return self.whole;
     }
 };

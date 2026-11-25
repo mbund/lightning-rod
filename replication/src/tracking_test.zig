@@ -182,7 +182,7 @@ const Fixture = struct {
             const at = (self.entities.places.space.get(id) orelse continue).position;
             const far = random.uintLessThan(u8, 50) == 0;
             const next: [3]f64 = if (far) self.point() else .{ at[0] + (random.float(f64) - 0.5) * 2, at[1], at[2] + (random.float(f64) - 0.5) * 2 };
-            try self.entities.places.move(id, 0, next);
+            try self.entities.places.moveById(id, 0, next);
         }
         for (0..random.uintLessThan(usize, 4)) |_| try self.spawn();
         if (self.live.items.len > 0 and random.boolean()) self.despawn(random.uintLessThan(usize, self.live.items.len));

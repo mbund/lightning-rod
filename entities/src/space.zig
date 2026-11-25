@@ -1026,19 +1026,14 @@ pub const Space = struct {
         // and whoever takes the log looks over everything.
         const at = self.reserve(slot) catch {
             self.log_overflowed = true;
-            self.unplace(entity);
+            self.unplace(slot);
             return;
         };
-        self.unplace(entity);
+        self.unplace(slot);
         self.fill(at, slot, .removed);
     }
 
-    fn unplace(self: *Space, entity: Id) void {
-        const slot = self.directory.slotOf(entity) orelse return;
-        self.unplaceSlot(slot);
-    }
-
-    fn unplaceSlot(self: *Space, slot: u32) void {
+    fn unplace(self: *Space, slot: u32) void {
         const entry = self.directory.entry(slot);
         if (entry.space_column == none) return;
         const index = entry.space_column;
@@ -1082,13 +1077,13 @@ pub const Space = struct {
 
     /// An entity moved: into another column or section it comes last there; within its section
     /// it keeps its turn.
-    pub fn move(self: *Space, entity: Id, world: u32, position: [3]f64) !void {
+    pub fn moveById(self: *Space, entity: Id, world: u32, position: [3]f64) !void {
         const slot = self.directory.slotOf(entity) orelse return error.NotPlaced;
-        return self.moveSlot(slot, world, position);
+        return self.move(slot, world, position);
     }
 
     /// The entity in a slot moved, as `move`.
-    pub fn moveSlot(self: *Space, slot: u32, world: u32, position: [3]f64) !void {
+    pub fn move(self: *Space, slot: u32, world: u32, position: [3]f64) !void {
         const entry = self.directory.entry(slot);
         if (entry.space_column == none) return error.NotPlaced;
         const entity = entry.id;
@@ -1114,7 +1109,7 @@ pub const Space = struct {
         const shape: Shape = .{ .kind = self.runs.at(block.run).kind, .half_width = block.half_width[row], .height = block.height[row] };
         const at = try self.reserve(slot);
         errdefer self.unreserve(slot, at);
-        self.unplaceSlot(slot);
+        self.unplace(slot);
         try self.putPlaceSlot(slot, entity, world, position, shape);
         self.fill(at, slot, .moved);
         self.noteMover(slot);
@@ -1224,7 +1219,7 @@ pub const Space = struct {
         boxed.x_count = @intCast(xs[1] - xs[0] + 1);
         boxed.z_count = @intCast(zs[1] - zs[0] + 1);
         // Listed first, so its place going lets none of its columns go.
-        if (self.directory.entry(slot).space_column != none) self.unplace(self.directory.entry(slot).id);
+        if (self.directory.entry(slot).space_column != none) self.unplace(slot);
         self.enwheel(index);
         self.box_count += 1;
         self.kind_boxed[kind] += 1;
@@ -1893,9 +1888,9 @@ test "lookups meet entities in vanilla's order and pass over what does not meet"
     // Touching is not meeting.
     try testing.expectEqualSlices(Id, &.{}, try collect(space, .{ .min = .{ 8.45, 71.4, 7 }, .max = .{ 9, 72, 9 } }, &buffer));
     // A move within its section keeps its turn; into another, it comes last there.
-    try space.move(1, 0, .{ 8.2, 71, 8 });
+    try space.moveById(1, 0, .{ 8.2, 71, 8 });
     try testing.expectEqualSlices(Id, &.{ 2, 1, 5, 3, 4 }, try collect(space, all, &buffer));
-    try space.move(2, 0, .{ 8.5, 70, 8 });
+    try space.moveById(2, 0, .{ 8.5, 70, 8 });
     try testing.expectEqualSlices(Id, &.{ 1, 5, 2, 3, 4 }, try collect(space, all, &buffer));
     space.remove(5);
     try testing.expectEqualSlices(Id, &.{ 1, 2, 3, 4 }, try collect(space, all, &buffer));
@@ -1929,10 +1924,10 @@ test "kinds keep runs of their own, met in one order, each with its revision" {
     const at: Column = .{ .world = 0, .x = 0, .z = 0 };
     const cows_then = space.revisionOf(at, .of(&.{cow.kind}));
     const pigs_then = space.revisionOf(at, .of(&.{pig.kind}));
-    try space.move(2, 0, .{ 2, 65, 1 });
+    try space.moveById(2, 0, .{ 2, 65, 1 });
     try testing.expectEqual(cows_then, space.revisionOf(at, .of(&.{cow.kind})));
     try testing.expect(space.revisionOf(at, .of(&.{pig.kind})) != pigs_then);
-    try space.move(1, 0, .{ 2, 65, 1 });
+    try space.moveById(1, 0, .{ 2, 65, 1 });
     try testing.expect(space.revisionOf(at, .of(&.{cow.kind})) != cows_then);
     // The last pig going is a change to whoever asks of pigs, never a revision seen before.
     const seen_with_pigs = space.revisionOf(at, .of(&.{ cow.kind, pig.kind }));
@@ -1983,7 +1978,7 @@ test "a visit may change the space, and the rest are still met once" {
             s.count += 1;
             // The next one goes before it is met, and one moves on ahead: both met as found.
             if (entry.id % 2 == 1) s.space.remove(entry.id + 1);
-            if (entry.id == 51) try s.space.move(51, 0, .{ 2, 80, 2 });
+            if (entry.id == 51) try s.space.moveById(51, 0, .{ 2, 80, 2 });
             // A lookup from inside a visit finds afresh.
             if (entry.id == 10) {
                 var inner: struct { count: usize = 0 } = .{};
@@ -2094,13 +2089,13 @@ test "movers are kept once each until taken" {
     space.keepMovers();
     try fixture.insert(1, .{ 1, 64, 1 });
     try fixture.insert(2, .{ 1, 64, 1 });
-    try space.move(1, 0, .{ 2, 64, 1 });
-    try space.move(1, 0, .{ 40, 64, 1 });
+    try space.moveById(1, 0, .{ 2, 64, 1 });
+    try space.moveById(1, 0, .{ 40, 64, 1 });
     try testing.expectEqual(@as(usize, 2), space.moversSince().slots.len);
     space.clearMovers();
-    try space.move(2, 0, .{ 2, 64, 1 });
+    try space.moveById(2, 0, .{ 2, 64, 1 });
     // Standing still is not moving.
-    try space.move(1, 0, .{ 40, 64, 1 });
+    try space.moveById(1, 0, .{ 40, 64, 1 });
     const movers = space.moversSince().slots;
     try testing.expectEqual(@as(usize, 1), movers.len);
     try testing.expectEqual(fixture.directory.slotOf(2).?, movers.at(0).*);

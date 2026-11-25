@@ -23,8 +23,6 @@ pub const ItemEntities = struct {
         /// Whether resting items sleep. Off, every one ticks every tick, which sleeping must
         /// match.
         sleep: bool = true,
-        /// Items replication is told of at once; past it, it looks over every item.
-        change_ids: usize = 65536,
         /// The columns holding items, and the columns they tick in.
         columns: usize = 16384,
     };
@@ -198,11 +196,11 @@ pub const ItemEntities = struct {
     io: std.Io,
     /// Every item near players, gone ones not yet forgotten included.
     items: entities.BodyTable(Item),
-    /// Items replication must look at in full, by id, and those whose only change is their
-    /// revision, as a resting item's motion changes every tick: replication need only note
-    /// them until they are due to send. Full, replication looks over every item instead.
-    changes: entities.IdSet,
-    moved: entities.IdSet,
+    /// The slots of items replication must look at in full, and of those whose only change is
+    /// their revision, as a resting item's motion changes every tick: replication need only
+    /// note them until they are due to send. Room for every slot, so none goes unnoted.
+    changes: lightning_rod.system.IndexSet,
+    moved: lightning_rod.system.IndexSet,
     /// Where every entity in memory is, the order they tick in, and the columns that tick,
     /// shared by every kind.
     places: *entities.Places,
@@ -246,8 +244,8 @@ pub const ItemEntities = struct {
             .deps = deps,
             .allocator = allocator,
             .io = io,
-            .changes = try entities.IdSet.init(allocator, &deps.entities.pool, config.change_ids),
-            .moved = try entities.IdSet.init(allocator, &deps.entities.pool, config.change_ids),
+            .changes = try .init(allocator, bound),
+            .moved = try .init(allocator, bound),
             .items = try .init(allocator, deps.entities, kind),
             .asleep_ids = try .init(allocator, &deps.entities.pool, bound),
             .due_slots = try allocator.alloc(u32, bound),
@@ -334,7 +332,7 @@ pub const ItemEntities = struct {
             // Made in a ticking chunk, it ticks from the next tick on.
             try self.items.add(entity.*, body, .{ .metadata = request.metadata }, shape);
             try self.residency.hold(entities.space.columnOf(request.world, request.position));
-            self.changes.insert(entity.*);
+            self.changes.insert(self.items.slotOf(entity.*).?);
         }
     }
 
@@ -381,7 +379,7 @@ pub const ItemEntities = struct {
             if (self.at == self.ids.len) return null;
             defer self.at += 1;
             const entity = self.ids[self.at];
-            return .{ .id = entity, .metadata = (try self.owner.items.get(entity)).?.metadata };
+            return .{ .id = entity, .metadata = (try self.owner.items.getById(entity)).?.metadata };
         }
     };
 
@@ -395,8 +393,8 @@ pub const ItemEntities = struct {
     pub fn readAt(self: *ItemEntities, entity: entities.Id, at: u32) !View {
         self.reads += 1;
         try self.catchUpAt(entity, at);
-        const item = self.items.ptrAt(at).*;
-        const body = self.deps.entities.bodyAt(at) orelse return .{ .body = undefined, .metadata = item.metadata };
+        const item = self.items.ptr(at).*;
+        const body = self.deps.entities.body(at) orelse return .{ .body = undefined, .metadata = item.metadata };
         return .{ .body = body.*, .metadata = item.metadata };
     }
 
@@ -415,7 +413,7 @@ pub const ItemEntities = struct {
     }
 
     fn writeQuietly(self: *ItemEntities, entity: entities.Id, metadata: Metadata) !void {
-        var item = (try self.items.get(entity)).?;
+        var item = (try self.items.getById(entity)).?;
         const previous = item.metadata;
         const Change = enum { none, revision, other };
         const change: Change = if (previous.on_ground != metadata.on_ground or previous.alive != metadata.alive or
@@ -424,12 +422,12 @@ pub const ItemEntities = struct {
             (previous.fire_ticks > 0) != (metadata.fire_ticks > 0)) .other else if (previous.revision != metadata.revision) .revision else .none;
         switch (change) {
             .none => {},
-            .revision => self.moved.insert(entity),
-            .other => self.changes.insert(entity),
+            .revision => self.moved.insert(self.items.slotOf(entity).?),
+            .other => self.changes.insert(self.items.slotOf(entity).?),
         }
         item.metadata = metadata;
         item.dirty = true;
-        try self.items.put(entity, item);
+        try self.items.putById(entity, item);
     }
 
     /// Brings an item's state up to the tick it has had, if it slept behind.
@@ -442,8 +440,8 @@ pub const ItemEntities = struct {
         const sleep = self.sleepAt(at) orelse return;
         const target = @min(self.clock.through(sleep.sequence), sleep.until);
         if (target != sleep.since) {
-            const item = self.items.ptrAt(at);
-            const body = self.deps.entities.bodyAt(at) orelse return error.Corrupt;
+            const item = self.items.ptr(at);
+            const body = self.deps.entities.body(at) orelse return error.Corrupt;
             var tick = sleep.since;
             while (tick < target) : (tick += 1) rest(body, &item.metadata, self.givenId(entity), sleep.speed, sleep.friction);
             item.dirty = true;
@@ -488,8 +486,8 @@ pub const ItemEntities = struct {
         const listed = self.rows();
         var hasher = std.hash.Wyhash.init(0);
         for (listed.ids) |entity| {
-            var metadata = (try self.items.get(entity)).?.metadata;
-            var body = try self.deps.entities.get(entity) orelse continue;
+            var metadata = (try self.items.getById(entity)).?.metadata;
+            var body = try self.deps.entities.getById(entity) orelse continue;
             if (self.sleepOf(entity)) |sleep| {
                 var tick = sleep.since;
                 while (tick < @min(self.clock.through(sleep.sequence), sleep.until)) : (tick += 1) rest(&body, &metadata, self.givenId(entity), sleep.speed, sleep.friction);
@@ -511,7 +509,7 @@ pub const ItemEntities = struct {
 
     /// The sleep of the item in a slot, while its state is behind.
     fn sleepAt(self: *const ItemEntities, at: u32) ?*Sleep {
-        const item = self.items.ptrAt(at);
+        const item = self.items.ptr(at);
         return if (item.sleep) |*sleep| sleep else null;
     }
 
@@ -521,7 +519,7 @@ pub const ItemEntities = struct {
 
     /// Up to date, or gone: nothing of a sleep is left.
     fn forgetSleep(self: *ItemEntities, at: u32) void {
-        self.items.ptrAt(at).sleep = null;
+        self.items.ptr(at).sleep = null;
         self.asleep_ids.remove(self.deps.entities.directory.entry(at).id);
     }
 
@@ -542,7 +540,7 @@ pub const ItemEntities = struct {
         const at = self.items.slotOf(entity).?;
         assert(self.sleepAt(at) == null);
         const section: chunks.Section = .{ .world = body.world, .x = columnOf(body).x, .y = sectionOf(body), .z = columnOf(body).z };
-        self.items.ptrAt(at).sleep = .{ .since = self.clock.tick, .ticks = metadata.ticks, .age = metadata.age, .speed = speed, .friction = friction, .sequence = sequence, .section = section, .position = body.position };
+        self.items.ptr(at).sleep = .{ .since = self.clock.tick, .ticks = metadata.ticks, .age = metadata.age, .speed = speed, .friction = friction, .sequence = sequence, .section = section, .position = body.position };
         self.asleep_ids.insert(entity);
         self.places.order.sleep(entity);
         try self.schedule(entity, metadata.ticks, metadata.age);
@@ -564,7 +562,7 @@ pub const ItemEntities = struct {
     pub fn wakeDue(self: *ItemEntities, tick: u64) !void {
         var found: usize = 0;
         self.places.space.takeDue(tick, kinds, self.due_slots, &found);
-        for (self.due_slots[0..found]) |due| try self.places.order.wake(self.deps.entities.directory.entry(due).id);
+        for (self.due_slots[0..found]) |due| try self.places.order.wakeSlot(due);
     }
 
     /// A sleeper met at its turn with nothing to do but what its replay does: back to sleep,
@@ -633,15 +631,14 @@ pub const ItemEntities = struct {
     /// Moves an item's body: its place follows, and replication hears of a new place.
     pub fn move(self: *ItemEntities, entity: entities.Id, before: entities.State, after: entities.State) !void {
         if (self.deps.worlds.get(after.world) == null) return error.UnknownWorld;
-        if (!self.deps.entities.has(entity)) return error.UnknownItemEntity;
-        try self.deps.entities.set(entity, after);
-        var item = (try self.items.get(entity)).?;
-        item.dirty = true;
-        try self.items.put(entity, item);
+        // Found once: the rest goes by its slot.
+        const at = self.items.slotOf(entity) orelse return error.UnknownItemEntity;
+        (self.deps.entities.body(at) orelse return error.UnknownItemEntity).* = after;
+        self.items.ptr(at).dirty = true;
         if (before.world == after.world and std.meta.eql(before.position, after.position)) return;
         // Motion alone, as a resting item's every tick, comes to replication as a new revision.
-        self.changes.insert(entity);
-        try self.places.move(entity, after.world, after.position);
+        self.changes.insert(at);
+        try self.places.move(at, after.world, after.position);
     }
 
     pub fn retire(self: *ItemEntities, entity: entities.Id, body: entities.State, metadata: *Metadata) !void {
@@ -652,7 +649,7 @@ pub const ItemEntities = struct {
         if (self.items.slotOf(entity)) |at| self.forgetSleep(at);
         // Removed, it leaves its section at once, as vanilla's does: no lookup finds it.
         self.places.remove(entity);
-        self.items.dropBody(entity);
+        self.items.dropBodyById(entity);
         metadata.alive = false;
         metadata.revision += 1;
         try self.writeQuietly(entity, metadata.*);
@@ -660,17 +657,12 @@ pub const ItemEntities = struct {
 
     /// Lets go of a gone item, once no client knows of it.
     pub fn forget(self: *ItemEntities, entity: entities.Id) !void {
-        const item = try self.items.take(entity) orelse return error.UnknownItemEntity;
+        const at = self.items.slotOf(entity) orelse return error.UnknownItemEntity;
+        self.changes.remove(at);
+        self.moved.remove(at);
+        const item = try self.items.takeById(entity) orelse return error.UnknownItemEntity;
         assert(!item.metadata.alive);
         if (item.stored) |column| try self.table.putBatch(&.{.{ .key = &entities.durable.key(record_prefix, column, entity), .value = null }});
-        self.changes.remove(entity);
-        self.moved.remove(entity);
-    }
-
-    /// Live items of a column's sections `low` through `high`, in vanilla's order: sections as
-    /// SectionPos.asLong sorts them, then as they entered each.
-    pub fn inColumn(self: *ItemEntities, column: Column, low: i32, high: i32, buffer: []entities.space.Entry) entities.Space.Ordered {
-        return self.places.space.ordered(column, low, high, kinds, buffer);
     }
 
     /// Keeps in memory the items of the columns near the centers, out to `radius`, and of the
@@ -703,13 +695,14 @@ pub const ItemEntities = struct {
         for (self.scratch[0..leaving_count]) |entity| {
             try self.catchUp(entity);
             if (self.leaving) |hook| hook.function(hook.context, entity);
-            const body = (try self.deps.entities.get(entity)).?;
-            self.forgetSleep(self.items.slotOf(entity).?);
-            const item = (try self.items.take(entity)).?;
+            const body = (try self.deps.entities.getById(entity)).?;
+            const at = self.items.slotOf(entity).?;
+            self.forgetSleep(at);
+            self.changes.remove(at);
+            self.moved.remove(at);
+            const item = (try self.items.takeById(entity)).?;
             try save(&batch, entity, body, item);
             self.places.remove(entity);
-            self.changes.remove(entity);
-            self.moved.remove(entity);
         }
         try batch.flush();
     }
@@ -727,7 +720,7 @@ pub const ItemEntities = struct {
                 if (self.items.contains(row.id)) return error.Corrupt;
                 if (!entities.valid(body)) return error.InvalidEntity;
                 try self.items.add(row.id, body, .{ .metadata = metadata, .stored = column, .dirty = false }, shape);
-                self.changes.insert(row.id);
+                self.changes.insert(self.items.slotOf(row.id).?);
             }
         }
     }
@@ -747,20 +740,20 @@ pub const ItemEntities = struct {
         const listed = self.rows();
         for (listed.ids) |entity| {
             try self.catchUp(entity);
-            var item = (try self.items.get(entity)).?;
+            var item = (try self.items.getById(entity)).?;
             if (!item.metadata.alive) {
                 // Gone but not yet forgotten: its record goes now, and nothing comes back.
                 if (item.stored) |column| try batch.delete(entities.durable.key(record_prefix, column, entity));
                 item.stored = null;
-                try self.items.put(entity, item);
+                try self.items.putById(entity, item);
                 continue;
             }
             if (!item.dirty) continue;
-            const body = (try self.deps.entities.get(entity)).?;
+            const body = (try self.deps.entities.getById(entity)).?;
             try save(&batch, entity, body, item);
             item.stored = columnOf(body);
             item.dirty = false;
-            try self.items.put(entity, item);
+            try self.items.putById(entity, item);
         }
         try batch.flush();
     }

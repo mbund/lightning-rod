@@ -18,6 +18,7 @@ const ItemTick = @import("item_tick.zig").ItemTick;
 const Players = @import("players").players.Players;
 const Tracking = @import("replication").tracking.Tracking;
 const shared_delivery = @import("replication").delivery;
+const IndexSet = lightning_rod.system.IndexSet;
 
 const assert = std.debug.assert;
 
@@ -30,8 +31,6 @@ pub const ItemReplication = struct {
         position_interval: u8 = 20,
         /// Items clients are shown at once.
         views: usize = 65536,
-        /// Items looked at in one tick before replication looks over all it has views of instead.
-        work_ids: usize = 65536,
         /// Keep a hash of every packet queued, for runs to be compared by.
         trace_sends: bool = false,
     };
@@ -138,18 +137,18 @@ pub const ItemReplication = struct {
     deps: Dependencies,
     /// Room to copy ids into, for sweeps that change what they pass over.
     viewed: []entities.Id,
-    found: []entities.Id,
     /// Views by item id: an item no client knows of has none.
     views: entities.Slab,
     record_bytes: usize,
     row_words: usize,
     presentation: u64 = 0,
-    /// Items to look at this tick, and those some viewer is still owed something by.
-    work: entities.IdSet,
+    /// The slots of items to look at this tick, and of those some viewer is still owed
+    /// something by: room for every slot, so none goes unnoted.
+    work: IndexSet,
     /// Items only due their turn: still where they were, so who is interested in each is as it
     /// was; anything that could change it puts the item in `work` instead.
-    turns: entities.IdSet,
-    retries: entities.IdSet,
+    turns: IndexSet,
+    retries: IndexSet,
     /// Viewers some retry is owed something by, as of the last tick.
     pending: sparse_sets.Workspace.RowView,
     selections: sparse_sets.Workspace,
@@ -176,6 +175,7 @@ pub const ItemReplication = struct {
         if (config.position_interval == 0) return error.InvalidConfiguration;
         const self = try allocator.create(ItemReplication);
         const players = deps.players.records.len;
+        const slots = deps.entities.directory.capacity();
         const selections = try sparse_sets.Workspace.init(allocator, 28, players);
         const row_words = std.math.divCeil(usize, players, @bitSizeOf(usize)) catch unreachable;
         const record_bytes = @sizeOf(Header) + row_count * row_words * @sizeOf(usize);
@@ -184,14 +184,13 @@ pub const ItemReplication = struct {
             .selections = selections,
             .views = try .init(allocator, &deps.dropped.deps.entities.pool, record_bytes, config.views),
             .viewed = try allocator.alloc(entities.Id, config.views),
-            .found = try allocator.alloc(entities.Id, deps.dropped.items.bound()),
             .record_bytes = record_bytes,
             .row_words = row_words,
             .batch = try Batch.init(allocator, deps.players, deps.packets, deps.sessions, row_words),
             .deps = deps,
-            .work = try entities.IdSet.init(allocator, &deps.dropped.deps.entities.pool, config.work_ids),
-            .turns = try entities.IdSet.init(allocator, &deps.dropped.deps.entities.pool, config.work_ids),
-            .retries = try entities.IdSet.init(allocator, &deps.dropped.deps.entities.pool, config.work_ids),
+            .work = try .init(allocator, slots),
+            .turns = try .init(allocator, slots),
+            .retries = try .init(allocator, slots),
             .targets = try allocator.alloc(sessions.Service.Target, players),
             .deliveries = try allocator.alloc(sessions.Service.Delivery, players),
             .tracker = undefined,
@@ -210,9 +209,10 @@ pub const ItemReplication = struct {
     fn itemLeaving(context: *anyopaque, entity: entities.Id) void {
         const self: *ItemReplication = @ptrCast(@alignCast(context));
         self.views.remove(entity);
-        self.retries.remove(entity);
-        self.work.remove(entity);
-        self.turns.remove(entity);
+        const slot = self.deps.dropped.items.slotOf(entity).?;
+        self.retries.remove(slot);
+        self.work.remove(slot);
+        self.turns.remove(slot);
     }
 
     /// How many clients an item is spawned for, and how many are still owed something by it.
@@ -220,26 +220,25 @@ pub const ItemReplication = struct {
 
     pub fn known(self: *ItemReplication, entity: entities.Id) !Known {
         const bytes = self.views.get(entity) orelse return .{};
-        const view = self.viewOf(entity, bytes);
+        const view = self.viewOf(entity, self.deps.entities.directory.slotOf(entity).?, bytes);
         return .{ .spawned = view.known.count(), .pending = view.pending.view().count(), .stacks = view.stacks.view().count() };
     }
 
     /// Whether a viewer is owed an item's position, for tests.
     pub fn dirtyFor(self: *ItemReplication, entity: entities.Id, viewer: usize) !bool {
         const bytes = self.views.get(entity) orelse return false;
-        return self.viewOf(entity, bytes).dirty.view().contains(viewer);
+        return self.viewOf(entity, self.deps.entities.directory.slotOf(entity).?, bytes).dirty.view().contains(viewer);
     }
 
     /// Takes views in hand, a fresh one of nothing for an item without one.
-    fn holdViews(self: *ItemReplication, ids: []const entities.Id, output: []View) !void {
-        assert(ids.len == output.len and ids.len <= 16);
-        for (ids, output) |entity, *view| view.* = self.viewOf(entity, try self.views.getOrCreate(entity));
+    fn holdViews(self: *ItemReplication, ids: []const entities.Id, slots: []const u32, output: []View) !void {
+        assert(ids.len == output.len and slots.len == output.len and ids.len <= 16);
+        for (ids, slots, output) |entity, slot, *view| view.* = self.viewOf(entity, slot, try self.views.getOrCreate(entity));
     }
 
-    fn viewOf(self: *ItemReplication, entity: entities.Id, bytes: []align(16) u8) View {
+    fn viewOf(self: *ItemReplication, entity: entities.Id, slot: u32, bytes: []align(16) u8) View {
         const words: []usize = @alignCast(std.mem.bytesAsSlice(usize, bytes[@sizeOf(Header)..]));
         const capacity = self.deps.players.records.len;
-        const slot = self.deps.entities.directory.slotOf(entity).?;
         var rows: [row_count]bit_sets.Row = undefined;
         for (&rows, 0..) |*row, at| row.* = .{ .words = words[at * self.row_words ..][0..self.row_words], .capacity = capacity };
         return .{
@@ -264,7 +263,7 @@ pub const ItemReplication = struct {
     fn slotChanged(context: *anyopaque, slot: inventories.Slot) void {
         const self: *ItemReplication = @ptrCast(@alignCast(context));
         const entity = ItemEntities.entityOf(slot.owner) orelse return;
-        self.work.insert(entity);
+        self.work.insert(self.deps.dropped.items.slotOf(entity) orelse return);
     }
 
     /// Items that only moved since last looked at: their viewers are owed a position, which goes
@@ -276,10 +275,10 @@ pub const ItemReplication = struct {
         // A sleeper moves every tick as any resting item does: on its turn it is looked at in
         // full, which brings it up to date first.
         for (dropped.asleep_ids.values()) |entity| {
-            if (self.onTurn(entity)) self.turns.insert(entity);
+            if (self.onTurn(entity)) self.turns.insert(dropped.items.slotOf(entity).?);
         }
-        for (dropped.moved.values()) |entity| {
-            if (self.onTurn(entity)) self.turns.insert(entity);
+        for (dropped.moved.values()) |slot| {
+            if (self.onTurn(self.deps.entities.directory.entry(@intCast(slot)).id)) self.turns.insert(slot);
         }
     }
 
@@ -296,7 +295,7 @@ pub const ItemReplication = struct {
         var changes = self.deps.tracking.changesOf(self.tracker);
         while (changes.next()) |change| {
             const entry = self.deps.entities.directory.entry(change.slot);
-            if (entry.retired) try self.removeLeft(change) else self.work.insert(entry.id);
+            if (entry.retired) try self.removeLeft(change) else self.work.insert(change.slot);
         }
         if (dropped.count() == 0) {
             self.work.clear();
@@ -317,47 +316,46 @@ pub const ItemReplication = struct {
             if (service.outputCredit(handle) != 0) available.insert(index);
         }
         self.noteMoved();
-        for (dropped.changes.values()) |entity| self.work.insert(entity);
-        // More changed than could be noted, or every stack shows differently: look at them all.
-        const sweep = presentation_changed or dropped.changes.overflowed or dropped.moved.overflowed or self.work.overflowed or self.retries.overflowed or self.turns.overflowed;
+        for (dropped.changes.values()) |slot| self.work.insert(slot);
+        // Every stack shows differently: look at them all.
+        const sweep = presentation_changed;
         dropped.changes.clear();
         // Retries are looked at again when someone they owe may be sent to; their owed viewers
         // are gathered again as they are.
         if (self.pending.view().intersects(available.view())) {
-            for (self.retries.values()) |entity| self.work.insert(entity);
+            for (self.retries.values()) |slot| self.work.insert(slot);
             self.pending.clear();
         }
         defer self.turns.clear();
-        if (self.work.count() == 0 and self.turns.count() == 0 and !sweep) return;
+        if (self.work.count == 0 and self.turns.count == 0 and !sweep) return;
         const outgoing = &self.batch;
         defer outgoing.abandon();
         const pass: Pass = .{ .available = available, .presentation_changed = presentation_changed, .outgoing = outgoing };
         // The work set takes no more while it is gone over; what comes of it waits for the next.
         var cursor: usize = 0;
-        while (cursor < self.work.count()) {
-            const count = @min(16, self.work.count() - cursor);
-            var ids: [16]entities.Id = undefined;
-            @memcpy(ids[0..count], self.work.values()[cursor..][0..count]);
+        while (cursor < self.work.count) {
+            var slots: [16]u32 = undefined;
+            const count = @min(slots.len, self.work.count - cursor);
+            for (slots[0..count], self.work.values()[cursor..][0..count]) |*slot, held| slot.* = @intCast(held);
             cursor += count;
-            try self.process(ids[0..count], pass, false);
+            try self.process(slots[0..count], pass, false);
         }
         // Those only due their turn, and looked at in full for nothing else.
         cursor = 0;
-        while (cursor < self.turns.count()) {
-            var ids: [16]entities.Id = undefined;
+        while (cursor < self.turns.count) {
+            var slots: [16]u32 = undefined;
             var count: usize = 0;
-            while (cursor < self.turns.count() and count < ids.len) : (cursor += 1) {
-                const entity = self.turns.values()[cursor];
-                if (self.work.contains(entity) or self.retries.contains(entity)) continue;
-                ids[count] = entity;
+            while (cursor < self.turns.count and count < slots.len) : (cursor += 1) {
+                const slot = self.turns.values()[cursor];
+                if (self.work.contains(slot) or self.retries.contains(slot)) continue;
+                slots[count] = @intCast(slot);
                 count += 1;
             }
-            try self.process(ids[0..count], pass, true);
+            try self.process(slots[0..count], pass, true);
         }
         self.work.clear();
         if (sweep) {
             self.sweeps.add(1);
-            self.retries.overflowed = false;
             try self.sweepAll(pass);
         }
         try self.settle(pass);
@@ -380,7 +378,7 @@ pub const ItemReplication = struct {
                 continue;
             }
             if (!alive and !view.known.any()) {
-                self.retries.remove(view.entity);
+                self.retries.remove(view.slot);
                 view.forget = true;
                 forgotten[forgotten_count] = view.entity;
                 forgotten_count += 1;
@@ -397,64 +395,41 @@ pub const ItemReplication = struct {
                 view.pending.unite(view.pending.view(), changed.view());
             }
             if (view.pending.view().any()) {
-                self.retries.insert(view.entity);
+                self.retries.insert(view.slot);
                 self.pending.unite(self.pending.view(), view.pending.view());
-            } else self.retries.remove(view.entity);
+            } else self.retries.remove(view.slot);
         }
         self.held_count = 0;
         for (forgotten[0..forgotten_count]) |entity| try self.deps.dropped.forget(entity);
     }
 
-    /// Looks at every item with a view, and every item whose audience changed,
-    /// each once while the work set, empty by now, has room to remember it.
+    /// Looks at every item with a view, each once, as every stack shows differently: those the
+    /// tick looked at already were in its work.
     fn sweepAll(self: *ItemReplication, pass: Pass) !void {
-        assert(self.work.count() == 0);
+        assert(self.work.count == 0);
         defer self.work.clear();
         const viewed = self.views.ids(self.viewed);
         var at: usize = 0;
         while (at < viewed.len) {
-            const count = @min(16, viewed.len - at);
-            var ids: [16]entities.Id = undefined;
-            @memcpy(ids[0..count], viewed[at..][0..count]);
-            at += count;
-            try self.process(self.unswept(ids[0..count]), pass, false);
+            var slots: [16]u32 = undefined;
+            var count: usize = 0;
+            while (at < viewed.len and count < slots.len) : (at += 1) {
+                // Forgotten already, its view going with it.
+                const slot = self.deps.dropped.items.slotOf(viewed[at]) orelse continue;
+                if (self.work.contains(slot)) continue;
+                self.work.insert(slot);
+                slots[count] = slot;
+                count += 1;
+            }
+            try self.process(slots[0..count], pass, false);
         }
-        // And every item whose audience changed, as the work could not hold them all.
-        var found_count: usize = 0;
-        var changes = self.deps.tracking.changesOf(self.tracker);
-        while (changes.next()) |change| {
-            const entry = self.deps.entities.directory.entry(change.slot);
-            if (entry.retired) continue;
-            self.found[found_count] = entry.id;
-            found_count += 1;
-        }
-        var next: usize = 0;
-        while (next < found_count) {
-            const count = @min(16, found_count - next);
-            var ids: [16]entities.Id = undefined;
-            @memcpy(ids[0..count], self.found[next..][0..count]);
-            next += count;
-            try self.process(self.unswept(ids[0..count]), pass, false);
-        }
-    }
-
-    /// Those of a sweep not looked at yet in it, which it now remembers.
-    fn unswept(self: *ItemReplication, ids: []entities.Id) []const entities.Id {
-        var count: usize = 0;
-        for (ids) |entity| {
-            if (self.work.contains(entity)) continue;
-            self.work.insert(entity);
-            ids[count] = entity;
-            count += 1;
-        }
-        return ids[0..count];
     }
 
     /// Looks at up to 16 items: who is interested, what each viewer is owed, and sends it.
     /// Items looked at: their audience as tracking has it, their stacks read for anyone interested,
     /// and what each viewer is owed sent. `turn_only` when nothing but their turn brought them,
     /// so a stack read is owed only where tracking changed who sees one.
-    fn process(self: *ItemReplication, given: []const entities.Id, pass: Pass, turn_only: bool) !void {
+    fn process(self: *ItemReplication, given: []const u32, pass: Pass, turn_only: bool) !void {
         assert(given.len <= 16);
         const dropped = self.deps.dropped;
         const service = self.deps.sessions;
@@ -462,19 +437,23 @@ pub const ItemReplication = struct {
         const available = pass.available;
         const presentation_changed = pass.presentation_changed;
         var ids: [16]entities.Id = undefined;
+        var slots: [16]u32 = undefined;
         var count: usize = 0;
-        for (given) |entity| {
+        for (given) |slot| {
             // Looked at moments ago, as a sweep finds some twice: once is enough.
             const in_hand = for (self.held[0..self.held_count]) |view| {
-                if (view.entity == entity) break true;
-            } else for (ids[0..count]) |other| {
-                if (other == entity) break true;
+                if (view.slot == slot) break true;
+            } else for (slots[0..count]) |other| {
+                if (other == slot) break true;
             } else false;
             if (in_hand) continue;
-            ids[count] = entity;
+            const entry = self.deps.entities.directory.entry(slot);
+            // Forgotten since it was noted, as the views in hand are let go of mid-tick.
+            if (entry.id == 0 or entry.retired) continue;
+            ids[count] = entry.id;
+            slots[count] = slot;
             count += 1;
         }
-        if (count == 0) return;
         if (count == 0) return;
         // Stacks are read a batch at a time, as many as the inventories hold at once.
         const limit = @min(16, self.deps.inventories.cache.entries.len, self.deps.inventories.items.entries.len);
@@ -482,10 +461,11 @@ pub const ItemReplication = struct {
         while (batch_start < count) {
             const batch_len = @min(limit, count - batch_start);
             const batch = ids[batch_start..][0..batch_len];
+            const batch_slots = slots[batch_start..][0..batch_len];
             batch_start += batch_len;
             if (self.held_count + batch.len > held_max) try self.settle(pass);
             const views = self.held[self.held_count..][0..batch.len];
-            try self.holdViews(batch, views);
+            try self.holdViews(batch, batch_slots, views);
             for (self.held_alive[self.held_count..][0..batch.len]) |*alive| alive.* = true;
             self.held_count += batch.len;
             const alive_flags = self.held_alive[self.held_count - batch.len ..][0..batch.len];
@@ -494,7 +474,7 @@ pub const ItemReplication = struct {
             for (batch, views[0..batch.len], metadata[0..batch.len], bodies[0..batch.len], alive_flags) |entity, *view, *value, *body, *alive| {
                 // Forgotten already, as one gone may be by the time a sweep comes to it.
                 const read = (try dropped.read(entity)) orelse {
-                    self.retries.remove(entity);
+                    self.retries.remove(view.slot);
                     view.done = true;
                     alive.* = false;
                     continue;
@@ -504,7 +484,7 @@ pub const ItemReplication = struct {
                 if (value.alive) body.* = read.body;
                 // No client has it, nor is any to have it.
                 if (!view.known.any() and self.deps.tracking.changed(view.slot) == null) {
-                    self.retries.remove(entity);
+                    self.retries.remove(view.slot);
                     view.pending.clear();
                     view.interested.clear();
                     view.done = true;
@@ -517,7 +497,7 @@ pub const ItemReplication = struct {
                 row.clear();
             }
             var slot_indices: [16]?usize = @splat(null);
-            var slots: [16]inventories.Slot = undefined;
+            var stack_slots: [16]inventories.Slot = undefined;
             var contents: [16]inventories.Contents = undefined;
             var slot_count: usize = 0;
             for (views[0..batch.len], bodies[0..batch.len], 0..) |*view, maybe_body, index| {
@@ -536,11 +516,11 @@ pub const ItemReplication = struct {
                 // Read for anyone interested, sendable now or not: a change unread would be lost.
                 if (interests[index].view().any()) {
                     slot_indices[index] = slot_count;
-                    slots[slot_count] = ItemEntities.slot(body);
+                    stack_slots[slot_count] = ItemEntities.slot(body);
                     slot_count += 1;
                 }
             }
-            try self.deps.inventories.getMany(slots[0..slot_count], contents[0..slot_count]);
+            try self.deps.inventories.getMany(stack_slots[0..slot_count], contents[0..slot_count]);
             var definition_stacks: [16]inventories.Stack = undefined;
             var definition_records: [16]usize = undefined;
             var definitions: [16]Items.Prepared = undefined;

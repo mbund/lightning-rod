@@ -173,9 +173,9 @@ pub const ExperienceReplication = struct {
         for (self.visit.collect(self.deps.tracking, self.tracker, directory, byId)) |slot| {
             const entry = directory.entry(slot);
             if (experience.orbs.slotOf(entry.id) != slot) continue;
-            const stored = experience.orbs.ptrAt(slot);
+            const stored = experience.orbs.ptr(slot);
             if (!stored.orb.alive) continue;
-            const body = experience.deps.entities.bodyAt(slot) orelse return error.Corrupt;
+            const body = experience.deps.entities.body(slot) orelse return error.Corrupt;
             try self.update(slot, .{ .entity = entry.id, .orb = stored.orb, .body = body.* }, self.deps.tracking.changed(slot));
         }
         try self.sendSounds();

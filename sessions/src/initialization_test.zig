@@ -1135,6 +1135,8 @@ test "broadcast groups retain independent protocol admission across audience reu
     try batch.begin(&targets);
     const group = try batch.writeGroup(.{ One, Two }, Encoder, targets[0].handle, null, {}, &.{ 8, 8 });
     batch.commit();
+    // One recipient short of room, and one excluded: what each packet reached must be asked.
+    try std.testing.expect(!batch.wentWhole());
     try std.testing.expectEqual(@as(usize, 10), batch.accepted(group).words[0]);
     const dependent = try batch.write(.{ One, Two }, Encoder, targets[1].handle, group, {}, 8);
     batch.finish();
@@ -1144,6 +1146,8 @@ test "broadcast groups retain independent protocol admission across audience reu
     try batch.begin(targets[1..2]);
     const next = try batch.write(.{ One, Two }, Encoder, null, null, {}, 8);
     batch.finish();
+    // Its one recipient had room: the packet went whole, as `accepted` agrees.
+    try std.testing.expect(batch.wentWhole());
     try std.testing.expectEqual(@as(usize, 2), batch.accepted(next).words[0]);
     var packets: usize = 0;
     while (endpoint.output.takeReady()) |packet| {

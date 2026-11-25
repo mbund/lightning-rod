@@ -262,15 +262,15 @@ pub const Experience = struct {
         assert(wanted.len == output.len and wanted.len <= 16);
         for (wanted, output) |entity, *held| {
             const at = self.orbs.slotOf(entity) orelse return error.UnknownExperienceOrb;
-            const stored = self.orbs.ptrAt(at);
-            const body: ?entities.State = if (self.deps.entities.bodyAt(at)) |found| found.* else null;
+            const stored = self.orbs.ptr(at);
+            const body: ?entities.State = if (self.deps.entities.body(at)) |found| found.* else null;
             held.* = .{ .id = entity, .slot = at, .orb = stored.orb, .body = body, .was = body };
         }
     }
 
     /// Writes back what changed of an orb in hand and lets it go.
     pub fn settle(self: *Experience, held: *Held) !void {
-        const stored = self.orbs.ptrAt(held.slot);
+        const stored = self.orbs.ptr(held.slot);
         assert(self.deps.entities.directory.entry(held.slot).id == held.id);
         if (!std.meta.eql(stored.orb, held.orb)) {
             if (stored.orb.revision != held.orb.revision or (stored.orb.fire > 0) != (held.orb.fire > 0)) self.replicated.insert(held.slot);
@@ -278,17 +278,17 @@ pub const Experience = struct {
             stored.dirty = true;
         }
         if (held.body) |body| if (held.was) |was| if (!std.meta.eql(body, was)) {
-            const kept = self.deps.entities.bodyAt(held.slot) orelse return error.UnknownExperienceOrb;
+            const kept = self.deps.entities.body(held.slot) orelse return error.UnknownExperienceOrb;
             kept.* = body;
             stored.dirty = true;
-            try self.places.moveSlot(held.slot, body.world, body.position);
+            try self.places.move(held.slot, body.world, body.position);
         };
     }
 
     /// An orb as it is, for tests and for whoever looks at one at a time.
     pub fn get(self: *Experience, entity: entities.Id) !?struct { orb: Orb, body: ?entities.State } {
-        const stored = try self.orbs.get(entity) orelse return null;
-        return .{ .orb = stored.orb, .body = try self.deps.entities.get(entity) };
+        const stored = try self.orbs.getById(entity) orelse return null;
+        return .{ .orb = stored.orb, .body = try self.deps.entities.getById(entity) };
     }
 
     /// Changes an orb as given: its body moves its place with it.
@@ -304,7 +304,7 @@ pub const Experience = struct {
     pub fn totalValue(self: *Experience) !i64 {
         var total: i64 = 0;
         for (self.ids()) |entity| {
-            const stored = (try self.orbs.get(entity)).?;
+            const stored = (try self.orbs.getById(entity)).?;
             if (stored.orb.alive) total += @as(i64, stored.orb.value) * stored.orb.count;
         }
         return total;
@@ -315,12 +315,12 @@ pub const Experience = struct {
     pub fn digest(self: *Experience) !u64 {
         var sum: u64 = 0;
         for (self.ids()) |entity| {
-            const stored = (try self.orbs.get(entity)).?;
+            const stored = (try self.orbs.getById(entity)).?;
             var hasher = std.hash.Wyhash.init(entity);
             var encoded = stored.orb.encode();
             encoded[0] = 2;
             hasher.update(&encoded);
-            if (try self.deps.entities.get(entity)) |body| inline for (@typeInfo(entities.State).@"struct".field_names) |name| hasher.update(std.mem.asBytes(&@field(body, name)));
+            if (try self.deps.entities.getById(entity)) |body| inline for (@typeInfo(entities.State).@"struct".field_names) |name| hasher.update(std.mem.asBytes(&@field(body, name)));
             sum +%= hasher.final();
         }
         return sum;
@@ -330,7 +330,7 @@ pub const Experience = struct {
     pub fn live(self: *Experience, output: []entities.Id) ![]entities.Id {
         var live_count: usize = 0;
         for (self.ids()) |entity| {
-            const stored = (try self.orbs.get(entity)).?;
+            const stored = (try self.orbs.getById(entity)).?;
             if (!stored.orb.alive) continue;
             if (live_count == output.len) return error.WorkingSetTooLarge;
             output[live_count] = entity;
@@ -458,7 +458,7 @@ pub const Experience = struct {
     fn retire(self: *Experience, held: *Held) !void {
         assert(held.orb.alive);
         errdefer self.deps.storage.fail();
-        self.orbs.dropBody(held.id);
+        self.orbs.dropBodyById(held.id);
         self.places.remove(held.id);
         held.orb.alive = false;
         held.body = null;
@@ -485,7 +485,7 @@ pub const Experience = struct {
     /// Lets go of a gone orb's record. Its slot, and with it the id clients know it by, stays
     /// until every client that had it was told it went.
     pub fn forget(self: *Experience, entity: entities.Id) !void {
-        const stored = try self.orbs.take(entity) orelse return error.UnknownExperienceOrb;
+        const stored = try self.orbs.takeById(entity) orelse return error.UnknownExperienceOrb;
         assert(!stored.orb.alive);
         if (stored.stored) |column| try self.table.putBatch(&.{.{ .key = &entities.durable.key(record_prefix, column, entity), .value = null }});
         self.places.remove(entity);
@@ -589,8 +589,8 @@ pub const Experience = struct {
             leaving_count += 1;
         }
         for (self.scratch[0..leaving_count]) |entity| {
-            const body = (try self.deps.entities.get(entity)).?;
-            const stored = (try self.orbs.take(entity)).?;
+            const body = (try self.deps.entities.getById(entity)).?;
+            const stored = (try self.orbs.takeById(entity)).?;
             try save(&batch, entity, body, stored);
             self.places.remove(entity);
         }
@@ -922,20 +922,20 @@ pub const Experience = struct {
         errdefer space.fail();
         var batch: entities.durable.Batch(record_bytes) = .{ .table = self.table };
         for (self.ids()) |entity| {
-            var stored = (try self.orbs.get(entity)).?;
+            var stored = (try self.orbs.getById(entity)).?;
             if (!stored.orb.alive) {
                 // Gone but not yet forgotten: its record goes now, and nothing comes back.
                 if (stored.stored) |column| try batch.delete(entities.durable.key(record_prefix, column, entity));
                 stored.stored = null;
-                try self.orbs.put(entity, stored);
+                try self.orbs.putById(entity, stored);
                 continue;
             }
             if (!stored.dirty) continue;
-            const body = (try self.deps.entities.get(entity)).?;
+            const body = (try self.deps.entities.getById(entity)).?;
             try save(&batch, entity, body, stored);
             stored.stored = entities.space.columnOf(body.world, body.position);
             stored.dirty = false;
-            try self.orbs.put(entity, stored);
+            try self.orbs.putById(entity, stored);
         }
         try batch.flush();
         const random_bytes = self.random.encode();

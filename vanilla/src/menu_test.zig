@@ -373,7 +373,7 @@ test "experience metadata bodies and random state survive reopen and discard int
             try std.testing.expectEqual(@as(i16, 3), orb.health);
             try std.testing.expectEqual(@as(i16, 80), orb.fire);
             try std.testing.expectEqualSlices(u8, &expected_random, &experience.random.encode());
-            try std.testing.expectEqual(@as(f64, 8.5), (try fixture.bodies.get(entity)).?.position[0]);
+            try std.testing.expectEqual(@as(f64, 8.5), (try fixture.bodies.getById(entity)).?.position[0]);
             try std.testing.expect(try experience.damage(entity, 100));
             try experience.checkpoint(experience.deps.storage);
         }
@@ -421,7 +421,7 @@ test "orb merges preserve denomination counts and minimum age and expiry removes
     try setOrb(experience, first, "age", 5999);
     try experience.deps.entities.tickAll();
     try std.testing.expect(!(try orbOf(experience, first)).alive);
-    try std.testing.expect((try fixture.bodies.get(entity)) == null);
+    try std.testing.expect((try fixture.bodies.getById(entity)) == null);
 }
 
 test "orb placement fluid currents block effects and fire follow vanilla physics" {
@@ -891,7 +891,7 @@ test "container clicks enforce output fuel stack and recipe remainder rules" {
         var drops = fixture.dropped.rows();
         const drop = (try drops.next()).?;
         try std.testing.expect((try drops.next()) == null);
-        const body = (try fixture.bodies.get(drop.id)).?;
+        const body = (try fixture.bodies.getById(drop.id)).?;
         const value = try fixture.ownership.get(ItemEntities.slot(body));
         try std.testing.expectEqual(bread, value.stack.?);
         const last: ContainerKey = .{ .world = first.world, .position = .{ .x = 5, .y = 1, .z = 0 } };
@@ -1059,7 +1059,7 @@ fn countOwned(fixture: InventoryFixture, keys: []const ContainerKey) ![conserved
     {
         while ((try rows.next())) |row| {
             if (!row.metadata.alive) continue;
-            const body = (try fixture.bodies.get(row.id)) orelse return error.MissingDroppedBody;
+            const body = (try fixture.bodies.getById(row.id)) orelse return error.MissingDroppedBody;
             const owned = try fixture.ownership.get(ItemEntities.slot(body));
             try std.testing.expect(owned.stack != null);
             try addOwned(&totals, &.{owned});

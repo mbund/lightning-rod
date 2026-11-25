@@ -96,7 +96,7 @@ test "resident merge candidates filter metadata and conserve item ownership with
         try std.testing.expectEqual(@as(usize, if (merge) 1 else count), active.len);
         var total: u32 = 0;
         for (active) |id| {
-            const body = (try bodies.get(id)).?;
+            const body = (try bodies.getById(id)).?;
             total += (try ownership.get(ItemEntities.slot(body))).stack.?.count;
         }
         try std.testing.expectEqual(@as(u32, @intCast(count)), total);
@@ -144,7 +144,7 @@ fn aliveItems(dropped: *ItemEntities, output: []entities.Id) !usize {
 
 fn gatherSection(dropped: *ItemEntities, world: u32, x: i32, section: i32, output: []entities.Id) !usize {
     var buffer: [3]entities.space.Entry = undefined;
-    var ordered = dropped.inColumn(.{ .world = world, .x = x, .z = 0 }, section, section, &buffer);
+    var ordered = dropped.places.space.ordered(.{ .world = world, .x = x, .z = 0 }, section, section, ItemEntities.kinds, &buffer);
     var count: usize = 0;
     while (true) {
         const batch = try ordered.next();
@@ -259,11 +259,11 @@ test "items burn in lava and fire unless they resist it, and blocks hold, lift a
     // A cobweb holds the item back on its next move.
     try std.testing.expectEqual(ItemEntities.Stuck.cobweb, (try metadata(dropped, ids[@backingInt(Spot.cobweb)])).stuck);
     // A bubble column lifts it.
-    const lifted = (try bodies.get(ids[@backingInt(Spot.bubbles)])).?;
+    const lifted = (try bodies.getById(ids[@backingInt(Spot.bubbles)])).?;
     try std.testing.expect(lifted.velocity[1] > 0);
     // Inside stone, it is pushed out the nearest open side, north of four alike, at 0.1 to
     // 0.3 a tick less the air's slowing, and moves through the stone to get there.
-    const pushed = (try bodies.get(ids[@backingInt(Spot.inside)])).?;
+    const pushed = (try bodies.getById(ids[@backingInt(Spot.inside)])).?;
     try std.testing.expect(pushed.velocity[2] < -0.1 * 0.98 and pushed.velocity[2] > -0.3);
     try std.testing.expect(pushed.position[2] < 8.5);
     try std.testing.expectEqual(@as(f64, 30.5), pushed.position[0]);

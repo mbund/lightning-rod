@@ -76,7 +76,7 @@ const Probe = struct {
         self.expected.cow = mob.entity.uuid;
         const stone = try self.deps.items.define("minecraft:stone");
         const item = try self.deps.dropped.create(world, .{ -3.5, 66, 2.5 }, .{ 0, 0, 0 }, .{ .item = stone, .count = 5 });
-        self.expected.item = (try self.deps.entities.get(item)).?.uuid;
+        self.expected.item = (try self.deps.entities.getById(item)).?.uuid;
         // Past the 8 blocks an orb follows a player from.
         try self.deps.experience.award(world, .{ 12.5, 66, -12.5 }, orb_value);
         const arrow = try self.deps.items.define("minecraft:arrow");
@@ -130,7 +130,7 @@ const Probe = struct {
         var item = false;
         var rows = self.deps.dropped.rows();
         while (try rows.next()) |row| {
-            const body = (try self.deps.entities.get(row.id)) orelse continue;
+            const body = (try self.deps.entities.getById(row.id)) orelse continue;
             if (body.uuid != self.expected.item) continue;
             if (!row.metadata.alive) return error.ItemRestoredChanged;
             item = true;

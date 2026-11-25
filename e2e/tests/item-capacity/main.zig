@@ -11,16 +11,13 @@ const sessions = @import("sessions");
 const inventories = @import("inventories");
 
 /// Items are never refused or lost, however little memory they have: every bound below is far
-/// smaller than what the test makes, so their states and bodies page through scratch files, and
-/// replication looks over everything as its notes overflow.
+/// smaller than what the test makes, so their states and bodies page through scratch files.
 pub fn main(init: std.process.Init) !void {
     const args = try e2e.profile.arguments(init);
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
             lightning_rod.plugin.configured(Players, Players.Configuration{ .render_distance = 2 }),
             lightning_rod.plugin.configured(vanilla.PlayerStates, .{ .gamemode = if (std.mem.eql(u8, args.fixture, "creative")) .creative else .survival }),
-            lightning_rod.plugin.configured(vanilla.ItemEntities, vanilla.ItemEntities.Configuration{ .change_ids = 2 }),
-            lightning_rod.plugin.configured(vanilla.ItemReplication, vanilla.ItemReplication.Configuration{ .work_ids = 2 }),
         }),
         lightning_rod.plugin.configured(Probe, .{}),
     });
@@ -108,7 +105,7 @@ const Probe = struct {
         while ((try rows.next())) |row| {
             if (!row.metadata.alive) continue;
             totals.alive += 1;
-            const body = (try self.deps.entities.get(row.id)) orelse return error.BodyLost;
+            const body = (try self.deps.entities.getById(row.id)) orelse return error.BodyLost;
             const stack = (try self.deps.inventories.get(vanilla.ItemEntities.slot(body))).stack orelse return error.StackLost;
             if (std.mem.eql(u8, &stack.item, &bread)) totals.bread += stack.count;
             if (std.mem.eql(u8, &stack.item, &(try self.deps.items.define("minecraft:stone")))) totals.stone += stack.count;

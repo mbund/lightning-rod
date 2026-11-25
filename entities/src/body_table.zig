@@ -60,16 +60,16 @@ pub fn BodyTable(comptime Extra: type) type {
         }
 
         /// The kind's record where it lies, good until the tick's end.
-        pub fn ptr(self: *const Self, entity: Id) !?*Extra {
+        pub fn ptrById(self: *const Self, entity: Id) !?*Extra {
             return self.table.ref(self.slotOf(entity) orelse return null).field("extra");
         }
 
-        pub fn get(self: *const Self, entity: Id) !?Extra {
-            return (try self.ptr(entity) orelse return null).*;
+        pub fn getById(self: *const Self, entity: Id) !?Extra {
+            return (try self.ptrById(entity) orelse return null).*;
         }
 
-        /// The kind's record of the entity in a slot, which `slotOf` gave: found without its id.
-        pub fn ptrAt(self: *const Self, slot: u32) *Extra {
+        /// The kind's record of the entity in a slot: found without its id.
+        pub fn ptr(self: *const Self, slot: u32) *Extra {
             // The space and the tick order give only slots of their kinds: checked where checks cost
             // nothing, as a release build reads the directory for it on every call.
             if (@import("builtin").mode == .debug) std.debug.assert(self.entities.directory.entry(slot).kind == self.kind);
@@ -77,8 +77,8 @@ pub fn BodyTable(comptime Extra: type) type {
         }
 
         /// The kind's record kept again, for an entity that has one.
-        pub fn put(self: *Self, entity: Id, value: Extra) !void {
-            (try self.ptr(entity) orelse return error.UnknownEntity).* = value;
+        pub fn putById(self: *Self, entity: Id, value: Extra) !void {
+            (try self.ptrById(entity) orelse return error.UnknownEntity).* = value;
         }
 
         /// An entity comes into memory: placed where its body is, in the tick order last if its
@@ -92,22 +92,22 @@ pub fn BodyTable(comptime Extra: type) type {
         }
 
         /// The entity's body goes, its record staying, as a gone entity's does until forgotten.
-        pub fn dropBody(self: *Self, entity: Id) void {
+        pub fn dropBodyById(self: *Self, entity: Id) void {
             const slot = self.slotOf(entity) orelse return;
             self.table.ref(slot).field("bodied").* = false;
         }
 
         /// The entity goes from memory: out of its place and the tick order, and its row with it.
-        pub fn remove(self: *Self, entity: Id) void {
+        pub fn removeById(self: *Self, entity: Id) void {
             const slot = self.slotOf(entity) orelse return;
             self.entities.places.remove(entity);
             self.table.remove(slot);
             self.entities.leave(slot);
         }
 
-        pub fn take(self: *Self, entity: Id) !?Extra {
-            const value = try self.get(entity) orelse return null;
-            self.remove(entity);
+        pub fn takeById(self: *Self, entity: Id) !?Extra {
+            const value = try self.getById(entity) orelse return null;
+            self.removeById(entity);
             return value;
         }
 

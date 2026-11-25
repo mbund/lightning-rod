@@ -158,7 +158,7 @@ const Probe = struct {
                 var metadata = try self.deps.dropped.get(self.isolated_item);
                 if (!metadata.alive) return error.CrossWorldPickup;
 
-                const body = (try self.deps.entities.get(self.isolated_item)).?;
+                const body = (try self.deps.entities.getById(self.isolated_item)).?;
                 const held = try self.deps.inventories.get(vanilla.ItemEntities.slot(body));
                 if (held.stack == null or held.stack.?.count != 3) return error.CrossWorldPickup;
                 if (!try self.deps.inventories.set(vanilla.ItemEntities.slot(body), held.revision, null)) return error.ItemCleanupFailed;

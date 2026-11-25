@@ -101,7 +101,7 @@ test "pickup batches preserve player priority item order and partial collection"
             var item_bodies: [3]entities.State = undefined;
             for (&ids, &item_bodies, 0..) |*id, *body, index| {
                 id.* = try dropped.create(world, .{ 0, 65, 0 }, @splat(0), .{ .item = if (index == 1) stone else bread, .count = if (index == 2) 1 else 2 });
-                body.* = (try bodies.get(id.*)).?;
+                body.* = (try bodies.getById(id.*)).?;
                 var metadata = try dropped.get(id.*);
                 metadata.pickup_delay = 0;
                 if (scenario == .owned and index == 0) metadata.owner = 2;

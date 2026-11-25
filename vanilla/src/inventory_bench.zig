@@ -540,14 +540,14 @@ pub fn benchmarkItemReplication() !void {
                 try dropped.put(held_id, metadata);
             }
             if (mode == .single_stack) {
-                const body = (try bodies.get(ids[0])).?;
+                const body = (try bodies.getById(ids[0])).?;
                 const slot = ItemEntities.slot(body);
                 const previous = try ownership.get(slot);
                 try std.testing.expect(try ownership.set(slot, previous.revision, .{ .item = stack.item, .count = 2 }));
             }
             if (mode == .blocked_change) items.components.changed();
             if (mode == .mutation or mode == .blocked_mutation or mode == .blocked_retirement) for (ids[0..count]) |id| {
-                const body = (try bodies.get(id)).?;
+                const body = (try bodies.getById(id)).?;
                 const slot = ItemEntities.slot(body);
                 const previous = try ownership.get(slot);
                 try std.testing.expect(try ownership.set(slot, previous.revision, if (mode == .blocked_retirement) null else .{ .item = stack.item, .count = @as(u16, if (mode == .mutation) 2 else 3) }));
@@ -788,7 +788,7 @@ pub fn benchmarkDrops() !void {
         for (next_id..bodies.next_id) |entity| {
             const metadata = try dropped.get(entity);
             try std.testing.expectEqual(@as(u16, 40), metadata.pickup_delay);
-            const body = (try bodies.get(entity)).?;
+            const body = (try bodies.getById(entity)).?;
             try std.testing.expectEqual(world, body.world);
             const held = try ownership.get(ItemEntities.slot(body));
             try std.testing.expectEqual(stack, held.stack.?);
