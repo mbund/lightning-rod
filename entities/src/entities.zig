@@ -74,6 +74,11 @@ pub const Entities = struct {
         log_moves: bool = true,
         /// Whether its entities are stored with their columns.
         stored: bool = true,
+        /// Whether queries far around a point ask for it among more numerous kinds, as of players:
+        /// then every tile keeps exactly the columns holding it.
+        near_index: bool = false,
+        /// Whether its entities sleep, boxed or resting: its owner's kinds share a wheel.
+        sleeps: bool = false,
         /// Its tracking range in blocks, EntityType clientTrackingRange times 16, and the most any of
         /// its entities' own ranges reach; null for one nobody is shown.
         tracking_range: ?u32 = null,
@@ -101,9 +106,10 @@ pub const Entities = struct {
     /// A kind's traits, applied wherever the substrate keeps them. The same declared again is
     /// nothing new; another is an error.
     pub fn declare(self: *Entities, spec: KindSpec) !void {
+        if (spec.sleeps) try self.places.space.sleepsOwn(spec.kinds);
         var kinds = spec.kinds.bits.iterator(.{});
         while (kinds.next()) |kind| {
-            const wanted: Declared = .{ .turns_own = spec.turns == .own, .log_moves = spec.log_moves, .stored = spec.stored, .tracked = if (spec.tracking_range) |range| .{ .range = range, .max_range = spec.tracking_max_range orelse range } else null };
+            const wanted: Declared = .{ .turns_own = spec.turns == .own, .log_moves = spec.log_moves, .stored = spec.stored, .near_index = spec.near_index, .tracked = if (spec.tracking_range) |range| .{ .range = range, .max_range = spec.tracking_max_range orelse range } else null };
             if (self.declared[kind]) |known| {
                 if (!std.meta.eql(known, wanted)) return error.KindDeclaredTwice;
                 continue;
@@ -113,6 +119,7 @@ pub const Entities = struct {
             if (wanted.turns_own) self.places.keepsOwnTurns(one);
             if (!wanted.log_moves) self.places.space.unlogged_moves.bits.set(kind);
             if (!wanted.stored) self.places.space.unstored.bits.set(kind);
+            if (wanted.near_index) try self.places.space.indexNear(@intCast(kind));
         }
     }
 
@@ -125,7 +132,7 @@ pub const Entities = struct {
         return self.declared[kind] != null;
     }
 
-    const Declared = struct { turns_own: bool, log_moves: bool, stored: bool, tracked: ?Tracked };
+    const Declared = struct { turns_own: bool, log_moves: bool, stored: bool, near_index: bool, tracked: ?Tracked };
 
     pub fn addBodyColumn(self: *Entities, kind: u32, column: BodyColumn) !void {
         if (self.body_columns[kind] != null) return error.BodyColumnTaken;

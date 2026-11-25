@@ -190,6 +190,9 @@ pub const Experience = struct {
     pickup_count: usize = 0,
     /// Orbs gone since their records were last let go.
     retired: []entities.Id,
+    /// Orbs whose replicated state changed since replication last looked: their motion's
+    /// revision, or whether they burn. Replication visits these, not every orb.
+    replicated: lightning_rod.system.IndexSet,
     retired_count: usize = 0,
     nearby: []entities.space.Entry,
     /// While entities tick: the blocks orbs read, shared by them all.
@@ -217,6 +220,7 @@ pub const Experience = struct {
             .table = table,
             .nearby = try allocator.alloc(entities.space.Entry, 1024),
             .retired = try allocator.alloc(entities.Id, bound),
+            .replicated = try .init(allocator, deps.entities.directory.capacity()),
         };
         @memset(self.deaths, .{});
         @memset(self.sounds, .{});
@@ -269,6 +273,7 @@ pub const Experience = struct {
         const stored = self.orbs.ptrAt(held.slot);
         assert(self.deps.entities.directory.entry(held.slot).id == held.id);
         if (!std.meta.eql(stored.orb, held.orb)) {
+            if (stored.orb.revision != held.orb.revision or (stored.orb.fire > 0) != (held.orb.fire > 0)) self.replicated.insert(held.slot);
             stored.orb = held.orb;
             stored.dirty = true;
         }
@@ -363,30 +368,8 @@ pub const Experience = struct {
     /// and in each column its sections' order, as getEntitiesByType goes; `visit` returns
     /// whether to stop.
     fn eachNear(self: *Experience, world: u32, low: [3]f64, high: [3]f64, context: anytype, comptime visit: fn (@TypeOf(context), entities.space.Entry) anyerror!bool) !void {
-        const space = &self.places.space;
-        const fold = kinds.fold();
-        const first: [2]i32 = .{ @intFromFloat(@floor(low[0] / 16)), @intFromFloat(@floor(low[2] / 16)) };
-        const last: [2]i32 = .{ @intFromFloat(@floor(high[0] / 16)), @intFromFloat(@floor(high[2] / 16)) };
-        var x = first[0];
-        while (x <= last[0]) : (x += 1) {
-            // z as an unsigned field: from 0 up, then the negative ones up.
-            const spans: [2][2]i32 = .{ .{ @max(first[1], 0), last[1] }, .{ first[1], @min(last[1], -1) } };
-            for (spans) |span| {
-                var column_z = span[0];
-                while (column_z <= span[1]) : (column_z += 1) {
-                    const column: entities.Column = .{ .world = world, .x = x, .z = column_z };
-                    // Most columns near a player hold no orb: one lookup says so.
-                    if (!space.holdsAny(column, fold)) continue;
-                    // Every visit here takes only orbs within the box.
-                    var ordered = space.orderedWithin(column, @intFromFloat(@floor(low[1] / 16)), @intFromFloat(@floor(high[1] / 16)), kinds, .{ .low = low, .high = high }, self.nearby);
-                    while (true) {
-                        const entries = try ordered.next();
-                        if (entries.len == 0) break;
-                        for (entries) |entry| if (try visit(context, entry)) return;
-                    }
-                }
-            }
-        }
+        // Every visit here takes only orbs within the box.
+        try self.places.space.eachWithin(world, .{ .low = low, .high = high }, kinds, self.nearby, context, visit);
     }
 
     pub fn awardWithDirection(self: *Experience, world: u32, position: [3]f64, direction: [3]f64, amount: i32) !void {

@@ -171,7 +171,7 @@ pub const Players = struct {
     /// How players are kept among entities: somewhere, not ticked there; their moves within a
     /// column told by the players themselves; never stored with columns.
     fn keepAmong(owned: *entities.Entities) !void {
-        try owned.declare(.{ .kinds = .of(&.{entity_kind}), .turns = .own, .log_moves = false, .stored = false, .tracking_range = 32 * 16 });
+        try owned.declare(.{ .kinds = .of(&.{entity_kind}), .turns = .own, .log_moves = false, .stored = false, .near_index = true, .tracking_range = 32 * 16 });
     }
 
     /// The players place themselves among these entities from now on: what tracks them reads
@@ -267,6 +267,20 @@ pub const Players = struct {
             }
         };
         try self.entities.?.places.space.each(world, box, .of(&.{entity_kind}), context, Adapter.each);
+    }
+
+    /// Whether player `a` comes before `b` as vanilla's level finds entities in its sections: by
+    /// column x, then z as SectionPos.asLong holds it, then section, then as each entered it. What
+    /// breaks a tie a box search's first-found would.
+    pub fn foundBefore(self: *const Players, a: usize, b: usize) bool {
+        const space = &self.entities.?.places.space;
+        const first = space.atSlot(self.entity_slots[a]).?;
+        const second = space.atSlot(self.entity_slots[b]).?;
+        const one = entities.space.columnOf(first.world, first.entry.position);
+        const other = entities.space.columnOf(second.world, second.entry.position);
+        if (one.x != other.x) return one.x < other.x;
+        if (one.z != other.z) return entities.space.zOrder(one.z) < entities.space.zOrder(other.z);
+        return entities.space.before(first.entry, second.entry);
     }
 
     /// Whether `a` came into its world before `b`: who of equals vanilla's level finds first.

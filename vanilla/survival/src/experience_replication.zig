@@ -7,6 +7,8 @@ const entities = @import("entities");
 const wire = @import("wire_1_21_5");
 const replication = @import("replication");
 const entity_packets = replication.entity_packets;
+const Delivery = replication.delivery.Delivery;
+const Visit = replication.visit.Visit;
 const Tracking = replication.tracking.Tracking;
 const bit_sets = lightning_rod.system.bit_sets;
 const Experience = @import("experience.zig").Experience;
@@ -43,8 +45,6 @@ pub const ExperienceReplication = struct {
     /// A running hash of every packet asked to be sent and whom to, when tests trace it.
     traced: u64 = 0,
     tracing: bool,
-    /// Room to copy the orbs' ids into.
-    orbs: []entities.Id,
     sent: entities.Array(Sent),
     words: usize,
     connections: []Connection,
@@ -56,6 +56,10 @@ pub const ExperienceReplication = struct {
     first_event: usize = 0,
     event_span: usize = 0,
     rows: []usize,
+    /// How an orb's packets go out to its audience, as every kind's do.
+    delivery: Delivery,
+    /// The orbs with anything to send this tick, as every kind finds them.
+    visit: Visit,
     targets: []sessions.Service.Target,
     deliveries: []sessions.Service.Delivery,
 
@@ -68,7 +72,6 @@ pub const ExperienceReplication = struct {
             .deps = deps,
             .tracker = undefined,
             .tracing = config.trace_sends,
-            .orbs = try allocator.alloc(entities.Id, deps.experience.orbs.bound()),
             .sent = try .init(allocator, &deps.experience.deps.entities.pool),
             .words = words,
             .connections = try allocator.alloc(Connection, players),
@@ -79,7 +82,10 @@ pub const ExperienceReplication = struct {
             .rows = try allocator.alloc(usize, 5 * words),
             .targets = try allocator.alloc(sessions.Service.Target, players),
             .deliveries = try allocator.alloc(sessions.Service.Delivery, players),
+            .delivery = undefined,
+            .visit = try .init(allocator, deps.experience.deps.entities.directory.capacity()),
         };
+        self.delivery = try .init(allocator, deps.players, deps.packets, deps.sessions);
         @memset(self.connections, .{});
         @memset(self.events, .{});
         @memset(self.event_rows, 0);
@@ -157,20 +163,27 @@ pub const ExperienceReplication = struct {
             self.event_slots.insert(at);
         }
         try self.sendPickups();
-        // Orbs gone, then every orb there is, by id.
+        // Orbs gone, then those with anything to send, by id: an audience changed, their state
+        // changed, or a viewer owed it whole. The rest have nothing to send, and are not looked at.
         var changes = self.deps.tracking.changesOf(self.tracker);
         while (changes.next()) |change| if (change.gone) try self.update(change.slot, null, change);
-        const ids = experience.ids();
-        const orbs = self.orbs[0..ids.len];
-        @memcpy(orbs, ids);
+        for (experience.replicated.values()) |slot| self.visit.mark(@intCast(slot));
+        experience.replicated.clear();
         const directory = &experience.deps.entities.directory;
-        for (orbs) |entity| {
-            const found = (try experience.get(entity)) orelse return error.Corrupt;
-            if (!found.orb.alive) continue;
-            const slot = directory.slotOf(entity) orelse return error.Corrupt;
-            try self.update(slot, .{ .entity = entity, .orb = found.orb, .body = found.body orelse return error.Corrupt }, self.deps.tracking.changed(slot));
+        for (self.visit.collect(self.deps.tracking, self.tracker, directory, byId)) |slot| {
+            const entry = directory.entry(slot);
+            if (experience.orbs.slotOf(entry.id) != slot) continue;
+            const stored = experience.orbs.ptrAt(slot);
+            if (!stored.orb.alive) continue;
+            const body = experience.deps.entities.bodyAt(slot) orelse return error.Corrupt;
+            try self.update(slot, .{ .entity = entry.id, .orb = stored.orb, .body = body.* }, self.deps.tracking.changed(slot));
         }
         try self.sendSounds();
+    }
+
+    /// Orbs in the order they were walked by, their ids.
+    fn byId(directory: *const entities.Directory, a: u32, b: u32) bool {
+        return directory.entry(a).id < directory.entry(b).id;
     }
 
     fn sendPickups(self: *ExperienceReplication) !void {
@@ -259,6 +272,8 @@ pub const ExperienceReplication = struct {
             }
         }
         if (change != null) tracking.confirm(slot, self.set(spawned), self.set(removed));
+        // A viewer still owed it whole brings it back next tick.
+        if (live != null and tracking.stale(slot).any()) self.visit.owe(slot) else self.visit.settle(slot);
     }
 
     fn any(words: []const usize) bool {
@@ -270,18 +285,8 @@ pub const ExperienceReplication = struct {
     /// session closed, go into `done`, but for a position or metadata, where `done` takes those
     /// it could not be queued for.
     fn deliver(self: *ExperienceReplication, comptime phase: Phase, slot: u32, live: ?Live, audience_words: []const usize, done: []usize) !void {
-        var recipients = self.set(audience_words).iterator();
-        var count: usize = 0;
-        while (recipients.next()) |player| {
-            const record = self.deps.players.records[player];
-            const handle = record.handle orelse {
-                put(done, player, phase != .position and phase != .metadata);
-                continue;
-            };
-            self.targets[count] = .{ .handle = handle, .protocol = record.protocol };
-            count += 1;
-        }
-        if (count == 0) return;
+        const audience = self.set(audience_words);
+        if (!audience.any()) return;
         const entity = entities.Entities.networkOfSlot(slot);
         const value = if (live) |orb| orb.orb.value else 0;
         if (self.tracing) {
@@ -289,31 +294,28 @@ pub const ExperienceReplication = struct {
             hasher.update(std.mem.asBytes(&entity));
             hasher.update(&.{@backingInt(phase)});
             hasher.update(std.mem.asBytes(&value));
-            for (self.targets[0..count]) |target| hasher.update(std.mem.asBytes(&target.handle.index));
+            var each = audience.iterator();
+            while (each.next()) |player| if (self.deps.players.records[player].handle != null) hasher.update(std.mem.asBytes(&player));
             self.traced = hasher.final();
         }
-        const targets = self.targets[0..count];
-        const deliveries = self.deliveries[0..count];
+        const delivery = &self.delivery;
         switch (phase) {
-            .remove => try self.deps.packets.fanout(writeRemove, targets, .{entity}, 32, deliveries),
+            .remove => try delivery.send(audience, writeRemove, .{entity}, 32),
             .spawn => {
                 const orb = live.?;
-                try self.deps.packets.fanoutGroup(.{ entity_packets.spawn, writeValue }, targets, .{ .{ entity, orb.body }, .{ entity, value, orb.orb.fire > 0 } }, &.{ 128, 32 }, deliveries);
+                try delivery.sendGroup(audience, .{ entity_packets.spawn, writeValue }, .{ .{ entity, orb.body }, .{ entity, value, orb.orb.fire > 0 } }, &.{ 128, 32 });
             },
-            .position => try self.deps.packets.fanout(writePosition, targets, .{ entity, live.?.body, live.?.orb.on_ground }, 128, deliveries),
-            .metadata => try self.deps.packets.fanout(writeValue, targets, .{ entity, value, live.?.orb.fire > 0 }, 32, deliveries),
+            .position => try delivery.send(audience, writePosition, .{ entity, live.?.body, live.?.orb.on_ground }, 128),
+            .metadata => try delivery.send(audience, writeValue, .{ entity, value, live.?.orb.fire > 0 }, 32),
             .whole => {
                 const orb = live.?;
-                try self.deps.packets.fanoutGroup(.{ writePosition, writeValue }, targets, .{ .{ entity, orb.body, orb.orb.on_ground }, .{ entity, value, orb.orb.fire > 0 } }, &.{ 128, 32 }, deliveries);
+                try delivery.sendGroup(audience, .{ writePosition, writeValue }, .{ .{ entity, orb.body, orb.orb.on_ground }, .{ entity, value, orb.orb.fire > 0 } }, &.{ 128, 32 });
             },
         }
-        for (targets, deliveries) |target, delivery| {
-            const player = target.handle.index;
-            switch (phase) {
-                .position, .metadata => if (delivery == .backpressured) put(done, player, true),
-                else => if (delivery == .queued or delivery == .closed) put(done, player, true),
-            }
-            if (delivery == .unsupported) self.deps.sessions.disconnect(target.handle);
+        // A change's phases count whom they reached; a delta's, whom it missed.
+        switch (phase) {
+            .position, .metadata => delivery.markMissed(done),
+            else => delivery.markReached(done),
         }
     }
 

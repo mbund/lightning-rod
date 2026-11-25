@@ -11,6 +11,7 @@
 //! section order so they share reads, and tests only the living things under its swept box.
 
 const std = @import("std");
+const bit_sets = @import("lightning_rod").system.bit_sets;
 const builtin = @import("builtin");
 const chunks = @import("chunks");
 const sessions = @import("sessions");
@@ -416,11 +417,8 @@ pub const Projectiles = struct {
     height_world: ?u32 = null,
     world_height: raycast.Height = .unbounded,
     /// The batch of packets going to one set of viewers, and what each packet is for.
-    outbox: sessions.Service.Broadcast,
-    outbox_audience: []u64,
-    outbox_pending: [sessions.Service.batch_max]Pending = undefined,
-    outbox_count: usize = 0,
-    recipients: []sessions.Service.Target,
+    /// Projectiles' packets for one audience at a time, as every kind batches its broadcasts.
+    outbox: Outbox,
     /// Viewers out of room this tick, and those one packet goes to.
     starved: []u64,
     audience: []u64,
@@ -492,9 +490,7 @@ pub const Projectiles = struct {
             .affecting_states = try affectingStates(allocator),
             .space = try chunks.occupancy.Table.init(allocator, configuration.space_sections),
             .air_state = @intCast(game_data.registry.blockStateId("minecraft:air").?),
-            .outbox = try .init(allocator, deps.players.deps.sessions, sessions.Service.batch_max * deps.players.deps.sessions.config.protocols.len),
-            .outbox_audience = try allocator.alloc(u64, row_words),
-            .recipients = try allocator.alloc(sessions.Service.Target, players),
+            .outbox = try .init(allocator, deps.players, deps.players.deps.packets, deps.players.deps.sessions, row_words),
             .starved = try allocator.alloc(u64, row_words),
             .audience = try allocator.alloc(u64, row_words),
             .entered = try allocator.alloc(DomainColumn, deps.domains.capacity()),
@@ -503,7 +499,7 @@ pub const Projectiles = struct {
         @memset(self.seen, .{});
         self.kinds = .of(&self.entity_types);
         // Projectiles keep their own turns: frozen columns hold them, not the columns' ticking.
-        try deps.entities.declare(.{ .kinds = self.kinds, .turns = .own, .tracking_range = 4 * 16 });
+        try deps.entities.declare(.{ .kinds = self.kinds, .turns = .own, .sleeps = true, .tracking_range = 4 * 16 });
         // What moves is what can come near a sleeper.
         deps.entities.places.space.keepMovers();
         // Projectiles take their turns in the one tick order, a batch at a time.
@@ -2189,22 +2185,19 @@ pub const Projectiles = struct {
 
     /// What a queued packet does for its viewers once they take it.
     const Purpose = enum { spawn, update, remove };
-    const Pending = struct { id: u64, kind: Purpose, removal: bool, receipt: sessions.Service.Broadcast.Receipt };
+    const Sent = struct { id: u64, kind: Purpose, removal: bool };
+    const Outbox = @import("replication").delivery.Batch(Sent);
 
-    /// Queues a packet for some of a projectile's viewers, as ItemReplication batches its own:
+    /// Queues a packet for some of a projectile's viewers, as every kind batches its broadcasts:
     /// packets for the same viewers go in one batch, admitted for all of them at once. What each
     /// viewer took is read back when the batch goes, so the known rows say what clients have.
     fn queue(self: *Projectiles, entity: u64, audience: []const u64, kind: Purpose, removal: bool, comptime writer: anytype, arguments: anytype) !void {
         self.traceSend(entity, audience, @backingInt(kind));
-        if (!try self.prepare(audience, 1)) return;
-        const receipt = self.deps.players.deps.packets.broadcast(&self.outbox, writer, null, null, arguments, 128) catch |err| switch (err) {
-            error.Backpressured => return self.backlog(),
-            else => return err,
-        };
-        self.record(entity, kind, removal, receipt);
+        if (!try self.ready(audience, 1)) return;
+        if (!try self.outbox.send(.{ .id = entity, .kind = kind, .removal = removal }, writer, arguments, 128)) return self.backlog(audience);
+        self.queued[@backingInt(kind)] += 1;
     }
 
-    /// A spawn and its entity data as one group, which each viewer takes whole or not at all.
     /// What projectiles ask to send, for runs to be compared by; whether viewers take it is the
     /// sessions' affair.
     fn traceSend(self: *Projectiles, entity: u64, audience: []const u64, kind: u8) void {
@@ -2218,48 +2211,44 @@ pub const Projectiles = struct {
         self.sent = hasher.final();
     }
 
+    /// A spawn and its entity data as one group, which each viewer takes whole or not at all.
     fn queueSpawn(self: *Projectiles, entity: u64, audience: []const u64, spawn: packets.Spawn, data: packets.Data) !void {
         self.traceSend(entity, audience, 255);
         // Two packets and the bundle around them.
-        if (!try self.prepare(audience, 4)) return;
-        const receipt = self.deps.players.deps.packets.broadcastGroup(&self.outbox, .{ .{ packets.spawnLegacy, packets.spawnPacked }, packets.writeData }, null, null, .{ .{spawn}, .{ spawn.id, data } }, &.{ 128, 128 }) catch |err| switch (err) {
-            error.Backpressured => return self.backlog(),
-            else => return err,
-        };
-        self.record(entity, .spawn, false, receipt);
+        if (!try self.ready(audience, 4)) return;
+        if (!try self.outbox.sendGroup(.{ .id = entity, .kind = .spawn, .removal = false }, .{ .{ packets.spawnLegacy, packets.spawnPacked }, packets.writeData }, .{ .{spawn}, .{ spawn.id, data } }, &.{ 128, 128 })) return self.backlog(audience);
+        self.queued[@backingInt(Purpose.spawn)] += 1;
     }
 
-    fn record(self: *Projectiles, entity: u64, kind: Purpose, removal: bool, receipt: sessions.Service.Broadcast.Receipt) void {
-        self.outbox_pending[self.outbox_count] = .{ .id = entity, .kind = kind, .removal = removal, .receipt = receipt };
-        self.queued[@backingInt(kind)] += 1;
-        self.outbox_count += 1;
+    /// The batch for an audience. False if nothing can go, to no one or to no room.
+    fn ready(self: *Projectiles, audience: []const u64, entries: usize) !bool {
+        assert(audience.len == self.row_words);
+        return switch (try self.outbox.prepare(.{ .words = audience, .capacity = self.deps.players.records.len }, entries, self, settleSent)) {
+            .ready => true,
+            .nobody => false,
+            // Nothing went: a spawn is tried again next tick, a removal on its next retry.
+            .backpressured => {
+                self.backlog(audience);
+                return false;
+            },
+        };
     }
 
     /// Sends the batch and reads back who took each packet: spawns and removals tracking hears of.
     fn flush(self: *Projectiles) !void {
-        const outbox = &self.outbox;
-        if (!outbox.active) return;
-        outbox.commit();
-        defer {
-            outbox.cancel();
-            self.outbox_count = 0;
-        }
-        for (self.outbox_pending[0..self.outbox_count]) |pending| {
-            var unsupported = outbox.unsupported(pending.receipt).iterator();
-            while (unsupported.next()) |index| self.deps.players.deps.sessions.disconnect(outbox.handleAt(index));
-            if (outbox.accepted(pending.receipt).count() > 0) self.taken[@backingInt(pending.kind)] += 1;
-            // Whoever did not take it gets it on a later tick, and nothing more new this one.
-            if (pending.kind != .update and outbox.accepted(pending.receipt).count() < outbox.recipients) self.starve(pending.receipt);
-            if (pending.kind != .update) try self.acknowledge(pending);
-        }
+        try self.outbox.flush(self, settleSent);
     }
 
-    /// Tells tracking who took a spawn or a removal, by the slot it was queued for.
-    fn acknowledge(self: *Projectiles, pending: Pending) !void {
+    /// What viewers took of one packet once the batch went.
+    fn settleSent(self: *Projectiles, sent: Sent, accepted: bit_sets.Set, recipients: usize) !void {
+        if (accepted.count() > 0) self.taken[@backingInt(sent.kind)] += 1;
+        if (sent.kind == .update) return;
+        // Whoever did not take it gets it on a later tick, and nothing more new this one.
+        if (accepted.count() < recipients) self.starve(accepted);
+        // Tracking hears who took a spawn or a removal, by the slot it was queued for.
         const tracking = self.tracking orelse return;
-        const accepted = self.outbox.accepted(pending.receipt);
-        const slot: u32 = @intCast(pending.id);
-        switch (pending.kind) {
+        const slot: u32 = @intCast(sent.id);
+        switch (sent.kind) {
             .spawn => tracking.confirm(slot, accepted, tracking.nobody()),
             .remove => tracking.confirm(slot, tracking.nobody(), accepted),
             .update => unreachable,
@@ -2383,16 +2372,13 @@ pub const Projectiles = struct {
         // A path longer than a chunk looks for itself; a shorter one shares its chunk's players.
         const far = high[0] - low[0] > 15 or high[2] - low[2] > 15;
         if (far) {
-            // In the order vanilla's level finds them in the box: of equals, the first.
-            var far_search: struct { projectiles: *Projectiles, projectile: *const Projectile, swept: body.Box, best: *?Found, best_distance: *f64, margin: f64, from: [3]f64, to: [3]f64 } = .{ .projectiles = self, .projectile = projectile, .swept = swept, .best = &best, .best_distance = &best_distance, .margin = margin, .from = from, .to = to };
-            try self.deps.players.eachInBox(projectile.world, .{ .min = swept.min, .max = swept.max }, &far_search, struct {
-                fn visit(context: *@TypeOf(far_search), other: usize) anyerror!bool {
-                    const box = playerBox(&context.projectiles.deps.players.records[other]);
-                    if (!box.intersects(context.swept) or !context.projectiles.canHitPlayer(context.projectile, other)) return false;
-                    context.projectiles.nearer(context.best, context.best_distance, .{ .player = other }, box, context.margin, context.from, context.to);
-                    return false;
-                }
-            }.visit);
+            // Of equals, the first vanilla's level finds: `nearer` breaks ties as its order would.
+            var players = self.deps.players.nearby(projectile.world, .{ .x = (low[0] + high[0]) / 2, .y = 0, .z = (low[2] + high[2]) / 2 }, @intFromFloat(@ceil((high[0] - low[0] + high[2] - low[2]) / 32) + 1));
+            while (players.next()) |other| {
+                const box = playerBox(&self.deps.players.records[other]);
+                if (!box.intersects(swept) or !self.canHitPlayer(projectile, other)) continue;
+                self.nearer(&best, &best_distance, .{ .player = other }, box, margin, from, to);
+            }
             return best;
         }
         // The players a chunk shares, ruled out at once when the path misses the box around them
@@ -2407,9 +2393,15 @@ pub const Projectiles = struct {
         return best;
     }
 
-    fn nearer(_: *const Projectiles, best: *?Found, best_distance: *f64, target: Target, box: body.Box, margin: f64, from: [3]f64, to: [3]f64) void {
+    fn nearer(self: *const Projectiles, best: *?Found, best_distance: *f64, target: Target, box: body.Box, margin: f64, from: [3]f64, to: [3]f64) void {
         const distance = clip(grown(box, margin), from, to) orelse return;
-        if (distance >= best_distance.*) return;
+        if (distance > best_distance.*) return;
+        if (distance == best_distance.*) {
+            // Of equals, the first vanilla's level finds: mobs before players, players in the
+            // order of their sections.
+            const current = best.* orelse return;
+            if (target != .player or current.target != .player or !self.deps.players.foundBefore(target.player, current.target.player)) return;
+        }
         best_distance.* = distance;
         best.* = .{ .target = target, .at = along(from, to, distance) };
     }
@@ -2672,26 +2664,20 @@ pub const Projectiles = struct {
     /// The players within a chunk of a chunk who may be hit, the farthest a path through it
     /// shorter than a chunk reaches.
     fn eligible(self: *Projectiles, column: Column, output: []u32, boxes: []body.Box) !usize {
-        // In the order vanilla's level finds them, which any box within keeps: of equals a path
-        // meets, the first.
-        var found: struct { projectiles: *Projectiles, world: u32, output: []u32, boxes: []body.Box, count: usize = 0 } = .{ .projectiles = self, .world = column.world, .output = output, .boxes = boxes };
-        const low_x: f64 = @floatFromInt((column.x - 1) * 16);
-        const low_z: f64 = @floatFromInt((column.z - 1) * 16);
-        const around_column: entities.space.Box = .{ .min = .{ low_x, -1.0e7, low_z }, .max = .{ low_x + 48, 1.0e7, low_z + 48 } };
-        try self.deps.players.eachInBox(column.world, around_column, &found, struct {
-            fn visit(context: *@TypeOf(found), other: usize) anyerror!bool {
-                const player = &context.projectiles.deps.players.records[other];
-                if (player.world != context.world or player.stage != .ready or player.handle == null) return false;
-                const state = context.projectiles.deps.player_states.of(player);
-                if (state.gamemode == .spectator or state.health <= 0) return false;
-                assert(context.count < context.output.len);
-                context.output[context.count] = @intCast(other);
-                context.boxes[context.count] = playerBox(player);
-                context.count += 1;
-                return false;
-            }
-        }.visit);
-        return found.count;
+        // In no order: `nearer` breaks ties as vanilla's would.
+        var count: usize = 0;
+        var nearby = self.deps.players.nearby(column.world, .{ .x = @as(f64, @floatFromInt(column.x)) * 16 + 8, .y = 0, .z = @as(f64, @floatFromInt(column.z)) * 16 + 8 }, 1);
+        while (nearby.next()) |other| {
+            const player = &self.deps.players.records[other];
+            if (player.world != column.world or player.stage != .ready or player.handle == null) continue;
+            const state = self.deps.player_states.of(player);
+            if (state.gamemode == .spectator or state.health <= 0) continue;
+            assert(count < output.len);
+            output[count] = @intCast(other);
+            boxes[count] = playerBox(player);
+            count += 1;
+        }
+        return count;
     }
 
     fn dataOf(_: *const Projectiles, projectile: *const Projectile) packets.Data {
@@ -2704,9 +2690,8 @@ pub const Projectiles = struct {
     }
 
     /// The viewers in the batch who did not take a packet are starved for the rest of the tick.
-    fn starve(self: *Projectiles, receipt: sessions.Service.Broadcast.Receipt) void {
-        const accepted = self.outbox.accepted(receipt);
-        for (self.outbox_audience, 0..) |word, at| {
+    fn starve(self: *Projectiles, accepted: bit_sets.Set) void {
+        for (self.outbox.audience, 0..) |word, at| {
             var bits = word;
             while (bits != 0) : (bits &= bits - 1) {
                 const other = at * 64 + @ctz(bits);
@@ -2715,42 +2700,10 @@ pub const Projectiles = struct {
         }
     }
 
-    /// The batch for an audience, begun if the one open is for others or full. False if nothing
-    /// can go, to no one or to no room.
-    fn prepare(self: *Projectiles, audience: []const u64, entries: usize) !bool {
-        assert(audience.len == self.row_words);
-        const outbox = &self.outbox;
-        const needed = entries * self.deps.players.deps.sessions.config.protocols.len;
-        if (outbox.active and (!std.mem.eql(u64, audience, self.outbox_audience) or self.outbox_count == sessions.Service.batch_max or outbox.count + needed > outbox.entries.len)) try self.flush();
-        if (!outbox.active) {
-            var count: usize = 0;
-            for (audience, 0..) |word, at| {
-                var bits = word;
-                while (bits != 0) : (bits &= bits - 1) {
-                    const player = &self.deps.players.records[at * 64 + @ctz(bits)];
-                    if (player.handle == null or player.stage != .ready) continue;
-                    self.recipients[count] = .{ .handle = player.handle.?, .protocol = player.protocol };
-                    count += 1;
-                }
-            }
-            if (count == 0) return false;
-            outbox.begin(self.recipients[0..count]) catch |err| switch (err) {
-                // Nothing went: a spawn is tried again next tick, a removal on its next retry.
-                error.Backpressured => {
-                    self.backlog();
-                    return false;
-                },
-                else => return err,
-            };
-            @memcpy(self.outbox_audience, audience);
-        }
-        return true;
-    }
-
-    /// The batch's viewers had no room: they are sent no more this tick, and tracking offers
+    /// An audience had no room: its viewers are sent no more this tick, and tracking offers
     /// them what they missed again.
-    fn backlog(self: *Projectiles) void {
-        for (self.starved, self.outbox_audience) |*starved, audience| starved.* |= audience;
+    fn backlog(self: *Projectiles, audience: []const u64) void {
+        for (self.starved, audience) |*starved, word| starved.* |= word;
     }
 
     fn sound(self: *Projectiles, projectile: *const Projectile, name: []const u8, volume: f32, pitch: f32) void {

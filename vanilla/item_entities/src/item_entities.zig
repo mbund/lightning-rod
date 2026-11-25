@@ -179,6 +179,9 @@ pub const ItemEntities = struct {
         metadata: Metadata,
         stored: ?Column = null,
         dirty: bool = true,
+        /// While its state is behind its ticks: how to bring it up to date. Its schedule is the
+        /// space's rest; this is only what its replay needs.
+        sleep: ?Sleep = null,
     };
 
     /// An item as it is: its body and its state, both copies.
@@ -204,10 +207,10 @@ pub const ItemEntities = struct {
     /// shared by every kind.
     places: *entities.Places,
     residency: entities.Residency,
-    /// Items whose state is behind their ticks: asleep, or woken and not read since.
-    sleepers: entities.Table(Sleep),
-    /// Sleepers due to look again: for a merge, to despawn.
-    due: entities.Schedule,
+    /// The items asleep, their ids side by side: what walks over sleepers each tick reads.
+    asleep_ids: entities.IdSet,
+    /// Room for the slots of sleepers due at once, which the space's wheel gives.
+    due_slots: []u32,
     /// Room to copy ids into, for passes that change what they pass over.
     scratch: []entities.Id,
     clock: Clock = .{},
@@ -246,15 +249,15 @@ pub const ItemEntities = struct {
             .changes = try entities.IdSet.init(allocator, &deps.entities.pool, config.change_ids),
             .moved = try entities.IdSet.init(allocator, &deps.entities.pool, config.change_ids),
             .items = try .init(allocator, deps.entities, kind),
-            .sleepers = try .init(allocator, &deps.entities.pool, bound),
-            .due = try .init(allocator, bound * 2),
+            .asleep_ids = try .init(allocator, &deps.entities.pool, bound),
+            .due_slots = try allocator.alloc(u32, bound),
             .scratch = try allocator.alloc(entities.Id, bound),
             .places = &deps.entities.places,
             .residency = try .init(allocator, config.columns),
             .sleep = config.sleep,
             .table = records.Table.init(deps.storage, deps.record_workspaces.resources),
         };
-        try deps.entities.declare(.{ .kinds = kinds, .tracking_range = 6 * 16 });
+        try deps.entities.declare(.{ .kinds = kinds, .sleeps = true, .tracking_range = 6 * 16 });
         try self.places.watchStopping(kinds, .{ .context = self, .function = stoppedTicking });
         try deps.entities.addColumnHolder(.init(ItemEntities, self, columnLoaded, columnUnloaded));
         try self.items.register();
@@ -275,7 +278,11 @@ pub const ItemEntities = struct {
     /// An item stopped ticking: a sleeper stops where its last tick left it.
     fn stoppedTicking(context: *anyopaque, entity: entities.Id) void {
         const self: *ItemEntities = @ptrCast(@alignCast(context));
-        if (self.sleepers.get(entity)) |sleep| {
+        if (self.sleepOf(entity)) |sleep| {
+            if (sleep.asleep) {
+                _ = self.places.space.unrest(self.deps.entities.directory.slotOf(entity).?);
+                self.asleep_ids.remove(entity);
+            }
             sleep.asleep = false;
             sleep.until = @min(sleep.until, self.clock.tick);
         }
@@ -403,7 +410,7 @@ pub const ItemEntities = struct {
     pub fn put(self: *ItemEntities, entity: entities.Id, metadata: Metadata) !void {
         if (!self.items.contains(entity)) return error.UnknownItemEntity;
         try self.catchUp(entity);
-        if (self.sleepers.get(entity)) |sleep| if (sleep.asleep) try self.wake(entity, std.math.maxInt(u64));
+        if (self.sleepOf(entity)) |sleep| if (sleep.asleep) try self.wake(entity, std.math.maxInt(u64));
         try self.writeQuietly(entity, metadata);
     }
 
@@ -432,7 +439,7 @@ pub const ItemEntities = struct {
 
     /// As `catchUp`, for an item whose slot is known.
     fn catchUpAt(self: *ItemEntities, entity: entities.Id, at: u32) !void {
-        const sleep = self.sleepers.get(entity) orelse return;
+        const sleep = self.sleepAt(at) orelse return;
         const target = @min(self.clock.through(sleep.sequence), sleep.until);
         if (target != sleep.since) {
             const item = self.items.ptrAt(at);
@@ -445,7 +452,7 @@ pub const ItemEntities = struct {
             sleep.age = item.metadata.age;
         }
         // Up to date and awake, it ticks for itself from here.
-        if (!sleep.asleep) _ = self.sleepers.remove(entity);
+        if (!sleep.asleep) self.forgetSleep(at);
     }
 
     /// One tick of a resting item, as ItemTick and ItemPhysics.advance go with nothing to move
@@ -483,7 +490,7 @@ pub const ItemEntities = struct {
         for (listed.ids) |entity| {
             var metadata = (try self.items.get(entity)).?.metadata;
             var body = try self.deps.entities.get(entity) orelse continue;
-            if (self.sleepers.getConst(entity)) |sleep| {
+            if (self.sleepOf(entity)) |sleep| {
                 var tick = sleep.since;
                 while (tick < @min(self.clock.through(sleep.sequence), sleep.until)) : (tick += 1) rest(&body, &metadata, self.givenId(entity), sleep.speed, sleep.friction);
             }
@@ -499,22 +506,44 @@ pub const ItemEntities = struct {
 
     /// How many items sleep.
     pub fn asleepCount(self: *const ItemEntities) usize {
-        var asleep_count: usize = 0;
-        for (self.sleepers.constItems()) |sleep| asleep_count += @intFromBool(sleep.asleep);
-        return asleep_count;
+        return self.asleep_ids.count();
+    }
+
+    /// The sleep of the item in a slot, while its state is behind.
+    fn sleepAt(self: *const ItemEntities, at: u32) ?*Sleep {
+        const item = self.items.ptrAt(at);
+        return if (item.sleep) |*sleep| sleep else null;
+    }
+
+    fn sleepOf(self: *const ItemEntities, entity: entities.Id) ?*Sleep {
+        return self.sleepAt(self.items.slotOf(entity) orelse return null);
+    }
+
+    /// Up to date, or gone: nothing of a sleep is left.
+    fn forgetSleep(self: *ItemEntities, at: u32) void {
+        self.items.ptrAt(at).sleep = null;
+        self.asleep_ids.remove(self.deps.entities.directory.entry(at).id);
     }
 
     pub fn asleep(self: *const ItemEntities, entity: entities.Id) ?Sleep {
-        const sleep = self.sleepers.getConst(entity) orelse return null;
+        const sleep = self.sleepOf(entity) orelse return null;
+        return if (sleep.asleep) sleep.* else null;
+    }
+
+    /// As `asleep`, for the item in a slot.
+    pub fn asleepAt(self: *const ItemEntities, at: u32) ?Sleep {
+        const sleep = self.sleepAt(at) orelse return null;
         return if (sleep.asleep) sleep.* else null;
     }
 
     /// Lets an item sleep from the end of the tick it just had: it leaves the awake order and
     /// looks again when due to merge or to despawn.
     pub fn lull(self: *ItemEntities, entity: entities.Id, sequence: u64, body: entities.State, metadata: Metadata, speed: f64, friction: f64) !void {
-        assert(!self.sleepers.contains(entity));
+        const at = self.items.slotOf(entity).?;
+        assert(self.sleepAt(at) == null);
         const section: chunks.Section = .{ .world = body.world, .x = columnOf(body).x, .y = sectionOf(body), .z = columnOf(body).z };
-        _ = try self.sleepers.put(entity, .{ .since = self.clock.tick, .ticks = metadata.ticks, .age = metadata.age, .speed = speed, .friction = friction, .sequence = sequence, .section = section, .position = body.position });
+        self.items.ptrAt(at).sleep = .{ .since = self.clock.tick, .ticks = metadata.ticks, .age = metadata.age, .speed = speed, .friction = friction, .sequence = sequence, .section = section, .position = body.position };
+        self.asleep_ids.insert(entity);
         self.places.order.sleep(entity);
         try self.schedule(entity, metadata.ticks, metadata.age);
     }
@@ -525,27 +554,23 @@ pub const ItemEntities = struct {
         const to_merge: u64 = 40 - @as(u64, ticks % 40);
         const to_despawn: u64 = @intCast(@max(1, 6000 - @as(i64, age)));
         const due_tick = self.clock.tick + @min(to_merge, to_despawn);
-        self.sleepers.get(entity).?.due = due_tick;
-        try self.due.push(.{ .tick = due_tick, .id = entity }, self, standing);
+        self.sleepOf(entity).?.due = due_tick;
+        // The space's wheel meets it then, as every kind's sleepers are met.
+        try self.places.space.rest(self.deps.entities.directory.slotOf(entity).?, self.clock.tick, due_tick);
     }
 
-    fn standing(self: *ItemEntities, due: entities.schedule.Due) bool {
-        const sleep = self.sleepers.getConst(due.id) orelse return false;
-        return sleep.asleep and sleep.due == due.tick;
-    }
-
-    /// Before a tick's pass: sleepers due this tick are met at their turn, to look again.
+    /// Before a tick's pass: sleepers due this tick are met at their turn, to look again. What
+    /// they find near is what earlier turns this tick left there, so they look at their turn.
     pub fn wakeDue(self: *ItemEntities, tick: u64) !void {
-        while (self.due.pop(tick)) |due| {
-            if (!self.standing(due)) continue;
-            try self.places.order.wake(due.id);
-        }
+        var found: usize = 0;
+        self.places.space.takeDue(tick, kinds, self.due_slots, &found);
+        for (self.due_slots[0..found]) |due| try self.places.order.wake(self.deps.entities.directory.entry(due).id);
     }
 
     /// A sleeper met at its turn with nothing to do but what its replay does: back to sleep,
     /// due again at its next look.
     pub fn sleepOn(self: *ItemEntities, entity: entities.Id, tick: u64) !void {
-        const sleep = self.sleepers.getConst(entity).?;
+        const sleep = self.sleepOf(entity).?;
         const elapsed: u32 = @intCast(tick - sleep.since);
         self.places.order.sleep(entity);
         try self.schedule(entity, sleep.ticks +% elapsed, sleep.age +% @as(i32, @intCast(elapsed)));
@@ -554,19 +579,13 @@ pub const ItemEntities = struct {
     /// The change counts of the items of the columns within `reach` of a place, summed: counts
     /// only grow, so the same sum is the same items there. What other kinds do leaves it.
     pub fn revisionAround(self: *const ItemEntities, world: u32, position: [3]f64, reach: f64) u64 {
-        var sum: u64 = 0;
-        var x = entities.space.coordinate(position[0] - reach);
-        while (x <= entities.space.coordinate(position[0] + reach)) : (x += 1) {
-            var z = entities.space.coordinate(position[2] - reach);
-            while (z <= entities.space.coordinate(position[2] + reach)) : (z += 1) sum += self.places.space.revisionOf(.{ .world = world, .x = x, .z = z }, kinds);
-        }
-        return sum;
+        return self.places.space.revisionAround(world, position, reach, kinds);
     }
 
     /// Whether a sleeper has another item in its merge box, looked again only once something
     /// near it changed.
     pub fn sleeperNearOthers(self: *ItemEntities, entity: entities.Id) bool {
-        const sleep = self.sleepers.get(entity).?;
+        const sleep = self.sleepOf(entity).?;
         const revision = self.revisionAround(sleep.section.world, sleep.position, 0.75);
         if (sleep.near_revision) |known| if (known == revision) return sleep.near;
         sleep.near = self.anyNear(entity, sleep.section.world, sleep.position);
@@ -577,35 +596,35 @@ pub const ItemEntities = struct {
     /// Whether any other item lies where an item at `position` would merge with it:
     /// ItemEntity.mergeWithNeighbours' box, its own grown by 0.5 sideways.
     pub fn anyNear(self: *ItemEntities, entity: entities.Id, world: u32, position: [3]f64) bool {
-        var x = entities.space.coordinate(position[0] - 0.75);
-        while (x <= entities.space.coordinate(position[0] + 0.75)) : (x += 1) {
-            var z = entities.space.coordinate(position[2] - 0.75);
-            while (z <= entities.space.coordinate(position[2] + 0.75)) : (z += 1) {
-                var walk = self.places.space.entries(.{ .world = world, .x = x, .z = z }, kinds);
-                while (walk.next()) |entry| {
-                    if (entry.id == entity) continue;
-                    const at = entry.position;
-                    if (@abs(position[0] - at[0]) < 0.75 and @abs(position[1] - at[1]) < 0.25 and @abs(position[2] - at[2]) < 0.75) return true;
-                }
+        const Other = struct {
+            entity: entities.Id,
+            position: [3]f64,
+            fn accept(context: @This(), entry: entities.space.Entry) bool {
+                const at = entry.position;
+                return entry.id != context.entity and @abs(context.position[0] - at[0]) < 0.75 and @abs(context.position[1] - at[1]) < 0.25 and @abs(context.position[2] - at[2]) < 0.75;
             }
-        }
-        return false;
+        };
+        const reach: [3]f64 = .{ 0.75, 0.25, 0.75 };
+        const within: entities.Feet = .{ .low = .{ position[0] - reach[0], position[1] - reach[1], position[2] - reach[2] }, .high = .{ position[0] + reach[0], position[1] + reach[1], position[2] + reach[2] } };
+        return self.places.space.anyWithin(world, within, kinds, Other{ .entity = entity, .position = position }, Other.accept);
     }
 
     /// Wakes a sleeping item, to tick from now on; its state comes up to date when next read.
     /// One that stops ticking stops at `until`.
     pub fn wake(self: *ItemEntities, entity: entities.Id, until: u64) !void {
-        const sleep = self.sleepers.get(entity).?;
+        const sleep = self.sleepOf(entity).?;
         assert(sleep.asleep);
+        _ = self.places.space.unrest(self.deps.entities.directory.slotOf(entity).?);
         sleep.asleep = false;
         sleep.asked = false;
+        self.asleep_ids.remove(entity);
         sleep.until = until;
         try self.places.order.wake(entity);
     }
 
     /// Asks a sleeper to wake at its next turn, as a block edit near it does.
     pub fn ask(self: *ItemEntities, entity: entities.Id) !void {
-        const sleep = self.sleepers.get(entity) orelse return;
+        const sleep = self.sleepOf(entity) orelse return;
         if (!sleep.asleep) return;
         sleep.asked = true;
         try self.places.order.wake(entity);
@@ -630,7 +649,7 @@ pub const ItemEntities = struct {
         errdefer self.deps.storage.fail();
         try self.deps.inventories.retire(slot(body));
         // Gone, it neither sleeps nor needs catching up: whoever retired it read it first.
-        _ = self.sleepers.remove(entity);
+        if (self.items.slotOf(entity)) |at| self.forgetSleep(at);
         // Removed, it leaves its section at once, as vanilla's does: no lookup finds it.
         self.places.remove(entity);
         self.items.dropBody(entity);
@@ -652,11 +671,6 @@ pub const ItemEntities = struct {
     /// SectionPos.asLong sorts them, then as they entered each.
     pub fn inColumn(self: *ItemEntities, column: Column, low: i32, high: i32, buffer: []entities.space.Entry) entities.Space.Ordered {
         return self.places.space.ordered(column, low, high, kinds, buffer);
-    }
-
-    /// As `inColumn`, of those whose feet are within a box only, for a caller that takes no other.
-    pub fn inColumnWithin(self: *ItemEntities, column: Column, low: i32, high: i32, within: entities.Feet, buffer: []entities.space.Entry) entities.Space.Ordered {
-        return self.places.space.orderedWithin(column, low, high, kinds, within, buffer);
     }
 
     /// Keeps in memory the items of the columns near the centers, out to `radius`, and of the
@@ -690,9 +704,9 @@ pub const ItemEntities = struct {
             try self.catchUp(entity);
             if (self.leaving) |hook| hook.function(hook.context, entity);
             const body = (try self.deps.entities.get(entity)).?;
+            self.forgetSleep(self.items.slotOf(entity).?);
             const item = (try self.items.take(entity)).?;
             try save(&batch, entity, body, item);
-            _ = self.sleepers.remove(entity);
             self.places.remove(entity);
             self.changes.remove(entity);
             self.moved.remove(entity);

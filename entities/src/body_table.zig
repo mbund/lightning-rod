@@ -70,7 +70,9 @@ pub fn BodyTable(comptime Extra: type) type {
 
         /// The kind's record of the entity in a slot, which `slotOf` gave: found without its id.
         pub fn ptrAt(self: *const Self, slot: u32) *Extra {
-            std.debug.assert(self.entities.directory.entry(slot).kind == self.kind);
+            // The space and the tick order give only slots of their kinds: checked where checks cost
+            // nothing, as a release build reads the directory for it on every call.
+            if (@import("builtin").mode == .debug) std.debug.assert(self.entities.directory.entry(slot).kind == self.kind);
             return self.table.ref(slot).field("extra");
         }
 

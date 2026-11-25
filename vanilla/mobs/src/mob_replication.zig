@@ -7,6 +7,7 @@ const std = @import("std");
 const entities = @import("entities");
 const lightning_rod = @import("lightning_rod");
 const Tracking = @import("replication").tracking.Tracking;
+const Delivery = @import("replication").delivery.Delivery;
 const sessions = @import("sessions");
 const packets = @import("minecraft_packets");
 const wire = @import("wire_1_21_5");
@@ -107,11 +108,8 @@ pub const MobReplication = struct {
     /// Players a delivery could not be queued for, who then need the mob whole.
     missed: []usize,
     missed_any: bool = false,
-    targets: []sessions.Service.Target,
-    deliveries: []sessions.Service.Delivery,
-    /// Players the last delivery reached, by slot.
-    sent: []usize,
-    sent_count: usize = 0,
+    /// How a mob's packets go out, as every kind's do: whom the last reached and missed.
+    delivery: Delivery,
     /// A running hash of every packet asked to be sent and whom to, when tests trace it.
     traced: u64 = 0,
     tracing: bool,
@@ -125,9 +123,7 @@ pub const MobReplication = struct {
             .rows = try allocator.alloc(usize, 4 * words),
             .words = words,
             .missed = try allocator.alloc(usize, words),
-            .targets = try allocator.alloc(sessions.Service.Target, deps.players.records.len),
-            .deliveries = try allocator.alloc(sessions.Service.Delivery, deps.players.records.len),
-            .sent = try allocator.alloc(usize, deps.players.records.len),
+            .delivery = try .init(allocator, deps.players, deps.packets, deps.sessions),
             .tracing = config.trace_sends,
         };
         @memset(self.missed, 0);
@@ -287,7 +283,7 @@ pub const MobReplication = struct {
     }
 
     fn targetsSent(self: *const MobReplication) []const usize {
-        return self.sent[0..self.sent_count];
+        return self.delivery.reachedPlayers();
     }
 
     fn start(mob: Mob) View {
@@ -447,15 +443,12 @@ pub const MobReplication = struct {
 
     /// Sends a packet to a set of players, noting in `sent` who got it.
     fn deliver(self: *MobReplication, recipients: lightning_rod.system.bit_sets.Set, outgoing: Outgoing) !void {
-        var iterator = recipients.iterator();
-        var count: usize = 0;
-        while (iterator.next()) |player| {
-            const handle = self.deps.players.records[player].handle orelse continue;
-            self.targets[count] = .{ .handle = handle, .protocol = self.deps.players.records[player].protocol };
-            count += 1;
+        const delivery = &self.delivery;
+        if (!recipients.any()) {
+            delivery.reached_count = 0;
+            delivery.missed_count = 0;
+            return;
         }
-        self.sent_count = 0;
-        if (count == 0) return;
         if (self.tracing) {
             var hasher = std.hash.Wyhash.init(self.traced);
             hasher.update(std.mem.asBytes(&self.tick_count));
@@ -467,34 +460,24 @@ pub const MobReplication = struct {
             while (who.next()) |player| hasher.update(std.mem.asBytes(&player));
             self.traced = hasher.final();
         }
-        const targets = self.targets[0..count];
-        const deliveries = self.deliveries[0..count];
-        const encoder = self.deps.packets;
         switch (outgoing) {
-            .status => |value| try encoder.fanout(writeStatus, targets, .{ value.id, value.status }, 32, deliveries),
-            .remove => |value| try encoder.fanout(writeRemove, targets, .{value}, 32, deliveries),
-            .spawn => |value| try encoder.fanout(.{ spawnLegacy, spawnPacked }, targets, .{value}, 128, deliveries),
-            .metadata => |value| try encoder.fanout(Metadata.write, targets, .{ value.id, value.data, value.changes }, 128, deliveries),
-            .velocity => |value| try encoder.fanout(.{ writeVelocityLegacy, writeVelocityPacked }, targets, .{ value.id, value.velocity }, 64, deliveries),
-            .sync => |value| try encoder.fanout(writeSync, targets, .{ value.id, value.position, value.velocity, value.yaw, value.pitch, value.on_ground }, 128, deliveries),
-            .relative => |value| try encoder.fanout(writeRelative, targets, .{ value.id, value.delta, value.on_ground }, 32, deliveries),
-            .look => |value| try encoder.fanout(writeLook, targets, .{ value.id, value.yaw, value.pitch, value.on_ground }, 32, deliveries),
-            .move_look => |value| try encoder.fanout(writeMoveLook, targets, .{ value.id, value.delta, value.yaw, value.pitch, value.on_ground }, 32, deliveries),
-            .head => |value| try encoder.fanout(writeHead, targets, .{ value.id, value.yaw }, 32, deliveries),
-            .damage => |value| try encoder.fanout(writeDamage, targets, .{ value.id, value.type_id, value.cause }, 32, deliveries),
-            .animation => |value| try encoder.fanout(writeAnimation, targets, .{ value.id, value.animation }, 32, deliveries),
+            .status => |value| try delivery.send(recipients, writeStatus, .{ value.id, value.status }, 32),
+            .remove => |value| try delivery.send(recipients, writeRemove, .{value}, 32),
+            .spawn => |value| try delivery.send(recipients, .{ spawnLegacy, spawnPacked }, .{value}, 128),
+            .metadata => |value| try delivery.send(recipients, Metadata.write, .{ value.id, value.data, value.changes }, 128),
+            .velocity => |value| try delivery.send(recipients, .{ writeVelocityLegacy, writeVelocityPacked }, .{ value.id, value.velocity }, 64),
+            .sync => |value| try delivery.send(recipients, writeSync, .{ value.id, value.position, value.velocity, value.yaw, value.pitch, value.on_ground }, 128),
+            .relative => |value| try delivery.send(recipients, writeRelative, .{ value.id, value.delta, value.on_ground }, 32),
+            .look => |value| try delivery.send(recipients, writeLook, .{ value.id, value.yaw, value.pitch, value.on_ground }, 32),
+            .move_look => |value| try delivery.send(recipients, writeMoveLook, .{ value.id, value.delta, value.yaw, value.pitch, value.on_ground }, 32),
+            .head => |value| try delivery.send(recipients, writeHead, .{ value.id, value.yaw }, 32),
+            .damage => |value| try delivery.send(recipients, writeDamage, .{ value.id, value.type_id, value.cause }, 32),
+            .animation => |value| try delivery.send(recipients, writeAnimation, .{ value.id, value.animation }, 32),
         }
-        for (targets, deliveries) |target, delivery| switch (delivery) {
-            .queued, .closed => {
-                self.sent[self.sent_count] = target.handle.index;
-                self.sent_count += 1;
-            },
-            .unsupported => self.deps.sessions.disconnect(target.handle),
-            .backpressured => {
-                put(self.missed, target.handle.index);
-                self.missed_any = true;
-            },
-        };
+        for (delivery.missedPlayers()) |player| {
+            put(self.missed, player);
+            self.missed_any = true;
+        }
     }
 };
 

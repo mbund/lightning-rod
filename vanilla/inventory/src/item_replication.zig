@@ -17,6 +17,7 @@ const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities
 const ItemTick = @import("item_tick.zig").ItemTick;
 const Players = @import("players").players.Players;
 const Tracking = @import("replication").tracking.Tracking;
+const shared_delivery = @import("replication").delivery;
 
 const assert = std.debug.assert;
 
@@ -100,83 +101,32 @@ pub const ItemReplication = struct {
 
     const Phase = enum { spawn, stack, position, collect, remove };
 
-    const Batch = struct {
-        const Delivery = struct { view: *View, phase: Phase, receipt: sessions.Service.Broadcast.Receipt };
+    /// One packet of an item's, as the batch keeps it until it goes: whom it reached then says
+    /// what its viewers have.
+    const ItemSend = struct { view: *View, phase: Phase };
+    const Batch = shared_delivery.Batch(ItemSend);
 
-        owner: *ItemReplication,
-        audience: sparse_sets.Workspace.RowView,
-        deliveries: [sessions.Service.batch_max]Delivery = undefined,
-        count: usize = 0,
-
-        fn prepare(self: *Batch, audience: bit_sets.Set, packets_per_group: usize) !bool {
-            assert(audience.any() and packets_per_group > 0 and packets_per_group <= sessions.Service.batch_max);
-            const owner = self.owner;
-            const broadcast = &owner.broadcast;
-            if (broadcast.active and (!self.audience.view().eql(audience) or self.count == self.deliveries.len or
-                packets_per_group * owner.deps.sessions.config.protocols.len > broadcast.entries.len - broadcast.count)) self.flush();
-            if (broadcast.active) return true;
-            assert(self.count == 0);
-            var remaining = audience.iterator();
-            var count: usize = 0;
-            while (remaining.next()) |index| {
-                const player = owner.deps.players.records[index];
-                owner.recipients[count] = .{ .handle = player.handle.?, .protocol = player.protocol };
-                count += 1;
-            }
-            broadcast.begin(owner.recipients[0..count]) catch |err| switch (err) {
-                error.Backpressured => return false,
-                else => return err,
-            };
-            self.audience.copy(audience);
-            return true;
+    /// What a packet's viewers have once it went to `delivered`.
+    fn settleSend(self: *ItemReplication, sent: ItemSend, delivered: bit_sets.Set, _: usize) !void {
+        const view = sent.view;
+        switch (sent.phase) {
+            .spawn => {
+                self.deps.tracking.confirm(view.slot, delivered, self.deps.tracking.nobody());
+                view.dirty.unite(view.dirty.view(), delivered);
+                view.stacks.subtract(view.stacks.view(), delivered);
+                view.collected.unite(view.collected.view(), delivered);
+            },
+            .stack => view.stacks.subtract(view.stacks.view(), delivered),
+            .position => view.dirty.subtract(view.dirty.view(), delivered),
+            .collect => view.collected.unite(view.collected.view(), delivered),
+            .remove => {
+                self.deps.tracking.confirm(view.slot, self.deps.tracking.nobody(), delivered);
+                view.dirty.subtract(view.dirty.view(), delivered);
+                view.collected.subtract(view.collected.view(), delivered);
+                view.stacks.subtract(view.stacks.view(), delivered);
+            },
         }
-
-        fn append(self: *Batch, view: *View, phase: Phase, receipt: sessions.Service.Broadcast.Receipt) void {
-            assert(self.owner.broadcast.active and self.count < self.deliveries.len);
-            assert(receipt.owner == &self.owner.broadcast and receipt.generation == self.owner.broadcast.generation);
-            self.deliveries[self.count] = .{ .view = view, .phase = phase, .receipt = receipt };
-            self.count += 1;
-        }
-
-        fn flush(self: *Batch) void {
-            const owner = self.owner;
-            const broadcast = &owner.broadcast;
-            if (!broadcast.active) {
-                assert(self.count == 0);
-                return;
-            }
-            assert(self.count > 0 and self.count <= self.deliveries.len);
-            broadcast.commit();
-            for (self.deliveries[0..self.count]) |delivery| {
-                const delivered = broadcast.accepted(delivery.receipt);
-                var unsupported = broadcast.unsupported(delivery.receipt).iterator();
-                while (unsupported.next()) |index| {
-                    owner.deps.sessions.disconnect(broadcast.handleAt(index));
-                }
-                const view = delivery.view;
-                switch (delivery.phase) {
-                    .spawn => {
-                        owner.deps.tracking.confirm(view.slot, delivered, owner.deps.tracking.nobody());
-                        view.dirty.unite(view.dirty.view(), delivered);
-                        view.stacks.subtract(view.stacks.view(), delivered);
-                        view.collected.unite(view.collected.view(), delivered);
-                    },
-                    .stack => view.stacks.subtract(view.stacks.view(), delivered),
-                    .position => view.dirty.subtract(view.dirty.view(), delivered),
-                    .collect => view.collected.unite(view.collected.view(), delivered),
-                    .remove => {
-                        owner.deps.tracking.confirm(view.slot, owner.deps.tracking.nobody(), delivered);
-                        view.dirty.subtract(view.dirty.view(), delivered);
-                        view.collected.subtract(view.collected.view(), delivered);
-                        view.stacks.subtract(view.stacks.view(), delivered);
-                    },
-                }
-            }
-            broadcast.cancel();
-            self.count = 0;
-            self.audience.clear();
-        }
-    };
+    }
 
     /// What one tick looks at items with: who may be sent to, who was replaced, what changed.
     const Pass = struct {
@@ -203,9 +153,9 @@ pub const ItemReplication = struct {
     /// Viewers some retry is owed something by, as of the last tick.
     pending: sparse_sets.Workspace.RowView,
     selections: sparse_sets.Workspace,
-    recipients: []sessions.Service.Target,
     listener: inventories.Inventories.Listener,
-    broadcast: sessions.Service.Broadcast,
+    /// Items' packets for one audience at a time, as every kind batches its broadcasts.
+    batch: Batch,
     tracker: Tracking.TrackerId,
     /// Room to tell players of items that left memory.
     targets: []sessions.Service.Target,
@@ -237,12 +187,11 @@ pub const ItemReplication = struct {
             .found = try allocator.alloc(entities.Id, deps.dropped.items.bound()),
             .record_bytes = record_bytes,
             .row_words = row_words,
-            .broadcast = try sessions.Service.Broadcast.init(allocator, deps.sessions, sessions.Service.batch_max * deps.sessions.config.protocols.len),
+            .batch = try Batch.init(allocator, deps.players, deps.packets, deps.sessions, row_words),
             .deps = deps,
             .work = try entities.IdSet.init(allocator, &deps.dropped.deps.entities.pool, config.work_ids),
             .turns = try entities.IdSet.init(allocator, &deps.dropped.deps.entities.pool, config.work_ids),
             .retries = try entities.IdSet.init(allocator, &deps.dropped.deps.entities.pool, config.work_ids),
-            .recipients = try allocator.alloc(sessions.Service.Target, players),
             .targets = try allocator.alloc(sessions.Service.Target, players),
             .deliveries = try allocator.alloc(sessions.Service.Delivery, players),
             .tracker = undefined,
@@ -326,8 +275,8 @@ pub const ItemReplication = struct {
         defer dropped.moved.clear();
         // A sleeper moves every tick as any resting item does: on its turn it is looked at in
         // full, which brings it up to date first.
-        for (dropped.sleepers.keys(), dropped.sleepers.constItems()) |entity, sleep| {
-            if (sleep.asleep and self.onTurn(entity)) self.turns.insert(entity);
+        for (dropped.asleep_ids.values()) |entity| {
+            if (self.onTurn(entity)) self.turns.insert(entity);
         }
         for (dropped.moved.values()) |entity| {
             if (self.onTurn(entity)) self.turns.insert(entity);
@@ -380,9 +329,9 @@ pub const ItemReplication = struct {
         }
         defer self.turns.clear();
         if (self.work.count() == 0 and self.turns.count() == 0 and !sweep) return;
-        var outgoing: Batch = .{ .owner = self, .audience = self.selections.row(4) };
-        defer if (self.broadcast.active) self.broadcast.cancel();
-        const pass: Pass = .{ .available = available, .presentation_changed = presentation_changed, .outgoing = &outgoing };
+        const outgoing = &self.batch;
+        defer outgoing.abandon();
+        const pass: Pass = .{ .available = available, .presentation_changed = presentation_changed, .outgoing = outgoing };
         // The work set takes no more while it is gone over; what comes of it waits for the next.
         var cursor: usize = 0;
         while (cursor < self.work.count()) {
@@ -417,7 +366,7 @@ pub const ItemReplication = struct {
     /// Learns what was sent for the views in hand, works out what each viewer is still owed,
     /// and lets them go; the gone no client knows of any more are forgotten.
     fn settle(self: *ItemReplication, pass: Pass) !void {
-        pass.outgoing.flush();
+        try pass.outgoing.flush(self, settleSend);
         var forgotten: [held_max]entities.Id = undefined;
         var forgotten_count: usize = 0;
         defer self.held_count = 0;
@@ -661,7 +610,7 @@ pub const ItemReplication = struct {
                         else => std.EnumSet(Phase).empty,
                     };
                     if (queued.intersectWith(dependencies).count() != 0) {
-                        outgoing.flush();
+                        try outgoing.flush(self, settleSend);
                         queued = .empty;
                     }
                     const wanted = self.selections.row(6);
@@ -712,11 +661,12 @@ pub const ItemReplication = struct {
                         audience.clear();
                         if (personalized) audience.insert(eligible.view().firstFrom(0).?) else audience.copy(eligible.view());
                         eligible.subtract(eligible.view(), audience.view());
-                        if (!try outgoing.prepare(audience.view(), if (phase == .spawn) 4 else 1)) continue;
+                        if (try outgoing.prepare(audience.view(), if (phase == .spawn) 4 else 1, self, settleSend) != .ready) continue;
                         const recipient = self.deps.players.records[audience.view().firstFrom(0).?].uuid;
                         const stack = if (held) |read| read.stack else null;
-                        const receipt = switch (phase) {
-                            .spawn => try self.deps.packets.broadcastGroup(&self.broadcast, .{ .{ writeSpawnLegacy, writeSpawnPacked }, writeItemStack }, null, null, .{
+                        const sending: ItemSend = .{ .view = view, .phase = phase };
+                        const sent = switch (phase) {
+                            .spawn => try outgoing.sendGroup(sending, .{ .{ writeSpawnLegacy, writeSpawnPacked }, writeItemStack }, .{
                                 .{Spawn{
                                     .entity_id = entity_id,
                                     .uuid = body.?.uuid,
@@ -725,16 +675,16 @@ pub const ItemReplication = struct {
                                 }},
                                 .{ self.deps.items, entity_id, stack, recipient, definition_views[record_index], value.fire_ticks > 0 },
                             }, &.{ 128, capacity }),
-                            .stack => try self.deps.packets.broadcastGroup(&self.broadcast, .{writeItemStack}, null, null, .{.{ self.deps.items, entity_id, stack, recipient, definition_views[record_index], value.fire_ticks > 0 }}, &.{capacity}),
-                            .position => try self.deps.packets.broadcast(&self.broadcast, writePosition, null, null, .{
+                            .stack => try outgoing.sendGroup(sending, .{writeItemStack}, .{.{ self.deps.items, entity_id, stack, recipient, definition_views[record_index], value.fire_ticks > 0 }}, &.{capacity}),
+                            .position => try outgoing.send(sending, writePosition, .{
                                 entity_id,
                                 minecraft.Position{ .x = body.?.position[0], .y = body.?.position[1], .z = body.?.position[2] },
                                 minecraft.Position{ .x = body.?.velocity[0], .y = body.?.velocity[1], .z = body.?.velocity[2] },
                                 minecraft.Rotation{ .yaw = 0, .pitch = 0 },
                                 value.on_ground,
                             }, capacity),
-                            .collect => try self.deps.packets.broadcast(&self.broadcast, writeCollect, null, null, .{ entity_id, value.collector, value.collected }, capacity),
-                            .remove => try self.deps.packets.broadcast(&self.broadcast, writeRemove, null, null, .{entity_id}, capacity),
+                            .collect => try outgoing.send(sending, writeCollect, .{ entity_id, value.collector, value.collected }, capacity),
+                            .remove => try outgoing.send(sending, writeRemove, .{entity_id}, capacity),
                         };
                         if (self.tracing) {
                             // What and of which item: who takes it waits on viewers' room, which wall time decides.
@@ -744,7 +694,7 @@ pub const ItemReplication = struct {
                             hasher.update(&.{@backingInt(phase)});
                             self.traced = hasher.final();
                         }
-                        outgoing.append(view, phase, receipt);
+                        if (!sent) continue;
                         queued.insert(phase);
                     }
                 }

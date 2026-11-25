@@ -221,7 +221,10 @@ pub const ColumnData = struct {
 pub const box_span = 3;
 const box_links = box_span * box_span;
 /// Ticks the wheel tells apart; no box is longer.
-pub const wheel_ticks = 32;
+pub const wheel_ticks = 64;
+/// Owners whose kinds sleep, each with a wheel of its own.
+pub const max_wheels = 4;
+const no_wheel = std.math.maxInt(u8);
 
 /// An entity's box: where its feet stay until a tick, and its own size, so its box anywhere along
 /// is the feet's grown by it.
@@ -247,6 +250,8 @@ pub const Boxed = struct {
     /// In the wheel, or taken from it as due and waiting to be placed again or taken back.
     in_wheel: bool = false,
     due: bool = false,
+    /// A placed entity resting until its tick: listed in the wheel alone, it keeps its place.
+    resting: bool = false,
     /// Placed again last in the columns it was in already.
     in_place: bool = false,
 
@@ -265,6 +270,11 @@ const Bucket = struct { key: u128 = 0, at: u32 = none };
 /// Columns a tile spans on each axis.
 pub const tile_side = 8;
 
+/// Kinds a space can index near, each with its own column masks in every tile: kinds queried
+/// far around a point, among others more numerous.
+pub const max_indexed = 4;
+const no_index = std.math.maxInt(u8);
+
 /// Where a column's tile is: its world, and its columns' coordinates shifted down.
 pub fn tileOf(column: Column) Column {
     return .{ .world = column.world, .x = column.x >> 3, .z = column.z >> 3 };
@@ -281,6 +291,8 @@ pub const TileData = struct {
     tile: Column,
     columns: u64 = 0,
     folded: u64 = 0,
+    /// For each kind indexed near, exactly the columns holding it.
+    kind_masks: [max_indexed]u64 = @splat(0),
     live_at: u32 = 0,
 };
 
@@ -311,6 +323,9 @@ pub const Space = struct {
     tile_live: Array(u32),
     tile_buckets: Array(Bucket),
     tile_mask: usize = 0,
+    /// Each kind's place among the indexed, if it is.
+    indexed: [Kinds.max_kinds]u8 = @splat(no_index),
+    indexed_count: u8 = 0,
     runs: extras.Records(Run),
     blocks: extras.Records(Block),
     placed: usize = 0,
@@ -353,13 +368,20 @@ pub const Space = struct {
     /// The dense index of the column each link is in.
     link_column: Array(u32),
     /// The boxes due on each tick of a turn, in no order.
-    wheel: [wheel_ticks]Array(u32),
+    wheels: [max_wheels][wheel_ticks]Array(u32),
+    /// The wheel each kind's sleepers are on: one per owner that sleeps its kinds, so a kind
+    /// meeting its due meets only its own.
+    wheel_of: [Kinds.max_kinds]u8 = @splat(no_wheel),
+    wheel_count: u8 = 0,
     box_count: usize = 0,
     /// Of each kind.
     kind_boxed: [Kinds.max_kinds]u32 = @splat(0),
     /// Of each kind, those due and not yet placed again or taken back.
     kind_due: [Kinds.max_kinds]u32 = @splat(0),
     box_of: []u32,
+    /// Each slot's rest, for a placed entity resting until a tick.
+    rest_of: []u32,
+    rest_count: usize = 0,
     /// Columns emptied this tick, let go at its end.
     emptied: Array(u32),
     /// The column last found, which lookups mostly ask again.
@@ -389,16 +411,20 @@ pub const Space = struct {
             .link_next = try .init(allocator, pool),
             .link_previous = try .init(allocator, pool),
             .link_column = try .init(allocator, pool),
-            .wheel = undefined,
+            .wheels = undefined,
             .box_of = try allocator.alloc(u32, directory.capacity()),
+            .rest_of = try allocator.alloc(u32, directory.capacity()),
             .emptied = try .init(allocator, pool),
             .found = undefined,
         };
         for (&self.found) |*list| list.* = try .init(allocator, pool);
-        for (&self.wheel) |*turn| turn.* = try .init(allocator, pool);
+        for (&self.wheels) |*wheel| for (wheel) |*turn| {
+            turn.* = try .init(allocator, pool);
+        };
         @memset(self.noted, 0);
         @memset(self.mover_noted, 0);
         @memset(self.box_of, none);
+        @memset(self.rest_of, none);
         return self;
     }
 
@@ -554,10 +580,8 @@ pub const Space = struct {
         if (self.lookup(key)) |index| return index;
         if ((self.live.len + 1) * 2 > self.buckets.len) try self.rehash(self.live.len + 1);
         try self.live.ensure(self.live.len + 1);
-        const tile = try self.ensureTile(column);
         self.columns_made += 1;
-        const index = try self.columns.add(.{ .column = column, .made = self.columns_made, .live_at = @intCast(self.live.len - 1), .tile = tile });
-        self.tiles.at(tile).columns |= tileBit(column);
+        const index = try self.columns.add(.{ .column = column, .made = self.columns_made, .live_at = @intCast(self.live.len - 1) });
         self.live.at(self.live.len - 1).* = index;
         self.buckets.at(self.bucketOf(key)).* = .{ .key = key, .at = index };
         return index;
@@ -575,7 +599,7 @@ pub const Space = struct {
         self.columns.at(last).live_at = held.live_at;
         self.live.pop();
         self.unhash(key);
-        self.leaveTile(held.tile, held.column);
+        assert(held.tile == none);
         if (self.last_key == key) {
             self.last_key = std.math.maxInt(u128);
             self.last_index = none;
@@ -815,20 +839,34 @@ pub const Space = struct {
             if (run.kind == kind) return at;
             at = run.next;
         }
+        // Its first run puts it in its tile, where queries far around a point look.
+        if (held.first_run == none) {
+            const tile = try self.ensureTile(held.column);
+            self.tiles.at(tile).columns |= tileBit(held.column);
+            held.tile = tile;
+        }
         const made = try self.runs.add(.{ .kind = kind, .column = index, .next = held.first_run });
         held.first_run = made;
         held.folded |= foldOf(kind);
         self.tiles.at(held.tile).folded |= foldOf(kind);
+        if (self.indexed[kind] != no_index) self.tiles.at(held.tile).kind_masks[self.indexed[kind]] |= tileBit(held.column);
         return made;
     }
 
     /// A run with nothing left goes, and the column says a kind went.
     fn dropRun(self: *Space, index: u32, dropped: u32) void {
         const held = self.columns.at(index);
+        const kind = self.runs.at(dropped).kind;
+        if (self.indexed[kind] != no_index) self.tiles.at(held.tile).kind_masks[self.indexed[kind]] &= ~tileBit(held.column);
         var link = &held.first_run;
         while (link.* != dropped) link = &self.runs.at(link.*).next;
         link.* = self.runs.at(dropped).next;
         self.runs.remove(dropped);
+        // Its last run gone, it leaves its tile: boxes alone are found by their columns.
+        if (held.first_run == none) {
+            self.leaveTile(held.tile, held.column);
+            held.tile = none;
+        }
         self.changes += 1;
         held.gone_revision = self.changes;
         held.folded = 0;
@@ -982,6 +1020,8 @@ pub const Space = struct {
     pub fn remove(self: *Space, entity: Id) void {
         const slot = self.directory.slotOf(entity) orelse return;
         if (self.directory.entry(slot).space_column == none) return;
+        // Gone from its place, it rests no more.
+        if (self.rest_count != 0) _ = self.unrest(slot);
         // A log that cannot grow is where vanilla runs out of heap: the removal still stands,
         // and whoever takes the log looks over everything.
         const at = self.reserve(slot) catch {
@@ -1111,12 +1151,13 @@ pub const Space = struct {
     /// place, if it had one, for the box. False when the box reaches too far, and nothing changed.
     pub fn box(self: *Space, slot: u32, world: u32, feet: Feet, half_width: f32, height: f32, now: u64, until: u64) !bool {
         assert(until > now and until - now < wheel_ticks);
+        assert(self.rest_count == 0 or self.rest_of[slot] == none);
         const half: f64 = half_width;
         const xs = columnRange(feet.low[0] - half, feet.high[0] + half) orelse return false;
         const zs = columnRange(feet.low[2] - half, feet.high[2] + half) orelse return false;
         if (xs[1] - xs[0] >= box_span or zs[1] - zs[0] >= box_span) return false;
         // Room in its turn first, so nothing after can fail.
-        const turn = &self.wheel[until % wheel_ticks];
+        const turn = self.turnOf(self.directory.entry(slot).kind, until);
         try turn.reserve(1);
         // Boxed already, as one due goes on to its next box: in its columns still, it stays
         // listed where it is.
@@ -1201,7 +1242,7 @@ pub const Space = struct {
     fn enwheel(self: *Space, index: u32) void {
         const boxed = self.boxes.at(index);
         assert(!boxed.in_wheel);
-        const turn = &self.wheel[boxed.until % wheel_ticks];
+        const turn = self.turnOf(boxed.kind, boxed.until);
         boxed.wheel_at = @intCast(turn.len);
         _ = turn.append(index) catch unreachable;
         boxed.in_wheel = true;
@@ -1211,7 +1252,7 @@ pub const Space = struct {
     fn unwheel(self: *Space, index: u32) void {
         const boxed = self.boxes.at(index);
         if (!boxed.in_wheel) return;
-        const turn = &self.wheel[boxed.until % wheel_ticks];
+        const turn = self.turnOf(boxed.kind, boxed.until);
         const last = turn.at(turn.len - 1).*;
         if (last != index) {
             turn.at(boxed.wheel_at).* = last;
@@ -1219,6 +1260,74 @@ pub const Space = struct {
         }
         turn.pop();
         boxed.in_wheel = false;
+    }
+
+    /// An owner's kinds sleep, boxed or resting, on a wheel of their own. Declared once, as the
+    /// kinds are; kinds of one owner share it.
+    pub fn sleepsOwn(self: *Space, kinds: Kinds) !void {
+        var owned = kinds.bits.iterator(.{});
+        var wheel: ?u8 = null;
+        while (owned.next()) |kind| if (self.wheel_of[kind] != no_wheel) {
+            wheel = self.wheel_of[kind];
+        };
+        const chosen = wheel orelse chosen: {
+            if (self.wheel_count == max_wheels) return error.TooManySleepingOwners;
+            self.wheel_count += 1;
+            break :chosen self.wheel_count - 1;
+        };
+        owned = kinds.bits.iterator(.{});
+        while (owned.next()) |kind| self.wheel_of[kind] = chosen;
+    }
+
+    /// The turn a kind's sleeper due at a tick goes in.
+    fn turnOf(self: *Space, kind: u32, tick: u64) *Array(u32) {
+        const wheel = self.wheel_of[kind];
+        assert(wheel != no_wheel);
+        return &self.wheels[wheel][tick % wheel_ticks];
+    }
+
+    /// A placed entity rests until a tick: it keeps its place, found as any other, and the wheel
+    /// lists it to be met then. Resting again moves its tick; one due rests again or is taken
+    /// back the tick it comes due, as a box is placed again.
+    pub fn rest(self: *Space, slot: u32, now: u64, until: u64) !void {
+        assert(until > now and until - now < wheel_ticks);
+        assert(self.box_of[slot] == none and self.directory.entry(slot).space_column != none);
+        const turn = self.turnOf(self.directory.entry(slot).kind, until);
+        try turn.reserve(1);
+        if (self.rest_of[slot] != none) {
+            const index = self.rest_of[slot];
+            self.unwheel(index);
+            const resting = self.boxes.at(index);
+            if (resting.due) self.kind_due[resting.kind] -= 1;
+            resting.due = false;
+            resting.until = until;
+            self.enwheel(index);
+            return;
+        }
+        const kind = self.directory.entry(slot).kind;
+        const index = try self.boxes.add(.{ .slot = slot, .kind = kind, .until = until, .used = true, .resting = true });
+        self.enwheel(index);
+        self.rest_of[slot] = index;
+        self.rest_count += 1;
+    }
+
+    /// Takes a rest back: the entity ticks again. Whether it rested.
+    pub fn unrest(self: *Space, slot: u32) bool {
+        if (slot >= self.rest_of.len) return false;
+        const index = self.rest_of[slot];
+        if (index == none) return false;
+        self.unwheel(index);
+        const resting = self.boxes.at(index);
+        if (resting.due) self.kind_due[resting.kind] -= 1;
+        self.boxes.remove(index);
+        self.rest_of[slot] = none;
+        self.rest_count -= 1;
+        return true;
+    }
+
+    pub fn restOf(self: *const Space, slot: u32) ?*const Boxed {
+        if (slot >= self.rest_of.len or self.rest_of[slot] == none) return null;
+        return self.boxes.at(self.rest_of[slot]);
     }
 
     /// How many of some kinds are boxed.
@@ -1277,26 +1386,39 @@ pub const Space = struct {
         for (columns[0..column_count]) |column| self.letGo(column);
     }
 
-    /// Takes every box back.
+    /// Takes every box and rest back.
     pub fn clearBoxes(self: *Space) void {
         for (0..self.box_of.len) |slot| if (self.box_of[slot] != none) self.dropBox(self.box_of[slot]);
+        for (0..self.rest_of.len) |slot| _ = self.unrest(@intCast(slot));
     }
 
     /// The boxes of some kinds due on a tick, their slots written to `output`. Each stays listed
     /// where it is until its kind places it again, boxed or not, which it does this tick: a box
     /// placed again in the same columns is never taken out of them.
     pub fn takeDue(self: *Space, now: u64, kinds: Kinds, output: []u32, found: *usize) void {
+        // The wheels of the kinds asked, each once: no kind meets another owner's due.
+        var met: [max_wheels]bool = @splat(false);
+        var settled = kinds.bits.iterator(.{});
+        while (settled.next()) |kind| assert(self.kind_due[kind] == 0);
         var waiting = kinds.bits.iterator(.{});
-        while (waiting.next()) |kind| assert(self.kind_due[kind] == 0);
-        // Every box in this turn is due now, as none is longer than the wheel: those of other
-        // kinds stay, packed to the front.
-        const turn = &self.wheel[now % wheel_ticks];
+        while (waiting.next()) |kind| {
+            const wheel = self.wheel_of[kind];
+            if (wheel == no_wheel or met[wheel]) continue;
+            met[wheel] = true;
+            self.takeDueOn(&self.wheels[wheel][now % wheel_ticks], now, kinds, output, found);
+        }
+    }
+
+    /// One wheel's turn: every entry of the kinds asked is due now, as none is longer than the
+    /// wheel; those of the owner's other kinds stay, packed to the front.
+    fn takeDueOn(self: *Space, turn: *Array(u32), now: u64, kinds: Kinds, output: []u32, found: *usize) void {
         var kept: usize = 0;
         for (0..turn.len) |at| {
             const index = turn.at(at).*;
             const boxed = self.boxes.at(index);
-            assert(boxed.used and boxed.in_wheel and boxed.until == now);
+            assert(boxed.used and boxed.in_wheel);
             if (kinds.has(boxed.kind)) {
+                assert(boxed.until == now);
                 assert(found.* < output.len);
                 output[found.*] = boxed.slot;
                 found.* += 1;
@@ -1314,9 +1436,9 @@ pub const Space = struct {
 
     /// Whether some box is overdue: none must be, as kinds place their entities again on time.
     pub fn overdue(self: *const Space, now: u64) bool {
-        for (&self.wheel) |*turn| {
+        for (&self.wheels) |*wheel| for (wheel) |*turn| {
             for (0..turn.len) |at| if (self.boxes.at(turn.at(at).*).until < now) return true;
-        }
+        };
         return false;
     }
 
@@ -1341,6 +1463,35 @@ pub const Space = struct {
     /// Visits the boxes of some kinds whose entity's box meets a box grown by `reach`,
     /// horizontally, and also vertically when `vertical`, each once; `visit` returning false
     /// stops the walk, which returns false.
+    /// The dormant entities of some kinds about a box: those resting whose feet are in it, and
+    /// the boxes that meet it, as `eachBox` finds them. What a change there may wake. `visit`
+    /// takes each one's slot and returns whether to go on; whether every one was visited.
+    pub fn eachDormant(self: *const Space, world: u32, query: Feet, kinds: Kinds, context: anytype) bool {
+        if (self.rest_count != 0) {
+            const xs = columnRange(query.low[0], query.high[0]) orelse return false;
+            const zs = columnRange(query.low[2], query.high[2]) orelse return false;
+            var x = xs[0];
+            while (x <= xs[1]) : (x += 1) {
+                var z = zs[0];
+                while (z <= zs[1]) : (z += 1) {
+                    var walk = self.entries(.{ .world = world, .x = x, .z = z }, kinds);
+                    while (walk.next()) |entry| {
+                        if (self.rest_of[entry.slot] == none or !query.contains(entry.position)) continue;
+                        if (!context.visit(entry.slot)) return false;
+                    }
+                }
+            }
+        }
+        const Boxes = struct {
+            space: *const Space,
+            inner: @TypeOf(context),
+            pub fn visit(boxes: @This(), index: u32) bool {
+                return boxes.inner.visit(boxes.space.boxAt(index).slot);
+            }
+        };
+        return self.eachBox(world, query, 0, kinds, Boxes{ .space = self, .inner = context }, true);
+    }
+
     pub fn eachBox(self: *const Space, world: u32, query: Feet, reach: f64, kinds: Kinds, context: anytype, vertical: bool) bool {
         if (self.box_count == 0) return true;
         const low_x = query.low[0] - reach;
@@ -1391,13 +1542,41 @@ pub const Space = struct {
         return self.columns.at(index).folded & fold != 0;
     }
 
+    /// The revisions of some kinds in the columns within `reach` of a point, summed: revisions
+    /// only rise, so the same sum is the same entities there, and what other kinds do leaves it.
+    /// What a query asks before looking again at what it saw last time.
+    pub fn revisionAround(self: *const Space, world: u32, position: [3]f64, reach: f64, kinds: Kinds) u64 {
+        var sum: u64 = 0;
+        var x = coordinate(position[0] - reach);
+        while (x <= coordinate(position[0] + reach)) : (x += 1) {
+            var z = coordinate(position[2] - reach);
+            while (z <= coordinate(position[2] + reach)) : (z += 1) sum += self.revisionOf(.{ .world = world, .x = x, .z = z }, kinds);
+        }
+        return sum;
+    }
+
+    /// A kind queried far around a point among more numerous others: its own column masks in
+    /// every tile, so `near` walks only the columns it is in. Before any is placed.
+    pub fn indexNear(self: *Space, kind: u32) !void {
+        if (self.indexed[kind] != no_index) return;
+        if (self.indexed_count == max_indexed) return error.TooManyIndexedKinds;
+        assert(self.kind_placed[kind] == 0);
+        self.indexed[kind] = self.indexed_count;
+        self.indexed_count += 1;
+    }
+
     /// Entities of some kinds in the columns at most `radius` from a column on both axes, a tile
     /// at a time: a query far around a point walks the tiles there, not every column.
     pub fn near(self: *const Space, center: Column, radius: i32, kinds: Kinds) Near {
         assert(radius >= 0);
         const low: [2]i32 = .{ center.x -| radius, center.z -| radius };
         const high: [2]i32 = .{ center.x +| radius, center.z +| radius };
-        return .{ .space = self, .world = center.world, .low = low, .high = high, .kinds = kinds, .fold = kinds.fold(), .tile_low = .{ low[0] >> 3, low[1] >> 3 }, .tile_high = .{ high[0] >> 3, high[1] >> 3 }, .tile = .{ low[0] >> 3, low[1] >> 3 } };
+        // One kind indexed near walks only the columns its masks say hold it.
+        const only: ?u8 = if (kinds.bits.count() == 1) indexed: {
+            const index = self.indexed[kinds.bits.findFirstSet().?];
+            break :indexed if (index == no_index) null else index;
+        } else null;
+        return .{ .space = self, .world = center.world, .low = low, .high = high, .kinds = kinds, .fold = kinds.fold(), .mask = only, .tile_low = .{ low[0] >> 3, low[1] >> 3 }, .tile_high = .{ high[0] >> 3, high[1] >> 3 }, .tile = .{ low[0] >> 3, low[1] >> 3 } };
     }
 
     pub const Near = struct {
@@ -1407,6 +1586,8 @@ pub const Space = struct {
         high: [2]i32,
         kinds: Kinds,
         fold: u64,
+        /// The masks of the one kind asked, if it is indexed near.
+        mask: ?u8,
         tile_low: [2]i32,
         tile_high: [2]i32,
         /// The tile looked at next, and the columns of the one at hand left to walk.
@@ -1446,9 +1627,10 @@ pub const Space = struct {
                 } else self.done = true;
                 const index = self.space.tileIndex(.{ .world = self.world, .x = at[0], .z = at[1] }) orelse continue;
                 const held = self.space.tileData(index);
-                if (held.folded & self.fold == 0) continue;
+                const holding = if (self.mask) |kind| held.kind_masks[kind] else if (held.folded & self.fold != 0) held.columns else 0;
+                if (holding == 0) continue;
                 self.origin = .{ at[0] * tile_side, at[1] * tile_side };
-                self.columns = held.columns & self.within();
+                self.columns = holding & self.within();
                 if (self.columns != 0) return true;
             }
             return false;
@@ -1475,6 +1657,52 @@ pub const Space = struct {
     pub fn ordered(self: *const Space, column: Column, low: i32, high: i32, kinds: Kinds, buffer: []Entry) Ordered {
         assert(buffer.len >= 2 and low <= high);
         return .{ .space = self, .column = column, .low = low, .high = high, .kinds = kinds, .buffer = buffer };
+    }
+
+    /// Whether some entity of some kinds whose feet are within a box is one `accept` takes, in no
+    /// order: for a question of whether, not of which first.
+    pub fn anyWithin(self: *const Space, world: u32, within: Feet, kinds: Kinds, context: anytype, comptime accept: fn (@TypeOf(context), Entry) bool) bool {
+        const xs = columnRange(within.low[0], within.high[0]) orelse return false;
+        const zs = columnRange(within.low[2], within.high[2]) orelse return false;
+        var x = xs[0];
+        while (x <= xs[1]) : (x += 1) {
+            var z = zs[0];
+            while (z <= zs[1]) : (z += 1) {
+                var walk = self.entries(.{ .world = world, .x = x, .z = z }, kinds);
+                while (walk.next()) |entry| if (within.contains(entry.position) and accept(context, entry)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// The entities of some kinds whose feet are within a box, as vanilla's level finds them: by
+    /// column x up, then z as SectionPos.asLong holds it, from 0 up and then the negative ones,
+    /// each column's sections by y as one, and in each section as they entered it. A column
+    /// holding none of the kinds is passed over at a glance. `visit` returns whether to stop; it
+    /// may change the space, a column's next round taking up after the last it gave.
+    pub fn eachWithin(self: *const Space, world: u32, within: Feet, kinds: Kinds, buffer: []Entry, context: anytype, comptime visit: fn (@TypeOf(context), Entry) anyerror!bool) !void {
+        const fold = kinds.fold();
+        const xs = columnRange(within.low[0], within.high[0]) orelse return;
+        const zs = columnRange(within.low[2], within.high[2]) orelse return;
+        const low = coordinate(within.low[1]);
+        const high = coordinate(within.high[1]);
+        var x = xs[0];
+        while (x <= xs[1]) : (x += 1) {
+            const spans: [2][2]i32 = .{ .{ @max(zs[0], 0), zs[1] }, .{ zs[0], @min(zs[1], -1) } };
+            for (spans) |span| {
+                var z = span[0];
+                while (z <= span[1]) : (z += 1) {
+                    const column: Column = .{ .world = world, .x = x, .z = z };
+                    if (!self.holdsAny(column, fold)) continue;
+                    var walk = self.orderedWithin(column, low, high, kinds, within, buffer);
+                    while (true) {
+                        const found = try walk.next();
+                        if (found.len == 0) break;
+                        for (found) |entry| if (try visit(context, entry)) return;
+                    }
+                }
+            }
+        }
     }
 
     /// As `ordered`, of those whose feet are within a box only: for a caller that takes no other,
@@ -1614,6 +1842,8 @@ const Fixture = struct {
         self.pool = try .init(allocator, 256 * pool_module.page_bytes);
         self.directory = try .init(allocator, &self.pool, 4096);
         self.space = try .init(allocator, &self.pool, &self.directory);
+        // Every kind of these tests sleeps on one wheel.
+        try self.space.sleepsOwn(.all);
     }
 
     fn insertAs(self: *Fixture, entity: Id, position: [3]f64, shape: Shape) !void {
@@ -1884,6 +2114,8 @@ test "near finds exactly the entities of its kinds within its columns, by tiles"
     const space = &fixture.space;
     var random = std.Random.DefaultPrng.init(0x7e1e);
     const player: Shape = .{ .kind = 5, .half_width = 0.3, .height = 1.8 };
+    // Players indexed near, as they are: cows walked by the fold.
+    try space.indexNear(5);
     var at: [600][3]f64 = undefined;
     for (&at, 0..) |*position, index| {
         position.* = .{ @floatFromInt(random.random().intRangeAtMost(i32, -700, 700)), 64, @floatFromInt(random.random().intRangeAtMost(i32, -700, 700)) };
@@ -1908,6 +2140,90 @@ test "near finds exactly the entities of its kinds within its columns, by tiles"
             expected[index] = false;
         }
         for (expected) |missing| try testing.expect(!missing);
+        var cows: [at.len]bool = @splat(false);
+        for (at, 0..) |position, index| {
+            if (index % 3 == 0 or index % 5 == 1) continue;
+            const column = columnOf(0, position);
+            cows[index] = @abs(column.x - center.x) <= radius and @abs(column.z - center.z) <= radius;
+        }
+        var herd = space.near(center, radius, .of(&.{cow.kind}));
+        while (herd.next()) |entry| {
+            const index: usize = @intCast(entry.id - 1);
+            try testing.expect(cows[index]);
+            cows[index] = false;
+        }
+        for (cows) |missing| try testing.expect(!missing);
     }
     try testing.expectEqual(@as(?u32, null), space.tileIndex(.{ .world = 1, .x = 0, .z = 0 }));
+}
+
+test "a rest keeps its place, comes due by the wheel, and goes with its place" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var fixture: Fixture = undefined;
+    try fixture.init(arena.allocator());
+    const space = &fixture.space;
+    try fixture.insert(1, .{ 5, 64, 5 });
+    try fixture.insert(2, .{ 6, 64, 5 });
+    const one = fixture.directory.slotOf(1).?;
+    const two = fixture.directory.slotOf(2).?;
+    try space.rest(one, 100, 140);
+    try space.rest(two, 100, 120);
+    // Resting, each is still where lookups find it.
+    var buffer: [8]Id = undefined;
+    try testing.expectEqualSlices(Id, &.{ 1, 2 }, try collect(space, .{ .min = .{ 0, 60, 0 }, .max = .{ 10, 70, 10 } }, &buffer));
+    var due: [4]u32 = undefined;
+    var found: usize = 0;
+    space.takeDue(119, .all, &due, &found);
+    try testing.expectEqual(@as(usize, 0), found);
+    space.takeDue(120, .all, &due, &found);
+    try testing.expectEqualSlices(u32, &.{two}, due[0..found]);
+    // Due, it rests again, which settles it.
+    try space.rest(two, 120, 150);
+    found = 0;
+    space.takeDue(140, .all, &due, &found);
+    try testing.expectEqualSlices(u32, &.{one}, due[0..found]);
+    try testing.expect(space.unrest(one));
+    try testing.expect(!space.unrest(one));
+    // Gone from its place, it rests no more.
+    space.remove(2);
+    try testing.expect(space.restOf(two) == null);
+    try testing.expectEqual(@as(usize, 0), space.rest_count);
+    found = 0;
+    space.takeDue(150, .all, &due, &found);
+    try testing.expectEqual(@as(usize, 0), found);
+}
+
+test "the dormant about a box are its resting and its boxes, each once" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var fixture: Fixture = undefined;
+    try fixture.init(arena.allocator());
+    const space = &fixture.space;
+    const arrow: Shape = .{ .kind = 3, .half_width = 0.25, .height = 0.5 };
+    try fixture.insert(1, .{ 5, 64, 5 });
+    try fixture.insert(2, .{ 7, 64, 5 });
+    try fixture.insert(3, .{ 40, 64, 5 });
+    try fixture.insertAs(4, .{ 20, 80, 5 }, arrow);
+    const one = fixture.directory.slotOf(1).?;
+    const three = fixture.directory.slotOf(3).?;
+    const four = fixture.directory.slotOf(4).?;
+    try space.rest(one, 100, 110);
+    try space.rest(three, 100, 110);
+    try testing.expect(try space.box(four, 0, .{ .low = .{ 2, 70, 4 }, .high = .{ 20, 80, 6 } }, 0.25, 0.5, 100, 110));
+    const Gather = struct {
+        found: *std.ArrayListUnmanaged(u32),
+        pub fn visit(context: @This(), slot: u32) bool {
+            context.found.appendAssumeCapacity(slot);
+            return true;
+        }
+    };
+    var buffer: [8]u32 = undefined;
+    var found: std.ArrayListUnmanaged(u32) = .initBuffer(&buffer);
+    // Two is awake, three is out of the box, the arrow's box meets it.
+    try testing.expect(space.eachDormant(0, .{ .low = .{ 0, 60, 0 }, .high = .{ 10, 75, 10 } }, .all, Gather{ .found = &found }));
+    try testing.expectEqualSlices(u32, &.{ one, four }, found.items);
+    found.clearRetainingCapacity();
+    try testing.expect(space.eachDormant(0, .{ .low = .{ 0, 60, 0 }, .high = .{ 10, 75, 10 } }, .of(&.{3}), Gather{ .found = &found }));
+    try testing.expectEqualSlices(u32, &.{four}, found.items);
 }

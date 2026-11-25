@@ -100,20 +100,20 @@ pub const ItemTick = struct {
     /// they rest on may be gone, and they fall on their own tick of four.
     fn blocksChanged(self: *ItemTick, section: chunks.Section, _: []const chunks.BlockEdit, _: []const u16) void {
         const dropped = self.deps.dropped;
-        if (dropped.sleepers.count() == 0) return;
-        var x = section.x - 1;
-        while (x <= section.x + 1) : (x += 1) {
-            var z = section.z - 1;
-            while (z <= section.z + 1) : (z += 1) {
-                var walk = dropped.places.space.entries(.{ .world = section.world, .x = x, .z = z }, ItemEntities.kinds);
-                while (walk.next()) |entry| {
-                    if (@abs(entry.section - section.y) > 1) continue;
-                    dropped.ask(entry.id) catch |err| {
-                        self.failure = err;
-                    };
-                }
+        // The sleepers of the sections about it, a section each way, look again.
+        const low: [3]f64 = .{ @floatFromInt((section.x - 1) * 16), @floatFromInt((section.y - 1) * 16), @floatFromInt((section.z - 1) * 16) };
+        const high: [3]f64 = .{ std.math.nextAfter(f64, low[0] + 48, -std.math.inf(f64)), std.math.nextAfter(f64, low[1] + 48, -std.math.inf(f64)), std.math.nextAfter(f64, low[2] + 48, -std.math.inf(f64)) };
+        const Ask = struct {
+            tick: *ItemTick,
+            pub fn visit(context: @This(), slot: u32) bool {
+                const owner = context.tick;
+                owner.deps.dropped.ask(owner.deps.dropped.deps.entities.directory.entry(slot).id) catch |err| {
+                    owner.failure = err;
+                };
+                return true;
             }
-        }
+        };
+        _ = dropped.places.space.eachDormant(section.world, .{ .low = low, .high = high }, ItemEntities.kinds, Ask{ .tick = self });
     }
 
     /// Whether lava flows strongly in the world, as in the nether, which pushes items harder.
@@ -149,7 +149,7 @@ pub const ItemTick = struct {
             // Every place before this one has had the tick, sleepers between included.
             dropped.clock.last = entry.sequence - 1;
             defer dropped.clock.last = entry.sequence;
-            if (dropped.asleep(entry.id)) |sleep| {
+            if (dropped.asleepAt(entry.slot)) |sleep| {
                 const elapsed = now - sleep.since;
                 const ticks = sleep.ticks +% @as(u32, @intCast(elapsed));
                 const despawning = @as(i64, sleep.age) + @as(i64, @intCast(elapsed)) >= 6000;
@@ -294,36 +294,23 @@ pub const ItemTick = struct {
     /// ItemEntity.mergeWithNeighbours: the items in its box grown by 0.5 sideways, in vanilla's
     /// order, merge into it or it into them while its stack has room.
     fn mergeWithNeighbours(self: *ItemTick, entity: entities.Id, body: *entities.State, metadata: *ItemEntities.Metadata) !void {
-        const dropped = self.deps.dropped;
         // A full stack finds out when its stack is read, once there is something to merge with.
-        const low: [3]i32 = .{ entities.space.coordinate(body.position[0] - 0.75), entities.space.coordinate(body.position[1] - 0.25), entities.space.coordinate(body.position[2] - 0.75) };
-        const high: [3]i32 = .{ entities.space.coordinate(body.position[0] + 0.75), entities.space.coordinate(body.position[1] + 0.25), entities.space.coordinate(body.position[2] + 0.75) };
         // Only those within it merge: the rest are passed over before they are put in order.
         const within: entities.Feet = .{ .low = .{ body.position[0] - 0.75, body.position[1] - 0.25, body.position[2] - 0.75 }, .high = .{ body.position[0] + 0.75, body.position[1] + 0.25, body.position[2] + 0.75 } };
-        var x = low[0];
-        while (x <= high[0]) : (x += 1) {
-            // Within one x, vanilla's sections go by z from 0 up, then the negative ones: the box
-            // spans two columns at most.
-            const z_first = if (low[2] < 0 and high[2] >= 0) high[2] else low[2];
-            const z_order = [2]i32{ z_first, if (z_first == low[2]) high[2] else low[2] };
-            for (z_order[0 .. @as(usize, @intCast(high[2] - low[2])) + 1]) |z| {
-                var ordered = dropped.inColumnWithin(.{ .world = body.world, .x = x, .z = z }, low[1], high[1], within, self.nearby);
-                while (true) {
-                    const entries = try ordered.next();
-                    if (entries.len == 0) break;
-                    for (entries) |candidate| {
-                        if (candidate.id == entity) continue;
-                        // The index knows where each is: those out of the box are not read.
-                        const at = candidate.position;
-                        if (@abs(body.position[0] - at[0]) >= 0.75 or @abs(body.position[1] - at[1]) >= 0.25 or @abs(body.position[2] - at[2]) >= 0.75) continue;
-                        switch (try self.mergeWith(entity, body.*, metadata, candidate)) {
-                            .next => {},
-                            .done => return,
-                        }
-                    }
-                }
+        var merging: struct { tick: *ItemTick, entity: entities.Id, body: *entities.State, metadata: *ItemEntities.Metadata } = .{ .tick = self, .entity = entity, .body = body, .metadata = metadata };
+        try self.deps.dropped.places.space.eachWithin(body.world, within, ItemEntities.kinds, self.nearby, &merging, struct {
+            fn visit(context: *@TypeOf(merging), candidate: entities.space.Entry) anyerror!bool {
+                if (candidate.id == context.entity) return false;
+                // The index knows where each is: those out of the box are not read.
+                const at = candidate.position;
+                const here = context.body.position;
+                if (@abs(here[0] - at[0]) >= 0.75 or @abs(here[1] - at[1]) >= 0.25 or @abs(here[2] - at[2]) >= 0.75) return false;
+                return switch (try context.tick.mergeWith(context.entity, context.body.*, context.metadata, candidate)) {
+                    .next => false,
+                    .done => true,
+                };
             }
-        }
+        }.visit);
     }
 
     const Merge = enum { next, done };

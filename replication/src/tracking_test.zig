@@ -43,6 +43,7 @@ const Fixture = struct {
             .allocator = allocator,
         };
         @memset(self.modes, .survival);
+        try self.entities.places.space.sleepsOwn(.of(&.{swept_kind}));
         self.players.setRules(.init(Fixture, self, gameMode, spawnWorld, spawnPoint));
         // Its players place themselves among these entities.
         self.players.entities = self.entities;
