@@ -2,13 +2,15 @@
 # The standard check for a change to the simulation: the working tree against a git ref, the
 # same way every time.
 #
-#   bench/tick/check.sh [--ref REF] [--out DIR] [--rounds N] [--cases a,b,...] [all|digests|oracle|matrix]
+#   bench/tick/check.sh [--ref REF] [--out DIR] [--rounds N] [--cases a,b,...] [all|digests|oracle|matrix|wire]
 #
 #   digests  Sleeping entities' state matches every tick: with sleep and without, and against REF.
 #   oracle   Tracking holds to the brute-force rule every tick (--check-tracking) in mixed scenes.
 #   matrix   Per tick, by alternating rounds: CPU and wall time, and instructions, loads, L1 and
 #            L2 misses when perf can count them. No kind may get slower than REF.
 #   all      The three, in that order (the default).
+#   wire     What every client receives matches REF byte for byte, tick for tick: for a change that
+#            must not alter replication. Not part of all, as many changes alter it on purpose.
 #
 # REF defaults to HEAD, so a run measures what is not committed yet. It is built in its own
 # worktree under DIR and kept there for the next run. A REF older than the bench's own flags
@@ -32,7 +34,7 @@ while [ $# -gt 0 ]; do
         --out) out=$2; shift 2 ;;
         --rounds) rounds=$2; shift 2 ;;
         --cases) only=$2; shift 2 ;;
-        all | digests | oracle | matrix) mode=$1; shift ;;
+        all | digests | oracle | matrix | wire) mode=$1; shift ;;
         -h | --help) sed -n '2,23p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -81,6 +83,28 @@ if [ "$mode" = all ] || [ "$mode" = digests ]; then
     against=$(diff "$out/digest-new.txt" "$out/digest-ref.txt" | grep -c '^<' || true)
     say "digests: $lines lines, $awake differ from sleep off, $against differ from $ref"
     if [ "$lines" -eq 0 ] || [ "$awake" -ne 0 ] || [ "$against" -ne 0 ]; then failed=1; fi
+fi
+
+# What clients receive, hashed player by player. Without arrows: their volleys fill output, and
+# what backpressure lets through depends on how fast it drains.
+wire_scene=(--players=8 --mode=moving --cows=256 --orbs=256 --drops=256 --stream --digest --ticks=400 --samples=1)
+wires() {
+    bench "$1" "${wire_scene[@]}" 2>&1 | grep '^digest' | grep -o 'tick=[0-9]* .*wire=[0-9a-f]*' | awk '{print $1, $NF}'
+}
+
+if [ "$mode" = wire ]; then
+    wires "$new" > "$out/wire-new.txt"
+    wires "$old" > "$out/wire-ref.txt"
+    lines=$(wc -l < "$out/wire-new.txt")
+    if ! grep -q wire= "$out/wire-ref.txt"; then
+        say "wire: $ref has no wire digest, cannot compare"
+        failed=1
+    else
+        differ=$(diff "$out/wire-new.txt" "$out/wire-ref.txt" | grep -c '^<' || true)
+        first=$(diff "$out/wire-new.txt" "$out/wire-ref.txt" | grep -m1 '^<' | awk '{print $2}' || true)
+        say "wire: $lines ticks, $differ differ from $ref${first:+, first at $first}"
+        if [ "$lines" -eq 0 ] || [ "$differ" -ne 0 ]; then failed=1; fi
+    fi
 fi
 
 oracle_scenes=(

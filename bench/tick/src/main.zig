@@ -261,6 +261,10 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     const player_states = simulation.get(vanilla.PlayerStates);
     const spawn_world = try players.spawnWorld();
     const handles = try backing.alloc(sessions.Handle, count);
+    if (options.digest) {
+        wire_streams = try backing.alloc(u64, count);
+        @memset(wire_streams, 0);
+    }
     const buffers = [2][][64]u8{ try backing.alloc([64]u8, count), try backing.alloc([64]u8, count) };
     const payloads = [2][][1][]const u8{ try backing.alloc([1][]const u8, count), try backing.alloc([1][]const u8, count) };
     for (players.records[0..count], 0..) |*player, index| {
@@ -453,7 +457,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
             for (cached_files) |file| if (file) |open| {
                 _ = std.os.linux.fadvise(open.handle, 0, 0, std.os.linux.POSIX_FADV.DONTNEED);
             };
-            if (options.digest) try writer.print("digest tick={d} mobs={x} orbs={x} projectiles={x} sent={x} items={x} mob_sent={x} item_sent={x} orb_sent={x} packets={d} recipients={d} sleeping={d} items_asleep={d}\n", .{ tick, try mobs.digest(), try simulation.get(vanilla.Experience).digest(), try simulation.get(vanilla.Projectiles).digest(), simulation.get(vanilla.Projectiles).sent, try simulation.get(vanilla.ItemEntities).digest(), simulation.get(vanilla.MobReplication).traced, simulation.get(vanilla.ItemReplication).traced, simulation.get(vanilla.ExperienceReplication).traced, packets, recipients, simulation.get(vanilla.Projectiles).sleepingCount(), simulation.get(vanilla.ItemEntities).asleepCount() });
+            if (options.digest) try writer.print("digest tick={d} mobs={x} orbs={x} projectiles={x} sent={x} items={x} mob_sent={x} item_sent={x} orb_sent={x} packets={d} recipients={d} sleeping={d} items_asleep={d} wire={x}\n", .{ tick, try mobs.digest(), try simulation.get(vanilla.Experience).digest(), try simulation.get(vanilla.Projectiles).digest(), simulation.get(vanilla.Projectiles).sent, try simulation.get(vanilla.ItemEntities).digest(), simulation.get(vanilla.MobReplication).traced, simulation.get(vanilla.ItemReplication).traced, simulation.get(vanilla.ExperienceReplication).traced, packets, recipients, simulation.get(vanilla.Projectiles).sleepingCount(), simulation.get(vanilla.ItemEntities).asleepCount(), wireDigest() });
         }
         cpus[sample] = @intCast(std.Io.Clock.now(.cpu_thread, io).nanoseconds - cpu);
         process_cpus += @intCast(std.Io.Clock.now(.cpu_process, io).nanoseconds - process_cpu);
@@ -515,6 +519,40 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
 /// Whether each tick holds tracking to the rule, as `--check-tracking` asks.
 var checking_tracking = false;
 
+/// Each player's stream of packets so far, hashed, when digests are asked: what clients receive,
+/// however replication groups its sends.
+var wire_streams: []u64 = &.{};
+
+/// boss_bar in 1.21.8, the release the check builds: other releases hash it too.
+const boss_bar_id: ?u8 = if (protocols.implementations[0].protocol_number == 772) 9 else null;
+
+/// A packet's id, its first varint: 255 for one too short to have it.
+fn packetId(bytes: []const u8) u8 {
+    var at: usize = 0;
+    const id = varint(bytes, &at) orelse return 255;
+    return @intCast(@min(id, 255));
+}
+
+fn varint(bytes: []const u8, at: *usize) ?u32 {
+    var value: u32 = 0;
+    var shift: u5 = 0;
+    while (at.* < bytes.len) {
+        const byte = bytes[at.*];
+        at.* += 1;
+        value |= @as(u32, byte & 0x7f) << shift;
+        if (byte & 0x80 == 0) return value;
+        if (shift == 28) return null;
+        shift += 7;
+    }
+    return null;
+}
+
+fn wireDigest() u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(std.mem.sliceAsBytes(wire_streams));
+    return hasher.final();
+}
+
 fn advance(simulation: *Simulation, service: *sessions.Service, handles: []const sessions.Handle, payloads: []const [1][]const u8, mode: Mode, packets: *u64, recipients: *u64, tick_time: *u64) !void {
     for (handles) |handle| {
         service.credit[handle.index].store(@as(u64, handle.generation) << 32 | sessions.Service.active | service.config.credit_bytes, .release);
@@ -540,6 +578,13 @@ fn advance(simulation: *Simulation, service: *sessions.Service, handles: []const
     while (batch.next()) |packet| {
         packets.* += 1;
         recipients.* += packet.recipients.len;
+        if (wire_streams.len != 0) {
+            var each = packet.recipients.iterator();
+            // The bench's boss bar shows its tick times, which no two runs share.
+            if (packetId(packet.bytes) != boss_bar_id) while (each.next()) |handle| {
+                wire_streams[handle.index] = std.hash.Wyhash.hash(wire_streams[handle.index], packet.bytes);
+            };
+        }
         service.recycle(simulation.io, &.{packet});
     }
     for (handles) |handle| _ = service.releases[handle.index].swap(0, .acq_rel);
