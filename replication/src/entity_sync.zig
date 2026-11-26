@@ -483,6 +483,21 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             self.missed_any = false;
         }
 
+        /// Of `players`, those a delivery since the last note missed are behind on the entity in a
+        /// slot. The rest of the misses go: they were of what `players` did not take.
+        fn behindIn(self: *Self, slot: u32, players: []const usize) void {
+            if (self.missed_any) {
+                for (self.missed, players) |*word, taken| word.* &= taken;
+                if (any(self.missed)) self.behind(slot, self.set(self.missed));
+            }
+            self.clearMissed();
+        }
+
+        fn clearMissed(self: *Self) void {
+            @memset(self.missed, 0);
+            self.missed_any = false;
+        }
+
         /// One entity's tick of ChunkMap.TrackedEntity and ServerEntity: removals and spawns as
         /// tracking asks, then what changed, then the whole of it to whoever missed some.
         /// The spec's `body` is asked only on the ticks something of it goes, and its `identity`
@@ -533,6 +548,8 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             @memset(removed, 0);
             try self.remove(slot, change.remove, removed);
             self.deps.tracking.confirm(slot, self.deps.tracking.nobody(), self.set(removed));
+            // Whom the removal missed still have it, and tracking offers it them again.
+            self.clearMissed();
             // Its view goes once no client has it: until then it is what they were last sent.
             if (!self.deps.tracking.known(slot).any()) self.drop(slot);
         }
@@ -552,8 +569,8 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             try self.remove(slot, change.remove, removed);
             try self.pair(slot, identity, view, change.spawn, spawned);
             self.deps.tracking.confirm(slot, self.set(spawned), self.set(removed));
-            @memset(self.missed, 0);
-            self.missed_any = false;
+            // One that took the spawn but missed what came with it has it, not whole: behind.
+            self.behindIn(slot, spawned);
         }
 
         /// Removals, but not before an event a client is owed of it, in the batch: tracking hears
@@ -694,9 +711,10 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             const changes = DataChanges.fromDefaults(view.data);
             if (changes.any()) try self.deliver(self.set(caught), .{ .metadata = .{ .id = id, .data = view.data, .changes = changes } });
             try self.deliver(self.set(caught), .{ .head = .{ .id = id, .yaw = view.head_yaw } });
+            // One that took where it is but missed its data or head is not caught up: still stale.
+            for (caught, self.missed) |*word, missed| word.* &= ~missed;
             self.deps.tracking.caughtUp(slot, self.set(caught));
-            @memset(self.missed, 0);
-            self.missed_any = false;
+            self.clearMissed();
         }
 
         fn unpack(angle: i8) f32 {
@@ -799,7 +817,8 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             const at = (self.held_first + self.held_count) % self.held.len;
             self.held_count += 1;
             for (self.heldRow(at), 0..) |*word, index| word.* = known.wordAt(index);
-            self.held[at] = .{ .slot = slot, .event = event };
+            // Whose it is, as the slot may be another's by the time it goes.
+            self.held[at] = .{ .slot = slot, .id = self.views.at(slot).id, .event = event };
         }
 
         /// Held events to whoever is owed them, in order: one with no room for an event gets no
@@ -814,6 +833,11 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                 const at = (self.held_first + offset) % self.held.len;
                 const held = self.held[at];
                 const owed = self.heldRow(at);
+                // Its entity is gone and its slot another's: no one is owed it now.
+                if (self.views.at(held.slot).id != held.id) {
+                    @memset(owed, 0);
+                    continue;
+                }
                 // Only those who still have it: one that reconnected since never saw it.
                 const known = self.deps.tracking.known(held.slot);
                 for (owed, 0..) |*word, index| word.* &= known.wordAt(index);
@@ -839,6 +863,8 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                 self.held_first = (self.held_first + 1) % self.held.len;
                 self.held_count -= 1;
             }
+            // Whom an event missed stay owed it in its row.
+            self.clearMissed();
         }
 
         // Sending.
