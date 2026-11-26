@@ -181,7 +181,9 @@ pub const Broadcast = struct {
             self.ordinals[index] = at;
             self.members[at] = .{ .protocol = protocol, .generation = target.handle.generation };
             self.identity = self.identity and index == at;
-            self.available[protocol] = @max(self.available[protocol], self.owner.outputCredit(target.handle));
+            // A member that may wait for credit on its way back has room, whatever it has now.
+            const room = if (self.owner.mayWait(target.handle)) self.owner.config.credit_bytes else self.owner.outputCredit(target.handle);
+            self.available[protocol] = @max(self.available[protocol], room);
             self.recipients += 1;
             self.protocol_masks[protocol * self.words + at / width] |= @as(usize, 1) << @as(Shift, @intCast(at % width));
         }
@@ -572,6 +574,7 @@ pub const Broadcast = struct {
             }
         }
         var slow_count: usize = 0;
+        var halved = false;
         var healthy_members: usize = 0;
         var reservations: usize = 0;
         for (0..self.recipients) |index| {
@@ -581,14 +584,25 @@ pub const Broadcast = struct {
             member.excluded = 0;
             if (needed == 0 or owner.moves[handle.index].state.load(.acquire) == .committed) continue;
             var value = owner.credit[handle.index].load(.acquire);
+            var waited = false;
             while (value >> 32 == handle.generation and value & service.Service.active != 0) {
                 const available: usize = @intCast(value & (service.Service.active - 1));
+                // Short of credit on its way back, a member waits for it once, as a socket
+                // write would; only one whose output stopped moving goes short.
+                if (available < needed and !waited) {
+                    waited = true;
+                    if (owner.awaitCreditLocked(handle, @min(needed, owner.config.credit_bytes))) {
+                        value = owner.credit[handle.index].load(.acquire);
+                        continue;
+                    }
+                }
                 const reserve = @min(available, needed);
                 if (reserve == 0) break;
                 if (owner.credit[handle.index].cmpxchgWeak(value, value - reserve, .acq_rel, .acquire)) |changed| {
                     value = changed;
                     continue;
                 }
+                halved = halved or owner.crossedHalf(value, value - reserve);
                 reservations += 1;
                 member.reserved = reserve;
                 const bit = @as(usize, 1) << @as(Shift, @intCast(index % width));
@@ -682,6 +696,8 @@ pub const Broadcast = struct {
             assert(refund <= member.reserved);
             if (refund != 0) owner.refund(self.audience_handles[index], refund);
         }
+        // A member's credit gone below half hands what waits to the worker during the tick.
+        if (halved and total_published != 0) owner.flushLocked();
         self.whole = self.whole and whole;
         self.committed = self.count;
     }

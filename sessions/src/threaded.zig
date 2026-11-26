@@ -43,6 +43,14 @@ fn Driver(comptime Core: type) type {
             self.thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, execute, .{self});
             // Named for profilers and per thread usage. Only a label, so failing to set it is fine.
             self.thread.?.setName(self.io, "sessions") catch {};
+            self.concurrent(true);
+        }
+
+        /// Tells the endpoints whether the worker runs on its thread, giving credit back while
+        /// a send waits for it, or is parked or gone, when nothing would.
+        fn concurrent(self: *Self, running: bool) void {
+            if (!@hasField(Core, "routing")) return;
+            for (self.core.routing.endpoints) |endpoint| endpoint.concurrent.store(running, .release);
         }
 
         fn execute(self: *Self) void {
@@ -66,6 +74,7 @@ fn Driver(comptime Core: type) type {
         }
 
         pub fn pause(self: *Self, deadline: std.Io.Clock.Timestamp) !void {
+            self.concurrent(false);
             self.core.quiesce(self.io);
             try self.parked.waitTimeout(self.io, .{ .deadline = deadline });
             try self.check();
@@ -76,9 +85,11 @@ fn Driver(comptime Core: type) type {
             try self.core.resumeReload(self.io);
             self.parked.reset();
             self.resume_requested.set(self.io);
+            self.concurrent(true);
         }
 
         pub fn stop(self: *Self) void {
+            self.concurrent(false);
             if (self.thread) |thread| {
                 self.closing.store(true, .release);
                 self.core.worker.stop();

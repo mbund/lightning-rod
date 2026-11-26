@@ -18,6 +18,9 @@ pub const Instrumentation = struct {
     input_bytes: metrics.Counter = .{},
     input_deferred: metrics.Counter = .{},
     input_pending: metrics.Gauge = .{},
+    credit_waits: metrics.Counter = .{},
+    credit_wait: metrics.Counter = .{},
+    slow_clients: metrics.Counter = .{},
 
     pub fn init(registry: ?*metrics.Registry, namespace: []const u8) !Instrumentation {
         const owner = registry orelse return .{};
@@ -29,6 +32,9 @@ pub const Instrumentation = struct {
             .input_bytes = try owner.counter(.{ .namespace = namespace, .name = "input_bytes", .description = "Packet bytes admitted to simulation ticks", .unit = .bytes }),
             .input_deferred = try owner.counter(.{ .namespace = namespace, .name = "input_deferred", .description = "Input loans deferred by per-tick work limits" }),
             .input_pending = try owner.gauge(.{ .namespace = namespace, .name = "input_pending", .description = "Input loans retained for later ticks" }),
+            .credit_waits = try owner.counter(.{ .namespace = namespace, .name = "credit_waits", .description = "Sends that waited for the worker to give back credit a client was taking" }),
+            .credit_wait = try owner.counter(.{ .namespace = namespace, .name = "credit_wait", .description = "Time sends waited for credit", .unit = .nanoseconds }),
+            .slow_clients = try owner.counter(.{ .namespace = namespace, .name = "slow_clients", .description = "Connections backpressured as their output stopped moving, once a tick" }),
         };
     }
 };
@@ -127,6 +133,11 @@ pub const Service = struct {
     /// Credit each connection slot has had back from sent output, ever, which tells a
     /// connection that is draining from one that takes nothing.
     returned: []std.atomic.Value(u64),
+    /// What each connection waited for credit this tick, under `publication`.
+    waits: []Wait,
+    /// Whether the worker runs on a thread of its own, which gives credit back while a send
+    /// waits for it. Without one, nothing would, so a send short of credit never waits.
+    concurrent: std.atomic.Value(bool) = .init(false),
     disconnects: []std.atomic.Value(u32),
     preparing: std.atomic.Value(usize) = .init(0),
     output_notifications: [16]?*std.Io.Event = @splat(null),
@@ -221,6 +232,9 @@ pub const Service = struct {
         const returned = try allocator.alloc(std.atomic.Value(u64), config.connections);
         errdefer allocator.free(returned);
         for (returned) |*value| value.* = .init(0);
+        const waits = try allocator.alloc(Wait, config.connections);
+        errdefer allocator.free(waits);
+        @memset(waits, .{});
         const disconnects = try allocator.alloc(std.atomic.Value(u32), config.connections);
         errdefer allocator.free(disconnects);
 
@@ -272,6 +286,7 @@ pub const Service = struct {
             .open_inputs = open_inputs,
             .credit = credit,
             .returned = returned,
+            .waits = waits,
             .disconnects = disconnects,
             .releases = releases,
             .departed = departed,
@@ -312,6 +327,7 @@ pub const Service = struct {
         self.allocator.free(self.departed);
         self.allocator.free(self.credit);
         self.allocator.free(self.returned);
+        self.allocator.free(self.waits);
         self.allocator.free(self.disconnects);
         self.allocator.free(self.events);
         self.allocator.free(self.recipient_marks);
@@ -331,7 +347,7 @@ pub const Service = struct {
             (self.recipient_marks.len + self.group_recipients.len) * @sizeOf(u64) +
             self.credit.len * @sizeOf(std.atomic.Value(u64)) + (self.disconnects.len + self.releases.len + self.departed.len) * @sizeOf(std.atomic.Value(u32)) +
             self.routes.len * @sizeOf(?network.Handle) + self.occupied.len * @sizeOf(std.atomic.Value(bool)) + self.moves.len * @sizeOf(Move) + (self.committed_moves.len + self.activity.len) * @sizeOf(std.atomic.Value(usize)) +
-            self.profiles.len * @sizeOf(PlayerProfile);
+            self.profiles.len * @sizeOf(PlayerProfile) + self.waits.len * @sizeOf(Wait);
     }
 
     /// What a player's login and client settings said, from the event that announced them on.
@@ -659,7 +675,8 @@ pub const Service = struct {
                     result.* = .closed;
                     continue;
                 }
-                if (credit & (active - 1) < charge or self.moves[target.handle.index].state.load(.acquire) == .committed) continue;
+                if (self.moves[target.handle.index].state.load(.acquire) == .committed) continue;
+                if (credit & (active - 1) < charge and (packets[0].packet.epoch != null or !self.awaitCreditLocked(target.handle, charge))) continue;
                 recipients[count] = target.handle;
                 count += 1;
             }
@@ -750,7 +767,7 @@ pub const Service = struct {
             var recipients: usize = 0;
             for (publication.recipients) |handle| {
                 const prepaid = if (packet.credit) |held| std.meta.eql(held.handle, handle) else false;
-                if (!prepaid and !self.canSend(handle, packet.boundLength(publication.length))) continue;
+                if (!prepaid and !self.creditFor(handle, packet.boundLength(publication.length), packet.epoch == null)) continue;
                 publication.recipients[recipients] = handle;
                 recipients += 1;
             }
@@ -782,6 +799,8 @@ pub const Service = struct {
 
     fn admitPacket(self: *Service, packet: *Packet, length: usize, recipients: []const network.Handle) SendError!void {
         const bytes = self.creditCharge(packet.boundLength(length));
+        // The simulation's packets wait for credit on its way back; background work's never do.
+        const waiting = packet.epoch == null;
         if (packet.credit) |held| {
             assert(bytes <= held.bytes);
             var found: usize = 0;
@@ -790,10 +809,10 @@ pub const Service = struct {
             const value = self.credit[held.handle.index].load(.acquire);
             if (value >> 32 != held.handle.generation or value & active == 0) return error.Closed;
             if (self.moves[held.handle.index].state.load(.acquire) == .committed) return error.Closed;
-            try self.chargeRecipientsExcept(bytes, recipients, held.handle);
+            try self.chargeRecipientsWaiting(bytes, recipients, held.handle, waiting);
             packet.credit = null;
             self.refund(held.handle, held.bytes - bytes);
-        } else try self.chargeRecipients(bytes, recipients);
+        } else try self.chargeRecipientsWaiting(bytes, recipients, null, waiting);
         _ = self.preparing.fetchAdd(1, .release);
     }
 
@@ -801,8 +820,98 @@ pub const Service = struct {
         return self.chargeRecipientsExcept(charge_bytes, recipients, null);
     }
 
+    /// What a connection waited for credit in a tick, and whether it was found slow in it.
+    pub const Wait = struct {
+        epoch: u64 = std.math.maxInt(u64),
+        waited_ns: u64 = 0,
+        slow: bool = false,
+    };
+
+    /// How long a connection's output may stand still, nothing of it taken and no credit back,
+    /// before it is slow: far longer than the worker takes to frame what was published and the
+    /// socket to take it from a client that reads.
+    pub const stall_ns: u64 = std.time.ns_per_ms;
+    /// How long a connection may wait for credit in a tick, all its waits together: a client
+    /// that reads keeps its waits to the worker's turns, far shorter.
+    pub const wait_budget_ns: u64 = 2 * std.time.ns_per_ms;
+
+    /// Waits, holding `publication`, until a connection has `needed` credit, as long as its
+    /// credit is only held by output on its way: published and not yet taken by the worker, or
+    /// in its ring and not yet taken by the socket. A client that reads keeps that moving, so
+    /// a send waits for it as a socket write would. One whose output stops moving, or that
+    /// waited its budget for the tick, is slow: true only when the credit came.
+    pub fn awaitCreditLocked(self: *Service, handle: network.Handle, needed: usize) bool {
+        if (!self.concurrent.load(.acquire) or needed > self.config.credit_bytes or handle.index >= self.credit.len) return false;
+        const wait = &self.waits[handle.index];
+        const epoch = self.epoch.load(.acquire);
+        if (wait.epoch != epoch) wait.* = .{ .epoch = epoch };
+        if (wait.slow) return false;
+        // What waits to be taken goes to the worker now, rather than when the tick ends.
+        self.flushLocked();
+        const start = now(self.io);
+        var moved = start;
+        var taken = self.output.ready.head.load(.acquire);
+        var returned = self.returned[handle.index].load(.acquire);
+        while (true) {
+            const value = self.credit[handle.index].load(.acquire);
+            if (value >> 32 != handle.generation or value & active == 0) return false;
+            const moment = now(self.io);
+            if (value & (active - 1) >= needed) {
+                wait.waited_ns += moment - start;
+                self.instruments.credit_waits.add(1);
+                self.instruments.credit_wait.add(moment - start);
+                return true;
+            }
+            const head = self.output.ready.head.load(.acquire);
+            const back = self.returned[handle.index].load(.acquire);
+            if (head != taken or back != returned) {
+                taken = head;
+                returned = back;
+                moved = moment;
+            }
+            if (moment - moved >= stall_ns or wait.waited_ns + (moment - start) >= wait_budget_ns) {
+                wait.waited_ns += moment - start;
+                wait.slow = true;
+                self.instruments.slow_clients.add(1);
+                self.instruments.credit_wait.add(moment - start);
+                return false;
+            }
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    /// Whether a send to a connection short of credit may wait for it this tick: the worker
+    /// gives credit back while it waits, and the connection was not found slow.
+    pub fn mayWait(self: *const Service, handle: network.Handle) bool {
+        if (!self.concurrent.load(.acquire) or handle.index >= self.waits.len) return false;
+        const wait = self.waits[handle.index];
+        return wait.epoch != self.epoch.load(.acquire) or !wait.slow;
+    }
+
+    fn now(io: std.Io) u64 {
+        return @intCast(std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds);
+    }
+
+    /// Whether charging took a connection's credit below half, which hands what waits to the
+    /// worker during the tick, so a client that reads has it back long before it runs out. A
+    /// worker that runs only between ticks would take nothing sooner: its output stays one
+    /// batch after the tick.
+    pub fn crossedHalf(self: *const Service, before: u64, after: u64) bool {
+        if (!self.concurrent.load(.acquire)) return false;
+        const half = self.config.credit_bytes / 2;
+        return before & (active - 1) >= half and after & (active - 1) < half;
+    }
+
+    /// Charges each recipient, waiting for credit on its way back when `waiting` and the
+    /// connection is not slow, as the simulation's sends do; background work never waits.
     fn chargeRecipientsExcept(self: *Service, charge_bytes: usize, recipients: []const network.Handle, prepaid: ?network.Handle) SendError!void {
+        return self.chargeRecipientsWaiting(charge_bytes, recipients, prepaid, false);
+    }
+
+    fn chargeRecipientsWaiting(self: *Service, charge_bytes: usize, recipients: []const network.Handle, prepaid: ?network.Handle, waiting: bool) SendError!void {
         if (self.stopping.load(.acquire)) return error.Closed;
+        var halved = false;
+        defer if (halved) self.flushLocked();
         self.publication_sequence +%= 1;
         if (self.publication_sequence == 0) {
             @memset(self.recipient_marks, 0);
@@ -830,10 +939,19 @@ pub const Service = struct {
             while (true) {
                 if (value >> 32 != handle.generation or value & active == 0) return error.Closed;
                 if (value & (active - 1) < charge_bytes) {
+                    if (waiting and self.awaitCreditLocked(handle, charge_bytes)) {
+                        value = self.credit[handle.index].load(.acquire);
+                        continue;
+                    }
                     self.flushLocked();
                     return error.Backpressured;
                 }
-                value = self.credit[handle.index].cmpxchgWeak(value, value - charge_bytes, .acq_rel, .acquire) orelse break;
+                if (self.credit[handle.index].cmpxchgWeak(value, value - charge_bytes, .acq_rel, .acquire)) |changed| {
+                    value = changed;
+                    continue;
+                }
+                halved = halved or self.crossedHalf(value, value - charge_bytes);
+                break;
             }
 
             admitted += 1;
@@ -1016,6 +1134,13 @@ pub const Service = struct {
         return length <= self.config.page_bytes and self.outputCredit(handle) >= self.creditCharge(length);
     }
 
+    /// As `canSend`, holding `publication`, but waiting for credit on its way back when
+    /// `waiting`, as `awaitCreditLocked` does.
+    fn creditFor(self: *Service, handle: network.Handle, length: usize, waiting: bool) bool {
+        if (self.canSend(handle, length)) return true;
+        return waiting and length <= self.config.page_bytes and self.awaitCreditLocked(handle, self.creditCharge(length));
+    }
+
     /// How many packets of this size background work may still send a connection.
     pub fn packetCapacity(self: *Service, handle: network.Handle, maximum_bytes: usize) usize {
         if (maximum_bytes > self.config.page_bytes) return 0;
@@ -1152,7 +1277,7 @@ pub const Service = struct {
         self.flushLocked();
     }
 
-    fn flushLocked(self: *Service) void {
+    pub fn flushLocked(self: *Service) void {
         if (self.published_since_flush.swap(0, .acq_rel) == 0) return;
         self.visible_output.store(self.output.ready.tail.load(.acquire), .release);
         if (self.readiness) |ready| _ = ready.output.fetchOr(ready.mask, .release);

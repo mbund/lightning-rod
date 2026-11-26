@@ -1102,6 +1102,49 @@ test "broadcast batches preserve exclusions dependencies credits and audience ow
     }
 }
 
+test "a send short of credit waits for a client that reads, and backpressures only one that stopped" {
+    var hooks: Hooks = .{};
+    var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .capacity = 16 });
+    defer registry.deinit();
+    const endpoint = try service_module.Service.init(std.testing.allocator, std.testing.io, transport(&hooks), .{ .metrics = &registry, .connections = 2, .credit_bytes = 512, .pages = 4, .page_bytes = 128, .protocols = &protocols.values, .max_input_bytes = 509 });
+    defer endpoint.deinit();
+    const handle: network.Handle = .{ .index = 0, .generation = 1 };
+    const Service = service_module.Service;
+    endpoint.credit[0].store(@as(u64, 1) << 32 | Service.active, .release);
+    endpoint.concurrent.store(true, .release);
+    defer endpoint.concurrent.store(false, .release);
+    // As the worker does for a client that reads: credit back soon after the send asks.
+    const Reader = struct {
+        fn run(service: *Service) void {
+            std.Io.sleep(std.testing.io, .fromNanoseconds(100 * std.time.ns_per_us), .awake) catch {};
+            service.refund(.{ .index = 0, .generation = 1 }, 200);
+        }
+    };
+    const reader = try std.Thread.spawn(.{}, Reader.run, .{endpoint});
+    endpoint.publication.lockUncancelable(std.testing.io);
+    const came = endpoint.awaitCreditLocked(handle, 200);
+    endpoint.publication.unlock(std.testing.io);
+    reader.join();
+    try std.testing.expect(came);
+    try std.testing.expectEqual(@as(u64, 1), endpoint.instruments.credit_waits.value());
+    try std.testing.expect(endpoint.mayWait(handle));
+    // Nothing more comes back: the client stopped reading, so the send gives up, once a tick.
+    endpoint.credit[0].store(@as(u64, 1) << 32 | Service.active, .release);
+    endpoint.publication.lockUncancelable(std.testing.io);
+    try std.testing.expect(!endpoint.awaitCreditLocked(handle, 200));
+    endpoint.publication.unlock(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 1), endpoint.instruments.slow_clients.value());
+    try std.testing.expect(!endpoint.mayWait(handle));
+    endpoint.publication.lockUncancelable(std.testing.io);
+    try std.testing.expect(!endpoint.awaitCreditLocked(handle, 200));
+    endpoint.publication.unlock(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 1), endpoint.instruments.slow_clients.value());
+    // Without a worker of its own, nothing would give credit back, so nothing waits.
+    endpoint.concurrent.store(false, .release);
+    try std.testing.expect(!endpoint.mayWait(.{ .index = 1, .generation = 1 }));
+    endpoint.credit[0].store(0, .release);
+}
+
 test "small packets for one audience pack into one buffer charged what they take on the wire" {
     const Version = struct {
         pub const protocol_number = 1;
