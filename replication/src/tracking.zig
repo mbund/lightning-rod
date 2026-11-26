@@ -189,6 +189,9 @@ pub const Tracking = struct {
         owner: u16 = no_owner,
         spectators_only: bool = false,
         restricted: bool = false,
+        /// The pass that last walked it among those with ranges of their own: listed again, as a
+        /// range can come and go and come within a pass, it is walked once.
+        ranged_pass: u64 = std.math.maxInt(u64),
         /// Where it was last answered for every player: a point's column and footprint, which its
         /// answers for players not at an edge depend on.
         placed: bool = false,
@@ -540,6 +543,8 @@ pub const Tracking = struct {
         const declared = try self.declaredRange(spec);
         const range: f64 = @floatFromInt(declared.range * scale / 100);
         const max_range: f64 = @floatFromInt(declared.max_range * scale / 100);
+        // A kind another tracker has is refused before anything changes.
+        for (0..Kinds.max_kinds) |entity_kind| if (spec.kinds.has(@intCast(entity_kind)) and self.tracker_of[entity_kind] != no_tracker) return error.KindTrackedTwice;
         // Trackers of one range share their masks.
         const group: u8 = for (self.groups[0..self.group_count], 0..) |*group, at| {
             if (group.range != range) continue;
@@ -553,7 +558,6 @@ pub const Tracking = struct {
         };
         self.trackers[index] = .{ .kinds = spec.kinds, .range = range, .max_range = max_range, .group = group, .exact = spec.exact };
         for (0..Kinds.max_kinds) |entity_kind| if (spec.kinds.has(@intCast(entity_kind))) {
-            if (self.tracker_of[entity_kind] != no_tracker) return error.KindTrackedTwice;
             self.tracker_of[entity_kind] = index;
             self.tracked.bits.set(entity_kind);
         };
@@ -791,6 +795,14 @@ pub const Tracking = struct {
     }
 
     /// One player's answer for an entity, kept where it differs from what the client has.
+    /// One word of the players owed a spawn of the entity, from what this tick or an earlier one
+    /// noted and nobody took yet.
+    fn owedSpawns(self: *const Tracking, meta: *const Meta, word: usize) u64 {
+        if (meta.work == none) return 0;
+        const rows = self.item(meta.work);
+        return rows[word] & rows[self.words + word];
+    }
+
     fn note(self: *Tracking, slot: u32, player: usize, wanted: bool) !void {
         const meta = self.metas.at(slot);
         if (meta.work == none) {
@@ -1519,7 +1531,11 @@ pub const Tracking = struct {
         if (meta.tracker == no_tracker) return;
         self.deps.entities.holdSlot(slot, false);
         if (meta.gone) {
-            if (meta.work != none) self.work_trackers.at(meta.work).* = no_tracker;
+            // Spawns owed and not yet taken go with it: nobody is to be shown what is gone.
+            if (meta.work != none) {
+                @memset(self.item(meta.work), 0);
+                self.work_trackers.at(meta.work).* = no_tracker;
+            }
             meta.* = .{ .looked = meta.looked, .work = meta.work };
         }
     }
@@ -1581,10 +1597,10 @@ pub const Tracking = struct {
         try self.occupy(tile, index);
         const masks = self.masksOf(tile, index, self.trackers[tracker].group);
         const known_words = self.knownWords(slot);
-        // Those who have it and whom the column is a no for are told it is gone.
+        // Those who have it, or are owed it, and whom the column is a no for are told it is gone.
         var quiet = true;
         for (known_words, masks.yes, masks.edge, 0..) |have, yes, edge, word| {
-            var gone = have & ~(yes | edge);
+            var gone = (have | self.owedSpawns(meta, word)) & ~(yes | edge);
             if (gone != 0) quiet = false;
             while (gone != 0) : (gone &= gone - 1) try self.note(slot, word * 64 + @ctz(gone), false);
         }
@@ -1818,8 +1834,10 @@ pub const Tracking = struct {
         // Answered for this very box this pass already, as players stood: what they did since
         // their walks ask about.
         if (meta.settled_for == self.tick_count and meta.settled_heard == self.heard_count and meta.work == none and std.meta.eql(meta.settled_box, boxed.feet)) return;
+        // Those who have it or are owed it, then whoever its columns may reach.
         const candidates = self.scratch[0..self.words];
         @memcpy(candidates, self.knownWords(slot));
+        for (candidates, 0..) |*word, at| word.* |= self.owedSpawns(meta, at);
         const edges = self.scratch[2 * self.words ..][0..self.words];
         @memset(edges, 0);
         try self.boxCandidates(boxed.world, reach_box, self.trackers[tracker].group, candidates, edges);
@@ -2072,7 +2090,12 @@ pub const Tracking = struct {
             for (resets) |reset| {
                 if (reset.player == player) break;
             } else {
+                // As a reset does: what it was owed around where it was goes with its anchor, so all
+                // it may have there is asked again, then it is anchored where it is.
+                const was: PlayerChanges.Snapshot = .{ .world = self.anchor_world[player], .ready = true, .x = self.anchor_x[player], .z = self.anchor_z[player], .reach = self.anchor_reach[player] };
+                const anchored = self.anchored[player];
                 self.unanchor(player);
+                if (anchored) try self.near(player, was, .recheck);
                 try self.anchor(player);
             }
         }
@@ -2133,6 +2156,9 @@ pub const Tracking = struct {
         while (at < self.own_ranged.len) : (at += 1) {
             const slot = self.own_ranged.at(at).*;
             if (slot >= self.metas.len or self.metas.at(slot).range == 0) continue;
+            const meta = self.metas.at(slot);
+            if (meta.ranged_pass == self.tick_count) continue;
+            meta.ranged_pass = self.tick_count;
             self.own_ranged.at(kept).* = slot;
             kept += 1;
             if (space.boxOf(slot)) |boxed| {
