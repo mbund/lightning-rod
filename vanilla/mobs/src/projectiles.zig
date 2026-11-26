@@ -1465,7 +1465,8 @@ pub const Projectiles = struct {
         }
         if (self.sleeping == 0) return;
         if (self.rouse_all) {
-            assert(self.boxedCount() == 0);
+            // Boxed sleepers among them too, as a full list of those to rouse wakes all: each is
+            // placed again as it settles, which takes its box back.
             // One pass: the index changes only once the pass is done.
             var pass = store.Pass.init(&self.index, store.under(.sleeping));
             while (true) {
@@ -1476,6 +1477,7 @@ pub const Projectiles = struct {
                 try self.wakeAll(ids[0..keys.len]);
             }
             if (self.sleeping != 0) return error.Corrupt;
+            assert(self.boxedCount() == 0);
             return;
         }
         const space = &self.deps.entities.places.space;
