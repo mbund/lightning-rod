@@ -825,6 +825,8 @@ pub const Service = struct {
         epoch: u64 = std.math.maxInt(u64),
         waited_ns: u64 = 0,
         slow: bool = false,
+        /// The tick it was last found slow in, by `epoch`.
+        slow_epoch: u64 = std.math.maxInt(u64),
     };
 
     /// How long a connection's output may stand still, nothing of it taken and no credit back,
@@ -844,7 +846,7 @@ pub const Service = struct {
         if (!self.concurrent.load(.acquire) or needed > self.config.credit_bytes or handle.index >= self.credit.len) return false;
         const wait = &self.waits[handle.index];
         const epoch = self.epoch.load(.acquire);
-        if (wait.epoch != epoch) wait.* = .{ .epoch = epoch };
+        if (wait.epoch != epoch) wait.* = .{ .epoch = epoch, .slow_epoch = wait.slow_epoch };
         if (wait.slow) return false;
         // What waits to be taken goes to the worker now, rather than when the tick ends.
         self.flushLocked();
@@ -872,6 +874,7 @@ pub const Service = struct {
             if (moment - moved >= stall_ns or wait.waited_ns + (moment - start) >= wait_budget_ns) {
                 wait.waited_ns += moment - start;
                 wait.slow = true;
+                wait.slow_epoch = epoch;
                 self.instruments.slow_clients.add(1);
                 self.instruments.credit_wait.add(moment - start);
                 return false;
@@ -886,6 +889,15 @@ pub const Service = struct {
         if (!self.concurrent.load(.acquire) or handle.index >= self.waits.len) return false;
         const wait = self.waits[handle.index];
         return wait.epoch != self.epoch.load(.acquire) or !wait.slow;
+    }
+
+    /// Whether a connection was found slow this tick or the last: one whose output stopped
+    /// moving, which game state should spend its credit on what it lacks rather than on changes
+    /// to what it has, until its output moves again. A tick moves `epoch` on twice.
+    pub fn lagging(self: *const Service, handle: network.Handle) bool {
+        if (handle.index >= self.waits.len) return false;
+        const found = self.waits[handle.index].slow_epoch;
+        return found != std.math.maxInt(u64) and self.epoch.load(.acquire) -% found <= 3;
     }
 
     fn now(io: std.Io) u64 {

@@ -361,12 +361,15 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
         /// Ticks this kind has sent.
         tick_count: u64 = 0,
         words: usize,
-        /// Rows of players: spawned, removed, current, caught up, owed whole, one alone, and a
-        /// class's viewers.
+        /// Rows of players: spawned, removed, current, caught up, owed whole, one alone, a class's
+        /// viewers, those told by their own riding, those lagging this tick, and those a catch-up or a
+        /// lag is for.
         rows: []usize,
         /// Players a delivery could not be queued for this entity, who then need it whole.
         missed: []usize,
         missed_any: bool = false,
+        /// Whether a player is lagging this tick, as row 8 holds.
+        lagging_any: bool = false,
         delivery: Delivery,
         /// Deltas of entities that go to the same players, admitted for all of them at once.
         /// Whatever goes out alone sends them first, so each player has its packets in order.
@@ -416,7 +419,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                 .personal = try allocator.alloc(usize, deps.players.records.len),
                 .views = try .init(allocator, deps.pool),
                 .words = words,
-                .rows = try allocator.alloc(usize, 8 * words),
+                .rows = try allocator.alloc(usize, 10 * words),
                 .missed = try allocator.alloc(usize, words),
                 .delivery = try .init(allocator, deps.players, deps.packets, deps.sessions),
                 .batch = try .init(allocator, deps.players, deps.packets, deps.sessions, words),
@@ -463,6 +466,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             errdefer self.batch.abandon();
             if (self.models) |*models| models.refresh();
             if (self.drift) |*drift| for (drift.check(self.deps.players, self.tick_count)) |moved| self.resync(moved);
+            self.noteLagging();
             try self.sendHeld();
         }
 
@@ -480,6 +484,34 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                 self.behind(slot, self.set(alone));
             }
             std.log.info("event=client_resync player={d} ticks={d}", .{ moved.player, moved.ticks });
+        }
+
+        /// The players whose output stopped moving this tick or the last, as sessions found
+        /// them: row 8. They are sent no changes until it moves again, only what they lack.
+        fn noteLagging(self: *Self) void {
+            const lagging = self.row(8);
+            @memset(lagging, 0);
+            self.lagging_any = false;
+            for (self.deps.players.records, 0..) |record, player| {
+                const handle = record.handle orelse continue;
+                if (!self.deps.sessions.lagging(handle)) continue;
+                put(lagging, player);
+                self.lagging_any = true;
+            }
+        }
+
+        /// Of an entity's players, those lagging are owed it whole rather than sent its changes,
+        /// so what credit they have goes to spawning the entities they lack before moving those
+        /// they have. Once their output moves, they catch up with all of it.
+        fn lagBehind(self: *Self, slot: u32) void {
+            const known = self.deps.tracking.known(slot);
+            const lag = self.row(9);
+            var anyone = false;
+            for (lag, self.row(8), 0..) |*word, lagging, index| {
+                word.* = known.wordAt(index) & lagging;
+                anyone = anyone or word.* != 0;
+            }
+            if (anyone) self.behind(slot, self.set(lag));
         }
 
         /// A tick ends: what is queued goes.
@@ -671,6 +703,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             if (change) |value| {
                 if (self.personalized()) try self.pairing(slot, self.spec.identity(self.spec.kind, slot), view, value, &body) else try self.leave(slot, value);
             }
+            if (self.lagging_any) self.lagBehind(slot);
             const known = self.current(slot);
             // ServerEntity.sendChanges begins with what it carries, if that changed.
             if (self.spec.passengers) |carried| {
@@ -1070,8 +1103,19 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
         /// Players that missed a delta get the entity as last sent to everyone: where it is, its
         /// data and its head. One its clients step goes exactly, as each class has it, or as it is.
         fn catchUp(self: *Self, slot: u32, view: *const View, body: *?Body) !void {
-            const stale = self.deps.tracking.stale(slot);
+            var stale = self.deps.tracking.stale(slot);
             if (!stale.any()) return;
+            // Those lagging catch up once their output moves again.
+            if (self.lagging_any) {
+                const due = self.row(9);
+                var anyone = false;
+                for (due, self.row(8), 0..) |*word, lagging, index| {
+                    word.* = stale.wordAt(index) & ~lagging;
+                    anyone = anyone or word.* != 0;
+                }
+                if (!anyone) return;
+                stale = self.set(due);
+            }
             const id = entities.Entities.networkOfSlot(slot);
             const caught = self.row(3);
             @memset(caught, 0);

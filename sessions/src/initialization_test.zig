@@ -1139,6 +1139,14 @@ test "a send short of credit waits for a client that reads, and backpressures on
     try std.testing.expect(!endpoint.awaitCreditLocked(handle, 200));
     endpoint.publication.unlock(std.testing.io);
     try std.testing.expectEqual(@as(u64, 1), endpoint.instruments.slow_clients.value());
+    // It lags this tick and the next, as game state learns of it, then no longer: a tick moves
+    // the epoch on twice. A new tick lets it wait again.
+    try std.testing.expect(endpoint.lagging(handle));
+    endpoint.epoch.store(endpoint.epoch.load(.acquire) + 2, .release);
+    try std.testing.expect(endpoint.lagging(handle) and endpoint.mayWait(handle));
+    endpoint.epoch.store(endpoint.epoch.load(.acquire) + 2, .release);
+    try std.testing.expect(!endpoint.lagging(handle));
+    try std.testing.expect(!endpoint.lagging(.{ .index = 1, .generation = 1 }));
     // Without a worker of its own, nothing would give credit back, so nothing waits.
     endpoint.concurrent.store(false, .release);
     try std.testing.expect(!endpoint.mayWait(.{ .index = 1, .generation = 1 }));
