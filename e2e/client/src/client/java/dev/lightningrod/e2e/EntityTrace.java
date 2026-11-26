@@ -4,6 +4,8 @@ import java.io.BufferedWriter;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Map;
+import java.util.TreeMap;
 import net.minecraft.client.Minecraft;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
@@ -17,12 +19,16 @@ public final class EntityTrace {
     static final EntityTrace INSTANCE = new EntityTrace();
     private BufferedWriter out;
     private long ticks;
+    /// By packet class, how many were decoded and their bytes, id and body, as decompressed.
+    private final Map<String, long[]> packets = new TreeMap<>();
+    private Path packetsPath;
 
     public static EntityTrace instance() { return INSTANCE; }
 
     void open(Path artifacts, String peer) {
         try {
             out = Files.newBufferedWriter(artifacts.resolve(peer + ".entities"));
+            packetsPath = artifacts.resolve(peer + ".packets");
         } catch (IOException error) { throw new IllegalStateException("cannot open the entity trace", error); }
     }
 
@@ -34,6 +40,7 @@ public final class EntityTrace {
             if (entity instanceof LivingEntity) continue;
             line("t " + ticks + " " + entity.getId(), entity);
         }
+        if (ticks % 200 == 0) writePackets();
         // A client may be stopped without closing: what each tick wrote is kept.
         try {
             out.flush();
@@ -50,6 +57,14 @@ public final class EntityTrace {
         line("p " + ticks + " " + kind + " " + id, entity);
     }
 
+    /// A packet off the wire, on the network thread: its bytes go to its class's count.
+    public synchronized void decoded(Object packet, int bytes) {
+        if (packetsPath == null) return;
+        long[] totals = packets.computeIfAbsent(packet.getClass().getSimpleName(), name -> new long[2]);
+        totals[0]++;
+        totals[1] += bytes;
+    }
+
     public void removed(int id) {
         if (out == null) return;
         write("r " + ticks + " " + id + "\n");
@@ -57,10 +72,24 @@ public final class EntityTrace {
 
     void close() {
         if (out == null) return;
+        writePackets();
         try {
             out.close();
         } catch (IOException error) { throw new IllegalStateException("cannot write the entity trace", error); }
         out = null;
+    }
+
+    /// Each packet class: how many, and their bytes. Counted under the lock, written after it, so
+    /// the network thread never waits on the disk.
+    private void writePackets() {
+        if (packetsPath == null) return;
+        StringBuilder text = new StringBuilder();
+        synchronized (this) {
+            packets.forEach((name, totals) -> text.append(name).append(' ').append(totals[0]).append(' ').append(totals[1]).append('\n'));
+        }
+        try {
+            Files.writeString(packetsPath, text);
+        } catch (IOException error) { throw new IllegalStateException("cannot write the packet counts", error); }
     }
 
     private void line(String prefix, Entity entity) {

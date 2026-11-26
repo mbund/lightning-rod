@@ -38,8 +38,6 @@ pub const ExperienceReplication = struct {
         pickup_events: usize = 1024,
         /// Keep a hash of every packet queued and whom to, for runs to be compared by.
         trace_sends: bool = false,
-        /// Send every position as the exact state, for client traces to prove: EntitySync's own.
-        exact_states: bool = false,
     };
     pub const Dependencies = struct { experience: *Experience, players: *Players, player_states: *PlayerStates, streaming: *Streaming, sessions: *sessions.Service, packets: *packets.Packets, tracking: *Tracking };
 
@@ -67,13 +65,15 @@ pub const ExperienceReplication = struct {
             .targets = try allocator.alloc(sessions.Service.Target, players),
             .deliveries = try allocator.alloc(sessions.Service.Delivery, players),
         };
-        self.sync = try .init(allocator, .{ .events = config.pickup_events, .trace_sends = config.trace_sends, .exact_states = config.exact_states, .visits = true }, .{ .players = deps.players, .sessions = deps.sessions, .packets = deps.packets, .tracking = deps.tracking, .pool = &owned.pool, .slots = owned.directory.capacity() }, .{
+        self.sync = try .init(allocator, .{ .events = config.pickup_events, .trace_sends = config.trace_sends, .visits = true }, .{ .players = deps.players, .sessions = deps.sessions, .packets = deps.packets, .tracking = deps.tracking, .tracker = self.tracker, .pool = &owned.pool, .slots = owned.directory.capacity() }, .{
             .kind = self,
             .write_data = writeData,
             .body = body,
             .identity = identity,
             .before = byId,
-            .update_interval = update_interval,
+            // A client eases an orb toward what it is sent, and moves it toward its own view of the
+            // nearest player.
+            .client = .{ .unpredictable = .{ .update_interval = update_interval } },
         });
         @memset(self.connections, .{});
         return self;
@@ -103,7 +103,7 @@ pub const ExperienceReplication = struct {
         for (experience.replicated.values()) |slot| self.sync.mark(@intCast(slot));
         experience.replicated.clear();
         const directory = &experience.deps.entities.directory;
-        for (self.sync.collect(self.tracker)) |slot| {
+        for (self.sync.collect()) |slot| {
             const entry = directory.entry(slot);
             if (experience.orbs.slotOf(entry.id) != slot) continue;
             const stored = experience.orbs.ptr(slot);

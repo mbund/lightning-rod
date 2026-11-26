@@ -201,9 +201,6 @@ pub const ItemEntities = struct {
     /// note them until they are due to send. Room for every slot, so none goes unnoted.
     changes: lightning_rod.system.IndexSet,
     moved: lightning_rod.system.IndexSet,
-    /// Items whose tick set Entity.hasImpulse: replication sends them that tick, whatever their
-    /// interval, and takes the set.
-    impulses: lightning_rod.system.IndexSet,
     /// Where every entity in memory is, the order they tick in, and the columns that tick,
     /// shared by every kind.
     places: *entities.Places,
@@ -249,7 +246,6 @@ pub const ItemEntities = struct {
             .io = io,
             .changes = try .init(allocator, bound),
             .moved = try .init(allocator, bound),
-            .impulses = try .init(allocator, bound),
             .items = try .init(allocator, deps.entities, kind),
             .asleep_ids = try .init(allocator, &deps.entities.pool, bound),
             .due_slots = try allocator.alloc(u32, bound),
@@ -664,7 +660,6 @@ pub const ItemEntities = struct {
         const at = self.items.slotOf(entity) orelse return error.UnknownItemEntity;
         self.changes.remove(at);
         self.moved.remove(at);
-        self.impulses.remove(at);
         const item = try self.items.takeById(entity) orelse return error.UnknownItemEntity;
         assert(!item.metadata.alive);
         if (item.stored) |column| try self.table.putBatch(&.{.{ .key = &entities.durable.key(record_prefix, column, entity), .value = null }});

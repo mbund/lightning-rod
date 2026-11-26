@@ -48,10 +48,8 @@ const Fixture = struct {
     yaws: []f32,
     data: []Marker.Data,
     slots: usize,
-    /// Positions go as exact states, so clients hold them to the bit.
-    exact: bool,
 
-    fn init(self: *Fixture, allocator: std.mem.Allocator, count: usize, seed: u64, exact: bool) !void {
+    fn init(self: *Fixture, allocator: std.mem.Allocator, count: usize, seed: u64) !void {
         const selected = comptime definitions: {
             var result: [protocols.implementations.len]sessions.Protocol = undefined;
             for (protocols.implementations, 0..) |Version, i| result[i] = .{ .number = Version.protocol_number };
@@ -78,15 +76,14 @@ const Fixture = struct {
             .yaws = undefined,
             .data = undefined,
             .slots = owned.directory.capacity(),
-            .exact = exact,
         };
         self.players.setRules(.init(Fixture, self, gameMode, spawnWorld, spawnPoint));
         self.players.entities = owned;
         try self.players.initIndexes(allocator);
         try self.players.rebuildIndexes();
         self.tracking = try Tracking.init(allocator, .{}, .{ .entities = owned, .players = &self.players });
-        _ = try self.tracking.register(.{ .kinds = .of(&.{Marker.kind}), .range = 64 });
-        self.sync = try .init(allocator, .{ .exact_states = exact }, .{ .players = &self.players, .sessions = service, .packets = packet_api, .tracking = self.tracking, .pool = &owned.pool }, .{ .kind = self, .write_data = Marker.writeData, .body = body, .identity = identity, .update_interval = Marker.update_interval, .track_deltas = false });
+        const tracker = try self.tracking.register(.{ .kinds = .of(&.{Marker.kind}), .range = 64 });
+        self.sync = try .init(allocator, .{}, .{ .players = &self.players, .sessions = service, .packets = packet_api, .tracking = self.tracking, .tracker = tracker, .pool = &owned.pool }, .{ .kind = self, .write_data = Marker.writeData, .body = body, .identity = identity, .client = .{ .unpredictable = .{ .update_interval = Marker.update_interval, .track_deltas = false } } });
         self.seen = try allocator.alloc(Seen, count * self.slots);
         @memset(self.seen, .{});
         self.yaws = try allocator.alloc(f32, self.slots);
@@ -211,22 +208,15 @@ const Fixture = struct {
                 seen.known = false;
             }
         } else if (id == Client.packetId(.entity_teleport)) {
-            const entity, const a = try Client.packet_entity_teleport.read(payload).entityId();
-            const x, const b = try a.x();
-            const y, const c = try b.y();
-            const z, _ = try c.z();
-            const seen = self.seenOf(client, entity);
-            try std.testing.expect(self.exact and seen.known);
-            seen.position = .{ x, y, z };
+            // One its clients cannot predict goes on ServerEntity's schedule, which sends none.
+            return error.TestUnexpectedResult;
         } else if (id == Client.packetId(.rel_entity_move)) {
-            try std.testing.expect(!self.exact);
             const entity, const a = try Client.packet_rel_entity_move.read(payload).entityId();
             const dx, const b = try a.dX();
             const dy, const c = try b.dY();
             const dz, _ = try c.dZ();
             moveBy(self.seenOf(client, entity), .{ dx, dy, dz });
         } else if (id == Client.packetId(.entity_move_look)) {
-            try std.testing.expect(!self.exact);
             const entity, const a = try Client.packet_entity_move_look.read(payload).entityId();
             const dx, const b = try a.dX();
             const dy, const c = try b.dY();
@@ -240,7 +230,6 @@ const Fixture = struct {
             const yaw, _ = try a.yaw();
             self.seenOf(client, entity).yaw = yaw;
         } else if (id == Client.packetId(.sync_entity_position)) {
-            try std.testing.expect(!self.exact);
             const entity, const a = try Client.packet_sync_entity_position.read(payload).entityId();
             const x, const b = try a.x();
             const y, const c = try b.y();
@@ -270,7 +259,7 @@ const Fixture = struct {
                 try std.testing.expectEqual(known, seen.known);
                 if (!known or self.tracking.stale(slot).contains(client)) continue;
                 const base = self.sync.views.at(slot).base;
-                for (seen.position, base) |got, want| if (self.exact) try std.testing.expectEqual(want, got) else try std.testing.expectApproxEqAbs(want, got, 1.0 / 4096.0);
+                for (seen.position, base) |got, want| try std.testing.expectApproxEqAbs(want, got, 1.0 / 4096.0);
             }
         }
     }
@@ -279,18 +268,12 @@ const Fixture = struct {
 test "clients see a kind on the shared ServerEntity as tracking and the sync say they have it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    for ([_]u64{ 7, 23, 42 }) |seed| try run(arena.allocator(), seed, false);
+    for ([_]u64{ 7, 23, 42 }) |seed| try run(arena.allocator(), seed);
 }
 
-test "with exact states, clients hold each entity where the server last sent it, to the bit" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    for ([_]u64{ 7, 23, 42 }) |seed| try run(arena.allocator(), seed, true);
-}
-
-fn run(allocator: std.mem.Allocator, seed: u64, exact: bool) !void {
+fn run(allocator: std.mem.Allocator, seed: u64) !void {
     var fixture: Fixture = undefined;
-    try fixture.init(allocator, 4, seed, exact);
+    try fixture.init(allocator, 4, seed);
     for (0..800) |tick| {
         // Now and then a client has no room, misses deltas, and is caught up once it has.
         for (0..fixture.records.len) |client| fixture.open(client, (tick + client) % 37 >= 3);

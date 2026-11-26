@@ -534,6 +534,14 @@ pub const Tracking = struct {
         return found orelse error.NoKinds;
     }
 
+    /// Whether every entity a tracker shows a player ticks: within `simulation` columns of the
+    /// player's, the square the server ticks entities in. Clients tick every entity they have, so
+    /// one shown past it would move on a client and stand still here.
+    pub fn ticksWhereShown(self: *const Tracking, tracker: TrackerId, simulation: i32) bool {
+        // A player at the edge of its column reaches a column further on that side.
+        return @as(f64, @floatFromInt(simulation * 16)) >= self.trackers[tracker].max_range + 16;
+    }
+
     /// A kind's entities are tracked from now on. Call while starting.
     pub fn register(self: *Tracking, spec: Spec) !TrackerId {
         if (self.tracker_count == max_trackers) return error.TooManyTrackers;

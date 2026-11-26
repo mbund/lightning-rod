@@ -118,7 +118,3 @@ test "operation counts for shared block delta retirement across delivery groups"
 test "operation counts for mining experience preserve vanilla drops and atomic admission" {
     try mining_replication.verifyExperience();
 }
-
-test "operation counts for item positions once per interval" {
-    try inventory.itemPositionInterval();
-}

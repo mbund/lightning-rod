@@ -575,44 +575,65 @@ test "online UUIDs format as Java writes them" {
     try std.testing.expectEqualStrings("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0", formatUuid(&buffer, 0x0f1e2d3c4b5a69788796a5b4c3d2e1f0));
 }
 
-/// Where the server traced its entities, each client's trace is held to it: between exact
-/// states, every tick a client computed must be the server's, bit for bit. What each client
-/// matched and where it strayed goes to `<peer>.entity-proof.txt`.
+/// Where the server traced its entities, each client's trace is held to it within the models'
+/// tolerance, which fails it, and to its models bit for bit where they are traced, which is told
+/// but does not: a client's tick count slips a tick against the server's as packets reach it a
+/// tick late or early, which moves an item at rest on another tick than its model, short of the
+/// tolerance. What each matched and where it strayed
+/// goes to `<peer>.entity-proof.txt`, and against the models to `<peer>.entity-model-proof.txt`.
 fn proveEntities(init: std.process.Init, artifacts: []const u8, peers: []const []const u8) !void {
+    // Against models, one may compare nothing, as a scene of arrows has none.
+    const models = try proveAgainst(init, artifacts, peers, "server.model.entities", "entity-model-proof", null);
+    if (models == .failed) std.log.warn("event=e2e_entity_model_proof_strayed artifacts={s}", .{artifacts});
+    // Against the server, one that compared nothing proves nothing.
+    switch (try proveAgainst(init, artifacts, peers, "server.entities", "entity-proof", model_tolerance)) {
+        .failed, .empty => return error.EntityProofFailed,
+        .missing, .passed => {},
+    }
+}
+
+/// How far a client may be from the truth before it is put right: the models' own.
+const model_tolerance = 1.0 / 16.0;
+
+fn proveAgainst(init: std.process.Init, artifacts: []const u8, peers: []const []const u8, traced: []const u8, report_name: []const u8, tolerance: ?f64) !enum { missing, empty, passed, failed } {
     const cwd = std.Io.Dir.cwd();
     const limit = std.Io.Limit.limited(1024 * 1024 * 1024);
-    const server_path = try std.fmt.allocPrint(init.gpa, "{s}/server.entities", .{artifacts});
+    const server_path = try std.fmt.allocPrint(init.gpa, "{s}/{s}", .{ artifacts, traced });
     defer init.gpa.free(server_path);
     const server_text = cwd.readFileAlloc(init.io, server_path, init.gpa, limit) catch |err| switch (err) {
-        error.FileNotFound => return,
+        error.FileNotFound => return .missing,
         else => return err,
     };
     defer init.gpa.free(server_text);
     var server = try entity_compare.Server.parse(init.gpa, server_text);
     defer server.deinit(init.gpa);
     var failed = false;
+    var compared: u64 = 0;
     for (peers) |peer| {
         const path = try std.fmt.allocPrint(init.gpa, "{s}/{s}.entities", .{ artifacts, peer });
         defer init.gpa.free(path);
         const client = try cwd.readFileAlloc(init.io, path, init.gpa, limit);
         defer init.gpa.free(client);
-        var report = try entity_compare.compare(init.gpa, &server, client, 64);
+        var report = try entity_compare.compare(init.gpa, &server, client, 64, tolerance);
         defer report.deinit(init.gpa);
-        const report_path = try std.fmt.allocPrint(init.gpa, "{s}/{s}.entity-proof.txt", .{ artifacts, peer });
+        const report_path = try std.fmt.allocPrint(init.gpa, "{s}/{s}.{s}.txt", .{ artifacts, peer, report_name });
         defer init.gpa.free(report_path);
         const file = try cwd.createFile(init.io, report_path, .{});
         defer file.close(init.io);
         var buffer: [4096]u8 = undefined;
         var writer = file.writer(init.io, &buffer);
         const out = &writer.interface;
-        try out.print("anchors {d} unmatched {d} compared {d} strayed {d} latent {d}\n", .{ report.anchors, report.unmatched, report.compared, report.strayed, report.latent });
+        try out.print("against {s}, tolerance {?d}\nanchors {d} unmatched {d} compared {d} strayed {d} latent {d} late {d} shown {d} farthest {d}\n", .{ traced, tolerance, report.anchors, report.unmatched, report.compared, report.strayed, report.latent, report.late, report.shown, report.farthest });
         for (report.divergences.items) |divergence| {
             try out.print("entity {d} at server tick {d}, {d} after its exact state, moving apart since {?d}\n  client {f}\n  server {f}\n", .{ divergence.id, divergence.server_tick, divergence.after, divergence.moved_apart, divergence.client, divergence.server });
         }
         try out.flush();
-        std.log.info("event=e2e_entity_proof peer={s} anchors={d} unmatched={d} compared={d} strayed={d} latent={d}", .{ peer, report.anchors, report.unmatched, report.compared, report.strayed, report.latent });
-        // A proof that compared nothing proves nothing.
-        if (report.strayed > 0 or report.unmatched > 0 or report.compared == 0) failed = true;
+        std.log.info("event=e2e_{s} peer={s} anchors={d} unmatched={d} compared={d} strayed={d} latent={d} late={d} shown={d} farthest={d}", .{ report_name, peer, report.anchors, report.unmatched, report.compared, report.strayed, report.latent, report.late, report.shown, report.farthest });
+        // Within a tolerance nothing past it may show, not even for the tick before its correction.
+        // One a correction came a tick late for is counted, not failed: a client that runs two ticks
+        // in one frame draws its own landing before any correction can reach it, as from vanilla.
+        compared += report.compared;
+        if (report.strayed > 0 or report.unmatched > 0 or (tolerance != null and report.shown > 0)) failed = true;
     }
-    if (failed) return error.EntityProofFailed;
+    return if (failed) .failed else if (compared == 0) .empty else .passed;
 }

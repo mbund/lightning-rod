@@ -1,1 +1,11 @@
-.{ .client = "EntityProofFixture", .scenarios = .{.{ .name = "entity-proof", .peers = .{"alice"} }} }
+.{ .client = "EntityProofFixture", .scenarios = .{
+    // Each client is held to the server within the tolerance, and to its class's models of what
+    // it steps bit for bit, which is told and not failed: a client's tick count slips a tick
+    // against the server's now and then, and an item pinned to the stream's end by its current
+    // steps otherwise on a 26.2 client.
+    .{ .name = "entity-proof", .fixture = "arrows", .peers = .{"alice"} },
+    .{ .name = "entity-proof-water", .fixture = "water", .peers = .{"alice"} },
+    .{ .name = "entity-proof-ocean", .fixture = "ocean", .peers = .{"alice"} },
+    // Items thrown onto ice, slime, soul sand, honey, a slab over ice and into a cobweb.
+    .{ .name = "entity-proof-blocks", .fixture = "blocks", .peers = .{"alice"} },
+} }

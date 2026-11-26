@@ -82,8 +82,8 @@ pub const MobReplication = struct {
             .write_data = writeData,
             .body = body,
             .identity = identity,
-            .update_interval = cow.update_interval,
-            .track_deltas = cow.track_deltas,
+            // A client eases a mob toward what it is sent, and its AI is the server's alone.
+            .client = .{ .unpredictable = .{ .update_interval = cow.update_interval, .track_deltas = cow.track_deltas } },
         });
         deps.mobs.events_full = .{ .context = self, .call = eventsFull };
         // A tracker for each range species track at, so every range is exact.
@@ -146,7 +146,7 @@ pub const MobReplication = struct {
         self.reading = .{ .whole = mob };
         try self.sync.update(index, .{
             .id = mob.entity.id,
-            .has_impulse = mob.entity.has_impulse,
+            .impulse = mob.entity.has_impulse,
             .hurt_marked = mob.entity.hurt_marked,
             .data = CowData.of(mob),
             .changed = changed,

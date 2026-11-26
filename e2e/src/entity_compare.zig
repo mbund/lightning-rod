@@ -11,8 +11,10 @@
 //! Doubles are their raw bits in hex. A packet's tick is the client's ticks done when it was
 //! handled, so the next tick is the first it shows in.
 //!
-//! An exact state, a teleport, anchors the entity to the server tick that held it. From there each
-//! of the client's ticks must equal the server's next, until another packet for it comes.
+//! An exact state, a teleport, anchors the entity to the server tick that held it, and so does a
+//! spawn, by where it is alone, as it rounds the velocity and puts the entity in the air. From there
+//! each of the client's ticks must equal the server's next. A motion packet changes how it moves,
+//! not when, so its stretch goes on; any other packet for it ends the stretch.
 const std = @import("std");
 
 pub const State = struct {
@@ -22,6 +24,19 @@ pub const State = struct {
 
     fn eql(a: State, b: State) bool {
         return std.mem.eql(u64, &a.position, &b.position) and std.mem.eql(u64, &a.velocity, &b.velocity) and a.on_ground == b.on_ground;
+    }
+
+    /// How far apart on the axis furthest apart.
+    fn distance(a: State, b: State) f64 {
+        var furthest: f64 = 0;
+        for (a.position, b.position) |x, y| furthest = @max(furthest, @abs(float(x) - float(y)));
+        return furthest;
+    }
+
+    /// Within `tolerance` on every axis: a difference no one sees, which a client model allows. Being
+    /// in another block shows only once it moves the client differently, as a later stray.
+    fn within(a: State, b: State, tolerance: f64) bool {
+        return a.distance(b) <= tolerance;
     }
 
     /// Where it is and whether on the ground, which a player sees: motion shows only in what follows.
@@ -59,6 +74,16 @@ pub const Report = struct {
     strayed: u64 = 0,
     /// Stretches whose motion differed but never where the entity was, until the next exact state.
     latent: u64 = 0,
+    /// Strays the next exact state put right a tick late: it was the server's from the tick before.
+    /// A client running two ticks in one frame handles packets only before both.
+    late: u64 = 0,
+    /// Strays the next exact state put right on the very tick, which the client drew first: what
+    /// the server could not send before the client computed it.
+    shown: u64 = 0,
+    /// The furthest apart a client was on an axis, on any tick compared.
+    farthest: f64 = 0,
+    /// Where that was: the entity and the server tick.
+    farthest_at: struct { id: i32 = 0, server_tick: u64 = 0 } = .{},
     divergences: std.ArrayList(Divergence) = .empty,
 
     pub fn deinit(self: *Report, allocator: std.mem.Allocator) void {
@@ -112,12 +137,13 @@ pub const Server = struct {
         return list.items[index].state;
     }
 
-    /// The tick that held a state nearest `near`: a resting entity holds one for many.
-    fn holding(self: *const Server, id: i32, state: State, near: ?i64) ?u64 {
+    /// The tick that held a state nearest `near`, or only where it was unless `whole`: a resting
+    /// entity holds one for many.
+    fn holding(self: *const Server, id: i32, state: State, whole: bool, near: ?i64) ?u64 {
         const list = self.by_id.get(id) orelse return null;
         var best: ?u64 = null;
         for (list.items) |item| {
-            if (!item.state.eql(state)) continue;
+            if (if (whole) !item.state.eql(state) else !std.mem.eql(u64, &item.state.position, &state.position)) continue;
             const guess = near orelse return item.tick;
             if (best == null or @abs(@as(i64, @intCast(item.tick)) - guess) < @abs(@as(i64, @intCast(best.?)) - guess)) best = item.tick;
         }
@@ -127,7 +153,7 @@ pub const Server = struct {
 
 /// A trace up to its last whole line: one stopped while writing leaves the last unfinished.
 fn finished(text: []const u8) []const u8 {
-    return text[0 .. if (std.mem.lastIndexOfScalar(u8, text, '\n')) |end| end + 1 else 0];
+    return text[0..if (std.mem.lastIndexOfScalar(u8, text, '\n')) |end| end + 1 else 0];
 }
 
 fn parseState(fields: *std.mem.TokenIterator(u8, .scalar)) !State {
@@ -138,9 +164,13 @@ fn parseState(fields: *std.mem.TokenIterator(u8, .scalar)) !State {
     return .{ .position = bits[0..3].*, .velocity = bits[3..6].*, .on_ground = ground[0] == '1' };
 }
 
+/// What a packet a client handled did to an entity: put it exactly, spawned it, changed how it
+/// moves, or anything else.
+const PacketKind = enum { exact, spawn, motion, other };
+
 const Record = union(enum) {
     tick: struct { tick: u64, id: i32, state: State },
-    packet: struct { tick: u64, exact: bool, id: i32, state: State },
+    packet: struct { tick: u64, kind: PacketKind, id: i32, state: State },
     removed: struct { tick: u64, id: i32 },
 };
 
@@ -155,7 +185,8 @@ fn parseClient(line: []const u8) !Record {
     if (std.mem.eql(u8, tag, "p")) {
         const kind = fields.next() orelse return error.Corrupt;
         const id = try std.fmt.parseInt(i32, fields.next() orelse return error.Corrupt, 10);
-        return .{ .packet = .{ .tick = tick, .exact = std.mem.eql(u8, kind, "teleport"), .id = id, .state = try parseState(&fields) } };
+        const parsed: PacketKind = if (std.mem.eql(u8, kind, "teleport")) .exact else if (std.mem.eql(u8, kind, "spawn")) .spawn else if (std.mem.eql(u8, kind, "motion")) .motion else .other;
+        return .{ .packet = .{ .tick = tick, .kind = parsed, .id = id, .state = try parseState(&fields) } };
     }
     if (std.mem.eql(u8, tag, "r")) return .{ .removed = .{ .tick = tick, .id = try std.fmt.parseInt(i32, fields.next() orelse return error.Corrupt, 10) } };
     return error.Corrupt;
@@ -174,7 +205,9 @@ const settle_ticks = 40;
 /// Compares a client's trace with the server's. The server's clock runs ahead of the client's by
 /// about the same each tick: the first anchor measures it, and it picks among the ticks a resting
 /// entity held still.
-pub fn compare(allocator: std.mem.Allocator, server: *const Server, client: []const u8, limit: usize) !Report {
+/// With a `tolerance`, a client strays only when it is further than that on an axis: as a client
+/// model allows, which keeps a client within it of the truth.
+pub fn compare(allocator: std.mem.Allocator, server: *const Server, client: []const u8, limit: usize, tolerance: ?f64) !Report {
     var report: Report = .{};
     errdefer report.deinit(allocator);
     var stretches: std.AutoHashMapUnmanaged(i32, Stretch) = .empty;
@@ -183,15 +216,28 @@ pub fn compare(allocator: std.mem.Allocator, server: *const Server, client: []co
     var lines = std.mem.tokenizeScalar(u8, finished(client), '\n');
     while (lines.next()) |line| switch (try parseClient(line)) {
         .packet => |packet| {
-            const previous = stretches.fetchRemove(packet.id);
-            if (!packet.exact) {
-                if (previous) |entry| try settle(allocator, &report, entry.value, null, limit);
+            // How it moves changed, not when: its stretch goes on. One that put right a stray on the
+            // very tick it strayed came a tick late, as for a client running two ticks in one frame:
+            // its stretch ends, as the client comes back from what it did meanwhile on its own.
+            if (packet.kind == .motion) {
+                const stretch = stretches.getPtr(packet.id) orelse continue;
+                const strayed = stretch.strayed orelse continue;
+                if (packet.tick != stretch.client_tick + strayed.after) continue;
+                report.late += 1;
+                _ = stretches.remove(packet.id);
                 continue;
             }
+            const previous = stretches.fetchRemove(packet.id);
+            if (packet.kind == .other) {
+                if (previous) |entry| try settle(allocator, &report, server, entry.value, null, limit);
+                continue;
+            }
+            // An entity this trace does not hold, as an arrow in one of models, is not proven by it.
+            if (server.by_id.get(packet.id) == null) continue;
             report.anchors += 1;
             const near: ?i64 = if (offset) |value| @as(i64, @intCast(packet.tick)) + value else null;
-            const server_tick = server.holding(packet.id, packet.state, near);
-            if (previous) |entry| try settle(allocator, &report, entry.value, packet.state, limit);
+            const server_tick = server.holding(packet.id, packet.state, packet.kind == .exact, near);
+            if (previous) |entry| try settle(allocator, &report, server, entry.value, packet.state, limit);
             const anchored = server_tick orelse {
                 report.unmatched += 1;
                 continue;
@@ -199,7 +245,7 @@ pub fn compare(allocator: std.mem.Allocator, server: *const Server, client: []co
             if (offset == null) offset = @as(i64, @intCast(anchored)) - @as(i64, @intCast(packet.tick));
             try stretches.put(allocator, packet.id, .{ .client_tick = packet.tick, .server_tick = anchored });
         },
-        .removed => |removed| if (stretches.fetchRemove(removed.id)) |entry| try settle(allocator, &report, entry.value, null, limit),
+        .removed => |removed| if (stretches.fetchRemove(removed.id)) |entry| try settle(allocator, &report, server, entry.value, null, limit),
         .tick => |seen| {
             const stretch = stretches.getPtr(seen.id) orelse continue;
             if (stretch.broken or seen.tick <= stretch.client_tick) continue;
@@ -210,9 +256,15 @@ pub fn compare(allocator: std.mem.Allocator, server: *const Server, client: []co
                 continue;
             };
             report.compared += 1;
-            if (seen.state.eql(expected)) continue;
+            if (seen.state.distance(expected) > report.farthest) {
+                report.farthest = seen.state.distance(expected);
+                report.farthest_at = .{ .id = seen.id, .server_tick = stretch.server_tick + after };
+            }
+            if (tolerance) |allowed| {
+                if (seen.state.within(expected, allowed)) continue;
+            } else if (seen.state.eql(expected)) continue;
             // Motion apart in the same place: the next ticks show whether it ever comes to anything.
-            if (seen.state.seen(expected)) {
+            if (tolerance == null and seen.state.seen(expected)) {
                 if (stretch.moved_apart == null) stretch.moved_apart = stretch.server_tick + after;
                 continue;
             }
@@ -224,19 +276,28 @@ pub fn compare(allocator: std.mem.Allocator, server: *const Server, client: []co
     var waiting = stretches.valueIterator();
     while (waiting.next()) |stretch| {
         if (stretch.strayed) |strayed| if (server.last(strayed.id) < strayed.server_tick + settle_ticks) continue;
-        try settle(allocator, &report, stretch.*, null, limit);
+        try settle(allocator, &report, server, stretch.*, null, limit);
     }
     return report;
 }
 
 /// A stretch, ended by the next exact state, `corrected`, or by something else: where it strayed
 /// counts unless that state excuses it, and motion apart that never showed is noted.
-fn settle(allocator: std.mem.Allocator, report: *Report, stretch: Stretch, corrected: ?State, limit: usize) !void {
+fn settle(allocator: std.mem.Allocator, report: *Report, server: *const Server, stretch: Stretch, corrected: ?State, limit: usize) !void {
     const divergence = stretch.strayed orelse {
         if (stretch.moved_apart != null) report.latent += 1;
         return;
     };
-    if (corrected) |state| if (state.eql(divergence.server)) return;
+    if (corrected) |state| {
+        if (state.eql(divergence.server)) {
+            report.shown += 1;
+            return;
+        }
+        if (server.at(divergence.id, divergence.server_tick - 1)) |before| if (state.eql(before)) {
+            report.late += 1;
+            return;
+        };
+    }
     if (report.divergences.items.len < limit) try report.divergences.append(allocator, divergence);
     report.strayed += 1;
 }
@@ -283,7 +344,7 @@ test "a client that steps as the server does matches from its anchor on, and one
     try client.appendSlice(allocator, traced(&buffer, "t ", 102, 5, falling[2]));
     try client.appendSlice(allocator, traced(&buffer, "t ", 103, 5, .{ 0, 69.76, 0, 0, -0.155, 0, 0 }));
     try client.appendSlice(allocator, traced(&buffer, "t ", 104, 5, falling[3]));
-    var report = try compare(allocator, &server, client.items, 8);
+    var report = try compare(allocator, &server, client.items, 8, null);
     defer report.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 1), report.anchors);
     try std.testing.expectEqual(@as(u64, 0), report.unmatched);
@@ -307,7 +368,7 @@ test "a client that strays on the tick the server sent exactly was put right, no
     try client.appendSlice(allocator, traced(&buffer, "t ", 103, 5, .{ 0, 69.76, 0, 0, -0.155, 0, 0 }));
     try anchor(allocator, &client, 104, falling[3]);
     try client.appendSlice(allocator, traced(&buffer, "t ", 105, 5, falling[3]));
-    var report = try compare(allocator, &server, client.items, 8);
+    var report = try compare(allocator, &server, client.items, 8, null);
     defer report.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 2), report.anchors);
     try std.testing.expectEqual(@as(u64, 0), report.strayed);
@@ -326,8 +387,48 @@ test "a client corrected only on its next turn was wrong until then" {
     try client.appendSlice(allocator, traced(&buffer, "t ", 101, 5, falling[1]));
     try client.appendSlice(allocator, traced(&buffer, "t ", 102, 5, .{ 0, 69.87, 0, 0, -0.1, 0, 0 }));
     try anchor(allocator, &client, 103, falling[3]);
-    var report = try compare(allocator, &server, client.items, 8);
+    var report = try compare(allocator, &server, client.items, 8, null);
     defer report.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 1), report.strayed);
     try std.testing.expectEqual(@as(u64, 12), report.divergences.items[0].server_tick);
+}
+
+test "a correction a tick late is told apart from a client that could not compute it" {
+    const allocator = std.testing.allocator;
+    var server = try serverFalling(allocator);
+    defer server.deinit(allocator);
+    var client: std.ArrayList(u8) = .empty;
+    defer client.deinit(allocator);
+    var buffer: [256]u8 = undefined;
+    // It strays on tick 13, and the exact state that comes after is tick 12's.
+    try anchor(allocator, &client, 100, falling[0]);
+    try client.appendSlice(allocator, traced(&buffer, "t ", 101, 5, falling[1]));
+    try client.appendSlice(allocator, traced(&buffer, "t ", 102, 5, falling[2]));
+    try client.appendSlice(allocator, traced(&buffer, "t ", 103, 5, .{ 0, 69.7, 0, 0, -0.155, 0, 0 }));
+    try anchor(allocator, &client, 103, falling[2]);
+    var report = try compare(allocator, &server, client.items, 8, null);
+    defer report.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 0), report.strayed);
+    try std.testing.expectEqual(@as(u64, 1), report.late);
+}
+
+test "a stray its motion is put right for on the tick it strayed came a tick late" {
+    const allocator = std.testing.allocator;
+    var server = try serverFalling(allocator);
+    defer server.deinit(allocator);
+    var client: std.ArrayList(u8) = .empty;
+    defer client.deinit(allocator);
+    var buffer: [256]u8 = undefined;
+    // It bounces on tick 13, and the motion that stops it is handled after that very tick.
+    try anchor(allocator, &client, 100, falling[0]);
+    try client.appendSlice(allocator, traced(&buffer, "t ", 101, 5, falling[1]));
+    try client.appendSlice(allocator, traced(&buffer, "t ", 102, 5, falling[2]));
+    try client.appendSlice(allocator, traced(&buffer, "t ", 103, 5, .{ 0, 69.9, 0, 0, 0.1, 0, 0 }));
+    const motion = traced(&buffer, "", 103, 5, .{ 0, 69.9, 0, 0, 0, 0, 0 });
+    try client.print(allocator, "p {d} motion ", .{103});
+    try client.appendSlice(allocator, motion[std.mem.indexOfScalar(u8, motion, ' ').? + 1 ..]);
+    var report = try compare(allocator, &server, client.items, 8, 1.0 / 16.0);
+    defer report.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 0), report.strayed);
+    try std.testing.expectEqual(@as(u64, 1), report.late);
 }

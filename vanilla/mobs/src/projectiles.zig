@@ -422,6 +422,12 @@ pub const Projectiles = struct {
     /// last looked, and those pushed; and the pickups players made this tick.
     replicated: IndexSet,
     impulses: IndexSet,
+    /// Those whose path this tick met a mob or a player, grown as findTarget sweeps it: a client
+    /// steps it against its own copy of them, which lags, so it may hit what the server missed or
+    /// miss what it hit. Once it meets none, what clients have of it is put right.
+    uncertain: IndexSet,
+    /// The projectile ticking met one so far this tick.
+    met_body: bool = false,
     pickups: []Taken,
     pickup_count: usize = 0,
 
@@ -489,6 +495,7 @@ pub const Projectiles = struct {
             .air_state = @intCast(game_data.registry.blockStateId("minecraft:air").?),
             .replicated = try .init(allocator, deps.entities.directory.capacity()),
             .impulses = try .init(allocator, deps.entities.directory.capacity()),
+            .uncertain = try .init(allocator, deps.entities.directory.capacity()),
             .pickups = try allocator.alloc(Taken, pickups_max),
             .entered = try allocator.alloc(DomainColumn, deps.domains.capacity()),
             .left = try allocator.alloc(DomainColumn, deps.domains.capacity()),
@@ -973,6 +980,17 @@ pub const Projectiles = struct {
         // Sleepers whose path the edited section reaches, within a block, look again.
         const low: [3]f64 = .{ @floatFromInt(section.x * 16 - 1), @floatFromInt(section.y * 16 - 1), @floatFromInt(section.z * 16 - 1) };
         self.rouseMeeting(section.world, .{ .low = low, .high = .{ low[0] + 18, low[1] + 18, low[2] + 18 } }, 0);
+        // Clients step their arrows before they hear of the edit: those flying in or next to the
+        // section are uncertain this tick.
+        self.deps.entities.places.space.each(section.world, .{ .min = low, .max = .{ low[0] + 18, low[1] + 18, low[2] + 18 } }, self.kinds, self, struct {
+            fn visit(projectiles: *Projectiles, entry: entities.space.Entry) anyerror!bool {
+                projectiles.uncertain.insert(entry.slot);
+                return false;
+            }
+        }.visit) catch |err| {
+            self.failure = err;
+            return;
+        };
         if (self.count == self.ticking + self.sleeping or self.failure != null) return;
         for (edits) |edit| {
             const index: i32 = edit.index;
@@ -2124,6 +2142,8 @@ pub const Projectiles = struct {
         const projectile = held.projectile;
         if (projectile.data_changed or projectile.impulse) self.replicated.insert(held.slot);
         if (projectile.impulse) self.impulses.insert(held.slot);
+        if (self.met_body) self.uncertain.insert(held.slot);
+        self.met_body = false;
         projectile.data_changed = false;
         projectile.impulse = false;
     }
@@ -2277,6 +2297,7 @@ pub const Projectiles = struct {
             fn visit(context: *@TypeOf(search), mob: Mob) anyerror!bool {
                 const mobs = context.projectiles.deps.mobs;
                 const index = mobs.slotOf(mob.entity.id).?;
+                if (mob.alive()) context.projectiles.met_body = true;
                 if (!mob.alive() or context.projectiles.pierced(context.projectile, mob.entity.id)) return false;
                 const distance = clip(grown(living.box(mobs, mob), context.margin), context.from, context.to) orelse return false;
                 if (distance < context.best_distance.*) {
@@ -2293,7 +2314,10 @@ pub const Projectiles = struct {
             var players = self.deps.players.nearby(projectile.world, .{ .x = (low[0] + high[0]) / 2, .y = 0, .z = (low[2] + high[2]) / 2 }, @intFromFloat(@ceil((high[0] - low[0] + high[2] - low[2]) / 32) + 1));
             while (players.next()) |other| {
                 const box = playerBox(&self.deps.players.records[other]);
-                if (!box.intersects(swept) or !self.canHitPlayer(projectile, other)) continue;
+                if (!box.intersects(swept)) continue;
+                // Not its owner, which it leaves at once and seldom turns back to.
+                if (other != projectile.owner) self.met_body = true;
+                if (!self.canHitPlayer(projectile, other)) continue;
                 self.nearer(&best, &best_distance, .{ .player = other }, box, margin, from, to);
             }
             return best;
@@ -2304,7 +2328,9 @@ pub const Projectiles = struct {
         const bounds = shared.bounds orelse return best;
         if (!bounds.intersects(swept)) return best;
         for (shared.players, shared.boxes) |other, box| {
-            if (!box.intersects(swept) or !self.mayHit(projectile, other)) continue;
+            if (!box.intersects(swept)) continue;
+            if (other != projectile.owner) self.met_body = true;
+            if (!self.mayHit(projectile, other)) continue;
             self.nearer(&best, &best_distance, .{ .player = other }, box, margin, from, to);
         }
         return best;

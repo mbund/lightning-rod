@@ -31,8 +31,6 @@ pub const ProjectileReplication = struct {
     pub const Configuration = struct {
         /// Keep a hash of every packet asked to be sent and whom to, for runs to be compared by.
         trace_sends: bool = false,
-        /// Send every position as the exact state, for client traces to prove: EntitySync's own.
-        exact_states: bool = false,
     };
     pub const Dependencies = struct { projectiles: *Projectiles, tracking: *Tracking, players: *Players, sessions: *sessions.Service, packets: *packets.Packets, entities: *entities.Entities };
 
@@ -45,13 +43,14 @@ pub const ProjectileReplication = struct {
         const self = try allocator.create(ProjectileReplication);
         self.* = .{ .deps = deps, .sync = undefined };
         try deps.projectiles.track(deps.tracking);
-        self.sync = try .init(allocator, .{ .trace_sends = config.trace_sends, .exact_states = config.exact_states, .visits = true }, .{ .players = deps.players, .sessions = deps.sessions, .packets = deps.packets, .tracking = deps.tracking, .pool = &deps.entities.pool, .slots = deps.entities.directory.capacity() }, .{
+        self.sync = try .init(allocator, .{ .trace_sends = config.trace_sends, .visits = true }, .{ .players = deps.players, .sessions = deps.sessions, .packets = deps.packets, .tracking = deps.tracking, .tracker = deps.projectiles.tracker, .pool = &deps.entities.pool, .slots = deps.entities.directory.capacity() }, .{
             .kind = self,
             .write_data = writeData,
             .body = body,
             .identity = identity,
             .before = byId,
-            .update_interval = Projectiles.update_interval,
+            // A client flies an arrow as the server does, from its spawn's rounded velocity.
+            .client = .{ .simulates = .{} },
         });
         return self;
     }
@@ -73,15 +72,23 @@ pub const ProjectileReplication = struct {
         for (projectiles.replicated.values()) |slot| self.sync.mark(@intCast(slot));
         projectiles.replicated.clear();
         defer projectiles.impulses.clear();
+        defer projectiles.uncertain.clear();
+        // One whose path met a body: whether it is still, which the sync looks at while it is.
+        for (projectiles.uncertain.values()) |slot| self.sync.mark(@intCast(slot));
         const directory = &self.deps.entities.directory;
-        for (self.sync.collect(projectiles.tracker)) |slot| {
+        for (self.sync.collect()) |slot| {
             const entry = directory.entry(slot);
             if (entry.id == 0 or entry.retired or !projectiles.holds(slot)) continue;
             const seen = (try projectiles.shown(slot)) orelse continue;
             self.reading = seen;
             try self.sync.update(slot, .{
                 .id = entry.id,
-                .has_impulse = projectiles.impulses.contains(slot),
+                // What the server alone does to it: falling loose, hits, deflections, a loyal
+                // trident's return, and its block hit, whose in-ground flag must not reach a client
+                // before the place it stopped.
+                .impulse = projectiles.impulses.contains(slot),
+                // Its path met a mob or a player, which a client steps it against its own copy of.
+                .uncertain = projectiles.uncertain.contains(slot),
                 .data = .{
                     .critical = seen.data.critical,
                     .pierce = seen.data.pierce,

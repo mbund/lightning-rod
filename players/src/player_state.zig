@@ -41,6 +41,9 @@ pub const Player = struct {
     known_movement: [3]f64 = @splat(0),
     /// Whether a move packet came this client tick.
     moved: bool = false,
+    /// The client ticks it ended since it began playing, as its ServerboundClientTickEndPacket
+    /// says: what clients that compute entities themselves stepped them by.
+    client_ticks: u64 = 0,
     /// The skin layers the player's client shows, one bit each, as its settings say.
     skin_parts: u8 = 0,
     /// Which chat the client shows, as its settings say: 0 everything, 1 only system messages, 2

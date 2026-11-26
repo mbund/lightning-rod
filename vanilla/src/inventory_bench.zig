@@ -525,7 +525,7 @@ pub fn benchmarkItemReplication() !void {
         @memset(streaming.published.sent, std.math.maxInt(u64));
         @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
-        const replication = try ItemReplication.init(allocator, .{ .position_interval = 200 }, .{ .dropped = dropped, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
+        const replication = try ItemReplication.init(allocator, .{}, .{ .dropped = dropped, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
         const Mode = enum { blocked_spawn, spawn, unchanged, single_move, unchanged_after_single_move, single_stack, unchanged_after_single_stack, age_only, blocked_change, change, mutation, unchanged_after_mutation, blocked_mutation, resumed_mutation, blocked_retirement, retirement, reuse, unchanged_after_reuse, leave_view, return_view, viewer_reset };
         for (std.enums.values(Mode)) |mode| {
             const blocked = mode == .blocked_spawn or mode == .blocked_change or mode == .blocked_mutation or mode == .blocked_retirement;
@@ -878,7 +878,7 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
     @memset(streaming.published.sent, std.math.maxInt(u64));
     @memset(streaming.published.occluded, 0);
     streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
-    const replication = try ItemReplication.init(allocator, .{ .position_interval = 200 }, .{ .dropped = dropped, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
+    const replication = try ItemReplication.init(allocator, .{}, .{ .dropped = dropped, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
 
     const Step = struct { position: [2]f64, visible: bool = true, unchanged: bool = false };
     const steps = [_]Step{
@@ -1001,7 +1001,7 @@ pub fn benchmarkItemVisibility() !void {
         @memset(streaming.published.sent, std.math.maxInt(u64));
         @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
-        const replication = try ItemReplication.init(allocator, .{ .position_interval = 200 }, .{ .dropped = dropped, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
+        const replication = try ItemReplication.init(allocator, .{}, .{ .dropped = dropped, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
 
         for (0..9) |mode| {
             if (mode == 2) {
@@ -1295,11 +1295,14 @@ pub fn benchmarkIdleTerrain() !void {
     try output.interface.flush();
 }
 
+/// Items an edit nearby leaves their clients unsure of are put right for every viewer in one go:
+/// the corrections of entities that go to the same players share an audience, each player takes
+/// them in id order, and one with no room is caught up once it has.
 pub fn benchmarkItemBroadcast() !void {
     const io = std.testing.io;
     var output_buffer: [2048]u8 = undefined;
     var output = std.Io.File.stdout().writer(io, &output_buffer);
-    try output.interface.writeAll("moving items | viewers | shared audiences | credit reservations | movement packets\n");
+    try output.interface.writeAll("items put right | viewers | shared audiences | credit reservations | corrections\n");
     for ([_]usize{ 64, 256 }) |count| for ([_]usize{ 1, 16, 64 }) |viewers| {
         var temporary = std.testing.tmpDir(.{});
         defer temporary.cleanup();
@@ -1364,7 +1367,7 @@ pub fn benchmarkItemBroadcast() !void {
         @memset(streaming.published.sent, std.math.maxInt(u64));
         @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
-        const replication = try ItemReplication.init(allocator, .{ .position_interval = 1 }, .{ .dropped = dropped, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
+        const replication = try ItemReplication.init(allocator, .{}, .{ .dropped = dropped, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
 
         const expected_viewers = viewers;
         for (0..2) |_| {
@@ -1394,6 +1397,8 @@ pub fn benchmarkItemBroadcast() !void {
                 var metadata = try dropped.get(held_id);
                 metadata.revision += 1;
                 try dropped.put(held_id, metadata);
+                // As blocks it moves among changed: what its clients hold cannot be trusted.
+                replication.sync.models.?.disturb(dropped.items.slotOf(held_id).?);
             }
             for (service.credit, 0..) |*credit, index| {
                 const bytes = if (limited and index == 0) service.framedBound(128) * 2 else service.config.credit_bytes;
@@ -1417,14 +1422,14 @@ pub fn benchmarkItemBroadcast() !void {
                 const protocol = player_records[packet.recipients.first().?.index].protocol;
                 var expected_id: ?i32 = null;
                 inline for (protocols.implementations) |Version| {
-                    if (protocol == Version.protocol_number) expected_id = Version.Protocol.play.toClient.packetId(.rel_entity_move);
+                    if (protocol == Version.protocol_number) expected_id = Version.Protocol.play.toClient.packetId(.entity_teleport);
                 }
-                // A move, as ServerEntity sends it: an eighth of a block from where it was last sent.
+                // Its exact state: where it is now, an eighth of a block from where its clients have it.
                 try std.testing.expectEqual(expected_id.?, header.id);
-                const reader: wire.play.toClient.packet_rel_entity_move.Reader = .{ ._cursor = .{ .buffer = header.body, .rest = header.body } };
+                const reader: wire.play.toClient.packet_entity_teleport.Reader = .{ ._cursor = .{ .buffer = header.body, .rest = header.body } };
                 const id, const next = try reader.entityId();
-                const dx, _ = try next.dX();
-                try std.testing.expectEqual(@as(i16, 512), dx);
+                const x, _ = try next.x();
+                try std.testing.expectEqual(@as(f64, if (limited) 0.75 else 0.625), x);
                 const at: usize = @intCast(id - dropped.networkId(ids[0]));
                 try std.testing.expect(at < count);
                 var recipient_iterator = packet.recipients.iterator();
@@ -1465,13 +1470,13 @@ pub fn benchmarkItemBroadcast() !void {
                 var retry = service.outputBatch();
                 while (retry.next()) |packet| {
                     const header = try wire.play.toClient.readHeader(packet.bytes);
-                    // The viewer behind is sent each item whole: where it is, its data and its head.
-                    if (header.id != wire.play.toClient.packetId(.sync_entity_position)) {
+                    // The viewer behind is sent each item whole: its exact state, its data and its head.
+                    if (header.id != wire.play.toClient.packetId(.entity_teleport)) {
                         try std.testing.expectEqual(@as(u16, 0), packet.recipients.first().?.index);
                         service.recycle(io, &.{packet});
                         continue;
                     }
-                    const reader: wire.play.toClient.packet_sync_entity_position.Reader = .{ ._cursor = .{ .buffer = header.body, .rest = header.body } };
+                    const reader: wire.play.toClient.packet_entity_teleport.Reader = .{ ._cursor = .{ .buffer = header.body, .rest = header.body } };
                     const id, _ = try reader.entityId();
                     const at: usize = @intCast(id - dropped.networkId(ids[0]));
                     try std.testing.expectEqual(@as(usize, 1), packet.recipients.len);
@@ -1738,7 +1743,7 @@ pub fn benchmarkItemBoundaries() !void {
         @memset(streaming.published.sent, std.math.maxInt(u64));
         @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
-        const replication = try ItemReplication.init(allocator, .{ .position_interval = 200 }, .{ .dropped = dropped, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
+        const replication = try ItemReplication.init(allocator, .{}, .{ .dropped = dropped, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
 
         failing.fail_index = failing.alloc_index;
         const Step = struct { position: [2]f64, visible: bool = true, unchanged: bool = false };
@@ -2329,96 +2334,4 @@ fn survivalStates(allocator: std.mem.Allocator, players: []const Players.Player)
     const result = try allocator.create(PlayerStates);
     result.* = .{ .deps = undefined, .config = .{ .gamemode = .survival }, .records = states };
     return result;
-}
-
-/// A dropped item moving every tick goes out once per interval, as vanilla tracks items.
-pub fn itemPositionInterval() !void {
-    const io = std.testing.io;
-    const count = 1;
-    {
-        var temporary = std.testing.tmpDir(.{});
-        defer temporary.cleanup();
-        var path_buffer: [256]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/replication", .{temporary.sub_path});
-        var store = try storage.Store.init(std.testing.allocator, io, .{ .path = path });
-        defer store.deinit();
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        const allocator = arena.allocator();
-        var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .capacity = 256 });
-        defer registry.deinit();
-        const workspaces = try records.Workspaces.init(allocator, io, .{});
-        const ownership = try inventories.Inventories.init(allocator, io, .{ .cache_slots = 128, .cache_items = 8, .max_item_bytes = 1024 }, .{
-            .metrics = &registry,
-            .storage = try store.openSpace("inventory"),
-            .record_workspaces = workspaces,
-        });
-        const gameplay_definitions = try vanilla_content.prepare(allocator);
-        const items = try Items.init(allocator, .{}, .{ .definitions = gameplay_definitions.items, .inventories = ownership, .registry_identity = undefined });
-        const stack: inventories.Stack = .{ .item = try items.define("minecraft:bread"), .count = 1 };
-        const bodies = try entities.Entities.init(allocator, io, .{}, .{ .metrics = &registry, .storage = try store.openSpace("bodies"), .record_workspaces = workspaces });
-        const dimensions = try worlds.Worlds.init(allocator, .{ .maximum = 1 }, .{ .storage = try store.openSpace("worlds") });
-        const world = try dimensions.create(.{ .name = "test:world", .dimension = .{ .name = "test:dimension", .minimum_section = 0, .section_count = 16 } });
-        const dropped = try ItemEntities.init(allocator, io, .{}, .{
-            .metrics = &registry,
-            .record_workspaces = workspaces,
-            .entities = bodies,
-            .inventories = ownership,
-            .items = items,
-            .worlds = dimensions,
-            .storage = try store.openSpace("metadata"),
-        });
-        var ids: [64]entities.Id = undefined;
-        for (ids[0..count]) |*id| id.* = try dropped.create(world, .{ 0.5, 65, 0.5 }, @splat(0), stack);
-        var catalog = try protocols.Default.init(allocator);
-        defer catalog.deinit(allocator);
-        var sink: Sink = .{};
-        const transport: network.Transport = .{ .context = &sink, .vtable = network.Transport.adapter(Sink) };
-        const service = try sessions.Service.init(allocator, io, transport, .{ .connections = 1, .pages = 512, .page_bytes = 4096, .credit_bytes = 1024 * 1024, .protocols = &catalog.values });
-        defer service.deinit();
-        const encoding = try packets.Packets.init(allocator, .{ .sessions = service });
-        var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .loaded = true, .protocol = catalog.values[0].number }};
-        var players: Players = .{ .deps = undefined, .config = .{ .render_distance = 2 }, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
-        try players.initIndexes(allocator);
-        try players.rebuildIndexes();
-        const terrain = try chunks.Chunks.init(allocator, io, .{ .cache_sections = 256, .cache_groups = 4 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
-        const block_properties = &(try vanilla_content.blocks(allocator)).published;
-        const streaming = try Streaming.init(allocator, io, .{ .chunk_sections = 24, .fallback_biome = game_data.registry.biomeId("minecraft:plains").? }, .{ .metrics = &registry, .players = &players, .chunks = terrain, .sessions = service, .packets = encoding, .worlds = dimensions, .blocks = block_properties, .lighting = try Lighting.init(allocator, .{ .chunk_sections = 24 }, .{ .metrics = &registry, .blocks = block_properties, .chunks = terrain, .worlds = dimensions }) });
-        defer service.unsubscribeOutput(streaming.changed);
-        defer terrain.unsubscribeReady(streaming.changed);
-        streaming.published.setStream(0, .{ .generation = 1, .life = player_records[0].life, .setup = .streaming });
-        @memset(streaming.published.sent, std.math.maxInt(u64));
-        @memset(streaming.published.occluded, 0);
-        streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
-        const replication = try ItemReplication.init(allocator, .{}, .{ .dropped = dropped, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
-        var positions: usize = 0;
-        for (0..41) |tick| {
-            if (tick > 0) {
-                const held_id = (ids[0..1])[0];
-                const before = (try dropped.read(held_id)).?.body;
-                var after = before;
-                after.position[0] += 0.125;
-                try dropped.move(held_id, before, after);
-                var metadata = try dropped.get(held_id);
-                metadata.revision += 1;
-                try dropped.put(held_id, metadata);
-            }
-            service.credit[0].store((@as(u64, 1) << 32) | sessions.Service.active | service.config.credit_bytes, .release);
-            service.beginTick();
-            streaming.tick();
-            try replication.deps.tracking.tick();
-            try replication.tick();
-            service.endTick(true);
-            service.flush();
-            var batch = service.outputBatch();
-            var queued: usize = 0;
-            while (batch.next()) |packet| {
-                queued += 1;
-                service.recycle(io, &.{packet});
-            }
-            // The first tick spawns the item, every later packet is a position.
-            if (tick > 0) positions += queued;
-        }
-        try std.testing.expectEqual(@as(usize, 2), positions);
-    }
 }

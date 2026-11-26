@@ -1,6 +1,7 @@
 //! What clients know of dropped items, through the shared entity sync: tracking says who is to
-//! have each item, and the sync sends its spawns, removals and motion as ServerEntity does, its
-//! stack and flags as they change, and its pickups before it goes. Stacks are read in batches,
+//! have each item, and the sync sends its spawns and removals, corrects what its clients step of
+//! it where they would look apart from it, sends its stack and flags as they change, and its
+//! pickups before it goes. Stacks are read in batches,
 //! only for the items whose stack something is to be sent of.
 
 const std = @import("std");
@@ -15,6 +16,8 @@ const packets = @import("minecraft_packets");
 const wire = @import("wire_1_21_5");
 const replication = @import("replication");
 const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
+const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
+const ItemTick = @import("item_tick.zig").ItemTick;
 const Players = @import("players").players.Players;
 const Tracking = replication.tracking.Tracking;
 const IndexSet = lightning_rod.system.IndexSet;
@@ -35,15 +38,10 @@ pub const ItemReplication = struct {
     pub const id = "minecraft:item_replication";
 
     pub const Configuration = struct {
-        /// EntityType.ITEM's trackingTickInterval: ticks between an item's movement updates,
-        /// which clients move it by its velocity in between.
-        position_interval: u8 = 20,
         /// Pickups owed to clients at once; past it the oldest is let go.
         pickup_events: usize = 1024,
         /// Keep a hash of every packet queued, for runs to be compared by.
         trace_sends: bool = false,
-        /// Send every position as the exact state, for client traces to prove: EntitySync's own.
-        exact_states: bool = false,
     };
 
     pub const Dependencies = struct {
@@ -55,6 +53,10 @@ pub const ItemReplication = struct {
         entities: *entities.Entities,
         inventories: *inventories.Inventories,
         items: *Items,
+        /// What steps the items, and beside each its clients' models of it. Without it, as where
+        /// replication alone is measured, nothing steps them, so nothing but what tracking, data
+        /// and the backstop send goes.
+        item_tick: ?*ItemTick = null,
     };
 
     /// A stack read this tick, for the item in a slot, while its definition is held.
@@ -80,7 +82,6 @@ pub const ItemReplication = struct {
     read_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*ItemReplication {
-        if (config.position_interval == 0) return error.InvalidConfiguration;
         const self = try allocator.create(ItemReplication);
         self.* = .{
             .deps = deps,
@@ -90,16 +91,19 @@ pub const ItemReplication = struct {
             .collections = try .init(allocator, &deps.entities.pool),
             .listener = .{ .context = self, .function = slotChanged },
         };
-        self.sync = try .init(allocator, .{ .events = config.pickup_events, .trace_sends = config.trace_sends, .exact_states = config.exact_states, .visits = true }, .{ .players = deps.players, .sessions = deps.sessions, .packets = deps.packets, .tracking = deps.tracking, .pool = &deps.entities.pool, .slots = deps.entities.directory.capacity() }, .{
+        self.sync = try .init(allocator, .{ .events = config.pickup_events, .trace_sends = config.trace_sends, .visits = true }, .{ .players = deps.players, .sessions = deps.sessions, .packets = deps.packets, .tracking = deps.tracking, .tracker = self.tracker, .pool = &deps.entities.pool, .slots = deps.entities.directory.capacity() }, .{
             .kind = self,
             .write_data = writeData,
             .body = body,
             .identity = identity,
             .before = byId,
-            .update_interval = config.position_interval,
+            // A client steps an item itself: otherwise than the server where it lands, by its
+            // release's drag and stops, and at rest on its own tick count.
+            .client = .{ .simulates = .{ .models = .{ .phases = 4, .rule_sets = ItemPhysics.rule_sets, .rules = ItemPhysics.rulesOf } } },
             .data_bytes = dataBytes,
             .personalized = personalized,
         });
+        if (deps.item_tick) |item_tick| item_tick.client_models = &self.sync.models.?;
         deps.inventories.listen(&self.listener);
         return self;
     }
@@ -154,8 +158,6 @@ pub const ItemReplication = struct {
             }
         }
         dropped.changes.clear();
-        // Items with an impulse go this tick, whatever their interval.
-        for (dropped.impulses.values()) |slot| self.sync.mark(@intCast(slot));
         // Items that moved, a sleeper woken among them, are visited on their interval again.
         for (dropped.moved.values()) |slot| self.sync.stir(@intCast(slot));
         dropped.moved.clear();
@@ -171,7 +173,7 @@ pub const ItemReplication = struct {
         while (changes.next()) |change| {
             if (self.deps.entities.directory.entry(change.slot).retired) try self.sync.gone(change.slot);
         }
-        const visited = self.sync.collect(self.tracker);
+        const visited = self.sync.collect();
         // As many as the inventories hold at once.
         const limit = @min(batch_max, self.deps.inventories.cache.entries.len, self.deps.inventories.items.entries.len);
         var at: usize = 0;
@@ -180,7 +182,6 @@ pub const ItemReplication = struct {
             try self.visit(visited[at..][0..count]);
             at += count;
         }
-        dropped.impulses.clear();
         try self.sync.finish();
     }
 
@@ -250,7 +251,6 @@ pub const ItemReplication = struct {
             self.reading = view;
             try self.sync.update(slot, .{
                 .id = self.deps.entities.directory.entry(slot).id,
-                .has_impulse = dropped.impulses.contains(slot),
                 .data = data,
                 .changed = tracking.changed(slot) != null,
                 // A sleeper moves only when it wakes, which stirs it.

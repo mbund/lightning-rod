@@ -607,6 +607,7 @@ pub const Players = struct {
         const player = &self.records[handle.index];
         if (!player.moved) player.known_movement = @splat(0);
         player.moved = false;
+        player.client_ticks += 1;
     }
 
     fn onPlayerLoaded(self: *Players, handle: sessions.Handle, body: wire_1_21_5.play.toServer.packet_player_loaded.Reader) !void {

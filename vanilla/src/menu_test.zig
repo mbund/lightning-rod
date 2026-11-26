@@ -1781,13 +1781,14 @@ test "items drift with water currents and float in water and lava, as vanilla's 
     var window = physics.readWindow();
     defer window.deinit();
     const resting: entities.State = .{ .uuid = 1, .kind = 1, .world = world, .position = .{ 4.5, 8, 4.5 }, .velocity = .{ 0, 0, 0 } };
+    // 26.2's drag, ItemEntity.tick's getAirDrag, across and down alike.
     const drag: f64 = @as(f32, 0.98);
     const lift: f64 = @as(f32, 5.0e-4);
 
     // Pushed east at the current's strength, then afloat: slowed across and lifted.
     const drifting = try physics.step(&window, 1, 1, resting, false, false);
     try std.testing.expectEqual(0.014 * @as(f64, @as(f32, 0.99)) * drag, drifting.body.velocity[0]);
-    try std.testing.expectEqual(lift * 0.98, drifting.body.velocity[1]);
+    try std.testing.expectEqual(lift * drag, drifting.body.velocity[1]);
     try std.testing.expectEqual(@as(f64, 0), drifting.body.velocity[2]);
     try std.testing.expect(drifting.body.position[0] > resting.position[0]);
 
@@ -1795,13 +1796,13 @@ test "items drift with water currents and float in water and lava, as vanilla's 
     var in_lava = resting;
     in_lava.position = .{ 10.5, 8, 4.5 };
     const floating = try physics.step(&window, 1, 1, in_lava, false, false);
-    try std.testing.expectEqual(@as([3]f64, .{ 0, lift * 0.98, 0 }), floating.body.velocity);
+    try std.testing.expectEqual(@as([3]f64, .{ 0, lift * drag, 0 }), floating.body.velocity);
 
     // Out of any fluid it falls.
     var dry = resting;
     dry.position = .{ 20.5, 8, 4.5 };
     const falling = try physics.step(&window, 1, 1, dry, false, false);
-    try std.testing.expectEqual(@as([3]f64, .{ 0, -0.04 * 0.98, 0 }), falling.body.velocity);
+    try std.testing.expectEqual(@as([3]f64, .{ 0, -0.04 * drag, 0 }), falling.body.velocity);
 }
 
 var live_orbs: [256]u64 = undefined;

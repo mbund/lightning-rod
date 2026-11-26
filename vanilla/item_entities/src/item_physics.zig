@@ -62,12 +62,7 @@ pub const ItemPhysics = struct {
     pub fn advanceRandomly(self: *ItemPhysics, neighborhood: *Window, entity_id: u32, ticks: u32, pushed: entities.State, on_ground: bool, fluids: Fluids, stuck: [3]f64, effects: anytype, random: ?std.Random) !Result {
         assert(entity_id > 0);
         var body = pushed;
-        // ItemEntity.setUnderwaterMovement and setUnderLavaMovement in place of gravity.
-        if (fluids.water > @as(f32, 0.1)) {
-            buoy(&body.velocity, @as(f32, 0.99));
-        } else if (fluids.lava > @as(f32, 0.1)) {
-            buoy(&body.velocity, @as(f32, 0.95));
-        } else body.velocity[1] -= 0.04;
+        afloat(&body.velocity, fluids);
         // Inside a block, it moves through blocks, pushed towards the nearest way out.
         var inside = false;
         if (random) |source| if (try self.collides(neighborhood, body, 0.125, 0.25)) {
@@ -75,7 +70,7 @@ pub const ItemPhysics = struct {
             try self.escape(neighborhood, &body, source, 0.125);
         };
         if (inside) return self.advanceThrough(neighborhood, entity_id, ticks, body, on_ground, effects);
-        return self.advanceBody(false, neighborhood, entity_id, ticks, body, on_ground, stuck, effects);
+        return self.advanceBody(false, .server, .latest, neighborhood, entity_id, ticks, body, on_ground, stuck, effects);
     }
 
     /// ItemEntity.tick's move with noClip set: Entity.move only adds the motion, touching neither
@@ -92,7 +87,7 @@ pub const ItemPhysics = struct {
                 friction *= self.deps.blocks.get(try self.blockState(neighborhood, body.world, below)).friction;
             }
             next.velocity[0] *= friction;
-            next.velocity[1] *= 0.98;
+            next.velocity[1] *= Release.latest.verticalDrag();
             next.velocity[2] *= friction;
             if (on_ground and next.velocity[1] < 0) next.velocity[1] *= -0.5;
         }
@@ -110,7 +105,7 @@ pub const ItemPhysics = struct {
     }
 
     pub fn advanceOrb(self: *ItemPhysics, neighborhood: *Window, entity_id: u32, ticks: u32, body: entities.State, on_ground: bool, stuck: [3]f64) !Result {
-        return self.advanceBody(true, neighborhood, entity_id, ticks, body, on_ground, stuck, {});
+        return self.advanceBody(true, .server, .latest, neighborhood, entity_id, ticks, body, on_ground, stuck, {});
     }
 
     pub const OrbEnvironment = struct { solid: bool, water: bool, lava: bool };
@@ -197,7 +192,7 @@ pub const ItemPhysics = struct {
         }
         // The block it rests on, as advanceBody finds it after a move; none, and it keeps awake.
         const supporting = (try self.nearestSupport(window, body.world, p, 0.125, .{ 0, 0 })) orelse return null;
-        const below_position: chunks.Position = .{ .x = supporting.x, .y = floorCell(p[1] - @as(f64, @as(f32, 0.500001))), .z = supporting.z };
+        const below_position: chunks.Position = .{ .x = supporting.x, .y = floorCell(p[1] - @as(f64, @as(f32, 0.999999))), .z = supporting.z };
         const below = try self.blockState(window, body.world, below_position);
         const name = game_data.registry.block_state_names[below];
         const block = name[0 .. std.mem.indexOfScalar(u8, name, '[') orelse name.len];
@@ -556,7 +551,65 @@ pub const ItemPhysics = struct {
         return movement;
     }
 
-    fn advanceBody(self: *ItemPhysics, comptime orb: bool, neighborhood: *Window, entity_id: u32, ticks: u32, body: entities.State, on_ground: bool, stuck: [3]f64, effects: anytype) !Result {
+    /// Which side moves it: a client skips what only the side that simulates it does.
+    pub const Side = enum { server, client };
+
+    /// An item's move as a client makes it, from where it was pushed: ItemEntity.tick with
+    /// Entity.canSimulateMovement false, so no landing reaction keeps a fall from turning into a
+    /// bounce, and never pushed out of the block it is in. `ticks` is the client's own tick count,
+    /// and `release` how its release steps it.
+    pub fn advanceClient(self: *ItemPhysics, neighborhood: *Window, entity_id: u32, ticks: u32, pushed: entities.State, on_ground: bool, fluids: Fluids, release: Release) !Result {
+        var body = pushed;
+        afloat(&body.velocity, fluids);
+        return self.advanceBody(false, .client, release, neighborhood, entity_id, ticks, body, on_ground, .{ 0, 0, 0 }, {});
+    }
+
+    /// How a release steps an item, where releases differ. From 26.2, ItemEntity.tick slows its
+    /// fall by Entity.getAirDrag, the float 0.98, and before by the double 0.98; and from 26.2
+    /// Entity.restituteMovementAfterCollisions takes the motion of a sideways stop too, only where
+    /// canSimulateMovement, so a client keeps an item's motion against a wall, where before every
+    /// side took it. The server steps as the latest.
+    pub const Release = enum {
+        latest,
+        before_26_2,
+
+        /// 26.2's protocol.
+        const latest_protocol = 776;
+
+        pub fn of(protocol: i32) Release {
+            return if (protocol >= latest_protocol) .latest else .before_26_2;
+        }
+
+        fn verticalDrag(self: Release) f64 {
+            return switch (self) {
+                .latest => @as(f64, @as(f32, 0.98)),
+                .before_26_2 => 0.98,
+            };
+        }
+    };
+
+    /// The sets of rules clients step items by, the server's own first: the releases.
+    pub const rule_sets = @typeInfo(Release).@"enum".field_names.len;
+
+    /// Which set of rules a protocol's clients step items by.
+    pub fn rulesOf(protocol: i32) u8 {
+        return @backingInt(Release.of(protocol));
+    }
+
+    pub fn releaseOf(rules: u8) Release {
+        return @fromBackingInt(@intCast(rules));
+    }
+
+    /// ItemEntity.setUnderwaterMovement and setUnderLavaMovement in place of gravity.
+    fn afloat(velocity: *[3]f64, fluids: Fluids) void {
+        if (fluids.water > @as(f32, 0.1)) {
+            buoy(velocity, @as(f32, 0.99));
+        } else if (fluids.lava > @as(f32, 0.1)) {
+            buoy(velocity, @as(f32, 0.95));
+        } else velocity[1] -= 0.04;
+    }
+
+    fn advanceBody(self: *ItemPhysics, comptime orb: bool, comptime moving: Side, release: Release, neighborhood: *Window, entity_id: u32, ticks: u32, body: entities.State, on_ground: bool, stuck: [3]f64, effects: anytype) !Result {
         assert(entity_id > 0 and neighborhood.client.index == self.chunk_client.index);
         var next = body;
 
@@ -678,8 +731,11 @@ pub const ItemPhysics = struct {
                 // A vertical stop is Block.onEntityLand, which scales the fall away (to -0.0 when
                 // falling); a sideways one counts only past MathHelper.approximatelyEquals.
                 if (axis == 1) {
-                    if (requested != movement) next.velocity[1] *= 0;
-                } else if (!(@abs(movement - requested) < 1.0e-5)) next.velocity[axis] = 0;
+                    if (requested != movement) {
+                        // Entity.restituteMovementAfterCollisions, where canSimulateMovement.
+                        if (moving == .server) next.velocity[1] *= 0;
+                    }
+                } else if (!(@abs(movement - requested) < 1.0e-5) and (moving == .server or release == .before_26_2)) next.velocity[axis] = 0;
             }
             const taken = adjusted[0] * adjusted[0] + adjusted[1] * adjusted[1] + adjusted[2] * adjusted[2];
             const asked = motion[0] * motion[0] + motion[1] * motion[1] + motion[2] * motion[2];
@@ -689,10 +745,11 @@ pub const ItemPhysics = struct {
 
             var below: ?u16 = null;
             const half_width: f64 = if (orb) 0.25 else 0.125;
-            // Entity.getVelocityAffectingPos: the block it rests on when it rests on one, at the
-            // height just over half a block below its feet.
+            // ItemEntity and ExperienceOrb.getBlockPosBelowThatAffectsMyMovement, getOnPos(0.999999):
+            // the block it rests on when it rests on one, at the height just under a block below
+            // its feet, so the block under a slab it lies on.
             const supporting = if (grounded) try self.supportingBlock(neighborhood, body.world, next.position, half_width, adjusted) else null;
-            const below_y: i32 = @intFromFloat(@floor(next.position[1] - @as(f64, @as(f32, 0.500001))));
+            const below_y: i32 = @intFromFloat(@floor(next.position[1] - @as(f64, @as(f32, 0.999999))));
             const below_position: chunks.Position = if (supporting) |at| .{ .x = at.x, .y = below_y, .z = at.z } else .{ .x = @intFromFloat(@floor(next.position[0])), .y = below_y, .z = @intFromFloat(@floor(next.position[2])) };
             // Entity.getBlockSpeedFactor, which slows every body on soul sand and honey.
             {
@@ -732,7 +789,7 @@ pub const ItemPhysics = struct {
             }
 
             next.velocity[0] *= friction;
-            next.velocity[1] *= if (orb) @as(f64, friction) else 0.98;
+            next.velocity[1] *= if (orb) @as(f64, friction) else release.verticalDrag();
             next.velocity[2] *= friction;
 
             if (orb) {

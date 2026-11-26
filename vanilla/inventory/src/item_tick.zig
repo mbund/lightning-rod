@@ -4,7 +4,8 @@ const entities = @import("entities");
 const worlds = @import("worlds");
 const chunks = @import("chunks");
 const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
-const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
+const item_physics = @import("vanilla_item_entities").item_physics;
+const ItemPhysics = item_physics.ItemPhysics;
 const ItemMerging = @import("vanilla_item_entities").item_merging.ItemMerging;
 const ItemPickup = @import("item_pickup.zig").ItemPickup;
 const Players = @import("players").players.Players;
@@ -13,6 +14,11 @@ const Items = @import("vanilla_items").items.Items;
 const Dimensions = @import("vanilla_content").dimensions.Dimensions;
 const ClientRegistries = @import("vanilla_content").client_registries.ClientRegistries;
 const hazards_module = @import("item_hazards.zig");
+const replication = @import("replication");
+
+const Models = replication.models.Models;
+const Model = replication.models.Model;
+const Classes = replication.models.Classes;
 
 const assert = std.debug.assert;
 
@@ -61,6 +67,9 @@ pub const ItemTick = struct {
     /// Where the items near one merging are, in order.
     nearby: []entities.space.Entry,
     random: std.Random.DefaultPrng,
+    /// What clients have of items, which step them themselves: each item's models are stepped
+    /// beside it, as their clients step it. Their replication sets it.
+    client_models: ?*Models = null,
     /// While entities tick: this tick's number, and the blocks items read, shared by them all.
     now: u64 = 0,
     neighborhood: ?ItemPhysics.Window = null,
@@ -114,6 +123,19 @@ pub const ItemTick = struct {
             }
         };
         _ = dropped.places.space.eachDormant(section.world, .{ .low = low, .high = high }, ItemEntities.kinds, Ask{ .tick = self });
+        // Clients step their items before they hear of the edit: those in or next to the section
+        // are sent as they are.
+        const models = self.client_models orelse return;
+        const near_low: [3]f64 = .{ @floatFromInt(section.x * 16 - 1), @floatFromInt(section.y * 16 - 1), @floatFromInt(section.z * 16 - 1) };
+        const near: entities.space.Box = .{ .min = near_low, .max = .{ near_low[0] + 18, near_low[1] + 18, near_low[2] + 18 } };
+        dropped.places.space.each(section.world, near, ItemEntities.kinds, models, struct {
+            fn visit(context: *Models, entry: entities.space.Entry) anyerror!bool {
+                context.disturb(entry.slot);
+                return false;
+            }
+        }.visit) catch |err| {
+            self.failure = err;
+        };
     }
 
     /// Whether lava flows strongly in the world, as in the nether, which pushes items harder.
@@ -265,17 +287,14 @@ pub const ItemTick = struct {
         // again by the currents where it ended up.
         if (metadata.alive) {
             var again = body;
-            const after = try self.deps.physics.push(neighborhood, &again, try self.ultrawarm(body.world));
+            _ = try self.deps.physics.push(neighborhood, &again, try self.ultrawarm(body.world));
             if (!std.meta.eql(again, body)) {
                 try dropped.move(entity, body, again);
                 metadata.revision += 1;
                 body = again;
             }
-            // ItemEntity.tick sets hasImpulse in water or lava, and when its velocity changed by
-            // more than 0.1 since its base tick: ServerEntity sends it that very tick.
-            var change: f64 = 0;
-            for (body.velocity, pushed.velocity) |now, was| change += (now - was) * (now - was);
-            if (after.water > 0 or after.lava > 0 or change > 0.01) dropped.impulses.insert(dropped.items.slotOf(entity).?);
+            // Its clients step it too: their models step beside it, and are held to it.
+            if (self.client_models) |models| try self.stepModels(models, neighborhood, entity, body, metadata.on_ground);
         }
         const world = self.deps.worlds.get(body.world) orelse return error.UnknownWorld;
         const void_y: f64 = @floatFromInt(world.dimension.minimumSection() * 16 - 64);
@@ -294,6 +313,60 @@ pub const ItemTick = struct {
             metadata.stuck == .none and metadata.age >= 0 and metadata.age < 5999 and metadata.revision == moved_revision;
         if (metadata.alive) try dropped.put(entity, metadata);
         if (restful) if (try self.deps.physics.rest(neighborhood, body)) |still| try dropped.lull(entity, sequence, body, metadata, still.speed, still.friction);
+    }
+
+    /// Steps an item's models, each as the clients holding it step the item, and has them judged
+    /// against the item as it now is. Clients whose steps would differ, by their release's rules or
+    /// by whether their own tick count moves an item at rest this tick, are stepped apart.
+    fn stepModels(self: *ItemTick, models: *Models, neighborhood: *ItemPhysics.Window, entity: entities.Id, body: entities.State, on_ground: bool) !void {
+        const slot = self.deps.dropped.items.slotOf(entity).?;
+        const entries = (try models.begin(slot, entity)) orelse return;
+        const given = self.deps.dropped.givenId(entity);
+        const warm = try self.ultrawarm(body.world);
+        for (entries) |entry| {
+            var left = entry.classes;
+            while (left != 0) {
+                const first: u8 = @ctz(left);
+                const way = stepWay(models, first, entry.model, given);
+                var alike: Classes = 0;
+                var each = left;
+                while (each != 0) : (each &= each - 1) {
+                    const class: u8 = @ctz(each);
+                    if (stepWay(models, class, entry.model, given) == way) alike |= @as(Classes, 1) << @intCast(class);
+                }
+                left &= ~alike;
+                var state = body;
+                state.position = entry.model.position;
+                state.velocity = entry.model.velocity;
+                const fluids = try self.deps.physics.push(neighborhood, &state, warm);
+                const stepped = try self.deps.physics.advanceClient(neighborhood, given, models.ticksOf(first), state, entry.model.on_ground, fluids, ItemPhysics.releaseOf(models.rulesOf(first)));
+                var after = stepped.body;
+                _ = try self.deps.physics.push(neighborhood, &after, warm);
+                const model: Model = .{ .position = after.position, .velocity = after.velocity, .on_ground = stepped.on_ground };
+                // Each class, as whether its tick count moves the item next tick is its own.
+                var each_alike = alike;
+                while (each_alike != 0) : (each_alike &= each_alike - 1) {
+                    const class: u8 = @ctz(each_alike);
+                    models.put(model, @as(Classes, 1) << @intCast(class), standsStill(model, models.ticksOf(class) + 1, given));
+                }
+            }
+        }
+        models.judge(.{ .position = body.position, .velocity = body.velocity, .on_ground = on_ground });
+    }
+
+    /// Whether a client will not move an item next tick, its tick count then `ticks`: at rest on
+    /// the ground, off its tick of four.
+    fn standsStill(model: Model, ticks: u32, given: u32) bool {
+        const across = model.velocity[0] * model.velocity[0] + model.velocity[2] * model.velocity[2];
+        return model.on_ground and !(across > @as(f64, @as(f32, 0.00001))) and !item_physics.movesOnPhase(ticks, given);
+    }
+
+    /// What decides a class's step from a model: its rules, and, on the ground, whether its tick
+    /// count moves it this tick. Classes alike in both step alike.
+    fn stepWay(models: *const Models, class: u8, model: Model, given: u32) u8 {
+        const rules = models.rulesOf(class);
+        const gated = model.on_ground and item_physics.movesOnPhase(models.ticksOf(class), given);
+        return rules * 2 + @intFromBool(gated or !model.on_ground);
     }
 
     /// ItemEntity.mergeWithNeighbours: the items in its box grown by 0.5 sideways, in vanilla's

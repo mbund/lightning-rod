@@ -1,28 +1,99 @@
 //! Vanilla's ServerEntity, once, for every kind: what clients that track an entity were last
 //! sent of it, and every tick what changed since. A kind says what its entities synchronize, as
-//! its Data and how each entry is written, and what one is now. This sends its spawns and
-//! removals as tracking asks, its movement, rotation, head and data as ServerEntity.sendChanges
-//! does, the whole of it to whoever missed a delta, and what befell it before it goes.
+//! its Data and how each entry is written, what one is now, and how its clients move it between
+//! what they are sent. This sends its spawns and removals as tracking asks, the whole of it to
+//! whoever missed some, and what befell it before it goes; and its movement by how its clients
+//! move it. Clients that cannot be predicted are sent it as ServerEntity.sendChanges sends it.
+//! Clients that step it themselves are held to models of what they computed, and sent the
+//! cheapest correction only where one would look apart from it.
 
 const std = @import("std");
 const entities = @import("entities");
 const lightning_rod = @import("lightning_rod");
 const sessions = @import("sessions");
 const packets = @import("minecraft_packets");
+const protocols = @import("minecraft_packets").protocols;
+const support = @import("protocol_support");
 const wire = @import("wire_1_21_5");
 const packed_wire = @import("wire_1_21_9");
 const Players = @import("players").players.Players;
 const Tracking = @import("tracking.zig").Tracking;
 const delivery_module = @import("delivery.zig");
+const models_module = @import("models.zig");
 
 const Delivery = delivery_module.Delivery;
 const Visit = @import("visit.zig").Visit;
+pub const Models = models_module.Models;
+pub const Model = models_module.Model;
+pub const Classes = models_module.Classes;
+const Drift = models_module.Drift;
+const IndexSet = lightning_rod.system.IndexSet;
 
 const none = std.math.maxInt(u32);
 /// Turns of the wheel kinds that visit are due on: more than the longest update interval.
 const wheel_ticks = 64;
+/// The most ticks an entity its clients step and that moves goes without being put right for
+/// every viewer.
+const backstop_ticks = 400;
+/// How near the entity a model must be on every axis for its clients to be put right by its
+/// motion alone.
+const motion_reach = 1.0 / 4096.0;
 const bit_sets = lightning_rod.system.bit_sets;
 const assert = std.debug.assert;
+
+/// How a kind's clients move its entities between what they are sent.
+pub const Client = union(enum) {
+    /// Clients step it themselves every tick, as an item or an arrow. It is sent only where a
+    /// class of them would look apart from it, as their models say.
+    simulates: Simulation,
+    /// What clients make of it cannot be worked out here: mobs (their AI), players (their input),
+    /// orbs (they ease toward what they are sent and chase their client's view of the nearest
+    /// player). It goes on ServerEntity's schedule.
+    unpredictable: Unpredictable,
+};
+
+pub const Simulation = struct {
+    /// Where clients step it otherwise than the server does: its models, which its kind steps.
+    /// Null where they step it as the server does, its spawn's rounded velocity all they differ
+    /// by, which keeps them well within the tolerance for as long as the backstop lets it go.
+    models: ?Models.Configuration = null,
+};
+
+pub const Unpredictable = struct {
+    /// EntityType.updateInterval: how often it is looked at, as ServerEntity is.
+    update_interval: u32,
+    /// EntityType.trackDeltas: its velocity goes whenever it changes.
+    track_deltas: bool = true,
+};
+
+/// How each protocol rounds the velocity its spawn and motion packets carry, as the writers this
+/// sends them by choose for it: a short of eighths of a thousandth, or a packed vector from 1.21.9.
+const Rounding = enum(u8) { short, packed_vector };
+
+const roundings: Models.Roundings = .{ .count = @typeInfo(Rounding).@"enum".field_names.len, .of = roundingOf };
+
+pub fn roundingOf(protocol: i32) u8 {
+    inline for (protocols.implementations) |Version| {
+        const spawn = comptime sessions.packet_api.select(Version, .{ spawnLegacy, spawnPacked });
+        const motion = comptime sessions.packet_api.select(Version, .{ writeVelocityLegacy, writeVelocityPacked });
+        comptime assert(spawn == motion);
+        if (Version.protocol_number == protocol) return spawn;
+    }
+    unreachable;
+}
+
+/// The velocity a client of a rounding is given when sent `velocity`.
+fn rounded(rounding: u8, velocity: [3]f64) [3]f64 {
+    switch (@as(Rounding, @fromBackingInt(@intCast(rounding)))) {
+        .short => return .{ @as(f64, @floatFromInt(shortVelocity(velocity[0]))) / 8000.0, @as(f64, @floatFromInt(shortVelocity(velocity[1]))) / 8000.0, @as(f64, @floatFromInt(shortVelocity(velocity[2]))) / 8000.0 },
+        .packed_vector => {
+            var buffer: [16]u8 = undefined;
+            const rest = support.write_lpVec3(&buffer, .{ .x = velocity[0], .y = velocity[1], .z = velocity[2] }) catch unreachable;
+            const read, _ = support.read_lpVec3(buffer[0 .. buffer.len - rest.len]) catch unreachable;
+            return .{ read.x, read.y, read.z };
+        },
+    }
+}
 
 /// Which of a kind's Data entries differ between two of its values: a set of its fields.
 pub fn Changes(comptime Data: type) type {
@@ -161,9 +232,8 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             body: *const fn (kind: *Kind, slot: u32) Body,
             /// What the entity in a slot is: asked only to spawn it.
             identity: *const fn (kind: *Kind, slot: u32) Identity,
-            /// EntityType.updateInterval and trackDeltas.
-            update_interval: u32,
-            track_deltas: bool = true,
+            /// How its clients move it between what they are sent. No default: every kind says.
+            client: Client,
             /// Room for one entity's data packet, when it can be more than 256 bytes.
             data_bytes: ?*const fn (kind: *Kind, slot: u32) usize = null,
             /// Whether the data is written for each recipient apart, as `entries.recipient` says.
@@ -176,10 +246,15 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
         pub const Subject = struct {
             /// Its entity id, which a slot holds until it is let go.
             id: u64,
-            /// Entity.hasImpulse: its next send goes now, whatever the interval.
-            has_impulse: bool = false,
+            /// Entity.hasImpulse: the server alone changed how it moves, as a hit, a knock or a
+            /// push. A change of its data that changes how its clients step it is one too. It goes
+            /// now, whatever its interval.
+            impulse: bool = false,
             /// Entity.hurtMarked: its velocity goes now.
             hurt_marked: bool = false,
+            /// Its clients step it against what they cannot know, as their own copies of the other
+            /// entities it meets. Once it is no longer, it goes, where clients step it.
+            uncertain: bool = false,
             /// Null when it is known not to have changed since it was last sent.
             data: ?Data,
             /// Whether tracking changed its audience this tick, as `Tracking.changed` says.
@@ -228,6 +303,10 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             started: u64 = 0,
             teleport_delay: u32 = 0,
             was_on_ground: bool = false,
+            /// Where clients step it: the tick every viewer was last put right, and whether its
+            /// clients were stepping it against what they cannot know.
+            corrected: u64 = 0,
+            uncertain: bool = false,
             data: Data = .{},
         };
 
@@ -246,12 +325,8 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             /// Whether the kind visits only what has something to send, through `collect`, rather
             /// than walking every entity it has each tick.
             visits: bool = false,
-            /// Send every position as the exact state, a teleport: where it is and how it moves, to
-            /// the bit, with a spawn and with each update. Clients then compute each tick between
-            /// them themselves, which the client traces prove against the server's.
-            exact_states: bool = false,
         };
-        pub const Dependencies = struct { players: *const Players, sessions: *sessions.Service, packets: *packets.Packets, tracking: *Tracking, pool: *entities.Pool, slots: usize = 0 };
+        pub const Dependencies = struct { players: *const Players, sessions: *sessions.Service, packets: *packets.Packets, tracking: *Tracking, tracker: ?Tracking.TrackerId = null, pool: *entities.Pool, slots: usize = 0 };
 
         deps: Dependencies,
         /// What the kind supplies.
@@ -261,7 +336,8 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
         /// Ticks this kind has sent.
         tick_count: u64 = 0,
         words: usize,
-        /// Rows of players: spawned, removed, current, caught up, owed whole, and one alone.
+        /// Rows of players: spawned, removed, current, caught up, owed whole, one alone, and a
+        /// class's viewers.
         rows: []usize,
         /// Players a delivery could not be queued for this entity, who then need it whole.
         missed: []usize,
@@ -288,12 +364,26 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
         /// A running hash of every packet asked to be sent and whom to, when tests trace it.
         traced: u64 = 0,
         tracing: bool,
-        /// Every position goes as the exact state: `Configuration.exact_states`.
-        exact: bool,
+        /// Where clients step its entities otherwise than the server: what each class of them has.
+        models: ?Models,
+        /// Where clients step its entities: whether each viewer's client stepped as the server
+        /// did, and the entities whose clients stepped them against what they cannot know.
+        drift: ?Drift,
+        unsure: ?IndexSet,
 
         pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies, spec: Spec) !Self {
             if (config.visits) assert(spec.before != null);
+            // A kind that visits is visited by its tracker's changes.
+            if (config.visits and deps.tracker == null) return error.InvalidConfiguration;
             if (config.events == 0) return error.InvalidEventCapacity;
+            const simulated = spec.client == .simulates;
+            if (simulated) {
+                // Visited only where something goes: no interval brings it back.
+                if (!config.visits) return error.InvalidConfiguration;
+                // Clients step every entity they have: one shown where the server does not tick it
+                // would move on a client and stand still here.
+                if (!deps.tracking.ticksWhereShown(deps.tracker.?, deps.players.config.simulation_distance)) return error.InvalidConfiguration;
+            }
             const words = deps.tracking.row_words;
             const self: Self = .{
                 .deps = deps,
@@ -301,14 +391,19 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                 .personal = try allocator.alloc(usize, deps.players.records.len),
                 .views = try .init(allocator, deps.pool),
                 .words = words,
-                .rows = try allocator.alloc(usize, 6 * words),
+                .rows = try allocator.alloc(usize, 7 * words),
                 .missed = try allocator.alloc(usize, words),
                 .delivery = try .init(allocator, deps.players, deps.packets, deps.sessions),
                 .batch = try .init(allocator, deps.players, deps.packets, deps.sessions, words),
                 .held = try allocator.alloc(Held, config.events),
                 .held_rows = try allocator.alloc(usize, config.events * words),
                 .tracing = config.trace_sends,
-                .exact = config.exact_states,
+                .models = switch (spec.client) {
+                    .simulates => |simulation| if (simulation.models) |models| try .init(allocator, models, .{ .players = deps.players, .tracking = deps.tracking, .pool = deps.pool, .slots = deps.slots, .roundings = roundings }) else null,
+                    .unpredictable => null,
+                },
+                .drift = if (simulated) try .init(allocator, deps.players.records.len) else null,
+                .unsure = if (simulated) try .init(allocator, @max(1, deps.slots)) else null,
                 .visit = if (config.visits) try .init(allocator, deps.slots) else null,
                 .dues = try .init(allocator, deps.pool),
             };
@@ -341,12 +436,33 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
         /// A tick begins: what befell entities since the last goes first, in order.
         pub fn begin(self: *Self) !void {
             errdefer self.batch.abandon();
+            if (self.models) |*models| models.refresh();
+            if (self.drift) |*drift| for (drift.check(self.deps.players, self.tick_count)) |moved| self.resync(moved);
             try self.sendHeld();
+        }
+
+        /// A viewer's client fell behind the server or ran ahead of it: what it computed of each
+        /// entity is that many ticks off, and its tick counts in another phase. It is owed each
+        /// whole, as its class has it.
+        fn resync(self: *Self, moved: Drift.Shift) void {
+            if (self.models) |*models| models.shift(moved.player, moved.ticks);
+            const alone = self.row(5);
+            @memset(alone, 0);
+            put(alone, moved.player);
+            for (0..self.views.len) |at| {
+                const slot: u32 = @intCast(at);
+                if (self.views.at(slot).id == 0 or !self.deps.tracking.known(slot).contains(moved.player)) continue;
+                self.behind(slot, self.set(alone));
+            }
+            std.log.info("event=client_resync player={d} ticks={d}", .{ moved.player, moved.ticks });
         }
 
         /// A tick ends: what is queued goes.
         pub fn finish(self: *Self) !void {
-            defer self.tick_count += 1;
+            defer {
+                self.tick_count += 1;
+                if (self.models) |*models| models.advance();
+            }
             errdefer self.batch.abandon();
             try self.flushQueued();
         }
@@ -398,15 +514,19 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
         /// The slots to send this tick, each once, in the order `before` puts them: those tracking
         /// changed an audience of, those marked, those a viewer is owed whole, and those whose
         /// interval falls now. Nothing else has anything to send. Good until the next collect.
-        pub fn collect(self: *Self, tracker: Tracking.TrackerId) []const u32 {
+        pub fn collect(self: *Self) []const u32 {
             const visit = &self.visit.?;
+            // Models judged apart from their entity this tick, or a viewer's class without one.
+            if (self.models) |*models| for (models.owing.values()) |slot| visit.mark(@intCast(slot));
+            // Those whose clients stepped them against what they cannot know: whether they still do.
+            if (self.unsure) |*unsure| for (unsure.values()) |slot| visit.mark(@intCast(slot));
             var at = self.wheel[self.tick_count % wheel_ticks];
             while (at != none) {
                 const due = self.dues.at(at);
                 if (due.tick == self.tick_count) visit.mark(at);
                 at = due.next;
             }
-            return visit.collect(self.deps.tracking, tracker, &self.spec, beforeBySpec);
+            return visit.collect(self.deps.tracking, self.deps.tracker.?, &self.spec, beforeBySpec);
         }
 
         fn beforeBySpec(spec: *const Spec, a: u32, b: u32) bool {
@@ -414,7 +534,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
         }
 
         /// An entity visited: due again when its interval next falls, and owed while a viewer is.
-        fn visited(self: *Self, slot: u32, view: *View, interval: u32, resting: bool) !void {
+        fn visited(self: *Self, slot: u32, view: *View, resting: bool) !void {
             const visit = &(self.visit orelse return);
             if (self.deps.tracking.stale(slot).any()) visit.owe(slot) else visit.settle(slot);
             // One no client has has nothing to send on its interval, and one at rest nothing new:
@@ -423,8 +543,11 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                 self.unschedule(slot);
                 return;
             }
-            const since = self.tick_count -% view.started;
-            const next = self.tick_count + interval - since % interval;
+            // One its clients step has no interval: only its backstop is due.
+            const next = switch (self.spec.client) {
+                .simulates => @max(self.tick_count + 1, view.corrected + backstop_ticks),
+                .unpredictable => |unpredictable| self.tick_count + unpredictable.update_interval - (self.tick_count -% view.started) % unpredictable.update_interval,
+            };
             try self.dues.ensureFilled(@as(usize, slot) + 1, .{});
             const due = self.dues.at(slot);
             if (!due.scheduled or due.tick != next) {
@@ -454,6 +577,8 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             self.unschedule(slot);
             if (self.visit) |*visit| visit.settle(slot);
             self.views.at(slot).* = .{};
+            if (self.models) |*models| models.forget(slot);
+            if (self.unsure) |*unsure| unsure.remove(slot);
         }
 
         /// Who has the entity and is not behind: who its deltas go to.
@@ -512,33 +637,152 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                 body = self.spec.body(self.spec.kind, slot);
                 view.* = start(subject, body.?);
                 view.started = self.tick_count -% subject.age;
+                view.corrected = self.tick_count;
             }
             // Removals first; spawns after its changes went to those who have it, so new viewers
             // are shown it as everyone now has it. Data written for each recipient apart pairs as
             // vanilla orders it, all of it first.
             const change: ?Tracking.Change = if (subject.changed) tracking.changed(slot).? else null;
             if (change) |value| {
-                if (self.personalized()) try self.pairing(slot, self.spec.identity(self.spec.kind, slot), view, value) else try self.leave(slot, value);
+                if (self.personalized()) try self.pairing(slot, self.spec.identity(self.spec.kind, slot), view, value, &body) else try self.leave(slot, value);
             }
             const known = self.current(slot);
             // Data known not to have changed is not compared.
             const now = subject.data orelse view.data;
             const changes: DataChanges = if (subject.data) |data| .between(view.data, data) else .{};
-            // ServerEntity.sendChanges: on its interval, an impulse or changed data, its movement,
-            // velocity, data and head; a hurt entity's velocity at once.
-            if ((self.tick_count -% view.started) % self.spec.update_interval == 0 or subject.has_impulse or changes.any()) {
-                if (body == null) body = self.spec.body(self.spec.kind, slot);
-                try self.sendDue(slot, known, body.?, subject.has_impulse, view, now, changes);
-            }
-            if (subject.hurt_marked) {
-                if (body == null) body = self.spec.body(self.spec.kind, slot);
-                try self.queue(slot, known, .{ .velocity = .{ .id = entities.Entities.networkOfSlot(slot), .velocity = body.?.velocity } });
+            switch (self.spec.client) {
+                .simulates => try self.sendSimulated(slot, subject, &body, view, now, changes, known),
+                .unpredictable => |unpredictable| {
+                    // ServerEntity.sendChanges: on its interval, an impulse or changed data, its
+                    // movement, velocity, data and head; a hurt entity's velocity at once.
+                    if ((self.tick_count -% view.started) % unpredictable.update_interval == 0 or subject.impulse or changes.any()) {
+                        try self.sendDue(slot, known, self.bodyOf(slot, &body), subject.impulse, unpredictable.track_deltas, view, now, changes);
+                    }
+                    if (subject.hurt_marked) {
+                        try self.queue(slot, known, .{ .velocity = .{ .id = entities.Entities.networkOfSlot(slot), .velocity = self.bodyOf(slot, &body).velocity } });
+                    }
+                },
             }
             self.noteMissed(slot);
-            if (change) |value| if (!self.personalized()) try self.join(slot, self.spec.identity(self.spec.kind, slot), view, value);
+            if (change) |value| if (!self.personalized()) try self.join(slot, self.spec.identity(self.spec.kind, slot), view, value, &body);
             self.leaving = false;
-            if (tracking.stale(slot).any()) try self.catchUp(slot, view);
-            if (self.visit != null) try self.visited(slot, view, self.spec.update_interval, subject.resting);
+            if (tracking.stale(slot).any()) try self.catchUp(slot, view, &body);
+            if (self.visit != null) try self.visited(slot, view, subject.resting);
+        }
+
+        /// Where the entity in a slot is, asked of its kind once a tick at most.
+        fn bodyOf(self: *Self, slot: u32, body: *?Body) Body {
+            if (body.* == null) body.* = self.spec.body(self.spec.kind, slot);
+            return body.*.?;
+        }
+
+        /// Every class of viewer a kind its clients step has.
+        fn allClasses(self: *const Self) Classes {
+            return if (self.models) |*models| models.all() else 1;
+        }
+
+        fn modelOfBody(body: Body) Model {
+            return .{ .position = body.position, .velocity = body.velocity, .on_ground = body.on_ground };
+        }
+
+        fn exactOfModel(id: i32, model: Model, body: Body) Exact {
+            return .{ .id = id, .position = model.position, .velocity = model.velocity, .yaw = body.yaw, .pitch = body.pitch, .on_ground = model.on_ground };
+        }
+
+        /// One its clients step: those of its classes that would look apart from it are put
+        /// right, and every class is when the server alone changed it, when its clients were
+        /// stepping it against what they cannot know and no longer are, or when its backstop is
+        /// due; then its data, after what it changed. Kinds whose clients step them have no head
+        /// of their own.
+        fn sendSimulated(self: *Self, slot: u32, subject: Subject, body: *?Body, view: *View, now: Data, changes: DataChanges, known: bit_sets.Set) !void {
+            const taken: Models.Owed = if (self.models) |*models| models.takeOwed(slot) else .{};
+            var owed = taken.classes;
+            const settled = view.uncertain and !subject.uncertain;
+            view.uncertain = subject.uncertain;
+            if (subject.uncertain) self.unsure.?.insert(slot) else self.unsure.?.remove(slot);
+            const due = !subject.resting and self.tick_count -% view.corrected >= backstop_ticks;
+            const forced = taken.forced or subject.impulse or subject.hurt_marked or settled or due;
+            if (forced) owed = self.allClasses();
+            if (owed != 0) try self.correct(slot, subject.id, known, self.bodyOf(slot, body), owed, forced, view);
+            if (changes.any()) {
+                try self.queue(slot, known, .{ .metadata = .{ .id = entities.Entities.networkOfSlot(slot), .data = now, .changes = changes } });
+                view.data = now;
+            }
+        }
+
+        /// How a class of clients is put right.
+        const Fix = union(enum) {
+            none,
+            /// A motion packet: where it is stands, how it moves is the entity's, as the class's
+            /// protocol rounds it.
+            motion: [3]f64,
+            /// The exact state, which is the entity to the bit.
+            exact,
+        };
+
+        /// The cheapest packet that brings clients holding `held` within the tolerance of the
+        /// entity, or `forced`, as near to it as a packet can. A class without a model, whose
+        /// clients may hold anything, is sent it exactly.
+        fn choose(held: ?Model, truth: Model, rounding: u8, forced: bool, tolerance: f64) Fix {
+            const model = held orelse return .exact;
+            const velocity = rounded(rounding, truth.velocity);
+            if (forced) {
+                if (model.on_ground != truth.on_ground or !std.mem.eql(u64, @ptrCast(&model.position), @ptrCast(&truth.position))) return .exact;
+                return if (std.mem.eql(u64, @ptrCast(&model.velocity), @ptrCast(&velocity))) .none else .{ .motion = velocity };
+            }
+            if (!model.apart(truth, tolerance, false)) return .none;
+            // Its motion alone only where it is already where the entity is, as after a landing its
+            // client bounced from: a model off from its client would leave any place it is off by
+            // until the next exact state, which puts both right.
+            for (model.position, truth.position) |held_axis, actual| if (@abs(held_axis - actual) > motion_reach) return .exact;
+            const moved: Model = .{ .position = model.position, .velocity = velocity, .on_ground = model.on_ground };
+            if (model.on_ground == truth.on_ground and !moved.apart(truth, tolerance, false)) return .{ .motion = velocity };
+            return .exact;
+        }
+
+        /// The viewers of the classes owed a correction are put right, those alike together: the
+        /// same model and protocol rounding take the same packet. `forced`, every class is brought
+        /// as near to the entity as a packet can.
+        fn correct(self: *Self, slot: u32, id: u64, known: bit_sets.Set, body: Body, owed: Classes, forced: bool, view: *View) !void {
+            const network = entities.Entities.networkOfSlot(slot);
+            const truth = modelOfBody(body);
+            const exact = exactOfModel(network, truth, body);
+            if (forced) view.corrected = self.tick_count;
+            const models = &(self.models orelse {
+                // Its clients step it as the server does, from what they were sent.
+                return self.queue(slot, known, .{ .exact = exact });
+            });
+            var left = owed & models.present(slot, known);
+            while (left != 0) {
+                const first: u8 = @ctz(left);
+                const held = models.modelOf(slot, id, first);
+                const rounding = models.roundingOf(first);
+                var alike: Classes = 0;
+                const viewers = self.row(6);
+                @memset(viewers, 0);
+                var each = left;
+                while (each != 0) : (each &= each - 1) {
+                    const class: u8 = @ctz(each);
+                    if (models.roundingOf(class) != rounding) continue;
+                    const other = models.modelOf(slot, id, class);
+                    if ((other == null) != (held == null) or (other != null and !other.?.eql(held.?))) continue;
+                    alike |= @as(Classes, 1) << @intCast(class);
+                    const of_class = models.viewersOf(slot, class, known, self.row(5));
+                    for (viewers, 0..) |*word, at| word.* |= of_class.wordAt(at);
+                }
+                left &= ~alike;
+                switch (choose(held, truth, rounding, forced, models.config.tolerance)) {
+                    .none => {},
+                    .motion => |velocity| {
+                        try self.queue(slot, self.set(viewers), .{ .velocity = .{ .id = network, .velocity = truth.velocity } });
+                        try models.assign(slot, id, alike, .{ .position = held.?.position, .velocity = velocity, .on_ground = held.?.on_ground });
+                    },
+                    .exact => {
+                        try self.queue(slot, self.set(viewers), .{ .exact = exact });
+                        try models.assign(slot, id, alike, truth);
+                    },
+                }
+            }
         }
 
         /// An entity gone from memory: only its removal is left, for whoever has it.
@@ -561,13 +805,19 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
         }
 
         /// Removals and spawns sent at once, as data written for each recipient apart needs.
-        fn pairing(self: *Self, slot: u32, identity: Identity, view: *const View, change: Tracking.Change) !void {
+        fn pairing(self: *Self, slot: u32, identity: Identity, view: *const View, change: Tracking.Change, body: *?Body) !void {
             const spawned = self.row(0);
             const removed = self.row(1);
             @memset(spawned, 0);
             @memset(removed, 0);
             try self.remove(slot, change.remove, removed);
-            try self.pair(slot, identity, view, change.spawn, spawned);
+            if (change.spawn.any()) switch (self.spec.client) {
+                .unpredictable => try self.pair(slot, identity, view, change.spawn, spawned, null, false),
+                .simulates => {
+                    var groups = try self.spawnGroups(slot, view.id, change.spawn, self.bodyOf(slot, body));
+                    while (try groups.next()) |group| try self.pair(slot, identity, view, group.viewers, spawned, group.shown, group.exact);
+                },
+            };
             self.deps.tracking.confirm(slot, self.set(spawned), self.set(removed));
             // One that took the spawn but missed what came with it has it, not whole: behind.
             self.behindIn(slot, spawned);
@@ -585,10 +835,62 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
 
         /// Spawns in the batch, so many entities spawning for the same players go at once, each
         /// as its viewers were just sent it.
-        fn join(self: *Self, slot: u32, identity: Identity, view: *const View, change: Tracking.Change) !void {
+        fn join(self: *Self, slot: u32, identity: Identity, view: *const View, change: Tracking.Change, body: *?Body) !void {
             const spawned = self.row(0);
             for (spawned, 0..) |*word, at| word.* = change.spawn.wordAt(at);
-            if (any(spawned)) try self.queueSpawn(slot, identity, view, self.set(spawned));
+            if (!any(spawned)) return;
+            switch (self.spec.client) {
+                .unpredictable => try self.queueSpawn(slot, identity, view, self.set(spawned), null, false),
+                .simulates => {
+                    var groups = try self.spawnGroups(slot, view.id, self.set(spawned), self.bodyOf(slot, body));
+                    while (try groups.next()) |group| try self.queueSpawn(slot, identity, view, group.viewers, group.shown, group.exact);
+                },
+            }
+        }
+
+        /// The new viewers of one its clients step, by what each is to be sent. A class whose
+        /// clients have it already is joined as they have it, which an exact state after the
+        /// spawn gives; one that has none is sent it as it is, which the spawn alone gives but for
+        /// its protocol's rounding of the velocity, and that is what the class then has. Without
+        /// models it is sent as it is. Their tick counts begin now, so they are all in this tick's
+        /// phase.
+        const SpawnGroups = struct {
+            sync: *Self,
+            slot: u32,
+            id: u64,
+            recipients: bit_sets.Set,
+            body: Body,
+            set: u8 = 0,
+            done: bool = false,
+
+            const Group = struct { viewers: bit_sets.Set, shown: Exact, exact: bool };
+
+            fn next(self: *SpawnGroups) !?Group {
+                const sync = self.sync;
+                const network = entities.Entities.networkOfSlot(self.slot);
+                const truth = modelOfBody(self.body);
+                const models = &(sync.models orelse {
+                    if (self.done) return null;
+                    self.done = true;
+                    return .{ .viewers = self.recipients, .shown = exactOfModel(network, truth, self.body), .exact = false };
+                });
+                while (self.set < models.sets) {
+                    const class = models.startingClass(self.set);
+                    self.set += 1;
+                    const viewers = models.viewersOf(self.slot, class, self.recipients, sync.row(6));
+                    if (!viewers.any()) continue;
+                    if (models.modelOf(self.slot, self.id, class)) |model| return .{ .viewers = viewers, .shown = exactOfModel(network, model, self.body), .exact = true };
+                    // What the spawn gives: where it is, its velocity rounded, and in the air.
+                    try models.assign(self.slot, self.id, @as(Classes, 1) << @intCast(class), .{ .position = truth.position, .velocity = rounded(models.roundingOf(class), truth.velocity), .on_ground = false });
+                    return .{ .viewers = viewers, .shown = exactOfModel(network, truth, self.body), .exact = false };
+                }
+                return null;
+            }
+        };
+
+        fn spawnGroups(self: *Self, slot: u32, id: u64, recipients: bit_sets.Set, body: Body) !SpawnGroups {
+            if (self.models) |*models| try models.began(slot, recipients);
+            return .{ .sync = self, .slot = slot, .id = id, .recipients = recipients, .body = body };
         }
 
         /// Of the players an entity leaves, those not owed an event of it first: row 4.
@@ -611,26 +913,27 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
 
         /// ServerEntity.sendPairingData, batched: the entity as last sent and its data that
         /// differs from the defaults, one group each player takes whole or not at all.
-        fn queueSpawn(self: *Self, slot: u32, identity: Identity, view: *const View, recipients: bit_sets.Set) !void {
+        /// One its clients step is shown as `shown`, with that exact state after it when `exact`.
+        fn queueSpawn(self: *Self, slot: u32, identity: Identity, view: *const View, recipients: bit_sets.Set, shown: ?Exact, exact_after: bool) !void {
             const id = entities.Entities.networkOfSlot(slot);
-            const spawn: Spawn = .{ .id = id, .uuid = identity.uuid, .kind = identity.entity_type, .data = identity.object_data, .position = view.base, .velocity = view.velocity, .yaw = view.yaw, .pitch = view.pitch, .head_yaw = view.head_yaw };
+            const spawn = spawnOf(id, identity, view, shown);
             const changes = DataChanges.fromDefaults(view.data);
             if (self.tracing) self.traceSend(recipients, .{ .spawn = spawn });
-            if (!changes.any() and !self.exact) return self.queueControl(slot, recipients, .spawn, .{ .spawn = spawn });
+            if (!changes.any() and !exact_after) return self.queueControl(slot, recipients, .spawn, .{ .spawn = spawn });
             if (self.tracing and changes.any()) self.traceSend(recipients, .{ .metadata = .{ .id = id, .data = view.data, .changes = changes } });
-            const exact = exactOf(id, view);
-            if (self.tracing and self.exact) self.traceSend(recipients, .{ .exact = exact });
+            const exact = shown orelse exactOf(id, view);
+            if (self.tracing and exact_after) self.traceSend(recipients, .{ .exact = exact });
             const queued: Queued = .{ .slot = slot, .purpose = .spawn };
             const data = .{ id, view.data, changes, &self.spec, @as(?u128, null) };
             for (0..2) |_| {
                 // The packets and the bundle around them.
-                const count: usize = 1 + @as(usize, @intFromBool(changes.any())) + @intFromBool(self.exact);
+                const count: usize = 1 + @as(usize, @intFromBool(changes.any())) + @intFromBool(exact_after);
                 switch (try self.batch.prepare(recipients, count + 2, self, settleQueued)) {
                     .ready => {},
                     // No one to take it now: tracking offers it again next tick.
                     .nobody, .backpressured => return,
                 }
-                const sent = if (!self.exact)
+                const sent = if (!exact_after)
                     try self.batch.sendGroup(queued, .{ .{ spawnLegacy, spawnPacked }, writeMetadata }, .{ .{spawn}, data }, &.{ 128, self.dataBytes(slot) })
                 else if (changes.any())
                     try self.batch.sendGroup(queued, .{ .{ spawnLegacy, spawnPacked }, writeMetadata, writeExact }, .{ .{spawn}, data, .{exact} }, &.{ 128, self.dataBytes(slot), 128 })
@@ -644,6 +947,12 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
         /// The entity as last sent, to the bit but for its turn, which views keep packed.
         fn exactOf(id: i32, view: *const View) Exact {
             return .{ .id = id, .position = view.base, .velocity = view.velocity, .yaw = unpack(view.yaw), .pitch = unpack(view.pitch), .on_ground = view.was_on_ground };
+        }
+
+        /// ClientboundAddEntityPacket of the entity as last sent, or as `shown`.
+        fn spawnOf(id: i32, identity: Identity, view: *const View, shown: ?Exact) Spawn {
+            const exact = shown orelse return .{ .id = id, .uuid = identity.uuid, .kind = identity.entity_type, .data = identity.object_data, .position = view.base, .velocity = view.velocity, .yaw = view.yaw, .pitch = view.pitch, .head_yaw = view.head_yaw };
+            return .{ .id = id, .uuid = identity.uuid, .kind = identity.entity_type, .data = identity.object_data, .position = exact.position, .velocity = exact.velocity, .yaw = packDegrees(exact.yaw), .pitch = packDegrees(exact.pitch), .head_yaw = view.head_yaw };
         }
 
         /// A spawn without data, or a removal, in the batch: tracking hears who took it when the
@@ -689,25 +998,49 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
 
         /// ServerEntity.sendPairingData: the entity as last sent, and its data that differs from
         /// the defaults. Those the spawn was queued for go into `spawned`.
-        fn pair(self: *Self, slot: u32, identity: Identity, view: *const View, recipients: bit_sets.Set, spawned: []usize) !void {
+        fn pair(self: *Self, slot: u32, identity: Identity, view: *const View, recipients: bit_sets.Set, spawned: []usize, shown: ?Exact, exact_after: bool) !void {
             const id = entities.Entities.networkOfSlot(slot);
-            try self.deliver(recipients, .{ .spawn = .{ .id = id, .uuid = identity.uuid, .kind = identity.entity_type, .data = identity.object_data, .position = view.base, .velocity = view.velocity, .yaw = view.yaw, .pitch = view.pitch, .head_yaw = view.head_yaw } });
+            try self.deliver(recipients, .{ .spawn = spawnOf(id, identity, view, shown) });
             self.delivery.markReached(spawned);
             const changes = DataChanges.fromDefaults(view.data);
             if (changes.any()) try self.deliver(recipients, .{ .metadata = .{ .id = id, .data = view.data, .changes = changes } });
-            if (self.exact) try self.deliver(recipients, .{ .exact = exactOf(id, view) });
+            if (exact_after) try self.deliver(recipients, .{ .exact = shown orelse exactOf(id, view) });
         }
 
         /// Players that missed a delta get the entity as last sent to everyone: where it is, its
-        /// data and its head.
-        fn catchUp(self: *Self, slot: u32, view: *const View) !void {
+        /// data and its head. One its clients step goes exactly, as each class has it, or as it is.
+        fn catchUp(self: *Self, slot: u32, view: *const View, body: *?Body) !void {
             const stale = self.deps.tracking.stale(slot);
             if (!stale.any()) return;
             const id = entities.Entities.networkOfSlot(slot);
-            try self.deliver(stale, if (self.exact) .{ .exact = exactOf(id, view) } else .{ .sync = .{ .id = id, .position = view.base, .velocity = view.velocity, .yaw = unpack(view.yaw), .pitch = unpack(view.pitch), .on_ground = view.was_on_ground } });
             const caught = self.row(3);
             @memset(caught, 0);
-            self.delivery.markReached(caught);
+            if (self.spec.client == .unpredictable) {
+                try self.deliver(stale, .{ .sync = .{ .id = id, .position = view.base, .velocity = view.velocity, .yaw = unpack(view.yaw), .pitch = unpack(view.pitch), .on_ground = view.was_on_ground } });
+                self.delivery.markReached(caught);
+            } else {
+                const now = self.bodyOf(slot, body);
+                // Removals queued go first, so those they reached are no longer behind, nor sent this.
+                try self.flushQueued();
+                if (self.models) |*models| {
+                    var classes = models.present(slot, stale);
+                    while (classes != 0) : (classes &= classes - 1) {
+                        const class: u8 = @ctz(classes);
+                        // As its class has it, unless that is not known or would look apart, as the
+                        // correction it was owed reached none of its viewers: then as it is.
+                        const held = models.modelOf(slot, view.id, class);
+                        const model = if (held != null and !held.?.apart(modelOfBody(now), models.config.tolerance, false)) held.? else fresh: {
+                            try models.assign(slot, view.id, @as(Classes, 1) << @intCast(class), modelOfBody(now));
+                            break :fresh modelOfBody(now);
+                        };
+                        try self.deliver(models.viewersOf(slot, class, stale, self.row(6)), .{ .exact = exactOfModel(id, model, now) });
+                        self.delivery.markReached(caught);
+                    }
+                } else {
+                    try self.deliver(stale, .{ .exact = exactOfModel(id, modelOfBody(now), now) });
+                    self.delivery.markReached(caught);
+                }
+            }
             const changes = DataChanges.fromDefaults(view.data);
             if (changes.any()) try self.deliver(self.set(caught), .{ .metadata = .{ .id = id, .data = view.data, .changes = changes } });
             try self.deliver(self.set(caught), .{ .head = .{ .id = id, .yaw = view.head_yaw } });
@@ -721,7 +1054,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             return @as(f32, @floatFromInt(angle)) * 360.0 / 256.0;
         }
 
-        fn sendDue(self: *Self, slot: u32, known: bit_sets.Set, subject: Body, has_impulse: bool, view: *View, now: Data, changes: DataChanges) !void {
+        fn sendDue(self: *Self, slot: u32, known: bit_sets.Set, subject: Body, impulse: bool, track_deltas: bool, view: *View, now: Data, changes: DataChanges) !void {
             const yaw = packDegrees(subject.yaw);
             const pitch = packDegrees(subject.pitch);
             const turned = @abs(@as(i32, yaw) - view.yaw) >= 1 or @abs(@as(i32, pitch) - view.pitch) >= 1;
@@ -759,21 +1092,13 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             }
             const id = entities.Entities.networkOfSlot(slot);
             var velocity_due = false;
-            if (has_impulse or self.spec.track_deltas) {
+            if (impulse or track_deltas) {
                 const difference: [3]f64 = .{ subject.velocity[0] - view.velocity[0], subject.velocity[1] - view.velocity[1], subject.velocity[2] - view.velocity[2] };
                 const squared = difference[0] * difference[0] + difference[1] * difference[1] + difference[2] * difference[2];
                 const length = subject.velocity[0] * subject.velocity[0] + subject.velocity[1] * subject.velocity[1] + subject.velocity[2] * subject.velocity[2];
                 velocity_due = squared > 1.0e-7 or (squared > 0 and length == 0);
             }
-            if (self.exact and (velocity_due or sent_position)) {
-                // All of it at once, to the bit: the teleport carries the motion too.
-                view.velocity = subject.velocity;
-                view.was_on_ground = subject.on_ground;
-                movement = .none;
-                sent_position = true;
-                sent_rotation = true;
-                try self.queue(slot, known, .{ .exact = .{ .id = id, .position = subject.position, .velocity = subject.velocity, .yaw = subject.yaw, .pitch = subject.pitch, .on_ground = subject.on_ground } });
-            } else if (velocity_due) {
+            if (velocity_due) {
                 view.velocity = subject.velocity;
                 try self.queue(slot, known, .{ .velocity = .{ .id = id, .velocity = view.velocity } });
             }
