@@ -1155,7 +1155,9 @@ pub const Space = struct {
         const turn = self.turnOf(self.directory.entry(slot).kind, until);
         try turn.reserve(1);
         // Boxed already, as one due goes on to its next box: in its columns still, it stays
-        // listed where it is.
+        // listed where it is. In others, its old box goes only once nothing can fail, so a box that
+        // cannot be made leaves it as it was.
+        var old_box: ?u32 = null;
         if (self.box_of[slot] != none) {
             const index = self.box_of[slot];
             const boxed = self.boxes.at(index);
@@ -1176,7 +1178,7 @@ pub const Space = struct {
                 self.fill(at, slot, .boxed);
                 return true;
             }
-            self.dropBox(index);
+            old_box = index;
         }
         const kind = self.directory.entry(slot).kind;
         // Room for every link first: a box is listed in all its columns or none.
@@ -1196,6 +1198,7 @@ pub const Space = struct {
                 made_count += 1;
             }
         }
+        if (old_box) |old| self.dropBox(old);
         // A log that cannot grow is where vanilla runs out of heap: the box still stands, and
         // whoever takes the log looks over everything.
         const at = self.reserve(slot) catch overflowed: {
