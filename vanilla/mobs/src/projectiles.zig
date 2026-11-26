@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const bit_sets = @import("lightning_rod").system.bit_sets;
+const IndexSet = @import("lightning_rod").system.IndexSet;
 const builtin = @import("builtin");
 const chunks = @import("chunks");
 const sessions = @import("sessions");
@@ -42,7 +43,14 @@ const Mobs = @import("mobs.zig").Mobs;
 const Domains = @import("domains").domains.Domains;
 const DomainColumn = @import("domains").domains.Column;
 const Mob = @import("mob.zig").Mob;
-const packets = @import("projectile_packets.zig");
+/// AbstractArrow's entity data: its flags, how many it pierces, whether it is stuck, and a
+/// trident's loyalty and glint.
+pub const Data = struct {
+    critical: bool,
+    pierce: u8,
+    in_ground: bool,
+    trident: ?struct { loyalty: u8, foil: bool } = null,
+};
 const store = @import("projectile_store.zig");
 const Tracking = @import("replication").tracking.Tracking;
 
@@ -236,8 +244,6 @@ pub const Projectiles = struct {
         /// Whether flying projectiles with nothing near their path sleep. Off, every one ticks
         /// every tick, which is what sleeping must match.
         sleep: bool = true,
-        /// Keep a hash of everything asked to be sent, for runs to be compared by.
-        trace_sends: bool = false,
         seed: u64 = 0x6172726f77,
     };
     pub const Dependencies = struct {
@@ -260,7 +266,7 @@ pub const Projectiles = struct {
         domains: *Domains,
     };
     /// ServerEntity's update interval for arrows.
-    const update_interval = 20;
+    pub const update_interval = 20;
     const half_width = 0.25;
     const height = 0.5;
     /// The chunk reads one tick of projectiles shares: a ray's eight cells at most.
@@ -346,9 +352,6 @@ pub const Projectiles = struct {
     tracker: Tracking.TrackerId = 0,
     sleeping: usize = 0,
     sleep: bool,
-    /// A running hash of everything asked to be sent, when tests trace it.
-    sent: u64 = 0,
-    tracing: bool,
     /// Mobs placed anywhere as the tick began.
     mobs_placed: usize = 0,
     /// Room for the states a sleeper plans.
@@ -415,15 +418,12 @@ pub const Projectiles = struct {
     /// ticks.
     height_world: ?u32 = null,
     world_height: raycast.Height = .unbounded,
-    /// The batch of packets going to one set of viewers, and what each packet is for.
-    /// Projectiles' packets for one audience at a time, as every kind batches its broadcasts.
-    outbox: Outbox,
-    /// Viewers out of room this tick, and those one packet goes to.
-    starved: []u64,
-    audience: []u64,
-    /// Packets queued and packets some viewer took, by purpose: spawns, updates, removals.
-    queued: [3]u64 = @splat(0),
-    taken: [3]u64 = @splat(0),
+    /// For replication, by slot: projectiles whose data changed or that were pushed since it
+    /// last looked, and those pushed; and the pickups players made this tick.
+    replicated: IndexSet,
+    impulses: IndexSet,
+    pickups: []Taken,
+    pickup_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, _: std.Io, configuration: Configuration, deps: Dependencies) !*Projectiles {
         const self = try allocate(allocator, configuration, deps);
@@ -465,7 +465,6 @@ pub const Projectiles = struct {
             .ops = try allocator.alloc(IndexOp, ops_max),
             .held = try allocator.alloc(Held, batch_max),
             .sleep = configuration.sleep,
-            .tracing = configuration.trace_sends,
             .rousing = try allocator.alloc(u32, rousing_max),
             .waking = try allocator.alloc(u32, configuration.claims),
             .order = try allocator.alloc(Order, batch_max),
@@ -488,9 +487,9 @@ pub const Projectiles = struct {
             .affecting_states = try affectingStates(allocator),
             .space = try chunks.occupancy.Table.init(allocator, configuration.space_sections),
             .air_state = @intCast(game_data.registry.blockStateId("minecraft:air").?),
-            .outbox = try .init(allocator, deps.players, deps.players.deps.packets, deps.players.deps.sessions, row_words),
-            .starved = try allocator.alloc(u64, row_words),
-            .audience = try allocator.alloc(u64, row_words),
+            .replicated = try .init(allocator, deps.entities.directory.capacity()),
+            .impulses = try .init(allocator, deps.entities.directory.capacity()),
+            .pickups = try allocator.alloc(Taken, pickups_max),
             .entered = try allocator.alloc(DomainColumn, deps.domains.capacity()),
             .left = try allocator.alloc(DomainColumn, deps.domains.capacity()),
         };
@@ -1031,7 +1030,7 @@ pub const Projectiles = struct {
         if (self.columns.count() > 0) self.columns.clearRetainingCapacity();
         self.last_columns = .{ null, null };
         self.candidate_count = 0;
-        @memset(self.starved, 0);
+        self.pickup_count = 0;
         self.notice();
         self.watch();
         try self.holdingIndex(rouse);
@@ -1041,14 +1040,11 @@ pub const Projectiles = struct {
         for (self.waking[0..self.waking_count]) |slot| try self.tick_order.wakeSlot(slot);
     }
 
-    /// After entities tick: the parked look over their viewers, players pick up, and
-    /// everything this tick sends goes out.
+    /// After entities tick: the parked look over their viewers and players pick up. Replication
+    /// sends what came of the tick once tracking looked.
     pub fn finishTick(self: *Projectiles) !void {
         if (!self.active) return;
         defer self.window.deinit();
-        defer self.flush() catch |err| {
-            self.failure = err;
-        };
         try self.collect();
     }
 
@@ -1084,9 +1080,9 @@ pub const Projectiles = struct {
                     continue;
                 }
                 // Its tick was worked out when it fell asleep: only its update is left to send.
-                if (held.quick) try self.updates(held) else {
+                if (!held.quick) {
                     try self.step(held);
-                    if (!held.projectile.removed) try self.replicate(held);
+                    if (!held.projectile.removed) self.noteChanges(held);
                 }
                 if (!held.projectile.removed) try self.lull(held);
                 // One that did not sleep again ticks from now on.
@@ -2112,141 +2108,66 @@ pub const Projectiles = struct {
                 if (!try self.deps.menus.giveStack(slot, stack)) return;
             },
         }
-        try self.queue(projectile.id, self.knownTo(held.slot, false), .update, false, packets.writeCollect, .{ self.networkId(projectile), entity_effects.playerId(slot), @as(i32, 1) });
+        // Its pickup, for those who have it, before it goes for them.
+        if (self.pickup_count < self.pickups.len) {
+            self.pickups[self.pickup_count] = .{ .slot = held.slot, .collector = entity_effects.playerId(slot) };
+            self.pickup_count += 1;
+        }
         projectile.removed = true;
     }
 
-    /// ServerEntity for projectiles: who sees one is told of it once, then of its state when
-    /// it changes and where it is when it was pushed or every second.
-    fn replicate(self: *Projectiles, held: *Held) !void {
-        try self.updates(held);
-    }
-
-    /// Who has a projectile spawned, as tracking keeps it; with `roomy`, only those with room
-    /// this tick.
-    fn knownTo(self: *Projectiles, slot: u32, roomy: bool) []const u64 {
-        @memset(self.audience, 0);
-        const tracking = self.tracking orelse return self.audience;
-        const known = tracking.known(slot);
-        for (self.audience, self.starved, 0..) |*audience, starved, at| audience.* = known.wordAt(at) & (if (roomy) ~starved else ~@as(u64, 0));
-        return self.audience;
-    }
-
-    /// Spawns and removals, as tracking found them this tick, after every entity ticked: each
-    /// to those who have room, the rest a later tick. Run by ProjectileReplication.
-    pub fn replicateChanges(self: *Projectiles) !void {
-        const tracking = self.tracking orelse return;
-        var changes = tracking.changesOf(self.tracker);
-        while (changes.next()) |change| {
-            if (change.remove.any()) {
-                for (self.audience, self.starved, 0..) |*audience, starved, at| audience.* = change.remove.wordAt(at) & ~starved;
-                try self.queue(change.slot, self.audience, .remove, true, packets.writeRemove, .{entities.Entities.networkOfSlot(change.slot)});
-            }
-            if (change.gone or !change.spawn.any()) continue;
-            // Those it would go to with room first: with none, as a backlog has, nothing is read.
-            var wanted = false;
-            for (self.audience, self.starved, 0..) |*audience, starved, at| {
-                audience.* = change.spawn.wordAt(at) & ~starved;
-                wanted = wanted or audience.* != 0;
-            }
-            if (!wanted) continue;
-            const entity = self.deps.entities.directory.entry(change.slot).id;
-            const kept = (try self.records.get(entity)) orelse return error.Corrupt;
-            var stored: Projectile = undefined;
-            @memcpy(std.mem.asBytes(&stored), kept.bytes[0..@sizeOf(Projectile)]);
-            // A sleeper where its plan has it now.
-            const projectile = self.present(stored, self.now);
-            const spawn: packets.Spawn = .{ .id = entities.Entities.networkOfSlot(change.slot), .uuid = projectile.uuid, .kind = self.entity_types[@backingInt(projectile.kind)], .position = projectile.position, .velocity = projectile.velocity, .yaw = angle(projectile.yaw), .pitch = angle(projectile.pitch), .owner = entity_effects.playerId(projectile.owner) };
-            try self.queueSpawn(change.slot, self.audience, spawn, self.dataOf(&projectile));
-        }
-        try self.flush();
-    }
-
-    /// Changes of state and position, for the viewers who have room this tick; a client that
-    /// misses one simulates on and takes the next.
-    fn updates(self: *Projectiles, held: *Held) !void {
+    /// What replication is told of a projectile's tick: its data changed or it was pushed, and
+    /// it is looked at; its interval, which ServerEntity sends on, replication keeps itself.
+    fn noteChanges(self: *Projectiles, held: *Held) void {
         const projectile = held.projectile;
-        const due = @rem(self.age(projectile), update_interval) == 0;
-        const moving = projectile.impulse or (due and !projectile.in_ground);
-        if (!projectile.data_changed and !moving) return;
-        _ = self.knownTo(held.slot, true);
-        if (projectile.data_changed) try self.queue(projectile.id, self.audience, .update, false, packets.writeData, .{ self.networkId(projectile), self.dataOf(projectile) });
+        if (projectile.data_changed or projectile.impulse) self.replicated.insert(held.slot);
+        if (projectile.impulse) self.impulses.insert(held.slot);
         projectile.data_changed = false;
-        if (!moving) return;
-        try self.queue(projectile.id, self.audience, .update, false, packets.writeSync, .{ self.networkId(projectile), projectile.position, projectile.velocity, projectile.yaw, projectile.pitch, projectile.in_ground });
         projectile.impulse = false;
     }
 
-    /// What a queued packet does for its viewers once they take it.
-    const Purpose = enum { spawn, update, remove };
-    const Sent = struct { id: u64, kind: Purpose, removal: bool };
-    const Outbox = @import("replication").delivery.Batch(Sent);
+    /// A player took a projectile: its pickup goes to whoever has it.
+    pub const Taken = struct { slot: u32, collector: i32 };
+    const pickups_max = 1024;
 
-    /// Queues a packet for some of a projectile's viewers, as every kind batches its broadcasts:
-    /// packets for the same viewers go in one batch, admitted for all of them at once. What each
-    /// viewer took is read back when the batch goes, so the known rows say what clients have.
-    fn queue(self: *Projectiles, entity: u64, audience: []const u64, kind: Purpose, removal: bool, comptime writer: anytype, arguments: anytype) !void {
-        self.traceSend(entity, audience, @backingInt(kind));
-        if (!try self.ready(audience, 1)) return;
-        if (!try self.outbox.send(.{ .id = entity, .kind = kind, .removal = removal }, writer, arguments, 128)) return self.backlog(audience);
-        self.queued[@backingInt(kind)] += 1;
-    }
+    /// A projectile as clients are shown it: where its plan has it now, a sleeper too.
+    pub const Shown = struct {
+        uuid: u128,
+        entity_type: u32,
+        owner: i32,
+        position: [3]f64,
+        velocity: [3]f64,
+        yaw: f32,
+        pitch: f32,
+        in_ground: bool,
+        data: Data,
+        /// Ticks since it was shot, which its update interval counts from.
+        age: u64,
+    };
 
-    /// What projectiles ask to send, for runs to be compared by; whether viewers take it is the
-    /// sessions' affair.
-    fn traceSend(self: *Projectiles, entity: u64, audience: []const u64, kind: u8) void {
-        if (!self.tracing) return;
-        var hasher = std.hash.Wyhash.init(self.sent);
-        hasher.update(std.mem.asBytes(&self.now));
-        hasher.update(std.mem.asBytes(&entity));
-        hasher.update(&.{kind});
-        // Not who: that waits on viewers having room, which wall time decides.
-        _ = audience;
-        self.sent = hasher.final();
-    }
-
-    /// A spawn and its entity data as one group, which each viewer takes whole or not at all.
-    fn queueSpawn(self: *Projectiles, entity: u64, audience: []const u64, spawn: packets.Spawn, data: packets.Data) !void {
-        self.traceSend(entity, audience, 255);
-        // Two packets and the bundle around them.
-        if (!try self.ready(audience, 4)) return;
-        if (!try self.outbox.sendGroup(.{ .id = entity, .kind = .spawn, .removal = false }, .{ .{ packets.spawnLegacy, packets.spawnPacked }, packets.writeData }, .{ .{spawn}, .{ spawn.id, data } }, &.{ 128, 128 })) return self.backlog(audience);
-        self.queued[@backingInt(Purpose.spawn)] += 1;
-    }
-
-    /// The batch for an audience. False if nothing can go, to no one or to no room.
-    fn ready(self: *Projectiles, audience: []const u64, entries: usize) !bool {
-        assert(audience.len == self.row_words);
-        return switch (try self.outbox.prepare(.{ .words = audience, .capacity = self.deps.players.records.len }, entries, self, settleSent)) {
-            .ready => true,
-            .nobody => false,
-            // Nothing went: a spawn is tried again next tick, a removal on its next retry.
-            .backpressured => {
-                self.backlog(audience);
-                return false;
-            },
+    pub fn shown(self: *Projectiles, slot: u32) !?Shown {
+        const entity = self.deps.entities.directory.entry(slot).id;
+        const kept = (try self.records.get(entity)) orelse return null;
+        var stored: Projectile = undefined;
+        @memcpy(std.mem.asBytes(&stored), kept.bytes[0..@sizeOf(Projectile)]);
+        const projectile = self.present(stored, self.now);
+        return .{
+            .uuid = projectile.uuid,
+            .entity_type = self.entity_types[@backingInt(projectile.kind)],
+            .owner = entity_effects.playerId(projectile.owner),
+            .position = projectile.position,
+            .velocity = projectile.velocity,
+            .yaw = projectile.yaw,
+            .pitch = projectile.pitch,
+            .in_ground = projectile.in_ground,
+            .data = self.dataOf(&projectile),
+            .age = @intCast(self.age(&projectile)),
         };
     }
 
-    /// Sends the batch and reads back who took each packet: spawns and removals tracking hears of.
-    fn flush(self: *Projectiles) !void {
-        try self.outbox.flush(self, settleSent);
-    }
-
-    /// What viewers took of one packet once the batch went.
-    fn settleSent(self: *Projectiles, sent: Sent, accepted: bit_sets.Set, recipients: usize) !void {
-        if (accepted.count() > 0) self.taken[@backingInt(sent.kind)] += 1;
-        if (sent.kind == .update) return;
-        // Whoever did not take it gets it on a later tick, and nothing more new this one.
-        if (accepted.count() < recipients) self.starve(accepted);
-        // Tracking hears who took a spawn or a removal, by the slot it was queued for.
-        const tracking = self.tracking orelse return;
-        const slot: u32 = @intCast(sent.id);
-        switch (sent.kind) {
-            .spawn => tracking.confirm(slot, accepted, tracking.nobody()),
-            .remove => tracking.confirm(slot, tracking.nobody(), accepted),
-            .update => unreachable,
-        }
+    /// Whether a slot holds a projectile, for replication's visits.
+    pub fn holds(self: *const Projectiles, slot: u32) bool {
+        return self.records.ours(slot);
     }
 
     /// A chunk's shared players, the last one asked for first.
@@ -2674,30 +2595,13 @@ pub const Projectiles = struct {
         return count;
     }
 
-    fn dataOf(_: *const Projectiles, projectile: *const Projectile) packets.Data {
+    fn dataOf(_: *const Projectiles, projectile: *const Projectile) Data {
         return .{
             .critical = projectile.critical,
             .pierce = projectile.pierce,
             .in_ground = projectile.in_ground,
             .trident = if (projectile.kind == .trident) .{ .loyalty = projectile.loyalty, .foil = projectile.foil } else null,
         };
-    }
-
-    /// The viewers in the batch who did not take a packet are starved for the rest of the tick.
-    fn starve(self: *Projectiles, accepted: bit_sets.Set) void {
-        for (self.outbox.audience, 0..) |word, at| {
-            var bits = word;
-            while (bits != 0) : (bits &= bits - 1) {
-                const other = at * 64 + @ctz(bits);
-                if (!accepted.contains(other)) self.starved[at] |= @as(u64, 1) << @intCast(@ctz(bits));
-            }
-        }
-    }
-
-    /// An audience had no room: its viewers are sent no more this tick, and tracking offers
-    /// them what they missed again.
-    fn backlog(self: *Projectiles, audience: []const u64) void {
-        for (self.starved, audience) |*starved, word| starved.* |= word;
     }
 
     fn sound(self: *Projectiles, projectile: *const Projectile, name: []const u8, volume: f32, pitch: f32) void {

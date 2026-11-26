@@ -1916,7 +1916,7 @@ const Row = struct {
     /// The link to the mob's rare parts in `extras`, or none.
     extras: u32,
 };
-const Table = entities.KindTable(Row);
+pub const Table = entities.KindTable(Row);
 
 const ColumnTicks = struct { revision: u64 = std.math.maxInt(u64), world: u32 = 0, chunk: [2]i32 = .{ 0, 0 }, ticks: bool = false };
 

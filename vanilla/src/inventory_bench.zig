@@ -525,7 +525,7 @@ pub fn benchmarkItemReplication() !void {
         @memset(streaming.published.sent, std.math.maxInt(u64));
         @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
-        const replication = try ItemReplication.init(allocator, .{ .position_interval = 1 }, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
+        const replication = try ItemReplication.init(allocator, .{ .position_interval = 200 }, .{ .dropped = dropped, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
         const Mode = enum { blocked_spawn, spawn, unchanged, single_move, unchanged_after_single_move, single_stack, unchanged_after_single_stack, age_only, blocked_change, change, mutation, unchanged_after_mutation, blocked_mutation, resumed_mutation, blocked_retirement, retirement, reuse, unchanged_after_reuse, leave_view, return_view, viewer_reset };
         for (std.enums.values(Mode)) |mode| {
             const blocked = mode == .blocked_spawn or mode == .blocked_change or mode == .blocked_mutation or mode == .blocked_retirement;
@@ -598,30 +598,35 @@ pub fn benchmarkItemReplication() !void {
                 queued += 1;
                 service.recycle(io, &.{packet});
             }
+            // The interval is longer than the run, so all that goes is what changed, as ServerEntity
+            // sends: a move waits for the item's interval, a stack goes at once.
             const unchanged = mode == .age_only or mode == .unchanged or mode == .unchanged_after_single_move or mode == .unchanged_after_single_stack or mode == .unchanged_after_mutation or mode == .unchanged_after_reuse;
-            if (blocked or unchanged) try std.testing.expectEqual(@as(usize, 0), queued) else try std.testing.expect(queued >= (if (mode == .single_move or mode == .single_stack) @as(usize, 1) else count));
+            const acquired = ownership.cache.metrics.acquired.value() - slots_before;
+            // Unchanged items cost nothing: nothing read, nothing sent.
             if (unchanged) {
+                try std.testing.expectEqual(@as(usize, 0), queued);
                 try std.testing.expectEqual(metadata_before, dropped.reads);
+                try std.testing.expectEqual(@as(u64, 0), acquired);
             }
-            if (mode == .single_move or mode == .single_stack) {
-                try std.testing.expectEqual(@as(u64, 1), dropped.reads - metadata_before);
-                try std.testing.expectEqual(@as(usize, 1), queued);
+            // A move waits for its interval: looked at, it sends nothing and reads no stack.
+            if (mode == .single_move) {
+                try std.testing.expectEqual(@as(usize, 0), queued);
+                try std.testing.expectEqual(@as(u64, 0), acquired);
             }
-            // A stack is read whenever anyone is interested in an item looked at.
-            const acquired: usize = switch (mode) {
-                .single_stack, .single_move => 1,
-                .blocked_spawn, .spawn, .blocked_change, .change, .mutation, .blocked_mutation, .resumed_mutation, .reuse, .return_view, .viewer_reset => count,
-                else => 0,
-            };
-            // Definitions are read only for a stack to send: a move alone sends none.
-            const prepared: usize = if (mode == .change or mode == .return_view or mode == .viewer_reset) count else if (mode == .single_move) 0 else acquired;
-            try std.testing.expectEqual(acquired, ownership.cache.metrics.acquired.value() - slots_before);
-            try std.testing.expectEqual(prepared, ownership.items.metrics.acquired.value() - definitions_before);
-            if (mode == .mutation or mode == .resumed_mutation or mode == .reuse or mode == .unchanged_after_reuse) for (ids[0..count]) |id| {
-                // Its stack went out to its viewer: nothing is owed.
-                const view = try replication.known(id);
-                try std.testing.expectEqual(@as(usize, 0), view.stacks);
-                try std.testing.expectEqual(@as(usize, 0), view.pending);
+            // Nothing reaches a viewer with no room.
+            if (blocked) try std.testing.expectEqual(@as(usize, 0), queued);
+            // A changed stack is read and sent, with the move that waited for its interval, as a
+            // data change sends all ServerEntity has.
+            if (mode == .single_stack) {
+                try std.testing.expect(queued >= 1);
+                try std.testing.expectEqual(@as(u64, 1), acquired);
+            }
+            // Spawns, stacks and those owed reach the viewer once it has room.
+            const sends = mode == .spawn or mode == .change or mode == .mutation or mode == .resumed_mutation or mode == .retirement or mode == .reuse or mode == .leave_view or mode == .return_view or mode == .viewer_reset;
+            if (sends) try std.testing.expect(queued >= count);
+            // With room, no viewer is left behind.
+            if (!blocked and mode != .retirement) for (ids[0..count]) |id| {
+                try std.testing.expectEqual(@as(usize, 0), (try replication.known(id)).pending);
             };
             try output.interface.print("{d:13} | {s:13} | {d:17} | {d:23} | {d}\n", .{ count, @tagName(mode), ownership.cache.metrics.acquired.value() - slots_before, ownership.items.metrics.acquired.value() - definitions_before, queued });
         }
@@ -873,7 +878,7 @@ fn verifyItemMovement(count: usize, capacity: usize, output: *std.Io.Writer) !vo
     @memset(streaming.published.sent, std.math.maxInt(u64));
     @memset(streaming.published.occluded, 0);
     streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
-    const replication = try ItemReplication.init(allocator, .{ .position_interval = 1 }, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
+    const replication = try ItemReplication.init(allocator, .{ .position_interval = 200 }, .{ .dropped = dropped, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
 
     const Step = struct { position: [2]f64, visible: bool = true, unchanged: bool = false };
     const steps = [_]Step{
@@ -996,7 +1001,7 @@ pub fn benchmarkItemVisibility() !void {
         @memset(streaming.published.sent, std.math.maxInt(u64));
         @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
-        const replication = try ItemReplication.init(allocator, .{ .position_interval = 1 }, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
+        const replication = try ItemReplication.init(allocator, .{ .position_interval = 200 }, .{ .dropped = dropped, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
 
         for (0..9) |mode| {
             if (mode == 2) {
@@ -1359,7 +1364,7 @@ pub fn benchmarkItemBroadcast() !void {
         @memset(streaming.published.sent, std.math.maxInt(u64));
         @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
-        const replication = try ItemReplication.init(allocator, .{ .position_interval = 1 }, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
+        const replication = try ItemReplication.init(allocator, .{ .position_interval = 1 }, .{ .dropped = dropped, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
 
         const expected_viewers = viewers;
         for (0..2) |_| {
@@ -1412,13 +1417,14 @@ pub fn benchmarkItemBroadcast() !void {
                 const protocol = player_records[packet.recipients.first().?.index].protocol;
                 var expected_id: ?i32 = null;
                 inline for (protocols.implementations) |Version| {
-                    if (protocol == Version.protocol_number) expected_id = Version.Protocol.play.toClient.packetId(.sync_entity_position);
+                    if (protocol == Version.protocol_number) expected_id = Version.Protocol.play.toClient.packetId(.rel_entity_move);
                 }
+                // A move, as ServerEntity sends it: an eighth of a block from where it was last sent.
                 try std.testing.expectEqual(expected_id.?, header.id);
-                const reader: wire.play.toClient.packet_sync_entity_position.Reader = .{ ._cursor = .{ .buffer = header.body, .rest = header.body } };
+                const reader: wire.play.toClient.packet_rel_entity_move.Reader = .{ ._cursor = .{ .buffer = header.body, .rest = header.body } };
                 const id, const next = try reader.entityId();
-                const x, _ = try next.x();
-                try std.testing.expectEqual(@as(f64, if (limited) 0.75 else 0.625), x);
+                const dx, _ = try next.dX();
+                try std.testing.expectEqual(@as(i16, 512), dx);
                 const at: usize = @intCast(dropped.networkId(ids[0]) - id);
                 try std.testing.expect(at < count);
                 var recipient_iterator = packet.recipients.iterator();
@@ -1459,6 +1465,12 @@ pub fn benchmarkItemBroadcast() !void {
                 var retry = service.outputBatch();
                 while (retry.next()) |packet| {
                     const header = try wire.play.toClient.readHeader(packet.bytes);
+                    // The viewer behind is sent each item whole: where it is, its data and its head.
+                    if (header.id != wire.play.toClient.packetId(.sync_entity_position)) {
+                        try std.testing.expectEqual(@as(u16, 0), packet.recipients.first().?.index);
+                        service.recycle(io, &.{packet});
+                        continue;
+                    }
                     const reader: wire.play.toClient.packet_sync_entity_position.Reader = .{ ._cursor = .{ .buffer = header.body, .rest = header.body } };
                     const id, _ = try reader.entityId();
                     const at: usize = @intCast(dropped.networkId(ids[0]) - id);
@@ -1726,7 +1738,7 @@ pub fn benchmarkItemBoundaries() !void {
         @memset(streaming.published.sent, std.math.maxInt(u64));
         @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
-        const replication = try ItemReplication.init(allocator, .{ .position_interval = 1 }, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
+        const replication = try ItemReplication.init(allocator, .{ .position_interval = 200 }, .{ .dropped = dropped, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
 
         failing.fail_index = failing.alloc_index;
         const Step = struct { position: [2]f64, visible: bool = true, unchanged: bool = false };
@@ -2378,7 +2390,7 @@ pub fn itemPositionInterval() !void {
         @memset(streaming.published.sent, std.math.maxInt(u64));
         @memset(streaming.published.occluded, 0);
         streaming.published.dirty_words.setRangeValue(.{ .start = 0, .end = streaming.published.sent.len }, true);
-        const replication = try ItemReplication.init(allocator, .{}, .{ .dropped = dropped, .item_tick = undefined, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
+        const replication = try ItemReplication.init(allocator, .{}, .{ .dropped = dropped, .players = &players, .tracking = try Tracking.init(allocator, .{}, .{ .entities = bodies, .players = &players, .streaming = streaming }), .sessions = service, .packets = encoding, .entities = bodies, .inventories = ownership, .items = items });
         var positions: usize = 0;
         for (0..41) |tick| {
             if (tick > 0) {

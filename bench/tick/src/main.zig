@@ -239,7 +239,8 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
             lightning_rod.plugin.configured(Chunks, Chunks.Configuration.forPlayers(maximum)),
             lightning_rod.plugin.configured(vanilla.Entities, .{ .memory = if (options.entity_memory) |mib| mib * 1024 * 1024 else 64 * 1024 * 1024 }),
             lightning_rod.plugin.configured(vanilla.Mobs, .{ .edits = options.mob_edits }),
-            lightning_rod.plugin.configured(vanilla.Projectiles, .{ .sleep = options.sleep, .trace_sends = options.digest }),
+            lightning_rod.plugin.configured(vanilla.Projectiles, .{ .sleep = options.sleep }),
+            lightning_rod.plugin.configured(vanilla.ProjectileReplication, .{ .trace_sends = options.digest }),
             lightning_rod.plugin.configured(vanilla.ItemEntities, .{ .sleep = !options.no_item_sleep }),
             lightning_rod.plugin.configured(vanilla.MobReplication, .{ .trace_sends = options.digest }),
             lightning_rod.plugin.configured(vanilla.ItemReplication, .{ .trace_sends = options.digest }),
@@ -393,7 +394,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
         try flyers(simulation, spawn_world, options.flying, !options.unforced);
         for (0..40) |tick| {
             try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
-            if (options.digest) try writer.print("warm tick={d} projectiles={x} sent={x} queued={any} sleeping={d}\n", .{ tick, try simulation.get(vanilla.Projectiles).digest(), simulation.get(vanilla.Projectiles).sent, simulation.get(vanilla.Projectiles).queued, simulation.get(vanilla.Projectiles).sleepingCount() });
+            if (options.digest) try writer.print("warm tick={d} projectiles={x} sent={x} sleeping={d}\n", .{ tick, try simulation.get(vanilla.Projectiles).digest(), simulation.get(vanilla.ProjectileReplication).traced(), simulation.get(vanilla.Projectiles).sleepingCount() });
         }
     }
     var volleys: usize = 0;
@@ -457,7 +458,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
             for (cached_files) |file| if (file) |open| {
                 _ = std.os.linux.fadvise(open.handle, 0, 0, std.os.linux.POSIX_FADV.DONTNEED);
             };
-            if (options.digest) try writer.print("digest tick={d} mobs={x} orbs={x} projectiles={x} sent={x} items={x} mob_sent={x} item_sent={x} orb_sent={x} packets={d} recipients={d} sleeping={d} items_asleep={d} wire={x}\n", .{ tick, try mobs.digest(), try simulation.get(vanilla.Experience).digest(), try simulation.get(vanilla.Projectiles).digest(), simulation.get(vanilla.Projectiles).sent, try simulation.get(vanilla.ItemEntities).digest(), simulation.get(vanilla.MobReplication).traced, simulation.get(vanilla.ItemReplication).traced, simulation.get(vanilla.ExperienceReplication).traced, packets, recipients, simulation.get(vanilla.Projectiles).sleepingCount(), simulation.get(vanilla.ItemEntities).asleepCount(), wireDigest() });
+            if (options.digest) try writer.print("digest tick={d} mobs={x} orbs={x} projectiles={x} sent={x} items={x} mob_sent={x} item_sent={x} orb_sent={x} packets={d} recipients={d} sleeping={d} items_asleep={d} wire={x}\n", .{ tick, try mobs.digest(), try simulation.get(vanilla.Experience).digest(), try simulation.get(vanilla.Projectiles).digest(), simulation.get(vanilla.ProjectileReplication).traced(), try simulation.get(vanilla.ItemEntities).digest(), simulation.get(vanilla.MobReplication).traced(), simulation.get(vanilla.ItemReplication).traced(), simulation.get(vanilla.ExperienceReplication).traced(), packets, recipients, simulation.get(vanilla.Projectiles).sleepingCount(), simulation.get(vanilla.ItemEntities).asleepCount(), wireDigest() });
         }
         cpus[sample] = @intCast(std.Io.Clock.now(.cpu_thread, io).nanoseconds - cpu);
         process_cpus += @intCast(std.Io.Clock.now(.cpu_process, io).nanoseconds - process_cpu);
@@ -500,7 +501,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
         const per: f64 = @floatFromInt(ticks);
         try writer.print("  tracking logged={d:.1} quiet={d:.1} anchored={d:.2} slack_moves={d:.1} columns={d:.1} measured={d:.1} asked={d:.1} changed={d:.1} near={d:.1} walks={d:.2} boxes={d:.1} exact={d:.2} tiles={d} /tick\n", .{ @as(f64, @floatFromInt(done.logged - was.logged)) / per, @as(f64, @floatFromInt(done.logged_quiet - was.logged_quiet)) / per, @as(f64, @floatFromInt(done.anchored - was.anchored)) / per, @as(f64, @floatFromInt(done.slack_moves - was.slack_moves)) / per, @as(f64, @floatFromInt(done.columns - was.columns)) / per, @as(f64, @floatFromInt(done.measured - was.measured)) / per, @as(f64, @floatFromInt(done.asked - was.asked)) / per, @as(f64, @floatFromInt(done.changed - was.changed)) / per, @as(f64, @floatFromInt(done.near_measured - was.near_measured)) / per, @as(f64, @floatFromInt(done.edge_walks - was.edge_walks)) / per, @as(f64, @floatFromInt(done.boxes - was.boxes)) / per, @as(f64, @floatFromInt(done.exact - was.exact)) / per, done.tiles_made });
     }
-    if (options.arrows > 0 or options.flying > 0) try writer.print("  arrows={d} ticking={d} volleys={d} queued={any} taken={any} sleeping={d}\n", .{ simulation.get(vanilla.Projectiles).activeCount(), simulation.get(vanilla.Projectiles).tickingCount(), volleys, simulation.get(vanilla.Projectiles).queued, simulation.get(vanilla.Projectiles).taken, simulation.get(vanilla.Projectiles).sleepingCount() });
+    if (options.arrows > 0 or options.flying > 0) try writer.print("  arrows={d} ticking={d} volleys={d} sleeping={d}\n", .{ simulation.get(vanilla.Projectiles).activeCount(), simulation.get(vanilla.Projectiles).tickingCount(), volleys, simulation.get(vanilla.Projectiles).sleepingCount() });
     if (options.cows > 0) try writer.print("  domain_revision={d} audience_changes={d} cows={d} ticked={d} resting={d} idle_ticks={d} blocks={d} rare_lanes={d} travels_skipped={d} travels_run={d} path_searches={d:.3}/tick edits={d} edit_recomputes={d} edits_answered_early={d} sections_decoded={d}\n", .{ mobs.domain_revision, simulation.get(vanilla.MobReplication).audience_changes, mobs.active.count, ticked, resting, mobs.idle_ticks - idle_before, mobs.idle_blocks - blocks_before, mobs.rare_lanes - rare_before, mobs.travels_skipped - skipped_before, mobs.travels_run - run_before, @as(f64, @floatFromInt(mobs.path_searches - searches_before)) / @as(f64, @floatFromInt(ticks)), edits, mobs.edit_recomputes - recomputes_before, mobs.edits_answered_early, mobs.copies.decoded });
     if (options.detail) for (snapshots, before[0..snapshots.len]) |after, previous| {
         if (after.kind == .counter) {
