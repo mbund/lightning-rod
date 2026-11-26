@@ -265,12 +265,17 @@ pub const ItemTick = struct {
         // again by the currents where it ended up.
         if (metadata.alive) {
             var again = body;
-            _ = try self.deps.physics.push(neighborhood, &again, try self.ultrawarm(body.world));
+            const after = try self.deps.physics.push(neighborhood, &again, try self.ultrawarm(body.world));
             if (!std.meta.eql(again, body)) {
                 try dropped.move(entity, body, again);
                 metadata.revision += 1;
                 body = again;
             }
+            // ItemEntity.tick sets hasImpulse in water or lava, and when its velocity changed by
+            // more than 0.1 since its base tick: ServerEntity sends it that very tick.
+            var change: f64 = 0;
+            for (body.velocity, pushed.velocity) |now, was| change += (now - was) * (now - was);
+            if (after.water > 0 or after.lava > 0 or change > 0.01) dropped.impulses.insert(dropped.items.slotOf(entity).?);
         }
         const world = self.deps.worlds.get(body.world) orelse return error.UnknownWorld;
         const void_y: f64 = @floatFromInt(world.dimension.minimumSection() * 16 - 64);

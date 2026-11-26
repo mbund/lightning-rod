@@ -152,6 +152,8 @@ pub const ItemReplication = struct {
             }
         }
         dropped.changes.clear();
+        // Items with an impulse go this tick, whatever their interval.
+        for (dropped.impulses.values()) |slot| self.sync.mark(@intCast(slot));
         // Items that moved, a sleeper woken among them, are visited on their interval again.
         for (dropped.moved.values()) |slot| self.sync.stir(@intCast(slot));
         dropped.moved.clear();
@@ -176,6 +178,7 @@ pub const ItemReplication = struct {
             try self.visit(visited[at..][0..count]);
             at += count;
         }
+        dropped.impulses.clear();
         try self.sync.finish();
     }
 
@@ -245,6 +248,7 @@ pub const ItemReplication = struct {
             self.reading = view;
             try self.sync.update(slot, .{
                 .id = self.deps.entities.directory.entry(slot).id,
+                .has_impulse = dropped.impulses.contains(slot),
                 .data = data,
                 .changed = tracking.changed(slot) != null,
                 // A sleeper moves only when it wakes, which stirs it.
