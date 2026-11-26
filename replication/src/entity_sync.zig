@@ -265,7 +265,10 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
         delivery: Delivery,
         /// Deltas of entities that go to the same players, admitted for all of them at once.
         /// Whatever goes out alone sends them first, so each player has its packets in order.
-        batch: delivery_module.Batch(u32),
+        batch: delivery_module.Batch(Queued),
+        /// Whether the entity under way is being removed for some players this tick, whom row 1
+        /// holds: they are sent nothing more of it, as their removal settles when the batch goes.
+        leaving: bool = false,
         /// Events in the order they befell, each with the players still owed it: a ring.
         held: []Held,
         held_rows: []usize,
@@ -452,6 +455,9 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             const stale = self.deps.tracking.stale(slot);
             const words = self.row(2);
             for (words, 0..) |*word, at| word.* = known.wordAt(at) & ~stale.wordAt(at);
+            if (self.leaving) for (words, self.row(1)) |*word, removing| {
+                word.* &= ~removing;
+            };
             return self.set(words);
         }
 
@@ -485,7 +491,13 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                 view.* = start(subject, body.?);
                 view.started = self.tick_count -% subject.age;
             }
-            if (subject.changed) try self.pairing(slot, self.spec.identity(self.spec.kind, slot), view, tracking.changed(slot).?);
+            // Removals first; spawns after its changes went to those who have it, so new viewers
+            // are shown it as everyone now has it. Data written for each recipient apart pairs as
+            // vanilla orders it, all of it first.
+            const change: ?Tracking.Change = if (subject.changed) tracking.changed(slot).? else null;
+            if (change) |value| {
+                if (self.personalized()) try self.pairing(slot, self.spec.identity(self.spec.kind, slot), view, value) else try self.leave(slot, value);
+            }
             const known = self.current(slot);
             // Data known not to have changed is not compared.
             const now = subject.data orelse view.data;
@@ -501,6 +513,8 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                 try self.queue(slot, known, .{ .velocity = .{ .id = entities.Entities.networkOfSlot(slot), .velocity = body.?.velocity } });
             }
             self.noteMissed(slot);
+            if (change) |value| if (!self.personalized()) try self.join(slot, self.spec.identity(self.spec.kind, slot), view, value);
+            self.leaving = false;
             if (tracking.stale(slot).any()) try self.catchUp(slot, view);
             if (self.visit != null) try self.visited(slot, view, self.spec.update_interval, subject.resting);
         }
@@ -522,7 +536,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             self.drop(slot);
         }
 
-        /// Removals, but not before an event a client is owed of it; then spawns.
+        /// Removals and spawns sent at once, as data written for each recipient apart needs.
         fn pairing(self: *Self, slot: u32, identity: Identity, view: *const View, change: Tracking.Change) !void {
             const spawned = self.row(0);
             const removed = self.row(1);
@@ -535,7 +549,26 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             self.missed_any = false;
         }
 
-        fn remove(self: *Self, slot: u32, players: bit_sets.Set, removed: []usize) !void {
+        /// Removals, but not before an event a client is owed of it, in the batch: tracking hears
+        /// who took each when the batch goes.
+        fn leave(self: *Self, slot: u32, change: Tracking.Change) !void {
+            const leaving = self.row(1);
+            @memcpy(leaving, self.withoutOwed(slot, change.remove));
+            if (!any(leaving)) return;
+            try self.queueControl(slot, self.set(leaving), .remove, .{ .remove = entities.Entities.networkOfSlot(slot) });
+            self.leaving = true;
+        }
+
+        /// Spawns in the batch, so many entities spawning for the same players go at once, each
+        /// as its viewers were just sent it.
+        fn join(self: *Self, slot: u32, identity: Identity, view: *const View, change: Tracking.Change) !void {
+            const spawned = self.row(0);
+            for (spawned, 0..) |*word, at| word.* = change.spawn.wordAt(at);
+            if (any(spawned)) try self.queueSpawn(slot, identity, view, self.set(spawned));
+        }
+
+        /// Of the players an entity leaves, those not owed an event of it first: row 4.
+        fn withoutOwed(self: *Self, slot: u32, players: bit_sets.Set) []usize {
             const pending = self.row(4);
             for (pending, 0..) |*word, at| word.* = players.wordAt(at);
             for (0..self.held_count) |offset| {
@@ -543,8 +576,63 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                 if (self.held[at].slot != slot) continue;
                 for (pending, self.heldRow(at)) |*word, owed| word.* &= ~owed;
             }
+            return pending;
+        }
+
+        fn remove(self: *Self, slot: u32, players: bit_sets.Set, removed: []usize) !void {
+            const pending = self.withoutOwed(slot, players);
             try self.deliver(self.set(pending), .{ .remove = entities.Entities.networkOfSlot(slot) });
             self.delivery.markReached(removed);
+        }
+
+        /// ServerEntity.sendPairingData, batched: the entity as last sent and its data that
+        /// differs from the defaults, one group each player takes whole or not at all.
+        fn queueSpawn(self: *Self, slot: u32, identity: Identity, view: *const View, recipients: bit_sets.Set) !void {
+            const id = entities.Entities.networkOfSlot(slot);
+            const spawn: Spawn = .{ .id = id, .uuid = identity.uuid, .kind = identity.entity_type, .data = identity.object_data, .position = view.base, .velocity = view.velocity, .yaw = view.yaw, .pitch = view.pitch, .head_yaw = view.head_yaw };
+            const changes = DataChanges.fromDefaults(view.data);
+            if (self.tracing) self.traceSend(recipients, .{ .spawn = spawn });
+            if (!changes.any()) return self.queueControl(slot, recipients, .spawn, .{ .spawn = spawn });
+            if (self.tracing) self.traceSend(recipients, .{ .metadata = .{ .id = id, .data = view.data, .changes = changes } });
+            const queued: Queued = .{ .slot = slot, .purpose = .spawn };
+            for (0..2) |_| {
+                // Two packets and the bundle around them.
+                switch (try self.batch.prepare(recipients, 4, self, settleQueued)) {
+                    .ready => {},
+                    // No one to take it now: tracking offers it again next tick.
+                    .nobody, .backpressured => return,
+                }
+                if (try self.batch.sendGroup(queued, .{ .{ spawnLegacy, spawnPacked }, writeMetadata }, .{ .{spawn}, .{ id, view.data, changes, &self.spec, @as(?u128, null) } }, &.{ 128, self.dataBytes(slot) })) return;
+                try self.flushQueued();
+            }
+        }
+
+        /// A spawn without data, or a removal, in the batch: tracking hears who took it when the
+        /// batch goes, and offers it again next tick to whoever did not.
+        fn queueControl(self: *Self, slot: u32, recipients: bit_sets.Set, purpose: Purpose, outgoing: Outgoing) !void {
+            if (self.tracing and purpose == .remove) self.traceSend(recipients, outgoing);
+            const queued: Queued = .{ .slot = slot, .purpose = purpose };
+            for (0..2) |_| {
+                switch (try self.batch.prepare(recipients, 1, self, settleQueued)) {
+                    .ready => {},
+                    .nobody, .backpressured => break,
+                }
+                const sent = switch (outgoing) {
+                    .spawn => |value| try self.batch.send(queued, .{ spawnLegacy, spawnPacked }, .{value}, 128),
+                    .remove => |value| try self.batch.send(queued, writeRemove, .{value}, 32),
+                    else => unreachable,
+                };
+                if (sent) return;
+                try self.flushQueued();
+            }
+            // A removal that could not go leaves its players with the entity, sent nothing more of it.
+            if (purpose == .remove) {
+                const owed = self.row(4);
+                @memset(owed, 0);
+                var each = recipients.iterator();
+                while (each.next()) |player| if (self.deps.players.records[player].handle != null) put(owed, player);
+                self.behind(slot, self.set(owed));
+            }
         }
 
         fn start(subject: Subject, body: Body) View {
@@ -780,6 +868,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                     // None of them playing yet, or none with room: they are owed it all the same.
                     .nobody, .backpressured => break,
                 }
+                const queued: Queued = .{ .slot = slot, .purpose = .delta };
                 const sent = switch (outgoing) {
                     .metadata => |value| if (self.personalized()) {
                         // Written for each recipient apart: it goes alone, so the batch takes the rest.
@@ -791,13 +880,13 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                         for (self.delivery.missedPlayers()) |player| put(late, player);
                         self.behind(slot, self.set(late));
                         return;
-                    } else try self.batch.send(slot, writeMetadata, .{ value.id, value.data, value.changes, &self.spec, @as(?u128, null) }, self.dataBytes(slot)),
-                    .velocity => |value| try self.batch.send(slot, .{ writeVelocityLegacy, writeVelocityPacked }, .{ value.id, value.velocity }, 64),
-                    .sync => |value| try self.batch.send(slot, writeSync, .{ value.id, value.position, value.velocity, value.yaw, value.pitch, value.on_ground }, 128),
-                    .relative => |value| try self.batch.send(slot, writeRelative, .{ value.id, value.delta, value.on_ground }, 32),
-                    .look => |value| try self.batch.send(slot, writeLook, .{ value.id, value.yaw, value.pitch, value.on_ground }, 32),
-                    .move_look => |value| try self.batch.send(slot, writeMoveLook, .{ value.id, value.delta, value.yaw, value.pitch, value.on_ground }, 32),
-                    .head => |value| try self.batch.send(slot, writeHead, .{ value.id, value.yaw }, 32),
+                    } else try self.batch.send(queued, writeMetadata, .{ value.id, value.data, value.changes, &self.spec, @as(?u128, null) }, self.dataBytes(slot)),
+                    .velocity => |value| try self.batch.send(queued, .{ writeVelocityLegacy, writeVelocityPacked }, .{ value.id, value.velocity }, 64),
+                    .sync => |value| try self.batch.send(queued, writeSync, .{ value.id, value.position, value.velocity, value.yaw, value.pitch, value.on_ground }, 128),
+                    .relative => |value| try self.batch.send(queued, writeRelative, .{ value.id, value.delta, value.on_ground }, 32),
+                    .look => |value| try self.batch.send(queued, writeLook, .{ value.id, value.yaw, value.pitch, value.on_ground }, 32),
+                    .move_look => |value| try self.batch.send(queued, writeMoveLook, .{ value.id, value.delta, value.yaw, value.pitch, value.on_ground }, 32),
+                    .head => |value| try self.batch.send(queued, writeHead, .{ value.id, value.yaw }, 32),
                     else => unreachable,
                 };
                 if (sent) return;
@@ -811,10 +900,27 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             self.behind(slot, self.set(owed));
         }
 
-        /// What a queued delta of the entity in a slot reached: whom it missed are behind.
-        fn settleQueued(self: *Self, slot: u32, accepted: bit_sets.Set, _: usize) !void {
-            const missed = self.batch.missedOf(accepted);
-            if (missed.any()) self.behind(slot, missed);
+        /// What a packet the batch held is for, and of which entity.
+        const Purpose = enum { delta, spawn, remove };
+        const Queued = struct { slot: u32, purpose: Purpose };
+
+        /// What a queued packet reached: whom a delta missed are behind; tracking hears who took a
+        /// spawn or a removal.
+        fn settleQueued(self: *Self, queued: Queued, accepted: bit_sets.Set, _: usize) !void {
+            const tracking = self.deps.tracking;
+            switch (queued.purpose) {
+                .delta => {
+                    const missed = self.batch.missedOf(accepted);
+                    if (missed.any()) self.behind(queued.slot, missed);
+                },
+                .spawn => tracking.confirm(queued.slot, accepted, tracking.nobody()),
+                .remove => {
+                    tracking.confirm(queued.slot, tracking.nobody(), accepted);
+                    // Those it missed still have the entity and were sent nothing more of it: behind.
+                    const missed = self.batch.missedOf(accepted);
+                    if (missed.any()) self.behind(queued.slot, missed);
+                },
+            }
         }
 
         fn flushQueued(self: *Self) !void {
