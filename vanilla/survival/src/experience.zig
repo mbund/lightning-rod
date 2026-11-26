@@ -359,9 +359,9 @@ pub const Experience = struct {
         return self.deps.entities.networkOf(entity).?;
     }
 
-    /// The id it was given, which the wire's negates: what vanilla's getId gives.
+    /// The id it was given, the wire's: what vanilla's getId gives.
     pub fn givenId(self: *const Experience, entity: u64) u32 {
-        return @intCast(-@as(i64, self.networkId(entity)));
+        return @intCast(self.networkId(entity));
     }
 
     /// Orbs of a box's columns in vanilla's order: x up, z from 0 up then the negative ones,

@@ -411,20 +411,33 @@ pub const Entities = struct {
         };
     }
 
-    /// The id clients know an entity in memory by: its slot plus one, negated, as players take the
-    /// positive ids.
+    /// Network ids up to this are players', their slots plus one; entities in memory take those
+    /// after `entity_ids_after`. Positive, as vanilla's are: every entity packet carries one as a
+    /// varint, three bytes for these where a negative id takes five.
+    pub const player_ids = 65536;
+    /// A multiple of 40 past the players', so the phases vanilla reads from an id, id % 4 for an
+    /// item's motion and id % 40 for an orb's merge group, are its slot's plus one.
+    pub const entity_ids_after = 65560;
+
+    /// The id clients know an entity in memory by.
     pub fn networkOf(self: *const Entities, entity: Id) ?i32 {
         return networkOfSlot(self.directory.slotOf(entity) orelse return null);
     }
 
     pub fn networkOfSlot(slot: u32) i32 {
-        return -@as(i32, @intCast(slot + 1));
+        return @intCast(@as(u64, slot) + 1 + entity_ids_after);
+    }
+
+    /// The slot of the entity clients know by an id, which must be one of an entity's.
+    pub fn slotOfNetwork(wire_id: i32) u32 {
+        assert(wire_id > entity_ids_after);
+        return @intCast(wire_id - 1 - entity_ids_after);
     }
 
     /// The entity in memory clients know by an id.
     pub fn entityOfNetwork(self: *const Entities, wire_id: i32) ?Id {
-        if (wire_id >= 0) return null;
-        const slot: u64 = @intCast(-@as(i64, wire_id) - 1);
+        if (wire_id <= entity_ids_after) return null;
+        const slot: u64 = slotOfNetwork(wire_id);
         if (slot >= self.directory.high()) return null;
         const entity = self.directory.entry(@intCast(slot)).id;
         return if (entity == 0) null else entity;

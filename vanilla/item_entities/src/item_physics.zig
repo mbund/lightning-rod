@@ -748,23 +748,23 @@ pub const ItemPhysics = struct {
 };
 
 /// ItemEntity.tick's `(age + getId()) % 4 == 0`, in Java's int arithmetic with the network id
-/// the world sends, which is the negated entity id. An item lying still on the ground moves, and
-/// so finds out its block went, only on these ticks: items fall in four groups by their id, which
-/// wireless redstone relies on. Sleeping must keep waking resting items in time for theirs.
+/// the world sends. An item lying still on the ground moves, and so finds out its block went,
+/// only on these ticks: items fall in four groups by their id, which wireless redstone relies on. Sleeping must keep waking resting items in time for theirs.
 pub fn movesOnPhase(ticks: u32, entity_id: u32) bool {
     assert(entity_id > 0 and entity_id <= std.math.maxInt(i32));
-    const network_id = -@as(i32, @intCast(entity_id));
+    const network_id: i32 = @intCast(entity_id);
     return @rem(@as(i32, @bitCast(ticks)) +% network_id, 4) == 0;
 }
 
 test "resting items move on ticks grouped by their network id, four groups" {
-    // Entity 1 is network id -1: (5 + -1) % 4 == 0.
-    try std.testing.expect(movesOnPhase(5, 1));
-    try std.testing.expect(!movesOnPhase(5, 2));
-    try std.testing.expect(movesOnPhase(6, 2));
-    // Java's remainder keeps the sign: (1 + -3) % 4 is -2, not a move tick; (3 + -3) is.
-    try std.testing.expect(!movesOnPhase(1, 3));
-    try std.testing.expect(movesOnPhase(3, 3));
+    // (3 + 1) % 4 == 0.
+    try std.testing.expect(movesOnPhase(3, 1));
+    try std.testing.expect(!movesOnPhase(3, 2));
+    try std.testing.expect(movesOnPhase(2, 2));
+    // Java's int addition wraps, and its remainder keeps the sign: an age past the int range
+    // goes negative, (-2147483648 + 4) % 4 == 0.
+    try std.testing.expect(movesOnPhase(0x8000_0000, 4));
+    try std.testing.expect(!movesOnPhase(0x8000_0001, 4));
     // Every tick, exactly a quarter of any four consecutive ids move.
     for (0..8) |tick| {
         var moving: usize = 0;

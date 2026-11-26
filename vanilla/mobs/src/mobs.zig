@@ -662,14 +662,14 @@ pub const Mobs = struct {
         }
     }
 
-    /// The id a mob was given in memory, which the wire's negates: what vanilla's getId gives.
+    /// The id a mob was given in memory, the wire's: what vanilla's getId gives.
     pub fn givenId(self: *const Mobs, mob: Mob) u32 {
-        return @intCast(-@as(i64, self.deps.entities.networkOf(mob.entity.id).?));
+        return @intCast(self.deps.entities.networkOf(mob.entity.id).?);
     }
 
     /// The id a mob in a slot was given, as `givenId`.
     fn givenOfSlot(slot: u32) i32 {
-        return -entities.Entities.networkOfSlot(slot);
+        return entities.Entities.networkOfSlot(slot);
     }
 
     /// Whether an entity's slot holds a mob of the mobs' table.

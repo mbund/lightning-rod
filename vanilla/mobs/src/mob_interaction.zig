@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const game_data = @import("game_data");
+const entities = @import("entities");
 const sessions = @import("sessions");
 const inventories = @import("inventories");
 const wire = @import("wire_1_21_5");
@@ -144,9 +145,9 @@ pub const MobInteraction = struct {
         if (hand < 0 or hand > 1) return error.InvalidPacket;
         const player = &self.deps.players.records[handle.index];
         if (player.stage != .ready) return;
-        // Players' network ids are their slots plus one; other entities' are negative.
-        if (target > 0) return self.dispatchPlayer(handle.index, @intCast(target - 1), mouse);
-        if (target == 0) return;
+        // Players' network ids are their slots plus one; other entities' come after.
+        if (target <= 0) return;
+        if (target <= entities.Entities.player_ids) return self.dispatchPlayer(handle.index, @intCast(target - 1), mouse);
         const mob = (try self.deps.mobs.get(self.deps.mobs.deps.entities.entityOfNetwork(target) orelse return)) orelse return;
         if (mob.motion.world != player.world or mob.entity.removed) return;
         // ServerGamePacketListenerImpl.handleInteract: nothing outside the border is reached.

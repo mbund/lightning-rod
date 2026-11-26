@@ -958,7 +958,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
         /// An entity's data to a set of players: to all at once, or written for each apart, the
         /// delivery then saying whom all of them reached and missed.
         fn deliverData(self: *Self, recipients: bit_sets.Set, id: i32, data: Data, changes: DataChanges) !void {
-            const slot: u32 = @intCast(-id - 1);
+            const slot: u32 = entities.Entities.slotOfNetwork(id);
             const delivery = &self.delivery;
             if (!self.personalized()) return delivery.send(recipients, writeMetadata, .{ id, data, changes, &self.spec, @as(?u128, null) }, self.dataBytes(slot));
             const reached = self.personal;
@@ -988,7 +988,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
 
         fn writeMetadata(packet: wire.play.toClient.packet_entity_metadata.Writer, registry: packets.Registry, id: i32, data: Data, changes: DataChanges, spec: *const Spec, recipient: ?u128) ![]u8 {
             var metadata = try (try packet.entityId(id)).metadata();
-            const done = try packets.nested(.{writeEntries}).write(try metadata.begin(), Values{ .data = data, .changes = changes, .protocol = packet.layoutProtocol(), .spec = spec, .slot = @intCast(-id - 1), .recipient = recipient, .registry = registry });
+            const done = try packets.nested(.{writeEntries}).write(try metadata.begin(), Values{ .data = data, .changes = changes, .protocol = packet.layoutProtocol(), .spec = spec, .slot = entities.Entities.slotOfNetwork(id), .recipient = recipient, .registry = registry });
             return (try metadata.advance(done)).finish();
         }
 

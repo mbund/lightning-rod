@@ -1408,7 +1408,7 @@ pub fn benchmarkItemBroadcast() !void {
             service.flush();
             const audiences = service.output.pool.audiences.len - service.output.pool.free_audiences.count();
             var received: [64][256]bool = @splat(@splat(false));
-            var previous: [64]i32 = @splat(std.math.maxInt(i32));
+            var previous: [64]i32 = @splat(std.math.minInt(i32));
             var sent: [64]usize = @splat(0);
             var queued: usize = 0;
             var batch = service.outputBatch();
@@ -1425,13 +1425,13 @@ pub fn benchmarkItemBroadcast() !void {
                 const id, const next = try reader.entityId();
                 const dx, _ = try next.dX();
                 try std.testing.expectEqual(@as(i16, 512), dx);
-                const at: usize = @intCast(dropped.networkId(ids[0]) - id);
+                const at: usize = @intCast(id - dropped.networkId(ids[0]));
                 try std.testing.expect(at < count);
                 var recipient_iterator = packet.recipients.iterator();
                 while (recipient_iterator.next()) |handle| {
                     try std.testing.expectEqual(protocol, player_records[handle.index].protocol);
                     try std.testing.expectEqual(@as(u32, 1), handle.generation);
-                    try std.testing.expect(id < previous[handle.index]);
+                    try std.testing.expect(id > previous[handle.index]);
                     previous[handle.index] = id;
                     received[handle.index][at] = true;
                     sent[handle.index] += 1;
@@ -1473,7 +1473,7 @@ pub fn benchmarkItemBroadcast() !void {
                     }
                     const reader: wire.play.toClient.packet_sync_entity_position.Reader = .{ ._cursor = .{ .buffer = header.body, .rest = header.body } };
                     const id, _ = try reader.entityId();
-                    const at: usize = @intCast(dropped.networkId(ids[0]) - id);
+                    const at: usize = @intCast(id - dropped.networkId(ids[0]));
                     try std.testing.expectEqual(@as(usize, 1), packet.recipients.len);
                     try std.testing.expectEqual(@as(u16, 0), packet.recipients.first().?.index);
                     try std.testing.expect(!received[0][at]);

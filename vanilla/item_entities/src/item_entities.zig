@@ -781,9 +781,9 @@ pub const ItemEntities = struct {
         return self.deps.entities.networkOf(entity).?;
     }
 
-    /// The id it was given, which the wire's negates: what vanilla's getId gives.
+    /// The id it was given, the wire's: what vanilla's getId gives.
     pub fn givenId(self: *const ItemEntities, entity: entities.Id) u32 {
-        return @intCast(-@as(i64, self.networkId(entity)));
+        return @intCast(self.networkId(entity));
     }
 };
 

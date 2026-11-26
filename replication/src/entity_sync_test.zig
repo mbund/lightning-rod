@@ -183,7 +183,7 @@ const Fixture = struct {
     }
 
     fn seenOf(self: *Fixture, client: usize, network_id: i32) *Seen {
-        const slot: usize = @intCast(-network_id - 1);
+        const slot: usize = entities.Entities.slotOfNetwork(network_id);
         return &self.seen[client * self.slots + slot];
     }
 

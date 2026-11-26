@@ -302,7 +302,8 @@ pub const Players = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Players {
         const position = config.spawn orelse default_spawn;
-        if (config.maximum == 0 or config.render_distance < 2 or config.render_distance > 32 or config.simulation_distance < 1 or config.dig_observers == 0 or config.dig_observers > 256)
+        // Players take the network ids up to entities.Entities.player_ids, entities those above.
+        if (config.maximum == 0 or config.maximum > entities.Entities.player_ids or config.render_distance < 2 or config.render_distance > 32 or config.simulation_distance < 1 or config.dig_observers == 0 or config.dig_observers > 256)
             return error.InvalidConfiguration;
         if (config.brand.len == 0 or config.brand.len > 256) return error.InvalidConfiguration;
 
