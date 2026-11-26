@@ -199,9 +199,9 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             errdefer allocator.free(packets);
             @memset(packets, .{});
             // Only a packet larger than its ring and what was published behind it wait, and each
-            // charges at least the bound of the smallest frame, so credit bounds how many.
+            // charges at least the smallest charge, so credit bounds how many.
             var smallest: usize = std.math.maxInt(usize);
-            for (endpoints) |endpoint| smallest = @min(smallest, endpoint.framedBound(1));
+            for (endpoints) |endpoint| smallest = @min(smallest, endpoint.creditCharge(1));
             const backlog_capacity = config.output_bytes / smallest + 1;
             const backlogs = try allocator.alloc(Backlog, config.connections);
             errdefer allocator.free(backlogs);
@@ -480,7 +480,9 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             const packet_index = self.sources[source].packet_base + raw.page;
             const packet = &self.packets[packet_index];
             assert(packet.source == null and packet.waiting == 0);
-            packet.* = .{ .raw = raw, .source = source, .charge = endpoint.creditCharge(endpoint.chargedLength(raw.bytes.len, raw.decoded_length)) };
+            // Packed pieces charged together what publishing them said; anything else its bound.
+            const charge = if (raw.group.pieces != 0) raw.group.bytes else endpoint.creditCharge(endpoint.chargedLength(raw.bytes.len, raw.decoded_length));
+            packet.* = .{ .raw = raw, .source = source, .charge = charge };
             packet.framed = self.frame(endpoint, raw) catch |err| {
                 std.log.warn("event=session_packet_unframed bytes={d} reason={s}", .{ raw.bytes.len, @errorName(err) });
                 var recipients = raw.recipients.iterator();
@@ -535,6 +537,7 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             const threshold = self.config.compression_threshold;
             const compressing = self.instruments.compression.start();
             defer compressing.end();
+            if (raw.group.pieces != 0) return self.framePieces(storage, raw, number, threshold);
             const framed = if (raw.decoded_length != 0)
                 try Endpoint.preparedFrame(number, &self.engine.workspaces, storage, raw.bytes.len, raw.decoded_length, threshold, self.compressed)
             else
@@ -544,6 +547,21 @@ pub fn Worker(comptime Endpoint: type, comptime Hooks: type, comptime Router: ty
             if (framed.len > storage.len) return error.FrameTooLarge;
             @memcpy(storage[0..framed.len], framed);
             return storage[0..framed.len];
+        }
+
+        /// Packed pieces as they go on the wire, one frame after another in the packet's own
+        /// storage, as `shared.framePieces` frames them.
+        fn framePieces(self: *Self, storage: []u8, raw: shared.RawPacket, number: i32, threshold: ?usize) ![]const u8 {
+            const Framing = struct {
+                worker: *Self,
+                number: i32,
+                threshold: ?usize,
+                fn frame(framing: @This(), piece: []u8, length: usize) anyerror![]const u8 {
+                    return Endpoint.sharedFrame(framing.number, &framing.worker.engine.workspaces, piece, length, framing.threshold, framing.worker.compressed);
+                }
+            };
+            const payload = storage[shared.headroom..][0..raw.bytes.len];
+            return shared.framePieces(payload, raw.group.pieces, threshold, Framing{ .worker = self, .number = number, .threshold = threshold }, Framing.frame);
         }
 
         fn drainBacklogs(self: *Self, io: std.Io) void {

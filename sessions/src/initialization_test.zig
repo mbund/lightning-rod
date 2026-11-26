@@ -1102,6 +1102,61 @@ test "broadcast batches preserve exclusions dependencies credits and audience ow
     }
 }
 
+test "small packets for one audience pack into one buffer charged what they take on the wire" {
+    const Version = struct {
+        pub const protocol_number = 1;
+    };
+    const Encoder = struct {
+        pub fn writeGroup(comptime _: type, buffers: []const []u8, lengths: []usize, arguments: anytype) !void {
+            for (buffers, lengths, 0..) |buffer, *length, index| {
+                length.* = arguments[0] + index;
+                @memset(buffer[0..length.*], @intCast(arguments[1]));
+            }
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var hooks: Hooks = .{};
+    // Frames that add four bytes at most without compressing, as Minecraft's.
+    const plain = [1]protocol.Protocol{.{ .number = 1, .frame_bound = .{ .plain_overhead = 4 } }};
+    const endpoint = try service_module.Service.init(allocator, std.testing.io, transport(&hooks), .{ .connections = 2, .pages = 8, .page_bytes = 4096, .credit_bytes = 64 * 1024, .protocols = &plain, .compression_threshold = 256 });
+    defer endpoint.deinit();
+    var batch = try service_module.Service.Broadcast.init(allocator, endpoint, 64);
+    defer batch.deinit();
+    var targets: [2]service_module.Service.Target = undefined;
+    for (&targets, 0..) |*target, index| {
+        target.* = .{ .handle = .{ .index = @intCast(index), .generation = 1 }, .protocol = 1 };
+        endpoint.credit[index].store(@as(u64, 1) << 32 | service_module.Service.active | endpoint.config.credit_bytes, .release);
+    }
+    try batch.begin(&targets);
+    var receipts: [20]service_module.Service.Broadcast.Receipt = undefined;
+    var bound: usize = 0;
+    for (&receipts, 0..) |*receipt, index| {
+        // Movement alone, then a spawn and its data, which go together.
+        if (index % 2 == 0) {
+            receipt.* = try batch.write(.{Version}, Encoder, null, null, .{ 10, index }, 32);
+            bound += 10 + 4;
+        } else {
+            receipt.* = try batch.writeGroup(.{Version}, Encoder, null, null, .{ 20, index }, &.{ 64, 64 });
+            bound += 20 + 4 + 21 + 4;
+        }
+    }
+    batch.commit();
+    for (receipts) |receipt| {
+        const accepted = batch.accepted(receipt);
+        try std.testing.expect(accepted.contains(0) and accepted.contains(1));
+    }
+    // One packet of every piece, charged their frames together, far less than a bound each.
+    const packet = endpoint.output.takeReady() orelse return error.MissingBroadcast;
+    try std.testing.expectEqual(@as(u16, 30), packet.group.pieces);
+    try std.testing.expectEqual(bound, packet.group.bytes);
+    try std.testing.expect(endpoint.output.takeReady() == null);
+    for (endpoint.credit[0..2]) |*credit| try std.testing.expectEqual(endpoint.config.credit_bytes - bound, credit.load(.acquire) & (service_module.Service.active - 1));
+    endpoint.recycle(std.testing.io, &.{packet});
+    batch.cancel();
+}
+
 test "broadcast groups retain independent protocol admission across audience reuse" {
     const One = struct {
         pub const protocol_number = 1;

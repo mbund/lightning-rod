@@ -1418,31 +1418,35 @@ pub fn benchmarkItemBroadcast() !void {
             var queued: usize = 0;
             var batch = service.outputBatch();
             while (batch.next()) |packet| {
-                const header = try wire.play.toClient.readHeader(packet.bytes);
-                const protocol = player_records[packet.recipients.first().?.index].protocol;
-                var expected_id: ?i32 = null;
-                inline for (protocols.implementations) |Version| {
-                    if (protocol == Version.protocol_number) expected_id = Version.Protocol.play.toClient.packetId(.entity_teleport);
+                defer service.recycle(io, &.{packet});
+                // Small packets for one audience come packed into one: each read as its client gets it.
+                var pieces = sessions.Pieces.of(packet);
+                while (pieces.next()) |bytes| {
+                    const header = try wire.play.toClient.readHeader(bytes);
+                    const protocol = player_records[packet.recipients.first().?.index].protocol;
+                    var expected_id: ?i32 = null;
+                    inline for (protocols.implementations) |Version| {
+                        if (protocol == Version.protocol_number) expected_id = Version.Protocol.play.toClient.packetId(.entity_teleport);
+                    }
+                    // Its exact state: where it is now, an eighth of a block from where its clients have it.
+                    try std.testing.expectEqual(expected_id.?, header.id);
+                    const reader: wire.play.toClient.packet_entity_teleport.Reader = .{ ._cursor = .{ .buffer = header.body, .rest = header.body } };
+                    const id, const next = try reader.entityId();
+                    const x, _ = try next.x();
+                    try std.testing.expectEqual(@as(f64, if (limited) 0.75 else 0.625), x);
+                    const at: usize = @intCast(id - dropped.networkId(ids[0]));
+                    try std.testing.expect(at < count);
+                    var recipient_iterator = packet.recipients.iterator();
+                    while (recipient_iterator.next()) |handle| {
+                        try std.testing.expectEqual(protocol, player_records[handle.index].protocol);
+                        try std.testing.expectEqual(@as(u32, 1), handle.generation);
+                        try std.testing.expect(id > previous[handle.index]);
+                        previous[handle.index] = id;
+                        received[handle.index][at] = true;
+                        sent[handle.index] += 1;
+                    }
+                    queued += 1;
                 }
-                // Its exact state: where it is now, an eighth of a block from where its clients have it.
-                try std.testing.expectEqual(expected_id.?, header.id);
-                const reader: wire.play.toClient.packet_entity_teleport.Reader = .{ ._cursor = .{ .buffer = header.body, .rest = header.body } };
-                const id, const next = try reader.entityId();
-                const x, _ = try next.x();
-                try std.testing.expectEqual(@as(f64, if (limited) 0.75 else 0.625), x);
-                const at: usize = @intCast(id - dropped.networkId(ids[0]));
-                try std.testing.expect(at < count);
-                var recipient_iterator = packet.recipients.iterator();
-                while (recipient_iterator.next()) |handle| {
-                    try std.testing.expectEqual(protocol, player_records[handle.index].protocol);
-                    try std.testing.expectEqual(@as(u32, 1), handle.generation);
-                    try std.testing.expect(id > previous[handle.index]);
-                    previous[handle.index] = id;
-                    received[handle.index][at] = true;
-                    sent[handle.index] += 1;
-                }
-                queued += 1;
-                service.recycle(io, &.{packet});
             }
             if (!limited) {
                 const batches = (count + sessions.Service.batch_max - 1) / sessions.Service.batch_max;
@@ -1469,21 +1473,23 @@ pub fn benchmarkItemBroadcast() !void {
                 service.flush();
                 var retry = service.outputBatch();
                 while (retry.next()) |packet| {
-                    const header = try wire.play.toClient.readHeader(packet.bytes);
-                    // The viewer behind is sent each item whole: its exact state, its data and its head.
-                    if (header.id != wire.play.toClient.packetId(.entity_teleport)) {
+                    defer service.recycle(io, &.{packet});
+                    var pieces = sessions.Pieces.of(packet);
+                    while (pieces.next()) |bytes| {
+                        const header = try wire.play.toClient.readHeader(bytes);
+                        // The viewer behind is sent each item whole: its exact state, its data and its head.
+                        if (header.id != wire.play.toClient.packetId(.entity_teleport)) {
+                            try std.testing.expectEqual(@as(u16, 0), packet.recipients.first().?.index);
+                            continue;
+                        }
+                        const reader: wire.play.toClient.packet_entity_teleport.Reader = .{ ._cursor = .{ .buffer = header.body, .rest = header.body } };
+                        const id, _ = try reader.entityId();
+                        const at: usize = @intCast(id - dropped.networkId(ids[0]));
+                        try std.testing.expectEqual(@as(usize, 1), packet.recipients.len);
                         try std.testing.expectEqual(@as(u16, 0), packet.recipients.first().?.index);
-                        service.recycle(io, &.{packet});
-                        continue;
+                        try std.testing.expect(!received[0][at]);
+                        received[0][at] = true;
                     }
-                    const reader: wire.play.toClient.packet_entity_teleport.Reader = .{ ._cursor = .{ .buffer = header.body, .rest = header.body } };
-                    const id, _ = try reader.entityId();
-                    const at: usize = @intCast(id - dropped.networkId(ids[0]));
-                    try std.testing.expectEqual(@as(usize, 1), packet.recipients.len);
-                    try std.testing.expectEqual(@as(u16, 0), packet.recipients.first().?.index);
-                    try std.testing.expect(!received[0][at]);
-                    received[0][at] = true;
-                    service.recycle(io, &.{packet});
                 }
                 try std.testing.expect(std.mem.allEqual(bool, received[0][0..count], true));
                 for (ids[0..count]) |id| try std.testing.expectEqual(@as(usize, 0), (try replication.known(id)).pending);

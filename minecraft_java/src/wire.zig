@@ -7,7 +7,9 @@ const fields = sessions.fields;
 pub const Wire = struct {
     pub const Workspace = compression.Workspace;
     pub const always_copy = false;
-    pub const frame_bound: sessions.protocol.Protocol.FrameBound = .{};
+    /// A frame that does not compress adds its length, three bytes at most, and the zero length
+    /// that says it is not compressed; encryption keeps every length.
+    pub const frame_bound: sessions.protocol.Protocol.FrameBound = .{ .plain_overhead = 4 };
     pub const Encryption = Cipher.Encryption;
     pub const encryption_batch_size = Cipher.batch_size;
     pub const encryptBatch = Cipher.encryptBatch;

@@ -28,6 +28,7 @@ pub const OutputPool = shared.Pool;
 pub const shared_headroom = shared.headroom;
 pub const SharedConfiguration = shared.Configuration;
 pub const RawPacket = shared.RawPacket;
+pub const Pieces = shared.Pieces;
 pub const Recipients = shared.Recipients;
 pub const profiles = @import("profiles.zig");
 pub const PlayerProfile = profiles.PlayerProfile;

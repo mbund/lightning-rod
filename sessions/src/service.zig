@@ -39,6 +39,10 @@ pub const Configuration = struct {
     /// published to it always fits there when the worker takes it, but for a packet larger
     /// than the ring, which takes all of it.
     credit_bytes: usize = 64 * 1024,
+    /// The least credit a packet takes of each recipient however small it is, which bounds how
+    /// many packets a connection can have waiting: its credit over this. Packets are otherwise
+    /// charged the most they take on the wire, so this bounds their count, not their bytes.
+    packet_charge: usize = 64,
     pages: usize = 32,
     page_bytes: usize = 384 * 1024,
     output_pool: ?*shared.Pool = null,
@@ -171,7 +175,7 @@ pub const Service = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, transport: network.Transport, config: Configuration) !*Service {
-        if (config.page_bytes == 0 or config.protocols.len == 0 or config.credit_bytes < 2 * frameBound(config.protocols, 1) or config.credit_bytes >= active or config.connections == 0)
+        if (config.page_bytes == 0 or config.protocols.len == 0 or config.packet_charge == 0 or config.credit_bytes < 2 * chargeFor(config, 1) or config.credit_bytes >= active or config.connections == 0)
             return error.InvalidConfiguration;
         if (config.max_input_bytes == 0) return error.InvalidConfiguration;
         try config.input_work.validate(config.connections, .{ .operations = 1, .bytes = config.max_input_bytes });
@@ -183,11 +187,11 @@ pub const Service = struct {
             .pages = config.pages,
             .page_bytes = config.page_bytes,
             .recipients_per_page = config.connections,
-            // Every recipient of every packet not yet taken charges at least the smallest
-            // frame's bound of its connection's credit. A connection gone before what was
-            // published to it is taken leaves its slot to one with all its credit again, so a
-            // slot may have two credits' worth waiting.
-            .recipient_handles = try std.math.mul(usize, 2 * config.connections, config.credit_bytes / frameBound(config.protocols, 1)),
+            // Every recipient of every packet not yet taken charges at least the smallest charge
+            // of its connection's credit. A connection gone before what was published to it is
+            // taken leaves its slot to one with all its credit again, so a slot may have two
+            // credits' worth waiting.
+            .recipient_handles = try std.math.mul(usize, 2 * config.connections, config.credit_bytes / chargeFor(config, 1)),
             .pool = config.output_pool,
             .compression_threshold = config.compression_threshold,
         });
@@ -1047,16 +1051,34 @@ pub const Service = struct {
         return @max(length, decoded_length);
     }
 
-    /// The credit a packet of `length` bytes takes of each recipient: its frame's bound, or all
-    /// of the credit for a packet larger than it, which goes out in pieces while nothing else
-    /// can be published to the connection.
+    /// The credit a packet of `length` bytes takes of each recipient until it is delivered: the
+    /// most it takes on the wire, but never less than `packet_charge`, or all of the credit for
+    /// a packet larger than it, which goes out in pieces while nothing else can be published to
+    /// the connection.
     pub fn creditCharge(self: *const Service, length: usize) usize {
-        return @min(self.framedBound(length), self.config.credit_bytes);
+        return chargeFor(self.config, length);
     }
 
-    /// What publishing a packet of `length` bytes charges each recipient until it is delivered:
-    /// the most its frame can take on the wire. Even the smallest packet charges the bound's
-    /// overhead, so credit bounds how many packets a recipient can have waiting.
+    /// The credit a packet of pieces takes, each framed on its own without compressing, as
+    /// `Broadcast` packs small packets: what `pieceBound` gave for each of them together, but
+    /// never less than `packet_charge`.
+    pub fn piecesCharge(self: *const Service, bound: usize) usize {
+        return @min(@max(self.config.packet_charge, bound), self.config.credit_bytes);
+    }
+
+    /// The most a piece of `length` bytes takes on the wire framed without compressing, or null
+    /// where a frame could outgrow the headroom before the piece, which it is framed into.
+    pub fn pieceBound(self: *const Service, length: usize) ?usize {
+        var maximum: usize = 0;
+        for (self.config.protocols) |protocol| {
+            const overhead = protocol.frame_bound.plain_overhead orelse return null;
+            if (overhead > shared.headroom) return null;
+            maximum = @max(maximum, protocol.frame_bound.plain(length));
+        }
+        return maximum;
+    }
+
+    /// The most a packet of `length` bytes can take on the wire, compressed or not.
     pub fn framedBound(self: *const Service, length: usize) usize {
         return frameBound(self.config.protocols, length);
     }
@@ -1452,6 +1474,20 @@ fn frameBound(protocols: []const engine.Protocol, length: usize) usize {
     var maximum: usize = 0;
     for (protocols) |protocol| maximum = @max(maximum, protocol.frame_bound.bytes(length));
     return maximum;
+}
+
+/// The most a packet of `length` bytes takes on the wire: framed as it is below the compression
+/// threshold or without one, otherwise as compressing it may grow it.
+fn wireBound(config: Configuration, length: usize) usize {
+    const compresses = if (config.compression_threshold) |threshold| length >= threshold else false;
+    var maximum: usize = 0;
+    for (config.protocols) |protocol| maximum = @max(maximum, if (compresses) protocol.frame_bound.bytes(length) else protocol.frame_bound.plain(length));
+    return maximum;
+}
+
+/// What a packet of `length` bytes charges each recipient, as `Service.creditCharge`.
+fn chargeFor(config: Configuration, length: usize) usize {
+    return @min(@max(config.packet_charge, wireBound(config, length)), config.credit_bytes);
 }
 
 test "a held slot stays taken after its player leaves until the game lets it go" {

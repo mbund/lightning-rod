@@ -592,14 +592,17 @@ fn advance(simulation: *Simulation, service: *sessions.Service, handles: []const
     tick_time.* += @intCast(std.Io.Clock.now(.awake, simulation.io).nanoseconds - tick_started);
     var batch = service.outputBatch();
     while (batch.next()) |packet| {
-        packets.* += 1;
-        recipients.* += packet.recipients.len;
-        if (wire_streams.len != 0) {
-            var each = packet.recipients.iterator();
-            // The bench's boss bar shows its tick times, which no two runs share.
-            if (packetId(packet.bytes) != boss_bar_id) while (each.next()) |handle| {
-                wire_streams[handle.index] = std.hash.Wyhash.hash(wire_streams[handle.index], packet.bytes);
-            };
+        // Packet by packet, as each recipient's client gets them, however they were packed.
+        var pieces = sessions.Pieces.of(packet);
+        while (pieces.next()) |bytes| {
+            packets.* += 1;
+            recipients.* += packet.recipients.len;
+            if (wire_streams.len != 0) {
+                // The bench's boss bar shows its tick times, which no two runs share.
+                if (packetId(bytes) == boss_bar_id) continue;
+                var each = packet.recipients.iterator();
+                while (each.next()) |handle| wire_streams[handle.index] = std.hash.Wyhash.hash(wire_streams[handle.index], bytes);
+            }
         }
         service.recycle(simulation.io, &.{packet});
     }

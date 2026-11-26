@@ -23,7 +23,15 @@ pub const Broadcast = struct {
         charge: usize,
         unsupported: bool = false,
         mask_index: usize = std.math.maxInt(usize),
+        /// Packets packed into it as pieces, and what their frames take on the wire together.
+        pieces: u16 = 0,
+        piece_bound: usize = 0,
     };
+
+    /// Room in a buffer small packets for the batch's audience pack into, one after another: as
+    /// much as the pool keeps among its small packets, so a buffer never breaks up the runs
+    /// larger packets need. What it does not fill goes back when it is published.
+    pub const pack_bytes = 1024;
     const Member = struct {
         protocol: usize = 0,
         healthy: bool = false,
@@ -222,7 +230,9 @@ pub const Broadcast = struct {
         assert(capacities.len > 0 and capacities.len <= service.Service.batch_max);
         const omitted = if (excluded) |handle| self.ordinalOf(handle) else null;
         if (required) |receipt| assert(receipt.owner == self and receipt.generation == self.generation and receipt.first + receipt.count <= self.count);
-        const first = self.count;
+        var first = self.count;
+        // Packets for everyone, none needing another first, pack into one buffer when they fit.
+        const packing = if (excluded == null and required == null) self.packable(capacities) else null;
         inline for (implementations) |Version| {
             const selected = for (self.owner.config.protocols, 0..) |protocol, index| {
                 if (protocol.number == Version.protocol_number) break index;
@@ -235,6 +245,12 @@ pub const Broadcast = struct {
                 // None of its players with room: it goes to none of them.
                 if (wanted and self.available[protocol] == 0) self.whole = false;
                 if (wanted and self.available[protocol] != 0) version: {
+                    if (packing) |needed| {
+                        if (try self.pack(scratch, Version, Encoder, protocol, arguments, capacities, needed)) |index| {
+                            first = @min(first, index);
+                            break :version;
+                        }
+                    }
                     if (capacities.len > self.entries.len - self.count) return error.BroadcastFull;
                     const packets = &scratch.packets;
                     var reserved = self.owner.reserveBatch(capacities, packets[0..capacities.len]) catch |err| {
@@ -301,6 +317,89 @@ pub const Broadcast = struct {
             }
         }
         return .{ .owner = self, .generation = self.generation, .first = first, .count = self.count - first };
+    }
+
+    /// Room a write of packets of `capacities` takes packed, each after its header, or null when
+    /// it does not pack: one that may compress, a protocol whose frame could outgrow the header,
+    /// more than a buffer holds, or credit too small for a buffer's charge.
+    fn packable(self: *const Broadcast, capacities: []const usize) ?usize {
+        if (self.owner.config.credit_bytes < pack_bytes or self.owner.config.page_bytes < pack_bytes) return null;
+        var needed: usize = 0;
+        for (capacities) |capacity| {
+            if (self.owner.config.compression_threshold) |threshold| if (capacity >= threshold) return null;
+            _ = self.owner.pieceBound(capacity) orelse return null;
+            needed += shared.headroom + capacity;
+        }
+        return if (needed <= pack_bytes) needed else null;
+    }
+
+    /// Writes packets for a protocol as pieces of the open buffer last in the batch, or of a new
+    /// one when that is full, for another protocol or published: the entry it went in, or null
+    /// when it went in none, as no buffer could be had or the version cannot encode it, which
+    /// the usual way then finds. Pieces keep the order they were written in, as the buffer is
+    /// last until another packet follows it.
+    fn pack(self: *Broadcast, scratch: *GroupScratch, comptime Version: type, comptime Encoder: type, protocol: usize, arguments: anytype, capacities: []const usize, needed: usize) !?usize {
+        var index = self.count;
+        if (self.count > self.committed) {
+            const last = &self.entries[self.count - 1];
+            if (last.pieces != 0 and last.protocol == protocol and last.packet.bytes.len - last.length >= needed) index = self.count - 1;
+        }
+        const opened = index == self.count;
+        if (opened) {
+            if (self.count == self.entries.len) return error.BroadcastFull;
+            var packets: [1]service.Service.Packet = undefined;
+            const reserved = self.owner.reserveBatch(&.{pack_bytes}, &packets) catch |err| switch (err) {
+                error.Closed => return null,
+                else => return err,
+            };
+            if (reserved == 0) return null;
+            const reservation = packets[0].reservation.?;
+            self.entries[self.count] = .{ .packet = packets[0], .length = 0, .protocol = protocol, .excluded = null, .required = null, .charge = 0, .group = .{ .protocol = Version.protocol_number, .first = reservation.page, .generation = reservation.generation } };
+            self.count += 1;
+        }
+        const entry = &self.entries[index];
+        errdefer if (opened) {
+            entry.packet.cancel();
+            self.count -= 1;
+        };
+        // Each packet written a header past the last, as far apart as it may grow, then each
+        // moved down against the one before. A header never reaches the packet it is for.
+        const bytes = entry.packet.bytes;
+        const buffers = scratch.buffers[0..capacities.len];
+        const lengths = scratch.lengths[0..capacities.len];
+        var at = entry.length;
+        for (capacities, buffers) |capacity, *buffer| {
+            buffer.* = bytes[at + shared.headroom ..][0..capacity];
+            at += shared.headroom + capacity;
+        }
+        Encoder.writeGroup(Version, buffers, lengths, arguments) catch |err| {
+            if (err == error.UnsupportedEncoding) {
+                if (opened) {
+                    entry.packet.cancel();
+                    self.count -= 1;
+                }
+                return null;
+            }
+            return err;
+        };
+        var written = entry.length;
+        var from = entry.length;
+        var bound: usize = 0;
+        for (capacities, lengths) |capacity, length| {
+            assert(length > 0 and length <= capacity);
+            shared.writePieceLength(bytes[written..][0..shared.headroom], length);
+            std.mem.copyForwards(u8, bytes[written + shared.headroom ..][0..length], bytes[from + shared.headroom ..][0..length]);
+            written += shared.headroom + length;
+            from += shared.headroom + capacity;
+            bound += self.owner.pieceBound(length).?;
+        }
+        entry.length = written;
+        entry.pieces += @intCast(capacities.len);
+        entry.piece_bound += bound;
+        entry.charge = self.owner.piecesCharge(entry.piece_bound);
+        entry.group.bytes = @intCast(entry.charge);
+        entry.group.pieces = entry.pieces;
+        return index;
     }
 
     /// Connection indices address captured generations until the next begin.

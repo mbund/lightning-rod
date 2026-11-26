@@ -228,12 +228,22 @@ pub const Protocol = struct {
     pub const FrameBound = struct {
         expansion_per_mille: usize = 1,
         overhead: usize = 134,
+        /// The most a frame adds to a packet that goes out without compressing, below the
+        /// compression threshold or without one, which a frame needs far less for than one that
+        /// compresses. Without it, such a frame is bounded as one that compresses.
+        plain_overhead: ?usize = null,
 
         pub fn bytes(self: FrameBound, length: usize) usize {
             const scaled = std.math.mul(usize, length, self.expansion_per_mille) catch return std.math.maxInt(usize);
             const expansion = scaled / 1000 + @intFromBool(scaled % 1000 != 0);
             const total = std.math.add(usize, length, expansion) catch return std.math.maxInt(usize);
             return std.math.add(usize, total, self.overhead) catch std.math.maxInt(usize);
+        }
+
+        /// The most a packet of `length` bytes takes on the wire framed without compressing.
+        pub fn plain(self: FrameBound, length: usize) usize {
+            const overhead = self.plain_overhead orelse return self.bytes(length);
+            return std.math.add(usize, length, overhead) catch std.math.maxInt(usize);
         }
     };
 

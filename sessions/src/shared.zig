@@ -86,7 +86,119 @@ pub const Group = struct {
     first: SlotId = 0,
     index: u8 = 0,
     count: u8 = 1,
+    /// Packets packed into this one as pieces, each after a header of `headroom` bytes whose
+    /// first two give its length, framed each on its own without compressing. `bytes` is then
+    /// what the packet charged. None for a packet as it is.
+    pieces: u16 = 0,
 };
+
+/// Where a piece's length goes in the header before it.
+pub fn writePieceLength(header: []u8, length: usize) void {
+    std.mem.writeInt(u16, header[0..2], @intCast(length), .little);
+}
+
+pub fn readPieceLength(header: []const u8) usize {
+    return std.mem.readInt(u16, header[0..2], .little);
+}
+
+/// The packets a packet published carries, in the order they go out: itself, or each piece packed
+/// into it, unframed, as whoever reads what was published before the worker frames it sees them.
+pub const Pieces = struct {
+    bytes: []const u8,
+    left: usize,
+    packed_pieces: bool,
+
+    pub fn of(packet: RawPacket) Pieces {
+        return ofBytes(packet.bytes, packet.group.pieces);
+    }
+
+    /// Of a packet's bytes and how many pieces were packed into it, none for a packet as it is.
+    pub fn ofBytes(bytes: []const u8, pieces: u16) Pieces {
+        return .{ .bytes = bytes, .left = if (pieces == 0) 1 else pieces, .packed_pieces = pieces != 0 };
+    }
+
+    pub fn next(self: *Pieces) ?[]const u8 {
+        if (self.left == 0) return null;
+        self.left -= 1;
+        if (!self.packed_pieces) return self.bytes;
+        const length = readPieceLength(self.bytes);
+        const piece = self.bytes[headroom..][0..length];
+        self.bytes = self.bytes[headroom + length ..];
+        return piece;
+    }
+};
+
+/// Packed pieces as they go on the wire: each framed on its own by `framePiece` in the header
+/// before it, below `threshold` so none compresses, and moved down against the last, so the
+/// frames follow one another from the start of `payload`. `framePiece` is handed a piece's header
+/// and bytes, as a packet's storage holds its headroom and bytes, and frames it in place. No
+/// frame outgrows its header, so each moves down onto bytes already framed or its own.
+pub fn framePieces(payload: []u8, pieces: usize, threshold: ?usize, context: anytype, comptime framePiece: fn (@TypeOf(context), []u8, usize) anyerror![]const u8) ![]const u8 {
+    var read: usize = 0;
+    var written: usize = 0;
+    var count: usize = 0;
+    while (read < payload.len) : (count += 1) {
+        if (payload.len - read < headroom) return error.InvalidPieces;
+        const length = readPieceLength(payload[read..]);
+        if (length == 0 or length > payload.len - read - headroom) return error.InvalidPieces;
+        if (threshold) |limit| if (length >= limit) return error.InvalidPieces;
+        const piece = payload[read..][0 .. headroom + length];
+        const framed = try framePiece(context, piece, length);
+        const start = @intFromPtr(framed.ptr);
+        if (start < @intFromPtr(piece.ptr) or start + framed.len > @intFromPtr(piece.ptr) + piece.len) return error.FrameTooLarge;
+        std.mem.copyForwards(u8, payload[written..][0..framed.len], framed);
+        written += framed.len;
+        read += piece.len;
+    }
+    if (count != pieces) return error.InvalidPieces;
+    return payload[0..written];
+}
+
+test "a packet read for what it carries gives itself, or each piece packed into it" {
+    var payload: [2 * headroom + 5]u8 = undefined;
+    writePieceLength(payload[0..], 2);
+    @memcpy(payload[headroom..][0..2], "ab");
+    writePieceLength(payload[headroom + 2 ..], 3);
+    @memcpy(payload[2 * headroom + 2 ..][0..3], "cde");
+    var pieces = Pieces.ofBytes(&payload, 2);
+    try std.testing.expectEqualStrings("ab", pieces.next().?);
+    try std.testing.expectEqualStrings("cde", pieces.next().?);
+    try std.testing.expect(pieces.next() == null);
+    var whole = Pieces.ofBytes("whole", 0);
+    try std.testing.expectEqualStrings("whole", whole.next().?);
+    try std.testing.expect(whole.next() == null);
+}
+
+test "packed pieces go out as frames one after another" {
+    // A frame as Minecraft's without compression: its length, a zero, then the packet.
+    const Framer = struct {
+        fn frame(_: void, piece: []u8, length: usize) anyerror![]const u8 {
+            const body = length + 1;
+            piece[headroom - 1] = 0;
+            piece[headroom - 2] = @intCast(body);
+            return piece[headroom - 2 ..][0 .. body + 1];
+        }
+    };
+    const Packed = struct {
+        fn fill(payload: []u8) void {
+            var at: usize = 0;
+            for ([_][]const u8{ "ab", "cdef", "ghi" }) |packet| {
+                writePieceLength(payload[at..], packet.len);
+                @memcpy(payload[at + headroom ..][0..packet.len], packet);
+                at += headroom + packet.len;
+            }
+        }
+    };
+    var payload: [3 * headroom + 9]u8 = undefined;
+    Packed.fill(&payload);
+    const framed = try framePieces(&payload, 3, 256, {}, Framer.frame);
+    try std.testing.expectEqualSlices(u8, &.{ 3, 0, 'a', 'b', 5, 0, 'c', 'd', 'e', 'f', 4, 0, 'g', 'h', 'i' }, framed);
+    // A count other than the pieces there, or a piece that would compress, is refused.
+    Packed.fill(&payload);
+    try std.testing.expectError(error.InvalidPieces, framePieces(&payload, 2, 256, {}, Framer.frame));
+    Packed.fill(&payload);
+    try std.testing.expectError(error.InvalidPieces, framePieces(&payload, 3, 4, {}, Framer.frame));
+}
 
 pub const Recipients = struct {
     handles: []const networking.Handle,
