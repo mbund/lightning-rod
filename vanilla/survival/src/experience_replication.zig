@@ -38,6 +38,8 @@ pub const ExperienceReplication = struct {
         pickup_events: usize = 1024,
         /// Keep a hash of every packet queued and whom to, for runs to be compared by.
         trace_sends: bool = false,
+        /// Send every position as the exact state, for client traces to prove: EntitySync's own.
+        exact_states: bool = false,
     };
     pub const Dependencies = struct { experience: *Experience, players: *Players, player_states: *PlayerStates, streaming: *Streaming, sessions: *sessions.Service, packets: *packets.Packets, tracking: *Tracking };
 
@@ -65,7 +67,7 @@ pub const ExperienceReplication = struct {
             .targets = try allocator.alloc(sessions.Service.Target, players),
             .deliveries = try allocator.alloc(sessions.Service.Delivery, players),
         };
-        self.sync = try .init(allocator, .{ .events = config.pickup_events, .trace_sends = config.trace_sends, .visits = true }, .{ .players = deps.players, .sessions = deps.sessions, .packets = deps.packets, .tracking = deps.tracking, .pool = &owned.pool, .slots = owned.directory.capacity() }, .{
+        self.sync = try .init(allocator, .{ .events = config.pickup_events, .trace_sends = config.trace_sends, .exact_states = config.exact_states, .visits = true }, .{ .players = deps.players, .sessions = deps.sessions, .packets = deps.packets, .tracking = deps.tracking, .pool = &owned.pool, .slots = owned.directory.capacity() }, .{
             .kind = self,
             .write_data = writeData,
             .body = body,

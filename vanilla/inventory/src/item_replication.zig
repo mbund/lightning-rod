@@ -42,6 +42,8 @@ pub const ItemReplication = struct {
         pickup_events: usize = 1024,
         /// Keep a hash of every packet queued, for runs to be compared by.
         trace_sends: bool = false,
+        /// Send every position as the exact state, for client traces to prove: EntitySync's own.
+        exact_states: bool = false,
     };
 
     pub const Dependencies = struct {
@@ -88,7 +90,7 @@ pub const ItemReplication = struct {
             .collections = try .init(allocator, &deps.entities.pool),
             .listener = .{ .context = self, .function = slotChanged },
         };
-        self.sync = try .init(allocator, .{ .events = config.pickup_events, .trace_sends = config.trace_sends, .visits = true }, .{ .players = deps.players, .sessions = deps.sessions, .packets = deps.packets, .tracking = deps.tracking, .pool = &deps.entities.pool, .slots = deps.entities.directory.capacity() }, .{
+        self.sync = try .init(allocator, .{ .events = config.pickup_events, .trace_sends = config.trace_sends, .exact_states = config.exact_states, .visits = true }, .{ .players = deps.players, .sessions = deps.sessions, .packets = deps.packets, .tracking = deps.tracking, .pool = &deps.entities.pool, .slots = deps.entities.directory.capacity() }, .{
             .kind = self,
             .write_data = writeData,
             .body = body,

@@ -110,6 +110,7 @@ public final class Recorder {
         timeoutTicks = integer("mcc.timeoutTicks", timeoutTicks);
         connectTick = integer("mcc.connectTick", connectTick);
         fixture = Fixture.create(this, System.getProperty("mcc.fixture"));
+        if (fixture.traceEntities()) EntityTrace.instance().open(artifacts, peer);
         int distance = fixture.renderDistance();
         minimumRadius = integer("mcc.minimumRadius", distance);
         targetChunks = integer("mcc.targetChunks", Fixture.horizonColumns(distance));
@@ -287,6 +288,7 @@ public final class Recorder {
                 result(false, "client_stopped_before_visual_result");
                 resultPublished = true;
             }
+            EntityTrace.instance().close();
             events.close();
         } catch (IOException error) { throw new IllegalStateException("cannot write e2e artifacts", error); }
     }

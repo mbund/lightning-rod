@@ -37,6 +37,8 @@ abstract class Fixture {
     boolean encrypted() { return false; }
     boolean canConnect() { return true; }
     int renderDistance() { return 2; }
+    /// Whether the client traces its entities, for the runner to prove against the server's trace.
+    boolean traceEntities() { return false; }
     void disconnected(Minecraft game, String title) { client.fail("disconnected: " + title); }
     boolean prepare(Minecraft game) { return true; }
     abstract void tick(Minecraft game, int loaded, int missing);

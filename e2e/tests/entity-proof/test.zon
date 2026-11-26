@@ -1,0 +1,1 @@
+.{ .client = "EntityProofFixture", .scenarios = .{.{ .name = "entity-proof", .peers = .{"alice"} }} }

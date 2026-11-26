@@ -31,6 +31,8 @@ pub const ProjectileReplication = struct {
     pub const Configuration = struct {
         /// Keep a hash of every packet asked to be sent and whom to, for runs to be compared by.
         trace_sends: bool = false,
+        /// Send every position as the exact state, for client traces to prove: EntitySync's own.
+        exact_states: bool = false,
     };
     pub const Dependencies = struct { projectiles: *Projectiles, tracking: *Tracking, players: *Players, sessions: *sessions.Service, packets: *packets.Packets, entities: *entities.Entities };
 
@@ -43,7 +45,7 @@ pub const ProjectileReplication = struct {
         const self = try allocator.create(ProjectileReplication);
         self.* = .{ .deps = deps, .sync = undefined };
         try deps.projectiles.track(deps.tracking);
-        self.sync = try .init(allocator, .{ .trace_sends = config.trace_sends, .visits = true }, .{ .players = deps.players, .sessions = deps.sessions, .packets = deps.packets, .tracking = deps.tracking, .pool = &deps.entities.pool, .slots = deps.entities.directory.capacity() }, .{
+        self.sync = try .init(allocator, .{ .trace_sends = config.trace_sends, .exact_states = config.exact_states, .visits = true }, .{ .players = deps.players, .sessions = deps.sessions, .packets = deps.packets, .tracking = deps.tracking, .pool = &deps.entities.pool, .slots = deps.entities.directory.capacity() }, .{
             .kind = self,
             .write_data = writeData,
             .body = body,

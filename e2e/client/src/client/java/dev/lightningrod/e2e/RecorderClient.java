@@ -34,7 +34,10 @@ public final class RecorderClient implements ClientModInitializer {
             if (recorder.enabled) recorder.fixture.client.send("sync");
         });
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> Recorder.instance().disconnected());
-        ClientTickEvents.END_CLIENT_TICK.register(client -> Recorder.instance().advance(client));
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            Recorder.instance().advance(client);
+            EntityTrace.instance().tick(client);
+        });
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> Recorder.instance().write());
     }
 }

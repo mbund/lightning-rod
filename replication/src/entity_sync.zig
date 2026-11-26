@@ -246,6 +246,10 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             /// Whether the kind visits only what has something to send, through `collect`, rather
             /// than walking every entity it has each tick.
             visits: bool = false,
+            /// Send every position as the exact state, a teleport: where it is and how it moves, to
+            /// the bit, with a spawn and with each update. Clients then compute each tick between
+            /// them themselves, which the client traces prove against the server's.
+            exact_states: bool = false,
         };
         pub const Dependencies = struct { players: *const Players, sessions: *sessions.Service, packets: *packets.Packets, tracking: *Tracking, pool: *entities.Pool, slots: usize = 0 };
 
@@ -284,6 +288,8 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
         /// A running hash of every packet asked to be sent and whom to, when tests trace it.
         traced: u64 = 0,
         tracing: bool,
+        /// Every position goes as the exact state: `Configuration.exact_states`.
+        exact: bool,
 
         pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies, spec: Spec) !Self {
             if (config.visits) assert(spec.before != null);
@@ -302,6 +308,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                 .held = try allocator.alloc(Held, config.events),
                 .held_rows = try allocator.alloc(usize, config.events * words),
                 .tracing = config.trace_sends,
+                .exact = config.exact_states,
                 .visit = if (config.visits) try .init(allocator, deps.slots) else null,
                 .dues = try .init(allocator, deps.pool),
             };
@@ -592,19 +599,34 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             const spawn: Spawn = .{ .id = id, .uuid = identity.uuid, .kind = identity.entity_type, .data = identity.object_data, .position = view.base, .velocity = view.velocity, .yaw = view.yaw, .pitch = view.pitch, .head_yaw = view.head_yaw };
             const changes = DataChanges.fromDefaults(view.data);
             if (self.tracing) self.traceSend(recipients, .{ .spawn = spawn });
-            if (!changes.any()) return self.queueControl(slot, recipients, .spawn, .{ .spawn = spawn });
-            if (self.tracing) self.traceSend(recipients, .{ .metadata = .{ .id = id, .data = view.data, .changes = changes } });
+            if (!changes.any() and !self.exact) return self.queueControl(slot, recipients, .spawn, .{ .spawn = spawn });
+            if (self.tracing and changes.any()) self.traceSend(recipients, .{ .metadata = .{ .id = id, .data = view.data, .changes = changes } });
+            const exact = exactOf(id, view);
+            if (self.tracing and self.exact) self.traceSend(recipients, .{ .exact = exact });
             const queued: Queued = .{ .slot = slot, .purpose = .spawn };
+            const data = .{ id, view.data, changes, &self.spec, @as(?u128, null) };
             for (0..2) |_| {
-                // Two packets and the bundle around them.
-                switch (try self.batch.prepare(recipients, 4, self, settleQueued)) {
+                // The packets and the bundle around them.
+                const count: usize = 1 + @as(usize, @intFromBool(changes.any())) + @intFromBool(self.exact);
+                switch (try self.batch.prepare(recipients, count + 2, self, settleQueued)) {
                     .ready => {},
                     // No one to take it now: tracking offers it again next tick.
                     .nobody, .backpressured => return,
                 }
-                if (try self.batch.sendGroup(queued, .{ .{ spawnLegacy, spawnPacked }, writeMetadata }, .{ .{spawn}, .{ id, view.data, changes, &self.spec, @as(?u128, null) } }, &.{ 128, self.dataBytes(slot) })) return;
+                const sent = if (!self.exact)
+                    try self.batch.sendGroup(queued, .{ .{ spawnLegacy, spawnPacked }, writeMetadata }, .{ .{spawn}, data }, &.{ 128, self.dataBytes(slot) })
+                else if (changes.any())
+                    try self.batch.sendGroup(queued, .{ .{ spawnLegacy, spawnPacked }, writeMetadata, writeExact }, .{ .{spawn}, data, .{exact} }, &.{ 128, self.dataBytes(slot), 128 })
+                else
+                    try self.batch.sendGroup(queued, .{ .{ spawnLegacy, spawnPacked }, writeExact }, .{ .{spawn}, .{exact} }, &.{ 128, 128 });
+                if (sent) return;
                 try self.flushQueued();
             }
+        }
+
+        /// The entity as last sent, to the bit but for its turn, which views keep packed.
+        fn exactOf(id: i32, view: *const View) Exact {
+            return .{ .id = id, .position = view.base, .velocity = view.velocity, .yaw = unpack(view.yaw), .pitch = unpack(view.pitch), .on_ground = view.was_on_ground };
         }
 
         /// A spawn without data, or a removal, in the batch: tracking hears who took it when the
@@ -656,6 +678,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             self.delivery.markReached(spawned);
             const changes = DataChanges.fromDefaults(view.data);
             if (changes.any()) try self.deliver(recipients, .{ .metadata = .{ .id = id, .data = view.data, .changes = changes } });
+            if (self.exact) try self.deliver(recipients, .{ .exact = exactOf(id, view) });
         }
 
         /// Players that missed a delta get the entity as last sent to everyone: where it is, its
@@ -664,7 +687,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             const stale = self.deps.tracking.stale(slot);
             if (!stale.any()) return;
             const id = entities.Entities.networkOfSlot(slot);
-            try self.deliver(stale, .{ .sync = .{ .id = id, .position = view.base, .velocity = view.velocity, .yaw = unpack(view.yaw), .pitch = unpack(view.pitch), .on_ground = view.was_on_ground } });
+            try self.deliver(stale, if (self.exact) .{ .exact = exactOf(id, view) } else .{ .sync = .{ .id = id, .position = view.base, .velocity = view.velocity, .yaw = unpack(view.yaw), .pitch = unpack(view.pitch), .on_ground = view.was_on_ground } });
             const caught = self.row(3);
             @memset(caught, 0);
             self.delivery.markReached(caught);
@@ -717,14 +740,24 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                 sent_rotation = true;
             }
             const id = entities.Entities.networkOfSlot(slot);
+            var velocity_due = false;
             if (has_impulse or self.spec.track_deltas) {
                 const difference: [3]f64 = .{ subject.velocity[0] - view.velocity[0], subject.velocity[1] - view.velocity[1], subject.velocity[2] - view.velocity[2] };
                 const squared = difference[0] * difference[0] + difference[1] * difference[1] + difference[2] * difference[2];
                 const length = subject.velocity[0] * subject.velocity[0] + subject.velocity[1] * subject.velocity[1] + subject.velocity[2] * subject.velocity[2];
-                if (squared > 1.0e-7 or (squared > 0 and length == 0)) {
-                    view.velocity = subject.velocity;
-                    try self.queue(slot, known, .{ .velocity = .{ .id = id, .velocity = view.velocity } });
-                }
+                velocity_due = squared > 1.0e-7 or (squared > 0 and length == 0);
+            }
+            if (self.exact and (velocity_due or sent_position)) {
+                // All of it at once, to the bit: the teleport carries the motion too.
+                view.velocity = subject.velocity;
+                view.was_on_ground = subject.on_ground;
+                movement = .none;
+                sent_position = true;
+                sent_rotation = true;
+                try self.queue(slot, known, .{ .exact = .{ .id = id, .position = subject.position, .velocity = subject.velocity, .yaw = subject.yaw, .pitch = subject.pitch, .on_ground = subject.on_ground } });
+            } else if (velocity_due) {
+                view.velocity = subject.velocity;
+                try self.queue(slot, known, .{ .velocity = .{ .id = id, .velocity = view.velocity } });
             }
             const short: [3]i16 = .{ @truncate(encoded[0]), @truncate(encoded[1]), @truncate(encoded[2]) };
             switch (movement) {
@@ -828,6 +861,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                 .metadata => |value| try self.deliverData(recipients, value.id, value.data, value.changes),
                 .velocity => |value| try delivery.send(recipients, .{ writeVelocityLegacy, writeVelocityPacked }, .{ value.id, value.velocity }, 64),
                 .sync => |value| try delivery.send(recipients, writeSync, .{ value.id, value.position, value.velocity, value.yaw, value.pitch, value.on_ground }, 128),
+                .exact => |value| try delivery.send(recipients, writeExact, .{value}, 128),
                 .relative => |value| try delivery.send(recipients, writeRelative, .{ value.id, value.delta, value.on_ground }, 32),
                 .look => |value| try delivery.send(recipients, writeLook, .{ value.id, value.yaw, value.pitch, value.on_ground }, 32),
                 .move_look => |value| try delivery.send(recipients, writeMoveLook, .{ value.id, value.delta, value.yaw, value.pitch, value.on_ground }, 32),
@@ -883,6 +917,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                     } else try self.batch.send(queued, writeMetadata, .{ value.id, value.data, value.changes, &self.spec, @as(?u128, null) }, self.dataBytes(slot)),
                     .velocity => |value| try self.batch.send(queued, .{ writeVelocityLegacy, writeVelocityPacked }, .{ value.id, value.velocity }, 64),
                     .sync => |value| try self.batch.send(queued, writeSync, .{ value.id, value.position, value.velocity, value.yaw, value.pitch, value.on_ground }, 128),
+                    .exact => |value| try self.batch.send(queued, writeExact, .{value}, 128),
                     .relative => |value| try self.batch.send(queued, writeRelative, .{ value.id, value.delta, value.on_ground }, 32),
                     .look => |value| try self.batch.send(queued, writeLook, .{ value.id, value.yaw, value.pitch, value.on_ground }, 32),
                     .move_look => |value| try self.batch.send(queued, writeMoveLook, .{ value.id, value.delta, value.yaw, value.pitch, value.on_ground }, 32),
@@ -935,6 +970,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             metadata: struct { id: i32, data: Data, changes: DataChanges },
             velocity: struct { id: i32, velocity: [3]f64 },
             sync: struct { id: i32, position: [3]f64, velocity: [3]f64, yaw: f32, pitch: f32, on_ground: bool },
+            exact: Exact,
             relative: struct { id: i32, delta: [3]i16, on_ground: bool },
             look: struct { id: i32, yaw: i8, pitch: i8, on_ground: bool },
             move_look: struct { id: i32, delta: [3]i16, yaw: i8, pitch: i8, on_ground: bool },
@@ -1083,6 +1119,16 @@ fn writeLook(packet: wire.play.toClient.packet_entity_look.Writer, id: i32, yaw:
 
 fn writeMoveLook(packet: wire.play.toClient.packet_entity_move_look.Writer, id: i32, delta: [3]i16, yaw: i8, pitch: i8, on_ground: bool) ![]u8 {
     return (try (try (try (try (try (try (try packet.entityId(id)).dX(delta[0])).dY(delta[1])).dZ(delta[2])).yaw(yaw)).pitch(pitch)).onGround(on_ground)).finish();
+}
+
+/// An entity's exact state: ClientboundTeleportEntityPacket, which sets where it is and how it
+/// moves to the bit, and whether it is on the ground.
+const Exact = struct { id: i32, position: [3]f64, velocity: [3]f64, yaw: f32, pitch: f32, on_ground: bool };
+
+fn writeExact(packet: wire.play.toClient.packet_entity_teleport.Writer, exact: Exact) ![]u8 {
+    const positioned = try (try (try (try packet.entityId(exact.id)).x(exact.position[0])).y(exact.position[1])).z(exact.position[2]);
+    const moving = try (try (try positioned.dx(exact.velocity[0])).dy(exact.velocity[1])).dz(exact.velocity[2]);
+    return (try (try (try (try moving.yaw(exact.yaw)).pitch(exact.pitch)).flags(.{})).onGround(exact.on_ground)).finish();
 }
 
 fn writeSync(packet: wire.play.toClient.packet_sync_entity_position.Writer, id: i32, position: [3]f64, velocity: [3]f64, yaw: f32, pitch: f32, on_ground: bool) ![]u8 {
