@@ -11,6 +11,7 @@ const metrics = @import("metrics");
 const inventories = @import("inventories");
 const entities = @import("entities");
 const worlds = @import("worlds");
+const test_levels = @import("test_levels.zig");
 const chunks = @import("chunks");
 const sessions = @import("sessions");
 const protocols = @import("minecraft_packets").protocols;
@@ -110,7 +111,7 @@ const Fixture = struct {
         const blocks = try Blocks.init(allocator, std.testing.io, .{ .metrics = registry, .chunks = terrain, .players = players, .streaming = streaming, .sessions = service, .packets = encoding, .worlds = dimensions }, .{ .delta_sections = 16, .queued_sections = 32 });
         const domains = try Domains.init(allocator, .{}, .{ .players = players });
         _ = try EntityColumns.init(allocator, .{}, .{ .domains = domains, .entities = bodies });
-        const experience = try Experience.init(allocator, .{}, .{ .enchantments = gameplay_definitions.enchantments, .dimensions = gameplay_definitions.dimensions, .players = players, .player_states = player_states, .world_border = world_border, .entities = bodies, .physics = try ItemPhysics.init(allocator, .{ .blocks = gameplay_definitions.blocks, .chunks = terrain }), .inventories = ownership, .inventory = menus, .storage = try store.openSpace("experience"), .record_workspaces = workspaces });
+        const experience = try Experience.init(allocator, .{}, .{ .enchantments = gameplay_definitions.enchantments, .dimensions = gameplay_definitions.dimensions, .players = players, .player_states = player_states, .world_border = world_border, .entities = bodies, .physics = try test_levels.itemPhysics(allocator, gameplay_definitions.blocks, terrain, dimensions), .inventories = ownership, .inventory = menus, .storage = try store.openSpace("experience"), .record_workspaces = workspaces });
         // Orbs hear of the columns that tick from the first tick on.
         domains.tick();
         const mining = try Mining.allocate(allocator, .{}, .{ .enchantments = gameplay_definitions.enchantments, .block_definitions = gameplay_definitions.blocks, .attributes = try EquipmentAttributes.init(allocator, .{}, .{ .players = players, .player_states = player_states, .items = items, .enchantments = gameplay_definitions.enchantments, .client = gameplay_definitions.client }), .definitions = gameplay_definitions.mining, .visibility = try Visibility.init(allocator, .{}, .{ .players = players }), .metrics = registry, .storage = try store.openSpace("mining"), .players = players, .player_states = player_states, .world_border = world_border, .input = input, .inventories = ownership, .items = items, .durability = try Durability.init(allocator, .{ .items = items, .inventories = ownership, .enchantments = gameplay_definitions.enchantments }), .worlds = dimensions, .chunks = terrain, .menus = menus, .loot = try BlockLoot.init(allocator, .{ .loot = gameplay_definitions.loot }), .experience = experience, .dropped = dropped, .blocks = blocks, .actions = try BlockActions.init(allocator, .{}) });

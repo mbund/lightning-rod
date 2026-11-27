@@ -282,11 +282,32 @@ pub const Level = struct {
         return self.copies.?.get(self.world, .{ .x = x, .y = y, .z = z });
     }
 
-    /// Whether the window around the mob ticking holds every cell from first to last and none of
-    /// them is marked with any of the bits, so a scan for them there would find nothing.
-    pub fn without(self: *const Level, marks: u8, first: [3]i32, last: [3]i32) bool {
-        const window = self.window orelse return false;
-        return self.overlay == null and window.marks & marks == 0 and window.covers(self.world, first, last);
+    /// Whether none of the cells from first to last is marked with any of the bits, by the marks
+    /// of the sections they lie in, so a scan for them there would find nothing. Blocks as they
+    /// stood before an edit are not marked, so under an overlay nothing is ruled out.
+    pub fn without(self: *const Level, marks: u8, first: [3]i32, last: [3]i32) !bool {
+        if (self.overlay != null) return false;
+        return (try self.marked(first, last)) & marks == 0;
+    }
+
+    /// What the sections holding the cells from first to last may hold, by mob_blocks' marks: the
+    /// window's when it covers them, else each section's copy's, else anything.
+    pub fn marked(self: *const Level, first: [3]i32, last: [3]i32) !u8 {
+        if (self.window) |window| if (window.covers(self.world, first, last)) return window.marks;
+        const copies = self.copies orelse return 0xff;
+        if (copies.marks == null) return 0xff;
+        const bottom = @divFloor(self.minimum_y, 16);
+        const top = @divFloor(self.minimum_y + self.height - 1, 16);
+        var result: u8 = 0;
+        var y = @max(@divFloor(first[1], 16), bottom);
+        while (y <= @min(@divFloor(last[1], 16), top)) : (y += 1) {
+            var z = @divFloor(first[2], 16);
+            while (z <= @divFloor(last[2], 16)) : (z += 1) {
+                var x = @divFloor(first[0], 16);
+                while (x <= @divFloor(last[0], 16)) : (x += 1) result |= copies.marked[try copies.sectionSlot(self.world, x, y, z)];
+            }
+        }
+        return result;
     }
 
     pub fn fluid(self: *const Level, x: i32, y: i32, z: i32) !game_data.physics_data.State {
@@ -392,20 +413,20 @@ pub const Shapes = struct {
     /// No shape around reaches past its block, so only the cells inside the outer layer matter.
     inner: bool = false,
 
-    pub fn init(level: *const Level, query: Box, context: Context) Shapes {
+    pub fn init(level: *const Level, query: Box, context: Context) !Shapes {
         const first: [3]i32 = .{ mth.floor(query.min[0] - 1.0e-7) - 1, mth.floor(query.min[1] - 1.0e-7) - 1, mth.floor(query.min[2] - 1.0e-7) - 1 };
         const last: [3]i32 = .{ mth.floor(query.max[0] + 1.0e-7) + 1, mth.floor(query.max[1] + 1.0e-7) + 1, mth.floor(query.max[2] + 1.0e-7) + 1 };
         var shapes: Shapes = .{ .level = level, .query = query, .context = context, .first = first, .last = last, .at = first };
         if (level.window) |window| if (level.overlay == null and window.covers(level.world, first, last)) {
             shapes.inside = window;
-            // SteelMC's trick: cells on the outer layer yield only shapes that reach in, and none do.
-            if (window.marks & mob_blocks.mark_large == 0) {
-                shapes.inner = true;
-                shapes.first = .{ first[0] + 1, first[1] + 1, first[2] + 1 };
-                shapes.last = .{ last[0] - 1, last[1] - 1, last[2] - 1 };
-                shapes.at = shapes.first;
-            }
         };
+        // SteelMC's trick: cells on the outer layer yield only shapes that reach in, and none do.
+        if (try level.without(mob_blocks.mark_large, first, last)) {
+            shapes.inner = true;
+            shapes.first = .{ first[0] + 1, first[1] + 1, first[2] + 1 };
+            shapes.last = .{ last[0] - 1, last[1] - 1, last[2] - 1 };
+            shapes.at = shapes.first;
+        }
         return shapes;
     }
 
@@ -462,7 +483,7 @@ fn collideAxis(level: *const Level, query: Box, context: Context, others: []cons
         if (@abs(result) < 1.0e-7) return 0;
         for (outside) |side| result = collideBox(side, moving, axis, result);
     }
-    var shapes: Shapes = .init(level, query, context);
+    var shapes: Shapes = try .init(level, query, context);
     while (try shapes.next()) |shape| {
         if (@abs(result) < 1.0e-7) return 0;
         for (0..shape.boxes.count) |index| result = collideBox(shape.get(index), moving, axis, result);
@@ -488,7 +509,7 @@ fn collideBox(obstacle: Box, moving: Box, axis: usize, distance: f64) f64 {
 }
 
 fn anyShape(level: *const Level, query: Box, context: Context) !bool {
-    var shapes: Shapes = .init(level, query, context);
+    var shapes: Shapes = try .init(level, query, context);
     return try shapes.next() != null;
 }
 
@@ -533,7 +554,7 @@ pub const Colliders = struct {
             self.ends[self.shape_count] = @intCast(self.box_count);
             self.shape_count += 1;
         }
-        var shapes: Shapes = .init(level, query, context);
+        var shapes: Shapes = try .init(level, query, context);
         while (try shapes.next()) |shape| {
             if (self.box_count + shape.boxes.count > box_capacity) {
                 self.complete = false;
@@ -645,7 +666,7 @@ pub fn collide(level: *const Level, start: Box, movement: [3]f64, context: Conte
 fn stepHeights(level: *const Level, query: Box, context: Context, others: []const Box, base: Box, max_up_step: f32, skip: f32, output: *[64]f32) !usize {
     var count: usize = 0;
     for (others) |value| count = stepEdges(value, base, max_up_step, skip, output, count);
-    var shapes: Shapes = .init(level, query, context);
+    var shapes: Shapes = try .init(level, query, context);
     while (try shapes.next()) |shape| {
         for (0..shape.boxes.count) |index| count = stepEdges(shape.get(index), base, max_up_step, skip, output, count);
     }
@@ -700,7 +721,7 @@ pub fn climbableAt(level: *const Level, at: [3]i32) !bool {
 pub fn findSupportingBlock(level: *const Level, query: Box, context: Context, position: [3]f64) !?[3]i32 {
     var best: ?[3]i32 = null;
     var best_distance = std.math.floatMax(f64);
-    var shapes: Shapes = .init(level, query, context);
+    var shapes: Shapes = try .init(level, query, context);
     while (try shapes.next()) |shape| {
         const dx = @as(f64, @floatFromInt(shape.x)) + 0.5 - position[0];
         const dy = @as(f64, @floatFromInt(shape.y)) + 0.5 - position[1];
@@ -713,6 +734,30 @@ pub fn findSupportingBlock(level: *const Level, query: Box, context: Context, po
         }
     }
     return best;
+}
+
+/// Entity.checkSupportingBlock's search for a body on the ground: of the blocks under a sliver
+/// below its box, findSupportingBlock's nearest; none there, and none found the tick before either,
+/// the same back along the move it just made.
+pub fn supportingBlock(level: *const Level, current: Box, context: Context, position: [3]f64, moved: ?[3]f64, none_before: bool) !?[3]i32 {
+    const below: Box = .{ .min = .{ current.min[0], current.min[1] - 1.0e-6, current.min[2] }, .max = .{ current.max[0], current.min[1], current.max[2] } };
+    if (try findSupportingBlock(level, below, context, position)) |found| return found;
+    if (none_before) return null;
+    const back = moved orelse return null;
+    return findSupportingBlock(level, below.move(.{ -back[0], 0, -back[2] }), context, position);
+}
+
+/// Entity.getOnPos: the block a body stands on, looked for `depth` below its feet. The block it
+/// rests on, but at that depth, unless a fence there, at half a block or less, or a wall or fence
+/// gate keeps the body on its own block.
+pub fn onPos(level: *const Level, supporting: ?[3]i32, position: [3]f64, depth: f32) ![3]i32 {
+    if (supporting) |at| {
+        if (!(depth > 1.0e-5)) return at;
+        const entry = level.blocks.get(try level.state(at[0], at[1], at[2]));
+        if ((depth <= 0.5 and entry.flags.fence) or entry.flags.wall or entry.flags.fence_gate) return at;
+        return .{ at[0], mth.floor(position[1] - depth), at[2] };
+    }
+    return .{ mth.floor(position[0]), mth.floor(position[1] - depth), mth.floor(position[2]) };
 }
 
 /// Vec3i.compareTo(a, b) < 0.

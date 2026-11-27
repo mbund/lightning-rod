@@ -17,6 +17,8 @@ pub fn hurt(mobs: *Mobs, mob: Mob, damage: mob_state.Damage, amount: f32) !bool 
     if (mob.entity.removed) return false;
     if (flags.fire and mobs.traits(mob.entity.species).fire_immune) return false;
     if (!mob.alive()) return false;
+    // What a hurt changes the idle and resting paths do not follow: the mob takes its full tick.
+    mobs.rouseMob(mob);
     mob.idle.no_action_time = 0;
     var value = @max(amount, 0);
     if (std.math.isNan(value) or std.math.isInf(value)) value = std.math.floatMax(f32);

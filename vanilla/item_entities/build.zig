@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const module = b.addModule("vanilla_item_entities", .{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
-    inline for (.{ "chunks", "entities", "game_data", "inventories", "lightning_rod", "metrics", "players", "records", "vanilla_content", "vanilla_items", "worlds" }) |name|
+    inline for (.{ "chunks", "entities", "game_data", "inventories", "lightning_rod", "metrics", "players", "records", "vanilla_bodies", "vanilla_content", "vanilla_items", "worlds" }) |name|
         module.addImport(name, b.dependency(name, .{ .target = target, .optimize = optimize }).module(name));
 
     // Standalone development selects every supported release, as a server does by default,

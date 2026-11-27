@@ -30,6 +30,9 @@ pub const EntityCollisions = struct {
         pushable: ?Answer = null,
         /// Entity.isPickable.
         pickable: ?Answer = null,
+        /// A sleeping entity of the kind wakes to look about it again, as one that may be inside a
+        /// solid entity now: vanilla's, awake, would be pushed out.
+        wake: ?*const fn (context: *anyopaque, slot: u32) void = null,
         /// Where the entity is now, which the space may trail within a tick: kinds that push answer.
         position: ?*const fn (context: *anyopaque, slot: u32) [3]f64 = null,
         /// Something pushable met it, as Entity.push(Entity) does: a resting one wakes, as its own
@@ -58,6 +61,8 @@ pub const EntityCollisions = struct {
     solid: entities.Kinds = .{},
     pushable: entities.Kinds = .{},
     pickable: entities.Kinds = .{},
+    /// The kinds whose sleepers a solid entity moving wakes.
+    sleepers: entities.Kinds = .{},
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*EntityCollisions {
         const self = try allocator.create(EntityCollisions);
@@ -74,12 +79,30 @@ pub const EntityCollisions = struct {
             if (rule.solid != null) self.solid.bits.set(kind);
             if (rule.pushable != null) self.pushable.bits.set(kind);
             if (rule.pickable != null) self.pickable.bits.set(kind);
+            if (rule.wake != null) self.sleepers.bits.set(kind);
         }
     }
 
     /// What a level asks of the entities.
     pub fn source(self: *EntityCollisions) body.EntitySource {
         return .{ .context = self, .gather = gather };
+    }
+
+    /// A solid entity moved to `box`: the sleepers about it wake, a block either way, as those it
+    /// now meets would be pushed out of it.
+    pub fn disturb(self: *EntityCollisions, world: u32, box: Box) void {
+        const space = &self.deps.entities.places.space;
+        if (space.countOf(self.sleepers) == 0) return;
+        const Wake = struct {
+            collisions: *EntityCollisions,
+            pub fn visit(wake: @This(), slot: u32) bool {
+                const rule = wake.collisions.rules[wake.collisions.deps.entities.directory.entry(slot).kind].?;
+                rule.wake.?(rule.context, slot);
+                return true;
+            }
+        };
+        const near = box.inflate(1, 1, 1);
+        _ = space.eachDormant(world, .{ .low = near.min, .high = near.max }, self.sleepers, Wake{ .collisions = self });
     }
 
     /// Level.getEntities(except, query, selector): those the selector takes whose boxes meet the
@@ -90,6 +113,8 @@ pub const EntityCollisions = struct {
             .pushable => self.pushable,
             .pickable => self.pickable,
         };
+        // None of the kinds anywhere, as there are no boats in most worlds, is nothing to look for.
+        if (self.deps.entities.places.space.countOf(kinds) == 0) return;
         var walk: Walk = .{ .collisions = self, .query = query, .except = except, .test_kind = test_kind, .visitor = visitor };
         try self.deps.entities.places.space.each(world, .{ .min = query.min, .max = query.max }, kinds, &walk, Walk.visit);
     }
@@ -156,6 +181,7 @@ pub const EntityCollisions = struct {
         const vehicle = mover.vehicle and !mover.empty;
         const kinds = if (vehicle) self.solid.with(self.pushable) else self.solid;
         const owned = self.deps.entities;
+        if (owned.places.space.countOf(kinds) == 0) return output[0..0];
         const Find = struct {
             collisions: *EntityCollisions,
             query: Box,

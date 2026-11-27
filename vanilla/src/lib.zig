@@ -95,6 +95,7 @@ pub const ItemPickup = @import("vanilla_inventory").item_pickup.ItemPickup;
 pub const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
 pub const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
 pub const EntityCollisions = @import("vanilla_bodies").entity_collisions.EntityCollisions;
+pub const Levels = @import("vanilla_bodies").levels.Levels;
 pub const raycast = @import("vanilla_blocks").raycast;
 pub const ItemUse = @import("vanilla_blocks").item_use.ItemUse;
 pub const ItemActions = @import("vanilla_items").item_actions.ItemActions;
@@ -199,6 +200,8 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(Lore, Lore.Configuration{}),
     // How bodies meet each other, which every kind that moves asks.
     lightning_rod.plugin.configured(EntityCollisions, .{}),
+    // The world as bodies read it, which every kind that moves reads through.
+    lightning_rod.plugin.configured(Levels, Levels.Configuration{}),
     lightning_rod.plugin.configured(ItemEntities, ItemEntities.Configuration{}),
     lightning_rod.plugin.configured(BlockLoot, BlockLoot.Configuration{}),
     lightning_rod.plugin.configured(ItemPhysics, ItemPhysics.Configuration{}),

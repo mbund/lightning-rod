@@ -8,6 +8,7 @@ const inventories = @import("inventories");
 const metrics = @import("metrics");
 const entities = @import("entities");
 const worlds = @import("worlds");
+const test_levels = @import("test_levels.zig");
 const chunks = @import("chunks");
 const Items = @import("vanilla_items").items.Items;
 const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
@@ -73,7 +74,7 @@ test "resident merge candidates filter metadata and conserve item ownership with
         var source: Source = .{};
         const terrain = try chunks.Chunks.init(allocator, io, .{ .edit_sections = 1, .simulation_sections = 16, .cache_sections = 24, .cache_groups = 2 }, .{ .metrics = &registry, .storage = try store.openSpace("chunks"), .record_workspaces = workspaces });
         terrain.setSource(chunks.Source.init(&source, Source.read));
-        const physics = try ItemPhysics.init(allocator, .{ .blocks = gameplay_definitions.blocks, .chunks = terrain });
+        const physics = try test_levels.itemPhysics(allocator, gameplay_definitions.blocks, terrain, dimensions);
         const merging = try ItemMerging.init(allocator);
         var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready }};
         var players: Players = .{ .deps = undefined, .config = .{}, .spawn_world = world, .records = &player_records, .dig_handlers = &.{} };
@@ -217,7 +218,7 @@ test "items burn in lava and fire unless they resist it, and blocks hold, lift a
         burning.fire_ticks = 100;
         try dropped.put(ids[@backingInt(Spot.water)], burning);
     }
-    const physics = try ItemPhysics.init(allocator, .{ .blocks = gameplay_definitions.blocks, .chunks = terrain });
+    const physics = try test_levels.itemPhysics(allocator, gameplay_definitions.blocks, terrain, dimensions);
     const merging = try ItemMerging.init(allocator);
     // Near enough that items tick, too far to hear them, as no connection takes sounds here.
     var player_records: [1]Players.Player = .{.{ .handle = .{ .index = 0, .generation = 1 }, .uuid = 1, .world = world, .stage = .ready, .position = .{ .x = 16, .y = 64, .z = 72 } }};

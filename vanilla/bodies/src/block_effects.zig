@@ -170,7 +170,7 @@ fn applyWith(host: anytype, subject: anytype, recorded: []const Movement, moveme
     collector.reset();
     // With no fluid and no block that acts on a body inside it around the one ticking, the walk
     // finds nothing, which Debug still checks.
-    const quiet = quietAround(host, subject, movements[0..count]);
+    const quiet = try quietAround(host, subject, movements[0..count]);
     if (!quiet or verify_skips) try checkInsideBlocks(host, subject, movements[0..count], collector);
     if (quiet) assert(collector.final_count == 0 and !collector.acted and collector.before_count[0] == 0);
     collector.flush();
@@ -223,9 +223,9 @@ fn stepOn(host: anytype, subject: anytype) !bool {
     return kind == .slime_block or (living and (kind == .magma_block or kind == .turtle_egg));
 }
 
-/// Whether the window around the body holds every cell the movements could visit, one block
-/// more for the fluid above, and none of them is a fluid or acts on what is inside it.
-fn quietAround(host: anytype, subject: anytype, movements: []const Movement) bool {
+/// Whether no cell the movements could visit, one block more for the fluid above, lies in a
+/// section that may hold a fluid or a block that acts on what is inside it.
+fn quietAround(host: anytype, subject: anytype, movements: []const Movement) !bool {
     const level = host.level(fieldOf(subject, "world").*);
     const half: f64 = host.width(subject) / 2.0;
     const tall: f64 = host.height(subject);
@@ -237,7 +237,7 @@ fn quietAround(host: anytype, subject: anytype, movements: []const Movement) boo
     };
     const first: [3]i32 = .{ mth.floor(low[0] - half) - 1, mth.floor(low[1]) - 1, mth.floor(low[2] - half) - 1 };
     const last: [3]i32 = .{ mth.floor(high[0] + half) + 1, mth.floor(high[1] + tall) + 1, mth.floor(high[2] + half) + 1 };
-    return level.without(mob_blocks.mark_fluid | mob_blocks.mark_inside, first, last);
+    return try level.without(mob_blocks.mark_fluid | mob_blocks.mark_inside, first, last);
 }
 
 const verify_skips = @import("builtin").mode == .debug;

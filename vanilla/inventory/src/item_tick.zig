@@ -20,6 +20,7 @@ const Models = replication.models.Models;
 const Model = replication.models.Model;
 const Classes = replication.models.Classes;
 
+const Level = @import("vanilla_bodies").body.Level;
 const assert = std.debug.assert;
 
 pub const ItemTick = struct {
@@ -70,31 +71,31 @@ pub const ItemTick = struct {
     /// What clients have of items, which step them themselves: each item's models are stepped
     /// beside it, as their clients step it. Their replication sets it.
     client_models: ?*Models = null,
-    /// While entities tick: this tick's number, and the blocks items read, shared by them all.
+    /// While entities tick: this tick's number.
     now: u64 = 0,
-    neighborhood: ?ItemPhysics.Window = null,
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*ItemTick {
         const self = try allocator.create(ItemTick);
-        // Items collide with the world border.
-        if (deps.world_border) |world_border| deps.physics.border = &world_border.shared;
         self.* = .{
             .deps = deps,
             .centers = try allocator.alloc(entities.residency.Center, deps.players.records.len),
             .last_centers = try allocator.alloc(entities.residency.Center, deps.players.records.len),
             .hazards = try .init(allocator, .{
-                .chunks = deps.physics.deps.chunks,
+                .chunks = deps.physics.deps.levels.deps.chunks,
                 .blocks = deps.physics.deps.blocks,
                 .items = deps.items,
                 .client = deps.client,
                 .players = deps.players,
                 .worlds = deps.worlds,
                 .inventories = deps.inventories,
+                .levels = deps.physics.deps.levels,
             }),
             .nearby = try allocator.alloc(entities.space.Entry, 1024),
             .random = .init(config.seed),
         };
-        try deps.physics.deps.chunks.observe(.init(self, blocksChanged));
+        try deps.physics.deps.levels.deps.chunks.observe(.init(self, blocksChanged));
+        // A solid entity moving onto a sleeping item wakes it, to be pushed out as vanilla's would.
+        if (deps.physics.deps.levels.deps.collisions) |collisions| try collisions.register(ItemEntities.kinds, .{ .context = self, .wake = wakeItem });
         try deps.entities.addTicker(self.ticker());
         return self;
     }
@@ -138,6 +139,13 @@ pub const ItemTick = struct {
         };
     }
 
+    fn wakeItem(context: *anyopaque, slot: u32) void {
+        const self: *ItemTick = @ptrCast(@alignCast(context));
+        self.deps.dropped.ask(self.deps.entities.directory.entry(slot).id) catch |err| {
+            self.failure = err;
+        };
+    }
+
     /// Whether lava flows strongly in the world, as in the nether, which pushes items harder.
     fn ultrawarm(self: *ItemTick, world: u32) !bool {
         if (self.last_world != world) {
@@ -155,8 +163,6 @@ pub const ItemTick = struct {
         if (self.failure) |err| return err;
         try self.refresh();
         self.now = dropped.clock.tick + 1;
-        self.neighborhood = self.deps.physics.readWindow();
-        self.hazards.window = &self.neighborhood.?;
         // Items tick in the tick order: others reading one know from this whether it has had
         // this tick.
         dropped.clock = .{ .tick = self.now, .running = true };
@@ -184,16 +190,12 @@ pub const ItemTick = struct {
                 }
                 try dropped.wake(entry.id, std.math.maxInt(u64));
             }
-            try self.tickOne(&self.neighborhood.?, entry.id, entry.sequence);
+            try self.tickOne(entry.id, entry.sequence);
         }
     }
 
     pub fn finishTick(self: *ItemTick) !void {
         self.deps.dropped.clock.running = false;
-        self.hazards.endTick();
-        self.hazards.window = null;
-        if (self.neighborhood) |*neighborhood| neighborhood.deinit();
-        self.neighborhood = null;
     }
 
     /// Items in memory are those near players, out to their view and one more, and those of
@@ -221,12 +223,13 @@ pub const ItemTick = struct {
         self.last_held = dropped.residency.held;
     }
 
-    fn tickOne(self: *ItemTick, neighborhood: *ItemPhysics.Window, entity: entities.Id, sequence: u64) !void {
+    fn tickOne(self: *ItemTick, entity: entities.Id, sequence: u64) !void {
         const dropped = self.deps.dropped;
         const view = (try dropped.read(entity)) orelse return;
         var metadata = view.metadata;
         if (!metadata.alive) return;
         var body = view.body;
+        const level = self.deps.physics.level(body.world);
         // Visited but not ticked: moved this tick where nothing ticks.
         if (!dropped.places.ticks(ItemEntities.columnOf(body))) return;
         const before = body.position;
@@ -234,7 +237,7 @@ pub const ItemTick = struct {
 
         // Entity.baseTick: pushed by currents, then burning down.
         var pushed = body;
-        const fluids = try self.deps.physics.push(neighborhood, &pushed, try self.ultrawarm(body.world));
+        const fluids = try self.deps.physics.push(&level, &pushed, try self.ultrawarm(body.world));
         var subject: hazards_module.Subject = .{
             .world = body.world,
             .position = body.position,
@@ -250,9 +253,10 @@ pub const ItemTick = struct {
         // Entity.isInLava, which is false on an entity's first tick.
         try self.hazards.burn(&subject, metadata.ticks > 1 and fluids.lava > 0);
         var advanced: ItemPhysics.Result = .{ .body = pushed, .on_ground = metadata.on_ground, .crossed_block = false };
+        var hooked: hazards_module.Hook = .{ .hazards = &self.hazards, .subject = &subject };
         if (!subject.removed) {
             if (metadata.pickup_delay > 0 and metadata.pickup_delay != 32767) metadata.pickup_delay -= 1;
-            advanced = try self.deps.physics.advanceRandomly(neighborhood, self.deps.dropped.givenId(entity), metadata.ticks, pushed, metadata.on_ground, fluids, metadata.stuck.multiplier(), hazards_module.Hook{ .hazards = &self.hazards, .subject = &subject }, self.random.random());
+            advanced = try self.deps.physics.advanceRandomly(&level, self.deps.dropped.givenId(entity), metadata.ticks, pushed, metadata.on_ground, fluids, metadata.stuck.multiplier(), hooked.physics(), self.random.random());
             if (advanced.moved) metadata.stuck = ItemEntities.Stuck.of(subject.stuck);
         }
         metadata.on_ground = advanced.on_ground;
@@ -287,14 +291,14 @@ pub const ItemTick = struct {
         // again by the currents where it ended up.
         if (metadata.alive) {
             var again = body;
-            _ = try self.deps.physics.push(neighborhood, &again, try self.ultrawarm(body.world));
+            _ = try self.deps.physics.push(&level, &again, try self.ultrawarm(body.world));
             if (!std.meta.eql(again, body)) {
                 try dropped.move(entity, body, again);
                 metadata.revision += 1;
                 body = again;
             }
             // Its clients step it too: their models step beside it, and are held to it.
-            if (self.client_models) |models| try self.stepModels(models, neighborhood, entity, body, metadata.on_ground);
+            if (self.client_models) |models| try self.stepModels(models, &level, entity, body, metadata.on_ground);
         }
         const world = self.deps.worlds.get(body.world) orelse return error.UnknownWorld;
         const void_y: f64 = @floatFromInt(world.dimension.minimumSection() * 16 - 64);
@@ -312,13 +316,13 @@ pub const ItemTick = struct {
             fluids.water == 0 and fluids.lava == 0 and metadata.fire_ticks == 0 and metadata.ticks_frozen == 0 and !subject.hurt and
             metadata.stuck == .none and metadata.age >= 0 and metadata.age < 5999 and metadata.revision == moved_revision;
         if (metadata.alive) try dropped.put(entity, metadata);
-        if (restful) if (try self.deps.physics.rest(neighborhood, body)) |still| try dropped.lull(entity, sequence, body, metadata, still.speed, still.friction);
+        if (restful) if (try self.deps.physics.rest(&level, body)) |still| try dropped.lull(entity, sequence, body, metadata, still.speed, still.friction);
     }
 
     /// Steps an item's models, each as the clients holding it step the item, and has them judged
     /// against the item as it now is. Clients whose steps would differ, by their release's rules or
     /// by whether their own tick count moves an item at rest this tick, are stepped apart.
-    fn stepModels(self: *ItemTick, models: *Models, neighborhood: *ItemPhysics.Window, entity: entities.Id, body: entities.State, on_ground: bool) !void {
+    fn stepModels(self: *ItemTick, models: *Models, level: *const Level, entity: entities.Id, body: entities.State, on_ground: bool) !void {
         const slot = self.deps.dropped.items.slotOf(entity).?;
         const entries = (try models.begin(slot, entity)) orelse return;
         const given = self.deps.dropped.givenId(entity);
@@ -338,10 +342,10 @@ pub const ItemTick = struct {
                 var state = body;
                 state.position = entry.model.position;
                 state.velocity = entry.model.velocity;
-                const fluids = try self.deps.physics.push(neighborhood, &state, warm);
-                const stepped = try self.deps.physics.advanceClient(neighborhood, given, models.ticksOf(first), state, entry.model.on_ground, fluids, ItemPhysics.releaseOf(models.rulesOf(first)));
+                const fluids = try self.deps.physics.push(level, &state, warm);
+                const stepped = try self.deps.physics.advanceClient(level, given, models.ticksOf(first), state, entry.model.on_ground, fluids, ItemPhysics.releaseOf(models.rulesOf(first)));
                 var after = stepped.body;
-                _ = try self.deps.physics.push(neighborhood, &after, warm);
+                _ = try self.deps.physics.push(level, &after, warm);
                 const model: Model = .{ .position = after.position, .velocity = after.velocity, .on_ground = stepped.on_ground };
                 // Each class, as whether its tick count moves the item next tick is its own.
                 var each_alike = alike;

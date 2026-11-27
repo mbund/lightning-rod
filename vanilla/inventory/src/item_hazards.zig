@@ -12,6 +12,7 @@ const encoding = game_data.encoding;
 const bodies = @import("vanilla_bodies");
 const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
 const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
+const Levels = bodies.levels.Levels;
 const Items = @import("vanilla_items").items.Items;
 const ClientRegistries = @import("vanilla_content").client_registries.ClientRegistries;
 const Blocks = @import("vanilla_content").blocks.Blocks;
@@ -51,17 +52,12 @@ pub const Subject = struct {
 
 pub const Hazards = struct {
     deps: Dependencies,
-    copies: *chunks.Copies,
-    blocks: *const bodies.mob_blocks.MobBlocks,
     scratch: effects.Scratch = .{},
     sounds: world_effects.Effects,
     /// Entity.random for the sounds items make, which vanilla seeds anew for each entity.
     random: JavaRandom,
     level_random: JavaRandom,
     sound_seeds: std.Random.DefaultPrng,
-    /// The read window of the tick, let go before a block effect edits terrain, as edits wait
-    /// for every lease.
-    window: ?*ItemPhysics.Window = null,
 
     pub const Dependencies = struct {
         chunks: *chunks.Chunks,
@@ -71,25 +67,18 @@ pub const Hazards = struct {
         players: *Players,
         worlds: *worlds.Worlds,
         inventories: *inventories.Inventories,
+        levels: *Levels,
     };
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !Hazards {
-        const blocks = try bodies.mob_blocks.MobBlocks.init(allocator, deps.blocks);
         return .{
             .deps = deps,
-            .copies = try chunks.Copies.init(allocator, deps.chunks, 64),
-            .blocks = blocks,
             .sounds = try .init(allocator, deps.players),
             // Vanilla seeds these anew for each entity and level; any seed draws alike.
             .random = .init(0x6974656d),
             .level_random = .init(0x6c6576656c),
             .sound_seeds = .init(0x736f756e64),
         };
-    }
-
-    /// Copies read this tick are dropped at its end.
-    pub fn endTick(self: *Hazards) void {
-        self.copies.endTick();
     }
 
     /// The start of Entity.baseTick for a burning item: it counts down, hurt by its fire once
@@ -155,20 +144,10 @@ pub const Hazards = struct {
     }
 
     fn level(self: *Hazards, world: u32) bodies.body.Level {
-        const definition = self.deps.worlds.get(world).?;
-        return .{
-            .copies = self.copies,
-            .blocks = self.blocks,
-            .world = world,
-            .minimum_y = definition.dimension.minimumSection() * 16,
-            .height = @intCast(definition.dimension.sectionCount() * 16),
-            .air = @intCast(game_data.registry.blockStateId("minecraft:air").?),
-        };
+        return self.deps.levels.level(world);
     }
 
-    /// An edit waits for every lease, so the tick's window lets go of its first.
     fn edit(self: *Hazards, world: u32, position: [3]i32, state: u16) !void {
-        if (self.window) |window| window.deinit();
         try self.deps.chunks.setBlock(world, .{ .x = position[0], .y = position[1], .z = position[2] }, state);
     }
 };
@@ -178,7 +157,17 @@ pub const Hook = struct {
     hazards: *Hazards,
     subject: *Subject,
 
-    pub fn apply(self: Hook, body: *entities.State, on_ground: bool, from: [3]f64) !void {
+    /// As ItemPhysics takes it.
+    pub fn physics(self: *Hook) ItemPhysics.Hook {
+        return .{ .context = self, .apply = applyHook };
+    }
+
+    fn applyHook(context: *anyopaque, body: *entities.State, on_ground: bool, from: [3]f64) anyerror!void {
+        const self: *Hook = @ptrCast(@alignCast(context));
+        return self.apply(body, on_ground, from);
+    }
+
+    fn apply(self: *Hook, body: *entities.State, on_ground: bool, from: [3]f64) !void {
         const subject = self.subject;
         subject.position = body.position;
         subject.velocity = body.velocity;

@@ -21,7 +21,7 @@ pub fn heightAndPush(level: *const body.Level, box: body.Box, velocity: *[3]f64,
     const first: [3]i32 = .{ mth.floor(current.min[0]), mth.floor(current.min[1]), mth.floor(current.min[2]) };
     const last: [3]i32 = .{ mth.ceil(current.max[0]), mth.ceil(current.max[1]), mth.ceil(current.max[2]) };
     // No fluid around the body ticking means nothing to find, which Debug still looks for.
-    const dry = level.without(mob_blocks.mark_fluid, first, .{ last[0] - 1, last[1] - 1, last[2] - 1 });
+    const dry = try level.without(mob_blocks.mark_fluid, first, .{ last[0] - 1, last[1] - 1, last[2] - 1 });
     if (dry and !verify_skips) return .{ .touching = false, .height = 0 };
     var deepest: f64 = 0;
     var touching = false;

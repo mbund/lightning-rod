@@ -1,6 +1,6 @@
 //! The mobs of every world, in memory with the places they stand, ticked in vanilla's order
-//! where the ticking domain reaches and saved at checkpoints. Mobs read blocks through copies
-//! of the sections they touch, kept across ticks.
+//! where the ticking domain reaches and saved at checkpoints. Mobs read blocks through the
+//! levels every body shares.
 
 const std = @import("std");
 const game_data = @import("game_data");
@@ -20,6 +20,7 @@ const Domains = @import("domains").domains.Domains;
 const world_effects = @import("vanilla_blocks").world_effects;
 const body = @import("vanilla_bodies").body;
 const EntityCollisions = @import("vanilla_bodies").entity_collisions.EntityCollisions;
+const Levels = @import("vanilla_bodies").levels.Levels;
 const PlayerRecord = @import("players").player_state.Player;
 const living = @import("living.zig");
 const mth = @import("vanilla_bodies").mth;
@@ -103,8 +104,6 @@ pub const Mobs = struct {
     pub const Configuration = struct {
         /// Events held for the replication between its ticks; past them, it sends them early.
         events: usize = 1024,
-        /// Sections of blocks mobs keep decoded across ticks.
-        copies: u32 = 512,
         /// Block edits held for paths to answer in a batch, from the first that changes a
         /// collision. When they fill, the paths answer them at once.
         edits: u32 = 16384,
@@ -136,6 +135,7 @@ pub const Mobs = struct {
         furnaces: *Furnaces,
         enchantment_registry: *EnchantmentRegistry,
         collisions: *EntityCollisions,
+        levels: *Levels,
     };
 
     deps: Dependencies,
@@ -160,8 +160,8 @@ pub const Mobs = struct {
     active: entities.pool.IndexSet,
     /// Every mob's slot in the order replication sends them, as `collectOrder` last found.
     ordered: entities.Array(u32),
+    /// The classes of blocks, as the levels have them.
     blocks: *mob_blocks.MobBlocks,
-    copies: *chunks.Copies,
     species: [@typeInfo(Species).@"enum".field_names.len]species_data.Traits,
     /// The level's random, which a few block reactions draw from.
     level_random: JavaRandom,
@@ -216,8 +216,6 @@ pub const Mobs = struct {
     /// The blocks around the awake mob ticking, which levels read while it is set.
     window: body.Window = .{},
     window_view: ?*const body.Window = null,
-    /// Room a move and its block effects work in, reused by every mob.
-    colliders: body.Colliders = .{},
     effects_scratch: @import("block_effects.zig").Scratch = .{},
     /// By player slot, whether the player holds cow food in either hand, noted as mobs start
     /// ticking: tempting asks every other tick for every mob, and hands change only between.
@@ -274,8 +272,7 @@ pub const Mobs = struct {
             .active = try .init(allocator, pool),
             .extras = try .init(allocator, pool),
             .ordered = try .init(allocator, pool),
-            .blocks = try mob_blocks.MobBlocks.init(allocator, deps.block_definitions),
-            .copies = try chunks.Copies.init(allocator, deps.chunks, config.copies),
+            .blocks = deps.levels.blocks,
             .species = undefined,
             .level_random = .init(@bitCast(config.seed)),
             .seeds = .init(config.seed ^ 0x73656564),
@@ -296,7 +293,6 @@ pub const Mobs = struct {
             .holders = try allocator.alloc(herd_state.Audience.Player, deps.players.records.len),
             .overlay = try .init(allocator, config.edits + chunks.edit_previous_max),
         };
-        self.copies.mark(self.blocks.marks);
         try self.readTags();
         try deps.items.deps.definitions.registry.onChange(self, readTags);
         try deps.chunks.observe(.init(self, blocksChanged));
@@ -329,8 +325,6 @@ pub const Mobs = struct {
         var result = self.view(world).level;
         result.overlay = self.overlay_view;
         result.window = self.window_view;
-        result.colliders = &self.colliders;
-        result.entities = self.deps.collisions.source();
         return result;
     }
 
@@ -346,15 +340,7 @@ pub const Mobs = struct {
         const dimension = self.deps.dimensions.get(definition.dimension.name);
         const made: WorldView = .{
             .world = world,
-            .level = .{
-                .copies = self.copies,
-                .blocks = self.blocks,
-                .world = world,
-                .minimum_y = definition.dimension.minimumSection() * 16,
-                .height = @intCast(definition.dimension.sectionCount() * 16),
-                .air = self.air_state,
-                .border = self.deps.world_border.bounds(world),
-            },
+            .level = self.deps.levels.level(world),
             .ultrawarm = if (dimension) |found| found.ultrawarm else false,
         };
         // Outside the tick nothing is kept, and more worlds than places only means finding one again.
@@ -723,7 +709,6 @@ pub const Mobs = struct {
     }
 
     pub fn finishTick(self: *Mobs) !void {
-        self.copies.endTick();
         self.tickViews(false);
     }
 

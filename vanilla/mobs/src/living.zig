@@ -126,29 +126,15 @@ fn checkSupportingBlock(mobs: *Mobs, mob: Mob, moved: [3]f64) !void {
         return;
     }
     const level = mobs.level(mob.motion.world);
-    const current = box(mobs, mob);
-    const below: Box = .{ .min = .{ current.min[0], current.min[1] - 1.0e-6, current.min[2] }, .max = .{ current.max[0], current.min[1], current.max[2] } };
-    var found = try body.findSupportingBlock(&level, below, context(mob), mob.motion.position);
-    if (found != null or mob.motion.on_ground_no_blocks) {
-        mob.motion.supporting = found;
-    } else {
-        found = try body.findSupportingBlock(&level, below.move(.{ -moved[0], 0, -moved[2] }), context(mob), mob.motion.position);
-        mob.motion.supporting = found;
-    }
+    const found = try body.supportingBlock(&level, box(mobs, mob), context(mob), mob.motion.position, moved, mob.motion.on_ground_no_blocks);
+    mob.motion.supporting = found;
     mob.motion.on_ground_no_blocks = found == null;
 }
 
 /// Entity.getOnPos: the block the mob stands on, looked for this far below its feet.
 pub fn onPosition(mobs: *Mobs, mob: Mob, depth: f32) ![3]i32 {
-    if (mob.motion.supporting) |supporting| {
-        if (!(depth > 1.0e-5)) return supporting;
-        const level = mobs.level(mob.motion.world);
-        const entry = level.blocks.get(try level.state(supporting[0], supporting[1], supporting[2]));
-        const keeps = (depth <= 0.5 and entry.flags.fence) or entry.flags.wall or entry.flags.fence_gate;
-        if (keeps) return supporting;
-        return .{ supporting[0], mth.floor(mob.motion.position[1] - depth), supporting[2] };
-    }
-    return .{ mth.floor(mob.motion.position[0]), mth.floor(mob.motion.position[1] - depth), mth.floor(mob.motion.position[2]) };
+    const level = mobs.level(mob.motion.world);
+    return body.onPos(&level, mob.motion.supporting, mob.motion.position, depth);
 }
 
 /// LivingEntity.checkFallDamage then Entity.checkFallDamage.

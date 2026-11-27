@@ -13,6 +13,7 @@
         .minecraft_packets = .{ .path = "../../minecraft_packets" },
         .players = .{ .path = "../../players" },
         .records = .{ .path = "../../records" },
+        .vanilla_bodies = .{ .path = "../bodies" },
         .vanilla_content = .{ .path = "../content" },
         .vanilla_items = .{ .path = "../items" },
         .worlds = .{ .path = "../../worlds" },

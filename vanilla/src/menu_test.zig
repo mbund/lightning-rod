@@ -7,6 +7,7 @@ const std = @import("std");
 const Domains = @import("domains").domains.Domains;
 const EntityColumns = @import("domains").entity_columns.EntityColumns;
 const storage = @import("storage");
+const test_levels = @import("test_levels.zig");
 const fault = @import("fault_disk");
 const metrics = @import("metrics");
 const packets = @import("minecraft_packets");
@@ -478,8 +479,7 @@ test "orb placement fluid currents block effects and fire follow vanilla physics
     try std.testing.expect(!(try orbOf(experience, burning)).alive);
     try containers.deps.chunks.setBlock(world, .{ .x = 12, .y = 8, .z = 4 }, @intCast(game_data.registry.blockStateId("minecraft:bubble_column[drag=false]").?));
     try containers.deps.chunks.setBlock(world, .{ .x = 14, .y = 8, .z = 4 }, @intCast(game_data.registry.blockStateId("minecraft:cobweb").?));
-    var window = experience.deps.physics.readWindow();
-    defer window.deinit();
+    const window = experience.deps.physics.level(world);
     var moving = (try bodyOf(experience, second));
     moving.position = .{ 12.5, 8, 4.5 };
     moving.velocity = .{ 0, 0, 0 };
@@ -492,9 +492,7 @@ test "orb placement fluid currents block effects and fire follow vanilla physics
     try std.testing.expectApproxEqAbs(@as(f64, 14.525), stuck.body.position[0], 1e-12);
     try std.testing.expectApproxEqAbs(@as(f64, 8.4985), stuck.body.position[1], 1e-12);
     try std.testing.expectEqual(@as([3]f64, .{ 0, 0, 0 }), stuck.body.velocity);
-    window.deinit();
     try containers.deps.chunks.setBlock(world, .{ .x = 20, .y = 8, .z = 4 }, @intCast(game_data.registry.blockStateId("minecraft:honey_block").?));
-    window = experience.deps.physics.readWindow();
     moving.position = .{ 21.2, 8.5, 4.5 };
     moving.velocity = .{ 0, -0.3, 0.1 };
     const sliding = try experience.deps.physics.advanceOrb(&window, 1, 1, moving, false, .{ 0, 0, 0 });
@@ -680,7 +678,7 @@ fn blockContainers(allocator: std.mem.Allocator, store: *storage.Store, registry
         .player_states = fixture.player_states,
         .world_border = fixture.world_border,
         .entities = fixture.bodies,
-        .physics = try ItemPhysics.init(allocator, .{ .blocks = fixture.definitions.blocks, .chunks = terrain }),
+        .physics = try test_levels.itemPhysics(allocator, fixture.definitions.blocks, terrain, fixture.players.deps.worlds),
         .inventories = fixture.ownership,
         .inventory = fixture.menu,
         .storage = try store.openSpace("experience"),
@@ -1778,8 +1776,7 @@ test "items drift with water currents and float in water and lava, as vanilla's 
     for ([_]chunks.Position{ .{ .x = 3, .y = 8, .z = 4 }, .{ .x = 4, .y = 8, .z = 3 }, .{ .x = 4, .y = 8, .z = 5 } }) |position| try terrain.setBlock(world, position, stone);
     try terrain.setBlock(world, .{ .x = 5, .y = 8, .z = 4 }, @intCast(game_data.registry.blockStateId("minecraft:water[level=4]").?));
     try terrain.setBlock(world, .{ .x = 10, .y = 8, .z = 4 }, @intCast(game_data.registry.blockStateId("minecraft:lava[level=0]").?));
-    var window = physics.readWindow();
-    defer window.deinit();
+    const window = physics.level(world);
     const resting: entities.State = .{ .uuid = 1, .kind = 1, .world = world, .position = .{ 4.5, 8, 4.5 }, .velocity = .{ 0, 0, 0 } };
     // 26.2's drag, ItemEntity.tick's getAirDrag, across and down alike.
     const drag: f64 = @as(f32, 0.98);

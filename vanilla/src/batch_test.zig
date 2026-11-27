@@ -13,6 +13,7 @@ const Players = @import("players").players.Players;
 const chunks = @import("chunks");
 const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
 const item_physics = @import("vanilla_item_entities").item_physics;
+const test_levels = @import("test_levels.zig");
 
 fn itemPhysicsProbe(output: *std.Io.Writer) !void {
     const Source = struct {
@@ -36,7 +37,7 @@ fn itemPhysicsProbe(output: *std.Io.Writer) !void {
     defer arena.deinit();
     var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .capacity = 128 });
     defer registry.deinit();
-    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 19, .cache_groups = 2 }, .{
+    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .edit_sections = 1, .simulation_sections = 1, .cache_sections = 19, .cache_groups = 2 }, .{
         .metrics = &registry,
         .storage = try store.openSpace(chunks.Chunks.id),
         .record_workspaces = try persistent_records.Workspaces.init(arena.allocator(), io, .{}),
@@ -47,47 +48,44 @@ fn itemPhysicsProbe(output: *std.Io.Writer) !void {
     const reader = try terrain.client(.{ .name = "test", .sections = 2 });
     const warm = try reader.acquire(section);
     warm.release();
-    var physics: ItemPhysics = .{ .deps = .{ .blocks = try vanilla_content.blocks(arena.allocator()), .chunks = terrain }, .chunk_client = try terrain.client(.{ .name = "item physics", .sections = 16 }) };
+    const physics = try test_levels.itemPhysics(arena.allocator(), try vanilla_content.blocks(arena.allocator()), terrain, try test_levels.testWorlds(arena.allocator(), try store.openSpace("worlds")));
+    const level = physics.level(0);
     const body: entities.State = .{ .uuid = 1, .kind = 1, .world = 0, .position = .{ 8, 70, 8 }, .velocity = .{ 0.1, 0, 0.1 } };
     try output.writeAll("moving items | section acquisitions | storage reads | generated sections\n");
     for ([_]usize{ 1, 64, 1024 }) |count| {
         const before = terrain.cache.metrics.acquired.value();
         const reads = terrain.cache.metrics.reads.value();
         const generated = source.generated;
-        var neighborhood = physics.readWindow();
-        defer neighborhood.deinit();
         for (0..count) |index| {
-            const result = try physics.step(&neighborhood, @intCast(index + 1), 1, body, false, false);
+            const result = try physics.step(&level, @intCast(index + 1), 1, body, false, false);
             try std.testing.expectApproxEqAbs(@as(f64, 8.1), result.body.position[0], 0.000001);
             try std.testing.expectApproxEqAbs(@as(f64, 69.96), result.body.position[1], 0.000001);
             try std.testing.expectApproxEqAbs(@as(f64, 8.1), result.body.position[2], 0.000001);
         }
-        try std.testing.expectEqual(@as(u64, 1), terrain.cache.metrics.acquired.value() - before);
+        // The section is read once, then every body finds it copied.
+        try std.testing.expect(terrain.cache.metrics.acquired.value() - before <= 1);
         try std.testing.expectEqual(reads, terrain.cache.metrics.reads.value());
         try std.testing.expectEqual(generated, source.generated);
         try output.print("{d:12} | {d:20} | {d:13} | {d}\n", .{ count, terrain.cache.metrics.acquired.value() - before, terrain.cache.metrics.reads.value() - reads, source.generated - generated });
     }
     try terrain.setBlock(0, .{ .x = 8, .y = 69, .z = 8 }, game_data.registry.block_stone_default_state);
     try terrain.setBlock(0, .{ .x = 9, .y = 70, .z = 8 }, game_data.registry.block_stone_default_state);
-    var neighborhood = physics.readWindow();
-    defer neighborhood.deinit();
     var moving = body;
     moving.velocity[0] = 1;
-    const collision = try physics.step(&neighborhood, 1, 1, moving, false, false);
+    const collision = try physics.step(&level, 1, 1, moving, false, false);
     try std.testing.expect(collision.on_ground);
     try std.testing.expectApproxEqAbs(@as(f64, 8.875), collision.body.position[0], 0.000001);
     try std.testing.expectApproxEqAbs(@as(f64, 70), collision.body.position[1], 0.000001);
     try std.testing.expectEqual(@as(f64, 0), collision.body.velocity[0]);
     moving.position = .{ -8, 70, -8 };
     moving.velocity = .{ -0.1, 0, -0.1 };
-    const negative = try physics.step(&neighborhood, 1, 1, moving, false, false);
+    const negative = try physics.step(&level, 1, 1, moving, false, false);
     try std.testing.expectApproxEqAbs(@as(f64, -8.1), negative.body.position[0], 0.000001);
     try std.testing.expectApproxEqAbs(@as(f64, -8.1), negative.body.position[2], 0.000001);
     moving.position = .{ 15.8, 70, 8 };
     moving.velocity = .{ 0.4, 0, 0 };
-    const crossing = try physics.step(&neighborhood, 1, 1, moving, false, false);
+    const crossing = try physics.step(&level, 1, 1, moving, false, false);
     try std.testing.expectApproxEqAbs(@as(f64, 16.2), crossing.body.position[0], 0.000001);
-    neighborhood.deinit();
     try std.testing.expectEqual(@as(usize, 0), terrain.borrowed_count);
 
     // Items lying on blocks that go fall on their own tick of four, by network id, which wireless
@@ -99,10 +97,8 @@ fn itemPhysicsProbe(output: *std.Io.Writer) !void {
         try terrain.setBlock(0, at, game_data.registry.block_air_default_state);
         var resting: entities.State = .{ .uuid = 2 + id, .kind = 1, .world = 0, .position = .{ @as(f64, @floatFromInt(at.x)) + 0.5, 70, 3.5 }, .velocity = .{ 0, 0, 0 } };
         var ground = true;
-        var window = physics.readWindow();
-        defer window.deinit();
         for (1..9) |tick| {
-            const result = try physics.step(&window, @intCast(id), @intCast(tick), resting, ground, false);
+            const result = try physics.step(&level, @intCast(id), @intCast(tick), resting, ground, false);
             resting = result.body;
             ground = result.on_ground;
             if (fell.* == 0 and resting.position[1] < 70) fell.* = @intCast(tick);
@@ -127,22 +123,18 @@ fn itemPhysicsProbe(output: *std.Io.Writer) !void {
         uniform.release();
         dense.release();
 
-        var uniform_window = physics.readWindow();
-        defer uniform_window.deinit();
-        var dense_window = physics.readWindow();
-        defer dense_window.deinit();
         var falling = body;
         falling.position = .{ @as(f64, @floatFromInt(uniform_section.x * 16)) + 8, 80.01, 8 };
         falling.velocity[1] = -0.1;
         var translated = falling;
         translated.position[0] += 16;
         if (state == std.math.maxInt(u16)) {
-            try std.testing.expectError(error.Corrupt, physics.step(&uniform_window, 1, 1, falling, false, false));
-            try std.testing.expectError(error.Corrupt, physics.step(&dense_window, 1, 1, translated, false, false));
+            try std.testing.expectError(error.Corrupt, physics.step(&level, 1, 1, falling, false, false));
+            try std.testing.expectError(error.Corrupt, physics.step(&level, 1, 1, translated, false, false));
             continue;
         }
-        const compact = try physics.step(&uniform_window, 1, 1, falling, false, false);
-        const expanded = try physics.step(&dense_window, 1, 1, translated, false, false);
+        const compact = try physics.step(&level, 1, 1, falling, false, false);
+        const expanded = try physics.step(&level, 1, 1, translated, false, false);
         for (compact.body.position, expanded.body.position, 0..) |first, second, axis| try std.testing.expectApproxEqAbs(first, second - @as(f64, if (axis == 0) 16 else 0), 0.000000001);
         try std.testing.expectEqualSlices(f64, &compact.body.velocity, &expanded.body.velocity);
         try std.testing.expectEqual(compact.crossed_block, expanded.crossed_block);
@@ -158,7 +150,7 @@ pub fn benchmarkItemPhysics() !void {
     try output.interface.flush();
 }
 
-test "item physics reuses its neighborhood across axes and preserves collision resolution" {
+test "item physics reads its blocks once and keeps collision resolution" {
     var buffer: [256]u8 = undefined;
     var output = std.Io.Writer.Discarding.init(&buffer);
     try itemPhysicsProbe(&output.writer);
@@ -359,20 +351,18 @@ pub fn benchmarkItemPhysicsWindow() !void {
     defer arena.deinit();
     var registry = try metrics.Registry.init(std.testing.allocator, io, .{ .capacity = 128 });
     defer registry.deinit();
-    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .edit_sections = 1, .simulation_sections = 0, .cache_sections = 19, .cache_groups = 2 }, .{
+    const terrain = try chunks.Chunks.init(arena.allocator(), io, .{ .edit_sections = 1, .simulation_sections = 1, .cache_sections = 19, .cache_groups = 2 }, .{
         .metrics = &registry,
         .storage = try store.openSpace(chunks.Chunks.id),
         .record_workspaces = try persistent_records.Workspaces.init(arena.allocator(), io, .{}),
     });
     var source: Source = .{};
     terrain.setSource(chunks.Source.init(&source, Source.read));
-    var physics: ItemPhysics = .{ .deps = .{ .blocks = try vanilla_content.blocks(arena.allocator()), .chunks = terrain }, .chunk_client = try terrain.client(.{ .name = "item physics", .sections = 16 }) };
+    const physics = try test_levels.itemPhysics(arena.allocator(), try vanilla_content.blocks(arena.allocator()), terrain, try test_levels.testWorlds(arena.allocator(), try store.openSpace("worlds")));
+    const level = physics.level(0);
     const body: entities.State = .{ .uuid = 1, .kind = 1, .world = 0, .position = .{ 15.875, 65, 8 }, .velocity = .{ 0.1, 0, 0.1 } };
-    {
-        var window = physics.readWindow();
-        defer window.deinit();
-        _ = try physics.step(&window, 1, 1, body, true, false);
-    }
+    // The first step copies the four sections about the item; every step after finds them copied.
+    _ = try physics.step(&level, 1, 1, body, true, false);
     var buffer: [1024]u8 = undefined;
     var output = std.Io.File.stdout().writer(io, &buffer);
     try output.interface.writeAll("moving items | section acquisitions | acquisition batches | storage reads\n");
@@ -381,21 +371,19 @@ pub fn benchmarkItemPhysicsWindow() !void {
         const batches = terrain.cache.metrics.batches.value();
         const reads = terrain.cache.metrics.reads.value();
         const generated = source.generated;
-        var window = physics.readWindow();
         for (0..count) |at| {
-            const result = try physics.step(&window, @intCast(at + 1), 1, body, true, false);
+            const result = try physics.step(&level, @intCast(at + 1), 1, body, true, false);
             try std.testing.expect(result.on_ground);
             try std.testing.expectApproxEqAbs(@as(f64, 15.975), result.body.position[0], 0.000001);
             try std.testing.expectApproxEqAbs(@as(f64, 65), result.body.position[1], 0.000001);
         }
-        window.deinit();
         try std.testing.expectEqual(@as(usize, 0), terrain.borrowed_count);
         try std.testing.expectEqual(reads, terrain.cache.metrics.reads.value());
         try std.testing.expectEqual(generated, source.generated);
         const acquired = terrain.cache.metrics.acquired.value() - before;
         const calls = terrain.cache.metrics.batches.value() - batches;
-        try std.testing.expectEqual(@as(u64, 4), acquired);
-        try std.testing.expectEqual(@as(u64, 1), calls);
+        try std.testing.expectEqual(@as(u64, 0), acquired);
+        try std.testing.expectEqual(@as(u64, 0), calls);
         try output.interface.print("{d:12} | {d:20} | {d:19} | 0\n", .{ count, acquired, calls });
     }
     try output.interface.flush();

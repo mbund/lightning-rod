@@ -562,6 +562,7 @@ pub const Boats = struct {
         if (!std.meta.eql(before, state.*)) {
             stored.dirty = true;
             try self.places.move(slot, state.world, state.position);
+            if (!std.meta.eql(before.position, state.position)) self.deps.collisions.disturb(state.world, boat_module.boxAt(state.position));
         }
         if (!std.meta.eql(replicated_before, replicatedOf(stored.boat))) self.replicated.insert(slot);
     }
@@ -1119,6 +1120,7 @@ pub const Boats = struct {
         state.pitch = @rem(std.math.clamp(turned[1], -90.0, 90.0), 360.0);
         if (kept) |movement| stored.steer.record(movement);
         try self.places.move(slot, state.world, state.position);
+        if (!std.meta.eql(was, state.position)) self.deps.collisions.disturb(state.world, boat_module.boxAt(state.position));
         stored.dirty = true;
         self.replicated.insert(slot);
         const moved: [3]f64 = .{ to[0] - was[0], to[1] - was[1], to[2] - was[2] };
@@ -1144,7 +1146,7 @@ pub const Boats = struct {
         const deflate = @as(f64, @as(f32, 1.0e-5));
         const was = old_box.inflate(-deflate, -deflate, -deflate);
         const now = boat_module.boxAt(to).inflate(-deflate, -deflate, -deflate);
-        var shapes: body.Shapes = .init(&level, now, .{ .bottom = old_box.min[1], .fall_distance = self.boats.ptr(slot).boat.fall_distance });
+        var shapes: body.Shapes = try .init(&level, now, .{ .bottom = old_box.min[1], .fall_distance = self.boats.ptr(slot).boat.fall_distance });
         while (try shapes.next()) |shape| for (0..shape.boxes.count) |index| {
             const piece = shape.get(index);
             if (piece.intersects(now) and !piece.intersects(was)) return true;

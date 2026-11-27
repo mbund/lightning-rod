@@ -126,7 +126,14 @@ pub const Copies = struct {
         const view = lease.view();
         for (&self.states[slot], 0..) |*state, cell| state.* = view.get(@intCast(cell));
         self.marked[slot] = 0;
+        // The marks know every state, so one past them is a section gone bad: refused, its slot
+        // given back.
         if (self.marks) |marks| for (self.states[slot]) |state| {
+            if (state >= marks.len) {
+                self.free[self.free_count] = slot;
+                self.free_count += 1;
+                return error.Corrupt;
+            }
             self.marked[slot] |= marks[state];
         };
         self.sections[slot] = section;

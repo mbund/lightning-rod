@@ -4,6 +4,8 @@
     .{ .name = "boats-ride", .peers = .{"alice"} },
     // A cow beside the boat is taken aboard, and set down when the boat breaks.
     .{ .name = "boats-cow", .fixture = "cow", .peers = .{"alice"} },
+    // A diamond dropped onto a boat comes to rest on it, as items collide with boats.
+    .{ .name = "boats-item", .fixture = "diamond", .peers = .{"alice"} },
     // A chest boat's chest, opened sneaking, keeps what is put in it and drops it as it breaks.
     .{ .name = "boats-chest", .peers = .{"alice"} },
     // Two players in one boat: alice steers with bob behind, gets off, and bob steers alone.

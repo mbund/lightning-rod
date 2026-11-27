@@ -19,12 +19,13 @@ import net.minecraft.world.phys.Vec3;
  * and still on the still water. In survival, a few punches break it, and its item drops.
  */
 final class BoatsFixture extends Fixture {
-    private enum Phase { GIVE, PLACE, AFLOAT, SURVIVAL, BREAK, DROPPED, BOARD, RIDING, DRIVE, LEAVE, LEFT, ABOARD, KEPT, SEATED, RIDDEN_OPEN, OFF, SNEAK, OPEN, STORE, STORED, PAIR_WAIT, PAIR_DRIVE, PAIR_CARRIED, PAIR_LEAVE, PAIR_WATCH }
+    private enum Phase { GIVE, PLACE, AFLOAT, SURVIVAL, BREAK, DROPPED, BOARD, RIDING, DRIVE, LEAVE, LEFT, ABOARD, KEPT, SEATED, RIDDEN_OPEN, OFF, SNEAK, OPEN, STORE, STORED, PAIR_WAIT, PAIR_DRIVE, PAIR_CARRIED, PAIR_LEAVE, PAIR_WATCH, RESTING }
     /** Bob in the pair scenario: aboard behind alice, carried, then steering once she is off. */
     private enum Bob { WAIT, BOARD, ABOARD, CARRIED, STEER, DRIVEN }
     private Bob bob = Bob.WAIT;
     private Vec3 left;
     private long seen;
+    private final StringBuilder trail = new StringBuilder();
     private Phase phase = Phase.GIVE;
     private long phaseStart;
     private double settledY = Double.NaN;
@@ -205,6 +206,7 @@ final class BoatsFixture extends Fixture {
                 if (r.scenario.equals("boats-ride") || pair()) { next(Phase.BOARD); return; }
                 if (r.scenario.equals("boats-cow")) { this.boat = boat; next(Phase.ABOARD); return; }
                 if (chest()) { this.boat = boat; interact(game, boat); next(Phase.SEATED); return; }
+                if (r.scenario.equals("boats-item")) { this.boat = boat; next(Phase.RESTING); return; }
                 game.getConnection().sendCommand("gamemode survival");
                 next(Phase.SURVIVAL);
             }
@@ -259,6 +261,20 @@ final class BoatsFixture extends Fixture {
                 if (at.distanceTo(driven) > 1.0) { client.fail("boat_went_back_from_" + driven + "_to_" + at); return; }
                 if (game.player.position().distanceTo(at) > 3.0) { client.fail("rider_set_down_far_" + game.player.position() + "_boat_" + at); return; }
                 client.pass("boat_boarded_driven_and_left_at_" + at);
+            }
+            case RESTING -> {
+                // The diamond the scene dropped over the boat lands on its top, which stops its
+                // fall. Vanilla then may push it out of the boat as the boat settles into it, by
+                // the item's own unseeded random, so where it goes after is not asked.
+                ItemEntity diamond = null;
+                for (var entity : game.level.entitiesForRendering()) if (entity instanceof ItemEntity item && item.getItem().is(Items.DIAMOND)) diamond = item;
+                if (diamond == null) { if (timedOut(300)) client.fail("no_diamond"); return; }
+                if (seen == 0) seen = r.tick;
+                double top = boat.getBoundingBox().maxY;
+                trail.append(String.format("%.3f ", diamond.getY()));
+                if (Math.abs(diamond.getY() - top) < 0.001 && diamond.onGround()) { client.pass("diamond_landed_on_the_boat_at_" + diamond.position()); return; }
+                if (diamond.getY() < top - 0.3) { client.fail("diamond_fell_past_the_boat_top_" + top + "_trail_" + trail); return; }
+                if (r.tick - seen > 100) client.fail("diamond_never_landed_trail_" + trail);
             }
             case PAIR_WAIT -> {
                 if (!client.marked("bob.aboard")) { if (timedOut(400)) client.fail("bob_never_aboard"); return; }

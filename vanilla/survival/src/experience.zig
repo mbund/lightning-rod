@@ -14,6 +14,7 @@ const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
 const WorldBorder = @import("vanilla_world").world_border.WorldBorder;
 const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
 const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
+const Level = @import("vanilla_bodies").body.Level;
 const Random = @import("vanilla_content").random.Random;
 const item_data = @import("vanilla_items").item_data;
 const encoding = @import("protocol_support");
@@ -195,8 +196,6 @@ pub const Experience = struct {
     replicated: lightning_rod.system.IndexSet,
     retired_count: usize = 0,
     nearby: []entities.space.Entry,
-    /// While entities tick: the blocks orbs read, shared by them all.
-    window: ?ItemPhysics.Window = null,
 
     pub fn allocate(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Experience {
         if (deps.inventories.items.entries.len < 2) return error.InventoryCacheTooSmall;
@@ -227,8 +226,6 @@ pub const Experience = struct {
         try deps.entities.declare(.{ .kinds = kinds, .tracking_range = 6 * 16 });
         try deps.entities.addTicker(.init(Experience, self, kinds, batch_max));
         try deps.entities.addColumnHolder(.init(Experience, self, columnLoaded, columnUnloaded));
-        // Items and orbs collide with the world border.
-        deps.physics.border = &deps.world_border.shared;
         try self.orbs.register();
         return self;
     }
@@ -378,8 +375,7 @@ pub const Experience = struct {
         if (self.deps.players.deps.worlds.get(world) == null) return error.UnknownWorld;
         if (amount < 0) return error.InvalidExperience;
         errdefer self.deps.storage.fail();
-        var window = self.deps.physics.readWindow();
-        defer window.deinit();
+        const level = self.deps.physics.level(world);
         var left = amount;
         while (left > 0) {
             const value = xp.denomination(left);
@@ -424,7 +420,7 @@ pub const Experience = struct {
                     if (dot < 0) motion.* = -motion.*;
                 }
             }
-            try self.create(&window, world, origin, velocity, yaw, value);
+            try self.create(&level, world, origin, velocity, yaw, value);
         }
     }
 
@@ -435,18 +431,17 @@ pub const Experience = struct {
         if (self.deps.players.deps.worlds.get(world) == null) return error.UnknownWorld;
         if (value <= 0) return error.InvalidExperience;
         errdefer self.deps.storage.fail();
-        var window = self.deps.physics.readWindow();
-        defer window.deinit();
+        const level = self.deps.physics.level(world);
         const random = self.random.random();
         const yaw = random.float(f32) * 360;
         const velocity: [3]f64 = .{ (random.float(f64) * 0.2 - 0.1) * 2, random.float(f64) * 0.2 * 2, (random.float(f64) * 0.2 - 0.1) * 2 };
-        try self.create(&window, world, position, velocity, yaw, value);
+        try self.create(&level, world, position, velocity, yaw, value);
     }
 
-    fn create(self: *Experience, window: *ItemPhysics.Window, world: u32, position: [3]f64, velocity: [3]f64, yaw: f32, value: i32) !void {
+    fn create(self: *Experience, level: *const Level, world: u32, position: [3]f64, velocity: [3]f64, yaw: f32, value: i32) !void {
         const expected = self.deps.entities.next_id;
         var body: entities.State = .{ .uuid = @as(u128, expected) | (@as(u128, 0xe000) << 64), .kind = kind, .world = world, .position = position, .velocity = velocity, .yaw = yaw };
-        try self.deps.physics.placeOrb(window, &body);
+        try self.deps.physics.placeOrb(level, &body);
         if (!entities.valid(body)) return error.InvalidEntity;
         const created = try self.deps.entities.reserveIds(1);
         assert(created == expected);
@@ -505,7 +500,6 @@ pub const Experience = struct {
         try self.forgetRetired();
         // Where nothing follows the loaded domain, orbs follow the players themselves.
         if (!self.deps.entities.columns_followed) try self.refresh();
-        self.window = self.deps.physics.readWindow();
     }
 
     /// Orbs next in the tick order, held together as they tick, as a merge may take another.
@@ -517,7 +511,7 @@ pub const Experience = struct {
         try self.hold(batch[0..run.len], held[0..run.len], true);
         var settled: usize = 0;
         defer for (held[settled..run.len]) |*orb| self.settle(orb) catch self.deps.storage.fail();
-        for (held[0..run.len]) |*orb| try self.tickOne(&self.window.?, orb, held[0..run.len]);
+        for (held[0..run.len]) |*orb| try self.tickOne(orb, held[0..run.len]);
         for (held[0..run.len]) |*orb| {
             try self.settle(orb);
             settled += 1;
@@ -527,10 +521,6 @@ pub const Experience = struct {
     /// After entities tick: what players took goes.
     pub fn finishTick(self: *Experience) !void {
         errdefer self.deps.storage.fail();
-        defer {
-            if (self.window) |*window| window.deinit();
-            self.window = null;
-        }
         try self.collect();
         try self.forgetRetired();
     }
@@ -623,10 +613,11 @@ pub const Experience = struct {
         try batch.put(entities.durable.key(record_prefix, here, entity), &value);
     }
 
-    fn tickOne(self: *Experience, window: *ItemPhysics.Window, held: *Held, batch: []Held) !void {
+    fn tickOne(self: *Experience, held: *Held, batch: []Held) !void {
         const orb = &held.orb;
         if (!orb.alive) return;
         var body = held.body orelse return error.CorruptExperienceOrb;
+        const level = self.deps.physics.level(body.world);
         // Visited but not ticked: moved this tick where nothing ticks.
         if (!self.places.ticks(entities.space.columnOf(body.world, body.position))) return;
         const world = self.deps.players.deps.worlds.get(body.world) orelse return error.CorruptExperienceOrb;
@@ -635,10 +626,10 @@ pub const Experience = struct {
             return;
         }
         orb.ticks +%= 1;
-        try self.deps.physics.pushOrb(window, &body, if (self.deps.dimensions.get(world.dimension.name)) |dimension| dimension.ultrawarm else false);
-        const environment = try self.deps.physics.orbEnvironment(window, body);
+        try self.deps.physics.pushOrb(&level, &body, if (self.deps.dimensions.get(world.dimension.name)) |dimension| dimension.ultrawarm else false);
+        const environment = try self.deps.physics.orbEnvironment(&level, body);
         if (orb.fire > 0) {
-            if (@mod(orb.fire, 20) == 0 and (try self.deps.physics.orbEffects(window, body)).lava == 0) {
+            if (@mod(orb.fire, 20) == 0 and (try self.deps.physics.orbEffects(&level, body)).lava == 0) {
                 held.body = body;
                 _ = try self.hurt(held, 1);
                 if (!orb.alive) return;
@@ -690,12 +681,12 @@ pub const Experience = struct {
         if (target == null and environment.solid) {
             var moved = body;
             for (&moved.position, moved.velocity) |*position, velocity| position.* += velocity;
-            if (try self.deps.physics.orbCollides(window, moved)) {
-                try self.deps.physics.escapeOrb(window, &body, self.random.random());
+            if (try self.deps.physics.orbCollides(&level, moved)) {
+                try self.deps.physics.escapeOrb(&level, &body, self.random.random());
                 orb.revision +%= 1;
             }
         }
-        const advanced = try self.deps.physics.advanceOrb(window, self.givenId(held.id), orb.ticks, body, orb.on_ground, orb.stuck.multiplier());
+        const advanced = try self.deps.physics.advanceOrb(&level, self.givenId(held.id), orb.ticks, body, orb.on_ground, orb.stuck.multiplier());
         orb.on_ground = advanced.on_ground;
         held.body = advanced.body;
         const hazards = advanced.effects;
