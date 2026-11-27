@@ -534,12 +534,12 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
         }
 
         /// An entity visited: due again when its interval next falls, and owed while a viewer is.
-        fn visited(self: *Self, slot: u32, view: *View, resting: bool) !void {
+        fn visited(self: *Self, slot: u32, view: *View, resting: bool, joining: bool) !void {
             const visit = &(self.visit orelse return);
             if (self.deps.tracking.stale(slot).any()) visit.owe(slot) else visit.settle(slot);
-            // One no client has has nothing to send on its interval, and one at rest nothing new:
-            // tracking's change, or its kind stirring it, brings it back.
-            if (resting or !self.deps.tracking.known(slot).any()) {
+            // One no client has, or is being spawned for, has nothing to send on its interval, and
+            // one at rest nothing new: tracking's change, or its kind stirring it, brings it back.
+            if (resting or !(joining or self.deps.tracking.known(slot).any())) {
                 self.unschedule(slot);
                 return;
             }
@@ -667,7 +667,9 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             if (change) |value| if (!self.personalized()) try self.join(slot, self.spec.identity(self.spec.kind, slot), view, value, &body);
             self.leaving = false;
             if (tracking.stale(slot).any()) try self.catchUp(slot, view, &body);
-            if (self.visit != null) try self.visited(slot, view, subject.resting);
+            // Viewers spawning it now are known once the batch goes: they count as having it.
+            const joining = if (change) |value| value.spawn.any() else false;
+            if (self.visit != null) try self.visited(slot, view, subject.resting, joining);
         }
 
         /// Where the entity in a slot is, asked of its kind once a tick at most.
