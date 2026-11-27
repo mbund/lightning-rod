@@ -52,7 +52,8 @@ const Probe = struct {
             for (&self.cows, [_]f64{ -0.65, 0.5, 1.65 }) |*cow, x| cow.* = try self.deps.mobs.spawn(.{ .species = .cow, .world = self.deps.players.records[0].world, .position = .{ x, 65, -1.5 }, .yaw = 0 });
             self.spawned = true;
             var buffer: [32]u8 = undefined;
-            try self.deps.control.send(handle, try std.fmt.bufPrint(&buffer, "attack {d}", .{-@as(i64, @intCast(self.cows[1]))}));
+            // The id its client knows it by.
+            try self.deps.control.send(handle, try std.fmt.bufPrint(&buffer, "attack {d}", .{self.deps.mobs.deps.entities.networkOf(self.cows[1]).?}));
         } else if (std.mem.eql(u8, text, "attacked")) {
             try self.verify();
             try self.deps.control.send(handle, "verified");
