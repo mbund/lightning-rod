@@ -115,12 +115,18 @@ pub const EntityCollisions = struct {
     /// Level.getEntities(except, query, selector): those the selector takes whose boxes meet the
     /// query, in the level's order, all found before the first is visited.
     pub fn each(self: *EntityCollisions, world: u32, query: Box, except: u32, test_kind: Test, visitor: Visitor) !void {
-        const kinds = switch (test_kind) {
+        return self.eachOf(world, query, except, test_kind, .all, visitor);
+    }
+
+    /// As `each`, of the kinds `within` alone.
+    pub fn eachOf(self: *EntityCollisions, world: u32, query: Box, except: u32, test_kind: Test, within: entities.Kinds, visitor: Visitor) !void {
+        const selected = switch (test_kind) {
             .solid => self.solid,
             .pushable => self.pushable,
             .pickable => self.pickable,
             .living => self.living,
         };
+        const kinds = selected.only(within);
         // None of the kinds anywhere, as there are no boats in most worlds, is nothing to look for.
         if (self.deps.entities.places.space.countOf(kinds) == 0) return;
         var walk: Walk = .{ .collisions = self, .query = query, .except = except, .test_kind = test_kind, .visitor = visitor };
@@ -137,6 +143,8 @@ pub const EntityCollisions = struct {
         if (owned.rootOf(this) == owned.rootOf(other)) return;
         const this_rule = self.rules[owned.directory.entry(this).kind].?;
         const other_rule = self.rules[owned.directory.entry(other).kind].?;
+        // Neither moves nor wakes, as two players do, whose clients move them: nothing to do.
+        if (this_rule.touched == null and other_rule.touched == null and this_rule.nudge == null and other_rule.nudge == null) return;
         if (this_rule.touched) |touched| touched(this_rule.context, this);
         if (other_rule.touched) |touched| touched(other_rule.context, other);
         if (this_rule.pushes) |pushes| {

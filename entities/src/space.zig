@@ -60,6 +60,20 @@ pub const Kinds = struct {
         return result;
     }
 
+    /// Those of these kinds that are among those too.
+    pub fn only(self: Kinds, other: Kinds) Kinds {
+        var result = self;
+        result.bits.setIntersection(other.bits);
+        return result;
+    }
+
+    /// These kinds but none of those.
+    pub fn without(self: Kinds, other: Kinds) Kinds {
+        var result = self;
+        result.bits.setIntersection(other.bits.complement());
+        return result;
+    }
+
     /// Each kind's bit folded onto 64: a column whose own fold shares none holds none of them.
     pub fn fold(self: *const Kinds) u64 {
         var folded: u64 = 0;

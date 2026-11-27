@@ -44,6 +44,7 @@ const Weather = @import("vanilla_world").weather.Weather;
 const Items = @import("vanilla_items").items.Items;
 const ClientRegistries = @import("vanilla_content").client_registries.ClientRegistries;
 const Experience = @import("vanilla_survival").experience.Experience;
+const PlayerDamage = @import("vanilla_survival").player_damage.PlayerDamage;
 const damage_types = @import("vanilla_survival").damage_types;
 const DamageTypes = damage_types.DamageTypes;
 const Loot = @import("vanilla_items").loot_registry.Loot;
@@ -138,6 +139,8 @@ pub const Mobs = struct {
         collisions: *EntityCollisions,
         levels: *Levels,
         block_edits: *BlockEdits,
+        /// What hurts players, as cramming does.
+        damage: *PlayerDamage,
     };
 
     deps: Dependencies,
@@ -219,6 +222,8 @@ pub const Mobs = struct {
     window: body.Window = .{},
     window_view: ?*const body.Window = null,
     effects_scratch: @import("block_effects.zig").Scratch = .{},
+    /// What each player answers as pushable through the players' pushes, by player slot.
+    player_pushable: []?body.Box,
     /// By player slot, whether the player holds cow food in either hand, noted as mobs start
     /// ticking: tempting asks every other tick for every mob, and hands change only between.
     holding_food: []bool,
@@ -282,6 +287,7 @@ pub const Mobs = struct {
             .loot_random = .init(config.seed ^ 0x6c6f6f74),
             .loot_scratch = .init(try allocator.alloc(u8, 16 * 1024)),
             .effects = try .init(allocator, deps.players),
+            .player_pushable = try allocator.alloc(?body.Box, deps.players.records.len),
             .table = records.Table.init(deps.storage, deps.record_workspaces.resources),
             .air_state = @intCast(game_data.registry.blockStateId("minecraft:air").?),
             .search = try .init(allocator, search_nodes),
@@ -711,8 +717,72 @@ pub const Mobs = struct {
     }
 
     pub fn finishTick(self: *Mobs) !void {
+        try self.playersPush();
         self.tickViews(false);
     }
+
+    /// LivingEntity.pushEntities for each player, which ServerPlayer.doTick runs from its
+    /// connection's tick, after the levels' entities have ticked, in the order the players
+    /// connected: what is pushable by the player and in its box steps apart from it, and the
+    /// player, whose client moves it, stays. A spectator pushes nothing, as Entity.push(Entity)
+    /// passes by what has noPhysics.
+    fn playersPush(self: *Mobs) !void {
+        const players = self.deps.players;
+        const collisions = self.deps.collisions;
+        // Whether each player is pushable, which nothing in the pass changes but a hurt: asked once.
+        @memset(self.player_pushable, null);
+        for (players.activeSlots()) |index| if (players.entitySlot(index)) |slot| {
+            self.player_pushable[index] = try playerPushable(self, slot);
+        };
+        for (players.activeSlots()) |index| {
+            const player = &players.records[index];
+            if (!player.inWorld() or self.deps.player_states.of(player).gamemode == .spectator) continue;
+            const slot = players.entitySlot(index) orelse continue;
+            const own = playerBox(player);
+            const others = collisions.pushable.without(player_kinds);
+            var found: Found = .{ .entities = self.deps.entities };
+            try collisions.eachOf(player.world, own, slot, .pushable, others, found.visitor());
+            // Another player stays as it is, as the player does, so the two pushing changes nothing:
+            // other players count only towards the cramming rule, by what they answered this pass, and
+            // only as far as the rule asks: past 23 in all, then, one tick in four, past 23 riding nothing.
+            if (try self.crowded(player.world, own, slot, found.all, false)) {
+                // The maxEntityCramming rule at its default, as for a mob, from the player's random.
+                if (self.deps.damage.random.random().uintLessThan(u32, 4) == 0 and try self.crowded(player.world, own, slot, found.free, true)) {
+                    _ = try self.deps.damage.hurt(index, .{ .type = .cramming }, 6.0);
+                    self.player_pushable[index] = try playerPushable(self, slot);
+                }
+            }
+            if (found.all > 0) try found.pushAll(collisions, player.world, own, slot, others, self.player_pushable[index]);
+        }
+    }
+
+    /// Whether `found` others and the players a player's pushEntities finds, as each answered
+    /// pushable this pass, pass the cramming rule: those riding nothing alone, when `free`.
+    fn crowded(self: *Mobs, world: u32, query: body.Box, except: u32, found: u32, free: bool) !bool {
+        if (found > cramming - 1) return true;
+        var crowd: Crowd = .{ .mobs = self, .query = query, .except = except, .free = free, .count = found };
+        try self.places.space.each(world, .{ .min = query.min, .max = query.max }, player_kinds, &crowd, Crowd.visit);
+        return crowd.count > cramming - 1;
+    }
+
+    const Crowd = struct {
+        mobs: *Mobs,
+        query: body.Box,
+        except: u32,
+        free: bool,
+        count: u32,
+
+        fn visit(crowd: *Crowd, entry: entities.space.Entry) anyerror!bool {
+            if (entry.slot == crowd.except) return false;
+            const owned = crowd.mobs.deps.entities;
+            const box = crowd.mobs.player_pushable[Players.playerOfEntity(owned.directory.entry(entry.slot).id)] orelse return false;
+            if (!box.intersects(crowd.query)) return false;
+            if (crowd.free and owned.vehicleOf(entry.slot) != null) return false;
+            crowd.count += 1;
+            // Enough to pass the rule: no need to count on.
+            return crowd.count > cramming - 1;
+        }
+    };
 
     /// A mob's box as lookups meet it: its kind's size, a baby's when young.
     fn shapeOf(self: *const Mobs, mob: Mob) entities.Shape {
@@ -1546,43 +1616,66 @@ pub const Mobs = struct {
         const slot = self.slotOf(mob.entity.id).?;
         const collisions = self.deps.collisions;
         var found: Found = .{ .entities = self.deps.entities };
-        try collisions.each(mob.motion.world, own, slot, .pushable, .{ .context = &found, .visit = Found.visit });
+        try collisions.each(mob.motion.world, own, slot, .pushable, found.visitor());
         if (found.all == 0) return 0;
         // The maxEntityCramming rule at its default: past 23, one tick in four, those that ride
         // nothing are counted, and past 23 of them it hurts. The hurt moves nothing.
-        const cramming = 24;
         if (found.all > cramming - 1 and mob.idle.random.nextIntBounded(4) == 0 and found.free > cramming - 1) {
             _ = try self.hurt(mob, .{ .type = .cramming }, 6.0);
         }
-        var pushing: Pushing = .{ .collisions = collisions, .mob = slot, .own = try mobPushable(self, slot) };
-        try collisions.each(mob.motion.world, own, slot, .pushable, .{ .context = &pushing, .visit = Pushing.visit });
+        try found.pushAll(collisions, mob.motion.world, own, slot, .all, try mobPushable(self, slot));
         return found.all;
     }
 
-    /// What LivingEntity.pushEntities counts: all it found, and those that ride nothing.
+    /// The maxEntityCramming rule at its default: past 23, one tick in four, those that ride
+    /// nothing are counted, and past 23 of them it hurts.
+    const cramming = 24;
+    const player_kinds: entities.Kinds = .of(&.{Players.entityKind()});
+
+    /// What LivingEntity.pushEntities finds: how many, how many ride nothing, and the first of
+    /// them, which push from here as vanilla pushes from its list.
     const Found = struct {
         entities: *entities.Entities,
         all: u32 = 0,
         free: u32 = 0,
+        near: [16]Near = undefined,
 
-        fn visit(context: *anyopaque, entry: entities.space.Entry, _: body.Box) anyerror!bool {
+        const Near = struct { slot: u32, box: body.Box };
+
+        fn visitor(found: *Found) EntityCollisions.Visitor {
+            return .{ .context = found, .visit = visit };
+        }
+
+        fn visit(context: *anyopaque, entry: entities.space.Entry, box: body.Box) anyerror!bool {
             const found: *Found = @ptrCast(@alignCast(context));
+            if (found.all < found.near.len) found.near[found.all] = .{ .slot = entry.slot, .box = box };
             found.all += 1;
             if (found.entities.vehicleOf(entry.slot) == null) found.free += 1;
             return false;
         }
+
+        /// LivingEntity.doPush for each found. Past the first, which the list kept, a second query
+        /// finds them all again in order, as the pushes before move nothing and wake no answer.
+        fn pushAll(found: *const Found, collisions: *EntityCollisions, world: u32, query: body.Box, except: u32, within: entities.Kinds, own: ?body.Box) !void {
+            if (found.all <= found.near.len) {
+                for (found.near[0..found.all]) |kept| try collisions.push(kept.slot, kept.box, except, own);
+                return;
+            }
+            var pushing: Pushing = .{ .collisions = collisions, .pusher = except, .own = own };
+            try collisions.eachOf(world, query, except, .pushable, within, .{ .context = &pushing, .visit = Pushing.visit });
+        }
     };
 
-    /// LivingEntity.doPush: each found pushes back, Entity.push(the mob).
+    /// LivingEntity.doPush: each found pushes back, Entity.push(the pusher), a mob or a player.
     const Pushing = struct {
         collisions: *EntityCollisions,
-        mob: u32,
-        /// The mob's own pushable box, null where it is not pushable, as on a ladder.
+        pusher: u32,
+        /// The pusher's own pushable box, null where it is not pushable, as on a ladder.
         own: ?body.Box,
 
         fn visit(context: *anyopaque, entry: entities.space.Entry, found: body.Box) anyerror!bool {
             const pushing: *Pushing = @ptrCast(@alignCast(context));
-            try pushing.collisions.push(entry.slot, found, pushing.mob, pushing.own);
+            try pushing.collisions.push(entry.slot, found, pushing.pusher, pushing.own);
             return false;
         }
     };
