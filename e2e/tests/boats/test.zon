@@ -6,4 +6,6 @@
     .{ .name = "boats-cow", .fixture = "cow", .peers = .{"alice"} },
     // A chest boat's chest, opened sneaking, keeps what is put in it and drops it as it breaks.
     .{ .name = "boats-chest", .peers = .{"alice"} },
+    // Two players in one boat: alice steers with bob behind, gets off, and bob steers alone.
+    .{ .name = "boats-pair", .peers = .{ "alice", "bob" } },
 } }

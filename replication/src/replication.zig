@@ -17,6 +17,7 @@ const wire_1_21_5 = @import("wire_1_21_5");
 const wire_1_21_9 = @import("wire_1_21_9");
 
 const Tracking = @import("tracking.zig").Tracking;
+const entity_sync = @import("entity_sync.zig");
 
 const assert = std.debug.assert;
 
@@ -30,6 +31,14 @@ pub const Replication = struct {
     const no_slot = std.math.maxInt(u32);
 
     pub const Dependencies = struct { players: *Players, visibility: *Visibility, tracking: *Tracking };
+
+    /// What a kind with riders tells of a vehicle by its id: its network id and who rides it, for
+    /// ServerEntity.sendPairingData, which pairs a rider with its vehicle's passengers.
+    pub const Vehicles = struct {
+        context: *anyopaque,
+        carrying: *const fn (context: *anyopaque, vehicle: u64) ?Carrying,
+    };
+    pub const Carrying = struct { id: i32, passengers: entity_sync.Passengers };
 
     const Spawn = struct {
         entity_id: i32,
@@ -102,6 +111,9 @@ pub const Replication = struct {
 
     deps: Dependencies,
     actors: IndexSet,
+    /// The kinds players ride, asked of a rider's vehicle as it is paired.
+    vehicles: [4]Vehicles = undefined,
+    vehicle_count: usize = 0,
     lifecycle: Lifecycle,
     /// What each observer's client last took of each subject's movement and head, subject
     /// major: exact for every pair, so an observer that fell behind catches up with relative
@@ -204,6 +216,18 @@ pub const Replication = struct {
             return protocol == .lt or (protocol == .eq and (absolute == .lt or (absolute == .eq and (baseline == .lt or (baseline == .eq and move == .lt)))));
         }
     };
+
+    /// A kind players ride, which tells of its vehicles.
+    pub fn addVehicles(self: *Replication, vehicles: Vehicles) !void {
+        if (self.vehicle_count == self.vehicles.len) return error.VehicleKindCapacity;
+        self.vehicles[self.vehicle_count] = vehicles;
+        self.vehicle_count += 1;
+    }
+
+    fn carrying(self: *const Replication, vehicle: u64) ?Carrying {
+        for (self.vehicles[0..self.vehicle_count]) |kind| if (kind.carrying(kind.context, vehicle)) |carried| return carried;
+        return null;
+    }
 
     pub fn init(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Replication {
         if (config.update_interval == 0) return error.InvalidConfiguration;
@@ -522,6 +546,8 @@ pub const Replication = struct {
             const yaw = self.subjects[index].yaw;
             const pitch = self.subjects[index].pitch;
             const entity_id: i32 = @intCast(index + 1);
+            // A rider is paired with what carries it, as its client seats it only so.
+            const carried: ?Carrying = if (subject.vehicle) |vehicle| self.carrying(vehicle) else null;
             inline for (std.enums.values(Action)) |phase| {
                 const remaining = needed[@backingInt(phase)];
                 while (remaining.view().any()) {
@@ -545,7 +571,12 @@ pub const Replication = struct {
                         .add_player => players.deps.packets.fanout(Players.writePlayerProfile, targets[0..count], .{ subject.uuid, subject.name[0..subject.name_len], players.deps.sessions.profile(subject.handle.?).textures(), players.chatSession(index), @as(i32, @backingInt(self.subjects[index].gamemode)), listed_audience.contains(first) }, Players.profilePacketBytes(players.deps.sessions.profile(subject.handle.?).textures(), players.chatSession(index)), deliveries[0..count]),
                         .mode => players.deps.packets.fanout(writeInfo, targets[0..count], .{ subject.uuid, self.subjects[index].gamemode, listed_audience.contains(first) }, 2048, deliveries[0..count]),
                         .chat => players.deps.packets.fanout(writeChatInfo, targets[0..count], .{ subject.uuid, players.chatSession(index) }, 2048, deliveries[0..count]),
-                        .spawn => players.deps.packets.fanoutGroup(.{ .{ writeSpawnLegacy, writeSpawnPacked }, writeFlags, writeHeadRotation }, targets[0..count], .{
+                        .spawn => if (carried) |vehicle| players.deps.packets.fanoutGroup(.{ .{ writeSpawnLegacy, writeSpawnPacked }, writeFlags, writeHeadRotation, entity_sync.writePassengers }, targets[0..count], .{
+                            .{Spawn{ .entity_id = entity_id, .uuid = subject.uuid, .position = subject.position, .pitch = pitch, .yaw = yaw, .head_yaw = yaw }},
+                            .{ entity_id, self.subjects[index].flags },
+                            .{ entity_id, yaw },
+                            .{ vehicle.id, vehicle.passengers },
+                        }, &.{ 2048, 32, 16, 64 }, deliveries[0..count]) else players.deps.packets.fanoutGroup(.{ .{ writeSpawnLegacy, writeSpawnPacked }, writeFlags, writeHeadRotation }, targets[0..count], .{
                             .{Spawn{ .entity_id = entity_id, .uuid = subject.uuid, .position = subject.position, .pitch = pitch, .yaw = yaw, .head_yaw = yaw }},
                             .{ entity_id, self.subjects[index].flags },
                             .{ entity_id, yaw },

@@ -19,7 +19,12 @@ import net.minecraft.world.phys.Vec3;
  * and still on the still water. In survival, a few punches break it, and its item drops.
  */
 final class BoatsFixture extends Fixture {
-    private enum Phase { GIVE, PLACE, AFLOAT, SURVIVAL, BREAK, DROPPED, BOARD, RIDING, DRIVE, LEAVE, LEFT, ABOARD, KEPT, SEATED, RIDDEN_OPEN, OFF, SNEAK, OPEN, STORE, STORED }
+    private enum Phase { GIVE, PLACE, AFLOAT, SURVIVAL, BREAK, DROPPED, BOARD, RIDING, DRIVE, LEAVE, LEFT, ABOARD, KEPT, SEATED, RIDDEN_OPEN, OFF, SNEAK, OPEN, STORE, STORED, PAIR_WAIT, PAIR_DRIVE, PAIR_CARRIED, PAIR_LEAVE, PAIR_WATCH }
+    /** Bob in the pair scenario: aboard behind alice, carried, then steering once she is off. */
+    private enum Bob { WAIT, BOARD, ABOARD, CARRIED, STEER, DRIVEN }
+    private Bob bob = Bob.WAIT;
+    private Vec3 left;
+    private long seen;
     private Phase phase = Phase.GIVE;
     private long phaseStart;
     private double settledY = Double.NaN;
@@ -91,9 +96,78 @@ final class BoatsFixture extends Fixture {
         game.player.setXRot((float) -Math.toDegrees(Math.atan2(dy, Math.sqrt(dx * dx + dz * dz))));
     }
 
+    private boolean pair() {
+        return r.scenario.equals("boats-pair");
+    }
+
+    private void bobTick(Minecraft game) {
+        switch (bob) {
+            case WAIT -> {
+                // On the grass south of the pool, near enough to reach the boat.
+                game.player.setPos(5.5, 65, 9.5);
+                if (!client.marked("alice.aboard")) return;
+                boat = boat(game);
+                if (boat == null) return;
+                bob = Bob.BOARD;
+                phaseStart = r.tick;
+            }
+            case BOARD -> {
+                lookAt(game, boat.position());
+                interact(game, boat);
+                bob = Bob.ABOARD;
+                phaseStart = r.tick;
+            }
+            case ABOARD -> {
+                var riders = boat.getPassengers();
+                if (game.player.getVehicle() != boat || riders.size() != 2) { if (timedOut(100)) client.fail("bob_never_boarded_" + riders); return; }
+                if (riders.get(1) != game.player) { client.fail("bob_not_behind_" + riders); return; }
+                client.mark("bob.aboard");
+                bob = Bob.CARRIED;
+                phaseStart = r.tick;
+            }
+            case CARRIED -> {
+                if (!client.marked("alice.drove")) { if (timedOut(400)) client.fail("alice_never_drove"); else seen = r.tick; return; }
+                // Twenty ticks after alice stopped, for the boat's moves to arrive.
+                if (r.tick - seen < 20) return;
+                // Carried along, behind the driver.
+                if (game.player.getVehicle() != boat) { client.fail("bob_fell_off"); return; }
+                if (boat.position().x < 6.5) { client.fail("bob_sees_boat_unmoved_" + boat.position() + "_riders_" + boat.getPassengers()); return; }
+                if (game.player.position().distanceTo(boat.position()) > 1.0) { client.fail("bob_not_seated_" + game.player.position() + "_" + boat.position()); return; }
+                client.mark("bob.carried");
+                bob = Bob.STEER;
+                phaseStart = r.tick;
+            }
+            case STEER -> {
+                if (!client.marked("alice.left")) { if (timedOut(400)) client.fail("alice_never_left"); return; }
+                var riders = boat.getPassengers();
+                if (riders.size() != 1 || riders.get(0) != game.player) { if (timedOut(100)) client.fail("bob_never_alone_" + riders); return; }
+                // Alone, bob steers: back west.
+                if (start == null) { start = boat.position(); phaseStart = r.tick; }
+                game.player.setYRot(90);
+                boat.setYRot(90);
+                game.options.keyUp.setDown(true);
+                if (r.tick - phaseStart < 15) return;
+                game.options.keyUp.setDown(false);
+                driven = boat.position();
+                if (start.x - driven.x < 1.0) { client.fail("bob_did_not_steer_" + start + "_" + driven); return; }
+                client.mark("bob.drove");
+                bob = Bob.DRIVEN;
+                phaseStart = r.tick;
+            }
+            case DRIVEN -> {
+                // The server kept the boat where bob drove it: it coasts on west, never back.
+                if (!timedOut(40)) return;
+                if (boat.position().x > driven.x + 0.1) { client.fail("boat_went_back_from_" + driven + "_to_" + boat.position()); return; }
+                if (game.player.getVehicle() != boat) { client.fail("bob_not_aboard_at_end"); return; }
+                client.pass("bob_carried_then_steered_to_" + boat.position());
+            }
+        }
+    }
+
     @Override void tick(Minecraft game, int loaded, int missing) {
         if (game.player == null || game.level == null || game.gameMode == null || r.terrainTick < 0 || missingChunks(game, 1) != 0) return;
         if (r.tick - r.terrainTick > 2400) { client.fail("boats_timeout_" + phase); return; }
+        if (pair() && !r.peer.equals("alice")) { bobTick(game); return; }
         switch (phase) {
             case GIVE -> {
                 // At the pool's west edge, looking at its middle.
@@ -128,7 +202,7 @@ final class BoatsFixture extends Fixture {
                 if (Double.isNaN(settledY)) { settledY = at.y; return; }
                 if (!timedOut(120)) return;
                 if (Math.abs(at.y - settledY) > 0.05) { client.fail("boat_bobbing_" + settledY + "_to_" + at.y); return; }
-                if (r.scenario.equals("boats-ride")) { next(Phase.BOARD); return; }
+                if (r.scenario.equals("boats-ride") || pair()) { next(Phase.BOARD); return; }
                 if (r.scenario.equals("boats-cow")) { this.boat = boat; next(Phase.ABOARD); return; }
                 if (chest()) { this.boat = boat; interact(game, boat); next(Phase.SEATED); return; }
                 game.getConnection().sendCommand("gamemode survival");
@@ -158,7 +232,7 @@ final class BoatsFixture extends Fixture {
                 next(Phase.RIDING);
             }
             case RIDING -> {
-                if (game.player.getVehicle() == boat) { next(Phase.DRIVE); return; }
+                if (game.player.getVehicle() == boat) { if (pair()) { client.mark("alice.aboard"); next(Phase.PAIR_WAIT); } else next(Phase.DRIVE); return; }
                 if (timedOut(100)) client.fail("never_boarded_" + game.player.position());
             }
             case DRIVE -> {
@@ -185,6 +259,46 @@ final class BoatsFixture extends Fixture {
                 if (at.distanceTo(driven) > 1.0) { client.fail("boat_went_back_from_" + driven + "_to_" + at); return; }
                 if (game.player.position().distanceTo(at) > 3.0) { client.fail("rider_set_down_far_" + game.player.position() + "_boat_" + at); return; }
                 client.pass("boat_boarded_driven_and_left_at_" + at);
+            }
+            case PAIR_WAIT -> {
+                if (!client.marked("bob.aboard")) { if (timedOut(400)) client.fail("bob_never_aboard"); return; }
+                // Alice steers, first; bob sits behind.
+                var riders = boat.getPassengers();
+                if (riders.size() != 2 || riders.get(0) != game.player) { client.fail("riders_" + riders); return; }
+                start = boat.position();
+                next(Phase.PAIR_DRIVE);
+            }
+            case PAIR_DRIVE -> {
+                game.player.setYRot(-90);
+                boat.setYRot(-90);
+                game.options.keyUp.setDown(true);
+                if (!timedOut(15)) return;
+                game.options.keyUp.setDown(false);
+                driven = boat.position();
+                if (driven.distanceTo(start) < 1.0) { client.fail("pair_boat_did_not_move_" + start + "_" + driven); return; }
+                client.mark("alice.drove");
+                next(Phase.PAIR_CARRIED);
+            }
+            case PAIR_CARRIED -> {
+                if (!client.marked("bob.carried")) { if (timedOut(200)) client.fail("bob_never_carried"); return; }
+                game.options.keyShift.setDown(true);
+                next(Phase.PAIR_LEAVE);
+            }
+            case PAIR_LEAVE -> {
+                if (game.player.getVehicle() != null) { if (timedOut(100)) client.fail("alice_never_left"); return; }
+                game.options.keyShift.setDown(false);
+                left = boat.position();
+                client.mark("alice.left");
+                next(Phase.PAIR_WATCH);
+            }
+            case PAIR_WATCH -> {
+                // Bob steers it now: alice sees it go back west, bob still aboard.
+                if (!client.marked("bob.drove")) { if (timedOut(400)) client.fail("bob_never_drove"); return; }
+                if (!timedOut(40)) return;
+                var at = boat.position();
+                if (left.x - at.x < 1.0) { client.fail("alice_saw_no_steering_" + left + "_" + at); return; }
+                if (boat.getPassengers().size() != 1) { client.fail("alice_sees_riders_" + boat.getPassengers()); return; }
+                client.pass("pair_drove_and_handed_over_at_" + at);
             }
             case SEATED -> {
                 // With room aboard and not sneaking, a click boards it.

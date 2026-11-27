@@ -11,6 +11,7 @@ const Players = @import("players").players.Players;
 const Boats = @import("boats.zig").Boats;
 
 const Tracking = replication.tracking.Tracking;
+const Replication = replication.replication.Replication;
 const entity_sync = replication.entity_sync;
 
 /// What vanilla synchronizes for a boat, in its entries' order: Entity's flags and frost,
@@ -37,7 +38,7 @@ pub const BoatReplication = struct {
         /// Keep a hash of every packet queued and of its viewers, for runs to be compared by.
         trace_sends: bool = false,
     };
-    pub const Dependencies = struct { boats: *Boats, players: *Players, sessions: *sessions.Service, packets: *packets.Packets, tracking: *Tracking };
+    pub const Dependencies = struct { boats: *Boats, players: *Players, sessions: *sessions.Service, packets: *packets.Packets, tracking: *Tracking, replication: *Replication };
 
     deps: Dependencies,
     tracker: Tracking.TrackerId,
@@ -57,6 +58,8 @@ pub const BoatReplication = struct {
             // A client eases a boat toward what it is sent: InterpolationHandler.
             .client = .{ .unpredictable = .{ .update_interval = update_interval } },
         });
+        // A player riding a boat is paired with the boat's passengers.
+        try deps.replication.addVehicles(.{ .context = self, .carrying = carrying });
         return self;
     }
 
@@ -122,6 +125,13 @@ fn writeData(_: *BoatReplication, entries: *entity_sync.Entries, data: BoatData,
     if (changes.contains(.paddle_left)) try entries.putBoolean(11, data.paddle_left);
     if (changes.contains(.paddle_right)) try entries.putBoolean(12, data.paddle_right);
     if (changes.contains(.bubble_time)) try entries.putInt(13, data.bubble_time);
+}
+
+fn carrying(context: *anyopaque, vehicle: u64) ?Replication.Carrying {
+    const self: *BoatReplication = @ptrCast(@alignCast(context));
+    const boats = self.deps.boats;
+    const slot = boats.boats.slotOf(vehicle) orelse return null;
+    return .{ .id = entities.Entities.networkOfSlot(slot), .passengers = boats.passengersOf(slot) };
 }
 
 fn passengers(self: *BoatReplication, slot: u32) entity_sync.Passengers {

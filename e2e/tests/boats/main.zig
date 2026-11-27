@@ -13,7 +13,8 @@ pub fn main(init: std.process.Init) !void {
     const operators = e2e.profile.aliceOperator();
     const plugins = lightning_rod.plugin.compose(.{
         lightning_rod.plugin.replace(e2e.profile.plugins(), .{
-            lightning_rod.plugin.configured(Players, .{ .maximum = 1, .render_distance = 2 }),
+            // Two share a boat in boats-pair.
+            lightning_rod.plugin.configured(Players, .{ .maximum = 2, .render_distance = 2 }),
             lightning_rod.plugin.configured(Operators, Operators.Configuration{ .operators = &operators }),
         }),
         lightning_rod.plugin.configured(Scene, .{ .cow = std.mem.eql(u8, args.fixture, "cow") }),
