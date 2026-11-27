@@ -13,6 +13,7 @@ const records = @import("records");
 const chunks = @import("chunks");
 const Items = @import("vanilla_items").items.Items;
 const item_physics = @import("item_physics.zig");
+const Ground = item_physics.ItemPhysics.Ground;
 
 const assert = std.debug.assert;
 
@@ -105,17 +106,20 @@ pub const ItemEntities = struct {
     };
 
     pub const Metadata = struct {
-        pub const encoded_size = 61;
+        pub const encoded_size = 74;
+        /// Before items kept the block they stand on.
+        const encoded_size_3 = 61;
         pub fn encode(value: Metadata, output: []u8) void {
             assert(output.len == encoded_size);
             assert(value.pickup_delay <= 32767);
             var writer = std.Io.Writer.fixed(output);
-            writer.writeByte(3) catch unreachable;
+            writer.writeByte(4) catch unreachable;
             writer.writeInt(u32, value.ticks, .little) catch unreachable;
             writer.writeInt(i32, value.age, .little) catch unreachable;
             writer.writeInt(u16, value.pickup_delay, .little) catch unreachable;
             writer.writeInt(i16, value.health, .little) catch unreachable;
-            writer.writeByte(@intFromBool(value.on_ground)) catch unreachable;
+            // Whether it is on the ground, and on no block there.
+            writer.writeByte(@as(u8, @intFromBool(value.on_ground)) | @as(u8, @intFromBool(value.on_ground_no_blocks)) << 1) catch unreachable;
             writer.writeByte(@intFromBool(value.owner != null)) catch unreachable;
             writer.writeInt(u128, value.owner orelse 0, .little) catch unreachable;
             writer.writeInt(u64, value.revision, .little) catch unreachable;
@@ -126,7 +130,20 @@ pub const ItemEntities = struct {
             writer.writeInt(i32, value.fire_ticks, .little) catch unreachable;
             writer.writeInt(i16, value.ticks_frozen, .little) catch unreachable;
             writer.writeByte(@backingInt(value.stuck)) catch unreachable;
+            writer.writeByte(@intFromBool(value.supporting != null)) catch unreachable;
+            for (value.supporting orelse .{ 0, 0, 0 }) |axis| writer.writeInt(i32, axis, .little) catch unreachable;
             assert(writer.end == output.len);
+        }
+
+        /// Where it stands, as its next move goes by it.
+        pub fn ground(self: Metadata) Ground {
+            return .{ .on = self.on_ground, .no_blocks = self.on_ground_no_blocks, .supporting = self.supporting };
+        }
+
+        pub fn stand(self: *Metadata, where: Ground) void {
+            self.on_ground = where.on;
+            self.on_ground_no_blocks = where.no_blocks;
+            self.supporting = where.supporting;
         }
 
         ticks: u32 = 0,
@@ -134,6 +151,10 @@ pub const ItemEntities = struct {
         pickup_delay: u16 = 10,
         health: i16 = 5,
         on_ground: bool = false,
+        /// Entity.onGroundNoBlocks: on the ground with nothing but an entity under it.
+        on_ground_no_blocks: bool = false,
+        /// Entity.mainSupportingBlockPos: the block it stands on, as its last move found it.
+        supporting: ?[3]i32 = null,
         owner: ?u128 = null,
         revision: u64 = 1,
         alive: bool = true,
@@ -695,7 +716,7 @@ pub const ItemEntities = struct {
             const found = try reader.next(&found_rows);
             if (found.len == 0) break;
             for (found) |row| {
-                if (row.value.len != record_bytes) return error.Corrupt;
+                if (row.value.len != record_bytes and row.value.len != entities.encoded_bytes + Metadata.encoded_size_3) return error.Corrupt;
                 const body = try entities.decode(row.value[0..entities.encoded_bytes]);
                 const metadata = try decode(row.value[entities.encoded_bytes..]);
                 if (self.items.contains(row.id)) return error.Corrupt;
@@ -764,15 +785,18 @@ pub const ItemEntities = struct {
 };
 
 fn decode(bytes: []const u8) !ItemEntities.Metadata {
-    if (bytes.len != ItemEntities.Metadata.encoded_size or bytes[0] != 3) return error.Corrupt;
-    if (bytes[13] > 1 or bytes[14] > 1 or bytes[39] > 1) return error.Corrupt;
+    const version: u8 = if (bytes.len == ItemEntities.Metadata.encoded_size) 4 else if (bytes.len == ItemEntities.Metadata.encoded_size_3) 3 else return error.Corrupt;
+    if (bytes[0] != version) return error.Corrupt;
+    // No block under it is only for one on the ground.
+    if (bytes[13] > 3 or bytes[13] == 2 or bytes[14] > 1 or bytes[39] > 1) return error.Corrupt;
     if (bytes[60] > @backingInt(ItemEntities.Stuck.powder_snow)) return error.Corrupt;
-    const value: ItemEntities.Metadata = .{
+    var value: ItemEntities.Metadata = .{
         .ticks = std.mem.readInt(u32, bytes[1..5], .little),
         .age = std.mem.readInt(i32, bytes[5..9], .little),
         .pickup_delay = std.mem.readInt(u16, bytes[9..11], .little),
         .health = std.mem.readInt(i16, bytes[11..13], .little),
-        .on_ground = bytes[13] == 1,
+        .on_ground = bytes[13] & 1 != 0,
+        .on_ground_no_blocks = bytes[13] & 2 != 0,
         .owner = if (bytes[14] == 0) null else std.mem.readInt(u128, bytes[15..31], .little),
         .revision = std.mem.readInt(u64, bytes[31..39], .little),
         .alive = bytes[39] == 1,
@@ -783,12 +807,16 @@ fn decode(bytes: []const u8) !ItemEntities.Metadata {
         .ticks_frozen = std.mem.readInt(i16, bytes[58..60], .little),
         .stuck = @fromBackingInt(@intCast(bytes[60])),
     };
+    if (version == 4) {
+        if (bytes[61] > 1) return error.Corrupt;
+        if (bytes[61] == 1) value.supporting = .{ std.mem.readInt(i32, bytes[62..66], .little), std.mem.readInt(i32, bytes[66..70], .little), std.mem.readInt(i32, bytes[70..74], .little) };
+    }
     if (value.pickup_delay > 32767 or value.revision == 0) return error.Corrupt;
     return value;
 }
 
 test "item records round trip" {
-    const value: ItemEntities.Metadata = .{ .ticks = 7, .age = 40, .health = 3, .owner = 9, .revision = 5, .fire_ticks = 298, .ticks_frozen = 2, .stuck = .cobweb };
+    const value: ItemEntities.Metadata = .{ .ticks = 7, .age = 40, .health = 3, .on_ground = true, .supporting = .{ 1, -2, 3 }, .owner = 9, .revision = 5, .fire_ticks = 298, .ticks_frozen = 2, .stuck = .cobweb };
     var bytes: [ItemEntities.Metadata.encoded_size]u8 = undefined;
     ItemEntities.Metadata.encode(value, &bytes);
     try std.testing.expectEqual(value, try decode(&bytes));

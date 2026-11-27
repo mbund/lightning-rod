@@ -488,12 +488,12 @@ test "orb placement fluid currents block effects and fire follow vanilla physics
     moving.velocity = .{ 0, 0, 0 };
     var subject: orb_hazards.Subject = .{ .world = world, .old_position = moving.position, .health = 5, .fire_ticks = 0, .ticks_frozen = 0 };
     var hook: orb_hazards.Hook = .{ .hazards = &experience.hazards, .level = &window, .subject = &subject };
-    const lifted = try experience.deps.physics.advanceOrb(&window, 1, 1, moving, false, .{ 0, 0, 0 }, hook.physics());
+    const lifted = try experience.deps.physics.advanceOrb(&window, 1, 1, moving, .{}, .{ 0, 0, 0 }, hook.physics());
     try std.testing.expectApproxEqAbs(@as(f64, 0.1) * @as(f64, @as(f32, 0.98)), lifted.body.velocity[1], 1e-12);
     moving.position = .{ 14.5, 8.5, 4.5 };
     moving.velocity = .{ 0.1, -0.03, 0.1 };
     subject.old_position = moving.position;
-    const stuck = try experience.deps.physics.advanceOrb(&window, 1, 1, moving, false, .{ 0.25, 0.05, 0.25 }, hook.physics());
+    const stuck = try experience.deps.physics.advanceOrb(&window, 1, 1, moving, .{}, .{ 0.25, 0.05, 0.25 }, hook.physics());
     // WebBlock holds by 0.05F.
     try std.testing.expectEqual(@as([3]f64, .{ 0.25, @as(f32, 0.05), 0.25 }), subject.stuck);
     try std.testing.expectApproxEqAbs(@as(f64, 14.525), stuck.body.position[0], 1e-12);
@@ -503,7 +503,7 @@ test "orb placement fluid currents block effects and fire follow vanilla physics
     moving.position = .{ 21.2, 8.5, 4.5 };
     moving.velocity = .{ 0, -0.3, 0.1 };
     subject.old_position = moving.position;
-    const sliding = try experience.deps.physics.advanceOrb(&window, 1, 1, moving, false, .{ 0, 0, 0 }, hook.physics());
+    const sliding = try experience.deps.physics.advanceOrb(&window, 1, 1, moving, .{}, .{ 0, 0, 0 }, hook.physics());
     const drag = @as(f64, @as(f32, 0.98));
     try std.testing.expectApproxEqAbs((-0.05 - 0.08) * drag * drag, sliding.body.velocity[1], 1e-12);
 }

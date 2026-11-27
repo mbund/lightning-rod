@@ -25,19 +25,25 @@ pub const ItemPhysics = struct {
 
     pub const Dependencies = struct { blocks: *Blocks, levels: *Levels };
 
+    /// Where a body stands, as Entity keeps it from one move to the next: onGround;
+    /// onGroundNoBlocks, on the ground with nothing but an entity under it, which the next move
+    /// goes by; and mainSupportingBlockPos, the block it stands on, which getOnPos goes by. A move
+    /// inside a block, with noPhysics, leaves it all as it was.
+    pub const Ground = struct { on: bool = false, no_blocks: bool = false, supporting: ?[3]i32 = null };
+
     pub const Result = struct {
         body: entities.State,
-        on_ground: bool,
+        ground: Ground,
         crossed_block: bool,
         /// Whether it moved this tick, which takes what held it back.
         moved: bool = false,
     };
 
     /// What an item's move does once it moved: Entity.applyEffectsFromBlocks with the blocks it
-    /// crossed, answered by whoever keeps its hazards.
+    /// crossed, answered by whoever keeps its hazards, given where the body stands after the move.
     pub const Hook = struct {
         context: *anyopaque,
-        apply: *const fn (context: *anyopaque, state: *entities.State, on_ground: bool, from: [3]f64) anyerror!void,
+        apply: *const fn (context: *anyopaque, state: *entities.State, ground: Ground, from: [3]f64) anyerror!void,
     };
 
     deps: Dependencies,
@@ -101,44 +107,45 @@ pub const ItemPhysics = struct {
     /// tenth deep and falling otherwise, then moved, held back by what `stuck` holds it in, and
     /// slowed. Moving, it goes through `hook`, which does what the blocks it crossed do to it, as
     /// Entity.applyEffectsFromBlocks. A stuck item stays stuck until it moves.
-    pub fn advance(self: *ItemPhysics, at: *const Level, entity_id: u32, ticks: u32, pushed: entities.State, on_ground: bool, fluid: Fluids, stuck: [3]f64, hook: ?Hook) !Result {
-        return self.advanceRandomly(at, entity_id, ticks, pushed, on_ground, fluid, stuck, hook, null);
+    pub fn advance(self: *ItemPhysics, at: *const Level, entity_id: u32, ticks: u32, pushed: entities.State, ground: Ground, fluid: Fluids, stuck: [3]f64, hook: ?Hook) !Result {
+        return self.advanceRandomly(at, entity_id, ticks, pushed, ground, fluid, stuck, hook, null);
     }
 
     /// As `advance`, with the random an item inside a block is pushed out by: ItemEntity.tick's
     /// noPhysics, then Entity.moveTowardsClosestSpace. Without one, an item inside stays as it is.
-    pub fn advanceRandomly(self: *ItemPhysics, at: *const Level, entity_id: u32, ticks: u32, pushed: entities.State, on_ground: bool, fluid: Fluids, stuck: [3]f64, hook: ?Hook, random: ?std.Random) !Result {
+    pub fn advanceRandomly(self: *ItemPhysics, at: *const Level, entity_id: u32, ticks: u32, pushed: entities.State, ground: Ground, fluid: Fluids, stuck: [3]f64, hook: ?Hook, random: ?std.Random) !Result {
         assert(entity_id > 0);
         var next = pushed;
         afloat(&next.velocity, fluid);
         // Inside a block, or a solid entity, it moves through them, pushed towards the nearest way out.
         if (random) |source| if (!try body.noCollision(at, itemBox(next.position).inflate(-1.0e-7, -1.0e-7, -1.0e-7), .{ .bottom = next.position[1] })) {
             try escape(at, &next, source, item_height / 2);
-            return self.advanceThrough(at, entity_id, ticks, next, on_ground, hook);
+            return self.advanceThrough(at, entity_id, ticks, next, ground, hook);
         };
-        return self.advanceBody(false, .server, .latest, at, entity_id, ticks, next, on_ground, stuck, hook);
+        return self.advanceBody(false, .server, .latest, at, entity_id, ticks, next, ground, stuck, hook);
     }
 
     /// ItemEntity.tick's move with noPhysics set: Entity.move only adds the motion, touching
-    /// neither what holds the item back nor whether it is on the ground; the slowing after is as
-    /// ever.
-    fn advanceThrough(self: *ItemPhysics, at: *const Level, entity_id: u32, ticks: u32, state: entities.State, on_ground: bool, hook: ?Hook) !Result {
+    /// neither what holds the item back nor where it stands; the slowing after is as ever, by the
+    /// block it stood on.
+    fn advanceThrough(self: *ItemPhysics, at: *const Level, entity_id: u32, ticks: u32, state: entities.State, ground: Ground, hook: ?Hook) !Result {
         var next = state;
+        const on_ground = ground.on;
         const moved = !on_ground or next.velocity[0] * next.velocity[0] + next.velocity[2] * next.velocity[2] > @as(f64, @as(f32, 0.00001)) or movesOnPhase(ticks, entity_id);
         if (moved) {
             for (&next.position, next.velocity) |*position, velocity| position.* += velocity;
-            if (hook) |effects| try effects.apply(effects.context, &next, on_ground, state.position);
+            if (hook) |effects| try effects.apply(effects.context, &next, ground, state.position);
             var friction: f32 = 0.98;
             if (on_ground) {
-                const below = try at.state(mth.floor(next.position[0]), mth.floor(next.position[1] - @as(f64, @as(f32, 0.999999))), mth.floor(next.position[2]));
-                friction *= self.deps.blocks.get(below).friction;
+                const below = try body.onPos(at, ground.supporting, next.position, @as(f32, 0.999999));
+                friction *= self.deps.blocks.get(try at.state(below[0], below[1], below[2])).friction;
             }
             next.velocity[0] *= friction;
             next.velocity[1] *= Release.latest.verticalDrag();
             next.velocity[2] *= friction;
             if (on_ground and next.velocity[1] < 0) next.velocity[1] *= -0.5;
         }
-        return .{ .body = next, .on_ground = on_ground, .crossed_block = crossed(state.position, next.position), .moved = moved };
+        return .{ .body = next, .ground = ground, .crossed_block = crossed(state.position, next.position), .moved = moved };
     }
 
     /// An item's movement alone, `push` then `advance`, with nothing holding it back and no
@@ -146,12 +153,13 @@ pub const ItemPhysics = struct {
     pub fn step(self: *ItemPhysics, at: *const Level, entity_id: u32, ticks: u32, state: entities.State, on_ground: bool, ultrawarm: bool) !Result {
         var pushed = state;
         const fluid = try self.push(at, &pushed, ultrawarm);
-        return self.advance(at, entity_id, ticks, pushed, on_ground, fluid, .{ 0, 0, 0 }, null);
+        return self.advance(at, entity_id, ticks, pushed, .{ .on = on_ground }, fluid, .{ 0, 0, 0 }, null);
     }
 
     /// ExperienceOrb.tick's move, through `hook` every tick, as Entity.applyEffectsFromBlocks.
-    pub fn advanceOrb(self: *ItemPhysics, at: *const Level, entity_id: u32, ticks: u32, state: entities.State, on_ground: bool, stuck: [3]f64, hook: ?Hook) !Result {
-        return self.advanceBody(true, .server, .latest, at, entity_id, ticks, state, on_ground, stuck, hook);
+    /// An orb always moves, so the block it stands on is found anew each tick.
+    pub fn advanceOrb(self: *ItemPhysics, at: *const Level, entity_id: u32, ticks: u32, state: entities.State, ground: Ground, stuck: [3]f64, hook: ?Hook) !Result {
+        return self.advanceBody(true, .server, .latest, at, entity_id, ticks, state, ground, stuck, hook);
     }
 
     pub const OrbEnvironment = struct { solid: bool, water: bool, lava: bool };
@@ -322,10 +330,10 @@ pub const ItemPhysics = struct {
     /// Entity.canSimulateMovement false, so no landing reaction keeps a fall from turning into a
     /// bounce, and never pushed out of the block it is in. `ticks` is the client's own tick count,
     /// and `release` how its release steps it.
-    pub fn advanceClient(self: *ItemPhysics, at: *const Level, entity_id: u32, ticks: u32, pushed: entities.State, on_ground: bool, fluid: Fluids, release: Release) !Result {
+    pub fn advanceClient(self: *ItemPhysics, at: *const Level, entity_id: u32, ticks: u32, pushed: entities.State, ground: Ground, fluid: Fluids, release: Release) !Result {
         var next = pushed;
         afloat(&next.velocity, fluid);
-        return self.advanceBody(false, .client, release, at, entity_id, ticks, next, on_ground, .{ 0, 0, 0 }, null);
+        return self.advanceBody(false, .client, release, at, entity_id, ticks, next, ground, .{ 0, 0, 0 }, null);
     }
 
     /// How a release steps an item, where releases differ. From 26.2, ItemEntity.tick slows its
@@ -373,13 +381,15 @@ pub const ItemPhysics = struct {
         } else velocity[1] -= 0.04;
     }
 
-    fn advanceBody(self: *ItemPhysics, comptime orb: bool, comptime moving: Side, release: Release, at: *const Level, entity_id: u32, ticks: u32, state: entities.State, on_ground: bool, stuck: [3]f64, hook: ?Hook) !Result {
+    fn advanceBody(self: *ItemPhysics, comptime orb: bool, comptime moving: Side, release: Release, at: *const Level, entity_id: u32, ticks: u32, state: entities.State, ground: Ground, stuck: [3]f64, hook: ?Hook) !Result {
         assert(entity_id > 0);
         var next = state;
+        const on_ground = ground.on;
         for (state.position ++ state.velocity) |value| assert(std.math.isFinite(value));
         const vertical_velocity = next.velocity[1];
         var motion = next.velocity;
         var grounded = on_ground;
+        var after = ground;
         var moved = false;
         if (orb or !on_ground or next.velocity[0] * next.velocity[0] + next.velocity[2] * next.velocity[2] > @as(f64, @as(f32, 0.00001)) or
             movesOnPhase(ticks, entity_id))
@@ -419,7 +429,9 @@ pub const ItemPhysics = struct {
             // the block it rests on when it rests on one, at the height just under a block below
             // its feet, so the block under a slab it lies on.
             const box = if (orb) orbBox(next.position) else itemBox(next.position);
-            const supporting = if (grounded) try body.supportingBlock(at, box, .{ .bottom = next.position[1] }, next.position, adjusted, false) else null;
+            // Entity.checkSupportingBlock.
+            const supporting = if (grounded) try body.supportingBlock(at, box, .{ .bottom = next.position[1] }, next.position, adjusted, ground.no_blocks) else null;
+            after = .{ .on = grounded, .no_blocks = grounded and supporting == null, .supporting = supporting };
             const below_position = try body.onPos(at, supporting, next.position, @as(f32, 0.999999));
             var below: ?u16 = null;
             // Entity.getBlockSpeedFactor, which slows every body on soul sand and honey.
@@ -433,7 +445,7 @@ pub const ItemPhysics = struct {
                 next.velocity[0] *= speed;
                 next.velocity[2] *= speed;
             }
-            if (hook) |effects| try effects.apply(effects.context, &next, grounded, state.position);
+            if (hook) |effects| try effects.apply(effects.context, &next, after, state.position);
             var friction: f32 = 0.98;
             if (grounded) {
                 const below_state = below orelse try at.state(below_position[0], below_position[1], below_position[2]);
@@ -448,7 +460,7 @@ pub const ItemPhysics = struct {
                 if (grounded and vertical_velocity < -0.03) next.velocity[1] = -vertical_velocity * 0.4;
             } else if (grounded and next.velocity[1] < 0) next.velocity[1] *= -0.5;
         }
-        return .{ .body = next, .on_ground = grounded, .crossed_block = crossed(state.position, next.position), .moved = moved };
+        return .{ .body = next, .ground = after, .crossed_block = crossed(state.position, next.position), .moved = moved };
     }
 };
 

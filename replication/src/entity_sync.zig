@@ -823,11 +823,14 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                     .none => {},
                     .motion => |velocity| {
                         try self.queue(slot, self.set(viewers), .{ .velocity = .{ .id = network, .velocity = truth.velocity } });
-                        try models.assign(slot, id, alike, .{ .position = held.?.position, .velocity = velocity, .on_ground = held.?.on_ground });
+                        try models.assign(slot, id, alike, .{ .position = held.?.position, .velocity = velocity, .on_ground = held.?.on_ground, .on_ground_no_blocks = held.?.on_ground_no_blocks });
                     },
                     .exact => {
                         try self.queue(slot, self.set(viewers), .{ .exact = exact });
-                        try models.assign(slot, id, alike, truth);
+                        // Where it is and how it moves, but the flag its client keeps for itself.
+                        var sent = truth;
+                        sent.on_ground_no_blocks = if (held) |model| model.on_ground_no_blocks else false;
+                        try models.assign(slot, id, alike, sent);
                     },
                 }
             }

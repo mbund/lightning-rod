@@ -13,6 +13,7 @@ const Players = @import("players").players.Players;
 const chunks = @import("chunks");
 const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
 const item_physics = @import("vanilla_item_entities").item_physics;
+const body_module = @import("vanilla_bodies").body;
 const test_levels = @import("test_levels.zig");
 
 fn itemPhysicsProbe(output: *std.Io.Writer) !void {
@@ -73,7 +74,7 @@ fn itemPhysicsProbe(output: *std.Io.Writer) !void {
     var moving = body;
     moving.velocity[0] = 1;
     const collision = try physics.step(&level, 1, 1, moving, false, false);
-    try std.testing.expect(collision.on_ground);
+    try std.testing.expect(collision.ground.on);
     try std.testing.expectApproxEqAbs(@as(f64, 8.875), collision.body.position[0], 0.000001);
     try std.testing.expectApproxEqAbs(@as(f64, 70), collision.body.position[1], 0.000001);
     try std.testing.expectEqual(@as(f64, 0), collision.body.velocity[0]);
@@ -100,7 +101,7 @@ fn itemPhysicsProbe(output: *std.Io.Writer) !void {
         for (1..9) |tick| {
             const result = try physics.step(&level, @intCast(id), @intCast(tick), resting, ground, false);
             resting = result.body;
-            ground = result.on_ground;
+            ground = result.ground.on;
             if (fell.* == 0 and resting.position[1] < 70) fell.* = @intCast(tick);
         }
         var first: u32 = 1;
@@ -138,9 +139,43 @@ fn itemPhysicsProbe(output: *std.Io.Writer) !void {
         for (compact.body.position, expanded.body.position, 0..) |first, second, axis| try std.testing.expectApproxEqAbs(first, second - @as(f64, if (axis == 0) 16 else 0), 0.000000001);
         try std.testing.expectEqualSlices(f64, &compact.body.velocity, &expanded.body.velocity);
         try std.testing.expectEqual(compact.crossed_block, expanded.crossed_block);
-        try std.testing.expectEqual(compact.on_ground, expanded.on_ground);
-        try std.testing.expectEqual(state == game_data.registry.block_stone_default_state, compact.on_ground);
+        try std.testing.expectEqual(compact.ground.on, expanded.ground.on);
+        try std.testing.expectEqual(state == game_data.registry.block_stone_default_state, compact.ground.on);
     }
+    // Landing on a solid entity, with no block under it: Entity.onGroundNoBlocks, which the next
+    // move goes by.
+    const Floor = struct {
+        fn gather(_: *anyopaque, _: u32, query: body_module.Box, _: body_module.Context, found: []body_module.Box) anyerror![]body_module.Box {
+            const floor: body_module.Box = .{ .min = .{ 7, 99, 7 }, .max = .{ 9, 100, 9 } };
+            if (!floor.intersects(query)) return found[0..0];
+            found[0] = floor;
+            return found[0..1];
+        }
+    };
+    var on_entity = level;
+    on_entity.entities = .{ .context = &source, .gather = Floor.gather };
+    var landing = body;
+    landing.position = .{ 8, 100.05, 8 };
+    landing.velocity = .{ 0, -0.1, 0 };
+    const landed = try physics.step(&on_entity, 1, 1, landing, false, false);
+    try std.testing.expect(landed.ground.on and landed.ground.no_blocks and landed.ground.supporting == null);
+    try std.testing.expectEqual(@as(f64, 100), landed.body.position[1]);
+    // Inside a block, with noPhysics, it slows by the block it last stood on, which that move
+    // leaves as it was: ice beside the stone it is in, not the stone under it.
+    const ice: u16 = @intCast(game_data.registry.blockStateId("minecraft:ice").?);
+    try terrain.setBlock(0, .{ .x = 20, .y = 99, .z = 8 }, ice);
+    try terrain.setBlock(0, .{ .x = 21, .y = 99, .z = 8 }, game_data.registry.block_stone_default_state);
+    try terrain.setBlock(0, .{ .x = 21, .y = 100, .z = 8 }, game_data.registry.block_stone_default_state);
+    var inside = body;
+    inside.position = .{ 21.5, 100.2, 8.5 };
+    inside.velocity = .{ 0.1, 0, 0 };
+    var results: [2]ItemPhysics.Result = undefined;
+    for (&results, [_]?[3]i32{ .{ 20, 99, 8 }, null }) |*result, supporting| {
+        var random = std.Random.DefaultPrng.init(1);
+        result.* = try physics.advanceRandomly(&level, 1, 1, inside, .{ .on = true, .supporting = supporting }, .{}, .{ 0, 0, 0 }, null, random.random());
+        try std.testing.expectEqual(supporting, result.ground.supporting);
+    }
+    try std.testing.expectApproxEqRel(@as(f64, @as(f32, 0.98)) / @as(f64, @as(f32, 0.6)), results[0].body.velocity[0] / results[1].body.velocity[0], 1e-6);
 }
 
 pub fn benchmarkItemPhysics() !void {
@@ -373,7 +408,7 @@ pub fn benchmarkItemPhysicsWindow() !void {
         const generated = source.generated;
         for (0..count) |at| {
             const result = try physics.step(&level, @intCast(at + 1), 1, body, true, false);
-            try std.testing.expect(result.on_ground);
+            try std.testing.expect(result.ground.on);
             try std.testing.expectApproxEqAbs(@as(f64, 15.975), result.body.position[0], 0.000001);
             try std.testing.expectApproxEqAbs(@as(f64, 65), result.body.position[1], 0.000001);
         }

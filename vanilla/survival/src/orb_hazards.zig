@@ -61,12 +61,12 @@ pub const Hook = struct {
         return .{ .context = self, .apply = applyHook };
     }
 
-    fn applyHook(context: *anyopaque, body: *entities.State, on_ground: bool, from: [3]f64) anyerror!void {
+    fn applyHook(context: *anyopaque, body: *entities.State, ground: ItemPhysics.Ground, from: [3]f64) anyerror!void {
         const self: *Hook = @ptrCast(@alignCast(context));
         const subject = self.subject;
         // The move took what held it back.
         subject.stuck = .{ 0, 0, 0 };
-        const answers: Context = .{ .hazards = self.hazards, .subject = subject, .position = body.position };
+        const answers: Context = .{ .hazards = self.hazards, .subject = subject, .level = self.level, .position = body.position, .supporting = ground.supporting };
         const host: Host = .{
             .context = &answers,
             .level = self.level,
@@ -88,7 +88,7 @@ pub const Hook = struct {
             .world = subject.world,
             .position = body.position,
             .old_position = subject.old_position,
-            .on_ground = on_ground,
+            .on_ground = ground.on,
             .removed = subject.health <= 0,
             .width = 0.5,
             .height = 0.5,
@@ -102,7 +102,7 @@ pub const Hook = struct {
     }
 };
 
-const Context = struct { hazards: *OrbHazards, subject: *Subject, position: [3]f64 };
+const Context = struct { hazards: *OrbHazards, subject: *Subject, level: *const Level, position: [3]f64, supporting: ?[3]i32 };
 const Host = effects.Host(*const Context);
 
 fn alive(context: *const Context) bool {
@@ -115,8 +115,7 @@ fn fireImmune(_: *const Context) anyerror!bool {
 
 /// Entity.getOnPos below an orb.
 fn onPosition(context: *const Context, depth: f32) anyerror![3]i32 {
-    const position = context.position;
-    return .{ bodies.mth.floor(position[0]), bodies.mth.floor(position[1] - depth), bodies.mth.floor(position[2]) };
+    return bodies.body.onPos(context.level, context.supporting, context.position, depth);
 }
 
 /// ExperienceOrb.hurtServer: health lost, the orb gone at none once its tick ends.

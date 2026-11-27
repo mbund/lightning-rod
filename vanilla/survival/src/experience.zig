@@ -67,7 +67,8 @@ pub const Experience = struct {
             std.mem.writeInt(i32, bytes[5..9], orb.count, .little);
             std.mem.writeInt(u16, bytes[9..11], orb.age, .little);
             std.mem.writeInt(i16, bytes[11..13], orb.health, .little);
-            bytes[13] = @intFromBool(orb.on_ground);
+            // Whether it is on the ground, and on no block there.
+            bytes[13] = @as(u8, @intFromBool(orb.on_ground)) | @as(u8, @intFromBool(orb.on_ground_no_blocks)) << 1;
             std.mem.writeInt(i16, bytes[14..16], orb.fire, .little);
             std.mem.writeInt(u32, bytes[16..20], orb.ticks, .little);
             bytes[20] = @backingInt(orb.stuck);
@@ -85,13 +86,15 @@ pub const Experience = struct {
         pub fn decode(bytes: []const u8) !Orb {
             const version: u8 = if (bytes.len == encoded_size) 4 else if (bytes.len == encoded_size_3) 3 else return error.CorruptExperienceOrb;
             if (bytes[0] != version) return error.CorruptExperienceOrb;
-            if (bytes[13] > 1) return error.CorruptExperienceOrb;
+            // No block under it is only for one on the ground.
+            if (bytes[13] > 3 or bytes[13] == 2) return error.CorruptExperienceOrb;
             var orb: Orb = .{
                 .value = std.mem.readInt(i32, bytes[1..5], .little),
                 .count = std.mem.readInt(i32, bytes[5..9], .little),
                 .age = std.mem.readInt(u16, bytes[9..11], .little),
                 .health = std.mem.readInt(i16, bytes[11..13], .little),
-                .on_ground = bytes[13] != 0,
+                .on_ground = bytes[13] & 1 != 0,
+                .on_ground_no_blocks = bytes[13] & 2 != 0,
                 .fire = std.mem.readInt(i16, bytes[14..16], .little),
                 .alive = true,
             };
@@ -120,6 +123,8 @@ pub const Experience = struct {
         following: ?sessions.Handle = null,
         alive: bool = true,
         on_ground: bool = false,
+        /// Entity.onGroundNoBlocks: on the ground with nothing but an entity under it.
+        on_ground_no_blocks: bool = false,
         stuck: Stuck = .none,
         /// Grows whenever viewers are owed the orb's motion again.
         revision: u64 = 0,
@@ -691,8 +696,9 @@ pub const Experience = struct {
         }
         var subject: orb_hazards.Subject = .{ .world = body.world, .old_position = start, .health = orb.health, .fire_ticks = orb.fire, .ticks_frozen = orb.ticks_frozen };
         var hook: orb_hazards.Hook = .{ .hazards = &self.hazards, .level = &level, .subject = &subject };
-        const advanced = try self.deps.physics.advanceOrb(&level, self.givenId(held.id), orb.ticks, body, orb.on_ground, orb.stuck.multiplier(), hook.physics());
-        orb.on_ground = advanced.on_ground;
+        const advanced = try self.deps.physics.advanceOrb(&level, self.givenId(held.id), orb.ticks, body, .{ .on = orb.on_ground, .no_blocks = orb.on_ground_no_blocks }, orb.stuck.multiplier(), hook.physics());
+        orb.on_ground = advanced.ground.on;
+        orb.on_ground_no_blocks = advanced.ground.no_blocks;
         held.body = advanced.body;
         orb.stuck = Stuck.of(subject.stuck);
         orb.fire = @intCast(subject.fire_ticks);

@@ -29,11 +29,14 @@ pub const Model = struct {
     position: [3]f64,
     velocity: [3]f64,
     on_ground: bool,
+    /// Entity.onGroundNoBlocks as the client has it: its own moves set it, and nothing it is sent
+    /// touches it.
+    on_ground_no_blocks: bool = false,
 
     /// The same to the bit, as a client stepping on from either would step the same.
     pub fn eql(a: Model, b: Model) bool {
         for (a.position ++ a.velocity, b.position ++ b.velocity) |x, y| if (@as(u64, @bitCast(x)) != @as(u64, @bitCast(y))) return false;
-        return a.on_ground == b.on_ground;
+        return a.on_ground == b.on_ground and a.on_ground_no_blocks == b.on_ground_no_blocks;
     }
 
     /// Whether a client with `self` would look apart from `truth`: in another block, which can

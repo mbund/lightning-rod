@@ -48,6 +48,8 @@ pub const Subject = struct {
     fire_immune: ?bool = null,
     /// Hurt this tick, which sends its velocity again as ItemEntity.hurtServer does.
     hurt: bool = false,
+    /// The block it stands on after its move, Entity.mainSupportingBlockPos.
+    supporting: ?[3]i32 = null,
 };
 
 pub const Hazards = struct {
@@ -96,8 +98,8 @@ pub const Hazards = struct {
     /// Entity.applyEffectsFromBlocks for an item that moved this tick.
     pub fn apply(self: *Hazards, subject: *Subject, from: [3]f64) !void {
         const movement: effects.Movement = .{ .from = from, .to = subject.position, .axis_independent = true };
-        const context: Context = .{ .hazards = self, .subject = subject };
         const level_view = self.level(subject.world);
+        const context: Context = .{ .hazards = self, .subject = subject, .level = &level_view };
         const host = hostOf(&context, &level_view);
         _ = try effects.apply(*const Context, &host, subjectOf(subject), &.{movement});
     }
@@ -161,16 +163,17 @@ pub const Hook = struct {
         return .{ .context = self, .apply = applyHook };
     }
 
-    fn applyHook(context: *anyopaque, body: *entities.State, on_ground: bool, from: [3]f64) anyerror!void {
+    fn applyHook(context: *anyopaque, body: *entities.State, ground: ItemPhysics.Ground, from: [3]f64) anyerror!void {
         const self: *Hook = @ptrCast(@alignCast(context));
-        return self.apply(body, on_ground, from);
+        return self.apply(body, ground, from);
     }
 
-    fn apply(self: *Hook, body: *entities.State, on_ground: bool, from: [3]f64) !void {
+    fn apply(self: *Hook, body: *entities.State, ground: ItemPhysics.Ground, from: [3]f64) !void {
         const subject = self.subject;
         subject.position = body.position;
         subject.velocity = body.velocity;
-        subject.on_ground = on_ground;
+        subject.on_ground = ground.on;
+        subject.supporting = ground.supporting;
         // The move took what held it back.
         subject.stuck = .{ 0, 0, 0 };
         try self.hazards.apply(subject, from);
@@ -179,7 +182,7 @@ pub const Hook = struct {
 };
 
 /// An item as the shared block effects' host sees it: not living.
-const Context = struct { hazards: *Hazards, subject: *Subject };
+const Context = struct { hazards: *Hazards, subject: *Subject, level: *const bodies.body.Level };
 const Host = effects.Host(*const Context);
 
 fn hostOf(context: *const Context, level: *const bodies.body.Level) Host {
@@ -226,10 +229,8 @@ const Answers = struct {
     fn fireImmune(context: *const Context) anyerror!bool {
         return context.hazards.fireImmune(context.subject);
     }
-    /// Entity.getOnPos below an item, which keeps no supporting block.
     fn onPosition(context: *const Context, depth: f32) anyerror![3]i32 {
-        const position = context.subject.position;
-        return .{ bodies.mth.floor(position[0]), bodies.mth.floor(position[1] - depth), bodies.mth.floor(position[2]) };
+        return bodies.body.onPos(context.level, context.subject.supporting, context.subject.position, depth);
     }
     fn hurt(context: *const Context, damage: effects.Damage, amount: f32) anyerror!bool {
         const kind: Damage = switch (damage) {

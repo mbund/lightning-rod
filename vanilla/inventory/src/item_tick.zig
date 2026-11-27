@@ -254,14 +254,14 @@ pub const ItemTick = struct {
         const was_burning = metadata.fire_ticks > 0;
         // Entity.isInLava, which is false on an entity's first tick.
         try self.hazards.burn(&subject, metadata.ticks > 1 and fluids.lava > 0);
-        var advanced: ItemPhysics.Result = .{ .body = pushed, .on_ground = metadata.on_ground, .crossed_block = false };
+        var advanced: ItemPhysics.Result = .{ .body = pushed, .ground = metadata.ground(), .crossed_block = false };
         var hooked: hazards_module.Hook = .{ .hazards = &self.hazards, .subject = &subject };
         if (!subject.removed) {
             if (metadata.pickup_delay > 0 and metadata.pickup_delay != 32767) metadata.pickup_delay -= 1;
-            advanced = try self.deps.physics.advanceRandomly(&level, self.deps.dropped.givenId(entity), metadata.ticks, pushed, metadata.on_ground, fluids, metadata.stuck.multiplier(), hooked.physics(), self.random.random());
+            advanced = try self.deps.physics.advanceRandomly(&level, self.deps.dropped.givenId(entity), metadata.ticks, pushed, metadata.ground(), fluids, metadata.stuck.multiplier(), hooked.physics(), self.random.random());
             if (advanced.moved) metadata.stuck = ItemEntities.Stuck.of(subject.stuck);
         }
-        metadata.on_ground = advanced.on_ground;
+        metadata.stand(advanced.ground);
         metadata.fire_ticks = subject.fire_ticks;
         metadata.ticks_frozen = @intCast(subject.ticks_frozen);
         metadata.health = subject.health;
@@ -313,7 +313,7 @@ pub const ItemTick = struct {
         }
 
         // Resting where it is, with nothing around to change it, it sleeps until something does.
-        const restful = dropped.sleep and metadata.alive and advanced.moved and advanced.on_ground and !advanced.crossed_block and
+        const restful = dropped.sleep and metadata.alive and advanced.moved and advanced.ground.on and !advanced.crossed_block and
             std.meta.eql(before, body.position) and @abs(body.velocity[0]) < 1.0e-5 and @abs(body.velocity[2]) < 1.0e-5 and
             fluids.water == 0 and fluids.lava == 0 and metadata.fire_ticks == 0 and metadata.ticks_frozen == 0 and !subject.hurt and
             metadata.stuck == .none and metadata.age >= 0 and metadata.age < 5999 and metadata.revision == moved_revision;
@@ -345,10 +345,10 @@ pub const ItemTick = struct {
                 state.position = entry.model.position;
                 state.velocity = entry.model.velocity;
                 const fluids = try self.deps.physics.push(level, &state, warm);
-                const stepped = try self.deps.physics.advanceClient(level, given, models.ticksOf(first), state, entry.model.on_ground, fluids, ItemPhysics.releaseOf(models.rulesOf(first)));
+                const stepped = try self.deps.physics.advanceClient(level, given, models.ticksOf(first), state, .{ .on = entry.model.on_ground, .no_blocks = entry.model.on_ground_no_blocks }, fluids, ItemPhysics.releaseOf(models.rulesOf(first)));
                 var after = stepped.body;
                 _ = try self.deps.physics.push(level, &after, warm);
-                const model: Model = .{ .position = after.position, .velocity = after.velocity, .on_ground = stepped.on_ground };
+                const model: Model = .{ .position = after.position, .velocity = after.velocity, .on_ground = stepped.ground.on, .on_ground_no_blocks = stepped.ground.no_blocks };
                 // Each class, as whether its tick count moves the item next tick is its own.
                 var each_alike = alike;
                 while (each_alike != 0) : (each_alike &= each_alike - 1) {
