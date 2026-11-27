@@ -32,11 +32,11 @@ pub const Replication = struct {
 
     pub const Dependencies = struct { players: *Players, visibility: *Visibility, tracking: *Tracking };
 
-    /// What a kind with riders tells of a vehicle by its id: its network id and who rides it, for
-    /// ServerEntity.sendPairingData, which pairs a rider with its vehicle's passengers.
+    /// What a kind with riders tells of a vehicle by its slot: its network id and who rides it,
+    /// for ServerEntity.sendPairingData, which pairs a rider with its vehicle's passengers.
     pub const Vehicles = struct {
         context: *anyopaque,
-        carrying: *const fn (context: *anyopaque, vehicle: u64) ?Carrying,
+        carrying: *const fn (context: *anyopaque, vehicle: u32) ?Carrying,
     };
     pub const Carrying = struct { id: i32, passengers: entity_sync.Passengers };
 
@@ -224,7 +224,7 @@ pub const Replication = struct {
         self.vehicle_count += 1;
     }
 
-    fn carrying(self: *const Replication, vehicle: u64) ?Carrying {
+    fn carrying(self: *const Replication, vehicle: u32) ?Carrying {
         for (self.vehicles[0..self.vehicle_count]) |kind| if (kind.carrying(kind.context, vehicle)) |carried| return carried;
         return null;
     }
@@ -547,7 +547,7 @@ pub const Replication = struct {
             const pitch = self.subjects[index].pitch;
             const entity_id: i32 = @intCast(index + 1);
             // A rider is paired with what carries it, as its client seats it only so.
-            const carried: ?Carrying = if (subject.vehicle) |vehicle| self.carrying(vehicle) else null;
+            const carried: ?Carrying = if (players.vehicleOf(index)) |vehicle| self.carrying(vehicle) else null;
             inline for (std.enums.values(Action)) |phase| {
                 const remaining = needed[@backingInt(phase)];
                 while (remaining.view().any()) {

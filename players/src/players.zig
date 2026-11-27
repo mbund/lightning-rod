@@ -673,7 +673,7 @@ pub const Players = struct {
             if (!std.math.isFinite(position.x) or !std.math.isFinite(position.y) or !std.math.isFinite(position.z) or @abs(position.x) > 30_000_000 or @abs(position.y) > 30_000_000 or @abs(position.z) > 30_000_000) return;
         }
         if (movement.rotation) |rotation| accepted.rotation = normalizeRotation(rotation) catch return;
-        if (player.vehicle != null) {
+        if (self.vehicleOf(handle.index) != null) {
             // ServerGamePacketListenerImpl.handleMovePlayer for a passenger: it turns, and its
             // vehicle places it. What it moved is what its vehicle moved.
             accepted.position = null;
@@ -799,7 +799,7 @@ pub const Players = struct {
             .start_sprinting => player.flags.sprinting = true,
             .stop_sprinting => player.flags.sprinting = false,
             // ServerGamePacketListenerImpl.handlePlayerCommand: the vehicle ridden opens its own.
-            .open_vehicle_inventory => if (player.vehicle != null) if (self.vehicle_inventory) |opener| try opener.open(opener.context, handle.index),
+            .open_vehicle_inventory => if (self.vehicleOf(handle.index) != null) if (self.vehicle_inventory) |opener| try opener.open(opener.context, handle.index),
             else => {},
         }
         player.revision += 1;
@@ -1084,11 +1084,26 @@ pub const Players = struct {
         return null;
     }
 
+    /// The slot of what a player rides, as the entities keep it: its client steers it, its kind
+    /// places the player on it, and the player's own moves then turn it alone.
+    pub fn vehicleOf(self: *const Players, index: usize) ?u32 {
+        const slot = self.entitySlot(index) orelse return null;
+        return self.entities.?.vehicleOf(slot);
+    }
+
+    /// The player's slot among the entities, while it is in its world.
+    pub fn entitySlot(self: *const Players, index: usize) ?u32 {
+        // Players made without the entities, in tests, are in none.
+        if (self.entity_slots.len == 0) return null;
+        const slot = self.entity_slots[index];
+        return if (slot == entities.directory.none) null else slot;
+    }
+
     /// A rider as its vehicle places it, Entity.positionRider: where it is, what it moved, and its
     /// place among entities, all following the vehicle.
     pub fn placeRider(self: *Players, slot: usize, position: minecraft.Position) !void {
         const player = &self.records[slot];
-        assert(player.vehicle != null and player.inWorld());
+        assert(self.vehicleOf(slot) != null and player.inWorld());
         if (std.meta.eql(player.position, position)) return;
         player.position = position;
         try self.updateIndexes(slot);

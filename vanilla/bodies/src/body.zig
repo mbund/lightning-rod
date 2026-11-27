@@ -269,6 +269,9 @@ pub const Level = struct {
     air: u16,
     /// The world border in this world, if bodies collide with one.
     border: ?Bounds = null,
+    /// The entities bodies collide with, Level.getEntityCollisions; none, and they collide with
+    /// none.
+    entities: ?EntitySource = null,
 
     /// Outside the world's height a level reads void air, which collides with nothing.
     pub fn state(self: *const Level, x: i32, y: i32, z: i32) !u16 {
@@ -291,14 +294,40 @@ pub const Level = struct {
     }
 };
 
-/// What a collision query knows about the entity, for the few blocks whose collision shape
-/// depends on it (EntityCollisionContext).
+/// What a collision query knows about the entity, EntityCollisionContext: for the few blocks whose
+/// collision shape depends on it, and for the entities it collides with.
 pub const Context = struct {
     bottom: f64 = 0,
     fall_distance: f64 = 0,
-    /// CollisionContext.empty, for queries with no entity.
+    /// CollisionContext.empty, for queries with no entity: only solid entities count, as
+    /// EntitySelector.CAN_BE_COLLIDED_WITH, and the border not at all.
     empty: bool = false,
+    /// The entity's slot, which it does not collide with, nor with what rides with it.
+    slot: u32 = no_slot,
+    /// AbstractBoat.canCollideWith, canVehicleCollide: it collides with pushable entities too.
+    vehicle: bool = false,
 };
+
+pub const no_slot = std.math.maxInt(u32);
+
+/// Level.getEntityCollisions, answered by whoever keeps the entities: the boxes of those the mover
+/// collides with that meet `query`, in the level's order, into `output`.
+pub const EntitySource = struct {
+    context: *anyopaque,
+    gather: *const fn (context: *anyopaque, world: u32, query: Box, mover: Context, output: []Box) anyerror![]Box,
+};
+
+/// AABB.getSize: the mean of its sides.
+pub fn sizeOf(value: Box) f64 {
+    return (value.max[0] - value.min[0] + (value.max[1] - value.min[1]) + (value.max[2] - value.min[2])) / 3.0;
+}
+
+/// Level.getEntityCollisions: none for a box of no size, else the source's, a little wider.
+pub fn entityCollisions(level: *const Level, query: Box, context: Context, output: []Box) ![]Box {
+    const source = level.entities orelse return output[0..0];
+    if (sizeOf(query) < 1.0e-7) return output[0..0];
+    return source.gather(source.context, level.world, query.inflate(1.0e-7, 1.0e-7, 1.0e-7), context, output);
+}
 
 /// The collision boxes of a block state at a position, for an entity.
 pub fn collisionBoxes(level: *const Level, state: u16, x: i32, y: i32, z: i32, context: Context) game_data.physics.Boxes {
@@ -467,6 +496,8 @@ fn anyShape(level: *const Level, query: Box, context: Context) !bool {
 /// so every axis and every step height after reads them from here and not the world.
 pub const Colliders = struct {
     boxes: [box_capacity]Box = undefined,
+    /// The entities' boxes one move collides with, found once for all its tries.
+    entity_boxes: [entity_capacity]Box = undefined,
     /// Where each shape's boxes end, as Shapes.collide checks its tolerance between shapes.
     ends: [box_capacity]u16 = undefined,
     box_count: usize = 0,
@@ -475,6 +506,7 @@ pub const Colliders = struct {
     complete: bool = true,
 
     const box_capacity = 256;
+    pub const entity_capacity = 1024;
 
     /// Fills in place, as the boxes are too many to copy around. The other entities' boxes come
     /// first, a shape each, as Entity.collectColliders puts them.
@@ -577,10 +609,12 @@ pub fn borderFor(level: *const Level, start: Box, query: Box) ?[4]Box {
     return boxes;
 }
 
-/// Entity.collide, with stepping up onto blocks no higher than max_up_step. `others` are the boxes
-/// of the entities the body collides with, as Level.getEntityCollisions finds them around the
-/// box expanded by the movement, every step tried against the same.
-pub fn collide(level: *const Level, start: Box, movement: [3]f64, context: Context, others: []const Box, on_ground: bool, max_up_step: f32) ![3]f64 {
+/// Entity.collide, with stepping up onto blocks no higher than max_up_step: against the entities
+/// Level.getEntityCollisions finds around the box expanded by the movement, every step tried
+/// against the same, and the blocks and border each try finds.
+pub fn collide(level: *const Level, start: Box, movement: [3]f64, context: Context, on_ground: bool, max_up_step: f32) ![3]f64 {
+    const others: []const Box = try entityCollisions(level, start.expandTowards(movement), context, &level.colliders.?.entity_boxes);
+    if (others.len == Colliders.entity_capacity) return error.TooManyEntityColliders;
     const length_squared = movement[0] * movement[0] + movement[1] * movement[1] + movement[2] * movement[2];
     const collided = if (length_squared == 0) movement else try collideWithShapes(level, start.expandTowards(movement), context, others, movement, start);
     const blocked_x = movement[0] != collided[0];
@@ -635,6 +669,16 @@ fn stepEdges(value: Box, base: Box, max_up_step: f32, skip: f32, output: *[64]f3
     return count;
 }
 
+/// LivingEntity.onClimbable's blocks: a climbable block at the body's block, or an open trapdoor
+/// over a ladder facing its way.
+pub fn climbableAt(level: *const Level, at: [3]i32) !bool {
+    const entry = level.blocks.get(try level.state(at[0], at[1], at[2]));
+    if (entry.flags.climbable) return true;
+    if (!entry.flags.trapdoor or !entry.flags.open) return false;
+    const below = level.blocks.get(try level.state(at[0], at[1] - 1, at[2]));
+    return below.kind == .ladder and below.facing == entry.facing;
+}
+
 /// Level.findSupportingBlock: of the blocks under the box, the one whose center is nearest the
 /// position, ties broken toward the larger position in vanilla's order (y, then z, then x).
 pub fn findSupportingBlock(level: *const Level, query: Box, context: Context, position: [3]f64) !?[3]i32 {
@@ -662,10 +706,24 @@ fn lessBlock(a: [3]i32, b: [3]i32) bool {
     return a[0] < b[0];
 }
 
-/// CollisionGetter.noCollision for a box, which vanilla also asks with no entity's context
-/// in places, ignoring entities since mobs collide with none here.
+/// DismountHelper.canDismountTo: no block shape within the box, as CollisionGetter.getBlockCollisions
+/// finds none, and the box within the world border.
+pub fn canDismountTo(level: *const Level, query: Box, context: Context) !bool {
+    if (try anyShape(level, query, context)) return false;
+    const bounds = level.border orelse return true;
+    return bounds.containsBox(query.min[0], query.min[2], query.max[0], query.max[2]);
+}
+
+/// CollisionGetter.noCollision: no block shape, entity the body collides with, or, for a body, the
+/// world border's outside within the box.
 pub fn noCollision(level: *const Level, query: Box, context: Context) !bool {
-    return !try anyShape(level, query, context);
+    if (try anyShape(level, query, context)) return false;
+    var found: [1]Box = undefined;
+    if ((try entityCollisions(level, query, context, &found)).len > 0) return false;
+    if (context.empty) return true;
+    const border = borderFor(level, query, query) orelse return true;
+    for (border) |side| if (side.intersects(query)) return false;
+    return true;
 }
 
 test "a box stops at a block and steps up a slab" {

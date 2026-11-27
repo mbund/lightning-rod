@@ -68,7 +68,7 @@ pub const BoatItems = struct {
         const reach = playerBox(player).expandTowards(.{ view[0] * 5, view[1] * 5, view[2] * 5 }).inflate(1, 1, 1);
         if (try boats.pickableHolds(player.world, reach, eye)) return .pass;
         const placed = boat_module.boxAt(hit.location);
-        if (!try boats.clear(player.world, placed, hit.location[1], null)) return .denied;
+        if (!try boats.clear(player.world, placed, hit.location[1], body.no_slot)) return .denied;
         _ = try boats.spawn(.{ .model = model, .world = player.world, .position = hit.location, .yaw = player.rotation.yaw });
         if (!creative) try self.consume(context);
         return .applied;

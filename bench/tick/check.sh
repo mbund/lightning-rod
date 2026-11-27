@@ -69,9 +69,11 @@ bench() { taskset -c "$bench_cpus" "$@"; }
 failed=0
 
 # Every kind at once, sleeping and woken, with digests every tick.
-digest_scene=(--players=8 --mode=moving --cows=256 --orbs=256 --drops=256 --arrows=200 --volley-interval=40 --stream --digest --ticks=400)
+digest_scene=(--players=8 --mode=moving --cows=256 --orbs=256 --drops=256 --arrows=200 --volley-interval=40 --boats=64 --stream --digest --ticks=400)
+# Each kind's state, by name. Packet counts follow the stream's timing, which varies run to run.
 digests() {
-    bench "$1" "${digest_scene[@]}" "${@:2}" 2>&1 | grep '^digest' | awk '{print $2, $3, $4, $5, $7}'
+    bench "$1" "${digest_scene[@]}" "${@:2}" 2>&1 | grep '^digest' |
+        awk '{ line = ""; for (i = 2; i <= NF; i++) { split($i, kv, "="); if (kv[1] ~ /^(tick|mobs|orbs|projectiles|items|boats)$/) line = line " " $i } print substr(line, 2) }'
 }
 
 if [ "$mode" = all ] || [ "$mode" = digests ]; then

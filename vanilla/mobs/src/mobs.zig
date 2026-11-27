@@ -19,6 +19,8 @@ const WorldBorder = @import("vanilla_world").world_border.WorldBorder;
 const Domains = @import("domains").domains.Domains;
 const world_effects = @import("vanilla_blocks").world_effects;
 const body = @import("vanilla_bodies").body;
+const EntityCollisions = @import("vanilla_bodies").entity_collisions.EntityCollisions;
+const PlayerRecord = @import("players").player_state.Player;
 const living = @import("living.zig");
 const mth = @import("vanilla_bodies").mth;
 const content_tags = @import("vanilla_content").content_tags;
@@ -133,6 +135,7 @@ pub const Mobs = struct {
         dropped: *ItemEntities,
         furnaces: *Furnaces,
         enchantment_registry: *EnchantmentRegistry,
+        collisions: *EntityCollisions,
     };
 
     deps: Dependencies,
@@ -196,7 +199,6 @@ pub const Mobs = struct {
     /// The boats, which mobs push and collide with, once they start.
     boats: ?*Boats = null,
     /// The boxes the last move collided with but blocks.
-    collision_boxes: [64]body.Box = undefined,
     /// Path searches run, and recomputations edits asked for, for measuring.
     path_searches: u64 = 0,
     edit_recomputes: u64 = 0,
@@ -308,6 +310,10 @@ pub const Mobs = struct {
         // Mobs take their turns in the one tick order, as many as fill a pass's run.
         try deps.entities.addTicker(.init(Mobs, self, self.kinds, entities.Entities.run_max));
         try deps.entities.addColumnHolder(.init(Mobs, self, loadColumn, unloadColumn));
+        // LivingEntity.isPushable, which vehicles collide with: mobs, and players, whose bodies
+        // are living ones too.
+        try deps.collisions.register(self.kinds, .{ .context = self, .pushable = mobPushable });
+        try deps.collisions.register(.of(&.{Players.entityKind()}), .{ .context = self, .pushable = playerPushable });
         for (self.species) |species| {
             self.widest_half = @max(self.widest_half, @as(f64, species.width) / 2);
             self.tallest = @max(self.tallest, @as(f64, species.height));
@@ -324,6 +330,7 @@ pub const Mobs = struct {
         result.overlay = self.overlay_view;
         result.window = self.window_view;
         result.colliders = &self.colliders;
+        result.entities = self.deps.collisions.source();
         return result;
     }
 
@@ -825,8 +832,7 @@ pub const Mobs = struct {
 
     /// Whether a mob rides something, which ticks it after itself.
     pub fn rides(self: *const Mobs, slot: u32) bool {
-        const boats = self.boats orelse return false;
-        return boats.carriesMob(slot);
+        return self.deps.entities.vehicleOf(slot) != null;
     }
 
     /// Mob.rideTick for a mob a boat carries: Entity.rideTick's still start and full tick, then
@@ -1553,7 +1559,7 @@ pub const Mobs = struct {
             const mobs = pushing.mobs;
             if (mobs.boats) |boats| if (boats.kinds.has(entry.shape.kind)) {
                 // Entity.push passes over what it rides itself.
-                if (!boats.solid(entry.slot) or boats.vehicleOfMob(pushing.own) == entry.slot) return false;
+                if (!boats.solid(entry.slot) or mobs.deps.entities.vehicleOf(pushing.own) == entry.slot) return false;
                 pushing.found += 1;
                 // LivingEntity.doPush: the boat is pushed by the mob, as AbstractBoat.push has it.
                 if (pushing.push) {
@@ -1564,7 +1570,7 @@ pub const Mobs = struct {
             };
             if (entry.id == pushing.mob.entity.id) return false;
             // Nor what rides the same vehicle.
-            if (mobs.boats) |boats| if (boats.vehicleOfMob(pushing.own)) |vehicle| if (boats.vehicleOfMob(entry.slot) == vehicle) return false;
+            if (mobs.deps.entities.vehicleOf(pushing.own)) |vehicle| if (mobs.deps.entities.vehicleOf(entry.slot) == vehicle) return false;
             const other = try mobs.inSlot(entry.slot);
             if (other.entity.removed or !living.box(mobs, other).intersects(pushing.box)) return false;
             if (!other.alive() or try living.onClimbable(mobs, other)) return false;
@@ -1618,18 +1624,6 @@ pub const Mobs = struct {
         return living.width(self, mob);
     }
 
-    /// Level.getEntityCollisions for a mob: the boats whose boxes meet the box, as mobs collide with
-    /// nothing else here, but the one it rides. Good until the next ask.
-    pub fn collisionsOf(self: *Mobs, mob: Mob, query: body.Box) ![]const body.Box {
-        const boats = self.boats orelse return &.{};
-        if (boats.count() == 0) return &.{};
-        const world = mob.motion.world;
-        const vehicle = boats.vehicleOfMob(self.slotOf(mob.entity.id).?);
-        // AABB.getSize: too small a box meets nothing.
-        if ((query.max[0] - query.min[0] + (query.max[1] - query.min[1]) + (query.max[2] - query.min[2])) / 3.0 < 1.0e-7) return &.{};
-        return boats.solidBoxes(world, query.inflate(1.0e-7, 1.0e-7, 1.0e-7), vehicle, &self.collision_boxes);
-    }
-
     /// A mob's box where it can be picked, as LivingEntity.isPickable has it: any not removed.
     pub fn pickableBox(self: *Mobs, slot: u32) !?body.Box {
         const mob = try self.inSlot(slot);
@@ -1637,12 +1631,24 @@ pub const Mobs = struct {
         return living.box(self, mob);
     }
 
-    /// A mob's box where it is pushable, which is where a boat collides with it, as
-    /// AbstractBoat.canCollideWith has it: alive and off climbables.
-    pub fn pushableBox(self: *Mobs, slot: u32) !?body.Box {
+    /// LivingEntity.isPushable for a mob: alive and off climbables, its box.
+    fn mobPushable(context: *anyopaque, slot: u32) anyerror!?body.Box {
+        const self: *Mobs = @ptrCast(@alignCast(context));
         const mob = try self.inSlot(slot);
         if (mob.entity.removed or !mob.alive() or try living.onClimbable(self, mob)) return null;
         return living.box(self, mob);
+    }
+
+    /// LivingEntity.isPushable for a player: in the world, alive, no spectator, off climbables.
+    fn playerPushable(context: *anyopaque, slot: u32) anyerror!?body.Box {
+        const self: *Mobs = @ptrCast(@alignCast(context));
+        const player = &self.deps.players.records[Players.playerOfEntity(self.deps.entities.directory.entry(slot).id)];
+        if (!player.inWorld()) return null;
+        const state = self.deps.player_states.of(player);
+        if (state.gamemode == .spectator or state.health <= 0) return null;
+        const around = self.level(player.world);
+        if (try body.climbableAt(&around, .{ mth.floor(player.position.x), mth.floor(player.position.y), mth.floor(player.position.z) })) return null;
+        return playerBox(player);
     }
 
     /// Wakes a resting mob, one the plugin holds or a copy Debug checks run on.
@@ -2155,4 +2161,9 @@ fn withProperty(state: u16, key: []const u8, value: []const u8) ?u16 {
     writer.writeByte(']') catch return null;
     const found = game_data.registry.blockStateId(writer.buffered()) orelse return null;
     return @intCast(found);
+}
+
+/// A player's box, standing or sneaking, as its pose makes it.
+pub fn playerBox(player: *const PlayerRecord) body.Box {
+    return body.makeBox(.{ player.position.x, player.position.y, player.position.z }, 0.6, if (player.flags.sneaking) 1.5 else 1.8);
 }

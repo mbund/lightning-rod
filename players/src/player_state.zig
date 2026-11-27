@@ -41,9 +41,6 @@ pub const Player = struct {
     known_movement: [3]f64 = @splat(0),
     /// Whether a move packet came this client tick.
     moved: bool = false,
-    /// The entity the player rides, by its id, which its client steers and its kind places the
-    /// player on: the player's own moves then turn it alone.
-    vehicle: ?u64 = null,
     /// The client ticks it ended since it began playing, as its ServerboundClientTickEndPacket
     /// says: what clients that compute entities themselves stepped them by.
     client_ticks: u64 = 0,

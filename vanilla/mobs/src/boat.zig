@@ -85,9 +85,8 @@ pub const Sound = enum { generic_splash, generic_burn, generic_extinguish_fire, 
 /// What a boat ticks against besides the blocks, answered by whoever keeps it.
 pub const Around = struct {
     context: *anyopaque,
-    /// Level.getEntityCollisions for the boat: the boxes of the entities but it that it collides
-    /// with and that meet `query`, in the order the level finds them, into `output`.
-    collisions: *const fn (context: *anyopaque, query: Box, output: []Box) anyerror![]Box,
+    /// The boat's slot, which meets the other entities through the level, as a vehicle does.
+    slot: u32,
     /// VehicleEntity.hurtServer, for what blocks and fire do to the boat, whose kind of damage
     /// counts for nothing: whether it took the damage.
     hurt: *const fn (context: *anyopaque, amount: f32) anyerror!bool,
@@ -107,10 +106,6 @@ pub const Around = struct {
 /// Room a tick works in, kept by the owner so it is not filled anew each tick.
 pub const Scratch = struct {
     effects: block_effects.Scratch = .{},
-    others: [max_others]Box = undefined,
-
-    /// The entities a boat collides with in one query at most: past these, the rest are passed by.
-    pub const max_others = 64;
 };
 
 /// EntityDimensions.makeBoundingBox at a position.
@@ -145,8 +140,8 @@ pub fn tick(level: *const body.Level, around: Around, state: *entities.State, bo
         state.velocity = .{ 0, 0, 0 };
         try applyEffects(level, around, state, boat, scratch, steering.movements);
     } else {
-        try floatBoat(level, around, state, boat, scratch);
-        const kept = try move(level, around, state, boat, state.velocity, scratch);
+        try floatBoat(level, around, state, boat);
+        const kept = try move(level, around, state, boat, state.velocity);
         try applyEffects(level, around, state, boat, scratch, if (kept) |movement| &.{movement} else &.{});
     }
     try applyEffects(level, around, state, boat, scratch, &.{});
@@ -332,7 +327,7 @@ fn splash(around: Around, state: *const entities.State, boat: *Boat) void {
 
 /// AbstractBoat.floatBoat: gravity, buoyancy and friction by where the boat is, a boat landing on
 /// water out of the air set at its surface.
-fn floatBoat(level: *const body.Level, around: Around, state: *entities.State, boat: *Boat, scratch: *Scratch) !void {
+fn floatBoat(level: *const body.Level, around: Around, state: *entities.State, boat: *Boat) !void {
     var fall: f64 = -gravity;
     var buoyancy: f64 = 0;
     var friction: f32 = 0.05;
@@ -342,7 +337,7 @@ fn floatBoat(level: *const body.Level, around: Around, state: *entities.State, b
         boat.water_level = state.position[1] + @as(f64, box_height);
         const settled = @as(f64, try waterLevelAbove(level, boxAt(state.position), boat.last_yd) - box_height) + 0.101;
         const box = boxAt(state.position);
-        if (try noCollision(level, around, box.move(.{ 0, settled - state.position[1], 0 }), state.position[1], boat.fall_distance, scratch)) {
+        if (try body.noCollision(level, box.move(.{ 0, settled - state.position[1], 0 }), contextOf(around, state, boat))) {
             state.position[1] = settled;
             // Vec3.multiply(1, 0, 1), which keeps the sign of what it zeroes.
             state.velocity[1] *= 0;
@@ -372,24 +367,14 @@ fn floatBoat(level: *const body.Level, around: Around, state: *entities.State, b
     if (buoyancy > 0) state.velocity[1] = (state.velocity[1] + buoyancy * (gravity / 0.65)) * 0.75;
 }
 
-/// CollisionGetter.noCollision for the boat: no block shape, entity it collides with or the world
-/// border's outside within the box.
-fn noCollision(level: *const body.Level, around: Around, query: Box, bottom: f64, fall_distance: f64, scratch: *Scratch) !bool {
-    if (!try body.noCollision(level, query, .{ .bottom = bottom, .fall_distance = fall_distance })) return false;
-    if (sizeOf(query) >= 1.0e-7 and (try around.collisions(around.context, query.inflate(1.0e-7, 1.0e-7, 1.0e-7), &scratch.others)).len > 0) return false;
-    const border = body.borderFor(level, query, query) orelse return true;
-    for (border) |side| if (side.intersects(query)) return false;
-    return true;
-}
-
-/// AABB.getSize: the mean of its sides.
-fn sizeOf(box: Box) f64 {
-    return (box.max[0] - box.min[0] + (box.max[1] - box.min[1]) + (box.max[2] - box.min[2])) / 3.0;
+/// The boat as collisions take it: a vehicle, AbstractBoat.canCollideWith.
+fn contextOf(around: Around, state: *const entities.State, boat: *const Boat) body.Context {
+    return .{ .bottom = state.position[1], .fall_distance = boat.fall_distance, .slot = around.slot, .vehicle = true };
 }
 
 /// Entity.move for a boat moving itself, as one that never steps up: the movement it keeps for
 /// the block effects, if it moved.
-fn move(level: *const body.Level, around: Around, state: *entities.State, boat: *Boat, requested_in: [3]f64, scratch: *Scratch) !?block_effects.Movement {
+fn move(level: *const body.Level, around: Around, state: *entities.State, boat: *Boat, requested_in: [3]f64) !?block_effects.Movement {
     var kept: ?block_effects.Movement = null;
     var requested = requested_in;
     if (lengthSquared(boat.stuck) > 1.0e-7) {
@@ -398,11 +383,7 @@ fn move(level: *const body.Level, around: Around, state: *entities.State, boat: 
         state.velocity = .{ 0, 0, 0 };
     }
     const start = boxAt(state.position);
-    const context: body.Context = .{ .bottom = state.position[1], .fall_distance = boat.fall_distance };
-    // Level.getEntityCollisions around the box the move sweeps, found once for the whole move.
-    const sweep = start.expandTowards(requested);
-    const others: []const Box = if (sizeOf(sweep) < 1.0e-7) &.{} else try around.collisions(around.context, sweep.inflate(1.0e-7, 1.0e-7, 1.0e-7), &scratch.others);
-    const moved = try body.collide(level, start, requested, context, others, boat.on_ground, 0);
+    const moved = try body.collide(level, start, requested, contextOf(around, state, boat), boat.on_ground, 0);
     const moved_squared = lengthSquared(moved);
     if (moved_squared > 1.0e-7 or lengthSquared(requested) - moved_squared < 1.0e-7) {
         const destination: [3]f64 = .{ state.position[0] + moved[0], state.position[1] + moved[1], state.position[2] + moved[2] };
@@ -434,8 +415,8 @@ fn move(level: *const body.Level, around: Around, state: *entities.State, boat: 
 
 /// Entity.move for a boat its rider's client moved, MoverType.PLAYER as handleMoveVehicle moves
 /// it: what the move kept for the block effects, if it moved.
-pub fn moveBy(level: *const body.Level, around: Around, state: *entities.State, boat: *Boat, movement: [3]f64, scratch: *Scratch) !?block_effects.Movement {
-    return move(level, around, state, boat, movement, scratch);
+pub fn moveBy(level: *const body.Level, around: Around, state: *entities.State, boat: *Boat, movement: [3]f64) !?block_effects.Movement {
+    return move(level, around, state, boat, movement);
 }
 
 /// Entity.setOnGroundWithMovement then doCheckFallDamage, each finding its support again, as

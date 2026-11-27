@@ -19,6 +19,7 @@ const entity_sync = @import("replication").entity_sync;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
 const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
 const Containers = @import("vanilla_containers").containers.Containers;
+const EntityCollisions = bodies.entity_collisions.EntityCollisions;
 const EquipmentAttributes = @import("vanilla_items").equipment_attributes.EquipmentAttributes;
 const canInteractWithEntity = @import("mob_interaction.zig").canInteractWithEntity;
 const item_data = @import("vanilla_items").item_data;
@@ -55,6 +56,7 @@ pub const Boats = struct {
         input: *Input,
         containers: *Containers,
         attributes: *EquipmentAttributes,
+        collisions: *EntityCollisions,
     };
 
     /// The woods boats are made of, and bamboo, whose boat is a raft.
@@ -249,8 +251,6 @@ pub const Boats = struct {
     boarding: []u64,
     /// By slot, the tick before which a mob may not board, the mobs riding, and what each rides.
     mob_boarding: []u64,
-    riding_mobs: lightning_rod.system.IndexSet,
-    mob_vehicles: []u32,
     /// The boat ticking, for the world's answers to its tick.
     ticking: ?Ticking = null,
     /// How the boat ticking moves: by itself, or by its rider, until an eject frees it.
@@ -288,8 +288,6 @@ pub const Boats = struct {
             .replicated = try .init(allocator, bound),
             .boarding = try allocator.alloc(u64, deps.players.records.len),
             .mob_boarding = try allocator.alloc(u64, bound),
-            .riding_mobs = try .init(allocator, bound),
-            .mob_vehicles = try allocator.alloc(u32, bound),
         };
         @memset(self.boarding, 0);
         @memset(self.mob_boarding, 0);
@@ -298,6 +296,8 @@ pub const Boats = struct {
         try deps.entities.addTicker(.init(Boats, self, kinds, 1));
         try deps.entities.addColumnHolder(.init(Boats, self, columnLoaded, columnUnloaded));
         try self.boats.register();
+        // AbstractBoat: canBeCollidedWith, isPushable and isPickable while it is in the world.
+        try deps.collisions.register(kinds, .{ .context = self, .solid = boatBox, .pushable = boatBox, .pickable = boatBox });
         deps.mobs.boats = self;
         try deps.input.on(.vehicle_move, self, onVehicleMove);
         try deps.input.on(.steer_boat, self, onSteerBoat);
@@ -505,89 +505,42 @@ pub const Boats = struct {
         self.animation_count += 1;
     }
 
+    fn boatBox(context: *anyopaque, slot: u32) anyerror!?Box {
+        const self: *Boats = @ptrCast(@alignCast(context));
+        if (self.boats.ptr(slot).boat.removed) return null;
+        return boat_module.boxAt(self.deps.entities.body(slot).?.position);
+    }
+
     /// Whether the boat in the slot is still in the world, as what collides with and pushes others.
     pub fn solid(self: *const Boats, slot: u32) bool {
         return !self.boats.ptr(slot).boat.removed;
     }
 
-    /// The boats whose boxes meet `query` but `except`, as Level.getEntityCollisions finds them,
-    /// into `output`: what mobs and other boats collide with, as boats are solid.
-    pub fn solidBoxes(self: *Boats, world: u32, query: Box, except: ?u32, output: []Box) ![]Box {
-        if (self.boats.count() == 0) return output[0..0];
-        const Gather = struct {
-            boats: *Boats,
-            query: Box,
-            except: ?u32,
-            output: []Box,
-            count: usize = 0,
-            fn visit(gather: *@This(), entry: entities.space.Entry) anyerror!bool {
-                if (gather.except == entry.slot) return false;
-                if (gather.boats.boats.ptr(entry.slot).boat.removed) return false;
-                const box = boat_module.boxAt(entry.position);
-                if (!box.intersects(gather.query)) return false;
-                if (gather.count == gather.output.len) return true;
-                gather.output[gather.count] = box;
-                gather.count += 1;
-                return false;
-            }
-        };
-        var gather: Gather = .{ .boats = self, .query = query, .except = except, .output = output };
-        try self.places.space.each(world, .{ .min = query.min, .max = query.max }, self.kinds, &gather, Gather.visit);
-        return output[0..gather.count];
-    }
-
     /// Whether a pickable entity whose box meets `query` holds the point, as BoatItem.use asks of
-    /// Level.getEntities with EntitySelector.CAN_BE_PICKED: boats and mobs not removed.
+    /// Level.getEntities with EntitySelector.CAN_BE_PICKED.
     pub fn pickableHolds(self: *Boats, world: u32, query: Box, point: [3]f64) !bool {
         const Find = struct {
-            boats: *Boats,
             point: [3]f64,
             found: bool = false,
-            fn visit(find: *@This(), entry: entities.space.Entry) anyerror!bool {
-                const boats = find.boats;
-                const box = if (boats.kinds.has(entry.shape.kind)) box: {
-                    if (!boats.solid(entry.slot)) return false;
-                    break :box boat_module.boxAt(entry.position);
-                } else (try boats.deps.mobs.pickableBox(entry.slot)) orelse return false;
+            fn visit(context: *anyopaque, _: entities.space.Entry, box: Box) anyerror!bool {
+                const find: *@This() = @ptrCast(@alignCast(context));
                 // AABB.contains, the pick radius none.
                 for (0..3) |axis| if (!(find.point[axis] >= box.min[axis] and find.point[axis] < box.max[axis])) return false;
                 find.found = true;
                 return true;
             }
         };
-        var find: Find = .{ .boats = self, .point = point };
-        try self.places.space.each(world, .{ .min = query.min, .max = query.max }, self.kinds.with(self.deps.mobs.kinds), &find, Find.visit);
+        var find: Find = .{ .point = point };
+        try self.deps.collisions.each(world, query, body.no_slot, .pickable, .{ .context = &find, .visit = Find.visit });
         return find.found;
     }
 
-    /// CollisionGetter.noCollision for a boat about to be placed with its box there: no block
-    /// shape, no entity it would collide with, and not the world border's outside.
-    pub fn clear(self: *Boats, world: u32, box: Box, bottom: f64, except: ?u32) !bool {
+    /// CollisionGetter.noCollision for a boat with its box there, the one in `slot` or one about to
+    /// be placed: no block shape, no entity it would collide with, and not the world border's
+    /// outside.
+    pub fn clear(self: *Boats, world: u32, box: Box, bottom: f64, slot: u32) !bool {
         const level = self.deps.mobs.level(world);
-        if (!try body.noCollision(&level, box, .{ .bottom = bottom })) return false;
-        const Find = struct {
-            boats: *Boats,
-            box: Box,
-            except: ?u32,
-            found: bool = false,
-            fn visit(find: *@This(), entry: entities.space.Entry) anyerror!bool {
-                const boats = find.boats;
-                if (find.except == entry.slot) return false;
-                const other = if (boats.kinds.has(entry.shape.kind)) other: {
-                    if (!boats.solid(entry.slot)) return false;
-                    break :other boat_module.boxAt(entry.position);
-                } else (try boats.deps.mobs.pushableBox(entry.slot)) orelse return false;
-                if (!other.intersects(find.box)) return false;
-                find.found = true;
-                return true;
-            }
-        };
-        var find: Find = .{ .boats = self, .box = box.inflate(1.0e-7, 1.0e-7, 1.0e-7), .except = except };
-        try self.places.space.each(world, .{ .min = find.box.min, .max = find.box.max }, self.kinds.with(self.deps.mobs.kinds), &find, Find.visit);
-        if (find.found) return false;
-        const border = body.borderFor(&level, box, box) orelse return true;
-        for (border) |side| if (side.intersects(box)) return false;
-        return true;
+        return body.noCollision(&level, box, .{ .bottom = bottom, .slot = slot, .vehicle = true });
     }
 
     /// Before entities tick: boats near players come into memory.
@@ -623,7 +576,7 @@ pub const Boats = struct {
         defer self.ticking = null;
         // A boat a player steers is moved by its client: its tick traces the moves since the last.
         self.steering = .{ .steered = self.steeredBy(slot) != null, .movements = stored.steer.moves[0..stored.steer.move_count] };
-        try boat_module.tick(&level, self.around(state.world), state, &stored.boat, &self.work, &self.steering);
+        try boat_module.tick(&level, self.around(state.world, slot), state, &stored.boat, &self.work, &self.steering);
         stored.steer.move_count = 0;
         // AbstractBoat.tick: paddles turn only under a player.
         if (stored.riders.count == 0 and (stored.paddles[0] or stored.paddles[1])) stored.paddles = .{ false, false };
@@ -679,9 +632,9 @@ pub const Boats = struct {
                 }
                 const mobs = boats.deps.mobs;
                 const width = (try mobs.nearBoat(entry.slot, reach.box)) orelse return false;
-                if (boats.vehicleOfMob(entry.slot) == reach.slot) return false;
+                if (boats.deps.entities.vehicleOf(entry.slot) == reach.slot) return false;
                 const carrier = boats.boats.ptr(reach.slot);
-                if (boats.steeredBy(reach.slot) == null and carrier.riders.count < carrier.model.capacity() and !boats.carriesMob(entry.slot) and width < boat_module.box_width) {
+                if (boats.steeredBy(reach.slot) == null and carrier.riders.count < carrier.model.capacity() and boats.deps.entities.vehicleOf(entry.slot) == null and width < boat_module.box_width) {
                     try boats.mountMob(reach.slot, entry.slot);
                     return false;
                 }
@@ -693,10 +646,10 @@ pub const Boats = struct {
         try self.places.space.each(state.world, .{ .min = box.min, .max = box.max }, self.kinds.with(self.deps.mobs.kinds), &reach, Around.visit);
     }
 
-    fn around(self: *Boats, world: u32) boat_module.Around {
+    fn around(self: *Boats, world: u32, slot: u32) boat_module.Around {
         return .{
             .context = self,
-            .collisions = collisions,
+            .slot = slot,
             .hurt = hurtByWorld,
             .sound = sound,
             .destroy_block = destroyBlock,
@@ -707,41 +660,6 @@ pub const Boats = struct {
             .mob_griefing = self.deps.mobs.mobGriefing(),
             .ultrawarm = self.deps.mobs.ultrawarm(world),
         };
-    }
-
-    /// Level.getEntityCollisions for the boat ticking: AbstractBoat.canCollideWith, other boats and
-    /// whatever is pushable, living mobs off climbables and players not spectating.
-    fn collisions(context: *anyopaque, query: Box, output: []Box) anyerror![]Box {
-        const self: *Boats = @ptrCast(@alignCast(context));
-        const ticking = self.ticking.?;
-        const state = self.deps.entities.body(ticking.slot).?;
-        const Gather = struct {
-            boats: *Boats,
-            query: Box,
-            except: u32,
-            output: []Box,
-            count: usize = 0,
-            fn visit(gather: *@This(), entry: entities.space.Entry) anyerror!bool {
-                if (entry.slot == gather.except) return false;
-                const boats = gather.boats;
-                const box = if (boats.kinds.has(entry.shape.kind)) box: {
-                    if (boats.boats.ptr(entry.slot).boat.removed) return false;
-                    break :box boat_module.boxAt(entry.position);
-                } else box: {
-                    // AbstractBoat.canCollideWith passes over what rides it.
-                    if (boats.vehicleOfMob(entry.slot) == gather.except) return false;
-                    break :box (try boats.deps.mobs.pushableBox(entry.slot)) orelse return false;
-                };
-                if (!box.intersects(gather.query)) return false;
-                if (gather.count == gather.output.len) return true;
-                gather.output[gather.count] = box;
-                gather.count += 1;
-                return false;
-            }
-        };
-        var gather: Gather = .{ .boats = self, .query = query, .except = ticking.slot, .output = output };
-        try self.places.space.each(state.world, .{ .min = query.min, .max = query.max }, self.kinds.with(self.deps.mobs.kinds), &gather, Gather.visit);
-        return output[0..gather.count];
     }
 
     fn hurtByWorld(context: *anyopaque, amount: f32) anyerror!bool {
@@ -802,8 +720,8 @@ pub const Boats = struct {
     /// AbstractChestBoat.openCustomInventoryScreen: the inventory key of a chest boat's rider.
     fn openRidden(context: *anyopaque, player_slot: usize) anyerror!void {
         const self: *Boats = @ptrCast(@alignCast(context));
-        const ridden = self.deps.players.records[player_slot].vehicle orelse return;
-        const slot = self.boats.slotOf(ridden) orelse return;
+        const slot = self.deps.players.vehicleOf(player_slot) orelse return;
+        if (!self.isBoat(slot)) return;
         if (self.boats.ptr(slot).model.chest) try self.openChest(player_slot, slot);
     }
 
@@ -876,14 +794,14 @@ pub const Boats = struct {
     /// it is and what it rides.
     fn mount(self: *Boats, player_slot: usize, slot: u32) !bool {
         const player = &self.deps.players.records[player_slot];
-        const entity = self.deps.entities.directory.entry(slot).id;
-        if (player.vehicle == entity) return false;
+        const players = self.deps.players;
+        if (players.vehicleOf(player_slot) == slot) return false;
         // Entity.canRide: not sneaking, and not just off a vehicle.
         if (player.flags.sneaking or self.now < self.boarding[player_slot]) return false;
         if (!self.roomFor(slot)) return false;
-        if (player.vehicle) |other| if (self.boats.slotOf(other)) |was| try self.dismount(was, self.riderIndex(was, .{ .player = .{ .slot = player_slot, .generation = player.handle.?.generation, .life = player.life } }) orelse return false);
+        if (players.vehicleOf(player_slot)) |was| if (self.isBoat(was)) try self.dismount(was, self.riderIndex(was, .{ .player = .{ .slot = player_slot, .generation = player.handle.?.generation, .life = player.life } }) orelse return false);
         const at = self.board(slot, .{ .player = .{ .slot = player_slot, .generation = player.handle.?.generation, .life = player.life } });
-        player.vehicle = entity;
+        self.deps.entities.ride(players.entitySlot(player_slot).?, slot);
         // ServerPlayer.startRiding: placed where the boat seats it, its client teleported there and
         // told what it rides.
         try self.deps.players.placeRider(player_slot, toPosition(self.seatOf(slot, at)));
@@ -898,8 +816,7 @@ pub const Boats = struct {
         if (self.now < self.mob_boarding[mob]) return;
         if (!self.roomFor(slot)) return;
         _ = self.board(slot, .{ .mob = .{ .slot = mob, .id = self.deps.entities.directory.entry(mob).id } });
-        self.mob_vehicles[mob] = slot;
-        self.riding_mobs.insert(mob);
+        self.deps.entities.ride(mob, slot);
     }
 
     /// AbstractBoat.canAddPassenger: room for one more, its eyes out of the water.
@@ -926,24 +843,19 @@ pub const Boats = struct {
 
     /// A mob whose slot is freed rides nothing, so what next takes the slot does not.
     pub fn forgetMob(self: *Boats, mob: u32) void {
-        if (!self.riding_mobs.contains(mob)) return;
-        const slot = self.mob_vehicles[mob];
+        const slot = self.deps.entities.vehicleOf(mob) orelse return;
+        if (!self.isBoat(slot)) return;
         const stored = self.boats.ptr(slot);
         for (stored.riders.list[0..stored.riders.count], 0..) |rider, at| if (rider == .mob and rider.mob.slot == mob) {
             self.letGo(slot, at);
             return;
         };
-        self.riding_mobs.remove(mob);
+        self.deps.entities.alight(mob);
     }
 
-    /// Whether a boat carries the mob in a slot.
-    pub fn carriesMob(self: *const Boats, mob: u32) bool {
-        return self.riding_mobs.contains(mob);
-    }
-
-    /// The boat a mob rides, if it rides one.
-    pub fn vehicleOfMob(self: *const Boats, mob: u32) ?u32 {
-        return if (self.riding_mobs.contains(mob)) self.mob_vehicles[mob] else null;
+    /// Whether the entity in a slot is a boat.
+    fn isBoat(self: *const Boats, slot: u32) bool {
+        return self.kinds.has(self.deps.entities.directory.entry(slot).kind);
     }
 
     /// Entity.positionRider with AbstractBoat.getPassengerAttachmentPoint: where the boat seats its
@@ -1020,8 +932,7 @@ pub const Boats = struct {
             .player => |who| {
                 const player = &self.deps.players.records[who.slot];
                 const handle = player.handle orelse return false;
-                const entity = self.deps.entities.directory.entry(slot).id;
-                return handle.generation == who.generation and player.life == who.life and player.inWorld() and player.vehicle == entity and
+                return handle.generation == who.generation and player.life == who.life and player.inWorld() and self.deps.players.vehicleOf(who.slot) == slot and
                     player.world == self.deps.entities.body(slot).?.world and self.deps.player_states.of(player).health > 0;
             },
             .mob => |carried| {
@@ -1042,10 +953,10 @@ pub const Boats = struct {
         switch (rider) {
             .player => |who| {
                 const player = &self.deps.players.records[who.slot];
-                const entity = self.deps.entities.directory.entry(slot).id;
-                if (player.handle != null and player.handle.?.generation == who.generation and player.vehicle == entity) player.vehicle = null;
+                if (player.handle != null and player.handle.?.generation == who.generation and self.deps.players.vehicleOf(who.slot) == slot) self.deps.entities.alight(self.deps.players.entitySlot(who.slot).?);
             },
-            .mob => |carried| self.riding_mobs.remove(carried.slot),
+            // The slot may be another's by now, which rides what it rides.
+            .mob => |carried| if (self.deps.entities.vehicleOf(carried.slot) == slot) self.deps.entities.alight(carried.slot),
         }
     }
 
@@ -1060,14 +971,14 @@ pub const Boats = struct {
         switch (rider) {
             .player => |who| {
                 const player = &self.deps.players.records[who.slot];
-                player.vehicle = null;
+                self.deps.entities.alight(self.deps.players.entitySlot(who.slot).?);
                 self.boarding[who.slot] = self.now + 60;
                 self.tellRider(who.slot, slot);
                 const position = try self.dismountLocation(slot, .{ player.position.x, player.position.y, player.position.z }, player.rotation.yaw, 0.6, &.{ 1.8, 1.5, 0.6 });
                 try self.deps.players.teleport(player, player.world, toPosition(position), player.rotation);
             },
             .mob => |carried| {
-                self.riding_mobs.remove(carried.slot);
+                self.deps.entities.alight(carried.slot);
                 self.mob_boarding[carried.slot] = self.now + 60;
                 const mob = try self.deps.mobs.inSlot(carried.slot);
                 const width = living.width(self.deps.mobs, mob);
@@ -1118,7 +1029,7 @@ pub const Boats = struct {
             // Its dismount poses, each tried on every floor.
             for (heights) |tall| for (floors[0..found]) |y| {
                 const room = body.makeBox(.{ x, y, z }, width, tall);
-                if (try body.noCollision(&level, room, .{ .bottom = y })) return .{ x, y, z };
+                if (try body.canDismountTo(&level, room, .{ .bottom = y })) return .{ x, y, z };
             };
         }
         return .{ state.position[0], top, state.position[2] };
@@ -1192,8 +1103,8 @@ pub const Boats = struct {
     fn steered(self: *Boats, handle: sessions.Handle) ?u32 {
         const player = &self.deps.players.records[handle.index];
         if (player.stage != .ready) return null;
-        const entity = player.vehicle orelse return null;
-        const slot = self.boats.slotOf(entity) orelse return null;
+        const slot = self.deps.players.vehicleOf(handle.index) orelse return null;
+        if (!self.isBoat(slot)) return null;
         if (self.steeredBy(slot) != handle.index) return null;
         return slot;
     }
@@ -1227,7 +1138,7 @@ pub const Boats = struct {
         self.ticking = .{ .slot = slot };
         defer self.ticking = null;
         const step: [3]f64 = .{ to[0] - stored.steer.last_good[0], to[1] - stored.steer.last_good[1], to[2] - stored.steer.last_good[2] };
-        const kept = try boat_module.moveBy(&level, self.around(state.world), state, &stored.boat, step, &self.work);
+        const kept = try boat_module.moveBy(&level, self.around(state.world, slot), state, &stored.boat, step);
         // Moved wrongly: the move fell short of where the client says by more than a quarter
         // block across. Up and down never count.
         const off_x = to[0] - state.position[0];
@@ -1274,10 +1185,8 @@ pub const Boats = struct {
             const piece = shape.get(index);
             if (piece.intersects(now) and !piece.intersects(was)) return true;
         };
-        self.ticking = .{ .slot = slot };
-        defer self.ticking = null;
-        var room: [boat_module.Scratch.max_others]Box = undefined;
-        for (try collisions(self, now, &room)) |other| if (!other.intersects(was)) return true;
+        const context: body.Context = .{ .bottom = old_box.min[1], .slot = slot, .vehicle = true };
+        for (try body.entityCollisions(&level, now, context, &level.colliders.?.entity_boxes)) |other| if (!other.intersects(was)) return true;
         if (body.borderFor(&level, now, now)) |border| for (border) |side| if (side.intersects(now) and !side.intersects(was)) return true;
         return false;
     }

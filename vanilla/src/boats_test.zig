@@ -94,14 +94,11 @@ const Quiet = struct {
     terrain: *Terrain,
 
     fn around(self: *Quiet) boat_module.Around {
-        return .{ .context = self, .collisions = collisions, .hurt = hurt, .sound = sound, .destroy_block = change, .break_block = breakBlock, .lower_cauldron = change, .eject = eject, .level_random = &self.level_random };
+        return .{ .context = self, .slot = body.no_slot, .hurt = hurt, .sound = sound, .destroy_block = change, .break_block = breakBlock, .lower_cauldron = change, .eject = eject, .level_random = &self.level_random };
     }
     fn breakBlock(context: *anyopaque, _: u32, position: [3]i32) anyerror!void {
         const self: *Quiet = @ptrCast(@alignCast(context));
         self.terrain.put(position[0], position[1], position[2], try stateOf("minecraft:air"));
-    }
-    fn collisions(_: *anyopaque, _: body.Box, output: []body.Box) anyerror![]body.Box {
-        return output[0..0];
     }
     fn hurt(_: *anyopaque, _: f32) anyerror!bool {
         return error.UnexpectedHurt;

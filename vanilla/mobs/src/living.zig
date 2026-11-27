@@ -48,6 +48,13 @@ pub fn context(mob: Mob) body.Context {
     return .{ .bottom = mob.motion.position[1], .fall_distance = mob.motion.fall_distance };
 }
 
+/// The context of a mob moving or asking for room: its own, which other entities meet too.
+pub fn moverContext(mobs: *const Mobs, mob: Mob) body.Context {
+    var result = context(mob);
+    result.slot = mobs.slotOf(mob.entity.id).?;
+    return result;
+}
+
 fn lengthSquared(vector: [3]f64) f64 {
     return vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2];
 }
@@ -76,8 +83,7 @@ pub fn move(mobs: *Mobs, mob: Mob, requested_in: [3]f64) !void {
     const level = mobs.level(mob.motion.world);
     const traits = mobs.traits(mob.entity.species);
     const start = box(mobs, mob);
-    const others = try mobs.collisionsOf(mob, start.expandTowards(requested));
-    const moved = try body.collide(&level, start, requested, context(mob), others, mob.motion.on_ground, @floatCast(traits.attribute(.step_height)));
+    const moved = try body.collide(&level, start, requested, moverContext(mobs, mob), mob.motion.on_ground, @floatCast(traits.attribute(.step_height)));
     const moved_squared = lengthSquared(moved);
     if (moved_squared > 1.0e-7 or lengthSquared(requested) - moved_squared < 1.0e-7) {
         if (mob.motion.fall_distance != 0 and moved_squared >= 1.0) {
@@ -480,19 +486,9 @@ fn handleOnClimbable(mobs: *Mobs, mob: Mob) !void {
 pub fn onClimbable(mobs: *Mobs, mob: Mob) !bool {
     const level = mobs.level(mob.motion.world);
     const at = mob.blockPosition();
-    const entry = level.blocks.get(try level.state(at[0], at[1], at[2]));
-    if (entry.flags.climbable) {
-        mob.living.last_climbable = at;
-        return true;
-    }
-    if (entry.flags.trapdoor and entry.flags.open) {
-        const below = level.blocks.get(try level.state(at[0], at[1] - 1, at[2]));
-        if (below.kind == .ladder and below.facing == entry.facing) {
-            mob.living.last_climbable = at;
-            return true;
-        }
-    }
-    return false;
+    if (!try body.climbableAt(&level, at)) return false;
+    mob.living.last_climbable = at;
+    return true;
 }
 
 /// Entity.moveRelative with Entity.getInputVector.
@@ -511,8 +507,7 @@ pub fn moveRelative(mob: Mob, speed: f32, input: [3]f32) void {
 pub fn isFree(mobs: *Mobs, mob: Mob, offset: [3]f64) !bool {
     const level = mobs.level(mob.motion.world);
     const moved = box(mobs, mob).move(offset);
-    if (!try body.noCollision(&level, moved, context(mob))) return false;
-    if ((try mobs.collisionsOf(mob, moved)).len > 0) return false;
+    if (!try body.noCollision(&level, moved, moverContext(mobs, mob))) return false;
     return !try containsLiquid(&level, moved);
 }
 

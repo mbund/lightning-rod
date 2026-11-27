@@ -127,11 +127,11 @@ fn writeData(_: *BoatReplication, entries: *entity_sync.Entries, data: BoatData,
     if (changes.contains(.bubble_time)) try entries.putInt(13, data.bubble_time);
 }
 
-fn carrying(context: *anyopaque, vehicle: u64) ?Replication.Carrying {
+fn carrying(context: *anyopaque, vehicle: u32) ?Replication.Carrying {
     const self: *BoatReplication = @ptrCast(@alignCast(context));
     const boats = self.deps.boats;
-    const slot = boats.boats.slotOf(vehicle) orelse return null;
-    return .{ .id = entities.Entities.networkOfSlot(slot), .passengers = boats.passengersOf(slot) };
+    if (!boats.kinds.has(boats.deps.entities.directory.entry(vehicle).kind)) return null;
+    return .{ .id = entities.Entities.networkOfSlot(vehicle), .passengers = boats.passengersOf(vehicle) };
 }
 
 fn passengers(self: *BoatReplication, slot: u32) entity_sync.Passengers {

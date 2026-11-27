@@ -33,6 +33,8 @@ pub const Entry = struct {
     space_column: u32 = none,
     space_block: u32 = 0,
     space_row: u16 = 0,
+    /// The slot of what it rides, Entity.vehicle, none riding nothing. Freed with the slot.
+    vehicle: u32 = none,
     /// While the slot is free, the one let go after it.
     next_free: u32 = none,
     /// Whether clients still know the entity, so the slot, and with it the network id, stays

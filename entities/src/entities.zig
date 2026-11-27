@@ -395,6 +395,32 @@ pub const Entities = struct {
         ((try self.bodyById(entity)) orelse unreachable).* = state;
     }
 
+    // Riding, which every kind shares: what an entity rides, by slot.
+
+    /// Entity.getVehicle.
+    pub fn vehicleOf(self: *const Entities, slot: u32) ?u32 {
+        const vehicle = self.directory.entry(slot).vehicle;
+        return if (vehicle == directory.none) null else vehicle;
+    }
+
+    /// Entity.startRiding's link, made by the kind that carries it.
+    pub fn ride(self: *Entities, rider: u32, vehicle: u32) void {
+        assert(rider != vehicle and self.directory.entry(vehicle).vehicle == directory.none);
+        self.directory.entry(rider).vehicle = vehicle;
+    }
+
+    /// Entity.removeVehicle's link undone.
+    pub fn alight(self: *Entities, rider: u32) void {
+        self.directory.entry(rider).vehicle = directory.none;
+    }
+
+    /// Entity.getRootVehicle: what it rides at the bottom, or itself.
+    pub fn rootOf(self: *const Entities, slot: u32) u32 {
+        var root = slot;
+        while (self.vehicleOf(root)) |vehicle| root = vehicle;
+        return root;
+    }
+
     pub fn hasById(self: *Entities, entity: Id) bool {
         const slot = self.directory.slotOf(entity) orelse return false;
         return self.body(slot) != null;
