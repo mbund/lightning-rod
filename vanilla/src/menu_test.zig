@@ -23,6 +23,7 @@ const item_data = @import("vanilla_items").item_data;
 const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
 const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
 const Experience = @import("vanilla_survival").experience.Experience;
+const orb_hazards = @import("vanilla_survival").orb_hazards;
 const ExperienceState = @import("vanilla_player").experience_state.State;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
 const Random = @import("vanilla_content").random.Random;
@@ -443,6 +444,8 @@ test "orb placement fluid currents block effects and fire follow vanilla physics
     const experience = containers.deps.experience;
     const world = fixture.players.records[0].world;
     fixture.player_states.records[0].gamemode = .spectator;
+    // Near the orbs, it hears what they do.
+    fixture.players.records[0].protocol = selected[0].number;
     fixture.players.records[0].position = .{ .x = 8, .y = 8, .z = 8 };
     try fixture.players.rebuildIndexes();
     try containers.deps.chunks.setBlock(world, .{ .x = 0, .y = 8, .z = 0 }, @intCast(game_data.registry.blockStateId("minecraft:stone").?));
@@ -483,21 +486,25 @@ test "orb placement fluid currents block effects and fire follow vanilla physics
     var moving = (try bodyOf(experience, second));
     moving.position = .{ 12.5, 8, 4.5 };
     moving.velocity = .{ 0, 0, 0 };
-    const lifted = try experience.deps.physics.advanceOrb(&window, 1, 1, moving, false, .{ 0, 0, 0 });
+    var subject: orb_hazards.Subject = .{ .world = world, .old_position = moving.position, .health = 5, .fire_ticks = 0, .ticks_frozen = 0 };
+    var hook: orb_hazards.Hook = .{ .hazards = &experience.hazards, .level = &window, .subject = &subject };
+    const lifted = try experience.deps.physics.advanceOrb(&window, 1, 1, moving, false, .{ 0, 0, 0 }, hook.physics());
     try std.testing.expectApproxEqAbs(@as(f64, 0.1) * @as(f64, @as(f32, 0.98)), lifted.body.velocity[1], 1e-12);
     moving.position = .{ 14.5, 8.5, 4.5 };
     moving.velocity = .{ 0.1, -0.03, 0.1 };
-    const stuck = try experience.deps.physics.advanceOrb(&window, 1, 1, moving, false, .{ 0.25, 0.05, 0.25 });
-    try std.testing.expectEqual(@as([3]f64, .{ 0.25, 0.05, 0.25 }), stuck.effects.stuck);
+    subject.old_position = moving.position;
+    const stuck = try experience.deps.physics.advanceOrb(&window, 1, 1, moving, false, .{ 0.25, 0.05, 0.25 }, hook.physics());
+    // WebBlock holds by 0.05F.
+    try std.testing.expectEqual(@as([3]f64, .{ 0.25, @as(f32, 0.05), 0.25 }), subject.stuck);
     try std.testing.expectApproxEqAbs(@as(f64, 14.525), stuck.body.position[0], 1e-12);
     try std.testing.expectApproxEqAbs(@as(f64, 8.4985), stuck.body.position[1], 1e-12);
     try std.testing.expectEqual(@as([3]f64, .{ 0, 0, 0 }), stuck.body.velocity);
     try containers.deps.chunks.setBlock(world, .{ .x = 20, .y = 8, .z = 4 }, @intCast(game_data.registry.blockStateId("minecraft:honey_block").?));
     moving.position = .{ 21.2, 8.5, 4.5 };
     moving.velocity = .{ 0, -0.3, 0.1 };
-    const sliding = try experience.deps.physics.advanceOrb(&window, 1, 1, moving, false, .{ 0, 0, 0 });
+    subject.old_position = moving.position;
+    const sliding = try experience.deps.physics.advanceOrb(&window, 1, 1, moving, false, .{ 0, 0, 0 }, hook.physics());
     const drag = @as(f64, @as(f32, 0.98));
-    try std.testing.expect(sliding.effects.honey);
     try std.testing.expectApproxEqAbs((-0.05 - 0.08) * drag * drag, sliding.body.velocity[1], 1e-12);
 }
 
@@ -671,6 +678,10 @@ fn blockContainers(allocator: std.mem.Allocator, store: *storage.Store, registry
     const terrain = try chunks.Chunks.init(allocator, std.testing.io, .{ .edit_sections = 1, .simulation_sections = 64, .cache_sections = 96, .cache_groups = 4 }, .{ .storage = try store.openSpace("chunks"), .metrics = registry, .record_workspaces = resources });
     const domains = try Domains.init(allocator, .{}, .{ .players = fixture.players });
     _ = try EntityColumns.init(allocator, .{}, .{ .domains = domains, .entities = fixture.bodies });
+    // Orbs make sounds, which go to the players near them.
+    const sender = try packets.Packets.init(allocator, .{ .sessions = fixture.service });
+    fixture.players.deps.packets = sender;
+    const physics = try test_levels.itemPhysics(allocator, fixture.definitions.blocks, terrain, fixture.players.deps.worlds);
     const experience = try Experience.init(allocator, .{}, .{
         .enchantments = fixture.definitions.enchantments,
         .dimensions = fixture.definitions.dimensions,
@@ -678,7 +689,8 @@ fn blockContainers(allocator: std.mem.Allocator, store: *storage.Store, registry
         .player_states = fixture.player_states,
         .world_border = fixture.world_border,
         .entities = fixture.bodies,
-        .physics = try test_levels.itemPhysics(allocator, fixture.definitions.blocks, terrain, fixture.players.deps.worlds),
+        .physics = physics,
+        .block_edits = try test_levels.blockEdits(allocator, physics, fixture.players),
         .inventories = fixture.ownership,
         .inventory = fixture.menu,
         .storage = try store.openSpace("experience"),
@@ -702,7 +714,7 @@ fn blockContainers(allocator: std.mem.Allocator, store: *storage.Store, registry
         .actions = try BlockActions.init(allocator, .{}),
         .dropped = fixture.dropped,
         .sessions = fixture.service,
-        .packets = try packets.Packets.init(allocator, .{ .sessions = fixture.service }),
+        .packets = sender,
         .storage = try store.openSpace("containers"),
         .record_workspaces = resources,
     });

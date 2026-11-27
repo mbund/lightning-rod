@@ -150,26 +150,7 @@ pub const ItemEntities = struct {
 
     /// What can hold back an item's next move: the blocks whose makeStuckInBlock reaches what
     /// is not living.
-    pub const Stuck = enum(u8) {
-        none,
-        cobweb,
-        powder_snow,
-
-        pub fn multiplier(self: Stuck) [3]f64 {
-            return switch (self) {
-                .none => .{ 0, 0, 0 },
-                .cobweb => .{ 0.25, @as(f32, 0.05), 0.25 },
-                .powder_snow => .{ @as(f32, 0.9), 1.5, @as(f32, 0.9) },
-            };
-        }
-
-        pub fn of(multiplier_value: [3]f64) Stuck {
-            inline for (.{ Stuck.none, Stuck.cobweb, Stuck.powder_snow }) |each| {
-                if (std.meta.eql(multiplier_value, each.multiplier())) return each;
-            }
-            unreachable;
-        }
-    };
+    pub const Stuck = @import("vanilla_bodies").block_effects.Stuck;
 
     /// An item in memory: its state, and where its record in the store lies, which a move to
     /// another column leaves behind until the next save.

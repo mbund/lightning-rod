@@ -503,7 +503,9 @@ fn blockSpeedFactor(level: *const body.Level, position: [3]f64, boat: *const Boa
 
 /// Entity.applyEffectsFromBlocks over the movements recorded, or from where the tick began when none.
 fn applyEffects(level: *const body.Level, around: Around, state: *entities.State, boat: *Boat, scratch: *Scratch, recorded: []const block_effects.Movement) !void {
-    _ = try block_effects.apply(Host{ .level_view = level, .around = around, .held = boat, .room = scratch }, Subject.of(state, boat), recorded);
+    const context: EffectsContext = .{ .level = level, .around = around, .held = boat, .position = state.position };
+    const host = effectsHost(&context, scratch);
+    _ = try block_effects.apply(*const EffectsContext, &host, effectsSubject(state, boat), recorded);
 }
 
 /// AbstractBoat.tickBubbleColumn on the server: a boat over a bubble column long enough is thrown
@@ -553,105 +555,81 @@ fn lengthSquared(vector: [3]f64) f64 {
     return vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2];
 }
 
-/// What the shared block effects read and change of a boat.
-const Subject = struct {
-    world: *u32,
-    position: *[3]f64,
-    old_position: *[3]f64,
-    velocity: *[3]f64,
-    on_ground: *bool,
-    fall_distance: *f64,
-    stuck: *[3]f64,
-    removed: *bool,
-    fire_ticks: *i32,
-    ticks_frozen: *i32,
-    in_powder_snow: *bool,
+/// The boat as the shared block effects' host sees it: not living, and not immune to fire.
+const EffectsContext = struct { level: *const body.Level, around: Around, held: *Boat, position: [3]f64 };
+const EffectsHost = block_effects.Host(*const EffectsContext);
 
-    fn of(state: *entities.State, boat: *Boat) Subject {
-        return .{
-            .world = &state.world,
-            .position = &state.position,
-            .old_position = &boat.old_position,
-            .velocity = &state.velocity,
-            .on_ground = &boat.on_ground,
-            .fall_distance = &boat.fall_distance,
-            .stuck = &boat.stuck,
-            .removed = &boat.removed,
-            .fire_ticks = &boat.fire_ticks,
-            .ticks_frozen = &boat.ticks_frozen,
-            .in_powder_snow = &boat.in_powder_snow,
-        };
-    }
-};
+fn effectsSubject(state: *entities.State, boat: *Boat) block_effects.Subject {
+    return .{
+        .world = state.world,
+        .position = state.position,
+        .old_position = boat.old_position,
+        .on_ground = boat.on_ground,
+        .removed = boat.removed,
+        .width = box_width,
+        .height = box_height,
+        .velocity = &state.velocity,
+        .fall_distance = &boat.fall_distance,
+        .stuck = &boat.stuck,
+        .fire_ticks = &boat.fire_ticks,
+        .ticks_frozen = &boat.ticks_frozen,
+        .in_powder_snow = &boat.in_powder_snow,
+    };
+}
 
-/// The boat as the host of the shared block effects: not living, and not immune to fire.
-const Host = struct {
-    pub const living = false;
-    pub const boat = true;
-    level_view: *const body.Level,
-    around: Around,
-    held: *Boat,
-    room: *Scratch,
+fn effectsHost(context: *const EffectsContext, scratch: *Scratch) EffectsHost {
+    return .{
+        .context = context,
+        .level = context.level,
+        .scratch = &scratch.effects,
+        .random = &context.held.random,
+        .level_random = context.around.level_random,
+        .mob_griefing = context.around.mob_griefing,
+        .alive = EffectsAnswers.alive,
+        .fire_immune = EffectsAnswers.fireImmune,
+        .on_position = EffectsAnswers.onPosition,
+        .hurt = EffectsAnswers.hurt,
+        .play_sound = EffectsAnswers.playSound,
+        .destroy_block = EffectsAnswers.destroyBlock,
+        .lower_cauldron = EffectsAnswers.lowerCauldron,
+        .above_bubble_column = EffectsAnswers.aboveBubbleColumn,
+        .break_lily_pad = EffectsAnswers.breakLilyPad,
+    };
+}
 
-    pub fn level(self: Host, _: u32) body.Level {
-        return self.level_view.*;
+const EffectsAnswers = struct {
+    fn alive(context: *const EffectsContext) bool {
+        return !context.held.removed;
     }
-    pub fn scratch(self: Host) *block_effects.Scratch {
-        return &self.room.effects;
-    }
-    pub fn width(_: Host, _: Subject) f32 {
-        return box_width;
-    }
-    pub fn height(_: Host, _: Subject) f32 {
-        return box_height;
-    }
-    pub fn alive(self: Host, _: Subject) bool {
-        return !self.held.removed;
-    }
-    pub fn fireImmune(_: Host, _: Subject) error{}!bool {
+    fn fireImmune(_: *const EffectsContext) anyerror!bool {
         return false;
     }
-    pub fn onPosition(self: Host, subject: Subject, depth: f32) ![3]i32 {
-        return onPositionOf(self.level_view, subject.position.*, self.held, depth);
+    fn onPosition(context: *const EffectsContext, depth: f32) anyerror![3]i32 {
+        return onPositionOf(context.level, context.position, context.held, depth);
     }
-    pub fn hurt(self: Host, _: Subject, _: block_effects.Damage, amount: f32) !bool {
-        return self.around.hurt(self.around.context, amount);
+    /// What kind of damage it is counts for nothing to a boat.
+    fn hurt(context: *const EffectsContext, _: block_effects.Damage, amount: f32) anyerror!bool {
+        return context.around.hurt(context.around.context, amount);
     }
-    pub fn playSound(self: Host, _: Subject, sound: block_effects.Sound, volume: f32, pitch: f32) void {
+    fn playSound(context: *const EffectsContext, sound: block_effects.Sound, volume: f32, pitch: f32) void {
         const kind: Sound = switch (sound) {
             inline else => |tag| @field(Sound, @tagName(tag)),
         };
-        self.around.sound(self.around.context, kind, volume, pitch);
+        context.around.sound(context.around.context, kind, volume, pitch);
     }
-    pub fn random(self: Host, _: Subject) *JavaRandom {
-        return &self.held.random;
+    fn destroyBlock(context: *const EffectsContext, position: [3]i32) anyerror!void {
+        return context.around.destroy_block(context.around.context, context.level.world, position);
     }
-    pub fn levelRandom(self: Host) *JavaRandom {
-        return self.around.level_random;
+    fn lowerCauldron(context: *const EffectsContext, position: [3]i32) anyerror!void {
+        return context.around.lower_cauldron(context.around.context, context.level.world, position);
     }
-    pub fn mobGriefing(self: Host) bool {
-        return self.around.mob_griefing;
+    fn breakLilyPad(context: *const EffectsContext, position: [3]i32) anyerror!void {
+        return context.around.break_block(context.around.context, context.level.world, position);
     }
-    pub fn destroyBlock(self: Host, world: u32, position: [3]i32) !void {
-        return self.around.destroy_block(self.around.context, world, position);
-    }
-    pub fn lowerCauldron(self: Host, world: u32, position: [3]i32) !void {
-        return self.around.lower_cauldron(self.around.context, world, position);
-    }
-    pub fn breakBlock(self: Host, world: u32, position: [3]i32) !void {
-        return self.around.break_block(self.around.context, world, position);
-    }
-    /// Turtle eggs crack under the living alone.
-    pub fn crackTurtleEgg(_: Host, _: u32, _: [3]i32, _: u16) !void {
-        unreachable;
-    }
-    /// Honey slide effects are for the living alone.
-    pub fn entityEvent(_: Host, _: Subject, _: u8) void {
-        unreachable;
-    }
-    pub fn onAboveBubbleColumn(self: Host, _: Subject, drag: bool, _: [3]i32) !void {
-        aboveBubbleColumn(self.held, drag);
+    fn aboveBubbleColumn(context: *const EffectsContext, drag: bool, _: [3]i32) anyerror!void {
+        aboveBubbleColumnOf(context.held, drag);
     }
 };
 
+const aboveBubbleColumnOf = aboveBubbleColumn;
 const onPositionOf = onPosition;

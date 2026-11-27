@@ -5,7 +5,6 @@
 
 const std = @import("std");
 const game_data = @import("game_data");
-const chunks = @import("chunks");
 const entities = @import("entities");
 const inventories = @import("inventories");
 const encoding = game_data.encoding;
@@ -13,6 +12,7 @@ const bodies = @import("vanilla_bodies");
 const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
 const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
 const Levels = bodies.levels.Levels;
+const BlockEdits = bodies.block_edits.BlockEdits;
 const Items = @import("vanilla_items").items.Items;
 const ClientRegistries = @import("vanilla_content").client_registries.ClientRegistries;
 const Blocks = @import("vanilla_content").blocks.Blocks;
@@ -60,7 +60,6 @@ pub const Hazards = struct {
     sound_seeds: std.Random.DefaultPrng,
 
     pub const Dependencies = struct {
-        chunks: *chunks.Chunks,
         blocks: *Blocks,
         items: *Items,
         client: *ClientRegistries,
@@ -68,6 +67,7 @@ pub const Hazards = struct {
         worlds: *worlds.Worlds,
         inventories: *inventories.Inventories,
         levels: *Levels,
+        block_edits: *BlockEdits,
     };
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !Hazards {
@@ -96,7 +96,10 @@ pub const Hazards = struct {
     /// Entity.applyEffectsFromBlocks for an item that moved this tick.
     pub fn apply(self: *Hazards, subject: *Subject, from: [3]f64) !void {
         const movement: effects.Movement = .{ .from = from, .to = subject.position, .axis_independent = true };
-        _ = try effects.apply(Host{ .hazards = self }, subject, &.{movement});
+        const context: Context = .{ .hazards = self, .subject = subject };
+        const level_view = self.level(subject.world);
+        const host = hostOf(&context, &level_view);
+        _ = try effects.apply(*const Context, &host, subjectOf(subject), &.{movement});
     }
 
     /// ItemEntity.isFireImmune: a stack that in_fire does not hurt.
@@ -146,10 +149,6 @@ pub const Hazards = struct {
     fn level(self: *Hazards, world: u32) bodies.body.Level {
         return self.deps.levels.level(world);
     }
-
-    fn edit(self: *Hazards, world: u32, position: [3]i32, state: u16) !void {
-        try self.deps.chunks.setBlock(world, .{ .x = position[0], .y = position[1], .z = position[2] }, state);
-    }
 };
 
 /// What ItemPhysics.advance calls once an item moved: the effects of the blocks it crossed.
@@ -179,85 +178,79 @@ pub const Hook = struct {
     }
 };
 
-/// Hazards as the host of the shared block effects, for items, which are not living.
-const Host = struct {
-    pub const living = false;
-    pub const boat = false;
-    hazards: *Hazards,
+/// An item as the shared block effects' host sees it: not living.
+const Context = struct { hazards: *Hazards, subject: *Subject };
+const Host = effects.Host(*const Context);
 
-    pub fn level(self: Host, world: u32) bodies.body.Level {
-        return self.hazards.level(world);
+fn hostOf(context: *const Context, level: *const bodies.body.Level) Host {
+    return .{
+        .context = context,
+        .level = level,
+        .scratch = &context.hazards.scratch,
+        .random = &context.hazards.random,
+        .level_random = &context.hazards.level_random,
+        // The mobGriefing game rule, which this server keeps at vanilla's default.
+        .mob_griefing = true,
+        .alive = Answers.alive,
+        .fire_immune = Answers.fireImmune,
+        .on_position = Answers.onPosition,
+        .hurt = Answers.hurt,
+        .play_sound = Answers.playSound,
+        .destroy_block = Answers.destroyBlock,
+        .lower_cauldron = Answers.lowerCauldron,
+    };
+}
+
+fn subjectOf(subject: *Subject) effects.Subject {
+    return .{
+        .world = subject.world,
+        .position = subject.position,
+        .old_position = subject.old_position,
+        .on_ground = subject.on_ground,
+        .removed = subject.removed,
+        .width = 0.25,
+        .height = 0.25,
+        .velocity = &subject.velocity,
+        .fall_distance = &subject.fall_distance,
+        .stuck = &subject.stuck,
+        .fire_ticks = &subject.fire_ticks,
+        .ticks_frozen = &subject.ticks_frozen,
+        .in_powder_snow = &subject.in_powder_snow,
+    };
+}
+
+const Answers = struct {
+    fn alive(context: *const Context) bool {
+        return !context.subject.removed;
     }
-    pub fn scratch(self: Host) *effects.Scratch {
-        return &self.hazards.scratch;
-    }
-    pub fn width(_: Host, _: *const Subject) f32 {
-        return 0.25;
-    }
-    pub fn height(_: Host, _: *const Subject) f32 {
-        return 0.25;
-    }
-    pub fn alive(_: Host, subject: *const Subject) bool {
-        return !subject.removed;
-    }
-    pub fn fireImmune(self: Host, subject: *Subject) !bool {
-        return self.hazards.fireImmune(subject);
+    fn fireImmune(context: *const Context) anyerror!bool {
+        return context.hazards.fireImmune(context.subject);
     }
     /// Entity.getOnPos below an item, which keeps no supporting block.
-    pub fn onPosition(_: Host, subject: *const Subject, depth: f32) ![3]i32 {
-        return .{ bodies.mth.floor(subject.position[0]), bodies.mth.floor(subject.position[1] - depth), bodies.mth.floor(subject.position[2]) };
+    fn onPosition(context: *const Context, depth: f32) anyerror![3]i32 {
+        const position = context.subject.position;
+        return .{ bodies.mth.floor(position[0]), bodies.mth.floor(position[1] - depth), bodies.mth.floor(position[2]) };
     }
-    pub fn hurt(self: Host, subject: *Subject, damage: effects.Damage, amount: f32) !bool {
+    fn hurt(context: *const Context, damage: effects.Damage, amount: f32) anyerror!bool {
         const kind: Damage = switch (damage) {
             inline else => |tag| @field(Damage, @tagName(tag)),
         };
-        return self.hazards.hurt(subject, kind, amount);
+        return context.hazards.hurt(context.subject, kind, amount);
     }
-    pub fn playSound(self: Host, subject: *const Subject, sound: effects.Sound, volume: f32, pitch: f32) void {
+    fn playSound(context: *const Context, sound: effects.Sound, volume: f32, pitch: f32) void {
+        const subject = context.subject;
+        const hazards = context.hazards;
         const name = switch (sound) {
             .generic_burn => "minecraft:entity.generic.burn",
             .generic_extinguish_fire => "minecraft:entity.generic.extinguish_fire",
             .honey_block_slide => "minecraft:block.honey_block.slide",
         };
-        self.hazards.sounds.sound(subject.world, .{ .x = subject.position[0], .y = subject.position[1], .z = subject.position[2] }, name, .neutral, volume, pitch, @bitCast(self.hazards.sound_seeds.next()), null);
+        hazards.sounds.sound(subject.world, .{ .x = subject.position[0], .y = subject.position[1], .z = subject.position[2] }, name, .neutral, volume, pitch, @bitCast(hazards.sound_seeds.next()), null);
     }
-    pub fn random(self: Host, _: *Subject) *JavaRandom {
-        return &self.hazards.random;
+    fn destroyBlock(context: *const Context, position: [3]i32) anyerror!void {
+        return context.hazards.deps.block_edits.destroyBlock(context.subject.world, position);
     }
-    pub fn levelRandom(self: Host) *JavaRandom {
-        return &self.hazards.level_random;
-    }
-    /// The mobGriefing game rule, which this server keeps at vanilla's default.
-    pub fn mobGriefing(_: Host) bool {
-        return true;
-    }
-    /// Level.destroyBlock with no drops: the block's break effect, then air.
-    pub fn destroyBlock(self: Host, world: u32, position: [3]i32) !void {
-        const state = try self.hazards.level(world).state(position[0], position[1], position[2]);
-        if (game_data.physics.get(state).air) return;
-        self.hazards.sounds.worldEvent(world, .{ .x = position[0], .y = position[1], .z = position[2] }, 2001, state);
-        try self.hazards.edit(world, position, 0);
-    }
-    /// LayeredCauldronBlock.handleEntityOnFireInside: a burning item takes a level of water,
-    /// and powder snow turns to water a level lower.
-    pub fn lowerCauldron(self: Host, world: u32, position: [3]i32) !void {
-        const level_view = self.hazards.level(world);
-        const state = try level_view.state(position[0], position[1], position[2]);
-        const entry = level_view.blocks.get(state);
-        if (entry.flags.level == 0) return;
-        const remaining = entry.flags.level - 1;
-        const lowered: u16 = if (remaining == 0) @intCast(game_data.registry.blockStateId("minecraft:cauldron").?) else @intCast(game_data.registry.blockStateId(if (remaining == 1) "minecraft:water_cauldron[level=1]" else "minecraft:water_cauldron[level=2]").?);
-        try self.hazards.edit(world, position, lowered);
-    }
-    /// Turtle eggs crack under living bodies alone.
-    pub fn crackTurtleEgg(_: Host, _: u32, _: [3]i32, _: u16) !void {
-        unreachable;
-    }
-    /// Honey slide effects are for living bodies alone.
-    pub fn entityEvent(_: Host, _: *Subject, _: u8) void {
-        unreachable;
-    }
-    pub fn onAboveBubbleColumn(self: Host, subject: *Subject, drag: bool, _: [3]i32) !void {
-        effects.aboveBubbleColumn(self, subject, drag);
+    fn lowerCauldron(context: *const Context, position: [3]i32) anyerror!void {
+        return context.hazards.deps.block_edits.lowerCauldron(context.subject.world, position);
     }
 };

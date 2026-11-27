@@ -21,6 +21,7 @@ const Model = replication.models.Model;
 const Classes = replication.models.Classes;
 
 const Level = @import("vanilla_bodies").body.Level;
+const BlockEdits = @import("vanilla_bodies").block_edits.BlockEdits;
 const assert = std.debug.assert;
 
 pub const ItemTick = struct {
@@ -45,6 +46,7 @@ pub const ItemTick = struct {
         worlds: *worlds.Worlds,
         dimensions: *Dimensions,
         client: *ClientRegistries,
+        block_edits: *BlockEdits,
     };
 
     deps: Dependencies,
@@ -81,7 +83,6 @@ pub const ItemTick = struct {
             .centers = try allocator.alloc(entities.residency.Center, deps.players.records.len),
             .last_centers = try allocator.alloc(entities.residency.Center, deps.players.records.len),
             .hazards = try .init(allocator, .{
-                .chunks = deps.physics.deps.levels.deps.chunks,
                 .blocks = deps.physics.deps.blocks,
                 .items = deps.items,
                 .client = deps.client,
@@ -89,6 +90,7 @@ pub const ItemTick = struct {
                 .worlds = deps.worlds,
                 .inventories = deps.inventories,
                 .levels = deps.physics.deps.levels,
+                .block_edits = deps.block_edits,
             }),
             .nearby = try allocator.alloc(entities.space.Entry, 1024),
             .random = .init(config.seed),

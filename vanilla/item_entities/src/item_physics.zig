@@ -31,7 +31,6 @@ pub const ItemPhysics = struct {
         crossed_block: bool,
         /// Whether it moved this tick, which takes what held it back.
         moved: bool = false,
-        effects: OrbEffects = .{},
     };
 
     /// What an item's move does once it moved: Entity.applyEffectsFromBlocks with the blocks it
@@ -82,8 +81,9 @@ pub const ItemPhysics = struct {
         return pushFluids(at, itemBox(state.position), state, ultrawarm);
     }
 
-    pub fn pushOrb(_: *ItemPhysics, at: *const Level, state: *entities.State, ultrawarm: bool) !void {
-        _ = try pushFluids(at, orbBox(state.position), state, ultrawarm);
+    /// The start of an orb's Entity.baseTick, as `push` for items.
+    pub fn pushOrb(_: *ItemPhysics, at: *const Level, state: *entities.State, ultrawarm: bool) !Fluids {
+        return pushFluids(at, orbBox(state.position), state, ultrawarm);
     }
 
     /// How deep a body is in water and in lava: from its bottom to the top of the fluid.
@@ -149,12 +149,12 @@ pub const ItemPhysics = struct {
         return self.advance(at, entity_id, ticks, pushed, on_ground, fluid, .{ 0, 0, 0 }, null);
     }
 
-    pub fn advanceOrb(self: *ItemPhysics, at: *const Level, entity_id: u32, ticks: u32, state: entities.State, on_ground: bool, stuck: [3]f64) !Result {
-        return self.advanceBody(true, .server, .latest, at, entity_id, ticks, state, on_ground, stuck, null);
+    /// ExperienceOrb.tick's move, through `hook` every tick, as Entity.applyEffectsFromBlocks.
+    pub fn advanceOrb(self: *ItemPhysics, at: *const Level, entity_id: u32, ticks: u32, state: entities.State, on_ground: bool, stuck: [3]f64, hook: ?Hook) !Result {
+        return self.advanceBody(true, .server, .latest, at, entity_id, ticks, state, on_ground, stuck, hook);
     }
 
     pub const OrbEnvironment = struct { solid: bool, water: bool, lava: bool };
-    pub const OrbEffects = struct { extinguish: bool = false, lava: u8 = 0, fire: u8 = 0, cactus: u8 = 0, stuck: [3]f64 = .{ 0, 0, 0 }, honey: bool = false, bubble: ?struct { drag: bool, surface: bool } = null };
 
     /// ExperienceOrb.tick's look about it: inside something it collides with, as
     /// Level.noCollision(box) asks with no entity; its eyes under water; in lava at its feet.
@@ -177,47 +177,6 @@ pub const ItemPhysics = struct {
     /// no entity, inverted.
     pub fn orbCollides(_: *ItemPhysics, at: *const Level, state: entities.State) !bool {
         return !try body.noCollision(at, orbBox(state.position), .{ .empty = true });
-    }
-
-    pub fn orbEffects(self: *ItemPhysics, at: *const Level, state: entities.State) !OrbEffects {
-        var result: OrbEffects = .{};
-        const low: [3]f64 = .{ state.position[0] - 0.25 + 1e-5, state.position[1] + 1e-5, state.position[2] - 0.25 + 1e-5 };
-        const high: [3]f64 = .{ state.position[0] + 0.25 - 1e-5, state.position[1] + 0.5 - 1e-5, state.position[2] + 0.25 - 1e-5 };
-        var y: i32 = mth.floor(low[1]);
-        while (@as(f64, @floatFromInt(y)) < high[1]) : (y += 1) {
-            var z: i32 = mth.floor(low[2]);
-            while (@as(f64, @floatFromInt(z)) < high[2]) : (z += 1) {
-                var x: i32 = mth.floor(low[0]);
-                while (@as(f64, @floatFromInt(x)) < high[0]) : (x += 1) {
-                    const block_state = try at.state(x, y, z);
-                    const name = game_data.registry.blockStateName(block_state).?;
-                    const properties = self.deps.blocks.get(block_state);
-                    if (properties.fluid != .none) {
-                        const above = self.deps.blocks.get(try at.state(x, y + 1, z));
-                        const height = if (above.fluid == properties.fluid) @as(f64, 1) else properties.height();
-                        if (low[1] < @as(f64, @floatFromInt(y)) + height) {
-                            result.extinguish = result.extinguish or properties.fluid == .water;
-                            if (properties.fluid == .lava) result.lava += 1;
-                        }
-                    }
-                    if (std.mem.startsWith(u8, name, "minecraft:fire[")) result.fire += 1;
-                    if (std.mem.eql(u8, name, "minecraft:soul_fire")) result.fire += 2;
-                    if (std.mem.startsWith(u8, name, "minecraft:cactus[")) result.cactus += 1;
-                    if (std.mem.eql(u8, name, "minecraft:cobweb")) result.stuck = .{ 0.25, 0.05, 0.25 };
-                    if (std.mem.eql(u8, name, "minecraft:powder_snow")) {
-                        result.stuck = .{ 0.9, 1.5, 0.9 };
-                        result.extinguish = true;
-                    }
-                    if (std.mem.eql(u8, name, "minecraft:honey_block") and state.position[1] <= @as(f64, @floatFromInt(y)) + 0.9375 - 1e-7 and
-                        (@abs(@as(f64, @floatFromInt(x)) + 0.5 - state.position[0]) + 1e-7 > 0.6875 or @abs(@as(f64, @floatFromInt(z)) + 0.5 - state.position[2]) + 1e-7 > 0.6875)) result.honey = true;
-                    if (std.mem.startsWith(u8, name, "minecraft:bubble_column[")) {
-                        const above = game_data.registry.blockStateName(try at.state(x, y + 1, z)).?;
-                        result.bubble = .{ .drag = std.mem.indexOf(u8, name, "drag=true") != null, .surface = std.mem.eql(u8, above, "minecraft:air") or std.mem.eql(u8, above, "minecraft:cave_air") or std.mem.eql(u8, above, "minecraft:void_air") };
-                    }
-                }
-            }
-        }
-        return result;
     }
 
     /// What a resting item's move ticks take from its block, if nothing else around it does
@@ -420,7 +379,6 @@ pub const ItemPhysics = struct {
         for (state.position ++ state.velocity) |value| assert(std.math.isFinite(value));
         const vertical_velocity = next.velocity[1];
         var motion = next.velocity;
-        var orb_effects: OrbEffects = .{};
         var grounded = on_ground;
         var moved = false;
         if (orb or !on_ground or next.velocity[0] * next.velocity[0] + next.velocity[2] * next.velocity[2] > @as(f64, @as(f32, 0.00001)) or
@@ -476,25 +434,6 @@ pub const ItemPhysics = struct {
                 next.velocity[2] *= speed;
             }
             if (hook) |effects| try effects.apply(effects.context, &next, grounded, state.position);
-            if (orb) {
-                orb_effects = try self.orbEffects(at, next);
-                const effects_found = orb_effects;
-                if (effects_found.honey and !grounded) {
-                    // Vanilla applies its living-entity gravity transform to every honey slider.
-                    const previous = next.velocity[1] / @as(f64, @as(f32, 0.98)) + 0.08;
-                    if (previous < -0.08) {
-                        if (previous < -0.13) {
-                            next.velocity[0] *= -0.05 / previous;
-                            next.velocity[2] *= -0.05 / previous;
-                        }
-                        next.velocity[1] = (-0.05 - 0.08) * @as(f64, @as(f32, 0.98));
-                    }
-                }
-                if (effects_found.bubble) |bubble| {
-                    next.velocity[1] = if (bubble.drag) @max(if (bubble.surface) @as(f64, -0.9) else -0.3, next.velocity[1] - 0.03) else @min(if (bubble.surface) @as(f64, 1.8) else 0.7, next.velocity[1] + (if (bubble.surface) @as(f64, 0.1) else 0.06));
-                }
-            }
-
             var friction: f32 = 0.98;
             if (grounded) {
                 const below_state = below orelse try at.state(below_position[0], below_position[1], below_position[2]);
@@ -509,7 +448,7 @@ pub const ItemPhysics = struct {
                 if (grounded and vertical_velocity < -0.03) next.velocity[1] = -vertical_velocity * 0.4;
             } else if (grounded and next.velocity[1] < 0) next.velocity[1] *= -0.5;
         }
-        return .{ .body = next, .on_ground = grounded, .crossed_block = crossed(state.position, next.position), .moved = moved, .effects = orb_effects };
+        return .{ .body = next, .on_ground = grounded, .crossed_block = crossed(state.position, next.position), .moved = moved };
     }
 };
 

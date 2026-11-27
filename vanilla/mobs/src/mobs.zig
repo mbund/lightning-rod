@@ -21,6 +21,7 @@ const world_effects = @import("vanilla_blocks").world_effects;
 const body = @import("vanilla_bodies").body;
 const EntityCollisions = @import("vanilla_bodies").entity_collisions.EntityCollisions;
 const Levels = @import("vanilla_bodies").levels.Levels;
+const BlockEdits = @import("vanilla_bodies").block_edits.BlockEdits;
 const PlayerRecord = @import("players").player_state.Player;
 const living = @import("living.zig");
 const mth = @import("vanilla_bodies").mth;
@@ -136,6 +137,7 @@ pub const Mobs = struct {
         enchantment_registry: *EnchantmentRegistry,
         collisions: *EntityCollisions,
         levels: *Levels,
+        block_edits: *BlockEdits,
     };
 
     deps: Dependencies,
@@ -1695,7 +1697,7 @@ pub const Mobs = struct {
         self.blockSound(world, centerOf(position), .turtle_egg_break, 0.7, pitch);
         const name = game_data.registry.blockStateName(state).?;
         const eggs = propertyValue(name, "eggs") orelse return;
-        if (eggs.len != 1 or eggs[0] <= '1') return self.destroyBlock(world, position);
+        if (eggs.len != 1 or eggs[0] <= '1') return self.deps.block_edits.destroyBlock(world, position);
         const fewer = withProperty(state, "eggs", &.{eggs[0] - 1}) orelse return;
         try self.deps.chunks.setBlock(world, .{ .x = position[0], .y = position[1], .z = position[2] }, fewer);
         self.effects.worldEvent(world, .{ .x = position[0], .y = position[1], .z = position[2] }, 2001, state);
@@ -1734,30 +1736,6 @@ pub const Mobs = struct {
         // FluidState.createLegacyBlock: a waterlogged block leaves its water.
         const left: u16 = if (physics.fluid == .water and physics.amount == 8 and !physics.falling) @intCast(game_data.registry.blockStateId("minecraft:water[level=0]").?) else self.air_state;
         try self.deps.chunks.setBlock(world, .{ .x = position[0], .y = position[1], .z = position[2] }, left);
-    }
-
-    /// Level.destroyBlock with no drops: the block's break effect, then air.
-    pub fn destroyBlock(self: *Mobs, world: u32, position: [3]i32) !void {
-        const level_view = self.level(world);
-        const state = try level_view.state(position[0], position[1], position[2]);
-        if (game_data.physics.get(state).air) return;
-        self.effects.worldEvent(world, .{ .x = position[0], .y = position[1], .z = position[2] }, 2001, state);
-        try self.deps.chunks.setBlock(world, .{ .x = position[0], .y = position[1], .z = position[2] }, self.air_state);
-    }
-
-    /// LayeredCauldronBlock.handleEntityOnFireInside: a burning mob takes a level of water, and
-    /// powder snow turns to water a level lower.
-    pub fn lowerCauldron(self: *Mobs, world: u32, position: [3]i32) !void {
-        const level_view = self.level(world);
-        const state = try level_view.state(position[0], position[1], position[2]);
-        const entry = level_view.blocks.get(state);
-        if (entry.flags.level == 0) return;
-        const remaining = entry.flags.level - 1;
-        const lowered: u16 = if (remaining == 0) @intCast(game_data.registry.blockStateId("minecraft:cauldron").?) else blk: {
-            const water = game_data.registry.blockStateId(if (remaining == 1) "minecraft:water_cauldron[level=1]" else "minecraft:water_cauldron[level=2]").?;
-            break :blk @intCast(water);
-        };
-        try self.deps.chunks.setBlock(world, .{ .x = position[0], .y = position[1], .z = position[2] }, lowered);
     }
 
     // Saving.

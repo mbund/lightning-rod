@@ -647,7 +647,7 @@ pub const Boats = struct {
 
     fn destroyBlock(context: *anyopaque, world: u32, position: [3]i32) anyerror!void {
         const self: *Boats = @ptrCast(@alignCast(context));
-        return self.deps.mobs.destroyBlock(world, position);
+        return self.deps.mobs.deps.block_edits.destroyBlock(world, position);
     }
 
     fn breakBlock(context: *anyopaque, world: u32, position: [3]i32) anyerror!void {
@@ -664,7 +664,7 @@ pub const Boats = struct {
 
     fn lowerCauldron(context: *anyopaque, world: u32, position: [3]i32) anyerror!void {
         const self: *Boats = @ptrCast(@alignCast(context));
-        return self.deps.mobs.lowerCauldron(world, position);
+        return self.deps.mobs.deps.block_edits.lowerCauldron(world, position);
     }
 
     // Riding.

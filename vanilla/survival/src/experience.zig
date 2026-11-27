@@ -14,6 +14,9 @@ const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
 const WorldBorder = @import("vanilla_world").world_border.WorldBorder;
 const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
 const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
+const BlockEdits = @import("vanilla_bodies").block_edits.BlockEdits;
+const orb_hazards = @import("orb_hazards.zig");
+const OrbHazards = orb_hazards.OrbHazards;
 const Level = @import("vanilla_bodies").body.Level;
 const Random = @import("vanilla_content").random.Random;
 const item_data = @import("vanilla_items").item_data;
@@ -44,36 +47,22 @@ pub const Experience = struct {
         inventory: *PlayerInventory,
         storage: storage.Space,
         record_workspaces: *records.Workspaces,
+        block_edits: *BlockEdits,
     };
 
     /// What holds an orb back on its next move: the blocks whose makeStuckInBlock reaches it.
-    pub const Stuck = enum(u8) {
-        none,
-        cobweb,
-        powder_snow,
-
-        pub fn multiplier(self: Stuck) [3]f64 {
-            return switch (self) {
-                .none => .{ 0, 0, 0 },
-                .cobweb => .{ 0.25, 0.05, 0.25 },
-                .powder_snow => .{ 0.9, 1.5, 0.9 },
-            };
-        }
-
-        pub fn of(multiplier_value: [3]f64) Stuck {
-            inline for (.{ Stuck.none, Stuck.cobweb, Stuck.powder_snow }) |each| {
-                if (std.meta.eql(multiplier_value, each.multiplier())) return each;
-            }
-            unreachable;
-        }
-    };
+    pub const Stuck = @import("vanilla_bodies").block_effects.Stuck;
 
     pub const Orb = struct {
-        pub const encoded_size = 39;
+        pub const encoded_size = 40;
+        /// Before orbs kept how frozen they are.
+        const encoded_size_3 = 39;
+        /// Entity.getTicksRequiredToFreeze.
+        const max_ticks_frozen = 140;
 
         pub fn encode(orb: Orb) [encoded_size]u8 {
             var bytes: [encoded_size]u8 = @splat(0);
-            bytes[0] = 3;
+            bytes[0] = 4;
             std.mem.writeInt(i32, bytes[1..5], orb.value, .little);
             std.mem.writeInt(i32, bytes[5..9], orb.count, .little);
             std.mem.writeInt(u16, bytes[9..11], orb.age, .little);
@@ -89,11 +78,13 @@ pub const Experience = struct {
             }
             std.mem.writeInt(u64, bytes[30..38], orb.revision, .little);
             bytes[38] = @intFromBool(orb.alive);
+            bytes[39] = orb.ticks_frozen;
             return bytes;
         }
 
         pub fn decode(bytes: []const u8) !Orb {
-            if (bytes.len != encoded_size or bytes[0] != 3) return error.CorruptExperienceOrb;
+            const version: u8 = if (bytes.len == encoded_size) 4 else if (bytes.len == encoded_size_3) 3 else return error.CorruptExperienceOrb;
+            if (bytes[0] != version) return error.CorruptExperienceOrb;
             if (bytes[13] > 1) return error.CorruptExperienceOrb;
             var orb: Orb = .{
                 .value = std.mem.readInt(i32, bytes[1..5], .little),
@@ -110,6 +101,10 @@ pub const Experience = struct {
             if (bytes[21] == 1) orb.following = .{ .index = std.mem.readInt(u32, bytes[22..26], .little), .generation = std.mem.readInt(u32, bytes[26..30], .little) };
             orb.revision = std.mem.readInt(u64, bytes[30..38], .little);
             orb.alive = bytes[38] == 1;
+            if (version == 4) {
+                if (bytes[39] > max_ticks_frozen) return error.CorruptExperienceOrb;
+                orb.ticks_frozen = bytes[39];
+            }
             if (orb.alive and (orb.value <= 0 or orb.count <= 0 or orb.age >= 6000 or orb.health <= 0)) return error.CorruptExperienceOrb;
             return orb;
         }
@@ -119,6 +114,8 @@ pub const Experience = struct {
         age: u16 = 0,
         health: i16 = 5,
         fire: i16 = 0,
+        /// Entity.ticksFrozen, which grows in powder snow and nothing but fire takes from an orb.
+        ticks_frozen: u8 = 0,
         ticks: u32 = 0,
         following: ?sessions.Handle = null,
         alive: bool = true,
@@ -196,6 +193,8 @@ pub const Experience = struct {
     replicated: lightning_rod.system.IndexSet,
     retired_count: usize = 0,
     nearby: []entities.space.Entry,
+    /// What blocks do to orbs.
+    hazards: OrbHazards,
 
     pub fn allocate(allocator: std.mem.Allocator, config: Configuration, deps: Dependencies) !*Experience {
         if (deps.inventories.items.entries.len < 2) return error.InventoryCacheTooSmall;
@@ -220,6 +219,7 @@ pub const Experience = struct {
             .nearby = try allocator.alloc(entities.space.Entry, 1024),
             .retired = try allocator.alloc(entities.Id, bound),
             .replicated = try .init(allocator, deps.entities.directory.capacity()),
+            .hazards = try .init(allocator, deps.players, deps.block_edits),
         };
         @memset(self.deaths, .{});
         @memset(self.sounds, .{});
@@ -594,7 +594,7 @@ pub const Experience = struct {
             const found = try reader.next(&rows);
             if (found.len == 0) break;
             for (found) |row| {
-                if (row.value.len != record_bytes) return error.CorruptExperienceOrb;
+                if (row.value.len != record_bytes and row.value.len != entities.encoded_bytes + Orb.encoded_size_3) return error.CorruptExperienceOrb;
                 const body = try entities.decode(row.value[0..entities.encoded_bytes]);
                 const orb = try Orb.decode(row.value[entities.encoded_bytes..]);
                 if (self.orbs.contains(row.id) or body.kind != kind) return error.CorruptExperienceOrb;
@@ -618,6 +618,8 @@ pub const Experience = struct {
         if (!orb.alive) return;
         var body = held.body orelse return error.CorruptExperienceOrb;
         const level = self.deps.physics.level(body.world);
+        // Entity.oldPosition: where the tick began.
+        const start = body.position;
         // Visited but not ticked: moved this tick where nothing ticks.
         if (!self.places.ticks(entities.space.columnOf(body.world, body.position))) return;
         const world = self.deps.players.deps.worlds.get(body.world) orelse return error.CorruptExperienceOrb;
@@ -626,10 +628,11 @@ pub const Experience = struct {
             return;
         }
         orb.ticks +%= 1;
-        try self.deps.physics.pushOrb(&level, &body, if (self.deps.dimensions.get(world.dimension.name)) |dimension| dimension.ultrawarm else false);
+        const fluids = try self.deps.physics.pushOrb(&level, &body, if (self.deps.dimensions.get(world.dimension.name)) |dimension| dimension.ultrawarm else false);
         const environment = try self.deps.physics.orbEnvironment(&level, body);
         if (orb.fire > 0) {
-            if (@mod(orb.fire, 20) == 0 and (try self.deps.physics.orbEffects(&level, body)).lava == 0) {
+            // Entity.isInLava, never on its first tick.
+            if (@mod(orb.fire, 20) == 0 and !(orb.ticks > 1 and fluids.lava > 0)) {
                 held.body = body;
                 _ = try self.hurt(held, 1);
                 if (!orb.alive) return;
@@ -686,23 +689,20 @@ pub const Experience = struct {
                 orb.revision +%= 1;
             }
         }
-        const advanced = try self.deps.physics.advanceOrb(&level, self.givenId(held.id), orb.ticks, body, orb.on_ground, orb.stuck.multiplier());
+        var subject: orb_hazards.Subject = .{ .world = body.world, .old_position = start, .health = orb.health, .fire_ticks = orb.fire, .ticks_frozen = orb.ticks_frozen };
+        var hook: orb_hazards.Hook = .{ .hazards = &self.hazards, .level = &level, .subject = &subject };
+        const advanced = try self.deps.physics.advanceOrb(&level, self.givenId(held.id), orb.ticks, body, orb.on_ground, orb.stuck.multiplier(), hook.physics());
         orb.on_ground = advanced.on_ground;
         held.body = advanced.body;
-        const hazards = advanced.effects;
-        orb.stuck = Stuck.of(hazards.stuck);
-        if (hazards.lava > 0) {
-            orb.fire = @max(orb.fire, 300);
-            _ = try self.hurt(held, @as(f32, @floatFromInt(hazards.lava)) * 4);
+        orb.stuck = Stuck.of(subject.stuck);
+        orb.fire = @intCast(subject.fire_ticks);
+        orb.ticks_frozen = @intCast(subject.ticks_frozen);
+        orb.health = subject.health;
+        // Gone once its tick ends, as ExperienceOrb.hurtServer discards one.
+        if (orb.health <= 0) {
+            try self.retire(held);
+            return;
         }
-        if (orb.alive and hazards.fire > 0) {
-            orb.fire = @max(orb.fire, 160);
-            _ = try self.hurt(held, @floatFromInt(hazards.fire));
-        }
-        if (orb.alive and hazards.cactus > 0) _ = try self.hurt(held, @floatFromInt(hazards.cactus));
-        if (!orb.alive) return;
-        if (hazards.extinguish) orb.fire = 0;
-        if (orb.fire == 0) orb.fire = -1;
         if (orb.ticks % 20 == 0) orb.revision +%= 1;
         orb.age += 1;
         if (orb.age >= 6000) try self.retire(held);

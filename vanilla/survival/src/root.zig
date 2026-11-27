@@ -2,6 +2,7 @@
 const std = @import("std");
 
 pub const experience = @import("experience.zig");
+pub const orb_hazards = @import("orb_hazards.zig");
 pub const experience_replication = @import("experience_replication.zig");
 pub const damage_types = @import("damage_types.zig");
 pub const fall_damage = @import("fall_damage.zig");

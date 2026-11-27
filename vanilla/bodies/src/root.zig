@@ -13,6 +13,7 @@ pub const fluids = @import("fluids.zig");
 pub const clip = @import("clip.zig");
 pub const entity_collisions = @import("entity_collisions.zig");
 pub const levels = @import("levels.zig");
+pub const block_edits = @import("block_edits.zig");
 
 test {
     std.testing.refAllDecls(@This());
