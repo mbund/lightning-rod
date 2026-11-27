@@ -84,6 +84,32 @@ pub const Containers = struct {
         storage: storage.Space,
         record_workspaces: *records.Workspaces,
     };
+    /// A container an entity carries, as a chest boat's chest: whose slots it holds, what the
+    /// menu is called, and whether a player may still use it, as ContainerEntity asks the entity.
+    pub const EntityContainer = struct {
+        context: *anyopaque,
+        entity: u64,
+        world: u32,
+        owner: u128,
+        /// The translation key of the entity's name, which titles the menu.
+        title: []const u8,
+        still_valid: *const fn (context: *anyopaque, entity: u64, player: usize) anyerror!bool,
+
+        /// The owner of the slots of an entity's container, by its uuid.
+        pub fn ownerOf(uuid: u128) u128 {
+            var hash = std.crypto.hash.Blake3.init(.{});
+            hash.update("lightning-rod:entity-container");
+            var bytes: [16]u8 = undefined;
+            std.mem.writeInt(u128, &bytes, uuid, .big);
+            hash.update(&bytes);
+            var owner: [16]u8 = undefined;
+            hash.final(&owner);
+            owner[6] = (owner[6] & 15) | 0x80;
+            owner[8] = (owner[8] & 63) | 0x80;
+            return std.mem.readInt(u128, &owner, .big);
+        }
+    };
+
     pub const View = struct {
         generation: u32 = 0,
         life: u32 = 0,
@@ -91,6 +117,8 @@ pub const Containers = struct {
         revision: i32 = 0,
         kind: blocks.Kind = .chest,
         key: Key = undefined,
+        /// The entity whose container is open, when it is not a block's.
+        entity: ?EntityContainer = null,
         partner: ?chunks.Position = null,
         owners: [2]u128 = @splat(0),
         container_slots: usize = 0,
@@ -532,12 +560,29 @@ pub const Containers = struct {
         if (view.kind == .chest) self.queueLids(view.*);
     }
 
+    /// Player.openMenu for a container an entity carries, a chest of 27 slots without a lid.
+    pub fn openEntity(self: *Containers, index: usize, container: EntityContainer) !void {
+        if (self.opened.contains(index) and !try self.close(index, true)) return;
+        try self.deps.inventory.closeMenu(index);
+        if (self.deps.inventory.states[index].close) return;
+        const player = self.deps.players.records[index];
+        const view = &self.views[index];
+        const window = @mod(view.window, 100) + 1;
+        view.* = .{ .generation = player.handle.?.generation, .life = player.life, .window = window, .key = .{ .world = container.world, .position = .{ .x = 0, .y = 0, .z = 0 } }, .kind = .chest, .entity = container, .container_slots = 27 };
+        view.owners[0] = container.owner;
+        view.watches[0] = self.watch(player.uuid, true, 0);
+        view.watches[1] = self.watch(container.owner, false, 27);
+        view.watch_count = 2;
+        self.deps.inventory.states[index].external = true;
+        self.opened.insert(index);
+    }
+
     fn closeAt(self: *Containers, key: Key) !void {
         var offset: usize = 0;
         while (offset < self.opened.values().len) {
             const index = self.opened.values()[offset];
             const view = self.views[index];
-            if (std.meta.eql(view.key, key) or view.owners[0] == key.owner() or view.owners[1] == key.owner()) {
+            if ((view.entity == null and std.meta.eql(view.key, key)) or view.owners[0] == key.owner() or view.owners[1] == key.owner()) {
                 if (!try self.close(index, true)) offset += 1;
             } else offset += 1;
         }
@@ -545,7 +590,7 @@ pub const Containers = struct {
 
     fn close(self: *Containers, index: usize, notify: bool) !bool {
         const view = &self.views[index];
-        if (view.kind == .chest and !self.canQueueLids(view.*)) {
+        if (view.kind == .chest and view.entity == null and !self.canQueueLids(view.*)) {
             view.closing = true;
             return false;
         }
@@ -562,7 +607,7 @@ pub const Containers = struct {
         for (view.watches[0..view.watch_count]) |watched| self.unwatch(watched);
         view.watch_count = 0;
         self.opened.remove(index);
-        if (view.kind == .chest) self.queueLids(view.*);
+        if (view.kind == .chest and view.entity == null) self.queueLids(view.*);
         const state = &self.deps.inventory.states[index];
         if (state.generation == view.generation and state.life == view.life) {
             // Return cursor and crafting inputs after block drops have been allocated.
@@ -605,7 +650,7 @@ pub const Containers = struct {
         const index = handle.index;
         const view = &self.views[index];
         const player = self.deps.players.records[index];
-        if (view.closing or window != view.window or view.generation != handle.generation or !view.opened or !self.valid(index)) return;
+        if (view.closing or window != view.window or view.generation != handle.generation or !view.opened or !try self.valid(index)) return;
         view.dirty = true;
         const status = self.deps.player_states.of(&player);
         if (status.gamemode == .spectator or status.health <= 0) return;
@@ -685,7 +730,7 @@ pub const Containers = struct {
         const index = handle.index;
         const view = &self.views[index];
         const player = self.deps.players.records[index];
-        if (!view.opened or view.closing or view.window != window or !self.valid(index) or self.deps.player_states.of(&player).gamemode == .spectator or
+        if (!view.opened or view.closing or view.window != window or !try self.valid(index) or self.deps.player_states.of(&player).gamemode == .spectator or
             (recipe.furnace and view.kind != .furnace) or (!recipe.furnace and view.kind != .crafting)) return .blocked;
         const count = view.container_slots + 38;
         var slots: [menu_click.maximum_slots]inventories.Slot = undefined;
@@ -719,10 +764,12 @@ pub const Containers = struct {
         return result;
     }
 
-    fn valid(self: *Containers, index: usize) bool {
+    fn valid(self: *Containers, index: usize) !bool {
         const player = self.deps.players.records[index];
         const view = self.views[index];
-        if (player.handle == null or player.handle.?.generation != view.generation or player.life != view.life or player.world != view.key.world or player.stage != .ready) return false;
+        // A teleport within the world keeps a menu open, as vanilla's does. Respawning closes it.
+        if (player.handle == null or player.handle.?.generation != view.generation or player.life != view.life or player.world != view.key.world or !player.inPlay() or player.stage == .respawn) return false;
+        if (view.entity) |held| return try held.still_valid(held.context, held.entity, index);
         const dx = player.position.x - (@as(f64, @floatFromInt(view.key.position.x)) + 0.5);
         const dy = player.position.y - (@as(f64, @floatFromInt(view.key.position.y)) + 0.5);
         const dz = player.position.z - (@as(f64, @floatFromInt(view.key.position.z)) + 0.5);
@@ -734,7 +781,7 @@ pub const Containers = struct {
         var offset: usize = 0;
         while (offset < self.opened.values().len) {
             const index = self.opened.values()[offset];
-            if (self.views[index].closing or !self.valid(index)) {
+            if (self.views[index].closing or !try self.valid(index)) {
                 if (!try self.close(index, true)) offset += 1;
                 continue;
             }
@@ -796,7 +843,7 @@ pub const Containers = struct {
                 .crafting => "minecraft:crafting",
             };
             const title: []const u8 = switch (view.kind) {
-                .chest => if (view.container_slots == 54) "container.chestDouble" else "container.chest",
+                .chest => if (view.entity) |held| held.title else if (view.container_slots == 54) "container.chestDouble" else "container.chest",
                 .furnace => "container.furnace",
                 .crafting => "container.crafting",
             };

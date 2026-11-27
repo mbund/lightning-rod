@@ -479,6 +479,7 @@ pub const Mobs = struct {
     pub fn release(self: *Mobs, index: u32) !void {
         const mob = try self.inSlot(index);
         assert(mob.entity.removed);
+        if (self.boats) |boats| boats.forgetMob(index);
         if (mob.entity.placed) self.places.remove(mob.entity.id);
         mob.entity.placed = false;
         self.releasePath(mob);
@@ -663,6 +664,8 @@ pub const Mobs = struct {
             defer at += 1;
             // One gone from the world since the pass began is passed over.
             const index = self.slotOf(entries[at].id) orelse continue;
+            // ServerLevel ticks a passenger after what it rides, not on its own turn.
+            if (self.rides(index)) continue;
             try self.tickPlace(index, context);
         }
     }
@@ -813,11 +816,60 @@ pub const Mobs = struct {
         try self.locate(index);
         // Blocks the mob changed, as trampled farmland, before the next mob moves.
         try self.answerEdits();
-        if (!tracking.idling and herd_state.idle(self, mob)) {
+        if (!tracking.idling and !self.rides(index) and herd_state.idle(self, mob)) {
             tracking.idling = true;
             tracking.gaze_yaw = herd_state.gazeYaw(mob);
             tracking.fresh = true;
         }
+    }
+
+    /// Whether a mob rides something, which ticks it after itself.
+    pub fn rides(self: *const Mobs, slot: u32) bool {
+        const boats = self.boats orelse return false;
+        return boats.carriesMob(slot);
+    }
+
+    /// Mob.rideTick for a mob a boat carries: Entity.rideTick's still start and full tick, then
+    /// LivingEntity.rideTick's fall forgotten. Its vehicle places it after.
+    pub fn rideTick(self: *Mobs, slot: u32) !void {
+        const mob = try self.inSlot(slot);
+        if (mob.entity.removed) return;
+        mob.motion.velocity = .{ 0, 0, 0 };
+        mob.motion.resting = false;
+        self.trackingOf(slot).idling = false;
+        try self.tickPlace(slot, &self.context);
+        (try self.inSlot(slot)).motion.fall_distance = 0;
+    }
+
+    /// Entity.positionRider for a mob, with AbstractBoat.positionRider's turns: at the seat, its
+    /// body the vehicle's way, its look within 105 degrees of it, and a quarter turn out for an
+    /// animal in a full boat, by its id. The boat's own turn it would add is none on a server,
+    /// as only a client steering turns one.
+    pub fn seatRider(self: *Mobs, slot: u32, seat: [3]f64, vehicle_yaw: f32, full: bool) !void {
+        const mob = try self.inSlot(slot);
+        if (mob.entity.removed) return;
+        mob.motion.position = seat;
+        // AbstractBoat.clampRotation.
+        mob.idle.body_yaw = vehicle_yaw;
+        const off = mth.wrapDegrees(mob.motion.yaw - vehicle_yaw);
+        const kept = mth.clamp(off, -105.0, 105.0);
+        mob.motion.old_yaw += kept - off;
+        mob.motion.yaw += kept - off;
+        mob.idle.head_yaw = mob.motion.yaw;
+        if (full) {
+            const turn: f32 = if (@rem(givenOfSlot(slot), 2) == 0) 90 else 270;
+            mob.idle.body_yaw += turn;
+            mob.idle.head_yaw += turn;
+        }
+        try self.locate(slot);
+    }
+
+    /// Where a mob is set down off a vehicle, and placed there: Entity.dismountTo.
+    pub fn dismountTo(self: *Mobs, slot: u32, at: [3]f64) !void {
+        const mob = try self.inSlot(slot);
+        mob.motion.position = at;
+        mob.motion.resting = false;
+        try self.locate(slot);
     }
 
     /// The players idle mobs look for, as mobs start ticking and players stand still.
@@ -1471,7 +1523,8 @@ pub const Mobs = struct {
         const own = living.box(self, mob);
         // Counted first, for the cramming check before any push, then pushed in the same order:
         // the hurt moves nothing.
-        var counting: Pushing = .{ .mobs = self, .mob = mob, .box = own };
+        const slot = self.slotOf(mob.entity.id).?;
+        var counting: Pushing = .{ .mobs = self, .mob = mob, .own = slot, .box = own };
         try self.eachPushable(&counting);
         const found = counting.found;
         if (found == 0) return 0;
@@ -1481,7 +1534,7 @@ pub const Mobs = struct {
             // None of them rides anything here.
             _ = try self.hurt(mob, .{ .type = .cramming }, 6.0);
         }
-        var pushing: Pushing = .{ .mobs = self, .mob = mob, .box = own, .push = true };
+        var pushing: Pushing = .{ .mobs = self, .mob = mob, .own = slot, .box = own, .push = true };
         try self.eachPushable(&pushing);
         return found;
     }
@@ -1490,6 +1543,8 @@ pub const Mobs = struct {
     const Pushing = struct {
         mobs: *Mobs,
         mob: Mob,
+        /// The mob's own slot, which what it rides is known by.
+        own: u32,
         box: body.Box,
         push: bool = false,
         found: u32 = 0,
@@ -1497,7 +1552,8 @@ pub const Mobs = struct {
         fn visit(pushing: *Pushing, entry: entities.space.Entry) anyerror!bool {
             const mobs = pushing.mobs;
             if (mobs.boats) |boats| if (boats.kinds.has(entry.shape.kind)) {
-                if (!boats.solid(entry.slot)) return false;
+                // Entity.push passes over what it rides itself.
+                if (!boats.solid(entry.slot) or boats.vehicleOfMob(pushing.own) == entry.slot) return false;
                 pushing.found += 1;
                 // LivingEntity.doPush: the boat is pushed by the mob, as AbstractBoat.push has it.
                 if (pushing.push) {
@@ -1507,6 +1563,8 @@ pub const Mobs = struct {
                 return false;
             };
             if (entry.id == pushing.mob.entity.id) return false;
+            // Nor what rides the same vehicle.
+            if (mobs.boats) |boats| if (boats.vehicleOfMob(pushing.own)) |vehicle| if (boats.vehicleOfMob(entry.slot) == vehicle) return false;
             const other = try mobs.inSlot(entry.slot);
             if (other.entity.removed or !living.box(mobs, other).intersects(pushing.box)) return false;
             if (!other.alive() or try living.onClimbable(mobs, other)) return false;
@@ -1544,23 +1602,32 @@ pub const Mobs = struct {
         }
     };
 
-    /// AbstractBoat.tick pushing what is around it: the mob in the slot, if it is pushable and its
-    /// box meets the boat's reach.
-    pub fn pushedByBoat(self: *Mobs, slot: u32, reach: body.Box, boat: u32) !void {
+    /// AbstractBoat.tick pushing a mob around it that `nearBoat` found.
+    pub fn pushedByBoat(self: *Mobs, slot: u32, boat: u32) !void {
         const mob = try self.inSlot(slot);
-        if (mob.entity.removed or !living.box(self, mob).intersects(reach)) return;
-        if (!mob.alive() or try living.onClimbable(self, mob)) return;
         var pushed: PushedMob = .{ .mobs = self, .mob = mob };
         self.boats.?.push(boat, pushed.asPushed());
     }
 
+    /// A mob AbstractBoat.tick finds in its reach, as EntitySelector.pushableBy takes it: its width
+    /// if it is pushable there.
+    pub fn nearBoat(self: *Mobs, slot: u32, reach: body.Box) !?f32 {
+        const mob = try self.inSlot(slot);
+        if (mob.entity.removed or !living.box(self, mob).intersects(reach)) return null;
+        if (!mob.alive() or try living.onClimbable(self, mob)) return null;
+        return living.width(self, mob);
+    }
+
     /// Level.getEntityCollisions for a mob: the boats whose boxes meet the box, as mobs collide with
-    /// nothing else here. Good until the next ask.
-    pub fn collisionsOf(self: *Mobs, world: u32, query: body.Box) ![]const body.Box {
+    /// nothing else here, but the one it rides. Good until the next ask.
+    pub fn collisionsOf(self: *Mobs, mob: Mob, query: body.Box) ![]const body.Box {
         const boats = self.boats orelse return &.{};
+        if (boats.count() == 0) return &.{};
+        const world = mob.motion.world;
+        const vehicle = boats.vehicleOfMob(self.slotOf(mob.entity.id).?);
         // AABB.getSize: too small a box meets nothing.
         if ((query.max[0] - query.min[0] + (query.max[1] - query.min[1]) + (query.max[2] - query.min[2])) / 3.0 < 1.0e-7) return &.{};
-        return boats.solidBoxes(world, query.inflate(1.0e-7, 1.0e-7, 1.0e-7), null, &self.collision_boxes);
+        return boats.solidBoxes(world, query.inflate(1.0e-7, 1.0e-7, 1.0e-7), vehicle, &self.collision_boxes);
     }
 
     /// A mob's box where it can be picked, as LivingEntity.isPickable has it: any not removed.

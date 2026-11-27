@@ -399,7 +399,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
             // Three blocks apart, more than a boat is wide, in the chunks around the players.
             const x: f64 = -40.5 + @as(f64, @floatFromInt(index % side)) * 3;
             const z: f64 = 20.5 + @as(f64, @floatFromInt(index / side)) * 3;
-            _ = try boats.spawn(.{ .variant = @fromBackingInt(@intCast(index % 10)), .world = spawn_world, .position = .{ x, 80, z } });
+            _ = try boats.spawn(.{ .model = .{ .variant = @fromBackingInt(@intCast(index % 10)) }, .world = spawn_world, .position = .{ x, 80, z } });
             // Between runs of spawns nothing is held: memory makes room for the next.
             if (index % 64 == 63) try simulation.get(vanilla.Entities).settle();
         }

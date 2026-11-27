@@ -76,7 +76,7 @@ pub fn move(mobs: *Mobs, mob: Mob, requested_in: [3]f64) !void {
     const level = mobs.level(mob.motion.world);
     const traits = mobs.traits(mob.entity.species);
     const start = box(mobs, mob);
-    const others = try mobs.collisionsOf(mob.motion.world, start.expandTowards(requested));
+    const others = try mobs.collisionsOf(mob, start.expandTowards(requested));
     const moved = try body.collide(&level, start, requested, context(mob), others, mob.motion.on_ground, @floatCast(traits.attribute(.step_height)));
     const moved_squared = lengthSquared(moved);
     if (moved_squared > 1.0e-7 or lengthSquared(requested) - moved_squared < 1.0e-7) {
@@ -512,7 +512,7 @@ pub fn isFree(mobs: *Mobs, mob: Mob, offset: [3]f64) !bool {
     const level = mobs.level(mob.motion.world);
     const moved = box(mobs, mob).move(offset);
     if (!try body.noCollision(&level, moved, context(mob))) return false;
-    if ((try mobs.collisionsOf(mob.motion.world, moved)).len > 0) return false;
+    if ((try mobs.collisionsOf(mob, moved)).len > 0) return false;
     return !try containsLiquid(&level, moved);
 }
 

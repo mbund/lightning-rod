@@ -20,7 +20,7 @@ pub const Conditions = struct {
 };
 
 /// Player.getEyeHeight for the pose the player is in.
-fn playerEyeHeight(sneaking: bool) f64 {
+pub fn playerEyeHeight(sneaking: bool) f64 {
     return if (sneaking) @as(f32, 1.27) else @as(f32, 1.62);
 }
 

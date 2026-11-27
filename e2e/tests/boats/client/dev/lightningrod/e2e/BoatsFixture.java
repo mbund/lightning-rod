@@ -7,6 +7,7 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.inventory.ChestMenu;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.GameType;
@@ -18,7 +19,7 @@ import net.minecraft.world.phys.Vec3;
  * and still on the still water. In survival, a few punches break it, and its item drops.
  */
 final class BoatsFixture extends Fixture {
-    private enum Phase { GIVE, PLACE, AFLOAT, SURVIVAL, BREAK, DROPPED, BOARD, RIDING, DRIVE, LEAVE, LEFT }
+    private enum Phase { GIVE, PLACE, AFLOAT, SURVIVAL, BREAK, DROPPED, BOARD, RIDING, DRIVE, LEAVE, LEFT, ABOARD, KEPT, SEATED, RIDDEN_OPEN, OFF, SNEAK, OPEN, STORE, STORED }
     private Phase phase = Phase.GIVE;
     private long phaseStart;
     private double settledY = Double.NaN;
@@ -38,8 +39,12 @@ final class BoatsFixture extends Fixture {
         return r.tick - phaseStart > ticks;
     }
 
-    private static boolean isBoat(Entity entity) {
-        return BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).getPath().equals("oak_boat");
+    private boolean chest() {
+        return r.scenario.equals("boats-chest");
+    }
+
+    private boolean isBoat(Entity entity) {
+        return BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).getPath().equals(chest() ? "oak_chest_boat" : "oak_boat");
     }
 
     /** The boats the client draws near the player. */
@@ -47,6 +52,16 @@ final class BoatsFixture extends Fixture {
         var found = new ArrayList<Entity>();
         for (var entity : game.level.entitiesForRendering()) if (isBoat(entity) && entity.distanceTo(game.player) < 24) found.add(entity);
         return found;
+    }
+
+    private Entity boat(Minecraft game) {
+        var boats = boats(game);
+        return boats.isEmpty() ? null : boats.get(0);
+    }
+
+    private static Entity cow(Minecraft game) {
+        for (var entity : game.level.entitiesForRendering()) if (BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).getPath().equals("cow")) return entity;
+        return null;
     }
 
     /** Right clicks an entity, through whichever interact the client release has. */
@@ -84,9 +99,14 @@ final class BoatsFixture extends Fixture {
                 // At the pool's west edge, looking at its middle.
                 game.player.setPos(1.5, 65, 5.5);
                 lookAt(game, new Vec3(5.5, 64.95, 5.5));
-                var boat = new ItemStack(Items.OAK_BOAT);
+                var boat = new ItemStack(chest() ? Items.OAK_CHEST_BOAT : Items.OAK_BOAT);
                 game.player.getInventory().setItem(0, boat);
                 game.gameMode.handleCreativeModeItemAdd(boat, 36);
+                if (chest()) {
+                    var diamond = new ItemStack(Items.DIAMOND, 5);
+                    game.player.getInventory().setItem(1, diamond);
+                    game.gameMode.handleCreativeModeItemAdd(diamond, 37);
+                }
                 game.player.getInventory().setSelectedSlot(0);
                 if (timedOut(20)) next(Phase.PLACE);
             }
@@ -109,6 +129,8 @@ final class BoatsFixture extends Fixture {
                 if (!timedOut(120)) return;
                 if (Math.abs(at.y - settledY) > 0.05) { client.fail("boat_bobbing_" + settledY + "_to_" + at.y); return; }
                 if (r.scenario.equals("boats-ride")) { next(Phase.BOARD); return; }
+                if (r.scenario.equals("boats-cow")) { this.boat = boat; next(Phase.ABOARD); return; }
+                if (chest()) { this.boat = boat; interact(game, boat); next(Phase.SEATED); return; }
                 game.getConnection().sendCommand("gamemode survival");
                 next(Phase.SURVIVAL);
             }
@@ -164,7 +186,85 @@ final class BoatsFixture extends Fixture {
                 if (game.player.position().distanceTo(at) > 3.0) { client.fail("rider_set_down_far_" + game.player.position() + "_boat_" + at); return; }
                 client.pass("boat_boarded_driven_and_left_at_" + at);
             }
+            case SEATED -> {
+                // With room aboard and not sneaking, a click boards it.
+                if (game.player.getVehicle() != boat) { if (timedOut(100)) client.fail("chest_boat_never_boarded"); return; }
+                // The inventory key of a chest boat's rider opens the chest.
+                game.player.sendOpenInventory();
+                next(Phase.RIDDEN_OPEN);
+            }
+            case RIDDEN_OPEN -> {
+                if (!(game.player.containerMenu instanceof ChestMenu)) { if (timedOut(100)) client.fail("ridden_chest_never_opened"); return; }
+                game.player.closeContainer();
+                game.options.keyShift.setDown(true);
+                next(Phase.OFF);
+            }
+            case OFF -> {
+                if (game.player.getVehicle() != null) { if (timedOut(100)) client.fail("never_got_off_the_chest_boat"); return; }
+                // Getting off ends the sneak for the server, as Player.rideTick does, and the client
+                // says only when its keys change: so shift goes up and down again.
+                game.options.keyShift.setDown(false);
+                next(Phase.SNEAK);
+            }
+            case SNEAK -> {
+                // Sneaking, a click opens the chest rather than boarding.
+                if (r.tick - phaseStart == 5) game.options.keyShift.setDown(true);
+                if (!timedOut(10)) return;
+                lookAt(game, boat.position());
+                interact(game, boat);
+                next(Phase.OPEN);
+            }
+            case OPEN -> {
+                if (!(game.player.containerMenu instanceof ChestMenu menu)) { if (timedOut(100)) client.fail("chest_never_opened"); return; }
+                if (game.player.getVehicle() != null) { client.fail("boarded_instead_of_opening"); return; }
+                if (menu.getRowCount() != 3) { client.fail("chest_rows_" + menu.getRowCount()); return; }
+                // The diamonds in the hotbar's second slot, after the chest's 27 and the 27 above the hotbar.
+                GameApi.inventoryClick(game, 27 + 27 + 1, 0, ClickType.QUICK_MOVE);
+                next(Phase.STORE);
+            }
+            case STORE -> {
+                if (!(game.player.containerMenu instanceof ChestMenu menu)) { client.fail("chest_closed_early"); return; }
+                if (!timedOut(20)) return;
+                if (!menu.getSlot(0).getItem().is(Items.DIAMOND) || menu.getSlot(0).getItem().getCount() != 5) { client.fail("chest_holds_" + menu.getSlot(0).getItem()); return; }
+                game.player.closeContainer();
+                game.options.keyShift.setDown(false);
+                next(Phase.STORED);
+            }
+            case STORED -> {
+                if (!timedOut(20)) return;
+                if (game.player.getInventory().contains(new ItemStack(Items.DIAMOND))) { client.fail("diamonds_still_carried"); return; }
+                game.getConnection().sendCommand("gamemode survival");
+                next(Phase.SURVIVAL);
+            }
+            case ABOARD -> {
+                // The cow the scene put beside the boat rides it.
+                var cow = cow(game);
+                if (cow != null && cow.getVehicle() == boat) { next(Phase.KEPT); return; }
+                if (timedOut(200)) client.fail("cow_never_aboard_" + (cow == null ? "none" : cow.position() + "_rides_" + cow.getVehicle()));
+            }
+            case KEPT -> {
+                var cow = cow(game);
+                if (cow == null || cow.getVehicle() != boat) { client.fail("cow_left_the_boat"); return; }
+                if (cow.position().distanceTo(boat.position()) > 1.0) { client.fail("cow_not_seated_" + cow.position() + "_boat_" + boat.position()); return; }
+                if (!timedOut(40)) return;
+                game.getConnection().sendCommand("gamemode survival");
+                next(Phase.SURVIVAL);
+            }
             case DROPPED -> {
+                if (chest()) {
+                    // The chest's diamonds drop with the boat.
+                    boolean diamonds = game.player.getInventory().contains(new ItemStack(Items.DIAMOND));
+                    for (var entity : game.level.entitiesForRendering()) if (entity instanceof ItemEntity item && item.getItem().is(Items.DIAMOND)) diamonds = true;
+                    if (diamonds) { client.pass("chest_boat_held_diamonds_and_dropped_them_after_" + attacks); return; }
+                    if (timedOut(200)) client.fail("no_diamonds_dropped");
+                    return;
+                }
+                if (r.scenario.equals("boats-cow")) {
+                    var cow = cow(game);
+                    if (cow != null && cow.getVehicle() == null) { client.pass("cow_rode_the_boat_and_was_set_down_at_" + cow.position()); return; }
+                    if (timedOut(200)) client.fail("cow_still_riding");
+                    return;
+                }
                 for (var entity : game.level.entitiesForRendering()) {
                     if (entity instanceof ItemEntity item && item.getItem().is(Items.OAK_BOAT) && item.distanceTo(game.player) < 16) { client.pass("boat_floated_and_broke_into_its_item_after_" + attacks); return; }
                 }

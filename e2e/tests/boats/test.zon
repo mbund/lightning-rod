@@ -2,4 +2,8 @@
     .{ .name = "boats", .peers = .{"alice"} },
     // Boarded, steered across the pool by its client and left by sneaking.
     .{ .name = "boats-ride", .peers = .{"alice"} },
+    // A cow beside the boat is taken aboard, and set down when the boat breaks.
+    .{ .name = "boats-cow", .fixture = "cow", .peers = .{"alice"} },
+    // A chest boat's chest, opened sneaking, keeps what is put in it and drops it as it breaks.
+    .{ .name = "boats-chest", .peers = .{"alice"} },
 } }

@@ -114,6 +114,8 @@ pub const Players = struct {
     join_count: u64 = 0,
     movement_observer: ?MovementObserver = null,
     teleport_gate: ?TeleportGate = null,
+    /// What opens the inventory of the vehicle a player rides, as a chest boat's chest.
+    vehicle_inventory: ?VehicleInventory = null,
 
     dig_handlers: []DigHandler,
     dig_count: usize = 0,
@@ -143,6 +145,12 @@ pub const Players = struct {
             };
             return .{ .context = context, .vtable = &Adapter.vtable };
         }
+    };
+    /// HasCustomInventoryScreen.openCustomInventoryScreen for the vehicle a player rides, which
+    /// its client asks for with the inventory key.
+    pub const VehicleInventory = struct {
+        context: *anyopaque,
+        open: *const fn (context: *anyopaque, slot: usize) anyerror!void,
     };
     const DigHandler = struct {
         context: *anyopaque,
@@ -508,6 +516,12 @@ pub const Players = struct {
         self.teleport_gate = gate;
     }
 
+    /// Who opens vehicles' inventories: one owner.
+    pub fn openVehicleInventories(self: *Players, opener: VehicleInventory) void {
+        std.debug.assert(self.vehicle_inventory == null);
+        self.vehicle_inventory = opener;
+    }
+
     pub fn observeDig(self: *Players, context: anytype, comptime handler: anytype) !void {
         if (self.dig_count == self.dig_handlers.len) return error.DigObserverCapacity;
         const Adapter = struct {
@@ -784,6 +798,8 @@ pub const Players = struct {
         switch (std.enums.fromInt(minecraft.Action, action_id) orelse return error.InvalidPacket) {
             .start_sprinting => player.flags.sprinting = true,
             .stop_sprinting => player.flags.sprinting = false,
+            // ServerGamePacketListenerImpl.handlePlayerCommand: the vehicle ridden opens its own.
+            .open_vehicle_inventory => if (player.vehicle != null) if (self.vehicle_inventory) |opener| try opener.open(opener.context, handle.index),
             else => {},
         }
         player.revision += 1;

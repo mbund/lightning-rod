@@ -26,6 +26,8 @@ const Mobs = @import("mobs.zig").Mobs;
 const body = @import("vanilla_bodies").body;
 const Melee = @import("melee.zig").Melee;
 const Boats = @import("boats.zig").Boats;
+const senses = @import("senses.zig");
+const Player = @import("players").player_state.Player;
 const boat_module = @import("boat.zig");
 
 const Mob = mob_state.Mob;
@@ -195,18 +197,9 @@ pub const MobInteraction = struct {
         try self.deps.melee.attack(slot, .{ .player = victim });
     }
 
-    /// Player.canInteractWithEntity with ServerGamePacketListenerImpl's three blocks of slack:
-    /// the entity's box within the interaction range of the eyes.
+    /// ServerGamePacketListenerImpl's three blocks of slack over the interaction range.
     fn withinReach(self: *MobInteraction, slot: usize, box: body.Box) !bool {
-        const player = &self.deps.players.records[slot];
-        const range = try self.deps.attributes.value(slot, "minecraft:entity_interaction_range") + 3.0;
-        const eye: [3]f64 = .{ player.position.x, player.position.y + (if (player.flags.sneaking) @as(f64, @as(f32, 1.27)) else @as(f64, @as(f32, 1.62))), player.position.z };
-        var squared: f64 = 0;
-        for (0..3) |axis| {
-            const distance = @max(box.min[axis] - eye[axis], 0, eye[axis] - box.max[axis]);
-            squared += distance * distance;
-        }
-        return squared < range * range;
+        return canInteractWithEntity(self.deps.attributes, &self.deps.players.records[slot], slot, box, 3.0);
     }
 
     // Mob.interact.
@@ -304,3 +297,16 @@ pub const MobInteraction = struct {
         self.effects.sound(player.world, player.position, name, .players, 1, 1, @bitCast(self.sound_seeds.next()), slot);
     }
 };
+
+/// Player.canInteractWithEntity: the entity's box within the player's interaction range of its
+/// eyes, and `slack` more.
+pub fn canInteractWithEntity(attributes: *EquipmentAttributes, player: *const Player, slot: usize, box: body.Box, slack: f64) !bool {
+    const range = try attributes.value(slot, "minecraft:entity_interaction_range") + slack;
+    const eye: [3]f64 = .{ player.position.x, player.position.y + senses.playerEyeHeight(player.flags.sneaking), player.position.z };
+    var squared: f64 = 0;
+    for (0..3) |axis| {
+        const distance = @max(box.min[axis] - eye[axis], 0, eye[axis] - box.max[axis]);
+        squared += distance * distance;
+    }
+    return squared < range * range;
+}

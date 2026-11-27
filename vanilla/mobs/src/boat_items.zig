@@ -1,4 +1,4 @@
-//! Boat items: BoatItem.use puts the item's boat where the player looks, on a block or on any
+//! Boat items, with chests or without: BoatItem.use puts the item's boat where the player looks, on a block or on any
 //! fluid, facing as the player faces, where it is clear.
 
 const std = @import("std");
@@ -33,27 +33,27 @@ pub const BoatItems = struct {
     };
 
     deps: Dependencies,
-    /// The item of each variant's boat, by registry id.
-    items: [@typeInfo(Boats.Variant).@"enum".field_names.len]u32,
+    /// The item of each model's boat, by registry id.
+    items: [Boats.Model.count]u32,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*BoatItems {
         const self = try allocator.create(BoatItems);
-        var items: [@typeInfo(Boats.Variant).@"enum".field_names.len]u32 = undefined;
-        for (&items, 0..) |*item, index| item.* = @intCast(game_data.registry.itemId(@as(Boats.Variant, @fromBackingInt(@intCast(index))).name()) orelse return error.UnknownItem);
+        var items: [Boats.Model.count]u32 = undefined;
+        for (&items, 0..) |*item, index| item.* = @intCast(game_data.registry.itemId(Boats.Model.at(index).name()) orelse return error.UnknownItem);
         self.* = .{ .deps = deps, .items = items };
         try deps.actions.on(item_actions.Binding.bind(BoatItems, self, use));
         return self;
     }
 
-    fn variantOf(self: *const BoatItems, item: u32) ?Boats.Variant {
-        for (self.items, 0..) |known, index| if (known == item) return @fromBackingInt(@intCast(index));
+    fn modelOf(self: *const BoatItems, item: u32) ?Boats.Model {
+        for (self.items, 0..) |known, index| if (known == item) return Boats.Model.at(index);
         return null;
     }
 
     /// BoatItem.use, which answers using the item in the air: clicking a block passes to it.
     fn use(self: *BoatItems, context: *const item_actions.Context) !item_actions.Result {
         if (context.hit != null) return .pass;
-        const variant = self.variantOf(context.item.kind) orelse return .pass;
+        const model = self.modelOf(context.item.kind) orelse return .pass;
         const player = context.player;
         const boats = self.deps.boats;
         const level = boats.deps.mobs.level(player.world);
@@ -69,7 +69,7 @@ pub const BoatItems = struct {
         if (try boats.pickableHolds(player.world, reach, eye)) return .pass;
         const placed = boat_module.boxAt(hit.location);
         if (!try boats.clear(player.world, placed, hit.location[1], null)) return .denied;
-        _ = try boats.spawn(.{ .variant = variant, .world = player.world, .position = hit.location, .yaw = player.rotation.yaw });
+        _ = try boats.spawn(.{ .model = model, .world = player.world, .position = hit.location, .yaw = player.rotation.yaw });
         if (!creative) try self.consume(context);
         return .applied;
     }
