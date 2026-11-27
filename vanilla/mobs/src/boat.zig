@@ -57,6 +57,8 @@ pub const Boat = struct {
     in_powder_snow: bool = false,
     was_touching_water: bool = false,
     lava_height: f64 = 0,
+    /// Entity.isEyeInFluid(WATER), as the last tick left it.
+    eye_in_water: bool = false,
     first_tick: bool = true,
     removed: bool = false,
     /// Entity.hasImpulse and hurtMarked, for replication to send its motion now.
@@ -94,6 +96,8 @@ pub const Around = struct {
     destroy_block: *const fn (context: *anyopaque, world: u32, position: [3]i32) anyerror!void,
     break_block: *const fn (context: *anyopaque, world: u32, position: [3]i32) anyerror!void,
     lower_cauldron: *const fn (context: *anyopaque, world: u32, position: [3]i32) anyerror!void,
+    /// Entity.ejectPassengers, which may leave the boat its own to move.
+    eject: *const fn (context: *anyopaque) anyerror!void,
     level_random: *JavaRandom,
     mob_griefing: bool = true,
     /// Whether the dimension is ultrawarm, where lava pushes harder.
@@ -114,25 +118,39 @@ pub fn boxAt(position: [3]f64) Box {
     return body.makeBox(position, box_width, box_height);
 }
 
-/// AbstractBoat.tick on the server for a boat no player steers: its body and state move on a
-/// tick. The owner has set `old_position` and pushes and picks up what is around it after.
-pub fn tick(level: *const body.Level, around: Around, state: *entities.State, boat: *Boat, scratch: *Scratch) !void {
+/// Who moves a boat: the server, or the client of the player who steers it, whose moves since the
+/// last tick block effects trace.
+pub const Steering = struct {
+    steered: bool = false,
+    movements: []const block_effects.Movement = &.{},
+};
+
+/// AbstractBoat.tick on the server: its body and state move on a tick, by itself unless a player
+/// steers it. The owner pushes and picks up what is around it after, and places its riders.
+pub fn tick(level: *const body.Level, around: Around, state: *entities.State, boat: *Boat, scratch: *Scratch, steering: *const Steering) !void {
     boat.old_position = state.position;
     boat.old_status = boat.status;
     const status = try statusOf(level, state.position, boat);
     boat.status = status;
     boat.out_of_control = if (status == .under_water or status == .under_flowing_water) boat.out_of_control + 1 else 0;
+    if (boat.out_of_control >= out_of_control_limit) try around.eject(around.context);
     if (boat.hurt_time > 0) boat.hurt_time -= 1;
     if (boat.damage > 0) boat.damage -= 1;
     // A boat removed on the way finishes its tick as vanilla's does: the block effects pass it by.
     try baseTick(level, around, state, boat);
-    try floatBoat(level, around, state, boat, scratch);
-    const kept = try move(level, around, state, boat, state.velocity, scratch);
-    // AbstractBoat.tick applies the block effects twice: the first takes the movement the move
+    // AbstractBoat.tick applies the block effects twice: the first takes the movements the moves
     // kept, and the second, finding none left, walks from where the tick began.
-    try applyEffects(level, around, state, boat, scratch, if (kept) |movement| &.{movement} else &.{});
+    if (steering.steered) {
+        // Not the server's to move: its client's packets did.
+        state.velocity = .{ 0, 0, 0 };
+        try applyEffects(level, around, state, boat, scratch, steering.movements);
+    } else {
+        try floatBoat(level, around, state, boat, scratch);
+        const kept = try move(level, around, state, boat, state.velocity, scratch);
+        try applyEffects(level, around, state, boat, scratch, if (kept) |movement| &.{movement} else &.{});
+    }
     try applyEffects(level, around, state, boat, scratch, &.{});
-    tickBubbleColumn(state, boat);
+    if (tickBubbleColumn(state, boat)) try around.eject(around.context);
 }
 
 /// AbstractBoat.getStatus, which also sets the water level and land friction it found.
@@ -284,6 +302,11 @@ fn updateFluids(level: *const body.Level, around: Around, state: *entities.State
         boat.was_touching_water = true;
     } else boat.was_touching_water = false;
     boat.lava_height = (try fluids.heightAndPush(level, box, &state.velocity, .lava, if (around.ultrawarm) 0.007 else 0.0023333333333333335)).height;
+    // Entity.updateFluidOnEyes: water over its eyes, at the top of its box.
+    const eye = state.position[1] + @as(f64, box_height);
+    const at: [3]i32 = .{ mth.floor(state.position[0]), mth.floor(eye), mth.floor(state.position[2]) };
+    const physics = try level.fluid(at[0], at[1], at[2]);
+    boat.eye_in_water = physics.fluid == .water and try fluids.top(level, at[0], at[1], at[2], physics) > eye;
 }
 
 /// Entity.doWaterSplashEffect for a boat that is its own controller: the sound, and the draws its
@@ -409,6 +432,22 @@ fn move(level: *const body.Level, around: Around, state: *entities.State, boat: 
     return kept;
 }
 
+/// Entity.move for a boat its rider's client moved, MoverType.PLAYER as handleMoveVehicle moves
+/// it: what the move kept for the block effects, if it moved.
+pub fn moveBy(level: *const body.Level, around: Around, state: *entities.State, boat: *Boat, movement: [3]f64, scratch: *Scratch) !?block_effects.Movement {
+    return move(level, around, state, boat, movement, scratch);
+}
+
+/// Entity.setOnGroundWithMovement then doCheckFallDamage, each finding its support again, as
+/// handleMoveVehicle takes what the rider's client said of the boat.
+pub fn landBy(level: *const body.Level, state: *const entities.State, boat: *Boat, moved: [3]f64, on_ground: bool) !void {
+    boat.on_ground = on_ground;
+    try checkSupportingBlock(level, state, boat, moved);
+    if (boat.removed) return;
+    try checkSupportingBlock(level, state, boat, moved);
+    try checkFallDamage(level, state, boat, moved[1]);
+}
+
 /// Entity.checkSupportingBlock, after a move that may have landed.
 fn checkSupportingBlock(level: *const body.Level, state: *const entities.State, boat: *Boat, moved: [3]f64) !void {
     if (!boat.on_ground) {
@@ -486,8 +525,9 @@ fn applyEffects(level: *const body.Level, around: Around, state: *entities.State
 }
 
 /// AbstractBoat.tickBubbleColumn on the server: a boat over a bubble column long enough is thrown
-/// up out of it, or pulled down into it.
-fn tickBubbleColumn(state: *entities.State, boat: *Boat) void {
+/// up out of it, or pulled down into it, and then its riders are thrown out.
+fn tickBubbleColumn(state: *entities.State, boat: *Boat) bool {
+    var pulled = false;
     if (!boat.above_bubble_column) boat.bubble_time = 0;
     var time = boat.bubble_time;
     if (time > 0) {
@@ -498,6 +538,7 @@ fn tickBubbleColumn(state: *entities.State, boat: *Boat) void {
             boat.bubble_time = 0;
             if (boat.bubble_column_down) {
                 state.velocity[1] += -0.7;
+                pulled = true;
             } else {
                 // 2.7 under a passenger that is a player, which no boat here carries.
                 state.velocity[1] = 0.6;
@@ -505,6 +546,7 @@ fn tickBubbleColumn(state: *entities.State, boat: *Boat) void {
         }
         boat.above_bubble_column = false;
     }
+    return pulled;
 }
 
 /// AbstractBoat.onAboveBubbleColumn on the server.

@@ -53,6 +53,7 @@ pub const BoatReplication = struct {
             .body = body,
             .identity = identity,
             .before = byId,
+            .passengers = passengers,
             // A client eases a boat toward what it is sent: InterpolationHandler.
             .client = .{ .unpredictable = .{ .update_interval = update_interval } },
         });
@@ -93,6 +94,8 @@ pub const BoatReplication = struct {
                     .hurt_dir = boat.hurt_dir,
                     .damage = boat.damage,
                     .bubble_time = boat.bubble_time,
+                    .paddle_left = stored.paddles[0],
+                    .paddle_right = stored.paddles[1],
                 },
                 .changed = self.deps.tracking.changed(slot) != null,
             });
@@ -119,6 +122,10 @@ fn writeData(_: *BoatReplication, entries: *entity_sync.Entries, data: BoatData,
     if (changes.contains(.paddle_left)) try entries.putBoolean(11, data.paddle_left);
     if (changes.contains(.paddle_right)) try entries.putBoolean(12, data.paddle_right);
     if (changes.contains(.bubble_time)) try entries.putInt(13, data.bubble_time);
+}
+
+fn passengers(self: *BoatReplication, slot: u32) entity_sync.Passengers {
+    return self.deps.boats.passengersOf(slot);
 }
 
 fn identity(self: *BoatReplication, slot: u32) Sync.Identity {

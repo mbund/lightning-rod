@@ -94,7 +94,7 @@ const Quiet = struct {
     terrain: *Terrain,
 
     fn around(self: *Quiet) boat_module.Around {
-        return .{ .context = self, .collisions = collisions, .hurt = hurt, .sound = sound, .destroy_block = change, .break_block = breakBlock, .lower_cauldron = change, .level_random = &self.level_random };
+        return .{ .context = self, .collisions = collisions, .hurt = hurt, .sound = sound, .destroy_block = change, .break_block = breakBlock, .lower_cauldron = change, .eject = eject, .level_random = &self.level_random };
     }
     fn breakBlock(context: *anyopaque, _: u32, position: [3]i32) anyerror!void {
         const self: *Quiet = @ptrCast(@alignCast(context));
@@ -107,6 +107,7 @@ const Quiet = struct {
         return error.UnexpectedHurt;
     }
     fn sound(_: *anyopaque, _: boat_module.Sound, _: f32, _: f32) void {}
+    fn eject(_: *anyopaque) anyerror!void {}
     fn change(_: *anyopaque, _: u32, _: [3]i32) anyerror!void {
         return error.UnexpectedEdit;
     }
@@ -166,7 +167,7 @@ test "boats float, drift and slide as vanilla's on random terrain" {
         line = lines.next();
         while (line) |expected| : (line = lines.next()) {
             if (std.mem.startsWith(u8, expected, "seed ")) break;
-            try boat_module.tick(&level, quiet.around(), &state, &boat, scratch);
+            try boat_module.tick(&level, quiet.around(), &state, &boat, scratch, &.{});
             const want = try std.fmt.parseInt(u64, expected, 16);
             const got = hash(state, &boat);
             if (want != got) {

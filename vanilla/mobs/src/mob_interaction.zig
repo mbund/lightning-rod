@@ -165,8 +165,8 @@ pub const MobInteraction = struct {
         }
     }
 
-    /// An interaction with a boat: an attack, as Player.attack takes it of what is not living.
-    /// Riding one, its use, is not built yet.
+    /// An interaction with a boat: an attack, as Player.attack takes it of what is not living, or
+    /// its use, AbstractBoat.interact, which boards it.
     fn dispatchBoat(self: *MobInteraction, slot: usize, boats: *Boats, boat: u32, mouse: i32) !void {
         const player = &self.deps.players.records[slot];
         if (!boats.solid(boat)) return;
@@ -174,7 +174,11 @@ pub const MobInteraction = struct {
         if (state.world != player.world) return;
         if (!self.deps.world_border.containsBlock(player.world, mth.floor(state.position[0]), mth.floor(state.position[2]))) return;
         if (!try self.withinReach(slot, boat_module.boxAt(state.position))) return;
-        if (mouse == 1) try self.deps.melee.attack(slot, .{ .boat = boat });
+        switch (mouse) {
+            1 => try self.deps.melee.attack(slot, .{ .boat = boat }),
+            0 => try boats.interact(slot, boat),
+            else => {},
+        }
     }
 
     /// An interaction with another player: an attack, as ServerPlayer.attack takes it. A player

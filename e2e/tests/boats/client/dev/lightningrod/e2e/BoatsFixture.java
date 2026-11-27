@@ -10,6 +10,7 @@ import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.GameType;
+import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.Vec3;
 
 /**
@@ -17,11 +18,14 @@ import net.minecraft.world.phys.Vec3;
  * and still on the still water. In survival, a few punches break it, and its item drops.
  */
 final class BoatsFixture extends Fixture {
-    private enum Phase { GIVE, PLACE, AFLOAT, SURVIVAL, BREAK, DROPPED }
+    private enum Phase { GIVE, PLACE, AFLOAT, SURVIVAL, BREAK, DROPPED, BOARD, RIDING, DRIVE, LEAVE, LEFT }
     private Phase phase = Phase.GIVE;
     private long phaseStart;
     private double settledY = Double.NaN;
     private int attacks;
+    private Entity boat;
+    private Vec3 start;
+    private Vec3 driven;
 
     BoatsFixture(Recorder r) { super(r); }
 
@@ -43,6 +47,25 @@ final class BoatsFixture extends Fixture {
         var found = new ArrayList<Entity>();
         for (var entity : game.level.entitiesForRendering()) if (isBoat(entity) && entity.distanceTo(game.player) < 24) found.add(entity);
         return found;
+    }
+
+    /** Right clicks an entity, through whichever interact the client release has. */
+    private void interact(Minecraft game, Entity entity) {
+        try {
+            for (var method : game.gameMode.getClass().getMethods()) {
+                if (!method.getName().equals("interact")) continue;
+                if (method.getParameterCount() == 4) {
+                    method.invoke(game.gameMode, game.player, entity, new EntityHitResult(entity, entity.position().add(0, entity.getBbHeight() / 2, 0)), InteractionHand.MAIN_HAND);
+                    return;
+                }
+                if (method.getParameterCount() == 3) {
+                    method.invoke(game.gameMode, game.player, entity, InteractionHand.MAIN_HAND);
+                    return;
+                }
+            }
+        } catch (ReflectiveOperationException failure) {
+            client.fail("interact_" + failure);
+        }
     }
 
     /** Looks from the eyes at a point, as a player turning to it would. */
@@ -85,6 +108,7 @@ final class BoatsFixture extends Fixture {
                 if (Double.isNaN(settledY)) { settledY = at.y; return; }
                 if (!timedOut(120)) return;
                 if (Math.abs(at.y - settledY) > 0.05) { client.fail("boat_bobbing_" + settledY + "_to_" + at.y); return; }
+                if (r.scenario.equals("boats-ride")) { next(Phase.BOARD); return; }
                 game.getConnection().sendCommand("gamemode survival");
                 next(Phase.SURVIVAL);
             }
@@ -102,6 +126,43 @@ final class BoatsFixture extends Fixture {
                 game.gameMode.attack(game.player, boats.get(0));
                 game.player.swing(InteractionHand.MAIN_HAND);
                 attacks++;
+            }
+            case BOARD -> {
+                var boats = boats(game);
+                if (boats.size() != 1) { client.fail("board_boats_" + boats.size()); return; }
+                boat = boats.get(0);
+                start = boat.position();
+                interact(game, boat);
+                next(Phase.RIDING);
+            }
+            case RIDING -> {
+                if (game.player.getVehicle() == boat) { next(Phase.DRIVE); return; }
+                if (timedOut(100)) client.fail("never_boarded_" + game.player.position());
+            }
+            case DRIVE -> {
+                // Paddling straight on, toward the pool's east side.
+                game.player.setYRot(-90);
+                boat.setYRot(-90);
+                game.options.keyUp.setDown(true);
+                if (!timedOut(15)) return;
+                game.options.keyUp.setDown(false);
+                driven = boat.position();
+                if (driven.distanceTo(start) < 1.0) { client.fail("boat_did_not_move_" + start + "_" + driven); return; }
+                game.options.keyShift.setDown(true);
+                next(Phase.LEAVE);
+            }
+            case LEAVE -> {
+                if (game.player.getVehicle() != null) { if (timedOut(100)) client.fail("never_left"); return; }
+                game.options.keyShift.setDown(false);
+                next(Phase.LEFT);
+            }
+            case LEFT -> {
+                // The server kept the boat where its rider drove it, and set the rider down beside it.
+                if (!timedOut(40)) return;
+                var at = boat.position();
+                if (at.distanceTo(driven) > 1.0) { client.fail("boat_went_back_from_" + driven + "_to_" + at); return; }
+                if (game.player.position().distanceTo(at) > 3.0) { client.fail("rider_set_down_far_" + game.player.position() + "_boat_" + at); return; }
+                client.pass("boat_boarded_driven_and_left_at_" + at);
             }
             case DROPPED -> {
                 for (var entity : game.level.entitiesForRendering()) {

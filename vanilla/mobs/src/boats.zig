@@ -11,6 +11,11 @@ const records = @import("records");
 const storage = @import("storage");
 const inventories = @import("inventories");
 const Players = @import("players").players.Players;
+const Input = @import("players").input.Input;
+const sessions = @import("sessions");
+const minecraft = @import("minecraft_model");
+const wire = @import("wire_1_21_5");
+const entity_sync = @import("replication").entity_sync;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
 const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEntities;
 const item_data = @import("vanilla_items").item_data;
@@ -23,6 +28,7 @@ const Mob = @import("mob.zig").Mob;
 const body = bodies.body;
 const mth = bodies.mth;
 const JavaRandom = bodies.java_random.JavaRandom;
+const block_effects = bodies.block_effects;
 const Boat = boat_module.Boat;
 const Box = body.Box;
 const assert = std.debug.assert;
@@ -43,6 +49,7 @@ pub const Boats = struct {
         inventories: *inventories.Inventories,
         storage: storage.Space,
         record_workspaces: *records.Workspaces,
+        input: *Input,
     };
 
     /// The woods boats are made of, and bamboo, whose boat is a raft; each its own entity type.
@@ -74,6 +81,51 @@ pub const Boats = struct {
         variant: Variant,
         stored: ?entities.Column = null,
         dirty: bool = true,
+        /// Who rides it, in AbstractBoat's order: the first steers.
+        riders: Riders = .{},
+        /// AbstractBoat.DATA_ID_PADDLE_LEFT and DATA_ID_PADDLE_RIGHT, as its rider's client says.
+        paddles: [2]bool = .{ false, false },
+        steer: Steer = .{},
+    };
+
+    /// A player riding a boat, as the slot, connection and life it boarded with.
+    pub const Rider = struct { slot: usize, generation: u32, life: u32 };
+
+    pub const Riders = struct {
+        /// AbstractBoat.getMaxPassengers.
+        pub const max = 2;
+        list: [max]Rider = undefined,
+        count: u8 = 0,
+
+        fn remove(self: *Riders, at: usize) void {
+            std.mem.copyForwards(Rider, self.list[at .. self.count - 1], self.list[at + 1 .. self.count]);
+            self.count -= 1;
+        }
+
+        fn indexOf(self: *const Riders, rider: Rider) ?usize {
+            for (self.list[0..self.count], 0..) |held, at| if (std.meta.eql(held, rider)) return at;
+            return null;
+        }
+    };
+
+    /// What handleMoveVehicle holds of a boat its rider's client moves: where the tick began, where
+    /// the last move left it, and the moves since, which block effects trace.
+    pub const Steer = struct {
+        first_good: [3]f64 = .{ 0, 0, 0 },
+        last_good: [3]f64 = .{ 0, 0, 0 },
+        moves: [8]block_effects.Movement = undefined,
+        move_count: u8 = 0,
+
+        fn record(self: *Steer, movement: block_effects.Movement) void {
+            // Vanilla keeps a hundred, merging the oldest: a tick of moves from a client is few.
+            if (self.move_count == self.moves.len) {
+                self.moves[1] = .{ .from = self.moves[0].from, .to = self.moves[1].to, .axis_independent = false };
+                std.mem.copyForwards(block_effects.Movement, self.moves[0 .. self.moves.len - 1], self.moves[1..]);
+                self.move_count -= 1;
+            }
+            self.moves[self.move_count] = movement;
+            self.move_count += 1;
+        }
     };
 
     /// What a boat keeps in the store beside its body, which is what vanilla saves of one: how far
@@ -149,8 +201,14 @@ pub const Boats = struct {
     /// Animations of boats since replication last sent them, in order.
     animations: [64]Animation = undefined,
     animation_count: usize = 0,
+    /// Ticks since start, which boarding waits counted against.
+    now: u64 = 0,
+    /// By player slot, the tick before which it may not board, as Entity.boardingCooldown.
+    boarding: []u64,
     /// The boat ticking, for the world's answers to its tick.
     ticking: ?Ticking = null,
+    /// How the boat ticking moves: by itself, or by its rider, until an eject frees it.
+    steering: boat_module.Steering = .{},
     work: boat_module.Scratch = .{},
 
     const Ticking = struct { slot: u32 };
@@ -182,13 +240,17 @@ pub const Boats = struct {
             .table = records.Table.init(deps.storage, deps.record_workspaces.resources),
             .retired = try allocator.alloc(entities.Id, bound),
             .replicated = try .init(allocator, bound),
+            .boarding = try allocator.alloc(u64, deps.players.records.len),
         };
+        @memset(self.boarding, 0);
         // EntityType's clientTrackingRange of 10 chunks.
         try deps.entities.declare(.{ .kinds = kinds, .tracking_range = 10 * 16 });
         try deps.entities.addTicker(.init(Boats, self, kinds, 1));
         try deps.entities.addColumnHolder(.init(Boats, self, columnLoaded, columnUnloaded));
         try self.boats.register();
         deps.mobs.boats = self;
+        try deps.input.on(.vehicle_move, self, onVehicleMove);
+        try deps.input.on(.steer_boat, self, onSteerBoat);
         return self;
     }
 
@@ -273,7 +335,7 @@ pub const Boats = struct {
         if (!creative and boat.damage > 40) {
             try self.destroy(slot);
         } else if (creative) {
-            self.discard(slot);
+            try self.discard(slot);
         }
         return true;
     }
@@ -283,7 +345,7 @@ pub const Boats = struct {
     fn destroy(self: *Boats, slot: u32) !void {
         const stored = self.boats.ptr(slot);
         const state = self.deps.entities.body(slot).?.*;
-        self.discard(slot);
+        try self.discard(slot);
         const random = self.deps.mobs.levelRandom();
         const dx = random.nextDouble() * 0.2 - 0.1;
         const dz = random.nextDouble() * 0.2 - 0.1;
@@ -292,13 +354,15 @@ pub const Boats = struct {
         _ = try self.deps.dropped.create(state.world, state.position, .{ dx, 0.2, dz }, stack);
     }
 
-    /// Entity.discard: the boat is removed, its body and place at the tick's end.
-    fn discard(self: *Boats, slot: u32) void {
+    /// Entity.discard: the boat is removed, its body and place at the tick's end, and its riders
+    /// get off, as Entity.setRemoved has them stop riding.
+    fn discard(self: *Boats, slot: u32) !void {
         const stored = self.boats.ptr(slot);
         if (stored.boat.removed) return;
         stored.boat.removed = true;
         self.retired[self.retired_count] = self.deps.entities.directory.entry(slot).id;
         self.retired_count += 1;
+        try self.eject(slot);
     }
 
     /// AbstractBoat.push(Entity), the boat in the slot and another: another boat counts only from
@@ -445,15 +509,17 @@ pub const Boats = struct {
 
     /// CollisionGetter.noCollision for a boat about to be placed with its box there: no block
     /// shape, no entity it would collide with, and not the world border's outside.
-    pub fn clear(self: *Boats, world: u32, box: Box, bottom: f64) !bool {
+    pub fn clear(self: *Boats, world: u32, box: Box, bottom: f64, except: ?u32) !bool {
         const level = self.deps.mobs.level(world);
         if (!try body.noCollision(&level, box, .{ .bottom = bottom })) return false;
         const Find = struct {
             boats: *Boats,
             box: Box,
+            except: ?u32,
             found: bool = false,
             fn visit(find: *@This(), entry: entities.space.Entry) anyerror!bool {
                 const boats = find.boats;
+                if (find.except == entry.slot) return false;
                 const other = if (boats.kinds.has(entry.shape.kind)) other: {
                     if (!boats.solid(entry.slot)) return false;
                     break :other boat_module.boxAt(entry.position);
@@ -463,7 +529,7 @@ pub const Boats = struct {
                 return true;
             }
         };
-        var find: Find = .{ .boats = self, .box = box.inflate(1.0e-7, 1.0e-7, 1.0e-7) };
+        var find: Find = .{ .boats = self, .box = box.inflate(1.0e-7, 1.0e-7, 1.0e-7), .except = except };
         try self.places.space.each(world, .{ .min = find.box.min, .max = find.box.max }, self.kinds.with(self.deps.mobs.kinds), &find, Find.visit);
         if (find.found) return false;
         const border = body.borderFor(&level, box, box) orelse return true;
@@ -474,6 +540,7 @@ pub const Boats = struct {
     /// Before entities tick: boats near players come into memory.
     pub fn prepareTick(self: *Boats) !void {
         errdefer self.deps.storage.fail();
+        self.now += 1;
         try self.forgetRetired();
         if (!self.deps.entities.columns_followed) try self.refresh();
     }
@@ -501,13 +568,22 @@ pub const Boats = struct {
         const level = self.deps.mobs.level(state.world);
         self.ticking = .{ .slot = slot };
         defer self.ticking = null;
-        try boat_module.tick(&level, self.around(state.world), state, &stored.boat, &self.work);
+        // A boat a player steers is moved by its client: its tick traces the moves since the last.
+        self.steering = .{ .steered = self.steeredBy(slot) != null, .movements = stored.steer.moves[0..stored.steer.move_count] };
+        try boat_module.tick(&level, self.around(state.world), state, &stored.boat, &self.work, &self.steering);
+        stored.steer.move_count = 0;
+        // AbstractBoat.tick: paddles turn only under a player.
+        if (stored.riders.count == 0 and (stored.paddles[0] or stored.paddles[1])) stored.paddles = .{ false, false };
         if (stored.boat.removed and !self.isRetired(slot)) {
             // Gone below the world, as Entity.onBelowWorld discards it.
             stored.boat.removed = false;
-            self.discard(slot);
+            try self.discard(slot);
         }
         if (!stored.boat.removed) try self.pushAround(slot);
+        // ServerLevel.tickPassenger: its riders tick after it.
+        try self.rideTicks(slot);
+        stored.steer.first_good = state.position;
+        stored.steer.last_good = state.position;
         if (!std.meta.eql(before, state.*)) {
             stored.dirty = true;
             try self.places.move(slot, state.world, state.position);
@@ -564,6 +640,7 @@ pub const Boats = struct {
             .destroy_block = destroyBlock,
             .break_block = breakBlock,
             .lower_cauldron = lowerCauldron,
+            .eject = ejectTicking,
             .level_random = self.deps.mobs.levelRandom(),
             .mob_griefing = self.deps.mobs.mobGriefing(),
             .ultrawarm = self.deps.mobs.ultrawarm(world),
@@ -629,9 +706,329 @@ pub const Boats = struct {
         return self.deps.mobs.breakBlock(world, position);
     }
 
+    /// Entity.ejectPassengers for the boat ticking, which then moves itself.
+    fn ejectTicking(context: *anyopaque) anyerror!void {
+        const self: *Boats = @ptrCast(@alignCast(context));
+        try self.eject(self.ticking.?.slot);
+        self.steering.steered = false;
+    }
+
     fn lowerCauldron(context: *anyopaque, world: u32, position: [3]i32) anyerror!void {
         const self: *Boats = @ptrCast(@alignCast(context));
         return self.deps.mobs.lowerCauldron(world, position);
+    }
+
+    // Riding.
+
+    /// AbstractBoat.interact: a player not sneaking boards a boat not too long under water.
+    pub fn interact(self: *Boats, player_slot: usize, slot: u32) !void {
+        const stored = self.boats.ptr(slot);
+        if (stored.boat.removed) return;
+        if (self.deps.players.records[player_slot].flags.sneaking) return;
+        if (stored.boat.out_of_control >= boat_module.out_of_control_limit) return;
+        try self.mount(player_slot, slot);
+    }
+
+    /// ServerPlayer.startRiding: Entity.startRiding's rules, then the rider is placed, told where
+    /// it is and what it rides.
+    fn mount(self: *Boats, player_slot: usize, slot: u32) !void {
+        const player = &self.deps.players.records[player_slot];
+        const entity = self.deps.entities.directory.entry(slot).id;
+        if (player.vehicle == entity) return;
+        // Entity.canRide: not sneaking, and not just off a vehicle.
+        if (player.flags.sneaking or self.now < self.boarding[player_slot]) return;
+        // AbstractBoat.canAddPassenger: room for one more, its eyes out of the water.
+        const stored = self.boats.ptr(slot);
+        if (stored.riders.count == Riders.max or stored.boat.eye_in_water) return;
+        if (player.vehicle) |other| if (self.boats.slotOf(other)) |was| try self.dismount(was, player_slot);
+        // Entity.addPassenger: a player goes first unless one is already, as one is when any rides.
+        const at: usize = stored.riders.count;
+        stored.riders.list[at] = .{ .slot = player_slot, .generation = player.handle.?.generation, .life = player.life };
+        stored.riders.count += 1;
+        player.vehicle = entity;
+        self.replicated.insert(slot);
+        // ServerPlayer.startRiding: placed where the boat seats it, its client teleported there and
+        // told what it rides.
+        try self.deps.players.placeRider(player_slot, self.seatOf(slot, at));
+        try self.deps.players.teleport(player, player.world, player.position, player.rotation);
+        self.tellRider(player_slot, slot);
+    }
+
+    /// Entity.positionRider with AbstractBoat.getPassengerAttachmentPoint: where the boat seats its
+    /// rider at `index`, the rider's vehicle attachment under it, a player's 0.6 up.
+    fn seatOf(self: *Boats, slot: u32, index: usize) minecraft.Position {
+        const stored = self.boats.ptr(slot);
+        const state = self.deps.entities.body(slot).?;
+        // Boat.rideHeight and Raft.rideHeight, in floats.
+        const ride_height: f64 = if (stored.variant == .bamboo) boat_module.box_height * @as(f32, 0.8888889) else boat_module.box_height / 3.0;
+        var offset: f32 = 0;
+        if (stored.riders.count > 1) offset = if (index == 0) 0.2 else -0.6;
+        // Vec3.yRot of (0, rideHeight, offset) by the boat's turn.
+        const angle = -state.yaw * 0.017453292;
+        const cosine: f64 = mth.cos(angle);
+        const sine: f64 = mth.sin(angle);
+        const along: f64 = offset;
+        return .{ .x = state.position[0] + along * sine, .y = state.position[1] + ride_height - 0.6, .z = state.position[2] + along * cosine };
+    }
+
+    /// After the boat's tick, its riders' Player.rideTick, in their order: one gone is let go, one
+    /// sneaking gets off, and the rest are seated, their turn kept within AbstractBoat.clampRotation.
+    fn rideTicks(self: *Boats, slot: u32) !void {
+        const stored = self.boats.ptr(slot);
+        var held = stored.riders;
+        for (held.list[0..held.count]) |rider| {
+            const at = stored.riders.indexOf(rider) orelse continue;
+            if (!self.present(rider, slot)) {
+                self.letGo(slot, at);
+                continue;
+            }
+            const player = &self.deps.players.records[rider.slot];
+            if (player.flags.sneaking) {
+                try self.dismount(slot, rider.slot);
+                // Player.rideTick: off, it stops sneaking.
+                player.flags.sneaking = false;
+                continue;
+            }
+            try self.deps.players.placeRider(rider.slot, self.seatOf(slot, at));
+            const yaw = self.deps.entities.body(slot).?.yaw;
+            const off = mth.wrapDegrees(player.rotation.yaw - yaw);
+            const kept = mth.clamp(off, -105.0, 105.0);
+            player.rotation.yaw += kept - off;
+        }
+    }
+
+    /// Whether a rider is still the player it was, in the world the boat is in.
+    fn present(self: *Boats, rider: Rider, slot: u32) bool {
+        const player = &self.deps.players.records[rider.slot];
+        const handle = player.handle orelse return false;
+        const entity = self.deps.entities.directory.entry(slot).id;
+        return handle.generation == rider.generation and player.life == rider.life and player.inWorld() and player.vehicle == entity and
+            player.world == self.deps.entities.body(slot).?.world and self.deps.player_states.of(player).health > 0;
+    }
+
+    /// A rider gone from the world, or riding no more, is let go without being moved.
+    fn letGo(self: *Boats, slot: u32, at: usize) void {
+        const stored = self.boats.ptr(slot);
+        const rider = stored.riders.list[at];
+        stored.riders.remove(at);
+        self.replicated.insert(slot);
+        const player = &self.deps.players.records[rider.slot];
+        const entity = self.deps.entities.directory.entry(slot).id;
+        if (player.handle != null and player.handle.?.generation == rider.generation and player.vehicle == entity) player.vehicle = null;
+    }
+
+    /// Player.stopRiding: off the boat, kept from boarding for 60 ticks, told it rides nothing, and
+    /// set down where LivingEntity.dismountVehicle puts it.
+    fn dismount(self: *Boats, slot: u32, player_slot: usize) !void {
+        const stored = self.boats.ptr(slot);
+        for (stored.riders.list[0..stored.riders.count], 0..) |rider, at| {
+            if (rider.slot != player_slot) continue;
+            stored.riders.remove(at);
+            break;
+        } else return;
+        const player = &self.deps.players.records[player_slot];
+        player.vehicle = null;
+        self.boarding[player_slot] = self.now + 60;
+        self.replicated.insert(slot);
+        self.tellRider(player_slot, slot);
+        const position = try self.dismountLocation(slot, player_slot);
+        try self.deps.players.teleport(player, player.world, .{ .x = position[0], .y = position[1], .z = position[2] }, player.rotation);
+    }
+
+    /// Entity.ejectPassengers: the last first.
+    fn eject(self: *Boats, slot: u32) !void {
+        const stored = self.boats.ptr(slot);
+        while (stored.riders.count > 0) {
+            const rider = stored.riders.list[stored.riders.count - 1];
+            if (self.present(rider, slot)) {
+                try self.dismount(slot, rider.slot);
+            } else self.letGo(slot, stored.riders.count - 1);
+        }
+    }
+
+    /// LivingEntity.dismountVehicle: beside a boat still there, as AbstractBoat finds room, else
+    /// where the rider is, no lower than the boat.
+    fn dismountLocation(self: *Boats, slot: u32, player_slot: usize) ![3]f64 {
+        const stored = self.boats.ptr(slot);
+        const state = self.deps.entities.body(slot).?;
+        const player = &self.deps.players.records[player_slot];
+        const at: [3]f64 = .{ player.position.x, player.position.y, player.position.z };
+        if (stored.boat.removed) return .{ at[0], @max(at[1], state.position[1]), at[2] };
+        // AbstractBoat.getDismountLocationForPassenger, from Entity.getCollisionHorizontalEscapeVector.
+        const reach = (@as(f64, boat_module.box_width * std.math.sqrt2) + @as(f64, @as(f32, 0.6)) + @as(f64, @as(f32, 1.0e-5))) / 2.0;
+        const turn = player.rotation.yaw * 0.017453292;
+        const f = -mth.sin(turn);
+        const g = mth.cos(turn);
+        const h = @max(@abs(f), @abs(g));
+        const x = state.position[0] + @as(f64, f) * reach / @as(f64, h);
+        const z = state.position[2] + @as(f64, g) * reach / @as(f64, h);
+        const top = boat_module.boxAt(state.position).max[1];
+        const above: [3]i32 = .{ mth.floor(x), mth.floor(top), mth.floor(z) };
+        const level = self.deps.mobs.level(state.world);
+        if ((try level.fluid(above[0], above[1] - 1, above[2])).fluid != .water) {
+            var floors: [2]f64 = undefined;
+            var found: usize = 0;
+            for ([2]i32{ above[1], above[1] - 1 }) |y| {
+                const floor = try blockFloorHeight(&level, .{ above[0], y, above[2] });
+                if (std.math.isInf(floor) or !(floor < 1.0)) continue;
+                floors[found] = @as(f64, @floatFromInt(y)) + floor;
+                found += 1;
+            }
+            // Player.getDismountPoses: standing, crouching, swimming.
+            for ([3]f32{ 1.8, 1.5, 0.6 }) |tall| for (floors[0..found]) |y| {
+                const room = body.makeBox(.{ x, y, z }, 0.6, tall);
+                if (try body.noCollision(&level, room, .{ .bottom = y })) return .{ x, y, z };
+            };
+        }
+        return .{ state.position[0], top, state.position[2] };
+    }
+
+    /// BlockGetter.getBlockFloorHeight: how high the floor stands in a block, from the block below
+    /// when it has none of its own.
+    fn blockFloorHeight(level: *const body.Level, at: [3]i32) !f64 {
+        const own = body.contextFreeBoxes(try level.state(at[0], at[1], at[2]), at[0], at[2]);
+        if (own.count > 0) return topOf(own);
+        const below = body.contextFreeBoxes(try level.state(at[0], at[1] - 1, at[2]), at[0], at[2]);
+        if (below.count == 0) return -std.math.inf(f64);
+        const reach = topOf(below);
+        return if (reach >= 1.0) reach - 1.0 else -std.math.inf(f64);
+    }
+
+    fn topOf(boxes: anytype) f64 {
+        var top: f64 = -std.math.inf(f64);
+        for (0..boxes.count) |index| top = @max(top, boxes.get(index)[4]);
+        return top;
+    }
+
+    /// ClientboundSetPassengersPacket of a boat, to a rider that boarded or left it.
+    fn tellRider(self: *Boats, player_slot: usize, slot: u32) void {
+        const player = &self.deps.players.records[player_slot];
+        const handle = player.handle orelse return;
+        _ = self.deps.players.sendPacket(writePassengers, player.protocol, handle, .{ entities.Entities.networkOfSlot(slot), self.passengersOf(slot) });
+    }
+
+    /// What a boat carries, by network id, in its order: players' ids are their slots plus one.
+    pub fn passengersOf(self: *Boats, slot: u32) entity_sync.Passengers {
+        const stored = self.boats.ptr(slot);
+        var carried: entity_sync.Passengers = .{};
+        for (stored.riders.list[0..stored.riders.count]) |rider| {
+            carried.ids[carried.count] = @intCast(rider.slot + 1);
+            carried.count += 1;
+        }
+        return carried;
+    }
+
+    /// Whether a player steers the boat: the first it carries, as AbstractBoat.getControllingPassenger.
+    fn steeredBy(self: *Boats, slot: u32) ?usize {
+        const stored = self.boats.ptr(slot);
+        if (stored.riders.count == 0) return null;
+        return stored.riders.list[0].slot;
+    }
+
+    /// ServerGamePacketListenerImpl.handlePaddleBoat: the paddles of the boat the player steers.
+    fn onSteerBoat(self: *Boats, handle: sessions.Handle, packet: wire.play.toServer.packet_steer_boat.Reader) !void {
+        const left, const a = try packet.leftPaddle();
+        const right, const done = try a.rightPaddle();
+        try done.finish();
+        const slot = self.steered(handle) orelse return;
+        const stored = self.boats.ptr(slot);
+        if (stored.paddles[0] == left and stored.paddles[1] == right) return;
+        stored.paddles = .{ left, right };
+        self.replicated.insert(slot);
+    }
+
+    /// The boat a player steers, as its connection: Player.getControlledVehicle.
+    fn steered(self: *Boats, handle: sessions.Handle) ?u32 {
+        const player = &self.deps.players.records[handle.index];
+        if (player.stage != .ready) return null;
+        const entity = player.vehicle orelse return null;
+        const slot = self.boats.slotOf(entity) orelse return null;
+        if (self.steeredBy(slot) != handle.index) return null;
+        return slot;
+    }
+
+    /// ServerGamePacketListenerImpl.handleMoveVehicle: where the rider's client moved the boat it
+    /// steers, taken unless too fast, or wrong where blocks or entities stand.
+    fn onVehicleMove(self: *Boats, handle: sessions.Handle, packet: wire.play.toServer.packet_vehicle_move.Reader) !void {
+        const x, const a = try packet.x();
+        const y, const b = try a.y();
+        const z, const c = try b.z();
+        const yaw, const d = try c.yaw();
+        const pitch, const e = try d.pitch();
+        const on_ground, const done = try e.onGround();
+        try done.finish();
+        const player = &self.deps.players.records[handle.index];
+        if (!std.math.isFinite(x) or !std.math.isFinite(y) or !std.math.isFinite(z) or !std.math.isFinite(yaw) or !std.math.isFinite(pitch)) return self.deps.players.refuse(player, "multiplayer.disconnect.invalid_vehicle_movement");
+        if (!player.loaded) return;
+        const slot = self.steered(handle) orelse return;
+        const stored = self.boats.ptr(slot);
+        const state = self.deps.entities.body(slot).?;
+        const was = state.position;
+        const to: [3]f64 = .{ std.math.clamp(x, -3.0e7, 3.0e7), std.math.clamp(y, -2.0e7, 2.0e7), std.math.clamp(z, -3.0e7, 3.0e7) };
+        const turned: [2]f32 = .{ mth.wrapDegrees(yaw), mth.wrapDegrees(pitch) };
+        // Moved too quickly: farther from where the tick began than its speed explains.
+        const v = state.velocity;
+        var travelled: f64 = 0;
+        for (to, stored.steer.first_good) |now, first| travelled += (now - first) * (now - first);
+        if (travelled - (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) > 100.0) return self.correctVehicle(handle, slot);
+        const old_box = boat_module.boxAt(was);
+        const level = self.deps.mobs.level(state.world);
+        self.ticking = .{ .slot = slot };
+        defer self.ticking = null;
+        const step: [3]f64 = .{ to[0] - stored.steer.last_good[0], to[1] - stored.steer.last_good[1], to[2] - stored.steer.last_good[2] };
+        const kept = try boat_module.moveBy(&level, self.around(state.world), state, &stored.boat, step, &self.work);
+        // Moved wrongly: the move fell short of where the client says by more than a quarter
+        // block across. Up and down never count.
+        const off_x = to[0] - state.position[0];
+        const off_z = to[2] - state.position[2];
+        const wrongly = off_x * off_x + off_z * off_z > 0.0625;
+        if ((wrongly and try self.clear(state.world, old_box, was[1], slot)) or try self.newlyColliding(slot, old_box, to)) {
+            state.position = was;
+            state.yaw = turned[0];
+            state.pitch = std.math.clamp(turned[1], -90.0, 90.0);
+            return self.correctVehicle(handle, slot);
+        }
+        state.position = to;
+        state.yaw = @rem(turned[0], 360.0);
+        state.pitch = @rem(std.math.clamp(turned[1], -90.0, 90.0), 360.0);
+        if (kept) |movement| stored.steer.record(movement);
+        try self.places.move(slot, state.world, state.position);
+        stored.dirty = true;
+        self.replicated.insert(slot);
+        const moved: [3]f64 = .{ to[0] - was[0], to[1] - was[1], to[2] - was[2] };
+        // ServerPlayer.handlePlayerKnownMovement: what its vehicle moved, it moved.
+        player.known_movement = moved;
+        player.moved = true;
+        try boat_module.landBy(&level, state, &stored.boat, moved, on_ground);
+        stored.steer.last_good = state.position;
+    }
+
+    /// ClientboundMoveVehiclePacket: the boat where the server has it, which the client takes.
+    fn correctVehicle(self: *Boats, handle: sessions.Handle, slot: u32) void {
+        const state = self.deps.entities.body(slot).?;
+        const player = &self.deps.players.records[handle.index];
+        _ = self.deps.players.sendPacket(writeVehicleMove, player.protocol, handle, .{ state.position, state.yaw, state.pitch });
+    }
+
+    /// isEntityCollidingWithAnythingNew: a shape the boat's box meets where the client put it that
+    /// it did not meet where it was.
+    fn newlyColliding(self: *Boats, slot: u32, old_box: Box, to: [3]f64) !bool {
+        const state = self.deps.entities.body(slot).?;
+        const level = self.deps.mobs.level(state.world);
+        const deflate = @as(f64, @as(f32, 1.0e-5));
+        const was = old_box.inflate(-deflate, -deflate, -deflate);
+        const now = boat_module.boxAt(to).inflate(-deflate, -deflate, -deflate);
+        var shapes: body.Shapes = .init(&level, now, .{ .bottom = old_box.min[1], .fall_distance = self.boats.ptr(slot).boat.fall_distance });
+        while (try shapes.next()) |shape| for (0..shape.boxes.count) |index| {
+            const piece = shape.get(index);
+            if (piece.intersects(now) and !piece.intersects(was)) return true;
+        };
+        self.ticking = .{ .slot = slot };
+        defer self.ticking = null;
+        var room: [boat_module.Scratch.max_others]Box = undefined;
+        for (try collisions(self, now, &room)) |other| if (!other.intersects(was)) return true;
+        if (body.borderFor(&level, now, now)) |border| for (border) |side| if (side.intersects(now) and !side.intersects(was)) return true;
+        return false;
     }
 
     /// The records of boats that went go too, and their bodies and places with them.
@@ -760,3 +1157,11 @@ pub const Boats = struct {
         try batch.flush();
     }
 };
+
+/// ClientboundSetPassengersPacket.
+const writePassengers = entity_sync.writePassengers;
+
+/// ClientboundMoveVehiclePacket: where the server has the boat its rider steers.
+fn writeVehicleMove(packet: wire.play.toClient.packet_vehicle_move.Writer, position: [3]f64, yaw: f32, pitch: f32) ![]u8 {
+    return (try (try (try (try (try packet.x(position[0])).y(position[1])).z(position[2])).yaw(yaw)).pitch(pitch)).finish();
+}

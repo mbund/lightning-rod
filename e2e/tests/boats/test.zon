@@ -1,1 +1,5 @@
-.{ .client = "BoatsFixture", .scenarios = .{.{ .name = "boats", .peers = .{"alice"} }} }
+.{ .client = "BoatsFixture", .scenarios = .{
+    .{ .name = "boats", .peers = .{"alice"} },
+    // Boarded, steered across the pool by its client and left by sneaking.
+    .{ .name = "boats-ride", .peers = .{"alice"} },
+} }
