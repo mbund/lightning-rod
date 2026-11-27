@@ -1833,7 +1833,13 @@ pub const Space = struct {
 
     /// A column's finds in order: in place where they share a page, as most do.
     fn sortFound(found: *Array(Entry), start: usize, end: usize) void {
-        if (found.run(start, end)) |values| return std.sort.pdq(Entry, values, {}, lessThan);
+        // Most finds in a column are none or a few: those are in order already, or put in order
+        // in place. Entries never tie, so every sort gives the same order.
+        if (end - start < 2) return;
+        if (found.run(start, end)) |values| {
+            if (values.len <= 16) return std.sort.insertion(Entry, values, {}, lessThan);
+            return std.sort.pdq(Entry, values, {}, lessThan);
+        }
         const Order = struct {
             values: *Array(Entry),
             pub fn lessThan(order: @This(), a: usize, b: usize) bool {
