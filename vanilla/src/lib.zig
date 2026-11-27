@@ -118,6 +118,9 @@ pub const Projectiles = @import("vanilla_mobs").projectiles.Projectiles;
 pub const ProjectileReplication = @import("vanilla_mobs").projectile_replication.ProjectileReplication;
 pub const Ranged = @import("vanilla_mobs").ranged.Ranged;
 pub const MobInteraction = @import("vanilla_mobs").mob_interaction.MobInteraction;
+pub const Boats = @import("vanilla_mobs").boats.Boats;
+pub const BoatItems = @import("vanilla_mobs").boat_items.BoatItems;
+pub const BoatReplication = @import("vanilla_mobs").boat_replication.BoatReplication;
 pub const Placement = @import("vanilla_blocks").placement.Placement;
 pub const BlockActions = @import("vanilla_blocks").block_actions.BlockActions;
 pub const container_storage = @import("vanilla_containers").containers;
@@ -226,6 +229,8 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(ToolActions, .{}),
     lightning_rod.plugin.configured(RandomTicks, RandomTicks.Configuration{}),
     lightning_rod.plugin.configured(Mobs, Mobs.Configuration{}),
+    lightning_rod.plugin.configured(Boats, .{}),
+    lightning_rod.plugin.configured(BoatItems, .{}),
     lightning_rod.plugin.configured(SpawnEggs, SpawnEggs.Configuration{}),
     lightning_rod.plugin.configured(Melee, .{}),
     lightning_rod.plugin.configured(Projectiles, .{}),
@@ -236,6 +241,7 @@ const defaults = lightning_rod.plugin.compose(.{
     lightning_rod.plugin.configured(ProjectileReplication, .{}),
     lightning_rod.plugin.configured(ExperienceReplication, .{}),
     lightning_rod.plugin.configured(MobReplication, MobReplication.Configuration{}),
+    lightning_rod.plugin.configured(BoatReplication, .{}),
     lightning_rod.plugin.configured(Equipment, Equipment.Configuration{}),
     lightning_rod.plugin.configured(ItemReplication, ItemReplication.Configuration{}),
 });

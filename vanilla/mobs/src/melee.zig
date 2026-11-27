@@ -26,6 +26,8 @@ const mth = @import("vanilla_bodies").mth;
 const living = @import("living.zig");
 const mob_state = @import("mob.zig");
 const Mobs = @import("mobs.zig").Mobs;
+const Boats = @import("boats.zig").Boats;
+const boat_module = @import("boat.zig");
 
 const Mob = mob_state.Mob;
 const Attack = attack_effects.Attack;
@@ -36,6 +38,9 @@ pub const Target = union(enum) {
     mob: Mob,
     /// A player, by slot.
     player: usize,
+    /// A boat, by slot: not living, so it takes no knockback but a push, wears no weapon and shows
+    /// no damage dealt.
+    boat: u32,
 };
 
 /// What a hit is, worked out before it lands. `base` is after attack strength and before a
@@ -206,6 +211,8 @@ pub const Melee = struct {
                 .speed = 0.2,
             });
         }
+        // ItemStack.hurtEnemy and postHurtEnemy are for the living alone.
+        if (target == .boat) return null;
         return if (weapon) |view| view.kind else null;
     }
 
@@ -259,6 +266,7 @@ pub const Melee = struct {
         const grounded = switch (target) {
             .mob => |mob| mob.motion.on_ground,
             .player => |victim| self.deps.players.records[victim].on_ground,
+            .boat => |boat| self.boats().boats.ptr(boat).boat.on_ground,
         };
         self.sound(slot, if (!grounded) "minecraft:item.mace.smash_air" else if (fallen > 5) "minecraft:item.mace.smash_ground_heavy" else "minecraft:item.mace.smash_ground");
         const at = self.positionOf(target);
@@ -281,7 +289,7 @@ pub const Melee = struct {
                 if (!mob.alive() or (context.target == .mob and context.target.mob.same(mob))) return false;
                 const strength = smashStrength(context.center, mob.motion.position, context.scale) * (1 - mobs.traits(mob.entity.species).attribute(.knockback_resistance));
                 if (strength <= 0) return false;
-                const away = living.normalize(.{ mob.motion.position[0] - context.center[0], mob.motion.position[1] - context.center[1], mob.motion.position[2] - context.center[2] });
+                const away = mth.normalize(.{ mob.motion.position[0] - context.center[0], mob.motion.position[1] - context.center[1], mob.motion.position[2] - context.center[2] });
                 mob.motion.velocity = .{ mob.motion.velocity[0] + away[0] * strength, mob.motion.velocity[1] + 0.7, mob.motion.velocity[2] + away[2] * strength };
                 mob.entity.has_impulse = true;
                 mobs.rouseMob(mob);
@@ -296,7 +304,7 @@ pub const Melee = struct {
             const at: [3]f64 = .{ candidate.position.x, candidate.position.y, candidate.position.z };
             const strength = smashStrength(center, at, scale) * (1 - try self.deps.attributes.value(other, "minecraft:knockback_resistance"));
             if (strength <= 0) continue;
-            const away = living.normalize(.{ at[0] - center[0], at[1] - center[1], at[2] - center[2] });
+            const away = mth.normalize(.{ at[0] - center[0], at[1] - center[1], at[2] - center[2] });
             try self.deps.damage.push(other, .{ away[0] * strength, 0.7, away[2] * strength });
         }
     }
@@ -316,7 +324,8 @@ pub const Melee = struct {
         }
         if (!hit.critical and !hit.sweep) self.sound(slot, if (hit.strong) "minecraft:entity.player.attack.strong" else "minecraft:entity.player.attack.weak");
         if (hit.enchanted > 0) self.animate(slot, target, .enchanted_hit);
-        if (hit.smash) try self.smash(slot, target, hit.fallen);
+        // MaceItem.hurtEnemy, which smashes, is for the living alone.
+        if (hit.smash and target != .boat) try self.smash(slot, target, hit.fallen);
         try self.postAttack(slot, weapon, effects, target);
     }
 
@@ -334,7 +343,7 @@ pub const Melee = struct {
             .max = .{ box.max[0] + 1, box.max[1] + 0.25, box.max[2] + 1 },
         };
         switch (target) {
-            .mob, .player => {
+            .mob, .player, .boat => {
                 var swept: struct { melee: *Melee, slot: usize, weapon: @TypeOf(weapon), effects: @TypeOf(effects), amount: @TypeOf(amount), scale: @TypeOf(hit.scale) } = .{ .melee = self, .slot = slot, .weapon = weapon, .effects = effects, .amount = amount, .scale = hit.scale };
                 const Sweep = struct {
                     fn visit(context: *@TypeOf(swept), mob: Mob) anyerror!bool {
@@ -344,7 +353,7 @@ pub const Melee = struct {
                 };
                 switch (target) {
                     .mob => |mob| try self.deps.mobs.near(mob, reach, .living, &swept, Sweep.visit),
-                    .player => try self.deps.mobs.each(player.world, reach, &swept, Sweep.visit),
+                    .player, .boat => try self.deps.mobs.each(player.world, reach, &swept, Sweep.visit),
                 }
             },
         }
@@ -503,6 +512,7 @@ pub const Melee = struct {
                 const disable = if (weapon) |view| if (game_data.physics.itemWeapon(view.kind)) |held| held.disable_blocking_seconds else 0 else 0;
                 break :blk self.deps.damage.hurt(victim, .{ .type = damage_type, .attacker = slot, .cause_id = network, .direct_id = network, .position = from, .attack = effects, .weapon = weapon, .melee = true, .disable_seconds = disable }, amount);
             },
+            .boat => |boat| self.boats().hurt(boat, amount, .{ .player = .{ .slot = slot, .creative = self.deps.player_states.of(player).gamemode == .creative } }),
         };
     }
 
@@ -510,6 +520,8 @@ pub const Melee = struct {
         switch (target) {
             .mob => |mob| self.deps.mobs.knockback(mob, strength, x, z),
             .player => |victim| try self.deps.damage.knockback(victim, strength, x, z),
+            // Entity.push for what is not living, the strength and the look as floats, and a lift.
+            .boat => |boat| self.boats().knock(boat, .{ @as(f32, @floatCast(-x)) * @as(f32, @floatCast(strength)), 0.1, @as(f32, @floatCast(-z)) * @as(f32, @floatCast(strength)) }),
         }
     }
 
@@ -517,6 +529,7 @@ pub const Melee = struct {
         switch (target) {
             .mob => |mob| self.deps.mobs.ignite(mob, seconds),
             .player => |victim| try self.deps.damage.ignite(victim, seconds),
+            .boat => |boat| self.boats().ignite(boat, seconds),
         }
     }
 
@@ -526,6 +539,7 @@ pub const Melee = struct {
         switch (target) {
             .mob => |mob| self.deps.mobs.animate(mob, animation),
             .player => |victim| self.entity.send(self.deps.replication.viewers(slot), slot, .{ .animation = .{ .id = entity_effects.playerId(victim), .animation = @backingInt(animation) } }),
+            .boat => |boat| self.boats().animate(boat, @backingInt(animation)),
         }
     }
 
@@ -533,6 +547,7 @@ pub const Melee = struct {
         return switch (target) {
             .mob => |mob| self.deps.mobs.traits(mob.entity.species).entity_type,
             .player => self.player_type,
+            .boat => |boat| self.deps.mobs.deps.entities.directory.entry(boat).kind,
         };
     }
 
@@ -540,6 +555,8 @@ pub const Melee = struct {
         return switch (target) {
             .mob => |mob| mob.living.health,
             .player => |victim| self.deps.player_states.of(&self.deps.players.records[victim]).health,
+            // Player.attack shows what it dealt to the living alone.
+            .boat => 0,
         };
     }
 
@@ -550,6 +567,7 @@ pub const Melee = struct {
                 const position = self.deps.players.records[victim].position;
                 break :blk .{ position.x, position.y, position.z };
             },
+            .boat => |boat| self.deps.mobs.deps.entities.body(boat).?.position,
         };
     }
 
@@ -557,7 +575,13 @@ pub const Melee = struct {
         return switch (target) {
             .mob => |mob| living.box(self.deps.mobs, mob),
             .player => |victim| playerBox(&self.deps.players.records[victim]),
+            .boat => |boat| boat_module.boxAt(self.deps.mobs.deps.entities.body(boat).?.position),
         };
+    }
+
+    /// The boats, which a boat target means are kept.
+    fn boats(self: *const Melee) *Boats {
+        return self.deps.mobs.boats.?;
     }
 
     /// Player.attack's sweep needs the attacker to move slower than 2.5 times its speed a tick,

@@ -8,6 +8,8 @@
 //!
 //!   living: bool, a declaration: whether subjects are living entities, which some blocks
 //!     act on alone
+//!   boat: bool, a declaration: whether subjects are boats, which lily pads break under. A boat
+//!     host answers breakBlock(world, [3]i32) !void, Level.destroyBlock with drops
 //!   level(world) body.Level, scratch() *Scratch
 //!   width(subject) f32, height(subject) f32, alive(subject) bool, fireImmune(subject) !bool
 //!   onPosition(subject, depth: f32) ![3]i32, Entity.getOnPos
@@ -16,6 +18,8 @@
 //!   levelRandom() *JavaRandom, mobGriefing() bool
 //!   destroyBlock(world, [3]i32) !void, lowerCauldron(world, [3]i32) !void,
 //!   crackTurtleEgg(world, [3]i32, state: u16) !void, entityEvent(subject, event: u8) void
+//!   onAboveBubbleColumn(subject, drag: bool, [3]i32) !void, Entity.onAboveBubbleColumn, which most
+//!     hosts answer with `aboveBubbleColumn` and boats with their own
 
 const std = @import("std");
 const game_data = @import("game_data");
@@ -428,6 +432,15 @@ fn visit(host: anytype, subject: anytype, position: [3]i32, step: i32, from: [3]
 fn meetsInside(host: anytype, subject: anytype, state: u16, position: [3]i32, from: [3]f64, to: [3]f64) !bool {
     const entry = host.level(fieldOf(subject, "world").*).blocks.get(state);
     const origin: [3]f64 = .{ @floatFromInt(position[0]), @floatFromInt(position[1]), @floatFromInt(position[2]) };
+    // PowderSnowBlock.getEntityInsideCollisionShape: its collision shape for the body, the whole
+    // block where it has none, as for a body that has not fallen far.
+    if (entry.kind == .powder_snow) {
+        const level = host.level(fieldOf(subject, "world").*);
+        const shape = body.collisionBoxes(&level, state, position[0], position[1], position[2], .{ .bottom = fieldOf(subject, "position").*[1], .fall_distance = fieldOf(subject, "fall_distance").* });
+        if (shape.count == 0) return true;
+        const falling: Box = (body.Shape{ .boxes = shape, .x = position[0], .y = position[1], .z = position[2] }).get(0);
+        return collidedMovingFrom(host, subject, from, to, &.{falling});
+    }
     const filled: ?f64 = switch (entry.kind) {
         .lava_cauldron => 15.0,
         .water_cauldron, .powder_snow_cauldron => 6.0 + @as(f64, @floatFromInt(entry.flags.level)) * 3.0,
@@ -501,7 +514,7 @@ fn clipBox(box: Box, from: [3]f64, to: [3]f64) bool {
 /// The kinds entityInside does something for, lit or not.
 pub fn insideActs(kind: mob_blocks.Kind) bool {
     return switch (kind) {
-        .cactus, .fire, .soul_fire, .campfire, .soul_campfire, .sweet_berry_bush, .cobweb, .powder_snow, .honey_block, .bubble_column, .lava_cauldron, .water_cauldron, .powder_snow_cauldron => true,
+        .cactus, .fire, .soul_fire, .campfire, .soul_campfire, .sweet_berry_bush, .cobweb, .powder_snow, .honey_block, .bubble_column, .lava_cauldron, .water_cauldron, .powder_snow_cauldron, .lily_pad => true,
         else => false,
     };
 }
@@ -543,16 +556,14 @@ fn entityInside(host: anytype, subject: anytype, state: u16, position: [3]i32, c
             collector.apply(.extinguish);
         },
         .honey_block => try honeySlide(host, subject, position),
+        // WaterlilyBlock.entityInside: a boat breaks it, and its drops fall.
+        .lily_pad => if (@TypeOf(host).boat) try host.breakBlock(fieldOf(subject, "world").*, position),
         .bubble_column => {
             const above = try level.state(position[0], position[1] + 1, position[2]);
             const open = body.contextFreeBoxes(above, position[0], position[2]).count == 0 and game_data.physics.get(above).fluid == .none;
             const drag = entry.flags.drag;
             if (open) {
-                fieldOf(subject, "velocity").*[1] = if (drag) @max(-0.9, fieldOf(subject, "velocity").*[1] - 0.03) else @min(1.8, fieldOf(subject, "velocity").*[1] + 0.1);
-                // Entity.sendBubbleColumnParticles draws from the level's random.
-                for (0..2) |_| for (0..4) |_| {
-                    _ = host.levelRandom().nextDouble();
-                };
+                try host.onAboveBubbleColumn(subject, drag, position);
             } else {
                 fieldOf(subject, "velocity").*[1] = if (drag) @max(-0.3, fieldOf(subject, "velocity").*[1] - 0.03) else @min(0.7, fieldOf(subject, "velocity").*[1] + 0.06);
                 fieldOf(subject, "fall_distance").* = 0;
@@ -568,6 +579,16 @@ fn entityInside(host: anytype, subject: anytype, state: u16, position: [3]i32, c
         },
         else => {},
     }
+}
+
+/// Entity.onAboveBubbleColumn as Entity has it: up or down at the column's top, and the
+/// particles' draws from the level's random.
+pub fn aboveBubbleColumn(host: anytype, subject: anytype, drag: bool) void {
+    fieldOf(subject, "velocity").*[1] = if (drag) @max(-0.9, fieldOf(subject, "velocity").*[1] - 0.03) else @min(1.8, fieldOf(subject, "velocity").*[1] + 0.1);
+    // Entity.sendBubbleColumnParticles draws from the level's random.
+    for (0..2) |_| for (0..4) |_| {
+        _ = host.levelRandom().nextDouble();
+    };
 }
 
 /// Entity.makeStuckInBlock.

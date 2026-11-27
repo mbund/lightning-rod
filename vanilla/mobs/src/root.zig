@@ -28,6 +28,10 @@ pub const projectile_replication = @import("projectile_replication.zig");
 pub const ranged = @import("ranged.zig");
 pub const projectile_store = @import("projectile_store.zig");
 pub const mob_interaction = @import("mob_interaction.zig");
+pub const boat = @import("boat.zig");
+pub const boats = @import("boats.zig");
+pub const boat_items = @import("boat_items.zig");
+pub const boat_replication = @import("boat_replication.zig");
 
 test {
     std.testing.refAllDecls(@This());
@@ -48,4 +52,10 @@ comptime {
     _ = &projectiles.Projectiles.init;
     _ = &projectiles.Projectiles.tickRun;
     _ = &ranged.Ranged.init;
+    _ = &boats.Boats.init;
+    _ = &boats.Boats.tickRun;
+    _ = &boats.Boats.checkpoint;
+    _ = &boat_items.BoatItems.init;
+    _ = &boat_replication.BoatReplication.init;
+    _ = &boat_replication.BoatReplication.tick;
 }

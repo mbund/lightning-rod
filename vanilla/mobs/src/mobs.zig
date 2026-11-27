@@ -51,6 +51,7 @@ const EnchantmentRegistry = @import("vanilla_items").enchantment_registry.Enchan
 const damage = @import("damage.zig");
 
 const Mob = mob_state.Mob;
+const Boats = @import("boats.zig").Boats;
 const MobState = mob_state.MobState;
 const Species = mob_state.Species;
 const assert = std.debug.assert;
@@ -192,6 +193,10 @@ pub const Mobs = struct {
     /// Sends the events at once, when they fill within a tick; without it, as with no
     /// replication, nobody hears and they are let go.
     events_full: ?EventsFull = null,
+    /// The boats, which mobs push and collide with, once they start.
+    boats: ?*Boats = null,
+    /// The boxes the last move collided with but blocks.
+    collision_boxes: [64]body.Box = undefined,
     /// Path searches run, and recomputations edits asked for, for measuring.
     path_searches: u64 = 0,
     edit_recomputes: u64 = 0,
@@ -1245,7 +1250,7 @@ pub const Mobs = struct {
             x = (random.float(f64) - random.float(f64)) * 0.01;
             z = (random.float(f64) - random.float(f64)) * 0.01;
         }
-        const direction = living.normalize(.{ x, 0, z });
+        const direction = mth.normalize(.{ x, 0, z });
         const velocity = mob.motion.velocity;
         mob.motion.velocity = .{
             velocity[0] / 2.0 - direction[0] * strength,
@@ -1459,20 +1464,16 @@ pub const Mobs = struct {
         return best;
     }
 
-    /// LivingEntity.pushEntities: mobs push the pushable mobs their box overlaps, in the order vanilla
-    /// finds them, and each moves apart, after the cramming check. How many it touched, each of
-    /// which wakes, as resting mobs skip their own query.
+    /// LivingEntity.pushEntities: mobs push the pushable mobs and the boats their box overlaps, in
+    /// the order vanilla finds them, and each moves apart, after the cramming check. How many it
+    /// touched, each of which wakes, as resting mobs skip their own query.
     pub fn pushEntities(self: *Mobs, mob: Mob) !u32 {
         const own = living.box(self, mob);
         // Counted first, for the cramming check before any push, then pushed in the same order:
         // the hurt moves nothing.
-        var found: u32 = 0;
-        try self.near(mob, own, .pushable, &found, struct {
-            fn visit(count: *u32, _: Mob) anyerror!bool {
-                count.* += 1;
-                return false;
-            }
-        }.visit);
+        var counting: Pushing = .{ .mobs = self, .mob = mob, .box = own };
+        try self.eachPushable(&counting);
+        const found = counting.found;
         if (found == 0) return 0;
         // The maxEntityCramming rule at its default: past 23 others, one tick in four hurts.
         const cramming = 24;
@@ -1480,15 +1481,101 @@ pub const Mobs = struct {
             // None of them rides anything here.
             _ = try self.hurt(mob, .{ .type = .cramming }, 6.0);
         }
-        const Pushing = struct { mobs: *Mobs, mob: Mob };
-        try self.near(mob, own, .pushable, Pushing{ .mobs = self, .mob = mob }, struct {
-            fn visit(pushing: Pushing, other: Mob) anyerror!bool {
-                pushing.mobs.rouseMob(other);
-                push(other, pushing.mob);
-                return false;
-            }
-        }.visit);
+        var pushing: Pushing = .{ .mobs = self, .mob = mob, .box = own, .push = true };
+        try self.eachPushable(&pushing);
         return found;
+    }
+
+    /// What LivingEntity.pushEntities finds around a mob, counted or pushed.
+    const Pushing = struct {
+        mobs: *Mobs,
+        mob: Mob,
+        box: body.Box,
+        push: bool = false,
+        found: u32 = 0,
+
+        fn visit(pushing: *Pushing, entry: entities.space.Entry) anyerror!bool {
+            const mobs = pushing.mobs;
+            if (mobs.boats) |boats| if (boats.kinds.has(entry.shape.kind)) {
+                if (!boats.solid(entry.slot)) return false;
+                pushing.found += 1;
+                // LivingEntity.doPush: the boat is pushed by the mob, as AbstractBoat.push has it.
+                if (pushing.push) {
+                    var pushed: PushedMob = .{ .mobs = mobs, .mob = pushing.mob };
+                    boats.push(entry.slot, pushed.asPushed());
+                }
+                return false;
+            };
+            if (entry.id == pushing.mob.entity.id) return false;
+            const other = try mobs.inSlot(entry.slot);
+            if (other.entity.removed or !living.box(mobs, other).intersects(pushing.box)) return false;
+            if (!other.alive() or try living.onClimbable(mobs, other)) return false;
+            pushing.found += 1;
+            if (pushing.push) {
+                mobs.rouseMob(other);
+                push(other, pushing.mob);
+            }
+            return false;
+        }
+    };
+
+    /// The mobs and boats around a mob in the order Level.getEntities finds them.
+    fn eachPushable(self: *Mobs, pushing: *Pushing) !void {
+        const kinds = if (self.boats) |boats| self.kinds.with(boats.kinds) else self.kinds;
+        try self.places.space.each(pushing.mob.motion.world, .{ .min = pushing.box.min, .max = pushing.box.max }, kinds, pushing, Pushing.visit);
+    }
+
+    /// A mob as a boat pushes it or is pushed by it.
+    const PushedMob = struct {
+        mobs: *Mobs,
+        mob: Mob,
+
+        fn asPushed(self: *PushedMob) Boats.Pushed {
+            return .{ .position = self.mob.motion.position, .box = living.box(self.mobs, self.mob), .boat = false, .context = self, .push = nudge };
+        }
+
+        /// Entity.push(x, y, z) on a mob: its velocity changes, and replication sends it.
+        fn nudge(context: *anyopaque, by: [2]f64) void {
+            const self: *PushedMob = @ptrCast(@alignCast(context));
+            self.mob.motion.velocity[0] += by[0];
+            self.mob.motion.velocity[2] += by[1];
+            self.mob.entity.has_impulse = true;
+            self.mobs.rouseMob(self.mob);
+        }
+    };
+
+    /// AbstractBoat.tick pushing what is around it: the mob in the slot, if it is pushable and its
+    /// box meets the boat's reach.
+    pub fn pushedByBoat(self: *Mobs, slot: u32, reach: body.Box, boat: u32) !void {
+        const mob = try self.inSlot(slot);
+        if (mob.entity.removed or !living.box(self, mob).intersects(reach)) return;
+        if (!mob.alive() or try living.onClimbable(self, mob)) return;
+        var pushed: PushedMob = .{ .mobs = self, .mob = mob };
+        self.boats.?.push(boat, pushed.asPushed());
+    }
+
+    /// Level.getEntityCollisions for a mob: the boats whose boxes meet the box, as mobs collide with
+    /// nothing else here. Good until the next ask.
+    pub fn collisionsOf(self: *Mobs, world: u32, query: body.Box) ![]const body.Box {
+        const boats = self.boats orelse return &.{};
+        // AABB.getSize: too small a box meets nothing.
+        if ((query.max[0] - query.min[0] + (query.max[1] - query.min[1]) + (query.max[2] - query.min[2])) / 3.0 < 1.0e-7) return &.{};
+        return boats.solidBoxes(world, query.inflate(1.0e-7, 1.0e-7, 1.0e-7), null, &self.collision_boxes);
+    }
+
+    /// A mob's box where it can be picked, as LivingEntity.isPickable has it: any not removed.
+    pub fn pickableBox(self: *Mobs, slot: u32) !?body.Box {
+        const mob = try self.inSlot(slot);
+        if (mob.entity.removed) return null;
+        return living.box(self, mob);
+    }
+
+    /// A mob's box where it is pushable, which is where a boat collides with it, as
+    /// AbstractBoat.canCollideWith has it: alive and off climbables.
+    pub fn pushableBox(self: *Mobs, slot: u32) !?body.Box {
+        const mob = try self.inSlot(slot);
+        if (mob.entity.removed or !mob.alive() or try living.onClimbable(self, mob)) return null;
+        return living.box(self, mob);
     }
 
     /// Wakes a resting mob, one the plugin holds or a copy Debug checks run on.
@@ -1541,6 +1628,41 @@ pub const Mobs = struct {
         const fewer = withProperty(state, "eggs", &.{eggs[0] - 1}) orelse return;
         try self.deps.chunks.setBlock(world, .{ .x = position[0], .y = position[1], .z = position[2] }, fewer);
         self.effects.worldEvent(world, .{ .x = position[0], .y = position[1], .z = position[2] }, 2001, state);
+    }
+
+    /// Level.destroyBlock with drops, as a boat breaks a lily pad: the block's break effect, what
+    /// its loot table drops with no tool, each as Block.popResource drops it from the level's
+    /// random, then what fluid the block held, or air.
+    pub fn breakBlock(self: *Mobs, world: u32, position: [3]i32) !void {
+        const level_view = self.level(world);
+        const state = try level_view.state(position[0], position[1], position[2]);
+        const physics = game_data.physics.get(state);
+        if (physics.air) return;
+        self.effects.worldEvent(world, .{ .x = position[0], .y = position[1], .z = position[2] }, 2001, state);
+        if (self.deps.loot.tables.blocks[game_data.registry.block_state_to_block[state]]) |table| {
+            self.loot_scratch.reset();
+            const context: loot.Context = .{ .items = self.deps.items.deps.definitions, .state = state, .location = .{ .world = world, .x = @floatFromInt(position[0]), .y = @floatFromInt(position[1]), .z = @floatFromInt(position[2]) }, .random = self.loot_random.random(), .scratch = &self.loot_scratch };
+            var buffer: [loot.maximum_drops]loot.Drop = undefined;
+            const drops = table.evaluate(&context, &buffer) catch |err| switch (err) {
+                error.OutOfMemory, error.LootCapacity => &.{},
+                else => return err,
+            };
+            var requests: [loot.maximum_drops]ItemEntities.Spawn = undefined;
+            var spawned: [loot.maximum_drops]entities.Id = undefined;
+            for (drops, requests[0..drops.len]) |drop, *request| {
+                // Block.popResource: half an item's height under a point near the block's centre.
+                const x = @as(f64, @floatFromInt(position[0])) + 0.5 + (self.level_random.nextDouble() * 0.5 - 0.25);
+                const y = @as(f64, @floatFromInt(position[1])) + 0.5 + (self.level_random.nextDouble() * 0.5 - 0.25) - @as(f64, @as(f32, 0.25)) / 2.0;
+                const z = @as(f64, @floatFromInt(position[2])) + 0.5 + (self.level_random.nextDouble() * 0.5 - 0.25);
+                const dx = self.level_random.nextDouble() * 0.2 - 0.1;
+                const dz = self.level_random.nextDouble() * 0.2 - 0.1;
+                request.* = .{ .world = world, .position = .{ x, y, z }, .velocity = .{ dx, 0.2, dz }, .stack = .{ .item = try item_data.define(self.deps.inventories, drop.kind, drop.components), .count = @intCast(drop.count) } };
+            }
+            try self.deps.dropped.createMany(requests[0..drops.len], spawned[0..drops.len]);
+        }
+        // FluidState.createLegacyBlock: a waterlogged block leaves its water.
+        const left: u16 = if (physics.fluid == .water and physics.amount == 8 and !physics.falling) @intCast(game_data.registry.blockStateId("minecraft:water[level=0]").?) else self.air_state;
+        try self.deps.chunks.setBlock(world, .{ .x = position[0], .y = position[1], .z = position[2] }, left);
     }
 
     /// Level.destroyBlock with no drops: the block's break effect, then air.

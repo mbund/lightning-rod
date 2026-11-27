@@ -257,3 +257,10 @@ test "the fast remainder by 360 matches the library's bit for bit" {
         try std.testing.expectEqual(@as(u32, @bitCast(@rem(value, @as(f32, 360.0)))), @as(u32, @bitCast(remainder360(value))));
     }
 }
+
+/// Vec3.normalize: a float's 1e-5 or shorter is no direction.
+pub fn normalize(vector: [3]f64) [3]f64 {
+    const length = @sqrt(vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]);
+    if (length < @as(f32, 1.0e-5)) return .{ 0, 0, 0 };
+    return .{ vector[0] / length, vector[1] / length, vector[2] / length };
+}

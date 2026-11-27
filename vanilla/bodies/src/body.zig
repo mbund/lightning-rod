@@ -423,8 +423,12 @@ pub const Shapes = struct {
 };
 
 /// Shapes.collide along one axis, against every shape the query yields, the border's first.
-fn collideAxis(level: *const Level, query: Box, context: Context, border: ?[4]Box, moving: Box, axis: usize, distance: f64) !f64 {
+fn collideAxis(level: *const Level, query: Box, context: Context, others: []const Box, border: ?[4]Box, moving: Box, axis: usize, distance: f64) !f64 {
     var result = distance;
+    for (others) |other| {
+        if (@abs(result) < 1.0e-7) return 0;
+        result = collideBox(other, moving, axis, result);
+    }
     if (border) |outside| {
         if (@abs(result) < 1.0e-7) return 0;
         for (outside) |side| result = collideBox(side, moving, axis, result);
@@ -472,11 +476,22 @@ pub const Colliders = struct {
 
     const box_capacity = 256;
 
-    /// Fills in place, as the boxes are too many to copy around.
-    pub fn gather(self: *Colliders, level: *const Level, query: Box, context: Context, border: ?[4]Box) !void {
+    /// Fills in place, as the boxes are too many to copy around. The other entities' boxes come
+    /// first, a shape each, as Entity.collectColliders puts them.
+    pub fn gather(self: *Colliders, level: *const Level, query: Box, context: Context, others: []const Box, border: ?[4]Box) !void {
         self.box_count = 0;
         self.shape_count = 0;
         self.complete = true;
+        if (others.len > box_capacity) {
+            self.complete = false;
+            return;
+        }
+        for (others) |other| {
+            self.boxes[self.box_count] = other;
+            self.box_count += 1;
+            self.ends[self.shape_count] = @intCast(self.box_count);
+            self.shape_count += 1;
+        }
         // Entity.findCollisionsForMovement: the border's shape before the blocks'.
         if (border) |outside| {
             for (outside) |side| {
@@ -529,33 +544,23 @@ pub const Colliders = struct {
     /// no higher than the step, sorted. Shape edges are box bottoms and tops here.
     fn stepHeights(self: *const Colliders, base: Box, max_up_step: f32, skip: f32, output: *[64]f32) usize {
         var count: usize = 0;
-        for (self.boxes[0..self.box_count]) |value| {
-            for ([2]f64{ value.min[1], value.max[1] }) |coordinate| {
-                const height: f32 = @floatCast(coordinate - base.min[1]);
-                if (height < 0 or height == skip or height > max_up_step) continue;
-                if (std.mem.indexOfScalar(f32, output[0..count], height) != null) continue;
-                // Distinct edges below one step cannot run out in any block vanilla has.
-                assert(count < output.len);
-                output[count] = height;
-                count += 1;
-            }
-        }
+        for (self.boxes[0..self.box_count]) |value| count = stepEdges(value, base, max_up_step, skip, output, count);
         std.sort.insertion(f32, output[0..count], {}, std.sort.asc(f32));
         return count;
     }
 };
 
 /// Entity.collideWithShapes against what a query gathers, or the world itself past what fits.
-fn collideWithShapes(level: *const Level, query: Box, context: Context, movement: [3]f64, start: Box) ![3]f64 {
+fn collideWithShapes(level: *const Level, query: Box, context: Context, others: []const Box, movement: [3]f64, start: Box) ![3]f64 {
     const colliders = level.colliders.?;
     const border = borderFor(level, start, query);
-    try colliders.gather(level, query, context, border);
+    try colliders.gather(level, query, context, others, border);
     if (colliders.complete) return colliders.collideWith(movement, start);
     var result: [3]f64 = .{ 0, 0, 0 };
     const order: [3]usize = if (@abs(movement[0]) < @abs(movement[2])) .{ 1, 2, 0 } else .{ 1, 0, 2 };
     for (order) |axis| {
         if (movement[axis] == 0) continue;
-        result[axis] = try collideAxis(level, query, context, border, start.move(result), axis, movement[axis]);
+        result[axis] = try collideAxis(level, query, context, others, border, start.move(result), axis, movement[axis]);
     }
     return result;
 }
@@ -572,10 +577,12 @@ pub fn borderFor(level: *const Level, start: Box, query: Box) ?[4]Box {
     return boxes;
 }
 
-/// Entity.collide, with stepping up onto blocks no higher than max_up_step.
-pub fn collide(level: *const Level, start: Box, movement: [3]f64, context: Context, on_ground: bool, max_up_step: f32) ![3]f64 {
+/// Entity.collide, with stepping up onto blocks no higher than max_up_step. `others` are the boxes
+/// of the entities the body collides with, as Level.getEntityCollisions finds them around the
+/// box expanded by the movement, every step tried against the same.
+pub fn collide(level: *const Level, start: Box, movement: [3]f64, context: Context, others: []const Box, on_ground: bool, max_up_step: f32) ![3]f64 {
     const length_squared = movement[0] * movement[0] + movement[1] * movement[1] + movement[2] * movement[2];
-    const collided = if (length_squared == 0) movement else try collideWithShapes(level, start.expandTowards(movement), context, movement, start);
+    const collided = if (length_squared == 0) movement else try collideWithShapes(level, start.expandTowards(movement), context, others, movement, start);
     const blocked_x = movement[0] != collided[0];
     const blocked_y = movement[1] != collided[1];
     const blocked_z = movement[2] != collided[2];
@@ -585,11 +592,11 @@ pub fn collide(level: *const Level, start: Box, movement: [3]f64, context: Conte
         var query = base.expandTowards(.{ movement[0], max_up_step, movement[2] });
         if (!landed) query = query.expandTowards(.{ 0, -@as(f64, @as(f32, 1.0e-5)), 0 });
         const colliders = level.colliders.?;
-        try colliders.gather(level, query, context, borderFor(level, start, query));
+        try colliders.gather(level, query, context, others, borderFor(level, start, query));
         var heights: [64]f32 = undefined;
-        const count = if (colliders.complete) colliders.stepHeights(base, max_up_step, @floatCast(collided[1]), &heights) else try stepHeights(level, query, context, base, max_up_step, @floatCast(collided[1]), &heights);
+        const count = if (colliders.complete) colliders.stepHeights(base, max_up_step, @floatCast(collided[1]), &heights) else try stepHeights(level, query, context, others, base, max_up_step, @floatCast(collided[1]), &heights);
         for (heights[0..count]) |height| {
-            const stepped = if (colliders.complete) colliders.collideWith(.{ movement[0], height, movement[2] }, base) else try collideWithShapes(level, query, context, .{ movement[0], height, movement[2] }, base);
+            const stepped = if (colliders.complete) colliders.collideWith(.{ movement[0], height, movement[2] }, base) else try collideWithShapes(level, query, context, others, .{ movement[0], height, movement[2] }, base);
             if (stepped[0] * stepped[0] + stepped[2] * stepped[2] > collided[0] * collided[0] + collided[2] * collided[2]) {
                 const lowered = start.min[1] - base.min[1];
                 return .{ stepped[0], stepped[1] - lowered, stepped[2] };
@@ -601,24 +608,30 @@ pub fn collide(level: *const Level, start: Box, movement: [3]f64, context: Conte
 
 /// Entity.collectCandidateStepUpHeights: the heights above the box's bottom of shape edges no
 /// higher than the step, sorted. Shape edges are box bottoms and tops here.
-fn stepHeights(level: *const Level, query: Box, context: Context, base: Box, max_up_step: f32, skip: f32, output: *[64]f32) !usize {
+fn stepHeights(level: *const Level, query: Box, context: Context, others: []const Box, base: Box, max_up_step: f32, skip: f32, output: *[64]f32) !usize {
     var count: usize = 0;
+    for (others) |value| count = stepEdges(value, base, max_up_step, skip, output, count);
     var shapes: Shapes = .init(level, query, context);
     while (try shapes.next()) |shape| {
-        for (0..shape.boxes.count) |index| {
-            const value = shape.get(index);
-            for ([2]f64{ value.min[1], value.max[1] }) |coordinate| {
-                const height: f32 = @floatCast(coordinate - base.min[1]);
-                if (height < 0 or height == skip or height > max_up_step) continue;
-                if (std.mem.indexOfScalar(f32, output[0..count], height) != null) continue;
-                // Distinct edges below one step cannot run out in any block vanilla has.
-                assert(count < output.len);
-                output[count] = height;
-                count += 1;
-            }
-        }
+        for (0..shape.boxes.count) |index| count = stepEdges(shape.get(index), base, max_up_step, skip, output, count);
     }
     std.sort.insertion(f32, output[0..count], {}, std.sort.asc(f32));
+    return count;
+}
+
+/// The bottom and top of a box as heights above the base, those no higher than the step and new
+/// added after the `count` already held: how many are held then.
+fn stepEdges(value: Box, base: Box, max_up_step: f32, skip: f32, output: *[64]f32, held: usize) usize {
+    var count = held;
+    for ([2]f64{ value.min[1], value.max[1] }) |coordinate| {
+        const height: f32 = @floatCast(coordinate - base.min[1]);
+        if (height < 0 or height == skip or height > max_up_step) continue;
+        if (std.mem.indexOfScalar(f32, output[0..count], height) != null) continue;
+        // Distinct edges below one step cannot run out in any block vanilla has.
+        assert(count < output.len);
+        output[count] = height;
+        count += 1;
+    }
     return count;
 }
 
@@ -675,7 +688,7 @@ pub fn contextFreeBoxes(state: u16, x: i32, z: i32) game_data.physics.Boxes {
 
 /// Shapes.collide along Y against the shapes a query yields, as EntityType.getYOffset asks.
 pub fn collideVertical(level: *const Level, query: Box, context: Context, moving: Box, distance: f64) !f64 {
-    return collideAxis(level, query, context, null, moving, 1, distance);
+    return collideAxis(level, query, context, &.{}, null, moving, 1, distance);
 }
 
 test "the world border stops a body near it and leaves the far ones alone" {
@@ -692,4 +705,80 @@ test "the world border stops a body near it and leaves the far ones alone" {
     try std.testing.expectEqual(@as(?[4]Box, null), borderFor(&level, far, far.expandTowards(.{ 1, 0, 0 })));
     level.border = null;
     try std.testing.expectEqual(@as(?[4]Box, null), borderFor(&level, moving, query));
+}
+
+/// Whether a ray from one point to another passes a block that resets falling or water, as the
+/// clip in Entity.move tests with Block.FALLDAMAGE_RESETTING and ClipContext.Fluid.WATER.
+pub fn clipsFallReset(level: *const Level, from: [3]f64, to: [3]f64) !bool {
+    const delta: [3]f64 = .{ to[0] - from[0], to[1] - from[1], to[2] - from[2] };
+    // BlockGetter.traverseBlocks walks the cells the segment crosses, from a start pulled back
+    // by 1e-7 toward the end.
+    const start: [3]f64 = .{ lerp(-1.0e-7, to[0], from[0]), lerp(-1.0e-7, to[1], from[1]), lerp(-1.0e-7, to[2], from[2]) };
+    const end: [3]f64 = .{ lerp(-1.0e-7, from[0], to[0]), lerp(-1.0e-7, from[1], to[1]), lerp(-1.0e-7, from[2], to[2]) };
+    var cell: [3]i32 = .{ mth.floor(start[0]), mth.floor(start[1]), mth.floor(start[2]) };
+    var step: [3]i32 = undefined;
+    var next: [3]f64 = undefined;
+    var increment: [3]f64 = undefined;
+    for (0..3) |axis| {
+        const span = end[axis] - start[axis];
+        step[axis] = if (span > 0) 1 else if (span < 0) -1 else 0;
+        increment[axis] = if (step[axis] == 0) std.math.floatMax(f64) else @as(f64, @floatFromInt(step[axis])) / span;
+        const fraction = start[axis] - @floor(start[axis]);
+        next[axis] = increment[axis] * (if (step[axis] > 0) 1.0 - fraction else fraction);
+    }
+    while (true) {
+        if (try hitsResetCell(level, cell, from, delta)) return true;
+        if (next[0] > 1 and next[1] > 1 and next[2] > 1) return false;
+        const axis: usize = if (next[0] < next[1]) (if (next[0] < next[2]) 0 else 2) else (if (next[1] < next[2]) 1 else 2);
+        cell[axis] += step[axis];
+        next[axis] += increment[axis];
+    }
+}
+
+fn lerp(delta: f64, start: f64, end: f64) f64 {
+    return start + delta * (end - start);
+}
+
+fn hitsResetCell(level: *const Level, cell: [3]i32, from: [3]f64, delta: [3]f64) !bool {
+    const state = try level.state(cell[0], cell[1], cell[2]);
+    const origin: [3]f64 = .{ @floatFromInt(cell[0]), @floatFromInt(cell[1]), @floatFromInt(cell[2]) };
+    if (level.blocks.get(state).flags.fall_damage_resetting) {
+        if (segmentHits(.{ .min = origin, .max = .{ origin[0] + 1, origin[1] + 1, origin[2] + 1 } }, from, delta)) return true;
+    }
+    const physics = game_data.physics.get(state);
+    if (physics.fluid == .water) {
+        const above = game_data.physics.get(try level.state(cell[0], cell[1] + 1, cell[2]));
+        const top: f64 = if (above.fluid == .water) 1.0 else physics.height();
+        if (segmentHits(.{ .min = origin, .max = .{ origin[0] + 1, origin[1] + top, origin[2] + 1 } }, from, delta)) return true;
+    }
+    return false;
+}
+
+/// VoxelShape.clip for one box: hit when the point just past the start is inside, or when the
+/// segment enters the box.
+fn segmentHits(target: Box, from: [3]f64, delta: [3]f64) bool {
+    if (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2] < 1.0e-7) return false;
+    const probe: [3]f64 = .{ from[0] + delta[0] * 0.001, from[1] + delta[1] * 0.001, from[2] + delta[2] * 0.001 };
+    if (probe[0] >= target.min[0] and probe[0] < target.max[0] and probe[1] >= target.min[1] and probe[1] < target.max[1] and probe[2] >= target.min[2] and probe[2] < target.max[2]) return true;
+    var enter: f64 = 0;
+    var leave: f64 = 1;
+    for (0..3) |axis| {
+        if (delta[axis] == 0) {
+            if (from[axis] < target.min[axis] or from[axis] > target.max[axis]) return false;
+            continue;
+        }
+        var near = (target.min[axis] - from[axis]) / delta[axis];
+        var far = (target.max[axis] - from[axis]) / delta[axis];
+        if (near > far) std.mem.swap(f64, &near, &far);
+        enter = @max(enter, near);
+        leave = @min(leave, far);
+        if (enter > leave) return false;
+    }
+    return true;
+}
+
+test "a ray reaching into water clips" {
+    const water: Box = .{ .min = .{ 0, 0, 0 }, .max = .{ 1, 0.8888889, 1 } };
+    try std.testing.expect(segmentHits(water, .{ 0.5, 3, 0.5 }, .{ 0, -2.5, 0 }));
+    try std.testing.expect(!segmentHits(water, .{ 0.5, 3, 0.5 }, .{ 0, -1.5, 0 }));
 }

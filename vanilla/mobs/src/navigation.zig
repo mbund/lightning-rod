@@ -292,8 +292,8 @@ fn shouldTargetNextNodeInDirection(mobs: *Mobs, mob: Mob, at: [3]f64) !bool {
     const next_squared = to_next[0] * to_next[0] + to_next[1] * to_next[1] + to_next[2] * to_next[2];
     const after_squared = to_after[0] * to_after[0] + to_after[1] * to_after[1] + to_after[2] * to_after[2];
     if (!(after_squared < next_squared) and !(next_squared < 0.5)) return false;
-    const a = living.normalize(to_next);
-    const b = living.normalize(to_after);
+    const a = mth.normalize(to_next);
+    const b = mth.normalize(to_after);
     return b[0] * a[0] + b[1] * a[1] + b[2] * a[2] < 0.0;
 }
 

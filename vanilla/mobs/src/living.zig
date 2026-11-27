@@ -9,6 +9,7 @@ const game_data = @import("game_data");
 const mth = @import("vanilla_bodies").mth;
 const body = @import("vanilla_bodies").body;
 const mob_blocks = @import("vanilla_bodies").mob_blocks;
+const fluids = @import("vanilla_bodies").fluids;
 const Mob = @import("mob.zig").Mob;
 const Movement = @import("mob.zig").Movement;
 const DamageType = @import("mob.zig").DamageType;
@@ -74,12 +75,14 @@ pub fn move(mobs: *Mobs, mob: Mob, requested_in: [3]f64) !void {
     }
     const level = mobs.level(mob.motion.world);
     const traits = mobs.traits(mob.entity.species);
-    const moved = try body.collide(&level, box(mobs, mob), requested, context(mob), mob.motion.on_ground, @floatCast(traits.attribute(.step_height)));
+    const start = box(mobs, mob);
+    const others = try mobs.collisionsOf(mob.motion.world, start.expandTowards(requested));
+    const moved = try body.collide(&level, start, requested, context(mob), others, mob.motion.on_ground, @floatCast(traits.attribute(.step_height)));
     const moved_squared = lengthSquared(moved);
     if (moved_squared > 1.0e-7 or lengthSquared(requested) - moved_squared < 1.0e-7) {
         if (mob.motion.fall_distance != 0 and moved_squared >= 1.0) {
             const destination: [3]f64 = .{ mob.motion.position[0] + moved[0], mob.motion.position[1] + moved[1], mob.motion.position[2] + moved[2] };
-            if (try clipsFallReset(&level, mob.motion.position, destination)) mob.motion.fall_distance = 0;
+            if (try body.clipsFallReset(&level, mob.motion.position, destination)) mob.motion.fall_distance = 0;
         }
         const from = mob.motion.position;
         const to: [3]f64 = .{ from[0] + moved[0], from[1] + moved[1], from[2] + moved[2] };
@@ -312,88 +315,18 @@ pub fn blockJumpFactor(mobs: *Mobs, mob: Mob) !f32 {
     return game_data.physics.mobState(try level.state(under[0], under[1], under[2])).jump_factor;
 }
 
-/// Whether a ray from one point to another passes a block that resets falling or water, as the
-/// clip in Entity.move tests with Block.FALLDAMAGE_RESETTING and ClipContext.Fluid.WATER.
-fn clipsFallReset(level: *const body.Level, from: [3]f64, to: [3]f64) !bool {
-    const delta: [3]f64 = .{ to[0] - from[0], to[1] - from[1], to[2] - from[2] };
-    // BlockGetter.traverseBlocks walks the cells the segment crosses, from a start pulled back
-    // by 1e-7 toward the end.
-    const start: [3]f64 = .{ lerp(-1.0e-7, to[0], from[0]), lerp(-1.0e-7, to[1], from[1]), lerp(-1.0e-7, to[2], from[2]) };
-    const end: [3]f64 = .{ lerp(-1.0e-7, from[0], to[0]), lerp(-1.0e-7, from[1], to[1]), lerp(-1.0e-7, from[2], to[2]) };
-    var cell: [3]i32 = .{ mth.floor(start[0]), mth.floor(start[1]), mth.floor(start[2]) };
-    var step: [3]i32 = undefined;
-    var next: [3]f64 = undefined;
-    var increment: [3]f64 = undefined;
-    for (0..3) |axis| {
-        const span = end[axis] - start[axis];
-        step[axis] = if (span > 0) 1 else if (span < 0) -1 else 0;
-        increment[axis] = if (step[axis] == 0) std.math.floatMax(f64) else @as(f64, @floatFromInt(step[axis])) / span;
-        const fraction = start[axis] - @floor(start[axis]);
-        next[axis] = increment[axis] * (if (step[axis] > 0) 1.0 - fraction else fraction);
-    }
-    while (true) {
-        if (try hitsResetCell(level, cell, from, delta)) return true;
-        if (next[0] > 1 and next[1] > 1 and next[2] > 1) return false;
-        const axis: usize = if (next[0] < next[1]) (if (next[0] < next[2]) 0 else 2) else (if (next[1] < next[2]) 1 else 2);
-        cell[axis] += step[axis];
-        next[axis] += increment[axis];
-    }
-}
-
-fn lerp(delta: f64, start: f64, end: f64) f64 {
-    return start + delta * (end - start);
-}
-
-fn hitsResetCell(level: *const body.Level, cell: [3]i32, from: [3]f64, delta: [3]f64) !bool {
-    const state = try level.state(cell[0], cell[1], cell[2]);
-    const origin: [3]f64 = .{ @floatFromInt(cell[0]), @floatFromInt(cell[1]), @floatFromInt(cell[2]) };
-    if (level.blocks.get(state).flags.fall_damage_resetting) {
-        if (segmentHits(.{ .min = origin, .max = .{ origin[0] + 1, origin[1] + 1, origin[2] + 1 } }, from, delta)) return true;
-    }
-    const physics = game_data.physics.get(state);
-    if (physics.fluid == .water) {
-        const above = game_data.physics.get(try level.state(cell[0], cell[1] + 1, cell[2]));
-        const top: f64 = if (above.fluid == .water) 1.0 else physics.height();
-        if (segmentHits(.{ .min = origin, .max = .{ origin[0] + 1, origin[1] + top, origin[2] + 1 } }, from, delta)) return true;
-    }
-    return false;
-}
-
-/// VoxelShape.clip for one box: hit when the point just past the start is inside, or when the
-/// segment enters the box.
-fn segmentHits(target: Box, from: [3]f64, delta: [3]f64) bool {
-    if (lengthSquared(delta) < 1.0e-7) return false;
-    const probe: [3]f64 = .{ from[0] + delta[0] * 0.001, from[1] + delta[1] * 0.001, from[2] + delta[2] * 0.001 };
-    if (probe[0] >= target.min[0] and probe[0] < target.max[0] and probe[1] >= target.min[1] and probe[1] < target.max[1] and probe[2] >= target.min[2] and probe[2] < target.max[2]) return true;
-    var enter: f64 = 0;
-    var leave: f64 = 1;
-    for (0..3) |axis| {
-        if (delta[axis] == 0) {
-            if (from[axis] < target.min[axis] or from[axis] > target.max[axis]) return false;
-            continue;
-        }
-        var near = (target.min[axis] - from[axis]) / delta[axis];
-        var far = (target.max[axis] - from[axis]) / delta[axis];
-        if (near > far) std.mem.swap(f64, &near, &far);
-        enter = @max(enter, near);
-        leave = @min(leave, far);
-        if (enter > leave) return false;
-    }
-    return true;
-}
-
 // Fluids.
 
 /// Entity.updateInWaterStateAndDoFluidPushing.
 pub fn updateFluids(mobs: *Mobs, mob: Mob) !void {
     try updateWaterState(mobs, mob);
     const ultrawarm = mobs.ultrawarm(mob.motion.world);
-    mob.entity.lava_height = (try fluidHeightAndPush(mobs, mob, .lava, if (ultrawarm) 0.007 else 0.0023333333333333335)).height;
+    mob.entity.lava_height = (try fluids.heightAndPush(&mobs.level(mob.motion.world), box(mobs, mob), &mob.motion.velocity, .lava, if (ultrawarm) 0.007 else 0.0023333333333333335)).height;
 }
 
 /// Entity.updateInWaterStateAndDoWaterCurrentPushing.
 pub fn updateWaterState(mobs: *Mobs, mob: Mob) !void {
-    const result = try fluidHeightAndPush(mobs, mob, .water, 0.014);
+    const result = try fluids.heightAndPush(&mobs.level(mob.motion.world), box(mobs, mob), &mob.motion.velocity, .water, 0.014);
     mob.entity.water_height = result.height;
     if (result.touching) {
         if (!mob.entity.touching_water and !mob.entity.first_tick) waterSplash(mobs, mob);
@@ -402,122 +335,6 @@ pub fn updateWaterState(mobs: *Mobs, mob: Mob) !void {
     } else {
         mob.entity.touching_water = false;
     }
-}
-
-const FluidResult = struct { touching: bool, height: f64 };
-
-/// Entity.updateFluidHeightAndDoFluidPushing.
-fn fluidHeightAndPush(mobs: *Mobs, mob: Mob, fluid: game_data.physics_data.Fluid, strength: f64) !FluidResult {
-    const level = mobs.level(mob.motion.world);
-    const current = box(mobs, mob).inflate(-0.001, -0.001, -0.001);
-    const first: [3]i32 = .{ mth.floor(current.min[0]), mth.floor(current.min[1]), mth.floor(current.min[2]) };
-    const last: [3]i32 = .{ mth.ceil(current.max[0]), mth.ceil(current.max[1]), mth.ceil(current.max[2]) };
-    // No fluid around the mob ticking means nothing to find, which Debug still looks for.
-    const dry = level.without(mob_blocks.mark_fluid, first, .{ last[0] - 1, last[1] - 1, last[2] - 1 });
-    if (dry and !verify_skips) return .{ .touching = false, .height = 0 };
-    var deepest: f64 = 0;
-    var touching = false;
-    var push: [3]f64 = .{ 0, 0, 0 };
-    var pushes: u32 = 0;
-    var x = first[0];
-    while (x < last[0]) : (x += 1) {
-        var y = first[1];
-        while (y < last[1]) : (y += 1) {
-            var z = first[2];
-            while (z < last[2]) : (z += 1) {
-                const physics = try level.fluid(x, y, z);
-                if (physics.fluid != fluid) continue;
-                const top = try fluidTop(&level, x, y, z, physics);
-                if (top < current.min[1]) continue;
-                touching = true;
-                deepest = @max(top - current.min[1], deepest);
-                // Every mob is pushed by fluids.
-                var flow = try fluidFlow(&level, x, y, z, physics);
-                if (deepest < 0.4) flow = .{ flow[0] * deepest, flow[1] * deepest, flow[2] * deepest };
-                push = .{ push[0] + flow[0], push[1] + flow[1], push[2] + flow[2] };
-                pushes += 1;
-            }
-        }
-    }
-    if (dry) assert(!touching and pushes == 0);
-    if (@sqrt(lengthSquared(push)) > 0) {
-        if (pushes > 0) {
-            const scale = 1.0 / @as(f64, @floatFromInt(pushes));
-            push = .{ push[0] * scale, push[1] * scale, push[2] * scale };
-        }
-        push = normalize(push);
-        push = .{ push[0] * strength, push[1] * strength, push[2] * strength };
-        if (@abs(mob.motion.velocity[0]) < 0.003 and @abs(mob.motion.velocity[2]) < 0.003 and @sqrt(lengthSquared(push)) < 0.0045000000000000005) {
-            push = normalize(push);
-            push = .{ push[0] * 0.0045000000000000005, push[1] * 0.0045000000000000005, push[2] * 0.0045000000000000005 };
-        }
-        mob.motion.velocity = .{ mob.motion.velocity[0] + push[0], mob.motion.velocity[1] + push[1], mob.motion.velocity[2] + push[2] };
-    }
-    return .{ .touching = touching, .height = deepest };
-}
-
-pub fn normalize(vector: [3]f64) [3]f64 {
-    const length = @sqrt(lengthSquared(vector));
-    // A float's 1e-5, as Vec3.normalize compares.
-    if (length < @as(f32, 1.0e-5)) return .{ 0, 0, 0 };
-    return .{ vector[0] / length, vector[1] / length, vector[2] / length };
-}
-
-/// The top of a fluid block: its y and FluidState.getHeight, a full block under the same fluid
-/// and its own height otherwise, added as floats as vanilla does.
-fn fluidTop(level: *const body.Level, x: i32, y: i32, z: i32, physics: game_data.physics_data.State) !f64 {
-    const above = try level.fluid(x, y + 1, z);
-    const own: f32 = if (above.fluid == physics.fluid) 1.0 else physics.height();
-    return @as(f32, @floatFromInt(y)) + own;
-}
-
-/// FlowingFluid.getFlow.
-fn fluidFlow(level: *const body.Level, x: i32, y: i32, z: i32, physics: game_data.physics_data.State) ![3]f64 {
-    // Direction.Plane.HORIZONTAL: north, east, south, west, with their sturdy face bits.
-    const directions = [_]struct { dx: i32, dz: i32, face: u3 }{
-        .{ .dx = 0, .dz = -1, .face = 2 },
-        .{ .dx = 1, .dz = 0, .face = 1 },
-        .{ .dx = 0, .dz = 1, .face = 3 },
-        .{ .dx = -1, .dz = 0, .face = 0 },
-    };
-    var flow_x: f64 = 0;
-    var flow_z: f64 = 0;
-    for (directions) |direction| {
-        const other = try level.fluid(x + direction.dx, y, z + direction.dz);
-        if (other.fluid != physics.fluid and other.fluid != .none) continue;
-        var own = other.height();
-        var difference: f32 = 0;
-        if (own == 0) {
-            if (!other.blocks_motion) {
-                const below = try level.fluid(x + direction.dx, y - 1, z + direction.dz);
-                if (below.fluid == physics.fluid or below.fluid == .none) {
-                    own = below.height();
-                    if (own > 0) difference = physics.height() - (own - 0.8888889);
-                }
-            }
-        } else if (own > 0) {
-            difference = physics.height() - own;
-        }
-        if (difference != 0) {
-            flow_x += @as(f64, @floatFromInt(direction.dx)) * difference;
-            flow_z += @as(f64, @floatFromInt(direction.dz)) * difference;
-        }
-    }
-    var flow: [3]f64 = .{ flow_x, 0, flow_z };
-    if (physics.falling) {
-        for (directions) |direction| {
-            const mask = @as(u8, 1) << direction.face;
-            const side = try level.fluid(x + direction.dx, y, z + direction.dz);
-            const above = try level.fluid(x + direction.dx, y + 1, z + direction.dz);
-            const solid = (side.fluid != physics.fluid and !side.ice and side.sturdy & mask != 0) or (above.fluid != physics.fluid and !above.ice and above.sturdy & mask != 0);
-            if (solid) {
-                flow = normalize(flow);
-                flow[1] -= 6.0;
-                break;
-            }
-        }
-    }
-    return normalize(flow);
 }
 
 /// Entity.doWaterSplashEffect: the sound, and the random particles cost, which vanilla draws
@@ -551,7 +368,7 @@ pub fn updateEyes(mobs: *Mobs, mob: Mob) !void {
         mob.entity.eye_in_water = false;
         return;
     }
-    const top = try fluidTop(&level, at[0], at[1], at[2], physics);
+    const top = try fluids.top(&level, at[0], at[1], at[2], physics);
     mob.entity.eye_in_water = top > eye and physics.fluid == .water;
 }
 
@@ -683,7 +500,7 @@ pub fn moveRelative(mob: Mob, speed: f32, input: [3]f32) void {
     const vector: [3]f64 = .{ input[0], input[1], input[2] };
     const squared = lengthSquared(vector);
     if (squared < 1.0e-7) return;
-    const unit = if (squared > 1.0) normalize(vector) else vector;
+    const unit = if (squared > 1.0) mth.normalize(vector) else vector;
     const scaled: [3]f64 = .{ unit[0] * speed, unit[1] * speed, unit[2] * speed };
     const sine: f64 = mth.sin(mob.motion.yaw * (std.math.pi / 180.0));
     const cosine: f64 = mth.cos(mob.motion.yaw * (std.math.pi / 180.0));
@@ -695,6 +512,7 @@ pub fn isFree(mobs: *Mobs, mob: Mob, offset: [3]f64) !bool {
     const level = mobs.level(mob.motion.world);
     const moved = box(mobs, mob).move(offset);
     if (!try body.noCollision(&level, moved, context(mob))) return false;
+    if ((try mobs.collisionsOf(mob.motion.world, moved)).len > 0) return false;
     return !try containsLiquid(&level, moved);
 }
 
@@ -725,10 +543,4 @@ pub fn jumpFromGround(mobs: *Mobs, mob: Mob) !void {
 /// LivingEntity.jumpInLiquid.
 pub fn jumpInLiquid(mob: Mob) void {
     mob.motion.velocity[1] += @as(f64, @as(f32, 0.04));
-}
-
-test "a ray reaching into water clips" {
-    const water: Box = .{ .min = .{ 0, 0, 0 }, .max = .{ 1, 0.8888889, 1 } };
-    try std.testing.expect(segmentHits(water, .{ 0.5, 3, 0.5 }, .{ 0, -2.5, 0 }));
-    try std.testing.expect(!segmentHits(water, .{ 0.5, 3, 0.5 }, .{ 0, -1.5, 0 }));
 }

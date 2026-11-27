@@ -9,6 +9,8 @@ pub const mob_blocks = @import("mob_blocks.zig");
 pub const shape_classes = @import("shape_classes.zig");
 pub const body = @import("body.zig");
 pub const block_effects = @import("block_effects.zig");
+pub const fluids = @import("fluids.zig");
+pub const clip = @import("clip.zig");
 
 test {
     std.testing.refAllDecls(@This());

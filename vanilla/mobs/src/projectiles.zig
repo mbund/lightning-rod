@@ -39,6 +39,7 @@ const entity_effects = @import("vanilla_world").entity_effects;
 const body = @import("vanilla_bodies").body;
 const mth = @import("vanilla_bodies").mth;
 const living = @import("living.zig");
+const boat_module = @import("boat.zig");
 const Mobs = @import("mobs.zig").Mobs;
 const Domains = @import("domains").domains.Domains;
 const DomainColumn = @import("domains").domains.Column;
@@ -352,8 +353,8 @@ pub const Projectiles = struct {
     tracker: Tracking.TrackerId = 0,
     sleeping: usize = 0,
     sleep: bool,
-    /// Mobs placed anywhere as the tick began.
-    mobs_placed: usize = 0,
+    /// Mobs and boats placed anywhere as the tick began.
+    bodies_placed: usize = 0,
     /// Room for the states a sleeper plans.
     plan_states: [update_interval + 1]Motion = undefined,
     plan_scratch: PlanScratch = undefined,
@@ -1031,9 +1032,9 @@ pub const Projectiles = struct {
     /// went, came due or were woken by edits are seen to; sleepers due this tick wake to take
     /// their turns.
     pub fn prepareTick(self: *Projectiles) !void {
-        // Mobs placed anywhere, counted once a tick: one placed since is a mover, which wakes what
-        // it meets the next.
-        self.mobs_placed = self.deps.entities.places.space.countOf(self.deps.mobs.kinds);
+        // Mobs and boats placed anywhere, counted once a tick: one placed since is a mover, which
+        // wakes what it meets the next.
+        self.bodies_placed = self.deps.entities.places.space.countOf(self.bodies());
         if (!self.loaded_all and !self.deps.entities.columns_followed) try self.loadAll();
         self.loaded_all = true;
         self.active = false;
@@ -1405,9 +1406,10 @@ pub const Projectiles = struct {
         const movers = space.moversSince();
         if (movers.overflowed) {
             for (0..mobs.active.count) |active_at| self.rouseMob(@intCast(mobs.active.at(active_at)));
+            if (mobs.boats) |boats| for (boats.ids()) |entity| self.rouseMob(self.deps.entities.directory.slotOf(entity).?);
         } else for (0..movers.slots.len) |at| {
             const slot = movers.slots.at(at).*;
-            if (mobs.kinds.has(self.deps.entities.directory.entry(slot).kind)) self.rouseMob(slot);
+            if (self.bodies().has(self.deps.entities.directory.entry(slot).kind)) self.rouseMob(slot);
         }
         var moved = self.moved.iterator(.{});
         while (moved.next()) |slot| {
@@ -1435,7 +1437,7 @@ pub const Projectiles = struct {
         found.count = 0;
         found.overflowed = false;
         const space = &self.deps.entities.places.space;
-        if (self.mobs_placed > 0) try space.each(world, .{ .min = within.min, .max = within.max }, self.deps.mobs.kinds, found, struct {
+        if (self.bodies_placed > 0) try space.each(world, .{ .min = within.min, .max = within.max }, self.bodies(), found, struct {
             fn visit(list: *NearBodies, entry: entities.space.Entry) anyerror!bool {
                 if (list.count == list.boxes.len) {
                     list.overflowed = true;
@@ -2038,7 +2040,7 @@ pub const Projectiles = struct {
         const eye: [3]f64 = .{ owner.position.x, owner.position.y + 1.62, owner.position.z };
         const toward: [3]f64 = .{ eye[0] - projectile.position[0], eye[1] - projectile.position[1], eye[2] - projectile.position[2] };
         projectile.position[1] += toward[1] * 0.015 * loyalty;
-        const unit = living.normalize(toward);
+        const unit = mth.normalize(toward);
         for (&projectile.velocity, unit) |*axis, direction| axis.* = axis.* * 0.95 + direction * 0.05 * loyalty;
         // Then PersistentProjectileEntity.tick without clipping: it faces back along its motion,
         // passes through to where it leads, and air slows it, without gravity.
@@ -2266,7 +2268,7 @@ pub const Projectiles = struct {
 
     /// Projectile.getMovementToShoot: the direction with a little spread, at a speed.
     pub fn aim(self: *Projectiles, direction: [3]f64, speed: f64, inaccuracy: f64) [3]f64 {
-        const unit = living.normalize(direction);
+        const unit = mth.normalize(direction);
         const random = self.random.random();
         var result: [3]f64 = undefined;
         for (0..3) |axis| result[axis] = (unit[axis] + 0.0172275 * inaccuracy * (random.float(f64) - random.float(f64))) * speed;
@@ -2279,7 +2281,13 @@ pub const Projectiles = struct {
         return !(projectile.kind == .trident and projectile.loyalty > 0 and (projectile.dealt_damage or projectile.returning));
     }
 
-    const Target = union(enum) { mob: u32, player: usize };
+    const Target = union(enum) { mob: u32, player: usize, boat: u32 };
+
+    /// What a projectile may hit beside players: mobs, and boats where they are kept.
+    fn bodies(self: *const Projectiles) entities.Kinds {
+        const mobs = self.deps.mobs;
+        return if (mobs.boats) |boats| mobs.kinds.with(boats.kinds) else mobs.kinds;
+    }
     const Found = struct { target: Target, at: [3]f64 };
 
     /// ProjectileUtil.getEntityHitResult: the living things whose boxes, grown by the margin a
@@ -2292,17 +2300,27 @@ pub const Projectiles = struct {
         const swept: body.Box = .{ .min = low, .max = high };
         var best: ?Found = null;
         var best_distance = std.math.inf(f64);
-        var search: struct { projectiles: *Projectiles, projectile: *const Projectile, from: [3]f64, to: [3]f64, margin: f64, best: *?Found, best_distance: *f64 } = .{ .projectiles = self, .projectile = projectile, .from = from, .to = to, .margin = margin, .best = &best, .best_distance = &best_distance };
-        try self.deps.mobs.each(projectile.world, swept, &search, struct {
-            fn visit(context: *@TypeOf(search), mob: Mob) anyerror!bool {
-                const mobs = context.projectiles.deps.mobs;
-                const index = mobs.slotOf(mob.entity.id).?;
-                if (mob.alive()) context.projectiles.met_body = true;
-                if (!mob.alive() or context.projectiles.pierced(context.projectile, mob.entity.id)) return false;
-                const distance = clip(grown(living.box(mobs, mob), context.margin), context.from, context.to) orelse return false;
+        var search: struct { projectiles: *Projectiles, projectile: *const Projectile, from: [3]f64, to: [3]f64, swept: body.Box, margin: f64, best: *?Found, best_distance: *f64 } = .{ .projectiles = self, .projectile = projectile, .from = from, .to = to, .swept = swept, .margin = margin, .best = &best, .best_distance = &best_distance };
+        // Mobs and boats in the order the level finds them: the first of equals is nearest.
+        try self.deps.entities.places.space.each(projectile.world, .{ .min = swept.min, .max = swept.max }, self.bodies(), &search, struct {
+            fn visit(context: *@TypeOf(search), entry: entities.space.Entry) anyerror!bool {
+                const projectiles = context.projectiles;
+                const mobs = projectiles.deps.mobs;
+                // Entity.canBeHitByProjectile: alive and pickable, as a boat not removed is.
+                const target: Target, const box = if (mobs.boats) |boats| if (boats.kinds.has(entry.shape.kind)) boat: {
+                    if (!boats.solid(entry.slot)) return false;
+                    break :boat .{ .{ .boat = entry.slot }, boat_module.boxAt(entry.position) };
+                } else mob: {
+                    break :mob try projectiles.mobTarget(entry.slot) orelse return false;
+                } else try projectiles.mobTarget(entry.slot) orelse return false;
+                if (!box.intersects(context.swept)) return false;
+                projectiles.met_body = true;
+                const entity = projectiles.deps.entities.directory.entry(entry.slot).id;
+                if (projectiles.pierced(context.projectile, entity)) return false;
+                const distance = clip(grown(box, context.margin), context.from, context.to) orelse return false;
                 if (distance < context.best_distance.*) {
                     context.best_distance.* = distance;
-                    context.best.* = .{ .target = .{ .mob = index }, .at = along(context.from, context.to, distance) };
+                    context.best.* = .{ .target = target, .at = along(context.from, context.to, distance) };
                 }
                 return false;
             }
@@ -2334,6 +2352,14 @@ pub const Projectiles = struct {
             self.nearer(&best, &best_distance, .{ .player = other }, box, margin, from, to);
         }
         return best;
+    }
+
+    /// A mob a projectile may hit, and its box: alive and not removed.
+    fn mobTarget(self: *Projectiles, slot: u32) !?struct { Target, body.Box } {
+        const mobs = self.deps.mobs;
+        const mob = try mobs.inSlot(slot);
+        if (mob.entity.removed or !mob.alive()) return null;
+        return .{ .{ .mob = slot }, living.box(mobs, mob) };
     }
 
     fn nearer(self: *const Projectiles, best: *?Found, best_distance: *f64, target: Target, box: body.Box, margin: f64, from: [3]f64, to: [3]f64) void {
@@ -2377,6 +2403,7 @@ pub const Projectiles = struct {
         const key: u64 = switch (target) {
             .mob => |index| (try self.deps.mobs.inSlot(index)).entity.id,
             .player => |other| @as(u64, @intCast(other + 1)) << 48,
+            .boat => |index| self.deps.entities.directory.entry(index).id,
         };
         if (projectile.pierce > 0) {
             if (projectile.pierced_count >= projectile.pierce + 1) {
@@ -2416,6 +2443,7 @@ pub const Projectiles = struct {
         const target_type = switch (target) {
             .mob => |index| self.deps.mobs.traits((try self.deps.mobs.inSlot(index)).entity.species).entity_type,
             .player => self.player_type,
+            .boat => |index| self.deps.entities.directory.entry(index).kind,
         };
         const enchanted = try self.withWeapon(projectile, struct {
             fn call(attack: *const attack_effects.Attack, weapon: ?item_data.View, kind: u32, amount: f32) !f32 {
@@ -2446,6 +2474,14 @@ pub const Projectiles = struct {
                 const cause = entity_effects.playerId(owner) + 1;
                 return self.deps.damage.hurt(other, .{ .type = damage_type, .attacker = owner, .cause_id = cause, .direct_id = self.networkId(projectile) + 1, .knockback = .{ v[0], v[2] }, .piercing = projectile.pierce > 0 }, amount);
             },
+            // VehicleEntity.hurtServer, whose shooter in creative breaks it without a drop.
+            .boat => |index| {
+                const boats = self.deps.mobs.boats.?;
+                if (projectile.fire_ticks > 0) boats.ignite(index, 5);
+                const shooter = &self.deps.players.records[owner];
+                const creative = shooter.handle != null and self.deps.player_states.of(shooter).gamemode == .creative;
+                return boats.hurt(index, amount, .{ .player = .{ .slot = owner, .creative = creative } });
+            },
         }
     }
 
@@ -2454,6 +2490,8 @@ pub const Projectiles = struct {
         const kind = switch (target) {
             .mob => |index| self.deps.mobs.traits((try self.deps.mobs.inSlot(index)).entity.species).entity_type,
             .player => self.player_type,
+            // AbstractArrow.doKnockback is for the living alone.
+            .boat => return,
         };
         const strength = try self.withWeapon(projectile, struct {
             fn call(attack: *const attack_effects.Attack, weapon: ?item_data.View, target_type: u32, amount: f32) !f32 {
@@ -2462,7 +2500,7 @@ pub const Projectiles = struct {
         }.call, kind, 0);
         if (strength <= 0) return;
         const v = projectile.velocity;
-        const flat = living.normalize(.{ v[0], 0, v[2] });
+        const flat = mth.normalize(.{ v[0], 0, v[2] });
         switch (target) {
             .mob => |index| {
                 const mob = try self.deps.mobs.inSlot(index);
@@ -2472,6 +2510,8 @@ pub const Projectiles = struct {
                 mob.entity.has_impulse = true;
             },
             .player => |other| try self.deps.damage.knockback(other, @as(f64, strength) * 0.6, -flat[0], -flat[2]),
+            // Returned before the strength was asked.
+            .boat => unreachable,
         }
     }
 

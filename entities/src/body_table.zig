@@ -1,6 +1,6 @@
-//! A kind whose entities are a body and a record of the kind's own: one row each in the kind's
-//! table, in the tick order's sequence, the body a column the entities' body calls reach through
-//! the directory. Used as a table of the kind's records by id.
+//! Kinds whose entities are a body and a record of the kinds' own: one row each in their table,
+//! in the tick order's sequence, the body a column the entities' body calls reach through the
+//! directory. Used as a table of the kinds' records by id.
 
 const std = @import("std");
 const entities_module = @import("entities.zig");
@@ -11,6 +11,8 @@ const Entities = entities_module.Entities;
 const State = entities_module.State;
 const Id = entities_module.Id;
 const Shape = entities_module.Shape;
+const Kinds = @import("space.zig").Kinds;
+const assert = std.debug.assert;
 
 pub fn BodyTable(comptime Extra: type) type {
     return struct {
@@ -20,16 +22,17 @@ pub fn BodyTable(comptime Extra: type) type {
 
         entities: *Entities,
         table: Table,
-        kind: u32,
+        kinds: Kinds,
 
-        pub fn init(allocator: std.mem.Allocator, owner: *Entities, kind: u32) !Self {
-            return .{ .entities = owner, .table = try .init(allocator, &owner.pool, &owner.directory), .kind = kind };
+        pub fn init(allocator: std.mem.Allocator, owner: *Entities, kinds: Kinds) !Self {
+            return .{ .entities = owner, .table = try .init(allocator, &owner.pool, &owner.directory), .kinds = kinds };
         }
 
-        /// Maintained with every table at the end of each tick, and the kind's bodies reached
+        /// Maintained with every table at the end of each tick, and the kinds' bodies reached
         /// through it. Called once the table is where it stays.
         pub fn register(self: *Self) !void {
-            try self.entities.addTable(self.kind, &self.table.core);
+            var each = self.kinds.bits.iterator(.{});
+            while (each.next()) |kind| try self.entities.addTable(@intCast(kind), &self.table.core);
             const Adapter = struct {
                 fn body(raw: *anyopaque, slot: u32) ?*State {
                     const held: *Self = @ptrCast(@alignCast(raw));
@@ -37,13 +40,14 @@ pub fn BodyTable(comptime Extra: type) type {
                     return if (row.field("bodied").*) row.field("body") else null;
                 }
             };
-            try self.entities.addBodyColumn(self.kind, .{ .context = self, .body = Adapter.body });
+            each = self.kinds.bits.iterator(.{});
+            while (each.next()) |kind| try self.entities.addBodyColumn(@intCast(kind), .{ .context = self, .body = Adapter.body });
         }
 
         pub fn slotOf(self: *const Self, entity: Id) ?u32 {
             const slot = self.entities.directory.slotOf(entity) orelse return null;
             const entry = self.entities.directory.entry(slot);
-            return if (entry.kind != self.kind or entry.block == directory.none) null else slot;
+            return if (!self.kinds.has(entry.kind) or entry.block == directory.none) null else slot;
         }
 
         pub fn contains(self: *const Self, entity: Id) bool {
@@ -59,7 +63,7 @@ pub fn BodyTable(comptime Extra: type) type {
             return self.entities.directory.capacity();
         }
 
-        /// The kind's record where it lies, good until the tick's end.
+        /// The record where it lies, good until the tick's end.
         pub fn ptrById(self: *const Self, entity: Id) !?*Extra {
             return self.table.ref(self.slotOf(entity) orelse return null).field("extra");
         }
@@ -68,11 +72,11 @@ pub fn BodyTable(comptime Extra: type) type {
             return (try self.ptrById(entity) orelse return null).*;
         }
 
-        /// The kind's record of the entity in a slot: found without its id.
+        /// The record of the entity in a slot: found without its id.
         pub fn ptr(self: *const Self, slot: u32) *Extra {
             // The space and the tick order give only slots of their kinds: checked where checks cost
             // nothing, as a release build reads the directory for it on every call.
-            if (@import("builtin").mode == .debug) std.debug.assert(self.entities.directory.entry(slot).kind == self.kind);
+            if (@import("builtin").mode == .debug) std.debug.assert(self.kinds.has(self.entities.directory.entry(slot).kind));
             return self.table.ref(slot).field("extra");
         }
 
@@ -84,7 +88,8 @@ pub fn BodyTable(comptime Extra: type) type {
         /// An entity comes into memory: placed where its body is, in the tick order last if its
         /// column ticks, and its row written.
         pub fn add(self: *Self, entity: Id, body: State, value: Extra, shape: Shape) !void {
-            const slot = try self.entities.enter(entity, self.kind);
+            assert(self.kinds.has(body.kind));
+            const slot = try self.entities.enter(entity, body.kind);
             errdefer self.entities.leave(slot);
             try self.entities.places.insert(entity, body.world, body.position, shape);
             errdefer self.entities.places.remove(entity);
@@ -121,7 +126,7 @@ pub fn BodyTable(comptime Extra: type) type {
             while (at < self.entities.directory.high()) : (at += 1) {
                 const slot: u32 = @intCast(at);
                 const entry = self.entities.directory.entry(slot);
-                if (entry.id == 0 or entry.kind != self.kind or entry.block == directory.none) continue;
+                if (entry.id == 0 or !self.kinds.has(entry.kind) or entry.block == directory.none) continue;
                 self.entities.places.remove(entry.id);
                 entry.block = directory.none;
                 self.entities.leave(slot);

@@ -25,6 +25,8 @@ const mob_state = @import("mob.zig");
 const Mobs = @import("mobs.zig").Mobs;
 const body = @import("vanilla_bodies").body;
 const Melee = @import("melee.zig").Melee;
+const Boats = @import("boats.zig").Boats;
+const boat_module = @import("boat.zig");
 
 const Mob = mob_state.Mob;
 const registry = game_data.registry;
@@ -148,7 +150,9 @@ pub const MobInteraction = struct {
         // Players' network ids are their slots plus one; other entities' come after.
         if (target <= 0) return;
         if (target <= entities.Entities.player_ids) return self.dispatchPlayer(handle.index, @intCast(target - 1), mouse);
-        const mob = (try self.deps.mobs.get(self.deps.mobs.deps.entities.entityOfNetwork(target) orelse return)) orelse return;
+        const entity = self.deps.mobs.deps.entities.entityOfNetwork(target) orelse return;
+        if (self.deps.mobs.boats) |boats| if (boats.boats.slotOf(entity)) |slot| return self.dispatchBoat(handle.index, boats, slot, mouse);
+        const mob = (try self.deps.mobs.get(entity)) orelse return;
         if (mob.motion.world != player.world or mob.entity.removed) return;
         // ServerGamePacketListenerImpl.handleInteract: nothing outside the border is reached.
         if (!self.deps.world_border.containsBlock(player.world, mth.floor(mob.motion.position[0]), mth.floor(mob.motion.position[2]))) return;
@@ -159,6 +163,18 @@ pub const MobInteraction = struct {
             0 => try self.interact(handle.index, mob, if (hand == 1) .off else .main),
             else => {},
         }
+    }
+
+    /// An interaction with a boat: an attack, as Player.attack takes it of what is not living.
+    /// Riding one, its use, is not built yet.
+    fn dispatchBoat(self: *MobInteraction, slot: usize, boats: *Boats, boat: u32, mouse: i32) !void {
+        const player = &self.deps.players.records[slot];
+        if (!boats.solid(boat)) return;
+        const state = boats.deps.entities.body(boat).?;
+        if (state.world != player.world) return;
+        if (!self.deps.world_border.containsBlock(player.world, mth.floor(state.position[0]), mth.floor(state.position[2]))) return;
+        if (!try self.withinReach(slot, boat_module.boxAt(state.position))) return;
+        if (mouse == 1) try self.deps.melee.attack(slot, .{ .boat = boat });
     }
 
     /// An interaction with another player: an attack, as ServerPlayer.attack takes it. A player

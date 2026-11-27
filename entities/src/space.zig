@@ -53,6 +53,13 @@ pub const Kinds = struct {
         return self.bits.isSet(kind);
     }
 
+    /// These kinds and those too, for a lookup after both.
+    pub fn with(self: Kinds, other: Kinds) Kinds {
+        var result = self;
+        result.bits.setUnion(other.bits);
+        return result;
+    }
+
     /// Each kind's bit folded onto 64: a column whose own fold shares none holds none of them.
     pub fn fold(self: *const Kinds) u64 {
         var folded: u64 = 0;

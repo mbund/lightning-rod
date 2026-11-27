@@ -97,6 +97,8 @@ const Options = struct {
     mob_edits: u32 = 16384,
     /// Experience orbs scattered around the players, apart enough not to merge or follow anyone.
     orbs: usize = 0,
+    /// Boats dropped in a grid around the players, three blocks apart, to land and rest.
+    boats: usize = 0,
     /// After every measured tick, the kernel drops what it caches of the world's files, so
     /// reads reach the disk.
     drop_page_cache: bool = false,
@@ -245,6 +247,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
             lightning_rod.plugin.configured(vanilla.MobReplication, .{ .trace_sends = options.digest }),
             lightning_rod.plugin.configured(vanilla.ItemReplication, .{ .trace_sends = options.digest }),
             lightning_rod.plugin.configured(vanilla.ExperienceReplication, .{ .trace_sends = options.digest }),
+            lightning_rod.plugin.configured(vanilla.BoatReplication, .{ .trace_sends = options.digest }),
             lightning_rod.plugin.configured(Inventories, .{ .cache_items = 10 }),
             lightning_rod.plugin.configured(sessions.World, .{ .endpoint = service }),
             lightning_rod.plugin.configured(vanilla.RecipeBook, .{ .packet_bytes = service.config.page_bytes }),
@@ -389,6 +392,18 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
             if (index % 64 == 63) try simulation.get(vanilla.Entities).settle();
         }
     }
+    if (options.boats > 0) {
+        const boats = simulation.get(vanilla.Boats);
+        const side = std.math.sqrt(options.boats) + 1;
+        for (0..options.boats) |index| {
+            // Three blocks apart, more than a boat is wide, in the chunks around the players.
+            const x: f64 = -40.5 + @as(f64, @floatFromInt(index % side)) * 3;
+            const z: f64 = 20.5 + @as(f64, @floatFromInt(index / side)) * 3;
+            _ = try boats.spawn(.{ .variant = @fromBackingInt(@intCast(index % 10)), .world = spawn_world, .position = .{ x, 80, z } });
+            // Between runs of spawns nothing is held: memory makes room for the next.
+            if (index % 64 == 63) try simulation.get(vanilla.Entities).settle();
+        }
+    }
     if (options.flying > 0) {
         if (count == 0) return error.ArrowsNeedAPlayer;
         try flyers(simulation, spawn_world, options.flying, !options.unforced);
@@ -458,7 +473,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
             for (cached_files) |file| if (file) |open| {
                 _ = std.os.linux.fadvise(open.handle, 0, 0, std.os.linux.POSIX_FADV.DONTNEED);
             };
-            if (options.digest) try writer.print("digest tick={d} mobs={x} orbs={x} projectiles={x} sent={x} items={x} mob_sent={x} item_sent={x} orb_sent={x} packets={d} recipients={d} sleeping={d} items_asleep={d} wire={x}\n", .{ tick, try mobs.digest(), try simulation.get(vanilla.Experience).digest(), try simulation.get(vanilla.Projectiles).digest(), simulation.get(vanilla.ProjectileReplication).traced(), try simulation.get(vanilla.ItemEntities).digest(), simulation.get(vanilla.MobReplication).traced(), simulation.get(vanilla.ItemReplication).traced(), simulation.get(vanilla.ExperienceReplication).traced(), packets, recipients, simulation.get(vanilla.Projectiles).sleepingCount(), simulation.get(vanilla.ItemEntities).asleepCount(), wireDigest() });
+            if (options.digest) try writer.print("digest tick={d} mobs={x} orbs={x} projectiles={x} sent={x} items={x} mob_sent={x} item_sent={x} orb_sent={x} boats={x} boat_sent={x} packets={d} recipients={d} sleeping={d} items_asleep={d} wire={x}\n", .{ tick, try mobs.digest(), try simulation.get(vanilla.Experience).digest(), try simulation.get(vanilla.Projectiles).digest(), simulation.get(vanilla.ProjectileReplication).traced(), try simulation.get(vanilla.ItemEntities).digest(), simulation.get(vanilla.MobReplication).traced(), simulation.get(vanilla.ItemReplication).traced(), simulation.get(vanilla.ExperienceReplication).traced(), try simulation.get(vanilla.Boats).digest(), simulation.get(vanilla.BoatReplication).traced(), packets, recipients, simulation.get(vanilla.Projectiles).sleepingCount(), simulation.get(vanilla.ItemEntities).asleepCount(), wireDigest() });
         }
         cpus[sample] = @intCast(std.Io.Clock.now(.cpu_thread, io).nanoseconds - cpu);
         process_cpus += @intCast(std.Io.Clock.now(.cpu_process, io).nanoseconds - process_cpu);
@@ -660,6 +675,8 @@ pub fn main(init: std.process.Init) !void {
             options.edit_flood = try std.fmt.parseInt(usize, argument[13..], 10);
         } else if (std.mem.startsWith(u8, argument, "--orbs=")) {
             options.orbs = try std.fmt.parseInt(usize, argument[7..], 10);
+        } else if (std.mem.startsWith(u8, argument, "--boats=")) {
+            options.boats = try std.fmt.parseInt(usize, argument[8..], 10);
         } else if (std.mem.eql(u8, argument, "--drop-page-cache")) {
             options.drop_page_cache = true;
         } else if (std.mem.startsWith(u8, argument, "--mob-edits=")) {

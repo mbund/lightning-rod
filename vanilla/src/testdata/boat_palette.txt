@@ -1,0 +1,12 @@
+minecraft:stone
+minecraft:ice
+minecraft:packed_ice
+minecraft:blue_ice
+minecraft:slime_block
+minecraft:soul_sand
+minecraft:honey_block
+minecraft:cobweb
+minecraft:lily_pad
+minecraft:oak_slab[type=bottom,waterlogged=false]
+minecraft:oak_fence[east=false,north=false,south=false,waterlogged=false,west=false]
+minecraft:powder_snow

@@ -60,6 +60,7 @@ const Entity = struct {
 
 const Host = struct {
     pub const living = true;
+    pub const boat = false;
     mobs: *Mobs,
     mob: Mob,
 
@@ -116,5 +117,8 @@ const Host = struct {
     }
     pub fn entityEvent(self: Host, _: Entity, event: u8) void {
         self.mobs.entityEvent(self.mob, event);
+    }
+    pub fn onAboveBubbleColumn(self: Host, subject: Entity, drag: bool, _: [3]i32) !void {
+        generic.aboveBubbleColumn(self, subject, drag);
     }
 };

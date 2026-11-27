@@ -193,6 +193,7 @@ pub const Hook = struct {
 /// Hazards as the host of the shared block effects, for items, which are not living.
 const Host = struct {
     pub const living = false;
+    pub const boat = false;
     hazards: *Hazards,
 
     pub fn level(self: Host, world: u32) bodies.body.Level {
@@ -266,5 +267,8 @@ const Host = struct {
     /// Honey slide effects are for living bodies alone.
     pub fn entityEvent(_: Host, _: *Subject, _: u8) void {
         unreachable;
+    }
+    pub fn onAboveBubbleColumn(self: Host, subject: *Subject, drag: bool, _: [3]i32) !void {
+        effects.aboveBubbleColumn(self, subject, drag);
     }
 };
