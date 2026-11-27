@@ -6,6 +6,7 @@ const std = @import("std");
 const game_data = @import("game_data");
 const mth = @import("vanilla_bodies").mth;
 const body = @import("vanilla_bodies").body;
+const entities = @import("entities");
 const living = @import("living.zig");
 const ai = @import("ai.zig");
 const navigation = @import("navigation.zig");
@@ -305,9 +306,15 @@ fn breedCanUse(mobs: *Mobs, mob: Mob) !bool {
 /// BreedGoal.getFreePartner: the nearest mob of the kind within 8 blocks that can mate and
 /// does not panic.
 fn freePartner(mobs: *Mobs, mob: Mob) !?u64 {
-    var search: struct { mobs: *Mobs, mob: Mob, best: ?u64 = null, best_distance: f64 = std.math.floatMax(f64) } = .{ .mobs = mobs, .mob = mob };
-    try mobs.near(mob, living.box(mobs, mob).inflate(8, 8, 8), .same_species, &search, struct {
-        fn visit(context: *@TypeOf(search), other: Mob) anyerror!bool {
+    const Search = struct {
+        mobs: *Mobs,
+        mob: Mob,
+        best: ?u64 = null,
+        best_distance: f64 = std.math.floatMax(f64),
+
+        fn visit(raw: *anyopaque, entry: entities.space.Entry, _: body.Box) anyerror!bool {
+            const context: *@This() = @ptrCast(@alignCast(raw));
+            const other = try context.mobs.inSlot(entry.slot);
             if (!other.alive()) return false;
             const distance = senses.distanceSquared(context.mob, other);
             // PARTNER_TARGETING's range, which mobs see at full visibility.
@@ -319,7 +326,9 @@ fn freePartner(mobs: *Mobs, mob: Mob) !?u64 {
             }
             return false;
         }
-    }.visit);
+    };
+    var search: Search = .{ .mobs = mobs, .mob = mob };
+    try mobs.eachOfSpecies(mob, living.box(mobs, mob).inflate(8, 8, 8), .{ .context = &search, .visit = Search.visit });
     return search.best;
 }
 
@@ -380,9 +389,15 @@ fn temptTick(mobs: *Mobs, mob: Mob) !void {
 
 fn followParentCanUse(mobs: *Mobs, mob: Mob) !bool {
     if (mob.idle.age >= 0) return false;
-    var search: struct { mobs: *Mobs, mob: Mob, best: ?u64 = null, best_distance: f64 = std.math.floatMax(f64) } = .{ .mobs = mobs, .mob = mob };
-    try mobs.near(mob, living.box(mobs, mob).inflate(8, 4, 8), .same_species, &search, struct {
-        fn visit(context: *@TypeOf(search), other: Mob) anyerror!bool {
+    const Search = struct {
+        mobs: *Mobs,
+        mob: Mob,
+        best: ?u64 = null,
+        best_distance: f64 = std.math.floatMax(f64),
+
+        fn visit(raw: *anyopaque, entry: entities.space.Entry, _: body.Box) anyerror!bool {
+            const context: *@This() = @ptrCast(@alignCast(raw));
+            const other = try context.mobs.inSlot(entry.slot);
             if (other.idle.age < 0) return false;
             const distance = senses.distanceSquared(context.mob, other);
             if (!(distance > context.best_distance)) {
@@ -391,7 +406,9 @@ fn followParentCanUse(mobs: *Mobs, mob: Mob) !bool {
             }
             return false;
         }
-    }.visit);
+    };
+    var search: Search = .{ .mobs = mobs, .mob = mob };
+    try mobs.eachOfSpecies(mob, living.box(mobs, mob).inflate(8, 4, 8), .{ .context = &search, .visit = Search.visit });
     const parent = search.best orelse return false;
     const best_distance = search.best_distance;
     if (best_distance < 9.0) return false;

@@ -1555,40 +1555,23 @@ pub const Mobs = struct {
     pub fn wake(self: *Mobs, world: u32, low: [3]f64, high: [3]f64) void {
         const margin = 2.0;
         const reach: body.Box = .{ .min = .{ low[0] - margin, low[1] - margin, low[2] - margin }, .max = .{ high[0] + margin, high[1] + margin, high[2] + margin } };
-        self.each(world, reach, self, struct {
-            fn visit(mobs: *Mobs, mob: Mob) anyerror!bool {
-                if (mob.motion.resting) mobs.rouseMob(mob);
-                return false;
-            }
-        }.visit) catch |err| {
+        self.deps.collisions.eachOf(world, reach, body.no_slot, .living, self.kinds, .{ .context = self, .visit = rouseResting }) catch |err| {
             self.failure = err;
         };
     }
 
-    /// Visits the mobs whose boxes meet a box, in the order EntitySectionStorage.getEntities
-    /// finds them: columns by x, then by z as an unsigned field, each column's sections by y as
-    /// one, and in each section as they came into it. `visit` returns whether to stop. Every
-    /// query keeps its own round of places, so a visit may ask again.
-    pub fn each(self: *Mobs, world: u32, query: body.Box, context: anytype, comptime visit: fn (@TypeOf(context), Mob) anyerror!bool) !void {
-        if (self.active.count == 0) return;
-        const Lookup = struct {
-            mobs: *Mobs,
-            query: body.Box,
-            context: @TypeOf(context),
+    fn rouseResting(context: *anyopaque, entry: entities.space.Entry, _: body.Box) anyerror!bool {
+        const self: *Mobs = @ptrCast(@alignCast(context));
+        const mob = try self.inSlot(entry.slot);
+        if (mob.motion.resting) self.rouseMob(mob);
+        return false;
+    }
 
-            fn each(lookup: *const @This(), entry: entities.space.Entry) anyerror!bool {
-                const mobs = lookup.mobs;
-                // The space gives only the mobs' kinds, each with its slot.
-                const index = entry.slot;
-                if (@import("builtin").mode == .debug) std.debug.assert(mobs.isMob(index));
-                // Held only while visited; a visitor keeps ids, not mobs.
-                const mob = try mobs.inSlot(index);
-                if (mob.entity.removed or !living.box(mobs, mob).intersects(lookup.query)) return false;
-                return visit(lookup.context, mob);
-            }
-        };
-        const lookup: Lookup = .{ .mobs = self, .query = query, .context = context };
-        try self.places.space.each(world, .{ .min = query.min, .max = query.max }, self.kinds, &lookup, Lookup.each);
+    /// Level.getEntitiesOfClass of the mob's own class: the others of its species whose boxes
+    /// meet the box, the dying too, in the level's order.
+    pub fn eachOfSpecies(self: *Mobs, mob: Mob, query: body.Box, visitor: EntityCollisions.Visitor) !void {
+        const kind = self.traits(mob.entity.species).entity_type;
+        try self.deps.collisions.eachOf(mob.motion.world, query, self.slotOf(mob.entity.id).?, .living, .of(&.{kind}), visitor);
     }
 
     /// The squared distance to the nearest player in the world who is not a spectator, as
@@ -1750,35 +1733,6 @@ pub const Mobs = struct {
     pub fn rouseMob(self: *Mobs, mob: Mob) void {
         if (self.inPool(mob)) return self.rouseHeld(self.slotOf(mob.entity.id).?, mob);
         mob.motion.resting = false;
-    }
-
-    /// pushable: what LivingEntity.pushEntities moves. same_species: mobs of the mob's own kind.
-    /// living: every living mob, as getEntitiesOfClass(LivingEntity) finds them.
-    pub const Nearness = enum { pushable, same_species, living };
-
-    /// The other mobs whose boxes meet a box, in the order EntitySectionStorage.getEntities finds
-    /// them: by section, then by when each came into its section. LivingEntity.isPushable keeps
-    /// the living off climbables, and asking marks a climber as vanilla's check does.
-    pub fn near(self: *Mobs, mob: Mob, query: body.Box, which: Nearness, context: anytype, comptime visit: fn (@TypeOf(context), Mob) anyerror!bool) !void {
-        const Search = struct {
-            mobs: *Mobs,
-            mob: Mob,
-            which: Nearness,
-            context: @TypeOf(context),
-
-            fn each(search: *const @This(), other: Mob) anyerror!bool {
-                const mobs = search.mobs;
-                if (other.entity.id == search.mob.entity.id) return false;
-                switch (search.which) {
-                    .pushable => if (!other.alive() or try living.onClimbable(mobs, other)) return false,
-                    .same_species => if (other.entity.species != search.mob.entity.species) return false,
-                    .living => {},
-                }
-                return visit(search.context, other);
-            }
-        };
-        const search: Search = .{ .mobs = self, .mob = mob, .which = which, .context = context };
-        try self.each(mob.motion.world, query, &search, Search.each);
     }
 
     /// FarmBlock.turnToDirt.
