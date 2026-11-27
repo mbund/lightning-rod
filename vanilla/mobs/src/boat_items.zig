@@ -59,11 +59,11 @@ pub const BoatItems = struct {
         const level = boats.deps.mobs.level(player.world);
         const creative = self.deps.player_states.of(player).gamemode == .creative;
         const eye = eyeOf(player);
-        const view = viewVector(player.rotation.pitch, player.rotation.yaw);
+        const view = mth.viewVector(player.rotation.pitch, player.rotation.yaw);
         // Player.blockInteractionRange, with creative's half block more.
         const range = try self.deps.attributes.value(player.handle.?.index, "minecraft:block_interaction_range") + @as(f64, if (creative) 0.5 else 0);
         const end: [3]f64 = .{ eye[0] + view[0] * range, eye[1] + view[1] * range, eye[2] + view[2] * range };
-        const hit = try clip.clip(&level, eye, end, .any) orelse return .pass;
+        const hit = try clip.clip(&level, eye, end, .outline, .any, .{}) orelse return .pass;
         // A pickable entity whose box holds the eyes is what the player uses, not the water.
         const reach = playerBox(player).expandTowards(.{ view[0] * 5, view[1] * 5, view[2] * 5 }).inflate(1, 1, 1);
         if (try boats.pickableHolds(player.world, reach, eye, boats.deps.players.entitySlot(player.handle.?.index) orelse body.no_slot)) return .pass;
@@ -95,15 +95,4 @@ fn eyeOf(player: *const Player) [3]f64 {
 /// A player's box, standing or sneaking.
 fn playerBox(player: *const Player) body.Box {
     return body.makeBox(.{ player.position.x, player.position.y, player.position.z }, 0.6, if (player.flags.sneaking) 1.5 else 1.8);
-}
-
-/// Entity.calculateViewVector: where the rotation looks, from the sine table, as floats.
-pub fn viewVector(pitch: f32, yaw: f32) [3]f64 {
-    const f = pitch * 0.017453292;
-    const g = -yaw * 0.017453292;
-    const h = mth.cos(g);
-    const i = mth.sin(g);
-    const j = mth.cos(f);
-    const k = mth.sin(f);
-    return .{ i * j, -k, h * j };
 }

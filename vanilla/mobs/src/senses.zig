@@ -6,6 +6,7 @@ const std = @import("std");
 const game_data = @import("game_data");
 const mth = @import("vanilla_bodies").mth;
 const body = @import("vanilla_bodies").body;
+const clip = @import("vanilla_bodies").clip;
 const living = @import("living.zig");
 const mob_state = @import("mob.zig");
 const Mobs = @import("mobs.zig").Mobs;
@@ -77,74 +78,7 @@ pub fn hasLineOfSight(mobs: *Mobs, mob: Mob, target: [3]f64) !bool {
     const dz = target[2] - eye[2];
     if (@sqrt(dx * dx + dy * dy + dz * dz) > 128.0) return false;
     const level = mobs.level(mob.motion.world);
-    return !try clipsCollider(&level, eye, target, living.context(mob));
-}
-
-/// Level.clip with COLLIDER shapes and no fluids: whether the segment enters a collision shape.
-pub fn clipsCollider(level: *const body.Level, from: [3]f64, to: [3]f64, context: body.Context) !bool {
-    if (from[0] == to[0] and from[1] == to[1] and from[2] == to[2]) return false;
-    const start: [3]f64 = .{ lerp(-1.0e-7, to[0], from[0]), lerp(-1.0e-7, to[1], from[1]), lerp(-1.0e-7, to[2], from[2]) };
-    const end: [3]f64 = .{ lerp(-1.0e-7, from[0], to[0]), lerp(-1.0e-7, from[1], to[1]), lerp(-1.0e-7, from[2], to[2]) };
-    const delta: [3]f64 = .{ to[0] - from[0], to[1] - from[1], to[2] - from[2] };
-    var cell: [3]i32 = .{ mth.floor(start[0]), mth.floor(start[1]), mth.floor(start[2]) };
-    if (try cellClips(level, cell, from, delta, context)) return true;
-    var step: [3]i32 = undefined;
-    var next: [3]f64 = undefined;
-    var increment: [3]f64 = undefined;
-    for (0..3) |axis| {
-        const span = end[axis] - start[axis];
-        step[axis] = if (span > 0) 1 else if (span < 0) -1 else 0;
-        increment[axis] = if (step[axis] == 0) std.math.floatMax(f64) else @as(f64, @floatFromInt(step[axis])) / span;
-        const fraction = start[axis] - @floor(start[axis]);
-        next[axis] = increment[axis] * (if (step[axis] > 0) 1.0 - fraction else fraction);
-    }
-    while (next[0] <= 1 or next[1] <= 1 or next[2] <= 1) {
-        const axis: usize = if (next[0] < next[1]) (if (next[0] < next[2]) 0 else 2) else (if (next[1] < next[2]) 1 else 2);
-        cell[axis] += step[axis];
-        next[axis] += increment[axis];
-        if (try cellClips(level, cell, from, delta, context)) return true;
-    }
-    return false;
-}
-
-fn lerp(delta: f64, start: f64, end: f64) f64 {
-    return start + delta * (end - start);
-}
-
-fn cellClips(level: *const body.Level, cell: [3]i32, from: [3]f64, delta: [3]f64, context: body.Context) !bool {
-    const state = try level.state(cell[0], cell[1], cell[2]);
-    const boxes = body.collisionBoxes(level, state, cell[0], cell[1], cell[2], context);
-    if (boxes.count == 0) return false;
-    const shape: body.Shape = .{ .boxes = boxes, .x = cell[0], .y = cell[1], .z = cell[2] };
-    const length = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
-    if (length < 1.0e-7) return false;
-    // VoxelShape.clip: a start just inside the shape hits.
-    const probe: [3]f64 = .{ from[0] + delta[0] * 0.001, from[1] + delta[1] * 0.001, from[2] + delta[2] * 0.001 };
-    for (0..boxes.count) |index| {
-        const target = shape.get(index);
-        if (probe[0] >= target.min[0] and probe[0] < target.max[0] and probe[1] >= target.min[1] and probe[1] < target.max[1] and probe[2] >= target.min[2] and probe[2] < target.max[2]) return true;
-        if (entersBox(target, from, delta)) return true;
-    }
-    return false;
-}
-
-/// AABB.clip: the segment enters the box through a face it starts outside of.
-fn entersBox(target: body.Box, from: [3]f64, delta: [3]f64) bool {
-    var enter: f64 = 0;
-    var leave: f64 = 1;
-    for (0..3) |axis| {
-        if (delta[axis] == 0) {
-            if (from[axis] < target.min[axis] or from[axis] > target.max[axis]) return false;
-            continue;
-        }
-        var near = (target.min[axis] - from[axis]) / delta[axis];
-        var far = (target.max[axis] - from[axis]) / delta[axis];
-        if (near > far) std.mem.swap(f64, &near, &far);
-        enter = @max(enter, near);
-        leave = @min(leave, far);
-        if (enter > leave) return false;
-    }
-    return enter <= 1.0;
+    return try clip.clip(&level, eye, target, .collider, .none, living.context(mob)) == null;
 }
 
 pub fn distanceSquared(a: Mob, b: Mob) f64 {

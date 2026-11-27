@@ -38,7 +38,7 @@ pub fn build(b: *std.Build) void {
         .{ .source = "batch_test" },
         .{ .source = "pickup_test" },
         .{ .source = "merge_test", .step = "test-item-merging", .description = "Verify bounded item merging and ownership" },
-        .{ .source = "placement_test", .step = "test-placement", .description = "Verify placement and collision raycasts" },
+        .{ .source = "placement_test", .step = "test-placement", .description = "Verify placement" },
         .{ .source = "creative_inventory_test" },
         .{ .source = "visibility_replication_test", .step = "test-player-replication", .description = "Verify player visibility and independent packet admission" },
         .{ .source = "environment_test" },

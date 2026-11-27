@@ -96,7 +96,6 @@ pub const ItemEntities = @import("vanilla_item_entities").item_entities.ItemEnti
 pub const ItemPhysics = @import("vanilla_item_entities").item_physics.ItemPhysics;
 pub const EntityCollisions = @import("vanilla_bodies").entity_collisions.EntityCollisions;
 pub const Levels = @import("vanilla_bodies").levels.Levels;
-pub const raycast = @import("vanilla_blocks").raycast;
 pub const ItemUse = @import("vanilla_blocks").item_use.ItemUse;
 pub const ItemActions = @import("vanilla_items").item_actions.ItemActions;
 pub const item_actions = @import("vanilla_items").item_actions;

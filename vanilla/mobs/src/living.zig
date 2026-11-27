@@ -8,6 +8,7 @@ const std = @import("std");
 const game_data = @import("game_data");
 const mth = @import("vanilla_bodies").mth;
 const body = @import("vanilla_bodies").body;
+const clip = @import("vanilla_bodies").clip;
 const mob_blocks = @import("vanilla_bodies").mob_blocks;
 const fluids = @import("vanilla_bodies").fluids;
 const Mob = @import("mob.zig").Mob;
@@ -88,7 +89,8 @@ pub fn move(mobs: *Mobs, mob: Mob, requested_in: [3]f64) !void {
     if (moved_squared > 1.0e-7 or lengthSquared(requested) - moved_squared < 1.0e-7) {
         if (mob.motion.fall_distance != 0 and moved_squared >= 1.0) {
             const destination: [3]f64 = .{ mob.motion.position[0] + moved[0], mob.motion.position[1] + moved[1], mob.motion.position[2] + moved[2] };
-            if (try body.clipsFallReset(&level, mob.motion.position, destination)) mob.motion.fall_distance = 0;
+            // Entity.move: a fall through water or a block that ends one ends it.
+            if (try clip.clip(&level, mob.motion.position, destination, .fall_damage_resetting, .water, context(mob)) != null) mob.motion.fall_distance = 0;
         }
         const from = mob.motion.position;
         const to: [3]f64 = .{ from[0] + moved[0], from[1] + moved[1], from[2] + moved[2] };

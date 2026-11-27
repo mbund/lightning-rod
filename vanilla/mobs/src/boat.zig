@@ -9,6 +9,7 @@ const bodies = @import("vanilla_bodies");
 
 const mth = bodies.mth;
 const body = bodies.body;
+const clip = bodies.clip;
 const fluids = bodies.fluids;
 const block_effects = bodies.block_effects;
 const JavaRandom = bodies.java_random.JavaRandom;
@@ -388,7 +389,7 @@ fn move(level: *const body.Level, around: Around, state: *entities.State, boat: 
     if (moved_squared > 1.0e-7 or lengthSquared(requested) - moved_squared < 1.0e-7) {
         const destination: [3]f64 = .{ state.position[0] + moved[0], state.position[1] + moved[1], state.position[2] + moved[2] };
         if (boat.fall_distance != 0 and moved_squared >= 1.0) {
-            if (try body.clipsFallReset(level, state.position, destination)) boat.fall_distance = 0;
+            if (try clip.clip(level, state.position, destination, .fall_damage_resetting, .water, contextOf(around, state, boat)) != null) boat.fall_distance = 0;
         }
         kept = .{ .from = state.position, .to = destination, .axis_independent = true };
         state.position = destination;

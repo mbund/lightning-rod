@@ -240,8 +240,16 @@ public class BoatOracle {
         return line.toString();
     }
 
-    /// Level.clip through outlines and any fluid, as BoatItem.use traces, for twenty rays across
-    /// the scenario's terrain: what each hit, or that it missed.
+    static void hit(StringBuilder line, net.minecraft.world.phys.BlockHitResult hit) {
+        if (hit.getType() == net.minecraft.world.phys.HitResult.Type.MISS) { line.append("miss\n"); return; }
+        var at = hit.getLocation();
+        line.append(Long.toHexString(Double.doubleToRawLongBits(at.x))).append(' ').append(Long.toHexString(Double.doubleToRawLongBits(at.y))).append(' ').append(Long.toHexString(Double.doubleToRawLongBits(at.z))).append(' ');
+        line.append(hit.getBlockPos().getX()).append(' ').append(hit.getBlockPos().getY()).append(' ').append(hit.getBlockPos().getZ()).append(' ').append(hit.getDirection().ordinal()).append(' ').append(hit.isInside() ? 1 : 0).append('\n');
+    }
+
+    /// Level.clip for twenty rays across the scenario's terrain, through outlines and any fluid as
+    /// BoatItem.use traces, and through collision shapes as projectiles do: what each hit, or that
+    /// it missed.
     static String clips(int seed, List<BlockState> palette, FakeLevel level) {
         terrain(new java.util.Random(seed), palette);
         var random = new java.util.Random(seed ^ 0x636c6970);
@@ -250,11 +258,10 @@ public class BoatOracle {
         for (int ray = 0; ray < 20; ray++) {
             var from = new Vec3(random.nextInt(20000) / 1000.0, 1 + random.nextInt(9000) / 1000.0, random.nextInt(20000) / 1000.0);
             var to = new Vec3(random.nextInt(20000) / 1000.0, random.nextInt(9000) / 1000.0, random.nextInt(20000) / 1000.0);
-            var hit = level.clip(new net.minecraft.world.level.ClipContext(from, to, net.minecraft.world.level.ClipContext.Block.OUTLINE, net.minecraft.world.level.ClipContext.Fluid.ANY, net.minecraft.world.phys.shapes.CollisionContext.empty()));
-            if (hit.getType() == net.minecraft.world.phys.HitResult.Type.MISS) { line.append("miss\n"); continue; }
-            var at = hit.getLocation();
-            line.append(Long.toHexString(Double.doubleToRawLongBits(at.x))).append(' ').append(Long.toHexString(Double.doubleToRawLongBits(at.y))).append(' ').append(Long.toHexString(Double.doubleToRawLongBits(at.z))).append(' ');
-            line.append(hit.getBlockPos().getX()).append(' ').append(hit.getBlockPos().getY()).append(' ').append(hit.getBlockPos().getZ()).append(' ').append(hit.getDirection().ordinal()).append(' ').append(hit.isInside() ? 1 : 0).append('\n');
+            // As a look traces, through outlines and any fluid, and as a projectile does, through
+            // collision shapes and no fluid.
+            hit(line, level.clip(new net.minecraft.world.level.ClipContext(from, to, net.minecraft.world.level.ClipContext.Block.OUTLINE, net.minecraft.world.level.ClipContext.Fluid.ANY, net.minecraft.world.phys.shapes.CollisionContext.empty())));
+            hit(line, level.clip(new net.minecraft.world.level.ClipContext(from, to, net.minecraft.world.level.ClipContext.Block.COLLIDER, net.minecraft.world.level.ClipContext.Fluid.NONE, net.minecraft.world.phys.shapes.CollisionContext.empty())));
         }
         return line.toString();
     }

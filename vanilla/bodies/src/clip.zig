@@ -1,14 +1,28 @@
 //! Level.clip: the first block shape or fluid a segment meets, as BlockGetter.clip walks the cells
 //! it crosses with ClipContext's shapes, VoxelShape.clip in each, and AABB.clip's arithmetic for
-//! where it enters, so the point is vanilla's to the bit.
+//! where it enters, so the point is vanilla's to the bit. Every trace through the world goes
+//! through here: looks and items with outlines, projectiles and sight with collision shapes, and
+//! a fall with the blocks that end it.
 
 const std = @import("std");
 const game_data = @import("game_data");
 const mth = @import("mth.zig");
 const body = @import("body.zig");
 
+const assert = std.debug.assert;
+
+/// ClipContext.Block: the shape each block gives a clip.
+pub const Block = enum {
+    /// Its collision shape, for the entity of the clip's context.
+    collider,
+    /// Its outline, as a look picks.
+    outline,
+    /// A whole block for those that end a fall, none for the rest.
+    fall_damage_resetting,
+};
+
 /// ClipContext.Fluid: the fluids a clip meets besides the shapes.
-pub const Fluids = enum { none, source_only, any };
+pub const Fluids = enum { none, source_only, any, water };
 
 /// Direction, in vanilla's order.
 pub const Face = enum(u3) {
@@ -35,16 +49,16 @@ pub const Face = enum(u3) {
 /// through, and whether it started inside the shape.
 pub const Hit = struct { location: [3]f64, cell: [3]i32, face: Face, inside: bool };
 
-/// BlockGetter.clip from `from` to `to` through outline shapes, ClipContext.Block.OUTLINE as
-/// looking and using items trace, or null for ClipContext's miss.
-pub fn clip(level: *const body.Level, from: [3]f64, to: [3]f64, fluids: Fluids) !?Hit {
+/// BlockGetter.clip from `from` to `to` through the shapes of `block` and the `fluids`, for the
+/// entity `context` names, or null for ClipContext's miss.
+pub fn clip(level: *const body.Level, from: [3]f64, to: [3]f64, block: Block, fluids: Fluids, context: body.Context) !?Hit {
     if (std.mem.eql(u64, @ptrCast(&from), @ptrCast(&to))) return null;
     // BlockGetter.traverseBlocks: from a start pulled 1e-7 back toward the end, to an end pulled
     // 1e-7 back toward the start.
     const start: [3]f64 = .{ lerp(-1.0e-7, from[0], to[0]), lerp(-1.0e-7, from[1], to[1]), lerp(-1.0e-7, from[2], to[2]) };
     const end: [3]f64 = .{ lerp(-1.0e-7, to[0], from[0]), lerp(-1.0e-7, to[1], from[1]), lerp(-1.0e-7, to[2], from[2]) };
     var cell: [3]i32 = .{ mth.floor(start[0]), mth.floor(start[1]), mth.floor(start[2]) };
-    if (try visit(level, from, to, cell, fluids)) |hit| return hit;
+    if (try visit(level, from, to, cell, block, fluids, context)) |hit| return hit;
     var step: [3]i32 = undefined;
     var next: [3]f64 = undefined;
     var increment: [3]f64 = undefined;
@@ -71,21 +85,27 @@ pub fn clip(level: *const body.Level, from: [3]f64, to: [3]f64, fluids: Fluids) 
             cell[2] += step[2];
             next[2] += increment[2];
         }
-        if (try visit(level, from, to, cell, fluids)) |hit| return hit;
+        if (try visit(level, from, to, cell, block, fluids, context)) |hit| return hit;
     }
     return null;
 }
 
 /// BlockGetter.clip's visitor for a cell: the nearer of the block's shape and its fluid's.
-fn visit(level: *const body.Level, from: [3]f64, to: [3]f64, cell: [3]i32, fluids: Fluids) !?Hit {
+fn visit(level: *const body.Level, from: [3]f64, to: [3]f64, cell: [3]i32, block: Block, fluids: Fluids, context: body.Context) !?Hit {
     const state = try level.state(cell[0], cell[1], cell[2]);
-    var boxes: [16]body.Box = undefined;
-    const block = shapeClip(from, to, cell, outlineOf(state, cell, &boxes));
+    var boxes: [box_capacity]body.Box = undefined;
+    const shape = switch (block) {
+        .outline => outlineOf(state, cell, &boxes),
+        .collider => colliderOf(level, state, cell, context, &boxes),
+        .fall_damage_resetting => if (level.blocks.get(state).flags.fall_damage_resetting) whole[0..] else &.{},
+    };
+    const hit = shapeClip(from, to, cell, shape);
     const physics = game_data.physics.get(state);
     const picks = switch (fluids) {
         .none => false,
         .source_only => physics.fluid != .none and physics.amount == 8 and !physics.falling,
         .any => physics.fluid != .none,
+        .water => physics.fluid == .water,
     };
     const fluid = if (picks) fluid: {
         // FlowingFluid.getShape keeps one shape a state, as tall as the first it was asked for
@@ -93,15 +113,34 @@ fn visit(level: *const body.Level, from: [3]f64, to: [3]f64, cell: [3]i32, fluid
         const box: body.Box = .{ .min = .{ 0, 0, 0 }, .max = .{ 1, physics.height(), 1 } };
         break :fluid shapeClip(from, to, cell, &.{box});
     } else null;
-    const block_distance = if (block) |hit| distanceSquared(from, hit.location) else std.math.floatMax(f64);
-    const fluid_distance = if (fluid) |hit| distanceSquared(from, hit.location) else std.math.floatMax(f64);
-    return if (block_distance <= fluid_distance) block else fluid;
+    const block_distance = if (hit) |found| distanceSquared(from, found.location) else std.math.floatMax(f64);
+    const fluid_distance = if (fluid) |found| distanceSquared(from, found.location) else std.math.floatMax(f64);
+    return if (block_distance <= fluid_distance) hit else fluid;
+}
+
+/// The most boxes a block's shape has.
+const box_capacity = 32;
+
+const whole = [1]body.Box{.{ .min = .{ 0, 0, 0 }, .max = .{ 1, 1, 1 } }};
+
+/// A state's collision shape for the entity, as boxes within its cell.
+fn colliderOf(level: *const body.Level, state: u16, cell: [3]i32, context: body.Context, output: *[box_capacity]body.Box) []const body.Box {
+    const boxes = body.collisionBoxes(level, state, cell[0], cell[1], cell[2], context);
+    assert(boxes.count <= output.len);
+    const shape: body.Shape = .{ .boxes = boxes, .x = cell[0], .y = cell[1], .z = cell[2] };
+    const origin: [3]f64 = .{ @floatFromInt(cell[0]), @floatFromInt(cell[1]), @floatFromInt(cell[2]) };
+    for (output[0..boxes.count], 0..) |*box, index| {
+        const placed = shape.get(index);
+        box.* = .{ .min = .{ placed.min[0] - origin[0], placed.min[1] - origin[1], placed.min[2] - origin[2] }, .max = .{ placed.max[0] - origin[0], placed.max[1] - origin[1], placed.max[2] - origin[2] } };
+    }
+    return output[0..boxes.count];
 }
 
 /// A state's outline shape as boxes within its cell.
-fn outlineOf(state: u16, cell: [3]i32, output: *[16]body.Box) []const body.Box {
+fn outlineOf(state: u16, cell: [3]i32, output: *[box_capacity]body.Box) []const body.Box {
     const outline = game_data.physics.outline(state, cell[0], cell[2]);
-    const count = @min(outline.count, output.len);
+    assert(outline.count <= output.len);
+    const count = outline.count;
     for (output[0..count], 0..) |*box, index| {
         const value = outline.get(index);
         box.* = .{ .min = .{ value[0], value[1], value[2] }, .max = .{ value[3], value[4], value[5] } };
@@ -133,6 +172,15 @@ fn shapeClip(from: [3]f64, to: [3]f64, cell: [3]i32, boxes: []const body.Box) ?H
     }
     const entered = face orelse return null;
     return .{ .location = .{ from[0] + time * delta[0], from[1] + time * delta[1], from[2] + time * delta[2] }, .cell = cell, .face = entered, .inside = false };
+}
+
+/// AABB.clip: how far along the segment, as a fraction, it first enters the box through a face it
+/// moves toward; none where it misses or starts inside.
+pub fn boxClip(box: body.Box, from: [3]f64, to: [3]f64) ?f64 {
+    const delta: [3]f64 = .{ to[0] - from[0], to[1] - from[1], to[2] - from[2] };
+    var time: f64 = 1.0;
+    _ = facing(box, from, delta, &time, null) orelse return null;
+    return time;
 }
 
 /// AABB.getDirection: each face the segment moves toward, tried as AABB.clipPoint tries it.

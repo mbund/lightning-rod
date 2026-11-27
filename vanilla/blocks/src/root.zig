@@ -18,7 +18,6 @@ pub const placement_registry = @import("placement_registry.zig");
 pub const replaceable = @import("replaceable.zig");
 pub const state_names = @import("state_names.zig");
 pub const world_effects = @import("vanilla_world").world_effects;
-pub const raycast = @import("raycast.zig");
 
 test {
     std.testing.refAllDecls(@This());

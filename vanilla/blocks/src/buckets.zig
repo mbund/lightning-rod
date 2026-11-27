@@ -6,7 +6,6 @@ const std = @import("std");
 const chunks = @import("chunks");
 const game_data = @import("game_data");
 const inventories = @import("inventories");
-const minecraft = @import("minecraft_model");
 const Worlds = @import("worlds").Worlds;
 const Players = @import("players").players.Players;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
@@ -19,11 +18,14 @@ const item_actions = @import("vanilla_items").item_actions;
 const fluids = @import("fluids.zig");
 const replaceable = @import("replaceable.zig");
 const Effects = @import("vanilla_world").world_effects.Effects;
-const raycast = @import("raycast.zig");
+const bodies = @import("vanilla_bodies");
+const clip = bodies.clip;
+const mth = bodies.mth;
+const Levels = bodies.levels.Levels;
+const EquipmentAttributes = @import("vanilla_items").equipment_attributes.EquipmentAttributes;
 
 const assert = std.debug.assert;
 const registry = game_data.registry;
-const physics = game_data.physics;
 
 const Direction = enum(u3) { down, up, north, south, west, east };
 
@@ -60,6 +62,8 @@ pub const Buckets = struct {
         worlds: *Worlds,
         dimensions: *Dimensions,
         fluids: *fluids.Fluids,
+        levels: *Levels,
+        attributes: *EquipmentAttributes,
     };
 
     const Bucket = enum { empty, water, lava };
@@ -263,88 +267,16 @@ pub const Buckets = struct {
         return false;
     }
 
-    /// Item.raycast: from the eyes along the look, as far as the player reaches blocks, through
-    /// outline shapes, and with an empty bucket stopping at fluid sources too.
+    /// Item.getPlayerPOVHitResult: Level.clip from the eyes along Entity.calculateViewVector, as
+    /// far as the player reaches blocks, through outlines, and for an empty bucket fluid sources.
     fn trace(self: *Buckets, player: *const Players.Player, creative: bool, sources: bool) !?Hit {
-        const eye: f64 = if (player.flags.sneaking) 1.27 else 1.62;
-        const origin: minecraft.Position = .{ .x = player.position.x, .y = player.position.y + eye, .z = player.position.z };
-        const look = raycast.direction(player.rotation);
-        // PlayerEntity.getBlockInteractionRange, with creative's modifier.
-        const reach: f64 = if (creative) 5 else 4.5;
-        var ray = try raycast.Ray.init(origin, look, reach);
-        const start: [3]f64 = .{ origin.x, origin.y, origin.z };
-        const end: [3]f64 = .{ origin.x + look[0] * reach, origin.y + look[1] * reach, origin.z + look[2] * reach };
-        while (ray.next()) |cell| {
-            const state = try self.get(player.world, cell);
-            var best: ?struct { distance: f64, side: Direction } = null;
-            const boxes = physics.outline(state, cell.x, cell.z);
-            for (0..boxes.count) |at| {
-                const box = boxes.get(at);
-                if (intersect(start, end, cell, box)) |entry| {
-                    if (best == null or entry.distance < best.?.distance) best = .{ .distance = entry.distance, .side = entry.side };
-                }
-            }
-            if (sources) {
-                const fluid = fluids.fluidOf(state);
-                if (fluid.still()) {
-                    // FluidState.getShape: as tall as the fluid stands, the whole cell under the same fluid.
-                    const above = fluids.fluidOf(try self.get(player.world, offset(cell, .up)));
-                    const height: f64 = if (above.kind == fluid.kind) 1 else @as(f64, @floatFromInt(fluid.amount)) / 9;
-                    if (intersect(start, end, cell, .{ 0, 0, 0, 1, height, 1 })) |entry| {
-                        if (best == null or entry.distance < best.?.distance) best = .{ .distance = entry.distance, .side = entry.side };
-                    }
-                }
-            }
-            if (best) |found| return .{ .position = cell, .side = found.side };
-        }
-        return null;
-    }
-
-    /// Where the segment first enters the box at `cell`, and through which face. A segment that
-    /// starts inside hits at once, through the face it leaves by reversed, as VoxelShape.raycast.
-    fn intersect(start: [3]f64, end: [3]f64, cell: chunks.Position, box: [6]f64) ?struct { distance: f64, side: Direction } {
-        const base = [3]f64{ @floatFromInt(cell.x), @floatFromInt(cell.y), @floatFromInt(cell.z) };
-        var low: f64 = 0;
-        var high: f64 = 1;
-        var entered: ?usize = null;
-        for (0..3) |axis| {
-            const delta = end[axis] - start[axis];
-            const minimum = base[axis] + box[axis];
-            const maximum = base[axis] + box[axis + 3];
-            if (@abs(delta) < 1e-12) {
-                if (start[axis] < minimum or start[axis] > maximum) return null;
-                continue;
-            }
-            var near = (minimum - start[axis]) / delta;
-            var far = (maximum - start[axis]) / delta;
-            if (near > far) std.mem.swap(f64, &near, &far);
-            if (near > low) {
-                low = near;
-                entered = axis;
-            }
-            high = @min(high, far);
-            if (low > high) return null;
-        }
-        const axis = entered orelse {
-            // Inside from the start: the face toward where the ray points, reversed.
-            const delta = [3]f64{ end[0] - start[0], end[1] - start[1], end[2] - start[2] };
-            var largest: usize = 0;
-            for (1..3) |candidate| if (@abs(delta[candidate]) > @abs(delta[largest])) {
-                largest = candidate;
-            };
-            return .{ .distance = 0, .side = faceOf(largest, delta[largest] < 0) };
-        };
-        const delta = end[axis] - start[axis];
-        return .{ .distance = low, .side = faceOf(axis, delta > 0) };
-    }
-
-    /// The face a ray moving along `axis`, towards positive coordinates when `towards_positive`,
-    /// enters through: the one facing back at it.
-    fn faceOf(axis: usize, towards_positive: bool) Direction {
-        return switch (axis) {
-            0 => if (towards_positive) .west else .east,
-            1 => if (towards_positive) .down else .up,
-            else => if (towards_positive) .north else .south,
-        };
+        const level = self.deps.levels.level(player.world);
+        const eye: [3]f64 = .{ player.position.x, player.position.y + @as(f64, @as(f32, if (player.flags.sneaking) 1.27 else 1.62)), player.position.z };
+        const view = mth.viewVector(player.rotation.pitch, player.rotation.yaw);
+        // Player.blockInteractionRange, with creative's half block more.
+        const reach = try self.deps.attributes.value(player.handle.?.index, "minecraft:block_interaction_range") + @as(f64, if (creative) 0.5 else 0);
+        const end: [3]f64 = .{ eye[0] + view[0] * reach, eye[1] + view[1] * reach, eye[2] + view[2] * reach };
+        const hit = try clip.clip(&level, eye, end, .outline, if (sources) .source_only else .none, .{}) orelse return null;
+        return .{ .position = .{ .x = hit.cell[0], .y = hit.cell[1], .z = hit.cell[2] }, .side = @fromBackingInt(@intCast(@backingInt(hit.face))) };
     }
 };

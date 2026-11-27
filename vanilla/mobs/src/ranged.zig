@@ -18,7 +18,7 @@ const enchantment_effects = @import("vanilla_items").enchantment_effects;
 const EnchantmentRegistry = @import("vanilla_items").enchantment_registry.EnchantmentRegistry;
 const Durability = @import("vanilla_items").item_properties.Durability;
 const world_effects = @import("vanilla_blocks").world_effects;
-const raycast = @import("vanilla_blocks").raycast;
+const mth = @import("vanilla_bodies").mth;
 const chunks = @import("chunks");
 const PlayerDamage = @import("vanilla_survival").player_damage.PlayerDamage;
 const projectiles = @import("projectiles.zig");
@@ -204,9 +204,11 @@ pub const Ranged = struct {
     /// spin attack that hurts what it meets on the way is not dealt here.
     fn launchHolder(self: *Ranged, slot: usize, use_: item_using.Use, strength: f32) !void {
         const player = &self.deps.players.records[slot];
-        const direction = look(player.rotation);
+        // TridentItem.releaseUsing, in floats: the look scaled to the strength by Mth.sqrt.
+        const direction = mth.shotDirection(player.rotation.pitch, player.rotation.yaw, 0);
         const length = @sqrt(direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2]);
-        const push: [3]f64 = .{ direction[0] / length * strength, direction[1] / length * strength, direction[2] / length * strength };
+        const scale = strength / length;
+        const push: [3]f64 = .{ direction[0] * scale, direction[1] * scale, direction[2] * scale };
         try self.deps.damage.push(slot, .{ push[0], push[1] + (if (player.on_ground) @as(f64, 1.1999999) else 0), push[2] });
         try self.wear(slot, use_.hand, 1);
         const level: usize = @intFromFloat(std.math.clamp((strength - 1.5) / 0.75, 0, 2));
@@ -295,7 +297,8 @@ pub const Ranged = struct {
     }
 };
 
-/// Entity.calculateViewVector from a player's rotation.
+/// Projectile.shootFromRotation's direction for a player's rotation, no roll.
 fn look(rotation: @import("minecraft_model").Rotation) [3]f64 {
-    return raycast.direction(rotation);
+    const direction = mth.shotDirection(rotation.pitch, rotation.yaw, 0);
+    return .{ direction[0], direction[1], direction[2] };
 }

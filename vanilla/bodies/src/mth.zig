@@ -264,3 +264,21 @@ pub fn normalize(vector: [3]f64) [3]f64 {
     if (length < @as(f32, 1.0e-5)) return .{ 0, 0, 0 };
     return .{ vector[0] / length, vector[1] / length, vector[2] / length };
 }
+
+/// Entity.calculateViewVector: where a rotation looks, from the sine table, as floats.
+pub fn viewVector(pitch: f32, yaw: f32) [3]f64 {
+    const f = pitch * 0.017453292;
+    const g = -yaw * 0.017453292;
+    const h = cos(g);
+    const i = sin(g);
+    const j = cos(f);
+    const k = sin(f);
+    return .{ i * j, -k, h * j };
+}
+
+/// The direction Projectile.shootFromRotation throws along, and TridentItem's riptide pushes
+/// along, for a pitch, yaw and roll: the sine table's, in floats.
+pub fn shotDirection(pitch: f32, yaw: f32, roll: f32) [3]f32 {
+    const radians: f32 = 0.017453292;
+    return .{ -sin(yaw * radians) * cos(pitch * radians), -sin((pitch + roll) * radians), cos(yaw * radians) * cos(pitch * radians) };
+}

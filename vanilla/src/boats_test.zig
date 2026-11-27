@@ -195,10 +195,11 @@ test "boats float, drift and slide as vanilla's on random terrain" {
 }
 
 /// What twenty rays through each scenario's terrain hit, by BoatOracle.clips: vanilla's
-/// Level.clip through outlines and any fluid, which BoatItem.use places a boat by.
+/// Level.clip through outlines and any fluid, which BoatItem.use places a boat by, then through
+/// collision shapes and no fluid, as projectiles and sight trace.
 const golden_clips = @embedFile("testdata/clips.txt");
 
-test "clips through outlines and fluids hit what vanilla's do, to the bit" {
+test "clips through outlines, fluids and collision shapes hit what vanilla's do, to the bit" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -225,22 +226,24 @@ test "clips through outlines and fluids hit what vanilla's do, to the bit" {
             to[0] = @as(f64, @floatFromInt(random.nextIntBounded(20000))) / 1000.0;
             to[1] = @as(f64, @floatFromInt(random.nextIntBounded(9000))) / 1000.0;
             to[2] = @as(f64, @floatFromInt(random.nextIntBounded(20000))) / 1000.0;
-            const expected = lines.next().?;
-            const hit = try clip.clip(&level, from, to, .any);
-            errdefer std.debug.print("seed {d} ray {d}: vanilla {s}, port {any}, from {any} at {s}\n", .{ seed, ray, expected, hit, from, if (hit) |h| game_data.registry.blockStateName(level.state(h.cell[0], h.cell[1], h.cell[2]) catch 0).? else "-" });
-            rays += 1;
-            if (std.mem.eql(u8, expected, "miss")) {
-                try std.testing.expect(hit == null);
-                continue;
+            for ([2]struct { clip.Block, clip.Fluids }{ .{ .outline, .any }, .{ .collider, .none } }) |mode| {
+                const expected = lines.next().?;
+                const hit = try clip.clip(&level, from, to, mode[0], mode[1], .{ .empty = true });
+                errdefer std.debug.print("seed {d} ray {d}: vanilla {s}, port {any}, from {any} at {s}\n", .{ seed, ray, expected, hit, from, if (hit) |h| game_data.registry.blockStateName(level.state(h.cell[0], h.cell[1], h.cell[2]) catch 0).? else "-" });
+                rays += 1;
+                if (std.mem.eql(u8, expected, "miss")) {
+                    try std.testing.expect(hit == null);
+                    continue;
+                }
+                const found = hit orelse return error.MissedAHit;
+                var fields = std.mem.tokenizeScalar(u8, expected, ' ');
+                for (found.location) |component| try std.testing.expectEqual(try std.fmt.parseInt(u64, fields.next().?, 16), @as(u64, @bitCast(component)));
+                for (found.cell) |component| try std.testing.expectEqual(try std.fmt.parseInt(i32, fields.next().?, 10), component);
+                try std.testing.expectEqual(try std.fmt.parseInt(u8, fields.next().?, 10), @backingInt(found.face));
+                try std.testing.expectEqual(try std.fmt.parseInt(u8, fields.next().?, 10), @intFromBool(found.inside));
+                hits += 1;
             }
-            const found = hit orelse return error.MissedAHit;
-            var fields = std.mem.tokenizeScalar(u8, expected, ' ');
-            for (found.location) |component| try std.testing.expectEqual(try std.fmt.parseInt(u64, fields.next().?, 16), @as(u64, @bitCast(component)));
-            for (found.cell) |component| try std.testing.expectEqual(try std.fmt.parseInt(i32, fields.next().?, 10), component);
-            try std.testing.expectEqual(try std.fmt.parseInt(u8, fields.next().?, 10), @backingInt(found.face));
-            try std.testing.expectEqual(try std.fmt.parseInt(u8, fields.next().?, 10), @intFromBool(found.inside));
-            hits += 1;
         }
     }
-    try std.testing.expect(rays == 3000 and hits > 1000);
+    try std.testing.expect(rays == 6000 and hits > 2000);
 }

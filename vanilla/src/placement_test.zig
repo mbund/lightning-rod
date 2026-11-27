@@ -19,7 +19,6 @@ const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInve
 const Input = @import("players").input.Input;
 const Placement = @import("vanilla_blocks").placement.Placement;
 const minecraft_model = @import("minecraft_model");
-const raycast = @import("vanilla_blocks").raycast;
 const ItemActions = @import("vanilla_items").item_actions.ItemActions;
 const BlockActions = @import("vanilla_blocks").block_actions.BlockActions;
 const BlockSynchronization = @import("terrain").block_sync.BlockSynchronization;
@@ -243,34 +242,4 @@ test "block and door placement retain collision boundaries across chunk edges" {
             try std.testing.expectEqual(!case.blocked and kind == 1, upper != 0);
         }
     };
-}
-
-test "raycasts test collision shapes across sections without allocating during the action" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var sealed = std.testing.FailingAllocator.init(arena.allocator(), .{});
-    const allocator = sealed.allocator();
-    var directory = std.testing.tmpDir(.{});
-    defer directory.cleanup();
-    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/raycast", .{directory.sub_path});
-    var store = try storage.Store.init(std.testing.allocator, std.testing.io, .{ .path = path });
-    defer store.deinit();
-    var registry = try metrics.Registry.init(std.testing.allocator, std.testing.io, .{ .enabled = false });
-    defer registry.deinit();
-    var fixture = try Fixture.init(allocator, &store, &registry);
-    defer fixture.deinit();
-    const world = fixture.players.records[0].world;
-    const stone: u16 = @intCast(game_data.registry.blockStateId("minecraft:stone").?);
-    const slab: u16 = @intCast(game_data.registry.blockStateId("minecraft:stone_slab[type=bottom,waterlogged=false]").?);
-    try fixture.terrain.setBlock(world, .{ .x = 15, .y = 70, .z = 0 }, slab);
-    try fixture.terrain.setBlock(world, .{ .x = 17, .y = 70, .z = 0 }, stone);
-    sealed.fail_index = sealed.alloc_index;
-    const origin: minecraft_model.Position = .{ .x = 14.5, .y = 70.75, .z = 0.5 };
-    const hit = (try raycast.trace(fixture.reader, world, origin, .{ 1, 0, 0 }, 4)).?;
-    try std.testing.expectEqual(@as(i32, 17), hit.block.x);
-    try std.testing.expectEqual(@as(f64, 2.5), hit.distance);
-    const lower = (try raycast.trace(fixture.reader, world, .{ .x = 14.5, .y = 70.25, .z = 0.5 }, .{ 1, 0, 0 }, 4)).?;
-    try std.testing.expectEqual(@as(i32, 15), lower.block.x);
-    try std.testing.expect(try raycast.trace(fixture.reader, world, origin, .{ 1, 0, 0 }, 2) == null);
-    try std.testing.expect(try raycast.trace(fixture.reader, fixture.other_world, origin, .{ 1, 0, 0 }, 4) == null);
 }

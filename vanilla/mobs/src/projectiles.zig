@@ -33,7 +33,8 @@ const EnchantmentRegistry = @import("vanilla_items").enchantment_registry.Enchan
 const ClientRegistries = @import("vanilla_content").client_registries.ClientRegistries;
 const PlayerInventory = @import("vanilla_inventory").player_inventory.PlayerInventory;
 const PlayerDamage = @import("vanilla_survival").player_damage.PlayerDamage;
-const raycast = @import("vanilla_blocks").raycast;
+const clip = @import("vanilla_bodies").clip;
+const Levels = @import("vanilla_bodies").levels.Levels;
 const world_effects = @import("vanilla_blocks").world_effects;
 const entity_effects = @import("vanilla_world").entity_effects;
 const body = @import("vanilla_bodies").body;
@@ -249,6 +250,7 @@ pub const Projectiles = struct {
     };
     pub const Dependencies = struct {
         players: *Players,
+        levels: *Levels,
         player_states: *PlayerStates,
         world_border: *WorldBorder,
         mobs: *Mobs,
@@ -328,8 +330,6 @@ pub const Projectiles = struct {
     table: records.Table,
     /// A projectile as memory keeps it, `Stored` past it.
     record_bytes: usize,
-    chunk_client: chunks.Chunks.Client,
-    window: chunks.ReadWindow(window_sections),
     /// How many projectiles there are, how many fly, and how many wakings are owed.
     count: u64 = 0,
     ticking: u64 = 0,
@@ -376,7 +376,7 @@ pub const Projectiles = struct {
     /// Those of the batch settled already.
     held_settled: usize = 0,
     order: []Order,
-    traces: []?raycast.Hit,
+    traces: []?Traced,
     /// The motion each projectile of the batch began its tick with, which its move goes by.
     motions: [][3]f64,
     row_words: usize,
@@ -418,7 +418,7 @@ pub const Projectiles = struct {
     /// The height of the world last asked about this tick, as definitions change only between
     /// ticks.
     height_world: ?u32 = null,
-    world_height: raycast.Height = .unbounded,
+    world_height: Height = .{ .minimum = 0, .maximum = 0 },
     /// For replication, by slot: projectiles whose data changed or that were pushed since it
     /// last looked, and those pushed; and the pickups players made this tick.
     replicated: IndexSet,
@@ -444,7 +444,6 @@ pub const Projectiles = struct {
         const self = try allocator.create(Projectiles);
         const row_words = (deps.players.records.len + 63) / 64;
         const record_bytes = @sizeOf(Projectile);
-        const chunk_client = try deps.chunks.simulation(window_sections);
         var columns: std.AutoHashMapUnmanaged(Column, Range) = .empty;
         try columns.ensureTotalCapacity(allocator, shared_columns * 2);
         const players = deps.players.records.len;
@@ -466,8 +465,6 @@ pub const Projectiles = struct {
             .id_scratch = try allocator.alloc(u64, bound),
             .table = records.Table.init(deps.storage, deps.record_workspaces.resources),
             .record_bytes = record_bytes,
-            .chunk_client = chunk_client,
-            .window = .init(chunk_client),
             .cells = cells,
             .ops = try allocator.alloc(IndexOp, ops_max),
             .held = try allocator.alloc(Held, batch_max),
@@ -475,7 +472,7 @@ pub const Projectiles = struct {
             .rousing = try allocator.alloc(u32, rousing_max),
             .waking = try allocator.alloc(u32, configuration.claims),
             .order = try allocator.alloc(Order, batch_max),
-            .traces = try allocator.alloc(?raycast.Hit, batch_max),
+            .traces = try allocator.alloc(?Traced, batch_max),
             .motions = try allocator.alloc([3]f64, batch_max),
             .row_words = row_words,
             .columns = columns,
@@ -1043,8 +1040,6 @@ pub const Projectiles = struct {
         if (self.failure) |err| return err;
         try self.thaw();
         if (self.count == 0) return;
-        // One window for every projectile this tick: arrows flying together read their
-        // sections once. Nothing a projectile does edits blocks, so holding it is safe.
         self.active = true;
         if (self.columns.count() > 0) self.columns.clearRetainingCapacity();
         self.last_columns = .{ null, null };
@@ -1063,7 +1058,6 @@ pub const Projectiles = struct {
     /// sends what came of the tick once tracking looked.
     pub fn finishTick(self: *Projectiles) !void {
         if (!self.active) return;
-        defer self.window.deinit();
         try self.collect();
     }
 
@@ -1890,7 +1884,7 @@ pub const Projectiles = struct {
             }
             const from = projectile.position;
             const length = @sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-            self.traces[entry.index] = if (length > 0) try raycast.traceIn(&self.window, projectile.world, try self.heightOf(projectile.world), .{ .x = from[0], .y = from[1], .z = from[2] }, v, length) else null;
+            self.traces[entry.index] = if (length > 0) try self.clipMove(projectile.world, from, v) else null;
         }
     }
 
@@ -1920,10 +1914,10 @@ pub const Projectiles = struct {
 
     /// stepMoveAndHit: the nearest block in the path, and before it the nearest living thing,
     /// which a piercing arrow passes through to the next.
-    fn move(self: *Projectiles, projectile: *Projectile, traced: ?raycast.Hit, v: [3]f64) !void {
+    fn move(self: *Projectiles, projectile: *Projectile, traced: ?Traced, v: [3]f64) !void {
         const from = projectile.position;
         var block = traced;
-        var end: [3]f64 = if (block) |hit| .{ hit.position.x, hit.position.y, hit.position.z } else .{ from[0] + v[0], from[1] + v[1], from[2] + v[2] };
+        var end: [3]f64 = if (block) |hit| hit.location else .{ from[0] + v[0], from[1] + v[1], from[2] + v[2] };
         // World.getCollisionsIncludingWorldBorder: a way out through the border meets it there.
         var against_border = false;
         const bounds = self.deps.world_border.bounds(projectile.world);
@@ -1982,12 +1976,12 @@ pub const Projectiles = struct {
     }
 
     /// AbstractArrow.onHitBlock: it backs out of the face a little and stays.
-    fn land(self: *Projectiles, projectile: *Projectile, hit: raycast.Hit) void {
+    fn land(self: *Projectiles, projectile: *Projectile, hit: Traced) void {
         // It keeps the way it last faced.
         for (&projectile.position, projectile.velocity) |*axis, motion| axis.* -= @as(f64, @floatFromInt(std.math.sign(motion))) * 0.05000000074505806;
         projectile.velocity = @splat(0);
         projectile.in_ground = true;
-        projectile.stuck = .{ hit.block.x, hit.block.y, hit.block.z };
+        projectile.stuck = hit.cell;
         projectile.stuck_state = hit.state;
         projectile.shake = 7;
         projectile.landed_at = self.now;
@@ -2317,7 +2311,7 @@ pub const Projectiles = struct {
                 projectiles.met_body = true;
                 const entity = projectiles.deps.entities.directory.entry(entry.slot).id;
                 if (projectiles.pierced(context.projectile, entity)) return false;
-                const distance = clip(grown(box, context.margin), context.from, context.to) orelse return false;
+                const distance = clip.boxClip(grown(box, context.margin), context.from, context.to) orelse return false;
                 if (distance < context.best_distance.*) {
                     context.best_distance.* = distance;
                     context.best.* = .{ .target = target, .at = along(context.from, context.to, distance) };
@@ -2363,7 +2357,7 @@ pub const Projectiles = struct {
     }
 
     fn nearer(self: *const Projectiles, best: *?Found, best_distance: *f64, target: Target, box: body.Box, margin: f64, from: [3]f64, to: [3]f64) void {
-        const distance = clip(grown(box, margin), from, to) orelse return;
+        const distance = clip.boxClip(grown(box, margin), from, to) orelse return;
         if (distance > best_distance.*) return;
         if (distance == best_distance.*) {
             // Of equals, the first vanilla's level finds: mobs before players, players in the
@@ -2540,13 +2534,19 @@ pub const Projectiles = struct {
         return .{ .min = .{ at[0] - half_width, at[1], at[2] - half_width }, .max = .{ at[0] + half_width, at[1] + height, at[2] + half_width } };
     }
 
-    /// One block, through the tick's shared window.
+    /// One block, as every body reads it.
     fn blockAt(self: *Projectiles, world: u32, at: [3]f64) !u16 {
-        const position: chunks.Position = .{ .x = mth.floor(at[0]), .y = mth.floor(at[1]), .z = mth.floor(at[2]) };
-        if (!(try self.heightOf(world)).contains(position.y)) return self.air_state;
-        var view: [1]chunks.View = undefined;
-        try self.window.readMany(&.{chunks.sectionAt(world, position)}, &view);
-        return view[0].get(chunks.localIndex(position));
+        const level = self.deps.levels.level(world);
+        return level.state(mth.floor(at[0]), mth.floor(at[1]), mth.floor(at[2]));
+    }
+
+    /// ProjectileUtil.getHitResultOnMoveVector's Level.clip: the block a move meets first,
+    /// through collision shapes and no fluids.
+    fn clipMove(self: *Projectiles, world: u32, from: [3]f64, v: [3]f64) !?Traced {
+        const level = self.deps.levels.level(world);
+        const to: [3]f64 = .{ from[0] + v[0], from[1] + v[1], from[2] + v[2] };
+        const hit = try clip.clip(&level, from, to, .collider, .none, .{ .bottom = from[1] }) orelse return null;
+        return .{ .location = hit.location, .cell = hit.cell, .state = try level.state(hit.cell[0], hit.cell[1], hit.cell[2]) };
     }
 
     /// Whether no block of 4x4x4 within a block of the box from `from` to `to` holds anything that
@@ -2599,14 +2599,21 @@ pub const Projectiles = struct {
     /// A section's blocks of 4x4x4 that hold what affects projectiles, read once until edited.
     fn occupancy(self: *Projectiles, section: chunks.Section) !u64 {
         if (self.space.get(section)) |mask| return mask;
-        var view: [1]chunks.View = undefined;
-        try self.window.readMany(&.{section}, &view);
-        const mask = try chunks.occupancy.of(view[0], self.affecting_states, affecting);
+        // The section as the levels hold it, decoded, which is the dense view of its states.
+        const copies = self.deps.levels.copies;
+        const slot = try copies.sectionSlot(section.world, section.x, section.y, section.z);
+        const mask = try chunks.occupancy.of(.{ .dense = @ptrCast(&copies.states[slot]) }, self.affecting_states, affecting);
         self.space.put(section, mask);
         return mask;
     }
 
-    fn heightOf(self: *Projectiles, world: u32) !raycast.Height {
+    /// A world's blocks from `minimum` up to, but not, `maximum`.
+    const Height = struct { minimum: i32, maximum: i32 };
+
+    /// The block a move met: where, which, and what stands there.
+    const Traced = struct { location: [3]f64, cell: [3]i32, state: u16 };
+
+    fn heightOf(self: *Projectiles, world: u32) !Height {
         if (self.height_world == world) return self.world_height;
         const dimension = (self.deps.worlds.get(world) orelse return error.UnknownWorld).dimension;
         const minimum = dimension.minimumSection() * 16;
@@ -2705,34 +2712,6 @@ fn grown(box: body.Box, margin: f64) body.Box {
 
 fn along(from: [3]f64, to: [3]f64, fraction: f64) [3]f64 {
     return .{ from[0] + (to[0] - from[0]) * fraction, from[1] + (to[1] - from[1]) * fraction, from[2] + (to[2] - from[2]) * fraction };
-}
-
-/// AABB.clip: where along the path from `from` to `to`, as a fraction, it enters the box. A
-/// path that starts inside never enters.
-fn clip(box: body.Box, from: [3]f64, to: [3]f64) ?f64 {
-    var enter: f64 = 0;
-    var leave: f64 = 1;
-    for (0..3) |axis| {
-        const delta = to[axis] - from[axis];
-        if (delta == 0) {
-            if (from[axis] < box.min[axis] or from[axis] > box.max[axis]) return null;
-            continue;
-        }
-        const a = (box.min[axis] - from[axis]) / delta;
-        const b = (box.max[axis] - from[axis]) / delta;
-        enter = @max(enter, @min(a, b));
-        leave = @min(leave, @max(a, b));
-        if (enter > leave) return null;
-    }
-    if (enter <= 0) return null;
-    return enter;
-}
-
-test "a path enters a box where its slabs meet, and not from inside" {
-    const box: body.Box = .{ .min = .{ 0, 0, 0 }, .max = .{ 1, 1, 1 } };
-    try std.testing.expectApproxEqAbs(@as(f64, 0.25), clip(box, .{ -1, 0.5, 0.5 }, .{ 3, 0.5, 0.5 }).?, 1e-12);
-    try std.testing.expect(clip(box, .{ 0.5, 0.5, 0.5 }, .{ 3, 0.5, 0.5 }) == null);
-    try std.testing.expect(clip(box, .{ -1, 2, 0.5 }, .{ 3, 2, 0.5 }) == null);
 }
 
 /// Projectiles' records: a row each in the arrows' table, in the tick order's sequence, those
