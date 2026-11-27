@@ -147,16 +147,38 @@ pub const Window = struct {
     states: [width * height * width]u16 = undefined,
     /// What the sections it reads from may hold, by mob_blocks' marks.
     marks: u8 = 0xff,
+    /// The copies' slots it was filled from, each of the up to eight sections it spans that
+    /// `sections` has, with their stamps then: while each is unchanged, so is it. None when it
+    /// was read block by block.
+    sections: u8 = 0,
+    slots: [8]u32 = undefined,
+    stamps: [8]u64 = undefined,
+    filled_from_copies: bool = false,
 
     /// Two blocks either side of the mob's block, and from two below its feet to three above,
     /// which covers a walking body's collision cells.
     const width = 5;
     const height = 6;
 
+    /// Whether every section it was filled from is as it was then, so a fill now would make it
+    /// again.
+    pub fn unchanged(self: *const Window, copies: *const chunks.Copies) bool {
+        if (!self.filled_from_copies) return false;
+        const base: [3]i32 = .{ @divFloor(self.origin[0], 16), @divFloor(self.origin[1], 16), @divFloor(self.origin[2], 16) };
+        for (0..8) |which| {
+            if (self.sections & (@as(u8, 1) << @intCast(which)) == 0) continue;
+            const key = sectionKey(base, which);
+            if (!copies.unchanged(self.slots[which], self.world, key[0], key[1], key[2], self.stamps[which])) return false;
+        }
+        return true;
+    }
+
     pub fn fill(self: *Window, level: *const Level, at: [3]i32) !void {
         assert(level.window == null and level.overlay == null);
         self.world = level.world;
         self.origin = .{ at[0] - 2, at[1] - 2, at[2] - 2 };
+        self.filled_from_copies = false;
+        self.sections = 0;
         const copies = level.copies orelse {
             // Worlds held in memory, for tests, read block by block.
             self.marks = 0xff;
@@ -189,6 +211,15 @@ pub const Window = struct {
             }
             if (held) break;
         }
+        // The sections it is filled from, each as it stands, for whoever keeps it to tell later.
+        for (0..8) |which| {
+            const key = sectionKey(base, which);
+            if (key[0] > top[0] or key[1] > top[1] or key[2] > top[2] or key[1] < lowest or key[1] > highest) continue;
+            self.sections |= @as(u8, 1) << @intCast(which);
+            self.slots[which] = slots[which];
+            self.stamps[which] = copies.stamps[slots[which]];
+        }
+        self.filled_from_copies = true;
         self.marks = 0;
         const split = @min(width, @as(usize, @intCast(16 - @mod(self.origin[0], 16))));
         for (0..height) |dy| {
@@ -231,6 +262,23 @@ pub const Window = struct {
     }
 
     /// Whether every cell from first to last, inclusive, lies in the window.
+    /// Whether it is the window `fill` makes around a block.
+    pub fn around(self: *const Window, world: u32, at: [3]i32) bool {
+        return self.world == world and std.meta.eql(self.origin, [3]i32{ at[0] - 2, at[1] - 2, at[2] - 2 });
+    }
+
+    /// Debug: whether every cell reads as the level does without it, as one filled now would.
+    pub fn matches(self: *const Window, level: *const Level) !bool {
+        assert(level.window == null);
+        for (0..height) |dy| for (0..width) |dz| for (0..width) |dx| {
+            const x = self.origin[0] + @as(i32, @intCast(dx));
+            const y = self.origin[1] + @as(i32, @intCast(dy));
+            const z = self.origin[2] + @as(i32, @intCast(dz));
+            if (self.states[(dy * width + dz) * width + dx] != try level.state(x, y, z)) return false;
+        };
+        return true;
+    }
+
     pub fn covers(self: *const Window, world: u32, first: [3]i32, last: [3]i32) bool {
         if (world != self.world) return false;
         return first[0] >= self.origin[0] and first[1] >= self.origin[1] and first[2] >= self.origin[2] and

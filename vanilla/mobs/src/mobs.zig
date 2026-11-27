@@ -106,6 +106,10 @@ pub const Mobs = struct {
     pub const Configuration = struct {
         /// Events held for the replication between its ticks; past them, it sends them early.
         events: usize = 1024,
+        /// Windows of blocks around awake mobs kept across ticks, by slot: a mob still in the
+        /// block it was in, with no section around it changed since, reads its window again rather
+        /// than filling it. Mobs whose slots share one fill it in turn.
+        windows: u32 = 8192,
         /// Block edits held for paths to answer in a batch, from the first that changes a
         /// collision. When they fill, the paths answer them at once.
         edits: u32 = 16384,
@@ -218,9 +222,10 @@ pub const Mobs = struct {
     /// Blocks as they stood after the edit being answered, which levels read while it is set.
     overlay: body.Overlay,
     overlay_view: ?*const body.Overlay = null,
-    /// The blocks around the awake mob ticking, which levels read while it is set.
-    window: body.Window = .{},
-    window_view: ?*const body.Window = null,
+    /// The blocks around awake mobs, kept across ticks by slot, `Configuration.windows` of them.
+    windows: []KeptWindow,
+    /// The window of the awake mob ticking, which levels read while it is set.
+    window_view: ?*body.Window = null,
     effects_scratch: @import("block_effects.zig").Scratch = .{},
     /// What each player answers as pushable through the players' pushes, by player slot.
     player_pushable: []?body.Box,
@@ -280,6 +285,7 @@ pub const Mobs = struct {
             .extras = try .init(allocator, pool),
             .ordered = try .init(allocator, pool),
             .blocks = deps.levels.blocks,
+            .windows = try allocator.alloc(KeptWindow, config.windows),
             .species = undefined,
             .level_random = .init(@bitCast(config.seed)),
             .seeds = .init(config.seed ^ 0x73656564),
@@ -301,6 +307,7 @@ pub const Mobs = struct {
             .holders = try allocator.alloc(herd_state.Audience.Player, deps.players.records.len),
             .overlay = try .init(allocator, config.edits + chunks.edit_previous_max),
         };
+        @memset(self.windows, .{});
         try self.readTags();
         try deps.items.deps.definitions.registry.onChange(self, readTags);
         try deps.chunks.observe(.init(self, blocksChanged));
@@ -862,6 +869,25 @@ pub const Mobs = struct {
         }
     }
 
+    /// A window kept for the mob in a slot.
+    const KeptWindow = struct { slot: u32 = std.math.maxInt(u32), window: body.Window = .{} };
+
+    /// The blocks around an awake mob: its window from an earlier tick while it is still in the
+    /// block it was filled around and no section it was filled from has changed, otherwise
+    /// filled anew. An edit renews only the windows of the sections it touched.
+    fn windowOf(self: *Mobs, index: u32, mob: Mob) !*body.Window {
+        const at = mob.blockPosition();
+        const kept = &self.windows[index % self.windows.len];
+        const around = self.level(mob.motion.world);
+        if (kept.slot == index and kept.window.around(mob.motion.world, at) and kept.window.unchanged(self.deps.levels.copies)) {
+            if (@import("builtin").mode == .debug) assert(try kept.window.matches(&around));
+            return &kept.window;
+        }
+        try kept.window.fill(&around, at);
+        kept.slot = index;
+        return &kept.window;
+    }
+
     fn tickPlace(self: *Mobs, index: u32, context: *TickContext) !void {
         const row = self.rows.ref(index);
         const tracking = row.field("tracking");
@@ -895,11 +921,7 @@ pub const Mobs = struct {
         }
         // An awake mob reads the blocks around it many times over, so they are read once. A resting
         // one reads almost none.
-        if (!mob.motion.resting) {
-            const around = self.level(mob.motion.world);
-            try self.window.fill(&around, mob.blockPosition());
-            self.window_view = &self.window;
-        }
+        if (!mob.motion.resting) self.window_view = try self.windowOf(index, mob);
         {
             defer self.window_view = null;
             try mob_tick.tick(self, mob);
@@ -1034,9 +1056,9 @@ pub const Mobs = struct {
     fn blocksChanged(self: *Mobs, section: chunks.Section, edits: []const chunks.BlockEdit, previous: []const u16) void {
         if (self.active.count == 0) return;
         // The window around the mob ticking shows edits as they happen.
-        if (self.window_view != null) for (edits) |edit| {
+        if (self.window_view) |window| for (edits) |edit| {
             const at: i32 = edit.index;
-            self.window.edit(section.world, .{ section.x * 16 + (at & 15), section.y * 16 + (at >> 8), section.z * 16 + ((at >> 4) & 15) }, edit.state);
+            window.edit(section.world, .{ section.x * 16 + (at & 15), section.y * 16 + (at >> 8), section.z * 16 + ((at >> 4) & 15) }, edit.state);
         };
         // Resting mobs near any edit wake, a section's batch at a time.
         var low: [3]i32 = .{ 15, 15, 15 };

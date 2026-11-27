@@ -38,6 +38,13 @@ pub const Copies = struct {
     marked: []u8,
     /// Sections decoded, for measuring.
     decoded: u64 = 0,
+    /// By slot, a stamp of the copy as it stands: new whenever the slot takes a section and
+    /// whenever an edit changes it. What a reader took from a slot holds while the slot holds
+    /// the same section at the same stamp; a section copied again, as after an edit while it
+    /// was not held, or a fill by generation, has a new one.
+    stamps: []u64,
+    /// The last stamp given.
+    stamped: u64 = 0,
 
     /// Startup only. Registers an edit observer, so make one per reader.
     pub fn init(allocator: std.mem.Allocator, owner: *chunks.Chunks, capacity: u32) !*Copies {
@@ -52,6 +59,7 @@ pub const Copies = struct {
             .marked = try allocator.alloc(u8, capacity),
             .referenced = try allocator.alloc(bool, capacity),
             .used = try allocator.alloc(bool, capacity),
+            .stamps = try allocator.alloc(u64, capacity),
             .free = try allocator.alloc(u32, capacity),
             .free_count = capacity,
         };
@@ -77,6 +85,12 @@ pub const Copies = struct {
 
     pub fn holds(self: *const Copies, slot: u32, world: u32, x: i32, y: i32, z: i32) bool {
         return self.used[slot] and sameSection(self.sections[slot], .{ .world = world, .x = x, .y = y, .z = z });
+    }
+
+    /// Whether a slot still holds a section as it stood at a stamp: what was read of it then
+    /// reads the same now.
+    pub fn unchanged(self: *const Copies, slot: u32, world: u32, x: i32, y: i32, z: i32, stamp: u64) bool {
+        return self.holds(slot, world, x, y, z) and self.stamps[slot] == stamp;
     }
 
     /// Startup only, before anything is read: the states sections are marked for holding.
@@ -137,6 +151,8 @@ pub const Copies = struct {
             self.marked[slot] |= marks[state];
         };
         self.sections[slot] = section;
+        self.stamped += 1;
+        self.stamps[slot] = self.stamped;
         self.absent[slot] = lease.record.read() == null;
         self.used[slot] = true;
         self.referenced[slot] = true;
@@ -186,5 +202,7 @@ pub const Copies = struct {
             self.states[slot][edit.index] = edit.state;
             if (self.marks) |marks| self.marked[slot] |= marks[edit.state];
         }
+        self.stamped += 1;
+        self.stamps[slot] = self.stamped;
     }
 };
