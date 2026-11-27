@@ -26,8 +26,10 @@ const mth = @import("vanilla_bodies").mth;
 const living = @import("living.zig");
 const mob_state = @import("mob.zig");
 const Mobs = @import("mobs.zig").Mobs;
+const playerBox = @import("mobs.zig").playerBox;
 const Boats = @import("boats.zig").Boats;
 const boat_module = @import("boat.zig");
+const EntityCollisions = @import("vanilla_bodies").entity_collisions.EntityCollisions;
 
 const Mob = mob_state.Mob;
 const Attack = attack_effects.Attack;
@@ -275,39 +277,50 @@ pub const Melee = struct {
     }
 
     /// MaceItem.knockback: the living within 3.5 blocks of the target, but the attacker and the
-    /// target, are thrown up and away, harder after a long fall.
+    /// target, are thrown up and away, harder after a long fall. The dying too, and in the order
+    /// the level finds them.
     fn smashKnockback(self: *Melee, slot: usize, target: Target, fallen: f32) !void {
         const player = &self.deps.players.records[slot];
-        const center = self.positionOf(target);
         const box = self.boxOf(target);
         const reach: body.Box = .{ .min = .{ box.min[0] - 3.5, box.min[1] - 3.5, box.min[2] - 3.5 }, .max = .{ box.max[0] + 3.5, box.max[1] + 3.5, box.max[2] + 3.5 } };
-        const scale: f64 = if (fallen > 5) 2 else 1;
-        var knock: struct { mobs: *Mobs, target: Target, center: [3]f64, scale: f64 } = .{ .mobs = self.deps.mobs, .target = target, .center = center, .scale = scale };
-        try self.deps.mobs.each(player.world, reach, &knock, struct {
-            fn visit(context: *@TypeOf(knock), mob: Mob) anyerror!bool {
-                const mobs = context.mobs;
-                if (!mob.alive() or (context.target == .mob and context.target.mob.same(mob))) return false;
-                const strength = smashStrength(context.center, mob.motion.position, context.scale) * (1 - mobs.traits(mob.entity.species).attribute(.knockback_resistance));
-                if (strength <= 0) return false;
-                const away = mth.normalize(.{ mob.motion.position[0] - context.center[0], mob.motion.position[1] - context.center[1], mob.motion.position[2] - context.center[2] });
-                mob.motion.velocity = .{ mob.motion.velocity[0] + away[0] * strength, mob.motion.velocity[1] + 0.7, mob.motion.velocity[2] + away[2] * strength };
-                mob.entity.has_impulse = true;
-                mobs.rouseMob(mob);
-                return false;
-            }
-        }.visit);
-        var players = self.deps.players.nearby(player.world, .{ .x = center[0], .y = 0, .z = center[2] }, 1);
-        while (players.next()) |other| {
-            if (other == slot or (target == .player and target.player == other)) continue;
-            const candidate = &self.deps.players.records[other];
-            if (candidate.world != player.world or self.deps.player_states.of(candidate).gamemode == .spectator or !playerBox(candidate).intersects(reach)) continue;
-            const at: [3]f64 = .{ candidate.position.x, candidate.position.y, candidate.position.z };
-            const strength = smashStrength(center, at, scale) * (1 - try self.deps.attributes.value(other, "minecraft:knockback_resistance"));
-            if (strength <= 0) continue;
-            const away = mth.normalize(.{ at[0] - center[0], at[1] - center[1], at[2] - center[2] });
-            try self.deps.damage.push(other, .{ away[0] * strength, 0.7, away[2] * strength });
-        }
+        var knock: Knock = .{ .melee = self, .target = target, .center = self.positionOf(target), .scale = if (fallen > 5) 2 else 1 };
+        try self.collisions().each(player.world, reach, self.attackerSlot(slot), .living, .{ .context = &knock, .visit = Knock.visit });
     }
+
+    const Knock = struct {
+        melee: *Melee,
+        target: Target,
+        center: [3]f64,
+        scale: f64,
+
+        fn visit(context: *anyopaque, entry: @import("entities").space.Entry, _: body.Box) anyerror!bool {
+            const knock: *Knock = @ptrCast(@alignCast(context));
+            const melee = knock.melee;
+            const victim = try melee.livingAt(entry.slot);
+            if (sameTarget(victim, knock.target)) return false;
+            const at = melee.positionOf(victim);
+            const resistance = switch (victim) {
+                .mob => |mob| melee.deps.mobs.traits(mob.entity.species).attribute(.knockback_resistance),
+                .player => |other| try melee.deps.attributes.value(other, "minecraft:knockback_resistance"),
+                .boat => unreachable,
+            };
+            const strength = smashStrength(knock.center, at, knock.scale) * (1 - resistance);
+            if (strength <= 0) return false;
+            const away = mth.normalize(.{ at[0] - knock.center[0], at[1] - knock.center[1], at[2] - knock.center[2] });
+            // Entity.push, upward by the float 0.7.
+            const by: [3]f64 = .{ away[0] * strength, @as(f32, 0.7), away[2] * strength };
+            switch (victim) {
+                .mob => |mob| {
+                    mob.motion.velocity = .{ mob.motion.velocity[0] + by[0], mob.motion.velocity[1] + by[1], mob.motion.velocity[2] + by[2] };
+                    mob.entity.has_impulse = true;
+                    melee.deps.mobs.rouseMob(mob);
+                },
+                .player => |other| try melee.deps.damage.push(other, by),
+                .boat => unreachable,
+            }
+            return false;
+        }
+    };
 
     /// Player.attack after a hurt that took: knockback, the sweep, sounds, sparks, and the
     /// post-attack enchantments of the victim's gear and the weapon.
@@ -330,48 +343,55 @@ pub const Melee = struct {
     }
 
     /// Player.attack's sweep: every other living thing in reach of the target's box inflated by
-    /// (1, 0.25, 1) and within 3 blocks of the attacker, mobs in the order vanilla finds them and
-    /// then players in theirs. The space gives the few in the sections under the box, so a sweep
-    /// looks at nothing farther.
+    /// (1, 0.25, 1) and within 3 blocks of the attacker, in the order the level finds them. The
+    /// space gives the few in the sections under the box, so a sweep looks at nothing farther.
     fn sweep(self: *Melee, slot: usize, weapon: ?item_data.View, effects: *const Attack, target: Target, hit: Hit) !void {
         const player = &self.deps.players.records[slot];
         const ratio: f32 = @floatCast(try self.deps.attributes.value(slot, "minecraft:sweeping_damage_ratio"));
-        const amount = 1.0 + ratio * hit.base;
         const box = self.boxOf(target);
         const reach: body.Box = .{
             .min = .{ box.min[0] - 1, box.min[1] - 0.25, box.min[2] - 1 },
             .max = .{ box.max[0] + 1, box.max[1] + 0.25, box.max[2] + 1 },
         };
-        switch (target) {
-            .mob, .player, .boat => {
-                var swept: struct { melee: *Melee, slot: usize, weapon: @TypeOf(weapon), effects: @TypeOf(effects), amount: @TypeOf(amount), scale: @TypeOf(hit.scale) } = .{ .melee = self, .slot = slot, .weapon = weapon, .effects = effects, .amount = amount, .scale = hit.scale };
-                const Sweep = struct {
-                    fn visit(context: *@TypeOf(swept), mob: Mob) anyerror!bool {
-                        try context.melee.sweepOne(context.slot, context.weapon, context.effects, .{ .mob = mob }, context.amount, context.scale);
-                        return false;
-                    }
-                };
-                switch (target) {
-                    .mob => |mob| try self.deps.mobs.near(mob, reach, .living, &swept, Sweep.visit),
-                    .player, .boat => try self.deps.mobs.each(player.world, reach, &swept, Sweep.visit),
-                }
-            },
-        }
-        // Players as vanilla's level finds them in the box: section by section, as they entered.
-        var others: struct { melee: *Melee, slot: usize, world: u32, target: Target, reach: body.Box, weapon: @TypeOf(weapon), effects: @TypeOf(effects), amount: @TypeOf(amount), scale: @TypeOf(hit.scale) } = .{ .melee = self, .slot = slot, .world = player.world, .target = target, .reach = reach, .weapon = weapon, .effects = effects, .amount = amount, .scale = hit.scale };
-        try self.deps.players.eachInBox(player.world, .{ .min = reach.min, .max = reach.max }, &others, struct {
-            fn visit(context: *@TypeOf(others), other: usize) anyerror!bool {
-                const melee = context.melee;
-                if (other == context.slot or std.meta.eql(context.target, Target{ .player = other })) return false;
-                const candidate = &melee.deps.players.records[other];
-                if (candidate.world != context.world or melee.deps.player_states.of(candidate).gamemode == .spectator) return false;
-                if (!playerBox(candidate).intersects(context.reach)) return false;
-                try melee.sweepOne(context.slot, context.weapon, context.effects, .{ .player = other }, context.amount, context.scale);
-                return false;
-            }
-        }.visit);
+        var swept: Sweep = .{ .melee = self, .slot = slot, .target = target, .weapon = weapon, .effects = effects, .amount = 1.0 + ratio * hit.base, .scale = hit.scale };
+        try self.collisions().each(player.world, reach, self.attackerSlot(slot), .living, .{ .context = &swept, .visit = Sweep.visit });
         self.sound(slot, "minecraft:entity.player.attack.sweep");
         self.sweepParticle(slot);
+    }
+
+    const Sweep = struct {
+        melee: *Melee,
+        slot: usize,
+        target: Target,
+        weapon: ?item_data.View,
+        effects: *const Attack,
+        amount: f32,
+        scale: f32,
+
+        fn visit(context: *anyopaque, entry: @import("entities").space.Entry, _: body.Box) anyerror!bool {
+            const swept: *Sweep = @ptrCast(@alignCast(context));
+            const victim = try swept.melee.livingAt(entry.slot);
+            if (sameTarget(victim, swept.target)) return false;
+            try swept.melee.sweepOne(swept.slot, swept.weapon, swept.effects, victim, swept.amount, swept.scale);
+            return false;
+        }
+    };
+
+    /// The living thing in an entity slot that a query of the living found: a mob or a player.
+    fn livingAt(self: *Melee, slot: u32) !Target {
+        const entities_ = self.deps.mobs.deps.entities;
+        const entry = entities_.directory.entry(slot);
+        if (entry.kind == Players.entityKind()) return .{ .player = Players.playerOfEntity(entry.id) };
+        return .{ .mob = try self.deps.mobs.inSlot(slot) };
+    }
+
+    /// The attacker's own slot, which its queries pass by.
+    fn attackerSlot(self: *const Melee, slot: usize) u32 {
+        return self.deps.players.entitySlot(slot) orelse body.no_slot;
+    }
+
+    fn collisions(self: *const Melee) *EntityCollisions {
+        return self.deps.mobs.deps.collisions;
     }
 
     /// One of a sweep's victims: within 3 blocks of the attacker, it takes the sweep's damage
@@ -613,12 +633,15 @@ fn smashStrength(center: [3]f64, at: [3]f64, scale: f64) f64 {
     const dz = at[2] - center[2];
     const distance = @sqrt(dx * dx + dy * dy + dz * dz);
     if (distance * distance > 12.25) return 0;
-    return (3.5 - distance) * 0.7 * scale;
+    // MaceItem.getKnockbackPower, by the float 0.7.
+    return (3.5 - distance) * @as(f32, 0.7) * scale;
 }
 
-/// A standing player's box: 0.6 wide, 1.8 tall, or 1.5 sneaking.
-fn playerBox(player: *const @import("players").player_state.Player) body.Box {
-    const height: f64 = if (player.flags.sneaking) 1.5 else 1.8;
-    const at = player.position;
-    return .{ .min = .{ at.x - 0.3, at.y, at.z - 0.3 }, .max = .{ at.x + 0.3, at.y + height, at.z + 0.3 } };
+/// Whether two targets are the same: the one struck, which the sweep and the smash pass by.
+fn sameTarget(a: Target, b: Target) bool {
+    return switch (a) {
+        .mob => |mob| b == .mob and b.mob.same(mob),
+        .player => |other| b == .player and b.player == other,
+        .boat => |boat| b == .boat and b.boat == boat,
+    };
 }

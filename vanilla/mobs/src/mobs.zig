@@ -310,8 +310,8 @@ pub const Mobs = struct {
         try deps.entities.addColumnHolder(.init(Mobs, self, loadColumn, unloadColumn));
         // How mobs and players meet others, living bodies both: pushable, which vehicles collide
         // with and what pushes, and pickable.
-        try deps.collisions.register(self.kinds, .{ .context = self, .pushable = mobPushable, .pickable = mobPickable, .position = mobPosition, .nudge = mobNudge, .touched = mobTouched });
-        try deps.collisions.register(.of(&.{Players.entityKind()}), .{ .context = self, .pushable = playerPushable, .pickable = playerPickable, .position = playerPosition });
+        try deps.collisions.register(self.kinds, .{ .context = self, .pushable = mobPushable, .pickable = mobPickable, .living = mobPickable, .position = mobPosition, .nudge = mobNudge, .touched = mobTouched });
+        try deps.collisions.register(.of(&.{Players.entityKind()}), .{ .context = self, .pushable = playerPushable, .pickable = playerPickable, .living = playerPickable, .position = playerPosition });
         for (self.species) |species| {
             self.widest_half = @max(self.widest_half, @as(f64, species.width) / 2);
             self.tallest = @max(self.tallest, @as(f64, species.height));
@@ -1615,7 +1615,8 @@ pub const Mobs = struct {
         return .{ player.position.x, player.position.y, player.position.z };
     }
 
-    /// LivingEntity.isPickable for a mob: any not removed, its box.
+    /// LivingEntity.isPickable for a mob: any not removed, its box, which is what a query of the
+    /// living finds too.
     fn mobPickable(context: *anyopaque, slot: u32) anyerror!?body.Box {
         const self: *Mobs = @ptrCast(@alignCast(context));
         const mob = try self.inSlot(slot);
@@ -1631,7 +1632,8 @@ pub const Mobs = struct {
         return living.box(self, mob);
     }
 
-    /// Player.isPickable: in the world and no spectator, its box.
+    /// Player.isPickable: in the world and no spectator, its box, as a query of the living finds
+    /// it, which passes spectators by.
     fn playerPickable(context: *anyopaque, slot: u32) anyerror!?body.Box {
         const self: *Mobs = @ptrCast(@alignCast(context));
         const player = &self.deps.players.records[Players.playerOfEntity(self.deps.entities.directory.entry(slot).id)];

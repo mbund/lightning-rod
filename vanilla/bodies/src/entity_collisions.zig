@@ -1,10 +1,12 @@
 //! How bodies meet each other, for every kind at once. Each kind says once how others meet its
-//! entities, by vanilla's three entity selectors: Entity.canBeCollidedWith makes one a wall to
-//! everything that moves, boats as shulkers; Entity.isPushable makes it one to vehicles, as
-//! AbstractBoat.canCollideWith's canVehicleCollide, and what living things push; isPickable makes
-//! it what a look or a projectile can hit. Every move and free check through body.collide and
-//! body.noCollision meets them, through the level's `entities`, and the pushing and picking
-//! queries here find them. A mover never meets itself, nor what shares its root vehicle.
+//! entities, by vanilla's three entity selectors and its class of the living:
+//! Entity.canBeCollidedWith makes one a wall to everything that moves, boats as shulkers;
+//! Entity.isPushable makes it one to vehicles, as AbstractBoat.canCollideWith's
+//! canVehicleCollide, and what living things push; isPickable makes it what a look or a
+//! projectile can hit; a LivingEntity is what a sweep or a smash reaches. Every move and free
+//! check through body.collide and body.noCollision meets them, through the level's
+//! `entities`, and the pushing, picking and living queries here find them. A mover never meets
+//! itself, nor what shares its root vehicle.
 
 const std = @import("std");
 const entities = @import("entities");
@@ -30,6 +32,9 @@ pub const EntityCollisions = struct {
         pushable: ?Answer = null,
         /// Entity.isPickable.
         pickable: ?Answer = null,
+        /// Whether it is a LivingEntity, as EntityGetter.getEntitiesOfClass(LivingEntity) finds them:
+        /// any not removed, the dying too.
+        living: ?Answer = null,
         /// A sleeping entity of the kind wakes to look about it again, as one that may be inside a
         /// solid entity now: vanilla's, awake, would be pushed out.
         wake: ?*const fn (context: *anyopaque, slot: u32) void = null,
@@ -47,7 +52,7 @@ pub const EntityCollisions = struct {
     };
 
     /// Which of the selectors a query takes.
-    pub const Test = enum { solid, pushable, pickable };
+    pub const Test = enum { solid, pushable, pickable, living };
 
     /// What a query visits, each in the level's order: whether to stop.
     pub const Visitor = struct {
@@ -61,6 +66,7 @@ pub const EntityCollisions = struct {
     solid: entities.Kinds = .{},
     pushable: entities.Kinds = .{},
     pickable: entities.Kinds = .{},
+    living: entities.Kinds = .{},
     /// The kinds whose sleepers a solid entity moving wakes.
     sleepers: entities.Kinds = .{},
 
@@ -79,6 +85,7 @@ pub const EntityCollisions = struct {
             if (rule.solid != null) self.solid.bits.set(kind);
             if (rule.pushable != null) self.pushable.bits.set(kind);
             if (rule.pickable != null) self.pickable.bits.set(kind);
+            if (rule.living != null) self.living.bits.set(kind);
             if (rule.wake != null) self.sleepers.bits.set(kind);
         }
     }
@@ -112,6 +119,7 @@ pub const EntityCollisions = struct {
             .solid => self.solid,
             .pushable => self.pushable,
             .pickable => self.pickable,
+            .living => self.living,
         };
         // None of the kinds anywhere, as there are no boats in most worlds, is nothing to look for.
         if (self.deps.entities.places.space.countOf(kinds) == 0) return;
@@ -168,6 +176,7 @@ pub const EntityCollisions = struct {
                 .solid => rule.solid,
                 .pushable => rule.pushable,
                 .pickable => rule.pickable,
+                .living => rule.living,
             }.?;
             const value = (try answer(rule.context, entry.slot)) orelse return false;
             if (!value.intersects(walk.query)) return false;
