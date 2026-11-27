@@ -205,6 +205,26 @@ fn Entry(comptime Value: type) type {
 }
 
 /// What befell an entity, sent to whoever has it as it is in memory, before anything after.
+/// The entities an entity carries, by their network ids in its order, as
+/// ClientboundSetPassengersPacket lists them: the first steers.
+pub const Passengers = struct {
+    pub const max = 4;
+    ids: [max]i32 = @splat(0),
+    count: u8 = 0,
+
+    pub fn slice(self: *const Passengers) []const i32 {
+        return self.ids[0..self.count];
+    }
+
+    pub fn eql(self: Passengers, other: Passengers) bool {
+        return std.mem.eql(i32, self.slice(), other.slice());
+    }
+
+    pub fn has(self: *const Passengers, id: i32) bool {
+        return std.mem.indexOfScalar(i32, self.slice(), id) != null;
+    }
+};
+
 pub const Event = union(enum) {
     /// ClientboundEntityEventPacket.
     status: u8,
@@ -240,6 +260,9 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             personalized: ?*const fn (kind: *const Kind) bool = null,
             /// The order `collect` gives a tick's visits in, for a kind that visits.
             before: ?*const fn (kind: *Kind, a: u32, b: u32) bool = null,
+            /// What the entity in a slot carries, for a kind whose entities carry others: asked of
+            /// every entity visited.
+            passengers: ?*const fn (kind: *Kind, slot: u32) Passengers = null,
         };
 
         /// What decides whether an entity has anything to send this tick, read every tick.
@@ -308,6 +331,8 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             corrected: u64 = 0,
             uncertain: bool = false,
             data: Data = .{},
+            /// What its viewers were last told it carries.
+            passengers: Passengers = .{},
         };
 
         /// For kinds that visit only what has something to send: the next tick an entity's interval
@@ -391,7 +416,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                 .personal = try allocator.alloc(usize, deps.players.records.len),
                 .views = try .init(allocator, deps.pool),
                 .words = words,
-                .rows = try allocator.alloc(usize, 7 * words),
+                .rows = try allocator.alloc(usize, 8 * words),
                 .missed = try allocator.alloc(usize, words),
                 .delivery = try .init(allocator, deps.players, deps.packets, deps.sessions),
                 .batch = try .init(allocator, deps.players, deps.packets, deps.sessions, words),
@@ -647,6 +672,14 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                 if (self.personalized()) try self.pairing(slot, self.spec.identity(self.spec.kind, slot), view, value, &body) else try self.leave(slot, value);
             }
             const known = self.current(slot);
+            // ServerEntity.sendChanges begins with what it carries, if that changed.
+            if (self.spec.passengers) |carried| {
+                const now_carried = carried(self.spec.kind, slot);
+                if (!now_carried.eql(view.passengers)) {
+                    try self.queue(slot, self.withoutRiders(known, view.passengers, now_carried), .{ .passengers = .{ .id = entities.Entities.networkOfSlot(slot), .passengers = now_carried } });
+                    view.passengers = now_carried;
+                }
+            }
             // Data known not to have changed is not compared.
             const now = subject.data orelse view.data;
             const changes: DataChanges = if (subject.data) |data| .between(view.data, data) else .{};
@@ -670,6 +703,19 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             // Viewers spawning it now are known once the batch goes: they count as having it.
             const joining = if (change) |value| value.spawn.any() else false;
             if (self.visit != null) try self.visited(slot, view, subject.resting, joining);
+        }
+
+        /// Those who have it but the players who mounted or dismounted it, who are told by their own
+        /// riding: ServerEntity.mountedOrDismounted.
+        fn withoutRiders(self: *Self, known: bit_sets.Set, was: Passengers, now: Passengers) bit_sets.Set {
+            const told = self.row(7);
+            for (told, 0..) |*word, at| word.* = known.wordAt(at);
+            for ([2]Passengers{ was, now }, [2]Passengers{ now, was }) |side, other| for (side.slice()) |id| {
+                if (other.has(id) or id <= 0 or id > entities.Entities.player_ids) continue;
+                const player: usize = @intCast(id - 1);
+                told[player / @bitSizeOf(usize)] &= ~(@as(usize, 1) << @intCast(player % @bitSizeOf(usize)));
+            };
+            return self.set(told);
         }
 
         /// Where the entity in a slot is, asked of its kind once a tick at most.
@@ -831,7 +877,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             const leaving = self.row(1);
             @memcpy(leaving, self.withoutOwed(slot, change.remove));
             if (!any(leaving)) return;
-            try self.queueControl(slot, self.set(leaving), .remove, .{ .remove = entities.Entities.networkOfSlot(slot) });
+            _ = try self.queueControl(slot, self.set(leaving), .remove, .{ .remove = entities.Entities.networkOfSlot(slot) });
             self.leaving = true;
         }
 
@@ -917,6 +963,13 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
         /// differs from the defaults, one group each player takes whole or not at all.
         /// One its clients step is shown as `shown`, with that exact state after it when `exact`.
         fn queueSpawn(self: *Self, slot: u32, identity: Identity, view: *const View, recipients: bit_sets.Set, shown: ?Exact, exact_after: bool) !void {
+            if (!try self.queueSpawnAlone(slot, identity, view, recipients, shown, exact_after)) return;
+            // ServerEntity.sendPairingData: what it carries, after it.
+            if (view.passengers.count > 0) try self.queue(slot, recipients, .{ .passengers = .{ .id = entities.Entities.networkOfSlot(slot), .passengers = view.passengers } });
+        }
+
+        /// The spawn and data of `queueSpawn`, and whether they went into the batch.
+        fn queueSpawnAlone(self: *Self, slot: u32, identity: Identity, view: *const View, recipients: bit_sets.Set, shown: ?Exact, exact_after: bool) !bool {
             const id = entities.Entities.networkOfSlot(slot);
             const spawn = spawnOf(id, identity, view, shown);
             const changes = DataChanges.fromDefaults(view.data);
@@ -933,7 +986,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                 switch (try self.batch.prepare(recipients, count + 2, self, settleQueued)) {
                     .ready => {},
                     // No one to take it now: tracking offers it again next tick.
-                    .nobody, .backpressured => return,
+                    .nobody, .backpressured => return false,
                 }
                 const sent = if (!exact_after)
                     try self.batch.sendGroup(queued, .{ .{ spawnLegacy, spawnPacked }, writeMetadata }, .{ .{spawn}, data }, &.{ 128, self.dataBytes(slot) })
@@ -941,9 +994,10 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                     try self.batch.sendGroup(queued, .{ .{ spawnLegacy, spawnPacked }, writeMetadata, writeExact }, .{ .{spawn}, data, .{exact} }, &.{ 128, self.dataBytes(slot), 128 })
                 else
                     try self.batch.sendGroup(queued, .{ .{ spawnLegacy, spawnPacked }, writeExact }, .{ .{spawn}, .{exact} }, &.{ 128, 128 });
-                if (sent) return;
+                if (sent) return true;
                 try self.flushQueued();
             }
+            return false;
         }
 
         /// The entity as last sent, to the bit but for its turn, which views keep packed.
@@ -959,7 +1013,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
 
         /// A spawn without data, or a removal, in the batch: tracking hears who took it when the
         /// batch goes, and offers it again next tick to whoever did not.
-        fn queueControl(self: *Self, slot: u32, recipients: bit_sets.Set, purpose: Purpose, outgoing: Outgoing) !void {
+        fn queueControl(self: *Self, slot: u32, recipients: bit_sets.Set, purpose: Purpose, outgoing: Outgoing) !bool {
             if (self.tracing and purpose == .remove) self.traceSend(recipients, outgoing);
             const queued: Queued = .{ .slot = slot, .purpose = purpose };
             for (0..2) |_| {
@@ -972,7 +1026,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                     .remove => |value| try self.batch.send(queued, writeRemove, .{value}, 32),
                     else => unreachable,
                 };
-                if (sent) return;
+                if (sent) return true;
                 try self.flushQueued();
             }
             // A removal that could not go leaves its players with the entity, sent nothing more of it.
@@ -983,6 +1037,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                 while (each.next()) |player| if (self.deps.players.records[player].handle != null) put(owed, player);
                 self.behind(slot, self.set(owed));
             }
+            return false;
         }
 
         fn start(subject: Subject, body: Body) View {
@@ -1046,6 +1101,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             const changes = DataChanges.fromDefaults(view.data);
             if (changes.any()) try self.deliver(self.set(caught), .{ .metadata = .{ .id = id, .data = view.data, .changes = changes } });
             try self.deliver(self.set(caught), .{ .head = .{ .id = id, .yaw = view.head_yaw } });
+            if (view.passengers.count > 0) try self.deliver(self.set(caught), .{ .passengers = .{ .id = id, .passengers = view.passengers } });
             // One that took where it is but missed its data or head is not caught up: still stale.
             for (caught, self.missed) |*word, missed| word.* &= ~missed;
             self.deps.tracking.caughtUp(slot, self.set(caught));
@@ -1222,6 +1278,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                 .damage => |value| try delivery.send(recipients, writeDamage, .{ value.id, value.type_id, value.cause }, 32),
                 .animation => |value| try delivery.send(recipients, writeAnimation, .{ value.id, value.animation }, 32),
                 .collect => |value| try delivery.send(recipients, writeCollect, .{ value.id, value.collector, value.count }, 32),
+                .passengers => |value| try delivery.send(recipients, writePassengers, .{ value.id, value.passengers }, 64),
             }
             for (delivery.missedPlayers()) |player| {
                 put(self.missed, player);
@@ -1275,6 +1332,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
                     .look => |value| try self.batch.send(queued, writeLook, .{ value.id, value.yaw, value.pitch, value.on_ground }, 32),
                     .move_look => |value| try self.batch.send(queued, writeMoveLook, .{ value.id, value.delta, value.yaw, value.pitch, value.on_ground }, 32),
                     .head => |value| try self.batch.send(queued, writeHead, .{ value.id, value.yaw }, 32),
+                    .passengers => |value| try self.batch.send(queued, writePassengers, .{ value.id, value.passengers }, 64),
                     else => unreachable,
                 };
                 if (sent) return;
@@ -1331,6 +1389,7 @@ pub fn EntitySync(comptime Data: type, comptime Kind: type) type {
             damage: struct { id: i32, type_id: i32, cause: i32 },
             animation: struct { id: i32, animation: u8 },
             collect: struct { id: i32, collector: i32, count: i32 },
+            passengers: struct { id: i32, passengers: Passengers },
         };
 
         /// Room for one entity's data packet, as its kind says.
@@ -1515,6 +1574,13 @@ fn writeRemove(packet: wire.play.toClient.packet_entity_destroy.Writer, id: i32)
     const ids = try packet.entityIds(1);
     const entry = try ids.element(id);
     return (try entry.finish()).finish();
+}
+
+/// ClientboundSetPassengersPacket.
+pub fn writePassengers(packet: wire.play.toClient.packet_set_passengers.Writer, id: i32, passengers: Passengers) ![]u8 {
+    var list = try (try packet.entityId(id)).passengers(passengers.count);
+    for (passengers.slice()) |passenger| list = try list.element(passenger);
+    return (try list.finish()).finish();
 }
 
 fn writeCollect(packet: wire.play.toClient.packet_collect.Writer, id: i32, collector: i32, count: i32) ![]u8 {
