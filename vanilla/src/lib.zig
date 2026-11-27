@@ -112,6 +112,7 @@ pub const Fluids = @import("vanilla_blocks").fluids.Fluids;
 pub const Buckets = @import("vanilla_blocks").buckets.Buckets;
 pub const ToolActions = @import("vanilla_blocks").tool_actions.ToolActions;
 pub const Mobs = @import("vanilla_mobs").mobs.Mobs;
+pub const mob_goals = @import("vanilla_mobs").goals;
 pub const MobReplication = @import("vanilla_mobs").mob_replication.MobReplication;
 pub const SpawnEggs = @import("vanilla_mobs").spawn_eggs.SpawnEggs;
 pub const Melee = @import("vanilla_mobs").melee.Melee;
