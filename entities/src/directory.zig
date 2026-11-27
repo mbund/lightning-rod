@@ -35,6 +35,8 @@ pub const Entry = struct {
     space_row: u16 = 0,
     /// The slot of what it rides, Entity.vehicle, none riding nothing. Freed with the slot.
     vehicle: u32 = none,
+    /// How many ride it, Entity.isVehicle when any.
+    passengers: u16 = 0,
     /// While the slot is free, the one let go after it.
     next_free: u32 = none,
     /// Whether clients still know the entity, so the slot, and with it the network id, stays
@@ -138,11 +140,23 @@ pub const Directory = struct {
         const gone = self.entries.at(slot);
         assert(gone.held and !gone.retired);
         assert(self.ids.remove(gone.id));
+        self.unride(slot);
         gone.* = .{ .held = true, .retired = true };
+    }
+
+    /// An entity leaving gets off what it rides. Its own riders got off first, as its kind ejects
+    /// them.
+    fn unride(self: *Directory, slot: u32) void {
+        const gone = self.entries.at(slot);
+        assert(gone.passengers == 0);
+        if (gone.vehicle == none) return;
+        self.entries.at(gone.vehicle).passengers -= 1;
+        gone.vehicle = none;
     }
 
     /// A slot no entity holds any more goes back, taken again last.
     pub fn free(self: *Directory, slot: u32) void {
+        self.unride(slot);
         self.entries.at(slot).* = .{};
         if (self.free_tail == none) self.free_head = slot else self.entries.at(self.free_tail).next_free = slot;
         self.free_tail = slot;

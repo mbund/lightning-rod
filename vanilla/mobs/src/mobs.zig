@@ -310,10 +310,10 @@ pub const Mobs = struct {
         // Mobs take their turns in the one tick order, as many as fill a pass's run.
         try deps.entities.addTicker(.init(Mobs, self, self.kinds, entities.Entities.run_max));
         try deps.entities.addColumnHolder(.init(Mobs, self, loadColumn, unloadColumn));
-        // LivingEntity.isPushable, which vehicles collide with: mobs, and players, whose bodies
-        // are living ones too.
-        try deps.collisions.register(self.kinds, .{ .context = self, .pushable = mobPushable });
-        try deps.collisions.register(.of(&.{Players.entityKind()}), .{ .context = self, .pushable = playerPushable });
+        // How mobs and players meet others, living bodies both: pushable, which vehicles collide
+        // with and what pushes, and pickable.
+        try deps.collisions.register(self.kinds, .{ .context = self, .pushable = mobPushable, .pickable = mobPickable, .position = mobPosition, .nudge = mobNudge, .touched = mobTouched });
+        try deps.collisions.register(.of(&.{Players.entityKind()}), .{ .context = self, .pushable = playerPushable, .pickable = playerPickable, .position = playerPosition });
         for (self.species) |species| {
             self.widest_half = @max(self.widest_half, @as(f64, species.width) / 2);
             self.tallest = @max(self.tallest, @as(f64, species.height));
@@ -651,11 +651,40 @@ pub const Mobs = struct {
         self.tickViews(true);
         try self.noteHeldFood();
         try self.answerEdits();
+        try self.wakeTouched();
         const audience = self.noteAudience();
         const cow = self.traits(.cow);
         const species: herd_state.Species = .{ .tempt_range = cow.attribute(.tempt_range), .eye_height = cow.eye_height, .ambient_interval = cow.ambient_interval };
         self.context = .{ .audience = audience, .species = species, .volume = cow.sound_volume };
     }
+
+    /// A mob's pushEntities finds the players its box meets, and each pushes it, which one
+    /// resting or idling skips: so each a player touches wakes first. Waking one more than
+    /// needed, as by a player on a ladder, which is not pushable, changes nothing.
+    fn wakeTouched(self: *Mobs) !void {
+        if (self.active.count == 0) return;
+        const players = self.deps.players;
+        for (players.activeSlots()) |index| {
+            const player = &players.records[index];
+            if (!player.inWorld()) continue;
+            const state = self.deps.player_states.of(player);
+            if (state.gamemode == .spectator or state.health <= 0) continue;
+            var touch: Wake = .{ .mobs = self, .box = playerBox(player) };
+            try self.places.space.each(player.world, .{ .min = touch.box.min, .max = touch.box.max }, self.kinds, &touch, Wake.visit);
+        }
+    }
+
+    const Wake = struct {
+        mobs: *Mobs,
+        box: body.Box,
+
+        fn visit(touch: *Wake, entry: entities.space.Entry) anyerror!bool {
+            const mob = try touch.mobs.inSlot(entry.slot);
+            if (mob.entity.removed or !living.box(touch.mobs, mob).intersects(touch.box)) return false;
+            touch.mobs.rouseHeld(entry.slot, mob);
+            return false;
+        }
+    };
 
     /// Mobs next in ServerLevel's entity tick list: runs of idle ones side by side in the mobs'
     /// table, one per lane, advance at once.
@@ -1522,110 +1551,86 @@ pub const Mobs = struct {
         return best;
     }
 
-    /// LivingEntity.pushEntities: mobs push the pushable mobs and the boats their box overlaps, in
-    /// the order vanilla finds them, and each moves apart, after the cramming check. How many it
-    /// touched, each of which wakes, as resting mobs skip their own query.
+    /// LivingEntity.pushEntities: what is pushable by the mob and in its box, in the order the
+    /// level finds it, after the cramming check, each pushing back as LivingEntity.doPush has it.
+    /// How many it found, each of which wakes, as resting mobs skip their own query.
     pub fn pushEntities(self: *Mobs, mob: Mob) !u32 {
         const own = living.box(self, mob);
-        // Counted first, for the cramming check before any push, then pushed in the same order:
-        // the hurt moves nothing.
         const slot = self.slotOf(mob.entity.id).?;
-        var counting: Pushing = .{ .mobs = self, .mob = mob, .own = slot, .box = own };
-        try self.eachPushable(&counting);
-        const found = counting.found;
-        if (found == 0) return 0;
-        // The maxEntityCramming rule at its default: past 23 others, one tick in four hurts.
+        const collisions = self.deps.collisions;
+        var found: Found = .{ .entities = self.deps.entities };
+        try collisions.each(mob.motion.world, own, slot, .pushable, .{ .context = &found, .visit = Found.visit });
+        if (found.all == 0) return 0;
+        // The maxEntityCramming rule at its default: past 23, one tick in four, those that ride
+        // nothing are counted, and past 23 of them it hurts. The hurt moves nothing.
         const cramming = 24;
-        if (found > cramming - 1 and mob.idle.random.nextIntBounded(4) == 0) {
-            // None of them rides anything here.
+        if (found.all > cramming - 1 and mob.idle.random.nextIntBounded(4) == 0 and found.free > cramming - 1) {
             _ = try self.hurt(mob, .{ .type = .cramming }, 6.0);
         }
-        var pushing: Pushing = .{ .mobs = self, .mob = mob, .own = slot, .box = own, .push = true };
-        try self.eachPushable(&pushing);
-        return found;
+        var pushing: Pushing = .{ .collisions = collisions, .mob = slot, .own = try mobPushable(self, slot) };
+        try collisions.each(mob.motion.world, own, slot, .pushable, .{ .context = &pushing, .visit = Pushing.visit });
+        return found.all;
     }
 
-    /// What LivingEntity.pushEntities finds around a mob, counted or pushed.
-    const Pushing = struct {
-        mobs: *Mobs,
-        mob: Mob,
-        /// The mob's own slot, which what it rides is known by.
-        own: u32,
-        box: body.Box,
-        push: bool = false,
-        found: u32 = 0,
+    /// What LivingEntity.pushEntities counts: all it found, and those that ride nothing.
+    const Found = struct {
+        entities: *entities.Entities,
+        all: u32 = 0,
+        free: u32 = 0,
 
-        fn visit(pushing: *Pushing, entry: entities.space.Entry) anyerror!bool {
-            const mobs = pushing.mobs;
-            if (mobs.boats) |boats| if (boats.kinds.has(entry.shape.kind)) {
-                // Entity.push passes over what it rides itself.
-                if (!boats.solid(entry.slot) or mobs.deps.entities.vehicleOf(pushing.own) == entry.slot) return false;
-                pushing.found += 1;
-                // LivingEntity.doPush: the boat is pushed by the mob, as AbstractBoat.push has it.
-                if (pushing.push) {
-                    var pushed: PushedMob = .{ .mobs = mobs, .mob = pushing.mob };
-                    boats.push(entry.slot, pushed.asPushed());
-                }
-                return false;
-            };
-            if (entry.id == pushing.mob.entity.id) return false;
-            // Nor what rides the same vehicle.
-            if (mobs.deps.entities.vehicleOf(pushing.own)) |vehicle| if (mobs.deps.entities.vehicleOf(entry.slot) == vehicle) return false;
-            const other = try mobs.inSlot(entry.slot);
-            if (other.entity.removed or !living.box(mobs, other).intersects(pushing.box)) return false;
-            if (!other.alive() or try living.onClimbable(mobs, other)) return false;
-            pushing.found += 1;
-            if (pushing.push) {
-                mobs.rouseMob(other);
-                push(other, pushing.mob);
-            }
+        fn visit(context: *anyopaque, entry: entities.space.Entry, _: body.Box) anyerror!bool {
+            const found: *Found = @ptrCast(@alignCast(context));
+            found.all += 1;
+            if (found.entities.vehicleOf(entry.slot) == null) found.free += 1;
             return false;
         }
     };
 
-    /// The mobs and boats around a mob in the order Level.getEntities finds them.
-    fn eachPushable(self: *Mobs, pushing: *Pushing) !void {
-        const kinds = if (self.boats) |boats| self.kinds.with(boats.kinds) else self.kinds;
-        try self.places.space.each(pushing.mob.motion.world, .{ .min = pushing.box.min, .max = pushing.box.max }, kinds, pushing, Pushing.visit);
-    }
+    /// LivingEntity.doPush: each found pushes back, Entity.push(the mob).
+    const Pushing = struct {
+        collisions: *EntityCollisions,
+        mob: u32,
+        /// The mob's own pushable box, null where it is not pushable, as on a ladder.
+        own: ?body.Box,
 
-    /// A mob as a boat pushes it or is pushed by it.
-    const PushedMob = struct {
-        mobs: *Mobs,
-        mob: Mob,
-
-        fn asPushed(self: *PushedMob) Boats.Pushed {
-            return .{ .position = self.mob.motion.position, .box = living.box(self.mobs, self.mob), .boat = false, .context = self, .push = nudge };
-        }
-
-        /// Entity.push(x, y, z) on a mob: its velocity changes, and replication sends it.
-        fn nudge(context: *anyopaque, by: [2]f64) void {
-            const self: *PushedMob = @ptrCast(@alignCast(context));
-            self.mob.motion.velocity[0] += by[0];
-            self.mob.motion.velocity[2] += by[1];
-            self.mob.entity.has_impulse = true;
-            self.mobs.rouseMob(self.mob);
+        fn visit(context: *anyopaque, entry: entities.space.Entry, found: body.Box) anyerror!bool {
+            const pushing: *Pushing = @ptrCast(@alignCast(context));
+            try pushing.collisions.push(entry.slot, found, pushing.mob, pushing.own);
+            return false;
         }
     };
 
-    /// AbstractBoat.tick pushing a mob around it that `nearBoat` found.
-    pub fn pushedByBoat(self: *Mobs, slot: u32, boat: u32) !void {
-        const mob = try self.inSlot(slot);
-        var pushed: PushedMob = .{ .mobs = self, .mob = mob };
-        self.boats.?.push(boat, pushed.asPushed());
+    /// Where a mob is now.
+    fn mobPosition(context: *anyopaque, slot: u32) [3]f64 {
+        const self: *Mobs = @ptrCast(@alignCast(context));
+        return (self.inSlot(slot) catch unreachable).motion.position;
     }
 
-    /// A mob AbstractBoat.tick finds in its reach, as EntitySelector.pushableBy takes it: its width
-    /// if it is pushable there.
-    pub fn nearBoat(self: *Mobs, slot: u32, reach: body.Box) !?f32 {
-        const mob = try self.inSlot(slot);
-        if (mob.entity.removed or !living.box(self, mob).intersects(reach)) return null;
-        if (!mob.alive() or try living.onClimbable(self, mob)) return null;
-        return living.width(self, mob);
+    /// Entity.push(x, y, z) on a mob: its velocity changes, and replication sends it.
+    fn mobNudge(context: *anyopaque, slot: u32, by: [2]f64) void {
+        const self: *Mobs = @ptrCast(@alignCast(context));
+        const mob = self.inSlot(slot) catch unreachable;
+        mob.motion.velocity[0] += by[0];
+        mob.motion.velocity[2] += by[1];
+        mob.entity.has_impulse = true;
     }
 
-    /// A mob's box where it can be picked, as LivingEntity.isPickable has it: any not removed.
-    pub fn pickableBox(self: *Mobs, slot: u32) !?body.Box {
+    /// A mob something pushable met wakes.
+    fn mobTouched(context: *anyopaque, slot: u32) void {
+        const self: *Mobs = @ptrCast(@alignCast(context));
+        self.rouseHeld(slot, self.inSlot(slot) catch unreachable);
+    }
+
+    /// Where a player is now.
+    fn playerPosition(context: *anyopaque, slot: u32) [3]f64 {
+        const self: *Mobs = @ptrCast(@alignCast(context));
+        const player = &self.deps.players.records[Players.playerOfEntity(self.deps.entities.directory.entry(slot).id)];
+        return .{ player.position.x, player.position.y, player.position.z };
+    }
+
+    /// LivingEntity.isPickable for a mob: any not removed, its box.
+    fn mobPickable(context: *anyopaque, slot: u32) anyerror!?body.Box {
+        const self: *Mobs = @ptrCast(@alignCast(context));
         const mob = try self.inSlot(slot);
         if (mob.entity.removed) return null;
         return living.box(self, mob);
@@ -1637,6 +1642,14 @@ pub const Mobs = struct {
         const mob = try self.inSlot(slot);
         if (mob.entity.removed or !mob.alive() or try living.onClimbable(self, mob)) return null;
         return living.box(self, mob);
+    }
+
+    /// Player.isPickable: in the world and no spectator, its box.
+    fn playerPickable(context: *anyopaque, slot: u32) anyerror!?body.Box {
+        const self: *Mobs = @ptrCast(@alignCast(context));
+        const player = &self.deps.players.records[Players.playerOfEntity(self.deps.entities.directory.entry(slot).id)];
+        if (!player.inWorld() or self.deps.player_states.of(player).gamemode == .spectator) return null;
+        return playerBox(player);
     }
 
     /// LivingEntity.isPushable for a player: in the world, alive, no spectator, off climbables.
@@ -2060,28 +2073,6 @@ fn mth_floor(value: f64) i32 {
     return @intFromFloat(@floor(value));
 }
 
-/// Entity.push(Entity): the pusher and the pushed move apart, each by up to 0.05 a tick.
-fn push(pushed: Mob, pusher: Mob) void {
-    var dx = pusher.motion.position[0] - pushed.motion.position[0];
-    var dz = pusher.motion.position[2] - pushed.motion.position[2];
-    var farthest = @max(@abs(dx), @abs(dz));
-    if (farthest < @as(f64, @as(f32, 0.01))) return;
-    farthest = @sqrt(farthest);
-    dx /= farthest;
-    dz /= farthest;
-    const scale = @min(1.0, 1.0 / farthest);
-    dx *= scale * @as(f64, @as(f32, 0.05));
-    dz *= scale * @as(f64, @as(f32, 0.05));
-    pushed.motion.velocity[0] -= dx;
-    pushed.motion.velocity[2] -= dz;
-    pushed.entity.has_impulse = true;
-    pusher.motion.velocity[0] += dx;
-    pusher.motion.velocity[2] += dz;
-    pusher.entity.has_impulse = true;
-}
-
-/// A path's nodes, as many as a path holds at most.
-/// The mobs' table: a row each, a column for each of a mob's components.
 /// What the mobs keep of each mob beside its state: whether it idles and the look an idle
 /// tick keeps, whether its column ticks, and where its record lies in the store.
 const Tracking = struct {

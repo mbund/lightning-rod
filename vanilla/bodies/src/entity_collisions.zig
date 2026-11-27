@@ -30,6 +30,17 @@ pub const EntityCollisions = struct {
         pushable: ?Answer = null,
         /// Entity.isPickable.
         pickable: ?Answer = null,
+        /// Where the entity is now, which the space may trail within a tick: kinds that push answer.
+        position: ?*const fn (context: *anyopaque, slot: u32) [3]f64 = null,
+        /// Something pushable met it, as Entity.push(Entity) does: a resting one wakes, as its own
+        /// pushEntities would have found the other.
+        touched: ?*const fn (context: *anyopaque, slot: u32) void = null,
+        /// Entity.push(x, y, z) on the entity: its velocity moves by `by` across, and it wakes. None,
+        /// and a push leaves it as it is, as a player's client moves it.
+        nudge: ?*const fn (context: *anyopaque, slot: u32, by: [2]f64) void = null,
+        /// A kind's own Entity.push(Entity) test before stepping apart from `other`, as
+        /// AbstractBoat.push has: none, and it always steps apart.
+        pushes: ?*const fn (context: *anyopaque, slot: u32, own: Box, other: u32, other_box: Box) bool = null,
     };
 
     /// Which of the selectors a query takes.
@@ -81,6 +92,41 @@ pub const EntityCollisions = struct {
         };
         var walk: Walk = .{ .collisions = self, .query = query, .except = except, .test_kind = test_kind, .visitor = visitor };
         try self.deps.entities.places.space.each(world, .{ .min = query.min, .max = query.max }, kinds, &walk, Walk.visit);
+    }
+
+    /// Entity.push(Entity): `this` and `other` step apart, unless they ride the same vehicle, `this`
+    /// kind's own test says no, or they stand too close to tell a way; each moves that carries
+    /// nothing and is pushable.
+    /// `this_box` and `other_box` are what each answered as pushable, null where it is not: the
+    /// queries that find them have them in hand.
+    pub fn push(self: *EntityCollisions, this: u32, this_box: ?Box, other: u32, other_box: ?Box) !void {
+        const owned = self.deps.entities;
+        if (owned.rootOf(this) == owned.rootOf(other)) return;
+        const this_rule = self.rules[owned.directory.entry(this).kind].?;
+        const other_rule = self.rules[owned.directory.entry(other).kind].?;
+        if (this_rule.touched) |touched| touched(this_rule.context, this);
+        if (other_rule.touched) |touched| touched(other_rule.context, other);
+        if (this_rule.pushes) |pushes| {
+            const own = this_box orelse try self.placedBox(this);
+            if (!pushes(this_rule.context, this, own, other, other_box orelse try self.placedBox(other))) return;
+        }
+        const from = if (this_rule.position) |at| at(this_rule.context, this) else try self.placedPosition(this);
+        const to = if (other_rule.position) |at| at(other_rule.context, other) else try self.placedPosition(other);
+        const apart = body.pushApart(from, to) orelse return;
+        if (!owned.isVehicle(this) and this_box != null) if (this_rule.nudge) |nudge| nudge(this_rule.context, this, .{ -apart[0], -apart[1] });
+        if (!owned.isVehicle(other) and other_box != null) if (other_rule.nudge) |nudge| nudge(other_rule.context, other, apart);
+    }
+
+    /// Where the space has an entity, for a kind that does not answer itself.
+    fn placedBox(self: *EntityCollisions, slot: u32) !Box {
+        const placed = self.deps.entities.places.space.atSlot(slot) orelse return error.EntityNotPlaced;
+        const value = placed.entry.box();
+        return .{ .min = value.min, .max = value.max };
+    }
+
+    fn placedPosition(self: *EntityCollisions, slot: u32) ![3]f64 {
+        const placed = self.deps.entities.places.space.atSlot(slot) orelse return error.EntityNotPlaced;
+        return placed.entry.position;
     }
 
     const Walk = struct {

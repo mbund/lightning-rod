@@ -405,13 +405,22 @@ pub const Entities = struct {
 
     /// Entity.startRiding's link, made by the kind that carries it.
     pub fn ride(self: *Entities, rider: u32, vehicle: u32) void {
-        assert(rider != vehicle and self.directory.entry(vehicle).vehicle == directory.none);
+        assert(rider != vehicle and self.directory.entry(vehicle).vehicle == directory.none and self.directory.entry(rider).vehicle == directory.none);
         self.directory.entry(rider).vehicle = vehicle;
+        self.directory.entry(vehicle).passengers += 1;
     }
 
     /// Entity.removeVehicle's link undone.
     pub fn alight(self: *Entities, rider: u32) void {
-        self.directory.entry(rider).vehicle = directory.none;
+        const entry = self.directory.entry(rider);
+        if (entry.vehicle == directory.none) return;
+        self.directory.entry(entry.vehicle).passengers -= 1;
+        entry.vehicle = directory.none;
+    }
+
+    /// Entity.isVehicle: something rides it.
+    pub fn isVehicle(self: *const Entities, slot: u32) bool {
+        return self.directory.entry(slot).passengers > 0;
     }
 
     /// Entity.getRootVehicle: what it rides at the bottom, or itself.

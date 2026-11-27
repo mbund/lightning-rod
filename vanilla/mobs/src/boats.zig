@@ -296,8 +296,9 @@ pub const Boats = struct {
         try deps.entities.addTicker(.init(Boats, self, kinds, 1));
         try deps.entities.addColumnHolder(.init(Boats, self, columnLoaded, columnUnloaded));
         try self.boats.register();
-        // AbstractBoat: canBeCollidedWith, isPushable and isPickable while it is in the world.
-        try deps.collisions.register(kinds, .{ .context = self, .solid = boatBox, .pushable = boatBox, .pickable = boatBox });
+        // AbstractBoat: canBeCollidedWith, isPushable and isPickable while it is in the world, and
+        // its own push.
+        try deps.collisions.register(kinds, .{ .context = self, .solid = boatBox, .pushable = boatBox, .pickable = boatBox, .position = boatPosition, .nudge = boatNudge, .pushes = boatPushes });
         deps.mobs.boats = self;
         try deps.input.on(.vehicle_move, self, onVehicleMove);
         try deps.input.on(.steer_boat, self, onSteerBoat);
@@ -418,50 +419,6 @@ pub const Boats = struct {
         try self.eject(slot);
     }
 
-    /// AbstractBoat.push(Entity), the boat in the slot and another: another boat counts only from
-    /// below this one's top, anything else only from no higher than its bottom; then both move
-    /// apart, as Entity.push(Entity) moves each that is pushable and carries nothing. A boat pushes
-    /// so as it ticks, and is pushed so by mobs as they tick.
-    pub fn push(self: *Boats, slot: u32, other: Pushed) void {
-        const state = self.deps.entities.body(slot).?;
-        const box = boat_module.boxAt(state.position);
-        if (other.boat) {
-            if (!(other.box.min[1] < box.max[1])) return;
-        } else if (!(other.box.min[1] <= box.min[1])) return;
-        const apart = apartOf(state.position, other.position) orelse return;
-        self.nudge(slot, .{ -apart[0], -apart[1] });
-        other.nudge(apart);
-    }
-
-    /// Something a boat pushes or is pushed by: where it is, and how to push it.
-    pub const Pushed = struct {
-        position: [3]f64,
-        box: Box,
-        boat: bool,
-        context: *anyopaque,
-        push: *const fn (context: *anyopaque, by: [2]f64) void,
-
-        fn nudge(self: Pushed, by: [2]f64) void {
-            self.push(self.context, by);
-        }
-    };
-
-    /// Entity.push(Entity)'s step apart: how far the other moves from this one, x and z, or none
-    /// when they stand too close to tell a way.
-    fn apartOf(here: [3]f64, there: [3]f64) ?[2]f64 {
-        var dx = there[0] - here[0];
-        var dz = there[2] - here[2];
-        var farthest = @max(@abs(dx), @abs(dz));
-        if (farthest < @as(f64, @as(f32, 0.01))) return null;
-        farthest = @sqrt(farthest);
-        dx /= farthest;
-        dz /= farthest;
-        const scale = @min(1.0, 1.0 / farthest);
-        dx *= scale * @as(f64, @as(f32, 0.05));
-        dz *= scale * @as(f64, @as(f32, 0.05));
-        return .{ dx, dz };
-    }
-
     /// Entity.push(x, y, z) on a boat: its velocity changes, and replication sends it.
     fn nudge(self: *Boats, slot: u32, by: [2]f64) void {
         const state = self.deps.entities.body(slot).?;
@@ -473,11 +430,23 @@ pub const Boats = struct {
         self.replicated.insert(slot);
     }
 
-    fn nudgeBoat(context: *anyopaque, by: [2]f64) void {
-        const pushed: *const PushedBoat = @ptrCast(@alignCast(context));
-        pushed.boats.nudge(pushed.slot, by);
+    fn boatNudge(context: *anyopaque, slot: u32, by: [2]f64) void {
+        const self: *Boats = @ptrCast(@alignCast(context));
+        self.nudge(slot, by);
     }
-    const PushedBoat = struct { boats: *Boats, slot: u32 };
+
+    fn boatPosition(context: *anyopaque, slot: u32) [3]f64 {
+        const self: *Boats = @ptrCast(@alignCast(context));
+        return self.deps.entities.body(slot).?.position;
+    }
+
+    /// AbstractBoat.push(Entity): another boat counts only from below this one's top, anything
+    /// else only from no higher than its bottom.
+    fn boatPushes(context: *anyopaque, _: u32, own: Box, other: u32, other_box: Box) bool {
+        const self: *Boats = @ptrCast(@alignCast(context));
+        if (self.isBoat(other)) return other_box.min[1] < own.max[1];
+        return other_box.min[1] <= own.min[1];
+    }
 
     /// Entity.push(x, y, z) from a hit: the boat's velocity changes, and replication sends it.
     pub fn knock(self: *Boats, slot: u32, by: [3]f64) void {
@@ -516,9 +485,9 @@ pub const Boats = struct {
         return !self.boats.ptr(slot).boat.removed;
     }
 
-    /// Whether a pickable entity whose box meets `query` holds the point, as BoatItem.use asks of
-    /// Level.getEntities with EntitySelector.CAN_BE_PICKED.
-    pub fn pickableHolds(self: *Boats, world: u32, query: Box, point: [3]f64) !bool {
+    /// Whether a pickable entity but `except` whose box meets `query` holds the point, as
+    /// BoatItem.use asks of Level.getEntities with the player and EntitySelector.CAN_BE_PICKED.
+    pub fn pickableHolds(self: *Boats, world: u32, query: Box, point: [3]f64, except: u32) !bool {
         const Find = struct {
             point: [3]f64,
             found: bool = false,
@@ -531,7 +500,7 @@ pub const Boats = struct {
             }
         };
         var find: Find = .{ .point = point };
-        try self.deps.collisions.each(world, query, body.no_slot, .pickable, .{ .context = &find, .visit = Find.visit });
+        try self.deps.collisions.each(world, query, except, .pickable, .{ .context = &find, .visit = Find.visit });
         return find.found;
     }
 
@@ -617,33 +586,28 @@ pub const Boats = struct {
         const Around = struct {
             boats: *Boats,
             slot: u32,
-            box: Box,
-            fn visit(reach: *@This(), entry: entities.space.Entry) anyerror!bool {
+            own: ?Box,
+
+            fn visit(context: *anyopaque, entry: entities.space.Entry, found: Box) anyerror!bool {
+                const reach: *@This() = @ptrCast(@alignCast(context));
                 const boats = reach.boats;
-                if (entry.slot == reach.slot) return false;
-                if (boats.kinds.has(entry.shape.kind)) {
-                    const other = boats.boats.ptr(entry.slot);
-                    if (other.boat.removed) return false;
-                    const other_box = boat_module.boxAt(entry.position);
-                    if (!other_box.intersects(reach.box)) return false;
-                    var pushed: PushedBoat = .{ .boats = boats, .slot = entry.slot };
-                    boats.push(reach.slot, .{ .position = entry.position, .box = other_box, .boat = true, .context = &pushed, .push = nudgeBoat });
-                    return false;
-                }
-                const mobs = boats.deps.mobs;
-                const width = (try mobs.nearBoat(entry.slot, reach.box)) orelse return false;
-                if (boats.deps.entities.vehicleOf(entry.slot) == reach.slot) return false;
+                const owned = boats.deps.entities;
                 const carrier = boats.boats.ptr(reach.slot);
-                if (boats.steeredBy(reach.slot) == null and carrier.riders.count < carrier.model.capacity() and boats.deps.entities.vehicleOf(entry.slot) == null and width < boat_module.box_width) {
+                // A small living thing that rides nothing, not a player, boards a boat no player
+                // steers that has room.
+                const width = found.max[0] - found.min[0];
+                if (boats.deps.mobs.kinds.has(entry.shape.kind) and boats.steeredBy(reach.slot) == null and carrier.riders.count < carrier.model.capacity() and
+                    owned.vehicleOf(entry.slot) == null and width < boat_module.box_width)
+                {
                     try boats.mountMob(reach.slot, entry.slot);
                     return false;
                 }
-                try mobs.pushedByBoat(entry.slot, reach.slot);
+                try boats.deps.collisions.push(reach.slot, reach.own, entry.slot, found);
                 return false;
             }
         };
-        var reach: Around = .{ .boats = self, .slot = slot, .box = box };
-        try self.places.space.each(state.world, .{ .min = box.min, .max = box.max }, self.kinds.with(self.deps.mobs.kinds), &reach, Around.visit);
+        var reach: Around = .{ .boats = self, .slot = slot, .own = try boatBox(self, slot) };
+        try self.deps.collisions.each(state.world, box, slot, .pushable, .{ .context = &reach, .visit = Around.visit });
     }
 
     fn around(self: *Boats, world: u32, slot: u32) boat_module.Around {

@@ -669,6 +669,22 @@ fn stepEdges(value: Box, base: Box, max_up_step: f32, skip: f32, output: *[64]f3
     return count;
 }
 
+/// Entity.push(Entity)'s step apart: how far the entity at `there` moves from the one at `here`,
+/// x and z, the one at `here` the opposite, or none when they stand too close to tell a way.
+pub fn pushApart(here: [3]f64, there: [3]f64) ?[2]f64 {
+    var dx = there[0] - here[0];
+    var dz = there[2] - here[2];
+    var farthest = @max(@abs(dx), @abs(dz));
+    if (farthest < @as(f64, @as(f32, 0.01))) return null;
+    farthest = @sqrt(farthest);
+    dx /= farthest;
+    dz /= farthest;
+    const scale = @min(1.0, 1.0 / farthest);
+    dx *= scale * @as(f64, @as(f32, 0.05));
+    dz *= scale * @as(f64, @as(f32, 0.05));
+    return .{ dx, dz };
+}
+
 /// LivingEntity.onClimbable's blocks: a climbable block at the body's block, or an open trapdoor
 /// over a ladder facing its way.
 pub fn climbableAt(level: *const Level, at: [3]i32) !bool {
