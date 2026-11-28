@@ -2,6 +2,7 @@ const lightning_rod = @import("lightning_rod");
 const std = @import("std");
 const inventories = @import("inventories");
 const entities = @import("entities");
+const minecraft = @import("minecraft_model");
 const Players = @import("players").players.Players;
 const PlayerStates = @import("vanilla_player").player_states.PlayerStates;
 const PlayerInventory = @import("player_inventory.zig").PlayerInventory;
@@ -93,37 +94,53 @@ pub const ItemPickup = struct {
             } else if (found) {
                 quiet.revision = null;
             };
-            const low: [2]i32 = .{ @intFromFloat(@floor((player.position.x - 1.425) / 16)), @intFromFloat(@floor((player.position.z - 1.425) / 16)) };
-            const high: [2]i32 = .{ @intFromFloat(@floor((player.position.x + 1.425) / 16)), @intFromFloat(@floor((player.position.z + 1.425) / 16)) };
-            var x = low[0];
-            while (x <= high[0]) : (x += 1) {
-                var z = low[1];
-                while (z <= high[1]) : (z += 1) {
-                    var walk = dropped.places.space.entries(.{ .world = player.world, .x = x, .z = z }, ItemEntities.kinds);
-                    while (walk.next()) |entry| {
-                        if (entry.id <= after) continue;
-                        if (@abs(entry.position[0] - player.position.x) >= 1.425 or @abs(entry.position[2] - player.position.z) >= 1.425) continue;
-                        found = true;
-                        if (cutoff) |limit| if (entry.id > limit) {
-                            more.* = true;
-                            continue;
-                        };
-                        if (count == self.reach.len) {
-                            // Full: keep the lower half, and leave the rest for the next round.
-                            count = unique(self.reach);
-                            if (count > self.reach.len / 2) count = self.reach.len / 2;
-                            cutoff = self.reach[count - 1];
-                            more.* = true;
-                            if (entry.id > cutoff.?) continue;
-                        }
-                        self.reach[count] = entry.id;
-                        count += 1;
-                    }
-                }
-            }
+            // The items whose boxes come within reach across, at any height: a lookup tests boxes
+            // alone, and only those that meet it are read.
+            const query: entities.space.Box = .{
+                .min = .{ player.position.x - 1.425, -far, player.position.z - 1.425 },
+                .max = .{ player.position.x + 1.425, far, player.position.z + 1.425 },
+            };
+            var walk: Walk = .{ .pickup = self, .player = player.position, .after = after, .count = &count, .cutoff = &cutoff, .more = more, .found = &found };
+            try dropped.places.space.each(player.world, query, ItemEntities.kinds, &walk, Walk.visit);
         }
         return self.reach[0..unique(self.reach[0..count])];
     }
+
+    /// Past any height a world has: a lookup at every height.
+    const far = 1.0e6;
+
+    /// Each item a lookup about a player meets, kept when it is within reach across.
+    const Walk = struct {
+        pickup: *ItemPickup,
+        player: minecraft.Position,
+        after: entities.Id,
+        count: *usize,
+        cutoff: *?entities.Id,
+        more: *bool,
+        found: *bool,
+
+        fn visit(walk: *Walk, entry: entities.space.Entry) anyerror!bool {
+            const self = walk.pickup;
+            if (entry.id <= walk.after) return false;
+            if (@abs(entry.position[0] - walk.player.x) >= 1.425 or @abs(entry.position[2] - walk.player.z) >= 1.425) return false;
+            walk.found.* = true;
+            if (walk.cutoff.*) |limit| if (entry.id > limit) {
+                walk.more.* = true;
+                return false;
+            };
+            if (walk.count.* == self.reach.len) {
+                // Full: keep the lower half, and leave the rest for the next round.
+                walk.count.* = unique(self.reach);
+                if (walk.count.* > self.reach.len / 2) walk.count.* = self.reach.len / 2;
+                walk.cutoff.* = self.reach[walk.count.* - 1];
+                walk.more.* = true;
+                if (entry.id > walk.cutoff.*.?) return false;
+            }
+            self.reach[walk.count.*] = entry.id;
+            walk.count.* += 1;
+            return false;
+        }
+    };
 
     /// Sorts ids and keeps each once, returning how many there are.
     fn unique(ids: []entities.Id) usize {
