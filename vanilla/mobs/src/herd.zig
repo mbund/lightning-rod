@@ -21,24 +21,22 @@ const Motion = mob_state.Motion;
 const assert = std.debug.assert;
 const species_count = mob_state.max_species;
 
-/// RandomLookAroundGoal, last of the animal goals, which every species that idles registers.
-const look_around_priority: u4 = for (species_data.animal_goals, 0..) |goal, at| {
-    if (std.meta.eql(goal, species_data.Goal{ .shared = .look_around })) break at;
-} else unreachable;
-const look_around_bit: u16 = @as(u16, 1) << look_around_priority;
-
 /// Whether a resting mob's tick is only counters, draws and turning: no goal but the look
 /// around runs, nothing hurts, and the look control's pitch stays level.
 pub fn idle(mobs: *const Mobs, mob: Mob) bool {
     const hot = mob.idle;
-    const gazing = hot.running == look_around_bit and hot.move_owner == look_around_priority and hot.look_owner == look_around_priority;
+    const traits = mobs.traits(mob.entity.species);
+    if (!mobs.config.herd or !traits.definition.idles) return false;
+    // RandomLookAroundGoal, last of the animal goals, which every species that idles registers.
+    const look_around = traits.shared[@backingInt(species_data.Shared.look_around)].?;
+    const gazing = hot.running == (@as(u16, 1) << look_around) and hot.move_owner == look_around and hot.look_owner == look_around;
     const still = hot.running == 0 and hot.move_owner == null and hot.look_owner == null;
     if (!(gazing or still)) return false;
     // Looking around is the only goal running, if any: nothing else keeps a focus.
     assert(mob.part(.focus) == null);
     // While the look control counts down, the pitch it turns toward must keep the head level.
     if (hot.look_cooldown > 0) if (ai.lookPitch(mobs, mob)) |pitch| if (mth.rotateTowards(0, pitch, hot.look_max_pitch) != 0) return false;
-    return mob.motion.resting and mob.alive() and !mob.control.no_ai and !mob.entity.first_tick and mobs.traits(mob.entity.species).definition.idles and
+    return mob.motion.resting and mob.alive() and !mob.control.no_ai and !mob.entity.first_tick and
         mob.goals.jump_owner == null and mob.goals.disabled == 0 and
         !mob.navigation.path.active and !mob.navigation.has_delayed_recomputation and
         mob.motion.pitch == 0 and mob.motion.old_pitch == 0 and mob.motion.yaw == mob.motion.old_yaw and
@@ -108,6 +106,14 @@ pub const Species = struct {
     tempt_range: f64,
     eye_height: f32,
     ambient_interval: i32,
+    /// The priority of its RandomLookAroundGoal, and the bound of its own goal's idle roll, drawn
+    /// after tempting and before strolling.
+    look_around: u4,
+    own_roll: ?i32 = null,
+
+    fn lookAroundBit(self: Species) u16 {
+        return @as(u16, 1) << self.look_around;
+    }
 };
 
 /// An idle tick that stays idle, with the pitch of the ambient sound it plays, if it does.
@@ -134,7 +140,7 @@ pub fn advance(hot: *Idle, still: Still, gaze_yaw: *f32, audience: Audience, spe
     var ambient = hot.ambient_sound_time;
     var no_action = hot.no_action_time;
     var calm_down = hot.tempt_calm_down;
-    var gazing = hot.running == look_around_bit;
+    var gazing = hot.running == species.lookAroundBit();
     var look_around_time = hot.look_around.time;
     var cooldown = hot.look_cooldown;
     var gaze = gaze_yaw.*;
@@ -175,6 +181,8 @@ pub fn advance(hot: *Idle, still: Still, gaze_yaw: *f32, audience: Audience, spe
         } else if (audience.temptsNear(species.which, world, position, species.tempt_range)) {
             return .started;
         }
+        // The species' own goal, as EatBlockGoal.canUse: its roll first, which starts it on a zero.
+        if (species.own_roll) |bound| if (random.nextIntBounded(bound) == 0) return .started;
         if (no_action < 100 and random.nextIntBounded(60) == 0) return .started;
         // LookAtPlayerGoal: on its roll it looks for a player within 6 blocks, measured from the
         // mob, and starts only for one it sees.
@@ -218,7 +226,7 @@ pub fn advance(hot: *Idle, still: Still, gaze_yaw: *f32, audience: Audience, spe
     hot.no_action_time = no_action;
     hot.tempt_calm_down = calm_down;
     hot.navigation_tick += 1;
-    setGazing(hot, gazing);
+    setGazing(hot, gazing, species.look_around);
     hot.look_around = .{ .relative = look_vector, .time = look_around_time };
     hot.look_cooldown = cooldown;
     gaze_yaw.* = gaze;
@@ -235,10 +243,10 @@ pub fn advance(hot: *Idle, still: Still, gaze_yaw: *f32, audience: Audience, spe
 }
 
 /// The look around runs or not, holding the move and look flags while it does.
-fn setGazing(hot: *Idle, gazing: bool) void {
-    hot.running = if (gazing) look_around_bit else 0;
-    hot.move_owner = if (gazing) look_around_priority else null;
-    hot.look_owner = if (gazing) look_around_priority else null;
+fn setGazing(hot: *Idle, gazing: bool, look_around: u4) void {
+    hot.running = if (gazing) @as(u16, 1) << look_around else 0;
+    hot.move_owner = if (gazing) look_around else null;
+    hot.look_owner = if (gazing) look_around else null;
 }
 
 // Lanes at once: as many 32-bit values as the target's vectors hold, the wider ones taking two.
@@ -257,6 +265,8 @@ pub const Block = struct {
     /// Lanes that met something rare and take `advance` instead.
     rare: [lane_count]bool,
     any_rare: bool,
+    /// The priority of the run's species' look around.
+    look_around: u4,
     seed: [lane_count]u64,
     tick_count: [lane_count]i32,
     ambient_sound_time: [lane_count]i32,
@@ -287,6 +297,20 @@ fn draw(seed: *U64, drawing: Mask, comptime bits: u6) I32 {
 /// draw again is rare.
 fn boundedInt(seed: *U64, drawing: Mask, comptime bound: i32, rare: *Mask) I32 {
     const bits = draw(seed, drawing, 31);
+    const value = @rem(bits, @as(I32, @splat(bound)));
+    const accepted = (bits -% value +% @as(I32, @splat(bound - 1))) >= @as(I32, @splat(0));
+    rare.* = rare.* | (drawing & !accepted);
+    return value;
+}
+
+/// JavaRandom.nextIntBounded for a bound known only now, as a species gives it.
+fn boundedIntOf(seed: *U64, drawing: Mask, bound: i32, rare: *Mask) I32 {
+    assert(bound > 0);
+    const bits = draw(seed, drawing, 31);
+    if (bound & (bound - 1) == 0) {
+        const wide: @Vector(lane_count, i64) = bits;
+        return @intCast((wide * @as(@Vector(lane_count, i64), @splat(bound))) >> @splat(31));
+    }
     const value = @rem(bits, @as(I32, @splat(bound)));
     const accepted = (bits -% value +% @as(I32, @splat(bound - 1))) >= @as(I32, @splat(0));
     rare.* = rare.* | (drawing & !accepted);
@@ -351,7 +375,7 @@ pub fn advanceBlock(run: Run, audience: Audience, species: Species) Block {
     var ambient = gather(i32, hot, "ambient_sound_time");
     var no_action = gather(i32, hot, "no_action_time");
     var calm_down = gather(i32, hot, "tempt_calm_down");
-    var gazing: Mask = gather(u16, hot, "running") == @as(@Vector(lane_count, u16), @splat(look_around_bit));
+    var gazing: Mask = gather(u16, hot, "running") == @as(@Vector(lane_count, u16), @splat(species.lookAroundBit()));
     var look_around_time: I32 = undefined;
     inline for (0..lane_count) |lane| look_around_time[lane] = hot[lane].look_around.time;
     var cooldown = gather(i32, hot, "look_cooldown");
@@ -405,6 +429,11 @@ pub fn advanceBlock(run: Run, audience: Audience, species: Species) Block {
             if (full[lane] and !calming[lane] and audience.temptsNear(species.which, worlds[lane], positions[lane], species.tempt_range)) rare[lane] = true;
         }
     }
+    // The species' own goal's idle roll, which starts it on a zero.
+    if (species.own_roll) |bound| {
+        const own = boundedIntOf(&seed, full, bound, &rare);
+        rare = rare | (full & (own == zero));
+    }
     const strolling = full & (no_action < @as(I32, @splat(100)));
     const stroll = boundedInt(&seed, strolling, 60, &rare);
     rare = rare | (strolling & (stroll == zero));
@@ -441,6 +470,7 @@ pub fn advanceBlock(run: Run, audience: Audience, species: Species) Block {
     return .{
         .rare = rare,
         .any_rare = @reduce(.Or, rare),
+        .look_around = species.look_around,
         .seed = seed,
         .tick_count = tick_count,
         .ambient_sound_time = ambient,
@@ -465,7 +495,7 @@ pub fn commitLane(hot: *Idle, block: *const Block, lane: usize) void {
     hot.no_action_time = block.no_action_time[lane];
     hot.tempt_calm_down = block.tempt_calm_down[lane];
     hot.navigation_tick +%= 1;
-    setGazing(hot, block.gazing[lane]);
+    setGazing(hot, block.gazing[lane], block.look_around);
     hot.look_around.time = block.look_around_time[lane];
     hot.look_cooldown = block.look_cooldown[lane];
     hot.old_head_yaw = hot.head_yaw;

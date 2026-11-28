@@ -4,7 +4,8 @@
 #
 #   bench/tick/check.sh [--ref REF] [--out DIR] [--rounds N] [--cases a,b,...] [all|digests|oracle|matrix|wire]
 #
-#   digests  Sleeping entities' state matches every tick: with sleep and without, and against REF.
+#   digests  Sleeping entities' state matches every tick: with sleep and without, and against REF;
+#            and idle mobs, sheep among them, as the herd and in full.
 #   oracle   Tracking holds to the brute-force rule every tick (--check-tracking) in mixed scenes.
 #   matrix   Per tick, by alternating rounds: CPU and wall time, and instructions, loads, L1 and
 #            L2 misses when perf can count them. No kind may get slower than REF.
@@ -35,7 +36,7 @@ while [ $# -gt 0 ]; do
         --rounds) rounds=$2; shift 2 ;;
         --cases) only=$2; shift 2 ;;
         all | digests | oracle | matrix | wire) mode=$1; shift ;;
-        -h | --help) sed -n '2,23p' "$0"; exit 0 ;;
+        -h | --help) sed -n '2,22p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -85,6 +86,14 @@ if [ "$mode" = all ] || [ "$mode" = digests ]; then
     against=$(diff "$out/digest-new.txt" "$out/digest-ref.txt" | grep -c '^<' || true)
     say "digests: $lines lines, $awake differ from sleep off, $against differ from $ref"
     if [ "$lines" -eq 0 ] || [ "$awake" -ne 0 ] || [ "$against" -ne 0 ]; then failed=1; fi
+    # Idle mobs of every species that idles, cows and sheep, ticking as the herd and each in
+    # full: the working tree alone, as older refs know no sheep.
+    digests "$new" --sheep=256 > "$out/digest-herd.txt"
+    digests "$new" --sheep=256 --no-herd > "$out/digest-full.txt"
+    herd_lines=$(wc -l < "$out/digest-herd.txt")
+    full=$(diff "$out/digest-herd.txt" "$out/digest-full.txt" | grep -c '^<' || true)
+    say "herd digests: $herd_lines lines with sheep, $full differ from every mob's full tick"
+    if [ "$herd_lines" -eq 0 ] || [ "$full" -ne 0 ]; then failed=1; fi
 fi
 
 # What clients receive, hashed player by player. Without arrows: their volleys fill output, and

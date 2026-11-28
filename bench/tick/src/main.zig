@@ -72,6 +72,9 @@ const Options = struct {
     paced: bool = false,
     /// Cows on a grid around the players, settled before measuring.
     cows: usize = 0,
+    /// Sheep in a field of their own beside the cows', and whether idle mobs tick as the herd.
+    sheep: usize = 0,
+    herd: bool = true,
     /// Blocks between neighbouring cows, and how far east of the players the field's middle is.
     cow_spacing: f64 = 2,
     cow_offset: f64 = 0,
@@ -240,7 +243,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
             lightning_rod.plugin.configured(Players, .{ .maximum = maximum, .render_distance = 8 }),
             lightning_rod.plugin.configured(Chunks, Chunks.Configuration.forPlayers(maximum)),
             lightning_rod.plugin.configured(vanilla.Entities, .{ .memory = if (options.entity_memory) |mib| mib * 1024 * 1024 else 64 * 1024 * 1024 }),
-            lightning_rod.plugin.configured(vanilla.Mobs, .{ .edits = options.mob_edits }),
+            lightning_rod.plugin.configured(vanilla.Mobs, .{ .edits = options.mob_edits, .herd = options.herd }),
             lightning_rod.plugin.configured(vanilla.Projectiles, .{ .sleep = options.sleep }),
             lightning_rod.plugin.configured(vanilla.ProjectileReplication, .{ .trace_sends = options.digest }),
             lightning_rod.plugin.configured(vanilla.ItemEntities, .{ .sleep = !options.no_item_sleep }),
@@ -324,15 +327,18 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     for (0..options.warm) |tick| try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
     const mobs = simulation.get(vanilla.Mobs);
     const cow_species = simulation.get(vanilla.Cow).species;
-    if (options.cows > 0) {
-        // A square field on the flat grass, its middle east of the players at 8, 8 by the offset.
-        const side = std.math.sqrt(options.cows - 1) + 1;
-        for (0..options.cows) |index| {
-            const x = 8.5 + options.cow_offset + options.cow_spacing * (@as(f64, @floatFromInt(index % side)) - @as(f64, @floatFromInt(side / 2)));
-            const z = 8.5 + options.cow_spacing * (@as(f64, @floatFromInt(index / side)) - @as(f64, @floatFromInt(side / 2)));
-            _ = try mobs.spawn(.{ .species = cow_species, .world = spawn_world, .position = .{ x, 65, z }, .yaw = 0 });
-            // Between runs of spawns nothing is held: memory makes room for the next.
-            if (index % 64 == 63) try simulation.get(vanilla.Entities).settle();
+    if (options.cows + options.sheep > 0) {
+        // A square field on the flat grass, its middle east of the players at 8, 8 by the offset,
+        // and the sheep's as large south of it, or in its place where there are no cows.
+        const side = std.math.sqrt(@max(options.cows, options.sheep) -| 1) + 1;
+        for ([_]struct { vanilla.Species, usize, f64 }{ .{ cow_species, options.cows, 0 }, .{ simulation.get(vanilla.Sheep).species, options.sheep, if (options.cows == 0) 0 else options.cow_spacing * @as(f64, @floatFromInt(side)) + 4 } }) |field| {
+            for (0..field[1]) |index| {
+                const x = 8.5 + options.cow_offset + options.cow_spacing * (@as(f64, @floatFromInt(index % side)) - @as(f64, @floatFromInt(side / 2)));
+                const z = 8.5 + field[2] + options.cow_spacing * (@as(f64, @floatFromInt(index / side)) - @as(f64, @floatFromInt(side / 2)));
+                _ = try mobs.spawn(.{ .species = field[0], .world = spawn_world, .position = .{ x, 65, z }, .yaw = 0 });
+                // Between runs of spawns nothing is held: memory makes room for the next.
+                if (index % 64 == 63) try simulation.get(vanilla.Entities).settle();
+            }
         }
         for (0..options.settle) |tick| try advance(simulation, service, handles[0..count], payloads[tick % 2], mode, &packets, &recipients, &tick_time);
         if (options.love) for (0..mobs.active.count) |active_at| {
@@ -487,7 +493,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
     }
     // Cows walk into sections they have not read yet, so only a world without them is steady.
     // Items streaming through caches smaller than they are read on purpose, as are columns streamed.
-    if (!options.stream and options.cows == 0 and options.orbs == 0 and options.volley_interval == 0 and options.drop_edits == 0 and reads != inventories.cache.metrics.reads.value() + inventories.items.metrics.reads.value() + chunks.cache.metrics.reads.value()) return error.UnexpectedSteadyStateReads;
+    if (!options.stream and options.cows + options.sheep == 0 and options.orbs == 0 and options.volley_interval == 0 and options.drop_edits == 0 and reads != inventories.cache.metrics.reads.value() + inventories.items.metrics.reads.value() + chunks.cache.metrics.reads.value()) return error.UnexpectedSteadyStateReads;
     const snapshots = simulation.metrics.snapshot(stages);
     std.mem.sort(u64, cpus, {}, std.sort.asc(u64));
     std.mem.sort(u64, walls, {}, std.sort.asc(u64));
@@ -518,7 +524,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, options: Options, count: usize,
         try writer.print("  tracking logged={d:.1} quiet={d:.1} anchored={d:.2} slack_moves={d:.1} columns={d:.1} measured={d:.1} asked={d:.1} changed={d:.1} near={d:.1} walks={d:.2} boxes={d:.1} exact={d:.2} tiles={d} /tick\n", .{ @as(f64, @floatFromInt(done.logged - was.logged)) / per, @as(f64, @floatFromInt(done.logged_quiet - was.logged_quiet)) / per, @as(f64, @floatFromInt(done.anchored - was.anchored)) / per, @as(f64, @floatFromInt(done.slack_moves - was.slack_moves)) / per, @as(f64, @floatFromInt(done.columns - was.columns)) / per, @as(f64, @floatFromInt(done.measured - was.measured)) / per, @as(f64, @floatFromInt(done.asked - was.asked)) / per, @as(f64, @floatFromInt(done.changed - was.changed)) / per, @as(f64, @floatFromInt(done.near_measured - was.near_measured)) / per, @as(f64, @floatFromInt(done.edge_walks - was.edge_walks)) / per, @as(f64, @floatFromInt(done.boxes - was.boxes)) / per, @as(f64, @floatFromInt(done.exact - was.exact)) / per, done.tiles_made });
     }
     if (options.arrows > 0 or options.flying > 0) try writer.print("  arrows={d} ticking={d} volleys={d} sleeping={d}\n", .{ simulation.get(vanilla.Projectiles).activeCount(), simulation.get(vanilla.Projectiles).tickingCount(), volleys, simulation.get(vanilla.Projectiles).sleepingCount() });
-    if (options.cows > 0) try writer.print("  domain_revision={d} audience_changes={d} cows={d} ticked={d} resting={d} idle_ticks={d} blocks={d} rare_lanes={d} travels_skipped={d} travels_run={d} path_searches={d:.3}/tick edits={d} edit_recomputes={d} edits_answered_early={d} sections_decoded={d}\n", .{ mobs.domain_revision, simulation.get(vanilla.MobReplication).audience_changes, mobs.active.count, ticked, resting, mobs.idle_ticks - idle_before, mobs.idle_blocks - blocks_before, mobs.rare_lanes - rare_before, mobs.travels_skipped - skipped_before, mobs.travels_run - run_before, @as(f64, @floatFromInt(mobs.path_searches - searches_before)) / @as(f64, @floatFromInt(ticks)), edits, mobs.edit_recomputes - recomputes_before, mobs.edits_answered_early, simulation.get(vanilla.Levels).copies.decoded });
+    if (options.cows + options.sheep > 0) try writer.print("  domain_revision={d} audience_changes={d} cows={d} ticked={d} resting={d} idle_ticks={d} blocks={d} rare_lanes={d} travels_skipped={d} travels_run={d} path_searches={d:.3}/tick edits={d} edit_recomputes={d} edits_answered_early={d} sections_decoded={d}\n", .{ mobs.domain_revision, simulation.get(vanilla.MobReplication).audience_changes, mobs.active.count, ticked, resting, mobs.idle_ticks - idle_before, mobs.idle_blocks - blocks_before, mobs.rare_lanes - rare_before, mobs.travels_skipped - skipped_before, mobs.travels_run - run_before, @as(f64, @floatFromInt(mobs.path_searches - searches_before)) / @as(f64, @floatFromInt(ticks)), edits, mobs.edit_recomputes - recomputes_before, mobs.edits_answered_early, simulation.get(vanilla.Levels).copies.decoded });
     if (options.detail) for (snapshots, before[0..snapshots.len]) |after, previous| {
         if (after.kind == .counter) {
             const operations = after.value - previous.value;
@@ -629,6 +635,10 @@ pub fn main(init: std.process.Init) !void {
             options.samples = try std.fmt.parseInt(usize, argument[10..], 10);
         } else if (std.mem.startsWith(u8, argument, "--cows=")) {
             options.cows = try std.fmt.parseInt(usize, argument[7..], 10);
+        } else if (std.mem.startsWith(u8, argument, "--sheep=")) {
+            options.sheep = try std.fmt.parseInt(usize, argument[8..], 10);
+        } else if (std.mem.eql(u8, argument, "--no-herd")) {
+            options.herd = false;
         } else if (std.mem.startsWith(u8, argument, "--cow-spacing=")) {
             options.cow_spacing = try std.fmt.parseFloat(f64, argument[14..]);
         } else if (std.mem.startsWith(u8, argument, "--perf-control=")) {

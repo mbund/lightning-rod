@@ -48,6 +48,9 @@ pub const OwnGoal = struct {
     flags: Flags,
     /// Goal.requiresUpdateEveryTick.
     every_tick: bool = false,
+    /// For idle ticks: its canUse first draws nextInt of this bound and fails unless it is zero,
+    /// reading nothing before, so an idle tick draws the same and wakes the mob on a zero.
+    idle_roll: ?i32 = null,
     can_use: *const fn (context: *anyopaque, mobs: *Mobs, mob: Mob) anyerror!bool,
     can_continue: *const fn (context: *anyopaque, mobs: *Mobs, mob: Mob) anyerror!bool,
     start: *const fn (context: *anyopaque, mobs: *Mobs, mob: Mob) anyerror!void,
@@ -134,7 +137,8 @@ pub const Definition = struct {
     /// scaled with the rest.
     baby_eye_height: ?f32 = null,
     data: []const DataEntry = &.{},
-    /// Whether an idle mob of it ticks as the herd's, which stands for the animal goals alone.
+    /// Whether an idle mob of it ticks as the herd's, which stands for the animal goals, and
+    /// besides them own goals with an idle roll right after following a parent.
     idles: bool = false,
     hooks: Hooks = .{},
 };
@@ -164,6 +168,8 @@ pub const Traits = struct {
     look: u16 = 0,
     jump: u16 = 0,
     every_tick: u16 = 0,
+    /// For idle ticks: the bound of its own goal's idle roll, if it has one.
+    idle_roll: ?i32 = null,
 
     pub fn attribute(self: *const Traits, which: Attribute) f64 {
         return self.attributes[@backingInt(which)];
@@ -208,10 +214,23 @@ fn attributeId(name: []const u8) u16 {
     unreachable;
 }
 
-fn sameGoals(a: []const Goal, b: []const Goal) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |left, right| if (!std.meta.eql(left, right)) return false;
-    return true;
+/// The idle roll of a goal list the herd can stand for: the animal goals in their order, with at
+/// most one own goal between following a parent and strolling, which has an idle roll.
+fn idleRoll(goals: []const Goal) !?i32 {
+    var roll: ?i32 = null;
+    var shared: usize = 0;
+    for (goals) |goal| switch (goal) {
+        .shared => |which| {
+            if (shared == animal_goals.len or animal_goals[shared].shared != which) return error.IdleNeedsAnimalGoals;
+            shared += 1;
+        },
+        .own => |own| {
+            if (roll != null or shared == 0 or animal_goals[shared - 1].shared != .follow_parent) return error.IdleNeedsAnimalGoals;
+            roll = own.idle_roll orelse return error.IdleNeedsAnimalGoals;
+        },
+    };
+    if (shared != animal_goals.len) return error.IdleNeedsAnimalGoals;
+    return roll;
 }
 
 pub fn traits(definition: Definition) !Traits {
@@ -253,7 +272,8 @@ pub fn traits(definition: Definition) !Traits {
         },
         .own => {},
     };
-    // The herd's idle tick draws as the animal goals do, and no other.
-    if (definition.idles and !sameGoals(definition.goals, &animal_goals)) return error.IdleNeedsAnimalGoals;
+    // The herd's idle tick draws as the animal goals do, and the idle rolls of own goals after
+    // following a parent.
+    if (definition.idles) result.idle_roll = try idleRoll(definition.goals);
     return result;
 }

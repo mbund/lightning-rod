@@ -113,6 +113,7 @@ pub const Fluids = @import("vanilla_blocks").fluids.Fluids;
 pub const Buckets = @import("vanilla_blocks").buckets.Buckets;
 pub const ToolActions = @import("vanilla_blocks").tool_actions.ToolActions;
 pub const Mobs = @import("vanilla_mobs").mobs.Mobs;
+pub const Species = @import("vanilla_mobs").mob.Species;
 pub const Cow = @import("vanilla_cow").Cow;
 pub const Sheep = @import("vanilla_sheep").Sheep;
 pub const SleepDebug = @import("vanilla_debug").SleepDebug;

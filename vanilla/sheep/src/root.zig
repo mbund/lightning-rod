@@ -46,7 +46,7 @@ pub const Sheep = struct {
             .species = undefined,
             .climates = try allocator.alloc(Climate, game_data.registry.biome_names.len),
             .edible = try allocator.alloc(bool, game_data.registry.block_state_names.len),
-            .eat_block = .{ .context = self, .flags = .{ .move = true, .look = true, .jump = true }, .can_use = eatCanUse, .can_continue = eatCanContinue, .start = eatStart, .stop = eatStop, .tick = eatTick },
+            .eat_block = .{ .context = self, .flags = .{ .move = true, .look = true, .jump = true }, .idle_roll = 1000, .can_use = eatCanUse, .can_continue = eatCanContinue, .start = eatStart, .stop = eatStop, .tick = eatTick },
             .shears = @intCast(game_data.registry.itemId("minecraft:shears").?),
             .grass_block = @intCast(game_data.registry.blockStateId("minecraft:grass_block[snowy=false]").?),
             .dirt = @intCast(game_data.registry.blockStateId("minecraft:dirt").?),
@@ -120,6 +120,8 @@ const sheep: species_data.Definition = .{
     .sounds = .{ .ambient = "minecraft:entity.sheep.ambient", .hurt = "minecraft:entity.sheep.hurt", .death = "minecraft:entity.sheep.death", .step = "minecraft:entity.sheep.step" },
     // Sheep.DATA_WOOL_ID.
     .data = &.{.{ .key = 17, .modern_key = 18, .serializer = .byte, .kin = 0 }},
+    // Only grown sheep idle, whose EatBlockGoal draws one in a thousand.
+    .idles = true,
     .hooks = .{ .finalize = finalize, .offspring = offspring, .ate = ate, .interact = interact, .use_item = useItem, .facts = facts },
 };
 
@@ -394,4 +396,23 @@ test "dye items name their colours" {
 comptime {
     // A plugin compiles only where referenced, so its tests reference it.
     _ = &Sheep.init;
+}
+
+test "wool keeps its colour in the low bits and shearing in the fifth, as DATA_WOOL_ID" {
+    var state: mob_state.MobState = .{
+        .idle = .{ .random = JavaRandom.init(1) },
+        .motion = .{ .world = 0, .position = .{ 0, 0, 0 }, .old_position = .{ 0, 0, 0 } },
+        .entity = .{ .id = 1, .uuid = 1, .species = @enumFromInt(0) },
+        .living = .{ .health = 8 },
+        .kin = .{ .bytes = .{ @backingInt(Color.lime) | Wool.sheared_bit, 0, 0, 0 } },
+    };
+    const mob = Mob.of(&state);
+    try std.testing.expectEqual(Color.lime, Wool.color(mob));
+    try std.testing.expect(Wool.sheared(mob));
+    // What the loot tables see of it.
+    const answers = woolFacts(mob.kin);
+    try std.testing.expectEqualStrings("lime", answers.component(answers.context, "minecraft:sheep/color").?.text);
+    try std.testing.expect(answers.field(answers.context, "sheared").?.boolean);
+    try std.testing.expect(answers.is(answers.context, "minecraft:sheep"));
+    try std.testing.expect(!answers.is(answers.context, "minecraft:cow"));
 }

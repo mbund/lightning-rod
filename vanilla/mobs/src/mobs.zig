@@ -105,6 +105,9 @@ pub const Mobs = struct {
         /// collision. When they fill, the paths answer them at once.
         edits: u32 = 16384,
         seed: u64 = 0x6d6f6273,
+        /// Idle mobs tick as the herd's, counters and draws over their idle group alone; off, every
+        /// one takes its full tick, which checks of the herd compare against.
+        herd: bool = true,
     };
 
     pub const Dependencies = struct {
@@ -698,7 +701,7 @@ pub const Mobs = struct {
         try self.wakeTouched();
         const audience = self.noteAudience();
         self.context = .{ .audience = audience };
-        for (self.allSpecies(), 0..) |known, index| self.context.species[index] = .{ .which = @fromBackingInt(@intCast(index)), .tempt_range = known.attribute(.tempt_range), .eye_height = known.eye_height, .ambient_interval = known.ambient_interval };
+        for (self.allSpecies(), 0..) |known, index| self.context.species[index] = .{ .which = @fromBackingInt(@intCast(index)), .tempt_range = known.attribute(.tempt_range), .eye_height = known.eye_height, .ambient_interval = known.ambient_interval, .look_around = known.shared[@backingInt(species_data.Shared.look_around)] orelse 0, .own_roll = known.idle_roll };
     }
 
     /// A mob's pushEntities finds the players its box meets, and each pushes it, which one
