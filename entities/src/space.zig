@@ -207,7 +207,70 @@ pub const Run = struct {
     /// The column's next run.
     next: u32 = none,
     revision: u64 = 0,
+    /// Its cells' index among the space's `cell_heads` while it has them, none otherwise: a
+    /// crowded run a lookup reads makes them, and keeps them while lookups keep reading it.
+    cells: u32 = none,
+    /// The widest half width of its entities since it made its cells: how far from its cell an
+    /// entity's box may reach.
+    max_half: f32 = 0,
+    /// The lookup round it was last read in, and its place in the space's list of runs with cells.
+    looked: u64 = 0,
+    celled_at: u32 = none,
 };
+
+/// Blocks a side of the cells a crowded run also keeps its entities in, by where their feet are,
+/// so a lookup there reads those near what it asks rather than all of them.
+pub const cell_side = 1;
+const cells_across = 16 / cell_side;
+pub const column_cells = cells_across * cells_across;
+/// Entities a run holds past which a lookup reading it makes its cells, by default: `Space.crowded`.
+/// It lets them go below half as many, so one about the line does not make them again and again.
+pub const crowded_default = block_rows;
+
+/// A crowded run's cells: the first spot of each cell's entities, by `cellIn`, each linked to the
+/// next by its `next`, in no order.
+pub const CellHeads = struct { heads: [column_cells]u32 = @splat(none) };
+
+/// All a lookup reads of an entity of a run with cells, in one cache line: where it is, what it
+/// is and how big, when it came into its section, its slot, and its neighbours in its cell's list.
+/// Its block holds the same, and every change to one is made to the other.
+pub const Spot = extern struct {
+    x: f64,
+    y: f64,
+    z: f64,
+    id: Id,
+    entered: u64,
+    slot: u32,
+    kind: u32,
+    half_width: f32,
+    height: f32,
+    next: u32 = none,
+    previous: u32 = none,
+
+    fn position(self: *const Spot) [3]f64 {
+        return .{ self.x, self.y, self.z };
+    }
+};
+
+comptime {
+    assert(@sizeOf(Spot) == 64);
+}
+
+/// The cell of a column a position's feet are in.
+fn cellIn(position: [3]f64) usize {
+    const x: usize = @intCast(@as(i32, @intFromFloat(@floor(position[0]))) & 15);
+    const z: usize = @intCast(@as(i32, @intFromFloat(@floor(position[2]))) & 15);
+    return x / cell_side + z / cell_side * cells_across;
+}
+
+/// The cells along one axis of a column a range reaches, the range from the column's edge, or
+/// null where it misses the column.
+fn cellSpan(low: f64, high: f64) ?[2]usize {
+    if (!(high >= 0) or !(low < 16)) return null;
+    const from: usize = if (low <= 0) 0 else @intFromFloat(@floor(low));
+    const to: usize = if (high >= 15) 15 else @intFromFloat(@floor(high));
+    return .{ from / cell_side, to / cell_side };
+}
 
 /// A column holding entities, boxes or ticking: its runs, how many it holds, and its revision.
 pub const ColumnData = struct {
@@ -402,6 +465,21 @@ pub const Space = struct {
     box_of: []u32,
     /// Each slot's rest, for a placed entity resting until a tick.
     rest_of: []u32,
+    /// Each slot's spot while its run has cells, none otherwise.
+    spot_of: []u32,
+    /// The spots of the entities of runs with cells, those runs' cells, and the runs, listed for
+    /// the sweep that lets go of cells no lookup read.
+    spots: extras.Records(Spot),
+    cell_heads: extras.Records(CellHeads),
+    celled: Array(u32),
+    /// Lookups since the last sweep are of this round.
+    lookup_round: u64 = 1,
+    /// Entities a run holds past which a lookup makes its cells, and half as many below which it
+    /// lets them go.
+    crowded: u32 = crowded_default,
+    /// Whether lookups read the cells of crowded runs. Off, they read every block, as a check
+    /// that both meet the same.
+    read_cells: bool = true,
     rest_count: usize = 0,
     /// Columns emptied this tick, let go at its end.
     emptied: Array(u32),
@@ -435,6 +513,10 @@ pub const Space = struct {
             .wheels = undefined,
             .box_of = try allocator.alloc(u32, directory.capacity()),
             .rest_of = try allocator.alloc(u32, directory.capacity()),
+            .spot_of = try allocator.alloc(u32, directory.capacity()),
+            .spots = try .init(allocator, pool),
+            .cell_heads = try .init(allocator, pool),
+            .celled = try .init(allocator, pool),
             .emptied = try .init(allocator, pool),
             .found = undefined,
         };
@@ -446,7 +528,126 @@ pub const Space = struct {
         @memset(self.mover_noted, 0);
         @memset(self.box_of, none);
         @memset(self.rest_of, none);
+        @memset(self.spot_of, none);
         return self;
+    }
+
+    // Cells.
+
+    /// A spot joins the list of a cell of its run.
+    fn join(self: *Space, run: *const Run, spot: u32, cell: usize) void {
+        const head = &self.cell_heads.at(run.cells).heads[cell];
+        const joining = self.spots.at(spot);
+        joining.next = head.*;
+        joining.previous = none;
+        if (head.* != none) self.spots.at(head.*).previous = spot;
+        head.* = spot;
+    }
+
+    /// A spot leaves the list of the cell of its run it is in.
+    fn leave(self: *Space, run: *const Run, spot: u32, cell: usize) void {
+        const leaving = self.spots.at(spot);
+        if (leaving.previous != none) {
+            self.spots.at(leaving.previous).next = leaving.next;
+        } else {
+            const head = &self.cell_heads.at(run.cells).heads[cell];
+            assert(head.* == spot);
+            head.* = leaving.next;
+        }
+        if (leaving.next != none) self.spots.at(leaving.next).previous = leaving.previous;
+    }
+
+    /// The entity in a block's row of a run with cells takes a spot in the cell its feet are in.
+    /// Without room for it, the run lets its cells go, and lookups read its blocks.
+    fn cellLink(self: *Space, run_index: u32, block: *const Block, row: u32) void {
+        const run = self.runs.at(run_index);
+        if (run.cells == none) return;
+        const slot = block.slot[row];
+        const spot = self.spots.add(.{
+            .x = block.x[row],
+            .y = block.y[row],
+            .z = block.z[row],
+            .id = block.id[row],
+            .entered = block.entered[row],
+            .slot = slot,
+            .kind = run.kind,
+            .half_width = block.half_width[row],
+            .height = block.height[row],
+        }) catch return self.dropCells(run_index);
+        self.spot_of[slot] = spot;
+        run.max_half = @max(run.max_half, block.half_width[row]);
+        self.join(run, spot, cellIn(block.position(row)));
+    }
+
+    /// A slot leaves its spot, as it leaves its run.
+    fn cellUnlink(self: *Space, run: *const Run, slot: u32) void {
+        const spot = self.spot_of[slot];
+        if (spot == none) return;
+        self.leave(run, spot, cellIn(self.spots.at(spot).position()));
+        self.spots.remove(spot);
+        self.spot_of[slot] = none;
+    }
+
+    /// A crowded run a lookup reads makes its cells from its blocks. Without room for them,
+    /// lookups read its blocks as before.
+    fn makeCells(self: *Space, run_index: u32) void {
+        const cells = self.cell_heads.add(.{}) catch return;
+        const listed = self.celled.append(run_index) catch {
+            self.cell_heads.remove(cells);
+            return;
+        };
+        const run = self.runs.at(run_index);
+        run.cells = cells;
+        run.celled_at = @intCast(listed);
+        run.max_half = 0;
+        var at = run.first;
+        while (at != none) {
+            const block = self.blocks.at(at);
+            for (0..block.count) |row| {
+                self.cellLink(run_index, block, @intCast(row));
+                if (run.cells == none) return;
+            }
+            at = block.next;
+        }
+    }
+
+    /// A run no longer crowded, or no longer read, lets its cells go, and each of its entities its
+    /// spot.
+    fn dropCells(self: *Space, run_index: u32) void {
+        const run = self.runs.at(run_index);
+        if (run.cells == none) return;
+        var at = run.first;
+        while (at != none) {
+            const block = self.blocks.at(at);
+            for (block.slot[0..block.count]) |slot| {
+                const spot = self.spot_of[slot];
+                if (spot == none) continue;
+                self.spots.remove(spot);
+                self.spot_of[slot] = none;
+            }
+            at = block.next;
+        }
+        self.cell_heads.remove(run.cells);
+        run.cells = none;
+        // The last run listed takes its place in the list.
+        const last = self.celled.at(self.celled.len - 1).*;
+        self.celled.at(run.celled_at).* = last;
+        self.runs.at(last).celled_at = run.celled_at;
+        self.celled.len -= 1;
+        run.celled_at = none;
+    }
+
+    /// Once a tick: runs no lookup read since the last sweep let their cells go, so only runs that
+    /// are looked into pay to keep them as their entities move.
+    fn sweepCells(self: *Space) void {
+        // From the end, as a run letting go moves the last listed into its place.
+        var at = self.celled.len;
+        while (at > 0) {
+            at -= 1;
+            const run_index = self.celled.at(at).*;
+            if (self.runs.at(run_index).looked != self.lookup_round) self.dropCells(run_index);
+        }
+        self.lookup_round += 1;
     }
 
     /// How many of some kinds are placed.
@@ -639,6 +840,7 @@ pub const Space = struct {
 
     /// The columns emptied this tick that are empty still are let go.
     pub fn releaseEmptied(self: *Space) void {
+        self.sweepCells();
         for (0..self.emptied.len) |at| {
             const index = self.emptied.at(at).*;
             self.columns.at(index).emptied = false;
@@ -876,6 +1078,8 @@ pub const Space = struct {
 
     /// A run with nothing left goes, and the column says a kind went.
     fn dropRun(self: *Space, index: u32, dropped: u32) void {
+        // Its cells go with it.
+        self.dropCells(dropped);
         const held = self.columns.at(index);
         const kind = self.runs.at(dropped).kind;
         if (self.indexed[kind] != no_index) self.tiles.at(held.tile).kind_masks[self.indexed[kind]] &= ~tileBit(held.column);
@@ -948,6 +1152,7 @@ pub const Space = struct {
         entry.space_column = index;
         entry.space_block = run.last;
         entry.space_row = @intCast(row);
+        self.cellLink(run_index, block, @intCast(row));
         const held = self.columns.at(index);
         held.count += 1;
         run.count += 1;
@@ -1064,6 +1269,7 @@ pub const Space = struct {
         const run_index = hole.run;
         const run = self.runs.at(run_index);
         self.kind_placed[run.kind] -= 1;
+        self.cellUnlink(run, slot);
         // The run's last entity fills the hole.
         const last = self.blocks.at(run.last);
         const last_row = last.count - 1;
@@ -1090,6 +1296,7 @@ pub const Space = struct {
         entry.space_column = none;
         held.count -= 1;
         run.count -= 1;
+        if (run.cells != none and run.count * 2 < self.crowded) self.dropCells(run_index);
         self.placed -= 1;
         self.changed(held, run);
         if (run.count == 0) self.dropRun(index, run_index);
@@ -1122,6 +1329,22 @@ pub const Space = struct {
             block.x[row] = position[0];
             block.y[row] = position[1];
             block.z[row] = position[2];
+            // Its spot moves with it, into another cell's list if it came into another cell.
+            const spot = self.spot_of[slot];
+            if (spot != none) {
+                const moved = self.spots.at(spot);
+                const from = cellIn(moved.position());
+                moved.x = position[0];
+                moved.y = position[1];
+                moved.z = position[2];
+                moved.entered = block.entered[row];
+                const to = cellIn(position);
+                if (from != to) {
+                    const run = self.runs.at(block.run);
+                    self.leave(run, spot, from);
+                    self.join(run, spot, to);
+                }
+            }
             self.changed(held, self.runs.at(block.run));
             self.fill(at, slot, .moved);
             self.noteMover(slot);
@@ -1143,7 +1366,14 @@ pub const Space = struct {
         assert(self.runs.at(block.run).kind == shape.kind);
         block.half_width[entry.space_row] = shape.half_width;
         block.height[entry.space_row] = shape.height;
-        self.changed(self.columns.at(entry.space_column), self.runs.at(block.run));
+        const run = self.runs.at(block.run);
+        const spot = self.spot_of[block.slot[entry.space_row]];
+        if (spot != none) {
+            self.spots.at(spot).half_width = shape.half_width;
+            self.spots.at(spot).height = shape.height;
+            run.max_half = @max(run.max_half, shape.half_width);
+        }
+        self.changed(self.columns.at(entry.space_column), run);
         self.noteMover(block.slot[entry.space_row]);
     }
 
@@ -1802,8 +2032,22 @@ pub const Space = struct {
                     const held = self.columns.at(index);
                     if (held.folded & folded == 0) continue;
                     const start = found_count;
-                    var runs = self.runsAt(index, kinds);
-                    while (runs.next()) |run| {
+                    var run_at = held.first_run;
+                    while (run_at != none) {
+                        const run_index = run_at;
+                        const run = self.runs.at(run_index);
+                        run_at = run.next;
+                        if (!kinds.has(run.kind)) continue;
+                        // A crowded run is read by the cells the query may meet entities from, made the
+                        // first time a lookup reads it crowded.
+                        if (self.read_cells and run.count > self.crowded) {
+                            if (run.cells == none) self.makeCells(run_index);
+                            if (run.cells != none) {
+                                run.looked = self.lookup_round;
+                                found_count = try self.findInCells(found, found_count, held, run, query, .{ first[1], last[1] });
+                                continue;
+                            }
+                        }
                         var at = run.first;
                         while (at != none) {
                             const block = self.blocks.at(at);
@@ -1829,6 +2073,48 @@ pub const Space = struct {
             }
         }
         for (0..found_count) |at| if (try visit(context, found.at(at).*)) return;
+    }
+
+    /// The entities of a crowded run whose boxes meet a query, and whose sections are within
+    /// `sections`, found from the cells their feet may be in: an entity's box reaches no further
+    /// from its feet than the run's widest half width. The same entities reading all its blocks
+    /// finds, in another order, which `sortFound` then gives.
+    fn findInCells(self: *Space, found: *Array(Entry), start: usize, held: *const ColumnData, run: *const Run, query: Box, sections: [2]i32) !usize {
+        // A thousandth of a block more, so rounding never leaves out a cell an entity is in.
+        const reach: f64 = @as(f64, run.max_half) + 0.001;
+        const base_x: f64 = @floatFromInt(@as(i64, held.column.x) * 16);
+        const base_z: f64 = @floatFromInt(@as(i64, held.column.z) * 16);
+        const xs = cellSpan(query.min[0] - reach - base_x, query.max[0] + reach - base_x) orelse return start;
+        const zs = cellSpan(query.min[2] - reach - base_z, query.max[2] + reach - base_z) orelse return start;
+        var total = start;
+        const heads = &self.cell_heads.at(run.cells).heads;
+        for (zs[0]..zs[1] + 1) |cz| for (xs[0]..xs[1] + 1) |cx| {
+            // Each entity a line: all that is tested, and all an entry is made of.
+            var at = heads[cx + cz * cells_across];
+            while (at != none) {
+                const spot = self.spots.at(at);
+                at = spot.next;
+                const section = coordinate(spot.y);
+                if (section < sections[0] or section > sections[1]) continue;
+                const half: f64 = spot.half_width;
+                const box_of_spot: Box = .{
+                    .min = .{ spot.x - half, spot.y, spot.z - half },
+                    .max = .{ spot.x + half, spot.y + spot.height, spot.z + half },
+                };
+                if (!box_of_spot.intersects(query)) continue;
+                try found.ensure(total + 1);
+                found.at(total).* = .{
+                    .id = spot.id,
+                    .slot = spot.slot,
+                    .section = section,
+                    .entered = spot.entered,
+                    .position = spot.position(),
+                    .shape = .{ .kind = spot.kind, .half_width = spot.half_width, .height = spot.height },
+                };
+                total += 1;
+            }
+        };
+        return total;
     }
 
     /// A column's finds in order: in place where they share a page, as most do.
@@ -1895,6 +2181,81 @@ fn collectOf(space: *Space, query: Box, kinds: Kinds, output: []Id) ![]Id {
 
 fn collect(space: *Space, query: Box, output: []Id) ![]Id {
     return collectOf(space, query, .all, output);
+}
+
+/// Each entry a lookup meets, whole, in order.
+fn entriesOf(space: *Space, query: Box, kinds: Kinds, output: []Entry) ![]Entry {
+    var state: struct { output: []Entry, count: usize = 0 } = .{ .output = output };
+    try space.each(0, query, kinds, &state, struct {
+        fn visit(s: *@TypeOf(state), entry: Entry) anyerror!bool {
+            s.output[s.count] = entry;
+            s.count += 1;
+            return false;
+        }
+    }.visit);
+    return output[0..state.count];
+}
+
+test "crowded runs read by their cells meet what reading every block meets, in its order" {
+    // Every run read with cells, those past a few, and those past the default: runs make their
+    // cells as lookups read them and let them go as entities come, go and move, and as a round
+    // passes that read them not.
+    for ([_]u32{ 0, 8, crowded_default }) |threshold| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var fixture: Fixture = undefined;
+        try fixture.init(arena.allocator());
+        const space = &fixture.space;
+        space.crowded = threshold;
+        var prng = std.Random.DefaultPrng.init(0x63656c6c + threshold);
+        const random = prng.random();
+        // Cows, pigs, and a kind wider than a cell's edge is from its feet, about columns either
+        // side of zero, over two sections.
+        const wide: Shape = .{ .kind = 3, .half_width = 1.5, .height = 2 };
+        const shapes = [_]Shape{ cow, pig, wide };
+        const Place = struct {
+            fn anywhere(r: std.Random) [3]f64 {
+                return .{ r.float(f64) * 56 - 20, 60 + r.float(f64) * 8, r.float(f64) * 56 - 20 };
+            }
+        };
+        const count = 900;
+        for (0..count) |entity| try fixture.insertAs(entity + 1, Place.anywhere(random), shapes[entity % shapes.len]);
+        var cells: [4096]Entry = undefined;
+        var blocks: [4096]Entry = undefined;
+        for (0..6) |round| {
+            for (0..200) |_| {
+                const at = Place.anywhere(random);
+                const size: [3]f64 = .{ random.float(f64) * 6, random.float(f64) * 4, random.float(f64) * 6 };
+                const query: Box = .{ .min = at, .max = .{ at[0] + size[0], at[1] + size[1], at[2] + size[2] } };
+                const kinds: Kinds = if (random.boolean()) .all else .of(&.{shapes[random.uintLessThan(usize, shapes.len)].kind});
+                space.read_cells = true;
+                const by_cells = try entriesOf(space, query, kinds, &cells);
+                space.read_cells = false;
+                const by_blocks = try entriesOf(space, query, kinds, &blocks);
+                try testing.expectEqualSlices(Entry, by_blocks, by_cells);
+            }
+            // Each moves a little, across cells and columns, and some go and come back elsewhere,
+            // or, every other round, go for good.
+            for (0..count) |entity| {
+                const id: Id = entity + 1;
+                const placed = space.get(id) orelse continue;
+                if (random.uintLessThan(usize, 10) == 0) {
+                    space.remove(id);
+                    if (round % 2 == 0) try space.insert(id, 0, Place.anywhere(random), placed.shape);
+                    continue;
+                }
+                // Some grow or shrink, as babies grow up, keeping their kind.
+                if (random.uintLessThan(usize, 20) == 0) {
+                    space.reshape(id, .{ .kind = placed.shape.kind, .half_width = 0.2 + random.float(f32) * 1.3, .height = 0.5 + random.float(f32) * 1.5 });
+                }
+                const step: [3]f64 = .{ random.float(f64) * 4 - 2, random.float(f64) * 2 - 1, random.float(f64) * 4 - 2 };
+                try space.move(placed.slot, 0, .{ placed.position[0] + step[0], placed.position[1] + step[1], placed.position[2] + step[2] });
+            }
+            space.releaseEmptied();
+        }
+        // Only crowded runs kept cells.
+        if (threshold == crowded_default) try testing.expect(space.cell_heads.count < space.runs.count);
+    }
 }
 
 test "lookups meet entities in vanilla's order and pass over what does not meet" {
