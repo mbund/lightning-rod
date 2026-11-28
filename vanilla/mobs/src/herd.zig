@@ -86,7 +86,7 @@ pub const Audience = struct {
 
     /// Whether a holder is close enough that TemptGoal must look properly: within its 10
     /// blocks, before sneaking narrows that.
-    fn temptsNear(self: Audience, world: u32, position: [3]f64, range: f64) bool {
+    pub fn temptsNear(self: Audience, world: u32, position: [3]f64, range: f64) bool {
         for (self.holding_food) |player| {
             if (player.world != world) continue;
             const dx = position[0] - player.position[0];

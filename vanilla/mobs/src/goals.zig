@@ -361,7 +361,10 @@ fn temptCanUse(mobs: *Mobs, mob: Mob) !bool {
         return false;
     }
     const range = mobs.traits(mob.entity.species).attribute(.tempt_range);
-    const found = try senses.nearestPlayer(mobs, mob, .{ .range = range, .line_of_sight = false, .holding_food = true }, mob.motion.position);
+    // A player it may follow holds its food as the tick began and is within reach, which sneaking
+    // only narrows: with none such near, every player fails the conditions.
+    const near = mobs.context.audience.temptsNear(mob.motion.world, mob.motion.position, @max(range, 2.0));
+    const found = if (near) try senses.nearestPlayer(mobs, mob, .{ .range = range, .line_of_sight = false, .holding_food = true }, mob.motion.position) else null;
     // Asked again while it runs, the player it follows is the one found; it stops on none.
     const focus = mob.part(.focus);
     if (focus != null and focus.?.* == .tempt) {
