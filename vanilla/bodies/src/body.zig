@@ -409,30 +409,7 @@ pub const Level = struct {
     /// the one nearest it once each is moved by a hash of the zoom seed, as vanilla blends biome
     /// borders. Null for a level held in memory, or a section stored without biomes.
     pub fn biome(self: *const Level, position: [3]i32) !?u16 {
-        const shifted: [3]i32 = .{ position[0] - 2, position[1] - 2, position[2] - 2 };
-        var base: [3]i32 = undefined;
-        var fraction: [3]f64 = undefined;
-        for (0..3) |axis| {
-            base[axis] = shifted[axis] >> 2;
-            fraction[axis] = @as(f64, @floatFromInt(shifted[axis] & 3)) / 4.0;
-        }
-        var nearest: [3]i32 = base;
-        var best = std.math.inf(f64);
-        for (0..8) |corner| {
-            const far = [3]bool{ corner & 4 != 0, corner & 2 != 0, corner & 1 != 0 };
-            var cell: [3]i32 = undefined;
-            var offset: [3]f64 = undefined;
-            for (0..3) |axis| {
-                cell[axis] = if (far[axis]) base[axis] + 1 else base[axis];
-                offset[axis] = if (far[axis]) fraction[axis] - 1.0 else fraction[axis];
-            }
-            const distance = fiddledDistance(self.biome_zoom_seed, cell, offset);
-            if (best > distance) {
-                nearest = cell;
-                best = distance;
-            }
-        }
-        return self.noiseBiome(nearest);
+        return self.noiseBiome(zoomedCell(self.biome_zoom_seed, position));
     }
 
     /// ChunkAccess.getNoiseBiome: the biome cell at quart coordinates, its height kept within the
@@ -448,6 +425,35 @@ pub const Level = struct {
         return game_data.physics.get(try self.state(x, y, z));
     }
 };
+
+/// BiomeManager.getBiome's choice: of the eight biome cells around a block, in quart coordinates,
+/// the one nearest it once each is moved by a hash of the zoom seed, the first of equals.
+pub fn zoomedCell(seed: i64, position: [3]i32) [3]i32 {
+    const shifted: [3]i32 = .{ position[0] - 2, position[1] - 2, position[2] - 2 };
+    var base: [3]i32 = undefined;
+    var fraction: [3]f64 = undefined;
+    for (0..3) |axis| {
+        base[axis] = shifted[axis] >> 2;
+        fraction[axis] = @as(f64, @floatFromInt(shifted[axis] & 3)) / 4.0;
+    }
+    var nearest: [3]i32 = base;
+    var best = std.math.inf(f64);
+    for (0..8) |corner| {
+        const far = [3]bool{ corner & 4 != 0, corner & 2 != 0, corner & 1 != 0 };
+        var cell: [3]i32 = undefined;
+        var offset: [3]f64 = undefined;
+        for (0..3) |axis| {
+            cell[axis] = if (far[axis]) base[axis] + 1 else base[axis];
+            offset[axis] = if (far[axis]) fraction[axis] - 1.0 else fraction[axis];
+        }
+        const distance = fiddledDistance(seed, cell, offset);
+        if (best > distance) {
+            nearest = cell;
+            best = distance;
+        }
+    }
+    return nearest;
+}
 
 /// BiomeManager.getFiddledDistance: how far a cell's corner, moved by its hash, is from the block.
 fn fiddledDistance(seed: i64, cell: [3]i32, offset: [3]f64) f64 {

@@ -279,3 +279,56 @@ test "sheep drop wool of their colour unless shorn, and shearing gives one to th
         try std.testing.expectEqual(@as(usize, 0), (try shearing.evaluate(&.{ .items = deps.items, .entity_facts = sheep.woolFacts(&red_shorn), .random = prng.random(), .scratch = &scratch }, &buffer)).len);
     }
 }
+
+test "lambs take what their parents' dyes craft, else either colour by the level's random" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const deps = try defaults.prepare(arena.allocator());
+    const sheep = @import("vanilla_sheep");
+    const Color = sheep.Color;
+    const JavaRandom = @import("vanilla_mobs").java_random.JavaRandom;
+    // The two-dye shapeless recipes of 1.21.8, either way round.
+    const crafted = [_]struct { Color, Color, Color }{
+        .{ .blue, .red, .purple },        .{ .red, .white, .pink },        .{ .red, .yellow, .orange },
+        .{ .purple, .pink, .magenta },    .{ .green, .white, .lime },      .{ .gray, .white, .light_gray },
+        .{ .blue, .white, .light_blue },  .{ .black, .white, .gray },      .{ .blue, .green, .cyan },
+    };
+    var random = JavaRandom.init(11);
+    for (0..16) |a| for (0..16) |b| {
+        const first: Color = @enumFromInt(a);
+        const second: Color = @enumFromInt(b);
+        const expected: ?Color = for (crafted) |recipe| {
+            if ((recipe[0] == first and recipe[1] == second) or (recipe[0] == second and recipe[1] == first)) break recipe[2];
+        } else null;
+        const before = random.state();
+        const mixed = sheep.mixedColor(&deps.crafting.table, first, second, &random);
+        if (expected) |color| {
+            try std.testing.expectEqual(color, mixed);
+            // A recipe draws nothing.
+            try std.testing.expectEqual(before, random.state());
+        } else {
+            try std.testing.expect(mixed == first or mixed == second);
+            var once = JavaRandom.restore(before);
+            _ = once.nextBoolean();
+            try std.testing.expectEqual(once.state(), random.state());
+        }
+    };
+}
+
+/// Which biome cell vanilla's BiomeManager.getBiome reads for random blocks under four seeds,
+/// printed by BiomeOracle.java from the 1.21.8 jar.
+const golden_biomes = @embedFile("testdata/biomes.txt");
+
+test "biome lookups blend cells as vanilla's BiomeManager does" {
+    var lines = std.mem.tokenizeScalar(u8, golden_biomes, '\n');
+    var count: usize = 0;
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        const seed = try std.fmt.parseInt(i64, fields.next().?, 10);
+        var values: [6]i32 = undefined;
+        for (&values) |*value| value.* = try std.fmt.parseInt(i32, fields.next().?, 10);
+        try std.testing.expectEqual([3]i32{ values[3], values[4], values[5] }, body.zoomedCell(seed, values[0..3].*));
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 8000), count);
+}
