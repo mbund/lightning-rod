@@ -119,7 +119,8 @@ pub fn decode(allocator: std.mem.Allocator, scratch: std.mem.Allocator, resource
         const resource = resources.entries[index];
         const name = try resourceName(allocator, resource.name, "loot_table");
         const path = name[std.mem.indexOfScalar(u8, name, ':').? + 1 ..];
-        const entity_table = std.mem.startsWith(u8, path, "entities/");
+        // Tables entities drop from, on death or shearing, as the mobs here have them.
+        const entity_table = std.mem.startsWith(u8, path, "entities/") or std.mem.startsWith(u8, path, "shearing/");
         if (options.baseline and !std.mem.startsWith(u8, path, "blocks/") and !entity_table) continue;
         loot_compiler.format = try Format.select(resource.format);
         const table = loot_compiler.decode(resource.bytes) catch |err| switch (err) {

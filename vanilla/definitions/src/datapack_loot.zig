@@ -151,7 +151,8 @@ pub const Compiler = struct {
             if (std.mem.eql(u8, entity, "direct_attacker")) return .{ .attacker_enchanted = try self.mainHandEnchantmentTag(predicate) };
             if (!std.mem.eql(u8, entity, "this")) return error.UnsupportedLootPredicate;
             if (predicate.object.count() == 0) return .entity;
-            // The one entity predicate entity tables here use: whether the entity burns.
+            if (field(predicate, "type_specific") != null or field(predicate, "components") != null) return .{ .entity_properties = try self.entityPredicate(predicate) };
+            // The other entity predicate entity tables here use: whether the entity burns.
             const flags = field(predicate, "flags") orelse return error.UnsupportedLootPredicate;
             if (predicate.object.count() != 1 or flags != .object or flags.object.count() != 1) return error.UnsupportedLootPredicate;
             if (field(flags, "is_on_fire") == null) return error.UnsupportedLootPredicate;
@@ -169,6 +170,42 @@ pub const Compiler = struct {
         if (try self.extension(json, .condition)) |binding| return .{ .custom = binding.condition };
         return error.UnsupportedLootCondition;
     }
+    /// EntityPredicate by its components and type_specific, each a list of names and the text or
+    /// truth of each, as {"components":{"minecraft:sheep/color":"white"}} and
+    /// {"type_specific":{"type":"minecraft:sheep","sheared":false}} have it.
+    fn entityPredicate(self: *Compiler, predicate: std.json.Value) !loot.EntityPredicate {
+        var result: loot.EntityPredicate = .{};
+        var known: usize = 0;
+        if (field(predicate, "components")) |components| {
+            known += 1;
+            if (components != .object) return error.UnsupportedLootPredicate;
+            result.components = try self.plainProperties(components, null);
+        }
+        if (field(predicate, "type_specific")) |specific| {
+            known += 1;
+            if (specific != .object) return error.UnsupportedLootPredicate;
+            result.type_specific = .{ .entity_type = try self.allocator.dupe(u8, try text(specific, "type")), .fields = try self.plainProperties(specific, "type") };
+        }
+        if (predicate.object.count() != known) return error.UnsupportedLootPredicate;
+        return result;
+    }
+
+    /// An object's names and their plain values, but the one named `skip`.
+    fn plainProperties(self: *Compiler, object: std.json.Value, skip: ?[]const u8) ![]const loot.Property {
+        var result: std.ArrayList(loot.Property) = .empty;
+        var each = object.object.iterator();
+        while (each.next()) |entry| {
+            if (skip) |name| if (std.mem.eql(u8, entry.key_ptr.*, name)) continue;
+            const value: loot.Fact = switch (entry.value_ptr.*) {
+                .string => |string| .{ .text = try self.allocator.dupe(u8, string) },
+                .bool => |truth| .{ .boolean = truth },
+                else => return error.UnsupportedLootPredicate,
+            };
+            try result.append(self.allocator, .{ .name = try self.allocator.dupe(u8, entry.key_ptr.*), .value = value });
+        }
+        return result.toOwnedSlice(self.allocator);
+    }
+
     /// The one attacker predicate entity tables here use: an enchantment of a tag on the main hand,
     /// as {"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#tag"}]}}}}.
     fn mainHandEnchantmentTag(self: *Compiler, predicate: std.json.Value) ![]const u8 {

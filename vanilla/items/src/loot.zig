@@ -30,8 +30,59 @@ pub const Context = struct {
     attacker_weapon: ?item_data.View = null,
     smelter: ?Smelter = null,
     enchantment_tags: ?EnchantmentTags = null,
+    /// What entity_properties may ask of the entity the table drops for, as its kind answers.
+    entity_facts: ?EntityFacts = null,
     random: std.Random,
     scratch: *std.heap.FixedBufferAllocator,
+};
+
+/// A value entity_properties compares: a component's or a field's, as the datapack writes it.
+pub const Fact = union(enum) {
+    text: []const u8,
+    boolean: bool,
+
+    fn eql(self: Fact, other: Fact) bool {
+        return switch (self) {
+            .text => |value| other == .text and std.mem.eql(u8, value, other.text),
+            .boolean => |value| other == .boolean and value == other.boolean,
+        };
+    }
+};
+
+/// What an entity answers of entity_properties, as its kind knows it: good while the table is
+/// evaluated.
+pub const EntityFacts = struct {
+    context: *const anyopaque,
+    /// Whether it is of an entity type, by name.
+    is: *const fn (context: *const anyopaque, entity_type: []const u8) bool,
+    /// One of its data components, by name, if it has it.
+    component: *const fn (context: *const anyopaque, name: []const u8) ?Fact,
+    /// A field type_specific names for its type, if it has it.
+    field: *const fn (context: *const anyopaque, name: []const u8) ?Fact,
+};
+
+pub const Property = struct { name: []const u8, value: Fact };
+
+/// EntityPredicate's components and type_specific, by the names a datapack gives: every one must
+/// hold, and an entity that answers none of them holds none.
+pub const EntityPredicate = struct {
+    components: []const Property = &.{},
+    type_specific: ?struct { entity_type: []const u8, fields: []const Property } = null,
+
+    fn matches(self: EntityPredicate, answered: ?EntityFacts) bool {
+        const facts = answered orelse return false;
+        for (self.components) |wanted| {
+            const actual = facts.component(facts.context, wanted.name) orelse return false;
+            if (!actual.eql(wanted.value)) return false;
+        }
+        const specific = self.type_specific orelse return true;
+        if (!facts.is(facts.context, specific.entity_type)) return false;
+        for (specific.fields) |wanted| {
+            const actual = facts.field(facts.context, wanted.name) orelse return false;
+            if (!actual.eql(wanted.value)) return false;
+        }
+        return true;
+    }
 };
 
 /// What a furnace makes of an item, for furnace_smelt, which loot reaches through the server.
@@ -188,6 +239,8 @@ pub const ConditionDefinition = union(enum) {
     entity_on_fire: bool,
     /// entity_properties of the direct attacker, by an enchantment tag on its main hand.
     attacker_enchanted: []const u8,
+    /// entity_properties of the entity, by its data components and its type's own fields.
+    entity_properties: EntityPredicate,
     killed_by_player,
     explosion,
 };
@@ -243,6 +296,7 @@ pub const Condition = union(enum) {
     entity,
     entity_on_fire: bool,
     attacker_enchanted: []const u8,
+    entity_properties: EntityPredicate,
     killed_by_player,
     explosion,
 
@@ -293,6 +347,7 @@ pub const Condition = union(enum) {
                 while (try iterator.next()) |entry| if (tags.contains(tags.context, tag, entry.name)) break :blk true;
                 break :blk false;
             },
+            .entity_properties => |wanted| wanted.matches(context.entity_facts),
             .killed_by_player => context.killed_by_player,
             .explosion => true,
         };
@@ -683,6 +738,7 @@ const Preparation = struct {
             .entity => condition.* = .entity,
             .entity_on_fire => |burning| condition.* = .{ .entity_on_fire = burning },
             .attacker_enchanted => |tag| condition.* = .{ .attacker_enchanted = tag },
+            .entity_properties => |predicate| condition.* = .{ .entity_properties = predicate },
             .killed_by_player => condition.* = .killed_by_player,
             .explosion => condition.* = .explosion,
         };
