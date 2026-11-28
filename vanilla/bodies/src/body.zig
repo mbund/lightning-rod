@@ -365,6 +365,8 @@ pub const Level = struct {
     /// The entities bodies collide with, Level.getEntityCollisions; none, and they collide with
     /// none.
     entities: ?EntitySource = null,
+    /// BiomeManager.biomeZoomSeed: the hashed seed clients are sent, which blends biome borders.
+    biome_zoom_seed: i64 = 0,
 
     /// Outside the world's height a level reads void air, which collides with nothing.
     pub fn state(self: *const Level, x: i32, y: i32, z: i32) !u16 {
@@ -403,10 +405,79 @@ pub const Level = struct {
         return result;
     }
 
+    /// LevelReader.getBiome, by BiomeManager.getBiome: of the eight biome cells around a block,
+    /// the one nearest it once each is moved by a hash of the zoom seed, as vanilla blends biome
+    /// borders. Null for a level held in memory, or a section stored without biomes.
+    pub fn biome(self: *const Level, position: [3]i32) !?u16 {
+        const shifted: [3]i32 = .{ position[0] - 2, position[1] - 2, position[2] - 2 };
+        var base: [3]i32 = undefined;
+        var fraction: [3]f64 = undefined;
+        for (0..3) |axis| {
+            base[axis] = shifted[axis] >> 2;
+            fraction[axis] = @as(f64, @floatFromInt(shifted[axis] & 3)) / 4.0;
+        }
+        var nearest: [3]i32 = base;
+        var best = std.math.inf(f64);
+        for (0..8) |corner| {
+            const far = [3]bool{ corner & 4 != 0, corner & 2 != 0, corner & 1 != 0 };
+            var cell: [3]i32 = undefined;
+            var offset: [3]f64 = undefined;
+            for (0..3) |axis| {
+                cell[axis] = if (far[axis]) base[axis] + 1 else base[axis];
+                offset[axis] = if (far[axis]) fraction[axis] - 1.0 else fraction[axis];
+            }
+            const distance = fiddledDistance(self.biome_zoom_seed, cell, offset);
+            if (best > distance) {
+                nearest = cell;
+                best = distance;
+            }
+        }
+        return self.noiseBiome(nearest);
+    }
+
+    /// ChunkAccess.getNoiseBiome: the biome cell at quart coordinates, its height kept within the
+    /// world's.
+    fn noiseBiome(self: *const Level, quart: [3]i32) !?u16 {
+        const copies = self.copies orelse return null;
+        const lowest = self.minimum_y >> 2;
+        const highest = lowest + (self.height >> 2) - 1;
+        return copies.biome(self.world, .{ quart[0], std.math.clamp(quart[1], lowest, highest), quart[2] });
+    }
+
     pub fn fluid(self: *const Level, x: i32, y: i32, z: i32) !game_data.physics_data.State {
         return game_data.physics.get(try self.state(x, y, z));
     }
 };
+
+/// BiomeManager.getFiddledDistance: how far a cell's corner, moved by its hash, is from the block.
+fn fiddledDistance(seed: i64, cell: [3]i32, offset: [3]f64) f64 {
+    var hash = nextLcg(seed, cell[0]);
+    hash = nextLcg(hash, cell[1]);
+    hash = nextLcg(hash, cell[2]);
+    hash = nextLcg(hash, cell[0]);
+    hash = nextLcg(hash, cell[1]);
+    hash = nextLcg(hash, cell[2]);
+    const x = fiddle(hash);
+    hash = nextLcg(hash, seed);
+    const y = fiddle(hash);
+    hash = nextLcg(hash, seed);
+    const z = fiddle(hash);
+    return square(offset[2] + z) + square(offset[1] + y) + square(offset[0] + x);
+}
+
+/// LinearCongruentialGenerator.next.
+fn nextLcg(state: i64, add: i64) i64 {
+    return state *% (state *% 6364136223846793005 +% 1442695040888963407) +% add;
+}
+
+/// BiomeManager.getFiddle.
+fn fiddle(hash: i64) f64 {
+    return (@as(f64, @floatFromInt(@mod(hash >> 24, 1024))) / 1024.0 - 0.5) * 0.9;
+}
+
+fn square(value: f64) f64 {
+    return value * value;
+}
 
 /// What a collision query knows about the entity, EntityCollisionContext: for the few blocks whose
 /// collision shape depends on it, and for the entities it collides with.

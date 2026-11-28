@@ -18,6 +18,9 @@ pub const Copies = struct {
     client: chunks.Chunks.Client,
     sections: []chunks.Section,
     states: [][chunks.encoding.blocks]u16,
+    /// By slot, the section's biome cells, by (y * 4 + z) * 4 + x as vanilla's paletted container
+    /// has them, or `no_biome` for a section stored without them. No edit changes them.
+    biomes: [][chunks.encoding.biome_cells]u16,
     /// Copies of sections that were absent, dropped at the end of the tick.
     absent: []bool,
     referenced: []bool,
@@ -55,6 +58,7 @@ pub const Copies = struct {
             .client = try owner.simulation(1),
             .sections = try allocator.alloc(chunks.Section, capacity),
             .states = try allocator.alloc([chunks.encoding.blocks]u16, capacity),
+            .biomes = try allocator.alloc([chunks.encoding.biome_cells]u16, capacity),
             .absent = try allocator.alloc(bool, capacity),
             .marked = try allocator.alloc(u8, capacity),
             .referenced = try allocator.alloc(bool, capacity),
@@ -70,6 +74,18 @@ pub const Copies = struct {
         try owner.observe(.init(self, changed));
         return self;
     }
+
+    /// A section's biome cell by quart coordinates, a block in four on each axis: null for a
+    /// section stored without biomes.
+    pub fn biome(self: *Copies, world: u32, quart: [3]i32) !?u16 {
+        const section: chunks.Section = .{ .world = world, .x = quart[0] >> 2, .y = quart[1] >> 2, .z = quart[2] >> 2 };
+        const slot = try self.find(section);
+        const cell: usize = @intCast(((quart[1] & 3) * 4 + (quart[2] & 3)) * 4 + (quart[0] & 3));
+        const value = self.biomes[slot][cell];
+        return if (value == no_biome) null else value;
+    }
+
+    pub const no_biome = std.math.maxInt(u16);
 
     pub fn get(self: *Copies, world: u32, position: chunks.Position) !u16 {
         const section: chunks.Section = .{ .world = world, .x = @divFloor(position.x, 16), .y = @divFloor(position.y, 16), .z = @divFloor(position.z, 16) };
@@ -139,6 +155,9 @@ pub const Copies = struct {
         defer lease.release();
         const view = lease.view();
         for (&self.states[slot], 0..) |*state, cell| state.* = view.get(@intCast(cell));
+        if (lease.biomes()) |biomes| {
+            for (&self.biomes[slot], 0..) |*cell_biome, cell| cell_biome.* = biomes.get(@intCast(cell));
+        } else @memset(&self.biomes[slot], no_biome);
         self.marked[slot] = 0;
         // The marks know every state, so one past them is a section gone bad: refused, its slot
         // given back.

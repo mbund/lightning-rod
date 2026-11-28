@@ -12,6 +12,7 @@ const WorldBorder = @import("vanilla_world").world_border.WorldBorder;
 const body = @import("body.zig");
 const mob_blocks = @import("mob_blocks.zig");
 const EntityCollisions = @import("entity_collisions.zig").EntityCollisions;
+const Players = @import("players").players.Players;
 
 pub const Levels = struct {
     pub const id = "minecraft:body_levels";
@@ -63,6 +64,7 @@ pub const Levels = struct {
             .border = if (self.deps.world_border) |border| border.bounds(world) else null,
             .colliders = self.colliders,
             .entities = if (self.deps.collisions) |collisions| collisions.source() else null,
+            .biome_zoom_seed = Players.hashed_seed,
         };
     }
 

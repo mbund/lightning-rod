@@ -18,6 +18,9 @@ const default_spawn: minecraft.Position = .{ .x = 0.5, .y = 65, .z = 0.5 };
 
 pub const Players = struct {
     pub const id = "minecraft:players";
+    /// BiomeManager.obfuscateSeed of the world seed, as the login packet tells clients: what both
+    /// sides blend biome borders by. Worlds here keep no seed of their own, so it is zero.
+    pub const hashed_seed: i64 = 0;
     pub const saved_size = player_state.encoded_size;
     /// The record format this build writes. Records of other formats are refused, not converted.
     pub const saved_version = player_state.encoded_version;
@@ -872,7 +875,7 @@ pub const Players = struct {
                     .max_players = @intCast(self.config.maximum),
                     .view_distance = self.config.render_distance,
                     .simulation_distance = self.config.simulation_distance,
-                    .hashed_seed = 0,
+                    .hashed_seed = hashed_seed,
                     .gamemode = @backingInt(self.gameMode(index)),
                     .sea_level = 63,
                 }, self.securesChat(handle) })) break;
