@@ -70,6 +70,16 @@ pub const Effects = struct {
             std.debug.panic("invalid server packet: {s}", .{@errorName(err)});
     }
 
+    /// A sound that follows an entity, Level.playSound with an entity, for everyone near it but
+    /// `except`: those a sound at its place would reach, each client playing it where the entity
+    /// is as it moves.
+    pub fn entitySound(self: *Effects, world: u32, at: minecraft.Position, entity: i32, name: []const u8, category: Category, volume: f32, pitch: f32, seed: i64, except: ?usize) void {
+        const count = self.gather(world, at, if (volume > 1) 16 * @as(f64, volume) else 16, except);
+        if (count == 0) return;
+        self.players.deps.packets.fanout(writeEntitySound, self.targets[0..count], .{ name, @backingInt(category), entity, volume, pitch, seed }, 256, self.deliveries[0..count]) catch |err|
+            std.debug.panic("invalid server packet: {s}", .{@errorName(err)});
+    }
+
     /// A sound at the middle of a block, as World.playSound with a BlockPos places it.
     pub fn blockSound(self: *Effects, world: u32, position: chunks.Position, name: []const u8, category: Category, volume: f32, pitch: f32, seed: i64, except: ?usize) void {
         const at: minecraft.Position = .{ .x = @as(f64, @floatFromInt(position.x)) + 0.5, .y = @as(f64, @floatFromInt(position.y)) + 0.5, .z = @as(f64, @floatFromInt(position.z)) + 0.5 };
@@ -147,6 +157,13 @@ fn writeSound(packet: wire_1_21_5.play.toClient.packet_sound_effect.Writer, name
     const categorised = try (try holder.advance(selected)).soundCategory(category);
     const located = try (try (try categorised.x(@intFromFloat(at.x * 8))).y(@intFromFloat(at.y * 8))).z(@intFromFloat(at.z * 8));
     return (try (try (try located.volume(volume)).pitch(pitch)).seed(seed)).finish();
+}
+
+fn writeEntitySound(packet: wire_1_21_5.play.toClient.packet_entity_sound_effect.Writer, name: []const u8, category: u8, entity: i32, volume: f32, pitch: f32, seed: i64) ![]u8 {
+    var holder = try packet.sound();
+    const selected = try packets.nested(.{writeSoundHolder}).write(try holder.begin(), name);
+    const categorised = try (try holder.advance(selected)).soundCategory(category);
+    return (try (try (try (try categorised.entityId(entity)).volume(volume)).pitch(pitch)).seed(seed)).finish();
 }
 
 fn writeSoundHolder(packet: wire_1_21_5.ItemSoundHolder.Writer, name: []const u8) !wire_1_21_5.ItemSoundHolder.Writer.Done {

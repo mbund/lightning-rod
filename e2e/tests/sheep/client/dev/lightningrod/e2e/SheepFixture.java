@@ -167,6 +167,8 @@ final class SheepFixture extends Fixture {
                 shornId = first.getId();
                 shornColor = color(first);
                 use(game, SHEARS, first);
+                // Off to the side, so the wool lies where it fell to be counted.
+                game.player.setPos(first.getX() - 6, first.getY(), first.getZ() - 6);
                 next(Phase.SHORN, 0);
             }
             case SHORN -> {
@@ -175,13 +177,15 @@ final class SheepFixture extends Fixture {
                 int wool = 0;
                 for (var entity : game.level.getEntities((Entity) null, shorn.getBoundingBox().inflate(4)))
                     if (entity instanceof ItemEntity item && BuiltInRegistries.ITEM.getKey(item.getItem().getItem()).getPath().equals(shornColor + "_wool")) wool += item.getItem().getCount();
-                if (sheared(shorn) && wool >= 1) {
+                // The shear sound comes following the sheep, as ServerLevel.playSound with it sends it.
+                boolean followed = EntitySounds.followed("entity.sheep.shear", shornId);
+                if (sheared(shorn) && wool >= 1 && followed) {
                     if (wool > 3) { client.fail("too_much_wool_" + wool); return; }
                     client.event("sheep_shorn", "color", shornColor, "wool", Integer.toString(wool));
                     next(Phase.DYE_SHORN, 10);
                     return;
                 }
-                if (timedOut(200)) client.fail("not_shorn_" + sheared(shorn) + "_wool_" + wool);
+                if (timedOut(200)) client.fail("not_shorn_" + sheared(shorn) + "_wool_" + wool + "_sound_followed_" + EntitySounds.followed("entity.sheep.shear", shornId));
             }
             case DYE_SHORN -> {
                 // DyeItem passes a sheep with no wool by.

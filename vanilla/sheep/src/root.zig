@@ -167,7 +167,8 @@ fn interact(context: *anyopaque, use: *const Use) !bool {
 /// a block above its feet, each tossed further by its own random, and it is sheared.
 fn shear(mobs: *Mobs, mob: Mob, tool: item_data.View) !void {
     const at = mob.motion.position;
-    mobs.effects.sound(mob.motion.world, .{ .x = at[0], .y = at[1], .z = at[2] }, "minecraft:entity.sheep.shear", .players, 1.0, 1.0, @bitCast(mobs.sound_seeds.next()), null);
+    // ServerLevel.playSound with no player and the sheep: a sound that follows it, for everyone.
+    mobs.effects.entitySound(mob.motion.world, .{ .x = at[0], .y = at[1], .z = at[2] }, @intCast(mobs.givenId(mob)), "minecraft:entity.sheep.shear", .players, 1.0, 1.0, @bitCast(mobs.sound_seeds.next()), null);
     if (mobs.deps.loot.tables.get("minecraft:shearing/sheep")) |table| {
         mobs.loot_scratch.reset();
         var buffer: [loot.maximum_drops]loot.Drop = undefined;
@@ -402,7 +403,7 @@ test "wool keeps its colour in the low bits and shearing in the fifth, as DATA_W
     var state: mob_state.MobState = .{
         .idle = .{ .random = JavaRandom.init(1) },
         .motion = .{ .world = 0, .position = .{ 0, 0, 0 }, .old_position = .{ 0, 0, 0 } },
-        .entity = .{ .id = 1, .uuid = 1, .species = @enumFromInt(0) },
+        .entity = .{ .id = 1, .uuid = 1, .species = @fromBackingInt(@intCast(0)) },
         .living = .{ .health = 8 },
         .kin = .{ .bytes = .{ @backingInt(Color.lime) | Wool.sheared_bit, 0, 0, 0 } },
     };

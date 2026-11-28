@@ -327,11 +327,13 @@ pub const Use = struct {
     /// The held item's kind.
     kind: u32,
 
-    /// Sounds from where the mob is, for everyone but the player, whose client plays them.
+    /// Level.playSound with the player and the mob: a sound that follows the mob, for everyone
+    /// but the player, whose client plays it already.
     pub fn sound(self: *const Use, name: []const u8) void {
         const at = self.mob.motion.position;
         const interaction = self.interaction;
-        interaction.effects.sound(self.mob.motion.world, .{ .x = at[0], .y = at[1], .z = at[2] }, name, .players, 1, 1, @bitCast(interaction.sound_seeds.next()), self.slot);
+        const entity: i32 = @intCast(interaction.deps.mobs.givenId(self.mob));
+        interaction.effects.entitySound(self.mob.motion.world, .{ .x = at[0], .y = at[1], .z = at[2] }, entity, name, .players, 1, 1, @bitCast(interaction.sound_seeds.next()), self.slot);
     }
 };
 
