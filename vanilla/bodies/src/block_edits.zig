@@ -22,6 +22,7 @@ pub const BlockEdits = struct {
     effects: world_effects.Effects,
     cauldron: u16,
     water_cauldron: [2]u16,
+    water: u16,
 
     pub fn init(allocator: std.mem.Allocator, deps: Dependencies) !*BlockEdits {
         const self = try allocator.create(BlockEdits);
@@ -33,17 +34,21 @@ pub const BlockEdits = struct {
                 @intCast(game_data.registry.blockStateId("minecraft:water_cauldron[level=1]").?),
                 @intCast(game_data.registry.blockStateId("minecraft:water_cauldron[level=2]").?),
             },
+            .water = @intCast(game_data.registry.blockStateId("minecraft:water[level=0]").?),
         };
         return self;
     }
 
-    /// Level.destroyBlock without drops: the block's break effect, then air.
+    /// Level.destroyBlock without drops: the block's break effect, then what its fluid leaves,
+    /// FluidState.createLegacyBlock: water where it was waterlogged, else air.
     pub fn destroyBlock(self: *BlockEdits, world: u32, position: [3]i32) !void {
         const level = self.deps.levels.level(world);
         const state = try level.state(position[0], position[1], position[2]);
-        if (game_data.physics.get(state).air) return;
+        const physics = game_data.physics.get(state);
+        if (physics.air) return;
         self.effects.worldEvent(world, .{ .x = position[0], .y = position[1], .z = position[2] }, 2001, state);
-        try self.deps.chunks.setBlock(world, .{ .x = position[0], .y = position[1], .z = position[2] }, level.air);
+        const left = if (physics.fluid == .water and physics.amount == 8 and !physics.falling) self.water else level.air;
+        try self.deps.chunks.setBlock(world, .{ .x = position[0], .y = position[1], .z = position[2] }, left);
     }
 
     /// LayeredCauldronBlock.handleEntityOnFireInside: something burning takes a level of water,
