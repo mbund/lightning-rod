@@ -157,3 +157,86 @@ test "collision shape classes follow vanilla for every block state" {
     }
     try std.testing.expectEqual(@as(usize, 0), differences);
 }
+
+test "shape scans in a window and supporting blocks from gathered shapes find what scans of the world find" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const deps = try defaults.prepare(allocator);
+    const blocks = try mob_blocks.MobBlocks.init(allocator, deps.blocks);
+    var terrain = try Terrain.init(allocator);
+    const colliders = try allocator.create(body.Colliders);
+    colliders.* = .{};
+    const window = try allocator.create(body.Window);
+    window.* = .{};
+    var prng = std.Random.DefaultPrng.init(0x5ca1e);
+    const random = prng.random();
+    var inside: usize = 0;
+    var answered: usize = 0;
+    for (0..300) |seed| {
+        _ = terrain.generate(@intCast(seed));
+        const plain: body.Level = .{ .copies = null, .volume = &terrain.volume, .colliders = colliders, .blocks = blocks, .world = 0, .minimum_y = 0, .height = path_terrain.size_y, .air = terrain.air };
+        for (0..20) |_| {
+            const at: [3]i32 = .{ random.intRangeAtMost(i32, 3, path_terrain.size_x - 4), random.intRangeAtMost(i32, 2, 6), random.intRangeAtMost(i32, 3, path_terrain.size_z - 4) };
+            try window.fill(&plain, at);
+            var windowed = plain;
+            windowed.window = window;
+            const context: body.Context = .{ .bottom = @as(f64, @floatFromInt(at[1])) + random.float(f64) * 2 - 1, .fall_distance = random.float(f64) * 5 };
+            // Mostly boxes the window covers, some reaching past it.
+            const query = randomBox(random, at, if (random.boolean()) 1.0 else 2.5);
+            var expected: body.Shapes = try .init(&plain, query, context);
+            var found: body.Shapes = try .init(&windowed, query, context);
+            if (found.inside != null) inside += 1;
+            while (try expected.next()) |shape| {
+                const other = (try found.next()) orelse return error.ShapeMissed;
+                try std.testing.expectEqual([3]i32{ shape.x, shape.y, shape.z }, [3]i32{ other.x, other.y, other.z });
+                try std.testing.expectEqual(shape.boxes.offset, other.boxes.offset);
+                try std.testing.expectEqual(shape.boxes.count, other.boxes.count);
+            }
+            try std.testing.expectEqual(@as(?body.Shape, null), try found.next());
+            // A box within what a move gathered, as the sliver under a body that moved is.
+            try colliders.gather(&windowed, query, context, &.{}, null);
+            const within = shrink(random, query);
+            const position: [3]f64 = .{ (within.min[0] + within.max[0]) / 2, within.min[1], (within.min[2] + within.max[2]) / 2 };
+            if (colliders.supportingWithin(&windowed, within, position)) |kept| {
+                answered += 1;
+                try std.testing.expectEqual(try body.findSupportingBlock(&plain, within, context, position), kept);
+            }
+        }
+    }
+    // Both ways were taken often enough to mean something.
+    std.testing.expect(inside > 1000 and answered > 1000) catch |err| {
+        std.debug.print("inside {d}, answered {d}\n", .{ inside, answered });
+        return err;
+    };
+}
+
+const path_terrain = @import("path_terrain.zig");
+const body = @import("vanilla_mobs").body;
+
+/// A box up to `reach` from a block's center on each side, at least a hundredth across.
+fn randomBox(random: std.Random, at: [3]i32, reach: f64) body.Box {
+    var result: body.Box = undefined;
+    for (0..3) |axis| {
+        const center = @as(f64, @floatFromInt(at[axis])) + 0.5;
+        const a = center + (random.float(f64) * 2 - 1) * reach;
+        const b = center + (random.float(f64) * 2 - 1) * reach;
+        result.min[axis] = @min(a, b);
+        result.max[axis] = @max(a, b) + 0.01;
+    }
+    return result;
+}
+
+/// A box within another, sometimes a sliver as thin as the one under a body's feet.
+fn shrink(random: std.Random, outer: body.Box) body.Box {
+    var result: body.Box = undefined;
+    for (0..3) |axis| {
+        const span = outer.max[axis] - outer.min[axis];
+        const a = outer.min[axis] + random.float(f64) * span;
+        const b = outer.min[axis] + random.float(f64) * span;
+        result.min[axis] = @min(a, b);
+        result.max[axis] = @max(a, b);
+    }
+    if (random.boolean()) result.min[1] = @max(outer.min[1], result.max[1] - 1.0e-6);
+    return result;
+}

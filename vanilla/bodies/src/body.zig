@@ -15,6 +15,8 @@ const Bounds = @import("vanilla_content").border.Bounds;
 
 const MobBlocks = mob_blocks.MobBlocks;
 const assert = std.debug.assert;
+/// Debug builds still do what a shortcut spares and check it found the same.
+const verify_skips = @import("builtin").mode == .debug;
 
 pub const Box = struct {
     min: [3]f64,
@@ -154,6 +156,11 @@ pub const Window = struct {
     slots: [8]u32 = undefined,
     stamps: [8]u64 = undefined,
     filled_from_copies: bool = false,
+    /// By row, (dy * width + dz), a bit by dx for each cell whose state may have a collision shape,
+    /// as MobBlocks.mayCollide has it: what a scan for shapes reads, and air it passes by.
+    shaped: [height * width]u8 = undefined,
+    /// The blocks it classes its cells by, once filled.
+    blocks: ?*const MobBlocks = null,
 
     /// Two blocks either side of the mob's block, and from two below its feet to three above,
     /// which covers a walking body's collision cells.
@@ -179,13 +186,17 @@ pub const Window = struct {
         self.origin = .{ at[0] - 2, at[1] - 2, at[2] - 2 };
         self.filled_from_copies = false;
         self.sections = 0;
+        // Classed once whole, so an edit to a window a failed fill left classes nothing.
+        self.blocks = null;
         const copies = level.copies orelse {
-            // Worlds held in memory, for tests, read block by block.
-            self.marks = 0xff;
+            // Worlds held in memory, for tests, read block by block, marked by what they hold.
+            self.marks = 0;
             for (0..height) |dy| for (0..width) |dz| for (0..width) |dx| {
-                self.states[(dy * width + dz) * width + dx] = try level.state(self.origin[0] + @as(i32, @intCast(dx)), self.origin[1] + @as(i32, @intCast(dy)), self.origin[2] + @as(i32, @intCast(dz)));
+                const state = try level.state(self.origin[0] + @as(i32, @intCast(dx)), self.origin[1] + @as(i32, @intCast(dy)), self.origin[2] + @as(i32, @intCast(dz)));
+                self.states[(dy * width + dz) * width + dx] = state;
+                self.marks |= level.blocks.marks[state];
             };
-            return;
+            return self.classifyAll(level.blocks);
         };
         // The window spans at most two sections along each axis. Each is fetched, then all are
         // checked still held, as a later fetch may take an earlier one's slot when the copies are
@@ -246,6 +257,32 @@ pub const Window = struct {
                 }
             }
         }
+        self.classifyAll(level.blocks);
+    }
+
+    fn classifyAll(self: *Window, blocks: *const MobBlocks) void {
+        self.blocks = blocks;
+        for (0..height * width) |row| self.classify(row);
+    }
+
+    /// Sets a row's bits in `shaped` by its states.
+    fn classify(self: *Window, row: usize) void {
+        const blocks = self.blocks.?;
+        var bits: u8 = 0;
+        for (self.states[row * width ..][0..width], 0..) |state, dx| {
+            if (blocks.mayCollide(state)) bits |= @as(u8, 1) << @intCast(dx);
+        }
+        self.shaped[row] = bits;
+    }
+
+    /// Of the cells from x `from` to `to` of a row it covers, those that may have a collision
+    /// shape, a bit each from `from` up.
+    pub fn shapedIn(self: *const Window, from: i32, to: i32, y: i32, z: i32) u8 {
+        assert(from <= to);
+        const row: usize = @intCast((y - self.origin[1]) * width + (z - self.origin[2]));
+        const low: u3 = @intCast(from - self.origin[0]);
+        const count: u4 = @intCast(to - from + 1);
+        return (self.shaped[row] >> low) & @as(u8, @intCast((@as(u16, 1) << count) - 1));
     }
 
     fn sectionKey(base: [3]i32, which: usize) [3]i32 {
@@ -276,6 +313,13 @@ pub const Window = struct {
             const z = self.origin[2] + @as(i32, @intCast(dz));
             if (self.states[(dy * width + dz) * width + dx] != try level.state(x, y, z)) return false;
         };
+        for (0..height * width) |row| {
+            var bits: u8 = 0;
+            for (self.states[row * width ..][0..width], 0..) |state, dx| {
+                if (level.blocks.mayCollide(state)) bits |= @as(u8, 1) << @intCast(dx);
+            }
+            if (bits != self.shaped[row]) return false;
+        }
         return true;
     }
 
@@ -299,6 +343,7 @@ pub const Window = struct {
     pub fn edit(self: *Window, world: u32, position: [3]i32, state: u16) void {
         const at = self.slot(world, position[0], position[1], position[2]) orelse return;
         self.states[at] = state;
+        if (self.blocks != null) self.classify(at / width);
     }
 };
 
@@ -460,6 +505,9 @@ pub const Shapes = struct {
     inside: ?*const Window = null,
     /// No shape around reaches past its block, so only the cells inside the outer layer matter.
     inner: bool = false,
+    /// Whether its cells may hold scaffolding or powder snow, by their sections' marks, whose shapes
+    /// depend on the entity's bottom and fall: then what it yields holds only for its context.
+    contextual: bool = true,
 
     pub fn init(level: *const Level, query: Box, context: Context) !Shapes {
         const first: [3]i32 = .{ mth.floor(query.min[0] - 1.0e-7) - 1, mth.floor(query.min[1] - 1.0e-7) - 1, mth.floor(query.min[2] - 1.0e-7) - 1 };
@@ -468,8 +516,11 @@ pub const Shapes = struct {
         if (level.window) |window| if (level.overlay == null and window.covers(level.world, first, last)) {
             shapes.inside = window;
         };
+        // What its cells may hold, by their sections' marks, and anything under an overlay.
+        const marks: u8 = if (level.overlay != null) 0xff else try level.marked(first, last);
+        shapes.contextual = marks & mob_blocks.mark_contextual != 0;
         // SteelMC's trick: cells on the outer layer yield only shapes that reach in, and none do.
-        if (try level.without(mob_blocks.mark_large, first, last)) {
+        if (marks & mob_blocks.mark_large == 0) {
             shapes.inner = true;
             shapes.first = .{ first[0] + 1, first[1] + 1, first[2] + 1 };
             shapes.last = .{ last[0] - 1, last[1] - 1, last[2] - 1 };
@@ -479,30 +530,16 @@ pub const Shapes = struct {
     }
 
     pub fn next(self: *Shapes) !?Shape {
+        if (self.inside) |window| return self.nextInside(window);
         while (self.at[1] <= self.last[1]) {
             const x = self.at[0];
             const y = self.at[1];
             const z = self.at[2];
-            self.at[0] += 1;
-            if (self.at[0] > self.last[0]) {
-                self.at[0] = self.first[0];
-                self.at[2] += 1;
-                if (self.at[2] > self.last[2]) {
-                    self.at[2] = self.first[2];
-                    self.at[1] += 1;
-                }
-            }
-            // Cursor3D's type: how many coordinates lie on the outer layer.
-            var edges: u2 = 0;
-            if (!self.inner) {
-                if (x == self.first[0] or x == self.last[0]) edges += 1;
-                if (y == self.first[1] or y == self.last[1]) edges += 1;
-                if (z == self.first[2] or z == self.last[2]) edges += 1;
-                if (edges == 3) continue;
-            }
-            const state = if (self.inside) |window| window.cell(x, y, z) else try self.level.state(x, y, z);
+            self.step();
+            const edges = self.edgesOf(x, y, z) orelse continue;
             // Air, the most common cell, has no shape, and neither has a state whose shape is empty
             // for any entity, which all but scaffolding and powder snow show with no entity.
+            const state = try self.level.state(x, y, z);
             if (state == self.level.air) continue;
             const entry = self.level.blocks.get(state);
             if (entry.collision == shape_classes.empty and entry.kind != .scaffolding and entry.kind != .powder_snow) continue;
@@ -515,6 +552,70 @@ pub const Shapes = struct {
             for (0..boxes.count) |index| {
                 if (shape.get(index).intersects(self.query)) return shape;
             }
+        }
+        return null;
+    }
+
+    /// `next` within a window, which knows the cells that may have a shape: the rest, air
+    /// mostly, are passed by a row at a time.
+    fn nextInside(self: *Shapes, window: *const Window) ?Shape {
+        while (self.at[1] <= self.last[1]) {
+            const bits = window.shapedIn(self.at[0], self.last[0], self.at[1], self.at[2]);
+            if (bits == 0) {
+                self.nextRow();
+                continue;
+            }
+            const x = self.at[0] + @ctz(bits);
+            const y = self.at[1];
+            const z = self.at[2];
+            self.at[0] = x;
+            self.step();
+            const edges = self.edgesOf(x, y, z) orelse continue;
+            if (self.shapeAt(window.cell(x, y, z), edges, x, y, z)) |shape| return shape;
+        }
+        return null;
+    }
+
+    /// Past the cell `at` is on, in Cursor3D's order: x, then z, then y.
+    inline fn step(self: *Shapes) void {
+        self.at[0] += 1;
+        if (self.at[0] > self.last[0]) self.nextRow();
+    }
+
+    inline fn nextRow(self: *Shapes) void {
+        self.at[0] = self.first[0];
+        self.at[2] += 1;
+        if (self.at[2] > self.last[2]) {
+            self.at[2] = self.first[2];
+            self.at[1] += 1;
+        }
+    }
+
+    /// Cursor3D's type: how many coordinates of a cell lie on the outer layer, null for a corner,
+    /// which no shape reaches in from.
+    inline fn edgesOf(self: *const Shapes, x: i32, y: i32, z: i32) ?u2 {
+        if (self.inner) return 0;
+        var edges: u2 = 0;
+        if (x == self.first[0] or x == self.last[0]) edges += 1;
+        if (y == self.first[1] or y == self.last[1]) edges += 1;
+        if (z == self.first[2] or z == self.last[2]) edges += 1;
+        return if (edges == 3) null else edges;
+    }
+
+    /// The shape of a cell's state, when one of its boxes meets the query and its cell is not on
+    /// an outer layer it cannot reach in from.
+    inline fn shapeAt(self: *Shapes, state: u16, edges: u2, x: i32, y: i32, z: i32) ?Shape {
+        const entry = self.level.blocks.get(state);
+        // What MobBlocks.mayCollide says, which a window's bits already did for its cells.
+        if (entry.collision == shape_classes.empty and entry.kind != .scaffolding and entry.kind != .powder_snow) return null;
+        if (edges == 1 and !entry.flags.large_shape) return null;
+        if (edges == 2 and entry.kind != .moving_piston) return null;
+        // A full block, as most floors are, needs no decoding.
+        const boxes = if (entry.collision == self.level.blocks.full_cube) full_cube else collisionBoxes(self.level, state, x, y, z, self.context);
+        if (boxes.count == 0) return null;
+        const shape: Shape = .{ .boxes = boxes, .x = x, .y = y, .z = z };
+        for (0..boxes.count) |index| {
+            if (shape.get(index).intersects(self.query)) return shape;
         }
         return null;
     }
@@ -573,6 +674,17 @@ pub const Colliders = struct {
     shape_count: usize = 0,
     /// False when a long move met more boxes than fit, and callers walk the world instead.
     complete: bool = true,
+    /// What the last gather asked, for a question after the move it gathered for: its query and
+    /// world, where its block shapes begin, the cell of each, and whether its scan was of inner
+    /// cells only and met no state whose shape depends on the entity.
+    query: Box = undefined,
+    world: u32 = 0,
+    blocks_from: usize = 0,
+    cells: [box_capacity][3]i32 = undefined,
+    inner: bool = false,
+    contextual: bool = true,
+    /// Whether the last gather finished, its shapes all kept: until the next move's starts.
+    fresh: bool = false,
 
     const box_capacity = 256;
     pub const entity_capacity = 1024;
@@ -583,6 +695,9 @@ pub const Colliders = struct {
         self.box_count = 0;
         self.shape_count = 0;
         self.complete = true;
+        self.fresh = false;
+        self.query = query;
+        self.world = level.world;
         if (others.len > box_capacity) {
             self.complete = false;
             return;
@@ -602,6 +717,7 @@ pub const Colliders = struct {
             self.ends[self.shape_count] = @intCast(self.box_count);
             self.shape_count += 1;
         }
+        self.blocks_from = self.shape_count;
         var shapes: Shapes = try .init(level, query, context);
         while (try shapes.next()) |shape| {
             if (self.box_count + shape.boxes.count > box_capacity) {
@@ -612,9 +728,40 @@ pub const Colliders = struct {
                 self.boxes[self.box_count] = shape.get(index);
                 self.box_count += 1;
             }
+            self.cells[self.shape_count] = .{ shape.x, shape.y, shape.z };
             self.ends[self.shape_count] = @intCast(self.box_count);
             self.shape_count += 1;
         }
+        self.inner = shapes.inner;
+        self.contextual = shapes.contextual;
+        self.fresh = true;
+    }
+
+    /// Level.findSupportingBlock for a query within the last gather's, from the block shapes it
+    /// kept: those its scan of inner cells met are every shape the query's would meet, none
+    /// reaching past its block, and none depending on the entity, which may have moved since.
+    /// Null when they may not be, and the world must be asked.
+    pub fn supportingWithin(self: *const Colliders, level: *const Level, query: Box, position: [3]f64) ?(?[3]i32) {
+        if (!self.fresh or !self.inner or self.contextual or self.world != level.world or level.overlay != null) return null;
+        for (0..3) |axis| if (query.min[axis] < self.query.min[axis] or query.max[axis] > self.query.max[axis]) return null;
+        var best: ?[3]i32 = null;
+        var best_distance = std.math.floatMax(f64);
+        var begin: usize = if (self.blocks_from == 0) 0 else self.ends[self.blocks_from - 1];
+        for (self.blocks_from..self.shape_count) |shape| {
+            const end = self.ends[shape];
+            defer begin = end;
+            const meets = for (self.boxes[begin..end]) |value| {
+                if (value.intersects(query)) break true;
+            } else false;
+            if (!meets) continue;
+            const candidate = self.cells[shape];
+            const distance = centerDistance(candidate, position);
+            if (distance < best_distance or (distance == best_distance and (best == null or lessBlock(best.?, candidate)))) {
+                best = candidate;
+                best_distance = distance;
+            }
+        }
+        return best;
     }
 
     /// Shapes.collide along one axis.
@@ -682,6 +829,8 @@ pub fn borderFor(level: *const Level, start: Box, query: Box) ?[4]Box {
 /// Level.getEntityCollisions finds around the box expanded by the movement, every step tried
 /// against the same, and the blocks and border each try finds.
 pub fn collide(level: *const Level, start: Box, movement: [3]f64, context: Context, on_ground: bool, max_up_step: f32) ![3]f64 {
+    // What an earlier move gathered answers nothing about this one.
+    level.colliders.?.fresh = false;
     const others: []const Box = try entityCollisions(level, start.expandTowards(movement), context, &level.colliders.?.entity_boxes);
     if (others.len == Colliders.entity_capacity) return error.TooManyEntityColliders;
     const length_squared = movement[0] * movement[0] + movement[1] * movement[1] + movement[2] * movement[2];
@@ -771,11 +920,8 @@ pub fn findSupportingBlock(level: *const Level, query: Box, context: Context, po
     var best_distance = std.math.floatMax(f64);
     var shapes: Shapes = try .init(level, query, context);
     while (try shapes.next()) |shape| {
-        const dx = @as(f64, @floatFromInt(shape.x)) + 0.5 - position[0];
-        const dy = @as(f64, @floatFromInt(shape.y)) + 0.5 - position[1];
-        const dz = @as(f64, @floatFromInt(shape.z)) + 0.5 - position[2];
-        const distance = dx * dx + dy * dy + dz * dz;
         const candidate: [3]i32 = .{ shape.x, shape.y, shape.z };
+        const distance = centerDistance(candidate, position);
         if (distance < best_distance or (distance == best_distance and (best == null or lessBlock(best.?, candidate)))) {
             best = candidate;
             best_distance = distance;
@@ -793,6 +939,32 @@ pub fn supportingBlock(level: *const Level, current: Box, context: Context, posi
     if (none_before) return null;
     const back = moved orelse return null;
     return findSupportingBlock(level, below.move(.{ -back[0], 0, -back[2] }), context, position);
+}
+
+/// supportingBlock for a body whose move just gathered its colliders, which answer it when they
+/// hold every shape its searches would meet.
+pub fn supportingAfterMove(level: *const Level, current: Box, context: Context, position: [3]f64, moved: ?[3]f64, none_before: bool) !?[3]i32 {
+    const below: Box = .{ .min = .{ current.min[0], current.min[1] - 1.0e-6, current.min[2] }, .max = .{ current.max[0], current.min[1], current.max[2] } };
+    if (try nearestGathered(level, below, context, position)) |found| return found;
+    if (none_before) return null;
+    const back = moved orelse return null;
+    return nearestGathered(level, below.move(.{ -back[0], 0, -back[2] }), context, position);
+}
+
+/// findSupportingBlock from the colliders the move gathered, or the world past what they hold.
+fn nearestGathered(level: *const Level, query: Box, context: Context, position: [3]f64) !?[3]i32 {
+    const colliders = level.colliders orelse return findSupportingBlock(level, query, context, position);
+    const kept = colliders.supportingWithin(level, query, position) orelse return findSupportingBlock(level, query, context, position);
+    if (verify_skips) assert(std.meta.eql(kept, try findSupportingBlock(level, query, context, position)));
+    return kept;
+}
+
+/// How far a block's center is from a position, squared, as Level.findSupportingBlock measures.
+fn centerDistance(cell: [3]i32, position: [3]f64) f64 {
+    const dx = @as(f64, @floatFromInt(cell[0])) + 0.5 - position[0];
+    const dy = @as(f64, @floatFromInt(cell[1])) + 0.5 - position[1];
+    const dz = @as(f64, @floatFromInt(cell[2])) + 0.5 - position[2];
+    return dx * dx + dy * dy + dz * dz;
 }
 
 /// Entity.getOnPos: the block a body stands on, looked for `depth` below its feet. The block it

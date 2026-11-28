@@ -142,6 +142,8 @@ pub const mark_large: u8 = 1;
 pub const mark_fluid: u8 = 2;
 /// A block that acts on a mob inside it (BlockBehaviour.entityInside).
 pub const mark_inside: u8 = 4;
+/// Scaffolding or powder snow, whose collision shapes depend on the entity's bottom and fall.
+pub const mark_contextual: u8 = 8;
 
 pub const MobBlocks = struct {
     states: []State,
@@ -154,6 +156,9 @@ pub const MobBlocks = struct {
     /// By state, what sections are marked for holding (see `mark_large` and the others), so a
     /// mob's window knows what its blocks cannot do.
     marks: []u8,
+    /// By state, a bit each: whether it may have a collision shape for some entity. All but air and
+    /// the states whose shape is empty whoever asks, which scaffolding and powder snow are not.
+    shaped: []u64,
     trapdoors: []bool,
     campfires: []bool,
 
@@ -164,6 +169,7 @@ pub const MobBlocks = struct {
             .block_definitions = block_definitions,
             .trapdoors = try allocator.alloc(bool, registry.blocks.len),
             .marks = try allocator.alloc(u8, registry.block_state_names.len),
+            .shaped = try allocator.alloc(u64, (registry.block_state_names.len + 63) / 64),
             .campfires = try allocator.alloc(bool, registry.blocks.len),
         };
         try self.names.ensureTotalCapacity(allocator, @intCast(registry.blocks.len));
@@ -179,6 +185,12 @@ pub const MobBlocks = struct {
             if (entry.flags.large_shape) mark.* |= mark_large;
             if (game_data.physics.get(@intCast(state)).fluid != .none) mark.* |= mark_fluid;
             if (@import("block_effects.zig").insideActs(entry.kind)) mark.* |= mark_inside;
+            if (entry.kind == .scaffolding or entry.kind == .powder_snow) mark.* |= mark_contextual;
+        }
+        @memset(self.shaped, 0);
+        for (self.states, 0..) |entry, state| {
+            if (entry.collision == shape_classes.empty and entry.kind != .scaffolding and entry.kind != .powder_snow) continue;
+            self.shaped[state / 64] |= @as(u64, 1) << @intCast(state % 64);
         }
         try self.readTags();
         try block_definitions.registry.onChange(self, readTags);
@@ -187,6 +199,11 @@ pub const MobBlocks = struct {
 
     pub fn get(self: *const MobBlocks, state: u16) State {
         return self.states[state];
+    }
+
+    /// Whether a state may have a collision shape for some entity, as `shaped` holds.
+    pub fn mayCollide(self: *const MobBlocks, state: u16) bool {
+        return self.shaped[state / 64] >> @intCast(state % 64) & 1 != 0;
     }
 
     /// What does not change with tags: identities, classes, properties and method results.

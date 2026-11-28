@@ -128,7 +128,7 @@ fn checkSupportingBlock(mobs: *Mobs, mob: Mob, moved: [3]f64) !void {
         return;
     }
     const level = mobs.level(mob.motion.world);
-    const found = try body.supportingBlock(&level, box(mobs, mob), context(mob), mob.motion.position, moved, mob.motion.on_ground_no_blocks);
+    const found = try body.supportingAfterMove(&level, box(mobs, mob), context(mob), mob.motion.position, moved, mob.motion.on_ground_no_blocks);
     mob.motion.supporting = found;
     mob.motion.on_ground_no_blocks = found == null;
 }
