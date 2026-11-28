@@ -84,6 +84,16 @@ pub const Effects = struct {
         speed: f32 = 0,
     };
 
+    /// Particles for one player alone, as a debugging view shows what only it asked to see.
+    pub fn particlesTo(self: *Effects, player: *const @import("players").player_state.Player, request: Particles) void {
+        std.debug.assert(request.count >= 0);
+        const recipient = player.handle orelse return;
+        if (player.stage != .ready) return;
+        self.targets[0] = .{ .handle = recipient, .protocol = player.protocol };
+        self.players.deps.packets.fanout(writeParticles, self.targets[0..1], .{request}, 64, self.deliveries[0..1]) catch |err|
+            std.debug.panic("invalid server packet: {s}", .{@errorName(err)});
+    }
+
     /// ServerLevel.sendParticles without forcing: for the players within 32 blocks.
     pub fn particles(self: *Effects, world: u32, request: Particles) void {
         std.debug.assert(request.count >= 0);
@@ -108,7 +118,6 @@ fn writeParticle(packet: wire_1_21_5.Particle.Writer, id: i32) !wire_1_21_5.Part
 }
 
 /// The same from 1.21.9, whose particles carry other data.
-
 fn writeParticlePacked(packet: wire_1_21_9.Particle.Writer, id: i32) !wire_1_21_9.Particle.Writer.Done {
     var data = try (try packet.type(id)).data();
     return data.advance(try (try data.begin()).case_default());

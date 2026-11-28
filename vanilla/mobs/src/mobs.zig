@@ -759,6 +759,14 @@ pub const Mobs = struct {
         return entities.Entities.networkOfSlot(slot);
     }
 
+    /// How a mob in a slot rests, for those looking at how mobs spare work: null for no mob.
+    pub fn restOf(self: *const Mobs, slot: u32) ?enum { awake, resting, idling } {
+        if (!self.isMob(slot)) return null;
+        const row = self.rows.ref(slot);
+        if (row.field("tracking").idling) return .idling;
+        return if (row.field("motion").resting) .resting else .awake;
+    }
+
     /// Whether an entity's slot holds a mob of the mobs' table.
     fn isMob(self: *const Mobs, slot: u32) bool {
         const entry = self.deps.entities.directory.entry(slot);

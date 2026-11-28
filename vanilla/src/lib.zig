@@ -115,6 +115,7 @@ pub const ToolActions = @import("vanilla_blocks").tool_actions.ToolActions;
 pub const Mobs = @import("vanilla_mobs").mobs.Mobs;
 pub const Cow = @import("vanilla_cow").Cow;
 pub const Sheep = @import("vanilla_sheep").Sheep;
+pub const SleepDebug = @import("vanilla_debug").SleepDebug;
 pub const mob_goals = @import("vanilla_mobs").goals;
 pub const MobReplication = @import("vanilla_mobs").mob_replication.MobReplication;
 pub const SpawnEggs = @import("vanilla_mobs").spawn_eggs.SpawnEggs;

@@ -1,7 +1,7 @@
 const std = @import("std");
 
 /// The particles the server sends, each found by name in a release's particle registry.
-pub const Particle = enum { sweep_attack, damage_indicator, crit, enchanted_hit };
+pub const Particle = enum { sweep_attack, damage_indicator, crit, enchanted_hit, happy_villager, soul_fire_flame, wax_on, wax_off };
 
 pub const Registry = struct {
     /// Wire ids by Particle, absent ones negative. A mapping built by hand has none.
@@ -30,7 +30,7 @@ pub const Registry = struct {
     }
 
     pub fn particleId(self: Registry, particle: Particle) !i32 {
-        return lookup(self.particles, @intFromEnum(particle));
+        return lookup(self.particles, @backingInt(particle));
     }
 
     pub fn entityId(self: Registry, canonical: i32) !i32 {

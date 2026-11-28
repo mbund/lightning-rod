@@ -109,6 +109,7 @@ pub fn main(init: std.process.Init) !void {
         lightning_rod.plugin.configured(AllOperators, .{}),
         lightning_rod.plugin.configured(tps.Tps, .{ .shown = tps_bar }),
         lightning_rod.plugin.configured(RegionDebug, .{}),
+        lightning_rod.plugin.configured(vanilla.SleepDebug, .{}),
     });
     var protocols = try protocol_set.Default.init(allocator);
     defer protocols.deinit(allocator);

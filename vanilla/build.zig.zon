@@ -46,6 +46,7 @@
         .vanilla_mobs = .{ .path = "mobs" },
         .vanilla_cow = .{ .path = "cow" },
         .vanilla_sheep = .{ .path = "sheep" },
+        .vanilla_debug = .{ .path = "debug" },
         .vanilla_world = .{ .path = "world" },
         .worlds = .{ .path = "../worlds" },
     },
