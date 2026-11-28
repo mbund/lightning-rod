@@ -1597,20 +1597,10 @@ pub const Mobs = struct {
     }
 
     /// The squared distance to the nearest player in the world who is not a spectator, as
-    /// EntityGetter.getNearestPlayer with no range finds them.
+    /// EntityGetter.getNearestPlayer with no range finds them: of the players the tick began with,
+    /// who stand where they are until it ends.
     pub fn nearestPlayerDistanceSquared(self: *Mobs, world: u32, position: [3]f64) ?f64 {
-        var best: ?f64 = null;
-        for (self.deps.players.activeSlots()) |slot| {
-            const player = &self.deps.players.records[slot];
-            if (player.world != world or player.stage != .ready) continue;
-            if (self.deps.player_states.of(player).gamemode == .spectator) continue;
-            const dx = player.position.x - position[0];
-            const dy = player.position.y - position[1];
-            const dz = player.position.z - position[2];
-            const distance = dx * dx + dy * dy + dz * dz;
-            if (best == null or distance < best.?) best = distance;
-        }
-        return best;
+        return self.context.audience.nearestSquared(world, position);
     }
 
     /// LivingEntity.pushEntities: what is pushable by the mob and in its box, in the order the

@@ -59,7 +59,7 @@ pub const Audience = struct {
 
     pub const Player = struct { world: u32, position: [3]f64 };
 
-    fn nearestSquared(self: Audience, world: u32, position: [3]f64) ?f64 {
+    pub fn nearestSquared(self: Audience, world: u32, position: [3]f64) ?f64 {
         var best: ?f64 = null;
         for (self.present) |player| {
             if (player.world != world) continue;
