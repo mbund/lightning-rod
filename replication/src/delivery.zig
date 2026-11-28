@@ -243,12 +243,15 @@ pub fn Batch(comptime Payload: type) type {
         /// their output was full, or they were not yet playing. What `settle` is handed lets a kind
         /// owe them the state whole. Good until the next call.
         pub fn missedOf(self: *const Self, accepted: bit_sets.Set) bit_sets.Set {
-            const audience: bit_sets.Set = .{ .words = self.audience, .capacity = self.players.records.len };
-            var each = audience.iterator();
-            @memset(self.missed, 0);
-            while (each.next()) |player| {
-                if (self.players.records[player].handle == null or accepted.contains(player)) continue;
-                self.missed[player / 64] |= @as(usize, 1) << @intCast(player % 64);
+            for (self.missed, self.audience, 0..) |*missed, audience, at| {
+                // A word at a time: only those it passed by, few or none, are asked for a session.
+                var passed = audience & ~accepted.wordAt(at);
+                var each = passed;
+                while (each != 0) : (each &= each - 1) {
+                    const bit: u6 = @intCast(@ctz(each));
+                    if (self.players.records[at * 64 + bit].handle == null) passed &= ~(@as(usize, 1) << bit);
+                }
+                missed.* = passed;
             }
             return .{ .words = self.missed, .capacity = self.players.records.len };
         }
